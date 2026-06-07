@@ -64,6 +64,8 @@ Input requirements:
 - Microphone or line-in capture where supported
 - Optional low-bandwidth TTY/PTY streaming mode (see architecture docs)
 
+External orchestrated tools (invoked as subprocesses, never vendored): `whisper-cli` / `insanely-fast-whisper` / `python3` (backends), `ffmpeg`/`ffprobe` (normalization fallback), and `yt-dlp` for the `youtube` subcommand — each user-installed and overridable via env (`FRANKEN_WHISPER_*_BIN`; yt-dlp via `FRANKEN_WHISPER_YTDLP_BIN`).
+
 ---
 
 ## Porting Workflow (Spec-First)

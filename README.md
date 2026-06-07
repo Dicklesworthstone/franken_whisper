@@ -377,9 +377,125 @@ cat audio.mp3 | franken_whisper transcribe --stdin --json
 
 ---
 
+## YouTube Ingestion
+
+`franken_whisper youtube` downloads YouTube audio and transcribes each video into a clean, deep-linked **markdown + JSON** pair. Hand it individual video URLs, playlist URLs (auto-expanded to their videos), or a file of URLs — it downloads, transcribes, and writes one transcript per video into `youtube_transcripts/` (override with `--output-dir`). Because the transcription runs on the same engine as `transcribe`, this pairs naturally with the in-process native engine: **no cloud, no API keys, your audio never leaves the machine.**
+
+```bash
+# Single video
+franken_whisper youtube "https://www.youtube.com/watch?v=jNQXAC9IVRw" --model tiny.en
+
+# Several videos at once
+franken_whisper youtube \
+  "https://youtu.be/VIDEO_A" \
+  "https://youtu.be/VIDEO_B" \
+  --concurrency 4
+
+# A whole playlist (expanded to its videos automatically)
+franken_whisper youtube "https://www.youtube.com/playlist?list=PLxxxxxxxx"
+
+# A file with one URL per line (blank lines and #/;/] comments ignored)
+franken_whisper youtube --batch-file urls.txt --output-dir ./talks
+```
+
+URLs may be passed positionally or with repeated `--url` flags, and mixed freely with `--batch-file`. A `watch?v=X&list=Y` URL is treated as the **single video** `X`, not the surrounding playlist.
+
+### Output
+
+Each video produces a markdown transcript and a JSON sidecar, named `{upload_date} - {title} [{id}]` (the YouTube id keeps names collision-proof; non-ASCII titles are preserved, path-hostile characters folded). The downloaded audio is kept under `audio/<id>.<ext>` (delete it automatically with `--no-keep-audio`), and a `.fw_youtube_manifest.json` state file tracks per-video progress.
+
+```
+youtube_transcripts/
+├── 2005-04-24 - Me at the zoo [jNQXAC9IVRw].md
+├── 2005-04-24 - Me at the zoo [jNQXAC9IVRw].json
+├── audio/
+│   └── jNQXAC9IVRw.webm
+└── .fw_youtube_manifest.json
+```
+
+The **markdown** leads with the title, a metadata line, a source link, and an honesty note, then paragraphs grouped on natural pauses (and speaker changes when `--diarize` is set), each prefixed with a `youtu.be` deep-link that jumps to that moment in the video:
+
+```markdown
+# Me at the zoo
+
+**Channel:** jawed · **Uploaded:** 2005-04-24 · **Duration:** 0:19
+**Source:** [www.youtube.com/watch?v=jNQXAC9IVRw](https://www.youtube.com/watch?v=jNQXAC9IVRw) · **Transcribed:** franken_whisper 0.2.0 (native, tiny.en)
+
+> Note: machine transcription; timestamps are approximate and deep-link into the video.
+
+---
+
+**[0:00](https://youtu.be/jNQXAC9IVRw?t=0)** All right, so here we are in front of the elephants…
+
+---
+_Transcribed by franken_whisper 0.2.0 (native, tiny.en, auto) in 0.48s — RTF 0.025_
+```
+
+The **JSON** sidecar carries the structured form — `video` metadata, `run` metadata, and a flat `utterances` array (one record per segment with `start_sec` / `end_sec` / `text` / `confidence`, plus `speaker` when diarized):
+
+```json
+{
+  "video": { "id": "jNQXAC9IVRw", "title": "Me at the zoo", "channel": "jawed",
+             "upload_date": "20050424", "duration": 19,
+             "webpage_url": "https://www.youtube.com/watch?v=jNQXAC9IVRw" },
+  "run":   { "model": "tiny.en", "engine": "native", "backend": "auto",
+             "version_tag": "0.2.0", "started": "2026-06-07T00:00:00Z",
+             "wall_ms": 480, "rtf": 0.025 },
+  "utterances": [
+    { "i": 0, "start_sec": 0.0, "end_sec": 4.2,
+      "text": "All right, so here we are in front of the elephants…",
+      "confidence": 0.91, "speaker": null }
+  ]
+}
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `[URL]...` / `--url <U>` | — | Video or playlist URLs (positional or repeated `--url`) |
+| `--batch-file <F>` | — | File with one URL per line (`#`/`;`/`]` comments and blanks ignored) |
+| `--output-dir <DIR>` | `youtube_transcripts` | Destination for markdown, JSON, and `audio/` |
+| `--model <M>` | backend-specific | Model name or path forwarded to the engine |
+| `--language <L>` | auto-detect | Language hint (ISO 639-1) |
+| `--backend <B>` | `auto` | `auto`, `whisper-cpp`, `insanely-fast`, `whisper-diarization` |
+| `--diarize` | `false` | Speaker diarization (emits `SPEAKER_NN` labels) |
+| `--concurrency <N>` | `3` | Maximum concurrent downloads |
+| `--no-keep-audio` | `false` | Delete each audio file after its transcript is written |
+| `--no-retry` | `false` | Do not retry videos previously marked failed in the manifest |
+| `--abort-on-error` | `false` | Stop the whole run on the first per-video failure |
+| `--json-summary` | `false` | Emit the final run summary as JSON on stdout (for scripting) |
+
+### Idempotent & Resumable
+
+The `.fw_youtube_manifest.json` makes every run resumable. A re-run **skips videos already `done`**, **retries previously failed videos** (unless `--no-retry`), and picks up exactly where it left off. **Ctrl+C cancels cleanly** — yt-dlp is killed, in-flight transcription aborts, and the manifest stays honest about what completed. By default a partial failure is reported and the run continues; `--abort-on-error` stops on the first failure instead.
+
+### Requires `yt-dlp`
+
+This subcommand orchestrates [`yt-dlp`](https://github.com/yt-dlp/yt-dlp), which you install separately:
+
+```bash
+brew install yt-dlp        # macOS
+pipx install yt-dlp        # cross-platform, isolated
+pip install -U yt-dlp      # cross-platform
+```
+
+Point `franken_whisper` at a specific build with `FRANKEN_WHISPER_YTDLP_BIN=/path/to/yt-dlp` if it is not on `PATH`.
+
+**Keep yt-dlp current.** YouTube changes its site frequently, and `yt-dlp` ships rapid updates to keep pace — so a download that "stops working" is almost always a stale `yt-dlp`, not a franken_whisper bug. franken_whisper warns when the resolved `yt-dlp` build is **more than 90 days old**. The fix is simply:
+
+```bash
+yt-dlp -U                       # update to the latest stable
+yt-dlp --update-to nightly      # or track the nightly channel for the freshest fixes
+```
+
+franken_whisper deliberately downloads with the forgiving `bestaudio/best` format selector rather than a strict codec filter, so a slightly stale yt-dlp still succeeds in more cases — but when YouTube breakage does occur, updating yt-dlp is the first and usually the only step.
+
+---
+
 ## Command Reference
 
-`franken_whisper` exposes six top-level subcommands.
+`franken_whisper` exposes seven top-level subcommands.
 
 ### `transcribe`
 
