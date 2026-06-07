@@ -569,8 +569,14 @@ pub fn download_audio(
 ) -> FwResult<PathBuf> {
     let template = dest_dir.join("%(id)s.%(ext)s");
     let args = vec![
+        // Best audio-only, falling back to the best combined format when a
+        // video has no audio-only stream (older uploads, some live VODs). The
+        // normalize stage extracts audio from a combined file via ffmpeg
+        // `-vn`, so a video container costs only bandwidth, never correctness.
+        // Bare `ba` rejects such videos outright ("Requested format is not
+        // available"), so the fallback is load-bearing.
         "-f".to_owned(),
-        "ba".to_owned(),
+        "bestaudio/best".to_owned(),
         "--no-playlist".to_owned(),
         "--no-warnings".to_owned(),
         "--no-progress".to_owned(),
