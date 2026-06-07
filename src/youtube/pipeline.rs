@@ -603,6 +603,144 @@ fn engine_labels(report: &crate::model::RunReport) -> (String, String) {
 mod tests {
     use super::*;
 
+    /// Absolute path to the hermetic yt-dlp stub (emits 2 canned playlist
+    /// entries: vid000000001 / vid000000002).
+    fn stub_info() -> YtdlpInfo {
+        YtdlpInfo {
+            path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/youtube/ytdlp_stub.sh"),
+            version: "2025.01.01".to_owned(),
+            stale: false,
+        }
+    }
+
+    fn opts_with_urls(urls: Vec<String>) -> YoutubeRunOptions {
+        YoutubeRunOptions {
+            urls,
+            batch_file: None,
+            output_dir: PathBuf::from("/tmp/unused"),
+            model: None,
+            language: None,
+            backend: BackendKind::Auto,
+            diarize: false,
+            concurrency: 1,
+            keep_audio: false,
+            retry_failed: false,
+            abort_on_error: false,
+        }
+    }
+
+    // ---- resolve_videos: bug-hunt edge cases (no network for Video forms) --
+
+    #[test]
+    fn resolve_video_urls_are_local_and_dedup_by_id() {
+        // Two URL forms for the SAME id (watch?v= and youtu.be/) must dedup to
+        // one VideoRef — and never touch the network (Video/Ambiguous resolve
+        // purely via extract_video_id).
+        let token = CancellationToken::unbounded();
+        let opts = opts_with_urls(vec![
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+            "https://youtu.be/dQw4w9WgXcQ".to_owned(), // same id, different form
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLx".to_owned(), // ambiguous, same id
+            "https://youtu.be/SECOND00001".to_owned(),
+        ]);
+        let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
+        let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, vec!["dQw4w9WgXcQ", "SECOND00001"], "deduped by id");
+    }
+
+    #[test]
+    fn resolve_empty_inputs_errors() {
+        let token = CancellationToken::unbounded();
+        let opts = opts_with_urls(vec![]);
+        assert!(matches!(
+            resolve_videos(&stub_info(), &opts, &token),
+            Err(FwError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_playlist_expands_via_stub() {
+        let token = CancellationToken::unbounded();
+        let opts = opts_with_urls(vec![
+            "https://www.youtube.com/playlist?list=PL123".to_owned(),
+        ]);
+        let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].id, "vid000000001");
+        assert_eq!(videos[1].id, "vid000000002");
+    }
+
+    #[test]
+    fn resolve_mixed_playlist_and_videos_dedup_cross_source() {
+        // A playlist (stub -> vid000000001, vid000000002) PLUS an explicit video
+        // URL whose id collides with a playlist entry, PLUS a fresh video.
+        // Order-preserving, first-seen-wins dedup across BOTH sources.
+        let token = CancellationToken::unbounded();
+        let opts = opts_with_urls(vec![
+            "https://www.youtube.com/playlist?list=PL123".to_owned(),
+            "https://youtu.be/vid000000002".to_owned(), // dup of a playlist entry
+            "https://www.youtube.com/watch?v=FRESHvideo1".to_owned(),
+        ]);
+        let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
+        let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, vec!["vid000000001", "vid000000002", "FRESHvideo1"]);
+    }
+
+    #[test]
+    fn resolve_duplicate_playlist_urls_dedup() {
+        // The same playlist URL twice must not duplicate its entries.
+        let token = CancellationToken::unbounded();
+        let opts = opts_with_urls(vec![
+            "https://www.youtube.com/playlist?list=PL123".to_owned(),
+            "https://www.youtube.com/playlist?list=PL123".to_owned(),
+        ]);
+        let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
+        assert_eq!(videos.len(), 2, "duplicate playlist expansion deduped");
+    }
+
+    /// SCALE MEASURE: resolve (dedup) + upsert + partition for K synthetic
+    /// video URLs. Proves the path is linear (HashSet dedup + BTreeMap upsert,
+    /// no accidental O(N²) Vec::contains scan) and reports timing. Uses local
+    /// Video URLs so NO network/subprocess is involved — this isolates the
+    /// pure-CPU resolve/dedup/manifest cost.
+    #[test]
+    fn resolve_and_upsert_scale_2000_is_linear() {
+        const K: usize = 2000;
+        let token = CancellationToken::unbounded();
+        // K distinct video URLs + a full duplicate pass (4000 inputs, 2000 ids).
+        let mut urls: Vec<String> = (0..K)
+            .map(|i| format!("https://www.youtube.com/watch?v=vid{i:08}id"))
+            .collect();
+        urls.extend(urls.clone()); // duplicates to exercise dedup
+        let opts = opts_with_urls(urls);
+
+        let t_resolve = std::time::Instant::now();
+        let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
+        let resolve_elapsed = t_resolve.elapsed();
+        assert_eq!(videos.len(), K, "dedup collapses the duplicate pass");
+
+        // Upsert into the manifest (mirrors run()'s discovery loop).
+        let mut manifest = Manifest::default();
+        let t_upsert = std::time::Instant::now();
+        for v in &videos {
+            manifest.upsert_discovered(v);
+        }
+        let upsert_elapsed = t_upsert.elapsed();
+        assert_eq!(manifest.order.len(), K);
+        assert_eq!(manifest.entries.len(), K);
+
+        eprintln!(
+            "resolve+dedup scale: K={K} ids from {} inputs in {:?} ({:.2} us/id); \
+             upsert {K} entries in {:?} ({:.2} us/entry)",
+            2 * K,
+            resolve_elapsed,
+            resolve_elapsed.as_secs_f64() * 1e6 / (2 * K) as f64,
+            upsert_elapsed,
+            upsert_elapsed.as_secs_f64() * 1e6 / K as f64,
+        );
+    }
+
     #[test]
     fn batch_file_strips_comments_and_blanks() {
         let body = "\

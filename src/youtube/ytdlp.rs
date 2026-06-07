@@ -52,6 +52,14 @@ const EXPAND_TIMEOUT: Duration = Duration::from_secs(300);
 /// Downloads can legitimately run long (politeness sleeps + retries).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Mirror of [`crate::process`]'s private `MAX_CAPTURED_OUTPUT_BYTES` (the 4 MiB
+/// per-command stdout/stderr capture cap). [`expand_playlist`] uses it to detect
+/// a cap-truncated flat-playlist capture and refuse to silently drop the tail
+/// videos of an oversized playlist. **Coupling note:** if the cap in
+/// `process.rs` changes, update this constant (a `process.rs` change is the
+/// right place for a true uncapped expansion path; see the follow-up bead).
+const EXPAND_CAPTURE_CAP: usize = 4 * 1024 * 1024;
+
 /// Resolved `yt-dlp` tool: absolute path, parsed version, staleness flag.
 ///
 /// All orchestration functions take `&YtdlpInfo` and run `self.path`, so tests
@@ -490,7 +498,34 @@ pub fn expand_playlist(
         "--".to_owned(),
         url.to_owned(),
     ];
-    let output = run_ytdlp(info, &args, token, EXPAND_TIMEOUT)?;
+    let output = match run_ytdlp(info, &args, token, EXPAND_TIMEOUT) {
+        Ok(output) => output,
+        // A failure with NO stderr and an abnormal/signal-style exit is the
+        // signature of our own 4 MiB capture cap closing the read end of the
+        // pipe while yt-dlp is still streaming: yt-dlp dies on SIGPIPE (exit
+        // ~141, or signal-killed → no exit code) without writing anything to
+        // stderr. Real yt-dlp errors (private/geo/429/etc.) always print to
+        // stderr, so an empty-stderr abnormal exit on THIS command means the
+        // playlist's flat-JSON overran the cap. Surface the actionable
+        // too-large error rather than a confusing CommandFailed.
+        Err(err) if is_capture_truncation_failure(&err) => {
+            return Err(playlist_too_large_error(url));
+        }
+        Err(err) => return Err(err),
+    };
+    // CORRECTNESS: `expand_playlist`'s stdout flows through the shared 4 MiB
+    // capture cap (`process::MAX_CAPTURED_OUTPUT_BYTES`). A large playlist's
+    // flat-JSON can EXCEED that cap (realistic flat lines are ~1.2–3 KB each, so
+    // a ~1,400–3,500 entry playlist — well within YouTube's 5,000-video limit —
+    // overruns 4 MiB). When that happens the capture is silently shortened
+    // mid-line and the tail videos are lost with no error. Detect a capture that
+    // hit the cap and refuse to return a truncated list, rather than silently
+    // dropping videos. (Root-cause fix — a dedicated uncapped/streaming
+    // expansion path — lives in `process.rs`, which this module does not own;
+    // flagged for a follow-up bead.)
+    if output.stdout.len() >= EXPAND_CAPTURE_CAP {
+        return Err(playlist_too_large_error(url));
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut refs = Vec::new();
@@ -520,6 +555,38 @@ pub fn expand_playlist(
     }
 
     Ok(refs)
+}
+
+/// Actionable error for a playlist whose flat-JSON expansion exceeded the 4 MiB
+/// capture cap (so the captured list would be silently truncated).
+fn playlist_too_large_error(url: &str) -> FwError {
+    FwError::InvalidRequest(format!(
+        "playlist `{url}` is too large to expand: its yt-dlp flat-playlist output \
+         exceeded the {} MiB capture cap and would be truncated (silently dropping \
+         videos). Split it into smaller playlists, or pass the individual video URLs \
+         (e.g. via --batch-file).",
+        EXPAND_CAPTURE_CAP / (1024 * 1024)
+    ))
+}
+
+/// Heuristic: does this command failure carry the signature of the 4 MiB capture
+/// cap closing the pipe mid-stream (yt-dlp dying on SIGPIPE)? That manifests as
+/// an abnormal/signal-style exit with an EMPTY stderr — genuine yt-dlp errors
+/// always write to stderr, so empty-stderr + abnormal exit on the expand command
+/// means our reader truncated the capture.
+fn is_capture_truncation_failure(err: &FwError) -> bool {
+    match err {
+        FwError::CommandFailed {
+            status,
+            stderr_suffix,
+            ..
+        } => {
+            // 141 == 128 + SIGPIPE(13); -1 == killed by signal (no exit code).
+            let signal_like = *status == 141 || *status < 0;
+            signal_like && stderr_suffix.trim().is_empty()
+        }
+        _ => false,
+    }
 }
 
 /// Map a single flat-playlist JSON object into a [`VideoRef`], or `None` if it
@@ -1234,6 +1301,184 @@ mod tests {
                 extract_video_id(url).is_some(),
                 "{url} classified as {kind:?} but extract_video_id returned None"
             );
+        }
+    }
+
+    // ---- expand_playlist scale measurement -------------------------------
+
+    /// Build a synthetic stub that emits `n` *realistic* flat-playlist JSON
+    /// lines (yt-dlp `--flat-playlist --dump-json` lines are NOT ~150 bytes —
+    /// they carry a thumbnails array, channel/uploader block, description, etc.,
+    /// landing around 1.5–3 KB each). Returns `(tempdir, info, approx_line_len)`.
+    ///
+    /// The generated script ALSO honors `--version` (so it can be probed) and
+    /// prints the lines verbatim, exercising the real `run_command_cancellable`
+    /// capture path — including the 4 MiB `MAX_CAPTURED_OUTPUT_BYTES` cap that
+    /// `expand_playlist`'s stdout flows through. This lets the measurement prove
+    /// whether a large playlist's flat-JSON gets silently truncated.
+    fn synthetic_flat_playlist_info(n: usize) -> (tempfile::TempDir, YtdlpInfo, usize) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("flat_stub.sh");
+        // A representative flat-playlist entry template. yt-dlp emits a fat
+        // object per entry; this mirrors the realistic field set + a thumbnails
+        // array so the per-line byte cost is faithful (~1.6 KB here).
+        let line_template = |i: usize| -> String {
+            serde_json::json!({
+                "_type": "url",
+                "ie_key": "Youtube",
+                "id": format!("vid{i:08}xyz"),
+                "url": format!("https://www.youtube.com/watch?v=vid{i:08}xyz"),
+                "title": format!("A Reasonably Long Representative Playlist Video Title Number {i}"),
+                "description": "A multi-sentence description that yt-dlp includes in flat dumps. \
+                                It is typically a couple hundred characters of prose padding.",
+                "duration": 245.0 + (i % 600) as f64,
+                "channel_id": "UCabcdefghijklmnopqrstuv",
+                "channel": "Some Representative Channel Name",
+                "channel_url": "https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv",
+                "uploader": "Some Representative Channel Name",
+                "uploader_id": "@somerepresentativechannel",
+                "uploader_url": "https://www.youtube.com/@somerepresentativechannel",
+                "view_count": 123456 + i,
+                "availability": "public",
+                "live_status": "not_live",
+                "thumbnails": (0..5).map(|t| serde_json::json!({
+                    "url": format!("https://i.ytimg.com/vi/vid{i:08}xyz/hqdefault_{t}.jpg"),
+                    "height": 94 + t * 100,
+                    "width": 168 + t * 160,
+                })).collect::<Vec<_>>(),
+            })
+            .to_string()
+        };
+        let approx_line_len = line_template(0).len() + 1; // + newline
+        // Emit all lines from the script via a heredoc-free, fast `cat` of a
+        // pre-materialized data file (keeps the script tiny and the stdout
+        // generation cost out of the parse-time measurement's critical section).
+        let data_path = dir.path().join("flat_lines.jsonl");
+        {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&data_path).unwrap());
+            for i in 0..n {
+                writeln!(f, "{}", line_template(i)).unwrap();
+            }
+            f.flush().unwrap();
+        }
+        let script = format!(
+            "#!/usr/bin/env bash\nset -u\nfor a in \"$@\"; do [ \"$a\" = --version ] && \
+             {{ echo 2025.01.01; exit 0; }}; done\ncat {}\n",
+            data_path.display()
+        );
+        std::fs::write(&script_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        let info = YtdlpInfo {
+            path: script_path,
+            version: "2025.01.01".to_owned(),
+            stale: false,
+        };
+        (dir, info, approx_line_len)
+    }
+
+    /// MEASURE: time `expand_playlist` parsing for a large synthetic playlist
+    /// and report the per-line byte cost + total stdout size against the 4 MiB
+    /// `process::MAX_CAPTURED_OUTPUT_BYTES` cap. Asserts the parse is linear and
+    /// (within the cap) loses no entries; reports timing for the perf record.
+    #[test]
+    fn expand_playlist_scale_2000_is_linear_and_within_cap() {
+        const N: usize = 2000;
+        let (_dir, info, line_len) = synthetic_flat_playlist_info(N);
+        let token = CancellationToken::unbounded();
+
+        let t = std::time::Instant::now();
+        let refs =
+            expand_playlist(&info, "https://www.youtube.com/playlist?list=PLbig", &token).unwrap();
+        let elapsed = t.elapsed();
+
+        let total_bytes = line_len * N;
+        let cap = 4 * 1024 * 1024;
+        eprintln!(
+            "expand_playlist scale: N={N} entries, ~{line_len} B/line, \
+             ~{total_bytes} B total stdout (cap={cap} B), parsed {} refs in {:?} \
+             ({:.1} us/entry)",
+            refs.len(),
+            elapsed,
+            elapsed.as_secs_f64() * 1e6 / N as f64,
+        );
+        // The realistic ~1.6 KB/line × 2000 ≈ 3.2 MB stays just under the 4 MiB
+        // cap, so NO entries are lost here. (At ~2700+ such entries it WOULD
+        // exceed the cap — see expand_playlist_truncation_is_now_detected.)
+        assert_eq!(refs.len(), N, "all entries parsed when under the cap");
+    }
+
+    /// CORRECTNESS REGRESSION GUARD: a playlist whose flat-JSON stdout exceeds
+    /// the 4 MiB capture cap must NOT be parsed as a silently-shortened list.
+    /// Pre-fix this returned a truncated `Vec` (dropping the tail videos with no
+    /// error). The fix makes `expand_playlist` detect a cap-truncated capture
+    /// and surface an actionable error instead of silently losing videos.
+    #[test]
+    fn expand_playlist_truncation_is_now_detected() {
+        // ~1.6 KB/line × 4000 ≈ 6.4 MB > 4 MiB cap → capture is truncated.
+        const N: usize = 4000;
+        let (_dir, info, line_len) = synthetic_flat_playlist_info(N);
+        let token = CancellationToken::unbounded();
+        let total = line_len * N;
+        assert!(
+            total > 4 * 1024 * 1024,
+            "test precondition: {total} B must exceed the 4 MiB cap"
+        );
+        let result = expand_playlist(
+            &info,
+            "https://www.youtube.com/playlist?list=PLhuge",
+            &token,
+        );
+        match result {
+            Err(FwError::InvalidRequest(msg)) => {
+                assert!(
+                    msg.contains("truncat") || msg.contains("too large") || msg.contains("4 MiB"),
+                    "expected a truncation/too-large error, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidRequest about truncation, got {other:?}"),
+            Ok(refs) => panic!(
+                "BUG: silently returned {} refs from a cap-truncated capture (expected an error)",
+                refs.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn capture_truncation_failure_signature() {
+        // SIGPIPE-style death with empty stderr (our cap closed the pipe).
+        let sigpipe = FwError::from_command_failure("yt-dlp ...".to_owned(), 141, String::new());
+        assert!(is_capture_truncation_failure(&sigpipe));
+        let killed = FwError::from_command_failure("yt-dlp ...".to_owned(), -1, "  \n".to_owned());
+        assert!(is_capture_truncation_failure(&killed));
+        // A genuine yt-dlp error writes to stderr -> NOT a truncation signature.
+        let real = FwError::from_command_failure(
+            "yt-dlp ...".to_owned(),
+            1,
+            "ERROR: Private video".to_owned(),
+        );
+        assert!(!is_capture_truncation_failure(&real));
+        // A normal non-signal failure with empty stderr is also not it.
+        let plain = FwError::from_command_failure("yt-dlp ...".to_owned(), 2, String::new());
+        assert!(!is_capture_truncation_failure(&plain));
+    }
+
+    #[test]
+    fn playlist_too_large_error_is_actionable() {
+        let e = playlist_too_large_error("https://www.youtube.com/playlist?list=PLx");
+        match e {
+            FwError::InvalidRequest(msg) => {
+                assert!(msg.contains("too large"), "{msg}");
+                assert!(msg.contains("truncat"), "{msg}");
+                assert!(msg.contains("4 MiB"), "{msg}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
         }
     }
 
