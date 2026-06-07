@@ -402,6 +402,31 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                     continue;
                 }
             };
+            // ID-DIVERGENCE GUARD (manifest-key consistency, see the module
+            // invariant): the manifest is keyed — on discovery AND on every
+            // `set_state` — by `video.id`, which is derived **deterministically
+            // from the input URL** (`extract_video_id`, or the rare fallback
+            // fetch's id). Naming/output, by contrast, uses the authoritative
+            // `meta.id` from yt-dlp. For valid YouTube URLs these are equal (the
+            // `v=` param IS the video id and yt-dlp echoes it). They must stay
+            // equal for resume to be correct: a re-run re-derives the SAME key
+            // from the same URL and finds the `Done` entry, so a downloaded
+            // video is never reprocessed. If yt-dlp ever canonicalizes the id to
+            // something the URL parse can't reproduce, the output file (named
+            // from `meta.id`) and the manifest key (the URL-derived id) would
+            // disagree — resume still works (the key is URL-deterministic), but
+            // the on-disk filename id would differ from the manifest key. Surface
+            // that rare divergence rather than letting it pass silently.
+            if meta.id != video.id {
+                tracing::warn!(
+                    manifest_key = %video.id,
+                    resolved_id = %meta.id,
+                    url = %video.url,
+                    "yt-dlp resolved a video id that differs from the URL-derived id; \
+                     the output filename will use the resolved id while the manifest is \
+                     keyed by the URL-derived id (resume stays correct)"
+                );
+            }
             // NB: we intentionally do NOT persist a `Downloaded` state here.
             // Write-amplification fix: the manifest is a full-rewrite-on-save
             // BTreeMap, so each save is O(N) bytes; saving here once per video
@@ -739,6 +764,89 @@ mod tests {
             upsert_elapsed,
             upsert_elapsed.as_secs_f64() * 1e6 / K as f64,
         );
+    }
+
+    /// REGRESSION GUARD for the manifest-key-consistency invariant (mission
+    /// #1c). The manifest MUST be keyed by the URL-derived id (`extract_video_id`
+    /// of the input URL) — NOT by yt-dlp's resolved `meta.id` — so that a re-run
+    /// re-derives the SAME key from the same URL and finds the prior `Done`
+    /// entry. If a future refactor switched the manifest key to `meta.id`, a
+    /// re-run would re-derive the URL key, fail to match the `meta.id`-keyed
+    /// entry, and reprocess the video forever. This test pins:
+    /// (1) `resolve_videos` produces a `VideoRef.id` equal to `extract_video_id`,
+    /// (2) `upsert_discovered` keys the manifest by exactly that id, and
+    /// (3) the same URL re-resolves to the same key (idempotent discovery).
+    #[test]
+    fn manifest_key_is_url_derived_and_stable_across_reruns() {
+        let token = CancellationToken::unbounded();
+        // A spread of single-video URL forms; each must key by its URL-derived
+        // id and re-derive identically on a second pass (the resume contract).
+        let urls = vec![
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+            "https://youtu.be/SHORTID0001?t=42".to_owned(),
+            "https://www.youtube.com/watch?v=WITHLIST001&list=PLabc".to_owned(),
+            "https://www.youtube.com/shorts/SHORTSVID01".to_owned(),
+        ];
+        let opts = opts_with_urls(urls.clone());
+
+        // First "run": resolve + upsert.
+        let videos = resolve_videos(&stub_info(), &opts, &token).expect("resolve");
+        let mut manifest = Manifest::default();
+        for v in &videos {
+            // Each VideoRef.id is exactly the URL-derived id (no network).
+            assert_eq!(
+                Some(v.id.clone()),
+                ytdlp::extract_video_id(&v.url),
+                "VideoRef id must equal extract_video_id(url) for {}",
+                v.url
+            );
+            manifest.upsert_discovered(v);
+        }
+        // The manifest is keyed by the URL-derived ids, in discovery order.
+        let keys_after_first: Vec<String> = manifest.order.clone();
+        assert_eq!(
+            keys_after_first,
+            vec![
+                "dQw4w9WgXcQ".to_owned(),
+                "SHORTID0001".to_owned(),
+                "WITHLIST001".to_owned(),
+                "SHORTSVID01".to_owned(),
+            ],
+            "manifest keys must be the URL-derived ids"
+        );
+
+        // Mark all done (mirrors a completed run) and "re-run" discovery from
+        // the SAME urls: upsert must re-derive the SAME keys and add nothing,
+        // so the partition step would skip every already-done video.
+        for k in &keys_after_first {
+            manifest.set_state(
+                k,
+                VideoState::Done {
+                    audio_path: None,
+                    markdown_path: format!("{k}.md"),
+                    json_path: format!("{k}.json"),
+                },
+            );
+        }
+        let videos2 = resolve_videos(&stub_info(), &opts, &token).expect("re-resolve");
+        for v in &videos2 {
+            manifest.upsert_discovered(v); // idempotent: no new keys
+        }
+        assert_eq!(
+            manifest.order, keys_after_first,
+            "re-run must re-derive identical keys (no duplicate/reprocess entries)"
+        );
+        // Every re-discovered video maps to a Done entry -> would be skipped.
+        for v in &videos2 {
+            assert!(
+                matches!(
+                    manifest.entries.get(&v.id).and_then(|e| e.state.as_ref()),
+                    Some(VideoState::Done { .. })
+                ),
+                "re-discovered {} must already be Done (skipped on resume)",
+                v.id
+            );
+        }
     }
 
     #[test]
