@@ -177,3 +177,23 @@ vs `/tmp/fw_golden/{tiny.en,large-v3-turbo}.json`: **byte-exact on both models**
 **3086/3086** green; integration suites native_engine_e2e 6, no_canned_phrases 6,
 conformance_comparator 26, cli_integration 82 — all green. fmt --check clean,
 clippy --all-targets -D warnings clean.
+
+
+## 7. Round 3 — Scale (2026-06-06; artifacts in ../20260606T2341Z-scale-baseline/)
+
+The unprofiled dimension: real-world long audio (the original use case is
+2-hour call recordings). Fixture: a real 2h call, 297 windows, 25,348 tokens.
+
+| Pass | Outcome | Evidence |
+|------|---------|----------|
+| 1 Scale profile | Linear scaling proven (no super-linear bends); 2h tiny seq = 604s, RTF 0.083, 2.05GB RSS. Rejected with numbers: full-mel memory, prompt-quadratic (capped, mean 39 tok), window fixed overheads, report serialization (0.35% at 25k tokens). Found: tiny long-audio = 74% decode_loop; IF backend 1.43x SLOWER at scale + 67% seam word-diff. | HOTSPOTS.md |
+| 2 Tiny token floor | gemv_f16 PAR_THRESHOLD 1<<16 -> 1<<19 (measured crossover: serial wins <=393k MACs). self_qkv 1.38 -> 0.32 ms/tok; 600s decode_loop 6.83 -> 3.83 ms/tok (-44%); byte-identical. | PASS2_RESULTS.md |
+| 3 IF at scale | Contiguous ranges (rolling prompt within ranges; seams = workers-1) + no-oversubscription budget (MIN 5 threads/worker). tiny 1.43x -> 0.73x vs seq; word-diff 67% -> 22%; new contract: 1 worker == sequential byte-exact. | PASS3_RESULTS.md |
+| 4 Re-profile | ZERO-CHANGE floor verdict: **2h call = 262.9s via IF (2.30x round delta; RTF 0.036)**; decode floor flat 4ms/tok across 297 windows; skew 0.85%; every knob swept and rejected. | PASS4_RESULTS.md |
+| 5 Reserve | Skipped-as-redundant (pass 4 covered the scope hours earlier). | — |
+
+Round-3 convergence: both long-audio regimes at measured floors —
+tiny/long = serial-GEMV compute floor; large = encoder GEMM (closed in
+rounds 1-2). The 2-hour-call headline across the whole project: from
+"mock engine, no real output" 3 days ago to 262.9s of real transcription
+(13.7x faster than realtime) in memory-safe Rust.
