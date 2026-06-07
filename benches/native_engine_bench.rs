@@ -398,29 +398,58 @@ fn bench_e2e_tiny_jfk(c: &mut Criterion) {
 //     the 3.0 -> 13.5 GFLOP/s win shows up, free of model-load / encoder noise.
 // ---------------------------------------------------------------------------
 
-fn bench_f16_gemv_dequant(c: &mut Criterion) {
-    use franken_whisper::native_engine::nn;
-    let (out, inp) = (1280usize, 1280usize);
+fn f16_normal_weight(out: usize, inp: usize) -> Vec<ft_core::Float16> {
     // Deterministic normal-range half weight (whisper weights are normal range).
-    let w: Vec<ft_core::Float16> = (0..out * inp)
+    (0..out * inp)
         .map(|i| {
             let e = 1 + (i % 30) as u16;
             let m = (i * 37 % 1024) as u16;
             let s = ((i % 2) as u16) << 15;
             ft_core::Float16::from_bits(s | (e << 10) | m)
         })
-        .collect();
-    let x: Vec<f32> = (0..inp).map(|i| (i as f32 * 0.001).sin()).collect();
-    let mut out_buf = vec![0.0f32; out];
+        .collect()
+}
+
+fn bench_f16_gemv_dequant(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn;
 
     let mut group = c.benchmark_group("native_engine/f16_gemv");
-    group.throughput(criterion::Throughput::Elements((out * inp) as u64));
-    group.bench_function("f16_gemv_dequant_1280x1280", |b| {
-        b.iter(|| {
-            nn::gemv_f16(black_box(&w), out, inp, black_box(&x), None, &mut out_buf);
-            black_box(out_buf[0])
+
+    // The large decoder Linear width: the bandwidth-class shape where the
+    // band-parallel scope path wins big (the pass-3 3.0 → ~16 GFLOP/s case).
+    {
+        let (out, inp) = (1280usize, 1280usize);
+        let w = f16_normal_weight(out, inp);
+        let x: Vec<f32> = (0..inp).map(|i| (i as f32 * 0.001).sin()).collect();
+        let mut out_buf = vec![0.0f32; out];
+        group.throughput(criterion::Throughput::Elements((out * inp) as u64));
+        group.bench_function("f16_gemv_dequant_1280x1280", |b| {
+            b.iter(|| {
+                nn::gemv_f16(black_box(&w), out, inp, black_box(&x), None, &mut out_buf);
+                black_box(out_buf[0])
+            });
         });
-    });
+    }
+
+    // The tiny.en per-token self-attention / cross-attention Linear shape
+    // ([1,384] x [384,384]). At ~147 k MACs this is ~9 µs of compute, far below
+    // the 8-way `thread::scope` spawn/join cost — the round-3 pass-2 lever moves
+    // its `PAR_THRESHOLD` above this so it runs serial. This bench is the direct
+    // instrument for that spawn-elimination (it must DROP after the lever).
+    {
+        let (out, inp) = (384usize, 384usize);
+        let w = f16_normal_weight(out, inp);
+        let x: Vec<f32> = (0..inp).map(|i| (i as f32 * 0.001).sin()).collect();
+        let mut out_buf = vec![0.0f32; out];
+        group.throughput(criterion::Throughput::Elements((out * inp) as u64));
+        group.bench_function("f16_gemv_dequant_384x384", |b| {
+            b.iter(|| {
+                nn::gemv_f16(black_box(&w), out, inp, black_box(&x), None, &mut out_buf);
+                black_box(out_buf[0])
+            });
+        });
+    }
+
     group.finish();
 }
 
