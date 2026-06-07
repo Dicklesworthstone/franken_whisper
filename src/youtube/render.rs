@@ -294,9 +294,10 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
     let r = &input.run;
     let mut out = String::new();
 
-    // H1.
+    // H1. Collapse internal whitespace/newlines so a multi-line title cannot
+    // break the heading into the body.
     out.push_str("# ");
-    out.push_str(v.title.trim());
+    out.push_str(&v.title.split_whitespace().collect::<Vec<_>>().join(" "));
     out.push_str("\n\n");
 
     // Metadata line: channel · uploaded · duration.
@@ -447,12 +448,8 @@ fn description_intro(description: Option<&str>) -> Option<String> {
     if flat.is_empty() {
         return None;
     }
-    let mut intro: String = flat
-        .char_indices()
-        .take_while(|&(i, _)| i < DESCRIPTION_INTRO_CHARS)
-        .map(|(_, c)| c)
-        .collect();
-    if intro.len() < flat.len() {
+    let mut intro: String = flat.chars().take(DESCRIPTION_INTRO_CHARS).collect();
+    if flat.chars().count() > DESCRIPTION_INTRO_CHARS {
         intro.push('…');
     }
     Some(intro)

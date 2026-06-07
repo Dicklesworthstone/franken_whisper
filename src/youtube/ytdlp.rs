@@ -402,6 +402,10 @@ pub fn expand_playlist(
         "--flat-playlist".to_owned(),
         "--dump-json".to_owned(),
         "--no-warnings".to_owned(),
+        // `--` stops yt-dlp option parsing: a hostile URL (e.g. a
+        // playlist-entry `url` field starting with `-`) can never be read as a
+        // flag. Defense-in-depth on top of classify_url's host gate.
+        "--".to_owned(),
         url.to_owned(),
     ];
     let output = run_ytdlp(info, &args, token, EXPAND_TIMEOUT)?;
@@ -481,6 +485,10 @@ pub fn fetch_metadata(
         "--no-simulate".to_owned(),
         "--no-playlist".to_owned(),
         "--no-warnings".to_owned(),
+        // `--` stops yt-dlp option parsing: a hostile URL (e.g. a
+        // playlist-entry `url` field starting with `-`) can never be read as a
+        // flag. Defense-in-depth on top of classify_url's host gate.
+        "--".to_owned(),
         url.to_owned(),
     ];
     let output = run_ytdlp(info, &args, token, METADATA_TIMEOUT)?;
@@ -590,6 +598,10 @@ pub fn download_audio(
         "5".to_owned(),
         "--retries".to_owned(),
         "10".to_owned(),
+        // `--` stops yt-dlp option parsing: a hostile URL (e.g. a
+        // playlist-entry `url` field starting with `-`) can never be read as a
+        // flag. Defense-in-depth on top of classify_url's host gate.
+        "--".to_owned(),
         meta.webpage_url.clone(),
     ];
 

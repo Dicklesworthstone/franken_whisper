@@ -48,6 +48,11 @@ use super::ytdlp::{self, UrlKind, VideoMeta, VideoRef, YtdlpInfo};
 /// Manifest file name written into the output directory.
 const MANIFEST_NAME: &str = ".fw_youtube_manifest.json";
 
+/// A video that has failed this many times is not retried again on a plain
+/// re-run (it still counts as skipped). `--no-retry` skips any prior failure
+/// regardless; deleting the manifest entry forces a fresh attempt.
+const MAX_ATTEMPTS: u32 = 3;
+
 /// Per-video processing state. Persisted in the manifest so a re-run resumes
 /// exactly where a crash or cancellation left off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +293,13 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                 tracing::info!(id = %v.id, "previously failed; --no-retry, skipping");
                 summary.skipped.push(v.id.clone());
             }
+            Some(VideoState::Failed { attempts, .. }) if *attempts >= MAX_ATTEMPTS => {
+                tracing::info!(
+                    id = %v.id, attempts,
+                    "exhausted retry budget; skipping (delete the manifest entry to force a retry)"
+                );
+                summary.skipped.push(v.id.clone());
+            }
             _ => to_process.push(v.clone()),
         }
     }
@@ -335,11 +347,22 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
 
         // ── Transcription consumer: sequential, on this thread. ──
         for result in rx {
+            let DownloadResult { video, outcome } = result;
             if token.checkpoint().is_err() {
+                // Cancelled while this download sat in the channel: persist its
+                // state so a resume reuses the audio rather than orphaning it.
+                if let Ok(audio_path) = &outcome {
+                    manifest.set_state(
+                        &video.id,
+                        VideoState::Downloaded {
+                            audio_path: audio_path.display().to_string(),
+                        },
+                    );
+                    manifest.save(&manifest_path)?;
+                }
                 summary.cancelled = true;
                 break;
             }
-            let DownloadResult { video, outcome } = result;
             let audio_path = match outcome {
                 Ok(p) => p,
                 Err(error) => {
