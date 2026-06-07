@@ -1,12 +1,21 @@
 # Native YouTube extraction — feasibility & resume notes
 
-**Status (2026-06-07): PAUSED, blocked on FrankenEngine.** The YouTube path in
-`fw` currently orchestrates the external `yt-dlp` binary (`src/youtube/`). The
-goal of a fully native, memory-safe Rust port (no Python `yt-dlp`) is sound and
-the architecture below is decided — but it is gated on the
-[FrankenEngine](https://github.com/Dicklesworthstone/franken_engine) JavaScript
-engine maturing first. A one-afternoon spike proved the dependency isn't ready,
-so we paused before sinking weeks into a foundation that can't yet run.
+**Status (2026-06-07): PAUSED, but the cipher is NOT the blocker.** The YouTube
+path in `fw` currently orchestrates the external `yt-dlp` binary (`src/youtube/`).
+The goal of a fully native, memory-safe Rust port (no Python `yt-dlp`) is sound
+and the architecture below is decided. A spike against
+[FrankenEngine](https://github.com/Dicklesworthstone/franken_engine) `main`
+@ `8ca80bfc` proved its JS engine **runs the YouTube signature cipher correctly
+today** (acceptance gate `decipherSig("0123456789") == "31204576"` passes). The
+genuinely-blocked part is the **media download** layer (YouTube's 2025 SABR
+streaming + PO-token attestation); the rest — InnerTube metadata/search/playlist
++ the sig/n cipher — is buildable natively now.
+
+> **Correction:** an earlier draft of this memo said FrankenEngine "can't run the
+> cipher." That was tested against a stale `v0.1.0` checkout (the clone was
+> detached on the release tag, 228 commits behind `main`). Re-tested on `main`,
+> the cipher works. See the corrected gap report:
+> `docs/FRANKENENGINE_YOUTUBE_CIPHER_JS_GAP_REPORT.md`.
 
 ## Decided architecture (for when we resume)
 
@@ -33,22 +42,20 @@ today the code always uses the `yt-dlp` orchestration; only the
   still needs an update to the extraction pattern that locates the function in
   base.js, which is the volatile "knowledge" we sync per the bullet above.)
 
-## Why it's paused — two findings
+## Where the real blocker is — findings (corrected against `main`)
 
-1. **FrankenEngine can't run the cipher yet.** Its public `HybridRouter::eval`
-   runs literals, function-expression calls, and object-method dispatch, but is
-   **missing Array methods (`reverse`/`splice`/`slice`/`join`), `String.split`,
-   `String.fromCharCode`, and working loops** (a 5-iteration `for` exhausts the
-   100 000-instruction budget). The YouTube signature cipher is
-   `split("")` → a fixed sequence of helper transforms (`reverse`/`splice`/swap)
-   → `join("")` — i.e. exactly the missing Array/String builtins — so it cannot
-   run today. (Explicit `for`-loops, also broken here, dominate the `n`-transform
-   and BotGuard.) BotGuard (for PO tokens) is far harder JS than the cipher.
-   - The full gap analysis, reproducible harness, prioritized work items, and a
-     verified acceptance gate live in the FrankenEngine repo at
-     **`YOUTUBE_CIPHER_JS_GAP_REPORT.md`** (handed to the FrankenEngine agents).
+1. **FrankenEngine runs the cipher today (on `main`).** Its public
+   `HybridRouter::eval` handles every cipher primitive — Array
+   `reverse`/`splice`/`slice`/`join`, `String.split`/`fromCharCode`/`charCodeAt`,
+   `for` loops, bitwise — plus `RegExp`, `String.replace`, `Array.map`+closures,
+   `JSON`, `Math.imul`. The acceptance gate passes. So the sig/n cipher layer of
+   the native port is **unblocked**. The only FrankenEngine gaps left are three
+   *BotGuard*-specific features — **typed arrays, the `Function` constructor, and
+   `try/catch`** — which block PO-token attestation but not the cipher. (Details +
+   reproducible harness: `docs/FRANKENENGINE_YOUTUBE_CIPHER_JS_GAP_REPORT.md`.)
 
-2. **YouTube moved past the cipher (2025 SABR + PO tokens).** On a test video,
+2. **YouTube moved past the cipher (2025 SABR + PO tokens) — this is the real
+   blocker.** On a test video,
    `yt-dlp`'s own verbose log shows `bestaudio` resolving to **no plain GET-able
    URL** (`yt-dlp -f bestaudio --print url` printed empty), with "YouTube is
    forcing SABR streaming" and "Detected experiment to bind GVS PO Token" —
@@ -63,11 +70,18 @@ today the code always uses the `yt-dlp` orchestration; only the
 
 ## Resume condition
 
-Resume the native port when FrankenEngine passes the acceptance gate in its
-`YOUTUBE_CIPHER_JS_GAP_REPORT.md` (the §5 `decipherSig("0123456789") ==
-"31204576"` milestone, then the live-base.js stretch). At that point: build the
-InnerTube client on `asupersync`, wire FrankenEngine for sig/n, then tackle the
-SABR + PO-token layer (the genuinely hard part) as its own epic.
+The cipher prerequisite is already met (FrankenEngine `main` passes the
+acceptance gate), so the native port can resume *partially* whenever we want:
+build the InnerTube client on `asupersync` + metadata/search/playlist + wire
+FrankenEngine for sig/n. The part that stays blocked is **media download**:
+- **SABR/UMP streaming** — a protocol to implement in Rust (JS-engine-independent).
+- **PO-token (BotGuard)** — needs FrankenEngine to land the three remaining
+  features (typed arrays, `Function` constructor, `try/catch`); track that in the
+  gap report.
+
+So: the metadata/cipher layer is a "resume now" decision; the download layer is
+gated on (SABR implementation) + (BotGuard → 3 FrankenEngine features). Until
+both are done, downloads fall back to `yt-dlp`.
 
 ## Until then
 
