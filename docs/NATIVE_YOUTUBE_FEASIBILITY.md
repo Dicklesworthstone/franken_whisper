@@ -10,20 +10,28 @@ so we paused before sinking weeks into a foundation that can't yet run.
 
 ## Decided architecture (for when we resume)
 
-Native, memory-safe Rust, behind a `native-ytdl` cargo feature (default OFF so
-`fw`'s normal build stays lean). The existing `yt-dlp` orchestration stays as
-the `FRANKEN_WHISPER_YTDL=ytdlp` fallback.
+Native, memory-safe Rust, behind a `native-ytdl` cargo feature (planned;
+default OFF so `fw`'s normal build stays lean). The existing `yt-dlp`
+orchestration stays as the `FRANKEN_WHISPER_YTDL=ytdlp` fallback (also planned —
+today the code always uses the `yt-dlp` orchestration; only the
+`FRANKEN_WHISPER_YTDLP_BIN` *binary-path* override exists).
 
 - **Networking:** `asupersync` HTTP (no reqwest/hyper).
 - **JavaScript (cipher + BotGuard):** **FrankenEngine** (`frankenengine-engine`,
-  `HybridRouter::eval`), `default-features = false`. Not boa, not V8.
+  `HybridRouter::eval`), `default-features = false` — required today because its
+  default `asupersync-integration` feature fails to compile against
+  `franken-decision` 0.3.2 (the same `update_posterior` `E0053` drift
+  `franken_whisper` itself migrated; see the gap report §6). We want only the JS
+  engine anyway, not the decision/evidence control plane. Not boa, not V8.
 - **Extraction logic:** port yt-dlp's `youtube` extractor + the InnerTube
   protocol to Rust. The *volatile* knowledge (sig-function-extraction regexes,
   client versions/keys) can optionally be synced from yt-dlp's source so we ride
   the community's fixes without running their Python — data in, native execution.
 - **Self-healing cipher:** fetch the *live* `base.js` from YouTube at runtime and
-  run it through FrankenEngine, so a weekly cipher rotation just works (we never
-  hardcode the cipher).
+  run it through FrankenEngine, so a weekly cipher *value/rotation* change just
+  works — we never hardcode the cipher transform. (A *structural* base.js change
+  still needs an update to the extraction pattern that locates the function in
+  base.js, which is the volatile "knowledge" we sync per the bullet above.)
 
 ## Why it's paused — two findings
 
@@ -31,22 +39,27 @@ the `FRANKEN_WHISPER_YTDL=ytdlp` fallback.
    runs literals, function-expression calls, and object-method dispatch, but is
    **missing Array methods (`reverse`/`splice`/`slice`/`join`), `String.split`,
    `String.fromCharCode`, and working loops** (a 5-iteration `for` exhausts the
-   100 000-instruction budget). The YouTube signature cipher *is* exactly
-   `split → reverse/splice/swap → join` in a loop, so it cannot run today.
-   BotGuard (for PO tokens) is far harder JS than the cipher.
+   100 000-instruction budget). The YouTube signature cipher is
+   `split("")` → a fixed sequence of helper transforms (`reverse`/`splice`/swap)
+   → `join("")` — i.e. exactly the missing Array/String builtins — so it cannot
+   run today. (Explicit `for`-loops, also broken here, dominate the `n`-transform
+   and BotGuard.) BotGuard (for PO tokens) is far harder JS than the cipher.
    - The full gap analysis, reproducible harness, prioritized work items, and a
      verified acceptance gate live in the FrankenEngine repo at
      **`YOUTUBE_CIPHER_JS_GAP_REPORT.md`** (handed to the FrankenEngine agents).
 
-2. **YouTube moved past the cipher (2025 SABR + PO tokens).** Even `yt-dlp`'s own
-   verbose log now shows `bestaudio` with **no plain GET-able URL** for many
-   videos — "YouTube is forcing SABR streaming", "Detected experiment to bind GVS
-   PO Token". So a native port that stops at "InnerTube + sig/n cipher → GET url"
-   would fail the same way; the full path *also* needs **SABR/UMP streaming** and
-   **PO-token (BotGuard) attestation** — the hardest, most volatile code in the
-   extraction world. The user chose the full-native scope anyway (in-ethos), which
-   makes a capable JS engine (for BotGuard) the linchpin — hence FrankenEngine
-   first.
+2. **YouTube moved past the cipher (2025 SABR + PO tokens).** On a test video,
+   `yt-dlp`'s own verbose log shows `bestaudio` resolving to **no plain GET-able
+   URL** (`yt-dlp -f bestaudio --print url` printed empty), with "YouTube is
+   forcing SABR streaming" and "Detected experiment to bind GVS PO Token" —
+   consistent with the broad 2025 SABR rollout (yt-dlp issue #12482). `yt-dlp`
+   still *downloads* such videos because it implements SABR + PO-token handling
+   internally — which is precisely why it remains the reliable fallback. A native
+   port that stops at "InnerTube + sig/n cipher → GET url" would *not* download
+   them; the full path *also* needs **SABR/UMP streaming** and **PO-token
+   (BotGuard) attestation** — the hardest, most volatile code in the extraction
+   world. The user chose the full-native scope anyway (in-ethos), which makes a
+   capable JS engine (for BotGuard) the linchpin — hence FrankenEngine first.
 
 ## Resume condition
 
