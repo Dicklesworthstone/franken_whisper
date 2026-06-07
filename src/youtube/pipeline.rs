@@ -402,14 +402,17 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                     continue;
                 }
             };
-            manifest.set_state(
-                &video.id,
-                VideoState::Downloaded {
-                    audio_path: audio_path.display().to_string(),
-                },
-            );
-            manifest.save(&manifest_path)?;
-
+            // NB: we intentionally do NOT persist a `Downloaded` state here.
+            // Write-amplification fix: the manifest is a full-rewrite-on-save
+            // BTreeMap, so each save is O(N) bytes; saving here once per video
+            // makes per-video work O(N²) total writes for an N-video playlist.
+            // This intermediate save bought no resume benefit anyway — the
+            // partition logic above re-enters `download_one` for any non-Done /
+            // non-Failed entry (a `Downloaded` entry is re-downloaded on
+            // resume, which the contract permits), so the only durable states
+            // that matter are the terminal `Done`/`Failed` (and the rare
+            // cancel-persist below). The single per-video save now happens at
+            // the terminal transition.
             match transcribe_and_render(&engine, opts, &video, &meta, &audio_path) {
                 Ok(paths) => {
                     let audio_kept = if opts.keep_audio {
@@ -430,8 +433,11 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                     summary.done.push(video.id.clone());
                 }
                 Err(FwError::Cancelled(_)) => {
+                    // No terminal state to persist (the entry is still
+                    // `Pending`); a resume re-downloads + re-transcribes, which
+                    // the contract permits. Dropping this save avoids a full
+                    // O(N)-byte manifest rewrite on the cancel path.
                     summary.cancelled = true;
-                    manifest.save(&manifest_path)?;
                     break;
                 }
                 Err(e) => {
@@ -664,5 +670,104 @@ https://youtu.be/ccccccccccc
         let path = dir.path().join("bad.json");
         std::fs::write(&path, b"{not json").expect("write");
         assert!(Manifest::load(&path).is_err());
+    }
+
+    /// Write-amplification guard (hotspot #4): the manifest is a
+    /// full-rewrite-on-save BTreeMap, so each `save` writes O(N) bytes and the
+    /// per-video save count drives total write volume. This drives K=200 video
+    /// transitions through the manifest and measures cumulative bytes written
+    /// under the OLD pattern (a `Downloaded` save *then* a `Done` save per
+    /// video — 2 saves/video) vs the NEW pattern (a single terminal `Done` save
+    /// per video). It asserts the new pattern roughly halves the bytes.
+    ///
+    /// O(N²) NOTE: even at 1 save/video the total is O(N²) bytes (each of N
+    /// saves rewrites the whole ~O(N)-entry map). For realistic playlists
+    /// (<500 videos, ~200 B/entry) that is tens of MB cumulative — modest. A
+    /// future bead should only swap to an append-only journal (O(1) amortized
+    /// per transition, compacted on load) if N ever exceeds ~2000.
+    #[test]
+    fn manifest_write_volume_halves_after_coalescing() {
+        const K: usize = 200;
+
+        // Build the discovered set once (mirrors the single bulk-init save).
+        let mut manifest = Manifest::default();
+        for i in 0..K {
+            let v = VideoRef {
+                id: format!("video{i:05}"),
+                title: format!("Some Representative Video Title Number {i}"),
+                url: format!("https://www.youtube.com/watch?v=video{i:05}"),
+                duration_sec: Some(123.4),
+            };
+            manifest.upsert_discovered(&v);
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Helper: serialize the manifest exactly as `save` would and return the
+        // byte length (the per-save write volume). Using the real serializer
+        // keeps the measurement faithful to production `save`.
+        let save_bytes = |m: &Manifest| -> usize {
+            let path = dir.path().join("measure.json");
+            m.save(&path).expect("save");
+            std::fs::metadata(&path).expect("stat").len() as usize
+        };
+
+        // ── OLD pattern: bulk-init save + (Downloaded save, Done save)/video. ──
+        let mut old_bytes = save_bytes(&manifest); // bulk-init
+        let mut old_clone = manifest.clone();
+        for i in 0..K {
+            let id = format!("video{i:05}");
+            old_clone.set_state(
+                &id,
+                VideoState::Downloaded {
+                    audio_path: format!("audio/{id}.m4a"),
+                },
+            );
+            old_bytes += save_bytes(&old_clone); // intermediate save (dropped now)
+            old_clone.set_state(
+                &id,
+                VideoState::Done {
+                    audio_path: None,
+                    markdown_path: format!("out/{id}.md"),
+                    json_path: format!("out/{id}.json"),
+                },
+            );
+            old_bytes += save_bytes(&old_clone); // terminal save
+        }
+
+        // ── NEW pattern: bulk-init save + a single terminal Done save/video. ──
+        let mut new_bytes = save_bytes(&manifest); // bulk-init
+        let mut new_clone = manifest.clone();
+        for i in 0..K {
+            let id = format!("video{i:05}");
+            new_clone.set_state(
+                &id,
+                VideoState::Done {
+                    audio_path: None,
+                    markdown_path: format!("out/{id}.md"),
+                    json_path: format!("out/{id}.json"),
+                },
+            );
+            new_bytes += save_bytes(&new_clone); // sole terminal save
+        }
+
+        let saved = old_bytes - new_bytes;
+        let pct = (saved as f64 / old_bytes as f64) * 100.0;
+        eprintln!(
+            "manifest write volume @ K={K}: old={old_bytes} B, new={new_bytes} B, \
+             saved={saved} B ({pct:.1}%)",
+        );
+
+        // Dropping one of two equal-cost O(N) saves per video, while the single
+        // bulk-init save is shared, must cut total write volume by a bit under
+        // half (the shared init save keeps it from hitting exactly 50%).
+        assert!(
+            new_bytes < old_bytes,
+            "new pattern must write fewer bytes ({new_bytes} !< {old_bytes})"
+        );
+        assert!(
+            pct > 45.0,
+            "expected >45% byte reduction, got {pct:.1}% (old={old_bytes}, new={new_bytes})"
+        );
     }
 }
