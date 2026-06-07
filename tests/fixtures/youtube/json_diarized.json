@@ -1,0 +1,46 @@
+{
+  "video": {
+    "id": "dQw4w9WgXcQ",
+    "title": "Sample Talk",
+    "channel": "Example Channel",
+    "uploader": "Example Channel",
+    "upload_date": "20240115",
+    "duration": 3725.0,
+    "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  },
+  "run": {
+    "model": "large-v3",
+    "engine": "native",
+    "backend": "cpu",
+    "version_tag": "v0.2.0",
+    "started": "2026-06-06T12:00:00Z",
+    "wall_ms": 4200,
+    "rtf": 0.04
+  },
+  "utterances": [
+    {
+      "i": 0,
+      "start_sec": 0.0,
+      "end_sec": 2.0,
+      "text": "Thanks for joining.",
+      "confidence": 0.95,
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "i": 1,
+      "start_sec": 2.3,
+      "end_sec": 4.0,
+      "text": "How are you?",
+      "confidence": 0.91,
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "i": 2,
+      "start_sec": 4.5,
+      "end_sec": 6.0,
+      "text": "Doing great, thanks.",
+      "confidence": 0.88,
+      "speaker": "SPEAKER_01"
+    }
+  ]
+}

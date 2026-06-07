@@ -21,6 +21,7 @@ pub mod streaming;
 pub mod sync;
 pub mod tty_audio;
 pub mod tui;
+pub mod youtube;
 
 pub use error::{FwError, FwResult};
 pub use model::{BackendKind, RunReport, TranscribeRequest, TranscriptionResult};
