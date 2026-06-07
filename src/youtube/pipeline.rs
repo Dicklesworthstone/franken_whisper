@@ -231,18 +231,37 @@ fn resolve_videos(
                 }
             }
             UrlKind::Video | UrlKind::Ambiguous => {
-                // Resolve to a concrete id via the canonical metadata fetch so
-                // dedup and naming have a stable id even for short/youtu.be
-                // forms. (Ambiguous watch?v=X&list=Y -> the single video, per
-                // --no-playlist.)
-                let meta = ytdlp::fetch_metadata(info, &url, token)?;
-                if seen.insert(meta.id.clone()) {
-                    videos.push(VideoRef {
-                        id: meta.id.clone(),
-                        title: meta.title.clone(),
-                        url: meta.webpage_url.clone(),
-                        duration_sec: meta.duration_sec,
-                    });
+                // Resolve the id by PARSING the URL (no network round-trip):
+                // this is the #1 hotspot fix — dedup/naming get a stable id for
+                // short/youtu.be/shorts/Ambiguous forms without a `yt-dlp -j`
+                // call. The authoritative metadata fetch happens exactly once,
+                // later, inside the download worker. Title/duration are filled
+                // there (from the carried `VideoMeta`); we leave them empty/None
+                // here.
+                let video = match ytdlp::extract_video_id(&url) {
+                    Some(id) => VideoRef {
+                        id,
+                        title: String::new(),
+                        url: url.clone(),
+                        duration_sec: None,
+                    },
+                    None => {
+                        // classify_url accepted this as a Video/Ambiguous URL but
+                        // the id is unrecoverable by parsing (should not happen —
+                        // the two share the same URL grammar). Fall back to a
+                        // single metadata fetch for THIS url only, preserving
+                        // correctness at the cost of one round-trip.
+                        let meta = ytdlp::fetch_metadata(info, &url, token)?;
+                        VideoRef {
+                            id: meta.id,
+                            title: meta.title,
+                            url: meta.webpage_url,
+                            duration_sec: meta.duration_sec,
+                        }
+                    }
+                };
+                if seen.insert(video.id.clone()) {
+                    videos.push(video);
                 }
             }
         }
@@ -253,8 +272,12 @@ fn resolve_videos(
 /// A unit of work handed from the download pool to the transcription consumer.
 struct DownloadResult {
     video: VideoRef,
-    /// `Ok(audio_path)` on success, `Err(message)` on download failure.
-    outcome: Result<PathBuf, String>,
+    /// `Ok((audio_path, meta))` on success, `Err(message)` on download failure.
+    ///
+    /// The worker fetches metadata exactly once (the single authoritative
+    /// `yt-dlp -j` per video) and carries the resulting [`VideoMeta`] forward so
+    /// the renderer never re-fetches it.
+    outcome: Result<(PathBuf, VideoMeta), String>,
 }
 
 /// Run the full ingestion pipeline.
@@ -351,7 +374,7 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
             if token.checkpoint().is_err() {
                 // Cancelled while this download sat in the channel: persist its
                 // state so a resume reuses the audio rather than orphaning it.
-                if let Ok(audio_path) = &outcome {
+                if let Ok((audio_path, _meta)) = &outcome {
                     manifest.set_state(
                         &video.id,
                         VideoState::Downloaded {
@@ -363,8 +386,8 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
                 summary.cancelled = true;
                 break;
             }
-            let audio_path = match outcome {
-                Ok(p) => p,
+            let (audio_path, meta) = match outcome {
+                Ok(pair) => pair,
                 Err(error) => {
                     record_failure(&mut manifest, &manifest_path, &video, &error)?;
                     summary.failed.push(FailedVideo {
@@ -387,7 +410,7 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
             );
             manifest.save(&manifest_path)?;
 
-            match transcribe_and_render(&engine, &info_arc, opts, &video, &audio_path) {
+            match transcribe_and_render(&engine, opts, &video, &meta, &audio_path) {
                 Ok(paths) => {
                     let audio_kept = if opts.keep_audio {
                         Some(audio_path.display().to_string())
@@ -432,20 +455,22 @@ pub fn run(opts: &YoutubeRunOptions) -> FwResult<YoutubeRunSummary> {
     Ok(summary)
 }
 
-/// Download a single video's audio (metadata fetch + best-audio download).
+/// Download a single video's audio. This performs the **single** authoritative
+/// `yt-dlp -j` metadata fetch for the video and returns the fetched
+/// [`VideoMeta`] alongside the audio path, so the renderer never re-fetches it.
 fn download_one(
     info: &YtdlpInfo,
     video: &VideoRef,
     audio_dir: &Path,
     token: &CancellationToken,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, VideoMeta), String> {
     let t_meta = std::time::Instant::now();
     let meta = ytdlp::fetch_metadata(info, &video.url, token).map_err(|e| e.to_string())?;
     crate::native_engine::perf_span("yt.dl_metadata", t_meta.elapsed().as_secs_f64() * 1e3, "");
     let t_dl = std::time::Instant::now();
-    let path = ytdlp::download_audio(info, &meta, audio_dir, token).map_err(|e| e.to_string());
+    let path = ytdlp::download_audio(info, &meta, audio_dir, token).map_err(|e| e.to_string())?;
     crate::native_engine::perf_span("yt.download", t_dl.elapsed().as_secs_f64() * 1e3, "");
-    path
+    Ok((path, meta))
 }
 
 fn record_failure(
@@ -468,37 +493,18 @@ fn record_failure(
 }
 
 /// Transcribe a downloaded audio file and render markdown + JSON.
+///
+/// `meta` is the [`VideoMeta`] the download worker already fetched (the single
+/// authoritative `yt-dlp -j` per video); the renderer never re-fetches it. The
+/// `_video` reference is retained for symmetry/logging but its naming fields are
+/// superseded by the richer `meta`.
 fn transcribe_and_render(
     engine: &FrankenWhisperEngine,
-    info: &YtdlpInfo,
     opts: &YoutubeRunOptions,
-    video: &VideoRef,
+    _video: &VideoRef,
+    meta: &VideoMeta,
     audio_path: &Path,
 ) -> FwResult<OutputPaths> {
-    // Re-fetch metadata for the richest naming/JSON fields (cheap; also lets a
-    // resume render without a re-download). On failure fall back to the
-    // VideoRef we already have.
-    let token = CancellationToken::unbounded();
-    let t_rmeta = std::time::Instant::now();
-    let meta_opt = ytdlp::fetch_metadata(info, &video.url, &token).ok();
-    crate::native_engine::perf_span(
-        "yt.render_metadata",
-        t_rmeta.elapsed().as_secs_f64() * 1e3,
-        "",
-    );
-    let meta = meta_opt.unwrap_or(VideoMeta {
-        id: video.id.clone(),
-        title: video.title.clone(),
-        channel: None,
-        uploader: None,
-        upload_date: None,
-        duration_sec: video.duration_sec,
-        webpage_url: video.url.clone(),
-        description: None,
-        availability: None,
-        live_status: None,
-    });
-
     let started = chrono::Utc::now();
     let started_instant = Instant::now();
 

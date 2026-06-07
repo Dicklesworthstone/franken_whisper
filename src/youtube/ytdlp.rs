@@ -340,6 +340,91 @@ pub fn classify_url(url: &str) -> FwResult<UrlKind> {
     )))
 }
 
+/// Extract the YouTube video id from a single-video URL using the *same* URL
+/// parsing [`classify_url`] performs — purely, with no network round-trip.
+///
+/// This lets [`resolve_videos`](crate::youtube::pipeline) deduplicate
+/// `Video`/`Ambiguous` URLs by id without a `yt-dlp -j` metadata fetch (the #1
+/// hotspot: 3 metadata fetches/video collapse to 1 in the download worker).
+///
+/// Recognized forms (all yielding the bare id):
+/// - `watch?v=ID` (and `watch?v=ID&list=Y` — the `v=` param, honoring
+///   `--no-playlist`)
+/// - `youtu.be/ID` (with an optional `?t=`/`&`/trailing-path tail)
+/// - `shorts/ID`, `live/ID`, `embed/ID`
+///
+/// Returns `None` for playlist URLs, non-YouTube hosts, or any shape without a
+/// recoverable id. Callers that already classified a URL as `Video`/`Ambiguous`
+/// can treat `None` as a (should-not-happen) signal to fall back to a single
+/// metadata fetch for correctness.
+#[must_use]
+pub fn extract_video_id(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (host, rest) = split_host_and_rest(trimmed)?;
+    let host = host.to_ascii_lowercase();
+
+    // youtu.be/ID short links: the first path segment is the id.
+    if host == "youtu.be" {
+        let id = rest.trim_start_matches('/');
+        let id = id.split(['?', '&', '/']).next().unwrap_or_default();
+        return non_empty_id(id);
+    }
+
+    if !is_youtube_host(&host) {
+        return None;
+    }
+
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (rest, ""),
+    };
+    let path = path.trim_start_matches('/');
+
+    // /shorts/ID, /live/ID, /embed/ID -> the path segment after the prefix.
+    if let Some(id) = path
+        .strip_prefix("shorts/")
+        .or_else(|| path.strip_prefix("live/"))
+        .or_else(|| path.strip_prefix("embed/"))
+    {
+        let id = id.split('/').next().unwrap_or_default();
+        return non_empty_id(id);
+    }
+
+    // /watch?v=ID (&list=Y): the `v=` param is the single video, per
+    // --no-playlist. A bare /watch?list= with no v= is a playlist -> None.
+    if path == "watch" {
+        return query_param_value(query, "v").and_then(non_empty_id);
+    }
+
+    // Any other path: accept a `v=` query if present (mirrors classify_url's
+    // permissive tail), otherwise no id.
+    query_param_value(query, "v").and_then(non_empty_id)
+}
+
+/// Return `Some(id)` when `id` is non-empty, else `None`.
+fn non_empty_id(id: &str) -> Option<String> {
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_owned())
+    }
+}
+
+/// Return the (non-empty) value of query param `name`, or `None`.
+fn query_param_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == name && !v.is_empty() {
+            Some(v)
+        } else {
+            None
+        }
+    })
+}
+
 /// Split a URL into `(host, rest)` where `rest` is everything after the host
 /// (path + query). Tolerates a missing scheme. Returns `None` when no host can
 /// be isolated.
@@ -373,10 +458,7 @@ fn is_youtube_host(host: &str) -> bool {
 /// Return `true` when a `key=value` query string contains `name` with a
 /// non-empty value.
 fn query_has_nonempty_param(query: &str, name: &str) -> bool {
-    query.split('&').any(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        k == name && !v.is_empty()
-    })
+    query_param_value(query, name).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1104,137 @@ mod tests {
             classify_url("https://www.youtube.com/watch?list=PL123").unwrap(),
             UrlKind::Playlist
         );
+    }
+
+    // ---- extract_video_id ------------------------------------------------
+
+    #[test]
+    fn extract_id_watch() {
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ").as_deref(),
+            Some("dQw4w9WgXcQ")
+        );
+    }
+
+    #[test]
+    fn extract_id_watch_with_list_and_order() {
+        // watch?v=X&list=Y -> the single video id (honors --no-playlist).
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/watch?v=abc123&list=PL999").as_deref(),
+            Some("abc123")
+        );
+        // Param order independent.
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/watch?list=PL999&v=abc123").as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn extract_id_youtu_be() {
+        assert_eq!(
+            extract_video_id("https://youtu.be/dQw4w9WgXcQ").as_deref(),
+            Some("dQw4w9WgXcQ")
+        );
+        // With a timestamp / extra query.
+        assert_eq!(
+            extract_video_id("https://youtu.be/dQw4w9WgXcQ?t=42").as_deref(),
+            Some("dQw4w9WgXcQ")
+        );
+        assert_eq!(extract_video_id("youtu.be/abc").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn extract_id_shorts_live_embed() {
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/shorts/abc123XYZ_-").as_deref(),
+            Some("abc123XYZ_-")
+        );
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/live/abc123XYZ_-").as_deref(),
+            Some("abc123XYZ_-")
+        );
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/embed/embedID0001").as_deref(),
+            Some("embedID0001")
+        );
+    }
+
+    #[test]
+    fn extract_id_mobile_music_nocookie_hosts() {
+        assert_eq!(
+            extract_video_id("https://m.youtube.com/watch?v=abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            extract_video_id("https://music.youtube.com/watch?v=abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            extract_video_id("https://www.youtube-nocookie.com/watch?v=abc").as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn extract_id_scheme_optional() {
+        assert_eq!(
+            extract_video_id("youtube.com/watch?v=abc").as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn extract_id_none_for_playlist_and_bad_inputs() {
+        // Pure playlist: no single video id.
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/playlist?list=PL123"),
+            None
+        );
+        // watch?list= with no v= -> playlist landing page, no id.
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/watch?list=PL123"),
+            None
+        );
+        // Non-YouTube host.
+        assert_eq!(extract_video_id("https://vimeo.com/12345"), None);
+        // youtu.be with no id.
+        assert_eq!(extract_video_id("https://youtu.be/"), None);
+        // Empty / garbage.
+        assert_eq!(extract_video_id("   "), None);
+        assert_eq!(extract_video_id("not even a url"), None);
+        // Empty v= value.
+        assert_eq!(extract_video_id("https://www.youtube.com/watch?v="), None);
+    }
+
+    /// Every URL `classify_url` accepts as a single Video must yield an id, so
+    /// the resolve fast-path never needs the fallback fetch for these.
+    #[test]
+    fn extract_id_covers_every_classified_video_form() {
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ?t=42",
+            "https://www.youtube.com/shorts/abc123XYZ_-",
+            "https://www.youtube.com/live/abc123XYZ_-",
+            "https://www.youtube.com/watch?v=abc&list=PL123",
+            "https://www.youtube.com/watch?list=PL123&v=abc",
+            "https://m.youtube.com/watch?v=abc",
+            "https://music.youtube.com/watch?v=abc",
+            "https://www.youtube-nocookie.com/watch?v=abc",
+            "youtube.com/watch?v=abc",
+            "youtu.be/abc",
+        ] {
+            let kind = classify_url(url).unwrap();
+            assert!(
+                matches!(kind, UrlKind::Video | UrlKind::Ambiguous),
+                "{url} should classify as Video/Ambiguous, got {kind:?}"
+            );
+            assert!(
+                extract_video_id(url).is_some(),
+                "{url} classified as {kind:?} but extract_video_id returned None"
+            );
+        }
     }
 
     // ---- expand_playlist (via stub) --------------------------------------
