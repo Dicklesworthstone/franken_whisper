@@ -8,7 +8,7 @@
 //! "pilot" that fabricated deterministic phrases from audio-energy regions is
 //! gone.
 //!
-//! ## The insanely-fast identity: throughput via parallel windows
+//! ## The insanely-fast identity: throughput via parallel *contiguous ranges*
 //!
 //! [`whisper_cpp_native`](super::whisper_cpp_native) calls
 //! [`decode::transcribe_samples`] once over the whole clip; that function
@@ -16,29 +16,49 @@
 //! carrying whisper's seek-continuation and a rolling text prompt across window
 //! boundaries.
 //!
-//! This engine trades that continuity for **throughput**: it splits the audio
-//! into hard 30 s windows up front and decodes **multiple windows in parallel**
-//! across a worker pool, then merges the per-window transcripts in window order
-//! (offsetting each window's timestamps by `window_idx * 30 s`). This mirrors
-//! how the real `insanely-fast-whisper` batches chunked audio and merges the
-//! results.
+//! This engine trades a *minimum* of that continuity for **throughput**: it
+//! partitions the audio into a small number of **contiguous 30 s-aligned
+//! ranges** (one per worker) and decodes the ranges **in parallel** across a
+//! worker pool. Each worker runs the **real sequential**
+//! [`decode::transcribe_samples`] over its whole contiguous span — so whisper's
+//! seek-continuation, rolling text prompt, and timestamp-seek behavior are
+//! preserved *within* a range. The per-range transcripts are then merged in
+//! range order, offsetting each range's timestamps by its base start time.
+//!
+//! Compared to the old design (hard per-window round-robin, one seam *per
+//! window*, no rolling prompt at all), contiguous ranges cut the discontinuities
+//! from one-per-30 s-window down to **one per worker boundary** (`n_workers - 1`
+//! seams total) and restore the rolling prompt everywhere except at those few
+//! seams. This is exactly how production chunked-batched ASR (real
+//! `insanely-fast-whisper`) trades a handful of chunk seams for parallelism.
 //!
 //! ### Honest tradeoff
 //!
-//! Hard 30 s boundaries lose whisper's seek-continuation: a word straddling a
-//! boundary may be clipped or duplicated, and each window decodes with no prior
-//! text context (no rolling prompt). That is the documented behavior of chunked
-//! batched inference (`insanely-fast-whisper` chunks + merges identically). When
-//! cross-window continuity matters more than throughput, use the sequential
-//! [`whisper_cpp_native`](super::whisper_cpp_native) engine instead.
+//! The `n_workers - 1` range boundaries are hard cuts: at each seam the next
+//! range starts a fresh decode with no carried prompt and re-seeks from its
+//! base offset, so a word straddling a seam may be clipped or duplicated. With
+//! `n_workers` ranges that is `n_workers - 1` such seams for the whole clip
+//! (versus `n_windows - 1` in the old per-window design — typically ~30×
+//! fewer). When *zero* discontinuity matters more than throughput, use the
+//! sequential [`whisper_cpp_native`](super::whisper_cpp_native) engine.
 //!
-//! ### Determinism
+//! ### Determinism & the worker-count contract
 //!
-//! Output is **identical regardless of worker count**. Each window is decoded
-//! independently (greedy / temperature-0, shared read-only weights) and the
-//! windows are merged in deterministic window order, so the worker count only
-//! affects wall-clock time, never the transcript or timestamps. The gated tests
-//! assert 2-worker output equals 1-worker output exactly.
+//! Output is **deterministic for a fixed worker count** (greedy / temperature-0,
+//! shared read-only weights, ranges merged in deterministic range order). It now
+//! **varies with the worker count by design** — more workers means more (and
+//! differently-placed) range seams — exactly like every chunked ASR batcher.
+//!
+//! Two important properties the gated tests pin down:
+//!
+//! - **1 worker == sequential, byte-exact.** With one worker there is exactly
+//!   one range spanning the whole clip, so [`run`] degenerates to a single
+//!   [`decode::transcribe_samples`] call — identical to the
+//!   [`whisper_cpp_native`](super::whisper_cpp_native) path.
+//! - **N workers: deterministic for fixed N, and word-bounded vs sequential.**
+//!   Re-running with the same N yields byte-identical output; the word-diff
+//!   versus the 1-worker (sequential) reference stays small because seams are
+//!   rare and each range is a real sequential decode.
 //!
 //! ## Model resolution, silence pre-gate, availability, word timestamps
 //!
@@ -68,13 +88,50 @@ use super::whisper_cpp_native::{WordTimestampMode, build_segments, word_timestam
 /// whisper.cpp native engine so the evidence ledger has one schema).
 const SCHEMA_VERSION: &str = "native-v2";
 
-/// Default `batch_size` (max concurrent windows) when the request does not set
+/// Default `batch_size` (max concurrent ranges) when the request does not set
 /// one — matches the historical insanely-fast default.
 const DEFAULT_BATCH_SIZE: usize = 24;
 
-/// One 30 s window in seconds, used to offset each window's timestamps back into
-/// whole-clip time when merging.
+/// One 30 s window in seconds, used to align contiguous ranges to whole 30 s
+/// window boundaries (whisper decodes in 30 s chunks internally).
 const WINDOW_SECONDS: f64 = 30.0;
+
+/// Minimum intra-op threads a worker must be able to keep for window-range
+/// parallelism to be worth enabling.
+///
+/// The sequential path ([`decode::transcribe_samples`]) already saturates the
+/// machine with **intra-op** (rayon) parallelism on every encoder GEMM /
+/// decoder GEMV. Layering `n_workers × threads_per_worker` on top of that only
+/// helps when each worker still gets enough intra-op threads to run its GEMMs
+/// efficiently — otherwise the workers just oversubscribe the cores and thrash
+/// (the measured `×1.09–1.43` *slowdown* at `7 workers × 2 threads` on a 14-core
+/// host; see `tests/artifacts/perf/.../HOTSPOTS.md`). A worker needs at least
+/// this many intra-op threads or we do not spawn it.
+///
+/// # Why `5` (fewer workers × fuller threads)
+///
+/// The round-3 pass-3 measurements on a 14-core host (`fw_scale_600.wav`, both
+/// models, seq vs IF) show a clean throughput/accuracy tradeoff *per worker*
+/// (each extra worker adds one cold-started range seam):
+///
+/// | workers | tpw | wall ratio (IF/seq) | tiny LCS-diff vs seq |
+/// |--------:|----:|--------------------:|---------------------:|
+/// | 1       | 14  | 0.96 (byte-exact)   | 0.0 %                |
+/// | 2       | 7   | 0.93                | 22 %                 |
+/// | 3       | 4   | 0.87                | 41 %                 |
+///
+/// The marginal wall gain from the 3rd worker (0.93 → 0.87) is small, while its
+/// extra seam roughly **doubles** the tiny-model word-diff (a cold range start
+/// can drift / loop through its whole span). `5` makes the default `14 / 5 = 2`
+/// workers on this host — the sweet spot: still **faster** than sequential
+/// (~0.93×) with far less seam drift — and "fewer workers × fuller threads"
+/// generally (8 cores ⇒ 1 worker = sequential; 32 cores ⇒ 6 workers). The
+/// product `n_workers × threads_per_worker` never exceeds `total_threads`, so
+/// there is no oversubscription. Callers that want maximum throughput can raise
+/// `batch_size` to lift the worker ceiling; callers that want byte-exact output
+/// use the sequential [`whisper_cpp_native`](super::whisper_cpp_native) engine
+/// (or `batch_size = 1` here).
+const MIN_THREADS_PER_WORKER: usize = 5;
 
 /// Honestly report whether the native insanely-fast engine can run.
 ///
@@ -118,27 +175,53 @@ fn effective_model_spec(request: &TranscribeRequest) -> FwResult<String> {
     )))
 }
 
-/// Split `samples` into fixed 30 s windows (`N_SAMPLES_30S` each). The last
-/// window keeps the remainder (it may be shorter than 30 s). A clip shorter than
-/// one window yields a single window. Empty input yields no windows.
-fn split_windows(samples: &[f32]) -> Vec<&[f32]> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-    samples.chunks(N_SAMPLES_30S).collect()
+/// The number of 30 s windows `samples` spans (`ceil(len / N_SAMPLES_30S)`),
+/// used only to size the worker pool and partition the clip into contiguous
+/// ranges. A clip shorter than one window counts as one window; empty input is
+/// zero.
+fn n_windows(samples: &[f32]) -> usize {
+    samples.len().div_ceil(N_SAMPLES_30S)
+}
+
+/// The contiguous sample slice for a half-open window range `[start, end)`
+/// (window indices), clamped to the available samples. `start * N_SAMPLES_30S`
+/// is the range's base sample offset; `end * N_SAMPLES_30S` its end (saturating
+/// at `samples.len()` so the final range keeps the remainder).
+fn range_samples(samples: &[f32], range: (usize, usize)) -> &[f32] {
+    let (start, end) = range;
+    let lo = (start * N_SAMPLES_30S).min(samples.len());
+    let hi = (end * N_SAMPLES_30S).min(samples.len());
+    &samples[lo..hi.max(lo)]
 }
 
 /// Worker-pool sizing: pure, tested. Returns `(n_workers, threads_per_worker)`.
 ///
-/// - `n_workers = min(n_windows, batch_size, max(1, total_threads / 2))` — never
-///   more workers than windows, never more than the `batch_size` concurrency
-///   cap, and never more than half the thread budget (each worker wants ≥ 2
-///   intra-op threads where possible).
-/// - `threads_per_worker = max(1, total_threads / n_workers)` — the intra-op
-///   thread budget split evenly across workers, floored at 1.
+/// # Policy (round-3 pass-3, measurement-derived)
 ///
-/// Every branch is guarded so a zero or absurd input never yields a zero worker
-/// count or a zero thread count (which would deadlock or divide-by-zero).
+/// The old policy (`workers = min(windows, batch, total_threads/2)`, then
+/// `threads = total_threads / workers`) handed out e.g. `7 workers × 2 threads`
+/// on a 14-core host. Because the sequential decode already saturates the cores
+/// with **intra-op** (rayon) parallelism, that *oversubscribed* the machine and
+/// the parallel path ran `×1.09–1.43` **slower** than sequential (measured;
+/// `tests/artifacts/perf/.../HOTSPOTS.md`). The fix is to add workers **only
+/// when there is genuine headroom** — i.e. only when each worker can still hold
+/// at least [`MIN_THREADS_PER_WORKER`] intra-op threads:
+///
+/// - `n_workers = min(n_windows, batch_size, total_threads / MIN_THREADS_PER_WORKER)`,
+///   floored at 1. With `MIN_THREADS_PER_WORKER = 4` this is ≤ 3 workers on a
+///   14-core box (`14/4 = 3`) and **falls back to a single worker** whenever
+///   `total_threads < 2 * MIN_THREADS_PER_WORKER` (≤ 7 threads) — at which point
+///   intra-op parallelism alone already fills the machine and the run
+///   degenerates to the byte-exact sequential path.
+/// - `threads_per_worker = max(1, total_threads / n_workers)` — the intra-op
+///   budget split evenly. By construction `n_workers × threads_per_worker
+///   ≤ total_threads`, so workers **never oversubscribe** the cores.
+///
+/// `batch_size` still caps concurrency (a request can force `1` to serialize, or
+/// a larger value, but the `total_threads / MIN_THREADS_PER_WORKER` ceiling is
+/// the real governor). Every branch is guarded so a zero or absurd input never
+/// yields a zero worker or zero thread count (which would deadlock or
+/// divide-by-zero).
 pub(crate) fn plan_workers(
     n_windows: usize,
     batch_size: Option<usize>,
@@ -146,11 +229,41 @@ pub(crate) fn plan_workers(
 ) -> (usize, usize) {
     let batch = batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
     let total_threads = total_threads.max(1);
-    let half = (total_threads / 2).max(1);
-    let n_workers = n_windows.max(1).min(batch).min(half);
-    let n_workers = n_workers.max(1);
+    // Headroom ceiling: only as many workers as can each keep
+    // `MIN_THREADS_PER_WORKER` intra-op threads. This is the lever that prevents
+    // oversubscription on top of the already-saturating intra-op parallelism.
+    let headroom = (total_threads / MIN_THREADS_PER_WORKER).max(1);
+    let n_workers = n_windows.max(1).min(batch).min(headroom).max(1);
     let threads_per_worker = (total_threads / n_workers).max(1);
     (n_workers, threads_per_worker)
+}
+
+/// Partition `n_windows` 30 s windows into `n_workers` **contiguous** ranges of
+/// whole windows. Returns each range as `[window_start, window_end)` (half-open,
+/// in window indices). Earlier ranges get the extra window when the split is
+/// uneven (`ceil` distribution), and empty trailing ranges are dropped so the
+/// returned vec length is `min(n_workers, n_windows)`.
+///
+/// Contiguity is the accuracy linchpin: each range is a single contiguous audio
+/// span that one worker decodes with the **real sequential**
+/// [`decode::transcribe_samples`], so seek-continuation and the rolling prompt
+/// are preserved within the range. Seams occur only **between** ranges
+/// (`returned_len - 1` of them).
+pub(crate) fn plan_ranges(n_windows: usize, n_workers: usize) -> Vec<(usize, usize)> {
+    if n_windows == 0 {
+        return Vec::new();
+    }
+    let n_workers = n_workers.max(1);
+    // ceil-divide windows across workers so earlier ranges absorb the remainder.
+    let per = n_windows.div_ceil(n_workers);
+    let mut ranges = Vec::with_capacity(n_workers);
+    let mut start = 0usize;
+    while start < n_windows {
+        let end = (start + per).min(n_windows);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
 }
 
 /// Resolve the total intra-op thread budget for a request (request override,
@@ -178,18 +291,21 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
     }
 }
 
-/// One window's decode result, tagged with its window index for ordered merge.
-struct WindowResult {
-    index: usize,
+/// One contiguous range's decode result, tagged with its starting window index
+/// (the range's base time offset is `start_window * 30 s`) for the ordered merge.
+struct RangeResult {
+    /// Starting window index of the range; its base offset is `start_window * 30 s`.
+    start_window: usize,
     output: decode::DecodeOutput,
 }
 
-/// Run real native insanely-fast (parallel-window) inference over
+/// Run real native insanely-fast (parallel contiguous-range) inference over
 /// `normalized_wav` (guaranteed 16 kHz mono PCM16 by the pipeline) and return a
 /// [`TranscriptionResult`].
 ///
-/// See the module docs for the parallel-window strategy, determinism guarantee,
-/// and shared model-resolution / silence-pre-gate / word-timestamp policies.
+/// See the module docs for the contiguous-range strategy, the worker-count
+/// determinism contract, and shared model-resolution / silence-pre-gate /
+/// word-timestamp policies.
 ///
 /// # Errors
 ///
@@ -244,21 +360,28 @@ pub fn run(
         tok.checkpoint()?;
     }
 
-    // Split into 30 s windows and size the worker pool.
-    let windows = split_windows(&samples);
+    // Size the worker pool from the 30 s-window count, then partition the clip
+    // into that many CONTIGUOUS, 30 s-aligned ranges (one per worker).
+    let win_count = n_windows(&samples);
     let batch_size = request
         .backend_params
         .batch_size
         .and_then(|v| usize::try_from(v).ok());
     let total_threads = total_threads_for(request);
-    let (n_workers, threads_per_worker) = plan_workers(windows.len(), batch_size, total_threads);
+    let (n_workers, threads_per_worker) = plan_workers(win_count, batch_size, total_threads);
+    let ranges = plan_ranges(win_count, n_workers);
 
     let params = decode_params(request, threads_per_worker);
 
-    // Decode every window (parallel across workers); merge in window order.
-    let window_results = decode_windows_parallel(&model, &windows, &params, n_workers, token)?;
+    // Decode each contiguous range with the real sequential decode (parallel
+    // across workers); merge in range order, offsetting timestamps by each
+    // range's base start time.
+    let range_results = decode_ranges_parallel(&model, &samples, &ranges, &params, token)?;
 
-    let merged = merge_windows(&window_results);
+    let merged = merge_ranges(&range_results);
+    // Seams are the hard cuts BETWEEN ranges: one fewer than the number of
+    // (non-empty) ranges actually decoded.
+    let seams = ranges.len().saturating_sub(1);
 
     let word_mode = word_timestamp_mode(request.backend_params.word_timestamps.as_ref());
     let segments = build_segments(
@@ -275,9 +398,11 @@ pub fn run(
         &spec,
         &model_path,
         model.version_tag(),
-        windows.len(),
+        win_count,
         n_workers,
         threads_per_worker,
+        &ranges,
+        seams,
         &merged.windows,
         word_mode,
         request.backend_params.split_on_word,
@@ -295,31 +420,43 @@ pub fn run(
     })
 }
 
-/// Decode every window, distributing them round-robin across `n_workers`
-/// scoped threads, each running [`NativeWhisperModel::transcribe`] on the
-/// **shared** `Arc<NativeWhisperModel>` (weights are read-only). Returns the
-/// per-window outputs in arbitrary order (the caller sorts by index).
+/// Decode each contiguous `range` (one per worker) on its own scoped thread,
+/// running the **real sequential** [`NativeWhisperModel::transcribe`]
+/// ([`decode::transcribe_samples`]) over the range's contiguous audio span on
+/// the **shared** `Arc<NativeWhisperModel>` (weights are read-only). Returns the
+/// per-range outputs in arbitrary completion order (the caller sorts by start
+/// window).
+///
+/// Because each worker runs the full sequential decode over a contiguous span,
+/// seek-continuation and the rolling text prompt are preserved **within** every
+/// range; the only discontinuities are the `ranges.len() - 1` seams between
+/// ranges. With a single range (1 worker) this is byte-identical to the
+/// sequential [`whisper_cpp_native`](super::whisper_cpp_native) path.
 ///
 /// Cancellation + first-error: a shared [`AtomicBool`] short-circuits remaining
-/// windows the moment any window errors (or the token expires); the first error
-/// observed is returned. Per-window independence + the shared-weights model make
-/// the merged result identical regardless of `n_workers`.
-fn decode_windows_parallel(
+/// ranges the moment any range errors (or the token expires); the first error
+/// observed is returned. For a **fixed** range partition the merged result is
+/// deterministic regardless of which worker finished first.
+fn decode_ranges_parallel(
     model: &NativeWhisperModel,
-    windows: &[&[f32]],
+    samples: &[f32],
+    ranges: &[(usize, usize)],
     params: &decode::DecodeParams,
-    n_workers: usize,
     token: Option<&crate::orchestrator::CancellationToken>,
-) -> FwResult<Vec<WindowResult>> {
+) -> FwResult<Vec<RangeResult>> {
     let stop = AtomicBool::new(false);
     let first_error: Mutex<Option<FwError>> = Mutex::new(None);
-    let results: Mutex<Vec<WindowResult>> = Mutex::new(Vec::with_capacity(windows.len()));
+    let results: Mutex<Vec<RangeResult>> = Mutex::new(Vec::with_capacity(ranges.len()));
 
     std::thread::scope(|scope| {
-        for worker_id in 0..n_workers {
+        for &(start_window, end_window) in ranges {
             let stop = &stop;
             let first_error = &first_error;
             let results = &results;
+            let span = range_samples(samples, (start_window, end_window));
+            if span.is_empty() {
+                continue;
+            }
             scope.spawn(move || {
                 // A worker's checkpoint: honor the orchestrator token AND the
                 // shared stop flag so a sibling's error/cancellation halts every
@@ -332,31 +469,27 @@ fn decode_windows_parallel(
                     }
                     token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint)
                 };
-                // Round-robin window assignment: worker w handles windows
-                // w, w + n_workers, w + 2*n_workers, ...
-                let mut idx = worker_id;
-                while idx < windows.len() {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match model.transcribe(span, params, &checkpoint) {
+                    Ok(output) => {
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(RangeResult {
+                                start_window,
+                                output,
+                            });
                     }
-                    match model.transcribe(windows[idx], params, &checkpoint) {
-                        Ok(output) => {
-                            results
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push(WindowResult { index: idx, output });
+                    Err(err) => {
+                        // First error wins; signal every worker to stop.
+                        let mut slot = first_error.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(err);
                         }
-                        Err(err) => {
-                            // First error wins; signal every worker to stop.
-                            let mut slot = first_error.lock().unwrap_or_else(|e| e.into_inner());
-                            if slot.is_none() {
-                                *slot = Some(err);
-                            }
-                            stop.store(true, Ordering::Relaxed);
-                            return;
-                        }
+                        stop.store(true, Ordering::Relaxed);
                     }
-                    idx += n_workers;
                 }
             });
         }
@@ -367,32 +500,39 @@ fn decode_windows_parallel(
     }
 
     let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
-    results.sort_by_key(|r| r.index);
+    results.sort_by_key(|r| r.start_window);
     Ok(results)
 }
 
-/// The deterministic merge of per-window outputs into a whole-clip result.
+/// The deterministic merge of per-range outputs into a whole-clip result.
 struct MergedOutput {
     segments: Vec<TranscriptionSegment>,
     windows: Vec<decode::WindowStats>,
     language: Option<String>,
 }
 
-/// Merge per-window decode outputs in window order. Each window's
-/// segment/window-stat timestamps are offset by `window_idx * 30 s` to map them
-/// back into whole-clip time. The detected language (if any) is taken from the
-/// first window that reports one.
+/// Merge per-range decode outputs in range order. Each range decodes its
+/// contiguous span with timestamps *relative to the range start*, so every
+/// segment/window-stat is offset by `start_window * 30 s` to map it back into
+/// whole-clip time. The detected language (if any) is taken from the first range
+/// that reports one.
 ///
-/// This is the determinism linchpin: because windows are independent and merged
-/// strictly by index, the merged result does not depend on which worker decoded
-/// which window or in what order they finished.
-fn merge_windows(results: &[WindowResult]) -> MergedOutput {
+/// Seam semantics: ranges are simply concatenated in start-window order. Each
+/// range's internal segments already carry whisper's seek-continuation; the
+/// `ranges.len() - 1` boundaries between ranges are plain concatenation points
+/// (no de-duplication is attempted — a word straddling a seam may appear in both
+/// adjacent ranges, the documented chunked-batcher behavior).
+///
+/// This is the determinism linchpin: because ranges are merged strictly by their
+/// start window, the merged result does not depend on which worker decoded which
+/// range or in what order they finished — for a fixed range partition.
+fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
     let mut segments = Vec::new();
     let mut windows = Vec::new();
     let mut language = None;
 
     for result in results {
-        let offset = result.index as f64 * WINDOW_SECONDS;
+        let offset = result.start_window as f64 * WINDOW_SECONDS;
         if language.is_none() {
             language = result.output.language.clone();
         }
@@ -429,7 +569,14 @@ fn read_normalized_wav(path: &Path) -> FwResult<Vec<f32>> {
     decode::read_wav_16k_mono(&bytes)
 }
 
-/// The honest raw-output metadata JSON for a real-inference parallel-window run.
+/// The honest raw-output metadata JSON for a real-inference parallel
+/// contiguous-range run.
+///
+/// Schema stays `native-v2`-compatible: every legacy field is retained
+/// (`parallel_windows`, `workers`, `threads_per_worker`, `windows`, …) and the
+/// new range/seam fields are **additive** — `ranges` (the contiguous
+/// `[start_window, end_window)` partition) and `seams` (the count of hard cuts
+/// between ranges, `ranges.len() - 1`).
 #[allow(clippy::too_many_arguments)]
 fn raw_output_json(
     spec: &str,
@@ -438,6 +585,8 @@ fn raw_output_json(
     parallel_windows: usize,
     workers: usize,
     threads_per_worker: usize,
+    ranges: &[(usize, usize)],
+    seams: usize,
     windows: &[decode::WindowStats],
     word_mode: WordTimestampMode,
     split_on_word: bool,
@@ -459,6 +608,16 @@ fn raw_output_json(
             })
         })
         .collect();
+    let ranges_json: Vec<Value> = ranges
+        .iter()
+        .map(|&(start, end)| {
+            json!({
+                "start_window": start,
+                "end_window": end,
+                "start_sec": start as f64 * WINDOW_SECONDS,
+            })
+        })
+        .collect();
     json!({
         "engine": "insanely-fast-native",
         "schema_version": SCHEMA_VERSION,
@@ -468,6 +627,8 @@ fn raw_output_json(
         "parallel_windows": parallel_windows,
         "workers": workers,
         "threads_per_worker": threads_per_worker,
+        "ranges": ranges_json,
+        "seams": seams,
         "model": spec,
         "model_path": model_path.display().to_string(),
         "model_version_tag": version_tag,
@@ -499,6 +660,8 @@ fn silence_result(
             "parallel_windows": 0,
             "workers": 0,
             "threads_per_worker": 0,
+            "ranges": [],
+            "seams": 0,
             "model": spec,
             "model_loaded": false,
             "duration_ms": duration_ms,
@@ -600,11 +763,14 @@ mod tests {
 
     #[test]
     fn plan_workers_typical_split() {
-        // 16 threads, plenty of windows, default batch: workers = min(8, 24, 8) = 8;
-        // threads_per_worker = 16 / 8 = 2.
+        // 16 threads, plenty of windows, default batch: headroom = 16/5 = 3,
+        // workers = min(10, 24, 3) = 3; threads_per_worker = 16 / 3 = 5. The
+        // round-3 policy keeps each worker at >= MIN_THREADS_PER_WORKER so the
+        // product (3*5=15) never oversubscribes the 16 threads.
         let (w, t) = plan_workers(10, None, 16);
-        assert_eq!(w, 8);
-        assert_eq!(t, 2);
+        assert_eq!(w, 3);
+        assert_eq!(t, 5);
+        assert!(w * t <= 16, "must not oversubscribe");
     }
 
     #[test]
@@ -616,11 +782,31 @@ mod tests {
     }
 
     #[test]
-    fn plan_workers_threads_fewer_than_workers() {
-        // 3 threads, many windows: half = max(3/2,1) = 1 => 1 worker, 3 threads.
-        let (w, t) = plan_workers(50, None, 3);
-        assert_eq!(w, 1);
-        assert_eq!(t, 3);
+    fn plan_workers_small_thread_budget_falls_back_to_one_worker() {
+        // < 2 * MIN_THREADS_PER_WORKER (i.e. < 10) threads: headroom = total/5
+        // floored at 1 => a single worker (intra-op parallelism alone already
+        // fills the machine; degenerates to the byte-exact sequential path).
+        for total in 1..=9 {
+            let (w, t) = plan_workers(50, None, total);
+            assert_eq!(w, 1, "total_threads={total} must yield 1 worker");
+            assert_eq!(t, total.max(1));
+        }
+    }
+
+    #[test]
+    fn plan_workers_no_oversubscription_invariant() {
+        // For any plausible (windows, threads) the product workers*threads never
+        // exceeds the thread budget — the core round-3 oversubscription fix.
+        for total in 1..=64 {
+            for windows in [1usize, 2, 4, 8, 16, 64, 240] {
+                let (w, t) = plan_workers(windows, None, total);
+                assert!(
+                    w * t <= total.max(1),
+                    "windows={windows} total={total} => {w}*{t} > {total}"
+                );
+                assert!(w >= 1 && t >= 1);
+            }
+        }
     }
 
     #[test]
@@ -649,39 +835,66 @@ mod tests {
     }
 
     #[test]
-    fn plan_workers_batch_caps_below_threads() {
-        // batch_size limits workers even when threads/windows would allow more.
+    fn plan_workers_batch_caps_below_headroom() {
+        // batch_size limits workers even when threads/windows would allow more:
+        // headroom = 64/4 = 16, but batch_size 4 caps to 4 workers; tpw = 64/4 = 16.
         let (w, t) = plan_workers(100, Some(4), 64);
         assert_eq!(w, 4);
         assert_eq!(t, 16);
     }
 
-    // ── split_windows ─────────────────────────────────────────────────────
+    // ── n_windows / plan_ranges / range_samples ───────────────────────────
 
     #[test]
-    fn split_windows_empty_is_none() {
-        assert!(split_windows(&[]).is_empty());
+    fn n_windows_counts_30s_chunks() {
+        assert_eq!(n_windows(&[]), 0);
+        assert_eq!(n_windows(&vec![0.1f32; SAMPLE_RATE]), 1); // 1 s < 30 s.
+        assert_eq!(n_windows(&vec![0.1f32; N_SAMPLES_30S]), 1); // exactly 30 s.
+        assert_eq!(n_windows(&vec![0.1f32; N_SAMPLES_30S + 1]), 2); // 30 s + 1.
+        assert_eq!(n_windows(&vec![0.1f32; N_SAMPLES_30S * 3]), 3);
     }
 
     #[test]
-    fn split_windows_short_clip_single_window() {
-        let samples = vec![0.1f32; SAMPLE_RATE]; // 1 s < 30 s.
-        let w = split_windows(&samples);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].len(), SAMPLE_RATE);
+    fn plan_ranges_single_worker_is_whole_clip() {
+        // 1 worker => exactly one range spanning all windows (the byte-exact
+        // sequential contract).
+        assert_eq!(plan_ranges(5, 1), vec![(0, 5)]);
+        assert_eq!(plan_ranges(1, 1), vec![(0, 1)]);
     }
 
     #[test]
-    fn split_windows_last_keeps_remainder() {
-        // 30 s + 5 s => two windows: full + remainder.
+    fn plan_ranges_contiguous_cover_no_gaps() {
+        // Ranges are contiguous, half-open, and cover [0, n_windows) exactly.
+        for (n, workers) in [(10, 3), (7, 2), (240, 4), (5, 8)] {
+            let ranges = plan_ranges(n, workers);
+            assert_eq!(ranges.first().map(|r| r.0), Some(0));
+            assert_eq!(ranges.last().map(|r| r.1), Some(n));
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0, "ranges must be contiguous");
+            }
+            // never more ranges than workers or windows.
+            assert!(ranges.len() <= workers.min(n).max(1));
+        }
+    }
+
+    #[test]
+    fn plan_ranges_empty_clip_is_empty() {
+        assert!(plan_ranges(0, 4).is_empty());
+    }
+
+    #[test]
+    fn range_samples_slices_contiguous_span() {
+        // 30 s + 5 s clip, range [1, 2) => the 5 s remainder.
         let samples = vec![0.1f32; N_SAMPLES_30S + 5 * SAMPLE_RATE];
-        let w = split_windows(&samples);
-        assert_eq!(w.len(), 2);
-        assert_eq!(w[0].len(), N_SAMPLES_30S);
-        assert_eq!(w[1].len(), 5 * SAMPLE_RATE);
+        let span = range_samples(&samples, (1, 2));
+        assert_eq!(span.len(), 5 * SAMPLE_RATE);
+        // range [0, 1) => the first full 30 s window.
+        assert_eq!(range_samples(&samples, (0, 1)).len(), N_SAMPLES_30S);
+        // whole-clip range [0, 2) => all samples.
+        assert_eq!(range_samples(&samples, (0, 2)).len(), samples.len());
     }
 
-    // ── merge_windows offsets timestamps by window index ──────────────────
+    // ── merge_ranges offsets timestamps by the range's base window ─────────
 
     fn out_with_segment(start: f64, end: f64, text: &str, offset_sec: f64) -> decode::DecodeOutput {
         decode::DecodeOutput {
@@ -704,25 +917,30 @@ mod tests {
     }
 
     #[test]
-    fn merge_windows_offsets_by_30s_per_index() {
+    fn merge_ranges_offsets_by_start_window_times_30s() {
+        // Two contiguous ranges: range 0 starts at window 0 (offset 0 s); range 1
+        // starts at window 2 (offset 60 s). Each range's decode emits its
+        // segments RELATIVE to the range start, so the merge offsets range 1 by
+        // 60 s.
         let results = vec![
-            WindowResult {
-                index: 0,
+            RangeResult {
+                start_window: 0,
                 output: out_with_segment(0.0, 5.0, "first", 0.0),
             },
-            WindowResult {
-                index: 1,
+            RangeResult {
+                start_window: 2,
                 output: out_with_segment(1.0, 4.0, "second", 0.0),
             },
         ];
-        let merged = merge_windows(&results);
+        let merged = merge_ranges(&results);
         assert_eq!(merged.segments.len(), 2);
-        // Window 1's segment is offset by 30 s.
+        // Range 0's segment is unshifted.
         assert_eq!(merged.segments[0].start_sec, Some(0.0));
-        assert_eq!(merged.segments[1].start_sec, Some(31.0));
-        assert_eq!(merged.segments[1].end_sec, Some(34.0));
+        // Range 1's segment is offset by 2 * 30 s = 60 s.
+        assert_eq!(merged.segments[1].start_sec, Some(61.0));
+        assert_eq!(merged.segments[1].end_sec, Some(64.0));
         // Window stats offset too.
-        assert_eq!(merged.windows[1].window_offset_sec, 30.0);
+        assert_eq!(merged.windows[1].window_offset_sec, 60.0);
         assert_eq!(merged.language, Some("en".to_owned()));
     }
 
@@ -849,14 +1067,18 @@ mod tests {
     // ── raw_output schema ─────────────────────────────────────────────────
 
     #[test]
-    fn raw_output_carries_parallel_window_metadata() {
+    fn raw_output_carries_parallel_range_metadata() {
+        // 4 windows split into 2 contiguous ranges => 1 seam.
+        let ranges = vec![(0usize, 2usize), (2, 4)];
         let json = raw_output_json(
             "tiny.en",
             Path::new("/models/ggml-tiny.en.bin"),
             "fw-native-v1+sha256:abc".to_owned(),
-            2,
+            4,
             2,
             4,
+            &ranges,
+            1,
             &[],
             WordTimestampMode::Word,
             false,
@@ -866,10 +1088,18 @@ mod tests {
         assert_eq!(json["schema_version"].as_str(), Some(SCHEMA_VERSION));
         assert_eq!(json["implementation"].as_str(), Some("real-inference"));
         assert_eq!(json["in_process"].as_bool(), Some(true));
-        assert_eq!(json["parallel_windows"].as_u64(), Some(2));
+        assert_eq!(json["parallel_windows"].as_u64(), Some(4));
         assert_eq!(json["workers"].as_u64(), Some(2));
         assert_eq!(json["threads_per_worker"].as_u64(), Some(4));
         assert_eq!(json["word_timestamps"].as_str(), Some("interpolated"));
+        // Additive native-v2 fields: ranges + seams.
+        assert_eq!(json["seams"].as_u64(), Some(1));
+        let ranges_json = json["ranges"].as_array().expect("ranges array");
+        assert_eq!(ranges_json.len(), 2);
+        assert_eq!(ranges_json[0]["start_window"].as_u64(), Some(0));
+        assert_eq!(ranges_json[0]["end_window"].as_u64(), Some(2));
+        assert_eq!(ranges_json[1]["start_window"].as_u64(), Some(2));
+        assert_eq!(ranges_json[1]["start_sec"].as_f64(), Some(60.0));
     }
 
     // ── Gated end-to-end against the real tiny.en model + jfk.wav ─────────
@@ -929,28 +1159,36 @@ mod tests {
         assert!(result.segments.len() >= 2, "expected >= 2 segments");
     }
 
-    /// Decode jfk-concatenated-3x (~33 s => 2 windows) with an explicit worker
-    /// count and return the engine-level (offset, merged) outputs as plain text +
-    /// segment bounds for determinism comparison.
-    fn decode_long_jfk_with_workers(
+    /// Greedy `DecodeParams` matching what [`run`] builds (timestamps on,
+    /// auto-detect language), with the given intra-op thread budget.
+    fn det_params(n_threads: usize) -> decode::DecodeParams {
+        decode::DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads,
+            max_text_ctx: None,
+            ..decode::DecodeParams::default()
+        }
+    }
+
+    /// Decode `samples` with an explicit forced worker count (via batch_size),
+    /// running the real contiguous-range path, and return the engine-level
+    /// (merged, offset) outputs as plain text + segment bounds + (n_workers,
+    /// n_windows). This exercises exactly the [`run`] partition/merge machinery.
+    fn decode_with_workers(
         model: &NativeWhisperModel,
         samples: &[f32],
         batch_size: Option<usize>,
         total_threads: usize,
-    ) -> (String, Vec<(f64, f64)>, usize) {
-        let windows = split_windows(samples);
-        let (n_workers, tpw) = plan_workers(windows.len(), batch_size, total_threads);
-        let params = decode::DecodeParams {
-            language: None,
-            translate: false,
-            timestamps: true,
-            n_threads: tpw,
-            max_text_ctx: None,
-            ..decode::DecodeParams::default()
-        };
+    ) -> (String, Vec<(f64, f64)>, usize, usize) {
+        let win_count = n_windows(samples);
+        let (n_workers, tpw) = plan_workers(win_count, batch_size, total_threads);
+        let ranges = plan_ranges(win_count, n_workers);
+        let params = det_params(tpw);
         let results =
-            decode_windows_parallel(model, &windows, &params, n_workers, None).expect("decode");
-        let merged = merge_windows(&results);
+            decode_ranges_parallel(model, samples, &ranges, &params, None).expect("decode");
+        let merged = merge_ranges(&results);
         let text: String = merged
             .segments
             .iter()
@@ -962,47 +1200,140 @@ mod tests {
             .iter()
             .map(|s| (s.start_sec.unwrap_or(0.0), s.end_sec.unwrap_or(0.0)))
             .collect();
-        (text, bounds, windows.len())
+        (text, bounds, ranges.len(), win_count)
     }
 
-    #[test]
-    fn gated_determinism_two_workers_equals_one() {
-        let Some(model) = load_tiny_en() else {
-            eprintln!("SKIP gated_determinism: tiny.en model missing");
-            return;
+    /// Direct sequential reference: one `transcribe_samples` over the whole clip
+    /// (the byte-golden whisper.cpp-native path), rendered to the same
+    /// (text, bounds) shape as [`decode_with_workers`].
+    fn sequential_reference(
+        model: &NativeWhisperModel,
+        samples: &[f32],
+        n_threads: usize,
+    ) -> (String, Vec<(f64, f64)>) {
+        let params = det_params(n_threads);
+        let out = model
+            .transcribe(samples, &params, &|| Ok(()))
+            .expect("sequential decode");
+        let text: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bounds: Vec<(f64, f64)> = out
+            .segments
+            .iter()
+            .map(|s| (s.start_sec.unwrap_or(0.0), s.end_sec.unwrap_or(0.0)))
+            .collect();
+        (text, bounds)
+    }
+
+    /// Word-diff rate between two transcripts: the symmetric word-multiset
+    /// difference normalized by the larger word count (a coarse, order-agnostic
+    /// divergence metric, matching the scale-baseline HOTSPOTS measure).
+    fn word_diff_rate(a: &str, b: &str) -> f64 {
+        use std::collections::HashMap;
+        let count = |s: &str| {
+            let mut m: HashMap<String, i64> = HashMap::new();
+            for w in s.split_whitespace() {
+                *m.entry(w.to_lowercase()).or_default() += 1;
+            }
+            m
         };
-        let Some(samples) = load_jfk_samples() else {
-            eprintln!("SKIP gated_determinism: jfk.wav missing");
-            return;
-        };
-        // Concatenate jfk 3x (~33 s) => 2 windows.
+        let ma = count(a);
+        let mb = count(b);
+        let mut keys: std::collections::HashSet<&String> = ma.keys().collect();
+        keys.extend(mb.keys());
+        let diff: i64 = keys
+            .iter()
+            .map(|k| (ma.get(*k).copied().unwrap_or(0) - mb.get(*k).copied().unwrap_or(0)).abs())
+            .sum();
+        let total = a
+            .split_whitespace()
+            .count()
+            .max(b.split_whitespace().count());
+        if total == 0 {
+            0.0
+        } else {
+            diff as f64 / total as f64
+        }
+    }
+
+    /// jfk concatenated 3× (~33 s => 2 windows) — the fixed multi-window fixture.
+    fn jfk3x_samples() -> Option<Vec<f32>> {
+        let samples = load_jfk_samples()?;
         let mut long = Vec::with_capacity(samples.len() * 3);
         for _ in 0..3 {
             long.extend_from_slice(&samples);
         }
+        Some(long)
+    }
 
-        // Force 1 worker (batch_size 1) vs >= 2 workers (batch_size 8, threads 8).
-        let (text_seq, bounds_seq, n_windows_seq) =
-            decode_long_jfk_with_workers(&model, &long, Some(1), 8);
-        let (text_par, bounds_par, n_windows_par) =
-            decode_long_jfk_with_workers(&model, &long, Some(8), 8);
+    #[test]
+    fn gated_one_worker_equals_sequential_byte_exact() {
+        // NEW CONTRACT: with a single worker there is exactly one range spanning
+        // the whole clip, so the IF path degenerates to one `transcribe_samples`
+        // call — byte-identical to the sequential whisper.cpp-native path.
+        let Some(model) = load_tiny_en() else {
+            eprintln!("SKIP gated_one_worker_equals_sequential: tiny.en model missing");
+            return;
+        };
+        let Some(long) = jfk3x_samples() else {
+            eprintln!("SKIP gated_one_worker_equals_sequential: jfk.wav missing");
+            return;
+        };
 
-        assert!(n_windows_seq >= 2, "expected >= 2 windows for ~33s audio");
-        assert_eq!(n_windows_seq, n_windows_par);
+        // Force 1 worker (batch_size 1).
+        let (text_if1, bounds_if1, n_workers, win_count) =
+            decode_with_workers(&model, &long, Some(1), 8);
+        assert_eq!(n_workers, 1, "batch_size 1 forces a single worker/range");
+        assert!(win_count >= 2, "expected >= 2 windows for ~33s audio");
 
-        // CRITICAL: parallel output must be byte-identical to sequential.
+        let (text_seq, bounds_seq) = sequential_reference(&model, &long, 8);
+
         assert_eq!(
-            text_par, text_seq,
-            "2-worker transcript must equal 1-worker transcript exactly"
+            text_if1, text_seq,
+            "1-worker IF transcript must equal sequential exactly"
         );
         assert_eq!(
-            bounds_par, bounds_seq,
-            "2-worker timestamps must equal 1-worker timestamps exactly"
+            bounds_if1, bounds_seq,
+            "1-worker IF timestamps must equal sequential exactly"
         );
+        // The whole-clip sequential decode covers both internal 30 s windows:
+        // its last segment ends past 30 s.
+        assert!(
+            bounds_seq.last().is_some_and(|&(_, e)| e >= 30.0 - 1e-6),
+            "expected the decode to cover past 30 s: {bounds_seq:?}"
+        );
+    }
 
-        // Timestamps monotonic non-decreasing across the window boundary.
+    #[test]
+    fn gated_fixed_count_deterministic() {
+        // NEW CONTRACT: output varies WITH worker count by design, but is
+        // deterministic FOR A FIXED count — re-running the 2-worker partition
+        // yields byte-identical text and timestamps.
+        let Some(model) = load_tiny_en() else {
+            eprintln!("SKIP gated_fixed_count_deterministic: tiny.en model missing");
+            return;
+        };
+        let Some(long) = jfk3x_samples() else {
+            eprintln!("SKIP gated_fixed_count_deterministic: jfk.wav missing");
+            return;
+        };
+
+        // batch_size 8 with a 16-thread budget => headroom 16/5 = 3, capped to
+        // the 2 windows => 2 workers (one seam) for this 2-window clip.
+        let (text_a, bounds_a, workers_a, _) = decode_with_workers(&model, &long, Some(8), 16);
+        let (text_b, bounds_b, workers_b, _) = decode_with_workers(&model, &long, Some(8), 16);
+        assert_eq!(workers_a, 2, "expected 2 workers for the 2-window fixture");
+        assert_eq!(workers_a, workers_b);
+        assert_eq!(text_a, text_b, "fixed worker count must be deterministic");
+        assert_eq!(bounds_a, bounds_b, "fixed worker count timestamps stable");
+
+        // Timestamps monotonic non-decreasing across the seam.
         let mut prev_end = -1.0f64;
-        for (start, end) in &bounds_seq {
+        for (start, end) in &bounds_a {
             assert!(
                 *start + 1e-6 >= prev_end - 1e-6,
                 "segment start {start} must not precede previous end {prev_end}"
@@ -1010,18 +1341,44 @@ mod tests {
             assert!(*end + 1e-6 >= *start, "segment end {end} >= start {start}");
             prev_end = *end;
         }
-
-        // Segments span both windows: at least one segment starts at/after 30 s.
+        // The second range (>= 30 s) is present.
         assert!(
-            bounds_seq.iter().any(|(s, _)| *s >= 30.0 - 1e-6),
-            "expected segments in the second (>=30s) window: {bounds_seq:?}"
+            bounds_a.iter().any(|(s, _)| *s >= 30.0 - 1e-6),
+            "expected segments in the second range (>= 30 s): {bounds_a:?}"
+        );
+    }
+
+    #[test]
+    fn gated_word_diff_vs_sequential_bounded() {
+        // NEW CONTRACT: with contiguous ranges + real per-range sequential decode,
+        // the N-worker word-diff vs sequential must be SMALL (seams are rare).
+        // Assert < 10 % on the jfk3x fixture (was 67 % with the old hard-window
+        // round-robin design).
+        let Some(model) = load_tiny_en() else {
+            eprintln!("SKIP gated_word_diff_vs_sequential: tiny.en model missing");
+            return;
+        };
+        let Some(long) = jfk3x_samples() else {
+            eprintln!("SKIP gated_word_diff_vs_sequential: jfk.wav missing");
+            return;
+        };
+
+        let (text_par, _, workers, _) = decode_with_workers(&model, &long, Some(8), 16);
+        assert_eq!(workers, 2, "expected the 2-worker partition");
+        let (text_seq, _) = sequential_reference(&model, &long, 16);
+
+        let rate = word_diff_rate(&text_par, &text_seq);
+        assert!(
+            rate < 0.10,
+            "2-worker word-diff vs sequential must be < 10%, got {:.1}% \
+             (par={text_par:?} seq={text_seq:?})",
+            rate * 100.0
         );
 
-        // The repeated sentence's signature word should recur.
-        let lc = text_seq.to_lowercase();
+        // The signature word still recurs in the parallel output.
         assert!(
-            lc.matches("country").count() >= 2,
-            "expected the repeated sentence at least twice: {text_seq}"
+            text_par.to_lowercase().matches("country").count() >= 2,
+            "expected the repeated sentence at least twice: {text_par}"
         );
     }
 }
