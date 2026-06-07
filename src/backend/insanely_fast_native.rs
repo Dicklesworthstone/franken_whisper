@@ -133,6 +133,20 @@ const WINDOW_SECONDS: f64 = 30.0;
 /// (or `batch_size = 1` here).
 const MIN_THREADS_PER_WORKER: usize = 5;
 
+/// The effective [`MIN_THREADS_PER_WORKER`], with a **measurement-only** override
+/// via `$FRANKEN_WHISPER_IF_MIN_THREADS` (a positive integer). Production always
+/// uses the compiled-in default; the env var exists solely so the perf-loop knob
+/// sweep can probe alternate budgets (4 / 5 / 7) without recompiling. An unset,
+/// empty, zero, or unparsable value falls back to the const, so the policy is
+/// data-derived and the default is unchanged.
+fn min_threads_per_worker() -> usize {
+    std::env::var("FRANKEN_WHISPER_IF_MIN_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MIN_THREADS_PER_WORKER)
+}
+
 /// Honestly report whether the native insanely-fast engine can run.
 ///
 /// Shares [`whisper_cpp_native::is_available`](super::whisper_cpp_native::is_available)'s
@@ -232,7 +246,7 @@ pub(crate) fn plan_workers(
     // Headroom ceiling: only as many workers as can each keep
     // `MIN_THREADS_PER_WORKER` intra-op threads. This is the lever that prevents
     // oversubscription on top of the already-saturating intra-op parallelism.
-    let headroom = (total_threads / MIN_THREADS_PER_WORKER).max(1);
+    let headroom = (total_threads / min_threads_per_worker()).max(1);
     let n_workers = n_windows.max(1).min(batch).min(headroom).max(1);
     let threads_per_worker = (total_threads / n_workers).max(1);
     (n_workers, threads_per_worker)
@@ -472,8 +486,20 @@ fn decode_ranges_parallel(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                // Measurement-only (PERF_SPANS): per-worker wall + span samples so
+                // worker finish-time SKEW (range imbalance: even duration split,
+                // uneven speech density) is observable. No behavior change.
+                let worker_t0 = std::time::Instant::now();
                 match model.transcribe(span, params, &checkpoint) {
                     Ok(output) => {
+                        crate::native_engine::perf_span(
+                            "if_worker",
+                            worker_t0.elapsed().as_secs_f64() * 1e3,
+                            &format!(
+                                "\"start_window\":{start_window},\"end_window\":{end_window},\"samples\":{}",
+                                span.len()
+                            ),
+                        );
                         results
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
