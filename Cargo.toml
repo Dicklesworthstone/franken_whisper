@@ -11,6 +11,17 @@ tui = ["dep:ftui"]
 gpu-frankentorch = ["dep:ft-api"]
 gpu-frankenjax = ["dep:fj-api", "dep:fj-core"]
 
+# Two binaries from the same entry point: the full name and the short `fw`
+# alias agents and humans actually type. Listing them explicitly disables the
+# implicit package-named bin, so both are declared here.
+[[bin]]
+name = "franken_whisper"
+path = "src/main.rs"
+
+[[bin]]
+name = "fw"
+path = "src/main.rs"
+
 [dependencies]
 ctrlc = "3.4"
 base64 = "0.22.1"
