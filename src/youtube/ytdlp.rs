@@ -1052,7 +1052,7 @@ mod tests {
         let meta = fetch_metadata(&stub_info(), "https://youtu.be/dQw4w9WgXcQ", &token)
             .expect("metadata should parse");
         assert_eq!(meta.id, "dQw4w9WgXcQ");
-        assert_eq!(meta.title, "Stub Metadata Title");
+        assert_eq!(meta.title, "Stub Title dQw4w9WgXcQ");
         assert_eq!(meta.channel.as_deref(), Some("Stub Channel"));
         assert_eq!(meta.uploader.as_deref(), Some("Stub Uploader"));
         assert_eq!(meta.upload_date.as_deref(), Some("20240115"));

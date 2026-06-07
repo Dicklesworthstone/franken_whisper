@@ -115,6 +115,97 @@ pub enum Command {
         command: TtyAudioCommand,
     },
     Tui,
+    /// Download YouTube audio (videos / playlists / a URL file) and
+    /// transcribe each into a markdown + JSON pair.
+    Youtube(Box<YoutubeArgs>),
+}
+
+/// Arguments for the `youtube` subcommand.
+#[derive(Debug, Args)]
+pub struct YoutubeArgs {
+    /// Video or playlist URLs (also accepted as positional args).
+    #[arg(long = "url")]
+    pub urls: Vec<String>,
+
+    /// Positional video / playlist URLs.
+    #[arg(value_name = "URL")]
+    pub positional_urls: Vec<String>,
+
+    /// A file with one URL per line (`#`/`;`/`]` comments and blanks ignored).
+    #[arg(long)]
+    pub batch_file: Option<PathBuf>,
+
+    /// Output directory for the audio/, markdown, and JSON files.
+    #[arg(long, default_value = "youtube_transcripts")]
+    pub output_dir: PathBuf,
+
+    /// Model name or path forwarded to the engine.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Language hint (ISO 639-1); omitted = auto-detect.
+    #[arg(long)]
+    pub language: Option<String>,
+
+    /// Backend strategy.
+    #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
+    pub backend: BackendKind,
+
+    /// Enable speaker diarization.
+    #[arg(long)]
+    pub diarize: bool,
+
+    /// Maximum concurrent downloads.
+    #[arg(long, default_value_t = 3)]
+    pub concurrency: usize,
+
+    /// Delete each audio file after its transcript is written.
+    #[arg(long)]
+    pub no_keep_audio: bool,
+
+    /// Do not retry videos previously marked failed in the manifest.
+    #[arg(long)]
+    pub no_retry: bool,
+
+    /// Stop the whole run on the first per-video failure.
+    #[arg(long)]
+    pub abort_on_error: bool,
+
+    /// Emit the final run summary as JSON on stdout (for scripting).
+    #[arg(long)]
+    pub json_summary: bool,
+}
+
+impl YoutubeArgs {
+    /// Build the pipeline options, validating that at least one input source
+    /// was supplied. Positional and `--url` URLs are merged.
+    pub fn to_options(&self) -> FwResult<crate::youtube::pipeline::YoutubeRunOptions> {
+        let mut urls = self.urls.clone();
+        urls.extend(self.positional_urls.iter().cloned());
+        if urls.is_empty() && self.batch_file.is_none() {
+            return Err(FwError::InvalidRequest(
+                "no inputs: pass one or more URLs, --url, or --batch-file".to_owned(),
+            ));
+        }
+        if self.concurrency == 0 {
+            return Err(FwError::InvalidRequest(
+                "--concurrency must be at least 1".to_owned(),
+            ));
+        }
+        Ok(crate::youtube::pipeline::YoutubeRunOptions {
+            urls,
+            batch_file: self.batch_file.clone(),
+            output_dir: self.output_dir.clone(),
+            model: self.model.clone(),
+            language: self.language.clone(),
+            backend: self.backend,
+            diarize: self.diarize,
+            concurrency: self.concurrency,
+            keep_audio: !self.no_keep_audio,
+            retry_failed: !self.no_retry,
+            abort_on_error: self.abort_on_error,
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]

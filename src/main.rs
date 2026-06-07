@@ -304,6 +304,37 @@ fn run(cli: Cli) -> FwResult<()> {
             }
         },
         Command::Tui => franken_whisper::tui::run_tui(),
+        Command::Youtube(args) => {
+            let opts = args.to_options()?;
+            let summary = franken_whisper::youtube::pipeline::run(&opts)?;
+            if args.json_summary {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!(
+                    "YouTube ingestion: {} done, {} skipped, {} failed{}",
+                    summary.done.len(),
+                    summary.skipped.len(),
+                    summary.failed.len(),
+                    if summary.cancelled {
+                        " (cancelled)"
+                    } else {
+                        ""
+                    },
+                );
+                for f in &summary.failed {
+                    eprintln!("  failed {}: {} — {}", f.id, f.title, f.error);
+                }
+            }
+            // Any failed video is a non-zero outcome; cancellation is surfaced
+            // through the global shutdown exit code in main().
+            if !summary.failed.is_empty() && !summary.cancelled {
+                return Err(FwError::Unsupported(format!(
+                    "{} youtube video(s) failed",
+                    summary.failed.len()
+                )));
+            }
+            Ok(())
+        }
     }
 }
 

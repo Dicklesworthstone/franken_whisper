@@ -58,6 +58,7 @@ WANT_DOWNLOAD=0
 DEST_TEMPLATE=""
 NEXT_IS_OUTPUT=0
 
+LAST_URL=""
 for arg in "$@"; do
   if [ "$NEXT_IS_OUTPUT" -eq 1 ]; then
     DEST_TEMPLATE="$arg"
@@ -70,8 +71,22 @@ for arg in "$@"; do
     -j)               WANT_J=1 ;;
     -f)               WANT_DOWNLOAD=1 ;;  # `-f ba` only appears on the download path
     -o)               NEXT_IS_OUTPUT=1 ;;
+    http*)            LAST_URL="$arg" ;;  # remember the URL for id derivation
   esac
 done
+
+# Derive a stable video id from a watch URL so multi-URL runs stay distinct
+# and self-consistent. Falls back to STUB_VIDEO_ID for non-watch inputs.
+url_to_id() {
+  local u="$1" id=""
+  case "$u" in
+    *watch?v=*)   id="${u#*watch?v=}"; id="${id%%&*}" ;;
+    *youtu.be/*)  id="${u#*youtu.be/}"; id="${id%%[?&]*}" ;;
+    */shorts/*)   id="${u#*/shorts/}"; id="${id%%[?&]*}" ;;
+    *) id="" ;;
+  esac
+  [ -n "$id" ] && printf '%s' "$id" || printf '%s' "${STUB_VIDEO_ID:-dQw4w9WgXcQ}"
+}
 
 # ---- --version ------------------------------------------------------------
 if [ "$WANT_VERSION" -eq 1 ]; then
@@ -90,15 +105,16 @@ fi
 
 # ---- full metadata --------------------------------------------------------
 if [ "$WANT_J" -eq 1 ] && [ "$WANT_DOWNLOAD" -eq 0 ]; then
+  MID="$(url_to_id "$LAST_URL")"
   cat <<EOF
-{"id":"${STUB_VIDEO_ID:-dQw4w9WgXcQ}","title":"Stub Metadata Title","channel":"Stub Channel","uploader":"Stub Uploader","upload_date":"20240115","duration":212.0,"webpage_url":"https://www.youtube.com/watch?v=${STUB_VIDEO_ID:-dQw4w9WgXcQ}","description":"A canned description.","availability":"public","live_status":"${STUB_LIVE_STATUS:-not_live}"}
+{"id":"$MID","title":"Stub Title $MID","channel":"Stub Channel","uploader":"Stub Uploader","upload_date":"20240115","duration":212.0,"webpage_url":"https://www.youtube.com/watch?v=$MID","description":"A canned description.","availability":"public","live_status":"${STUB_LIVE_STATUS:-not_live}"}
 EOF
   exit 0
 fi
 
 # ---- download -------------------------------------------------------------
 if [ "$WANT_DOWNLOAD" -eq 1 ]; then
-  VIDEO_ID="${STUB_VIDEO_ID:-dQw4w9WgXcQ}"
+  VIDEO_ID="$(url_to_id "$LAST_URL")"
 
   # Resolve the destination directory from the -o template
   # (e.g. /tmp/xxx/%(id)s.%(ext)s -> /tmp/xxx) and materialize <id>.wav there.
