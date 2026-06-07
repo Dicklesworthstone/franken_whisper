@@ -30,6 +30,12 @@
 
 set -u
 
+# Profiling aid (measurement-only): when STUB_CALL_LOG is set, append one line
+# per invocation recording the mode + URL so a profiler can count yt-dlp calls.
+if [ -n "${STUB_CALL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_CALL_LOG"
+fi
+
 # ---- error injection ------------------------------------------------------
 case "${STUB_FAIL_MODE:-}" in
   private)

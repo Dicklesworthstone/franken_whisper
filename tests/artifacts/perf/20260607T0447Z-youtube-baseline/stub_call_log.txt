@@ -1,0 +1,9 @@
+--version
+-j --no-simulate --no-playlist --no-warnings -- https://www.youtube.com/watch?v=AAAAAAAAAAA
+-j --no-simulate --no-playlist --no-warnings -- https://youtu.be/BBBBBBBBBBB
+-j --no-simulate --no-playlist --no-warnings -- https://www.youtube.com/watch?v=AAAAAAAAAAA
+-j --no-simulate --no-playlist --no-warnings -- https://www.youtube.com/watch?v=BBBBBBBBBBB
+-f bestaudio/best --no-playlist --no-warnings --no-progress -o /tmp/fw_yt_count/audio/%(id)s.%(ext)s --print after_move:filepath --sleep-interval 2 --max-sleep-interval 5 --retries 10 -- https://www.youtube.com/watch?v=BBBBBBBBBBB
+-f bestaudio/best --no-playlist --no-warnings --no-progress -o /tmp/fw_yt_count/audio/%(id)s.%(ext)s --print after_move:filepath --sleep-interval 2 --max-sleep-interval 5 --retries 10 -- https://www.youtube.com/watch?v=AAAAAAAAAAA
+-j --no-simulate --no-playlist --no-warnings -- https://www.youtube.com/watch?v=BBBBBBBBBBB
+-j --no-simulate --no-playlist --no-warnings -- https://www.youtube.com/watch?v=AAAAAAAAAAA

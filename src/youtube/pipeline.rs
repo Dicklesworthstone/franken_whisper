@@ -439,8 +439,13 @@ fn download_one(
     audio_dir: &Path,
     token: &CancellationToken,
 ) -> Result<PathBuf, String> {
+    let t_meta = std::time::Instant::now();
     let meta = ytdlp::fetch_metadata(info, &video.url, token).map_err(|e| e.to_string())?;
-    ytdlp::download_audio(info, &meta, audio_dir, token).map_err(|e| e.to_string())
+    crate::native_engine::perf_span("yt.dl_metadata", t_meta.elapsed().as_secs_f64() * 1e3, "");
+    let t_dl = std::time::Instant::now();
+    let path = ytdlp::download_audio(info, &meta, audio_dir, token).map_err(|e| e.to_string());
+    crate::native_engine::perf_span("yt.download", t_dl.elapsed().as_secs_f64() * 1e3, "");
+    path
 }
 
 fn record_failure(
@@ -474,7 +479,14 @@ fn transcribe_and_render(
     // resume render without a re-download). On failure fall back to the
     // VideoRef we already have.
     let token = CancellationToken::unbounded();
-    let meta = ytdlp::fetch_metadata(info, &video.url, &token).unwrap_or(VideoMeta {
+    let t_rmeta = std::time::Instant::now();
+    let meta_opt = ytdlp::fetch_metadata(info, &video.url, &token).ok();
+    crate::native_engine::perf_span(
+        "yt.render_metadata",
+        t_rmeta.elapsed().as_secs_f64() * 1e3,
+        "",
+    );
+    let meta = meta_opt.unwrap_or(VideoMeta {
         id: video.id.clone(),
         title: video.title.clone(),
         channel: None,
@@ -510,6 +522,7 @@ fn transcribe_and_render(
 
     let report = engine.transcribe(request)?;
     let wall_ms = started_instant.elapsed().as_millis() as u64;
+    crate::native_engine::perf_span("yt.transcribe", wall_ms as f64, "");
     let segments: &[TranscriptionSegment] = &report.result.segments;
 
     let rtf = meta
@@ -548,12 +561,14 @@ fn transcribe_and_render(
         segments,
     };
 
+    let t_render = std::time::Instant::now();
     render::write_atomic(&paths.md, &render::render_markdown(&input))?;
     let json = render::render_json(&input);
     render::write_atomic(
         &paths.json,
         &serde_json::to_string_pretty(&json).map_err(FwError::Json)?,
     )?;
+    crate::native_engine::perf_span("yt.render", t_render.elapsed().as_secs_f64() * 1e3, "");
     Ok(paths)
 }
 
