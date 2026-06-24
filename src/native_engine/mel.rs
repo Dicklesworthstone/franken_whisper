@@ -140,7 +140,7 @@ impl FftTwiddles {
     fn build(n_fft: usize) -> Self {
         let mut levels = Vec::new();
         let mut n = n_fft;
-        while n % 2 == 0 && n > 1 {
+        while n.is_multiple_of(2) && n > 1 {
             let half = n / 2;
             let mut cos = vec![0.0f32; half];
             let mut neg_sin = vec![0.0f32; half];
