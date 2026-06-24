@@ -129,6 +129,20 @@ green conformance, and a before/after ratio in this ledger.
 The P1 levers depend on `bd-zk43` so product-speed claims cannot bypass the
 original-comparator evidence gate.
 
+### Validation after this entry
+
+```text
+git diff --check -> pass
+cargo fmt --check -> pass
+br dep cycles -> pass, no dependency cycles detected
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper \
+  --test conformance_comparator_tests
+result: local fallback, pass, 26 passed / 0 failed
+ubs docs/NEGATIVE_EVIDENCE.md .beads/issues.jsonl -> not applicable; no
+supported languages detected
+```
+
 ## 2026-06-24 - franken_whisper-cod-a kickoff
 
 ### Ratio convention
