@@ -226,6 +226,63 @@ verdict: build/bench gate only. No original comparator, no product-speed claim.
 `bd-0hnz` blocks the downstream cod-a perf levers so optimization work cannot
 bypass the original-comparator evidence gate.
 
+## 2026-06-24 - franken_whisper-cod-a OpenAI Whisper head-to-head
+
+### Fresh OpenAI Whisper comparator ratio
+
+| Workload | Franken path | Original path | Ratio vs original | Conformance | Verdict |
+| --- | --- | --- | ---: | --- | --- |
+| 11 s JFK, `tiny.en`, CPU, 8 threads | `franken_whisper` native `whisper.cpp-native`, release-perf, ggml `tiny.en` | OpenAI Whisper `openai-whisper==20250625`, PyTorch CPU, `tiny.en` | 2.13x | Normalized word tokens identical; raw punctuation differs by comma/leading space | Fresh measured win |
+
+Command evidence:
+
+```text
+git SHA: 2ef3fa8
+build:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+    rch exec -- cargo build -p franken_whisper --profile release-perf \
+    --bin franken_whisper
+  result: pass; rch local fallback; release-perf build 7m23s
+
+franken command:
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_NATIVE_EXECUTION=1 \
+  FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole \
+  /data/projects/.rch-targets/franken_whisper-cod-a/release-perf/franken_whisper \
+    transcribe --input /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --backend whisper-cpp --model tiny.en --language en --threads 8 \
+    --no-persist --json >/dev/null
+
+OpenAI Whisper command:
+  out=/tmp/franken_whisper_cod_a_openai_run_$(date +%s%N); mkdir -p "$out"; \
+  PATH=/home/ubuntu/.local/state/franken_whisper/tools/ffmpeg/bin:$PATH \
+  uvx --from openai-whisper whisper \
+    /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --model tiny.en --language en --device cpu --fp16 False --threads 8 \
+    --output_format json --output_dir "$out" --verbose False >/dev/null
+
+hyperfine:
+  --warmup 1 --runs 5
+  franken mean: 1.733 s +/- 0.685 s [user 3.869 s, sys 1.470 s]
+  OpenAI mean: 3.698 s +/- 0.653 s [user 12.682 s, sys 0.766 s]
+  speed_ratio = 3.698 / 1.733 = 2.13x
+
+conformance:
+  franken transcript:
+    And so my fellow Americans ask not what your country can do for you ask what you can do for your country.
+  OpenAI Whisper transcript:
+    " And so, my fellow Americans ask not what your country can do for you ask what you can do for your country."
+  normalized lowercase alnum tokens: identical, 22/22 tokens.
+```
+
+Notes:
+
+- This entry is a fresh product-level comparator measurement against OpenAI
+  Whisper, not evidence for the in-progress `src/native_engine/mel.rs` twiddle
+  precompute lever.
+- The uncommitted mel twiddle lever and `docs/PERF_LEDGER.md` were reserved by
+  `BlackThrush` during this run, so cod-a did not edit or land that code.
+
 ### Rule for future entries
 
 Every future entry must include: command, worker/host, git SHA, model SHA or
