@@ -288,3 +288,124 @@ Notes:
 Every future entry must include: command, worker/host, git SHA, model SHA or
 path, workload, original time, franken time, ratio, conformance result, verdict,
 and whether the code was kept, reverted, or only routed into a bead.
+
+## 2026-06-24 - franken_whisper-cod-b OpenAI loaded-model API check
+
+### Ratio convention
+
+`speed_ratio = original_wall_time / franken_wall_time`.
+
+- `> 1.0`: franken is faster.
+- `= 1.0`: parity.
+- `< 1.0`: franken is slower.
+
+### Fresh loaded-model comparator ratio
+
+This entry uses the OpenAI Whisper Python API with the model loaded before the
+timed section. That is a different workload from the CLI-startup comparator
+above, where each OpenAI run pays Python process and model-load cost.
+
+| Workload | Franken path | Original path | Ratio vs original | Conformance | Verdict |
+| --- | --- | --- | ---: | --- | --- |
+| 11 s JFK, `tiny.en`, CPU, model-reuse/API comparator | `franken_whisper` native `whisper.cpp-native`, shipped `release` profile, ggml `tiny.en`, CLI one-shot | OpenAI Whisper Python API, model loaded once before timing, PyTorch CPU, `tiny.en` | 0.465x | Normalized word tokens identical; franken adds final punctuation | Fresh measured loss for loaded-model API workload |
+
+Command evidence:
+
+```text
+git SHA: 656f55c
+build:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+    rch exec -- cargo build --profile release -p franken_whisper \
+    --bin franken_whisper
+  result: pass; rch worker ovh-a; release build 3m30s; artifact retrieved to
+  /data/projects/.rch-targets/franken_whisper-cod-b/release/franken_whisper
+
+OpenAI Whisper API command:
+  uv tool run --from openai-whisper python - <<'PY'
+  import json, time, wave
+  import numpy as np
+  import whisper
+  path = 'tests/fixtures/native/jfk.wav'
+  with wave.open(path, 'rb') as w:
+      raw = w.readframes(w.getnframes())
+  audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+  model = whisper.load_model('tiny.en', device='cpu')
+  model.transcribe(audio, language='en', fp16=False, verbose=False,
+                   temperature=0.0, condition_on_previous_text=False)
+  runs = []
+  texts = []
+  for _ in range(5):
+      start = time.perf_counter()
+      result = model.transcribe(audio, language='en', fp16=False,
+                                verbose=False, temperature=0.0,
+                                condition_on_previous_text=False)
+      runs.append(time.perf_counter() - start)
+      texts.append(result.get('text', '').strip())
+  print(json.dumps({'runs_s': runs, 'texts': texts}, indent=2))
+  PY
+
+OpenAI API result:
+  runs_s: [0.4218380448874086, 0.49884854396805167,
+           0.4356057639233768, 0.43359226104803383,
+           0.4581331869121641]
+  median: 0.4356057639233768 s
+  transcript:
+    And so my fellow Americans ask not what your country can do for you ask what you can do for your country
+
+franken command:
+  RUST_LOG=error \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_NATIVE_EXECUTION=1 \
+  FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole \
+  FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0 \
+  /data/projects/.rch-targets/franken_whisper-cod-b/release/franken_whisper \
+    transcribe --input /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --backend whisper-cpp --model tiny.en --language en --temperature 0.0 \
+    --beam-size 1 --best-of 1 --no-persist --json
+
+franken hyperfine:
+  --warmup 1 --runs 5
+  mean: 0.9460924366400001 s +/- 0.01580093129598703 s
+  median: 0.93704627044 s
+  min/max: 0.93067355044 s / 0.9646279524400001 s
+  raw runs: [0.9646279524400001, 0.9364485274400001,
+             0.9616658824400001, 0.93067355044, 0.93704627044]
+  user/system: 5.5155 s / 1.1490 s
+
+franken run metadata:
+  backend_identity: whisper.cpp-native
+  backend_version: native-pilot-v1/0.2.0
+  input_content_hash: d16054d2df9adaae9c6228d86113f256a4b43d448d1f6b9107b75e2136a934a0
+  output_payload_hash: 7fdbdde9a772bc5bda7d9933f1e475224837e8081f9505290f871316d87fd486
+  backend.ok elapsed_ms: 880
+  latency summary: service_total_ms=905, queue_total_ms=1
+  transcript:
+    And so my fellow Americans ask not what your country can do for you ask what you can do for your country.
+
+ratio:
+  speed_ratio = 0.4356057639233768 / 0.93704627044 = 0.464871x
+  inverse = 2.151134x slower than the loaded OpenAI API comparator
+```
+
+Notes:
+
+- The landed mel twiddle commit `656f55c` improves the stale pre-`656f55c`
+  release binary check from `0.327x` to `0.465x` on this loaded-model API
+  comparator, but this remains a loss.
+- This does not negate the previous CLI-startup comparator win; it narrows the
+  claim boundary. `franken_whisper` currently wins when the original pays CLI
+  startup/model-load cost, but loses to a reusable in-process OpenAI Whisper
+  Python model on this short `tiny.en` fixture.
+- No code lever was attempted in this session because the only fresh measured
+  win found in the checkout (`656f55c`, mel twiddle precompute) was already on
+  `main` and `master`.
+
+Validation after this entry:
+
+```text
+git diff --check -- docs/NEGATIVE_EVIDENCE.md -> pass
+ubs docs/NEGATIVE_EVIDENCE.md -> not applicable; no supported Markdown scanner
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests
+result: local fallback, pass, 26 passed / 0 failed
+```
