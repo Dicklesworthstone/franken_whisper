@@ -97,11 +97,25 @@ twiddle win (allocator churn ≈ single-digit ms vs the ~240 ms transcendental
 cost just removed). Tracked in bd-02do as a follow-up via per-thread scratch
 buffers.
 
-**Status: designed + pre-verified bit-exact** (standalone scratch-FFT harness,
-418,800 outputs, 0 mismatches) but **deferred** — its e2e impact is negligible
-(mel is a small fraction of transcription) and it cannot be A/B'd reliably under
-the worker variance documented below. Will land only if a same-worker A/B shows
-a real gain.
+**Status: MEASURED, NOT LANDED (deferred).** Pre-verified bit-exact (standalone
+scratch-FFT harness, 418,800 outputs, 0 mismatches). Measured via a standalone
+local same-process A/B (stable host — the rigorous way given the 5.6× worker
+variance below) over a realistic 3000-frame `N_FFT=400` pass:
+
+| FFT pass (3000 frames, 1 thread) | time | speedup |
+|---|---|---|
+| alloc (current) | 28.5 ms | — |
+| scratch (L2) | 23.4 ms | **1.21× (stable across runs)** |
+
+**Decision — not landed.** The 1.21× is real at the FFT-kernel level, but the
+FFT is only part of `mel_30s` (≈1.1× there) and `mel_30s` is itself a small
+fraction of end-to-end transcription ⇒ **e2e gain ≈ 0**. Landing it also forces
+`compute_frame_column` past the 7-arg `clippy::too_many_arguments` limit
+(struct-refactor or `#[allow]`) — added complexity in a freshly-clean file for
+no e2e benefit. Per the swarm's own "REVERT ~0-gain" rule, **deferred** until/
+unless a real workload shows the mel frontend on its critical path. Design +
+measurement preserved here and in the scratchpad so it can be landed in minutes
+if that changes.
 
 ---
 
