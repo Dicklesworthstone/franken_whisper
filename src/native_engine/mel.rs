@@ -287,6 +287,36 @@ pub fn n_frames_for(n_samples: usize) -> usize {
     (padded_len - N_FFT) / HOP
 }
 
+/// A mel filterbank paired with each filter's `[start, end)` nonzero freq-bin
+/// range. Real whisper mel filterbanks are sparse triangles (~5 nonzero bins of
+/// 201), so the projection can skip the leading/trailing zeros. This is
+/// **bit-exact**: a skipped term is `power[k] * 0.0`, and for the finite,
+/// non-negative `power` produced by an FFT of real audio that is `+0.0`, which
+/// never changes a running f64 sum. The ranges are computed once per `log_mel`
+/// call (not per frame). Bundling the filterbank + ranges keeps
+/// [`compute_frame_column`]'s arity under the clippy `too_many_arguments` limit.
+struct SparseMelFilters<'a> {
+    fb: &'a MelFilterbank,
+    /// `(start, end)` (end-exclusive) per mel filter; every weight outside the
+    /// range is exactly `0.0`.
+    ranges: Vec<(usize, usize)>,
+}
+
+impl<'a> SparseMelFilters<'a> {
+    fn new(fb: &'a MelFilterbank) -> Self {
+        let n_bins = fb.n_fft_bins;
+        let ranges = (0..fb.n_mel)
+            .map(|m| {
+                let row = &fb.data[m * n_bins..m * n_bins + n_bins];
+                let start = row.iter().position(|&v| v != 0.0).unwrap_or(0);
+                let end = row.iter().rposition(|&v| v != 0.0).map_or(0, |e| e + 1);
+                (start, end)
+            })
+            .collect();
+        Self { fb, ranges }
+    }
+}
+
 /// Compute one frame's pre-clamp `log10` mel column into `out` (length
 /// `n_mel`). `frame_idx` selects the sample offset (`frame_idx * HOP`);
 /// `valid_len` is the FFT-able prefix length. Frames whose offset is past
@@ -297,16 +327,16 @@ fn compute_frame_column(
     padded: &[f32],
     valid_len: usize,
     hann: &[f32; N_FFT],
-    filters: &MelFilterbank,
+    filters: &SparseMelFilters,
     twiddles: &FftTwiddles,
     out: &mut [f32],
 ) {
     let offset = frame_idx * HOP;
-    let n_fft_bins = filters.n_fft_bins; // 201
+    let n_fft_bins = filters.fb.n_fft_bins; // 201
 
     if offset >= valid_len {
         let floor = (1e-10f64).log10() as f32;
-        out[..filters.n_mel].fill(floor);
+        out[..filters.fb.n_mel].fill(floor);
         return;
     }
 
@@ -328,12 +358,17 @@ fn compute_frame_column(
         *p = re * re + im * im;
     }
 
-    // Mel projection + log10 floor. Accumulate in f64 like whisper.cpp.
-    for (j, o) in out.iter_mut().enumerate().take(filters.n_mel) {
-        let row = &filters.data[j * n_fft_bins..j * n_fft_bins + n_fft_bins];
+    // Mel projection + log10 floor. Accumulate in f64 like whisper.cpp, but only
+    // over each filter's nonzero freq-bin range: the skipped weights are exactly
+    // 0.0 and `power` is finite, so `power[k] * 0.0 == +0.0` contributes nothing
+    // to the f64 sum — bit-for-bit identical to the dense loop, but ~13x fewer
+    // multiply-adds on a real (sparse-triangular) mel filterbank.
+    for (j, o) in out.iter_mut().enumerate().take(filters.fb.n_mel) {
+        let (start, end) = filters.ranges[j];
+        let row = &filters.fb.data[j * n_fft_bins..j * n_fft_bins + n_fft_bins];
         let mut sum = 0.0f64;
-        for (k, &fk) in power.iter().enumerate() {
-            sum += f64::from(fk) * f64::from(row[k]);
+        for (&pk, &rk) in power[start..end].iter().zip(row[start..end].iter()) {
+            sum += f64::from(pk) * f64::from(rk);
         }
         *o = sum.max(1e-10).log10() as f32;
     }
@@ -367,6 +402,8 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
 
     let hann = cached_hann_window();
     let twiddles = cached_fft_twiddles();
+    // Precompute each mel filter's nonzero range once (real banks are sparse).
+    let sparse_filters = SparseMelFilters::new(filters);
     let (padded, valid_len) = build_padded(samples);
     let n_frames = (padded.len() - N_FFT) / HOP;
     let n_mel = filters.n_mel;
@@ -393,10 +430,11 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
             let end = (start + frames_per_thread).min(n_frames);
             let padded_ref = &padded;
             // `hann` and `twiddles` are already `&'static`; copy the references
-            // into the worker closure.
+            // into the worker closure. `sparse_filters` is built above and shared
+            // read-only across workers.
             let hann_ref = hann;
             let twiddles_ref = twiddles;
-            let filters_ref = filters;
+            let filters_ref = &sparse_filters;
             handles.push(scope.spawn(move || {
                 let len = end - start;
                 // frame-major local buffer: local[frame_local * n_mel + mel]
@@ -652,6 +690,46 @@ mod tests {
                 spec.iter().map(|(re, im)| re * re + im * im).sum::<f64>() / n as f64;
             let rel = (time_energy - freq_energy).abs() / time_energy.max(1e-9);
             assert!(rel < 1e-4, "Parseval N={n} rel={rel}");
+        }
+    }
+
+    #[test]
+    fn sparse_projection_matches_dense_bit_exact() {
+        // Real mel banks are sparse triangles; SparseMelFilters skips leading/
+        // trailing zeros. Verify the range-restricted f64 projection is
+        // bit-identical to the dense sum over all 201 bins, for every filter.
+        let n_bins = N_FREQ_BINS;
+        let n_mel = 16;
+        let mut data = vec![0.0f32; n_mel * n_bins];
+        for m in 0..n_mel {
+            let lo = (m * 7) % (n_bins - 12);
+            for k in lo..lo + 9 {
+                let w = 1.0 - ((k as f32 - (lo as f32 + 4.0)).abs() / 5.0);
+                data[m * n_bins + k] = w.max(0.0);
+            }
+        }
+        let fb = MelFilterbank {
+            n_mel,
+            n_fft_bins: n_bins,
+            data,
+        };
+        let sparse = SparseMelFilters::new(&fb);
+        let mut lcg = Lcg::new(0x000F_17E5);
+        for _ in 0..64 {
+            let power: Vec<f32> = (0..n_bins).map(|_| (lcg.next_f32() + 1.0) * 50.0).collect();
+            for m in 0..n_mel {
+                let row = &fb.data[m * n_bins..m * n_bins + n_bins];
+                let mut dense = 0.0f64;
+                for (k, &fk) in power.iter().enumerate() {
+                    dense += f64::from(fk) * f64::from(row[k]);
+                }
+                let (s, e) = sparse.ranges[m];
+                let mut sp = 0.0f64;
+                for (&pk, &rk) in power[s..e].iter().zip(row[s..e].iter()) {
+                    sp += f64::from(pk) * f64::from(rk);
+                }
+                assert_eq!(dense.to_bits(), sp.to_bits(), "mel {m}: sparse != dense");
+            }
         }
     }
 

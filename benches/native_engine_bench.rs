@@ -103,6 +103,46 @@ fn synthetic_filterbank(n_mel: usize) -> MelFilterbank {
     }
 }
 
+/// A REALISTIC sparse triangular mel filterbank (standard Slaney-style mel
+/// triangles), matching what a real ggml model carries: each of the `n_mel`
+/// filters is nonzero over only ~5 contiguous freq bins of `N_FREQ_BINS=201`,
+/// zero elsewhere. Unlike [`synthetic_filterbank`] (dense, every weight nonzero)
+/// this exercises the sparse-projection fast path the production engine actually
+/// hits — the dense bank hides ~13x of wasted multiply-by-zero work.
+fn realistic_mel_filterbank(n_mel: usize) -> MelFilterbank {
+    let n_fft_bins = mel::N_FREQ_BINS;
+    let sr = SAMPLE_RATE as f64;
+    let hz_to_mel = |h: f64| 2595.0 * (1.0 + h / 700.0).log10();
+    let mel_to_hz = |m: f64| 700.0 * (10f64.powf(m / 2595.0) - 1.0);
+    let m_min = hz_to_mel(0.0);
+    let m_max = hz_to_mel(sr / 2.0);
+    // n_mel+2 band edges in mel space, mapped back to Hz.
+    let edges: Vec<f64> = (0..n_mel + 2)
+        .map(|i| mel_to_hz(m_min + (m_max - m_min) * (i as f64) / ((n_mel + 1) as f64)))
+        .collect();
+    let bin_hz = |k: usize| (k as f64) * (sr / 2.0) / ((n_fft_bins - 1) as f64);
+    let mut data = vec![0.0f32; n_mel * n_fft_bins];
+    for m in 0..n_mel {
+        let (lo, ce, hi) = (edges[m], edges[m + 1], edges[m + 2]);
+        for k in 0..n_fft_bins {
+            let f = bin_hz(k);
+            let w = if f >= lo && f <= ce && ce > lo {
+                (f - lo) / (ce - lo)
+            } else if f > ce && f <= hi && hi > ce {
+                (hi - f) / (hi - ce)
+            } else {
+                0.0
+            };
+            data[m * n_fft_bins + k] = w as f32;
+        }
+    }
+    MelFilterbank {
+        n_mel,
+        n_fft_bins,
+        data,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared fixtures
 // ---------------------------------------------------------------------------
@@ -190,6 +230,30 @@ fn bench_mel_30s(c: &mut Criterion) {
     let filters = synthetic_filterbank(80);
 
     group.bench_function("mel_30s", |b| {
+        b.iter(|| {
+            let m = mel::log_mel(black_box(&audio), black_box(&filters), 8).expect("log_mel");
+            black_box(m.n_frames)
+        });
+    });
+
+    group.finish();
+}
+
+/// `mel_30s` over a REALISTIC sparse triangular filterbank — the production case
+/// (real ggml models carry sparse banks). This is the bench where the
+/// sparse-projection lever shows up: with a dense bank (`mel_30s`) the projection
+/// touches all 201 bins per filter; with a real sparse bank only ~5 are nonzero,
+/// so skipping the zeros (bit-exact) removes ~13x of the projection's
+/// multiply-adds. Compare `mel_30s` (dense) vs `mel_30s_realistic` to see the
+/// projection's share of the frontend.
+fn bench_mel_30s_realistic(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/mel");
+    group.measurement_time(Duration::from_secs(10));
+
+    let audio = synthetic_audio(N_SAMPLES_30S, 0xa11ce);
+    let filters = realistic_mel_filterbank(80);
+
+    group.bench_function("mel_30s_realistic", |b| {
         b.iter(|| {
             let m = mel::log_mel(black_box(&audio), black_box(&filters), 8).expect("log_mel");
             black_box(m.n_frames)
@@ -460,6 +524,7 @@ fn bench_f16_gemv_dequant(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_mel_30s,
+    bench_mel_30s_realistic,
     bench_encoder_window_tiny,
     bench_encoder_window_large,
     bench_decoder_token_step_tiny,

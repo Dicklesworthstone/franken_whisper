@@ -117,6 +117,42 @@ unless a real workload shows the mel frontend on its critical path. Design +
 measurement preserved here and in the scratchpad so it can be landed in minutes
 if that changes.
 
+### L3 — sparse mel-filterbank projection (bit-exact)  — `src/native_engine/mel.rs`
+
+**Hypothesis.** Real whisper mel filterbanks are sparse triangles: each of the 80
+filters is nonzero over only **~5 of the 201** FFT freq bins. The projection loop
+ran densely over all 201 bins per filter regardless — ~97.5% of the multiply-adds
+were `power[k] * 0.0`. Skipping the leading/trailing zeros is **bit-exact**: for
+the finite non-negative `power` an FFT of real audio produces, `power[k] * 0.0 ==
++0.0`, which never changes a running f64 sum (and the accumulation order over the
+nonzero range is unchanged).
+
+**Change.** Precompute each filter's `[start, end)` nonzero range once per
+`log_mel` (bundled with the bank in `SparseMelFilters`, keeping
+`compute_frame_column` under the 7-arg clippy limit); project only over that
+range.
+
+**Conformance.** New test `sparse_projection_matches_dense_bit_exact` asserts
+byte-identical f64 sums (range-restricted vs full 201-bin dense) across 16
+filters × 64 random non-negative power spectra. The existing mel tests
+(silence/determinism) stay green (output unchanged). The hermetic `mel_30s`
+(dense synthetic bank) is unaffected; new bench `mel_30s_realistic` (sparse
+triangular bank, the production case) captures the win.
+
+**Measurement (standalone local same-process A/B — rigorous given 5.6× rch worker
+variance — over a realistic 80×201 triangular bank, 3000 frames):**
+
+| projection (3000 frames) | time | speedup |
+|---|---|---|
+| dense (all 201 bins/filter) | 37.5 ms | — |
+| sparse (~4.9 nonzero bins/filter) | 2.9 ms | **12.78×** |
+
+Bit-exact check in the same harness: **0 / 240,000** mismatches. Since the dense
+projection (37.5 ms) is *larger* than the post-L1 FFT pass (~28 ms), eliminating
+it is **≈2× on the whole mel frontend for real (sparse-bank) models** —
+a genuine real-workload win, unlike L2. (e2e share still bounded by
+encoder/decoder, but mel is now near its bit-exact floor.) **Verdict: KEEP.**
+
 ---
 
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)
