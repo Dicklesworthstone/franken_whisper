@@ -85,18 +85,104 @@ fn cached_hann_window() -> &'static [f32; N_FFT] {
     HANN.get_or_init(hann_window)
 }
 
+/// Precomputed twiddle factors for ONE radix-2 decimation-in-time split of width
+/// `n` (so `half = n/2` butterflies). `cos[k] = cos(2*pi*k/n) as f32` and
+/// `sin[k] = -(sin(2*pi*k/n) as f32)` — i.e. the exact values the reference
+/// recursion (whisper.cpp's `fft`) computed inline per butterfly per frame.
+/// Precomputing them is **bit-for-bit identical** (the f64 transcendental and
+/// the `as f32` narrowing happen at table-build time instead of in the hot loop)
+/// while removing the per-frame `cos`/`sin` calls.
+struct LevelTwiddle {
+    half: usize,
+    cos: Vec<f32>,
+    /// Already negated: stores `-(sin(2*pi*k/n) as f32)`.
+    neg_sin: Vec<f32>,
+}
+
+/// Precomputed twiddle table for the odd-length naive-DFT base case (`n` odd).
+/// `cos[k*n + j] = cos(2*pi*k*j/n) as f32`, `sin[k*n + j] = sin(2*pi*k*j/n) as
+/// f32`. For `N_FFT = 400` the recursion's only base case is `n = 25`, whose
+/// 25x25 table is evaluated 16x per FFT frame — the dominant transcendental cost
+/// of the whole mel frontend. The lookups are bit-exact replacements for the
+/// inline `theta.cos()/theta.sin()` the reference `dft` computed.
+struct DftTable {
+    n: usize,
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+}
+
+impl DftTable {
+    fn build(n: usize) -> Self {
+        let mut cos = vec![0.0f32; n * n];
+        let mut sin = vec![0.0f32; n * n];
+        for k in 0..n {
+            for j in 0..n {
+                let theta = (2.0 * PI * (k * j) as f64) / n as f64;
+                cos[k * n + j] = theta.cos() as f32;
+                sin[k * n + j] = theta.sin() as f32;
+            }
+        }
+        Self { n, cos, sin }
+    }
+}
+
+/// The full precomputed twiddle set for a fixed transform length. `levels` holds
+/// one entry per radix-2 split, **largest width first** (`[400, 200, 100, 50]`
+/// for `N_FFT = 400`); `base` is the naive-DFT table for the final odd factor
+/// (`25`). The recursion advances through `levels` by one per split, so each FFT
+/// call indexes `levels[0]` with zero per-call lookup cost.
+struct FftTwiddles {
+    levels: Vec<LevelTwiddle>,
+    base: DftTable,
+}
+
+impl FftTwiddles {
+    fn build(n_fft: usize) -> Self {
+        let mut levels = Vec::new();
+        let mut n = n_fft;
+        while n % 2 == 0 && n > 1 {
+            let half = n / 2;
+            let mut cos = vec![0.0f32; half];
+            let mut neg_sin = vec![0.0f32; half];
+            for (k, (c, s)) in cos.iter_mut().zip(neg_sin.iter_mut()).enumerate() {
+                let theta = (2.0 * PI * k as f64) / n as f64;
+                *c = theta.cos() as f32;
+                *s = -(theta.sin() as f32);
+            }
+            levels.push(LevelTwiddle { half, cos, neg_sin });
+            n /= 2;
+        }
+        // `n` is now the final odd factor (25 for N_FFT=400; 1 for a power of 2,
+        // in which case the n==1 fast path means `base` is never consulted).
+        Self {
+            levels,
+            base: DftTable::build(n),
+        }
+    }
+}
+
+/// Twiddles for the production `N_FFT`, built once on first use and shared
+/// read-only across all mel worker threads.
+fn cached_fft_twiddles() -> &'static FftTwiddles {
+    static TW: std::sync::OnceLock<FftTwiddles> = std::sync::OnceLock::new();
+    TW.get_or_init(|| FftTwiddles::build(N_FFT))
+}
+
 /// Naive O(N^2) DFT of a real input. `out` is interleaved complex,
 /// length `2*N`: `out[2k] = Re`, `out[2k+1] = Im`. Mirrors whisper.cpp `dft`.
-fn dft(input: &[f32], out: &mut [f32]) {
+fn dft(input: &[f32], out: &mut [f32], table: &DftTable) {
     let n = input.len();
+    debug_assert_eq!(n, table.n, "dft twiddle table width mismatch");
     for k in 0..n {
         let mut re = 0.0f32;
         let mut im = 0.0f32;
+        // `t = 2*pi*k*j / N`; cos/sin precomputed at table-build time, so this is
+        // bit-for-bit identical to the inline `theta.cos()/theta.sin() as f32`.
+        let cos_row = &table.cos[k * table.n..k * table.n + n];
+        let sin_row = &table.sin[k * table.n..k * table.n + n];
         for (j, &x) in input.iter().enumerate() {
-            // t = 2*pi*k*j / N
-            let theta = (2.0 * PI * (k * j) as f64) / n as f64;
-            re += x * theta.cos() as f32;
-            im -= x * theta.sin() as f32;
+            re += x * cos_row[j];
+            im -= x * sin_row[j];
         }
         out[2 * k] = re;
         out[2 * k + 1] = im;
@@ -106,10 +192,12 @@ fn dft(input: &[f32], out: &mut [f32]) {
 /// Recursive Cooley-Tukey FFT of a real input, exactly mirroring whisper.cpp's
 /// `fft`: radix-2 decimation-in-time when `N` is even, falling back to the
 /// naive DFT when `N` is odd (the prime-factor base case). `out` is interleaved
-/// complex of length `2*N`. `scratch` provides the deinterleaved even/odd
-/// buffers and child outputs so we avoid per-call heap allocation in the hot
-/// loop.
-fn fft(input: &[f32], out: &mut [f32]) {
+/// complex of length `2*N`. `levels` holds the precomputed butterfly twiddles
+/// for the current width first (the recursion advances with `&levels[1..]`);
+/// `base` is the odd-`N` DFT twiddle table. Both are bit-exact stand-ins for the
+/// transcendentals the reference computed inline. (Per-call heap allocation of
+/// the even/odd split buffers is a separate deferred follow-up, bd-02do L2.)
+fn fft(input: &[f32], out: &mut [f32], levels: &[LevelTwiddle], base: &DftTable) {
     let n = input.len();
     if n == 1 {
         out[0] = input[0];
@@ -117,11 +205,13 @@ fn fft(input: &[f32], out: &mut [f32]) {
         return;
     }
     if n % 2 == 1 {
-        dft(input, out);
+        dft(input, out, base);
         return;
     }
 
+    let lvl = &levels[0];
     let half = n / 2;
+    debug_assert_eq!(lvl.half, half, "fft level twiddle width mismatch");
     let mut even = vec![0.0f32; half];
     let mut odd = vec![0.0f32; half];
     for i in 0..half {
@@ -131,15 +221,13 @@ fn fft(input: &[f32], out: &mut [f32]) {
 
     let mut even_fft = vec![0.0f32; 2 * half];
     let mut odd_fft = vec![0.0f32; 2 * half];
-    fft(&even, &mut even_fft);
-    fft(&odd, &mut odd_fft);
+    fft(&even, &mut even_fft, &levels[1..], base);
+    fft(&odd, &mut odd_fft, &levels[1..], base);
 
-    for k in 0..half {
-        // twiddle: t = 2*pi*k / N, factor = cos(t) - i*sin(t)
-        let theta = (2.0 * PI * k as f64) / n as f64;
-        let re = theta.cos() as f32;
-        let im = -(theta.sin() as f32);
-
+    // twiddle: t = 2*pi*k / N, factor = cos(t) - i*sin(t). Precomputed at
+    // table-build time; `neg_sin` already holds `-(sin(t) as f32)`. Iterating the
+    // twiddle slices (len == half) yields `k` in 0..half in order — bit-exact.
+    for (k, (&re, &im)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {
         let re_odd = odd_fft[2 * k];
         let im_odd = odd_fft[2 * k + 1];
 
@@ -210,6 +298,7 @@ fn compute_frame_column(
     valid_len: usize,
     hann: &[f32; N_FFT],
     filters: &MelFilterbank,
+    twiddles: &FftTwiddles,
     out: &mut [f32],
 ) {
     let offset = frame_idx * HOP;
@@ -229,7 +318,7 @@ fn compute_frame_column(
     }
 
     let mut fft_out = vec![0.0f32; 2 * N_FFT];
-    fft(&fft_in, &mut fft_out);
+    fft(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
 
     // Power spectrum over one-sided bins: re^2 + im^2 (NOT sqrt magnitude).
     let mut power = [0.0f32; N_FREQ_BINS];
@@ -277,6 +366,7 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
     }
 
     let hann = cached_hann_window();
+    let twiddles = cached_fft_twiddles();
     let (padded, valid_len) = build_padded(samples);
     let n_frames = (padded.len() - N_FFT) / HOP;
     let n_mel = filters.n_mel;
@@ -302,9 +392,10 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
             }
             let end = (start + frames_per_thread).min(n_frames);
             let padded_ref = &padded;
-            // `hann` is already a `&'static [f32; N_FFT]`; copy the reference
+            // `hann` and `twiddles` are already `&'static`; copy the references
             // into the worker closure.
             let hann_ref = hann;
+            let twiddles_ref = twiddles;
             let filters_ref = filters;
             handles.push(scope.spawn(move || {
                 let len = end - start;
@@ -312,7 +403,15 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
                 let mut local = vec![0.0f32; len * n_mel];
                 for (fl, frame) in (start..end).enumerate() {
                     let col = &mut local[fl * n_mel..fl * n_mel + n_mel];
-                    compute_frame_column(frame, padded_ref, valid_len, hann_ref, filters_ref, col);
+                    compute_frame_column(
+                        frame,
+                        padded_ref,
+                        valid_len,
+                        hann_ref,
+                        filters_ref,
+                        twiddles_ref,
+                        col,
+                    );
                 }
                 (start, end, local)
             }));
@@ -421,11 +520,94 @@ mod tests {
     }
 
     fn fft_to_complex(input: &[f32]) -> Vec<(f64, f64)> {
+        let tw = FftTwiddles::build(input.len());
         let mut out = vec![0.0f32; 2 * input.len()];
-        fft(input, &mut out);
+        fft(input, &mut out, &tw.levels, &tw.base);
         (0..input.len())
             .map(|k| (f64::from(out[2 * k]), f64::from(out[2 * k + 1])))
             .collect()
+    }
+
+    /// Inline-transcendental copy of the PRE-optimization recursive FFT/DFT,
+    /// exactly as whisper.cpp's `fft`/`dft`. Retained only to prove the
+    /// twiddle-table rewrite is bit-for-bit identical (the conformance contract).
+    fn dft_reference(input: &[f32], out: &mut [f32]) {
+        let n = input.len();
+        for k in 0..n {
+            let mut re = 0.0f32;
+            let mut im = 0.0f32;
+            for (j, &x) in input.iter().enumerate() {
+                let theta = (2.0 * PI * (k * j) as f64) / n as f64;
+                re += x * theta.cos() as f32;
+                im -= x * theta.sin() as f32;
+            }
+            out[2 * k] = re;
+            out[2 * k + 1] = im;
+        }
+    }
+
+    fn fft_reference(input: &[f32], out: &mut [f32]) {
+        let n = input.len();
+        if n == 1 {
+            out[0] = input[0];
+            out[1] = 0.0;
+            return;
+        }
+        if n % 2 == 1 {
+            dft_reference(input, out);
+            return;
+        }
+        let half = n / 2;
+        let mut even = vec![0.0f32; half];
+        let mut odd = vec![0.0f32; half];
+        for i in 0..half {
+            even[i] = input[2 * i];
+            odd[i] = input[2 * i + 1];
+        }
+        let mut even_fft = vec![0.0f32; 2 * half];
+        let mut odd_fft = vec![0.0f32; 2 * half];
+        fft_reference(&even, &mut even_fft);
+        fft_reference(&odd, &mut odd_fft);
+        for k in 0..half {
+            let theta = (2.0 * PI * k as f64) / n as f64;
+            let re = theta.cos() as f32;
+            let im = -(theta.sin() as f32);
+            let re_odd = odd_fft[2 * k];
+            let im_odd = odd_fft[2 * k + 1];
+            let e_re = even_fft[2 * k];
+            let e_im = even_fft[2 * k + 1];
+            out[2 * k] = e_re + re * re_odd - im * im_odd;
+            out[2 * k + 1] = e_im + re * im_odd + im * re_odd;
+            out[2 * (k + half)] = e_re - re * re_odd + im * im_odd;
+            out[2 * (k + half) + 1] = e_im - re * im_odd - im * re_odd;
+        }
+    }
+
+    #[test]
+    fn fft_twiddle_table_is_bit_exact_vs_inline_reference() {
+        // The optimization MUST NOT change a single output bit — the mel output
+        // is conformance-checked against whisper.cpp's exact encoder input.
+        // Compare the table-driven FFT against the inline-transcendental
+        // reference over many random frames at the production width (400) plus a
+        // spread of even/odd/power-of-two sizes that exercise every recursion
+        // and base-case path.
+        for &n in &[N_FFT, 200usize, 100, 50, 25, 256, 8, 5, 2, 1] {
+            let tw = FftTwiddles::build(n);
+            for seed in 0..64u64 {
+                let mut lcg = Lcg::new(
+                    0x9E37_79B9 ^ (n as u64).wrapping_mul(2_654_435_761).wrapping_add(seed),
+                );
+                let input: Vec<f32> = (0..n).map(|_| lcg.next_f32()).collect();
+                let mut got = vec![0.0f32; 2 * n];
+                let mut want = vec![0.0f32; 2 * n];
+                fft(&input, &mut got, &tw.levels, &tw.base);
+                fft_reference(&input, &mut want);
+                assert_eq!(
+                    got, want,
+                    "twiddle FFT diverged from inline reference at N={n} seed={seed}"
+                );
+            }
+        }
     }
 
     #[test]
