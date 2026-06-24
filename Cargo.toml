@@ -119,7 +119,7 @@ strip = false
 panic = "unwind" # deliberate override of release's abort: scoped-thread panics must unwind for clean bench/profiler teardown
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

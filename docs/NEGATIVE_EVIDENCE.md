@@ -480,3 +480,145 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
   rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests
 result: local fallback, pass, 26 passed / 0 failed
 ```
+
+## 2026-06-24 - franken_whisper-cod-b release opt-level throughput lever
+
+### Lever
+
+Change the shipped `release` profile from `opt-level = "z"` to `opt-level = 3`.
+This is a codegen/profile lever, not an algorithmic change. It follows the
+one-lever rule from the optimization loop: improve the current shipped binary
+without changing the native ASR data path or transcript semantics.
+
+Loss matrix:
+
+| Action | State | Loss |
+| --- | --- | --- |
+| Keep `opt-level = 3` | Real JFK/native workload improves and conformance stays green | Lower latency, larger binary |
+| Keep `opt-level = 3` | No material gain or conformance drift | Reject/revert |
+| Keep `opt-level = "z"` | Size remains smaller but short-clip native latency stays slower | User-visible latency loss |
+
+Fallback trigger: revert this profile change if package-scoped conformance fails
+or if same-target repeat measurements show less than 3% median improvement on
+the JFK native release workload.
+
+### Fresh measurements
+
+Comparator remains the loaded OpenAI Whisper Python API from the previous
+section:
+
+```text
+OpenAI Whisper API median: 0.4356057639233768 s
+```
+
+| Workload | Franken path | Median wall time | Ratio vs previous shipped release | Ratio vs OpenAI loaded API | Verdict |
+| --- | --- | ---: | ---: | ---: | --- |
+| 11 s JFK, `tiny.en`, CPU, one-shot CLI | shipped `release`, `opt-level = "z"`, git `656f55c`/`a79a2ae` baseline | 0.93704627044 s | 1.000000x | 0.464871x | Baseline loss |
+| 11 s JFK, `tiny.en`, CPU, one-shot CLI | shipped `release`, candidate `opt-level = 3` | 0.8180240627 s | 1.145500x | 0.532510x | Kept franken-side win; still OpenAI loss |
+| 11 s JFK, `tiny.en`, CPU, one-shot CLI | existing `release-perf` profile probe | 0.7972604734200001 s | 1.175338x | 0.546379x | Routing/profiling probe only; not shipped |
+
+Ratios:
+
+```text
+candidate speedup vs previous shipped release:
+  0.93704627044 / 0.8180240627 = 1.145500x
+
+candidate ratio vs loaded OpenAI Whisper API:
+  0.4356057639233768 / 0.8180240627 = 0.532510x
+
+inverse:
+  0.8180240627 / 0.4356057639233768 = 1.877900x slower than loaded OpenAI API
+```
+
+Command evidence:
+
+```text
+base build:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+    rch exec -- cargo build --profile release -p franken_whisper \
+    --bin franken_whisper
+  result: pass; rch worker ovh-a; release build 3m30s
+
+candidate build:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+    rch exec -- cargo build --profile release -p franken_whisper \
+    --bin franken_whisper
+  result: remote compile succeeded on vmi1152480 in 7m57s; artifact retrieval
+  returned RCH-E309/exit 102 after the binary had been retrieved locally.
+  smoke/bench binary:
+    /data/projects/.rch-targets/franken_whisper-cod-b/release/franken_whisper
+    size: 16346328 bytes
+    mtime: 2026-06-24 18:54:41 -0400
+
+candidate validation rebuild:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+    rch exec -- cargo build --profile release -p franken_whisper \
+    --bin franken_whisper
+  result: pass; rch worker ovh-a; release build 4m45s
+
+candidate command:
+  RUST_LOG=error \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_NATIVE_EXECUTION=1 \
+  FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole \
+  FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0 \
+  /data/projects/.rch-targets/franken_whisper-cod-b/release/franken_whisper \
+    transcribe --input /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --backend whisper-cpp --model tiny.en --language en --temperature 0.0 \
+    --beam-size 1 --best-of 1 --no-persist --json
+
+candidate hyperfine:
+  --warmup 1 --runs 5
+  mean: 0.8182363673000002 s +/- 0.004627252252512483 s
+  median: 0.8180240627 s
+  min/max: 0.8124394947 s / 0.8253633857 s
+  raw runs: [0.8182149747, 0.8180240627, 0.8124394947,
+             0.8171399187, 0.8253633857]
+  user/system: 3.88823802 s / 1.26704392 s
+
+release-perf probe:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+    rch exec -- cargo build --profile release-perf -p franken_whisper \
+    --bin franken_whisper
+  result: local fallback, pass, 5m30s
+  median: 0.7972604734200001 s
+  mean: 0.79741639482 s +/- 0.012041208883753702 s
+  raw runs: [0.80969776242, 0.7924667834200001, 0.8075918634200001,
+             0.78006509142, 0.7972604734200001]
+```
+
+Conformance evidence:
+
+```text
+candidate transcript:
+  And so my fellow Americans ask not what your country can do for you ask what you can do for your country.
+
+replay hashes unchanged from the previous shipped-release entry:
+  input_content_hash: d16054d2df9adaae9c6228d86113f256a4b43d448d1f6b9107b75e2136a934a0
+  output_payload_hash: 7fdbdde9a772bc5bda7d9933f1e475224837e8081f9505290f871316d87fd486
+```
+
+Validation after this entry:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo fmt --check -p franken_whisper
+result: pass
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo check -p franken_whisper --all-targets
+result: pass; rch worker hz2
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo clippy -p franken_whisper --all-targets -- -D warnings
+result: pass; rch worker hz2
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests
+result: pass; rch worker vmi1153651; 26 passed / 0 failed
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo build --profile release -p franken_whisper \
+  --bin franken_whisper
+result: pass; rch worker ovh-a
+```
