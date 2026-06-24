@@ -283,6 +283,77 @@ Notes:
 - The uncommitted mel twiddle lever and `docs/PERF_LEDGER.md` were reserved by
   `BlackThrush` during this run, so cod-a did not edit or land that code.
 
+## 2026-06-24 - franken_whisper-cod-a OpenAI Whisper after mel twiddle
+
+### Fresh current-main OpenAI Whisper comparator ratio
+
+| Workload | Franken path | Original path | Ratio vs original | Conformance | Verdict |
+| --- | --- | --- | ---: | --- | --- |
+| 11 s JFK, `tiny.en`, CPU, 8 threads | `franken_whisper` native `whisper.cpp-native`, `release-perf`, ggml `tiny.en`, commit `b0577d9` | OpenAI Whisper `openai-whisper==20250625`, PyTorch CPU, `tiny.en` | 3.26x | Normalized word tokens identical, 22/22; raw punctuation differs by comma/leading space | Fresh measured current-main win |
+
+Command evidence:
+
+```text
+git SHA: b0577d9
+worktree: /data/projects/franken_whisper-cod-a-main-measure
+
+build:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+    rch exec -- cargo build -p franken_whisper --profile release-perf \
+    --bin franken_whisper
+  result: pass; rch remote vmi1264463; release-perf build 14m39s
+
+bench:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+    rch exec -- cargo bench --profile release-perf -p franken_whisper \
+    --bench native_engine_bench -- --sample-size 10 --warm-up-time 0.1 \
+    native_engine/mel/mel_30s
+  result: pass; rch remote hz2
+  native_engine/mel/mel_30s: [38.150 ms 40.770 ms 43.015 ms]
+  note: `cargo bench --release` remains invalid on this Cargo; it exits with
+    `unexpected argument '--release'`, so `--profile release-perf` is the
+    package-scoped equivalent used here.
+
+franken command:
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_NATIVE_EXECUTION=1 \
+  FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole \
+  /data/projects/.rch-targets/franken_whisper-cod-a/release-perf/franken_whisper \
+    transcribe --input /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --backend whisper-cpp --model tiny.en --language en --threads 8 \
+    --no-persist --json >/dev/null
+
+OpenAI Whisper command:
+  out=/tmp/franken_whisper_cod_a_openai_run_$(date +%s%N); mkdir -p "$out"; \
+  PATH=/home/ubuntu/.local/state/franken_whisper/tools/ffmpeg/bin:$PATH \
+  uvx --from openai-whisper whisper \
+    /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --model tiny.en --language en --device cpu --fp16 False --threads 8 \
+    --output_format json --output_dir "$out" --verbose False >/dev/null
+
+hyperfine:
+  --warmup 1 --runs 5
+  export: /tmp/franken_whisper_cod_a_openai_jfk_tiny_after_mel_hyperfine.json
+  franken mean: 0.907338 s +/- 0.015135 s [user 3.958501 s, sys 1.232468 s]
+  OpenAI mean: 2.957021 s +/- 0.057506 s [user 11.522156 s, sys 0.685133 s]
+  speed_ratio = 2.957021 / 0.907338 = 3.26x
+
+conformance:
+  franken transcript:
+    And so my fellow Americans ask not what your country can do for you ask what you can do for your country.
+  OpenAI Whisper transcript:
+    " And so, my fellow Americans ask not what your country can do for you ask what you can do for your country."
+  normalized lowercase alnum tokens: identical, 22/22 tokens.
+```
+
+Notes:
+
+- This lands the current-main product-level ratio after the `src/native_engine/mel.rs`
+  twiddle precompute commit (`656f55c`) and its clippy follow-up (`b0577d9`).
+- Agent Mail writes were unavailable during this run because its SQLite database
+  reported corruption and refused writes; no MCP file reservation could be
+  created for this ledger-only edit.
+
 ### Rule for future entries
 
 Every future entry must include: command, worker/host, git SHA, model SHA or
