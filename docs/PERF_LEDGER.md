@@ -80,9 +80,14 @@ whisper.cpp's identical math, 9.2× faster." A true head-to-head wall-clock vs t
 C++/Python originals needs the original-vs-franken harness (bd-zk43 / bd-0hnz);
 the large-shape kernels also need the `large-v3-turbo` model staged (bd-ms0x).
 
-**Conformance gate:** `cargo test -p franken_whisper --lib native_engine::mel`
-(incl. `fft_twiddle_table_is_bit_exact_vs_inline_reference`) + clippy
-`-D warnings` — results recorded at commit time.
+**Conformance gate (CONFIRMED GREEN):** `cargo test -p franken_whisper --lib
+native_engine::mel` → **7/7 passed** incl.
+`fft_twiddle_table_is_bit_exact_vs_inline_reference` (0.32 s). Clippy
+`-D warnings` initially flagged the new `n % 2 == 0` (`manual_is_multiple_of`);
+fixed forward in **b0577d9** (`n.is_multiple_of(2)`, the codebase idiom) →
+clippy green (`Finished dev`, exit 0). Both commits on `origin/main` + `master`.
+
+> **Commits:** `656f55c` (L1) + `b0577d9` (clippy fix-forward).
 
 ### L2 — log-mel FFT per-call allocation elimination (deferred)  — bd-02do
 
@@ -90,4 +95,53 @@ The recursive `fft` still `vec!`-allocates even/odd split + child-output buffers
 at every recursion node (~60 allocs/frame × 3000 frames). Secondary to the
 twiddle win (allocator churn ≈ single-digit ms vs the ~240 ms transcendental
 cost just removed). Tracked in bd-02do as a follow-up via per-thread scratch
-buffers. Not yet measured.
+buffers.
+
+**Status: designed + pre-verified bit-exact** (standalone scratch-FFT harness,
+418,800 outputs, 0 mismatches) but **deferred** — its e2e impact is negligible
+(mel is a small fraction of transcription) and it cannot be A/B'd reliably under
+the worker variance documented below. Will land only if a same-worker A/B shows
+a real gain.
+
+---
+
+## Measurement infrastructure findings (2026-06-24, BlackThrush)
+
+These shape what is measurable and how the ratios above must be read.
+
+1. **Worker variance ≈ 5.6×.** `mel_30s` (identical code) measured **29 ms**
+   (vmi1149989), **63 ms** (ovh-a), **164 ms** (vmi1152480). rch assigns workers
+   per invocation and exposes **no pinning flag**, so **cross-run criterion
+   `--baseline` is invalid** unless both runs land on the same worker. L1's 9.2×
+   is trustworthy precisely because baseline + candidate both ran on vmi1149989.
+   **Rule:** only same-worker (single-`rch exec`) A/B is admissible.
+
+2. **Real-workload benches are unmeasurable via `rch`.**
+   `encoder_window_*`, `decoder_token_step_*`, `e2e_tiny_jfk`, `logits_gemv_large`
+   all SKIP on remote workers: the ggml model and `jfk.wav` are **gitignored**
+   (`*.wav`, model dirs) so rch does not sync them to the worker. The native
+   engine never downloads. ⇒ The big head-to-head workloads can only be measured
+   **locally** (assets present) with `$FRANKEN_WHISPER_MODEL_DIR` pointed at
+   `legacy_whispercpp/whisper.cpp/models`. Blocker bead: **bd-ms0x** (large model)
+   + new bead for the rch-sync gap.
+
+3. **No built `whisper.cpp` comparator.** `whisper-cli`/`main` is not built on
+   this host (only source under `legacy_whispercpp/whisper.cpp`). A true
+   wall-clock head-to-head vs the original requires building it first
+   (cmake) — harness work tracked under bd-zk43 / bd-0hnz (IcyWren).
+
+4. **Hermetic f16_gemv baselines** (ovh-a, for future levers):
+   `1280×1280 = 419 µs (3.9 Gelem/s)`, `384×384 = 137 µs (1.07 Gelem/s)`. The
+   small 384×384 (tiny.en per-token Linear) is ~4× lower throughput — a possible
+   future lever, but `gemv_f16` is already SIMD + band-parallel, so a bit-exact
+   gain there is uncertain.
+
+**Bit-exact-lever feasibility map.** The mel twiddle win was a sweet spot:
+constant (data-independent) transcendentals, precomputable exactly. The other
+hot kernels are NOT: `softmax`(exp), `gelu`(tanh), `layer_norm`(reduction) all
+have **data-dependent** transcendentals / order-sensitive f64 sums — any speedup
+(approx exp/tanh, reordered reduction) changes output bits and breaks the
+whisper.cpp conformance contract. Encoder GEMM is FrankenTorch's (external
+crate). So further *bit-exact* native-engine levers are limited; the largest
+remaining honest wins require the local-measurement unblock (item 2) and the
+`whisper.cpp` comparator (item 3).
