@@ -333,6 +333,14 @@ same 8 threads, transcription-only):
 | apples-to-apples (both no word timestamps) | **486 ms** | ~452 ms (522 total − 70 load) | **~0.93× (franken 1.07× slower — NEAR PARITY)** |
 | franken realistic (WITH DTW word timestamps) | 504 ms | n/a (whisper.cpp `dtw=0`) | franken adds word ts for +18 ms |
 
+**Re-verified later same day @ HEAD (peer agent's L14 rayon-pool cap merged, higher
+host contention):** franken no-ts **489 ms** vs whisper.cpp ~499 ms transcription
+(569 total − 70 load) = **~parity / franken ~1.02× faster under load**. franken's
+number is *stable* across measurements (~486–489 ms) while whisper.cpp swings with
+contention (452–499 ms) — so the gap is now **~parity (1.0–1.07×, contention-
+dependent)**, robustly holding. The decoder optimization (L9–L13) + the peer's L14
+took franken from 1.37× slower to dead-even with whisper.cpp on tiny.en CPU.
+
 **From 1.37× slower → ~1.07× (near parity) via 5 in-scope, conformance-green decoder
 wins** (L9 mlp spawn threshold, L10 m=1 gemv, L11 rayon gemv_f16, L12 rayon
 cross-attn no-ts, L13 rayon cross-attn record/ts). All the missing pieces were
