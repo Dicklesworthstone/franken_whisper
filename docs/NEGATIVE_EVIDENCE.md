@@ -833,3 +833,293 @@ verdict:
   source fast path reverted. The cod-b restart confirms the same conclusion:
   this is a ~0-gain/no-ship product-speed lever, below the 3% keep threshold.
 ```
+
+## 2026-06-25 - IcyWren current-main OpenAI Whisper bold-verify
+
+### Worktree scan
+
+No measured win was found in a detached worktree that is missing from current
+`main`.
+
+```text
+current main: fb2ca46
+AGENT_NAME: IcyWren
+
+/data/projects/franken_whisper-cod-a-clean:
+  HEAD 2ef3fa8 docs: record bold-verify validation evidence
+  ancestor of main: yes
+
+/data/projects/franken_whisper-cod-a-ledger:
+  HEAD df99f60 Record OpenAI Whisper head-to-head ratio
+  ancestor of main: yes
+
+/data/projects/franken_whisper-cod-a-main-measure:
+  HEAD 766f5f1 Record OpenAI ratio after mel twiddle
+  ancestor of main: no
+  verdict: stale measurement branch, not a landable win. The same ratio was
+    already recorded on main; its diff would remove current docs/benches and
+    roll back PERF_LEDGER content.
+
+/data/projects/franken_whisper-cod-a-push:
+  HEAD 5a42ed4 Record OpenAI ratio after mel twiddle
+  ancestor of main: yes
+
+/data/projects/franken_whisper-cod-b-land:
+  HEAD 866760c perf: speed up shipped release profile
+  ancestor of main: yes
+```
+
+### Fresh CLI-startup comparator
+
+`speed_ratio = OpenAI Whisper wall time / franken_whisper wall time`.
+
+| Workload | Franken path | Original path | Mean ratio | Median ratio | Conformance | Verdict |
+| --- | --- | --- | ---: | ---: | --- | --- |
+| 11 s JFK, `tiny.en`, CPU, 8 threads, one-shot CLI | `franken_whisper` native `whisper.cpp-native`, shipped `release`, ggml `tiny.en`, commit `fb2ca46` | OpenAI Whisper `openai-whisper==20250625`, PyTorch CPU, `tiny.en`, CLI startup each run | 4.142x | 4.161x | Normalized word tokens match the prior JFK comparator; punctuation differs | Fresh measured current-main win |
+
+Command evidence:
+
+```text
+build:
+  AGENT_NAME=IcyWren \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+    rch exec -- cargo build -p franken_whisper --profile release \
+    --bin franken_whisper --example native_ab
+  result: cancelled stale RCH build 29902804231389571 after hook progress went
+    stale on vmi1227854; no benchmark result used from that build.
+
+fallback build:
+  AGENT_NAME=IcyWren \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+    cargo build -p franken_whisper --profile release \
+    --bin franken_whisper --example native_ab
+  result: pass; local per-crate fallback; 7m03s
+
+hyperfine:
+  artifact: /tmp/franken_whisper_cod_a_current_main_openai_cli_20260625.json
+  --warmup 1 --runs 5
+
+franken command:
+  RUST_LOG=error \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_NATIVE_EXECUTION=1 \
+  FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole \
+  FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0 \
+  /data/projects/.rch-targets/franken_whisper-cod-a/release/franken_whisper \
+    transcribe --input /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --backend whisper-cpp --model tiny.en --language en --temperature 0.0 \
+    --beam-size 1 --best-of 1 --threads 8 --no-persist --json >/dev/null
+
+OpenAI Whisper command:
+  out=/tmp/franken_whisper_cod_a_openai_cli_$(date +%s%N); mkdir -p "$out"; \
+  PATH=/home/ubuntu/.local/state/franken_whisper/tools/ffmpeg/bin:$PATH \
+  uvx --from openai-whisper whisper \
+    /data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+    --model tiny.en --language en --device cpu --fp16 False --threads 8 \
+    --output_format json --output_dir "$out" --verbose False >/dev/null
+
+franken mean/median:
+  0.7824998565600001 s / 0.77482173956 s
+OpenAI CLI mean/median:
+  3.2414650167600003 s / 3.22429294756 s
+ratio mean/median:
+  4.142448065115336x / 4.161335159995623x
+```
+
+### New lever dug and rejected: loaded-model thread-count surface
+
+The radical lever from `alien_cs_graveyard.md` section 15.7 is zygote/COW or
+daemon-style model preloading: remove CLI startup/model-load from the hot path
+and hold initialized model state across requests. This pass tested the nearest
+existing in-crate surface for that idea, `examples/native_ab.rs`, which loads a
+model once and times repeated in-process `transcribe_samples` calls. The example
+now accepts an optional `threads` argument so the strict loaded-model comparator
+can test the same thread count as the product CLI without adding a new harness.
+
+OpenAI loaded API commands loaded `tiny.en` once, performed one warmup
+transcription, then timed five transcriptions with `torch.set_num_threads(N)`.
+Franken loaded timings used seven `native_ab` runs and discarded run 0 as the
+warmup-equivalent pass.
+
+| Workload | Franken loaded median | OpenAI loaded median | Ratio vs OpenAI | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| 11 s JFK, `tiny.en`, loaded model, 4 threads | 0.558630 s | 0.5165675168391317 s | 0.925x | Rejected, franken slower |
+| 11 s JFK, `tiny.en`, loaded model, 8 threads | 0.575680 s | 0.4237874080426991 s | 0.736x | Rejected, franken slower |
+
+Franken artifacts:
+
+```text
+4-thread:
+  command:
+    FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+      /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab \
+      tiny.en 7 4
+  times artifact:
+    /tmp/franken_whisper_cod_a_native_ab_4t_serial_20260625.times
+  json artifact:
+    /tmp/franken_whisper_cod_a_native_ab_4t_serial_20260625.json
+  runs_s:
+    [0.602880, 0.557460, 0.569590, 0.599170, 0.526460, 0.532780, 0.559800]
+  median_after_run0:
+    0.558630 s
+
+8-thread:
+  command:
+    FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+      /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab \
+      tiny.en 7 8
+  times artifact:
+    /tmp/franken_whisper_cod_a_native_ab_8t_serial_20260625.times
+  json artifact:
+    /tmp/franken_whisper_cod_a_native_ab_8t_serial_20260625.json
+  runs_s:
+    [0.568100, 0.595000, 0.539010, 0.549250, 0.622530, 0.737010, 0.556360]
+  median_after_run0:
+    0.575680 s
+```
+
+OpenAI loaded artifacts:
+
+```text
+4-thread artifact:
+  /tmp/franken_whisper_cod_a_openai_loaded_api_4t_20260625.json
+4-thread runs_s:
+  [0.5165675168391317, 0.5101817869581282, 0.5235818079672754,
+   0.5159314800985157, 0.5502593470737338]
+4-thread median:
+  0.5165675168391317 s
+
+8-thread artifact:
+  /tmp/franken_whisper_cod_a_openai_loaded_api_8t_20260625.json
+8-thread runs_s:
+  [0.4237874080426991, 0.4046412599273026, 0.41719948407262564,
+   0.4865700639784336, 0.4542978859972209]
+8-thread median:
+  0.4237874080426991 s
+```
+
+Conformance:
+
+```text
+franken transcript:
+  And so my fellow Americans ask not what your country can do for you ask what you can do for your country.
+OpenAI loaded API transcript:
+  And so my fellow Americans ask not what your country can do for you ask what you can do for your country
+normalized lowercase alnum tokens:
+  identical, 22/22 tokens
+```
+
+Decision:
+
+```text
+keep:
+  examples/native_ab.rs optional [threads] argument, because it improves the
+  bd-0hnz loaded-model comparator harness and makes the tested state explicit.
+
+reject as performance lever:
+  "use 8 threads for loaded native tiny.en JFK" is slower than 4 threads in
+  this surface (0.575680 s vs 0.558630 s median after warmup) and loses to the
+  loaded OpenAI API. No product default changed.
+
+route:
+  Current main still has a strong OpenAI CLI-startup win. The loaded-model gap
+  remains an architecture-sized zygote/daemon or external FrankenTorch GEMM
+  problem, not a same-turn franken_whisper hot-path patch.
+```
+
+Graveyard / artifact mapping used for this decision:
+
+- `alien_cs_graveyard.md` section 0.2: opportunity gate rejects low-value
+  tweaks without practical effect.
+- `alien_cs_graveyard.md` section 0.3: behavior is transcript-equivalent modulo
+  punctuation; no product inference path was changed.
+- `alien_cs_graveyard.md` section 15.7: zygote/COW model preloading is the right
+  architecture family for loaded-model API parity, but this same-turn test of
+  the nearest existing surface does not produce a win.
+- `high_level_summary_of_frankensuite_planned_and_implemented_features_and_concepts.md`
+  benchmarking rules: no single-run or mean-only claims; this entry records raw
+  distributions and medians.
+
+## 2026-06-25 - franken_whisper-cod-b cross-attention tiny serial cutoff rejection
+
+AGENT_NAME: IcyWren
+
+Decision source:
+
+- No unlanded measured worktree win was found in `.scratch/.worktrees` or the
+  sibling `franken_whisper-cod-*` worktrees; current `main` already contains the
+  prior OpenAI Whisper evidence and PERF_LEDGER closeout.
+- New lever tested from the alien-graveyard / alien-artifact /
+  extreme-optimization pass: raise decoder cross-attention head-parallel cutoff
+  from `1 << 13` to `1 << 14` so tiny's `tq=1, tk≈1500, n_head=6` path stays
+  serial instead of barely paying per-token `thread::scope` overhead.
+- Math/output contract: scheduling-only change; per-head outputs still scatter
+  into disjoint output bands, so the candidate should preserve token output.
+
+Fresh current-main baseline:
+
+```text
+git SHA: fb2ca46
+target dir: /data/projects/.rch-targets/franken_whisper-cod-b
+artifact: /tmp/franken_whisper_bold_fb2ca46_openai_cli.json
+
+franken mean/median: 0.7901267332600002 s / 0.7786809866600001 s
+OpenAI CLI mean/median: 3.28170112066 s / 3.14340868066 s
+ratio vs OpenAI Whisper CLI:
+  mean: 4.153386x
+  median: 4.036838x
+
+baseline perf spans:
+  model_parse: 68.45 ms
+  model_weights: 114.50 ms
+  mel: 6.49 ms
+  encoder_window: 256.41 ms
+  cross_kv: 42.23 ms
+  decoder_prefill: 10.19 ms
+  decode_loop: 265.37 ms
+  backend_run: 766.41 ms
+```
+
+Candidate measurement:
+
+```text
+candidate source delta:
+  src/native_engine/decoder.rs cross_attention PAR_THRESHOLD
+  1 << 13 -> 1 << 14
+
+build:
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+    cargo build --profile release -p franken_whisper --bin franken_whisper
+  result: pass; direct local package-scoped build; 2m39s
+
+artifact: /tmp/franken_whisper_bold_cross_threshold_openai_cli.json
+span artifact: /tmp/franken_whisper_bold_cross_threshold_span.json
+
+franken mean/median: 0.8191999434200001 s / 0.8188211554200001 s
+OpenAI CLI mean/median: 3.08047327522 s / 3.0076341314199997 s
+ratio vs OpenAI Whisper CLI:
+  mean: 3.760344x
+  median: 3.673127x
+
+candidate franken speedup vs current-main baseline:
+  mean: 0.964510x
+  median: 0.950978x
+
+candidate perf spans:
+  model_parse: 62.31 ms
+  model_weights: 100.60 ms
+  mel: 3.74 ms
+  encoder_window: 215.93 ms
+  cross_kv: 43.60 ms
+  decoder_prefill: 10.48 ms
+  decode_loop: 306.57 ms
+  backend_run: 747.50 ms
+```
+
+Verdict:
+
+- Rejected and source reverted. The lever makes the measured franken path slower
+  by both mean and median, and the span run shows the intended target
+  (`decode_loop`) regressed from 265.37 ms to 306.57 ms.
+- Current-main remains a measured win versus OpenAI Whisper CLI on this
+  one-shot tiny JFK workload, but this cutoff change is a no-ship lever.
