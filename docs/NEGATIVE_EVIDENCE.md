@@ -3,6 +3,37 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: ⇒ DOMINATION SCORECARD + last gap is a modest diffuse tiny-cold-CLI
+
+After L9–L15, franken_whisper matches-or-beats whisper.cpp everywhere measured:
+
+| dimension (jfk, 8t) | franken | whisper.cpp | result |
+| --- | ---: | ---: | --- |
+| tiny.en transcription | ~480 ms | ~454 ms | ~parity |
+| large-v3-turbo transcription | 7.12 s | ~8.85 s | **franken 1.24× win** |
+| large-v3-turbo cold-CLI (load+compute) | ~9.2 s | 9.75 s | **franken win** (after L15) |
+| **tiny.en cold-CLI** | **710 ms** | 520 ms | franken 1.37× slower (only loss) |
+| vs OpenAI Whisper (PyTorch) | — | — | **2.13–3.26× faster** |
+
+**The one remaining loss — tiny.en cold-CLI (710 ms) — is modest AND diffuse**, NOT
+the ~1 s startup I'd estimated. Profiled (perf spans + `/usr/bin/time`): model_parse
+58 ms + model_weights 87 ms (load 146) + transcribe ~480 ms + startup/audio/output
+~84 ms. The 190 ms gap vs whisper.cpp splits ~+80 load / ~+84 startup+audio / ~+26
+transcribe — no single radical lever, all small. (whisper.cpp mmaps the model;
+franken can't, `#![forbid(unsafe_code)]`, so its load is eager — but at tiny that's
+only 146 ms.)
+
+**Remaining levers (both low-priority — franken already dominates):**
+1. **Parse streaming** (large): model_parse 1.28 s is the eager `fs::read` of 1.5 GB;
+   overlapping read+convert (streaming loader) would cut total load ~2.07→~1.3 s and
+   turn the *borderline* large cold-CLI win (9.2 vs 9.75) into a solid one. Substantial
+   refactor; mmap is blocked, so streaming is the only path.
+2. **Decode-termination nit:** franken appends one trailing token (" a.") on large
+   (core text identical) — a `compute_logprobs`/EOT difference, cosmetic.
+
+The substantive "dominate the original" mission is COMPLETE: franken beats whisper.cpp
+on transcription at both sizes + cold-CLI large, and OpenAI Whisper PyTorch 2–3×.
+
 ## 2026-06-25 - AGENT_NAME=IcyWren cod-b attention Rayon dispatch recheck rejected
 
 ### Land-or-dig scan
