@@ -3,6 +3,110 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - AGENT_NAME=IcyWren attention Rayon head-band dispatch rejected
+
+### Land-or-dig scan
+
+Repo-local `.scratch` and `.worktrees` directories were absent. Sibling
+worktrees were checked with `git worktree list --porcelain`; no measured code
+win missing from current `main` was found to land.
+
+### RCH bench command status
+
+Requested command shape:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --release -p franken_whisper \
+    --bench native_engine_bench -- e2e_tiny_jfk \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result: blocked before benchmark execution. Cargo rejects `bench --release` with
+`unexpected argument '--release'`.
+
+Supported release-profile follow-up:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- e2e_tiny_jfk \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result: command completed per-crate under the warm target dir, but the bench
+harness skipped `e2e_tiny_jfk` and the other native benches because the model
+directory was not visible to the harness environment.
+
+### Candidate
+
+Alien-graveyard / extreme-optimization route: persistent worker-pool scheduling
+for repeated numeric kernels. One-lever probe: replace `attention_raw`'s
+per-call `std::thread::scope` head-band dispatch with Rayon `into_par_iter`
+over band starts. The intended win was removing repeated thread-spawn overhead
+while preserving one private output buffer per band and the existing disjoint
+merge, so output order and floating-point operation order per head stayed
+unchanged.
+
+### Measurement
+
+Built locally after the RCH bench path could not produce a model-backed timing:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo +nightly-2026-06-09 build -p franken_whisper \
+    --profile release --example native_ab --example decoder_attrib
+result: pass
+```
+
+Loaded franken path:
+
+```text
+FRANKEN_WHISPER_MODEL_DIR=.../legacy_whispercpp/whisper.cpp/models \
+  /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab tiny.en 9 8
+
+candidate wall_ms:
+  632.87, 570.70, 455.58, 473.64, 469.89, 486.16, 489.08, 482.24, 483.15
+candidate median after run0: 0.482695s
+candidate mean after run0:   0.488805s
+
+current median after run0:   0.449450s
+OpenAI Whisper median:       0.463101751s
+candidate vs current:        0.931126x
+candidate vs OpenAI Whisper: 0.959409x
+current vs OpenAI Whisper:   1.030374x
+```
+
+Output parity: candidate `native_ab` JSON matched the current franken baseline
+exactly.
+
+Decoder attribution also moved the wrong way:
+
+```text
+current decoder_attrib tiny.en 160:
+  total attributed: 8.2432 ms/token
+  mlp_fc_gelu_proj: 2.0315 ms/token
+  logits_gemv:      1.7171 ms/token
+  self_qkv_proj:    1.3783 ms/token
+  cross_attn:       1.1091 ms/token
+
+candidate decoder_attrib tiny.en 160:
+  total attributed: 8.9484 ms/token
+  mlp_fc_gelu_proj: 2.8995 ms/token
+  cross_attn:       1.5470 ms/token
+  logits_gemv:      1.3459 ms/token
+  self_qkv_proj:    1.2252 ms/token
+```
+
+### Decision
+
+Rejected. The candidate regressed the loaded tiny.en path versus both current
+franken and OpenAI Whisper. No code was retained; the working tree is back to
+the scoped-thread `attention_raw` implementation.
+
 ## 2026-06-25 - AGENT_NAME=IcyWren stack-scratch GEMV probe rejected
 
 ### Land-or-dig scan
