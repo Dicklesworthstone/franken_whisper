@@ -346,6 +346,19 @@ for future levers:
   the alternative organization → not worth the load-time relayout + kernel
   rewrite. Confirms the decoder gemv is mature regardless of layout; **REJECTED**.
 
+- **Encoder QKV-projection fusion — MEASURED component (1.14×), net ~0 at e2e,
+  NOT PURSUED.** Encoder attention does Q/K/V as 3 separate `matmul_bias` calls on
+  the same LHS `h` (encoder.rs:426-428); `matrixmultiply` re-packs `h` per call, so
+  fusing into one `[1500,384]×[384,1152]` saves 2 re-packings — standalone measured
+  **1.14×** on the QKV proj (16884→14791 µs, contended; bit-identical since sgemm
+  output columns are independent). But integration negates it: the fused output
+  `[1500,1152]` must be split back to q/k/v `[1500,384]` (3 strided copies ≈
+  6.9 MB/layer ≈ 1.4 ms/4 layers), eating most of the saving; and QKV is only
+  ~20-30% of the encoder → net **~0–0.5% e2e** (within bench noise). Classic
+  component-win-vanishes-at-integration (cf. L8). Deferred as not worth the change.
+  NB: the win is *matrixmultiply's per-call repacking overhead* — another cost the
+  `gemm`/faer swap (bd-4hc0) removes structurally, reinforcing that lever.
+
 **Net (measured, not assumed):** `#![forbid(unsafe_code)]` (no VNNI) + the
 e2e-dominant GEMM living in FrankenTorch (external crate `ft-kernel-cpu`, which
 hardcodes `matrixmultiply 0.3` with no feature knob) cap the kernel-level wins in
