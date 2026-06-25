@@ -283,6 +283,37 @@ revert = delete `.cargo/config.toml` (or use `x86-64-v2`). The bit-exact
 kernel levers (L1/L3/L4/L5) stack *on top* — they make the non-GEMM parts faster
 within this baseline.
 
+### L8 — vectorized accurate gelu + softmax (AVX2 minimax exp/tanh)  — `src/native_engine/nn.rs`
+
+**Hypothesis.** First profile of the real encoder showed scalar `libm` `tanh`
+(gelu) is **~15 ms/layer over [1500,1536] ≈ 30% of the 204 ms encoder**, and
+`softmax` (scalar `exp`) is a comparable attention cost. LLVM can't vectorize
+`libm` calls. Now that conformance is **transcription-level** (not bit-exact) and
+the build has `+fma` (L7), an *accurate* vectorized `exp`/`tanh` is both permitted
+and fast.
+
+**Change.** Added `exp_simd` (Cephes-style minimax `expf` for `f32x8`: range-
+reduce + degree-6 poly + `2^k` via exponent bits) and `tanh_simd`
+(`1 - 2/(exp(2y)+1)`); rewrote `gelu` and `softmax_rows` to process 8 lanes at a
+time (scalar tails), keeping the existing band-parallel fan-out.
+
+**Accuracy (standalone, x86-64-v3):** `exp_simd` max rel error **7.9e-8** over
+[-8,8]; gelu max abs error **3e-7** vs libm — essentially f32-exact, far inside
+the transcription budget.
+
+**Measurement (standalone, encoder MLP shape [1500,1536], x86-64-v3):**
+
+| gelu [1500,1536] | scalar libm | vectorized | speedup |
+|---|---|---|---|
+| one encoder layer | 15.2 ms | 4.3 ms | **3.56×** |
+
+gelu was ~30% of the encoder ⇒ ~1.2–1.4× expected on the encoder (in-tree e2e
+bench confirming; standalone is the rigorous kernel A/B). **Conformance GREEN:**
+clippy clean, **200/200 lib tests** (incl. new `gelu_simd_matches_libm_over_range`
++ existing gelu/softmax) and **native_engine_e2e 6/6 — transcription unchanged**.
+**Verdict: KEEP.** Stacks on L7; the only remaining big encoder cost besides the
+external GEMM. (#![forbid(unsafe_code)] preserved — `std::simd` is safe.)
+
 ---
 
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
