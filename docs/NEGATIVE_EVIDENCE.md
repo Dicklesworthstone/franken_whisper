@@ -159,10 +159,26 @@ country." franken appends one spurious trailing token (" a.") — a decode-termi
 difference (29 vs 28 tokens), core 22 word-tokens match. Minor, worth a follow-up.
 
 **NEW in-scope lever surfaced (biggest cold-start gap):** franken's model LOAD is
-~6× slower than whisper.cpp's (~5.8 s vs 0.90 s for 1.5 GB; tiny was ~1.1 s vs
-66 ms ≈ 16×). The load (ggml parse + per-weight `transpose_parallel` + f16 staging)
-is franken code → optimizable, and dominates cold single-clip CLI latency. Filed as
-the next dig.
+slower than whisper.cpp's (whisper.cpp load 0.90 s). **PROFILED via perf spans**
+(large, cached file): `model_parse` (fs::read 1.5 GB + ggml parse) = **1.28 s**,
+`model_weights` (`from_ggml`: per-weight `transpose_parallel` [out,in]→[in,out] +
+f16 stage) = **1.97 s** → total **~3.25 s** (the earlier 5.8 s estimate was inflated
+by startup/contention; the background SHA-256 hash overlaps and does NOT block the
+wall). So the bottleneck is **`model_weights` (the transposes)**, and `EncoderWeights::
+from_ggml` loads its layers in a **sequential** `for i in 0..n_layer` loop
+(encoder.rs:252) — for large that's 32 layers serial.
+
+**Lever (located, next dig):** parallelize `from_ggml` ACROSS layers (rayon over the
+0..n_layer loop), with each layer's transpose run SERIAL (a `transpose_serial`
+variant) to avoid the nested-pool oversubscription that rayon-layers × `thread::scope`-
+transpose would cause. Est. `model_weights` ~1.97 s → ~0.6–1 s on 8 cores → total
+load ~1.9–2.3 s, which would flip cold-CLI large from a loss (12.96 s vs 9.75 s) to a
+WIN (~9 s). Bit-identical (the transpose is a pure permutation). SECONDARY priority:
+this is a cold/one-time cost amortized in server mode; franken already wins the
+*transcription* compute (large 1.24×, tiny ~parity), which is the primary head-to-head.
+
+mmap (zero-copy parse) is BLOCKED by `#![forbid(unsafe_code)]` (memmap2's map is
+`unsafe`), so the parse stays an eager `std::fs::read`.
 
 ## 2026-06-25 - AGENT_NAME=IcyWren attention Rayon head-band dispatch rejected
 
