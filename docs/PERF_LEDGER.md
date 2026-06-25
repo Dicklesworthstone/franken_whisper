@@ -267,16 +267,23 @@ for future levers:
 - **rFFT / split-radix mel is contract-permitted** (no approval needed) — but mel
   is already ~4 ms post-L1/L3/L4, i.e. **<2% of e2e** (encoder/decoder-bound), so
   a further ~2× there is REVERT-~0-gain. Not pursued.
-- **Approximate-transcendental `gelu`/`softmax` (SIMD `exp`/`tanh`)** and
-  **INT8-quantized GEMV** become *legal* (transcription stays within tolerance —
-  whisper.cpp's own Q8_0 proves int8 preserves WER). These are the real remaining
-  *radical* levers, but both require **local e2e transcription verification**
-  (model + `jfk.wav` are gitignored → unmeasurable on rch; the bd-7xbq unblock),
-  and the e2e-dominant GEMM is FrankenTorch (external). INT8-GEMV is a project,
-  not a one-shot lever — worth its own scoped decision.
+- **INT8-quantized GEMV — MEASURED, REJECTED.** Accuracy is fine (int8 vs f32
+  max rel error 0.4%; whisper.cpp Q8_0 confirms int8 preserves WER), but a SAFE
+  `std::simd` int8 GEMV (widen i8→i32, no VNNI) clocks **0.24× — ~4× SLOWER** than
+  the f16/f32-dot path at both baseline and AVX2 (`int8_gemv.rs`). The int8 speed
+  win needs `vpdpbusd` (VNNI) intrinsics, which are **unsafe → forbidden by
+  `#![forbid(unsafe_code)]`**; the f16 path already uses hardware `f16c` dequant
+  safely. **DEAD under the safe-code constraint.**
+- **Approximate-transcendental `gelu`/`softmax` (SIMD `exp`/`tanh`)**: legal under
+  the contract, but they're small vs the GEMM (GEMM-bound e2e) and carry
+  transcription risk needing local-e2e verification → marginal EV.
 
-**Net:** within rch-measurable + already-set-up tooling, the lever space is
-exhausted; the next real win is INT8-GEMV gated on a local-e2e harness.
+**Net (measured, not assumed):** `#![forbid(unsafe_code)]` (no VNNI) + the
+e2e-dominant GEMM living in FrankenTorch (external crate) cap the kernel-level
+wins available in this crate. The bit-exact + safe lever space is **exhausted**:
+4 levers shipped (L1/L3/L4/L5), 3 measured-and-rejected (L2 ~0-e2e, L6 ~0-gain,
+INT8 0.24×). Further e2e wins require either FrankenTorch-side GEMM work or
+lifting `#![forbid(unsafe_code)]` for VNNI — both out of this lane.
 
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)
 
