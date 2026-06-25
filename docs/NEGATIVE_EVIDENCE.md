@@ -3,6 +3,174 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - AGENT_NAME=IcyWren greedy logit-filter allocation keep
+
+### Scope
+
+- User ask: BOLD-VERIFY `franken_whisper` vs OpenAI Whisper, warm
+  `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b`,
+  crate-scoped only (`-p franken_whisper`), land a measured win or revert
+  near-zero work.
+- Worktree scan: no unlanded `.scratch/.worktrees` win was found. A peer docs
+  commit (`15b03e7`) landed while this run was active; it touched only this
+  ledger, so the native-engine code baseline remained the measured `358ffa5`
+  tree.
+- New lever: avoid materializing a full `logprobs: Vec<f32>` on each greedy
+  decode token. The live path now applies the whisper logit filters, computes
+  the timestamp-forcing decision from logits in log space, and returns the
+  selected token plus its logprob directly. The old full-vector path remains
+  under tests as the bit-for-bit oracle.
+
+### Head-to-head ratios vs OpenAI Whisper
+
+Ratio convention: `speed_ratio = openai_wall_time / franken_wall_time`.
+
+One-shot CLI comparator, JFK 11 s, `tiny.en`, CPU, `threads=8`, 5 runs:
+
+| Build | Franken mean | Franken median | OpenAI CLI mean | OpenAI CLI median | Mean ratio | Median ratio | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| code baseline `358ffa5` | 0.885299 s | 0.850143 s | 3.144167 s | 3.030929 s | 3.552x | 3.565x | Routing baseline |
+| greedy candidate | 0.885747 s | 0.794411 s | 3.105076 s | 3.130091 s | 3.506x | 3.940x | Faster than OpenAI CLI, but too noisy for candidate-vs-baseline proof |
+
+Artifacts:
+
+```text
+/tmp/franken_whisper_bold_358ffa5_openai_cli.json
+/tmp/franken_whisper_bold_greedy_candidate_openai_cli.json
+```
+
+Loaded-model harness, same binary/model already resident, JFK 11 s, `tiny.en`:
+
+| Threads | Baseline median after run 0 | Candidate median after run 0 | Franken speedup | OpenAI loaded median | Candidate ratio vs OpenAI loaded | Verdict |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 4 | 0.684930 s | 0.516935 s | 1.325x | 0.516568 s | 0.999x | Parity with OpenAI loaded API, franken-side keep |
+| 8 | 0.640940 s | 0.516445 s | 1.241x | 0.423787 s | 0.821x | Still slower than OpenAI loaded API, franken-side keep |
+
+Artifacts:
+
+```text
+/tmp/franken_whisper_bold_358ffa5_native_ab_4t.times
+/tmp/franken_whisper_bold_greedy_candidate_native_ab_4t.times
+/tmp/franken_whisper_bold_358ffa5_native_ab_8t.times
+/tmp/franken_whisper_bold_greedy_candidate_native_ab_8t.times
+/tmp/franken_whisper_bold_358ffa5_native_ab_8t.json
+/tmp/franken_whisper_bold_greedy_candidate_native_ab_8t.json
+```
+
+The loaded harness is the admissible evidence for this lever because it removes
+model load/process setup noise and isolates the hot decode loop. The OpenAI CLI
+comparison remains useful for product routing, but a one-token allocation lever
+cannot be proved from the process-startup dominated mean.
+
+### Conformance and profiling evidence
+
+Behavior proof:
+
+```text
+diff -u \
+  /tmp/franken_whisper_bold_358ffa5_native_ab_8t.json \
+  /tmp/franken_whisper_bold_greedy_candidate_native_ab_8t.json
+result: no diff
+
+transcript:
+  And so my fellow Americans ask not what your country can do for you ask what
+  you can do for your country.
+
+segments:
+  [0.0, 8.0] "And so my fellow Americans ask not what your country can do for you"
+  [8.0, 10.99] "ask what you can do for your country."
+```
+
+Focused bit-equivalence test:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo test -p franken_whisper \
+  native_engine::decode::tests::greedy_filter_path_matches_full_logprobs_path
+
+result: pass; selected token and selected-token logprob bits match the old
+full `process_logits` + `argmax` path across initial suppression,
+text-dominant, timestamp-forcing, one-open-timestamp, and max-token-budget
+cases.
+```
+
+Span probe, same JFK workload:
+
+```text
+baseline span artifact:  /tmp/franken_whisper_bold_358ffa5_span.json
+candidate span artifact: /tmp/franken_whisper_bold_greedy_candidate_span.json
+
+decode_loop:
+  baseline:  350.75 ms, 27 tokens
+  candidate: 293.86 ms, 27 tokens
+
+backend_run:
+  baseline:  1134.39 ms
+  candidate:  772.10 ms
+```
+
+The span probe is not the primary keep proof because model parse/weight timings
+are noisy, but it agrees directionally with the loaded harness.
+
+### Validation
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo build --profile release -p franken_whisper \
+  --bin franken_whisper --example native_ab
+result: pass
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo check -p franken_whisper --all-targets
+result: pass
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo clippy -p franken_whisper --all-targets -- -D warnings
+result: pass
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo test -p franken_whisper --test conformance_comparator_tests
+result: pass; 26 passed / 0 failed
+
+rustfmt --edition 2024 --check src/native_engine/decode.rs
+git diff --check -- src/native_engine/decode.rs
+result: pass
+```
+
+Known non-blocking gate results:
+
+```text
+cargo fmt -p franken_whisper --check
+result: fail on pre-existing unrelated formatting drift in
+  src/native_engine/mel.rs
+  src/native_engine/nn.rs
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo test -p franken_whisper
+result: fail on pre-existing unrelated timing-sensitive test
+  orchestrator::tests::stage_budget_timeout_maps_to_timeout_error_code
+  (expected a 1 ms stage-budget timeout, observed Ok(()))
+
+ubs src/native_engine/decode.rs
+result: exit 1 on pre-existing scanner heuristics in this file, including
+  false secret/JWT findings for token decoding and WAV magic comparisons.
+  Build, clippy, targeted equivalence, and conformance gates were green.
+```
+
+### Verdict
+
+**KEEP.** This is a measured in-crate loaded-model decode win:
+
+- 1.325x median speedup at 4 threads.
+- 1.241x median speedup at 8 threads.
+- Byte-identical JFK output vs the code baseline.
+- Direct test proof that the greedy no-allocation path matches the old full
+  logprob-vector path at selected-token and selected-logprob bit level.
+
+It is **not** recorded as a full win over OpenAI Whisper's loaded API at 8
+threads: the candidate is still 1.219x slower there. At 4 threads it is
+effectively parity with OpenAI loaded API (0.999x by the ratio convention).
+
 ## 2026-06-24 - franken_whisper-cod-b kickoff
 
 ### Scope
