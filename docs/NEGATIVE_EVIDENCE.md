@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: ⇒ AFTER L9–L13, NEAR PARITY (gap 1.37×→~1.08×)
+
+Fresh back-to-back re-measure after the L9–L13 decoder optimizations (same host,
+same 8 threads, transcription-only):
+
+| Workload (tiny.en jfk, 8t, transcription-only) | franken | whisper.cpp | ratio |
+| --- | ---: | ---: | ---: |
+| apples-to-apples (both no word timestamps) | **486 ms** | ~452 ms (522 total − 70 load) | **~0.93× (franken 1.07× slower — NEAR PARITY)** |
+| franken realistic (WITH DTW word timestamps) | 504 ms | n/a (whisper.cpp `dtw=0`) | franken adds word ts for +18 ms |
+
+**From 1.37× slower → ~1.07× (near parity) via 5 in-scope, conformance-green decoder
+wins** (L9 mlp spawn threshold, L10 m=1 gemv, L11 rayon gemv_f16, L12 rayon
+cross-attn no-ts, L13 rayon cross-attn record/ts). All the missing pieces were
+whisper.cpp/GGML techniques: persistent thread pool (vs per-call `thread::scope`
+spawn) + dedicated gemv (vs sgemm packing at m=1). franken's mel + encoder already
+won; this closed the decoder. Outright win still needs bd-4hc0 (encoder
+`matrixmultiply→gemm`, ~2× the encoder; out-of-scope `ft-kernel-cpu`). See
+`docs/PERF_LEDGER.md` L9–L13 for the per-lever evidence.
+
 ## 2026-06-25 - BlackThrush: whisper.cpp comparator BUILT + first head-to-head (bd-zk43)
 
 The prior blocker ("`whisper-cli` and ggml models absent") is **RESOLVED**: I built
