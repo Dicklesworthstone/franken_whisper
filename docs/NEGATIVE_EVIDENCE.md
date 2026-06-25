@@ -1177,3 +1177,169 @@ Verdict:
   (`decode_loop`) regressed from 265.37 ms to 306.57 ms.
 - Current-main remains a measured win versus OpenAI Whisper CLI on this
   one-shot tiny JFK workload, but this cutoff change is a no-ship lever.
+
+## 2026-06-25 - IcyWren transcript-only loaded-model probe rejection
+
+AGENT_NAME: IcyWren
+
+Worktree scan:
+
+```text
+current main: 358ffa5
+no in-repo .scratch/.worktrees directory found
+
+/data/projects/franken_whisper-cod-a-clean:
+  HEAD 2ef3fa8; ancestor of main: yes
+/data/projects/franken_whisper-cod-a-ledger:
+  HEAD df99f60; ancestor of main: yes
+/data/projects/franken_whisper-cod-a-main-measure:
+  HEAD 766f5f1; ancestor of main: no
+  verdict: stale measurement branch. Its diff would delete current
+    NEGATIVE_EVIDENCE / PERF_LEDGER content and does not contain a landable
+    measured win absent from main.
+/data/projects/franken_whisper-cod-a-push:
+  HEAD 5a42ed4; ancestor of main: yes
+/data/projects/franken_whisper-cod-b-land:
+  HEAD 866760c; ancestor of main: yes
+```
+
+New lever tested:
+
+- Probe family: transcript-only loaded-model mode, mapped to
+  `alien_cs_graveyard.md` section 15.7 (preloaded model / no startup cost)
+  and section 0.2/0.3 (opportunity and isomorphism gates).
+- Temporary harness delta: add an optional `timestamps|no-timestamps` argument
+  to `examples/native_ab.rs` so the existing loaded-model harness could run
+  `DecodeParams { timestamps: false, .. }`.
+- Product-surface analogue: `--no-timestamps` / transcript-only requests.
+- Behavior contract: compare normalized word tokens only; timestamp spans are
+  intentionally not part of this transcript-only workload.
+
+Baseline and candidate commands:
+
+```text
+build:
+  AGENT_NAME=IcyWren \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+    cargo build -p franken_whisper --profile release --example native_ab
+  result: pass; package-scoped; 1m02s
+
+timestamped baseline:
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+    /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab \
+    tiny.en 7 4 timestamps
+  times artifact:
+    /tmp/franken_whisper_cod_a_native_ab_timestamps_4t_20260625b.times
+  json artifact:
+    /tmp/franken_whisper_cod_a_native_ab_timestamps_4t_20260625b.json
+
+transcript-only candidate:
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+    /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab \
+    tiny.en 7 4 no-timestamps
+  times artifact:
+    /tmp/franken_whisper_cod_a_native_ab_no_timestamps_4t_20260625b.times
+  json artifact:
+    /tmp/franken_whisper_cod_a_native_ab_no_timestamps_4t_20260625b.json
+
+transcript-only repeat:
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+    /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab \
+    tiny.en 9 4 no-timestamps
+  times artifact:
+    /tmp/franken_whisper_cod_a_native_ab_no_timestamps_4t_repeat_20260625b.times
+  json artifact:
+    /tmp/franken_whisper_cod_a_native_ab_no_timestamps_4t_repeat_20260625b.json
+
+OpenAI loaded API:
+  uvx --from openai-whisper python
+  torch.set_num_threads(4)
+  whisper.load_model("tiny.en", device="cpu")
+  one warmup transcribe, then 5 timed transcribes
+  artifact:
+    /tmp/franken_whisper_cod_a_openai_loaded_api_4t_20260625b.json
+```
+
+Measured distributions:
+
+```text
+timestamped baseline runs_s:
+  [0.543480, 0.521640, 0.504980, 0.510860, 0.505800, 0.508430, 0.505710]
+timestamped median_after_run0:
+  0.507115 s
+
+transcript-only candidate runs_s:
+  [0.516090, 0.499610, 0.487720, 0.496420, 0.491980, 0.489780, 0.484760]
+transcript-only candidate median_after_run0:
+  0.490880 s
+
+transcript-only repeat runs_s:
+  [0.526350, 0.496650, 0.507200, 0.492290, 0.490020, 0.502070, 0.498060,
+   0.476220, 0.485440]
+transcript-only repeat median_after_run0:
+  0.494470 s
+
+OpenAI loaded 4-thread runs_s:
+  [0.51801612903364, 0.5054755490273237, 0.4925481260288507,
+   0.5291743979323655, 0.49697991902939975]
+OpenAI loaded 4-thread median:
+  0.5054755490273237 s
+
+candidate speedup vs timestamped baseline:
+  first pass median: 1.033073x
+  repeat median:     1.025573x
+
+candidate ratio vs OpenAI loaded API:
+  first pass median: 1.029733x
+  repeat median:     1.022257x
+```
+
+Conformance:
+
+```text
+timestamped franken transcript:
+  And so my fellow Americans ask not what your country can do for you ask what you can do for your country.
+transcript-only franken transcript:
+  And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
+OpenAI loaded API transcript:
+  And so my fellow Americans ask not what your country can do for you ask what you can do for your country
+normalized lowercase alnum tokens:
+  identical, 22/22 tokens
+```
+
+Verdict:
+
+- Rejected as a product speed lever. The first pass barely clears a 3% local
+  timestamped-baseline gain, but the repeat falls to 2.56%, and the fresh
+  loaded-OpenAI ratio is only 1.02-1.03x. That is too close to host noise for a
+  BOLD-VERIFY keep.
+- Temporary source delta fully reverted before commit; `git diff --
+  examples/native_ab.rs` is empty.
+- The measured loaded-model gap remains routed to architecture-sized
+  preloaded-service/zygote work or the external FrankenTorch GEMM bead
+  (`bd-4hc0`), not a no-timestamps default change.
+
+Validation:
+
+```text
+git diff --check -- docs/NEGATIVE_EVIDENCE.md examples/native_ab.rs
+result: pass
+
+rustfmt --edition 2024 --check examples/native_ab.rs
+result: pass
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo check -p franken_whisper --all-targets
+result: pass; 1m02s; existing dead_code warnings in src/native_engine/decode.rs
+  for process_logits and argmax
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo test -p franken_whisper --test conformance_comparator_tests
+result: pass; 26 passed / 0 failed
+
+ubs docs/NEGATIVE_EVIDENCE.md examples/native_ab.rs
+result: pass; Rust scanner ran on examples/native_ab.rs; 0 critical /
+  0 warnings
+```
