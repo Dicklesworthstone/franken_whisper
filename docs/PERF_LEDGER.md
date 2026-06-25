@@ -253,6 +253,36 @@ would buy ≤1.1× at `[1500,384]` (noise) while *hurting* larger shapes. Per
 REVERT-~0-gain, not shipped. (The slow in-tree `layer_norm_1500x384` = 3.3 ms on
 ovh-b was worker variance, not spawn overhead.)
 
+### L7 — x86-64-v3 build baseline (AVX2/FMA)  — `.cargo/config.toml`  **[e2e win]**
+
+**Hypothesis.** The build used the Rust default target (`x86-64`, SSE2 only),
+leaving AVX2/FMA unused by *all* code — the SIMD native engine AND, crucially,
+**FrankenTorch's sgemm, which is ~99% of e2e** (encoder + decoder GEMM/GEMV). The
+first profile of the real workloads exposed this: e2e_tiny_jfk = 708 ms = mel
+~4 ms + **encoder 263 ms (37%) + decoder 441 ms (62%, ~15 ms/token)** — all
+GEMM/gemv-bound. `#![forbid(unsafe_code)]` rules out runtime `#[target_feature]`
+dispatch, so a build-wide CPU baseline is the only safe way to enable these
+instructions.
+
+**Change.** `.cargo/config.toml` → `rustflags = ["-C", "target-cpu=x86-64-v3"]`
+(AVX2+FMA+BMI, Haswell-2013+).
+
+**Measurement (local same-host A/B, tiny.en; first lever to move e2e):**
+
+| `native_engine_bench` | SSE2 (default) | x86-64-v3 | speedup |
+|---|---|---|---|
+| `encoder_window_tiny` | 263 ms | 204 ms | **1.29×** |
+| `decoder_token_step_tiny` | 122 ms | 102 ms | **1.20×** |
+| **`e2e_tiny_jfk`** (full 11 s transcription) | 708 ms | **633 ms** | **1.12×** |
+
+**Conformance.** Transcription-level (per `conformance-contract.md`), not
+bit-exact — AVX2/FMA changes f32 rounding but `native_engine_e2e` is **6/6 green**
+under the flag (transcription unchanged). **Verdict: KEEP.** First and only lever
+to move the e2e-dominant GEMM. **Trade-off:** raises min CPU to AVX2 (2013+);
+revert = delete `.cargo/config.toml` (or use `x86-64-v2`). The bit-exact
+kernel levers (L1/L3/L4/L5) stack *on top* — they make the non-GEMM parts faster
+within this baseline.
+
 ---
 
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
