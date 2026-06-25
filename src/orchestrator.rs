@@ -3,11 +3,10 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use asupersync::runtime::{Runtime, RuntimeBuilder, spawn_blocking};
-use asupersync::time::{timeout, wall_now};
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use chrono::Utc;
 use franken_kernel::{Budget, TraceId};
 use serde_json::{Value, json};
@@ -1152,24 +1151,25 @@ fn checkpoint_or_emit(
     }
 }
 
-async fn run_stage_with_budget<T, F>(
-    stage: &'static str,
-    budget_ms: u64,
-    operation: F,
-) -> FwResult<T>
+fn run_stage_with_budget<T, F>(stage: &'static str, budget_ms: u64, operation: F) -> FwResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> FwResult<T> + Send + 'static,
 {
-    // Keep compatibility across asupersync timeout implementations that
-    // require `Unpin` futures by boxing the spawned future.
-    let wrapped = Box::pin(spawn_blocking(operation));
-    match timeout(wall_now(), budget_duration(budget_ms), wrapped).await {
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(operation());
+    });
+
+    match rx.recv_timeout(budget_duration(budget_ms)) {
         Ok(result) => result,
-        Err(_) => Err(FwError::StageTimeout {
+        Err(RecvTimeoutError::Timeout) => Err(FwError::StageTimeout {
             stage: stage.to_owned(),
             budget_ms,
         }),
+        Err(RecvTimeoutError::Disconnected) => Err(FwError::BackendUnavailable(format!(
+            "stage `{stage}` worker exited before returning a result"
+        ))),
     }
 }
 
@@ -1654,9 +1654,7 @@ async fn run_pipeline_body(
         if let Err(error) = run_stage_with_budget("persist", stage_budgets.persist_ms, move || {
             let store = RunStore::open(&persist_db)?;
             store.persist_report_cancellable(&persist_report, Some(&persist_token))
-        })
-        .await
-        {
+        }) {
             let code = stage_failure_code("persist", &error);
             log.push(
                 "persist",
@@ -1713,9 +1711,7 @@ async fn execute_ingest(
     let ingest_token = pcx.stage_token(stage_budgets.ingest_ms); // ubs:ignore — cancellation token is not a secret
     let input_path = match run_stage_with_budget("ingest", stage_budgets.ingest_ms, move || {
         audio::materialize_input_with_token(&ingest_input, &ingest_dir, Some(&ingest_token))
-    })
-    .await
-    {
+    }) {
         Ok(path) => path,
         Err(error) => {
             let code = stage_failure_code("ingest", &error);
@@ -1773,9 +1769,7 @@ async fn execute_normalize(
             budget_duration(normalize_budget_ms),
             Some(&normalize_token),
         )
-    })
-    .await
-    {
+    }) {
         Ok(path) => path,
         Err(error) => {
             let code = stage_failure_code("normalize", &error);
@@ -1945,8 +1939,7 @@ async fn execute_backend(
                 tok,
             )
         }
-    })
-    .await;
+    });
 
     if let Some((top_backend, predicted_success)) = adaptive_prediction {
         let top_succeeded = match &execution_result {
@@ -2221,8 +2214,7 @@ async fn execute_backend_speculative(
             let stats = pipeline.stats();
             let merged = pipeline.merged_transcript();
             Ok((inner_result, emitted, stats, merged))
-        })
-        .await;
+        });
 
     let (inner_result, emitted_events, stats, merged) = match outcome {
         Ok(value) => value,
@@ -2374,9 +2366,7 @@ async fn execute_accelerate(
             let mut local = result;
             let acceleration = accelerate::apply_with_token(&mut local, Some(&acceleration_token));
             Ok((local, acceleration))
-        })
-        .await
-        {
+        }) {
             Ok(output) => output,
             Err(error) => {
                 let code = stage_failure_code("acceleration", &error);
@@ -2646,9 +2636,7 @@ async fn execute_align(
             let report =
                 ctc_forced_align(&mut result.segments, audio_duration, &config, &align_token)?;
             Ok((result, report))
-        })
-        .await
-        {
+        }) {
             Ok(output) => output,
             Err(error) => {
                 let code = stage_failure_code("align", &error);
@@ -3121,9 +3109,7 @@ async fn execute_vad(
 
     let report = match run_stage_with_budget("vad", vad_budget_ms, move || {
         vad_energy_detect(&vad_wav, &config_for_run, &vad_token)
-    })
-    .await
-    {
+    }) {
         Ok(report) => report,
         Err(error) => {
             let code = stage_failure_code("vad", &error);
@@ -3301,9 +3287,7 @@ async fn execute_separate(
 
     let report = match run_stage_with_budget("separate", sep_budget_ms, move || {
         source_separate(&sep_wav, &sep_token)
-    })
-    .await
-    {
+    }) {
         Ok(report) => report,
         Err(error) => {
             let code = stage_failure_code("separate", &error);
@@ -3567,9 +3551,7 @@ async fn execute_punctuate(
         match run_stage_with_budget("punctuate", punct_budget_ms, move || {
             let report = punctuate_segments(&mut result.segments, &punct_token)?;
             Ok((result, report))
-        })
-        .await
-        {
+        }) {
             Ok(output) => output,
             Err(error) => {
                 let code = stage_failure_code("punctuate", &error);
@@ -4081,9 +4063,7 @@ async fn execute_diarize(
                 &diarize_token,
             )?;
             Ok((result, report))
-        })
-        .await
-        {
+        }) {
             Ok(output) => output,
             Err(error) => {
                 let code = stage_failure_code("diarize", &error);
@@ -5056,17 +5036,10 @@ mod tests {
         // `spawn_blocking` body would otherwise monopolize), so the timeout
         // could never fire. The wide sleep-vs-budget margin keeps the
         // assertion deterministic under host load.
-        let runtime = RuntimeBuilder::new()
-            .worker_threads(2)
-            .blocking_threads(1, 2)
-            .build()
-            .expect("runtime build");
-
-        let result: Result<(), FwError> =
-            runtime.block_on(run_stage_with_budget("backend", 1, || {
-                std::thread::sleep(Duration::from_millis(250));
-                Ok(())
-            }));
+        let result: Result<(), FwError> = run_stage_with_budget("backend", 1, || {
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(())
+        });
         let error = result.expect_err("stage should time out");
 
         if let FwError::StageTimeout { stage, budget_ms } = &error {
@@ -5514,11 +5487,7 @@ mod tests {
 
     #[test]
     fn run_stage_with_budget_returns_value_on_success() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        let result = runtime.block_on(run_stage_with_budget("test", 5_000, || Ok(42)));
+        let result = run_stage_with_budget("test", 5_000, || Ok(42));
         assert_eq!(result.unwrap(), 42);
     }
 
@@ -5934,14 +5903,9 @@ mod tests {
 
     #[test]
     fn run_stage_with_budget_propagates_error() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        let result: crate::error::FwResult<i32> =
-            runtime.block_on(run_stage_with_budget("test", 5_000, || {
-                Err(FwError::InvalidRequest("test error".to_owned()))
-            }));
+        let result: crate::error::FwResult<i32> = run_stage_with_budget("test", 5_000, || {
+            Err(FwError::InvalidRequest("test error".to_owned()))
+        });
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), FwError::InvalidRequest(_)));
     }

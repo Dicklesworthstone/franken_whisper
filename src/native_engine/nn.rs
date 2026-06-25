@@ -194,6 +194,17 @@ pub fn matmul_raw_lhs(lhs: &[f32], m: usize, b: &Mat) -> FwResult<Mat> {
         )));
     }
     let n = b.cols;
+    if m == 1 {
+        let mut out = vec![0.0f32; n];
+        for (kk, &av) in lhs.iter().take(k).enumerate() {
+            let brow = &b.data[kk * n..(kk + 1) * n];
+            for (o, &bv) in out.iter_mut().zip(brow) {
+                *o += av * bv;
+            }
+        }
+        return Ok(Mat::from_vec(1, n, out));
+    }
+
     let lhs_meta = meta_2d(m, k);
     let rhs_meta = meta_2d(k, n);
     let data = ft_kernel_cpu::matmul_tensor_contiguous_f32(lhs, &b.data, &lhs_meta, &rhs_meta)
@@ -565,8 +576,7 @@ fn norm_rows(block: &mut [f32], cols: usize, w: &[f32], b: &[f32], eps: f64) {
         var /= V::splat(n);
         let inv = V::splat(1.0) / (var + V::splat(eps)).sqrt();
         for (j, s) in soa.iter().enumerate() {
-            let normed =
-                (*s - mean) * inv * V::splat(f64::from(w[j])) + V::splat(f64::from(b[j]));
+            let normed = (*s - mean) * inv * V::splat(f64::from(w[j])) + V::splat(f64::from(b[j]));
             let arr = normed.to_array();
             for (lane, &val) in arr.iter().enumerate() {
                 block[(g + lane) * cols + j] = val as f32;

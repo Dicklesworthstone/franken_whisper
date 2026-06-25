@@ -581,14 +581,7 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
                 let mut fl = 0usize;
                 while frame + FFT_LANES <= full_end {
                     let col8 = &mut local[fl * n_mel..(fl + FFT_LANES) * n_mel];
-                    compute_8_columns(
-                        frame,
-                        padded_ref,
-                        hann_ref,
-                        filters_ref,
-                        twiddles_ref,
-                        col8,
-                    );
+                    compute_8_columns(frame, padded_ref, hann_ref, filters_ref, twiddles_ref, col8);
                     frame += FFT_LANES;
                     fl += FFT_LANES;
                 }
