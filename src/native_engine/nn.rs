@@ -1217,6 +1217,29 @@ pub fn attention_with_cache(
 ///
 /// Isomorphism: a pure permutation — every output element is the same
 /// `data[r * cols + c]` the serial loop wrote, so results are bit-identical.
+/// Cache-blocked SERIAL transpose (no thread spawn). Same tiled permutation as
+/// [`transpose_parallel`]'s serial fallback, but never parallel — for callers
+/// that already parallelize at a coarser grain (e.g. model load fanning out
+/// across layers via rayon: a per-weight `thread::scope` here would nest and
+/// spawn-thrash). Pure permutation → bit-identical to `transpose_parallel`.
+pub(crate) fn transpose_serial(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    debug_assert_eq!(data.len(), rows * cols, "transpose shape/data mismatch");
+    const TILE: usize = 64;
+    let mut out = vec![0.0f32; rows * cols];
+    for r0 in (0..rows).step_by(TILE) {
+        let r1 = (r0 + TILE).min(rows);
+        for c0 in (0..cols).step_by(TILE) {
+            let c1 = (c0 + TILE).min(cols);
+            for r in r0..r1 {
+                for c in c0..c1 {
+                    out[c * rows + r] = data[r * cols + c];
+                }
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn transpose_parallel(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     debug_assert_eq!(data.len(), rows * cols, "transpose shape/data mismatch");
     const TILE: usize = 64;

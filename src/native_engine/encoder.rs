@@ -53,6 +53,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use rayon::prelude::*;
+
 use super::ggml::GgmlModel;
 use super::nn;
 use super::{Mat, Mel, WhisperHParams};
@@ -184,7 +186,14 @@ fn load_linear_transposed(
     in_dim: usize,
 ) -> FwResult<Mat> {
     let data = load_shaped(model, name, &[out_dim, in_dim])?;
-    Ok(transpose(&data, out_dim, in_dim))
+    // SERIAL transpose: `from_ggml` parallelizes across layers (rayon), so a
+    // per-weight `thread::scope` transpose here would nest and spawn-thrash. The
+    // coarse (layer) parallelism keeps all cores busy without nesting.
+    Ok(Mat::from_vec(
+        in_dim,
+        out_dim,
+        nn::transpose_serial(&data, out_dim, in_dim),
+    ))
 }
 
 /// Transpose a row-major `[rows, cols]` buffer into a `[cols, rows]` [`Mat`].
@@ -248,29 +257,37 @@ impl EncoderWeights {
         let pos_data = load_shaped(model, "encoder.positional_embedding", &[n_ctx, n_state])?;
         let pos_emb = Mat::from_vec(n_ctx, n_state, pos_data);
 
-        let mut layers = Vec::with_capacity(n_layer);
-        for i in 0..n_layer {
-            let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
-            let layer = EncoderLayer {
-                attn_ln_w: load_vec(model, &p("attn_ln.weight"), n_state)?,
-                attn_ln_b: load_vec(model, &p("attn_ln.bias"), n_state)?,
-                attn_q_w: load_linear_transposed(model, &p("attn.query.weight"), n_state, n_state)?,
-                attn_q_b: load_vec(model, &p("attn.query.bias"), n_state)?,
-                // whisper key projection has NO bias.
-                attn_k_w: load_linear_transposed(model, &p("attn.key.weight"), n_state, n_state)?,
-                attn_v_w: load_linear_transposed(model, &p("attn.value.weight"), n_state, n_state)?,
-                attn_v_b: load_vec(model, &p("attn.value.bias"), n_state)?,
-                attn_out_w: load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?,
-                attn_out_b: load_vec(model, &p("attn.out.bias"), n_state)?,
-                mlp_ln_w: load_vec(model, &p("mlp_ln.weight"), n_state)?,
-                mlp_ln_b: load_vec(model, &p("mlp_ln.bias"), n_state)?,
-                mlp_fc_w: load_linear_transposed(model, &p("mlp.0.weight"), mlp_hidden, n_state)?,
-                mlp_fc_b: load_vec(model, &p("mlp.0.bias"), mlp_hidden)?,
-                mlp_proj_w: load_linear_transposed(model, &p("mlp.2.weight"), n_state, mlp_hidden)?,
-                mlp_proj_b: load_vec(model, &p("mlp.2.bias"), n_state)?,
-            };
-            layers.push(layer);
-        }
+        // Build the per-block weights ACROSS layers in parallel (rayon's
+        // persistent pool). The dominant load cost is the per-weight transpose
+        // (`model_weights` ≈ 1.97 s on large = 32 layers); each layer is
+        // independent, reads disjoint tensors from the (shared, read-only)
+        // `model`, and now transposes SERIALLY, so this fans the 32 layers across
+        // cores with no nested spawn. Order is preserved (`map`+`collect`), so the
+        // assembled weights are byte-identical to the serial loop.
+        let layers = (0..n_layer)
+            .into_par_iter()
+            .map(|i| -> FwResult<EncoderLayer> {
+                let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
+                Ok(EncoderLayer {
+                    attn_ln_w: load_vec(model, &p("attn_ln.weight"), n_state)?,
+                    attn_ln_b: load_vec(model, &p("attn_ln.bias"), n_state)?,
+                    attn_q_w: load_linear_transposed(model, &p("attn.query.weight"), n_state, n_state)?,
+                    attn_q_b: load_vec(model, &p("attn.query.bias"), n_state)?,
+                    // whisper key projection has NO bias.
+                    attn_k_w: load_linear_transposed(model, &p("attn.key.weight"), n_state, n_state)?,
+                    attn_v_w: load_linear_transposed(model, &p("attn.value.weight"), n_state, n_state)?,
+                    attn_v_b: load_vec(model, &p("attn.value.bias"), n_state)?,
+                    attn_out_w: load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?,
+                    attn_out_b: load_vec(model, &p("attn.out.bias"), n_state)?,
+                    mlp_ln_w: load_vec(model, &p("mlp_ln.weight"), n_state)?,
+                    mlp_ln_b: load_vec(model, &p("mlp_ln.bias"), n_state)?,
+                    mlp_fc_w: load_linear_transposed(model, &p("mlp.0.weight"), mlp_hidden, n_state)?,
+                    mlp_fc_b: load_vec(model, &p("mlp.0.bias"), mlp_hidden)?,
+                    mlp_proj_w: load_linear_transposed(model, &p("mlp.2.weight"), n_state, mlp_hidden)?,
+                    mlp_proj_b: load_vec(model, &p("mlp.2.bias"), n_state)?,
+                })
+            })
+            .collect::<FwResult<Vec<_>>>()?;
 
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;

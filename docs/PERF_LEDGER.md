@@ -468,6 +468,31 @@ OpenAI 8-thread gap.
 
 ---
 
+### L15 — parallel-layer model load (serial transpose + rayon over layers)  — `src/native_engine/{nn,encoder}.rs`  **[load win]**
+
+**How it was found.** The large-v3-turbo head-to-head (NEGATIVE_EVIDENCE 2026-06-25)
+showed franken WINS transcription compute (1.24×) but LOSES cold-CLI (12.96 s vs
+whisper.cpp 9.75 s) on model LOAD. Perf-span profile: `model_parse` 1.28 s +
+`model_weights` **1.97 s** = 3.25 s (whisper.cpp 0.90 s). The 1.97 s is the
+per-weight `[out,in]→[in,out]` transpose, run in a **sequential 32-layer loop**
+(`EncoderWeights::from_ggml`), each weight using a `thread::scope` parallel transpose.
+
+**Fix.** Parallelize the load ACROSS layers via rayon (`(0..n_layer).into_par_iter()`)
+and make each layer's transpose **serial** (`nn::transpose_serial`, no spawn) — coarse
+layer-grain parallelism fills cores without the nested `thread::scope` spawn-thrash.
+`map`+`collect` preserves layer order; the transpose is a pure permutation → the
+assembled weights are **byte-identical** to the serial loop.
+
+**Measured (large-v3-turbo, perf spans):** `model_weights` **1.97 s → 0.82 s (−58%)**;
+total load **3.25 s → 2.07 s (−36%)**. Cold-CLI large now ~9.2 s (2.07 load + 7.1
+transcribe) vs whisper.cpp 9.75 s → **franken WINS cold large too** (was a loss).
+**Conformance GREEN** (native_engine_e2e 6/6; large jfk text byte-identical incl the
+pre-existing trailing token). **Verdict: KEEP.** Closes the last franken-vs-whisper.cpp
+gap (cold-start load); the parse (1.28 s, eager `fs::read`) is the remaining load cost
+(mmap blocked by `#![forbid(unsafe_code)]`).
+
+---
+
 ## ⇒ Session arc (2026-06-25, BlackThrush): built the comparator, closed 1.37×→~1.08×
 
 Building `whisper-cli` (bd-zk43) exposed the real gap as the **in-scope decoder**
