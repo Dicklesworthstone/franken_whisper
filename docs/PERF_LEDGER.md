@@ -353,13 +353,19 @@ The e2e wall is the encoder GEMM, delegated to `ft_kernel_cpu::matmul_tensor_
 contiguous_f32`, which uses **`matrixmultiply 0.3`**. Standalone A/B (x86-64-v3,
 rayon) for the encoder MLP shape `[1500,384]×[384,1536]`:
 
-| sgemm backend | throughput | time |
-|---|---|---|
-| `matrixmultiply 0.3` (current, via ft-kernel-cpu) | 187 GFLOP/s | 9451 µs |
-| `gemm 0.18` (faer backend) | **701 GFLOP/s** | 2523 µs → **3.75×** |
+Full per-shape profile (standalone same-run A/B; ratios are the signal — absolute
+GFLOP/s drops under box contention, e.g. the uncontended fc1 run hit
+187→701 GFLOP/s = 3.75×):
 
-So the GEMM — ~most of the GEMM-bound encoder (~32% of e2e) — is **3.75× off the
-achievable**. Swapping `ft-kernel-cpu`'s `matrixmultiply`→`gemm` is **~2× encoder
+| encoder GEMM shape | `gemm`/faer vs `matrixmultiply` |
+|---|---|
+| attn Q/K/V/out `[1500,384]×[384,384]` | **3.14×** |
+| MLP fc1 `[1500,384]×[384,1536]` | **2.24× – 3.75×** (uncontended) |
+| MLP fc2 `[1500,1536]×[1536,384]` | **1.46×** (larger K → smaller gap) |
+
+So EVERY encoder GEMM is faster on `gemm`/faer — `matrixmultiply` is consistently
+the bottleneck. The GEMM is ~most of the GEMM-bound encoder (~32% of e2e), so it
+is **~1.5–3.75× off achievable** (shape-dependent; weighted ~2–3×). Swapping `ft-kernel-cpu`'s `matrixmultiply`→`gemm` is **~2× encoder
 → ~1.2× e2e** for franken_whisper, and benefits every FrankenTorch user.
 `ft-kernel-cpu` already calls `matrixmultiply` via `unsafe`, so `gemm`'s unsafe
 API is fine there; `franken_whisper`'s `#![forbid(unsafe_code)]` blocks calling
