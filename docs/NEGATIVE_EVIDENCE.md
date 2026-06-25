@@ -3,6 +3,128 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - AGENT_NAME=IcyWren stack-scratch GEMV probe rejected
+
+### Land-or-dig scan
+
+Repo-local `.scratch` and `.worktrees` directories were absent. Sibling worktrees
+were checked with `git worktree list --porcelain`; all measured-code worktrees
+were ancestors of current `main` except `franken_whisper-cod-a-main-measure`,
+which is the stale docs-only OpenAI-ratio branch already superseded by main's
+current ledger entries. Nothing missing from current `main` was landable.
+
+### RCH bench command status
+
+Requested command shape:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --release -p franken_whisper \
+    --bench native_engine_bench -- e2e_tiny_jfk \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result: blocked before benchmark execution. Cargo rejects `bench --release` with
+`unexpected argument '--release'`.
+
+Supported release-profile follow-up:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- e2e_tiny_jfk \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result: blocked before benchmark execution by path-dependency version skew in
+the synced `frankensqlite` workspace: `fsqlite` requested
+`fsqlite-parser ^0.1.12`, while the path crate reported `0.1.11`.
+
+### Candidate
+
+Alien-graveyard / extreme-optimization route: cache-aware numeric-kernel
+scratch placement. The current attribution showed GEMV-heavy costs dominating
+the loaded tiny.en decoder step:
+
+```text
+current decoder_attrib tiny.en 160:
+  total attributed: 8.2432 ms/token
+  mlp_fc_gelu_proj: 2.0315 ms/token
+  logits_gemv:      1.7171 ms/token
+  self_qkv_proj:    1.3783 ms/token
+  cross_attn:       1.1091 ms/token
+```
+
+One-lever probe: replace per-call/per-worker heap scratch `Vec<f32>` in
+`nn::gemv_f16` and `nn::gemv_f16_batch` with stack-resident scratch arrays for
+the common Whisper widths 384, 1280, and 1536, falling back to `Vec` for other
+widths. This was intended to remove allocator traffic without changing
+dequantization, dot-product order, output-row order, or logits filtering.
+
+### Measurement
+
+Built locally after RCH bench blockage:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo +nightly-2026-06-09 build -p franken_whisper \
+    --profile release --example native_ab --example decoder_attrib
+result: pass
+```
+
+Loaded franken path:
+
+```text
+FRANKEN_WHISPER_MODEL_DIR=legacy_whispercpp/whisper.cpp/models \
+  /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab \
+  tiny.en 9 8
+```
+
+Run 0 discarded:
+
+| Build | Runs after warmup (s) | Median | Mean | Ratio vs current franken | OpenAI loaded median | Ratio vs OpenAI loaded | Verdict |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| current `a3f5cee` | 0.45257, 0.43648, 0.42870, 0.44397, 0.44733, 0.46900, 0.46109, 0.45157 | 0.449450 | 0.448839 | 1.000x | 0.463102 | 1.030x | Baseline |
+| stack scratch candidate | 0.60755, 0.68237, 0.53276, 0.52593, 0.52014, 0.48834, 0.51435, 0.61754 | 0.529345 | 0.561123 | 0.849x | 0.463102 | 0.875x | REJECT |
+
+OpenAI loaded-array comparator:
+
+```text
+uvx --from openai-whisper python
+torch.set_num_threads(8)
+whisper.load_model("tiny.en", device="cpu")
+one warmup, 9 timed transcribes over an already-loaded NumPy WAV array
+median: 0.4631017509382218 s
+artifact: /tmp/franken_whisper_cod_a_openai_loaded_array_8t_20260625e.json
+```
+
+Behavior proof:
+
+```text
+diff -u \
+  /tmp/franken_whisper_cod_a_current_a3f5cee_native_ab_8t_20260625e.json \
+  /tmp/franken_whisper_cod_a_candidate_stack_scratch_native_ab_8t_20260625e.json
+result: no diff
+```
+
+Candidate attribution also regressed rather than helping:
+
+```text
+candidate decoder_attrib tiny.en 160:
+  total attributed: 12.6505 ms/token
+  mlp_fc_gelu_proj: 3.3216 ms/token
+  logits_gemv:      2.6671 ms/token
+  cross_attn:       2.4900 ms/token
+```
+
+Verdict: rejected and reverted. Stack arrays for the common f16 GEMV widths
+appear to hurt this hot loop, likely via stack-frame pressure / poorer codegen
+rather than allocator savings. Do not retry this family without assembly or
+perf-counter evidence showing allocation traffic is actually material.
+
 ## 2026-06-25 - AGENT_NAME=IcyWren OpenAI Whisper after Rayon pool cap
 
 ### Worktree scan
