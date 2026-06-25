@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: linear resampler — bit-exact +6% kernel (L16) but e2e-neutral; windowed variant REJECTED
+
+Targeted the **one preprocessing kernel never touched** by L1–L16: the builtin
+no-ffmpeg decoder's `resample_mono_linear` (`src/audio.rs`). Two bit-exact
+restructures of the clamp-on-every-load loop were measured (standalone microbench,
+`rustc -O -C target-cpu=x86-64-v3`, 30 s mono, best-of-60):
+
+| variant | 44.1→16k | 48→16k | 22.05→16k | verdict |
+| --- | ---: | ---: | ---: | --- |
+| interior/tail split (L16) | **1.065×** | 1.061× | 1.061× | KEEP (bit-exact) |
+| windowed-slice `&input[l..l+2]` | 0.981× | 0.978× | 0.972× | **REJECTED** (regression) |
+
+Output is byte-identical to the original (`f32::to_bits()`, 6 rate pairs × 9
+lengths, in-tree test green). The split is landed (L16); the windowed variant is a
+measured loss and was discarded.
+
+**Ratio "vs OpenAI-Whisper" — honest caveat / non-comparable.** There is **no clean
+head-to-head**: OpenAI Whisper resamples via ffmpeg/torch (higher-quality sinc),
+franken's builtin path is linear, and this path is **bypassed entirely** when
+ffmpeg is present *and* early-returns when `src_rate == dst_rate` (every 16 kHz
+input, incl. the jfk e2e fixture). So the +6% is **vs franken's own faithful
+baseline** (same convention as L1's honesty note), and it is **e2e-neutral** — a
+once-per-file cold-path cleanup, not a transcription-time gap-closer. Recorded so
+this small win is not later misread as moving the head-to-head. The real remaining
+head-to-head gap stays as previously logged: tiny-cold-CLI (~190 ms, diffuse) and
+the diffuse large-decoder `gemv_f16` efficiency vs GGML's hand-tuned dot.
+
 ## 2026-06-25 - BlackThrush: large decoder profiled — diffuse gemv, no hotspot (offset by encoder win)
 
 The large-v3-turbo decoder is franken's biggest *component* gap (~2.8 s vs whisper.cpp

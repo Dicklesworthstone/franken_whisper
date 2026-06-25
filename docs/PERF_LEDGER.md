@@ -493,6 +493,49 @@ gap (cold-start load); the parse (1.28 s, eager `fs::read`) is the remaining loa
 
 ---
 
+### L16 — linear resampler interior/tail split (bit-exact)  — `src/audio.rs`
+
+**Hypothesis.** `resample_mono_linear` (the builtin no-ffmpeg decode path's
+sample-rate converter) clamps **both** source loads on **every** output sample
+(`input[left_idx.min(last)]`, `input[right_idx.min(last)]`). For all but the
+final 1–2 taps both indices are already in bounds, so those `.min()` clamps +
+`saturating_add` are pure per-sample overhead on the hot span.
+
+**Change.** Hoist the loop invariants (`last`, `total`) and split the loop body
+into an interior fast case (`left_idx < last` → index `input[left_idx]` /
+`input[left_idx+1]` with no clamp) and a tail branch for the last taps. The
+per-sample arithmetic is **byte-identical** — same `idx as f64 * ratio` position,
+same `floor`, same `(src_pos - left_idx as f64) as f32` frac — so the resampled
+signal is bit-exact; only the redundant clamp work is removed.
+
+**Conformance.** New test `audio::tests::resample_mono_linear_is_bit_exact_vs_reference`
+asserts byte-for-byte `f32::to_bits()` equality vs an inline copy of the original
+clamp-every-load form across 6 rate pairs (down/up/identity) × 9 lengths
+(0,1,2,3,7,31,1000,4096,44101 — covers empty, sub-tap, and edge tails). Green.
+
+**Measurement (standalone microbench, `rustc -O -C target-cpu=x86-64-v3`, 30 s of
+mono audio, best-of-60; bit-exact vs baseline verified each shape):**
+
+| resample | baseline | candidate (split) | speedup |
+|---|---|---|---|
+| 44.1 kHz → 16 kHz | 1.715 ms | 1.610 ms | **1.065×** |
+| 48 kHz → 16 kHz | 1.714 ms | 1.615 ms | **1.061×** |
+| 22.05 kHz → 16 kHz | 1.712 ms | 1.613 ms | **1.061×** |
+
+A *windowed-slice* variant (compute interior count, index `&input[l..l+2]`) was
+also measured and **REJECTED** — it regressed to **0.97–0.98×** (the interior-count
+arithmetic + 2-elem slice bound cost more than the clamp it removed).
+
+**Verdict: KEEP** (small but real, reproducible across 3 shapes, zero-downside,
+bit-exact). **Honest scope:** this path is **e2e-neutral** — `resample_mono_linear`
+runs only in the builtin (no-ffmpeg) decoder, once per file, and early-returns when
+`src_rate == dst_rate` (already-16 kHz inputs, incl. the jfk e2e fixture, never hit
+it). So this is a free kernel cleanup, not a head-to-head gap-closer; recorded for
+completeness as the one un-touched preprocessing kernel after L1–L4 (mel/FFT) and
+L15 (load). See NEGATIVE_EVIDENCE 2026-06-25 for the reject + scope caveat.
+
+---
+
 ## ⇒ Session arc (2026-06-25, BlackThrush): built the comparator, closed 1.37×→~1.08×
 
 Building `whisper-cli` (bd-zk43) exposed the real gap as the **in-scope decoder**
