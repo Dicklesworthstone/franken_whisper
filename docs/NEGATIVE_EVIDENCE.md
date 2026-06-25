@@ -3,6 +3,23 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: large decoder profiled — diffuse gemv, no hotspot (offset by encoder win)
+
+The large-v3-turbo decoder is franken's biggest *component* gap (~2.8 s vs whisper.cpp
+~0.585 s ≈ 4.8×) but it's **offset by the 1.9× encoder win** → franken still wins the
+large e2e (1.24×). Profiled it for an L9-style hotspot — found NONE:
+`decoder_attrib` large (per-token): mlp_fc_gelu 27.9%, logits_gemv 17.5%, self_qkv
+17.1%, cross_q/out + self_out 21%, cross_attn 11.3% → **~80% is `gemv_f16`**, all
+mature (L11 rayon) with no single dominant spawn/dispatch hotspot. The 4.8× is
+**diffuse f16-GEMV kernel efficiency vs GGML's hand-tuned dot**.
+
+One plausible kernel lever (uncertain, NOT a hotspot): franken's `gemv_f16`
+dequant-whole-row-to-scratch-then-`dot8` puts a 20 KB scratch (inp=5120 fc2) past L1
+→ L2 traffic; a **blocked dequant** (256-elem chunks in an L1 scratch, then dot) would
+cut that for large `inp`. Tiny `inp` (≤1280, ≤5 KB scratch) is already L1-resident, so
+this only helps large. Deferred: it's a kernel rewrite that *extends* an already-won
+e2e, not a gap-closer; franken's only e2e loss remains the tiny-cold-CLI 190 ms.
+
 ## 2026-06-25 - BlackThrush: ⇒ DOMINATION SCORECARD + last gap is a modest diffuse tiny-cold-CLI
 
 After L9–L15, franken_whisper matches-or-beats whisper.cpp everywhere measured:
