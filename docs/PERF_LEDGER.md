@@ -429,6 +429,43 @@ timestamps green).
 (native_engine_e2e 6/6). **Verdict: KEEP.** Now both decode paths (ts + no-ts) get
 parallel cross-attn.
 
+### L14 — cap Rayon default pool to native default_threads()  — `src/native_engine/mod.rs`
+
+**How it was found.** Current head (`a9ecb3b`) ran on a 64-way host. The native
+engine's own default is capped at 16 threads, and its glue kernels are tuned
+around 8-16 workers, but Rayon defaulted to all 64 host threads when
+`RAYON_NUM_THREADS` was unset. A same-binary surface sweep showed the issue:
+loaded `tiny.en` JFK at `threads=8` had median-after-warmup **0.624 s** with the
+default pool, while `RAYON_NUM_THREADS=16` measured **0.547 s**. The 4/8/12/16
+sweep showed 16 was the best tested cap; 4 regressed badly.
+
+**Fix.** Before the first native inference kernels run, initialize Rayon's
+global pool to [`default_threads()`] (16 on this host) when the operator has not
+already set `RAYON_NUM_THREADS`. Explicit `RAYON_NUM_THREADS` remains an override;
+if another embedding app already initialized Rayon, `build_global`'s error is
+ignored and behavior remains unchanged. This is pure scheduling: no numeric
+order inside any output row changes.
+
+**Measured (local same-host, current-head A/B, `native_ab tiny.en 9 <threads>`,
+discard run 0):**
+
+| loaded-model path | baseline median | L14 median | speedup |
+|---|---:|---:|---:|
+| 4 threads | 0.603520 s | 0.540470 s | **1.117×** |
+| 8 threads | 0.624235 s | 0.535540 s | **1.166×** |
+
+Decoder attribution agreed directionally: 13.064→11.878 ms/token, mainly from
+`logits_gemv` and `cross_attn` moving to the right-size persistent pool. Output
+proof: baseline and L14 `native_ab` JSON outputs are byte-identical at both 4
+and 8 threads.
+
+**OpenAI Whisper boundary (same host):** one-shot CLI comparator improved from
+**3.20×** to **4.23×** faster than OpenAI Whisper CLI. Loaded API boundary is
+mixed: L14 beats OpenAI loaded API at 4 threads (**1.078×**) but still loses at
+8 threads (**0.784×**, franken 1.275× slower). **Verdict: KEEP.** This is the
+first post-L13 in-crate e2e win; it narrows but does not eliminate the loaded
+OpenAI 8-thread gap.
+
 ---
 
 ## ⇒ Session arc (2026-06-25, BlackThrush): built the comparator, closed 1.37×→~1.08×

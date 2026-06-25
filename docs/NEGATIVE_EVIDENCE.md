@@ -3,6 +3,100 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - AGENT_NAME=IcyWren OpenAI Whisper after Rayon pool cap
+
+### Worktree scan
+
+No measured win was found in a detached worktree that was missing from current
+`main`. The earlier greedy-logprob allocation lever (`3cbd80e`) was explicitly
+reverted by `6d0d5be` as a measured near-zero path, so it was not re-landed.
+Current head for this pass: `a9ecb3b`.
+
+### Kept in-crate lever
+
+Lever: initialize Rayon's global pool to `native_engine::default_threads()` when
+`RAYON_NUM_THREADS` is unset. On this 64-way host, Rayon's default pool was too
+wide for the native engine's tuned 8-16-worker kernels. The new default is 16
+threads, while an explicit `RAYON_NUM_THREADS` override remains honored.
+
+Loaded-model A/B, `examples/native_ab tiny.en 9 <threads>`, run 0 discarded:
+
+| Threads | Baseline median | Candidate median | Franken speedup | OpenAI loaded median | Candidate ratio vs OpenAI loaded | Verdict |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 4 | 0.603520 s | 0.540470 s | 1.117x | 0.582495 s | 1.078x | Beats OpenAI loaded API on this 4t run |
+| 8 | 0.624235 s | 0.535540 s | 1.166x | 0.420035 s | 0.784x | Still slower than OpenAI loaded API at 8t |
+
+Artifacts:
+
+```text
+/tmp/franken_whisper_cod_b_a9ecb3b_native_ab_4t.times
+/tmp/franken_whisper_cod_b_a9ecb3b_native_ab_8t.times
+/tmp/franken_whisper_cod_b_rayoncap_candidate_native_ab_4t.times
+/tmp/franken_whisper_cod_b_rayoncap_candidate_native_ab_8t.times
+/tmp/franken_whisper_cod_b_a9ecb3b_openai_loaded.json
+```
+
+Behavior proof:
+
+```text
+diff -u \
+  /tmp/franken_whisper_cod_b_a9ecb3b_native_ab_8t.json \
+  /tmp/franken_whisper_cod_b_rayoncap_candidate_native_ab_8t.json
+result: no diff
+
+diff -u \
+  /tmp/franken_whisper_cod_b_a9ecb3b_native_ab_4t.json \
+  /tmp/franken_whisper_cod_b_rayoncap_candidate_native_ab_4t.json
+result: no diff
+```
+
+Decoder attribution:
+
+```text
+baseline:
+  wall total=2612.8ms, per-step=13.064ms
+  top costs: mlp_fc_gelu_proj 3.8018ms/tok, logits_gemv 2.6819ms/tok,
+    cross_attn 2.4902ms/tok
+
+candidate:
+  wall total=2375.6ms, per-step=11.878ms
+  top costs: mlp_fc_gelu_proj 3.8129ms/tok, logits_gemv 1.9428ms/tok,
+    cross_attn 2.1612ms/tok
+```
+
+### Fresh OpenAI Whisper CLI comparator
+
+`speed_ratio = OpenAI Whisper wall time / franken_whisper wall time`.
+
+| Build | Franken mean | Franken median | OpenAI CLI mean | OpenAI CLI median | Mean ratio | Median ratio | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| baseline `a9ecb3b` | 0.935723 s | 0.933698 s | 2.994287 s | 3.023920 s | 3.200x | 3.239x | Routing baseline |
+| Rayon-cap candidate | 0.783912 s | 0.774636 s | 3.318963 s | 3.259243 s | 4.234x | 4.207x | Kept product CLI win |
+
+Artifacts:
+
+```text
+/tmp/franken_whisper_cod_b_a9ecb3b_openai_cli.json
+/tmp/franken_whisper_cod_b_rayoncap_candidate_openai_cli.json
+```
+
+### Validation
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo build --profile release -p franken_whisper \
+  --bin franken_whisper --example native_ab --example decoder_attrib
+result: pass
+
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  cargo test -p franken_whisper --test conformance_comparator_tests
+result: pass; 26 passed / 0 failed
+```
+
+Additional quality gates are recorded in the commit/session closeout. Known
+boundary: this is a real loaded-model franken win and a stronger OpenAI CLI win,
+but it does not beat the loaded OpenAI API at 8 threads.
+
 ## 2026-06-25 - BlackThrush: ⇒ AFTER L9–L13, NEAR PARITY (gap 1.37×→~1.08×)
 
 Fresh back-to-back re-measure after the L9–L13 decoder optimizations (same host,

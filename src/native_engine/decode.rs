@@ -735,6 +735,7 @@ pub fn transcribe_samples(
             "transcribe_samples: empty audio".into(),
         ));
     }
+    super::ensure_default_rayon_pool();
 
     let tk = &m.tokenizer;
 

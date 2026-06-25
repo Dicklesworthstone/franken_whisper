@@ -460,6 +460,22 @@ pub fn default_threads() -> usize {
         .min(16)
 }
 
+/// Initialize Rayon before inference kernels touch the global pool.
+///
+/// Rayon defaults to the full host parallelism, which is a poor fit on large
+/// shared machines: this crate's kernels are tuned around [`default_threads`],
+/// and the caller can still opt into another value with `RAYON_NUM_THREADS`.
+pub(crate) fn ensure_default_rayon_pool() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(default_threads())
+                .build_global();
+        }
+    });
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Loaded-model cache
 // ─────────────────────────────────────────────────────────────────────────
