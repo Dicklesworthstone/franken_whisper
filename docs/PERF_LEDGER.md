@@ -150,8 +150,43 @@ variance — over a realistic 80×201 triangular bank, 3000 frames):**
 Bit-exact check in the same harness: **0 / 240,000** mismatches. Since the dense
 projection (37.5 ms) is *larger* than the post-L1 FFT pass (~28 ms), eliminating
 it is **≈2× on the whole mel frontend for real (sparse-bank) models** —
-a genuine real-workload win, unlike L2. (e2e share still bounded by
-encoder/decoder, but mel is now near its bit-exact floor.) **Verdict: KEEP.**
+a genuine real-workload win, unlike L2. **Verdict: KEEP.**
+
+### L4 — frame-batched SIMD FFT (bit-exact)  — `src/native_engine/mel.rs`
+
+**Hypothesis.** After L1+L3 the FFT is the dominant mel cost. Frames are
+independent and identically-shaped, so they vectorize *vertically*: put one frame
+per SIMD lane (`Simd<f32, 8>`, structure-of-arrays) and run one batched FFT over
+8 frames. IEEE-754 f32 lane ops are bit-identical to scalar f32 (no FMA
+contraction), so lane `L` equals the scalar FFT of frame `L` — **bit-exact**,
+not an approximation. (This is a *vectorization* axis, orthogonal to L1/L3's
+arithmetic-redundancy elimination — the "bit-exact floor" is lower than L3
+implied.)
+
+**Change.** `fft_simd8` / `dft_simd8` mirror the scalar recursion over
+`Simd<f32, 8>` with the same precomputed twiddles (splatted). The mel worker
+batches fully-valid frames (full `N_FFT` window) 8-at-a-time; the partial-window
+tail + noise-floor frames keep the scalar path. After the batched FFT each lane
+is transposed back and fed to the shared, tested `power_and_project` — so the
+columns are byte-identical to the scalar path. Needs `#![feature(portable_simd)]`
+(crate is nightly; stays `#![forbid(unsafe_code)]` — std::simd is safe).
+
+**Conformance.** New test `fft_simd8_matches_scalar_bit_exact` asserts
+byte-identical output per lane vs the scalar FFT (32 rounds × 8 frames × 802
+bins); existing silence/determinism mel tests stay green.
+
+**Measurement (standalone local same-process A/B, 3000-frame `N_FFT=400` pass —
+rigorous given 5.6× rch worker variance):**
+
+| FFT pass (3000 frames) | time | speedup |
+|---|---|---|
+| scalar (per-frame) | 26.7 ms | — |
+| SIMD f32×8 (baseline x86-64) | 6.3 ms | **4.22×** |
+| SIMD f32×8 (AVX2) | 4.5 ms | **5.62×** |
+
+Bit-exact: **0 / 2,400,000** mismatches. Since the FFT dominates the post-L3 mel
+frontend, this is **~2.5–3× on the whole mel frontend** on top of L1+L3.
+**Verdict: KEEP.**
 
 ---
 

@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 #![forbid(unsafe_code)]
 #![allow(clippy::needless_raw_string_hashes)]
 
