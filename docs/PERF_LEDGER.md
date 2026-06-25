@@ -407,22 +407,43 @@ gap **1.17×→~1.07–1.10× (NEAR PARITY)**. **Verdict: KEEP.**
 
 ---
 
+### L13 — rayon cross-attn for the RECORD (timestamps) path  — `src/native_engine/decoder.rs`  **[e2e win]**
+
+**Insight.** L12 only sped the no-ts path; the realistic default (`timestamps:true`,
+DTW word alignment) took the serial `record` branch because per-head softmax
+`scores` must land in `recorded` in head order. But the *compute* can still be
+parallel — only the recording needs ordering.
+
+**Fix.** Parallelize `compute_head` over heads via rayon (persistent pool), collect
+in head order, then push `scores` + scatter SERIALLY. `compute_head` never touches
+`recorded` → Sync; ordering + disjoint scatter unchanged → **bit-identical** (DTW
+timestamps green).
+
+**Measured (local v3, ts e2e):** **542→504 ms = −7%**; **conformance GREEN**
+(native_engine_e2e 6/6). **Verdict: KEEP.** Now both decode paths (ts + no-ts) get
+parallel cross-attn.
+
+---
+
 ## ⇒ Session arc (2026-06-25, BlackThrush): built the comparator, closed 1.37×→~1.08×
 
 Building `whisper-cli` (bd-zk43) exposed the real gap as the **in-scope decoder**
-(not the encoder, which already wins 204 vs 242 ms). Four bit-identical/
-transcription-green wins followed — all whisper.cpp/GGML techniques franken lacked:
+(not the encoder, which already wins 204 vs 242 ms). FIVE bit-identical/
+transcription-green wins followed — all whisper.cpp/GGML techniques franken lacked
+(spawn-bound dispatch → persistent pool; sgemm-for-gemv → dedicated dot):
 
-| lever | what | no-ts e2e |
+| lever | what | e2e |
 |---|---|---|
-| L9 | mlp GEMV spawn threshold | ~590→543 ms |
-| L10 | m=1 gemv (skip sgemm packing) | 543→534 ms |
-| L11 | rayon persistent-pool gemv_f16 | 534→523 ms |
-| L12 | rayon persistent-pool cross-attn | 523→**477–491 ms** |
+| L9 | mlp GEMV spawn threshold | no-ts ~590→543 ms |
+| L10 | m=1 gemv (skip sgemm packing) | no-ts 543→534 ms |
+| L11 | rayon persistent-pool gemv_f16 | no-ts 534→523 ms; ts 561→542 |
+| L12 | rayon persistent-pool cross-attn (no-ts) | no-ts 523→**477–491 ms** |
+| L13 | rayon cross-attn (ts/record path) | ts 542→**504 ms** |
 
-**franken_whisper tiny.en jfk: 1.37× slower → ~1.07–1.10× (near parity) vs
-whisper.cpp**, all conformance-green. Remaining to *win*: bd-4hc0 (encoder
-`matrixmultiply→gemm`, out-of-scope) would cut the encoder ~2× → outright win.
+**franken_whisper tiny.en jfk vs whisper.cpp: no-ts 1.37×→~1.07–1.10× (near
+parity); ts (realistic, with word timestamps) 614→504 ms (−18%)** — all
+conformance-green. Remaining to *win outright*: bd-4hc0 (encoder
+`matrixmultiply→gemm`, out-of-scope) would cut the encoder ~2×.
 
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
 

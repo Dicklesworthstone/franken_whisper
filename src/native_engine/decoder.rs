@@ -897,14 +897,29 @@ fn cross_attention(
 
     let mut out = vec![0.0f32; tq * n_state];
 
-    // When recording (DTW word timestamps) we keep the serial head loop: it
-    // must push each head's softmax `scores` into `recorded` in head order,
-    // and recording is rarely hot (opt-in, off by default).
+    // When recording (DTW word timestamps), the per-head softmax `scores` must
+    // land in `recorded` in head order. We still parallelize the per-head COMPUTE
+    // via rayon's persistent pool (L12: the per-token spawn, not the compute, was
+    // the cost — timestamps are the realistic default, so this path matters), then
+    // push scores + scatter SERIALLY in head order. `compute_head` captures only
+    // shared refs (it does not touch `recorded`), so it's Sync; ordering and the
+    // disjoint scatter are unchanged → bit-identical to the serial loop.
     if record {
-        for h in 0..n_head {
-            let (scores, out_h) = compute_head(h)?;
-            recorded.push(scores);
-            scatter(&mut out, h, &out_h);
+        if n_head < 2 || nn::worker_count() < 2 {
+            for h in 0..n_head {
+                let (scores, out_h) = compute_head(h)?;
+                recorded.push(scores);
+                scatter(&mut out, h, &out_h);
+            }
+        } else {
+            let heads: Vec<(Mat, Mat)> = (0..n_head)
+                .into_par_iter()
+                .map(&compute_head)
+                .collect::<FwResult<Vec<(Mat, Mat)>>>()?;
+            for (h, (scores, out_h)) in heads.into_iter().enumerate() {
+                recorded.push(scores);
+                scatter(&mut out, h, &out_h);
+            }
         }
         return Ok(Mat::from_vec(tq, n_state, out));
     }
