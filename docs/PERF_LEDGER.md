@@ -283,36 +283,24 @@ revert = delete `.cargo/config.toml` (or use `x86-64-v2`). The bit-exact
 kernel levers (L1/L3/L4/L5) stack *on top* — they make the non-GEMM parts faster
 within this baseline.
 
-### L8 — vectorized accurate gelu + softmax (AVX2 minimax exp/tanh)  — `src/native_engine/nn.rs`
+### L8 — vectorized gelu/softmax (AVX2 minimax exp/tanh)  — MEASURED, REVERTED (~0 e2e)
 
-**Hypothesis.** First profile of the real encoder showed scalar `libm` `tanh`
-(gelu) is **~15 ms/layer over [1500,1536] ≈ 30% of the 204 ms encoder**, and
-`softmax` (scalar `exp`) is a comparable attention cost. LLVM can't vectorize
-`libm` calls. Now that conformance is **transcription-level** (not bit-exact) and
-the build has `+fma` (L7), an *accurate* vectorized `exp`/`tanh` is both permitted
-and fast.
+**Hypothesis.** Scalar `libm` `tanh`/`exp` in `gelu`/`softmax` looked like ~30%
+of the encoder (a single isolated gelu over `[1500,1536]` is 15.2 ms scalar vs
+4.3 ms vectorized = **3.56×**, with an accurate `exp_simd` at 7.9e-8 rel error).
 
-**Change.** Added `exp_simd` (Cephes-style minimax `expf` for `f32x8`: range-
-reduce + degree-6 poly + `2^k` via exponent bits) and `tanh_simd`
-(`1 - 2/(exp(2y)+1)`); rewrote `gelu` and `softmax_rows` to process 8 lanes at a
-time (scalar tails), keeping the existing band-parallel fan-out.
+**Measured in-tree (clean v3 A/B, `e2e_tiny_jfk`):** **632.6 ms (v3) → 647 ms
+(v3 + vectorized gelu/softmax)** — **~0 gain, marginally negative.** The isolated
+3.56× did NOT translate: gelu/softmax are a *small* fraction of the
+GEMM-dominated encoder/decoder (my ~30% estimate was wrong — the FrankenTorch
+sgemm dominates), so vectorizing them moves e2e by noise. Conformance was green
+(200/200 lib tests incl. an accuracy test, native_engine_e2e 6/6), so it was
+*correct*, just not *worth it*.
 
-**Accuracy (standalone, x86-64-v3):** `exp_simd` max rel error **7.9e-8** over
-[-8,8]; gelu max abs error **3e-7** vs libm — essentially f32-exact, far inside
-the transcription budget.
-
-**Measurement (standalone, encoder MLP shape [1500,1536], x86-64-v3):**
-
-| gelu [1500,1536] | scalar libm | vectorized | speedup |
-|---|---|---|---|
-| one encoder layer | 15.2 ms | 4.3 ms | **3.56×** |
-
-gelu was ~30% of the encoder ⇒ ~1.2–1.4× expected on the encoder (in-tree e2e
-bench confirming; standalone is the rigorous kernel A/B). **Conformance GREEN:**
-clippy clean, **200/200 lib tests** (incl. new `gelu_simd_matches_libm_over_range`
-+ existing gelu/softmax) and **native_engine_e2e 6/6 — transcription unchanged**.
-**Verdict: KEEP.** Stacks on L7; the only remaining big encoder cost besides the
-external GEMM. (#![forbid(unsafe_code)] preserved — `std::simd` is safe.)
+**Verdict: REVERTED** (commit b42ce64 → reverted) per the swarm's "REVERT ~0-gain"
+rule. Lesson recorded so it isn't re-attempted: **isolated-kernel speedups must be
+validated at e2e before landing** — the encoder/decoder are GEMM-bound, so only
+the GEMM (FrankenTorch, external) or the build baseline (L7) move e2e here.
 
 ---
 

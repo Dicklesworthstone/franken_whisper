@@ -46,7 +46,6 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::simd::num::{SimdFloat, SimdInt};
 use std::simd::{Simd, StdFloat};
 
 use ft_core::{DType, Device, Float16, TensorMeta};
@@ -590,82 +589,33 @@ const GELU_COEF_A: f32 = 0.044_715;
 /// (note `x*(1 + a*x*x) == x + a*x^3`). We deliberately use this tanh form
 /// rather than ft's `gelu_value_f32`, which is the *erf* GELU and would
 /// diverge from whisper's activations.
-/// SIMD lane count for the activation kernels (one element per lane).
-const ACT_LANES: usize = 8;
-type ActVec = Simd<f32, ACT_LANES>;
-
-/// Accurate vectorized `expf` (minimax, range-reduced) for `f32x8`. Mirrors the
-/// Cephes single-precision algorithm: reduce `x = k*ln2 + r`, evaluate a degree-6
-/// polynomial on `r`, and scale by `2^k` via the exponent field. Max relative
-/// error ~8e-8 over a wide range (essentially f32-exact) — well inside the
-/// engine's transcription-level conformance budget (see `conformance-contract.md`;
-/// NOT bit-exact, but the scalar `libm` path it replaces isn't the reference
-/// either). Requires the `+fma` baseline (`.cargo/config.toml`, lever L7).
-#[inline]
-fn exp_simd(x: ActVec) -> ActVec {
-    let x = x.simd_clamp(ActVec::splat(-87.33), ActVec::splat(88.72));
-    let kf = (x * ActVec::splat(std::f32::consts::LOG2_E)).round();
-    // r = x - k*ln2, hi/lo split for accuracy.
-    let r = kf.mul_add(ActVec::splat(-0.693_359_4), x);
-    let r = kf.mul_add(ActVec::splat(2.121_944_4e-4), r);
-    let mut p = ActVec::splat(1.987_569_1e-4);
-    p = p.mul_add(r, ActVec::splat(1.398_199_9e-3));
-    p = p.mul_add(r, ActVec::splat(8.333_452e-3));
-    p = p.mul_add(r, ActVec::splat(4.166_579_6e-2));
-    p = p.mul_add(r, ActVec::splat(1.666_666_6e-1));
-    p = p.mul_add(r, ActVec::splat(5.0e-1));
-    p = p.mul_add(r * r, r) + ActVec::splat(1.0);
-    // 2^k via the IEEE-754 exponent field (k is small: |k| < ~128).
-    let k: Simd<i32, ACT_LANES> = kf.cast();
-    let pow2_bits: Simd<u32, ACT_LANES> =
-        ((k + Simd::splat(127)) << Simd::splat(23)).cast();
-    p * ActVec::from_bits(pow2_bits)
-}
-
-/// Vectorized `tanh` via `exp`: `tanh(y) = 1 - 2/(exp(2y)+1)`, clamped so the
-/// `exp(2y)` term cannot overflow (tanh saturates to ±1 well before then).
-#[inline]
-fn tanh_simd(y: ActVec) -> ActVec {
-    let yc = y.simd_clamp(ActVec::splat(-15.0), ActVec::splat(15.0));
-    let e = exp_simd(ActVec::splat(2.0) * yc);
-    ActVec::splat(1.0) - ActVec::splat(2.0) / (e + ActVec::splat(1.0))
-}
-
-/// Apply the tanh-GELU to a contiguous slice: 8 lanes at a time via the accurate
-/// vectorized `tanh`, then a scalar tail (identical formula). ~3.5x faster than
-/// the per-element `libm` `tanh` (the transcendental was ~30% of the encoder).
-fn gelu_slice(data: &mut [f32]) {
-    let n8 = data.len() / ACT_LANES * ACT_LANES;
-    let mut i = 0;
-    while i < n8 {
-        let v = ActVec::from_slice(&data[i..i + ACT_LANES]);
-        let inner = ActVec::splat(GELU_SQRT_2_OVER_PI)
-            * v
-            * (ActVec::splat(1.0) + ActVec::splat(GELU_COEF_A) * v * v);
-        let g = ActVec::splat(0.5) * v * (ActVec::splat(1.0) + tanh_simd(inner));
-        g.copy_to_slice(&mut data[i..i + ACT_LANES]);
-        i += ACT_LANES;
-    }
-    for v in &mut data[n8..] {
+pub fn gelu(x: &mut Mat) {
+    // Pure elementwise: each output depends only on its own input, so we
+    // split `data` into disjoint contiguous chunks across workers. The tanh
+    // transcendental dominates, so this scales well; threshold keeps small
+    // activations serial.
+    let apply = |v: &mut f32| {
         let x = *v;
         *v = 0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh());
-    }
-}
+    };
 
-pub fn gelu(x: &mut Mat) {
-    // Pure elementwise: each output depends only on its own input, so we split
-    // `data` into disjoint contiguous chunks across workers; each chunk is
-    // vectorized 8-wide by `gelu_slice`. Threshold keeps small activations serial.
     const PAR_THRESHOLD: usize = 1 << 15;
     let n = x.data.len();
     if n < PAR_THRESHOLD || worker_count() < 2 {
-        gelu_slice(&mut x.data);
+        for v in &mut x.data {
+            apply(v);
+        }
         return;
     }
     let chunk = n.div_ceil(worker_count()).max(1);
     std::thread::scope(|s| {
+        let apply = &apply;
         for band in x.data.chunks_mut(chunk) {
-            s.spawn(move || gelu_slice(band));
+            s.spawn(move || {
+                for v in band.iter_mut() {
+                    apply(v);
+                }
+            });
         }
     });
 }
@@ -690,36 +640,15 @@ pub fn softmax_rows(x: &mut Mat) {
             // All -inf (e.g. fully masked row): leave as-is to avoid NaNs.
             return;
         }
-        // exp(v - max) 8-wide via the accurate vectorized exp, then a scalar
-        // tail; the row sum is a SIMD reduction (order differs from the scalar
-        // running sum — allowed: conformance is transcription-level, and a
-        // masked `-inf` clamps to exp(-87) ~= 0, normalized away).
-        let maxv = ActVec::splat(max);
-        let n8 = row.len() / ACT_LANES * ACT_LANES;
-        let mut sumv = ActVec::splat(0.0);
-        let mut i = 0;
-        while i < n8 {
-            let e = exp_simd(ActVec::from_slice(&row[i..i + ACT_LANES]) - maxv);
-            e.copy_to_slice(&mut row[i..i + ACT_LANES]);
-            sumv += e;
-            i += ACT_LANES;
-        }
-        let mut sum = sumv.reduce_sum();
-        for v in &mut row[n8..] {
+        let mut sum = 0.0f32;
+        for v in row.iter_mut() {
             let e = (*v - max).exp();
             *v = e;
             sum += e;
         }
         if sum > 0.0 {
             let inv = 1.0 / sum;
-            let invv = ActVec::splat(inv);
-            let mut j = 0;
-            while j < n8 {
-                (ActVec::from_slice(&row[j..j + ACT_LANES]) * invv)
-                    .copy_to_slice(&mut row[j..j + ACT_LANES]);
-                j += ACT_LANES;
-            }
-            for v in &mut row[n8..] {
+            for v in row.iter_mut() {
                 *v *= inv;
             }
         }
@@ -1687,40 +1616,6 @@ mod tests {
         let std = 1.25f32.sqrt();
         let expected = (1.0 - 2.5) / std * 2.0 + 1.0;
         assert!((x.data[0] - expected).abs() < 1e-5);
-    }
-
-    #[test]
-    fn gelu_simd_matches_libm_over_range() {
-        // Vectorized gelu/softmax use an accurate minimax `exp_simd` (~8e-8 rel)
-        // instead of libm tanh/exp. Verify the gelu output matches the exact
-        // libm-tanh formula within a tight tolerance across the SIMD-chunk + tail
-        // (size 53 = 6*8 + 5), for inputs spanning the saturating range.
-        let n = 53usize;
-        let data: Vec<f32> = (0..n).map(|i| (i as f32 - 26.0) * 0.37).collect();
-        let mut m = Mat::from_vec(1, n, data.clone());
-        gelu(&mut m);
-        for (i, &xv) in data.iter().enumerate() {
-            let want =
-                0.5 * xv * (1.0 + (GELU_SQRT_2_OVER_PI * xv * (1.0 + GELU_COEF_A * xv * xv)).tanh());
-            assert!(
-                (m.data[i] - want).abs() < 1e-5,
-                "gelu[{i}] x={xv} got {} want {want}",
-                m.data[i]
-            );
-        }
-        // softmax: rows must sum to 1 and match a scalar reference within tol.
-        let cols = 53usize;
-        let row: Vec<f32> = (0..cols).map(|i| ((i * 7) % 23) as f32 * 0.3 - 3.0).collect();
-        let mut sm = Mat::from_vec(1, cols, row.clone());
-        softmax_rows(&mut sm);
-        let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let denom: f32 = row.iter().map(|&v| (v - mx).exp()).sum();
-        let sum: f32 = sm.data.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "softmax row sum {sum}");
-        for (i, &v) in row.iter().enumerate() {
-            let want = (v - mx).exp() / denom;
-            assert!((sm.data[i] - want).abs() < 1e-5, "softmax[{i}] got {} want {want}", sm.data[i]);
-        }
     }
 
     #[test]
