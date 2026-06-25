@@ -296,14 +296,23 @@ These shape what is measurable and how the ratios above must be read.
    is trustworthy precisely because baseline + candidate both ran on vmi1149989.
    **Rule:** only same-worker (single-`rch exec`) A/B is admissible.
 
-2. **Real-workload benches are unmeasurable via `rch`.**
-   `encoder_window_*`, `decoder_token_step_*`, `e2e_tiny_jfk`, `logits_gemv_large`
-   all SKIP on remote workers: the ggml model and `jfk.wav` are **gitignored**
-   (`*.wav`, model dirs) so rch does not sync them to the worker. The native
-   engine never downloads. ⇒ The big head-to-head workloads can only be measured
-   **locally** (assets present) with `$FRANKEN_WHISPER_MODEL_DIR` pointed at
-   `legacy_whispercpp/whisper.cpp/models`. Blocker bead: **bd-ms0x** (large model)
-   + new bead for the rch-sync gap.
+2. **Real-workload benches are unmeasurable via `rch` — RESOLVED via local builds
+   (bd-7xbq closed).** `encoder_window_*`, `decoder_token_step_*`, `e2e_tiny_jfk`,
+   `logits_gemv_large` SKIP on remote workers: the ggml model and `jfk.wav` are
+   **gitignored** (`*.wav`, model dirs) so rch does not sync them. **Working
+   path (proven):**
+   ```
+   RCH_MIN_LOCAL_TIME_MS=99999999 \      # forces rch to build LOCALLY (no offload)
+   CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cc-local \
+   FRANKEN_WHISPER_MODEL_DIR=.../legacy_whispercpp/whisper.cpp/models \
+   cargo test -p franken_whisper --release --test native_engine_e2e
+   ```
+   Built locally in **5m52s** (this host's nightly compiles `ft-kernel-cpu` fine —
+   the `ovh-a` `stdarch_neon_dotprod` failure is worker-specific drift) and ran
+   **6/6 gated pipeline tests that actually transcribed jfk** via the native
+   tiny.en engine (no SKIP) — i.e. **transcription conformance is verifiable
+   locally**. This is the gateway for any non-bit-exact lever AND the e2e
+   head-to-head. `large-v3-turbo` still absent (bd-ms0x).
 
 3. **No built `whisper.cpp` comparator.** `whisper-cli`/`main` is not built on
    this host (only source under `legacy_whispercpp/whisper.cpp`). A true
