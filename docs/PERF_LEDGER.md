@@ -199,6 +199,40 @@ So a real model's 30 s log-mel frontend now runs in **~4 ms** (from a 269 ms
 dense/transcendental-heavy starting point — a **~68× cumulative** reduction on the
 hermetic frontend, all bit-exact). e2e share remains bounded by encoder/decoder.
 
+### L5 — vertical-SIMD `layer_norm` (bit-exact)  — `src/native_engine/nn.rs`
+
+**Hypothesis.** `layer_norm` runs in every encoder + decoder block. Its per-row
+f64 mean/var reductions can't use *horizontal* SIMD (that reorders the f64 sum →
+not bit-exact), but the L4 *vertical* trick applies: one row per `f64x8` lane, so
+each lane reduces its own row in the original ascending order. IEEE-754 f64 lanes
++ correctly-rounded `sqrt`/division are bit-identical to scalar f64 ⇒ **bit-exact**
+(unlike `gelu`/`softmax`, whose `tanh`/`exp` have no bit-exact SIMD form).
+
+**Change.** Factor the per-row body into `norm_rows`, which gathers 8 rows into a
+structure-of-arrays, computes mean/var/inv-std/affine in `f64x8`, and scatters
+back; the `< 8`-row tail stays scalar. Both the serial and band-parallel paths
+call it, so SIMD stacks with the existing thread fan-out. Reuses the L4
+`#![feature(portable_simd)]` gate (still `#![forbid(unsafe_code)]`).
+
+**Conformance.** New test `layer_norm_simd_matches_scalar` asserts byte-identical
+output vs an independent scalar per-row f64 reference across row counts
+{1,7,8,9,20,33} (covers SIMD groups + tail); existing layer_norm tests stay green.
+
+**Measurement (standalone local same-process A/B, `[1500, 384]` encoder-window
+shape; rigorous given 5.6× rch worker variance):**
+
+| layer_norm `[1500,384]` | time | speedup |
+|---|---|---|
+| scalar per-row | 1.20 ms | — |
+| vertical `f64x8` (baseline x86-64) | 0.61 ms | **1.97×** |
+| vertical `f64x8` (AVX2) | 0.47 ms | **2.33×** |
+
+Bit-exact: **0 / 576,000** mismatches. ~2× on a real per-layer activation op
+(runs ×4 encoder + ×N decoder layers), bit-exact. New `layer_norm_1500x384`
+bench makes it a standing in-repo instrument. **Verdict: KEEP** (modest e2e share
+— still encoder/decoder-GEMM-bound — but a real, measured, bit-exact win and the
+last nn kernel amenable to bit-exact vectorization).
+
 ---
 
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)

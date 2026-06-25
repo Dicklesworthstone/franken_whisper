@@ -46,6 +46,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::simd::{Simd, StdFloat};
+
 use ft_core::{DType, Device, Float16, TensorMeta};
 use half::slice::HalfFloatSliceExt;
 
@@ -481,49 +483,96 @@ pub fn layer_norm(x: &mut Mat, w: &[f32], b: &[f32], eps: f32) {
         return;
     }
     let eps = f64::from(eps);
-    // Per-row mean/var/affine, with the exact same f64 accumulation order.
-    // Rows are independent, so we fan out over contiguous row bands; each
-    // band owns a disjoint slice of `x.data`. PAR_THRESHOLD is in elements
+    // Rows are independent, so we fan out over contiguous row bands; each band
+    // owns a disjoint slice of `x.data`. PAR_THRESHOLD is in elements
     // (rows*cols) so tiny decoder shapes ([1..7, 384]) stay serial and never
-    // pay spawn overhead.
-    let norm_row = |row: &mut [f32]| {
+    // pay spawn overhead. Within each band [`norm_rows`] vectorizes 8 rows at a
+    // time (one row per f64 lane).
+    const PAR_THRESHOLD: usize = 1 << 16;
+    let rows = x.rows;
+    if rows * cols < PAR_THRESHOLD || worker_count() < 2 {
+        norm_rows(&mut x.data, cols, w, b, eps);
+        return;
+    }
+    let band_rows = rows.div_ceil(worker_count()).max(1);
+    std::thread::scope(|s| {
+        for band in x.data.chunks_mut(band_rows * cols) {
+            s.spawn(move || {
+                norm_rows(band, cols, w, b, eps);
+            });
+        }
+    });
+}
+
+/// Layer-norm a contiguous block of `block.len() / cols` rows in place.
+///
+/// Processes 8 rows at a time with **vertical SIMD** — one row per `f64x8` lane,
+/// so each lane reduces its own row in the same ascending order as the scalar
+/// loop. IEEE-754 f64 lane ops, plus correctly-rounded `sqrt`/division, are
+/// bit-identical to scalar f64, so the result is **byte-for-byte** the same as
+/// the per-row scalar path (proven by `layer_norm_simd_matches_scalar`). The
+/// `< 8`-row tail runs scalar. Mean/var in f64 mirrors whisper.cpp.
+fn norm_rows(block: &mut [f32], cols: usize, w: &[f32], b: &[f32], eps: f64) {
+    const L: usize = 8;
+    type V = Simd<f64, L>;
+    let n = cols as f64;
+    let nrows = block.len() / cols;
+    let nfull = nrows - nrows % L;
+
+    let mut soa = vec![V::splat(0.0); cols]; // reused per 8-row group
+    let mut g = 0;
+    while g < nfull {
+        // Gather 8 rows into structure-of-arrays: soa[j] = element j of 8 rows.
+        for (j, s) in soa.iter_mut().enumerate() {
+            let mut a = [0.0f64; L];
+            for (lane, al) in a.iter_mut().enumerate() {
+                *al = f64::from(block[(g + lane) * cols + j]);
+            }
+            *s = V::from_array(a);
+        }
+        let mut sum = V::splat(0.0);
+        for s in &soa {
+            sum += *s;
+        }
+        let mean = sum / V::splat(n);
+        let mut var = V::splat(0.0);
+        for s in &soa {
+            let d = *s - mean;
+            var += d * d;
+        }
+        var /= V::splat(n);
+        let inv = V::splat(1.0) / (var + V::splat(eps)).sqrt();
+        for (j, s) in soa.iter().enumerate() {
+            let normed =
+                (*s - mean) * inv * V::splat(f64::from(w[j])) + V::splat(f64::from(b[j]));
+            let arr = normed.to_array();
+            for (lane, &val) in arr.iter().enumerate() {
+                block[(g + lane) * cols + j] = val as f32;
+            }
+        }
+        g += L;
+    }
+
+    // Scalar tail (< 8 remaining rows) — identical per-row f64 math.
+    for r in nfull..nrows {
+        let row = &mut block[r * cols..(r + 1) * cols];
         let mut sum = 0.0f64;
         for &v in row.iter() {
             sum += f64::from(v);
         }
-        let mean = sum / cols as f64;
+        let mean = sum / n;
         let mut var = 0.0f64;
         for &v in row.iter() {
             let d = f64::from(v) - mean;
             var += d * d;
         }
-        var /= cols as f64;
+        var /= n;
         let inv_std = 1.0 / (var + eps).sqrt();
         for ((v, &wi), &bi) in row.iter_mut().zip(w.iter()).zip(b.iter()) {
             let normed = (f64::from(*v) - mean) * inv_std;
             *v = (normed * f64::from(wi) + f64::from(bi)) as f32;
         }
-    };
-
-    const PAR_THRESHOLD: usize = 1 << 16;
-    let rows = x.rows;
-    if rows * cols < PAR_THRESHOLD || worker_count() < 2 {
-        for row in x.data.chunks_mut(cols) {
-            norm_row(row);
-        }
-        return;
     }
-    let band_rows = rows.div_ceil(worker_count()).max(1);
-    std::thread::scope(|s| {
-        let norm_row = &norm_row;
-        for band in x.data.chunks_mut(band_rows * cols) {
-            s.spawn(move || {
-                for row in band.chunks_mut(cols) {
-                    norm_row(row);
-                }
-            });
-        }
-    });
 }
 
 /// whisper.cpp coefficient `sqrt(2/pi)` (`SQRT_2_OVER_PI` in ggml `vec.h`).
@@ -1474,6 +1523,49 @@ mod tests {
         let x = Mat::zeros(2, 3);
         let w_t = Mat::zeros(3, 4);
         assert!(matmul_bias(&x, &w_t, Some(&[1.0, 2.0])).is_err());
+    }
+
+    #[test]
+    fn layer_norm_simd_matches_scalar() {
+        // norm_rows vectorizes 8 rows at a time; verify byte-identical to an
+        // independent scalar per-row f64 reference across SIMD groups + the
+        // < 8-row tail, for several row counts.
+        let cols = 384usize;
+        let eps_f32 = 1e-5f32;
+        for rows in [1usize, 7, 8, 9, 20, 33] {
+            let mut lcg = Lcg::new(0x000A_17E5 ^ rows as u64);
+            let w: Vec<f32> = (0..cols).map(|_| lcg.next_f32() * 0.5 + 1.0).collect();
+            let b: Vec<f32> = (0..cols).map(|_| lcg.next_f32() * 0.1).collect();
+            let data: Vec<f32> = (0..rows * cols).map(|_| lcg.next_f32()).collect();
+
+            let mut m = Mat::from_vec(rows, cols, data.clone());
+            layer_norm(&mut m, &w, &b, eps_f32);
+
+            // Independent scalar per-row f64 reference.
+            let mut want = data;
+            let eps = f64::from(eps_f32);
+            for row in want.chunks_mut(cols) {
+                let mut sum = 0.0f64;
+                for &v in row.iter() {
+                    sum += f64::from(v);
+                }
+                let mean = sum / cols as f64;
+                let mut var = 0.0f64;
+                for &v in row.iter() {
+                    let d = f64::from(v) - mean;
+                    var += d * d;
+                }
+                var /= cols as f64;
+                let inv = 1.0 / (var + eps).sqrt();
+                for ((v, &wi), &bi) in row.iter_mut().zip(w.iter()).zip(b.iter()) {
+                    let normed = (f64::from(*v) - mean) * inv;
+                    *v = (normed * f64::from(wi) + f64::from(bi)) as f32;
+                }
+            }
+            for (i, (got, exp)) in m.data.iter().zip(want.iter()).enumerate() {
+                assert_eq!(got.to_bits(), exp.to_bits(), "rows={rows} idx={i}");
+            }
+        }
     }
 
     #[test]

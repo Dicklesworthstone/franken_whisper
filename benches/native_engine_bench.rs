@@ -518,6 +518,37 @@ fn bench_f16_gemv_dequant(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// 7. layer_norm — vertical-SIMD per-row normalization (hermetic).
+//     Direct instrument for the L5 lever: one encoder-window-shaped
+//     `[1500, 384]` layer-norm. No model needed.
+// ---------------------------------------------------------------------------
+
+fn bench_layer_norm(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn;
+
+    let (rows, cols) = (1500usize, 384usize); // a full tiny.en encoder window
+    let mut lcg = Lcg::new(0x1a4e_7c0d);
+    let w: Vec<f32> = (0..cols).map(|_| lcg.next_f32() * 0.5 + 1.0).collect();
+    let b: Vec<f32> = (0..cols).map(|_| lcg.next_f32() * 0.1).collect();
+    let base: Vec<f32> = (0..rows * cols).map(|_| lcg.next_f32()).collect();
+
+    let mut group = c.benchmark_group("native_engine/layer_norm");
+    group.throughput(criterion::Throughput::Elements((rows * cols) as u64));
+    group.bench_function("layer_norm_1500x384", |bch| {
+        bch.iter_batched_ref(
+            || Mat::from_vec(rows, cols, base.clone()),
+            |m| {
+                nn::layer_norm(m, &w, &b, 1e-5);
+                black_box(m.data[0])
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
 
@@ -531,6 +562,7 @@ criterion_group!(
     bench_decoder_token_step_large,
     bench_logits_gemv_large,
     bench_f16_gemv_dequant,
+    bench_layer_norm,
     bench_e2e_tiny_jfk,
 );
 criterion_main!(benches);
