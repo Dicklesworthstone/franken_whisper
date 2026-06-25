@@ -188,6 +188,17 @@ Bit-exact: **0 / 2,400,000** mismatches. Since the FFT dominates the post-L3 mel
 frontend, this is **~2.5–3× on the whole mel frontend** on top of L1+L3.
 **Verdict: KEEP.**
 
+**In-tree cumulative result (criterion `native_engine/mel`, post L1+L3+L4):**
+
+| bench | time | notes |
+|---|---|---|
+| `mel_30s` (dense synthetic bank) | **12.8 ms** | L1+L4 only (dense bank can't use L3); was 269 ms pre-L1 |
+| `mel_30s_realistic` (sparse triangular bank = **production**) | **3.95 ms** | full L1+L3+L4 stack |
+
+So a real model's 30 s log-mel frontend now runs in **~4 ms** (from a 269 ms
+dense/transcendental-heavy starting point — a **~68× cumulative** reduction on the
+hermetic frontend, all bit-exact). e2e share remains bounded by encoder/decoder.
+
 ---
 
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)
