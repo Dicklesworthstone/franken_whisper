@@ -622,3 +622,214 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
   --bin franken_whisper
 result: pass; rch worker ovh-a
 ```
+
+## 2026-06-25 - IcyWren canonical WAV reuse probe
+
+### Lever
+
+Probe the already-normalized audio fast path: if the input is 16 kHz mono PCM16
+WAV, reuse the input path instead of decoding/resampling/re-emitting a temporary
+`normalized_16k_mono.wav`.
+
+This follows the one-lever rule: only the normalization bypass is evaluated, with
+the native backend, model, decoding parameters, and release profile held fixed.
+
+Fallback trigger: reject unless same-lane five-run median improves by at least
+3% and conformance remains green.
+
+### Fresh measurements
+
+```text
+git SHA: c09920e
+agent: IcyWren
+target dir: /data/projects/.rch-targets/franken_whisper-cod-a
+model dir: /data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models
+fixture: /data/projects/franken_whisper/tests/fixtures/native/jfk.wav
+fixture format: RIFF WAV, PCM16, mono, 16000 Hz
+
+worktree scan:
+  no in-repo .scratch or .worktrees directory found
+  detached franken_whisper-cod-a-* worktrees were older/equivalent to main; no
+  unlanded measured win found there
+
+build:
+  AGENT_NAME=IcyWren \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+    rch exec -- cargo build -p franken_whisper --profile release \
+    --bin franken_whisper
+  result: pass; rch local fallback; per-crate release build 2m20s
+```
+
+Current-main franken baseline from the same session, before the fast-path binary
+rebuild:
+
+```text
+artifact: /tmp/franken_whisper_cod_a_current_openai_cli_hyperfine.json
+franken mean: 0.7803093495200001 s
+franken median: 0.7786617565200001 s
+OpenAI CLI mean: 2.71806207152 s
+OpenAI CLI median: 2.6709804735200002 s
+```
+
+Candidate run:
+
+```text
+artifact: /tmp/franken_whisper_cod_a_reuse_wav_openai_cli_hyperfine.json
+hyperfine: --warmup 1 --runs 5
+
+franken mean: 0.7749115707800002 s +/- 0.01518011373626203 s
+franken median: 0.7709063643800002 s
+franken min/max: 0.75680692938 s / 0.7983650903800001 s
+franken raw runs:
+  [0.7983650903800001, 0.7709063643800002, 0.7779107963800002,
+   0.75680692938, 0.7705686733800001]
+franken user/system: 3.5846550600000002 s / 1.2107641199999999 s
+
+OpenAI CLI mean: 2.9077083927800005 s +/- 0.026109604708964593 s
+OpenAI CLI median: 2.90920979738 s
+OpenAI CLI min/max: 2.86921734038 s / 2.94291941938 s
+OpenAI CLI user/system: 11.72460946 s / 0.67641032 s
+
+same-run CLI-startup ratio:
+  mean: 2.9077083927800005 / 0.7749115707800002 = 3.752310x
+  median: 2.90920979738 / 0.7709063643800002 = 3.773752x
+
+candidate speedup vs current-main franken baseline:
+  mean: 0.7803093495200001 / 0.7749115707800002 = 1.006966x
+  median: 0.7786617565200001 / 0.7709063643800002 = 1.010060x
+```
+
+Loaded-model OpenAI API comparator remains a loss:
+
+```text
+OpenAI API comparator artifact: inline Python run in this session
+OpenAI API runs_s:
+  [0.4458767760079354, 0.3950597520451993, 0.4111597209703177,
+   0.41976338904350996, 0.34919446893036366]
+OpenAI API mean: 0.4042108213994652 s
+OpenAI API median: 0.4111597209703177 s
+
+candidate ratio vs loaded OpenAI API:
+  mean: 0.4042108213994652 / 0.7749115707800002 = 0.521622x
+  median: 0.4111597209703177 / 0.7709063643800002 = 0.533346x
+```
+
+Conformance / metadata:
+
+```text
+artifact: /tmp/franken_whisper_cod_a_reuse_wav_candidate.json
+normalized_wav_path:
+  /data/projects/franken_whisper/tests/fixtures/native/jfk.wav
+candidate transcript:
+  And so my fellow Americans ask not what your country can do for you ask what you can do for your country.
+OpenAI API transcript:
+  And so my fellow Americans ask not what your country can do for you ask what you can do for your country
+normalized lowercase alnum tokens: identical, 22/22 tokens
+replay input_content_hash:
+  59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e
+replay output_payload_hash:
+  79b7c1d5acb4a89217485af436be5bdb1b222aea11b85b778b51dd8a76ddb229
+normalize stage service_ms: 20
+backend stage service_ms: 711
+```
+
+### Verdict
+
+Rejected as a product-speed lever. The fast path fires and preserves transcript
+semantics, but the measured median e2e gain is only 1.006966x to 1.010060x
+against current main, below the 3% keep threshold and inside host noise. The
+same-run OpenAI CLI-startup path remains a fresh 3.77x win, while the stricter
+loaded-model API comparator remains a 0.533x loss.
+
+Graveyard / artifact mapping used for the decision:
+
+- `alien_cs_graveyard.md` section 0.10: require statistical honesty, raw
+  distributions, and a practical effect threshold before keeping a lever.
+- `alien_cs_graveyard.md` section 15.7: zygote/COW model preloading remains a
+  future architecture-sized lever for the loaded-model API gap, not a safe
+  same-turn patch.
+- `alien-artifact-coding`: explicit loss matrix, confidence threshold, and
+  conservative fallback trigger.
+
+Validation after this entry:
+
+```text
+git diff --check -- docs/NEGATIVE_EVIDENCE.md src/audio.rs .beads/issues.jsonl
+result: pass
+
+rustfmt --edition 2024 --check src/audio.rs
+result: pass
+
+cargo fmt --check
+result: blocked by pre-existing unrelated formatting drift in
+  src/native_engine/mel.rs
+  src/native_engine/nn.rs
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo check -p franken_whisper --all-targets
+result: pass; rch remote hz2
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo clippy -p franken_whisper --all-targets -- -D warnings
+result: pass; rch remote hz2
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests
+result: pass; local fallback; 26 passed / 0 failed
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo test -p franken_whisper audio::tests::normalize
+result: pass; rch remote vmi1149989; 14 passed / 0 failed
+
+UBS docs/NEGATIVE_EVIDENCE.md src/audio.rs .beads/issues.jsonl
+result: non-zero due existing broad scanner findings in src/audio.rs; no new
+  docs finding. The Rust compile/clippy/test gates above are green.
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+  --bench native_engine_bench -- --sample-size 10 --warm-up-time 0.1 \
+  --measurement-time 0.1 native_engine/e2e/e2e_tiny_jfk
+result: cancelled as non-decisive infrastructure-stale RCH probe after
+  build 29902804231389480 sat active on vmi1153651 for >22m with hook
+  heartbeats fresh but progress stale for ~10m. Product-level hyperfine/API
+  measurements above are the deciding evidence for this lever.
+```
+
+Cod-b restart confirmation:
+
+```text
+target dir: /data/projects/.rch-targets/franken_whisper-cod-b
+baseline artifact: /tmp/franken_whisper_bold_baseline_openai_cli.json
+candidate artifact: /tmp/franken_whisper_bold_candidate_openai_cli.json
+
+baseline franken mean/median: 0.76559047432 s / 0.76678070072 s
+baseline OpenAI CLI mean/median: 2.91310054872 s / 2.90075806972 s
+baseline OpenAI CLI-startup ratio:
+  mean: 3.805038x
+  median: 3.783035x
+
+candidate franken mean/median: 0.7569894835400002 s / 0.7626821207400001 s
+candidate OpenAI CLI mean/median: 2.6945086197399997 s / 2.69349702974 s
+candidate OpenAI CLI-startup ratio:
+  mean: 3.559506x
+  median: 3.531612x
+
+candidate speedup vs cod-b current-main franken baseline:
+  mean: 1.011362x
+  median: 1.005374x
+
+build notes:
+  stale remote build 29902804231389477 on vmi1167313 was cancelled.
+  stale remote retry 29902804231389526 on vmi1264463 was cancelled.
+  direct per-crate local build with CARGO_TARGET_DIR cod-b passed in 2m10s.
+
+verdict:
+  source fast path reverted. The cod-b restart confirms the same conclusion:
+  this is a ~0-gain/no-ship product-speed lever, below the 3% keep threshold.
+```
