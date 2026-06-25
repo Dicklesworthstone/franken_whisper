@@ -3,6 +3,137 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - AGENT_NAME=IcyWren cod-b attention Rayon dispatch recheck rejected
+
+### Land-or-dig scan
+
+Repo-local `.scratch` and `.worktrees` directories were absent. Sibling
+worktrees were checked with `git worktree list --porcelain`; all measured-code
+worktree heads were ancestors of current `main` except
+`franken_whisper-cod-a-main-measure`, whose unique commit is stale docs-only
+OpenAI-ratio evidence already superseded by current ledger entries. The
+`franken_whisper-cod-b-land` release-profile win is already an ancestor of
+current `main`.
+
+### RCH bench command status
+
+Requested command shape:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --release -p franken_whisper \
+    --bench native_engine_bench -- encoder_window_tiny \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result: blocked before benchmark execution. Cargo rejects `bench --release`
+with `unexpected argument '--release'`. The supported release-profile form
+below was then used, still via `rch exec`, still `-p franken_whisper`, still with
+the warm cod-b target dir:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- encoder_window_tiny \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+The detached bench worktree needed a local copy of the gitignored
+`tests/fixtures/native/jfk.wav` fixture before model-backed Criterion benches
+would run.
+
+### Candidate
+
+Alien-graveyard / extreme-optimization route: persistent worker-pool scheduling
+for repeated parallel numeric kernels, with the high-level FrankenSuite rule to
+reject mean-only or component-only claims. One-lever probe: replace
+`nn::attention_raw`'s per-call `std::thread::scope` head-band dispatch with
+Rayon `into_par_iter` over the same band starts. The intended win was removing
+repeated thread-spawn overhead while preserving one private output buffer per
+band and the existing disjoint merge.
+
+Loss matrix:
+
+```text
+keep:   component win plus same-session loaded product median >= 1.03x faster,
+        conformance unchanged, OpenAI loaded ratio not worse.
+reject: product median < 1.03x faster, OpenAI ratio worsens, or any transcript
+        drift.
+fallback: retain the scoped-thread attention_raw implementation.
+```
+
+### Measurements
+
+Criterion component bench, current `main` baseline:
+
+```text
+native_engine/encoder/encoder_window_tiny
+time: [233.69 ms 250.04 ms 272.93 ms]
+```
+
+Criterion component bench, Rayon candidate:
+
+```text
+native_engine/encoder/encoder_window_tiny
+time:   [209.39 ms 210.96 ms 212.41 ms]
+change: [-21.061% -17.651% -13.812%] (p = 0.00 < 0.05)
+component midpoint speedup: 250.04 / 210.96 = 1.185248x
+```
+
+Same-session loaded product A/B, `native_ab tiny.en 9 8`, run 0 discarded:
+
+| Build | Runs after warmup (s) | Median | Mean | Ratio vs current franken | OpenAI loaded median | Ratio vs OpenAI loaded | Verdict |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| current `fb7ed99` | 0.47129, 0.46955, 0.46733, 0.46477, 0.45449, 0.45827, 0.47474, 0.48605 | 0.468440 | 0.468311 | 1.000x | 0.423771608 | 0.904644x | Baseline loss |
+| Rayon candidate | 0.54808, 0.57949, 0.51244, 0.50387, 0.79453, 0.54327, 0.51769, 0.51774 | 0.530505 | 0.564639 | 0.883008x | 0.423771608 | 0.798808x | REJECT |
+
+Fresh OpenAI loaded API comparator:
+
+```text
+uvx --from openai-whisper python
+torch.set_num_threads(8)
+whisper.load_model("tiny.en", device="cpu")
+one warmup, 9 timed transcribes over already-loaded audio
+
+runs_s:
+  [0.4351202598772943, 0.39924179087392986, 0.4191680650692433,
+   0.4272299101576209, 0.4279980850405991, 0.4369896319694817,
+   0.3955063030589372, 0.4070793210994452, 0.4237716079223901]
+mean:   0.4191227750076602 s
+median: 0.4237716079223901 s
+artifact: /tmp/franken_whisper_cod_b_attention_raw_rayon_openai_loaded_8t.json
+```
+
+Behavior proof:
+
+```text
+diff -u \
+  /tmp/franken_whisper_cod_b_fb7ed99_native_ab_8t_same_session.json \
+  /tmp/franken_whisper_cod_b_attention_raw_rayon_native_ab_8t.json
+result: no diff
+```
+
+Artifacts:
+
+```text
+/tmp/franken_whisper_cod_b_fb7ed99_native_ab_8t_same_session.times
+/tmp/franken_whisper_cod_b_fb7ed99_native_ab_8t_same_session.json
+/tmp/franken_whisper_cod_b_attention_raw_rayon_native_ab_8t.times
+/tmp/franken_whisper_cod_b_attention_raw_rayon_native_ab_8t.json
+/tmp/franken_whisper_cod_b_attention_raw_rayon_openai_loaded_8t.json
+```
+
+### Decision
+
+Rejected and source reverted before commit. The candidate has a real isolated
+encoder-window win, but at the loaded product surface it regresses franken from
+0.468440 s to 0.530505 s median and worsens the loaded OpenAI Whisper ratio
+from 0.904644x to 0.798808x. This is a component-only win that fails the
+BOLD-VERIFY product gate.
+
 ## 2026-06-25 - AGENT_NAME=IcyWren attention Rayon head-band dispatch rejected
 
 ### Land-or-dig scan
