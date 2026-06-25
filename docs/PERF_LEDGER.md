@@ -384,6 +384,12 @@ gap 1.19×→**1.17×** (no-ts). **Verdict: KEEP.** rayon's persistent pool is t
 correct structural answer to the per-call-spawn problem L9 worked around; supersedes
 L9's serial-mlp compromise (threshold restored, dispatch via the pool).
 
+*Band-size follow-up (MEASURED, REJECTED):* finer chunks (`workers*4`, min 64
+rows) to let rayon work-steal on a contended host — hypothesis that a 1-chunk/core
+split stalls when a core is busy with another process. no-ts e2e **+3.7%
+(REGRESSED)**: the extra rayon task + per-chunk scratch-alloc overhead outweighs
+the work-steal benefit at these sizes. `band = out/workers` is optimal; kept.
+
 ---
 
 ### L12 — rayon persistent-pool cross-attn head dispatch  — `src/native_engine/decoder.rs`  **[e2e win]**
