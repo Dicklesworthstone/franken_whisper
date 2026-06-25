@@ -40,6 +40,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 hound = "3.5.1"
 symphonia = { version = "0.5.5", features = ["mp3", "aac", "isomp4", "ogg", "flac", "vorbis", "wav", "pcm"] }
+# Persistent-pool data parallelism for the decoder GEMV (mlp/logits): rayon's
+# global pool avoids the per-call `std::thread::scope` spawn that forced L9 to
+# serialize the per-token mid GEMVs (bd-6qih, L11). Already in the tree via
+# ft-kernel-cpu; pinned to the same minor.
+rayon = "1.10"
 
 asupersync = { version = "0.3.4", default-features = false }
 franken-kernel = "0.3.4"

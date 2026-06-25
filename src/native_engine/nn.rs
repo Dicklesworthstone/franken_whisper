@@ -50,6 +50,7 @@ use std::simd::{Simd, StdFloat};
 
 use ft_core::{DType, Device, Float16, TensorMeta};
 use half::slice::HalfFloatSliceExt;
+use rayon::prelude::*;
 
 use super::Mat;
 use crate::error::{FwError, FwResult};
@@ -350,21 +351,19 @@ pub fn gemv_f16(
         }
     };
 
-    // MACs of real work = out * inp. Below the threshold the spawn cost
-    // dominates, so stay serial. The original M4 Pro (10P+4E, idle) sweep put the
-    // break-even at ~590 k and chose `1 << 19` (524 288). But the 2026-06-25
-    // whisper.cpp head-to-head (BlackThrush, bd-6qih) exposed that under realistic
-    // host load the tiny.en MLP GEMVs (`[384,1536]`/`[1536,384]` = 590 k, *just*
-    // over 1<<19) were SPAWN-BOUND: `decoder_attrib` showed `mlp_fc_gelu` at
-    // 5.14 ms/tok (0.23 GFLOP/s — absurd for 1.18 M MACs). 590 k split 8 ways is
-    // ~20 µs compute/thread vs tens of µs of `thread::scope` spawn/join, so it
-    // never pays off off an idle box. Raising to `1 << 21` keeps these per-token
-    // mid Linears serial → `mlp_fc_gelu` 5.14→2.81 ms/tok (−45%), e2e_tiny_jfk
-    // 614→571 ms (−9.5%, p<0.05). The logits GEMV ([51864,384]=20 M) and the
-    // large-model Linears ([1280,5120]=6.5 M) stay > 2 M → still parallel. The
-    // split is a pure scheduling knob (disjoint row bands, each row's [`dot8`]
-    // order is band-independent), so it is bit-identical either way.
-    const PAR_THRESHOLD: usize = 1 << 21;
+    // MACs of real work = out * inp; below the threshold, parallel dispatch isn't
+    // worth it. History (bd-6qih): the original M4 Pro sweep chose `1<<19`; L9
+    // raised it to `1<<21` because the per-token mid GEMVs (`[384,1536]`=590 k)
+    // were SPAWN-BOUND under load on the old `std::thread::scope` path (per-call
+    // spawn/join dominated ~20 µs of compute), so serial beat spawning (−9.5% e2e).
+    // L11 fixes the *real* problem: dispatch via rayon's PERSISTENT global pool
+    // (no per-call spawn — what whisper.cpp's pool does), so the mid GEMVs can
+    // parallelize again. Standalone (contended host): rayon beats serial 1.40×
+    // (`[1536,384]`) / 1.35× (`[384,1536]`), bit-identical (disjoint output-row
+    // bands, each row's [`dot8`] order unchanged). Threshold back to `1<<19`:
+    // mlp (590 k) + logits (20 M) parallelize, the tiny `[384,384]`=147 k stay
+    // serial (rayon task overhead not worth it there).
+    const PAR_THRESHOLD: usize = 1 << 19;
     let workers = gemv_worker_count(out);
     if out * inp < PAR_THRESHOLD || workers < 2 {
         let mut scratch = vec![0.0f32; inp];
@@ -374,18 +373,16 @@ pub fn gemv_f16(
         return;
     }
     let band = out.div_ceil(workers).max(1);
-    std::thread::scope(|s| {
-        let row_dot = &row_dot;
-        for (w, band_slice) in out_slice.chunks_mut(band).enumerate() {
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(w, band_slice)| {
             let o_base = w * band;
-            s.spawn(move || {
-                let mut scratch = vec![0.0f32; inp];
-                for (i, slot) in band_slice.iter_mut().enumerate() {
-                    *slot = row_dot(o_base + i, &mut scratch);
-                }
-            });
-        }
-    });
+            let mut scratch = vec![0.0f32; inp];
+            for (i, slot) in band_slice.iter_mut().enumerate() {
+                *slot = row_dot(o_base + i, &mut scratch);
+            }
+        });
 }
 
 /// Batched fused dequant + GEMV: `out[t, o] = bias[o] + dot(W[o, :], x[t, :])`

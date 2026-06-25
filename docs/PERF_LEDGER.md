@@ -363,6 +363,29 @@ free, correct win and the right structural fix.
 
 ---
 
+### L11 — rayon persistent-pool `gemv_f16` (re-parallelize the mlp w/o spawn)  — `src/native_engine/nn.rs`  **[e2e win]**
+
+**The insight.** L9 serialized the per-token mid GEMVs because `std::thread::scope`
+*per-call spawn* dominated their compute under load. But serial leaves 7 of 8 cores
+idle on the mlp — whisper.cpp uses a PERSISTENT thread pool (no per-call spawn) and
+keeps the parallelism. franken used `thread::scope` everywhere (no persistent pool).
+
+**Fix.** Add `rayon` (already in-tree via ft-kernel-cpu) and dispatch `gemv_f16`'s
+parallel path via `par_chunks_mut` over output-row bands (rayon's global pool — no
+per-call spawn), and drop the threshold back `1<<21`→`1<<19` so the mlp (590 k) +
+logits (20 M) re-parallelize while the tiny `[384,384]`=147 k stay serial.
+**Bit-identical** (disjoint output-row bands, each row's `dot8` order unchanged;
+standalone maxdiff 0).
+
+**Measured.** Standalone (contended host) rayon vs serial gemv: `[1536,384]` 1.40×,
+`[384,1536]` 1.35×. In-tree: **`e2e_tiny_jfk` 561→542 ms (ts) / 534→523 ms
+(no-ts) = −3.4% / −2.1%**; **conformance GREEN** (native_engine_e2e 6/6). whisper.cpp
+gap 1.19×→**1.17×** (no-ts). **Verdict: KEEP.** rayon's persistent pool is the
+correct structural answer to the per-call-spawn problem L9 worked around; supersedes
+L9's serial-mlp compromise (threshold restored, dispatch via the pool).
+
+---
+
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
 
 `docs/conformance-contract.md`: **"Compatibility is *not* byte-for-byte identical
