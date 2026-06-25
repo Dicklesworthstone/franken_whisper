@@ -233,6 +233,26 @@ bench makes it a standing in-repo instrument. **Verdict: KEEP** (modest e2e shar
 — still encoder/decoder-GEMM-bound — but a real, measured, bit-exact win and the
 last nn kernel amenable to bit-exact vectorization).
 
+### L6 — re-tune `layer_norm` PAR_THRESHOLD post-SIMD  — REJECTED (~0-gain)
+
+**Hypothesis.** L5's SIMD made `layer_norm`'s compute ~2× cheaper, so the
+`thread::scope` spawn cost might now dominate at the encoder shape `[1500,384]`,
+arguing to raise `PAR_THRESHOLD` and run it serial-SIMD (a pure bit-exact
+scheduling knob).
+
+**Measured (standalone, same host, 8 workers):**
+
+| shape | serial-SIMD | parallel-SIMD | winner |
+|---|---|---|---|
+| `[1500,384]` (encoder) | 0.70 ms | 0.79 ms | serial **1.0–1.13×** (within noise) |
+| `[3000,384]` | 1.42 ms | 1.21 ms | parallel **1.17×** |
+
+**Verdict: REJECTED.** The crossover already sits right around the production
+encoder shape, so the existing `PAR_THRESHOLD = 1<<16` is well-tuned; raising it
+would buy ≤1.1× at `[1500,384]` (noise) while *hurting* larger shapes. Per
+REVERT-~0-gain, not shipped. (The slow in-tree `layer_norm_1500x384` = 3.3 ms on
+ovh-b was worker variance, not spawn overhead.)
+
 ---
 
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)
