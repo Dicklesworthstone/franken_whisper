@@ -255,6 +255,29 @@ ovh-b was worker variance, not spawn overhead.)
 
 ---
 
+## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
+
+`docs/conformance-contract.md`: **"Compatibility is *not* byte-for-byte identical
+output"** — the contract is **transcription-level** (exact/normalized text +
+≤50 ms timestamp tolerance + speaker/confidence bands), enforced by
+`tests/conformance_harness.rs`. All L1/L3/L4/L5 levers were **bit-exact** (zero
+risk, correct), but that is *stricter* than the contract requires. Implications
+for future levers:
+
+- **rFFT / split-radix mel is contract-permitted** (no approval needed) — but mel
+  is already ~4 ms post-L1/L3/L4, i.e. **<2% of e2e** (encoder/decoder-bound), so
+  a further ~2× there is REVERT-~0-gain. Not pursued.
+- **Approximate-transcendental `gelu`/`softmax` (SIMD `exp`/`tanh`)** and
+  **INT8-quantized GEMV** become *legal* (transcription stays within tolerance —
+  whisper.cpp's own Q8_0 proves int8 preserves WER). These are the real remaining
+  *radical* levers, but both require **local e2e transcription verification**
+  (model + `jfk.wav` are gitignored → unmeasurable on rch; the bd-7xbq unblock),
+  and the e2e-dominant GEMM is FrankenTorch (external). INT8-GEMV is a project,
+  not a one-shot lever — worth its own scoped decision.
+
+**Net:** within rch-measurable + already-set-up tooling, the lever space is
+exhausted; the next real win is INT8-GEMV gated on a local-e2e harness.
+
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)
 
 These shape what is measurable and how the ratios above must be read.
