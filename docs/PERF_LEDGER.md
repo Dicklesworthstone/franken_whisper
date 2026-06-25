@@ -506,6 +506,18 @@ for future levers:
   NB: the win is *matrixmultiply's per-call repacking overhead* — another cost the
   `gemm`/faer swap (bd-4hc0) removes structurally, reinforcing that lever.
 
+- **Decode-loop full-vocab logsumexp vectorization — MEASURED, REJECTED (~0).**
+  `compute_logprobs` (decode.rs) runs a log-softmax over ALL 51 864 logits per
+  token — ~1.45 M scalar `libm` `exp` over the decode — which *looks* like a fat
+  lever. Vectorized the logsumexp loop with an 8-wide minimax `exp_simd`
+  (`nn::logsumexp_over_finite`, ~7.9e-8 rel). Clean back-to-back A/B (no-ts e2e,
+  `--baseline`): **−0.32%, p=0.46 — "no change"** (a spurious −1.8% on one ts run
+  was contention noise). Reason: modern `libm` `expf` is ~5–7 ns, so the loop is
+  only ~7–10 ms total (~1.5%), within bench noise, and `compute_logprobs`'s
+  output `Vec` (needed by the ts timestamp-pairing) isn't the bottleneck either.
+  **REVERTED** (conformance was 6/6 green, so it was *correct*, just ~0). Don't
+  re-attempt: the per-token full-vocab `exp` is not a real e2e cost here.
+
 **Net (measured, not assumed):** `#![forbid(unsafe_code)]` (no VNNI) + the
 e2e-dominant GEMM living in FrankenTorch (external crate `ft-kernel-cpu`, which
 hardcodes `matrixmultiply 0.3` with no feature knob) cap the kernel-level wins in
