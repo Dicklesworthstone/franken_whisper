@@ -386,6 +386,44 @@ L9's serial-mlp compromise (threshold restored, dispatch via the pool).
 
 ---
 
+### L12 — rayon persistent-pool cross-attn head dispatch  — `src/native_engine/decoder.rs`  **[e2e win]**
+
+**Insight.** Extending L11 to the cross-attention wrapper. The no-timestamps decode
+path (record off — the apples-to-apples vs whisper.cpp's `dtw=0`) parallelized
+cross-attn over heads with `std::thread::scope` **per token** (6 head-threads ×
+~28 tokens). Like the mlp (L9/L11), that per-call spawn was the bottleneck, not the
+compute (serializing it had REGRESSED +2.7%, so parallelism is needed — just
+without the spawn).
+
+**Fix.** Dispatch the head bands via rayon's persistent pool
+(`band_starts.into_par_iter()`), each band scattering into a private buffer →
+disjoint-merge. **Bit-identical** (every position written by exactly one head;
+compute_head/scatter capture only shared refs).
+
+**Measured (local v3, no-ts e2e):** **523→477–491 ms = −6 to −8.8%** (contention-
+dependent); **conformance GREEN** (native_engine_e2e 6/6). The ts path is
+unchanged (it uses the serial `record` branch, not this parallel path). whisper.cpp
+gap **1.17×→~1.07–1.10× (NEAR PARITY)**. **Verdict: KEEP.**
+
+---
+
+## ⇒ Session arc (2026-06-25, BlackThrush): built the comparator, closed 1.37×→~1.08×
+
+Building `whisper-cli` (bd-zk43) exposed the real gap as the **in-scope decoder**
+(not the encoder, which already wins 204 vs 242 ms). Four bit-identical/
+transcription-green wins followed — all whisper.cpp/GGML techniques franken lacked:
+
+| lever | what | no-ts e2e |
+|---|---|---|
+| L9 | mlp GEMV spawn threshold | ~590→543 ms |
+| L10 | m=1 gemv (skip sgemm packing) | 543→534 ms |
+| L11 | rayon persistent-pool gemv_f16 | 534→523 ms |
+| L12 | rayon persistent-pool cross-attn | 523→**477–491 ms** |
+
+**franken_whisper tiny.en jfk: 1.37× slower → ~1.07–1.10× (near parity) vs
+whisper.cpp**, all conformance-green. Remaining to *win*: bd-4hc0 (encoder
+`matrixmultiply→gemm`, out-of-scope) would cut the encoder ~2× → outright win.
+
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
 
 `docs/conformance-contract.md`: **"Compatibility is *not* byte-for-byte identical

@@ -57,6 +57,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use rayon::prelude::*;
+
 use super::nn::{self, KvCache, WeightMat};
 use super::{Mat, WhisperHParams};
 use crate::error::{FwError, FwResult};
@@ -934,25 +936,24 @@ fn cross_attention(
 
     let workers = workers.min(n_head);
     let band = n_head.div_ceil(workers).max(1);
-    let results: Vec<FwResult<Vec<f32>>> = std::thread::scope(|s| {
-        let compute_head = &compute_head;
-        let scatter = &scatter;
-        let mut handles = Vec::new();
-        let mut h0 = 0;
-        while h0 < n_head {
+    // Dispatch head bands via rayon's persistent pool (no per-token spawn — the
+    // L11 lever, applied to the cross-attn wrapper). Each band scatters its heads
+    // into a private buffer; we disjoint-merge below (every position written by
+    // exactly one head → bit-identical). compute_head/scatter capture only shared
+    // refs, so they're Sync.
+    let band_starts: Vec<usize> = (0..n_head).step_by(band).collect();
+    let results: Vec<FwResult<Vec<f32>>> = band_starts
+        .into_par_iter()
+        .map(|h0| -> FwResult<Vec<f32>> {
             let h1 = (h0 + band).min(n_head);
-            handles.push(s.spawn(move || -> FwResult<Vec<f32>> {
-                let mut local = vec![0.0f32; tq * n_state];
-                for h in h0..h1 {
-                    let (_, out_h) = compute_head(h)?;
-                    scatter(&mut local, h, &out_h);
-                }
-                Ok(local)
-            }));
-            h0 = h1;
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+            let mut local = vec![0.0f32; tq * n_state];
+            for h in h0..h1 {
+                let (_, out_h) = compute_head(h)?;
+                scatter(&mut local, h, &out_h);
+            }
+            Ok(local)
+        })
+        .collect();
     for r in results {
         let local = r?;
         for (o, l) in out.iter_mut().zip(local.iter()) {
