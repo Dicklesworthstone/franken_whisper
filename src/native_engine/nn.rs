@@ -327,19 +327,20 @@ pub fn gemv_f16(
     };
 
     // MACs of real work = out * inp. Below the threshold the spawn cost
-    // dominates, so stay serial. The crossover is measured (M4 Pro, 10P+4E,
-    // a serial-vs-`thread::scope` sweep): at `out*inp` up to ~393 k the serial
-    // path is 1.5–3.7× faster (the [384,384] tiny per-token Linears were 3.7×
-    // slower in the 8-way scope path — pure spawn/join overhead on ~9 µs of
-    // compute); the two paths break even at ~590 k and the scope path pulls
-    // clearly ahead by ~1.6 M ([1280,1280] large) and at the vocab GEMV
-    // ([51864,384]). `1 << 19` (524 288) sits in that break-even band: it keeps
-    // EVERY tiny [384,384] per-token Linear (self q/k/v, self_out, cross_q,
-    // cross_out) serial — the round-3 self_qkv spawn-bound hotspot — while still
-    // spawning the large-model Linears and the logits GEMV. The split is a pure
-    // scheduling knob (disjoint row bands, each row's [`dot8`] order is
-    // band-independent), so it is bit-identical either way.
-    const PAR_THRESHOLD: usize = 1 << 19;
+    // dominates, so stay serial. The original M4 Pro (10P+4E, idle) sweep put the
+    // break-even at ~590 k and chose `1 << 19` (524 288). But the 2026-06-25
+    // whisper.cpp head-to-head (BlackThrush, bd-6qih) exposed that under realistic
+    // host load the tiny.en MLP GEMVs (`[384,1536]`/`[1536,384]` = 590 k, *just*
+    // over 1<<19) were SPAWN-BOUND: `decoder_attrib` showed `mlp_fc_gelu` at
+    // 5.14 ms/tok (0.23 GFLOP/s — absurd for 1.18 M MACs). 590 k split 8 ways is
+    // ~20 µs compute/thread vs tens of µs of `thread::scope` spawn/join, so it
+    // never pays off off an idle box. Raising to `1 << 21` keeps these per-token
+    // mid Linears serial → `mlp_fc_gelu` 5.14→2.81 ms/tok (−45%), e2e_tiny_jfk
+    // 614→571 ms (−9.5%, p<0.05). The logits GEMV ([51864,384]=20 M) and the
+    // large-model Linears ([1280,5120]=6.5 M) stay > 2 M → still parallel. The
+    // split is a pure scheduling knob (disjoint row bands, each row's [`dot8`]
+    // order is band-independent), so it is bit-identical either way.
+    const PAR_THRESHOLD: usize = 1 << 21;
     let workers = gemv_worker_count(out);
     if out * inp < PAR_THRESHOLD || workers < 2 {
         let mut scratch = vec![0.0f32; inp];
@@ -430,7 +431,7 @@ pub fn gemv_f16_batch(
     // dequantized once and dotted against all `tq` token rows, so the spawn is
     // amortized over `tq * out * inp` MACs. `1 << 19` keeps small prefills
     // serial while still parallelizing the realistic multi-token prompt batches.
-    const PAR_THRESHOLD: usize = 1 << 19;
+    const PAR_THRESHOLD: usize = 1 << 21;
     let workers = gemv_worker_count(out);
     if tq * out * inp < PAR_THRESHOLD || workers < 2 {
         compute_band(0, out, out_slice);

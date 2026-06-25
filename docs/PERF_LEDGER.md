@@ -304,6 +304,30 @@ the GEMM (FrankenTorch, external) or the build baseline (L7) move e2e here.
 
 ---
 
+### L9 — decoder GEMV PAR_THRESHOLD 1<<19→1<<21 (spawn-bound MLP)  — `src/native_engine/nn.rs`  **[e2e win]**
+
+**How it was found.** The 2026-06-25 whisper.cpp head-to-head (bd-zk43) showed
+franken's DECODER is ~2× slower than whisper.cpp (the encoder/mel already win).
+`decoder_attrib` (tiny.en, 400 steps, real load) pinpointed it: `mlp_fc_gelu` =
+**5.14 ms/tok (35%, 0.23 GFLOP/s)** — absurd for 1.18 M MACs → **spawn-bound, not
+compute-bound**. The MLP GEMVs (`[384,1536]`/`[1536,384]` = 590 k MACs) sit *just*
+over the old `1<<19` (524 k) threshold, so each spawned 8 `thread::scope` threads
+per token; 590 k split 8 ways is ~20 µs compute/thread vs tens of µs spawn/join.
+(whisper.cpp avoids this with a persistent thread pool.)
+
+**Fix.** Raise `PAR_THRESHOLD` to `1<<21` (2 M) in both GEMV paths, so the
+per-token mid-size Linears run serial while the logits GEMV (20 M) and large-model
+Linears (6.5 M) stay parallel. Pure scheduling knob → **bit-identical**.
+
+**Measured (local v3 A/B):** `decoder_attrib` `mlp_fc_gelu` 5.14→**2.81 ms/tok
+(−45%)**, total 14.67→12.32 ms/tok (−16%); **`e2e_tiny_jfk` 614→571 ms = −9.5%
+(criterion p<0.05, "improved")**. Narrows the whisper.cpp gap 1.37×→1.27×.
+**Verdict: KEEP.** Note: more decoder spawn-bound subs remain (cross_attn
+2.93 ms/tok, self_qkv 1.64) — a persistent thread pool would beat per-call
+`thread::scope` everywhere (bd-6qih, next).
+
+---
+
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
 
 `docs/conformance-contract.md`: **"Compatibility is *not* byte-for-byte identical
