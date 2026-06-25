@@ -140,6 +140,30 @@ pub fn matmul(a: &Mat, b: &Mat) -> FwResult<Mat> {
         )));
     }
     let (m, k, n) = (a.rows, a.cols, b.cols);
+
+    // m=1 fast path: the per-token decode attention matmuls (cross/self attn at
+    // tq=1: `[1,d]x[d,tk]` scores and `[1,tk]x[tk,d]` out) are GEMV-shaped, but
+    // ft sgemm packs/dispatches its full microkernel for them — MEASURED ~8–10×
+    // slower than a direct GEMV for these shapes (`[1,64]x[64,1500]`: sgemm 46 µs
+    // vs gemv 4.5 µs; `[1,1500]x[1500,64]`: 48 vs 6.3 µs; x86-64-v3). This is the
+    // franken-vs-whisper.cpp decoder gap (bd-6qih): GGML uses a dedicated dot, we
+    // routed everything through sgemm. A row-broadcast SAXPY accumulation over k
+    // (LLVM lowers the inner `out += a[k]*b[k,:]` to AVX2 FMA) avoids all the
+    // packing. NOT bit-identical to sgemm (different summation order; measured
+    // max abs diff ~1e-6/2.7e-5), so it relies on the transcription-level
+    // conformance contract — verified green (native_engine_e2e 6/6).
+    if m == 1 {
+        let mut out = vec![0.0f32; n];
+        for kk in 0..k {
+            let av = a.data[kk];
+            let brow = &b.data[kk * n..(kk + 1) * n];
+            for (o, &bv) in out.iter_mut().zip(brow) {
+                *o += av * bv;
+            }
+        }
+        return Ok(Mat::from_vec(1, n, out));
+    }
+
     let lhs_meta = meta_2d(m, k);
     let rhs_meta = meta_2d(k, n);
     let data = ft_kernel_cpu::matmul_tensor_contiguous_f32(&a.data, &b.data, &lhs_meta, &rhs_meta)

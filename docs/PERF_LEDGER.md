@@ -338,6 +338,31 @@ decoder gap (1.27×) is now compute-bound (GEMV/sgemm/softmax), not spawn-bound.
 
 ---
 
+### L10 — m=1 GEMV fast path in `nn::matmul` (skip ft sgemm for tq=1 attn)  — `src/native_engine/nn.rs`  **[e2e win]**
+
+**How it was found.** With spawn ruled out (L9 + follow-ups), the decoder gap is
+compute. `nn::matmul` routed *everything* through `ft_kernel_cpu` sgemm — including
+the per-token decode attention matmuls, which at tq=1 are GEMV-shaped
+(`[1,d]×[d,tk]` scores, `[1,tk]×[tk,d]` out). Standalone (x86-64-v3) showed ft
+sgemm pays huge packing/dispatch overhead at m=1: `[1,64]×[64,1500]` **sgemm 46 µs
+vs direct gemv 4.5 µs (10.2×)**; `[1,1500]×[1500,64]` **48 vs 6.3 µs (7.6×)**.
+(GGML/whisper.cpp use a dedicated dot here — this is a real slice of the decoder
+gap.)
+
+**Fix.** Add an `m == 1` branch to `nn::matmul`: row-broadcast SAXPY accumulation
+over k (`out += a[k]*b[k,:]`, LLVM → AVX2 FMA), skipping sgemm packing entirely.
+Helps every m=1 caller (cross_attn + self_attn). NOT bit-identical (different
+summation order, max abs diff ~1e-6/2.7e-5) → relies on the transcription-level
+contract.
+
+**Measured (local v3):** `e2e_tiny_jfk` 571→**561 ms (ts)** / 543→**534 ms
+(no-ts)** = **−1.7%**; whisper.cpp gap 1.21×→**1.19×** (no-ts). **Conformance
+GREEN** (native_engine_e2e 6/6). **Verdict: KEEP.** Modest at e2e (the attn
+matmuls are a small slice; the mlp/logits use the separate f16 GEMV path), but a
+free, correct win and the right structural fix.
+
+---
+
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
 
 `docs/conformance-contract.md`: **"Compatibility is *not* byte-for-byte identical
