@@ -3,6 +3,61 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: whisper.cpp comparator BUILT + first head-to-head (bd-zk43)
+
+The prior blocker ("`whisper-cli` and ggml models absent") is **RESOLVED**: I built
+`whisper-cli` from `legacy_whispercpp/whisper.cpp` (cmake Release, gcc, ggml 0.9.6)
+and `ggml-tiny.en.bin` is present. This is the first **engine-level** franken vs
+**whisper.cpp** head-to-head (same `ggml-tiny.en` weights, same `jfk.wav`, same 8
+threads, same contended host, transcription-only / model pre-loaded).
+
+| Workload (tiny.en, jfk 11s, 8t, transcription-only) | franken | whisper.cpp | ratio |
+| --- | ---: | ---: | ---: |
+| full pipeline (franken w/ DTW timestamps; whisper.cpp `dtw=0`) | 614 ms | ~448 ms | **0.73× (franken 1.37× SLOWER)** |
+| apples-to-apples (both no word timestamps) | 596 ms | ~448 ms | **0.75× (franken 1.33× SLOWER)** |
+
+**The README's "tiny.en 475ms vs whisper.cpp 1105ms (2.33×)" is STALE/FALSE.**
+whisper.cpp is actually ~448ms transcription (514ms incl. 66ms load) — not 1105ms.
+franken is ~1.33× **slower** than whisper.cpp here. (NB franken *does* still win
+~2.13–3.26× vs **OpenAI Whisper PyTorch** — a much slower baseline — per the
+2026-06-24 entries; the two "originals" are not the same bar.)
+
+**Stage breakdown — the gap is the DECODER, not the encoder:**
+
+| stage | franken | whisper.cpp | note |
+| --- | ---: | ---: | --- |
+| mel | ~4 ms | ~8 ms | franken WINS (L1/L3/L4 levers) |
+| encoder | ~204 ms | ~242 ms | franken WINS slightly |
+| decoder (+sample) | **~388 ms** | **~198 ms** | **whisper.cpp ~2× faster** |
+| DTW word ts | ~18 ms | n/a (dtw=0) | franken-only feature |
+
+This **overturns the session's prior focus**: bd-4hc0 (encoder GEMM 3.75×) would
+*extend* an already-winning encoder, but the real loss vs whisper.cpp is the
+**decoder (~2×), which is in-scope franken code** (gemv_f16 + the per-token loop).
+The earlier "decoder gemv is mature" conclusion compared franken-to-franken; vs
+GGML there is ~2× headroom. NEXT: profile the franken decoder per-token to locate
+the 2× (logits gemv vs GGML f16 matmul? per-token overhead/allocations? flash
+attn? whisper.cpp uses `flash attn = 1`). Also flagged: franken **binary**
+wall-clock (1.733 s hyperfine) vs whisper-cli total (~514 ms) implies ~1.1 s
+franken startup/model-load overhead worth a separate look (CLI/short-clip UX).
+
+Reproduce:
+
+```text
+# build whisper-cli
+cmake -S legacy_whispercpp/whisper.cpp -B legacy_whispercpp/whisper.cpp/build \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++
+cmake --build legacy_whispercpp/whisper.cpp/build -j 64 --target whisper-cli
+# whisper.cpp (reports load/mel/encode/decode/total)
+legacy_whispercpp/whisper.cpp/build/bin/whisper-cli \
+  -m legacy_whispercpp/whisper.cpp/models/ggml-tiny.en.bin \
+  -f legacy_whispercpp/whisper.cpp/samples/jfk.wav -t 8
+# franken (engine-level, pre-loaded; v3 build, n_threads=8 in bench)
+FRANKEN_WHISPER_MODEL_DIR=.../legacy_whispercpp/whisper.cpp/models \
+  RCH_MIN_LOCAL_TIME_MS=99999999 CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cc \
+  cargo bench -p franken_whisper --bench native_engine_bench -- e2e_tiny_jfk
+```
+
 ## 2026-06-24 - franken_whisper-cod-b kickoff
 
 ### Scope
