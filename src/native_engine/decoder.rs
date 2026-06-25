@@ -916,6 +916,11 @@ fn cross_attention(
     // many-head models (n_head≈20) still make per-step head parallelism worth
     // the spawn, so the threshold is tuned to engage there while keeping the
     // cheap few-head cases (e.g. tiny's 6 heads) serial.
+    // NB (bd-6qih, BlackThrush): raising this to 1<<14 (tiny's 6-head cross-attn
+    // serial) REGRESSED the no-timestamps e2e +2.7% (p<0.05) — the parallel path
+    // is genuinely faster here. `decoder_attrib`'s tight 400-step loop over-states
+    // this sub's spawn cost vs the real e2e (decode interspersed with mel/encode).
+    // Kept at 1<<13. (Only the MLP GEMV threshold, L9, was a real e2e spawn win.)
     const PAR_THRESHOLD: usize = 1 << 13; // tq*tk*n_head MACs
     let work = tq.saturating_mul(tk).saturating_mul(n_head);
     let workers = nn::worker_count();
@@ -1193,6 +1198,12 @@ fn project_qkv(
 ) -> FwResult<(Mat, Mat, Mat)> {
     // Two workers + the current thread: k and v on spawned threads while q
     // computes here, so all three run concurrently.
+    // NB (bd-6qih, BlackThrush): serializing these for tiny.en was MEASURED ~0 at
+    // e2e (566 vs 571 ms, p=0.55) — the L9 MLP-threshold fix already captured the
+    // decoder's spawn-bound win, and `project_qkv`'s contention doesn't bite in
+    // the real e2e (decode interspersed with mel/encode) the way it did in
+    // decoder_attrib's tight loop. Kept concurrent because it helps large models
+    // (the 3 projections are [1280,1280]=1.6 M MACs each there).
     std::thread::scope(|s| {
         let kh = s.spawn(|| k_lin.forward(h));
         let vh = s.spawn(|| v_lin.forward(h));

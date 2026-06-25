@@ -322,9 +322,19 @@ Linears (6.5 M) stay parallel. Pure scheduling knob → **bit-identical**.
 **Measured (local v3 A/B):** `decoder_attrib` `mlp_fc_gelu` 5.14→**2.81 ms/tok
 (−45%)**, total 14.67→12.32 ms/tok (−16%); **`e2e_tiny_jfk` 614→571 ms = −9.5%
 (criterion p<0.05, "improved")**. Narrows the whisper.cpp gap 1.37×→1.27×.
-**Verdict: KEEP.** Note: more decoder spawn-bound subs remain (cross_attn
-2.93 ms/tok, self_qkv 1.64) — a persistent thread pool would beat per-call
-`thread::scope` everywhere (bd-6qih, next).
+**Verdict: KEEP.** Follow-up (same tick): the *other* decoder subs that looked
+spawn-bound in `decoder_attrib` do NOT translate to the e2e — both MEASURED and
+REJECTED:
+- `project_qkv` serial (was 1.64 ms/tok in attrib): e2e **566 vs 571 ms, p=0.55
+  (~0)** → reverted, kept concurrent (helps large models).
+- `cross_attn` 1<<13→1<<14 (tiny serial; was 2.93 ms/tok in attrib): no-ts e2e
+  **+2.7%, p<0.05 (REGRESSED)** → reverted, parallel path is genuinely faster.
+
+Lesson: **`decoder_attrib`'s tight 400-step loop over-states per-call spawn cost**
+vs the real e2e (decode interspersed with mel/encode). Only the MLP GEMV
+threshold (L9, validated on the e2e) was a real spawn win; a blanket persistent
+thread pool is NOT obviously worth it. The remaining franken-vs-whisper.cpp
+decoder gap (1.27×) is now compute-bound (GEMV/sgemm/softmax), not spawn-bound.
 
 ---
 
