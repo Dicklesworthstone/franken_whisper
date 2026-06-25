@@ -1015,6 +1015,8 @@ Decision:
 keep:
   examples/native_ab.rs optional [threads] argument, because it improves the
   bd-0hnz loaded-model comparator harness and makes the tested state explicit.
+  The example was also cleaned up to return Result instead of panicking on
+  expected harness setup failures.
 
 reject as performance lever:
   "use 8 threads for loaded native tiny.en JFK" is slower than 4 threads in
@@ -1039,6 +1041,58 @@ Graveyard / artifact mapping used for this decision:
 - `high_level_summary_of_frankensuite_planned_and_implemented_features_and_concepts.md`
   benchmarking rules: no single-run or mean-only claims; this entry records raw
   distributions and medians.
+
+Validation:
+
+```text
+git diff --check -- docs/NEGATIVE_EVIDENCE.md examples/native_ab.rs
+result: pass
+
+rustfmt --edition 2024 --check examples/native_ab.rs
+result: pass
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo fmt --check
+result: blocked by pre-existing unrelated formatting drift in
+  src/native_engine/mel.rs
+  src/native_engine/nn.rs
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo build -p franken_whisper --profile release --example native_ab
+result: pass; local per-crate fallback; 55.64s after final harness cleanup
+
+final smoke:
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+    /data/projects/.rch-targets/franken_whisper-cod-a/release/examples/native_ab \
+    tiny.en 2 4
+  result: pass; transcript matches the JFK fixture; artifact:
+    /tmp/franken_whisper_cod_a_native_ab_final_smoke_20260625.json
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo check -p franken_whisper --all-targets
+result: pass; 5.05s after final harness cleanup
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo clippy -p franken_whisper --all-targets -- -D warnings
+result: pass; 0.39s after final harness cleanup
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo test -p franken_whisper --examples
+result: pass; 3 example targets, 0 tests each
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  cargo test -p franken_whisper --test conformance_comparator_tests
+result: pass; 26 passed / 0 failed
+
+ubs docs/NEGATIVE_EVIDENCE.md examples/native_ab.rs
+result: pass; 0 critical / 0 warnings
+```
 
 ## 2026-06-25 - franken_whisper-cod-b cross-attention tiny serial cutoff rejection
 
