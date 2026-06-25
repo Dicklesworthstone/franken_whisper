@@ -555,6 +555,17 @@ for future levers:
   **REVERTED** (conformance was 6/6 green, so it was *correct*, just ~0). Don't
   re-attempt: the per-token full-vocab `exp` is not a real e2e cost here.
 
+- **Encoder `attention_raw` rayon dispatch — MEASURED, REJECTED (~0).** L11/L12/L13
+  proved rayon's persistent pool beats per-call `thread::scope` for the DECODER's
+  per-token attention (tiny work, spawn-bound). Tried the same on the ENCODER's
+  `attention_raw` head dispatch (the encoder is now the largest e2e slice, ~42%).
+  Clean A/B (`encoder_window_tiny`, `--baseline`): **+2.9%, p=0.62 — "no change"**
+  (huge ±30 ms variance). Reason: the encoder's per-head work is BIG (sgemm +
+  softmax over `[~550,~550]`), so the 4-spawns/window `thread::scope` cost is
+  already amortized — it was never spawn-bound like the decoder's tq=1 per-token
+  attention. **REVERTED.** Confirms the spawn-bound win was decoder-per-token-
+  specific; the encoder is sgemm-bound (→ bd-4hc0, out-of-scope), not spawn-bound.
+
 **Net (measured, not assumed):** `#![forbid(unsafe_code)]` (no VNNI) + the
 e2e-dominant GEMM living in FrankenTorch (external crate `ft-kernel-cpu`, which
 hardcodes `matrixmultiply 0.3` with no feature knob) cap the kernel-level wins in
