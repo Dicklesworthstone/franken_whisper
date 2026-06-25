@@ -347,6 +347,27 @@ measured-and-rejected (L2 ~0-e2e, L6 ~0-gain, L8 ~0-e2e, INT8 0.24×, gemv-FMA
 work (`matrixmultiply` → `gemm`/faer, ~1.5–3×) or lifting `#![forbid(unsafe_code)]`
 for VNNI int8 — **both out of `franken_whisper`'s crate**.
 
+## ⇒ Biggest remaining e2e lever, MEASURED: the GEMM has 3.75× headroom (bd-4hc0)
+
+The e2e wall is the encoder GEMM, delegated to `ft_kernel_cpu::matmul_tensor_
+contiguous_f32`, which uses **`matrixmultiply 0.3`**. Standalone A/B (x86-64-v3,
+rayon) for the encoder MLP shape `[1500,384]×[384,1536]`:
+
+| sgemm backend | throughput | time |
+|---|---|---|
+| `matrixmultiply 0.3` (current, via ft-kernel-cpu) | 187 GFLOP/s | 9451 µs |
+| `gemm 0.18` (faer backend) | **701 GFLOP/s** | 2523 µs → **3.75×** |
+
+So the GEMM — ~most of the GEMM-bound encoder (~32% of e2e) — is **3.75× off the
+achievable**. Swapping `ft-kernel-cpu`'s `matrixmultiply`→`gemm` is **~2× encoder
+→ ~1.2× e2e** for franken_whisper, and benefits every FrankenTorch user.
+`ft-kernel-cpu` already calls `matrixmultiply` via `unsafe`, so `gemm`'s unsafe
+API is fine there; `franken_whisper`'s `#![forbid(unsafe_code)]` blocks calling
+`gemm` directly (and `faer`'s safe API is a heavy dep), so the clean fix lives in
+**ft-kernel-cpu** (out of `franken_whisper-cc`'s scope). **bd-4hc0 (P0).** This
+turns "the GEMM is external, untouchable" into "the GEMM has a measured 3.75×,
+here's exactly where."
+
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)
 
 These shape what is measurable and how the ratios above must be read.
