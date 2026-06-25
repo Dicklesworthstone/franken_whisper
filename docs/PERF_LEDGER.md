@@ -336,6 +336,16 @@ for future levers:
   contracts where it helps); forcing `mul_add` hurts. The decoder gemv is already
   optimal; **REJECTED**.
 
+- **Vertical-layout gemv (bd-n0m3) — MEASURED, REJECTED (~0-gain).** Hypothesis:
+  store the logits f16 weight interleaved `[OUT/8, INP, 8]` so the gemv vertically
+  vectorizes 8 output rows into f32×8 accumulators (no per-row horizontal
+  reduction) — a different organization than the current per-row `dequant+dot8`.
+  Standalone with real f16c dequant (logits shape 51864×384, x86-64-v3):
+  current 4154 µs vs vertical 4046 µs = **1.03×** (max abs diff 4e-6,
+  transcription-level). The current per-row dequant+dot8 is already within 3% of
+  the alternative organization → not worth the load-time relayout + kernel
+  rewrite. Confirms the decoder gemv is mature regardless of layout; **REJECTED**.
+
 **Net (measured, not assumed):** `#![forbid(unsafe_code)]` (no VNNI) + the
 e2e-dominant GEMM living in FrankenTorch (external crate `ft-kernel-cpu`, which
 hardcodes `matrixmultiply 0.3` with no feature knob) cap the kernel-level wins in
