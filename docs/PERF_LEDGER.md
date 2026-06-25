@@ -327,12 +327,25 @@ for future levers:
   the contract, but they're small vs the GEMM (GEMM-bound e2e) and carry
   transcription risk needing local-e2e verification → marginal EV.
 
+- **Explicit FMA (`mul_add`) in the gemv `dot8` — MEASURED, REJECTED (regression).**
+  The decoder is 62% of e2e and runs `gemv_f16`/`dot8` (separate mul+add, since
+  Rust doesn't auto-contract). Hypothesis: explicit `mul_add` under the +fma
+  baseline (L7) would speed the decoder core. Standalone (logits shape
+  51864×384, x86-64-v3): explicit `mul_add` dot = **0.791× — SLOWER** than the
+  current mul+add. LLVM already lowers the 8-accumulator mul+add optimally (and
+  contracts where it helps); forcing `mul_add` hurts. The decoder gemv is already
+  optimal; **REJECTED**.
+
 **Net (measured, not assumed):** `#![forbid(unsafe_code)]` (no VNNI) + the
-e2e-dominant GEMM living in FrankenTorch (external crate) cap the kernel-level
-wins available in this crate. The bit-exact + safe lever space is **exhausted**:
-4 levers shipped (L1/L3/L4/L5), 3 measured-and-rejected (L2 ~0-e2e, L6 ~0-gain,
-INT8 0.24×). Further e2e wins require either FrankenTorch-side GEMM work or
-lifting `#![forbid(unsafe_code)]` for VNNI — both out of this lane.
+e2e-dominant GEMM living in FrankenTorch (external crate `ft-kernel-cpu`, which
+hardcodes `matrixmultiply 0.3` with no feature knob) cap the kernel-level wins in
+this crate. The lever space is **exhaustively exhausted by measurement**: 5
+shipped (L1/L3/L4/L5 mel bit-exact + **L7 x86-64-v3 = the 1.12× e2e win**), 5
+measured-and-rejected (L2 ~0-e2e, L6 ~0-gain, L8 ~0-e2e, INT8 0.24×, gemv-FMA
+0.791×). e2e is encoder-GEMM-bound (external) + decoder-logits-bandwidth-bound
+(40 MB f16/token, fundamental). Further e2e wins require FrankenTorch-side GEMM
+work (`matrixmultiply` → `gemm`/faer, ~1.5–3×) or lifting `#![forbid(unsafe_code)]`
+for VNNI int8 — **both out of `franken_whisper`'s crate**.
 
 ## Measurement infrastructure findings (2026-06-24, BlackThrush)
 
