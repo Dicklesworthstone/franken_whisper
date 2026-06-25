@@ -134,6 +134,36 @@ encoder-window win, but at the loaded product surface it regresses franken from
 from 0.904644x to 0.798808x. This is a component-only win that fails the
 BOLD-VERIFY product gate.
 
+## 2026-06-25 - BlackThrush: ⇒ LARGE-V3-TURBO head-to-head — franken WINS compute 1.24× (blocker resolved)
+
+Resolved the documented blocker: downloaded `ggml-large-v3-turbo.bin` (1.5 GB f16,
+HuggingFace) and added `bench_e2e_large_jfk`. First large head-to-head (jfk 11 s, 8t,
+same ggml weights):
+
+| stage (large-v3-turbo, jfk, 8t) | franken | whisper.cpp | result |
+| --- | ---: | ---: | --- |
+| **encoder (one window)** | **4.31 s** | 8.25 s | **franken 1.9× FASTER** |
+| **transcription e2e (no-ts)** | **7.12 s** | ~8.85 s (9.75 total − 0.90 load) | **franken 1.24× FASTER** |
+| model load | ~5.8 s (12.96 binary − 7.1 compute) | 0.90 s | **franken ~6× SLOWER** |
+| cold binary (incl load) | 12.96 s | 9.75 s | whisper.cpp faster (franken load-bound) |
+
+**franken WINS the large compute** — the encoder (matrixmultiply + rayon) is 1.9×
+faster than GGML's encode at large shapes (the opposite of bd-4hc0's tiny finding;
+matrixmultiply is competitive at large `[1500,1280]×[1280,5120]` sizes), and that
+outweighs a slower decoder. So: **tiny.en ~parity, large-v3-turbo franken 1.24×
+faster** — franken beats whisper.cpp on the high-quality model.
+
+**Conformance:** franken core text **identical** to whisper.cpp — "And so, my fellow
+Americans, ask not what your country can do for you, ask what you can do for your
+country." franken appends one spurious trailing token (" a.") — a decode-termination
+difference (29 vs 28 tokens), core 22 word-tokens match. Minor, worth a follow-up.
+
+**NEW in-scope lever surfaced (biggest cold-start gap):** franken's model LOAD is
+~6× slower than whisper.cpp's (~5.8 s vs 0.90 s for 1.5 GB; tiny was ~1.1 s vs
+66 ms ≈ 16×). The load (ggml parse + per-weight `transpose_parallel` + f16 staging)
+is franken code → optimizable, and dominates cold single-clip CLI latency. Filed as
+the next dig.
+
 ## 2026-06-25 - AGENT_NAME=IcyWren attention Rayon head-band dispatch rejected
 
 ### Land-or-dig scan

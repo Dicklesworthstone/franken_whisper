@@ -453,6 +453,49 @@ fn bench_e2e_tiny_jfk(c: &mut Criterion) {
     group.finish();
 }
 
+// 5b. e2e_large_jfk — full transcribe over jfk with large-v3-turbo. No word
+// timestamps (matches whisper.cpp `dtw=0`) for an apples-to-apples head-to-head.
+fn bench_e2e_large_jfk(c: &mut Criterion) {
+    let Some(path) = find_model_file(MODEL_LARGE) else {
+        eprintln!("SKIP e2e_large_jfk: model {MODEL_LARGE} missing");
+        return;
+    };
+    let Some(samples) = load_jfk_samples() else {
+        eprintln!("SKIP e2e_large_jfk: jfk.wav missing");
+        return;
+    };
+    let model = match NativeWhisperModel::load(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP e2e_large_jfk: model load failed: {e}");
+            return;
+        }
+    };
+    let params = DecodeParams {
+        language: None,
+        translate: false,
+        timestamps: false,
+        n_threads: 8,
+        ..DecodeParams::default()
+    };
+    let noop = || Ok(());
+
+    let mut group = c.benchmark_group("native_engine/e2e");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(90));
+
+    group.bench_function("e2e_large_jfk", |b| {
+        b.iter(|| {
+            let out = model
+                .transcribe(black_box(&samples), &params, &noop)
+                .expect("transcribe");
+            black_box(out.segments.len())
+        });
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // 6. f16_gemv_dequant — isolated f16-resident GEMV (dequant + dot) throughput.
 //     Direct instrument for the pass-3 vectorizable-dequant lever: a single
@@ -564,5 +607,6 @@ criterion_group!(
     bench_f16_gemv_dequant,
     bench_layer_norm,
     bench_e2e_tiny_jfk,
+    bench_e2e_large_jfk,
 );
 criterion_main!(benches);
