@@ -235,15 +235,22 @@ struct FilterConfig {
     max_tokens: Option<usize>,
 }
 
-fn apply_logit_filters(
+/// Apply whisper's logit-filter suite IN ORDER and return the (mutated) logits
+/// plus the log-softmax `logprobs`. `prev_tokens` is the decoded text so far
+/// (excluding the prompt); `seek_delta_cs` is the running window shift in
+/// centiseconds (drives the monotonicity floor).
+///
+/// Port of `whisper_process_logits` (whisper.cpp 6178-6396); see the inline
+/// comments for the matching upstream line ranges.
+fn process_logits(
     tk: &Tokenizer,
     cfg: &FilterConfig,
-    logits: &mut [f32],
+    mut logits: Vec<f32>,
     prev_tokens: &[i32],
     has_ts: bool,
     seek_delta_cs: i64,
     tokens_in_window: usize,
-) {
+) -> (Vec<f32>, Vec<f32>) {
     let n = logits.len();
     let beg = tk.timestamp_begin;
     let is_initial = prev_tokens.is_empty();
@@ -258,18 +265,18 @@ fn apply_logit_filters(
 
     // suppress blank (whisper.cpp 6217-6222): only on the very first step.
     if cfg.suppress_blank && is_initial {
-        set(logits, tk.eot);
+        set(&mut logits, tk.eot);
         if let Some(sp) = cfg.space_token {
-            set(logits, sp);
+            set(&mut logits, sp);
         }
     }
 
     // suppress <|notimestamps|>; in no_timestamps mode mask all timestamps too
     // (whisper.cpp 6226-6231).
-    set(logits, tk.no_timestamps);
+    set(&mut logits, tk.no_timestamps);
     if cfg.no_timestamps {
         for i in beg..(n as i32) {
-            set(logits, i);
+            set(&mut logits, i);
         }
     }
 
@@ -283,28 +290,28 @@ fn apply_logit_filters(
         && tokens_in_window >= max_tokens
     {
         for i in 0..tk.eot {
-            set(logits, i);
+            set(&mut logits, i);
         }
     }
 
     // suppress sot, nosp, solm, task tokens, prev (whisper.cpp 6241-6260).
-    set(logits, tk.sot);
-    set(logits, tk.no_speech);
-    set(logits, tk.solm);
-    set(logits, tk.translate);
-    set(logits, tk.transcribe);
-    set(logits, tk.sot_prev);
+    set(&mut logits, tk.sot);
+    set(&mut logits, tk.no_speech);
+    set(&mut logits, tk.solm);
+    set(&mut logits, tk.translate);
+    set(&mut logits, tk.transcribe);
+    set(&mut logits, tk.sot_prev);
 
     // suppress language tokens (whisper.cpp 6254-6257).
     for (_, lang_id, _) in LANGUAGES {
         // language token for id n is sot+1+n (whisper.cpp whisper_token_lang).
-        set(logits, tk.sot + 1 + *lang_id);
+        set(&mut logits, tk.sot + 1 + *lang_id);
     }
 
     // suppress non-speech tokens (whisper.cpp 6279-6296), opt-in.
     if cfg.suppress_nst {
         for &id in tk.non_speech_tokens() {
-            set(logits, id);
+            set(&mut logits, id);
         }
     }
 
@@ -316,12 +323,12 @@ fn apply_logit_filters(
         if penult_was_ts {
             // two timestamps back-to-back: forbid another timestamp.
             for i in beg..(n as i32) {
-                set(logits, i);
+                set(&mut logits, i);
             }
         } else {
             // one timestamp open: force a timestamp or EOT (mask all text).
             for i in 0..tk.eot {
-                set(logits, i);
+                set(&mut logits, i);
             }
         }
     }
@@ -329,7 +336,7 @@ fn apply_logit_filters(
     // initial timestamp cannot exceed max_initial_ts (whisper.cpp 6319-6328).
     if is_initial && let Some(tid0) = cfg.max_initial_tid {
         for i in (beg + tid0 + 1)..(n as i32) {
-            set(logits, i);
+            set(&mut logits, i);
         }
     }
 
@@ -337,38 +344,9 @@ fn apply_logit_filters(
     if has_ts {
         let tid0 = (seek_delta_cs / 2) as i32; // centiseconds -> ts steps.
         for i in beg..(beg + tid0).min(n as i32) {
-            set(logits, i);
+            set(&mut logits, i);
         }
     }
-}
-
-/// Apply whisper's logit-filter suite IN ORDER and return the (mutated) logits
-/// plus the log-softmax `logprobs`. `prev_tokens` is the decoded text so far
-/// (excluding the prompt); `seek_delta_cs` is the running window shift in
-/// centiseconds (drives the monotonicity floor).
-///
-/// Port of `whisper_process_logits` (whisper.cpp 6178-6396); see the inline
-/// comments for the matching upstream line ranges.
-#[cfg(test)]
-fn process_logits(
-    tk: &Tokenizer,
-    cfg: &FilterConfig,
-    mut logits: Vec<f32>,
-    prev_tokens: &[i32],
-    has_ts: bool,
-    seek_delta_cs: i64,
-    tokens_in_window: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    let beg = tk.timestamp_begin;
-    apply_logit_filters(
-        tk,
-        cfg,
-        &mut logits,
-        prev_tokens,
-        has_ts,
-        seek_delta_cs,
-        tokens_in_window,
-    );
 
     // log-softmax over the (filtered) logits (whisper.cpp 6138-6158, 6341).
     let mut logprobs = compute_logprobs(&logits);
@@ -413,82 +391,9 @@ fn process_logits(
     (logits, logprobs)
 }
 
-fn process_logits_greedy(
-    tk: &Tokenizer,
-    cfg: &FilterConfig,
-    mut logits: Vec<f32>,
-    prev_tokens: &[i32],
-    has_ts: bool,
-    seek_delta_cs: i64,
-    tokens_in_window: usize,
-) -> (i32, f32) {
-    apply_logit_filters(
-        tk,
-        cfg,
-        &mut logits,
-        prev_tokens,
-        has_ts,
-        seek_delta_cs,
-        tokens_in_window,
-    );
-
-    let logsumexp = compute_logsumexp(&logits);
-    let beg_u = tk.timestamp_begin.max(0) as usize;
-    if timestamp_forces_from_logits(&logits, beg_u, logsumexp) {
-        for l in logits.iter_mut().take(beg_u) {
-            *l = f32::NEG_INFINITY;
-        }
-    }
-
-    let mut best_i = 0usize;
-    let mut best = f32::NEG_INFINITY;
-    for (i, &l) in logits.iter().enumerate() {
-        if l > best {
-            best = l;
-            best_i = i;
-        }
-    }
-    let plog = if best > f32::NEG_INFINITY && logsumexp.is_finite() {
-        best - logsumexp
-    } else {
-        f32::NEG_INFINITY
-    };
-    (i32::try_from(best_i).unwrap_or(0), plog)
-}
-
-fn timestamp_forces_from_logits(logits: &[f32], beg_u: usize, logsumexp: f32) -> bool {
-    let mut ts_logprob = f32::NEG_INFINITY;
-    if beg_u < logits.len() && logsumexp.is_finite() {
-        let logprob_max = logits[beg_u..]
-            .iter()
-            .copied()
-            .filter(|&l| l > f32::NEG_INFINITY)
-            .map(|l| l - logsumexp)
-            .fold(f32::NEG_INFINITY, f32::max);
-        if logprob_max.is_finite() {
-            let mut sum = 0.0f32;
-            for &l in &logits[beg_u..] {
-                if l > f32::NEG_INFINITY {
-                    sum += (l - logsumexp - logprob_max).exp();
-                }
-            }
-            if sum > 0.0 {
-                ts_logprob = sum.ln() + logprob_max;
-            }
-        }
-    }
-
-    let max_text_logprob = logits[..beg_u.min(logits.len())]
-        .iter()
-        .copied()
-        .filter(|&l| l > f32::NEG_INFINITY && logsumexp.is_finite())
-        .map(|l| l - logsumexp)
-        .fold(f32::NEG_INFINITY, f32::max);
-
-    ts_logprob > max_text_logprob
-}
-
-fn compute_logsumexp(logits: &[f32]) -> f32 {
+/// Numerically-stable log-softmax (whisper.cpp `whisper_compute_logprobs`,
+/// lines 6138-6158). `-inf` logits map to `-inf` logprobs.
+fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
     let logit_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut logsumexp = 0.0f32;
     for &l in logits {
@@ -496,13 +401,7 @@ fn compute_logsumexp(logits: &[f32]) -> f32 {
             logsumexp += (l - logit_max).exp();
         }
     }
-    logsumexp.ln() + logit_max
-}
-
-/// Numerically-stable log-softmax (whisper.cpp `whisper_compute_logprobs`,
-/// lines 6138-6158). `-inf` logits map to `-inf` logprobs.
-fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
-    let logsumexp = compute_logsumexp(logits);
+    let logsumexp = logsumexp.ln() + logit_max;
     logits
         .iter()
         .map(|&l| {
@@ -519,7 +418,6 @@ fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
 /// `whisper_sample_token(best=true)` (whisper.cpp 6503-6510): the chosen id is
 /// the argmax of the (post-filter) probabilities — equivalently logits — and
 /// `plog` is its log-softmax value.
-#[cfg(test)]
 fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
     let mut best_i = 0usize;
     let mut best = f32::NEG_INFINITY;
@@ -1017,7 +915,7 @@ pub fn transcribe_samples(
         let mut step_logits = prefill_logits;
 
         for i in 0..n_max_tokens {
-            let (tok, plog) = process_logits_greedy(
+            let (filtered, logprobs) = process_logits(
                 tk,
                 &cfg,
                 step_logits,
@@ -1026,6 +924,7 @@ pub fn transcribe_samples(
                 seek_delta_cs,
                 decoded.len(),
             );
+            let (tok, plog) = argmax(&filtered, &logprobs);
             decoded.push(tok);
             plogs.push(plog);
 
@@ -1636,91 +1535,6 @@ mod tests {
 
     fn is_suppressed(logits: &[f32], id: i32) -> bool {
         logits[id as usize] == f32::NEG_INFINITY
-    }
-
-    fn assert_greedy_matches_process_logits(
-        tk: &Tokenizer,
-        cfg: &FilterConfig,
-        logits: Vec<f32>,
-        prev_tokens: &[i32],
-        has_ts: bool,
-        seek_delta_cs: i64,
-        tokens_in_window: usize,
-    ) {
-        let (filtered, logprobs) = process_logits(
-            tk,
-            cfg,
-            logits.clone(),
-            prev_tokens,
-            has_ts,
-            seek_delta_cs,
-            tokens_in_window,
-        );
-        let expected = argmax(&filtered, &logprobs);
-        let got = process_logits_greedy(
-            tk,
-            cfg,
-            logits,
-            prev_tokens,
-            has_ts,
-            seek_delta_cs,
-            tokens_in_window,
-        );
-        assert_eq!(got.0, expected.0, "greedy token mismatch");
-        assert_eq!(
-            got.1.to_bits(),
-            expected.1.to_bits(),
-            "greedy logprob mismatch for token {}",
-            expected.0
-        );
-    }
-
-    #[test]
-    fn greedy_filter_path_matches_full_logprobs_path() {
-        let tk = synth_tokenizer();
-        let cfg = base_cfg(&tk);
-        assert_greedy_matches_process_logits(&tk, &cfg, zeros(&tk), &[], false, CHUNK_CS, 0);
-        assert_greedy_matches_process_logits(
-            &tk,
-            &cfg,
-            text_dominant(&tk),
-            &[2],
-            false,
-            CHUNK_CS,
-            0,
-        );
-
-        let mut ts_force = vec![-10.0f32; tk.vocab_size() as usize];
-        ts_force[2] = 1.0;
-        let beg = tk.timestamp_begin as usize;
-        for l in &mut ts_force[beg..(beg + 200).min(tk.vocab_size() as usize)] {
-            *l = 0.5;
-        }
-        assert_greedy_matches_process_logits(&tk, &cfg, ts_force, &[2], false, 0, 0);
-
-        let mut one_ts_open = vec![-5.0f32; tk.vocab_size() as usize];
-        one_ts_open[tk.eot as usize] = 20.0;
-        assert_greedy_matches_process_logits(
-            &tk,
-            &cfg,
-            one_ts_open,
-            &[2, tk.timestamp_begin + 10],
-            true,
-            20,
-            0,
-        );
-
-        let budget_cfg = FilterConfig {
-            suppress_blank: false,
-            space_token: None,
-            suppress_nst: false,
-            no_timestamps: false,
-            max_initial_tid: None,
-            max_tokens: Some(3),
-        };
-        let mut budget = vec![-20.0f32; tk.vocab_size() as usize];
-        budget[5] = 10.0;
-        assert_greedy_matches_process_logits(&tk, &budget_cfg, budget, &[], false, 0, 3);
     }
 
     // ----- Rule 1: blank + eot suppression at step 0 only -----
