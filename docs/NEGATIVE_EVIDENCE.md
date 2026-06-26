@@ -3,6 +3,55 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: log-mel one-sided / real-FFT (RFFT) lever REJECTED — gated by the bit-exact-with-whisper.cpp mel invariant + low e2e leverage
+
+**Dig result (alien-graveyard / extreme-optimization angle): a genuinely NEW
+lever the per-kernel audit never named, evaluated and rejected.** The audit
+declared the log-mel FFT "at the AVX2 hardware ceiling," but that was the ceiling
+of the *current algorithm*. `src/native_engine/mel.rs`'s `fft` / `fft_simd8` is a
+Cooley-Tukey FFT that takes REAL audio input yet computes the FULL complex
+spectrum — all `N_FFT = 400` interleaved-complex bins — while the mel projection
+consumes only the `N_FREQ_BINS = N_FFT/2 + 1 = 201` one-sided bins. The upper
+`bin 201..400` are the conjugate-symmetric (Hermitian) mirror: computed and
+discarded. A real-input / half-spectrum FFT (pack-two-reals, or a length-`N/2`
+complex FFT + split post-pass) computes only the 201 needed bins ⇒ **up to ~2×
+fewer FFT butterflies**. It is the single largest per-frame flop block in the
+frontend, so on paper it *looks* like a big lever.
+
+**Why it is rejected — two independent blockers:**
+
+1. **Hard conformance invariant (decisive).** The mel frontend is a *deliberate
+   bit-exact port of whisper.cpp* — module doc: "faithful port … output is
+   bit-for-bit comparable (within f32 rounding) to the reference encoder"; the
+   FFT comment: "exactly mirroring whisper.cpp's `fft` … bit-exact stand-ins for
+   the transcendentals the reference computed inline." whisper.cpp itself uses the
+   full-complex recursive FFT, NOT an RFFT. An RFFT restructures the butterfly
+   graph entirely → different float accumulation → diverges from the whisper.cpp
+   reference beyond f32-rounding noise → breaks the bit-exact mel guarantee and
+   `conformance_comparator_tests`. This is the SAME class of blocker as
+   `forbid(unsafe_code)` for the decoder f16c dot: a deliberate project invariant
+   (here: bit-exact-with-whisper.cpp mel) gates the lever. Adopting RFFT is an
+   OWNER POLICY call (relax bit-exact mel → transcription-safe-approx mel), not a
+   unilateral swap.
+
+2. **Low e2e leverage (independent).** Even at the full theoretical ~2× FFT win,
+   the FFT is one component of the log-mel frontend (alongside windowing, power,
+   sparse mel projection, f64 `log10`), and the frontend is PREPROCESSING — e2e is
+   dominated by encoder/decoder GEMV/GEMM (decoder ≈ 80% gemv). Measured anchor
+   this turn (rch `ovh-a`): `native_engine/mel/mel_30s` ≈ 6.23 ms / 3000 frames,
+   `mel_30s_realistic` ≈ 4.94 ms. Halving only the FFT slice yields a
+   single-digit-% frontend win and a sub-1% e2e move — franken already WINS
+   2.13–3.26× vs OpenAI everywhere. Not worth the conformance risk.
+
+**Verdict: REJECT** (no code change; nothing landed or reverted). Recorded so a
+future alien-graveyard / extreme-optimization pass does not re-chase the "2× FFT
+flops" headline. Reopen ONLY if the owner relaxes the bit-exact-with-whisper.cpp
+mel invariant (then a transcription-safety rel-diff bound, not bit-exactness,
+would govern). This completes the picture from the engine-at-ceiling decision:
+**every remaining franken lever now sits behind a deliberate project invariant —
+`forbid(unsafe_code)` (decoder f16c dot, 2.5–5×) and bit-exact-with-whisper.cpp
+(mel RFFT, ≤2× FFT) — both owner-policy gates, not engineering gaps.**
+
 ## 2026-06-25 - BlackThrush: ⭐ DECODER GEMV has a MEASURED 2.5–5× lever — the `forbid(unsafe_code)` tax (fused f16c dot)
 
 **This is the biggest measured lever in the project and it reframes the
