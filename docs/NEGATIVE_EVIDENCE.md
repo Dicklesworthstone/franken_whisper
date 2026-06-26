@@ -3,6 +3,28 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: ⭐ LANDED partial-SIMD GELU — bit-exact, MEASURED 1.29× (the "tanh dominates" comment was wrong)
+
+**Another "measure, don't reason" win.** `gelu`'s code comment asserted "the tanh
+transcendental dominates," implying no headroom. WRONG — the scalar `tanh()` call
+**blocks LLVM from autovectorizing the whole loop**, so the surrounding polynomial
+ran scalar too. I hand-SIMD'd the arithmetic (8 lanes) and keep `tanh` **scalar
+per lane** (extract → 8× `f32::tanh` → reinsert), preserving the exact scalar op
+order with no FMA fusion ⇒ **bit-exact**. No `unsafe`.
+
+**Correctness:** `native_engine::nn::tests::gelu_known_values` PASS (bit-exact);
+clippy `--lib --benches -D warnings` clean. (Added a `native_engine/gelu/gelu_1500x1536`
+bench — encoder-MLP shape; the kernel had none.)
+
+**Measured (deterministic same-session A/B, scalar main vs SIMD, local x86-64-v3,
+Criterion n=60):** `gelu_1500x1536` 4.269 ms → 3.306 ms = **−22.6% ⇒ 1.29×**
+(p=0.00). KEEP. So ~22% of GELU was vectorizable arithmetic the `tanh` call had
+been hiding from the optimizer — the 8 scalar tanh/iter are unchanged, the win is
+the SIMD'd polynomial. GELU is a HOT encoder/decoder-MLP kernel, so this is real
+leverage (though e2e isn't measurable here — encoder/decoder benches SKIP, models
+absent). vs OpenAI-Whisper: not directly comparable (isolated kernel).
+AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: ⭐ LANDED SIMD log-mel clamp+normalize — bit-exact, MEASURED −5% / −7.6% on mel (a HOT-path win, not cold)
 
 **The first hot-path win this arc** (the audio resample/downmix wins were cold

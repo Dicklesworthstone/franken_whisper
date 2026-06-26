@@ -749,33 +749,49 @@ const GELU_COEF_A: f32 = 0.044_715;
 /// (note `x*(1 + a*x*x) == x + a*x^3`). We deliberately use this tanh form
 /// rather than ft's `gelu_value_f32`, which is the *erf* GELU and would
 /// diverge from whisper's activations.
-pub fn gelu(x: &mut Mat) {
-    // Pure elementwise: each output depends only on its own input, so we
-    // split `data` into disjoint contiguous chunks across workers. The tanh
-    // transcendental dominates, so this scales well; threshold keeps small
-    // activations serial.
-    let apply = |v: &mut f32| {
+/// Apply tanh-approx GELU to one contiguous slice. The scalar `tanh()` call
+/// blocks LLVM from vectorizing the loop, so the surrounding polynomial is hand-
+/// SIMD'd (8 lanes) with `tanh` still done scalar per lane — same op order and
+/// no FMA fusion as the scalar form, so bit-exact.
+fn gelu_slice(data: &mut [f32]) {
+    use std::simd::Simd;
+    type V = Simd<f32, 8>;
+    let n = data.len();
+    let n8 = n - n % 8;
+    let coef_a = V::splat(GELU_COEF_A);
+    let sqrt_2pi = V::splat(GELU_SQRT_2_OVER_PI);
+    let one = V::splat(1.0);
+    let half = V::splat(0.5);
+    let mut i = 0;
+    while i < n8 {
+        let xv = V::from_slice(&data[i..i + 8]);
+        // arg = sqrt(2/pi) * x * (1 + a*x*x)  — exact scalar op order.
+        let arg = (sqrt_2pi * xv) * (one + (coef_a * xv) * xv);
+        let aa = arg.to_array();
+        let tanh = V::from_array(std::array::from_fn(|k| aa[k].tanh()));
+        ((half * xv) * (one + tanh)).copy_to_slice(&mut data[i..i + 8]);
+        i += 8;
+    }
+    for v in &mut data[n8..] {
         let x = *v;
         *v = 0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh());
-    };
+    }
+}
 
+pub fn gelu(x: &mut Mat) {
+    // Pure elementwise: each output depends only on its own input, so we
+    // split `data` into disjoint contiguous chunks across workers; threshold
+    // keeps small activations serial.
     const PAR_THRESHOLD: usize = 1 << 15;
     let n = x.data.len();
     if n < PAR_THRESHOLD || worker_count() < 2 {
-        for v in &mut x.data {
-            apply(v);
-        }
+        gelu_slice(&mut x.data);
         return;
     }
     let chunk = n.div_ceil(worker_count()).max(1);
     std::thread::scope(|s| {
-        let apply = &apply;
         for band in x.data.chunks_mut(chunk) {
-            s.spawn(move || {
-                for v in band.iter_mut() {
-                    apply(v);
-                }
-            });
+            s.spawn(move || gelu_slice(band));
         }
     });
 }

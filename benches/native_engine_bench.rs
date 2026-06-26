@@ -619,6 +619,31 @@ fn bench_layer_norm(c: &mut Criterion) {
     group.finish();
 }
 
+/// GELU over a tiny.en-large encoder MLP hidden activation ([1500, 1536]).
+/// No model needed — runs everywhere.
+fn bench_gelu(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn;
+
+    let (rows, cols) = (1500usize, 1536usize);
+    let mut lcg = Lcg::new(0x9e1c_0e1f);
+    let base: Vec<f32> = (0..rows * cols).map(|_| lcg.next_f32() * 6.0 - 3.0).collect();
+
+    let mut group = c.benchmark_group("native_engine/gelu");
+    group.throughput(criterion::Throughput::Elements((rows * cols) as u64));
+    group.bench_function("gelu_1500x1536", |bch| {
+        bch.iter_batched_ref(
+            || Mat::from_vec(rows, cols, base.clone()),
+            |m| {
+                nn::gelu(m);
+                black_box(m.data[0])
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 /// Linear resampler: 30 s of 44.1 kHz mono → 16 kHz (the most common decode-path
 /// resample; 16 kHz inputs skip it entirely). No model needed — runs everywhere.
 fn bench_resample(c: &mut Criterion) {
@@ -680,6 +705,7 @@ criterion_group!(
     bench_logits_gemv_large,
     bench_f16_gemv_dequant,
     bench_layer_norm,
+    bench_gelu,
     bench_resample,
     bench_downmix,
     bench_e2e_tiny_jfk,
