@@ -162,15 +162,30 @@ already optimized (L1–L5) or at ceiling (f16_gemv).**
 **⇒ BLOCKER.** No measurable compute lever remains on the prescribed
 `rch exec -- cargo bench` path. The only outstanding e2e gap is **tiny-cold-CLI vs
 whisper.cpp (~190 ms, diffuse: ~80 load / ~84 startup+audio / ~26 transcribe)** —
-not a kernel, dominated by eager model load (whisper.cpp `mmap`s; a safe `memmap2`
-load is a *structural* change whose benefit shows only on cold page-cache, which
-criterion warm-loops can't measure) and CLI startup. **vs OpenAI-Whisper franken
-already wins 2.13–3.26× everywhere.** Concrete unblock paths for a future turn,
-each needing a decision the kernel work can't make unilaterally: (a) stage the
-ggml models + jfk.wav on the rch workers so the model-gated/e2e benches run there;
-(b) owner sign-off on an `x86-64-v4` baseline *and* a Zen4+/AVX-512 bench host to
-even test it; (c) a `memmap2`-based cold-load path (safe-API dep; profiled cold,
-not via criterion).
+not a kernel, dominated by eager model load (`ggml.rs` does `std::fs::read` —
+whole-blob copy — then `parse(Vec<u8>)` copies every tensor out via a `Cursor`;
+whisper.cpp `mmap`s and faults weights in lazily) and CLI startup. **vs
+OpenAI-Whisper franken already wins 2.13–3.26× everywhere.** Concrete unblock
+paths for a future turn, each needing a decision the kernel work can't make
+unilaterally: (a) stage the ggml models + jfk.wav on the rch workers so the
+model-gated/e2e benches run there; (b) owner sign-off on an `x86-64-v4` baseline
+*and* a Zen4+/AVX-512 bench host to even test it; (c) an mmap cold-load path —
+but this is **genuinely BLOCKED by `#![forbid(unsafe_code)]`**: `memmap2::Mmap::map`
+is an `unsafe fn` (its contract is "the file must not be mutated while mapped"),
+so the call site needs `unsafe`. (CORRECTION of an earlier line in this very entry
+that called memmap2 a "safe-API dep" — that was wrong; the prior-session entry
+near the bottom of this file had it right. Unblocking mmap needs lifting
+`forbid(unsafe_code)` or an isolated helper crate — an owner policy call, not a
+kernel lever.)
+
+**Kernel audit completeness (this turn).** Confirmed the last un-audited hot
+kernel, the encoder `conv1d` stem (`nn::conv1d`), is **already im2col + ft sgemm**
+(parallel im2col gather, weight transpose is 0.07% of the conv matmul) — textbook
+optimal, no lever. With mel/FFT/filterbank (L1–L4), layer_norm (L5), gelu/softmax
+(L8), gemv_f16/dot8/gemv_f16_batch (L9–L13 + this session's two ceiling rejects),
+KV-cache + cross-K/V (decoder), and now conv1d all verified optimized-or-at-ceiling,
+**every hot kernel in the engine has been audited.** No benchable compute lever
+remains.
 
 ## 2026-06-25 - BlackThrush: multi-accumulator `dot8` REJECTED — 2.5× REGRESSION; `dot8`'s idiom is load-bearing (DO NOT hand-restructure)
 
