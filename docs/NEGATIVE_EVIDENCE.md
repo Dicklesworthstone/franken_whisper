@@ -3,6 +3,28 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: `layer_norm` row-group width 8→4 ZERO-GAIN — confirms it is MEMORY-BANDWIDTH-bound (last measurable kernel, now measured at ceiling)
+
+**Dig (extreme-optimization on `nn::norm_rows`).** layer_norm batches 8 rows per
+group as `Simd<f64, 8>` (= 2 ymm on AVX2). Probe: 4 rows/group (`Simd<f64, 4>` =
+one native ymm, less register pressure) — per-row f64 reduction order unchanged,
+so bit-exact. Bit-exact PASS (`layer_norm_simd_matches_scalar` + 3 other
+layer_norm tests 4/0; `conformance_comparator_tests` 26/0).
+
+**Measured (deterministic same-session A/B, L=8 main vs L=4, local x86-64-v3,
+Criterion n=50):** `layer_norm_1500x384` 829.50 µs → 830.30 µs = **−0.49%
+(p=0.66, CI spans 0) ⇒ ZERO-GAIN**. **REVERTED** (candidate in stash).
+
+**Why:** layer_norm is **memory-bandwidth-bound** — 1500×384×4 B ≈ 2.3 MB read +
+2.3 MB write dominates; the f64 SIMD compute (and its 8-vs-4 row grouping) is
+hidden under the I/O, so grouping width is irrelevant. The bit-exact SoA approach
+(8 strided rows, L1-resident per group) is already at ceiling. Corollary: an
+f32-accumulation layer_norm would also be ~0 (memory-bound, not compute-bound) —
+the deliberate f64 precision is effectively free. **This was the last measurable
+kernel not yet benched this session;** with mel (exhausted), gemv (`dot_f16c`
+4-acc at ceiling), and now layer_norm all MEASURED at their hardware ceilings,
+the conformance-safe measurable surface is empty. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: 8-accumulator `dot_f16c` REJECTED — MEASURED +3.7% REGRESSION on the large GEMV (the 4-acc is at ceiling; the dot is cvtph-bound)
 
 **Dig (extreme-software-optimization on the landed f16c dot).** Hypothesis: the
