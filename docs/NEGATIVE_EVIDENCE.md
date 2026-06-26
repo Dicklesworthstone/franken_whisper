@@ -3,6 +3,103 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - AGENT_NAME=IcyWren: log-mel stack FFT buffers REJECTED - heap Vec is not the bottleneck
+
+### Land-or-dig scan
+
+Repo-local `.scratch` and `.worktrees` directories are absent. Sibling worktrees
+were ancestry-checked against current `origin/main` (`b1eb23b` at scan time).
+The apparent detached-code wins were stale copies already present on `main`
+after rebases:
+
+- `franken_whisper-cod-b-fft-clean-daa0cf9` held the pre-rebase copy of the
+  log-mel SIMD projection fusion, already landed on `main` as `b1eb23b`.
+- `franken_whisper-cod-a-l14-validate` showed dirty Rayon-pool-cap code only
+  because the worktree head was old; current `main` already contains
+  `ensure_default_rayon_pool`, the L14 PERF ledger, and its OpenAI-ratio entry.
+- `franken_whisper-cod-a-main-measure` was a stale docs-only OpenAI ratio entry
+  already present in the current ledger.
+
+With no missing measured win left to land, this pass dug one new preprocessing
+lever.
+
+### Candidate
+
+New one-lever probe: in `src/native_engine/mel.rs::compute_8_columns`, replace
+the per-8-frame heap allocations
+
+```text
+vec![FrameLanes::splat(0.0); N_FFT]
+vec![FrameLanes::splat(0.0); 2 * N_FFT]
+```
+
+with fixed stack arrays. This targeted allocation/setup overhead after the
+previous projection-fusion keep removed the larger scalar-spectrum transpose.
+Arithmetic order, twiddle lookup, SIMD FFT, sparse projection, and output layout
+were unchanged. Existing bit-exact coverage
+`compute_8_columns_matches_scalar_columns_bit_exact` guards the path.
+
+### Requested bench path status
+
+The exact warm target dir remains blocked without destructive cleanup:
+
+```text
+AGENT_NAME=IcyWren
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b
+rch exec -- cargo bench --profile release -p franken_whisper \
+  --bench native_engine_bench -- mel_30s_realistic \
+  --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result: RCH fell back local and Cargo failed before benchmark execution with
+`E0514` stale build-script artifacts compiled by rustc `beae78130` while the
+current toolchain is `f20a92ec0`. The target dir was not cleaned because that
+would be destructive. As in the prior keep, the comparable A/B used the
+non-destructive sibling target dir
+`/data/projects/.rch-targets/franken_whisper-cod-b-rustc-f20`.
+
+### Measurements
+
+Comparable same-host local fallback through `rch exec`, same worktree, same
+generated lock state, same sibling target dir:
+
+```text
+AGENT_NAME=IcyWren
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b-rustc-f20
+rch exec -- cargo bench --profile release -p franken_whisper \
+  --bench native_engine_bench -- mel_30s_realistic \
+  --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+| Workload | Baseline median | Candidate median | Candidate/current ratio | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| `native_engine/mel/mel_30s_realistic` | 4.7133 ms | 4.7523 ms | 0.9918x | REJECT |
+
+The candidate was also observed on remote worker `ovh-a` at `2.9013 ms`, but the
+same-worker baseline could not be acquired immediately (`RCH_REQUIRE_REMOTE=1
+RCH_WORKER=ovh-a RCH_WORKERS=ovh-a` reported no admissible worker), so that
+remote number is routing evidence only and not used for the keep/reject call.
+
+Fresh OpenAI Whisper preprocessing comparator used the exact Criterion fixture
+audio (`synthetic_audio(N_SAMPLES_30S, 0xa11ce)` ported to Python), 15 warmups,
+then 25 timed `whisper.audio.log_mel_spectrogram(samples, n_mels=80)` calls
+with the first 5 timed calls discarded:
+
+```text
+OpenAI shape:         (80, 3000)
+OpenAI steady median: 4.379693069 ms
+OpenAI steady mean:   4.408710939 ms
+baseline/OpenAI speed ratio:  4.379693069 / 4.713300000 = 0.9292x
+candidate/OpenAI speed ratio: 4.379693069 / 4.752300000 = 0.9216x
+```
+
+### Decision
+
+Rejected. Stack-resident FFT lane buffers do not beat the committed heap-buffer
+path on the comparable run, and they slightly worsen the same OpenAI Whisper
+preprocessing ratio. Source was manually restored before commit; no code is
+retained.
+
 ## 2026-06-25 - OWNER DECISION: native engine declared at its SAFE CEILING — optimization loop CLOSED
 
 After a full kernel + load + timestamp-path audit (entries below), the engine has
