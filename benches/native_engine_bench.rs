@@ -644,6 +644,26 @@ fn bench_resample(c: &mut Criterion) {
     group.finish();
 }
 
+/// Stereo → mono downmix of 30 s of interleaved 44.1 kHz audio (the decode-path
+/// channel average). No model needed — runs everywhere.
+fn bench_downmix(c: &mut Criterion) {
+    use franken_whisper::audio::downmix_to_mono;
+
+    let frames = 44_100usize * 30;
+    let interleaved = synthetic_audio(frames * 2, 0x0d03_3a17);
+
+    let mut group = c.benchmark_group("native_engine/downmix");
+    group.throughput(criterion::Throughput::Elements(interleaved.len() as u64));
+    group.bench_function("downmix_stereo_30s", |bch| {
+        bch.iter(|| {
+            let out = downmix_to_mono(black_box(&interleaved), black_box(2));
+            black_box(out.len())
+        });
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -661,6 +681,7 @@ criterion_group!(
     bench_f16_gemv_dequant,
     bench_layer_norm,
     bench_resample,
+    bench_downmix,
     bench_e2e_tiny_jfk,
     bench_e2e_large_jfk,
 );

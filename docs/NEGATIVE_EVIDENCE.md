@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: ⭐ LANDED SIMD stereo downmix — bit-exact; ~6.3× over main's iterator form (of which 1.29× is the explicit SIMD over tight autovec scalar)
+
+**Win + refactor.** The decode-path stereo→mono downmix
+(`append_decoded_audio_to_mono`) used `interleaved.chunks(2).map(|f| f.sum()/2)`
+— iterator/slice overhead per 2-sample frame. Extracted a pure, pub, **tested**
+`audio::downmix_to_mono(interleaved, channels)` with a SAFE `std::simd`
+deinterleave stereo fast path (`Simd::<f32,8>::deinterleave` → `(L+R)*0.5`; scalar
+boundary + a scalar path for 3+ channels). No `unsafe` (within `deny(unsafe_code)`).
+Bit-exact: `0.0+L+R == L+R` and `/2.0 == *0.5` (exact power of two), guarded by a
+new `downmix_to_mono_is_bit_exact_vs_reference` test (stereo SIMD + tails + 3-ch).
+Also added `native_engine/downmix/downmix_stereo_30s` bench. clippy `-D warnings`
+clean.
+
+**Measured — HONEST breakdown (Criterion, local x86-64-v3):**
+| version | time (downmix_stereo_30s) | vs main iterator form |
+| --- | ---: | ---: |
+| main `chunks().sum()` iterator | ~1.903 ms | 1.0× |
+| tight indexed scalar (LLVM autovec) | 387.7 µs | ~4.9× |
+| **explicit std::simd deinterleave (landed)** | **301.3 µs** | **~6.3×** |
+
+The explicit SIMD is **1.29× over the tight autovec scalar** (n=80, p=0.00) — a
+real, significant extra win (the deinterleave beats LLVM's autovec shuffle for the
+stereo stride) — so I landed it, not just the tight scalar. But be honest: the
+bulk of the ~6.3× is removing the *iterator* overhead (any tight loop gets ~4.9×);
+the SIMD adds the final 1.29×.
+
+**Leverage caveat:** like the resampler, this is a decode-time COLD path — runs
+once per file, and only for STEREO inputs (mono skips it). e2e impact is tiny
+(~1.6 ms saved per stereo file). But it's free, bit-exact, safe, adds test+bench
+coverage, and replaces a genuinely-slow loop on main. vs OpenAI-Whisper: not
+directly comparable (OpenAI downmixes via ffmpeg/torchaudio). AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: ⭐ LANDED SIMD resampler — bit-exact, MEASURED 1.36× (safe std::simd gather; supersedes my own "low-ROI, not pursued")
 
 **Correction + win.** Last entry (below) assessed the resampler SIMD lever as

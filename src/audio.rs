@@ -735,10 +735,46 @@ fn append_decoded_audio_to_mono(
         return;
     }
 
-    for frame in interleaved.chunks(channel_count) {
-        let sum: f32 = frame.iter().copied().sum();
-        destination.push(sum / frame.len() as f32);
+    destination.extend_from_slice(&downmix_to_mono(interleaved, channel_count));
+}
+
+/// Average `channels` interleaved samples per frame down to mono. Bit-exact with
+/// the scalar `frame.sum() / channels` reference (`0.0+L+R == L+R`, and `/2.0`
+/// is exact); the stereo fast path uses a SAFE `std::simd` deinterleave. Exposed
+/// for the benchmark harness; not part of the stable API.
+pub fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return interleaved.to_vec();
     }
+    let frames = interleaved.len() / channels;
+    let mut out = vec![0.0f32; frames];
+
+    if channels == 2 {
+        use std::simd::Simd;
+        const L: usize = 8;
+        let simd_frames = (frames / L) * L;
+        let half = Simd::<f32, L>::splat(0.5);
+        let mut f = 0;
+        while f < simd_frames {
+            // [L0 R0 L1 R1 ...] across two 8-lane loads -> (L0..L7, R0..R7).
+            let a = Simd::<f32, L>::from_slice(&interleaved[2 * f..2 * f + L]);
+            let b = Simd::<f32, L>::from_slice(&interleaved[2 * f + L..2 * f + 2 * L]);
+            let (lefts, rights) = a.deinterleave(b);
+            ((lefts + rights) * half).copy_to_slice(&mut out[f..f + L]);
+            f += L;
+        }
+        for (i, slot) in out.iter_mut().enumerate().skip(simd_frames) {
+            *slot = (interleaved[2 * i] + interleaved[2 * i + 1]) * 0.5;
+        }
+        return out;
+    }
+
+    for (i, slot) in out.iter_mut().enumerate() {
+        let frame = &interleaved[i * channels..(i + 1) * channels];
+        let sum: f32 = frame.iter().copied().sum();
+        *slot = sum / channels as f32;
+    }
+    out
 }
 
 /// Linear-interpolation mono resampler (`src_rate` → `dst_rate`). Bit-exact with
@@ -1096,6 +1132,43 @@ mod tests {
                         g.to_bits(),
                         w.to_bits(),
                         "bit mismatch {src}->{dst} n={n} idx={i}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn downmix_to_mono_is_bit_exact_vs_reference() {
+        use super::downmix_to_mono;
+        // Byte-for-byte reference: per-frame `sum() / channels` (the pre-SIMD form).
+        fn reference(interleaved: &[f32], channels: usize) -> Vec<f32> {
+            if channels <= 1 {
+                return interleaved.to_vec();
+            }
+            interleaved
+                .chunks(channels)
+                .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+                .collect()
+        }
+        // Exercise the stereo SIMD path (lengths straddling the 8-frame block,
+        // incl. scalar tails) plus a 3-channel scalar path.
+        for &channels in &[1usize, 2, 3] {
+            for &frames in &[0usize, 1, 7, 8, 9, 15, 16, 1000, 4096, 4099] {
+                let interleaved: Vec<f32> = (0..frames * channels)
+                    .map(|i| {
+                        let x = i as f32 * 0.011;
+                        (x.sin() * 0.7 - (x * 1.3).cos() * 0.25).fract()
+                    })
+                    .collect();
+                let got = downmix_to_mono(&interleaved, channels);
+                let want = reference(&interleaved, channels);
+                assert_eq!(got.len(), want.len(), "len ch={channels} frames={frames}");
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "bit mismatch ch={channels} frames={frames} idx={i}: {g} vs {w}"
                     );
                 }
             }
