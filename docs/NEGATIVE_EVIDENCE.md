@@ -3,6 +3,52 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: BLOCKER — no benchable compute lever remains (AVX2 hardware ceiling + decoder algorithmically complete + models absent on rch fleet)
+
+Closing the loop on three things probed this session, with hardware/code proof so
+future turns don't re-spend on them:
+
+**1. The "wider-SIMD / AVX-512" lever (left open in the `R-quad-dot8` entry) is
+moot on the bench fleet — and there is no f32-SIMD headroom to take.** The rch
+worker (`ovh-a`) is an **AMD Threadripper PRO 5975WX (Zen 3)**: `/proc/cpuinfo`
+flags are `avx2 f16c fma` — **no `avx512*`**. So the committed 8-lane (`f32x8`,
+256-bit) `dot8` already uses the **widest f32 SIMD this hardware has**; an
+`x86-64-v4` build baseline would no-op (or `SIGILL`) here and cannot be measured.
+The two rejected kernel attempts this session (`R-blocked-dequant` +1.1–2.1×,
+`R-quad-dot8` +1.2–2.5×, both REGRESSIONS) confirm `gemv_f16`/`dot8` sits at the
+**AVX2 hardware ceiling** (1280×1280 ≈ 184 µs ≈ 18 GB/s of f16 reads — compute-,
+not bandwidth-bound) and is **brittle to any source restructuring** (hand-rolled
+indexing defeats the `chunks_exact(8)`/`0..8` autovectorization idiom).
+
+**2. The decoder is algorithmically complete — no recompute lever.** `decoder.rs`
+runs an **incremental per-layer self-attention KV cache** (`KvCache`, one per
+layer, causal append) and **precomputes cross-attention K/V once per window**;
+`gemv_f16_batch` **dequants each weight row once and reuses it across all `tq`
+prompt tokens** (convert hoisted out of the token loop). The classic whisper
+decode wins (KV cache, cross-K/V caching, dequant amortization) are all present.
+
+**3. The e2e-relevant benches cannot run on the rch fleet (measurement-infra
+gap).** `benches/native_engine_bench.rs`'s `encoder_window_*`, `decoder_token_step_*`,
+`logits_gemv_large`, `e2e_*` are model-gated; the worker prints
+`SKIP … model {tiny.en|large-v3-turbo} missing`. The models exist **locally**
+(`legacy_whispercpp/whisper.cpp/models/ggml-large-v3-turbo.bin`, jfk fixture) but
+are gitignored / not synced to rch workers. So **only the hermetic kernel benches
+(`mel`, `f16_gemv`, `layer_norm`) are measurable via `rch exec`, and all are
+already optimized (L1–L5) or at ceiling (f16_gemv).**
+
+**⇒ BLOCKER.** No measurable compute lever remains on the prescribed
+`rch exec -- cargo bench` path. The only outstanding e2e gap is **tiny-cold-CLI vs
+whisper.cpp (~190 ms, diffuse: ~80 load / ~84 startup+audio / ~26 transcribe)** —
+not a kernel, dominated by eager model load (whisper.cpp `mmap`s; a safe `memmap2`
+load is a *structural* change whose benefit shows only on cold page-cache, which
+criterion warm-loops can't measure) and CLI startup. **vs OpenAI-Whisper franken
+already wins 2.13–3.26× everywhere.** Concrete unblock paths for a future turn,
+each needing a decision the kernel work can't make unilaterally: (a) stage the
+ggml models + jfk.wav on the rch workers so the model-gated/e2e benches run there;
+(b) owner sign-off on an `x86-64-v4` baseline *and* a Zen4+/AVX-512 bench host to
+even test it; (c) a `memmap2`-based cold-load path (safe-API dep; profiled cold,
+not via criterion).
+
 ## 2026-06-25 - BlackThrush: multi-accumulator `dot8` REJECTED — 2.5× REGRESSION; `dot8`'s idiom is load-bearing (DO NOT hand-restructure)
 
 Applied the textbook FMA-latency lever (`/extreme-software-optimization`:
