@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - OWNER DECISION: native engine declared at its SAFE CEILING — optimization loop CLOSED
+
+After a full kernel + load + timestamp-path audit (entries below), the engine has
+no remaining in-policy speed lever. The owner was presented the only outstanding
+lever — mmap model-load, which needs `#![forbid(unsafe_code)]` relaxed
+(`memmap2::Mmap::map` is an `unsafe fn`) for a modest, mostly-warm gain (~7 ms tiny
+/ ~150 ms warm-large; cold-load is disk-bound ≈0) — and **chose to KEEP
+`#![forbid(unsafe_code)]`** and accept the safe ceiling.
+
+**Ratified status (do not re-litigate):**
+- Every hot kernel is at the AVX2 hardware ceiling on the Zen3 bench fleet and is
+  brittle to source restructuring (mel/FFT/filterbank L1–L4, layer_norm L5,
+  gelu/softmax L8, `gemv_f16`/`dot8`/`gemv_f16_batch` L9–L13 + two ceiling rejects
+  this session, `conv1d` = im2col+sgemm). Decoder is algorithmically complete
+  (KV-cache + precomputed cross-K/V). DTW post-proc is not the ts bottleneck.
+- vs **OpenAI-Whisper**: franken wins **2.13–3.26×** everywhere. vs whisper.cpp:
+  parity/win except tiny-cold-CLI (~190 ms, diffuse load+startup).
+- The mmap load lever is **declined by owner policy**; do NOT re-attempt it,
+  re-run the audit, or re-probe `dot8`/`gemv_f16` restructures (they regress).
+- **⇒ The per-kernel optimization loop is closed.** Reopen only if the owner
+  relaxes `forbid(unsafe_code)`, provides an AVX-512 (Zen4+) bench host + signs off
+  on an `x86-64-v4` baseline, or stages the ggml models on the rch fleet.
+
 ## 2026-06-25 - BlackThrush: "safe streaming load" gives ~0 speed (parse is already zero-copy) + DTW post-proc not the bottleneck
 
 Two last-mile levers checked and closed so no future turn re-spends on them.
