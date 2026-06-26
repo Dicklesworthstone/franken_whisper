@@ -3,6 +3,53 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: `fft_simd8` recursion scratch-reuse REJECTED — bit-exact but a MEASURED +40–50% REGRESSION (small per-call Vecs are faster)
+
+**Dig result (extreme-software-optimization angle): the deferred "kill per-call
+FFT heap allocs" lever (`bd-02do L2`), measured and rejected.** The hot-path
+`fft_simd8` recurses `400→200→100→50→25` and at every even level heap-allocates
+four `Vec<FrameLanes>` (`even`/`odd` inputs + `even_fft`/`odd_fft` outputs) — about
+**22k allocations per `mel_30s`**, 30× more than the top-level `compute_8_columns`
+allocs whose stack-array removal the prior probe already measured at 0.99× (see
+"log-mel stack FFT buffers REJECTED" below). This probe targeted that larger,
+untried recursion source: a single per-thread `thread_local` workspace
+(`FFT_SCRATCH_LEN = 6*N_FFT`) carved through the recursion with `split_at_mut`,
+grown once per worker thread and fully overwritten each batch ⇒ **zero per-call
+FFT allocation**.
+
+**Bit-exactness: PASS.** All 11 `native_engine::mel` tests pass, including
+`fft_simd8_matches_scalar_bit_exact`, `compute_8_columns_matches_scalar_columns_bit_exact`,
+`fft_matches_naive_dft`, and `determinism_across_thread_counts`. The transform is
+byte-identical; this is purely an allocation-strategy change.
+
+**Measurement: a large REGRESSION.** Deterministic same-machine back-to-back A/B
+via `git stash` (clean `main` `--save-baseline pre2`, then candidate `--baseline
+pre2`), `rch exec` build, local run, Criterion `--sample-size 40 --measurement-time 5`:
+
+| Workload | Clean main (pre2) | Candidate (scratch-reuse) | Change | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| `native_engine/mel/mel_30s` | 4.1395 ms | 5.8290 ms | **+39.9%** (p=0.00) | REJECT |
+| `native_engine/mel/mel_30s_realistic` | 2.9232 ms | 4.3721 ms | **+49.7%** (p=0.00) | REJECT |
+
+vs OpenAI Whisper (cross-run anchor, prior measured steady median ≈ 4.38 ms on
+this fixture): clean main `mel_30s_realistic` 2.92 ms **beats** OpenAI ~1.5×,
+while the candidate 4.37 ms only **ties** it — i.e. the change would *erase*
+franken's mel-frontend lead. Confirmed loss either way you frame it.
+
+**Why the "obvious" win loses:** the per-call `Vec<FrameLanes>` are small,
+same-size-class, hit the allocator's hot free-list, and stay L1-cache-resident;
+LLVM autovectorizes the butterfly loop over them cleanly. Replacing them with a
+76 KB reused workspace threaded through `split_at_mut` adds a per-batch
+`thread_local`+`RefCell::borrow_mut`, spreads the working set across more cache
+lines, and introduces slice-aliasing the optimizer handles worse. Allocation was
+never the bottleneck — the FFT is butterfly/compute-bound — so removing it only
+adds overhead.
+
+**Verdict: REJECT + REVERT.** Source restored to clean `main` (candidate
+preserved in a local stash); only this ledger entry is committed. This closes
+`bd-02do L2`: do NOT re-attempt FFT scratch-reuse — it is a measured ~1.5×
+regression, not a win. AGENT_NAME=BlackThrush.
+
 ## 2026-06-25 - BlackThrush: log-mel one-sided / real-FFT (RFFT) lever REJECTED — gated by the bit-exact-with-whisper.cpp mel invariant + low e2e leverage
 
 **Dig result (alien-graveyard / extreme-optimization angle): a genuinely NEW
