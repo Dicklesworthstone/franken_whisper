@@ -548,6 +548,19 @@ convert_to_f32_slice → dot8` auto-vectorizes to tight `vfmadd`; the chunked
 `fp16`) artifact that does not hold on x86. **REVERTED** (stash-preserved). Full
 analysis + table in NEGATIVE_EVIDENCE 2026-06-25.
 
+### R-quad-dot8 — 4 independent accumulators in `dot8`  — REJECTED (x86 2.5× REGRESSION)
+
+The FMA-latency lever (4 disjoint 8-lane accumulators over 32-elem chunks) to
+break `dot8`'s single-ymm dependency chain. Conformance green (27/27 nn tests),
+but criterion A/B vs committed `dot8` (`blk_pre`): `f16_gemv_dequant_1280x1280`
+**+122%**, `dequant_384x384` **+148%** (both p<0.05). Indexing `ach[8+i]`/`16+i`
+breaks the `chunks_exact(8)`/`0..8` idiom LLVM pattern-matches into `vfmadd` →
+scalarized (~383 µs, same floor as R-blocked-dequant). **Second confirmation that
+`dot8`'s clean form is load-bearing — do NOT hand-restructure it** (the single
+accumulator is not latency-bound in practice). REVERTED (stash-preserved). Real
+headroom needs wider SIMD (AVX-512/`x86-64-v4`, owner sign-off). Full analysis in
+NEGATIVE_EVIDENCE 2026-06-25.
+
 ---
 
 ## ⇒ Session arc (2026-06-25, BlackThrush): built the comparator, closed 1.37×→~1.08×

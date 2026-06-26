@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: multi-accumulator `dot8` REJECTED — 2.5× REGRESSION; `dot8`'s idiom is load-bearing (DO NOT hand-restructure)
+
+Applied the textbook FMA-latency lever (`/extreme-software-optimization`:
+*independent accumulators to saturate the FMA units*) to `dot8`
+(`src/native_engine/nn.rs`) — the single 8-lane accumulator is a loop-carried
+dependency on one ymm, so four disjoint 8-lane accumulators over 32-element
+chunks *should* hide FMA latency. Conformance held (tolerance reorder; 27/27 nn
+tests green). **Perf went the wrong way, hard.** Criterion A/B vs the committed
+`dot8` (`blk_pre` baseline), per-crate via `rch exec -- cargo bench -p
+franken_whisper --bench native_engine_bench`, x86 fleet `ovh-a`:
+
+| shape (`native_engine/f16_gemv`) | committed `dot8` | 4-accumulator | change |
+| --- | ---: | ---: | --- |
+| `dequant_1280x1280` | ~184 µs | 387 µs | **+122%** (p<0.05) → 2.2× slower |
+| `dequant_384x384` | 68.3 µs | 157 µs | **+148%** (p<0.05) → 2.5× slower |
+
+**Root cause + the durable lesson.** The committed `dot8` —
+`for (ach,bch) in a.chunks_exact(8).zip(b.chunks_exact(8)) { for i in 0..8 {
+acc[i] += ach[i]*bch[i] } }` — is a *specific idiom* the Rust/LLVM toolchain
+pattern-matches into one tight `vfmadd` per 8 lanes. Indexing a wider chunk
+(`ach[8+i]`, `ach[16+i]`, …) **breaks that pattern-match and scalarizes** the
+inner loop → ~2.5× slower. This is the **second independent confirmation** this
+session: the rejected blocked-dequant (entry below) hit the *identical* failure
+(its hand-rolled `x[c+j+l]` fold also scalarized, also ~383 µs at 1280×1280).
+Two different "optimizations", same ~383 µs scalarized floor vs the vectorized
+~184 µs committed path.
+
+⇒ **`dot8` is at the x86-64-v3 ceiling and its clean `chunks_exact(8)`/`0..8`
+form is load-bearing. Do NOT hand-restructure it** (blocking, unrolling, manual
+multi-accumulator) — every such attempt on this toolchain defeats autovectoriza-
+tion and regresses ~2–2.5×. The single accumulator is *not* latency-bound in
+practice (LLVM unrolls + the OOO engine overlaps with the dequant). Real headroom
+here would need **wider SIMD** (AVX-512 via an `x86-64-v4` build baseline — a
+deliberate min-CPU trade-off needing owner sign-off, cf. L7) or `std::simd`
+`f32x8` written so LLVM keeps the FMA form; plain index-restructuring is a trap.
+Code REVERTED (stash-preserved, non-destructive). **vs OpenAI-Whisper:** landing
+this would have ~halved the dominant per-token decoder GEMV throughput, erasing
+franken's large-v3-turbo lead — a net loss, not a gain.
+
 ## 2026-06-25 - BlackThrush: blocked-dequant `gemv_f16` REJECTED on x86 — 2.1× REGRESSION (in-code M4 claim did not reproduce)
 
 An **uncommitted working-tree** variant of `gemv_f16`'s `row_dot` (`src/native_engine/nn.rs`)
