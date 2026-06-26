@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: SIMD-`f64` mel-projection accumulation ZERO-GAIN (bit-exact, MEASURED ~0–1.4%, reverted)
+
+**Dig result (extreme-software-optimization): the last untried conformance-safe
+mel micro-lever, now MEASURED (not predicted).** `power_and_project_simd8`
+accumulates the sparse mel projection in a scalar `[f64; 8]` loop
+(`for lane in 0..8 { sums[lane] += f64::from(lanes[lane]) * weight }`). Candidate:
+accumulate as one `Simd<f64, 8>` (`pk.cast::<f64>()` exact widening; std::simd
+`*`/`+` don't fuse to FMA ⇒ identical per-lane multiply-then-add sequence).
+
+**Bit-exact: PASS** (all 11 `native_engine::mel` tests, incl.
+`compute_8_columns_matches_scalar_columns_bit_exact`). **Measured: ZERO-GAIN.**
+Deterministic same-machine A/B (`rch` build, Criterion `--sample-size 40
+--measurement-time 5`): candidate `mel_30s` 4.0992 ms / `mel_30s_realistic`
+2.9130 ms — statistically indistinguishable from clean main's established
+low-load medians (4.1395 / 2.9232 ms). Within-session Criterion change was
+−1.39% (p=0.01) / −0.55% (p=0.17) — one barely significant, one not, and both
+swamped by the box's ~1.5× transient-load variability (the baseline run drifted
+to 6.07/4.66 ms under load). Below any keep threshold; sub-noise; and the mel
+projection is not even the dominant cost (the n=25 DFT base is). **REVERTED**
+(candidate preserved in stash; nothing landed).
+
+**Why:** LLVM already autovectorizes the small fixed `0..8` f64 reduction; manual
+`Simd<f64,8>` matches it, no better — the same "autovec is at ceiling" result as
+`dot8` / FFT-scratch, now confirmed for the projection by measurement. This was
+the **last untried conformance-safe measurable mel lever**; it is now closed with
+data, not a prediction. (Bench-methodology note for future runs: the rch local
+run host varies ~1.5× by load — trust only deterministic same-session
+back-to-back A/B, and discard runs whose baseline drifted far from the ~4.14/2.92
+ms low-load anchor.) AGENT_NAME=BlackThrush.
+
 ## 2026-06-25 - BlackThrush: radix-5 base-DFT lever REJECTED — the dominant FFT cost, but conformance-blocked (whisper.cpp uses naive DFT) → FFT lever space now fully mapped
 
 **Dig result (extreme-software-optimization on the audit's named #1 cost).** The
