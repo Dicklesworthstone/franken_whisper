@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: f16c GEMV magnitude RESOLVED — definitive high-sample A/B = 1.34× (384) + 1.24× (1280); corrects the earlier "1280 inconclusive"
+
+**Why this entry:** the landed f16c dot had three conflicting numbers on record —
+Codex's "+3.49×", my first A/B's "1.40× (384) / inconclusive 1280 (p=0.43)", and
+the "2.5–5×" estimate. The 1280 (large/parallel) shape is the dominant decoder
+kernel, so leaving it inconclusive was a real gap. Re-ran a clean f16c-vs-two-pass
+A/B via the `FW_DISABLE_F16C_DOT` runtime toggle (same landed binary, no code
+change) at **100 samples / 8 s measurement** (the earlier run was 50/5 s and
+under-sampled the noisy parallel shape), local x86-64-v3, Criterion:
+
+| shape | two-pass | fused f16c | change | verdict |
+| --- | ---: | ---: | ---: | --- |
+| `f16_gemv_dequant_384x384` (serial) | 103.18 µs | 79.12 µs | **−25.1% ⇒ 1.34×** (p=0.00) | confirmed |
+| `f16_gemv_dequant_1280x1280` (rayon-parallel) | 247.55 µs | 202.13 µs | **−19.4% ⇒ 1.24×** (p=0.00) | RESOLVED (was inconclusive) |
+
+**Resolution:** f16c helps **both** decoder GEMV shapes — ~**1.34×** small / ~**1.24×**
+large, both significant. The earlier "1280 inconclusive" was under-sampling, NOT a
+real null (the 1280 fused win is partly diluted because that shape runs across the
+rayon pool and is RAM-bandwidth-bound on the 3.2 MB f16 weight read, but f16c
+still wins by avoiding the f32-scratch roundtrip's extra traffic + dequant). Honest
+overall magnitude: **~1.24–1.34×** on the decoder GEMV — real and bit-exact, but
+NOT the +3.49× / 2.5–5× previously cited; re-cite as ~1.3×. No code change;
+conformance unchanged (landed). **Methodology note:** use ≥100 samples / ≥8 s for
+the rayon-parallel GEMV shape — 50/5 s is too noisy to resolve a ~1.2× effect.
+AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: `layer_norm` row-group width 8→4 ZERO-GAIN — confirms it is MEMORY-BANDWIDTH-bound (last measurable kernel, now measured at ceiling)
 
 **Dig (extreme-optimization on `nn::norm_rows`).** layer_norm batches 8 rows per
