@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: 8-accumulator `dot_f16c` REJECTED — MEASURED +3.7% REGRESSION on the large GEMV (the 4-acc is at ceiling; the dot is cvtph-bound)
+
+**Dig (extreme-software-optimization on the landed f16c dot).** Hypothesis: the
+landed `dot_f16c` uses only 4 independent FMA accumulators, but Zen3 FMA is 4-cyc
+latency / 2-per-cyc throughput, so ~8 in-flight FMAs are needed to saturate the
+two FMA units → 4 accumulators leave the dot FMA-latency-bound on compute-bound
+shapes. Probe: widen to **8 accumulators** (64 elems/iter), keeping the 32/8/scalar
+tails. Stays in-scope (the f16c dot is already `#[allow(unsafe_code)]`).
+
+**Correctness: PASS** (bit-exact within the gemv tol gate — the wider reduction
+tree only reorders f32 adds): `native_engine::nn` tests 27/0 incl.
+`gemv_f16_matches_dequant_then_matmul`; `conformance_comparator_tests` 26/0.
+
+**Measured: REGRESSION / zero-gain** (deterministic same-session A/B, 4-acc `main`
+vs 8-acc, both f16c-enabled, local x86-64-v3, Criterion `--sample-size 50`):
+
+| shape | 4-acc (main) | 8-acc | change | verdict |
+| --- | ---: | ---: | ---: | --- |
+| `f16_gemv_dequant_1280x1280` | 259.69 µs | 267.96 µs | **+3.7%** (p=0.00) | REGRESSION |
+| `f16_gemv_dequant_384x384` | 83.10 µs | 85.67 µs | +0.5% (p=0.73) | zero-gain |
+
+**Why the hypothesis was wrong:** the dot is **`vcvtph2ps`-throughput-bound**
+(the f16→f32 convert is ~1/cyc on Zen3), not FMA-latency-bound — so more FMA
+accumulators don't help, and 8 ymm accumulators add register pressure that
+*regresses* the large shape. The large GEMV is also RAM-bandwidth-bound on the
+f16 weight read (both paths read the same 3.2 MB), which compute tuning can't
+touch (only lower-precision weights would — conformance-gated). **REVERTED** to
+the landed 4-accumulator version (candidate preserved in stash). The 4-acc
+`dot_f16c` is at its ceiling; do not widen it. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: f16c GEMV follow-up — clippy `-D warnings` FIX on the landed dot + an independent A/B that is LOWER than the +3.49× claim
 
 Two corrections on top of Codex's landed f16c GEMV (`c38b930` family):
