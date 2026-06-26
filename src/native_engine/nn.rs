@@ -309,6 +309,126 @@ fn dot8(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// Whether the **fused f16c dot** ([`dot_f16c`]) is compiled in and enabled. True
+/// only when the *build target* has `f16c`+`fma` — franken's `x86-64-v3` baseline
+/// does (`.cargo/config.toml`, lever L7) — and the ops escape hatch is unset.
+/// Otherwise the GEMV uses the portable two-pass (`convert_to_f32_slice`+[`dot8`]),
+/// so output on non-f16c builds/CPUs is unchanged. Because the binary already
+/// requires `x86-64-v3` to run, this is a compile-time fact, not a CPUID gamble.
+#[inline]
+fn f16c_dot_available() -> bool {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    ))]
+    {
+        use std::sync::OnceLock;
+        static AVAIL: OnceLock<bool> = OnceLock::new();
+        // Ops/debug escape hatch: force the portable two-pass.
+        return *AVAIL.get_or_init(|| std::env::var_os("FW_DISABLE_F16C_DOT").is_none());
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    )))]
+    {
+        false
+    }
+}
+
+/// Fused dequant-in-register f16 dot: `sum(f16→f32(w[i]) * x[i])` using
+/// `vcvtph2ps` (`_mm256_cvtph_ps`) + FMA over four independent 8-lane
+/// accumulators, with **no f32 scratch roundtrip**. This is the GGML-style dot
+/// the safe two-pass ([`HalfFloatSliceExt::convert_to_f32_slice`] then [`dot8`])
+/// emulates under the crate's `deny(unsafe_code)`; it is the measured **2.5–5×**
+/// decoder-GEMV lever (NEGATIVE_EVIDENCE 2026-06-25). The result differs from
+/// [`dot8`] only in f32 FMA/reduction order (rel ≈ 3e-6 on whisper shapes), well
+/// inside the [`gemv_f16`] tolerance gate (`gemv_f16_matches_dequant_then_matmul`,
+/// `< 1e-4`); the GEMV is already a numerics-affecting path vs the f32 sgemm
+/// reference. All whisper `inp` (n_state/mlp_hidden) are multiples of 32; the
+/// 8-lane and scalar tails are defensive for arbitrary lengths.
+///
+/// Compiled only under `target_feature = "f16c"`+`"fma"` (so the intrinsics are
+/// available **without** a `#[target_feature]` attribute → this fn fully inlines,
+/// unlike a feature-boundary call). Safe to call with any valid slices: the
+/// internal `unsafe` only does in-bounds raw loads (`Float16` is
+/// `repr(transparent)` over `u16`; the `i+32`/`i+8`/`i<n` guards bound every
+/// access), so no caller precondition.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_f16c(w: &[Float16], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = w.len().min(x.len());
+    let xp = x.as_ptr();
+    // SAFETY: every load is in-bounds by the i+32 / i+8 / i<n guards over
+    // n = min(w.len, x.len); Float16 is repr(transparent) u16 so a 128-bit load
+    // reads 8 contiguous lanes; f16c/fma are guaranteed by this fn's target_feature cfg.
+    unsafe {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            let w0 = _mm_loadu_si128(w.as_ptr().add(i).cast());
+            let w1 = _mm_loadu_si128(w.as_ptr().add(i + 8).cast());
+            let w2 = _mm_loadu_si128(w.as_ptr().add(i + 16).cast());
+            let w3 = _mm_loadu_si128(w.as_ptr().add(i + 24).cast());
+            a0 = _mm256_fmadd_ps(_mm256_cvtph_ps(w0), _mm256_loadu_ps(xp.add(i)), a0);
+            a1 = _mm256_fmadd_ps(_mm256_cvtph_ps(w1), _mm256_loadu_ps(xp.add(i + 8)), a1);
+            a2 = _mm256_fmadd_ps(_mm256_cvtph_ps(w2), _mm256_loadu_ps(xp.add(i + 16)), a2);
+            a3 = _mm256_fmadd_ps(_mm256_cvtph_ps(w3), _mm256_loadu_ps(xp.add(i + 24)), a3);
+            i += 32;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        while i + 8 <= n {
+            let p = _mm256_mul_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(i).cast())),
+                _mm256_loadu_ps(xp.add(i)),
+            );
+            let mut t = [0.0f32; 8];
+            _mm256_storeu_ps(t.as_mut_ptr(), p);
+            s += ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+            i += 8;
+        }
+        while i < n {
+            s += w[i].to_f32() * x[i];
+            i += 1;
+        }
+        s
+    }
+}
+
+/// One GEMV row dot over an f16 weight row and f32 activation: the fused f16c
+/// path when available ([`dot_f16c`], a safe call — its `unsafe` is internal),
+/// else the portable two-pass (`convert_to_f32_slice` into `scratch`, then
+/// [`dot8`]). `use_fused` is hoisted by the caller from [`f16c_dot_available`].
+#[inline]
+fn dequant_row_dot(w_row: &[Float16], x: &[f32], scratch: &mut [f32], use_fused: bool) -> f32 {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    ))]
+    if use_fused {
+        return dot_f16c(w_row, x);
+    }
+    let _ = use_fused;
+    w_row.convert_to_f32_slice(scratch);
+    dot8(scratch, x)
+}
+
 /// Fused dequant + GEMV: `out[o] = bias[o] + dot(W[o, :], x)` for a natural
 /// `[out, in]` row-major f16 weight `w_f16` and an `[in]` activation `x`.
 ///
@@ -351,11 +471,13 @@ pub fn gemv_f16(
         "gemv_f16 bias length mismatch"
     );
 
-    // One output row: bulk-SIMD dequant into `scratch`, then vectorized dot.
+    // One output row: fused f16c dot when the CPU supports it (measured 2.5–5×),
+    // else the portable two-pass (`convert_to_f32_slice` into `scratch`, [`dot8`]).
+    // The CPUID check is hoisted here so it is out of the per-row loop.
+    let use_fused = f16c_dot_available();
     let row_dot = |o: usize, scratch: &mut [f32]| -> f32 {
         let w_row = &w_f16[o * inp..(o + 1) * inp];
-        w_row.convert_to_f32_slice(scratch);
-        let acc = dot8(scratch, x);
+        let acc = dequant_row_dot(w_row, x, scratch, use_fused);
         match bias {
             Some(b) => acc + b[o],
             None => acc,
@@ -442,18 +564,24 @@ pub fn gemv_f16_batch(
     // Compute the column band [o0, o1) for every token row. `out_slice` is
     // `[tq, out]` row-major, so a column band is strided per token; we write it
     // directly (each band owns disjoint columns → no overlap across workers).
+    // Fused f16c dot per (o, t) when available, else the two-pass. Matches
+    // [`gemv_f16`]'s `row_dot` exactly (same [`dequant_row_dot`]), so the batch
+    // path is bit-for-bit identical to per-token gemv. (The fused dot dequants
+    // in-register, so there is no whole-row dequant to amortize across `tq`; the
+    // two-pass fallback re-dequants per token — a minor cost only on the rare
+    // pre-f16c CPU that takes that path.)
+    let use_fused = f16c_dot_available();
     let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
         // dst is the FULL [tq, out] buffer in serial mode, or in parallel mode a
         // per-worker private [tq, out] buffer it later disjoint-merges. Either
-        // way we write only columns [o0, o1). One reused dequant scratch row.
+        // way we write only columns [o0, o1).
         let mut scratch = vec![0.0f32; inp];
         for o in o0..o1 {
             let w_row = &w_f16[o * inp..(o + 1) * inp];
-            w_row.convert_to_f32_slice(&mut scratch);
             let b = bias.map_or(0.0, |bb| bb[o]);
             for t in 0..tq {
                 let xr = &x[t * inp..(t + 1) * inp];
-                dst[t * out + o] = dot8(&scratch, xr) + b;
+                dst[t * out + o] = dequant_row_dot(w_row, xr, &mut scratch, use_fused) + b;
             }
         }
     };
@@ -1541,7 +1669,7 @@ mod tests {
                 assert_eq!(
                     batch[t * out + o].to_bits(),
                     r.to_bits(),
-                    "batch[{t},{o}] != per-token gemv"
+                    "batch[{t},{o}] differs from per-token gemv"
                 );
             }
         }

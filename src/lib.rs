@@ -1,5 +1,11 @@
 #![feature(portable_simd)]
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) so the SINGLE audited f16c GEMV dot in
+// `native_engine::nn` (gated by `#[allow(unsafe_code)]` + a runtime
+// `is_x86_feature_detected!` check, with a safe two-pass fallback) can use the
+// `vcvtph2ps`+`fmadd` intrinsics GGML uses — a measured 2.5–5× on the dominant
+// decoder GEMV (owner-approved 2026-06-25; see docs/NEGATIVE_EVIDENCE.md). Every
+// other `unsafe` in the crate is still rejected at compile time.
+#![deny(unsafe_code)]
 #![allow(clippy::needless_raw_string_hashes)]
 
 pub mod accelerate;

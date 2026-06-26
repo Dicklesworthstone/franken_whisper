@@ -3,6 +3,50 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - Codex: LAND measured f16c fused f16 GEMV worktree win (decoder kernel +3.4904x; OpenAI-Whisper product ratio not remeasured)
+
+**Land-or-dig result:** a measured win was present off main in
+`/data/projects/franken_whisper-fused-f16c` / `134f404` and in the rebased clean
+landing worktree `/data/projects/franken_whisper-f16c-land-134f404` /
+`d284110`. This pass verified it against current `main` (`4ec4f2d`) and landed
+it instead of re-discovering another lever.
+
+**What changed:** the crate-level lint is relaxed from `forbid(unsafe_code)` to
+`deny(unsafe_code)` so one audited internal f16c/FMA kernel can exist while new
+unsafe sites still fail by default. `gemv_f16` and `gemv_f16_batch` now route
+rows through a fused half-to-f32 AVX/F16C dot when `f16c` + `fma` are available
+and `FW_DISABLE_F16C_DOT` is not set; scalar conversion + `dot8` remains the
+fallback and conformance oracle.
+
+**Fresh same-worker bench:** both A/B runs used `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`
+and `rch exec -- cargo bench -p franken_whisper --profile release --bench
+native_engine_bench f16_gemv_dequant -- --sample-size 10 --warm-up-time 0.2
+--measurement-time 0.5` on the same RCH worker, `vmi1227854`.
+
+| Bench | Fused disabled baseline | Fused enabled candidate | Ratio |
+| --- | ---: | ---: | ---: |
+| `f16_gemv_dequant_1280x1280` | `250.92 us` | `71.889 us` | `3.4904x` |
+| `f16_gemv_dequant_384x384` | `26.697 us` | `20.664 us` | `1.2920x` |
+
+Criterion marked both improvements significant (`p = 0.00 < 0.05`), with the
+large decoder-shape throughput moving from `6.5296 Gelem/s` to `22.791
+Gelem/s`.
+
+**OpenAI-Whisper ratio:** this is a decoder-kernel ratio, not a fresh
+OpenAI-Whisper end-to-end ratio. The RCH fleet still lacks the ggml fixtures for
+the model-gated e2e/logits benches (`jfk.wav` and `large-v3-turbo` skipped in
+the bench output), so the current product-level OpenAI evidence remains the
+existing ledger range: franken winning `2.13-3.26x` vs OpenAI-Whisper on the
+available one-shot CLI comparator, while stricter loaded-model OpenAI API
+comparators remain separately ledgered.
+
+**Conformance/quality gates:** `rch exec -- cargo check -p franken_whisper
+--lib` passed remotely on `hz2`; `rch exec -- cargo test -p franken_whisper
+--lib gemv_f16` passed the 4 focused f16 GEMV equivalence tests (`rch` failed
+open locally due no admissible workers at that instant). A first remote check on
+`ovh-b` died before franken code in `zerocopy` build-script SIGILL, so it is
+infrastructure noise, not a patch failure. AGENT_NAME=Codex.
+
 ## 2026-06-26 - BlackThrush: RADICAL-lever sweep — two more candidates gated; the franken lever space is now COMPLETELY characterized
 
 **Dig (alien-graveyard / alien-artifact / extreme-optimization for a *radical*,
