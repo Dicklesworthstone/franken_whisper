@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: bd-4hc0 GEMM lever RE-MEASURED — realistic win is ~1.1× (not 3.75×); faer swap NOT worth it
+
+`bd-4hc0` was logged as the "biggest remaining e2e lever, MEASURED 3.75× (P0)":
+swap `ft_kernel_cpu`'s `matrixmultiply 0.3` → `gemm`/faer. Owner asked to
+**validate on the Zen3 fleet before committing to the (heavy) faer dep**.
+Standalone same-run A/B on this Zen3 box (AMD Threadripper PRO 5975WX — *same
+model as rch worker `ovh-a`*), `target-cpu=x86-64-v3`, `matrixmultiply 0.3.10`
+(rayon-row-banded, as `ft-kernel-cpu` uses it) vs the `gemm` crate (faer's
+kernel), on the real encoder GEMM shapes, best-of-30:
+
+| encoder shape | 1-thread (kernel quality) | 8-thread (realistic) |
+| --- | ---: | ---: |
+| attn QKVO `[1500,384]×[384,384]` | 1.42× | **1.14×** |
+| mlp fc1 `[1500,384]×[384,1536]` | 1.38× | **1.44×** |
+| mlp fc2 `[1500,1536]×[1536,384]` | 1.36× | **1.05×** |
+| large attn `[1500,1280]×[1280,1280]` | 1.35× | **1.09×** |
+
+**The 3.75× was a parallel-scaling artifact, not a kernel-quality or realistic
+gap.** Single-threaded the kernels differ only ~1.37× (matrixmultiply ~90 GF/s vs
+gemm ~125 GF/s ≈ single-core f32 peak). The ledger's "187→701 GF/s = 3.75×"
+compared faer-**parallel** (~700 GF/s, matches my 8-thread gemm 719) against
+matrixmultiply **poorly** parallelized (187). But `ft-kernel-cpu` already
+rayon-bands matrixmultiply (my banded test: 90→~500 GF/s on 8 threads — and it
+*must*, since franken's encoder already WINS vs whisper.cpp), so with **both**
+properly parallelized the encoder GEMMs are memory-bandwidth-bound and the gap
+collapses to **~1.05–1.44× (weighted ~1.1×)**. Numerics transcription-safe
+(rel diff ~1e-6) either way.
+
+⇒ Realistic e2e from the faer swap ≈ **~1.1× on ~32% GEMM-bound encoder ≈ 1.03×
+e2e** — **not worth a heavy faer dependency**, and far below the logged 3.75×.
+**bd-4hc0 is DOWNGRADED from "P0 biggest lever" to a ~1.03× e2e item gated on a
+heavy dep.** (Validated in scratchpad; no franken_whisper source/dep change.)
+This reconciles with the owner's "engine at safe ceiling" decision: the GEMM was
+the one lever that *looked* big on paper, and measurement shows it is not.
+
 ## 2026-06-26 - AGENT_NAME=IcyWren: log-mel stack FFT buffers REJECTED - heap Vec is not the bottleneck
 
 ### Land-or-dig scan
