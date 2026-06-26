@@ -3,6 +3,56 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: RADICAL-lever sweep — two more candidates gated; the franken lever space is now COMPLETELY characterized
+
+**Dig (alien-graveyard / alien-artifact / extreme-optimization for a *radical*,
+not micro, lever vs OpenAI-Whisper).** Two genuinely new candidates beyond the
+FFT-algorithmic and micro-opt levers already in this ledger — both evaluated and
+gated; recorded so future radical sweeps don't re-derive them.
+
+1. **f32-throughout mel frontend** (drop the deliberate f64 accumulation in
+   power+projection; do the whole pipeline in f32 → 2× SIMD width, ~potential
+   mel speedup). REJECTED — **conformance-gated**, identical class to RFFT: the
+   mel frontend is a bit-exact port of whisper.cpp and the f64 accumulation is a
+   *deliberate* accuracy choice; an all-f32 path diverges beyond f32-rounding
+   from the reference → breaks `conformance_comparator_tests`. Owner-policy call
+   (relax bit-exact mel → transcription-safe-approx mel). Also low leverage (mel
+   is preprocessing).
+
+2. **Pre-dequantized f32 weight cache for the decoder GEMV** (dequantize the
+   reused Q/K/V/O + MLP weight matrices f16→f32 ONCE at load and cache, so the
+   per-token decode gemvs skip the repeated `convert_to_f32_slice` dequant).
+   REJECTED — **memory-policy-gated AND unmeasurable here, AND dominated**: it
+   ~2× the weight RAM (large-v3-turbo ≈ 1.5 GB f16 → ~3 GB f32), an owner memory
+   tradeoff the f16 storage choice already settled; the decode-loop win is
+   unmeasurable on the rch fleet (model-gated benches SKIP — models absent); and
+   it is strictly dominated by the owner-gated f16c fused dot (entry below), which
+   gets the same per-token dequant savings with **no** memory blow-up.
+
+**Complete lever-space characterization (this closes the investigation).** Across
+this arc every franken performance lever has been classified by measurement or
+hard structural blocker:
+- **LANDED wins:** mel projection fusion (beats OpenAI 1.0086×), chunk_frames
+  row-copy (7.16× intra-franken).
+- **Autovec-ceiling (MEASURED, safe micro-opts):** dot8 multi-accum +122–148%,
+  FFT recursion scratch-reuse +40–50%, SIMD-f64 projection ~0% — LLVM already
+  vectorizes these; manual restructuring matches-or-regresses.
+- **Conformance-gated (bit-exact-with-whisper.cpp invariant):** RFFT, radix-5
+  base DFT, f32-throughout mel.
+- **`forbid(unsafe_code)`-gated:** decoder f16c fused dot (2.5–5×, the biggest
+  lever).
+- **Memory-policy-gated:** pre-dequant f32 weight cache (dominated by the f16c
+  dot anyway).
+- **Unmeasurable on this fleet:** all decoder/encoder/e2e levers (ggml models
+  absent → model-gated benches SKIP).
+
+⇒ **No conformance-safe, measurable, non-owner-gated lever remains.** Productive
+optimization reopens ONLY on owner action: stage the ggml models on the rch
+fleet (unlocks measuring the high-leverage decoder/encoder GEMV levers), or relax
+one invariant (`forbid-unsafe` for the f16c dot, or bit-exact-mel for the FFT/f32
+levers). Until then the engine is at its safe ceiling, winning 2.13–3.26× vs
+OpenAI-Whisper. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: SIMD-`f64` mel-projection accumulation ZERO-GAIN (bit-exact, MEASURED ~0–1.4%, reverted)
 
 **Dig result (extreme-software-optimization): the last untried conformance-safe
