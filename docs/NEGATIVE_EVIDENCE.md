@@ -3,6 +3,42 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: ⭐ DECODER GEMV has a MEASURED 2.5–5× lever — the `forbid(unsafe_code)` tax (fused f16c dot)
+
+**This is the biggest measured lever in the project and it reframes the
+`forbid(unsafe_code)` decision.** The large-decoder ~4.8× gap vs GGML was logged
+as "diffuse `gemv_f16` kernel efficiency." Root-caused + measured: it is the
+**two-pass dequant** franken is *forced* into by `#![forbid(unsafe_code)]` —
+`half::convert_to_f32_slice` (f16→f32 scratch) **then** `dot8` — vs GGML's
+**fused f16c dot** (`_mm256_cvtph_ps` convert-in-register + `_mm256_fmadd_ps`,
+4 accumulators, no scratch). Standalone A/B on this Zen3 box (= rch `ovh-a`),
+`x86-64-v3`, same f16 weights, real decoder GEMV shapes, best-of-25:
+
+| shape | franken dispatch | 1-thread | 8-thread |
+| --- | --- | ---: | ---: |
+| tiny attn `[384,384]` | serial | **5.16×** | (n/a, serial) |
+| large attn QKVO `[1280,1280]` (1.6M<2M) | serial | **5.09×** | (n/a, serial) |
+| large mlp fc2 `[1280,5120]` | parallel | 5.82× | **2.73×** |
+| large mlp fc1 `[5120,1280]` | parallel | 5.07× | **2.47×** |
+| logits `[8192,1280]` (≈51866 real) | parallel | 4.71× | **2.91×** |
+
+two-pass tops out at ~7–9 GB/s single-thread (latency-bound: separate convert
+pass + single-accumulator `dot8`); fused hits 35–48 GB/s single-thread and
+86–116 GB/s at 8 threads. **In franken's actual dispatch the fused dot is ~5× on
+the serial per-token GEMVs (tiny + per-token attn) and ~2.5–2.9× on the large
+parallel GEMVs (mlp/logits).** Since the decoder is ~80% `gemv_f16`, that is
+roughly a **2–3× faster decoder** — by far the largest e2e lever found. Numerics
+transcription-safe (rel diff ~3e-6, same f16 values, FMA-order change only).
+
+**⇒ The `forbid(unsafe_code)` cost is NOT ~7 ms of mmap load (how that decision
+was originally framed) — it is a ~2.5–5× tax on the dominant decoder kernel.**
+Realizable safely-ish: a contained `unsafe` fused f16c dot, gated by
+`is_x86_feature_detected!("f16c")` with the current two-pass as the portable
+fallback (works on non-f16c CPUs), behind a lifted-`forbid` module OR an isolated
+helper crate. This is an owner POLICY call (relax `forbid(unsafe_code)` for one
+audited SIMD dot), now with the *correct* magnitude on the table. Validated in
+scratchpad; no franken_whisper source change.
+
 ## 2026-06-25 - BlackThrush: bd-4hc0 GEMM lever RE-MEASURED — realistic win is ~1.1× (not 3.75×); faer swap NOT worth it
 
 `bd-4hc0` was logged as the "biggest remaining e2e lever, MEASURED 3.75× (P0)":
