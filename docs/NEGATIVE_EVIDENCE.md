@@ -43,9 +43,11 @@ comparators remain separately ledgered.
 **Conformance/quality gates:** `rch exec -- cargo check -p franken_whisper
 --lib` passed remotely on `hz2`; `rch exec -- cargo test -p franken_whisper
 --lib gemv_f16` passed the 4 focused f16 GEMV equivalence tests (`rch` failed
-open locally due no admissible workers at that instant). A first remote check on
-`ovh-b` died before franken code in `zerocopy` build-script SIGILL, so it is
-infrastructure noise, not a patch failure. AGENT_NAME=Codex.
+open locally due no admissible workers at that instant); `rch exec -- cargo test
+-p franken_whisper --test conformance_comparator_tests` passed 26/26 remotely
+on `hz2`. A first remote check on `ovh-b` died before franken code in `zerocopy`
+build-script SIGILL, so it is infrastructure noise, not a patch failure.
+AGENT_NAME=Codex.
 
 ## 2026-06-26 - BlackThrush: RADICAL-lever sweep — two more candidates gated; the franken lever space is now COMPLETELY characterized
 
