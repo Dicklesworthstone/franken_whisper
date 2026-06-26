@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: "safe streaming load" gives ~0 speed (parse is already zero-copy) + DTW post-proc not the bottleneck
+
+Two last-mile levers checked and closed so no future turn re-spends on them.
+
+**Safe streaming model load = ~0 speed (only memory).** `ggml.rs::parse` does NOT
+copy the big tensors — for each it records `TensorEntry { byte_offset, byte_len }`,
+`cur.skip(byte_len)`, and **keeps the whole `blob: Vec<u8>` in the returned
+struct**; weights are later read as zero-copy *slices* into that blob. So
+`fs::read`'s single pagecache→`blob` copy is the *only* copy at load. A **safe**
+`BufReader` streaming refactor (no `unsafe`, no dep) would merely move that copy
+per-tensor — **same total bytes copied, ~0 wall-clock change**, only lower peak
+RSS (no whole-blob + typed buffers coexisting). The *speed* win (eliminate the
+pagecache→blob copy: ~7 ms tiny / ~150 ms warm-large) requires **mmap**, whose
+`memmap2::Mmap::map` is an `unsafe fn` → blocked by `#![forbid(unsafe_code)]`
+(owner policy). ⇒ no safe load-speed lever exists; the module's "streaming loader"
+doc-comment is aspirational (the code holds the full blob resident).
+
+**DTW post-processing is not the ts-path bottleneck.** `dtw_path` is a scalar DP
+over only `n_tokens × n_frames ≈ 28 × 1500 ≈ 42 k` cells (µs); `median_filter` /
+`token_timestamps` are per-head/token over 1500 frames (small). The realistic
+ts-path cost (504 ms) is dominated by the cross-attention **recording**, already
+parallelized in L13. No DTW lever.
+
+⇒ Combined with the prior entries, **every hot kernel AND the load/timestamp paths
+are now audited at-ceiling or owner-policy-blocked.** The single remaining
+speed lever in the whole engine — mmap load — needs `forbid(unsafe_code)` relaxed.
+
 ## 2026-06-25 - AGENT_NAME=IcyWren log-mel SIMD scratch reuse zero-gain rejected
 
 ### Land-or-dig scan
