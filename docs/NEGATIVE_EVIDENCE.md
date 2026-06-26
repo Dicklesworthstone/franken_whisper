@@ -236,6 +236,71 @@ optimal, no lever. With mel/FFT/filterbank (L1–L4), layer_norm (L5), gelu/soft
 KV-cache + cross-K/V (decoder), and now conv1d all verified optimized-or-at-ceiling,
 **every hot kernel in the engine has been audited.** No benchable compute lever
 remains.
+## 2026-06-26 - AGENT_NAME=IcyWren: log-mel SIMD projection fusion KEEP — Rust preprocessing now edges steady OpenAI Whisper
+
+Targeted the preprocessing lane while decoder GEMV work was occupied elsewhere:
+`src/native_engine/mel.rs` already had cached Hann/twiddles, sparse mel
+projection, and frame-batched `std::simd` FFT, but each 8-frame SIMD FFT batch
+still transposed the full complex spectrum back into eight scalar buffers before
+calling the scalar power+projection helper. The kept one-lever change fuses
+SIMD power-spectrum calculation with sparse mel projection, while preserving each
+lane's f64 accumulation order over filter-bin weights. The scalar transpose is
+gone; arithmetic semantics are guarded by a new bit-exact test:
+`native_engine::mel::tests::compute_8_columns_matches_scalar_columns_bit_exact`.
+
+### Benchmark path caveats
+
+The exact requested command form is not runnable in this repo:
+`cargo bench --release` is rejected by Cargo (`unexpected argument '--release'`);
+the supported equivalent used here is `cargo bench --profile release`. The exact
+requested warm target dir, `/data/projects/.rch-targets/franken_whisper-cod-b`,
+is also poisoned by old nightly build-script artifacts (`E0514`, compiled by
+rustc `beae78130` but current toolchain is `f20a92ec0`). Per the no-destructive
+rule, it was not cleaned. Measurements used non-destructive sibling target dir
+`/data/projects/.rch-targets/franken_whisper-cod-b-rustc-f20`; current
+`origin/main` also required a local `Cargo.lock` refresh because path crates
+(`fsqlite`, `ftui`) have advanced, but that lockfile is not part of this commit.
+
+### Measurements
+
+Criterion, per-crate only:
+
+```text
+AGENT_NAME=IcyWren
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b-rustc-f20
+rch exec -- cargo bench --profile release -p franken_whisper \
+  --bench native_engine_bench -- mel_30s_realistic \
+  --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Same disposable worktree and generated lock state, current `origin/main`
+`2ee9485` baseline vs candidate:
+
+| Workload | Baseline median | Candidate median | Ratio | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| `native_engine/mel/mel_30s_realistic` | 5.2211 ms | 4.7739 ms | **1.0937x** | KEEP |
+
+Criterion reported `[-10.260% -9.2345% -8.0507%]`, `p = 0.00`, so this is a
+statistically significant component win on the hermetic 30 s log-mel frontend.
+
+OpenAI Whisper preprocessing comparator, same 30 s deterministic synthetic audio
+shape `(80, 3000)`, `torch.set_num_threads(8)`, 15 warmups, then 25 timed
+`whisper.audio.log_mel_spectrogram(samples, n_mels=80)` calls with the first 5
+timed calls discarded:
+
+```text
+steady OpenAI median: 4.814779968 ms
+steady OpenAI mean:   4.497219343 ms
+candidate median:     4.773900000 ms
+candidate/OpenAI speed ratio: 4.814779968 / 4.773900000 = 1.0086x
+baseline/OpenAI speed ratio:  4.814779968 / 5.221100000 = 0.9222x
+```
+
+Scope: this is a preprocessing-component win, not an e2e claim. It is real
+because the same log-mel fixture now moves from slower than OpenAI Whisper's
+steady PyTorch preprocessing path to a small steady-state win, but e2e JFK
+fixtures at 16 kHz remain dominated by encoder/decoder work and model/load
+effects logged elsewhere.
 
 ## 2026-06-25 - BlackThrush: multi-accumulator `dot8` REJECTED — 2.5× REGRESSION; `dot8`'s idiom is load-bearing (DO NOT hand-restructure)
 

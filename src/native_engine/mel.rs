@@ -459,6 +459,38 @@ fn power_and_project(fft_out: &[f32], filters: &SparseMelFilters, out: &mut [f32
     }
 }
 
+/// SIMD-batch equivalent of [`power_and_project`]. Each lane is still
+/// accumulated over mel-bin weights in the same `k` order as the scalar helper;
+/// this only avoids transposing the whole complex FFT result back into eight
+/// scalar spectra before projection.
+fn power_and_project_simd8(fft_out: &[FrameLanes], filters: &SparseMelFilters, out8: &mut [f32]) {
+    let n_fft_bins = filters.fb.n_fft_bins;
+    let n_mel = filters.fb.n_mel;
+
+    let mut power = [FrameLanes::splat(0.0); N_FREQ_BINS];
+    for (j, p) in power.iter_mut().enumerate() {
+        let re = fft_out[2 * j];
+        let im = fft_out[2 * j + 1];
+        *p = re * re + im * im;
+    }
+
+    for m in 0..n_mel {
+        let (start, end) = filters.ranges[m];
+        let row = &filters.fb.data[m * n_fft_bins..m * n_fft_bins + n_fft_bins];
+        let mut sums = [0.0f64; FFT_LANES];
+        for (&pk, &rk) in power[start..end].iter().zip(row[start..end].iter()) {
+            let lanes = pk.to_array();
+            let weight = f64::from(rk);
+            for lane in 0..FFT_LANES {
+                sums[lane] += f64::from(lanes[lane]) * weight;
+            }
+        }
+        for lane in 0..FFT_LANES {
+            out8[lane * n_mel + m] = sums[lane].max(1e-10).log10() as f32;
+        }
+    }
+}
+
 /// Compute 8 FULLY-VALID frames' mel columns at once via the frame-batched FFT.
 /// Frames `frame_base .. frame_base + FFT_LANES` must each be fully inside
 /// `valid_len` (`offset + N_FFT <= valid_len`), so every window is a complete,
@@ -472,8 +504,6 @@ fn compute_8_columns(
     twiddles: &FftTwiddles,
     out8: &mut [f32],
 ) {
-    let n_mel = filters.fb.n_mel;
-
     // Structure-of-arrays windowed input: lane L holds frame (frame_base + L).
     let mut fft_in = vec![FrameLanes::splat(0.0); N_FFT];
     for (j, slot) in fft_in.iter_mut().enumerate() {
@@ -487,20 +517,7 @@ fn compute_8_columns(
 
     let mut fft_out = vec![FrameLanes::splat(0.0); 2 * N_FFT];
     fft_simd8(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
-
-    // Transpose each lane back to a scalar spectrum, then reuse the scalar
-    // power+projection (bit-exact, already validated) for each frame.
-    let mut scalar_outs = [[0.0f32; 2 * N_FFT]; FFT_LANES];
-    for (b, v) in fft_out.iter().enumerate() {
-        let arr = v.to_array();
-        for (lane_buf, &val) in scalar_outs.iter_mut().zip(arr.iter()) {
-            lane_buf[b] = val;
-        }
-    }
-    for (lane, lane_buf) in scalar_outs.iter().enumerate() {
-        let col = &mut out8[lane * n_mel..lane * n_mel + n_mel];
-        power_and_project(lane_buf, filters, col);
-    }
+    power_and_project_simd8(&fft_out, filters, out8);
 }
 
 /// Compute the log-mel spectrogram for the full padded input, exactly mirroring
@@ -880,6 +897,34 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn compute_8_columns_matches_scalar_columns_bit_exact() {
+        let filters = dummy_filters(24);
+        let sparse = SparseMelFilters::new(&filters);
+        let hann = cached_hann_window();
+        let tw = cached_fft_twiddles();
+
+        let mut lcg = Lcg::new(0xC011_EC70);
+        let samples: Vec<f32> = (0..SAMPLE_RATE * 2)
+            .map(|_| lcg.next_f32() * 0.75)
+            .collect();
+        let (padded, valid_len) = build_padded(&samples);
+        assert!(FFT_LANES * HOP + N_FFT <= valid_len);
+
+        let mut got = vec![0.0f32; FFT_LANES * filters.n_mel];
+        compute_8_columns(0, &padded, hann, &sparse, tw, &mut got);
+
+        let mut want = vec![0.0f32; FFT_LANES * filters.n_mel];
+        for lane in 0..FFT_LANES {
+            let col = &mut want[lane * filters.n_mel..(lane + 1) * filters.n_mel];
+            compute_frame_column(lane, &padded, valid_len, hann, &sparse, tw, col);
+        }
+
+        for (idx, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "column value {idx}");
         }
     }
 
