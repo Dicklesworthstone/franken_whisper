@@ -756,17 +756,42 @@ pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<
     let output_len = (((input.len() as f64) * dst_rate as f64) / src_rate as f64).ceil() as usize;
     let total = output_len.max(1);
     let last = input.len() - 1;
-    let mut output = Vec::with_capacity(total);
+    let mut output = vec![0.0f32; total];
 
-    // Linear interpolation. The interior — every output sample except the final
-    // one or two taps — has both source indices in bounds, so the per-sample
-    // `.min()` clamps the naive form applied on *every* load are pure overhead
-    // there; hoist them into a tail branch taken only when `left_idx + 1` runs
-    // off the end. The arithmetic per output sample is byte-identical to the
-    // clamped form (same `idx * ratio` f64 position, same `floor`, same f32
-    // `frac`), so the resampled signal is bit-exact — this only removes the
-    // redundant clamp work on the hot span. (perf ledger L16, MEASURED +6%.)
-    for idx in 0..total {
+    // PROBE: SIMD the interior (8 outputs/iter) with a SAFE `std::simd` gather —
+    // same `idx*ratio` f64 position, `floor`, f32 `frac`, and non-fused f32
+    // interp as the scalar form, so bit-exact (guarded by
+    // `resample_mono_linear_is_bit_exact_vs_reference`). Boundary/tail stays
+    // scalar (perf ledger L16: clamps hoisted out of the hot span).
+    use std::simd::{Simd, StdFloat};
+    const L: usize = 8;
+    // Interior = outputs whose `left_idx + 1 <= last` for all 8 lanes. With
+    // `left_idx = floor(idx*ratio)` monotonic, every idx < interior_end is safe.
+    let interior_end = if ratio > 0.0 {
+        (((last as f64) - 1.0) / ratio).floor().max(0.0) as usize
+    } else {
+        0
+    };
+    let simd_end = (interior_end / L) * L;
+    let ratio_v = Simd::<f64, L>::splat(ratio);
+    let lane_base = Simd::<f64, L>::from_array([0., 1., 2., 3., 4., 5., 6., 7.]);
+    let one = Simd::<usize, L>::splat(1);
+    let mut g = 0;
+    while g < simd_end {
+        let src_pos = (lane_base + Simd::splat(g as f64)) * ratio_v;
+        let left_f = src_pos.floor();
+        let lf = left_f.to_array();
+        let left_idx = Simd::<usize, L>::from_array(std::array::from_fn(|k| lf[k] as usize));
+        let fr = (src_pos - left_f).to_array();
+        let frac = Simd::<f32, L>::from_array(std::array::from_fn(|k| fr[k] as f32));
+        let left = Simd::<f32, L>::gather_or_default(input, left_idx);
+        let right = Simd::<f32, L>::gather_or_default(input, left_idx + one);
+        let out = left + (right - left) * frac;
+        output[g..g + L].copy_from_slice(&out.to_array());
+        g += L;
+    }
+    // Scalar boundary + tail (handles the last one/two taps' clamp).
+    for (idx, slot) in output.iter_mut().enumerate().skip(simd_end) {
         let src_pos = idx as f64 * ratio;
         let left_idx = src_pos.floor() as usize;
         let frac = (src_pos - left_idx as f64) as f32;
@@ -777,7 +802,7 @@ pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<
         } else {
             (input[last], input[last])
         };
-        output.push(left + (right - left) * frac);
+        *slot = left + (right - left) * frac;
     }
 
     output

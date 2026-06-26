@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: ⭐ LANDED SIMD resampler — bit-exact, MEASURED 1.36× (safe std::simd gather; supersedes my own "low-ROI, not pursued")
+
+**Correction + win.** Last entry (below) assessed the resampler SIMD lever as
+not worth it (predicting Zen3 `vpgatherdd` would eat the gain). I pursued it
+anyway and **measured the opposite** — a clean 1.36× win — so I landed it. The
+"measure, don't reason" discipline paid off; the prediction was wrong.
+
+`resample_mono_linear`'s interior now does 8 outputs/iter with a **SAFE
+`std::simd` gather** (`Simd::<f32,8>::gather_or_default`) over 8-wide f64
+`src_pos`/`floor`/`frac`; the boundary/tail stays scalar. No `unsafe` — fully
+within the crate's `deny(unsafe_code)` (the gather is the safe portable-simd
+intrinsic, not an `#[allow]` site). Same f64 position/floor and non-fused f32
+interp as scalar ⇒ **bit-exact**.
+
+**Correctness:** `resample_mono_linear_is_bit_exact_vs_reference` PASS (covers
+every decoder rate pair); `clippy -p franken_whisper --lib --benches -- -D
+warnings` clean.
+
+**Measured (deterministic same-session A/B, scalar main vs SIMD, local x86-64-v3,
+Criterion n=60):** `native_engine/resample/resample_44k_to_16k_30s` 1.766 ms →
+1.297 ms = **−24.1% ⇒ 1.36×** (p=0.00). KEEP.
+
+**Honest leverage caveat:** the resampler runs ONCE per file and is SKIPPED for
+16 kHz inputs (whisper's native rate), so e2e impact is small (~0.5 ms saved per
+non-16 kHz file). But it's a free, bit-exact, safe-code 1.36× on a real
+preprocessing kernel — zero risk (byte-identical output), so worth landing for
+44.1/48 kHz inputs (podcasts/video). vs OpenAI-Whisper: not directly comparable
+(OpenAI resamples via ffmpeg/torchaudio, outside the per-crate bench).
+AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: resampler benched (last un-benched non-model kernel) — baseline 1.67 ms; SIMD lever assessed LOW-ROI, not pursued
 
 **Dig: the only remaining non-model kernel without a benchmark.** `audio.rs`'s
