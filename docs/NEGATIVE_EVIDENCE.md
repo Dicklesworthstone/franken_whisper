@@ -3,6 +3,129 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - AGENT_NAME=IcyWren log-mel SIMD scratch reuse zero-gain rejected
+
+### Land-or-dig scan
+
+Repo-local `.scratch` and `.worktrees` directories were absent. Sibling worktree
+heads were checked with `git worktree list --porcelain` and ancestor-tested
+against current `main`. All measured-code worktrees were already ancestors of
+`main`; the only non-ancestor was `franken_whisper-cod-a-main-measure`, a stale
+docs-only OpenAI-ratio branch.
+
+### Candidate
+
+Preprocessing lane, avoiding the active `gemv_f16` work: `log_mel` /
+frame-batched STFT. One-lever probe: reuse the top-level `compute_8_columns`
+SIMD FFT input/output/transpose scratch buffers once per worker instead of
+allocating those buffers for every 8-frame batch. Arithmetic order, FFT
+twiddles, power projection, and output layout were unchanged.
+
+Decision contract:
+
+```text
+keep: Criterion proves a current-franken `mel_30s_realistic` win and the
+      OpenAI Whisper preprocessing ratio improves.
+reject: Criterion reports no significant current-franken improvement or any
+        comparator ratio regression.
+fallback: keep the committed per-batch scratch allocation path.
+```
+
+### RCH bench command status
+
+Requested command shape:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --release -p franken_whisper \
+    --bench native_engine_bench -- mel_30s_realistic \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Baseline attempt selected worker `vmi1227854`, but remote sync timed out after
+30 s, then RCH failed open locally. Cargo then rejected `bench --release` with
+`unexpected argument '--release'`. The candidate exact-form attempt later had no
+admissible RCH workers and failed locally with the same Cargo argument error.
+
+Supported release-profile baseline:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- mel_30s_realistic \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3 \
+    --save-baseline logmel-pre
+```
+
+RCH selected worker `vmi1227854`, remote sync timed out, then failed open
+locally. Result:
+
+```text
+native_engine/mel/mel_30s_realistic
+time: [5.4693 ms 5.5973 ms 5.8447 ms]
+```
+
+Supported release-profile candidate comparison:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- mel_30s_realistic \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3 \
+    --baseline logmel-pre
+```
+
+RCH selected worker `hz2`, remote sync timed out, then failed open locally.
+Result:
+
+```text
+native_engine/mel/mel_30s_realistic
+time:   [5.2833 ms 5.3899 ms 5.5499 ms]
+change: [-9.8590% -5.0179% +0.6976%] (p = 0.11 > 0.05)
+No change in performance detected.
+```
+
+### OpenAI Whisper preprocessing comparator
+
+Comparator command:
+
+```text
+uvx --from openai-whisper python
+```
+
+Timed `whisper.audio.log_mel_spectrogram(samples, n_mels=80)` on the same
+deterministic 30 s, 16 kHz synthetic sine+dither shape with
+`torch.set_num_threads(8)`. Result:
+
+```text
+OpenAI Whisper runs_s:
+  0.0058428091, 0.0052949998, 0.0055833368, 0.0055867631,
+  0.0054258581, 0.0060877942, 0.0056735280, 0.0052744520,
+  0.0052607148, 0.0054204389
+OpenAI median: 0.005504597s
+
+current franken Criterion midpoint:   0.005597300s
+candidate Criterion midpoint:         0.005389900s
+current vs OpenAI preprocessing:      0.983439x
+candidate vs OpenAI preprocessing:    1.021280x
+candidate vs current franken:         1.038479x midpoint only
+```
+
+Caveat: OpenAI returns `[80, 3000]`; franken's `log_mel` frontend computes the
+Whisper-style 30 s audio plus the padded tail (`mel_30s_realistic` exercises the
+same 3000 real FFT frames plus silence-tail handling). This is still useful as
+a preprocessing head-to-head, but not proof that a 2% midpoint difference is
+stable.
+
+### Decision
+
+Rejected as zero-gain. The OpenAI ratio was slightly favorable, but the
+same-Criterion current-franken comparison did not prove a win (`p=0.11`, CI
+crossed zero). Code was manually reverted; no source change was retained.
+
 ## 2026-06-25 - BlackThrush: BLOCKER — no benchable compute lever remains (AVX2 hardware ceiling + decoder algorithmically complete + models absent on rch fleet)
 
 Closing the loop on three things probed this session, with hardware/code proof so
