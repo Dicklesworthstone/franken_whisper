@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: radix-5 base-DFT lever REJECTED — the dominant FFT cost, but conformance-blocked (whisper.cpp uses naive DFT) → FFT lever space now fully mapped
+
+**Dig result (extreme-software-optimization on the audit's named #1 cost).** The
+audit flags `dft_simd8`'s odd base case as "the dominant transcendental cost of
+the whole mel frontend." Confirmed structurally: for `N_FFT = 400 = 2^4 * 5^2`
+the recursion bottoms out at `n = 25`, computed by a **naive O(n²) DFT** — 25×25 =
+625 SIMD FMA per call, and the base case is hit `400/25 = 16×` per FFT frame ⇒
+~10k FMA/frame, the single largest FFT block. Since `25 = 5×5`, a **radix-5
+Cooley-Tukey** factorization of the base would cut it to ~`25*(5+5) = 250`
+FMA/call (~2.5× fewer ops) — a real, novel lever (not previously in the ledger).
+
+**REJECTED — same conformance gate as the RFFT lever below.** whisper.cpp
+computes the odd factor with the naive DFT, and franken mirrors it bit-for-bit:
+`DftTable` is documented as "bit-exact replacements for the inline
+`theta.cos()/theta.sin()` the reference `dft` computed," and the module is "a
+faithful port … output is bit-for-bit comparable (within f32 rounding) to the
+reference encoder input." A radix-5 FFT restructures the accumulation graph →
+diverges beyond f32 rounding → breaks `conformance_comparator_tests`. Adopting it
+is an OWNER POLICY call (relax bit-exact mel → transcription-safe-approx mel), not
+an engineering choice. No code written (a measured "win" here is unreachable
+without breaking conformance by construction).
+
+**This closes the FFT lever space.** The two routes to a faster mel FFT —
+exploit real/Hermitian symmetry (RFFT, ≤2× butterflies) and factor the odd base
+case (radix-5, ~2.5× on the dominant block) — are BOTH conformance-blocked by the
+bit-exact-with-whisper.cpp invariant. The micro-opt route (kill per-call FFT
+allocs) is a MEASURED +40–50% regression (entry below). So every remaining mel
+FFT lever is either an owner-policy gate or a measured loss; the measurable,
+conformance-safe mel surface is exhausted. AGENT_NAME=BlackThrush.
+
 ## 2026-06-25 - BlackThrush: `fft_simd8` recursion scratch-reuse REJECTED — bit-exact but a MEASURED +40–50% REGRESSION (small per-call Vecs are faster)
 
 **Dig result (extreme-software-optimization angle): the deferred "kill per-call
