@@ -640,18 +640,42 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
     }
 
     // Global clamp + normalize: log_spec = max(log_spec, max - 8); (x + 4) / 4.
-    let mut mmax = f32::NEG_INFINITY;
-    for &v in &data {
-        if v > mmax {
-            mmax = v;
+    // SIMD over ~240k finite mel values: max-reduction is order-independent, and
+    // `simd_max` matches the scalar clamp for finite data, so this is bit-exact.
+    {
+        use std::simd::num::SimdFloat;
+        type V = std::simd::Simd<f32, 8>;
+        let n = data.len();
+        let n8 = n - n % 8;
+
+        let mut acc = V::splat(f32::NEG_INFINITY);
+        let mut i = 0;
+        while i < n8 {
+            acc = acc.simd_max(V::from_slice(&data[i..i + 8]));
+            i += 8;
         }
-    }
-    let floor = mmax - 8.0;
-    for v in &mut data {
-        if *v < floor {
-            *v = floor;
+        let mut mmax = acc.reduce_max();
+        for &v in &data[n8..] {
+            if v > mmax {
+                mmax = v;
+            }
         }
-        *v = (*v + 4.0) / 4.0;
+
+        let floor = mmax - 8.0;
+        let floor_v = V::splat(floor);
+        let four = V::splat(4.0);
+        let mut i = 0;
+        while i < n8 {
+            let v = V::from_slice(&data[i..i + 8]);
+            ((v.simd_max(floor_v) + four) / four).copy_to_slice(&mut data[i..i + 8]);
+            i += 8;
+        }
+        for v in &mut data[n8..] {
+            if *v < floor {
+                *v = floor;
+            }
+            *v = (*v + 4.0) / 4.0;
+        }
     }
 
     Ok(Mel {

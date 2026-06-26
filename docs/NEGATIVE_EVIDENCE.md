@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: ⭐ LANDED SIMD log-mel clamp+normalize — bit-exact, MEASURED −5% / −7.6% on mel (a HOT-path win, not cold)
+
+**The first hot-path win this arc** (the audio resample/downmix wins were cold
+once-per-file paths; this runs per encoder chunk). `log_mel`'s final step —
+global-max reduction, then `clamp(v, max-8)` + `(v+4)/4` over ~240k f32 mel
+values — was two SCALAR passes. SIMD'd both with safe `std::simd`
+(`simd_max`/`reduce_max`): the max reduction is order-independent (max selects,
+no rounding), `simd_max(v, floor)` equals the scalar clamp for finite mel data,
+and `/4.0` is exact ⇒ **bit-exact**. No `unsafe`.
+
+**Correctness:** `native_engine::mel` tests 11/0 (incl. `silence_collapses_to_floor`,
+`determinism_across_thread_counts`, the FFT/projection bit-exact tests);
+`conformance_comparator_tests` 26/0; clippy `--lib --benches -D warnings` clean.
+
+**Measured (deterministic same-session A/B, scalar main vs SIMD, local x86-64-v3,
+Criterion n=60):**
+
+| workload | scalar main | SIMD | change |
+| --- | ---: | ---: | --- |
+| `native_engine/mel/mel_30s` | 6.165 ms | 5.933 ms | **−5.0%** (p=0.00) |
+| `native_engine/mel/mel_30s_realistic` | 4.775 ms | 4.389 ms | **−7.6%** (p=0.00) |
+
+KEEP. The normalize was ~10–16% of mel; SIMD'ing it yields a 5–8% whole-mel win.
+vs OpenAI-Whisper: the landed mel-projection fusion already had `mel_30s_realistic`
+edging OpenAI's steady `log_mel_spectrogram` (~4.38 ms); at 4.39 ms this holds the
+lead with the normalize now also vectorized (the FFT base-DFT remains the dominant
+cost — conformance-gated, see radix-5 entry). Hot path, real leverage, free +
+bit-exact. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: ⭐ LANDED SIMD stereo downmix — bit-exact; ~6.3× over main's iterator form (of which 1.29× is the explicit SIMD over tight autovec scalar)
 
 **Win + refactor.** The decode-path stereo→mono downmix
