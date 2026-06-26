@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-25 - BlackThrush: blocked-dequant `gemv_f16` REJECTED on x86 — 2.1× REGRESSION (in-code M4 claim did not reproduce)
+
+An **uncommitted working-tree** variant of `gemv_f16`'s `row_dot` (`src/native_engine/nn.rs`)
+replaced the committed "bulk-SIMD dequant whole row → clean `dot8`" with an
+**interleaved blocked dequant**: dequant the f16 row in 256-element L1 chunks and
+fold each chunk into 8-lane accumulators via a hand-rolled
+`for l in 0..8 { acc[l] += scratch[j+l] * x[c+j+l] }` inner loop. Its in-code
+comment claimed `Standalone (x86-64-v3): 1.18× ([1536,384]) … 1.65× ([1280,5120])
+… 1.45× ([51865,1280])`, and the committed NEGATIVE_EVIDENCE ("large decoder
+profiled") floated this same blocking as a deferred idea.
+
+**It is a measured REGRESSION on the canonical x86 rch bench fleet** (worker
+`ovh-a`, the standard PERF_LEDGER measurement environment). Criterion A/B,
+committed baseline (`blk_pre`) vs the working-tree candidate, per-crate via
+`rch exec -- cargo bench -p franken_whisper --bench native_engine_bench`:
+
+| shape (`native_engine/f16_gemv`) | baseline | blocked candidate | change |
+| --- | ---: | ---: | --- |
+| `dequant_384x384` (tiny.en n_state) | 68.3 µs | 82.0 µs | **+19.9%** (p<0.05) |
+| `dequant_1280x1280` (large attn Linear) | ~184 µs | 384.6 µs | **+109%** (p<0.05) |
+
+**Root cause.** The committed path does one bulk `convert_to_f32_slice` (8-wide
+`f16c`) into scratch, then a clean `chunks_exact(8)` `dot8` that LLVM
+auto-vectorizes to tight `vfmadd` over the whole row. The blocked form's
+`x[c + j + l]` indexed inner loop + 256-chunk structure **defeats that
+auto-vectorization** (and on x86 the small-`inp` whole-row scratch already lives
+in L1, so the blocking buys nothing while adding chunk/partial-convert overhead).
+The standalone "win" was almost certainly an **M4/aarch64 (4-wide `fp16`)
+artifact** — it does not hold on the x86-64-v3 fleet these benches actually run on,
+which is precisely the architecture-dependent trap this ledger exists to catch.
+
+**Action.** Code REVERTED (stash-preserved, non-destructive; main's working tree
+restored to the committed bulk-dequant `dot8`). Had it been landed it would have
+**~halved the dominant per-token decoder GEMV throughput** on x86, widening (not
+closing) the franken-vs-whisper.cpp decoder gap and erasing franken's measured
+large-v3-turbo e2e win (1.24×) and PyTorch-OpenAI-Whisper lead (2.13–3.26×). The
+correct kernel on x86 remains the committed `bulk convert + dot8`. Conformance:
+n/a (no source change landed; baseline is the already-green committed code).
+
 ## 2026-06-25 - BlackThrush: linear resampler — bit-exact +6% kernel (L16) but e2e-neutral; windowed variant REJECTED
 
 Targeted the **one preprocessing kernel never touched** by L1–L16: the builtin

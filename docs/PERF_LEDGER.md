@@ -536,6 +536,20 @@ L15 (load). See NEGATIVE_EVIDENCE 2026-06-25 for the reject + scope caveat.
 
 ---
 
+### R-blocked-dequant — interleaved 256-chunk `gemv_f16` dequant  — REJECTED (x86 2.1× REGRESSION)
+
+An uncommitted working-tree `row_dot` rewrite (256-element L1-chunked dequant +
+hand-rolled 8-lane fold) carried an in-code comment claiming `x86-64-v3` wins of
+1.18–1.65×. Criterion A/B on the canonical x86 rch fleet (committed baseline vs
+candidate) showed the **opposite**: `f16_gemv_dequant_384x384` **+19.9%**,
+`f16_gemv_dequant_1280x1280` **+109%** (both p<0.05). The committed `bulk
+convert_to_f32_slice → dot8` auto-vectorizes to tight `vfmadd`; the chunked
+`x[c+j+l]` inner loop defeats that. The claimed win was an M4/aarch64 (4-wide
+`fp16`) artifact that does not hold on x86. **REVERTED** (stash-preserved). Full
+analysis + table in NEGATIVE_EVIDENCE 2026-06-25.
+
+---
+
 ## ⇒ Session arc (2026-06-25, BlackThrush): built the comparator, closed 1.37×→~1.08×
 
 Building `whisper-cli` (bd-zk43) exposed the real gap as the **in-scope decoder**
