@@ -741,7 +741,10 @@ fn append_decoded_audio_to_mono(
     }
 }
 
-fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+/// Linear-interpolation mono resampler (`src_rate` → `dst_rate`). Bit-exact with
+/// the clamp-on-every-load reference (perf ledger L16). Exposed so the benchmark
+/// harness can measure it directly; not part of the stable API.
+pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if input.is_empty() {
         return Vec::new();
     }

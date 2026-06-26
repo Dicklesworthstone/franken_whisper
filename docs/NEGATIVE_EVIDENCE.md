@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: resampler benched (last un-benched non-model kernel) — baseline 1.67 ms; SIMD lever assessed LOW-ROI, not pursued
+
+**Dig: the only remaining non-model kernel without a benchmark.** `audio.rs`'s
+`resample_mono_linear` (linear interpolation, already L16-optimized) had no bench,
+so it was the one measurable kernel never characterized. Made it `pub` (doc'd
+"exposed for benchmarking, not stable API") and added
+`native_engine/resample/resample_44k_to_16k_30s` (30 s of 44.1 kHz → 16 kHz, the
+most common decode resample). Build + bit-exact test green
+(`resample_mono_linear_is_bit_exact_vs_reference` 1/0); clippy `-D warnings` clean.
+
+**Baseline (Criterion n=60, local x86-64-v3):** `resample_44k_to_16k_30s` =
+**1.668 ms** (≈ 793 Melem/s over the 1.32 M-sample input → 480 k output).
+
+**SIMD lever — assessed and NOT pursued (low ROI).** The interior could go SIMD
+(8-wide f64 `src_pos`/`floor`/`frac` + two `_mm256_i32gather_ps` for
+`input[left_idx]` / `[left_idx+1]`, bit-exact since the f32 interp has no FMA),
+but: (1) **leverage is low** — the resampler runs ONCE per file and is SKIPPED
+entirely for 16 kHz inputs (whisper's native rate), so it is e2e-cold (memory:
+"e2e-neutral cold path"); (2) the access is an **irregular-stride gather**
+(`left_idx = floor(idx·ratio)` increments by a non-integer ~2.76 for 44.1→16 k),
+and **Zen3 `vpgatherdd` throughput is poor**, so the gather likely eats the SIMD
+gain; (3) the f64 floor + bit-exact f32 frac must match the scalar reference
+exactly. Net: a complex, bit-exact-fragile change for a near-zero e2e payoff —
+not worth it. **Landed: just the bench + `pub` (real coverage artifact + recorded
+baseline), no perf change.** With this, EVERY non-model kernel (mel, chunk_frames,
+f16c GEMV, layer_norm, resample) is now benched and characterized; the
+conformance-safe measurable surface is fully covered. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: f16c GEMV magnitude RESOLVED — definitive high-sample A/B = 1.34× (384) + 1.24× (1280); corrects the earlier "1280 inconclusive"
 
 **Why this entry:** the landed f16c dot had three conflicting numbers on record —

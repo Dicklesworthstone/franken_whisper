@@ -619,6 +619,31 @@ fn bench_layer_norm(c: &mut Criterion) {
     group.finish();
 }
 
+/// Linear resampler: 30 s of 44.1 kHz mono → 16 kHz (the most common decode-path
+/// resample; 16 kHz inputs skip it entirely). No model needed — runs everywhere.
+fn bench_resample(c: &mut Criterion) {
+    use franken_whisper::audio::resample_mono_linear;
+
+    let src_rate = 44_100u32;
+    let dst_rate = 16_000u32;
+    let input = synthetic_audio((src_rate as usize) * 30, 0x5e5a_3b1c);
+
+    let mut group = c.benchmark_group("native_engine/resample");
+    group.throughput(criterion::Throughput::Elements(input.len() as u64));
+    group.bench_function("resample_44k_to_16k_30s", |bch| {
+        bch.iter(|| {
+            let out = resample_mono_linear(
+                black_box(&input),
+                black_box(src_rate),
+                black_box(dst_rate),
+            );
+            black_box(out.len())
+        });
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -635,6 +660,7 @@ criterion_group!(
     bench_logits_gemv_large,
     bench_f16_gemv_dequant,
     bench_layer_norm,
+    bench_resample,
     bench_e2e_tiny_jfk,
     bench_e2e_large_jfk,
 );
