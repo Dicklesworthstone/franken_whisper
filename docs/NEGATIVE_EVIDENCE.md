@@ -100,6 +100,142 @@ path on the comparable run, and they slightly worsen the same OpenAI Whisper
 preprocessing ratio. Source was manually restored before commit; no code is
 retained.
 
+## 2026-06-25 - AGENT_NAME=IcyWren chunk_frames row-copy KEEP, but still behind OpenAI view/copy
+
+### Land-or-dig scan
+
+Sibling worktree heads were checked with `git worktree list --porcelain` and
+ancestor-tested against `main` `bfd3abf`. All measured-code worktrees were
+already ancestors of `main`. The only non-ancestor was
+`franken_whisper-cod-a-main-measure`; relative to current `main` it contains only
+a stale `docs/NEGATIVE_EVIDENCE.md` OpenAI-ratio entry, while its underlying
+mel-twiddle source win is already landed.
+
+### Candidate
+
+Preprocessing lane, avoiding the active `gemv_f16` work: `chunk_frames`, the
+Rust equivalent of slicing one `[n_mels, n_frames]` Whisper encoder window from
+the full row-major mel spectrogram. The old path prefilled the full destination
+with `SILENCE_FLOOR`, then copied every in-range frame scalar-by-scalar. The
+landed path computes the in-range row prefix once, appends each row with
+`extend_from_slice`, and writes `SILENCE_FLOOR` only for the true tail padding.
+
+Decision contract:
+
+```text
+keep: Criterion proves a current-franken `chunk_frames_80x3000_mid` win and
+      `chunk_frames` matches the old scalar reference on offsets/tails.
+reject: Criterion reports no significant current-franken improvement, or
+        conformance/reference tests fail.
+fallback: restore the scalar prefill-and-copy loop.
+```
+
+### RCH bench command status
+
+Requested command shape:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --release -p franken_whisper \
+    --bench native_engine_bench -- chunk_frames_80x3000_mid \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3 \
+    --save-baseline chunk-pre
+```
+
+RCH selected worker `vmi1264463`, but remote sync timed out after 30 s and RCH
+failed open locally. Cargo then rejected `bench --release` with `unexpected
+argument '--release'`.
+
+Supported release-profile scalar baseline:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- chunk_frames_80x3000_mid \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3 \
+    --save-baseline chunk-pre
+```
+
+RCH had no admissible workers (`insufficient_slots=4,hard_preflight=1`) and
+failed open locally. Result:
+
+```text
+native_engine/mel/chunk_frames_80x3000_mid
+time: [150.92 us 156.47 us 163.44 us]
+```
+
+Supported release-profile candidate comparison:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- chunk_frames_80x3000_mid \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3 \
+    --baseline chunk-pre
+```
+
+RCH again had no admissible workers and failed open locally. Result:
+
+```text
+native_engine/mel/chunk_frames_80x3000_mid
+time:   [21.292 us 21.841 us 22.414 us]
+change: [-86.742% -86.171% -85.625%] (p = 0.00 < 0.05)
+Performance has improved.
+```
+
+Ratio vs scalar franken baseline: `156.47 / 21.841 = 7.164x`.
+
+### OpenAI Whisper preprocessing comparator
+
+Comparator command:
+
+```text
+uvx --from openai-whisper python
+```
+
+Timed `whisper.audio.log_mel_spectrogram(samples, n_mels=80, padding=N_SAMPLES)`
+on the same deterministic 30 s, 16 kHz synthetic sine+dither shape, then sliced
+`mel[:, 512:3512]`. OpenAI Whisper version was `20250625`; tensor shape was
+`(80, 6000)`, stride `(6000, 1)`, contiguous `True`.
+
+```text
+view_runs_s:
+  0.0000018580, 0.0000019509, 0.0000017321, 0.0000017246,
+  0.0000017346, 0.0000019008, 0.0000016971, 0.0000016418,
+  0.0000016177, 0.0000016381
+view_median: 0.0000017283s
+
+contiguous_runs_s:
+  0.0000161745, 0.0000145278, 0.0000162915, 0.0000175538,
+  0.0000149650, 0.0000178667, 0.0000143769, 0.0000148083,
+  0.0000142467, 0.0000156478
+contiguous_median: 0.0000153064s
+```
+
+Ratio convention: `OpenAI median / franken median`.
+
+```text
+franken row-copy candidate vs OpenAI strided view:   0.079131x
+franken row-copy candidate vs OpenAI compact copy:   0.700810x
+```
+
+Caveat: OpenAI's actual slice can remain a strided PyTorch view, while the Rust
+encoder owns a compact `Mel` buffer. The compact-copy comparator is therefore the
+closer data-movement comparison, but the view timing is the honest OpenAI API
+floor.
+
+### Decision
+
+Keep and land. This is a real measured Rust preprocessing-kernel win
+(`7.164x`, Criterion `p=0.00`) and preserves the old scalar loop's output on
+offset/tail cases. It does not close the OpenAI head-to-head for this operation:
+franken remains slower than OpenAI's compact copy (`0.700810x`) and much slower
+than OpenAI's strided view floor (`0.079131x`). Recorded here so the win is not
+misrepresented as an OpenAI-beating slice path.
+
 ## 2026-06-25 - OWNER DECISION: native engine declared at its SAFE CEILING — optimization loop CLOSED
 
 After a full kernel + load + timestamp-path audit (entries below), the engine has

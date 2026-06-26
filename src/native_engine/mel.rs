@@ -671,13 +671,16 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
 /// [`SILENCE_FLOOR`].
 #[must_use]
 pub fn chunk_frames(mel: &Mel, frame_offset: usize, n_frames: usize) -> Mel {
-    let mut data = vec![SILENCE_FLOOR; mel.n_mel * n_frames];
+    let copy_frames = mel.n_frames.saturating_sub(frame_offset).min(n_frames);
+    let pad_frames = n_frames - copy_frames;
+    let mut data = Vec::with_capacity(mel.n_mel * n_frames);
     for m in 0..mel.n_mel {
-        for f in 0..n_frames {
-            let src = frame_offset + f;
-            if src < mel.n_frames {
-                data[m * n_frames + f] = mel.data[m * mel.n_frames + src];
-            }
+        if copy_frames > 0 {
+            let src = m * mel.n_frames + frame_offset;
+            data.extend_from_slice(&mel.data[src..src + copy_frames]);
+        }
+        if pad_frames > 0 {
+            data.resize(data.len() + pad_frames, SILENCE_FLOOR);
         }
     }
     Mel {
@@ -1030,6 +1033,39 @@ mod tests {
                     "pad slot ({m},{f}) not floor"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn chunk_frames_matches_scalar_reference() {
+        fn reference_chunk_frames(mel: &Mel, frame_offset: usize, n_frames: usize) -> Mel {
+            let mut data = vec![SILENCE_FLOOR; mel.n_mel * n_frames];
+            for m in 0..mel.n_mel {
+                for f in 0..n_frames {
+                    let src = frame_offset + f;
+                    if src < mel.n_frames {
+                        data[m * n_frames + f] = mel.data[m * mel.n_frames + src];
+                    }
+                }
+            }
+            Mel {
+                n_mel: mel.n_mel,
+                n_frames,
+                data,
+            }
+        }
+
+        let mel = Mel {
+            n_mel: 3,
+            n_frames: 7,
+            data: (0..21).map(|i| i as f32 + 0.25).collect(),
+        };
+        for &(offset, frames) in &[(0, 7), (2, 3), (5, 5), (7, 4), (9, 4), (3, 0)] {
+            let got = chunk_frames(&mel, offset, frames);
+            let want = reference_chunk_frames(&mel, offset, frames);
+            assert_eq!(got.n_mel, want.n_mel);
+            assert_eq!(got.n_frames, want.n_frames);
+            assert_eq!(got.data, want.data, "offset={offset} frames={frames}");
         }
     }
 

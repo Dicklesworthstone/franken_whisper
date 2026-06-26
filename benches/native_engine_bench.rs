@@ -263,6 +263,34 @@ fn bench_mel_30s_realistic(c: &mut Criterion) {
     group.finish();
 }
 
+/// Copy one Whisper encoder window out of a row-major full-mel buffer.
+///
+/// This isolates the decode loop's `mel[:, seek:seek+N_FRAMES]` equivalent:
+/// OpenAI Whisper can hand PyTorch a strided view, while the Rust encoder owns a
+/// compact `[n_mels, n_frames]` buffer and therefore copies/pads the window.
+fn bench_chunk_frames(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/mel");
+    let n_mel = 80;
+    let n_frames = FRAMES_PER_CHUNK + 1024;
+    let mut lcg = Lcg::new(0xc0ffee);
+    let data: Vec<f32> = (0..n_mel * n_frames).map(|_| lcg.next_f32()).collect();
+    let mel = Mel {
+        n_mel,
+        n_frames,
+        data,
+    };
+
+    group.bench_function("chunk_frames_80x3000_mid", |b| {
+        b.iter(|| {
+            let chunk =
+                mel::chunk_frames(black_box(&mel), black_box(512), black_box(FRAMES_PER_CHUNK));
+            black_box(chunk.data.len())
+        });
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // 2. encoder_window_{tiny,large} — one full 3000-frame encoder window
 // ---------------------------------------------------------------------------
@@ -599,6 +627,7 @@ criterion_group!(
     benches,
     bench_mel_30s,
     bench_mel_30s_realistic,
+    bench_chunk_frames,
     bench_encoder_window_tiny,
     bench_encoder_window_large,
     bench_decoder_token_step_tiny,
