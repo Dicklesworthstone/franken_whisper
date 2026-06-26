@@ -326,7 +326,7 @@ fn f16c_dot_available() -> bool {
         use std::sync::OnceLock;
         static AVAIL: OnceLock<bool> = OnceLock::new();
         // Ops/debug escape hatch: force the portable two-pass.
-        return *AVAIL.get_or_init(|| std::env::var_os("FW_DISABLE_F16C_DOT").is_none());
+        *AVAIL.get_or_init(|| std::env::var_os("FW_DISABLE_F16C_DOT").is_none())
     }
     #[cfg(not(all(
         target_arch = "x86_64",

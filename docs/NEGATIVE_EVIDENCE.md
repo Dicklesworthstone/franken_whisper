@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: f16c GEMV follow-up — clippy `-D warnings` FIX on the landed dot + an independent A/B that is LOWER than the +3.49× claim
+
+Two corrections on top of Codex's landed f16c GEMV (`c38b930` family):
+
+1. **Build fix (real CI bug).** The landed `native_engine::nn::f16c_dot_available`
+   used `return *AVAIL.get_or_init(...)` as the last statement of the
+   `target_feature=f16c+fma` cfg block → `clippy::needless_return`, which **fails
+   `cargo clippy -- -D warnings`** on franken's `x86-64-v3` baseline (the f16c
+   block is compiled there). Fixed to the tail expression (equivalent under both
+   cfg branches).
+
+2. **Independent A/B — magnitude is LOWER and shape-dependent (anti-optimism).**
+   Codex recorded "decoder kernel **+3.4904×**". A fresh same-binary A/B via the
+   `FW_DISABLE_F16C_DOT` runtime toggle (local x86-64-v3, Criterion
+   `--sample-size 50 --measurement-time 5`) does NOT reproduce that:
+
+   | shape | two-pass | fused f16c | change |
+   | --- | ---: | ---: | ---: |
+   | `f16_gemv_dequant_384x384` | 107.39 µs | 76.89 µs | **−28.5% ⇒ 1.40×** (p=0.00) |
+   | `f16_gemv_dequant_1280x1280` | 319.63 µs | 283.41 µs | +2.0% (p=0.43, **inconclusive**) |
+
+   So the isolated-kernel win is ~**1.40×** on the small (per-token) decoder shape
+   and statistically **inconclusive** on the large bandwidth-bound shape — well
+   below +3.49×. The win is real, bit-exact (rel ≈ 3e-6, inside the gemv tol gate;
+   `conformance_comparator_tests` 26/0), and conformance-safe — but it should be
+   cited as ~1.4× on the hot small GEMV, not 2.5–5× / 3.49×. The +3.49× and the
+   2.5–5× estimate are likely a different (serial-per-token) measurement path;
+   reconcile before re-citing. e2e vs OpenAI not re-measurable here (models
+   absent). AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - Codex: LAND measured f16c fused f16 GEMV worktree win (decoder kernel +3.4904x; OpenAI-Whisper product ratio not remeasured)
 
 **Land-or-dig result:** a measured win was present off main in
