@@ -3,6 +3,83 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: REJECT no-fill time-major window fast path; source locality beats dead-store elimination
+
+**Land-or-dig result: LAND already happened upstream, then DIG and REVERT.**
+While this session was measuring the unlanded radix-5 stash, `origin/main`
+advanced to `1eacf5b`, landing the radix-5 FFT base case with its ledgered
+OpenAI-Whisper ratio. I fast-forwarded to that commit and did not disturb it.
+
+**Radix-5 cautionary rerun:** before seeing `1eacf5b`, I applied the preserved
+stash variant on top of `c710cdd` and ran a same-target-dir local comparison
+because RCH had no admissible workers. The result was not a keep proof:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench native_engine_bench -- native_engine/mel/mel_30s_realistic \
+    --sample-size 20 --warm-up-time 0.2 --measurement-time 3
+
+pre-radix c710cdd baseline:
+native_engine/mel/mel_30s_realistic
+time: [3.8795 ms 3.9493 ms 4.0223 ms]
+
+stash-applied candidate rerun:
+native_engine/mel/mel_30s_realistic
+time: [3.9374 ms 4.0529 ms 4.2193 ms]
+change: [+5.7410% +17.433% +30.733%], Performance has regressed.
+```
+
+This rerun happened under local fallback and heavy system contention, so it is
+negative/cautionary evidence only; it does not supersede the upstream landing's
+base-case proof. It does prevent reusing my stale stash run as independent keep
+evidence.
+
+**New lever dug from the remaining biggest OpenAI-facing gap:** the current
+window-prep gap is still the `[80, 3000]` OpenAI slice/copy floor. Following the
+optimization hypothesis "delete a redundant destination fill when the window is
+fully in bounds", I tried a no-padding fast path in
+`encoder::time_major_mel_window_from_full_mel`: allocate with capacity and push
+time-major rows directly, avoiding the initial `vec![0.0; n_frames*n_mel]` fill.
+The correctness test passed, but the bench showed why this is the wrong lever:
+the push path makes source reads stride by `full_mel.n_frames`, losing the
+row-contiguous source locality that the landed tiled path preserves.
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper \
+    fused_full_mel_window_matches_chunk_then_transpose
+
+test native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose ... ok
+```
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [273.83 us 278.84 us 283.49 us]
+
+native_engine/mel/window_to_time_major_fused
+time: [228.03 us 240.21 us 258.83 us]
+change: [+87.383% +94.130% +102.76%], Performance has regressed.
+```
+
+Compare against the landed fused median from the previous BlackThrush entry:
+`120.96 us -> 240.21 us`, a `1.986x` slowdown. OpenAI-Whisper ratio convention
+is `OpenAI median / franken median`; using the same 2026-06-25 compact-copy
+anchor (`15.3064 us`), the candidate ratio is `15.3064 / 240.21 = 0.0637x`.
+That is worse than the landed fused path's `0.1265x`, so the no-fill fast path
+was reverted.
+
+**Operational note:** the requested literal `cargo bench --release` was also
+captured and rejected by this Cargo (`unexpected argument '--release'`); the
+release-profile equivalent above was used for executable per-crate benches.
+
+`AGENT_NAME=BlackThrush`.
+
 ## 2026-06-27 - SlateHeron: real-FFT (two-for-one) STEP 2 LANDED & DEFAULT-ON — MEASURED -8.37% mel (p=0.00); the "biggest remaining lever" is now in production
 
 **Land-or-dig result: LAND (the multi-turn lever completes).** Building on STEP 1
@@ -389,7 +466,6 @@ landed log10 + radix-5 frontend (~1.7x) to push franken mel to **~1.85x OpenAI**
 (estimate — no same-box OpenAI run was available this session; the -8.07% is the
 directly-measured figure). Conformance 26/0, mel suite 12/12, clippy `-D warnings`
 clean. AGENT_NAME=SlateHeron.
-
 ## 2026-06-27 - BlackThrush: LANDED full-mel window tile-order keep; 1.39x faster than current fused path, still 7.90x slower than OpenAI compact-copy anchor
 
 **Land-or-dig result: DIG then KEEP.** No unlanded measured code win was found in
