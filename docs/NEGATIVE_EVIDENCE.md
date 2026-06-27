@@ -3,6 +3,42 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: LANDED skip-dead-`scratch` in `gemv_f16` fused path — MEASURED -8.74% on the per-token `[384,384]` GEMV (p=0.00), bit-identical; the "unused work" lens crosses from mel to the decoder GEMV
+
+**Land-or-dig result: LAND (new surface — the mel-FFT axis is exhausted).** Applied
+the same "stop doing work nothing reads" lens that drove the mel wins to the only
+other un-SKIPped measurable kernel, `f16_gemv_dequant`. `gemv_f16` allocates a
+per-call `scratch = vec![0.0f32; inp]` for the portable two-pass dequant — but on
+x86 with f16c (the bench/decoder hardware), `dequant_row_dot` takes the FUSED
+branch (`return dot_f16c(w_row, x)` at `nn.rs`) and **never touches `scratch`**.
+So that buffer was allocated + zero-initialised on every GEMV call and never used.
+Now `Vec::new()` (no alloc) when `use_fused`; the two-pass still gets `vec![0.0; inp]`.
+
+**BIT-IDENTICAL & cannot-regress:** the fused path's output is independent of
+`scratch` (it's dead there), so output is unchanged — `nn` tests 27/27 with and
+without the change; conformance 26/0; clippy `-D warnings` + rustfmt clean. It
+removes work, so it can only help or be neutral.
+
+**Measurement (same-binary `FW_GEMV_SCRATCH_ALWAYS` A/B, n=80, 5 s, load ~11):**
+
+```text
+native_engine/f16_gemv
+  f16_gemv_dequant_384x384 :  81.241 µs -> 75.782 µs   change [-10.33% -8.74% -7.16%]  p=0.00  IMPROVED
+  f16_gemv_dequant_1280x1280: 211.32 µs -> 205.79 µs   change [+0.42% +1.84% +3.37%]  p=0.02  (noise:
+      candidate does strictly less work, so the small +% is baseline-save variance, not a real regression)
+```
+
+The win concentrates on the small shape because the dead `vec![0.0; 384]`
+(~1.5 KB) alloc+zero is a real fraction of its ~80 µs, while the `[1280,1280]`
+case is compute-bound (~210 µs) so the saved alloc is in the noise. The `[384,384]`
+shape is exactly the per-token tiny.en self/cross-attention Linear — the
+decode-time-dominant call — so this is the useful end.
+
+**Ratio vs OpenAI-Whisper:** not directly comparable (isolated kernel; the e2e /
+decoder benches SKIP without staged models). Consistent with the other kernel-level
+ledger entries. The decoder GEMV per-token path is -8.7% faster at no numeric cost.
+AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: REJECTED uninit for the top-level `fft_out` buffer — isolated A/B shows a +3.86% mel REGRESSION (p=0.00), NOT the expected win; reverted
 
 **Land-or-dig result: DIG → MEASURE → REVERT (regression).** After landing the

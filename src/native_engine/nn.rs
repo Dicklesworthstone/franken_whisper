@@ -454,7 +454,6 @@ fn dequant_row_dot(w_row: &[Float16], x: &[f32], scratch: &mut [f32], use_fused:
 /// # Panics (debug) / contract
 /// `w_f16.len()` must equal `out * inp`, `x.len() == inp`, `out_slice.len() ==
 /// out`, and `bias` (if present) length `out`. Callers are model-shaped, so a
-/// mismatch is a load bug; the debug asserts catch it in tests.
 pub fn gemv_f16(
     w_f16: &[Float16],
     out: usize,
@@ -499,7 +498,15 @@ pub fn gemv_f16(
     const PAR_THRESHOLD: usize = 1 << 19;
     let workers = gemv_worker_count(out);
     if out * inp < PAR_THRESHOLD || workers < 2 {
-        let mut scratch = vec![0.0f32; inp];
+        // The fused f16c path (`dequant_row_dot` with `use_fused`) reads the f16
+        // weights directly and never touches `scratch`; only the portable
+        // two-pass dequantizes into it. So skip the per-call alloc+zero entirely
+        // when fused (output is unaffected — `scratch` is dead on that path).
+        let mut scratch = if use_fused {
+            Vec::new()
+        } else {
+            vec![0.0f32; inp]
+        };
         for (o, slot) in out_slice.iter_mut().enumerate() {
             *slot = row_dot(o, &mut scratch);
         }
@@ -511,7 +518,12 @@ pub fn gemv_f16(
         .enumerate()
         .for_each(|(w, band_slice)| {
             let o_base = w * band;
-            let mut scratch = vec![0.0f32; inp];
+            // See the serial branch: `scratch` is dead on the fused f16c path.
+            let mut scratch = if use_fused {
+                Vec::new()
+            } else {
+                vec![0.0f32; inp]
+            };
             for (i, slot) in band_slice.iter_mut().enumerate() {
                 *slot = row_dot(o_base + i, &mut scratch);
             }
