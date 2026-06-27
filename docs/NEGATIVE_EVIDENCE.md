@@ -3,6 +3,46 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - IcyWren: REJECT (regression) mel process-policy hoist (`rfft_enabled` / `fft_top_full` / `proj_scalar`) — candidate **1.311x slower** than restored `main`
+
+**Land-or-dig result: DIG then REVERT.** Repo-local `.scratch` / `.worktrees`
+had no measured bench worktree win to land after updating to `origin/main`
+`66160fb`, so I dug the remaining mel frontend gap. New lever tried:
+hoist the process-global `OnceLock`/env policy checks (`rfft_enabled`,
+`fft_top_full`, `proj_scalar`) out of the 8-frame mel batch path and pass
+booleans through `log_mel` -> worker -> `compute_8_columns` ->
+`power_and_project_simd8`. Behavior should be stable because those switches are
+already process-global after first read.
+
+**Measurement — per-crate Criterion, same target dir, local `rch exec` fallback
+because no remote workers admitted the job (`insufficient_slots=3`,
+`hard_preflight=1`), `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`:**
+
+```text
+cargo bench --profile release -p franken_whisper --bench native_engine_bench -- \
+  native_engine/mel/mel_30s_realistic --sample-size 20 --warm-up-time 0.1 \
+  --measurement-time 3
+
+candidate saved as icywren-policy-hoist-candidate-20260627:
+  median 3.5514 ms  [3.3912, 3.8162] ms
+
+restored main, compared to saved candidate:
+  median 2.7096 ms  [2.6680, 2.7459] ms
+  Criterion change current-vs-candidate: -28.002% median
+  candidate / restored-main median ratio: 3.5514 / 2.7096 = 1.311x slower
+```
+
+**Ratio vs ORIG.** This does not improve the OpenAI/ORIG mel ratio. Anchored to
+the prior ledger's post-arena `main` ratio of roughly `2.5x` versus ORIG, the
+candidate would worsen the mel frontend to roughly `3.28x` (`2.5 * 1.311`).
+
+**REVERTED.** Source was manually restored to byte-clean `main`; no code change
+remains. Focused bit-exact parity passed before benchmarking:
+`cargo test -p franken_whisper native_engine::mel::tests::compute_8_columns_matches_scalar_columns_bit_exact`
+= 1/1. Conformance comparator GREEN:
+`cargo test -p franken_whisper --test conformance_comparator_tests -- --nocapture`
+= 26/26 on `rch` remote `hz2`. AGENT_NAME=IcyWren.
+
 ## 2026-06-27 - DuskFinch: LAND — cfft-recursion scratch ARENA: **−10.64% mel instructions / ~−7% cycles on production** (the biggest single mel lever of the arc). The per-batch malloc churn was the real cost behind the profile's allocator time.
 
 **Land-or-dig result: LAND a NEW radical structural lever.** Last entry identified
