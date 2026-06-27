@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: radix-5 FFT base case IMPLEMENTED in the codebase & VERIFIED (10/11 tests green) — preserved in stash@{0}, one owner policy-decision from landing
+
+**Ported the verified radix-5 reference into production code** (`DftTable` + `W_5`/
+`W_25` twiddle tables, scalar `radix5_dft` + FrameLanes `radix5_dft_simd8`, both
+gated on `n==25` with naive fallback for other widths). Built clean and ran the
+suite:
+- **`compute_8_columns_matches_scalar_columns_bit_exact`: PASS** — the scalar and
+  SIMD radix-5 paths are byte-identical (the lane-parallel mirror works).
+- **`fft_matches_naive_dft`: PASS** (radix-5's ~1e-7 is within its `rel<1e-4`).
+- **conformance 26/0 PASS, clippy `-D warnings` clean.** 10/11 mel tests green.
+- **The ONE failure: `fft_twiddle_table_is_bit_exact_vs_inline_reference`** — it
+  asserts the FFT is **bit-exact** vs the inline-transcendental reference, which
+  radix-5 (a different algorithm) diverges from by ~1e-7.
+
+**Why I did NOT land it (and preserved it in `git stash@{0}` instead):** the mel
+docstring — even after the log10 landing — explicitly states *"The only deliberate
+arithmetic relaxation is the projection log10."* So the FFT is **deliberately still
+bit-exact** by owner policy; radix-5 relaxing it is a NEW policy decision (extend
+transcription-tolerance from the projection to the FFT) that is the owner's to make
+— exactly as the owner themselves made the log10 call. **To land** (mechanical,
+~5 min once the policy is set): `git stash apply stash@{0}`, relax
+`fft_twiddle_table_is_bit_exact_vs_inline_reference` to a tolerance for the radix-5
+widths (mirror `fft_matches_naive_dft`'s `rel<1e-4`), update the docstring's "only
+relaxation" line to include the FFT. Payoff: ~10% mel (1.80× base-case, rel ~1e-7),
+mel ~1.58×→~1.7× OpenAI. The implementation is done and proven; only the policy bit
+remains. AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - BlackThrush: the log10 landing UN-GATES radix-5 — mel parity is now officially transcription-tolerance, so the verified radix-5 lever is the next ready-to-land win (no invariant left to relax)
 
 **Status change, not a new measurement.** With the SIMD-poly log10 now LANDED
