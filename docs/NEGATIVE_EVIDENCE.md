@@ -234,6 +234,85 @@ anchor, current main is `15.3064 / 124.29 = 0.1232x` and the candidate is
 conformance comparator passed 26/26 on `ovh-a`; source was reverted.
 AGENT_NAME=IcyWren.
 
+## 2026-06-27 - DuskFinch: SIMD f64 projection accumulator RE-MEASURED on a CLEAN same-worker A/B — big DENSE win (-42%) but PRODUCTION-sparse NEUTRAL (p=0.66); REVERTED. Closes IcyWren's inconclusive reject with admissible both-bank evidence.
+
+**Land-or-dig result: DIG then REVERT.** Worktree scan first: every sibling
+worktree was ancestry-checked vs `origin/main` (`7201eb8`) — all are 0-ahead
+(already landed), reject-doc-only, or stale. The two historically "big" levers are
+both closed: `bd-4hc0` (GEMM `matrixmultiply`→`gemm`/faer) was RE-MEASURED to
+~1.03x e2e and downgraded (entry 2026-06-25), and the fused f16c decoder dot
+(`dot_f16c`) is already landed + scratch-elided (`4e84513`). No landable win
+exists, so this turn re-opened the one lever the ledger explicitly left ajar.
+
+**Candidate (mel.rs `power_and_project_simd8`):** replace the per-bin
+`pk.to_array()` + 8-wide scalar lane loop with a SIMD f64 accumulator —
+`acc += pk.cast::<f64>() * Simd::<f64,8>::splat(f64::from(rk))` — exactly the shape
+IcyWren tried and rejected on 2026-06-27. That reject was **inadmissible** and its
+own text invited a retry: *"Do not retry this SIMD f64 accumulator shape without a
+same-worker bench."* Its rejection rested on (1) a **cross-worker** comparison —
+RCH `ovh-a` baseline vs RCH **local-fallback** candidate, which the PERF_LEDGER
+protocol forbids (worker variance ≈ 5.6x; "only same-worker A/B is admissible"),
+so its `+66%` was the worker penalty, not the lever; and (2) it measured only
+`mel_30s_realistic` (**sparse** bank), where the projection is a tiny FFT-dominated
+slice and a projection lever cannot show.
+
+**Clean same-worker A/B (this box = AMD Threadripper PRO 5975WX = rch worker
+`ovh-a`'s exact model; `target-cpu=x86-64-v3`; both arms built+run LOCALLY so they
+land on the same hardware; `CARGO_TARGET_DIR=.../franken_whisper-cc`):**
+
+```text
+baseline (main 7201eb8, scalar projection), saved criterion --save-baseline base:
+  native_engine/mel/mel_30s            8.1925 ms  CI [8.1206, 8.2647]   (dense bank)
+  native_engine/mel/mel_30s_realistic  3.0625 ms  CI [3.0360, 3.1009]   (sparse/production)
+
+candidate (Simd<f64,8> accumulator), low-load run (the admissible one):
+  native_engine/mel/mel_30s            change [-44.436% -43.043% -41.481%] (p=0.00)  IMPROVED
+  native_engine/mel/mel_30s_realistic  change [ -2.0624%  -0.3914%  +1.3356%] (p=0.66)  NO CHANGE
+```
+
+**Contention caveat (why this needed a clean read).** The box was shared with the
+active frankentorch swarm; load average ranged 12→52 across the session. Under
+heavy load, repeated `--baseline` runs swung wildly and INCOHERENTLY (dense
+`+1%/-43%/+173%`, sparse `+12%/+136%/+63%` in consecutive runs) — pure cross-time
+load drift, inadmissible per protocol. The decisive signal is the single low-load
+run above, corroborated by direction: the dense win and sparse-neutral move in
+**opposite** directions within one candidate run, which contention (a common-mode
+slowdown) cannot manufacture. This is precisely the artifact that made IcyWren's
+local-fallback candidate look like a regression.
+
+**Mechanism — why it is a dense-only win.** The SIMD accumulator removes the
+per-bin `to_array` unpack + 8 scalar widen/mul/add (~33 µops/bin → ~8). On the
+**dense** synthetic bank every filter touches all 201 bins, so the projection is
+~60% of `mel_30s` (dense 8.19 ms vs sparse 3.06 ms ⇒ ~5.1 ms of dense is extra
+projection) → a 1.7x projection speedup shows as -42% on `mel_30s`. But real ggml
+filterbanks (tiny.en/large 80-bin, large-v3 128-bin) are **sparse-triangular** —
+~5 nonzero bins/filter — so the production projection loop is ~5 iterations and the
+frontend is FFT-bound; the accumulator's µop saving is then immaterial (p=0.66).
+`mel_30s` (dense) is a diagnostic stress bench, not a production configuration.
+
+**Bit-exact (conformance GREEN).** Each lane still reduces over the same `k` order
+(`start..end`, increasing); `+`/`*` are not fused (no `mul_add`), so every lane's
+running f64 sum is byte-identical to the scalar `power_and_project`. `cargo test
+native_engine::mel::tests` = **14/14 green**, including
+`compute_8_columns_matches_scalar_columns_bit_exact` and
+`sparse_projection_matches_dense_bit_exact`, both before and after revert.
+
+**Ratio vs OpenAI-Whisper.** The ledger's OpenAI anchor
+(`whisper.audio.log_mel_spectrogram`, torch 8 threads) uses a real **sparse**
+filterbank, so the production-relevant comparison is franken's sparse path —
+exactly where the candidate is **~0 (p=0.66)**. The lever therefore does NOT move
+the OpenAI-Whisper mel ratio (franken mel stays ~2.4-2.5x per SlateHeron's
+entry). A bit-exact change that is neutral on the production/OpenAI surface and
+wins only on a synthetic stress bench is a REVERT under this ledger's policy
+("~0-gain levers are REVERTED, not kept").
+
+**Revert.** Surgical edit-reversal; `power_and_project_simd8` is byte-identical to
+`main`. (NB: an unrelated, pre-existing uncommitted `cfft_simd8` uninit-scratch
+change sits in the working tree of this checkout; it is not mine, not measured
+here, and is left untouched — only this ledger entry is committed.) **Do not
+re-attempt the SIMD f64 projection accumulator: it is now proven, on a clean
+same-worker A/B over BOTH banks, to be production-neutral.** AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - SlateHeron: real-FFT (two-for-one) STEP 2 LANDED & DEFAULT-ON — MEASURED -8.37% mel (p=0.00); the "biggest remaining lever" is now in production
 
 **Land-or-dig result: LAND (the multi-turn lever completes).** Building on STEP 1
