@@ -42,6 +42,42 @@ remains. Focused bit-exact parity passed before benchmarking:
 = 1/1. Conformance comparator GREEN:
 `cargo test -p franken_whisper --test conformance_comparator_tests -- --nocapture`
 = 26/26 on `rch` remote `hz2`. AGENT_NAME=IcyWren.
+## 2026-06-27 - DuskFinch: DECODER profiled for the FIRST time — per-token in-crate kernels are at ceiling; the remaining e2e gap vs ORIG is the EXTERNAL `ft_kernel_cpu` GEMM + its rayon overhead (bd-4hc0). SURFACE.
+
+**Land-or-dig result: DIG (profile the bigger gap) → SURFACE a blocker.** With the
+mel allocation arc done (`455b4b3` fft_out reuse + `66160fb` cfft arena = no
+per-batch heap alloc on the mel FFT path), I turned to the decoder — the bigger e2e
+gap vs ORIG, newly profileable since the `tiny.en` model fixtures are present.
+`perf record -e cycles:u` on `decoder_token_step_tiny` (release-perf symbols,
+`FRANKEN_WHISPER_MODEL_DIR` set):
+
+```text
+matrixmultiply sgemm_kernel + gemm_loop    ~33%   external ft_kernel_cpu GEMM
+crossbeam_epoch with_handle + try_advance  ~24%   rayon epoch-reclamation overhead
+nn::gemv_f16 (fused f16c dot)               7.8%  LANDED in-crate kernel
+load_linear_transposed                      7%    one-time ENCODER weight load (setup)
+softmax/exp + matmul SAXPY + memset         ~7%
+```
+
+**Reading it (per-token vs setup).** The per-token `forward_step` uses ONLY landed
+in-crate optimizations: `gemv_f16`'s fused f16c dot (`1d6af83`/`4e84513`) for the
+f16-weight projections, and `nn::matmul`'s `m==1` SAXPY fast path (bd-6qih, landed)
+for the tq=1 attention matmuls — so the per-token path issues ZERO external sgemm
+and ZERO rayon. The 33% sgemm + most of the 24% crossbeam is therefore the
+**one-time encoder run + `DecoderState::new` cross-K/V projection** (built once
+before the timed loop) and the external GEMM's own rayon — i.e. the **external
+`ft_kernel_cpu` matrixmultiply path (bd-4hc0)**, re-measured to ~1.03× and
+owner-closed / out-of-crate. `load_linear_transposed` (7%) is encoder weight
+loading, confirming the setup contamination.
+
+**⇒ Conclusion / blocker.** The in-crate decoder kernels are at their measured
+ceiling (fused dot + m==1 SAXPY both landed); no new in-crate decoder lever found.
+The remaining e2e gap vs ORIG is the **encoder/cross-attention GEMM in the external
+`ft_kernel_cpu` crate + its rayon/epoch overhead** — out of `franken_whisper-cc`'s
+scope (bd-4hc0). Caveat: `decoder_token_step` is setup-contaminated; a clean
+per-token-only number needs a decoder probe that runs setup once then loops many
+steps (the way `mel_perf_probe` does for mel) — the next dig if the decoder is
+re-opened. No source change. AGENT_NAME=DuskFinch.
 
 ## 2026-06-27 - DuskFinch: LAND — cfft-recursion scratch ARENA: **−10.64% mel instructions / ~−7% cycles on production** (the biggest single mel lever of the arc). The per-batch malloc churn was the real cost behind the profile's allocator time.
 
