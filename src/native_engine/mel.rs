@@ -824,6 +824,7 @@ fn cfft_simd8(
     out: &mut [FrameLanes],
     levels: &[LevelTwiddle],
     base: &DftTable,
+    scratch: &mut [CfftLevelScratch],
 ) {
     let n = input.len() / 2;
     if n == 1 {
@@ -837,18 +838,26 @@ fn cfft_simd8(
     }
     let lvl = &levels[0];
     let half = n / 2;
-    // Uninit: the split loop writes every element before the recursion reads it.
-    let (mut even, mut odd) = alloc_fft_scratch(2 * half);
+    // One reusable buffer set for this depth; `rest` feeds the two sub-FFTs
+    // (sequential siblings reuse it). `even`/`odd` are fully written by the split
+    // loop and `even_fft`/`odd_fft` fully by the recursion before any read.
+    let (lvl_scratch, rest) = scratch
+        .split_first_mut()
+        .expect("cfft scratch depth underflow");
+    let CfftLevelScratch {
+        even,
+        odd,
+        even_fft,
+        odd_fft,
+    } = lvl_scratch;
     for i in 0..half {
         even[2 * i] = input[2 * (2 * i)];
         even[2 * i + 1] = input[2 * (2 * i) + 1];
         odd[2 * i] = input[2 * (2 * i + 1)];
         odd[2 * i + 1] = input[2 * (2 * i + 1) + 1];
     }
-    // Uninit: the recursive `cfft_simd8` writes every element before the combine.
-    let (mut even_fft, mut odd_fft) = alloc_fft_scratch(2 * half);
-    cfft_simd8(&even, &mut even_fft, &levels[1..], base);
-    cfft_simd8(&odd, &mut odd_fft, &levels[1..], base);
+    cfft_simd8(&even[..], &mut even_fft[..], &levels[1..], base, rest);
+    cfft_simd8(&odd[..], &mut odd_fft[..], &levels[1..], base, rest);
     for (k, (&rec, &imc)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {
         let re = FrameLanes::splat(rec);
         let im = FrameLanes::splat(imc);
@@ -872,6 +881,8 @@ fn fft_simd8_twoforone(
     out: &mut [FrameLanes],
     levels: &[LevelTwiddle],
     base: &DftTable,
+    zf: &mut [FrameLanes],
+    cfft_scratch: &mut [CfftLevelScratch],
 ) {
     let n = input.len();
     let half = n / 2;
@@ -880,8 +891,7 @@ fn fft_simd8_twoforone(
         lvl.half, half,
         "fft_simd8_twoforone top twiddle width mismatch"
     );
-    let mut zf = vec![FrameLanes::splat(0.0); 2 * half];
-    cfft_simd8(input, &mut zf, &levels[1..], base);
+    cfft_simd8(input, zf, &levels[1..], base, cfft_scratch);
     let h = FrameLanes::splat(0.5);
     for k in 0..half {
         let km = (half - k) % half;
@@ -1166,6 +1176,21 @@ fn mel_scratch_noreuse() -> bool {
 struct MelFftScratch {
     fft_in: Vec<FrameLanes>,
     fft_out: Vec<FrameLanes>,
+    zf: Vec<FrameLanes>,
+    cfft: Vec<CfftLevelScratch>,
+}
+
+/// One radix-2 recursion level's reusable buffers for [`cfft_simd8`]: the
+/// even/odd deinterleave inputs and their sub-FFT outputs. The recursion's
+/// siblings are sequential and its buffer sizes are data-independent, so ONE
+/// buffer set per depth is reused across all sibling calls AND all batches —
+/// replacing ~28 `Vec` alloc/free per 8-frame batch (the per-batch malloc churn
+/// the perf profile attributed to `_int_malloc`/`_int_free`).
+struct CfftLevelScratch {
+    even: Vec<FrameLanes>,
+    odd: Vec<FrameLanes>,
+    even_fft: Vec<FrameLanes>,
+    odd_fft: Vec<FrameLanes>,
 }
 
 impl MelFftScratch {
@@ -1175,9 +1200,24 @@ impl MelFftScratch {
         } else {
             2 * N_FREQ_BINS
         };
+        // The two-for-one `cfft_simd8` recursion starts at `n = N_FFT/2` and
+        // halves while even; each level's four buffers are size `2*half == n`.
+        let mut cfft = Vec::new();
+        let mut m = N_FFT / 2;
+        while m > 1 && m.is_multiple_of(2) {
+            cfft.push(CfftLevelScratch {
+                even: vec![FrameLanes::splat(0.0); m],
+                odd: vec![FrameLanes::splat(0.0); m],
+                even_fft: vec![FrameLanes::splat(0.0); m],
+                odd_fft: vec![FrameLanes::splat(0.0); m],
+            });
+            m /= 2;
+        }
         Self {
             fft_in: vec![FrameLanes::splat(0.0); N_FFT],
             fft_out: vec![FrameLanes::splat(0.0); out_len],
+            zf: vec![FrameLanes::splat(0.0); N_FFT],
+            cfft,
         }
     }
 }
@@ -1215,6 +1255,8 @@ fn compute_8_columns(
             &mut scratch.fft_out,
             &twiddles.levels,
             &twiddles.base,
+            &mut scratch.zf,
+            &mut scratch.cfft,
         );
     } else if fft_top_full() {
         fft_simd8(
@@ -1709,7 +1751,15 @@ mod tests {
                 *slot = FrameLanes::from_array(a);
             }
             let mut vout = vec![FrameLanes::splat(0.0); 2 * N_FFT];
-            fft_simd8_twoforone(&vin, &mut vout, &tw.levels, &tw.base);
+            let mut scratch = MelFftScratch::new();
+            fft_simd8_twoforone(
+                &vin,
+                &mut vout,
+                &tw.levels,
+                &tw.base,
+                &mut scratch.zf,
+                &mut scratch.cfft,
+            );
             for (lane, frame) in frames.iter().enumerate() {
                 let mut sout = vec![0.0f32; 2 * N_FFT];
                 fft_twoforone(frame, &mut sout, &tw.levels, &tw.base);

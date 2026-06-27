@@ -3,6 +3,49 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: LAND — cfft-recursion scratch ARENA: **−10.64% mel instructions / ~−7% cycles on production** (the biggest single mel lever of the arc). The per-batch malloc churn was the real cost behind the profile's allocator time.
+
+**Land-or-dig result: LAND a NEW radical structural lever.** Last entry identified
+the only real remaining per-batch mel cost: `cfft_simd8` (the two-for-one default
+FFT) allocated FOUR `Vec`s (`even/odd/even_fft/odd_fft`) **per recursion call** —
+~28 alloc/free per 8-frame batch × 375 batches × workers. Replaced the per-call
+allocation with a reusable **scratch arena**: one `CfftLevelScratch` buffer-set per
+recursion DEPTH (sizes data-independent; siblings are sequential), threaded through
+the recursion via `slice::split_first_mut` (the borrow-checker-clean way to give
+each depth its level while passing the tail to the sub-FFTs). The arena (+ the
+reused `zf`) lives in the per-worker `MelFftScratch`, so the whole mel FFT path now
+does **zero per-batch heap allocation**. `cfft_simd8` no longer calls
+`alloc_fft_scratch` (still used by the non-default full/one-sided paths).
+
+**Measurement — perf, fixed-iteration driver, clean candidate-vs-`main` (455b4b3)
+two-build (instructions deterministic), this box = Threadripper PRO 5975WX:**
+
+```text
+INSTRUCTIONS/iter (deterministic):
+  realistic (production)  main 63,963,492  arena 57,155,641  = -10.64%
+  dense                   main 124,431,410 arena 117,701,335 = -5.41%
+
+CYCLES/iter realistic:
+  main (cfft allocs 28x/batch)        ~18.7M (18.63/19.23/18.62/18.44)
+  arena, per-worker reuse             ~17.4M  → ~-7% candidate-vs-main
+  same-binary FW_MEL_NOREUSE A/B (reuse vs per-batch alloc): 6/6 negative, mean -9.4%
+```
+
+**Bit-exact / conformance GREEN.** Arena buffers are fully written before any read
+(deinterleave fills `even/odd`; the recursion fills `even_fft/odd_fft`), sizing is
+derived from the `N_FFT/2`-halving recursion. `cargo test native_engine::mel::tests`
+= **14/14**; **conformance comparator 26/26** (full `log_mel` with the arena,
+bit-exact vs whisper.cpp — proves correct sizing + no stale data across batches).
+`cargo fmt --check` + `cargo clippy --lib -- -D warnings` clean.
+
+**Ratio vs ORIG.** This is the largest mel win of the arc, stacking on the prior
+`fft_out`-reuse (`455b4b3`) / projection (`b40f164`) / cfft-uninit (`1d6af83`)
+landings: production mel is now ~−10% beyond `main`, pushing the OpenAI-Whisper mel
+ratio further past ~2.5×. Vindicates last entry's redirect: the allocator time WAS
+a real lever — but the per-BATCH cfft churn, not the per-call memset red-herring.
+The "engine at ceiling" framing missed a 10% allocation lever for the whole arc.
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - DuskFinch: REJECT (~0) `power` dead-init → `from_fn`; and a RED-HERRING correction — the perf profile's 18% `__memset` is a PROBE ARTIFACT (per-call output buffers), NOT a per-batch lever. Real remaining target = the cfft-recursion malloc churn.
 
 **Land-or-dig result: DIG then REVERT (~0-gain).** Continuing last entry's
