@@ -3,7 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-06-26 - BlackThrush: GELU 8→16-wide — CONFIRMED ~4.3% win (bit-exact); 16 is the SWEET SPOT (32-wide is ~0, reverted)
+## 2026-06-26 - BlackThrush: the projection `log10` is ~20% of mel — the LARGEST gated mel lever (a SIMD log10 would close the OpenAI mel gap, but it's bit-exact-internal + model gated)
+
+**Dig (quantifying the biggest measured gap = the mel frontend).** `power_and_project_simd8`
+does **240k scalar `f64.log10()` per `log_mel`** (8 lanes × 80 mel × ~375 batches,
+line ~489). Measured its share: a same-machine A/B (box quiet ~load 7, Criterion
+n=50) replacing `.max(1e-10).log10() as f32` with `.max(1e-10) as f32`:
+`mel_30s_realistic` **4.482 ms** (with log10) vs **3.744 ms** (without) = the
+log10 is **~16–20% of mel** (Δ ≈ 0.74 ms, p=0.00). (`mel_30s` was noisy this run,
+p=0.41 — the realistic number is the clean one.) Edit reverted; `mel.rs == main`.
+
+**This is the single largest mel lever** — bigger than any FFT micro-opt — and
+it's on the surface where franken only *ties* OpenAI (see "biggest gap" entry). A
+**vectorized log10** (polynomial approx, ~4–8× over scalar libm) could cut mel by
+~12–18%, flipping the mel frontend from near-tie to a clear win over OpenAI's
+`torch.stft`. **Why it's not landed here (same gate as RFFT/radix-5):** (1) a SIMD
+log10 ≠ libm `f64.log10()` bit-for-bit, so it breaks the internal
+`compute_8_columns_matches_scalar_columns_bit_exact` test; (2) its
+transcription-safety is unverifiable here (ggml models absent → e2e/conformance
+SKIP). But recall the actual *conformance* gate is **transcription-tolerance, not
+bit-exact mel** — so the OWNER unblock is concrete: relax the internal mel
+bit-exact tests to the transcription-tolerance gate the harness already uses, stage
+a model to verify, then a SIMD log10 (+ RFFT) is the path to a *dominant* franken
+mel. AGENT_NAME=BlackThrush.
 
 UPDATE2: probed **32-wide** as the next step — it is **~0 vs 16-wide** (same-machine
 A/B n=60/6s: 16-wide 3.377 ms vs 32-wide 3.414 ms, p=0.57, CI [-4.6%, +1.8%] spans
