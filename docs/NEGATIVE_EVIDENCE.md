@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: `layer_norm` SoA uninit ~0 (p=0.56, reverted) — and with it the FULL measurable-kernel sweep closes: every non-mel bench is optimized; the only remaining lever is the multi-turn real-FFT
+
+**Land-or-dig result: DIG → MEASURE ~0 → REVERT.** Last clean candidate on the
+measurable surface: `norm_rows`'s reused `soa` SoA buffer (`vec![Simd<f64,8>; cols]`)
+is written in full before read, so its zero-init is dead — but it's allocated ONCE
+per `norm_rows` and reused across ~23 8-row groups, so the zero-init is ~1/90th of
+the buffer's traffic. Isolated same-binary A/B (`FW_LN_SOA_ZEROINIT`, n=80, 5 s,
+`layer_norm_1500x384`): zero-init 581.59 µs vs uninit 596.45 µs, **change
+[-2.17% +3.00% +10.96%], p=0.56 — NO CHANGE.** Amortized to noise, exactly as the
+1/90 traffic ratio predicts. Reverted (no new unsafe site for a non-win); `nn.rs`
+byte-identical to `4e84513`.
+
+**This closes the measurable-kernel sweep (every non-SKIP bench checked this
+session):**
+- `mel` (FFT scratch): exhausted both directions — `collect()` inputs + uninit
+  `even_fft`/`odd_fft` LANDED (~25% total); `fft_out` uninit REJECTED (+3.86%, hot
+  read-in-place buffer's zero-init is free prefetch).
+- `f16_gemv` (`gemv_f16`): dead fused-path `scratch` skip LANDED (-8.74% on [384,384]).
+- `layer_norm`: SoA zero-init amortized → ~0 (this entry). No fast-path dead alloc.
+- `gelu`: in-place, no per-call alloc.
+- `chunk_frames` / `window_to_time_major`: already `Vec::with_capacity`+extend / fused.
+- `resample` / `downmix`: large output Vecs are fresh (>128 KB → mmap'd, lazy zero
+  pages, so uninit is a no-op) AND e2e-cold (run once/file). No real win.
+
+**The allocation/zeroing/dead-work axis is now fully mined across every measurable
+kernel.** The ONLY remaining mel lever is the arithmetic-changing real-FFT
+(two-for-one / half-size complex FFT, ~2x the FFT). It is gate-open
+(transcription-tolerance) but requires a DUAL-path (scalar + SIMD) complex-input
+FFT rewrite to preserve `determinism_across_thread_counts` (the SIMD batch path and
+the scalar remainder-frame path must stay bit-identical) — ~200+ lines, too large
+to land safely in one turn. No ratio change vs OpenAI this turn (no-win measurement).
+franken remains ~2.2-2.3x mel / 2.13-3.26x e2e ahead. AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: LANDED skip-dead-`scratch` in `gemv_f16` fused path — MEASURED -8.74% on the per-token `[384,384]` GEMV (p=0.00), bit-identical; the "unused work" lens crosses from mel to the decoder GEMV
 
 **Land-or-dig result: LAND (new surface — the mel-FFT axis is exhausted).** Applied
