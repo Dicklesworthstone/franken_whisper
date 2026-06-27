@@ -3,7 +3,15 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-06-26 - BlackThrush: GELU 8→16-wide — CONFIRMED ~4.3% win (bit-exact); a cleaner re-run upgraded the first marginal read to p=0.00
+## 2026-06-26 - BlackThrush: GELU 8→16-wide — CONFIRMED ~4.3% win (bit-exact); 16 is the SWEET SPOT (32-wide is ~0, reverted)
+
+UPDATE2: probed **32-wide** as the next step — it is **~0 vs 16-wide** (same-machine
+A/B n=60/6s: 16-wide 3.377 ms vs 32-wide 3.414 ms, p=0.57, CI [-4.6%, +1.8%] spans
+0; 16-wide if anything marginally faster). So the diminishing-returns knee is at
+16: the 8→16 step (~4.3%) came from loop-overhead + better `tanh` ILP, but at 16
+the loop overhead is already negligible and the OOO window can't exploit 32
+independent `tanh`. **16-wide is optimal — do NOT widen further.** Bit-exact 32-wide
+gate passed but REVERTED as ~0-gain (surgical `Edit`, no stash drop). AGENT_NAME=BlackThrush.
 
 UPDATE: a second, cleaner same-machine A/B (n=60, measurement-time 6) **confirms
 this is a real win**, not noise: 16-wide **3.335 ms** vs 8-wide **3.478 ms** =
