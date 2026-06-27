@@ -3,6 +3,62 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: LAND — per-worker FFT scratch REUSE (radical lever found by perf profiling, not re-examining a reject): −1.97% mel instructions / −1.76% cycles on production. The mel was spending ~28% of cycles in memset+malloc.
+
+**Land-or-dig result: DIG a NEW radical lever — found by `perf record` profiling
+the mel, not by re-checking a wall-clock reject.** The profile (`perf record -g
+cycles:u` on `examples/mel_perf_probe`, realistic) revealed the mel's top cost is
+NOT FFT math but **memory management**: `__memset_avx2` **16.82%**, `memmove`
+3.20%, and `_int_malloc`/`_int_free`/`memalign`/consolidate **~8%** — ~28% of mel
+cycles re-creating per-8-frame-batch scratch (`fft_in`, `fft_out`, and the cfft
+recursion buffers), 375 batches × workers. The wall-clock campaign never saw this
+(it profiles time, not allocation).
+
+**The lever (first installment).** Hoist `fft_in` + `fft_out` into a reusable
+`MelFftScratch` allocated ONCE per worker (`std::thread::scope` worker) and reused
+across all its batches, instead of `vec!`-ing them every batch. Correctness:
+`fft_out` is zero-initialised ONCE; the FFT overwrites the SAME fixed output slots
+every batch (butterfly pattern is data-independent), so never-written slots keep
+their initial zero — bit-identical to per-batch zero-init. Reuse also keeps pages
+warm, which is why this WINS where the *uninit* `fft_out` attempt (`894cf1f`)
+regressed (cold-page faults). `FW_MEL_NOREUSE` escape hatch falls back to
+per-batch alloc for A/B.
+
+**Measurement — perf, fixed-iteration driver, same binary via `FW_MEL_NOREUSE`
+(this box = Threadripper PRO 5975WX = rch `ovh-a`, x86-64-v3, `franken_whisper-cc`):**
+
+```text
+INSTRUCTIONS/iter (deterministic):
+  realistic (production)  noreuse 65,153,378  reuse 63,864,167  = -1.97%
+  dense                   noreuse 125,360,325 reuse 124,516,807 = -0.67%
+
+CYCLES/iter realistic, 8 interleaved rounds @600 iters (noreuse vs reuse):
+  -2.41 -1.56 -2.25 -3.06 -0.45 -0.37 -2.17 -1.83  → 8/8 NEGATIVE, mean -1.76%
+```
+
+(Instructions under-represent the win: `memset` is few instructions but many
+cycles — memory-bandwidth + page-fault bound — so the −1.76% cycle reduction is the
+real-time signal. At 400 iters the cycles were noisy/mixed; 600 iters resolved it
+to 8/8 negative — fixed-iteration perf still needs enough work per sample on the
+contended box.)
+
+**Bit-exact / conformance GREEN.** `cargo test native_engine::mel::tests` = **14/14**
+(incl. a new reuse-fidelity check: dirty the scratch on a prior batch, recompute
+frame 0, assert it still matches the scalar reference); **conformance comparator
+26/26** — the FULL `log_mel` with reuse across all batches is bit-exact vs
+whisper.cpp, proving no stale-slot leakage. `cargo fmt --check` clean.
+
+**Ratio vs ORIG.** Stacks on `b40f164`/`1d6af83`: another −2% production cycles
+nudges the OpenAI-Whisper mel ratio further past ~2.5×.
+
+**NOT DONE — the bigger half remains (next dig).** This captured only `fft_out`'s
+per-batch alloc+memset. Still on the table (perf profile): the dead `power`
+stack-array zero-init in `power_and_project_simd8` (fully overwritten), and the
+**cfft recursion's** per-level `even/odd/even_fft/odd_fft` malloc/free churn —
+threading a reusable scratch arena through `cfft_simd8` is the larger structural
+win. The "engine at ceiling" framing missed ~28% of mel sitting in the allocator.
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - DuskFinch: LAND — SIMD f64 projection accumulator is a real production win too (−1.45% mel instructions / ~−2% cycles, −32% on dense). SECOND wall-clock false-negative corrected by perf instructions-retired.
 
 **Land-or-dig result: LAND — and it corrects a SECOND wall-clock false-negative**

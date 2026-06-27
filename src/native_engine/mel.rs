@@ -1146,6 +1146,42 @@ fn power_and_project_simd8(fft_out: &[FrameLanes], filters: &SparseMelFilters, o
     }
 }
 
+/// Perf escape hatch: allocate the FFT scratch fresh per 8-frame batch (the old
+/// behaviour) instead of reusing one buffer across a worker's batches. Off by
+/// default — reuse is the win (perf profile: per-batch alloc spent ~17% of mel in
+/// `memset` + ~8% in malloc/free). For A/B.
+fn mel_scratch_noreuse() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("FW_MEL_NOREUSE").is_some())
+}
+
+/// Reusable per-worker FFT scratch — `fft_in` (windowed SoA input) and `fft_out`
+/// (the one-sided spectrum). Allocated once per worker and reused across all its
+/// 8-frame batches. `fft_out` is zero-initialised ONCE; the FFT overwrites the
+/// SAME fixed set of output slots every batch (the butterfly pattern is
+/// data-independent), so any never-written slot keeps its initial zero —
+/// bit-identical to per-batch zero-init, but without the per-batch memset+alloc.
+/// Reuse also keeps the pages warm, sidestepping the first-touch page-fault cost
+/// that made an *uninit* `fft_out` a regression (NEGATIVE_EVIDENCE `894cf1f`).
+struct MelFftScratch {
+    fft_in: Vec<FrameLanes>,
+    fft_out: Vec<FrameLanes>,
+}
+
+impl MelFftScratch {
+    fn new() -> Self {
+        let out_len = if fft_top_full() {
+            2 * N_FFT
+        } else {
+            2 * N_FREQ_BINS
+        };
+        Self {
+            fft_in: vec![FrameLanes::splat(0.0); N_FFT],
+            fft_out: vec![FrameLanes::splat(0.0); out_len],
+        }
+    }
+}
+
 /// Compute 8 FULLY-VALID frames' mel columns at once via the frame-batched FFT.
 /// Frames `frame_base .. frame_base + FFT_LANES` must each be fully inside
 /// `valid_len` (`offset + N_FFT <= valid_len`), so every window is a complete,
@@ -1158,39 +1194,44 @@ fn compute_8_columns(
     filters: &SparseMelFilters,
     twiddles: &FftTwiddles,
     out8: &mut [f32],
+    scratch: &mut MelFftScratch,
 ) {
     // Structure-of-arrays windowed input: lane L holds frame (frame_base + L).
-    // Every slot is written, so build it directly via `collect()` — no dead
-    // zero-init to immediately overwrite (part of the measured ~5.5% scratch win).
-    let fft_in: Vec<FrameLanes> = (0..N_FFT)
-        .map(|j| {
-            let mut lanes = [0.0f32; FFT_LANES];
-            for (lane, l) in lanes.iter_mut().enumerate() {
-                let offset = (frame_base + lane) * HOP;
-                *l = hann[j] * padded[offset + j];
-            }
-            FrameLanes::from_array(lanes)
-        })
-        .collect();
-
-    // The one-sided path writes/reads only bins 0..=N_FFT/2 (interleaved indices
-    // `0..2*N_FREQ_BINS`); the full path writes the whole spectrum. Sizing the
-    // buffer to what's used shrinks its per-call zero-init (the `vec!` of a
-    // zero-bits value is an `alloc_zeroed`/memset) — measured ~4.5% of mel.
-    let out_len = if fft_top_full() {
-        2 * N_FFT
-    } else {
-        2 * N_FREQ_BINS
-    };
-    let mut fft_out = vec![FrameLanes::splat(0.0); out_len];
-    if rfft_enabled() {
-        fft_simd8_twoforone(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
-    } else if fft_top_full() {
-        fft_simd8(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
-    } else {
-        fft_simd8_onesided(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    // Overwritten in place (every slot is written) — no dead zero-init.
+    for (j, slot) in scratch.fft_in.iter_mut().enumerate() {
+        let mut lanes = [0.0f32; FFT_LANES];
+        for (lane, l) in lanes.iter_mut().enumerate() {
+            let offset = (frame_base + lane) * HOP;
+            *l = hann[j] * padded[offset + j];
+        }
+        *slot = FrameLanes::from_array(lanes);
     }
-    power_and_project_simd8(&fft_out, filters, out8);
+
+    // `fft_out` is reused (zeroed once at construction); disjoint field borrows
+    // let the FFT read `fft_in` and write `fft_out` from the same scratch.
+    if rfft_enabled() {
+        fft_simd8_twoforone(
+            &scratch.fft_in,
+            &mut scratch.fft_out,
+            &twiddles.levels,
+            &twiddles.base,
+        );
+    } else if fft_top_full() {
+        fft_simd8(
+            &scratch.fft_in,
+            &mut scratch.fft_out,
+            &twiddles.levels,
+            &twiddles.base,
+        );
+    } else {
+        fft_simd8_onesided(
+            &scratch.fft_in,
+            &mut scratch.fft_out,
+            &twiddles.levels,
+            &twiddles.base,
+        );
+    }
+    power_and_project_simd8(&scratch.fft_out, filters, out8);
 }
 
 /// Compute the log-mel spectrogram for the full padded input, exactly mirroring
@@ -1269,9 +1310,28 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
                 let full_end = end.min(n_full);
                 let mut frame = start;
                 let mut fl = 0usize;
+                // Reuse one FFT scratch across this worker's batches (the win);
+                // FW_MEL_NOREUSE falls back to a fresh scratch per batch for A/B.
+                let mut worker_scratch = (!mel_scratch_noreuse()).then(MelFftScratch::new);
                 while frame + FFT_LANES <= full_end {
                     let col8 = &mut local[fl * n_mel..(fl + FFT_LANES) * n_mel];
-                    compute_8_columns(frame, padded_ref, hann_ref, filters_ref, twiddles_ref, col8);
+                    let mut per_batch;
+                    let scratch = match worker_scratch.as_mut() {
+                        Some(s) => s,
+                        None => {
+                            per_batch = MelFftScratch::new();
+                            &mut per_batch
+                        }
+                    };
+                    compute_8_columns(
+                        frame,
+                        padded_ref,
+                        hann_ref,
+                        filters_ref,
+                        twiddles_ref,
+                        col8,
+                        scratch,
+                    );
                     frame += FFT_LANES;
                     fl += FFT_LANES;
                 }
@@ -1754,7 +1814,23 @@ mod tests {
         assert!(FFT_LANES * HOP + N_FFT <= valid_len);
 
         let mut got = vec![0.0f32; FFT_LANES * filters.n_mel];
-        compute_8_columns(0, &padded, hann, &sparse, tw, &mut got);
+        let mut scratch = MelFftScratch::new();
+        // Reuse fidelity: dirty the scratch on a different valid batch first, then
+        // recompute frame 0 with the SAME scratch — stale FFT/window state must not
+        // leak through (the FFT overwrites every slot the projection reads).
+        if 2 * FFT_LANES * HOP + N_FFT <= valid_len {
+            let mut warm = vec![0.0f32; FFT_LANES * filters.n_mel];
+            compute_8_columns(
+                FFT_LANES,
+                &padded,
+                hann,
+                &sparse,
+                tw,
+                &mut warm,
+                &mut scratch,
+            );
+        }
+        compute_8_columns(0, &padded, hann, &sparse, tw, &mut got, &mut scratch);
 
         let mut want = vec![0.0f32; FFT_LANES * filters.n_mel];
         for lane in 0..FFT_LANES {
