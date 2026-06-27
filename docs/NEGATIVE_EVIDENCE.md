@@ -46,6 +46,72 @@ scope. `decoder_perf_probe.rs` lands as the reusable per-token decode profiler (
 tool to re-check this in a calm window or after any decoder change). No lib change;
 conformance unaffected. AGENT_NAME=DuskFinch.
 
+## 2026-06-27 - IcyWren: LAND-OR-DIG blocker surfaced — no unlanded measured bench-worktree source win remains on current `main`; biggest ORIG gap is external GEMM / loaded API residency
+
+**Bench-worktree audit.** Updated the clean worktree to `origin/main` `40ea81c`
+and checked the non-ancestor franken_whisper bench worktrees under
+`/data/projects/franken_whisper-*` after the repo-local `.scratch/.worktrees`
+search came up empty. The remaining non-main heads were not landable wins:
+
+- `franken_whisper-cod-a-main-measure` / `766f5f1` is already represented in
+  this ledger as the "OpenAI Whisper after mel twiddle" ratio entry; no source
+  delta to land.
+- `franken_whisper-cod-b-fft-clean-daa0cf9` / `4dd616f` is superseded on
+  `main` by the later mel SIMD/cfft scratch arc.
+- `franken_whisper-fused-f16c` / `134f404` is superseded on `main`; current
+  `src/native_engine/nn.rs` already has the fused f16c dot/GEMV path.
+- `franken_whisper-cod-b-f16c-unroll8-848cea2`, `franken_whisper-codex-f16c-push-c38b930`,
+  and `franken_whisper-ledger-reject-443bc4f` are reject/docs snapshots or
+  stale ledger branches, not unlanded measured wins.
+
+**Ratio vs ORIG.** The best current end-to-end OpenAI Whisper comparator already
+landed in this ledger: `franken_whisper` native `tiny.en` on 11 s JFK at 8
+threads was **3.26x** vs OpenAI Whisper Python CPU with normalized words
+identical. The remaining strict product-facing loss is the reusable loaded-model
+API / decoder setup path: prior loaded API evidence is `0.535540 s` franken vs
+`0.420035 s` OpenAI loaded API at 8 threads, ORIG/franken = **0.784x**. The
+fresh decoder profile at `40ea81c` routes that gap to external
+`ft_kernel_cpu` matrixmultiply/rayon setup cost, not an unlanded in-crate
+decoder kernel.
+
+**Dig result.** `/alien-graveyard`, `/alien-artifact-coding`, and
+`/extreme-software-optimization` all point to the same next class: change the
+residency/GEMM substrate, not another local micro-kernel. The viable radical
+lever is an out-of-crate `ft_kernel_cpu` GEMM/rayon replacement or owner-approved
+model-residency change (for example mmap/service-resident weights with a
+deterministic eager-loader fallback and the existing conformance comparator as
+the safety gate). This cannot be landed inside `franken_whisper` today without
+either changing the external compute crate or introducing a new audited unsafe
+mapping policy. No source change was kept.
+
+**Quality gates.** Per-crate conformance/bench was run via `rch exec` with
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`.
+`cargo bench --release` is not accepted by this Cargo (`unexpected argument
+'--release'`), so the executable equivalent used here was
+`cargo bench --profile release -p franken_whisper ...`.
+
+```text
+AGENT_NAME=IcyWren CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests -- --nocapture
+RCH: local fallback after queue_timeout
+result: PASS, 26 passed; 0 failed
+
+AGENT_NAME=IcyWren CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 1
+RCH: local fallback (no admissible workers: insufficient_slots=3,hard_preflight=1)
+native_engine/mel/window_to_time_major_old_chunk_then_transpose:
+  [404.20 us 428.68 us 439.57 us]
+native_engine/mel/window_to_time_major_fused:
+  [173.72 us 176.83 us 179.50 us]
+ratio fused vs old in this run: 428.68 / 176.83 = 2.42x
+```
+
+The bench is a current-main sanity sample, not a new landable win: the fused
+window path was already landed and the remaining ORIG gap is the external
+loaded-model/decoder setup path above. AGENT_NAME=IcyWren.
+
 ## 2026-06-27 - IcyWren: REJECT (regression) mel process-policy hoist (`rfft_enabled` / `fft_top_full` / `proj_scalar`) — candidate **1.311x slower** than restored `main`
 
 **Land-or-dig result: DIG then REVERT.** Repo-local `.scratch` / `.worktrees`
