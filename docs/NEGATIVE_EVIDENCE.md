@@ -88,6 +88,86 @@ baseline it is recorded only as rejection evidence. No landed ratio improvement.
 
 `AGENT_NAME=BlackThrush`.
 
+## 2026-06-27 - IcyWren: REJECT 128-frame window tile; larger tile is ~0-gain on the OpenAI-copy gap
+
+**Land-or-dig result: DIG and REVERT.** I re-checked all sibling worktrees
+against current `origin/main` (`17b67b2` before rebase; `fa9c051` after rebase).
+The source-looking non-contained heads were not missing measured wins: `4dd616f`
+(`perf(mel): fuse simd projection`) is source-equivalent to the landed
+`b1eb23b` for `src/native_engine/mel.rs`, and `134f404` (`perf(nn): fuse f16c
+gemv dot`) is an older/fewer-change form than the landed `848cea2`. The other
+non-contained heads are stale docs/reject trees or old snapshots that would roll
+back newer measured work.
+
+**New lever dug from the remaining biggest OpenAI-facing gap:** the live
+OpenAI-facing gap remains `[80, 3000]` mel window preparation, where OpenAI can
+slice/view or compact-copy while the native Rust encoder materializes a
+time-major matrix. After the 32-frame tile regression, I tested the opposite
+schedule pressure in `encoder::time_major_mel_window_from_full_mel`: reduce
+outer-loop overhead with a larger tile while preserving source-contiguous row
+reads.
+
+```text
+const FRAME_TILE: usize = 64;   // current main
+const FRAME_TILE: usize = 128;  // rejected candidate
+```
+
+The candidate passed the focused equivalence test, but did not produce a
+measured keep. Median got slightly worse and Criterion reported no performance
+improvement, so the source change was reverted.
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo test -p franken_whisper \
+    fused_full_mel_window_matches_chunk_then_transpose -- --nocapture
+
+test native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose ... ok
+```
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3 \
+    --save-baseline icywren-frame64-current-r2-20260627
+
+current main, FRAME_TILE=64:
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [279.45 µs 292.25 µs 305.24 µs]
+native_engine/mel/window_to_time_major_fused
+time: [125.15 µs 127.99 µs 130.86 µs]
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3 \
+    --baseline icywren-frame64-current-r2-20260627
+
+candidate, FRAME_TILE=128:
+native_engine/mel/window_to_time_major_fused
+time: [127.76 µs 131.75 µs 135.46 µs]
+change: [-0.1412% +2.6901% +5.5115%] (p = 0.07 > 0.05)
+No change in performance detected.
+```
+
+RCH had no admissible worker and failed open locally for both runs, so this is a
+local same-target-dir comparison. The requested literal `cargo bench --release`
+is still not accepted by this Cargo; `--profile release` is the executable
+release-profile spelling used for the per-crate bench.
+
+OpenAI-Whisper ratio convention is `OpenAI median / franken median`. Using the
+same 2026-06-25 compact-copy anchor (`15.3064 µs`), current main is
+`15.3064 / 127.99 = 0.1196x`; the rejected candidate is
+`15.3064 / 131.75 = 0.1162x`. The candidate is only
+`127.99 / 131.75 = 0.9715x` of current main on the fused path. Do not re-open
+larger frame tiles for this kernel without a different loop schedule or a direct
+conv1 mel-major bypass.
+
+`AGENT_NAME=IcyWren`.
+
 ## 2026-06-27 - BlackThrush: REJECT destination-index strength reduction in fused window prep; no reliable gain on the OpenAI-copy gap
 
 **Land-or-dig result: DIG then REVERT.** No clean unlanded measured win remained
