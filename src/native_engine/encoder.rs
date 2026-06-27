@@ -236,11 +236,12 @@ pub fn time_major_mel_window_from_full_mel(
     };
     let mut data = vec![fill; n_frames * full_mel.n_mel];
 
-    const TILE: usize = 64;
-    for m0 in (0..full_mel.n_mel).step_by(TILE) {
-        let m1 = (m0 + TILE).min(full_mel.n_mel);
-        for f0 in (0..copy_frames).step_by(TILE) {
-            let f1 = (f0 + TILE).min(copy_frames);
+    const FRAME_TILE: usize = 64;
+    const MEL_TILE: usize = 80;
+    for f0 in (0..copy_frames).step_by(FRAME_TILE) {
+        let f1 = (f0 + FRAME_TILE).min(copy_frames);
+        for m0 in (0..full_mel.n_mel).step_by(MEL_TILE) {
+            let m1 = (m0 + MEL_TILE).min(full_mel.n_mel);
             for m in m0..m1 {
                 let src = m * full_mel.n_frames + frame_offset + f0;
                 let row = &full_mel.data[src..src + (f1 - f0)];

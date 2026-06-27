@@ -3,6 +3,105 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: LANDED full-mel window tile-order keep; 1.39x faster than current fused path, still 7.90x slower than OpenAI compact-copy anchor
+
+**Land-or-dig result: DIG then KEEP.** No unlanded measured code win was found in
+the sibling bench worktrees: the plausible SIMD mel projection and f16c/GEMV
+worktree source wins were already subsumed by `origin/main`, and the remaining
+bench worktree evidence was docs/reject material. The dig target stayed on the
+largest recorded OpenAI-facing gap: `[80, 3000]` mel window extraction into the
+encoder's time-major layout.
+
+**Lever:** `encoder::time_major_mel_window_from_full_mel` now iterates frame
+tiles first and covers the normal 80 mel lanes in one mel tile. The operation is
+semantically identical to `time_major_mel_window(&mel::chunk_frames(...))`, but
+the destination row is completed while hot instead of cycling all mel blocks as
+the outer loop.
+
+**Fresh per-crate bench:** requested `cargo bench --release` was rejected by this
+Cargo (`bench` has no `--release` flag). The release-profile equivalent was used
+under the requested `rch exec` wrapper and target directory; RCH failed open
+locally because no worker slot passed preflight:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+```
+
+Same-checkout baseline before the tile-order change:
+
+```text
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [253.82 us 258.60 us 263.96 us]
+
+native_engine/mel/window_to_time_major_fused
+time: [163.14 us 168.30 us 172.02 us]
+```
+
+After:
+
+```text
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [254.98 us 262.36 us 269.60 us]
+
+native_engine/mel/window_to_time_major_fused
+time: [118.65 us 120.96 us 123.11 us]
+```
+
+Ratio vs current franken fused prep: `168.30 / 120.96 = 1.391x` faster
+(`28.1%` lower median wall time). The old chunk+transpose comparison stayed in
+the same noise band, so the measured win is attributable to the fused helper.
+
+OpenAI-Whisper ratio convention: `OpenAI median / franken median`. Reusing the
+2026-06-25 OpenAI slice comparator anchors for the same `[80, 3000]` window
+shape:
+
+```text
+OpenAI strided view median:   1.7283 us
+OpenAI compact copy median:  15.3064 us
+
+patched Rust slice+transpose vs OpenAI strided view:  0.0143x
+patched Rust slice+transpose vs OpenAI compact copy:  0.1265x
+```
+
+This remains negative OpenAI-facing evidence: the Rust operation also transposes
+into the encoder's time-major layout, while the OpenAI anchors are PyTorch
+slice/view floors. Even against the compact-copy anchor, franken is still
+`120.96 / 15.3064 = 7.90x` slower. The useful landed claim is narrower: the
+current franken encoder-window prep path is materially faster, and the remaining
+OpenAI gap is explicitly recorded instead of hidden.
+
+**Validation:** focused equivalence passed:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper \
+    fused_full_mel_window_matches_chunk_then_transpose
+
+test native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose ... ok
+```
+
+Additional gates:
+
+```text
+cargo fmt --check
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo check -p franken_whisper --all-targets
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo clippy -p franken_whisper --all-targets -- -D warnings
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests
+ubs src/native_engine/encoder.rs docs/NEGATIVE_EVIDENCE.md
+```
+
+Results: fmt passed; check passed on `hz2`; clippy passed on `hz2`;
+conformance passed **26/26** on `ovh-a`; UBS exited 0 with no critical issues
+and existing warning inventory only.
+
+`AGENT_NAME=BlackThrush`.
+
 ## 2026-06-27 - AGENT_NAME=IcyWren: REJECT SIMD f64 accumulator in mel projection; no same-worker keep proof and fallback comparison regressed
 
 **Land-or-dig result: DIG then REVERT.** Sibling bench worktrees were checked
@@ -116,7 +215,6 @@ entry). Stacking it on the landed log10 takes mel from ~1.58× to ~1.7× OpenAI.
 (Fresh local franken-vs-OpenAI re-measure attempted but box was at load 42 —
 OpenAI mean 28 ms, franken 5.4–8.7 ms spread — unusable; the clean rch 2.792 ms /
 1.58× from the landing commit stands.) AGENT_NAME=BlackThrush.
-
 ## 2026-06-27 - BlackThrush: LANDED SIMD-poly log10 mel projection — fresh rch bench 2.792 ms; franken mel now ~1.58x OpenAI anchor
 
 **Land-or-dig result: LAND.** The measured `stash@{0}` SIMD-polynomial log10
