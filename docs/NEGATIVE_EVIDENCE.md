@@ -3,6 +3,26 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: the log10 landing UN-GATES radix-5 — mel parity is now officially transcription-tolerance, so the verified radix-5 lever is the next ready-to-land win (no invariant left to relax)
+
+**Status change, not a new measurement.** With the SIMD-poly log10 now LANDED
+(`cbf272c`, franken mel ~1.58× OpenAI) the mel docstring officially declares the
+projection a "deterministic polynomial approximation that stays within the
+transcription tolerance gate" — i.e. **the bit-exact-with-whisper invariant is
+already, deliberately relaxed on main.** That was the SOLE gate on the radix-5 FFT
+lever. So radix-5 is **no longer gated** — it is now a measured (~10% mel, 1.80×
+base-case, rel 1e-7 / 1-ULP — see prior entries) win fully consistent with the
+direction main already took, and the next ready-to-land mel optimization.
+**To land** (mirrors how the log10 landed — poly applied to BOTH the scalar `dft`
+and SIMD `dft_simd8` so the internal SIMD-vs-scalar bit-exact test stays green;
+`fft_matches_naive_dft` already uses a `rel<1e-4` tolerance that 1e-7 passes):
+write a radix-5 (`25=5×5` Cooley-Tukey) in both `dft`/`dft_simd8` + a `W_5`/`W_25`
+twiddle table; verified FrameLanes reference already exists (scratchpad, last
+entry). Stacking it on the landed log10 takes mel from ~1.58× to ~1.7× OpenAI.
+(Fresh local franken-vs-OpenAI re-measure attempted but box was at load 42 —
+OpenAI mean 28 ms, franken 5.4–8.7 ms spread — unusable; the clean rch 2.792 ms /
+1.58× from the landing commit stands.) AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - BlackThrush: LANDED SIMD-poly log10 mel projection — fresh rch bench 2.792 ms; franken mel now ~1.58x OpenAI anchor
 
 **Land-or-dig result: LAND.** The measured `stash@{0}` SIMD-polynomial log10
