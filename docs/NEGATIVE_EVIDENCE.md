@@ -3,6 +3,50 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: LANDED `collect()` over zero-init for FFT scratch — MEASURED -5.48% mel (p=0.00), BIT-EXACT; the dead zero-init of fully-written buffers WAS the bottleneck the "alloc isn't the FFT cost" audit got wrong
+
+**Land-or-dig result: LAND (3rd "do less of what's unused" win this session).**
+The FFT's per-call scratch — the windowed input `fft_in` (`N_FFT` `FrameLanes`) in
+`compute_8_columns`, and the `even`/`odd` decimation halves at every recursion
+level in `fft_simd8`/`fft_simd8_onesided` — was `vec![splat(0.0); n]` then
+**fully overwritten**. The zero-init was 100% dead work (~24 MB of memset per
+`mel_30s`: ~4.8 MB `fft_in` + ~19.2 MB even/odd across the 4 radix-2 levels).
+Replaced with `collect()` (allocates, then writes each element once — no
+zero-init), via a shared `split_even_odd` helper + a direct `fft_in` build.
+
+**BIT-EXACT, no parity gate:** `collect()` produces the identical values in the
+identical order; only the dead pre-zeroing is gone. mel 12/12 (incl.
+`fft_simd8_matches_scalar_bit_exact`, `compute_8_columns_matches_scalar_columns_bit_exact`),
+conformance 26/0, clippy `-D warnings` + rustfmt clean.
+
+**Measurement (same-binary `FW_FFT_ZEROFILL` A/B, n=60, 5 s, at box load ~53 —
+toggle isolates exactly the zero-init):**
+
+```text
+native_engine/mel/mel_30s_realistic
+  legacy zero-init (FW_FFT_ZEROFILL=1): 3.4918 ms  CI [3.4672, 3.5140]
+  collect (default):                    3.2695 ms  CI [3.2457, 3.2956]
+  change: [-6.3522% -5.4781% -4.5572%]  (p = 0.00 < 0.05)  Performance has improved.
+```
+
+(Toggle removed before landing; the collect path is now unconditional.)
+
+**This corrects a standing wrong belief.** The prior `6fdd8fe` note concluded
+"allocation is NOT the FFT bottleneck (it is compute/butterfly-bound)" — because a
+`thread_local` *scratch-reuse* of these buffers REGRESSED +40-50%. That experiment
+conflated two things: reuse (which defeats the L1/hot-free-list behavior → slower)
+vs. **the zero-init itself** (pure waste). `collect()` keeps the per-call alloc
+(fast) and drops only the zeroing → a clean win the reuse experiment masked. When a
+"reuse the buffer" experiment regresses, separately test "stop zeroing the buffer."
+
+**Ratio vs OpenAI-Whisper.** Directly measured: **-5.48%** intra-franken. Stacking
+this session's three bit-exact FFT-scratch/output wins — one-sided FFT (-8.07%),
+right-sized `fft_out` (-4.46%), and this (-5.48%) — gives **~17% cumulative** mel
+frontend speedup over the session-start baseline. Against the OpenAI mel anchor
+(`whisper.audio.log_mel_spectrogram`, torch 8-thread ~4.4 ms), franken mel is now
+**~2.0-2.1x** (estimate; the -5.48% is the directly-measured same-box figure).
+AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: LANDED right-sized `fft_out` buffer — MEASURED -4.46% mel (p=0.00), BIT-EXACT; the one-sided FFT left a dead 398-slot zero-init every frame-batch
 
 **Land-or-dig result: LAND (stacks on the one-sided FFT below).** Same "do less
