@@ -3,6 +3,91 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: REJECT 32-frame cache tile for fused window prep; smaller tile regresses under Criterion
+
+**Land-or-dig result: DIG then REVERT.** The remaining non-ancestor bench
+worktrees were not clean landings: docs-only ratio/reject branches or stale code
+branches whose useful changes are already represented on current main. The
+largest live OpenAI-facing gap remains the `[80, 3000]` mel window extraction
+into encoder time-major layout, so I tried one new cache-layout lever from the
+cache-oblivious/polyhedral tiling family: shrink the fused transpose frame tile
+from 64 to 32 frames, reducing the active destination tile from about 20 KiB to
+about 10 KiB for the common 80-mel case.
+
+**Candidate:** in `encoder::time_major_mel_window_from_full_mel`, change only:
+
+```text
+const FRAME_TILE: usize = 64;
+```
+
+to:
+
+```text
+const FRAME_TILE: usize = 32;
+```
+
+The hypothesis was that the smaller tile would reduce L1 pressure while keeping
+the source mel-row reads contiguous and the existing operation order otherwise
+unchanged.
+
+**Correctness:** focused equivalence passed:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper \
+    fused_full_mel_window_matches_chunk_then_transpose
+
+test native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose ... ok
+```
+
+**Bench:** the requested literal `cargo bench --release` was captured again and
+Cargo rejected it (`unexpected argument '--release'`), so the release-profile
+bench was used for executable evidence.
+
+Current-main baseline on `ovh-a`:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [180.83 us 181.37 us 182.18 us]
+
+native_engine/mel/window_to_time_major_fused
+time: [97.330 us 101.73 us 108.98 us]
+```
+
+Candidate rerun fell back locally because RCH had no admissible worker. It is
+therefore not a same-host keep proof, but it was strongly negative against
+Criterion's local history:
+
+```text
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [270.74 us 295.15 us 318.69 us]
+change: [+48.133% +56.008% +65.392%] (p = 0.00 < 0.05)
+Performance has regressed.
+
+native_engine/mel/window_to_time_major_fused
+time: [166.28 us 179.27 us 195.48 us]
+change: [+62.206% +73.235% +86.218%] (p = 0.00 < 0.05)
+Performance has regressed.
+```
+
+The old-path control was also noisy under local fallback, but the candidate is
+not plausibly a hidden win: the smaller tile adds more loop overhead and more
+destination-row revisit passes without improving the strided-write shape enough
+to compensate. The source change was reverted.
+
+OpenAI-Whisper ratio convention is `OpenAI median / franken median`. Using the
+same compact-copy anchor (`15.3064 us`), the current-main `ovh-a` baseline is
+`15.3064 / 101.73 = 0.1505x`. The candidate local fallback median would be
+`15.3064 / 179.27 = 0.0854x`, but because that arm was not same-host with the
+baseline it is recorded only as rejection evidence. No landed ratio improvement.
+
+`AGENT_NAME=BlackThrush`.
+
 ## 2026-06-27 - BlackThrush: REJECT destination-index strength reduction in fused window prep; no reliable gain on the OpenAI-copy gap
 
 **Land-or-dig result: DIG then REVERT.** No clean unlanded measured win remained
