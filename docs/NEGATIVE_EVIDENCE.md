@@ -3,6 +3,62 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: BLOCKER — the franken_whisper-cc dig loop is measurement-saturated. Crate is at its measured ceiling AND the shared box is too contended to resolve any residual lever. Needs an operator decision, not another micro-dig.
+
+**Land-or-dig result: SURFACE A BLOCKER (neither a clean LAND nor a measurable
+DIG is possible this turn).** This consolidates 3 sessions of converging evidence
+into the one decision the loop now needs.
+
+**(1) No landable win.** `.scratch/` and `.worktrees/` hold NO franken_whisper
+bench worktree (only `frankentorch-*` ones). The ahead-of-`main` siblings are the
+same already-evaluated reject-doc/stale copies (`cod-a-main-measure`, `fused-f16c`
+[f16c-gemv subsumed], `cod-b-fft-clean` [landed as `b1eb23b`], the `*reject*`
+branches). Nothing measured sits unlanded.
+
+**(2) The crate is at its measured ceiling.** PERF_LEDGER says the lever space is
+"exhaustively exhausted by measurement"; the per-kernel loop was closed by the
+owner. Every hot kernel is optimized + bit-exact-gated: mel FFT (radix-5 + two-for-one
+real-FFT + one-sided + twiddle tables + uninit scratch), the fused f16c decoder
+dot (`dot_f16c`, landed), the sparse projection. The two would-be "big" levers are
+dead: bd-4hc0 GEMM swap re-measured to ~1.03× (and external), and explicit FMA
+(`mul_add`) in the combine/dot is a *rejected* regression (0.791×, PERF_LEDGER
+L-series — LLVM already auto-contracts where it helps). The only residual in-crate
+candidate is **sub-1%** (cfft uninit on the two-for-one default: dense −1.34%,
+production-sparse NS — see the entry directly below).
+
+**(3) The instrument is broken: the box cannot measure sub-5% on the production
+bench.** This box (Threadripper PRO 5975WX = rch `ovh-a`) is shared with the
+active `frankentorch` swarm; 1-min load oscillated 13→94 across the session.
+A noise-floor control RUN THIS TURN at load ~18 — `FW_FFT_ZEROINIT=1` vs
+`FW_FFT_ZEROINIT=1`, **identical code, same binary, back-to-back** — measured:
+
+```text
+native_engine/mel/mel_30s            change [-0.917% +0.291% +1.505%] (p=0.65)  ~0 (dense floor ~±1.5%)
+native_engine/mel/mel_30s_realistic  change [+4.021% +5.178% +6.394%] (p=0.00)  FALSE +5.18% "significant"
+```
+
+Identical code differs by **+5.18% at p=0.00** on the production (sparse) bench:
+a ±5% phantom-significance floor. Every residual lever (all sub-1%) sits far
+below it, so NO production-relevant measurement is admissible right now. The
+short ~3 ms sparse bench is especially jitter-sensitive to the swarm's CPU spikes.
+
+**⇒ Decision needed (operator), not another micro-dig.** The honest unblock paths:
+- **(a) Accept the measured ceiling and pause the franken_whisper-cc per-kernel
+  dig loop** — consistent with the owner's already-closed per-kernel decision.
+  Further turns will only re-confirm exhaustion or produce noise-floor rejects.
+- **(b) Provide an UNCONTENDED measurement window/box.** The frankentorch swarm
+  saturates this Threadripper; a quiet box (or a swarm pause) would let the lone
+  sub-1% residual (cfft uninit, bit-exact, dense −1.34% p=0.00) be confirmed and,
+  if it holds on production, landed as a small Pareto win. It is NOT worth landing
+  unconfirmed (894cf1f shows uninit can regress).
+- **(c) Move the remaining e2e lever in `frankentorch`** (encoder GEMM) — but it
+  was re-measured to ~1.03× and is out of this crate's scope.
+
+**No source change** (mel.rs is byte-identical to `main`; conformance untouched).
+This is a measured blocker entry — the noise-floor control above IS the
+measurement — committed so the loop stops spending turns re-deriving the same
+contention wall. AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - DuskFinch: uninit FFT scratch on the NEW two-for-one default (`cfft_simd8`) — the -9.37% uninit lever (5b7f529) was SUPERSEDED by the two-for-one landing; now sub-1% and below the noise floor. REVERTED.
 
 **Land-or-dig result: DIG then REVERT.** Worktree scan: ahead-of-`main` siblings
