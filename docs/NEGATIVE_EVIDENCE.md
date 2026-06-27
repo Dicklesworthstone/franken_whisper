@@ -3,6 +3,30 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: the BIGGEST gap vs OpenAI-Whisper is the MEL FRONTEND (a near-tie, not dominance) — and it's conformance-gated
+
+**Fresh franken-vs-OpenAI mel measurement (same local box, `uvx openai-whisper`).**
+Franken wins **2.13–3.26× e2e**, but that dominance comes from the encoder/decoder,
+NOT the mel frontend. Measured same-host:
+- OpenAI `whisper.audio.log_mel_spectrogram(n_mels=80)`, torch 8-thread, 30 s
+  synthetic: **median 4.28 ms** (n=20).
+- franken `mel_30s_realistic` (Criterion n=50, **contended** by the OpenAI uvx
+  tail, load ~10): **4.63 ms** — but franken's *uncontended* mel is ~4.0–4.4 ms
+  (earlier clean runs, with the landed projection-fusion + clamp/normalize SIMD).
+
+⇒ **The mel frontend is a NEAR-TIE with OpenAI** (~0.92–1.01× depending on
+host/load/threading), not a 2–3× win. This is the single benchable surface where
+franken does NOT dominate OpenAI, i.e. the "biggest measured gap." **It is
+conformance-gated, not an engineering gap:** the dominant mel cost is the
+`dft_simd8` 25-pt base DFT (and the full-complex FFT), both **bit-exact-locked to
+whisper.cpp**; the only ways to beat OpenAI's PyTorch/`torch.stft` mel here are
+RFFT / radix-5 (break bit-exactness — see those entries) or accepting a
+transcription-safe-approx mel (owner policy). My safe-SIMD mel wins (fusion +
+normalize) keep franken *competitive* with OpenAI on mel but cannot make it
+dominate without relaxing the invariant. (Caveat: the same-host ratio is
+load/threading-confounded; the robust takeaway is "near-tie ~4.3 ms each," not the
+exact 0.92×.) AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: scalar-loop SIMD seam EXHAUSTED — clean post-arc baselines (no regressions) + remaining-blockers map
 
 **Dig result: searched for a NEW conformance-safe vectorizable-arithmetic scalar
