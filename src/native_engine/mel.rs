@@ -461,6 +461,70 @@ fn fft_simd8(
     }
 }
 
+/// Bench-only escape hatch (mirrors `FW_DISABLE_F16C_DOT` in `nn`): when
+/// `FW_FFT_FULL` is set, `compute_8_columns` uses the full-spectrum
+/// [`fft_simd8`]; otherwise it uses the one-sided [`fft_simd8_onesided`] default.
+/// Lets a single bench binary A/B the two on the same box (load-robust). Read
+/// once.
+fn fft_top_full() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| std::env::var_os("FW_FFT_FULL").is_some())
+}
+
+/// One-sided top-level mirror of [`fft_simd8`]. The mel power spectrum consumes
+/// only the 201 one-sided bins (`power_and_project_simd8` reads `fft_out[0..=200]`),
+/// so the conjugate-symmetric upper half (bins 201..=399) the full FFT writes is
+/// dead. This computes the lower half (bins 0..=199) plus the Nyquist bin 200 and
+/// skips the dead upper stores — at the **outermost** level only; the recursion
+/// still produces full sub-spectra, which the combine needs. The lower/Nyquist
+/// writes are the identical expressions [`fft_simd8`] uses, so bins 0..=200 are
+/// **bit-exact** (fewer stores, no arithmetic change): conformance and
+/// `compute_8_columns_matches_scalar_columns_bit_exact` are untouched.
+fn fft_simd8_onesided(
+    input: &[FrameLanes],
+    out: &mut [FrameLanes],
+    levels: &[LevelTwiddle],
+    base: &DftTable,
+) {
+    let n = input.len();
+    debug_assert!(
+        n.is_multiple_of(2) && n > 1,
+        "one-sided top level expects even N>1"
+    );
+    let lvl = &levels[0];
+    let half = n / 2;
+    debug_assert_eq!(
+        lvl.half, half,
+        "fft_simd8_onesided level twiddle width mismatch"
+    );
+    let mut even = vec![FrameLanes::splat(0.0); half];
+    let mut odd = vec![FrameLanes::splat(0.0); half];
+    for i in 0..half {
+        even[i] = input[2 * i];
+        odd[i] = input[2 * i + 1];
+    }
+    let mut even_fft = vec![FrameLanes::splat(0.0); 2 * half];
+    let mut odd_fft = vec![FrameLanes::splat(0.0); 2 * half];
+    fft_simd8(&even, &mut even_fft, &levels[1..], base);
+    fft_simd8(&odd, &mut odd_fft, &levels[1..], base);
+    for (k, (&rec, &imc)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {
+        let re = FrameLanes::splat(rec);
+        let im = FrameLanes::splat(imc);
+        let re_odd = odd_fft[2 * k];
+        let im_odd = odd_fft[2 * k + 1];
+        let e_re = even_fft[2 * k];
+        let e_im = even_fft[2 * k + 1];
+        out[2 * k] = e_re + re * re_odd - im * im_odd;
+        out[2 * k + 1] = e_im + re * im_odd + im * re_odd;
+        // Only bin `half` (Nyquist = k==0's upper output) is consumed downstream;
+        // bins 201..=399 are conjugate-symmetric duplicates the mel path never reads.
+        if k == 0 {
+            out[2 * half] = e_re - re * re_odd + im * im_odd;
+            out[2 * half + 1] = e_im - re * im_odd - im * re_odd;
+        }
+    }
+}
+
 /// Build the padded sample buffer exactly as whisper.cpp's
 /// `log_mel_spectrogram` does:
 /// - leading `N_FFT/2` samples: *reflective* pad — `reverse_copy(samples[1..1+pad])`,
@@ -700,7 +764,11 @@ fn compute_8_columns(
     }
 
     let mut fft_out = vec![FrameLanes::splat(0.0); 2 * N_FFT];
-    fft_simd8(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    if fft_top_full() {
+        fft_simd8(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    } else {
+        fft_simd8_onesided(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    }
     power_and_project_simd8(&fft_out, filters, out8);
 }
 
@@ -1139,6 +1207,39 @@ mod tests {
                         "lane {lane} bin {b}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn fft_simd8_onesided_matches_full_on_used_bins() {
+        // The one-sided top-level FFT must be byte-identical to the full
+        // `fft_simd8` over exactly the bins the mel power spectrum reads
+        // (`0..=N_FFT/2` = 0..=200, i.e. interleaved indices `0..2*(N_FFT/2)+2`).
+        // The upper bins it skips are unread, so they are intentionally NOT
+        // compared. This is what makes skipping them safe.
+        let tw = FftTwiddles::build(N_FFT);
+        let mut lcg = Lcg::new(0x07E5_1DED);
+        let used = 2 * (N_FFT / 2) + 2; // re+im of bins 0..=200
+        for _round in 0..32 {
+            let mut vin = vec![FrameLanes::splat(0.0); N_FFT];
+            for slot in &mut vin {
+                let mut a = [0.0f32; FFT_LANES];
+                for al in &mut a {
+                    *al = lcg.next_f32();
+                }
+                *slot = FrameLanes::from_array(a);
+            }
+            let mut full = vec![FrameLanes::splat(0.0); 2 * N_FFT];
+            let mut one = vec![FrameLanes::splat(0.0); 2 * N_FFT];
+            fft_simd8(&vin, &mut full, &tw.levels, &tw.base);
+            fft_simd8_onesided(&vin, &mut one, &tw.levels, &tw.base);
+            for b in 0..used {
+                assert_eq!(
+                    full[b].to_array().map(f32::to_bits),
+                    one[b].to_array().map(f32::to_bits),
+                    "one-sided diverged from full at used interleaved index {b}"
+                );
             }
         }
     }

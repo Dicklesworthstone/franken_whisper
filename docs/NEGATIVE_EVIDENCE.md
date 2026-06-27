@@ -3,6 +3,50 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: LANDED one-sided top-level mel FFT — MEASURED -8.07% mel (p=0.00), BIT-EXACT, no parity gate; a genuinely new lever the prior "FFT space fully mapped" audits missed
+
+**Land-or-dig result: LAND (a real measured win, not a relaxation).** The mel power
+spectrum (`power_and_project_simd8`) reads only the 201 one-sided bins
+`fft_out[0..=200]`, but `fft_simd8` computed the full 400-bin complex spectrum —
+so the conjugate-symmetric upper half (bins 201..=399) the outermost butterfly
+wrote was **dead stores**. New `fft_simd8_onesided` computes the lower half +
+Nyquist and skips the dead upper writes at the **outermost level only** (the
+recursion still produces full sub-spectra, which the combine needs). Wired into
+`compute_8_columns` behind a bench-only `FW_FFT_FULL` toggle (mirrors
+`FW_DISABLE_F16C_DOT`) for load-robust A/B.
+
+**Why this is NOT the rejected RFFT** (and why the prior audits missed it): the
+`9e0837e`/`3b46ea7` "FFT space fully mapped" rejections were about a *half-size*
+real FFT that **changes the arithmetic** (diverges → was gated on bit-exactness).
+This changes **nothing arithmetically** — the lower/Nyquist writes are the
+identical expressions `fft_simd8` uses; it just **stops storing outputs nothing
+reads**. So it is **bit-exact** (guarded directly by the new
+`fft_simd8_onesided_matches_full_on_used_bins`, and by the unchanged
+`compute_8_columns_matches_scalar_columns_bit_exact`), needs **no parity-policy
+decision at all**, and cannot regress (strictly fewer stores).
+
+**Measurement (same-binary `FW_FFT_FULL` A/B, one local box, criterion
+`--save-baseline`/`--baseline`, n=50, 5 s — robust to box load):**
+
+```text
+native_engine/mel/mel_30s_realistic
+  baseline (full FFT, FW_FFT_FULL=1): 3.5233 ms  CI [3.4823, 3.5712]
+  candidate (one-sided, default):     3.2577 ms  CI [3.2158, 3.3091]
+  change: [-10.295% -8.0662% -5.8297%]  (p = 0.00 < 0.05)  Performance has improved.
+```
+
+Bigger than the op-count would suggest because the top-level butterfly's output is
+the FFT's **largest buffer** (`2*N_FFT` FrameLanes = 25.6 KB); halving its stores
+is a memory-bandwidth win, not just a FLOP cut.
+
+**Ratio vs OpenAI-Whisper.** Directly measured here is the **-8.07%** intra-franken
+gain (the clean, same-box number). Against the standing OpenAI mel anchor
+(`whisper.audio.log_mel_spectrogram`, torch 8-thread ~4.4 ms), this stacks on the
+landed log10 + radix-5 frontend (~1.7x) to push franken mel to **~1.85x OpenAI**
+(estimate — no same-box OpenAI run was available this session; the -8.07% is the
+directly-measured figure). Conformance 26/0, mel suite 12/12, clippy `-D warnings`
+clean. AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - BlackThrush: LANDED full-mel window tile-order keep; 1.39x faster than current fused path, still 7.90x slower than OpenAI compact-copy anchor
 
 **Land-or-dig result: DIG then KEEP.** No unlanded measured code win was found in
