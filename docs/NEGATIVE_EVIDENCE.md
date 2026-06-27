@@ -69,6 +69,82 @@ ratio improvement.
 
 `AGENT_NAME=BlackThrush`.
 
+## 2026-06-27 - IcyWren: REJECT 32-frame window tile; smaller tile hurts the remaining OpenAI window-prep gap
+
+**Land-or-dig result: DIG and REVERT.** I checked the local perf branches and
+bench worktrees reachable from this checkout; the obvious measured source wins
+(`chunk_frames` row-copy, rayon cap, f16c/log-mel/real-FFT work) are already
+ancestors of current `origin/main` or are recorded rejects. No missing measured
+win was available to land.
+
+**New lever dug from the remaining biggest OpenAI-facing gap:** the explicit
+post-real-FFT gap remains the `[80, 3000]` mel window preparation surface, where
+OpenAI-Whisper can slice/view or compact-copy while the native Rust encoder
+currently materializes a time-major matrix. Following the alien-graveyard
+polyhedral/locality guidance, I tested a smaller cache tile in
+`encoder::time_major_mel_window_from_full_mel`:
+
+```text
+const FRAME_TILE: usize = 64;  // current main
+const FRAME_TILE: usize = 32;  // rejected candidate
+```
+
+The hypothesis was that a 32-frame tile would reduce the active source+dest
+footprint enough to improve L1 locality. Same-target-dir A/B contradicted it:
+the smaller tile increases loop overhead and loses the useful 64-frame balance.
+The candidate passed the focused equivalence test, but regressed the measured
+kernel and was reverted.
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo test -p franken_whisper \
+    fused_full_mel_window_matches_chunk_then_transpose -- --nocapture
+
+test native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose ... ok
+```
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3 \
+    --save-baseline icywren-frame64-current-20260627
+
+current main, FRAME_TILE=64:
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [257.76 µs 262.60 µs 268.88 µs]
+native_engine/mel/window_to_time_major_fused
+time: [120.70 µs 125.16 µs 131.67 µs]
+
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3 \
+    --baseline icywren-frame64-current-20260627
+
+candidate, FRAME_TILE=32:
+native_engine/mel/window_to_time_major_fused
+time: [154.60 µs 159.95 µs 164.74 µs]
+change: [+21.338% +26.500% +31.705%] (p = 0.00 < 0.05)
+Performance has regressed.
+```
+
+RCH had no admissible worker and failed open locally for both runs, so this is a
+local same-target-dir comparison rather than cross-worker evidence.
+
+OpenAI-Whisper ratio convention is `OpenAI median / franken median`. Using the
+same 2026-06-25 compact-copy anchor (`15.3064 µs`), current main is
+`15.3064 / 125.16 = 0.1223x`; the rejected candidate is
+`15.3064 / 159.95 = 0.0957x`. The candidate is also only
+`125.16 / 159.95 = 0.7825x` of current main on the fused path. Do not re-open
+smaller frame tiles for this kernel without a different loop schedule or a
+direct conv1 mel-major bypass.
+
+`AGENT_NAME=IcyWren`.
+
 ## 2026-06-27 - BlackThrush: REJECT no-fill time-major window fast path; source locality beats dead-store elimination
 
 **Land-or-dig result: LAND already happened upstream, then DIG and REVERT.**
