@@ -80,6 +80,18 @@ release-profile equivalent above was used for executable per-crate benches.
 
 `AGENT_NAME=BlackThrush`.
 
+**IcyWren independent rerun on latest head:** after `origin/main` advanced again
+to `7201eb8` (real-FFT default-on), I repeated the no-padding row-push check with
+the requested `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`.
+RCH had no admissible worker for the short A/B and failed open locally. The
+candidate measured `234.64 us` median; current `origin/main` measured `124.29 us`
+median in the same local fallback target dir, so the candidate is
+`124.29 / 234.64 = 0.5297x` current main. Against the same OpenAI compact-copy
+anchor, current main is `15.3064 / 124.29 = 0.1232x` and the candidate is
+`15.3064 / 234.64 = 0.0652x`. Focused equivalence passed on `ovh-a`, and
+conformance comparator passed 26/26 on `ovh-a`; source was reverted.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-27 - SlateHeron: real-FFT (two-for-one) STEP 2 LANDED & DEFAULT-ON — MEASURED -8.37% mel (p=0.00); the "biggest remaining lever" is now in production
 
 **Land-or-dig result: LAND (the multi-turn lever completes).** Building on STEP 1
