@@ -291,6 +291,50 @@ fn bench_chunk_frames(c: &mut Criterion) {
     group.finish();
 }
 
+/// Prepare one encoder window for conv1: old compact-window path vs fused
+/// slice+transpose. This targets the OpenAI view/copy gap recorded for
+/// `chunk_frames`: the encoder ultimately needs time-major data, so avoiding
+/// the intermediate compact mel-major window is the smallest in-crate
+/// zero-copy-style lever.
+fn bench_window_to_time_major(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/mel");
+    let n_mel = 80;
+    let n_frames = FRAMES_PER_CHUNK + 1024;
+    let mut lcg = Lcg::new(0xc0ffee);
+    let data: Vec<f32> = (0..n_mel * n_frames).map(|_| lcg.next_f32()).collect();
+    let mel = Mel {
+        n_mel,
+        n_frames,
+        data,
+    };
+    let offset = 512;
+
+    group.bench_function("window_to_time_major_old_chunk_then_transpose", |b| {
+        b.iter(|| {
+            let chunk = mel::chunk_frames(
+                black_box(&mel),
+                black_box(offset),
+                black_box(FRAMES_PER_CHUNK),
+            );
+            let time_major = encoder::time_major_mel_window(black_box(&chunk));
+            black_box(time_major.data.len())
+        });
+    });
+
+    group.bench_function("window_to_time_major_fused", |b| {
+        b.iter(|| {
+            let time_major = encoder::time_major_mel_window_from_full_mel(
+                black_box(&mel),
+                black_box(offset),
+                black_box(FRAMES_PER_CHUNK),
+            );
+            black_box(time_major.data.len())
+        });
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // 2. encoder_window_{tiny,large} — one full 3000-frame encoder window
 // ---------------------------------------------------------------------------
@@ -626,7 +670,9 @@ fn bench_gelu(c: &mut Criterion) {
 
     let (rows, cols) = (1500usize, 1536usize);
     let mut lcg = Lcg::new(0x9e1c_0e1f);
-    let base: Vec<f32> = (0..rows * cols).map(|_| lcg.next_f32() * 6.0 - 3.0).collect();
+    let base: Vec<f32> = (0..rows * cols)
+        .map(|_| lcg.next_f32() * 6.0 - 3.0)
+        .collect();
 
     let mut group = c.benchmark_group("native_engine/gelu");
     group.throughput(criterion::Throughput::Elements((rows * cols) as u64));
@@ -657,11 +703,8 @@ fn bench_resample(c: &mut Criterion) {
     group.throughput(criterion::Throughput::Elements(input.len() as u64));
     group.bench_function("resample_44k_to_16k_30s", |bch| {
         bch.iter(|| {
-            let out = resample_mono_linear(
-                black_box(&input),
-                black_box(src_rate),
-                black_box(dst_rate),
-            );
+            let out =
+                resample_mono_linear(black_box(&input), black_box(src_rate), black_box(dst_rate));
             black_box(out.len())
         });
     });
@@ -698,6 +741,7 @@ criterion_group!(
     bench_mel_30s,
     bench_mel_30s_realistic,
     bench_chunk_frames,
+    bench_window_to_time_major,
     bench_encoder_window_tiny,
     bench_encoder_window_large,
     bench_decoder_token_step_tiny,

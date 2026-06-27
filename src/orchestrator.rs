@@ -2991,10 +2991,11 @@ fn vad_energy_detect_legacy(
         &[] as &[u8]
     };
 
-    let samples: Vec<f64> = pcm_data
-        .chunks_exact(2)
+    let (sample_bytes, _) = pcm_data.as_chunks::<2>();
+    let samples: Vec<f64> = sample_bytes
+        .iter()
         .map(|chunk| {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let sample = i16::from_le_bytes(*chunk);
             sample as f64 / 32768.0
         })
         .collect();

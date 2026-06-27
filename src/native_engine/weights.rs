@@ -261,18 +261,18 @@ impl SafetensorsFile {
         let mut out = Vec::with_capacity(n_elements);
         match entry.dtype {
             StDType::F32 => {
-                for chunk in raw.chunks_exact(4) {
-                    out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                for chunk in raw.as_chunks::<4>().0 {
+                    out.push(f32::from_le_bytes(*chunk));
                 }
             }
             StDType::F16 => {
-                for chunk in raw.chunks_exact(2) {
-                    out.push(Float16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+                for chunk in raw.as_chunks::<2>().0 {
+                    out.push(Float16::from_le_bytes(*chunk).to_f32());
                 }
             }
             StDType::Bf16 => {
-                for chunk in raw.chunks_exact(2) {
-                    out.push(BFloat16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+                for chunk in raw.as_chunks::<2>().0 {
+                    out.push(BFloat16::from_le_bytes(*chunk).to_f32());
                 }
             }
         }

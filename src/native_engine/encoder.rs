@@ -206,6 +206,77 @@ fn transpose(data: &[f32], rows: usize, cols: usize) -> Mat {
     Mat::from_vec(cols, rows, nn::transpose_parallel(data, rows, cols))
 }
 
+/// Convert a compact mel-major encoder window to time-major conv input.
+///
+/// This is the exact preparation [`forward`] historically performed after
+/// [`super::mel::chunk_frames`]: `[n_mels, n_frames]` mel-major in, `[n_frames,
+/// n_mels]` time-major out.
+#[must_use]
+pub fn time_major_mel_window(mel_window: &Mel) -> Mat {
+    transpose(&mel_window.data, mel_window.n_mel, mel_window.n_frames)
+}
+
+/// Slice a window from a full mel spectrogram directly into time-major layout.
+///
+/// This is equivalent to `time_major_mel_window(&mel::chunk_frames(...))`, but
+/// skips materializing the intermediate compact mel-major [`Mel`] window. Frames
+/// beyond `full_mel.n_frames` are filled with [`mel::SILENCE_FLOOR`], matching
+/// [`super::mel::chunk_frames`].
+#[must_use]
+pub fn time_major_mel_window_from_full_mel(
+    full_mel: &Mel,
+    frame_offset: usize,
+    n_frames: usize,
+) -> Mat {
+    let copy_frames = full_mel.n_frames.saturating_sub(frame_offset).min(n_frames);
+    let fill = if copy_frames == n_frames {
+        0.0
+    } else {
+        super::mel::SILENCE_FLOOR
+    };
+    let mut data = vec![fill; n_frames * full_mel.n_mel];
+
+    const TILE: usize = 64;
+    for m0 in (0..full_mel.n_mel).step_by(TILE) {
+        let m1 = (m0 + TILE).min(full_mel.n_mel);
+        for f0 in (0..copy_frames).step_by(TILE) {
+            let f1 = (f0 + TILE).min(copy_frames);
+            for m in m0..m1 {
+                let src = m * full_mel.n_frames + frame_offset + f0;
+                let row = &full_mel.data[src..src + (f1 - f0)];
+                for (df, &v) in row.iter().enumerate() {
+                    data[(f0 + df) * full_mel.n_mel + m] = v;
+                }
+            }
+        }
+    }
+
+    Mat::from_vec(n_frames, full_mel.n_mel, data)
+}
+
+fn validate_mel_window_shape(w: &EncoderWeights, n_mel: usize, n_frames: usize) -> FwResult<()> {
+    if n_mel != w.n_mels {
+        return Err(FwError::InvalidRequest(format!(
+            "encoder: mel has {} channels, model expects {}",
+            n_mel, w.n_mels
+        )));
+    }
+    // The conv stem (stride-2 conv2) halves time, so the frame count must be
+    // even and at most `2 * n_audio_ctx`. The full-window case is the common
+    // `2 * 1500 = 3000`; a smaller even count is the tail-window truncation
+    // (whisper.cpp `audio_ctx`: conv input is `2*n_ctx` wide, 1982/1995). An
+    // odd count would yield a fractional ctx; an oversized one would overrun
+    // the positional embedding (re-checked after conv below).
+    let max_frames = 2 * w.n_ctx;
+    if n_frames == 0 || !n_frames.is_multiple_of(2) || n_frames > max_frames {
+        return Err(FwError::InvalidRequest(format!(
+            "encoder: mel window has {n_frames} frames, expected a positive even count \
+             ≤ {max_frames} (= 2*n_audio_ctx; use mel::chunk_frames)",
+        )));
+    }
+    Ok(())
+}
+
 impl EncoderWeights {
     /// The encoder embedding width (`n_audio_state`).
     #[must_use]
@@ -271,19 +342,49 @@ impl EncoderWeights {
                 Ok(EncoderLayer {
                     attn_ln_w: load_vec(model, &p("attn_ln.weight"), n_state)?,
                     attn_ln_b: load_vec(model, &p("attn_ln.bias"), n_state)?,
-                    attn_q_w: load_linear_transposed(model, &p("attn.query.weight"), n_state, n_state)?,
+                    attn_q_w: load_linear_transposed(
+                        model,
+                        &p("attn.query.weight"),
+                        n_state,
+                        n_state,
+                    )?,
                     attn_q_b: load_vec(model, &p("attn.query.bias"), n_state)?,
                     // whisper key projection has NO bias.
-                    attn_k_w: load_linear_transposed(model, &p("attn.key.weight"), n_state, n_state)?,
-                    attn_v_w: load_linear_transposed(model, &p("attn.value.weight"), n_state, n_state)?,
+                    attn_k_w: load_linear_transposed(
+                        model,
+                        &p("attn.key.weight"),
+                        n_state,
+                        n_state,
+                    )?,
+                    attn_v_w: load_linear_transposed(
+                        model,
+                        &p("attn.value.weight"),
+                        n_state,
+                        n_state,
+                    )?,
                     attn_v_b: load_vec(model, &p("attn.value.bias"), n_state)?,
-                    attn_out_w: load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?,
+                    attn_out_w: load_linear_transposed(
+                        model,
+                        &p("attn.out.weight"),
+                        n_state,
+                        n_state,
+                    )?,
                     attn_out_b: load_vec(model, &p("attn.out.bias"), n_state)?,
                     mlp_ln_w: load_vec(model, &p("mlp_ln.weight"), n_state)?,
                     mlp_ln_b: load_vec(model, &p("mlp_ln.bias"), n_state)?,
-                    mlp_fc_w: load_linear_transposed(model, &p("mlp.0.weight"), mlp_hidden, n_state)?,
+                    mlp_fc_w: load_linear_transposed(
+                        model,
+                        &p("mlp.0.weight"),
+                        mlp_hidden,
+                        n_state,
+                    )?,
                     mlp_fc_b: load_vec(model, &p("mlp.0.bias"), mlp_hidden)?,
-                    mlp_proj_w: load_linear_transposed(model, &p("mlp.2.weight"), n_state, mlp_hidden)?,
+                    mlp_proj_w: load_linear_transposed(
+                        model,
+                        &p("mlp.2.weight"),
+                        n_state,
+                        mlp_hidden,
+                    )?,
                     mlp_proj_b: load_vec(model, &p("mlp.2.bias"), n_state)?,
                 })
             })
@@ -356,33 +457,47 @@ pub fn forward(
 ) -> FwResult<Mat> {
     let _ = n_threads_hint; // ft kernels manage their own rayon pool.
 
-    if mel_window.n_mel != w.n_mels {
-        return Err(FwError::InvalidRequest(format!(
-            "encoder: mel has {} channels, model expects {}",
-            mel_window.n_mel, w.n_mels
-        )));
-    }
-    // The conv stem (stride-2 conv2) halves time, so the frame count must be
-    // even and at most `2 * n_audio_ctx`. The full-window case is the common
-    // `2 * 1500 = 3000`; a smaller even count is the tail-window truncation
-    // (whisper.cpp `audio_ctx`: conv input is `2*n_ctx` wide, 1982/1995). An
-    // odd count would yield a fractional ctx; an oversized one would overrun
-    // the positional embedding (re-checked after conv below).
-    let max_frames = 2 * w.n_ctx;
-    if mel_window.n_frames == 0
-        || !mel_window.n_frames.is_multiple_of(2)
-        || mel_window.n_frames > max_frames
-    {
-        return Err(FwError::InvalidRequest(format!(
-            "encoder: mel window has {} frames, expected a positive even count \
-             ≤ {max_frames} (= 2*n_audio_ctx; use mel::chunk_frames)",
-            mel_window.n_frames
-        )));
-    }
+    validate_mel_window_shape(w, mel_window.n_mel, mel_window.n_frames)?;
 
     // mel is mel-major [n_mel, n_frames]; conv1d wants time-major [T, Cin].
-    let x = transpose(&mel_window.data, mel_window.n_mel, mel_window.n_frames);
+    let x = time_major_mel_window(mel_window);
 
+    forward_time_major(w, x, checkpoint)
+}
+
+/// Run the whisper audio encoder over a window sliced from a full mel buffer.
+///
+/// This is numerically equivalent to:
+///
+/// ```text
+/// let mel_window = mel::chunk_frames(full_mel, frame_offset, n_frames);
+/// encoder::forward(w, &mel_window, n_threads_hint, checkpoint)
+/// ```
+///
+/// but fuses the window slice with the encoder's required mel-major to
+/// time-major transpose, avoiding an intermediate compact mel buffer in the
+/// decode loop.
+pub fn forward_from_full_mel_window(
+    w: &EncoderWeights,
+    full_mel: &Mel,
+    frame_offset: usize,
+    n_frames: usize,
+    n_threads_hint: usize,
+    checkpoint: &dyn Fn() -> FwResult<()>,
+) -> FwResult<Mat> {
+    let _ = n_threads_hint; // ft kernels manage their own rayon pool.
+
+    validate_mel_window_shape(w, full_mel.n_mel, n_frames)?;
+    let x = time_major_mel_window_from_full_mel(full_mel, frame_offset, n_frames);
+
+    forward_time_major(w, x, checkpoint)
+}
+
+fn forward_time_major(
+    w: &EncoderWeights,
+    x: Mat,
+    checkpoint: &dyn Fn() -> FwResult<()>,
+) -> FwResult<Mat> {
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
     let mut x = nn::conv1d(
         &x, &w.conv1_w, w.n_state, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
@@ -696,6 +811,23 @@ mod tests {
         assert_eq!(t.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         let back = transpose(&t.data, 3, 2);
         assert_eq!(back.data, data);
+    }
+
+    #[test]
+    fn fused_full_mel_window_matches_chunk_then_transpose() {
+        let full = Mel {
+            n_mel: 3,
+            n_frames: 7,
+            data: (0..21).map(|i| i as f32 + 0.25).collect(),
+        };
+        for &(offset, frames) in &[(0, 6), (2, 4), (5, 6), (7, 4), (9, 4)] {
+            let compact = mel::chunk_frames(&full, offset, frames);
+            let want = time_major_mel_window(&compact);
+            let got = time_major_mel_window_from_full_mel(&full, offset, frames);
+            assert_eq!(got.rows, want.rows);
+            assert_eq!(got.cols, want.cols);
+            assert_eq!(got.data, want.data, "offset={offset} frames={frames}");
+        }
     }
 
     /// Minimal inline 16-bit PCM mono WAV reader (jfk.wav is 16 kHz mono i16).

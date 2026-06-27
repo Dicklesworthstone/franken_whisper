@@ -853,9 +853,15 @@ pub fn transcribe_samples(
                 "tail-window encoder-context truncation engaged"
             );
         }
-        let mel_window = mel::chunk_frames(&full_mel, frame_offset, mel_frames);
         let t_enc = std::time::Instant::now();
-        let enc = encoder::forward(&m.encoder, &mel_window, params.n_threads, checkpoint)?;
+        let enc = encoder::forward_from_full_mel_window(
+            &m.encoder,
+            &full_mel,
+            frame_offset,
+            mel_frames,
+            params.n_threads,
+            checkpoint,
+        )?;
         super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
         let t_xkv = std::time::Instant::now();
         let mut st = DecoderState::new(&m.decoder, &enc)?;

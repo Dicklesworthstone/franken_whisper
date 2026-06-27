@@ -295,15 +295,15 @@ pub enum WeightMat {
 fn dot8(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0.0f32; 8];
-    let mut ac = a.chunks_exact(8);
-    let mut bc = b.chunks_exact(8);
-    for (ach, bch) in ac.by_ref().zip(bc.by_ref()) {
+    let (a_chunks, a_remainder) = a.as_chunks::<8>();
+    let (b_chunks, b_remainder) = b.as_chunks::<8>();
+    for (ach, bch) in a_chunks.iter().zip(b_chunks.iter()) {
         for i in 0..8 {
             acc[i] += ach[i] * bch[i];
         }
     }
     let mut s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-    for (&av, &bv) in ac.remainder().iter().zip(bc.remainder().iter()) {
+    for (&av, &bv) in a_remainder.iter().zip(b_remainder.iter()) {
         s += av * bv;
     }
     s

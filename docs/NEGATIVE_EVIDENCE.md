@@ -3,6 +3,96 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - AGENT_NAME=IcyWren: fused full-mel window prep KEEP, 1.71x faster than chunk+transpose but still behind OpenAI view/copy
+
+### Land-or-dig scan
+
+Checked sibling bench worktrees before editing. The likely measured candidates
+were already on `main`/`origin/main`/`origin/master`: `franken_whisper-cod-a-push`
+at `ca41d48` (`perf(mel): speed up chunk frame slicing`) had no `main..HEAD`
+diff, and the f16c land worktree's source win was already in the current branch
+history. No unlanded measured code win was waiting to be landed, so this took the
+dig path.
+
+### Lever
+
+The prior `chunk_frames` row-copy win still left Rust far behind OpenAI's
+PyTorch slice floor, and the decode loop immediately transposed each compact
+mel-major window into the encoder's time-major conv input. This lever fuses the
+full-mel window slice with that transpose:
+
+```text
+old:   mel::chunk_frames(full_mel, off, n) -> encoder::time_major_mel_window
+new:   encoder::time_major_mel_window_from_full_mel(full_mel, off, n)
+```
+
+The fused helper preserves `mel::chunk_frames` tail padding semantics
+(`SILENCE_FLOOR`) and the public encoder path now calls
+`forward_from_full_mel_window` from `decode.rs`, avoiding the intermediate
+compact `Mel` allocation in the transcription loop.
+
+### Evidence
+
+The requested `cargo bench --release` form is rejected by this nightly Cargo
+(`unexpected argument '--release'`), so the release-profile equivalent was used.
+RCH selected `hz2`, remote sync timed out after 30 s, and RCH failed open
+locally. The bench still used the requested per-crate surface and target dir:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result:
+
+```text
+native_engine/mel/window_to_time_major_old_chunk_then_transpose
+time: [242.06 us 251.16 us 259.78 us]
+
+native_engine/mel/window_to_time_major_fused
+time: [141.43 us 147.23 us 153.67 us]
+```
+
+Ratio vs current franken prep: `251.16 / 147.23 = 1.706x` faster
+(`~41.4%` lower median wall time).
+
+OpenAI-Whisper ratio convention: `OpenAI median / franken median`. Reusing the
+fresh 2026-06-25 OpenAI slice comparator for the same `[80, 3000]` window shape:
+
+```text
+OpenAI strided view median:   1.7283 us
+OpenAI compact copy median:  15.3064 us
+
+fused Rust slice+transpose vs OpenAI strided view:  0.0117x
+fused Rust slice+transpose vs OpenAI compact copy:  0.1040x
+```
+
+This is not a like-for-like OpenAI win: the Rust operation also transposes into
+the encoder's time-major layout, while the OpenAI measurements are the PyTorch
+mel slice/view floor. The useful claim is narrower: franken's own encoder-window
+prep is materially faster, and the OpenAI-facing gap is now correctly recorded
+instead of hidden behind the previous `chunk_frames` kernel-only result.
+
+### Conformance
+
+Focused equality proof:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a-icywren \
+  rch exec -- cargo test -p franken_whisper \
+    native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose \
+    -- --nocapture
+
+test native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose ... ok
+```
+
+The helper is exact against `time_major_mel_window(&mel::chunk_frames(...))` for
+normal windows and tail-padded offsets. Keep and land. AGENT_NAME=IcyWren.
+
 ## 2026-06-27 - BlackThrush: ACTUAL SIMD radix-5 speedup measured = 1.80× base-case (~10% mel), FrameLanes impl VERIFIED correct (1-ULP) — refines the op-count proxy; the radix-5 lever is now fully built & validated
 
 **The last unmeasured number on the radix-5 lever — its real SIMD speedup — now

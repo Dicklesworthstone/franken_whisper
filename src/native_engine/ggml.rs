@@ -351,8 +351,10 @@ impl GgmlModel {
                         n_elements
                     )));
                 }
-                raw.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect()
             }
             GgmlDType::F16 => {
@@ -414,8 +416,10 @@ impl GgmlModel {
             )));
         }
         let bits: Vec<u16> = raw
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         Ok((entry.shape.clone(), bits))
     }
@@ -432,8 +436,10 @@ impl GgmlModel {
 fn dequant_f16_parallel(raw: &[u8], n_elements: usize) -> Vec<f32> {
     const PAR_THRESHOLD: usize = 1 << 20; // 1M elements: below this, serial wins.
     let serial = |bytes: &[u8], out: &mut [f32]| {
-        for (c, o) in bytes.chunks_exact(2).zip(out.iter_mut()) {
-            *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+        let (chunks, remainder) = bytes.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        for (c, o) in chunks.iter().zip(out.iter_mut()) {
+            *o = f16_to_f32(u16::from_le_bytes(*c));
         }
     };
     let mut values = vec![0.0f32; n_elements];
