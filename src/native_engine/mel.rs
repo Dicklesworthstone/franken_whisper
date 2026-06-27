@@ -656,13 +656,19 @@ fn fft_scratch_zeroinit() -> bool {
     *Z.get_or_init(|| std::env::var_os("FW_FFT_ZEROINIT").is_some())
 }
 
-/// Allocate the two `n`-element output buffers (`even_fft`/`odd_fft`) for the
-/// recursive sub-FFTs. They are written in full by the immediately-following
-/// `fft_simd8` before the butterfly combine reads them, so the usual
-/// `vec![splat(0.0); n]` zero-init is pure dead work (~38 MB/`mel_30s`, measured
-/// ~9% of mel). The interleaved butterfly writes can't be `collect()`'d without
-/// doubling the complex multiplies, so the fast path allocates uninitialised.
-/// `FW_FFT_ZEROINIT` restores the zero-init path.
+/// Allocate two `n`-element scratch buffers for the recursive sub-FFTs. Used by
+/// both `fft_simd8` (the full/one-sided path) and `cfft_simd8` (the two-for-one
+/// default), for the `even_fft`/`odd_fft` sub-FFT outputs AND for `cfft_simd8`'s
+/// `even`/`odd` deinterleave inputs. Every slot is written in full before any
+/// read (the sub-FFT writes its whole output before the butterfly combine; the
+/// deinterleave loop writes all `2*half` slots before recursing), so the usual
+/// `vec![splat(0.0); n]` zero-init is pure dead work — measured ~9% of mel on the
+/// old full-FFT default, and **−3.05% of the production (sparse) mel
+/// instruction count + −4.3% cycles** on the two-for-one default (perf
+/// instructions-retired A/B, contention-immune; see the ledger). The interleaved
+/// butterfly writes can't be `collect()`'d without doubling the complex
+/// multiplies, so the fast path allocates uninitialised. `FW_FFT_ZEROINIT`
+/// restores the zero-init path.
 #[allow(unsafe_code)]
 #[inline]
 fn alloc_fft_scratch(n: usize) -> (Vec<FrameLanes>, Vec<FrameLanes>) {
@@ -674,12 +680,15 @@ fn alloc_fft_scratch(n: usize) -> (Vec<FrameLanes>, Vec<FrameLanes>) {
     }
     let mut even_fft = Vec::<FrameLanes>::with_capacity(n);
     let mut odd_fft = Vec::<FrameLanes>::with_capacity(n);
-    // SAFETY: each buffer is handed straight to `fft_simd8(&_, &mut buf, ..)`,
-    // which writes ALL `n` elements before any read — every recursion path is a
-    // pure store of its whole output: the radix-2 butterfly writes both halves
-    // `out[2k]/out[2k+1]` and `out[2(k+half)]/..` for k in 0..half, the radix-5 /
-    // naive base case writes every bin, and the n==1 leaf writes `[0],[1]`. No
-    // path reads `out` before writing it. `FrameLanes` (`Simd<f32,8>`) is `Copy`
+    // SAFETY: each buffer is written IN FULL before any read. Either it is handed
+    // straight to `fft_simd8`/`cfft_simd8(&_, &mut buf, ..)`, which writes ALL `n`
+    // elements before any read — every recursion path is a pure store of its whole
+    // output: the radix-2 butterfly writes both halves `out[2k]/out[2k+1]` and
+    // `out[2(k+half)]/..` for k in 0..half, the radix-5 / naive base case writes
+    // every bin, and the n==1 leaf writes `[0],[1]` — OR it is `cfft_simd8`'s
+    // `even`/`odd` buffer, whose deinterleave loop writes all `2*half` slots
+    // (`[2i],[2i+1]` for i in 0..half) before the recursive call reads it. No path
+    // reads a buffer before writing it. `FrameLanes` (`Simd<f32,8>`) is `Copy`
     // with no `Drop`, so `set_len` over uninitialised capacity neither drops nor
     // observes an uninitialised value. (Empirically: the full mel suite passes
     // bit-identically with and without this path — see the ledger.)
@@ -828,16 +837,16 @@ fn cfft_simd8(
     }
     let lvl = &levels[0];
     let half = n / 2;
-    let mut even = vec![FrameLanes::splat(0.0); 2 * half];
-    let mut odd = vec![FrameLanes::splat(0.0); 2 * half];
+    // Uninit: the split loop writes every element before the recursion reads it.
+    let (mut even, mut odd) = alloc_fft_scratch(2 * half);
     for i in 0..half {
         even[2 * i] = input[2 * (2 * i)];
         even[2 * i + 1] = input[2 * (2 * i) + 1];
         odd[2 * i] = input[2 * (2 * i + 1)];
         odd[2 * i + 1] = input[2 * (2 * i + 1) + 1];
     }
-    let mut even_fft = vec![FrameLanes::splat(0.0); 2 * half];
-    let mut odd_fft = vec![FrameLanes::splat(0.0); 2 * half];
+    // Uninit: the recursive `cfft_simd8` writes every element before the combine.
+    let (mut even_fft, mut odd_fft) = alloc_fft_scratch(2 * half);
     cfft_simd8(&even, &mut even_fft, &levels[1..], base);
     cfft_simd8(&odd, &mut odd_fft, &levels[1..], base);
     for (k, (&rec, &imc)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {

@@ -3,6 +3,67 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: LAND — uninit FFT scratch on the two-for-one default (`cfft_simd8`) IS a real production win after all (−3.05% mel instructions / ~−4% cycles). The instrument was wrong, not the lever; the contention BLOCKER is broken by perf instructions-retired.
+
+**Land-or-dig result: LAND — and it CORRECTS my own prior false-negative reject
+(`7e7f658`).** That entry rejected this exact `cfft_simd8` uninit-scratch change
+as "sub-1%, below the noise floor," because wall-clock Criterion on the
+swarm-contended box has a ±5% phantom floor on the short ~3 ms sparse bench (the
+zeroinit-vs-zeroinit control showed a FALSE +5.18% at p=0.00). The lever was real;
+**the instrument was broken.** This turn I switched to a contention-IMMUNE
+instrument — `perf stat -e instructions:u` over a FIXED-iteration driver
+(`examples/mel_perf_probe.rs`, new) — because instructions-retired for a
+deterministic workload is independent of box load.
+
+**The lever.** Route `cfft_simd8`'s four `even/odd/even_fft/odd_fft` scratch
+buffers through the existing toggleable `alloc_fft_scratch` (`FW_FFT_ZEROINIT`
+escape hatch) — `with_capacity`+`set_len` instead of `vec![splat(0.0)]`
+(`alloc_zeroed`/memset). This extends the LANDED uninit lever (`5b7f529`, −9.37% on
+the OLD full-`fft_simd8` default) to the now-default two-for-one path
+(`fft_simd8_twoforone`→`cfft_simd8`, default since `7201eb8`). Each scratch slot is
+written in full before any read (sub-FFT writes its whole output; the deinterleave
+loop writes all `2*half` slots) — SAFETY doc updated to cover the `cfft_simd8`
+caller.
+
+**Measurement — perf instructions-retired (deterministic) + cycles, fixed 400–500
+iterations, `FW_FFT_ZEROINIT=1` (zeroinit) vs default (uninit), this box
+(Threadripper PRO 5975WX = rch `ovh-a`, x86-64-v3, `CARGO_TARGET_DIR=.../franken_whisper-cc`):**
+
+```text
+PRODUCTION (realistic / sparse bank) — the ORIG-relevant path:
+  instructions/iter  zeroinit 65,478,581 / 65,546,748   uninit 63,505,600 / 63,443,248   = -3.05%  (sub-0.2% run-to-run variance — deterministic, load-IMMUNE)
+  cycles/iter        zeroinit ~20.13M (19.98/20.33/20.07) uninit ~19.26M (19.07/19.07/19.63) = -4.3%  (load-sensitive but tight across reads)
+
+DENSE bank (diagnostic):
+  instructions/iter  zeroinit 184,060,498   uninit 182,316,889   = -0.95%  (same ~1.7M memset removed, smaller % of the projection-heavy dense total)
+```
+
+The eliminated memset is ~2.0M instructions/iter; on the production path that is
+**−3.05% of mel instructions and ~−4% cycles**. Wall-clock Criterion confirms the
+direction but cannot resolve it through the ±5% contention floor — which is
+exactly why the deterministic instrument is required and why `7e7f658` mis-rejected
+it. Whole-process `perf` (no fixed iteration count) is NOT valid: criterion's
+adaptive iteration count confounds the total (the faster arm runs more iters →
+more total instructions). The fixed-iteration driver is mandatory.
+
+**Bit-exact / conformance GREEN.** `cargo test native_engine::mel::tests` = **14/14**
+in BOTH toggle states (incl. `compute_8_columns_matches_scalar_columns_bit_exact`,
+`sparse_projection_matches_dense_bit_exact`); `cargo fmt --check` clean; `cargo
+clippy --lib --example mel_perf_probe -- -D warnings` clean.
+
+**Ratio vs ORIG.** Mel was ~2.4–2.5× OpenAI-Whisper (`log_mel_spectrogram`, real
+sparse bank) per SlateHeron's `7201eb8` entry; this −4% production-cycle reduction
+lifts it to ~2.5–2.6×. The win is on the sparse/production path that the ORIG
+anchor actually compares against (not just the dense diagnostic).
+
+**This also resolves the BLOCKER below (`022ca6e`).** The dig loop was declared
+"measurement-saturated" because wall-clock couldn't resolve sub-5% on the
+contended box. `perf` instructions-retired (contention-immune) is the missing
+instrument: the residual lever WAS real and is now landed. Future sub-1% levers on
+this shared box should be measured the same way (fixed-iteration driver + perf
+instructions), not by wall-clock Criterion. `examples/mel_perf_probe.rs` is the
+reusable harness. AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - DuskFinch: BLOCKER — the franken_whisper-cc dig loop is measurement-saturated. Crate is at its measured ceiling AND the shared box is too contended to resolve any residual lever. Needs an operator decision, not another micro-dig.
 
 **Land-or-dig result: SURFACE A BLOCKER (neither a clean LAND nor a measurable
