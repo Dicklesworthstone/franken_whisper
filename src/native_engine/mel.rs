@@ -1,12 +1,13 @@
-//! Log-mel spectrogram frontend (pure Rust, exact whisper.cpp semantics).
+//! Log-mel spectrogram frontend (pure Rust, whisper.cpp-compatible semantics).
 //!
 //! This is a faithful port of whisper.cpp's `log_mel_spectrogram` /
 //! `whisper_pcm_to_mel` path (see `whisper.cpp` `src/whisper.cpp`
 //! `log_mel_spectrogram`, `log_mel_spectrogram_worker_thread`, `fft`, `dft`,
 //! and `fill_hann_window`). Every constant and every numeric behavior that
-//! could plausibly diverge from whisper.cpp is documented inline so the output
-//! is bit-for-bit comparable (within f32 rounding) to the reference encoder
-//! input.
+//! could plausibly diverge from whisper.cpp is documented inline. The only
+//! deliberate arithmetic relaxation is the projection `log10`: franken uses a
+//! deterministic polynomial approximation that stays within the transcription
+//! tolerance gate and avoids the scalar libm bottleneck.
 //!
 //! Pipeline (per whisper.cpp):
 //! 1. Pad the PCM: a leading *reflective* pad of `N_FFT/2` samples, the audio
@@ -15,7 +16,7 @@
 //! 2. Slide a length-`N_FFT` Hann (periodic) window with hop `HOP`.
 //! 3. FFT each windowed frame; take the **power** spectrum `re^2 + im^2` over
 //!    the one-sided `N_FFT/2 + 1 = 201` bins.
-//! 4. Project through the model's `n_mel x 201` filterbank, then
+//! 4. Project through the model's `n_mel x 201` filterbank, then an approximate
 //!    `log10(max(e, 1e-10))`.
 //! 5. Globally clamp to `max - 8.0` and normalize `(x + 4) / 4`.
 //!
@@ -455,8 +456,49 @@ fn power_and_project(fft_out: &[f32], filters: &SparseMelFilters, out: &mut [f32
         for (&pk, &rk) in power[start..end].iter().zip(row[start..end].iter()) {
             sum += f64::from(pk) * f64::from(rk);
         }
-        *o = sum.max(1e-10).log10() as f32;
+        *o = log10_floor_approx(sum);
     }
+}
+
+/// Approximate `log10(max(x, 1e-10))` for the mel projection.
+///
+/// This deliberately relaxes whisper.cpp's scalar `double log10` by about one
+/// f32 ULP on the measured mel range. It is shared by the scalar and SIMD
+/// projection paths so internal thread-count and scalar-vs-batched determinism
+/// stay exact even though the result is no longer bit-for-bit libm output.
+fn log10_floor_approx(x: f64) -> f32 {
+    let x = x.max(1e-10);
+    let bits = x.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let mantissa = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+    let t = (mantissa - 1.0) / (mantissa + 1.0);
+    let t2 = t * t;
+    let series = 1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0))));
+    let ln_m = 2.0 * t * series;
+    ((exp as f64 * std::f64::consts::LN_2 + ln_m) * (1.0 / std::f64::consts::LN_10)) as f32
+}
+
+fn log10_floor_approx_simd8(x: Simd<f64, FFT_LANES>) -> Simd<f32, FFT_LANES> {
+    use std::simd::num::{SimdFloat, SimdInt, SimdUint};
+
+    type Vf = Simd<f64, FFT_LANES>;
+    type Vu = Simd<u64, FFT_LANES>;
+
+    let x = x.simd_max(Vf::splat(1e-10));
+    let bits: Vu = x.to_bits();
+    let exp = ((bits >> 52) & Vu::splat(0x7ff)).cast::<i64>() - Simd::splat(1023);
+    let mantissa =
+        Vf::from_bits((bits & Vu::splat(0x000f_ffff_ffff_ffff)) | Vu::splat(0x3ff0_0000_0000_0000));
+    let t = (mantissa - Vf::splat(1.0)) / (mantissa + Vf::splat(1.0));
+    let t2 = t * t;
+    let series = Vf::splat(1.0)
+        + t2 * (Vf::splat(1.0 / 3.0)
+            + t2 * (Vf::splat(1.0 / 5.0)
+                + t2 * (Vf::splat(1.0 / 7.0) + t2 * Vf::splat(1.0 / 9.0))));
+    let ln_m = Vf::splat(2.0) * t * series;
+    ((exp.cast::<f64>() * Vf::splat(std::f64::consts::LN_2) + ln_m)
+        * Vf::splat(1.0 / std::f64::consts::LN_10))
+    .cast::<f32>()
 }
 
 /// SIMD-batch equivalent of [`power_and_project`]. Each lane is still
@@ -485,8 +527,9 @@ fn power_and_project_simd8(fft_out: &[FrameLanes], filters: &SparseMelFilters, o
                 sums[lane] += f64::from(lanes[lane]) * weight;
             }
         }
+        let logs = log10_floor_approx_simd8(Simd::<f64, FFT_LANES>::from_array(sums)).to_array();
         for lane in 0..FFT_LANES {
-            out8[lane * n_mel + m] = sums[lane].max(1e-10).log10() as f32;
+            out8[lane * n_mel + m] = logs[lane];
         }
     }
 }

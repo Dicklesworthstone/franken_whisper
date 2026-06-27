@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: LANDED SIMD-poly log10 mel projection — fresh rch bench 2.792 ms; franken mel now ~1.58x OpenAI anchor
+
+**Land-or-dig result: LAND.** The measured `stash@{0}` SIMD-polynomial log10
+probe is now production code in `src/native_engine/mel.rs`. The implementation
+applies the same deterministic approximation in the scalar and 8-frame batched
+projection paths, so franken's internal scalar-vs-SIMD and thread-count
+determinism gates remain exact while intentionally relaxing whisper.cpp's scalar
+`double log10` by the documented ~1 f32 ULP.
+
+**Fresh per-crate bench:** requested `cargo bench --release` was rejected by this
+Cargo (`bench` has no `--release` flag), so the actual bench command was:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+RUSTFLAGS='--cfg=fw_log10_land_20260627' \
+rch exec -- cargo bench -p franken_whisper --bench native_engine_bench \
+  native_engine/mel/mel_30s_realistic -- --sample-size 20 --warm-up-time 0.2 \
+  --measurement-time 3
+```
+
+Worker `vmi1227854`: `native_engine/mel/mel_30s_realistic`
+**2.7921 ms** median, CI **[2.7521, 2.8267] ms**. Versus the latest
+OpenAI-Whisper mel anchor in this ledger (`whisper.audio.log_mel_spectrogram`,
+torch 8-thread, 30 s, **4.423 ms**), the landed franken mel path is
+**4.423 / 2.7921 = 1.58x faster**. The exact cross-host ratio should not be
+over-read, but the direction matches the prior same-machine A/B: log10 was
+already measured at **~10-14% mel** on top of current franken.
+
+**Validation:** `rch exec -- cargo test -p franken_whisper native_engine::mel`
+passed **11/11** mel tests, including scalar-vs-batched exactness and
+thread-count determinism. `rch exec -- cargo test -p franken_whisper --test
+conformance_comparator_tests` passed **26/26**. A broad
+`cargo test -p franken_whisper` attempt reached **3226/3228** passing before
+failing in unrelated `youtube::ytdlp` fixture tests because the tracked clean
+checkout lacks the ignored `tests/fixtures/native/jfk.wav` fixture.
+`AGENT_NAME=BlackThrush`.
+
 ## 2026-06-27 - AGENT_NAME=IcyWren: fused full-mel window prep KEEP, 1.71x faster than chunk+transpose but still behind OpenAI view/copy
 
 ### Land-or-dig scan
