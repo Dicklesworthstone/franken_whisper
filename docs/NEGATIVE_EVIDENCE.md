@@ -251,6 +251,50 @@ Two corrections on top of Codex's landed f16c GEMV (`c38b930` family):
    2.5–5× estimate are likely a different (serial-per-token) measurement path;
    reconcile before re-citing. e2e vs OpenAI not re-measurable here (models
    absent). AGENT_NAME=BlackThrush.
+## 2026-06-27 - Codex: REJECT f16c eight-accumulator GEMV unroll (no measured win)
+
+**Dig result:** after landing the fused f16c GEMV path, tested the next
+instruction-level scheduling lever: widen `dot_f16c` from four independent
+AVX/F16C accumulators over 32 lanes to eight independent accumulators over 64
+lanes. This was the latency-hiding / accumulator-saturation lever from the
+alien-graveyard plus extreme-optimization sweep. Source was reverted after
+measurement.
+
+**Command caveat:** this Cargo rejects the requested `cargo bench --release`
+form with `unexpected argument '--release'`, so the runnable equivalent was
+`--profile release`. Benches were per-crate only with `-p franken_whisper` and
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b`.
+
+**Accepted same-worktree local A/B:** both runs used
+`/data/projects/franken_whisper-cod-b-f16c-unroll8-848cea2`, the same target
+dir, `rch exec` local fallback, and the same Criterion filter
+`f16_gemv_dequant`.
+
+| Bench | Baseline 4-accum median | Candidate 8-accum median | Ratio | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| `f16_gemv_dequant_1280x1280` | `278.42 us` | `283.10 us` | `0.9835x` | REJECT |
+| `f16_gemv_dequant_384x384` | `79.891 us` | `83.732 us` | `0.9541x` | REJECT |
+
+Criterion reported no meaningful change (`p=0.83` for 1280x1280 and `p=0.84`
+for 384x384).
+
+**Non-comparable route discarded:** a candidate-only remote run on `vmi1227854`
+measured `82.480 us` / `25.533 us`, but the paired baseline for that route was
+local fallback, so this is routing evidence only, not keep proof.
+
+**OpenAI-Whisper ratio:** no fresh end-to-end OpenAI-Whisper ratio was produced
+for this rejected internal decoder-kernel lever because the model-gated benches
+still skipped on the bench path (`jfk.wav`, `tiny.en`, and `large-v3-turbo`
+fixtures absent). Product-level OpenAI evidence remains the current ledger
+range: franken winning `2.13-3.26x` vs OpenAI-Whisper on the available one-shot
+CLI comparator, while stricter loaded-model OpenAI API comparators remain
+separately ledgered.
+
+**Conformance/quality:** `rch exec -- cargo test -p franken_whisper gemv_f16 --
+--nocapture` passed 4/4 on the candidate before revert. Final conformance
+`rch exec -- cargo test -p franken_whisper --test conformance_comparator_tests`
+passed 26/26 remotely on `ovh-a`. The final source diff was reverted to main,
+leaving only this ledger entry. AGENT_NAME=Codex.
 
 ## 2026-06-26 - Codex: LAND measured f16c fused f16 GEMV worktree win (decoder kernel +3.4904x; OpenAI-Whisper product ratio not remeasured)
 
