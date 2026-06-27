@@ -3,6 +3,30 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: SIMD-gather of the HOT-path window application REJECTED — measured ~5% REGRESSION; the scalar strided-load loop is already optimal on Zen3
+
+**Dig: the last un-SIMD'd hot scalar loop in mel.** `compute_8_columns` builds the
+windowed SoA input with a scalar inner loop — for each of 400 `j`, `for lane in
+0..8 { lanes[lane] = hann[j] * padded[(frame_base+lane)*HOP + j] }` then
+`FrameLanes::from_array`. That's a stride-`HOP`(=160) gather + multiply — the same
+shape as the resampler gather that won **1.36×**, and never vectorized. Replaced
+with `FrameLanes::gather_or_default(padded, lane_offsets + splat(base+j)) *
+splat(hann[j])` (f32 mul commutes ⇒ **bit-exact**: mel 11/0, conformance 26/0,
+clippy clean).
+
+**Measured: a REGRESSION** (same-machine A/B, quiet box ~load 6, n=50/6s): `mel_30s`
+SIMD-gather is **~5% SLOWER** than scalar (p=0.00, CI [+4.05%, +6.41%]);
+`mel_30s_realistic` inconclusive (p=0.38). **REVERTED** (surgical `Edit`, no stash
+drop; `mel.rs == main`).
+
+**Why the resampler lesson does NOT transfer:** the scalar window loop's 8
+*independent* strided loads already pipeline through the OOO engine; Zen3's
+`vgatherdps` is microcoded and gathers 8 elements spanning 8 cache lines (stride
+160 f32 = 640 B) — slower than 8 well-pipelined scalar loads + a cheap
+`from_array` pack. (The resampler gather won because its scalar form was a worse
+per-output recompute, not a clean strided load.) **The window application is at its
+scalar-pipelined ceiling — do not SIMD-gather it.** AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: SIMD-poly log10 = MEASURED ~14% mel win at 1-ULP-f32 accuracy — the mel↔OpenAI gap closer, gated ONLY by the bit-exact-with-whisper invariant (OWNER decision now near-trivial). Probe preserved in stash@{0}
 
 **The representative number on the biggest mel lever — and it's almost free.** I
