@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: log10 phase-separation (the only BIT-EXACT log10 lever) REJECTED — measured ~2.2% REGRESSION; the interleaved loop is optimal
+
+**Dig: the one NON-gated angle on the ~20%-of-mel log10.** A SIMD log10 is gated
+(breaks bit-exact + needs models — see entry below), but reordering the
+*independent* log10 calls is bit-exact and landable. Probe: split
+`power_and_project_simd8` into Phase 1 (accumulate every mel bin's f64 sums into a
+`sums_all` buffer) + Phase 2 (one tight, uninterrupted `log10` sweep) — hoping the
+unbroken transcendental run pipelines better (the gelu-ILP lesson).
+
+**Bit-exact PASS** (`native_engine::mel` 11/0, `conformance_comparator_tests`
+26/0, clippy clean). **Measured: a REGRESSION** (same-machine A/B, quiet box,
+n=50/6s): `mel_30s` main is **−2.2% faster** than phase-sep (p=0.00);
+`mel_30s_realistic` noisy/inconclusive (p=0.21). **REVERTED** (stashed, no drop).
+
+**Why it loses:** the current *interleaved* `for m { accumulate; log10 }` already
+lets the OOO engine overlap mel-bin m's log10 with mel-bin m+1's accumulation;
+separating the phases (a) loses that overlap and (b) adds `sums_all`
+store/load traffic — the gelu-ILP lesson does NOT transfer (gelu had no
+competing work to overlap the tanh with; the projection does). So the log10's
+8-independent-calls-per-bin already saturate the OOO window. **The log10 has NO
+bit-exact lever — its only speedup is the gated SIMD-approx (next entry).** The
+interleaved loop is optimal; do not re-attempt phase-splitting. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: the projection `log10` is ~20% of mel — the LARGEST gated mel lever (a SIMD log10 would close the OpenAI mel gap, but it's bit-exact-internal + model gated)
 
 **Dig (quantifying the biggest measured gap = the mel frontend).** `power_and_project_simd8`
