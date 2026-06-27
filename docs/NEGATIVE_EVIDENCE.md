@@ -3,6 +3,49 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: clean per-token DECODER probe built + profiled — the in-crate per-token decode IS at ceiling; its 47% rayon/epoch overhead is the DOCUMENTED tight-loop over-statement (bd-6qih), thresholds already tuned. No new in-crate lever.
+
+**Land-or-dig result: DIG (build the tool the last entry asked for) → confirm
+ceiling; LAND the reusable probe.** Last entry's decoder profile was setup-
+contaminated (model-gated bench mixes the one-time encoder run into the per-token
+numbers). So I built `examples/decoder_perf_probe.rs` (mirrors `mel_perf_probe`):
+load `tiny.en` + run the encoder + `DecoderState::new` ONCE, then loop a FIXED
+number of `forward_step`s — `perf` then isolates the **per-token** decode.
+
+**Clean per-token profile** (`perf record cycles:u`, release-perf symbols, 525 634
+samples, setup excluded):
+
+```text
+crossbeam_epoch::with_handle (epoch pin)   28.97%
+crossbeam_epoch::try_advance (epoch GC)    18.26%   } ~52% rayon/epoch OVERHEAD
+crossbeam_deque steal + rayon find_work     5.2%
+franken nn::gemv_f16 (fused f16c dot)       16.71%   the real per-token kernel
+franken nn::matmul (m==1 SAXPY attn)         4.0%
+matrixmultiply sgemm                          1.7%   <- confirms the bench's 33% sgemm was SETUP contamination
+```
+
+**Reading it — NO new in-crate lever (covered/over-stated).** The per-token kernel
+work is `gemv_f16`'s fused f16c dot (16.7%, landed) + `m==1` SAXPY (4%, bd-6qih) —
+both optimized; external sgemm is only 1.7% (the encoder GEMM really was setup
+contamination). The ~52% is rayon epoch machinery from the per-token parallel
+dispatches (gemv_f16 `par_chunks_mut` for the MLP/logits at `nn.rs` PAR_THRESHOLD
+`1<<19`; cross-attn head `into_par_iter` at `decoder.rs` `1<<13`). **Both
+thresholds are already tuned AND this exact overstatement is documented:** bd-6qih
+notes *"the tight decode loop OVER-STATES this sub's spawn cost vs the real e2e
+(decode interspersed with mel/encode)"*, and raising the cross-attn threshold
+(serial tiny heads) **REGRESSED e2e +2.7% (p<0.05)**; the MLP-GEMV threshold went
+serial→parallel across L9→L11 (rayon persistent pool). So the 47% epoch is a
+tight-loop artifact, not a real-e2e lever, and re-tuning the thresholds is covered
+work — not re-opened.
+
+**⇒ Conclusion.** The in-crate per-token decode is at its measured ceiling
+(fused dot + m==1 SAXPY + tuned rayon dispatch). Combined with the prior entry,
+the remaining e2e gap vs ORIG is the **external `ft_kernel_cpu` encoder GEMM
+(bd-4hc0)** + the inherent rayon-pool overhead — out of `franken_whisper-cc`
+scope. `decoder_perf_probe.rs` lands as the reusable per-token decode profiler (the
+tool to re-check this in a calm window or after any decoder change). No lib change;
+conformance unaffected. AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - IcyWren: REJECT (regression) mel process-policy hoist (`rfft_enabled` / `fft_top_full` / `proj_scalar`) — candidate **1.311x slower** than restored `main`
 
 **Land-or-dig result: DIG then REVERT.** Repo-local `.scratch` / `.worktrees`
