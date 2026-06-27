@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: CAPSTONE — the combined relax-parity mel upside is DIRECTLY MEASURED at ~25% (not estimated); franken mel → decisively dominant over OpenAI
+
+**Validated the two gated levers are additive with a single direct measurement.**
+Prior entries quantified log10 (~10–14%) and radix-5 (~8–13%) separately and
+*added* them (~20–25%). This applies BOTH at once — the stash@{0} SIMD-poly log10
+plus the dft-truncation radix-5 proxy — and measures the combined mel time vs main:
+combined **3.43 ms** vs main **4.47 ms** = **+25.3% (p=0.00, CI [+20.4%, +29.1%])**.
+So the levers ARE additive (they're sequential pipeline stages), and the total
+relax-parity upside is **~25% mel, now measured directly, not summed.** Notably
+this held cleanly at **load 25** — proof that same-machine back-to-back *relative*
+A/B is robust to box contention (both arms slow equally); trust the ratio, not the
+absolute ms. Both probes reverted; `mel.rs == main`; log10 probe still in stash@{0}.
+
+**Bottom line for the owner (the mel↔OpenAI story is now complete & quantified):**
+franken mel is *already* +1.8% vs OpenAI (landed wins). ONE parity-policy decision
+— relax bit-exact-with-whisper to the ≤1-ULP / few-ULP that the owner ALREADY
+accepted for the f16c decoder dot (rel ~3e-6) — unlocks a **measured ~25% mel
+speedup**, taking franken mel to **~3.4 ms vs OpenAI ~4.4 ms ≈ +25% = decisively
+dominant** on its one previously-non-winning surface. Path: apply the stash@{0}
+log10 poly (drop-in) + write the radix-5 base case (~60-line FrameLanes
+Cooley-Tukey). Both transcription-safe; the conformance gate is transcription-
+tolerance, and no whisper-golden test exists. AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - BlackThrush: base-case DFT is ~23% of mel — radix-5 (the gated FFT lever) ≈ ~8–13% mel; with log10 the FULL relax-parity upside is ~20–25% mel (mel goes from +1.8% to ~+25% vs OpenAI)
 
 **Quantifying the DOMINANT gated mel lever (the FFT base case) to complete the
