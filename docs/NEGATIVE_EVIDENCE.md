@@ -3,6 +3,49 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: REJECT (~0) `power` dead-init → `from_fn`; and a RED-HERRING correction — the perf profile's 18% `__memset` is a PROBE ARTIFACT (per-call output buffers), NOT a per-batch lever. Real remaining target = the cfft-recursion malloc churn.
+
+**Land-or-dig result: DIG then REVERT (~0-gain).** Continuing last entry's
+allocation lever (`455b4b3` reused `fft_out`). Re-profiled the post-reuse mel
+(`perf record -g cycles:u` on `mel_perf_probe`, realistic): `__memset_avx2` was
+STILL **18.27%** (unchanged), so I hypothesised the remaining memset was the dead
+zero-init of the `power` stack array in `power_and_project_simd8`
+(`[FrameLanes::splat(0.0); 201]`, fully overwritten before use, ~375 batches/call)
+and replaced it with `std::array::from_fn` (constructs each bin in place, no
+zero-init; bit-identical).
+
+**Measurement (perf, `FW_MEL_POWER_ZEROINIT` toggle, fixed-iter driver, load ~5):**
+
+```text
+INSTRUCTIONS/iter  realistic zeroinit 64,466,583  from_fn 64,281,398  = -0.28%
+                   dense     zeroinit 124,926,060 from_fn 124,687,536 = -0.19%
+CYCLES/iter realistic, 8 interleaved rounds: -0.27 +3.41 +0.33 -1.25 -1.76 -1.37 +1.81 -0.47
+                   → straddles zero, mean ~-0.2% (3/8 positive)
+```
+
+**~0. REVERTED.** The compiler already elides the `power` zero-init (it sees the
+immediate full overwrite), so `from_fn` is equivalent. Source restored
+byte-identical to `main`.
+
+**⇒ RED-HERRING CORRECTION (the valuable part).** Since the 18% memset did NOT
+move with the `power` fix, it is NOT the per-batch `power`/`fft_out` path. By
+elimination it is the **per-`log_mel`-call output buffers** (`local` per worker +
+the mel-major `data`), zero-init'd once per call. The `mel_perf_probe` harness
+calls `log_mel` 800× in a tight loop, so that per-CALL memset is inflated to ~18%
+of the profile — but in PRODUCTION `log_mel` runs ONCE per 30 s chunk, amortised
+over the whole ~3 ms mel, so it is a small fraction of a real transcription.
+**The memset profile is a probe artifact; do NOT chase it as a per-batch lever.**
+(This is why `455b4b3`'s `fft_out` reuse, measured by the `FW_MEL_NOREUSE`
+same-binary A/B that holds the per-call cost constant, was real −1.76% while this
+profile-chasing power fix is ~0.)
+
+**Real remaining per-batch target (next dig):** the `cfft_simd8` RECURSION's
+malloc/free churn — `even/odd/even_fft/odd_fft` allocated per level, per batch
+(~28 allocs/batch × 375 × workers; the `_int_malloc`/`_int_free`/`memalign` ~7% in
+the profile). Capturing it needs a reusable scratch ARENA threaded through the
+recursion (sized once per worker), not a one-line memset swap. That is the
+structural lever; deferred (out of this turn's safe budget). AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - DuskFinch: LAND — per-worker FFT scratch REUSE (radical lever found by perf profiling, not re-examining a reject): −1.97% mel instructions / −1.76% cycles on production. The mel was spending ~28% of cycles in memset+malloc.
 
 **Land-or-dig result: DIG a NEW radical lever — found by `perf record` profiling
