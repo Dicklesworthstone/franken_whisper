@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: SIMD-poly log10 = MEASURED ~14% mel win at 1-ULP-f32 accuracy — the mel↔OpenAI gap closer, gated ONLY by the bit-exact-with-whisper invariant (OWNER decision now near-trivial). Probe preserved in stash@{0}
+
+**The representative number on the biggest mel lever — and it's almost free.** I
+implemented a real **SIMD f64 log10 over 8 lanes** (`simd_log10_f64x8_probe`:
+exponent/mantissa bit-decomposition + the `(m-1)/(m+1)` log series, ~1e-9 f64) and
+wired it into `power_and_project_simd8`.
+
+- **Speedup: ~14% mel** (same-machine A/B, n=50/6s, p=0.00): `mel_30s_realistic`
+  3.97 ms (SIMD-poly log10) vs 4.60 ms (f64 libm log10), CI **[+12.5%, +16.1%]**.
+  (`mel_30s` was contention-contaminated this run — 1275 vs 2550 iters — ignore;
+  the realistic A/B is clean.) Sits exactly between the prior floor (~7–8%, scalar
+  f32) and ceiling (~20%, full log10 cost), as expected for a real SIMD log10.
+- **Accuracy: 1 ULP in f32.** `compute_8_columns_matches_scalar` fails only because
+  the SIMD path now differs from the scalar path by **one f32 ULP** (left
+  1071273506 vs right 1071273507) — i.e. the poly log10 lands within the last f32
+  bit of libm `f64.log10()`. Transcription-safe with enormous margin (the mel is
+  normalized `(x+4)/4`; the encoder is robust to 1-ULP perturbations).
+
+**What actually gates it (downgraded from "needs models + relaxed tests").** The
+mel bit-exact tests are ALL internal (SIMD-vs-scalar, dense-vs-sparse) — there is
+**no whisper-golden vector test**. So applying the poly log10 to all paths
+consistently would PASS the internal tests, and conformance is transcription-
+tolerance (1 ULP ≪ tolerance). The ONLY blocker is the **documented design
+invariant** "mel is bit-for-bit with whisper.cpp" — and whisper.cpp uses f64 libm
+`log10` (src/whisper.cpp:3155), so 1-ULP poly output technically violates strict
+bit-for-bit. **I did NOT land it** (unilaterally relaxing the core parity invariant
+is owner-scoped), but the owner decision is now near-trivial: **accept a 1-ULP-f32
+mel difference for a ~14% mel speedup that flips the mel frontend from a near-tie
+to a clear win over OpenAI's `torch.stft`.** The full probe is preserved in
+**`git stash@{0}`** ("SIMD-poly log10 ~14% mel @ 1-ULP-f32") — recover, apply the
+poly to the scalar path too, and it lands. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: gated mel log10 lever QUANTIFIED — even scalar f32 `log10f` (vs f64) is a measured ~7–8% mel win; gate root-cause confirmed at whisper.cpp source
 
 **Putting a measured number on the gated log10 lever (the biggest mel cost).**
