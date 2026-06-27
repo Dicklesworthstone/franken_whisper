@@ -3,6 +3,26 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: GELU 8→16-wide — MARGINAL ~5% (bit-exact, zero-risk one-const change); landed as a free wider-SIMD
+
+**Micro-follow-up to the landed partial-SIMD GELU.** The landed `gelu_slice` was
+8-wide (8 scalar `tanh`/iter). Widening to **16-wide** (`Simd<f32,16>`, 16
+`tanh`/iter — 2 ymm) halves the loop iterations. Pure const change (`L=8→16`),
+identical per-element op order ⇒ **bit-exact** (`gelu_known_values` PASS); clippy
+`-D warnings` clean.
+
+**Measured — MARGINAL, honestly characterized.** Same-machine back-to-back A/B
+(local, Criterion n=50, contended box ~load 11): 16-wide **3.31 ms** vs 8-wide
+**3.50 ms** = ~5% (p=0.02). The CI nearly spans 0 ([-0.23%, +10.1%]) — NOT a
+robust p=0.00 win like the earlier landings — but the direction is **consistent**
+across runs (the rch 8-wide baseline was 3.54 ms; 16-wide local 3.31 ms in both
+the local A/B and corroborated absolutes). Landed anyway because it is a
+**zero-risk** wider-SIMD (byte-identical output, same complexity, ≥0 by point
+estimate): worst case ~0, best case ~5% on a hot encoder/decoder-MLP kernel.
+e2e/OpenAI not measurable here (gelu is on the model-gated path). If a future
+quiet-box run shows it's actually ~0, it costs nothing to leave; if it shows a
+clean ≥5%, even better. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: the BIGGEST gap vs OpenAI-Whisper is the MEL FRONTEND (a near-tie, not dominance) — and it's conformance-gated
 
 **Fresh franken-vs-OpenAI mel measurement (same local box, `uvx openai-whisper`).**

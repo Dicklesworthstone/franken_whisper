@@ -755,24 +755,25 @@ const GELU_COEF_A: f32 = 0.044_715;
 /// no FMA fusion as the scalar form, so bit-exact.
 fn gelu_slice(data: &mut [f32]) {
     use std::simd::Simd;
-    type V = Simd<f32, 8>;
+    const L: usize = 16;
+    type V = Simd<f32, L>;
     let n = data.len();
-    let n8 = n - n % 8;
+    let nl = n - n % L;
     let coef_a = V::splat(GELU_COEF_A);
     let sqrt_2pi = V::splat(GELU_SQRT_2_OVER_PI);
     let one = V::splat(1.0);
     let half = V::splat(0.5);
     let mut i = 0;
-    while i < n8 {
-        let xv = V::from_slice(&data[i..i + 8]);
+    while i < nl {
+        let xv = V::from_slice(&data[i..i + L]);
         // arg = sqrt(2/pi) * x * (1 + a*x*x)  — exact scalar op order.
         let arg = (sqrt_2pi * xv) * (one + (coef_a * xv) * xv);
         let aa = arg.to_array();
         let tanh = V::from_array(std::array::from_fn(|k| aa[k].tanh()));
-        ((half * xv) * (one + tanh)).copy_to_slice(&mut data[i..i + 8]);
-        i += 8;
+        ((half * xv) * (one + tanh)).copy_to_slice(&mut data[i..i + L]);
+        i += L;
     }
-    for v in &mut data[n8..] {
+    for v in &mut data[nl..] {
         let x = *v;
         *v = 0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh());
     }
