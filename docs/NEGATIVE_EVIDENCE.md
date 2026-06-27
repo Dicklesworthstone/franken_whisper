@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: scalar-loop SIMD seam EXHAUSTED — clean post-arc baselines (no regressions) + remaining-blockers map
+
+**Dig result: searched for a NEW conformance-safe vectorizable-arithmetic scalar
+loop; none remain.** This arc landed 4 bit-exact safe-`std::simd` wins by SIMD'ing
+plain-scalar loops the "engine at ceiling" framing had overlooked: **resample
+1.36×, downmix ~6.3×, mel clamp+normalize −5/−7.6%, gelu 1.29×**; softmax was
+tried and **measured-rejected** (regression). I then swept the hot kernels for
+more of the same and found nothing landable:
+- transcendentals (`exp`/`tanh`/`cos`/`sin`) are either DONE (gelu),
+  measured-rejected (softmax), or in **cached one-time tables** (hann/twiddle) —
+  not hot loops;
+- `conv1d`/`matmul` are **GEMM-based** (im2col gather + sgemm + a bias-add LLVM
+  already autovectorizes) — no arith lever;
+- the `dft_simd8` 25-pt base DFT accumulation order is **conformance-locked**
+  (matches whisper.cpp's naive DFT) — can't multi-accumulate;
+- `layer_norm`/`mel`/`gemv` are already hand-SIMD'd at their ceilings.
+
+**Clean post-arc baselines (via `rch` on a quiet fleet worker, n=40 — confirms
+all 4 wins regression-free):** `gelu_1500x1536` 2.47 ms, `resample_44k_to_16k_30s`
+1.07 ms, `downmix_stereo_30s` 238 µs, `layer_norm_1500x384` 295 µs,
+`f16_gemv_dequant` 1280=98 µs / 384=44 µs. (Faster absolute than the per-win
+local A/Bs because this rch worker is quicker/quieter — the local box is often
+contended; A/B via `rch` or a same-binary toggle.)
+
+**Remaining benchable-surface levers are all OWNER/CONFORMANCE-gated**, not
+engineering gaps: faster mel FFT (RFFT / radix-5 base DFT) breaks bit-exact-with-
+whisper.cpp; the decoder f16c dot is landed and at its cvtph-bound ceiling;
+lower-precision weights/layer_norm-f32 break conformance. e2e/encoder/decoder
+levers are **unmeasurable here** (ggml models absent → those benches SKIP).
+Net: the safe-`std::simd` scalar-loop seam is mined out; further wins need a
+relaxed invariant or staged models. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: softmax partial-SIMD REJECTED — now MEASURED a REGRESSION (confirms the structural ~0; not landed)
 
 **Dig (the GELU follow-up), reverted.** I applied the gelu pattern to
