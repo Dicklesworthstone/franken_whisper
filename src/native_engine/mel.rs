@@ -1093,9 +1093,20 @@ fn log10_floor_approx_simd8(x: Simd<f64, FFT_LANES>) -> Simd<f32, FFT_LANES> {
 /// accumulated over mel-bin weights in the same `k` order as the scalar helper;
 /// this only avoids transposing the whole complex FFT result back into eight
 /// scalar spectra before projection.
+/// Perf escape hatch (mirrors `FW_FFT_ZEROINIT`): force the scalar per-lane
+/// projection accumulator instead of the SIMD f64x8 one. The two are
+/// bit-identical (same per-lane `k` order, `+`/`*` unfused), so this is a pure
+/// A/B + safety toggle. Off by default.
+fn proj_scalar() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("FW_PROJ_SCALAR").is_some())
+}
+
 fn power_and_project_simd8(fft_out: &[FrameLanes], filters: &SparseMelFilters, out8: &mut [f32]) {
+    use std::simd::num::SimdFloat;
     let n_fft_bins = filters.fb.n_fft_bins;
     let n_mel = filters.fb.n_mel;
+    let scalar = proj_scalar();
 
     let mut power = [FrameLanes::splat(0.0); N_FREQ_BINS];
     for (j, p) in power.iter_mut().enumerate() {
@@ -1107,15 +1118,28 @@ fn power_and_project_simd8(fft_out: &[FrameLanes], filters: &SparseMelFilters, o
     for m in 0..n_mel {
         let (start, end) = filters.ranges[m];
         let row = &filters.fb.data[m * n_fft_bins..m * n_fft_bins + n_fft_bins];
-        let mut sums = [0.0f64; FFT_LANES];
-        for (&pk, &rk) in power[start..end].iter().zip(row[start..end].iter()) {
-            let lanes = pk.to_array();
-            let weight = f64::from(rk);
-            for lane in 0..FFT_LANES {
-                sums[lane] += f64::from(lanes[lane]) * weight;
+        // Per-lane f64 reduction. Each lane sums over the same mel-bin `k` order
+        // (start..end) with `+`/`*` unfused, so both paths are bit-identical to the
+        // scalar `power_and_project`. The SIMD path replaces the per-bin `to_array`
+        // unpack + 8-wide scalar widen/mul/add with one f64x8 widen+mul+add.
+        let acc = if scalar {
+            let mut sums = [0.0f64; FFT_LANES];
+            for (&pk, &rk) in power[start..end].iter().zip(row[start..end].iter()) {
+                let lanes = pk.to_array();
+                let weight = f64::from(rk);
+                for lane in 0..FFT_LANES {
+                    sums[lane] += f64::from(lanes[lane]) * weight;
+                }
             }
-        }
-        let logs = log10_floor_approx_simd8(Simd::<f64, FFT_LANES>::from_array(sums)).to_array();
+            Simd::<f64, FFT_LANES>::from_array(sums)
+        } else {
+            let mut acc = Simd::<f64, FFT_LANES>::splat(0.0);
+            for (&pk, &rk) in power[start..end].iter().zip(row[start..end].iter()) {
+                acc += pk.cast::<f64>() * Simd::<f64, FFT_LANES>::splat(f64::from(rk));
+            }
+            acc
+        };
+        let logs = log10_floor_approx_simd8(acc).to_array();
         for lane in 0..FFT_LANES {
             out8[lane * n_mel + m] = logs[lane];
         }

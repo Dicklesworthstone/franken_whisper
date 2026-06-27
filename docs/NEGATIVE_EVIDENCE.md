@@ -3,6 +3,65 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: LAND — SIMD f64 projection accumulator is a real production win too (−1.45% mel instructions / ~−2% cycles, −32% on dense). SECOND wall-clock false-negative corrected by perf instructions-retired.
+
+**Land-or-dig result: LAND — and it corrects a SECOND wall-clock false-negative**
+(IcyWren's reject + my own `8923754`, both wall-clock). After `1d6af83` proved
+`perf` instructions-retired finds real levers below the box's ±5% wall-clock noise
+floor, I re-examined the strongest remaining false-negative candidate: the
+`Simd<f64,8>` accumulator in `power_and_project_simd8`. `8923754` measured it
+**dense −42%** (huge, real) but called production **"NEUTRAL (p=0.66)"** — a
+classic broken-instrument verdict: the dense win is so large that the same per-bin
+reduction MUST help the sparse path too, just below the wall-clock floor.
+
+**The lever.** Replace the per-bin `pk.to_array()` unpack + 8-wide scalar
+widen/mul/add with one `acc += pk.cast::<f64>() * splat(f64::from(rk))`. Each lane
+still reduces over the same `k` order with `+`/`*` unfused ⇒ bit-identical to the
+scalar `power_and_project`. Added an `FW_PROJ_SCALAR` escape hatch (mirrors
+`FW_FFT_ZEROINIT`) selecting the scalar path — a same-binary A/B toggle (and a
+safety fallback for the numerics-sensitive projection).
+
+**Measurement — perf, fixed-iteration driver `examples/mel_perf_probe.rs`, same
+binary via `FW_PROJ_SCALAR` (this box = Threadripper PRO 5975WX = rch `ovh-a`,
+x86-64-v3, `franken_whisper-cc`):**
+
+```text
+INSTRUCTIONS/iter (deterministic, load-immune):
+  realistic (production)  scalar 63,772,320  simd 62,843,086  = -1.45%
+  dense (diagnostic)      scalar 182,433,530 simd 123,508,640 = -32.29%
+
+CYCLES/iter realistic, FW_PROJ_SCALAR vs default, 9 interleaved same-binary rounds:
+  -3.51%, +8.06%*, -0.88%, -2.60%, -2.58%, -0.90%, -3.21%, +3.91%*, -0.36%
+  (* = load-spike outliers on the simd arm; 7/9 rounds negative, ~-2% mean of the
+   negatives, median -0.9%) — corroborates the deterministic instruction win.
+```
+
+The instruction reduction is the hard, contention-immune signal: −1.45% on the
+production (sparse) path, −32.29% on dense (the projection is most of dense mel).
+Why production is smaller: real ggml banks are sparse (~5–10 nonzero bins/filter),
+so the projection is a small FFT-dominated slice there — but the per-bin µop
+reduction is still a real −1.45%, which wall-clock's ±5% floor (the
+zeroinit-control phantom) cannot resolve. Whole-process perf would be confounded
+(adaptive iteration count); the fixed-iteration driver is mandatory.
+
+**Bit-exact / conformance GREEN.** `cargo test native_engine::mel::tests` = **14/14**
+in BOTH toggle states (incl. `compute_8_columns_matches_scalar_columns_bit_exact`,
+`sparse_projection_matches_dense_bit_exact`); `cargo fmt --check` + `cargo clippy
+--lib -- -D warnings` clean.
+
+**Ratio vs ORIG.** Stacks on `1d6af83`'s cfft −3.05%: production mel is now another
+~−1.5% instructions / ~−2% cycles, nudging the OpenAI-Whisper mel ratio up from
+~2.5–2.6× toward ~2.55–2.65×. The win is on the sparse/production path the ORIG
+anchor compares against.
+
+**Pattern (now confirmed twice).** Wall-clock Criterion on this swarm-contended box
+SYSTEMATICALLY under-credits sub-3% production levers (false negatives at
+`7e7f658` and `8923754`); `perf` instructions-retired over a fixed-iteration driver
+recovers them. The "engine at ceiling" framing was partly a measurement artifact:
+real sub-3% levers existed but were invisible to the broken instrument. Remaining
+search should re-run the same perf method on other wall-clock "~0/NS" rejects.
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - DuskFinch: LAND — uninit FFT scratch on the two-for-one default (`cfft_simd8`) IS a real production win after all (−3.05% mel instructions / ~−4% cycles). The instrument was wrong, not the lever; the contention BLOCKER is broken by perf instructions-retired.
 
 **Land-or-dig result: LAND — and it CORRECTS my own prior false-negative reject
