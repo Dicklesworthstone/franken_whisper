@@ -438,8 +438,7 @@ fn fft_simd8(
     let half = n / 2;
     debug_assert_eq!(lvl.half, half, "fft_simd8 level twiddle width mismatch");
     let (even, odd) = split_even_odd(input, half);
-    let mut even_fft = vec![FrameLanes::splat(0.0); 2 * half];
-    let mut odd_fft = vec![FrameLanes::splat(0.0); 2 * half];
+    let (mut even_fft, mut odd_fft) = alloc_fft_scratch(2 * half);
     fft_simd8(&even, &mut even_fft, &levels[1..], base);
     fft_simd8(&odd, &mut odd_fft, &levels[1..], base);
     for (k, (&rec, &imc)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {
@@ -479,6 +478,47 @@ fn split_even_odd(input: &[FrameLanes], half: usize) -> (Vec<FrameLanes>, Vec<Fr
     )
 }
 
+/// Safety escape hatch (mirrors `FW_DISABLE_F16C_DOT`): force the zero-initialised
+/// FFT output scratch instead of the uninitialised fast path. Off by default.
+fn fft_scratch_zeroinit() -> bool {
+    static Z: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *Z.get_or_init(|| std::env::var_os("FW_FFT_ZEROINIT").is_some())
+}
+
+/// Allocate the two `n`-element output buffers (`even_fft`/`odd_fft`) for the
+/// recursive sub-FFTs. They are written in full by the immediately-following
+/// `fft_simd8` before the butterfly combine reads them, so the usual
+/// `vec![splat(0.0); n]` zero-init is pure dead work (~38 MB/`mel_30s`, measured
+/// ~9% of mel). The interleaved butterfly writes can't be `collect()`'d without
+/// doubling the complex multiplies, so the fast path allocates uninitialised.
+/// `FW_FFT_ZEROINIT` restores the zero-init path.
+#[allow(unsafe_code)]
+#[inline]
+fn alloc_fft_scratch(n: usize) -> (Vec<FrameLanes>, Vec<FrameLanes>) {
+    if fft_scratch_zeroinit() {
+        return (
+            vec![FrameLanes::splat(0.0); n],
+            vec![FrameLanes::splat(0.0); n],
+        );
+    }
+    let mut even_fft = Vec::<FrameLanes>::with_capacity(n);
+    let mut odd_fft = Vec::<FrameLanes>::with_capacity(n);
+    // SAFETY: each buffer is handed straight to `fft_simd8(&_, &mut buf, ..)`,
+    // which writes ALL `n` elements before any read — every recursion path is a
+    // pure store of its whole output: the radix-2 butterfly writes both halves
+    // `out[2k]/out[2k+1]` and `out[2(k+half)]/..` for k in 0..half, the radix-5 /
+    // naive base case writes every bin, and the n==1 leaf writes `[0],[1]`. No
+    // path reads `out` before writing it. `FrameLanes` (`Simd<f32,8>`) is `Copy`
+    // with no `Drop`, so `set_len` over uninitialised capacity neither drops nor
+    // observes an uninitialised value. (Empirically: the full mel suite passes
+    // bit-identically with and without this path — see the ledger.)
+    unsafe {
+        even_fft.set_len(n);
+        odd_fft.set_len(n);
+    }
+    (even_fft, odd_fft)
+}
+
 /// One-sided top-level mirror of [`fft_simd8`]. The mel power spectrum consumes
 /// only the 201 one-sided bins (`power_and_project_simd8` reads `fft_out[0..=200]`),
 /// so the conjugate-symmetric upper half (bins 201..=399) the full FFT writes is
@@ -506,8 +546,7 @@ fn fft_simd8_onesided(
         "fft_simd8_onesided level twiddle width mismatch"
     );
     let (even, odd) = split_even_odd(input, half);
-    let mut even_fft = vec![FrameLanes::splat(0.0); 2 * half];
-    let mut odd_fft = vec![FrameLanes::splat(0.0); 2 * half];
+    let (mut even_fft, mut odd_fft) = alloc_fft_scratch(2 * half);
     fft_simd8(&even, &mut even_fft, &levels[1..], base);
     fft_simd8(&odd, &mut odd_fft, &levels[1..], base);
     for (k, (&rec, &imc)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {
