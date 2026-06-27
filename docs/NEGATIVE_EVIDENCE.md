@@ -3,7 +3,17 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-06-26 - BlackThrush: GELU 8→16-wide — MARGINAL ~5% (bit-exact, zero-risk one-const change); landed as a free wider-SIMD
+## 2026-06-26 - BlackThrush: GELU 8→16-wide — CONFIRMED ~4.3% win (bit-exact); a cleaner re-run upgraded the first marginal read to p=0.00
+
+UPDATE: a second, cleaner same-machine A/B (n=60, measurement-time 6) **confirms
+this is a real win**, not noise: 16-wide **3.335 ms** vs 8-wide **3.478 ms** =
+**+4.3% (p=0.00, CI [+2.33%, +6.42%] — clearly excludes 0)**. The first read below
+(p=0.02, CI nearly spanning 0) was just contended-box noise; the direction held
+and tightened on re-measurement. So the landed `gelu_slice` 16-wide is a robust,
+bit-exact, zero-risk ~4–5% on a hot encoder/decoder-MLP kernel — applying "measure,
+don't reason" to my own marginal call (and confirming it). (Re-validation also
+exposed/fixed a sed-script bug that had momentarily flipped `layer_norm`'s `L=8`;
+the working tree was restored to main, no spurious change shipped.)
 
 **Micro-follow-up to the landed partial-SIMD GELU.** The landed `gelu_slice` was
 8-wide (8 scalar `tanh`/iter). Widening to **16-wide** (`Simd<f32,16>`, 16
