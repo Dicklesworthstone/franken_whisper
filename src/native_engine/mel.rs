@@ -339,21 +339,23 @@ fn fft(input: &[f32], out: &mut [f32], levels: &[LevelTwiddle], base: &DftTable)
 }
 
 // ---------------------------------------------------------------------------
-// Real-FFT (two-for-one) — STEP 1 of a multi-turn lever, SCALAR + CORRECTNESS-
-// VERIFIED, behind the default-off `FW_RFFT` toggle. A real-input FFT of length
-// N can be computed from ONE complex FFT of length N/2 (pack the even/odd
-// decimation as one complex sequence) instead of TWO real sub-FFTs — ~halving
-// the dominant sub-FFT work. It changes the arithmetic (rel ~1e-7, within the
-// transcription-tolerance gate), so it must eventually land on BOTH the scalar
-// and SIMD paths to keep `determinism_across_thread_counts`. This turn lands the
-// verified scalar algorithm only (zero production impact: default off, scalar
-// remainder path); the SIMD port + perf landing follow.
+// Real-FFT (two-for-one) — the DEFAULT mel FFT path on BOTH scalar and SIMD.
+// A real-input FFT of length N is computed from ONE complex FFT of length N/2
+// (pack the even/odd decimation as one complex sequence) instead of TWO real
+// sub-FFTs — halving the butterfly/recursion work. Measured -8.37% mel (p=0.00).
+// It changes the arithmetic (rel ~1e-7, within the transcription-tolerance gate
+// — conformance 26/0 with it active), and is applied IDENTICALLY to the scalar
+// `fft_twoforone` and SIMD `fft_simd8_twoforone` so `determinism_across_thread_counts`
+// holds (proven by `fft_simd8_twoforone_matches_scalar`). `FW_RFFT_OFF` forces the
+// prior naive-recursion path (escape hatch / A/B baseline).
 // ---------------------------------------------------------------------------
 
-/// Enable the two-for-one real-FFT on the scalar path. Default off.
+/// The two-for-one real-FFT is the DEFAULT FFT path (both scalar and SIMD);
+/// `FW_RFFT_OFF` forces the prior naive-recursion path (escape hatch + A/B).
+/// Measured -8.37% mel (p=0.00) vs the one-sided path.
 fn rfft_enabled() -> bool {
     static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *R.get_or_init(|| std::env::var_os("FW_RFFT").is_some())
+    *R.get_or_init(|| std::env::var_os("FW_RFFT_OFF").is_none())
 }
 
 /// Complex-input radix-5 (`25 = 5x5`) — the complex twin of [`radix5_dft`]. Only
@@ -736,6 +738,163 @@ fn fft_simd8_onesided(
     }
 }
 
+/// FrameLanes complex radix-5 — lane-parallel mirror of [`radix5_cdft`] (same op
+/// order ⇒ each lane is bit-identical to the scalar complex path).
+fn radix5_cdft_simd8(input: &[FrameLanes], out: &mut [FrameLanes], t: &DftTable) {
+    let z = FrameLanes::splat(0.0);
+    let mut ir = [[z; 5]; 5];
+    let mut ii = [[z; 5]; 5];
+    for n2 in 0..5 {
+        for k1 in 0..5 {
+            let (mut re, mut im) = (z, z);
+            for n1 in 0..5 {
+                let xr = input[2 * (5 * n1 + n2)];
+                let xi = input[2 * (5 * n1 + n2) + 1];
+                let c = FrameLanes::splat(t.r5_c5[k1 * 5 + n1]);
+                let s = FrameLanes::splat(t.r5_s5[k1 * 5 + n1]);
+                re += xr * c + xi * s;
+                im += xi * c - xr * s;
+            }
+            ir[n2][k1] = re;
+            ii[n2][k1] = im;
+        }
+    }
+    let mut tr = [[z; 5]; 5];
+    let mut ti = [[z; 5]; 5];
+    for n2 in 0..5 {
+        for k1 in 0..5 {
+            let c = FrameLanes::splat(t.r5_c25[n2 * 5 + k1]);
+            let s = FrameLanes::splat(t.r5_s25[n2 * 5 + k1]);
+            tr[n2][k1] = ir[n2][k1] * c + ii[n2][k1] * s;
+            ti[n2][k1] = ii[n2][k1] * c - ir[n2][k1] * s;
+        }
+    }
+    for k1 in 0..5 {
+        for k2 in 0..5 {
+            let (mut re, mut im) = (z, z);
+            for n2 in 0..5 {
+                let c = FrameLanes::splat(t.r5_c5[k2 * 5 + n2]);
+                let s = FrameLanes::splat(t.r5_s5[k2 * 5 + n2]);
+                re += tr[n2][k1] * c + ti[n2][k1] * s;
+                im += ti[n2][k1] * c - tr[n2][k1] * s;
+            }
+            out[2 * (k1 + 5 * k2)] = re;
+            out[2 * (k1 + 5 * k2) + 1] = im;
+        }
+    }
+}
+
+/// FrameLanes complex base case — mirror of [`cdft`].
+fn cdft_simd8(input: &[FrameLanes], out: &mut [FrameLanes], table: &DftTable) {
+    let n = input.len() / 2;
+    if n == 25 {
+        radix5_cdft_simd8(input, out, table);
+        return;
+    }
+    for k in 0..n {
+        let (mut re, mut im) = (FrameLanes::splat(0.0), FrameLanes::splat(0.0));
+        let cos_row = &table.cos[k * table.n..k * table.n + n];
+        let sin_row = &table.sin[k * table.n..k * table.n + n];
+        for j in 0..n {
+            let xr = input[2 * j];
+            let xi = input[2 * j + 1];
+            let c = FrameLanes::splat(cos_row[j]);
+            let s = FrameLanes::splat(sin_row[j]);
+            re += xr * c + xi * s;
+            im += xi * c - xr * s;
+        }
+        out[2 * k] = re;
+        out[2 * k + 1] = im;
+    }
+}
+
+/// FrameLanes complex FFT recursion — mirror of [`cfft`]; reuses the same
+/// butterfly as [`fft_simd8`].
+fn cfft_simd8(
+    input: &[FrameLanes],
+    out: &mut [FrameLanes],
+    levels: &[LevelTwiddle],
+    base: &DftTable,
+) {
+    let n = input.len() / 2;
+    if n == 1 {
+        out[0] = input[0];
+        out[1] = input[1];
+        return;
+    }
+    if n % 2 == 1 {
+        cdft_simd8(input, out, base);
+        return;
+    }
+    let lvl = &levels[0];
+    let half = n / 2;
+    let mut even = vec![FrameLanes::splat(0.0); 2 * half];
+    let mut odd = vec![FrameLanes::splat(0.0); 2 * half];
+    for i in 0..half {
+        even[2 * i] = input[2 * (2 * i)];
+        even[2 * i + 1] = input[2 * (2 * i) + 1];
+        odd[2 * i] = input[2 * (2 * i + 1)];
+        odd[2 * i + 1] = input[2 * (2 * i + 1) + 1];
+    }
+    let mut even_fft = vec![FrameLanes::splat(0.0); 2 * half];
+    let mut odd_fft = vec![FrameLanes::splat(0.0); 2 * half];
+    cfft_simd8(&even, &mut even_fft, &levels[1..], base);
+    cfft_simd8(&odd, &mut odd_fft, &levels[1..], base);
+    for (k, (&rec, &imc)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {
+        let re = FrameLanes::splat(rec);
+        let im = FrameLanes::splat(imc);
+        let re_odd = odd_fft[2 * k];
+        let im_odd = odd_fft[2 * k + 1];
+        let e_re = even_fft[2 * k];
+        let e_im = even_fft[2 * k + 1];
+        out[2 * k] = e_re + re * re_odd - im * im_odd;
+        out[2 * k + 1] = e_im + re * im_odd + im * re_odd;
+        out[2 * (k + half)] = e_re - re * re_odd + im * im_odd;
+        out[2 * (k + half) + 1] = e_im - re * im_odd - im * re_odd;
+    }
+}
+
+/// FrameLanes two-for-one real FFT — mirror of [`fft_twoforone`], ONE-SIDED (only
+/// bins `0..=N/2`, matching [`fft_simd8_onesided`]). The pack is identity: the
+/// real input reinterpreted as `N/2` interleaved-complex IS the input itself.
+/// Bit-identical (per lane) to the scalar [`fft_twoforone`] on bins `0..=N/2`.
+fn fft_simd8_twoforone(
+    input: &[FrameLanes],
+    out: &mut [FrameLanes],
+    levels: &[LevelTwiddle],
+    base: &DftTable,
+) {
+    let n = input.len();
+    let half = n / 2;
+    let lvl = &levels[0];
+    debug_assert_eq!(
+        lvl.half, half,
+        "fft_simd8_twoforone top twiddle width mismatch"
+    );
+    let mut zf = vec![FrameLanes::splat(0.0); 2 * half];
+    cfft_simd8(input, &mut zf, &levels[1..], base);
+    let h = FrameLanes::splat(0.5);
+    for k in 0..half {
+        let km = (half - k) % half;
+        let ar = zf[2 * k];
+        let ai = zf[2 * k + 1];
+        let br = zf[2 * km];
+        let bi = zf[2 * km + 1];
+        let e_re = h * (ar + br);
+        let e_im = h * (ai - bi);
+        let o_re = h * (ai + bi);
+        let o_im = h * (br - ar);
+        let re = FrameLanes::splat(lvl.cos[k]);
+        let im = FrameLanes::splat(lvl.neg_sin[k]);
+        out[2 * k] = e_re + re * o_re - im * o_im;
+        out[2 * k + 1] = e_im + re * o_im + im * o_re;
+        if k == 0 {
+            out[2 * half] = e_re - re * o_re + im * o_im;
+            out[2 * half + 1] = e_im - re * o_im - im * o_re;
+        }
+    }
+}
+
 /// Build the padded sample buffer exactly as whisper.cpp's
 /// `log_mel_spectrogram` does:
 /// - leading `N_FFT/2` samples: *reflective* pad — `reverse_copy(samples[1..1+pad])`,
@@ -991,7 +1150,9 @@ fn compute_8_columns(
         2 * N_FREQ_BINS
     };
     let mut fft_out = vec![FrameLanes::splat(0.0); out_len];
-    if fft_top_full() {
+    if rfft_enabled() {
+        fft_simd8_twoforone(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    } else if fft_top_full() {
         fft_simd8(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
     } else {
         fft_simd8_onesided(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
@@ -1424,6 +1585,49 @@ mod tests {
                 spec.iter().map(|(re, im)| re * re + im * im).sum::<f64>() / n as f64;
             let rel = (time_energy - freq_energy).abs() / time_energy.max(1e-9);
             assert!(rel < 1e-4, "Parseval N={n} rel={rel}");
+        }
+    }
+
+    #[test]
+    fn fft_simd8_twoforone_matches_scalar() {
+        // The SIMD two-for-one (one-sided) must be byte-identical PER LANE to the
+        // scalar `fft_twoforone` over the bins mel reads (`0..=N_FFT/2`). This is
+        // what preserves `determinism_across_thread_counts` once FW_RFFT flips on:
+        // the SIMD-batch path and the scalar-remainder path produce identical mel.
+        let tw = FftTwiddles::build(N_FFT);
+        let mut lcg = Lcg::new(0x7F0F_2F01);
+        let used = 2 * (N_FFT / 2) + 2; // re+im of bins 0..=N_FFT/2
+        for _round in 0..32 {
+            let frames: Vec<[f32; N_FFT]> = (0..FFT_LANES)
+                .map(|_| {
+                    let mut f = [0.0f32; N_FFT];
+                    for x in &mut f {
+                        *x = lcg.next_f32();
+                    }
+                    f
+                })
+                .collect();
+            let mut vin = vec![FrameLanes::splat(0.0); N_FFT];
+            for (j, slot) in vin.iter_mut().enumerate() {
+                let mut a = [0.0f32; FFT_LANES];
+                for (lane, al) in a.iter_mut().enumerate() {
+                    *al = frames[lane][j];
+                }
+                *slot = FrameLanes::from_array(a);
+            }
+            let mut vout = vec![FrameLanes::splat(0.0); 2 * N_FFT];
+            fft_simd8_twoforone(&vin, &mut vout, &tw.levels, &tw.base);
+            for (lane, frame) in frames.iter().enumerate() {
+                let mut sout = vec![0.0f32; 2 * N_FFT];
+                fft_twoforone(frame, &mut sout, &tw.levels, &tw.base);
+                for b in 0..used {
+                    assert_eq!(
+                        vout[b].to_array()[lane].to_bits(),
+                        sout[b].to_bits(),
+                        "lane {lane} bin-idx {b}"
+                    );
+                }
+            }
         }
     }
 

@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: real-FFT (two-for-one) STEP 2 LANDED & DEFAULT-ON — MEASURED -8.37% mel (p=0.00); the "biggest remaining lever" is now in production
+
+**Land-or-dig result: LAND (the multi-turn lever completes).** Building on STEP 1
+(the verified scalar algorithm, commit `ac2b2eb`), this turn SIMD-ported it and
+flipped it on by default. The mel FFT now computes the length-`N` real transform
+from ONE complex FFT of length `N/2` (`cfft_simd8`, complex radix-5 base
+`radix5_cdft_simd8`) instead of TWO real sub-FFTs, halving the butterfly +
+recursion work; the complex base case (~1.3x a real radix-5) only partly offsets
+it. New SIMD `radix5_cdft_simd8`/`cdft_simd8`/`cfft_simd8`/`fft_simd8_twoforone`
+(one-sided) mirror the scalar twins lane-for-lane.
+
+**Measurement (same-binary `FW_RFFT_OFF` A/B, n=60, 5 s, load ~12):**
+
+```text
+native_engine/mel/mel_30s_realistic
+  prior one-sided path (FW_RFFT_OFF): 3.1803 ms  CI [3.1579, 3.2019]
+  two-for-one (default):              2.8635 ms  CI [2.8301, 2.8952]
+  change: [-9.5686% -8.3702% -7.1753%]  (p = 0.00 < 0.05)  Performance has improved.
+```
+
+**Correctness / determinism (all green):** applied IDENTICALLY to scalar
+(`fft_twoforone`) and SIMD (`fft_simd8_twoforone`), proven bit-identical per lane on
+the used bins by `fft_simd8_twoforone_matches_scalar`, so `determinism_across_thread_counts`
+holds with it active. `fft_twoforone_matches_fft` bounds the divergence from the
+naive FFT at `rel<1e-5` (~1e-7 actual). **conformance 26/0 BOTH with the two-for-one
+default AND with `FW_RFFT_OFF`.** 14/14 mel tests; clippy `-D warnings` + rustfmt
+clean. `FW_RFFT_OFF` is the escape hatch / A/B baseline.
+
+**Ratio vs OpenAI-Whisper.** Directly measured **-8.37%** intra-franken. Stacked on
+the session's prior bit-exact mel arc (radix-5, one-sided FFT, right-sized `fft_out`,
+collect-scratch, uninit-scratch) the mel frontend is now well over **~30% cumulative**
+faster than session start; against the OpenAI `log_mel_spectrogram` anchor (~4.4 ms
+torch) franken mel is now **~2.4-2.5x**. This was the single biggest remaining engine
+lever and it is now in production. AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: real-FFT (two-for-one) STEP 1 LANDED — verified-correct SCALAR algorithm, conformance-safe, behind default-off `FW_RFFT`; the SIMD port + perf landing is the remaining work
 
 **Land-or-dig result: DIG the one remaining lever, land its verified foundation.**
