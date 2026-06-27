@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: softmax partial-SIMD NOT landed — structurally ~0 (unlike GELU) AND unmeasurable this session (bench box contention)
+
+**Dig (the GELU follow-up), reverted.** I applied the gelu pattern to
+`softmax_rows`: a bit-exact `softmax_row_inplace` with SIMD max-reduction + `v-max`
+subtract + normalize, `exp` scalar per lane, and the running **sum kept SEQUENTIAL**
+(load-bearing f32 order). Gate green: `softmax_rows_*` 2/0, `conformance_comparator_tests`
+26/0, clippy `-D warnings` clean. **But it was NOT landed — for two reasons:**
+
+1. **Structurally ~0, unlike GELU.** GELU's win came from a whole *polynomial*
+   (~8 arith ops) the `tanh` call hid from autovec. softmax has only **ONE**
+   vectorizable op around `exp` (the `v-max` subtract); its **sum is a sequential
+   f32 accumulation that cannot be SIMD-reduced bit-exactly** (the order is
+   conformance-load-bearing); and the normalize pass (`v*=inv`, no call) is
+   **already LLVM-autovectorized**. So the only new SIMD content is a single
+   subtract + a cheap max-reduction — expected to be swamped by the scalar-`exp`
+   extract/reinsert overhead. The gelu surprise does NOT transfer.
+
+2. **Unmeasurable this session — BLOCKER.** The shared bench box was at **load
+   49→72** (multiple parallel agents benchmarking: FrankenTorch h2h, PearlReef
+   clippy, etc.); two A/B attempts were **killed mid-run**, and Criterion timings
+   at that load are unusable. I do not land an unmeasured change (landing requires
+   a measured win), so I REVERTED (candidate preserved in stash) rather than ship
+   on structure alone.
+
+**Reopen** only when the box is quiet (load < ~8): pop the stash and run the
+scalar-vs-SIMD A/B; if it's the expected ~0/regression, drop it. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: ⭐ LANDED partial-SIMD GELU — bit-exact, MEASURED 1.29× (the "tanh dominates" comment was wrong)
 
 **Another "measure, don't reason" win.** `gelu`'s code comment asserted "the tanh
