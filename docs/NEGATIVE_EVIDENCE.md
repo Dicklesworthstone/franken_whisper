@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: real-FFT (two-for-one) STEP 1 LANDED — verified-correct SCALAR algorithm, conformance-safe, behind default-off `FW_RFFT`; the SIMD port + perf landing is the remaining work
+
+**Land-or-dig result: DIG the one remaining lever, land its verified foundation.**
+The sole remaining engine lever (every alloc/dead-work axis is mined) is the
+arithmetic-changing real-FFT: a real-input FFT of length N from ONE complex FFT of
+length N/2 instead of TWO real sub-FFTs (~halves the dominant sub-FFT work, ~15-20%
+mel). The hard, risk-bearing part is the algorithm itself (a native complex FFT +
+the pack/unpack). This commit lands it **verified and correct**, with ZERO
+production impact:
+
+- New `radix5_cdft` (complex twin of `radix5_dft` — only stage-1 differs),
+  `cdft` (complex base case), `cfft` (complex recursion — the butterfly is reused
+  verbatim since it already combines complex sub-spectra), and `fft_twoforone`
+  (pack → one `cfft` → unpack Even/Odd → top butterfly). All SCALAR.
+- Wired into the scalar `compute_frame_column` behind `FW_RFFT` (default OFF), so
+  it is exercised (non-dead-code) but never runs in production yet.
+- **Verified:** new `fft_twoforone_matches_fft` asserts it matches the production
+  `fft` over ALL `2*N_FFT` bins within `rel < 1e-5` across 48 random inputs (it
+  diverges ~1e-7 — float op-order only; a real bug diverges ~0.1). **conformance
+  26/0 with `FW_RFFT=1` ACTIVE** — i.e. the two-for-one is transcription-safe.
+  13/13 mel tests, clippy `-D warnings` + rustfmt clean.
+
+**Why staged (not the full landing):** the perf win is on the SIMD batch path
+(`fft_simd8`), and it must land on BOTH scalar + SIMD identically to preserve
+`determinism_across_thread_counts` (SIMD-batch frames vs scalar-remainder frames
+must stay bit-identical). The SIMD `cfft_simd8`/`radix5_cdft_simd8`/`fft_simd8_twoforone`
+port + flipping the default + the A/B bench is the next step — now low-risk because
+the algorithm is proven correct here. No ratio change yet (FW_RFFT off in prod).
+AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: `layer_norm` SoA uninit ~0 (p=0.56, reverted) — and with it the FULL measurable-kernel sweep closes: every non-mel bench is optimized; the only remaining lever is the multi-turn real-FFT
 
 **Land-or-dig result: DIG → MEASURE ~0 → REVERT.** Last clean candidate on the

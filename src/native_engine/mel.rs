@@ -338,6 +338,175 @@ fn fft(input: &[f32], out: &mut [f32], levels: &[LevelTwiddle], base: &DftTable)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Real-FFT (two-for-one) — STEP 1 of a multi-turn lever, SCALAR + CORRECTNESS-
+// VERIFIED, behind the default-off `FW_RFFT` toggle. A real-input FFT of length
+// N can be computed from ONE complex FFT of length N/2 (pack the even/odd
+// decimation as one complex sequence) instead of TWO real sub-FFTs — ~halving
+// the dominant sub-FFT work. It changes the arithmetic (rel ~1e-7, within the
+// transcription-tolerance gate), so it must eventually land on BOTH the scalar
+// and SIMD paths to keep `determinism_across_thread_counts`. This turn lands the
+// verified scalar algorithm only (zero production impact: default off, scalar
+// remainder path); the SIMD port + perf landing follow.
+// ---------------------------------------------------------------------------
+
+/// Enable the two-for-one real-FFT on the scalar path. Default off.
+fn rfft_enabled() -> bool {
+    static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *R.get_or_init(|| std::env::var_os("FW_RFFT").is_some())
+}
+
+/// Complex-input radix-5 (`25 = 5x5`) — the complex twin of [`radix5_dft`]. Only
+/// the stage-1 5-point DFTs differ (complex vs real input); the twiddle and
+/// stage-2 are identical. `input`/`out` are interleaved complex of length `2*25`.
+fn radix5_cdft(input: &[f32], out: &mut [f32], t: &DftTable) {
+    let mut ir = [[0.0f32; 5]; 5];
+    let mut ii = [[0.0f32; 5]; 5];
+    for n2 in 0..5 {
+        for k1 in 0..5 {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for n1 in 0..5 {
+                let xr = input[2 * (5 * n1 + n2)];
+                let xi = input[2 * (5 * n1 + n2) + 1];
+                let c = t.r5_c5[k1 * 5 + n1];
+                let s = t.r5_s5[k1 * 5 + n1];
+                // (xr + i*xi) * (c - i*s)
+                re += xr * c + xi * s;
+                im += xi * c - xr * s;
+            }
+            ir[n2][k1] = re;
+            ii[n2][k1] = im;
+        }
+    }
+    let mut tr = [[0.0f32; 5]; 5];
+    let mut ti = [[0.0f32; 5]; 5];
+    for n2 in 0..5 {
+        for k1 in 0..5 {
+            let c = t.r5_c25[n2 * 5 + k1];
+            let s = t.r5_s25[n2 * 5 + k1];
+            tr[n2][k1] = ir[n2][k1] * c + ii[n2][k1] * s;
+            ti[n2][k1] = ii[n2][k1] * c - ir[n2][k1] * s;
+        }
+    }
+    for k1 in 0..5 {
+        for k2 in 0..5 {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for n2 in 0..5 {
+                let c = t.r5_c5[k2 * 5 + n2];
+                let s = t.r5_s5[k2 * 5 + n2];
+                re += tr[n2][k1] * c + ti[n2][k1] * s;
+                im += ti[n2][k1] * c - tr[n2][k1] * s;
+            }
+            out[2 * (k1 + 5 * k2)] = re;
+            out[2 * (k1 + 5 * k2) + 1] = im;
+        }
+    }
+}
+
+/// Naive complex DFT base case (`n` odd), with the radix-5 fast path for `n==25`.
+/// Complex twin of [`dft`]. `input`/`out` interleaved complex of length `2*n`.
+fn cdft(input: &[f32], out: &mut [f32], table: &DftTable) {
+    let n = input.len() / 2;
+    if n == 25 {
+        radix5_cdft(input, out, table);
+        return;
+    }
+    for k in 0..n {
+        let (mut re, mut im) = (0.0f32, 0.0f32);
+        let cos_row = &table.cos[k * table.n..k * table.n + n];
+        let sin_row = &table.sin[k * table.n..k * table.n + n];
+        for j in 0..n {
+            let xr = input[2 * j];
+            let xi = input[2 * j + 1];
+            re += xr * cos_row[j] + xi * sin_row[j];
+            im += xi * cos_row[j] - xr * sin_row[j];
+        }
+        out[2 * k] = re;
+        out[2 * k + 1] = im;
+    }
+}
+
+/// Recursive complex-input Cooley-Tukey FFT — complex twin of [`fft`]. The
+/// butterfly combine is identical (it already operates on complex sub-spectra);
+/// only the input load, the `n==1` leaf, the even/odd split, and the base case
+/// are complex. `input`/`out` interleaved complex of length `2*n`.
+fn cfft(input: &[f32], out: &mut [f32], levels: &[LevelTwiddle], base: &DftTable) {
+    let n = input.len() / 2;
+    if n == 1 {
+        out[0] = input[0];
+        out[1] = input[1];
+        return;
+    }
+    if n % 2 == 1 {
+        cdft(input, out, base);
+        return;
+    }
+    let lvl = &levels[0];
+    let half = n / 2;
+    debug_assert_eq!(lvl.half, half, "cfft level twiddle width mismatch");
+    let mut even = vec![0.0f32; 2 * half];
+    let mut odd = vec![0.0f32; 2 * half];
+    for i in 0..half {
+        even[2 * i] = input[2 * (2 * i)];
+        even[2 * i + 1] = input[2 * (2 * i) + 1];
+        odd[2 * i] = input[2 * (2 * i + 1)];
+        odd[2 * i + 1] = input[2 * (2 * i + 1) + 1];
+    }
+    let mut even_fft = vec![0.0f32; 2 * half];
+    let mut odd_fft = vec![0.0f32; 2 * half];
+    cfft(&even, &mut even_fft, &levels[1..], base);
+    cfft(&odd, &mut odd_fft, &levels[1..], base);
+    for (k, (&re, &im)) in lvl.cos.iter().zip(lvl.neg_sin.iter()).enumerate() {
+        let re_odd = odd_fft[2 * k];
+        let im_odd = odd_fft[2 * k + 1];
+        let e_re = even_fft[2 * k];
+        let e_im = even_fft[2 * k + 1];
+        out[2 * k] = e_re + re * re_odd - im * im_odd;
+        out[2 * k + 1] = e_im + re * im_odd + im * re_odd;
+        out[2 * (k + half)] = e_re - re * re_odd + im * im_odd;
+        out[2 * (k + half) + 1] = e_im - re * im_odd - im * re_odd;
+    }
+}
+
+/// Two-for-one real FFT of a length-`n` real `input` (n even, `n/2` reaching the
+/// radix-5 base): pack the even/odd decimation as one complex sequence of length
+/// `n/2`, run ONE [`cfft`], then unpack to the even/odd real sub-spectra and apply
+/// the top-level butterfly. Produces the same `2*n` interleaved-complex `out` as
+/// [`fft`] (within ~1e-7). `levels[0]` is the n-wide butterfly; `levels[1..]` and
+/// `base` drive the `n/2` complex FFT.
+fn fft_twoforone(input: &[f32], out: &mut [f32], levels: &[LevelTwiddle], base: &DftTable) {
+    let n = input.len();
+    debug_assert!(n.is_multiple_of(2) && n >= 2, "fft_twoforone needs even n");
+    let half = n / 2;
+    let lvl = &levels[0];
+    debug_assert_eq!(lvl.half, half, "fft_twoforone top twiddle width mismatch");
+    // Pack z[m] = even[m] + i*odd[m] = input[2m] + i*input[2m+1].
+    let mut z = vec![0.0f32; 2 * half];
+    for m in 0..half {
+        z[2 * m] = input[2 * m];
+        z[2 * m + 1] = input[2 * m + 1];
+    }
+    let mut zf = vec![0.0f32; 2 * half];
+    cfft(&z, &mut zf, &levels[1..], base);
+    // Unpack Even/Odd then top-level butterfly, per k in 0..half.
+    for k in 0..half {
+        let km = (half - k) % half;
+        let (ar, ai) = (zf[2 * k], zf[2 * k + 1]);
+        let (br, bi) = (zf[2 * km], zf[2 * km + 1]);
+        // Even[k] = (Z[k] + conj(Z[half-k]))/2 ; Odd[k] = (Z[k] - conj(Z[half-k]))/(2i)
+        let e_re = 0.5 * (ar + br);
+        let e_im = 0.5 * (ai - bi);
+        let o_re = 0.5 * (ai + bi);
+        let o_im = 0.5 * (br - ar);
+        let re = lvl.cos[k];
+        let im = lvl.neg_sin[k];
+        out[2 * k] = e_re + re * o_re - im * o_im;
+        out[2 * k + 1] = e_im + re * o_im + im * o_re;
+        out[2 * (k + half)] = e_re - re * o_re + im * o_im;
+        out[2 * (k + half) + 1] = e_im - re * o_im - im * o_re;
+    }
+}
+
 /// Number of mel frames the SIMD path transforms at once — one frame per lane.
 /// f32x8 lane operations are bit-identical to scalar f32 (IEEE-754, no FMA
 /// contraction), so lane `L` of the batched transform equals the scalar FFT of
@@ -672,7 +841,11 @@ fn compute_frame_column(
     }
 
     let mut fft_out = vec![0.0f32; 2 * N_FFT];
-    fft(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    if rfft_enabled() {
+        fft_twoforone(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    } else {
+        fft(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    }
     power_and_project(&fft_out, filters, out);
 }
 
@@ -1174,6 +1347,37 @@ mod tests {
                         "twiddle FFT diverged from inline reference at N={n} seed={seed}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn fft_twoforone_matches_fft() {
+        // The two-for-one real FFT must match the production `fft` over ALL bins
+        // at the mel width within transcription tolerance (it changes float op
+        // order, diverging ~1e-7). N=400 is the only production width; N/2=200
+        // bottoms at the radix-5 base (200 = 8*25). A real bug diverges ~0.1.
+        let tw = FftTwiddles::build(N_FFT);
+        for seed in 0..48u64 {
+            let mut lcg = Lcg::new(0x2F01_BEEF ^ seed.wrapping_mul(2_654_435_761));
+            let input: Vec<f32> = (0..N_FFT).map(|_| lcg.next_f32()).collect();
+            let mut got = vec![0.0f32; 2 * N_FFT];
+            let mut want = vec![0.0f32; 2 * N_FFT];
+            fft_twoforone(&input, &mut got, &tw.levels, &tw.base);
+            fft(&input, &mut want, &tw.levels, &tw.base);
+            let scale: f64 = want
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| (f64::from(c[0]).powi(2) + f64::from(c[1]).powi(2)).sqrt())
+                .fold(0.0f64, f64::max)
+                .max(1e-9);
+            for b in 0..2 * N_FFT {
+                let rel = (f64::from(got[b]) - f64::from(want[b])).abs() / scale;
+                assert!(
+                    rel < 1e-5,
+                    "two-for-one diverged from fft at seed={seed} idx={b}: rel={rel}"
+                );
             }
         }
     }
