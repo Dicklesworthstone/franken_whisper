@@ -763,7 +763,16 @@ fn compute_8_columns(
         *slot = FrameLanes::from_array(lanes);
     }
 
-    let mut fft_out = vec![FrameLanes::splat(0.0); 2 * N_FFT];
+    // The one-sided path writes/reads only bins 0..=N_FFT/2 (interleaved indices
+    // `0..2*N_FREQ_BINS`); the full path writes the whole spectrum. Sizing the
+    // buffer to what's used shrinks its per-call zero-init (the `vec!` of a
+    // zero-bits value is an `alloc_zeroed`/memset) — measured ~4.5% of mel.
+    let out_len = if fft_top_full() {
+        2 * N_FFT
+    } else {
+        2 * N_FREQ_BINS
+    };
+    let mut fft_out = vec![FrameLanes::splat(0.0); out_len];
     if fft_top_full() {
         fft_simd8(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
     } else {

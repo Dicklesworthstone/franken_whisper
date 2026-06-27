@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: LANDED right-sized `fft_out` buffer — MEASURED -4.46% mel (p=0.00), BIT-EXACT; the one-sided FFT left a dead 398-slot zero-init every frame-batch
+
+**Land-or-dig result: LAND (stacks on the one-sided FFT below).** Same "do less
+of what's unused" lens as the one-sided FFT, applied to allocation: `compute_8_columns`
+allocated `fft_out = vec![splat(0.0); 2*N_FFT]` = 800 `FrameLanes` (25.6 KB) and
+**zero-initialised all of it** every call (375×/`mel_30s`), but the one-sided path
+writes/reads only `2*N_FREQ_BINS = 402` slots — the other 398 were memset-then-never-
+touched. (`vec!` of a zero-bits value lowers to `alloc_zeroed`; on the reused hot
+chunk that is a real ~13 KB memset per call.) Now sized to `2*N_FREQ_BINS` on the
+one-sided path (`2*N_FFT` only when `FW_FFT_FULL`).
+
+**BIT-EXACT, no parity gate:** identical algorithm and identical writes — strictly
+a smaller buffer. `power_and_project_simd8` reads at most `fft_out[401]`, so 402
+slots are exactly sufficient; mel 12/12 (incl. `compute_8_columns_matches_scalar_columns_bit_exact`),
+conformance 26/0, clippy `-D warnings` + rustfmt clean.
+
+**Measurement (same-binary `FW_FFT_OUT_BIG` A/B, one local box, n=50, 5 s —
+isolates the buffer effect: both arms one-sided, differ only in `fft_out` size):**
+
+```text
+native_engine/mel/mel_30s_realistic
+  one-sided, 800-slot buffer (FW_FFT_OUT_BIG=1): 3.4739 ms  CI [3.4520, 3.4944]
+  one-sided, 402-slot buffer (default):          3.2972 ms  CI [3.2731, 3.3290]
+  change: [-5.4677% -4.4566% -3.3782%]  (p = 0.00 < 0.05)  Performance has improved.
+```
+
+(The A/B toggle was removed before landing; the sizing now follows `FW_FFT_FULL`.)
+
+**Ratio vs OpenAI-Whisper.** Directly measured: **-4.46%** intra-franken, stacking
+on the one-sided FFT (-8.07%) below for a combined **~12%** mel frontend gain over
+this session's full-FFT/full-buffer baseline. Against the standing OpenAI mel
+anchor (`whisper.audio.log_mel_spectrogram`, torch 8-thread ~4.4 ms), franken mel
+is now **~1.9-2.0x** (estimate; the -4.46% is the directly-measured same-box
+figure). **LESSON: an "unused output" optimization can leave a matching "unused
+allocation" — when you stop computing/reading part of a buffer, also stop
+allocating+zeroing it.** AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: LANDED one-sided top-level mel FFT — MEASURED -8.07% mel (p=0.00), BIT-EXACT, no parity gate; a genuinely new lever the prior "FFT space fully mapped" audits missed
 
 **Land-or-dig result: LAND (a real measured win, not a relaxation).** The mel power
