@@ -3,6 +3,70 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - DuskFinch: uninit FFT scratch on the NEW two-for-one default (`cfft_simd8`) — the -9.37% uninit lever (5b7f529) was SUPERSEDED by the two-for-one landing; now sub-1% and below the noise floor. REVERTED.
+
+**Land-or-dig result: DIG then REVERT.** Worktree scan: ahead-of-`main` siblings
+are the same already-evaluated reject-doc/stale copies (`cod-a-main-measure`,
+`fused-f16c` f16c-gemv [subsumed], `cod-b-fft-clean` [landed as `b1eb23b`], the
+`*reject*` branches) — no landable win. So I measured the one real lever sitting
+unlanded: an orphaned, uncommitted `cfft_simd8` change in the main checkout that
+extends the **landed** uninit-FFT-scratch lever (commit `5b7f529`, measured
+**-9.37% mel** on the then-default full `fft_simd8`) to the **now-default**
+two-for-one path. `fft_simd8_twoforone` → `cfft_simd8` is the production FFT since
+`7201eb8`; the change routes its four `even/odd/even_fft/odd_fft` buffers through
+the existing toggleable `alloc_fft_scratch` (`FW_FFT_ZEROINIT` escape hatch),
+swapping `vec![splat(0.0)]` (an `alloc_zeroed`/memset) for `with_capacity`+`set_len`.
+
+**Why it is a real lever but a small one.** The two-for-one default (`7201eb8`)
+computes the length-400 real transform from ONE length-200 complex FFT, halving
+the recursion + butterfly work that `5b7f529`'s -9.37% acted on. So the zero-init
+this removes is now a much smaller slice — `5b7f529`'s big win was **superseded**
+by the later two-for-one win, not additive to it.
+
+**Measurement — contention-robust SAME-BINARY A/B** (one build; `FW_FFT_ZEROINIT=1`
+= zero-init control vs default = uninit candidate; both arms run back-to-back so
+common-mode load cancels; this box = Threadripper PRO 5975WX = rch `ovh-a`,
+`x86-64-v3`, `CARGO_TARGET_DIR=.../franken_whisper-cc`):
+
+```text
+ROUND A (steady load ~54 across both arms — the admissible read):
+  native_engine/mel/mel_30s            change [-1.9012% -1.3440% -0.7089%] (p=0.00)  small win (dense)
+  native_engine/mel/mel_30s_realistic  change [-2.4234% -0.9474% +0.5239%] (p=0.20)  NO CHANGE (sparse/production)
+
+NOISE-FLOOR CONTROL — zeroinit vs zeroinit, IDENTICAL code (ideal 0%):
+  native_engine/mel/mel_30s            change [-1.9065% +0.8644% +3.3990%] (p=0.53)  ~0
+  native_engine/mel/mel_30s_realistic  change [-3.8320% -2.8193% -1.8071%] (p=0.00)  FALSE -2.82% "significant"
+
+ROUNDS B/C (bursty load): incoherent (sparse -25%/-35%, dense -10%/+8%) — pure
+  load-drift artifacts (a zeroinit sub-run hitting a swarm CPU spike fakes a huge
+  candidate "improvement"). Inadmissible.
+```
+
+**Verdict — below the noise floor.** The decisive datum is the control: two runs
+of *identical* zeroinit code differ by **-2.82% at p=0.00** on the sparse bench.
+The box (shared with the active frankentorch swarm; 1-min load oscillated 13→94
+this session) manufactures **±3% phantom "significant" effects**. The lever's
+production signal (-0.95%, p=0.20) and even the dense -1.34% sit INSIDE that floor,
+so neither is a demonstrable win. Per this ledger's policy ("every entry records a
+real criterion measurement; ~0-gain levers are REVERTED") an effect that cannot be
+separated from same-code noise is a REVERT.
+
+**Ratio vs OpenAI-Whisper.** The ledger's OpenAI anchor (`whisper.log_mel_
+spectrogram`, real sparse bank) compares against franken's sparse path, where the
+lever is within noise → it does NOT demonstrably move the OpenAI mel ratio
+(franken mel stays ~2.4-2.5x, SlateHeron's `7201eb8` entry).
+
+**Bit-exact / conformance GREEN.** Uninit is a pure write-before-read store path
+(the split loop fully writes `even/odd`; the recursion fully writes
+`even_fft/odd_fft`); `cargo test native_engine::mel::tests` = **14/14 green** in
+BOTH toggle states, incl. `compute_8_columns_matches_scalar_columns_bit_exact`.
+
+**Revert.** `cfft_simd8` restored byte-identical to `main` (the orphaned WIP is
+removed for tree hygiene; only this ledger entry lands). The `FW_FFT_ZEROINIT`
+toggle + this entry let a future agent re-measure **in a sustained calm window** —
+do NOT re-dig this sub-1% effect under swarm load; the noise floor swamps it.
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - BlackThrush: REJECT 32-frame cache tile for fused window prep; smaller tile regresses under Criterion
 
 **Land-or-dig result: DIG then REVERT.** The remaining non-ancestor bench
