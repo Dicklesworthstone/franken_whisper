@@ -3,6 +3,73 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - AGENT_NAME=IcyWren: REJECT SIMD f64 accumulator in mel projection; no same-worker keep proof and fallback comparison regressed
+
+**Land-or-dig result: DIG then REVERT.** Sibling bench worktrees were checked
+against `origin/main`; the apparent measured source wins (`power_and_project_simd8`
+projection fusion and f16c GEMV dot) were already subsumed by current main, while
+the remaining non-ancestor worktrees were docs/reject material. The new lever
+targeted the current OpenAI-facing mel frontend surface.
+
+**Candidate:** in `src/native_engine/mel.rs::power_and_project_simd8`, replace the
+per-bin `pk.to_array()` plus scalar lane loop with a `Simd<f64, 8>` accumulator:
+
+```text
+sums += pk.cast::<f64>() * Simd::splat(f64::from(rk))
+```
+
+The intent was to remove one vector-to-array unpack in the sparse mel projection
+inner loop while preserving each lane's mel-bin order.
+
+**Behavior gate:** focused conformance passed on RCH:
+
+```text
+AGENT_NAME=IcyWren \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  rch exec -- cargo test -p franken_whisper \
+    native_engine::mel::tests::compute_8_columns_matches_scalar_columns_bit_exact
+
+result: PASS on remote ovh-a
+```
+
+**Benchmark attempts:** Cargo in this repo rejects `cargo bench --release`; the
+release-profile equivalent was used through `rch exec` with `-p franken_whisper`.
+Remote same-worker proof was blocked by RCH routing/slot behavior: one `hz2`
+baseline completed, an `ovh-a` compare failed because the baseline was not present
+on that worker, and proof-mode later refused local fallback due no admissible
+worker.
+
+The completed usable rejection signal was the fallback comparison after an
+`ovh-a` current-main baseline was retrieved into the requested target dir:
+
+```text
+current main baseline, RCH remote ovh-a:
+native_engine/mel/mel_30s_realistic
+time: [2.2565 ms 2.2626 ms 2.2677 ms]
+
+candidate run, RCH local fallback against that retrieved baseline:
+native_engine/mel/mel_30s_realistic
+time: [3.6466 ms 3.6914 ms 3.7914 ms]
+change: [+61.718% +66.792% +73.044%] (p = 0.00)
+Performance has regressed.
+```
+
+**OpenAI-Whisper ratio caveat:** using the existing synthetic 30 s mel anchor in
+this ledger (`whisper.audio.log_mel_spectrogram`, torch 8 threads,
+`2.497522 ms`, ratio convention `OpenAI median / franken median`):
+
+```text
+current main vs OpenAI anchor:      2.497522 / 2.2626 = 1.1038x
+candidate fallback vs OpenAI anchor: 2.497522 / 3.6914 = 0.6766x
+```
+
+The candidate ratio is not a clean same-worker OpenAI proof because RCH fell back
+locally for the candidate compare, but it is enough to reject the lever: no
+credible measured win exists, and the only completed comparison moved the wrong
+way. Source was reverted. Do not retry this SIMD f64 accumulator shape without a
+same-worker bench or assembly evidence showing the `cast::<f64>()` path is better
+than the scalar lane accumulator on the target CPU.
+
 ## 2026-06-27 - BlackThrush: radix-5 FFT base case IMPLEMENTED in the codebase & VERIFIED (10/11 tests green) — preserved in stash@{0}, one owner policy-decision from landing
 
 **Ported the verified radix-5 reference into production code** (`DftTable` + `W_5`/
