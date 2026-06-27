@@ -3,6 +3,72 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: REJECT destination-index strength reduction in fused window prep; no reliable gain on the OpenAI-copy gap
+
+**Land-or-dig result: DIG then REVERT.** No clean unlanded measured win remained
+in the sibling bench worktrees: the apparent source wins were stale branches
+whose useful code is already represented on current main, while the remaining
+non-ancestor worktrees were reject/docs snapshots or old trees that would delete
+newer measured work. The live OpenAI-facing negative surface is still the
+`[80, 3000]` window-prep copy/transpose floor, so I tried one narrower lever
+inside `encoder::time_major_mel_window_from_full_mel`.
+
+**Candidate:** keep the landed mel-row/tile source locality but replace the
+inner destination expression:
+
+```text
+data[(f0 + df) * full_mel.n_mel + m] = v
+```
+
+with an incrementing `dst += full_mel.n_mel`. The hypothesis was that deleting a
+per-element multiply/add would improve the fused transpose without changing
+access order.
+
+**Correctness:** the focused equivalence test passed:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo test -p franken_whisper \
+    fused_full_mel_window_matches_chunk_then_transpose
+
+test native_engine::encoder::tests::fused_full_mel_window_matches_chunk_then_transpose ... ok
+```
+
+**Bench:** the requested literal `cargo bench --release` was captured and still
+rejected by Cargo (`unexpected argument '--release'`), so the executable
+release-profile equivalent was used.
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench native_engine_bench -- window_to_time_major \
+    --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+
+current-main fused baseline:
+native_engine/mel/window_to_time_major_fused
+time: [129.59 us 142.50 us 152.74 us]
+
+candidate fused rerun:
+native_engine/mel/window_to_time_major_fused
+time: [131.41 us 135.63 us 140.95 us]
+change: [+1.7481% +8.0992% +14.476%] (p = 0.01 < 0.05)
+Performance has regressed.
+```
+
+The direct medians were noisy and overlapped, while Criterion's change detector
+reported a statistically significant regression against its stored baseline. The
+old chunk+transpose control also swung badly under local fallback load, so this
+does not clear the proof bar for a code keep. The source change was reverted.
+
+OpenAI-Whisper ratio convention is `OpenAI median / franken median`. Using the
+same 2026-06-25 compact-copy anchor (`15.3064 us`), current main's measured
+median in this run is `15.3064 / 142.50 = 0.1074x`; the candidate median is
+`15.3064 / 135.63 = 0.1129x`, but that small apparent ratio lift is inside the
+noisy/non-keep band and contradicted by Criterion's regression result. No landed
+ratio improvement.
+
+`AGENT_NAME=BlackThrush`.
+
 ## 2026-06-27 - BlackThrush: REJECT no-fill time-major window fast path; source locality beats dead-store elimination
 
 **Land-or-dig result: LAND already happened upstream, then DIG and REVERT.**
