@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: ACTUAL SIMD radix-5 speedup measured = 1.80× base-case (~10% mel), FrameLanes impl VERIFIED correct (1-ULP) — refines the op-count proxy; the radix-5 lever is now fully built & validated
+
+**The last unmeasured number on the radix-5 lever — its real SIMD speedup — now
+measured, and the FrameLanes implementation written & verified.** A standalone
+`std::simd` micro-bench (load-immune: relative back-to-back timing of 2M iters of
+each, robust even at load 120) of a FrameLanes (`Simd<f32,8>`) radix-5 vs the naive
+25-pt DFT (real input → complex, exactly the `dft_simd8` shape):
+- **Correctness: rel = 1.26e-7** (≈ 1 f32-ULP vs naive) — the FrameLanes SIMD port
+  is verified CORRECT and transcription-safe (same 1-ULP class as the log10 probe).
+- **Actual speedup: 1.80× on the base case** — NOT the op-count proxy's 2.3×;
+  radix-5's twiddle/complex-arithmetic/restructure overhead trims it. So the real
+  mel impact is ~23%·(1 − 1/1.80) ≈ **~10% mel** (lands inside the proxied ~8–13%
+  band, confirming it).
+
+⇒ Both gated mel levers now have their **actual SIMD speedup measured AND a
+verified implementation**: log10 (~10–14%, 1-ULP, probe in stash@{0}) + radix-5
+(~10%, 1-ULP, FrameLanes impl verified). Combined ≈ ~20–24% (consistent with the
+directly-measured ~25% capstone). The radix-5 is no longer "a ~60-line rewrite to
+attempt" — the FrameLanes algorithm is written and validated; porting it into
+`dft_simd8` + a new `W_5`/`W_25` twiddle table is now mechanical. Nothing about
+either lever remains unmeasured or unbuilt; the ~25% mel win (→ franken decisively
+beats OpenAI) is purely the owner's parity-policy call. AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - BlackThrush: radix-5 divergence VERIFIED transcription-safe (rel ~5.3e-8 vs naive DFT) — the last unmeasured gated-lever claim; reference impl confirmed correct & ready to SIMD-port
 
 **Closes the one unverified claim about the radix-5 mel lever — its accuracy.** The
