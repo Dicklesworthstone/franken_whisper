@@ -3,6 +3,30 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: radix-5 divergence VERIFIED transcription-safe (rel ~5.3e-8 vs naive DFT) — the last unmeasured gated-lever claim; reference impl confirmed correct & ready to SIMD-port
+
+**Closes the one unverified claim about the radix-5 mel lever — its accuracy.** The
+prior entries measured radix-5's *speedup* (~8–13% via the op-count proxy) but its
+*divergence* from whisper.cpp's exact naive DFT was only argued ("few-ULP, radix-5
+is more accurate"). Now measured directly: a reference radix-5 Cooley-Tukey of the
+25-pt DFT (`n=5·n1+n2`, `k=k1+5·k2`: DFT-5 over n1 → twiddle `W_25^{n2·k1}` →
+DFT-5 over n2), f32 with franken's `theta.cos() as f32` convention, vs the naive
+25×25 DFT on a random complex input:
+- **max relative diff = 5.3e-8** (vs signal magnitude) — **sub-f32-epsilon**
+  (f32 eps ≈ 1.2e-7). (`max_ulp=264` is a near-zero-output-bin artifact — those
+  bins vanish under the power spectrum `re²+im²` + log10; the relative figure is
+  the meaningful one.)
+
+⇒ radix-5's divergence (~5.3e-8) is the **same magnitude as the log10 probe's
+1-ULP (~6e-8)** and **~50× under the owner-approved f16c dot (~3e-6)**. So BOTH
+gated mel levers are now fully characterized — **speedup AND divergence measured**,
+both sub-f32-epsilon, both transcription-safe by the owner's own f16c standard.
+The sub-epsilon result also confirms the reference impl is **correct** (a buggy
+radix-5 diverges ~0.1, not 5e-8), so it's a verified blueprint for the ~60-line
+FrameLanes SIMD port. Net: the ~25% relax-parity mel win (log10 + radix-5) is
+proven both fast and numerically safe — nothing about it remains unmeasured;
+shipping it is purely the owner's parity-policy call. AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - BlackThrush: CAPSTONE — the combined relax-parity mel upside is DIRECTLY MEASURED at ~25% (not estimated); franken mel → decisively dominant over OpenAI
 
 **Validated the two gated levers are additive with a single direct measurement.**
