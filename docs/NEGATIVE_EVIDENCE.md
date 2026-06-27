@@ -3,7 +3,7 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-06-26 - BlackThrush: softmax partial-SIMD NOT landed — structurally ~0 (unlike GELU) AND unmeasurable this session (bench box contention)
+## 2026-06-26 - BlackThrush: softmax partial-SIMD REJECTED — now MEASURED a REGRESSION (confirms the structural ~0; not landed)
 
 **Dig (the GELU follow-up), reverted.** I applied the gelu pattern to
 `softmax_rows`: a bit-exact `softmax_row_inplace` with SIMD max-reduction + `v-max`
@@ -20,15 +20,21 @@ subtract + normalize, `exp` scalar per lane, and the running **sum kept SEQUENTI
    subtract + a cheap max-reduction — expected to be swamped by the scalar-`exp`
    extract/reinsert overhead. The gelu surprise does NOT transfer.
 
-2. **Unmeasurable this session — BLOCKER.** The shared bench box was at **load
-   49→72** (multiple parallel agents benchmarking: FrankenTorch h2h, PearlReef
-   clippy, etc.); two A/B attempts were **killed mid-run**, and Criterion timings
-   at that load are unusable. I do not land an unmeasured change (landing requires
-   a measured win), so I REVERTED (candidate preserved in stash) rather than ship
-   on structure alone.
+2. **Now MEASURED (via `rch`) — a REGRESSION, not a win.** Two LOCAL A/B attempts
+   were killed by bench-box contention (load 49→72, parallel agents). A later
+   `rch exec` run got numbers: `softmax_512x1536` scalar **550 µs** vs SIMD
+   **1.05 ms** = **+91% (p=0.00)**. The magnitude is confounded — the two runs
+   landed on different rch-fleet workers (~1.5× speed variance) — but the
+   **direction is unambiguous and matches the structure**: the per-lane `exp`
+   `to_array`/`from_array` round-trip + the sequential-sum bookkeeping cost MORE
+   than the single SIMD subtract saves. So softmax SIMD is **slower**, not ~0.
 
-**Reopen** only when the box is quiet (load < ~8): pop the stash and run the
-scalar-vs-SIMD A/B; if it's the expected ~0/regression, drop it. AGENT_NAME=BlackThrush.
+**Verdict: REJECT** (reverted; candidate dropped — do NOT re-attempt). The gelu
+partial-SIMD pattern requires substantial vectorizable arithmetic (a polynomial);
+softmax (one subtract + a conformance-locked sequential sum) lacks it and
+regresses. Process note: the shared bench box is frequently saturated by parallel
+agents — prefer `rch` (remote worker) or a same-binary runtime toggle for A/Bs.
+AGENT_NAME=BlackThrush.
 
 ## 2026-06-26 - BlackThrush: ⭐ LANDED partial-SIMD GELU — bit-exact, MEASURED 1.29× (the "tanh dominates" comment was wrong)
 
