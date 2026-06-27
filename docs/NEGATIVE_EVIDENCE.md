@@ -3,6 +3,44 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: REJECTED uninit for the top-level `fft_out` buffer — isolated A/B shows a +3.86% mel REGRESSION (p=0.00), NOT the expected win; reverted
+
+**Land-or-dig result: DIG → MEASURE → REVERT (regression).** After landing the
+uninit treatment for the sub-FFT scratch (`even_fft`/`odd_fft`, -9.37%), the
+natural next target was the one remaining zero-initialised-then-fully-written FFT
+buffer: the top-level `fft_out` in `compute_8_columns`. The buffer-*sizing* win
+(`800→402`, -4.46%) made it look like `fft_out` zeroing was expensive, so uninit
+seemed like free ~4% more. **It is the opposite.**
+
+**Isolated same-binary A/B** (added a temporary `FW_FFT_OUT_ZEROINIT` toggle so one
+binary compares `fft_out` zero-init vs uninit with the sub-FFT scratch held uninit
+in BOTH arms — i.e. exactly main vs main+`fft_out`-uninit; n=60, 5 s):
+
+```text
+native_engine/mel/mel_30s_realistic
+  fft_out zero-init (= main):  3.2463 ms  CI [3.2247, 3.2646]
+  fft_out uninit (candidate):  3.3326 ms  CI [3.3090, 3.3583]
+  change: [+2.7033% +3.8628% +4.9994%]  (p = 0.00 < 0.05)  Performance has REGRESSED.
+```
+
+**Why it regresses (the lesson):** unlike the 38 MB of sub-FFT scratch (where the
+memset dominated), `fft_out` is one small 402-slot buffer (~12.9 KB) that is
+**written by `fft_simd8_onesided` and then immediately read by
+`power_and_project_simd8` in the same call**. The `vec![splat(0.0)]` zero-init
+*pre-faults/warms those exact pages* right before the hot write+read, so the
+memset pays for itself; replacing it with `set_len` over fresh `with_capacity`
+capacity makes the FFT's stores take the cold first-touch page faults instead —
+net slower. **A dead zero-init is only worth removing when the buffer is large
+relative to cache and/or not re-touched immediately; for a small, hot,
+write-then-read-in-place buffer the zero-init is effectively free prefetch.** The
+two earlier methods that DID win — `collect()` for `fft_in`/even/odd and uninit for
+`even_fft`/`odd_fft` — were large and/or not re-read in the same tight window.
+
+**Action:** the candidate (incl. the temporary toggle) was reverted; `mel.rs` is
+byte-identical to `5b7f529`. No ratio change vs OpenAI-Whisper (the lever
+regresses). The mel-FFT allocation/zeroing axis is now genuinely exhausted in both
+directions. AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: LANDED the uninit `even_fft`/`odd_fft` scratch — MEASURED -9.37% mel (p=0.00); owner directive "do NOT defer/hold" un-gated the surfaced lever below
 
 **Land-or-dig result: LAND.** The previous entry SURFACED this -9% lever and
