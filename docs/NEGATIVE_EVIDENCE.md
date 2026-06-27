@@ -3,6 +3,53 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: REJECT / no-ship per-worker mel scratch arena uninit — **no same-worker measured win; ORIG ratio unchanged**
+
+**Land-or-dig result: no unlanded bench-worktree source win found, then DIG and
+REVERT.** Checked the sibling bench worktrees after the repo-local
+`.scratch/.worktrees` search stayed empty: the old FFT/projection/f16c heads are
+already represented or superseded on current `main`, and the remaining heads are
+docs/reject snapshots. New lever from `/alien-graveyard` +
+`/alien-artifact-coding` + `/extreme-software-optimization`: remove one more
+allocation/zero-init layer by constructing `MelFftScratch::new`'s per-worker
+arena buffers (`fft_in`, `fft_out`, `zf`, and each `CfftLevelScratch`) with the
+existing uninitialised scratch allocator. This was behavior-auditable because the
+frame input, one-sided FFT output, zero-fill buffer, and cfft depth buffers are
+written in full before read, with `FW_FFT_ZEROINIT` available as the deterministic
+fallback. The code was reverted because the timing evidence did not clear the
+same-worker/noise bar.
+
+**Measurement.** Per-crate bench only, `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b`.
+The user-requested `cargo bench --release` form is not accepted by this Cargo, so
+it was captured as a parser failure and the executable equivalent used
+`--profile release`.
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/mel/mel_30s_realistic --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+result: Cargo rejected --release (unexpected argument)
+
+baseline, current main, remote hz2:
+  rch exec -- cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/mel/mel_30s_realistic --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+  native_engine/mel/mel_30s_realistic: [3.8551 ms 4.1235 ms 4.3573 ms]
+
+candidate, local fallback (not comparable to hz2 baseline):
+  rch exec -- cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/mel/mel_30s_realistic --sample-size 20 --warm-up-time 0.1 --measurement-time 3
+  native_engine/mel/mel_30s_realistic: [3.3259 ms 3.3973 ms 3.4605 ms]
+  Criterion local-history change: [-16.480% -8.4105% +1.5152%], p = 0.11
+  verdict: No change in performance detected.
+```
+
+**Ratio vs ORIG.** No kept source change, so the ORIG comparator ratios stay at
+the current ledger values: e2e native `tiny.en` remains the landed **3.26x** vs
+OpenAI Whisper CPU path, while the strict loaded-model API gap remains
+ORIG/franken = **0.784x**. Do not reuse the local-fallback median as a win; it is
+not same-worker evidence and Criterion reported no statistically significant
+change. AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - DuskFinch: clean per-token DECODER probe built + profiled — the in-crate per-token decode IS at ceiling; its 47% rayon/epoch overhead is the DOCUMENTED tight-loop over-statement (bd-6qih), thresholds already tuned. No new in-crate lever.
 
 **Land-or-dig result: DIG (build the tool the last entry asked for) → confirm
