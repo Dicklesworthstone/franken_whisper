@@ -385,6 +385,88 @@ toggle + this entry let a future agent re-measure **in a sustained calm window**
 do NOT re-dig this sub-1% effect under swarm load; the noise floor swamps it.
 AGENT_NAME=DuskFinch.
 
+## 2026-06-27 - BlackThrush: BLOCKED loaded-model OpenAI API dig; model-gated bench path still skips in clean worktree
+
+**Land-or-dig result: SURFACED BLOCKER.** I found no landable measured win in
+the current checkout's `.scratch/.worktrees` area, and the non-ancestor sibling
+worktrees were either docs-only stale ratio/reject branches or older code
+branches already represented/superseded on `main`. I did not re-run the covered
+window-prep, mel projection/log10, f16 GEMV, layer-norm, GELU, resample, or
+downmix families.
+
+The remaining strict product-facing ORIG loss is the reusable loaded-model
+OpenAI-Whisper API surface: prior same-session loaded comparisons show current
+franken still below parity at 8 threads, e.g. the Rayon-cap keep recorded
+`0.535540 s` franken vs `0.420035 s` OpenAI loaded API, an ORIG/franken ratio of
+`0.420035 / 0.535540 = 0.784x`. Earlier one-shot franken CLI vs loaded OpenAI
+API evidence was worse (`0.4356057639233768 / 0.93704627044 = 0.464871x`).
+
+**New radical lever routed from `/alien-graveyard` + `/alien-artifact-coding` +
+`/extreme-software-optimization`:** zero-copy / library-OS style model residency
+for the loaded API gap, with a conservative fallback to the current eager
+`std::fs::read` + parse path. The concrete implementation family is mmap-backed
+or service-resident model loading so repeated API calls stop paying full eager
+blob copy/parse/residency costs and can fault weights lazily like the original
+C/C++ lineage. The loss matrix is simple: keep only if same-worker loaded
+OpenAI API ratio improves and native conformance stays green; otherwise fall
+back to the current eager loader. This is not a safe commit target today because
+`memmap2::Mmap::map` is `unsafe` and this repo still requires owner-audited
+unsafe sites, and because the prescribed bench path cannot currently execute
+the model/e2e benches from this clean worktree.
+
+**Required per-crate bench command status.** The user-requested literal command
+shape was run with `-p franken_whisper` and the required shared target dir:
+
+```text
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  rch exec -- cargo bench --release -p franken_whisper \
+    --bench native_engine_bench -- e2e_tiny_jfk \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+Result: `rch` fell back locally because no worker was admissible, then Cargo
+rejected the command before bench execution:
+
+```text
+error: unexpected argument '--release' found
+```
+
+The Cargo-supported release-profile equivalent was then run, still via
+`rch exec`, still per-crate, still with the required target dir:
+
+```text
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- e2e_tiny_jfk \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+```
+
+It compiled and reached the Criterion harness, but all model/e2e benches skipped
+because `tests/fixtures/native/jfk.wav` is gitignored and absent from this clean
+bench worktree:
+
+```text
+SKIP: jfk.wav not readable (No such file or directory (os error 2))
+SKIP encoder_window_tiny: model tiny.en or jfk.wav missing
+SKIP decoder_token_step_tiny: model tiny.en or jfk.wav missing
+SKIP e2e_tiny_jfk: jfk.wav missing
+SKIP e2e_large_jfk: jfk.wav missing
+```
+
+**Decision:** no source change was made and no covered hermetic kernel was
+re-verified. The ORIG ratio remains the last measured loaded-API ratio
+(`0.784x` at 8 threads; worse historical one-shot-vs-loaded ratio `0.464871x`)
+until the bench path is unblocked. Concrete unblock: stage `jfk.wav` plus
+`ggml-tiny.en.bin` / `ggml-large-v3-turbo.bin` in an rch-visible fixture/model
+location for clean worktrees, or explicitly authorize an audited mmap helper
+path with its own conformance gate.
+
+`AGENT_NAME=BlackThrush`.
+
 ## 2026-06-27 - BlackThrush: REJECT 32-frame cache tile for fused window prep; smaller tile regresses under Criterion
 
 **Land-or-dig result: DIG then REVERT.** The remaining non-ancestor bench
