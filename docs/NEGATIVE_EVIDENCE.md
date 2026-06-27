@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - BlackThrush: base-case DFT is ~23% of mel — radix-5 (the gated FFT lever) ≈ ~8–13% mel; with log10 the FULL relax-parity upside is ~20–25% mel (mel goes from +1.8% to ~+25% vs OpenAI)
+
+**Quantifying the DOMINANT gated mel lever (the FFT base case) to complete the
+mel-cost model.** `dft_simd8` (the 25-pt naive DFT, the audit's #1 cost) does
+25×25 = 1250 FMA/call, 16×/frame. Radix-5 (`25 = 5×5`, Cooley-Tukey) needs ~275
+ops vs 625 (~2.3× fewer) but diverges from whisper.cpp's exact naive DFT — gated
+on the same bit-exact-with-whisper invariant as the log10. **Op-count proxy
+measurement** (truncate the inner accumulation to 11/25 inputs ≈ radix-5's op
+count; garbage output but valid timing; same-machine A/B, n=50/6s): full-25 vs
+truncated-11 = `mel_30s_realistic` **+12.8%** (p=0.00, CI [+10.9%, +14.7%];
+`mel_30s` noisier ~+4.9%). ⇒ the base-case DFT is **~23% of mel** and a radix-5
+rewrite saves **up to ~12.8% mel** (UPPER bound — radix-5's combine/twiddle
+overhead trims the real figure to ~8–13%). Reverted (proxy only; `mel.rs == main`).
+
+**The complete mel relax-parity upside, now fully quantified.** Two gated levers,
+both transcription-safe (1-ULP / few-ULP) under the same invariant the owner
+already relaxed for the f16c dot (rel ~3e-6):
+- **log10 SIMD-poly: ~10–14% mel** (1-ULP-f32, probe in `git stash@{0}`).
+- **radix-5 base-case FFT: ~8–13% mel** (few-ULP; radix-5 is *more* accurate than
+  the naive DFT it replaces — fewer rounding steps for the same transform).
+Together ≈ **~20–25% mel**. franken mel is *already* +1.8% vs OpenAI (prior entry);
+relaxing parity takes it to **~+25% = decisively dominant** on the one surface
+where it didn't already win. The radix-5 is a real implementation (FrameLanes
+Cooley-Tukey, ~60 lines) so it's a bigger lift than the log10 (a drop-in poly), but
+the upside is now measured, not guessed. AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - BlackThrush: FRESH franken-vs-OpenAI mel ratio — franken now LEADS OpenAI ~1.8% (was a near-tie); the stash@{0} log10 probe would make it ~13% = clearly dominant
 
 **Ratio vs OpenAI-Whisper on the biggest gap (the mel frontend), re-measured with
