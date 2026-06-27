@@ -3,6 +3,57 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - SlateHeron: SURFACED (not landed) uninit `even_fft`/`odd_fft` scratch — MEASURED -9.14% mel (p=0.00), the single biggest remaining mel lever, BLOCKED only by `#![deny(unsafe_code)]` (owner call, same class as `dot_f16c`)
+
+**Land-or-dig result: DIG → MEASURE → SURFACE (gated, reverted).** After the three
+landed bit-exact scratch wins, the largest dead-zeroing left is the recursive FFT
+**output** buffers `even_fft`/`odd_fft` (`vec![splat(0.0); 2*half]` at every level
+of `fft_simd8`/`fft_simd8_onesided`) — ~38 MB of memset per `mel_30s`, the biggest
+single chunk. They CANNOT use the `collect()` trick the inputs did: the butterfly
+writes bin `k` and bin `k+half` in one interleaved step, so a sequential build
+would double the complex multiplies (a net regression on a compute-bound kernel).
+The only way to skip their zero-init is **uninitialised allocation**, which is
+`unsafe` and the crate is deliberately `#![deny(unsafe_code)]` (one owner-audited
+`#[allow]` exists: `native_engine::nn::dot_f16c`).
+
+**Measured the lever behind a contained `#[allow(unsafe_code)]` + `FW_FFT_UNINIT`
+toggle (`Vec::with_capacity` + `set_len`), then REVERTED it — mel.rs is byte-identical
+to `35f2a90`:**
+
+```text
+native_engine/mel/mel_30s_realistic   (same-binary A/B, n=60, 5 s, load ~23-34)
+  zero-init even_fft/odd_fft (default):  3.4733 ms  CI [3.4552, 3.4913]
+  uninit (FW_FFT_UNINIT=1):              3.1704 ms  CI [3.1545, 3.1869]
+  change: [-9.8828% -9.1396% -8.3902%]  (p = 0.00 < 0.05)  Performance has improved.
+```
+
+**Soundness is airtight and was empirically verified:** `fft_simd8`/`fft_simd8_onesided`
+write EVERY element of their `out` before any read (butterflies and the radix-5
+base case are pure stores; `n==1` stores `[0],[1]`), and `FrameLanes` is `Copy`/POD
+(no `Drop`), so `set_len` over uninitialised capacity never drops or observes an
+uninit value. The full mel suite passed 12/12 **with `FW_FFT_UNINIT=1` AND without**,
+producing bit-identical output both ways — i.e. the write-before-read invariant
+holds in practice, not just in theory.
+
+**Why surfaced, not landed:** adding `unsafe` is the owner's call. `dot_f16c` is the
+precedent — it was surfaced with a measured magnitude and the OWNER added the
+`#[allow]` + landed it; `#![deny(unsafe_code)]` is a deliberate one-audited-site-at-
+a-time policy, not an engineering gap. This is the same class of decision.
+
+**To land (owner, ~10 min, mechanical):** add a `#[allow(unsafe_code)]` helper
+`alloc_fft_scratch(n) -> (Vec<FrameLanes>, Vec<FrameLanes>)` that does
+`Vec::with_capacity(n)` + `unsafe { set_len(n) }` with the SAFETY comment above,
+and replace the two `vec![FrameLanes::splat(0.0); 2*half]` pairs in `fft_simd8`
+and `fft_simd8_onesided` with it. (Full impl was validated this session; reverted
+pending the policy call.)
+
+**Ratio vs OpenAI-Whisper.** Directly measured **-9.14%** intra-franken — if landed
+it would take this session's bit-exact stack (one-sided FFT, right-sized `fft_out`,
+collect-scratch) from ~17% to **~25% cumulative** mel frontend speedup, franken mel
+to **~2.2-2.3x** the OpenAI `log_mel_spectrogram` anchor (~4.4 ms torch). The safe
+zeroing axis is now exhausted; this is the last big mel lever and it is owner-gated.
+AGENT_NAME=SlateHeron.
+
 ## 2026-06-27 - SlateHeron: LANDED `collect()` over zero-init for FFT scratch — MEASURED -5.48% mel (p=0.00), BIT-EXACT; the dead zero-init of fully-written buffers WAS the bottleneck the "alloc isn't the FFT cost" audit got wrong
 
 **Land-or-dig result: LAND (3rd "do less of what's unused" win this session).**
