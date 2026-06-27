@@ -3,6 +3,30 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-26 - BlackThrush: gated mel log10 lever QUANTIFIED — even scalar f32 `log10f` (vs f64) is a measured ~7–8% mel win; gate root-cause confirmed at whisper.cpp source
+
+**Putting a measured number on the gated log10 lever (the biggest mel cost).**
+Two confirmations + a measurement this turn:
+
+1. **Gate is real, confirmed at the source.** `legacy_whispercpp/.../src/whisper.cpp:3155`
+   does `sum = log10(std::max(sum, 1e-10))` on a **`double`** — so franken's f64
+   `log10` is *mandated by whisper.cpp parity*, not over-conservatism. Any cheaper
+   log10 (f32 or SIMD-poly) diverges from the bit-exact-with-whisper reference.
+
+2. **Measured the simplest cheaper variant.** Swapping the projection's
+   `f64 log10 → as f32` for `as f32 → f32 log10f` (cast then `log10f`) is a clean
+   A/B win (same-machine, quiet box, n=50/6s, p=0.00): `mel_30s` **+8.2%**,
+   `mel_30s_realistic` **+7.1%** faster (f32-log10 ≈ 5.68 / 4.16 ms vs f64
+   6.14 / 4.41 ms). **REVERTED** — it diverges from whisper's f64 log10 (~f32
+   precision), so it's gated, not landable.
+
+⇒ The gated log10 lever now has a measured **floor (~7–8%, scalar f32 log10f)**
+and a measured **ceiling (~20%, the full log10 cost from the prior entry)**; a
+SIMD-polynomial log10 sits between. So the owner's decision to close the mel↔OpenAI
+gap is concrete: relaxing bit-exact-mel for the log10 buys **~7–20% of mel** (the
+mel frontend is currently a near-tie), gated behind (a) the internal mel bit-exact
+tests + (b) model-staging to confirm transcription-safety. AGENT_NAME=BlackThrush.
+
 ## 2026-06-26 - BlackThrush: log10 phase-separation (the only BIT-EXACT log10 lever) REJECTED — measured ~2.2% REGRESSION; the interleaved loop is optimal
 
 **Dig: the one NON-gated angle on the ~20%-of-mel log10.** A SIMD log10 is gated
