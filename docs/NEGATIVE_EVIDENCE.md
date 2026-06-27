@@ -296,6 +296,53 @@ separately ledgered.
 passed 26/26 remotely on `ovh-a`. The final source diff was reverted to main,
 leaving only this ledger entry. AGENT_NAME=Codex.
 
+## 2026-06-27 - Codex: REJECT log-mel contiguous stitch transpose (zero-gain vs current franken; 0.5379x vs OpenAI-Whisper)
+
+**Land-or-dig result:** no measured bench worktree win remained to land. The
+f16c GEMV worktree win is already present on `origin/main` and `origin/master`
+at `c38b930bb1a8a3374f3a2ca3e0c6bac22adb3dfb`; the remaining inspected
+worktrees were patch-equivalent or superseded (`franken_whisper-cod-a-main-measure`,
+`franken_whisper-cod-b-fft-clean-daa0cf9`, and
+`franken_whisper-fused-f16c`). No nested `.scratch` or `.worktrees` git
+worktree was found under the repo.
+
+**Candidate:** log-mel final stitch from per-thread frame-major local buffers
+into the global mel-major output. The attempted lever changed the final copy to
+write each destination mel row contiguously while reading the local buffer with
+stride `n_mel`. The mapping is algebraically identical and touches no FFT,
+window, mel filterbank, or accumulation arithmetic.
+
+**Bench protocol:** per-crate only with
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`. This Cargo
+does not accept `cargo bench --release`, so the supported equivalent was used:
+`rch exec -- cargo bench -p franken_whisper --profile release --bench
+native_engine_bench mel_30s_realistic -- --sample-size 10 --warm-up-time 0.1
+--measurement-time 1`. The first remote Criterion comparison failed because the
+remote worker did not have the local baseline directory, so the accepted A/B is
+the same target-dir comparison that Criterion completed.
+
+| Run | Median | Ratio |
+| --- | ---: | ---: |
+| franken baseline (`codex-stitch-remote`) | `4.7652 ms` | `0.5241x` vs OpenAI |
+| franken candidate (contiguous stitch) | `4.6429 ms` | `0.5379x` vs OpenAI |
+| OpenAI-Whisper `whisper.audio.log_mel_spectrogram`, torch 8 threads | `2.497522 ms` | baseline |
+
+Criterion reported `change: [-3.4031% -1.1799% +0.8135%]` with
+`p = 0.34 > 0.05`, so no statistically significant franken-side improvement was
+detected. The apparent median movement is not a keep.
+
+**Verdict:** REJECT and revert the code. Current franken remains slower than the
+fresh OpenAI-Whisper preprocessing comparator on this synthetic 30s log-mel case
+(`2.497522 / 4.6429 = 0.5379x`, OpenAI/franken). The source change was reverted;
+only this evidence entry is retained.
+
+**Conformance/quality gates:** `rch exec -- timeout 300s cargo test -p
+franken_whisper --test conformance_comparator_tests` passed 26/26 remotely on
+`ovh-a` with `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`.
+An earlier unbounded `rch exec` wrapper sat with no child compiler/test output
+and was interrupted; the bounded rerun produced normal remote logs and passed.
+AGENT_NAME=Codex.
+
 ## 2026-06-26 - Codex: LAND measured f16c fused f16 GEMV worktree win (decoder kernel +3.4904x; OpenAI-Whisper product ratio not remeasured)
 
 **Land-or-dig result:** a measured win was present off main in
