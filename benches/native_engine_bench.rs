@@ -577,6 +577,50 @@ fn bench_e2e_tiny_jfk(c: &mut Criterion) {
     group.finish();
 }
 
+// 5a. e2e_tiny_jfk_no_timestamps — same loaded-model tiny JFK path with
+// timestamp-token segmentation disabled. This mirrors the large head-to-head
+// bench mode and isolates the cost of the timestamped decode policy.
+fn bench_e2e_tiny_jfk_no_timestamps(c: &mut Criterion) {
+    let Some(path) = find_model_file(MODEL_TINY) else {
+        eprintln!("SKIP e2e_tiny_jfk_no_timestamps: model {MODEL_TINY} missing");
+        return;
+    };
+    let Some(samples) = load_jfk_samples() else {
+        eprintln!("SKIP e2e_tiny_jfk_no_timestamps: jfk.wav missing");
+        return;
+    };
+    let model = match NativeWhisperModel::load(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("SKIP e2e_tiny_jfk_no_timestamps: model load failed: {e}");
+            return;
+        }
+    };
+    let params = DecodeParams {
+        language: None,
+        translate: false,
+        timestamps: false,
+        n_threads: 8,
+        ..DecodeParams::default()
+    };
+    let noop = || Ok(());
+
+    let mut group = c.benchmark_group("native_engine/e2e");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    group.bench_function("e2e_tiny_jfk_no_timestamps", |b| {
+        b.iter(|| {
+            let out = model
+                .transcribe(black_box(&samples), &params, &noop)
+                .expect("transcribe");
+            black_box(out.segments.len())
+        });
+    });
+
+    group.finish();
+}
+
 // 5b. e2e_large_jfk — full transcribe over jfk with large-v3-turbo. No word
 // timestamps (matches whisper.cpp `dtw=0`) for an apples-to-apples head-to-head.
 fn bench_e2e_large_jfk(c: &mut Criterion) {
@@ -806,6 +850,7 @@ criterion_group!(
     bench_resample,
     bench_downmix,
     bench_e2e_tiny_jfk,
+    bench_e2e_tiny_jfk_no_timestamps,
     bench_e2e_large_jfk,
 );
 criterion_main!(benches);

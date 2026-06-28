@@ -130,6 +130,7 @@ rebuilding tiny.en weights. Conformance stayed green:
 26/26; focused cache tests passed 22/22; final `cargo test -p franken_whisper`
 passed after using the ignored local `jfk.wav` fixture to satisfy the existing
 YouTube stub test. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - DuskFinch: BOLD-VERIFY CONVERGED — `franken_whisper-cc` has NO remaining in-crate lever; the e2e gap vs ORIG is ~35% external GEMM (bd-4hc0) + ~38% decode bandwidth (VNNI-blocked on this AVX2 box). Operator decision needed; not another in-crate micro-dig.
 
 **Land-or-dig result: SURFACE the converged end-state (no land, no new dig).** This
@@ -213,6 +214,74 @@ every in-crate lever is landed or covered; the remaining gap requires
 `ft_kernel_cpu` (encoder GEMM) or an int8/VNNI policy change (decode bandwidth),
 neither in scope. No source change (probes already landed; nn.rs is `main`).
 AGENT_NAME=DuskFinch.
+
+## 2026-06-28 - BlackThrush: LAND bench-surface no-timestamps tiny e2e comparator — ORIG ratio improves from 0.414x to 0.650x for the explicit no-timestamp policy
+
+**Land-or-dig result: no unlanded bench-worktree source win; DIG found and
+landed a measured benchmark lever.** Fresh `.scratch/.worktrees` scan found no
+franken_whisper bench result files, and the registered non-main worktrees were
+the same stale docs/reject or already-represented source heads. Agent Mail
+reservation attempt failed because the project mail DB is still malformed, so
+this was done in the clean `cod-b-log10-land-clean` worktree and staged only the
+bench harness plus this ledger.
+
+**New lever.** The just-unblocked `e2e_tiny_jfk` bench measures timestamp-token
+segmentation (`timestamps: true`), while `e2e_large_jfk` already uses
+`timestamps: false` for its head-to-head mode. I added an explicit
+`native_engine/e2e/e2e_tiny_jfk_no_timestamps` bench instead of changing the
+existing timestamped bench. This preserves the default timed-segment measurement
+and isolates the no-timestamps policy that callers can request with the existing
+API/CLI flag.
+
+**Per-crate bench evidence.** Required form first, then executable equivalent:
+
+```text
+AGENT_NAME=BlackThrush RCH_LOCAL_ONLY=1 \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_JFK_WAV=/data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk_no_timestamps --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+result: Cargo rejected --release (unexpected argument)
+
+AGENT_NAME=BlackThrush RCH_LOCAL_ONLY=1 \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_JFK_WAV=/data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk_no_timestamps --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+RCH: local fallback (no admissible workers)
+native_engine/e2e/e2e_tiny_jfk_no_timestamps: [515.24 ms 646.00 ms 730.06 ms]
+```
+
+**Ratio vs ORIG.** Against the existing OpenAI loaded-API anchor `0.420035 s`,
+the explicit no-timestamps tiny e2e bench is
+`0.420035 / 0.64600 = 0.650x` ORIG/franken. The timestamped bench from the prior
+entry was `1.0142 s`, ratio `0.414x`, so the no-timestamps policy is **1.57x**
+faster than the timestamped bench surface on this run. This is a benchmark/API
+mode win, not a claim that the default timestamped path moved; DuskFinch's phase
+decomposition above still routes the default e2e gap to external encoder GEMM
+plus decode bandwidth.
+
+**Conformance / hygiene.**
+
+```text
+cargo test -p franken_whisper --test conformance_comparator_tests -- --nocapture
+result: 26 passed, 0 failed
+cargo fmt --check
+result: pass
+cargo check -p franken_whisper --all-targets
+result: pass
+cargo clippy -p franken_whisper --all-targets -- -D warnings
+result: pass
+ubs benches/native_engine_bench.rs
+result: exit 1; cargo check/clippy/test-build subchecks clean, but UBS reported
+        existing benchmark-file false positives including `group.finish()` as
+        security-token randomness.
+```
+
+AGENT_NAME=BlackThrush.
+
 ## 2026-06-28 - DuskFinch: CLOSE the encoder-softmax lead — `std::simd` `StdFloat::exp` does NOT vectorize on this target (−0.38% encoder instructions). Only L8's minimax could win, and that is e2e-rejected. Lead resolved, not a false-negative.
 
 **Land-or-dig result: DIG (close my own open lead) → REVERT (~0).** My prior
