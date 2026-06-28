@@ -3,6 +3,42 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: SHARPEN the bd-4hc0 redirect — the encoder GEMM is ~39% small-dim ATTENTION shapes (K=64 / N=64) that bd-4hc0 NEVER measured; its "~1.03×" was only the K≥384 projection/MLP shapes. A concrete unmeasured external sub-lever (~22% of e2e).
+
+**Land-or-dig result: load-immune ANALYSIS that makes the redirect concrete (no new
+in-crate lever; no land).** Building on the e2e decomposition (encoder ~62% of e2e,
+56% external sgemm), I broke the encoder GEMM down by MAC count (rigorous arithmetic
+from tiny.en's architecture — `n_state=384, n_head=6, head_dim=64, n_mlp=1536,
+n_ctx=1500, 4 layers`), per layer:
+
+```text
+QKV + out projections  [1500,384]x[384,384]            884M MAC   20%
+attention scores       [1500,64]x[64,1500]   (K=64)    864M MAC   20%  } ~39% ATTENTION
+attention x V          [1500,1500]x[1500,64] (N=64)    864M MAC   20%  }
+MLP fc1+fc2            [1500,384]x[384,1536] + ...     1768M MAC   40%
+```
+
+**The new insight.** bd-4hc0 re-measured the matmul→`gemm`/faer swap at **~1.03×**
+("not worth it") — but ONLY on the large-inner-dim shapes (`[1500,384]×[384,384]`,
+`[1500,384]×[384,1536]`, `[1500,1536]×[1536,384]`, `[1500,1280]×[1280,1280]`; all
+K≥384). It **never measured the attention scores/×V GEMMs**, which have a tiny
+dimension (K=64 for scores, N=64 for ×V) — exactly where a packing GEMM like
+`matrixmultiply` is weakest (packing/microkernel overhead is largest relative to the
+flops at small K/N). These attention GEMMs are **~39% of the encoder GEMM ≈ ~22% of
+e2e** (encoder is ~62% of e2e × 56% sgemm × 39% attention-share). They go through
+`ft_kernel_cpu` sgemm (encoder `tq=1500`, so NOT the `m==1` SAXPY decode fast path).
+
+**⇒ Refines operator-decision (b) into a SPECIFIC, UNMEASURED external sub-lever:**
+re-measure bd-4hc0's `gemm`/faer (or a dedicated small-dim kernel) on the encoder
+attention shapes `[1500,64]×[64,1500]` and `[1500,1500]×[1500,64]` — the prior ~1.03×
+verdict does not cover them, and small-K/N is `matrixmultiply`'s worst case, so the
+real attention-GEMM gain may be materially larger. This lives in `ft_kernel_cpu`
+(frankentorch swarm), out of `franken_whisper-cc` scope — a handoff lead, not an
+in-crate lever. (A hand-rolled in-crate small-K path was considered and rejected: a
+SAXPY over K=64 would rewrite the 9 MB `[1500,1500]` scores 64× = ~576 MB traffic,
+far worse than a tiled GEMM; the fix must be a better tiled kernel in `ft_kernel_cpu`,
+not a franken-side reroute.) No source change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-27 - IcyWren: LAND bounded resident model cache — model reload component collapses **12,393.7x**, full loaded-API ORIG gap still GEMM-limited
 
 **Land-or-dig result: no unlanded measured bench-worktree source win found, then
