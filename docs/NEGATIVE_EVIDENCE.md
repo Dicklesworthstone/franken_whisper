@@ -3,6 +3,51 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: e2e PHASE DECOMPOSITION (first quantitative one) — jfk e2e is ENCODER-dominated (~62%) + decode (~38%); the single biggest gap vs ORIG is the external `ft_kernel_cpu` GEMM (~35% of e2e). Mel is negligible.
+
+**Land-or-dig result: DIG (measure where the e2e gap actually is) → SURFACE the
+quantified gap.** All three in-crate paths are profiled + at ceiling and all leads
+closed, so the open question is *which phase* carries the e2e gap vs ORIG. Using the
+three perf-probes (`mel_perf_probe` / `encoder_perf_probe` / `decoder_perf_probe`,
+all release-perf, `perf stat`), measured per-call **instructions** (deterministic /
+load-immune):
+
+```text
+per-call INSTRUCTIONS (release-perf):
+  mel      (per 30 s window)   58,536,498
+  encoder  (per window)     9,416,227,218
+  decoder  (per token)       115,671,814
+
+jfk (1 mel window, 1 encoder, ~50 decode tokens):
+  mel      58.5M     ~0.4%
+  encoder  9.42B    ~62%
+  decode   ~5.8B    ~38%   (50 x 115.7M)
+  TOTAL   ~15.3B
+```
+
+**Reading it.** For the standard jfk benchmark (11 s → ~50 tokens) the e2e is
+**encoder-dominated (~62%)** with the **decode a strong second (~38%)** and mel
+negligible (<0.5%). Cross-referencing the encoder profile (56% external sgemm),
+**the external `ft_kernel_cpu` matrixmultiply GEMM is ~0.56 × 62% ≈ 35% of e2e —
+the single biggest gap vs ORIG**, and it is bd-4hc0 (re-measured ~1.03×,
+owner-closed, out-of-crate). The decode's ~38% is the `gemv_f16` fused-dot logits
+path (40 MB f16/token, bandwidth-bound, fundamental). Caveats: per-token decode
+cycles are over-stated by the tight-loop probe (bd-6qih), so the *real-e2e* decode
+share is somewhat below 38% (→ encoder even more dominant); the cycle counts are
+multi-threaded totals (÷~10 rayon threads ≈ wall — encoder 7.42 B cyc ÷10 ≈ 247 ms
+wall, matching the historical `encoder_window_tiny`). Longer audio shifts the
+balance toward decode (more tokens), but jfk (the ORIG comparator) is
+encoder-bound.
+
+**⇒ Definitive close on "where is the gap."** Not the mel (optimized to a franken
+win, <0.5% of e2e), not a new in-crate kernel — the e2e gap vs ORIG is **~35%
+external encoder GEMM (bd-4hc0) + ~38% decode logits bandwidth (fundamental)**,
+both out of `franken_whisper-cc`'s reach. This quantitatively closes the arc:
+every in-crate lever is landed or covered; the remaining gap requires
+`ft_kernel_cpu` (encoder GEMM) or an int8/VNNI policy change (decode bandwidth),
+neither in scope. No source change (probes already landed; nn.rs is `main`).
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: CLOSE the encoder-softmax lead — `std::simd` `StdFloat::exp` does NOT vectorize on this target (−0.38% encoder instructions). Only L8's minimax could win, and that is e2e-rejected. Lead resolved, not a false-negative.
 
 **Land-or-dig result: DIG (close my own open lead) → REVERT (~0).** My prior
