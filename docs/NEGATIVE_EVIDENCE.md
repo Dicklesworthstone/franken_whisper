@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: REJECT decode gemv-output uninit (matmul-uninit lever applied to the decode logits + per-layer projections) — e2e A/B INCONCLUSIVE: adjacent interleaved pairs contradict under load drift; expected ≈0.3% e2e (logits dead-init is ~10 MB vs the matmul's ~324 MB/window). Reverted to 0 source delta. The decode has no big dead-init (tq=1 ⇒ small outputs).
+
+**Land-or-dig result: LAND empty; DIG extended the dead-init vein to the decode,
+MEASURED inconclusive, reverted.** LAND: `origin/main == local` at `67089b0`, no
+`.scratch`/`.worktrees`, no parked bench.
+
+**DIG — the landed matmul win (`d44f1fa`) was a dead output zero-init; the decode
+has the same shape:** `decoder.rs` allocates `vec![0.0; …]` for the per-layer
+projection outputs (`y`, via `gemv_f16_batch`) and the logits (`vec![0.0; 51864]`,
+via `gemv_f16`), both then FULLY overwritten (verified: `gemv_f16` writes every
+`out_slice` band directly; `gemv_f16_batch` `copy_from_slice`s each disjoint band —
+no sum-merge, so the zero-init is dead for all `tq`). Converted both to an uninit
+`nn::alloc_gemv_out` helper (escape hatch `FW_DECODE_GEMV_ZEROINIT`) and A/B'd
+`e2e_tiny_jfk`, interleaved:
+
+```text
+A uninit  : 353.09 / 343.47 ms
+B zeroinit: 365.57 / 333.80 ms   (B2 CI [333.18,334.28] = caught a load dip)
+load drifted 14 -> 38 across the run
+```
+
+**⇒ Inconclusive / below noise.** A1<B1 (353 vs 365, −3.4%) but A2>B2 (343 vs 334) —
+**adjacent pairs contradict**, so the signal is load drift, not the lever. Magnitude
+check: the decode dead-init is **~10 MB total** (50 logits × 207 KB + tiny tq=1
+projections) vs the encoder matmul's **~324 MB/window** (36 × 9 MB scores), so the
+expected effect is ~3% of the matmul win ≈ **~0.3% e2e** — under the e2e wall-clock
+floor (e2e CIs span ~±3%). Unlike the matmul (big outputs, ON the critical path),
+the decode outputs are `tq=1` ⇒ small. Per "REVERT ~0-gain" + the control-spread
+discipline: REVERTED to 0 source delta; conformance GREEN by construction. **The
+matmul OUTPUT was THE dead-init lever; the decode (and gather, conv, cross-K/V) have
+no comparable one — dead-init vein now fully mined.** No source change kept.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: REJECT attention gather-buffer uninit (the matmul-uninit lever applied to qh/kh/kh_t/vh) — encoder A/B is BELOW the noise floor and confounded by load drift (uninit-at-high-load = zeroinit). Reverted to 0 source delta. The matmul OUTPUT was THE dead-init lever; the small head-parallel gather buffers add ~0.
 
 **Land-or-dig result: LAND empty; DIG = chased the dead-init vein from the landed
