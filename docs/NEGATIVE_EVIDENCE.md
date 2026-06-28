@@ -3,6 +3,75 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: BOLD-VERIFY at HEAD c665ec3 — first CLEAN-LOAD (load ~3.5–8.7, not ~187) bench re-confirms the landed residency lever (**628.9x**) and the e2e tiny-JFK gap at PARITY with the OpenAI anchor (**1.011x**); the sole remaining lever is the external ft-kernel-cpu K=64 microkernel — no in-crate win to land.
+
+**Land-or-dig result: LAND side empty (no worktree holds an unlanded measured
+win — every branch is `+0` ahead of `main` except one whose sole extra commit is a
+docs *rejection*, not a win). DIG side closed at the kernel-call level.** This is a
+verification pass, the first under a low-load window after the long run of
+"load ~187, no measurement possible" entries.
+
+**Fresh clean-load measurement (local execution — see methodological note).**
+
+```text
+AGENT_NAME=IcyWren
+FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cc-local
+cargo bench --profile release -p franken_whisper --bench native_engine_bench -- \
+  'native_engine/(model_residency|e2e/e2e_tiny_jfk$)' \
+  --sample-size 10 --warm-up-time 0.1 --measurement-time 1
+```
+
+```text
+native_engine/model_residency/tiny_parse_weights_nonresident:
+  [156.27 ms 160.45 ms 165.06 ms]
+native_engine/model_residency/tiny_resident_cache_lookup:
+  [13.608 µs 14.090 µs 14.577 µs]
+native_engine/model_residency/tiny_resident_canonical_lookup:
+  [21.959 ns 22.404 ns 23.061 ns]
+native_engine/e2e/e2e_tiny_jfk:
+  [407.13 ms 415.56 ms 421.02 ms]
+```
+
+Ratios from Criterion means:
+
+```text
+resident canonical vs current resident lookup:     14.090 µs / 22.404 ns = 628.9x
+resident canonical vs parse+weights ORIG component: 160.45 ms / 22.404 ns = 7,161,756x
+e2e_tiny_jfk vs OpenAI loaded-API anchor:           0.420035 s / 0.41556 s = 1.011x
+```
+
+The residency lever reproduces the landed `601.2x` (now `628.9x` clean-load); the
+e2e in-process `transcribe` sits at `415.56 ms`, i.e. **parity** (`1.011x`) with the
+recorded OpenAI loaded-API anchor `0.420035 s`. Caveat kept explicit: `e2e_tiny_jfk`
+is the lean in-process path (no API/IPC wrapper), so `1.011x` is not a strict
+apples-to-apples claim against the loaded-API harness — it CONFIRMS the documented
+faithful-port ceiling rather than asserting a new win.
+
+**DIG — the one remaining concrete lever, traced to the kernel call (not just
+catalogued).** Biggest gap with any headroom is the encoder attention-scores GEMM
+`[1500,64]×[64,1500]` (K=64, prior probe 171 GFLOP/s). Code path:
+- `nn::matmul` delegates **100% of f32 matmul** to
+  `ft_kernel_cpu::matmul_tensor_contiguous_f32` (`src/native_engine/nn.rs:10,170`).
+- For K=64 (≤ `F32_2D_MAX_K = 1024`) ft-kernel-cpu already routes to its **2-D-tiled
+  parallel** sgemm path (`frankentorch/crates/ft-kernel-cpu/src/lib.rs:55,1070`), not
+  a naive row split — so the only further win is a better K=64 microkernel **inside**
+  ft-kernel-cpu (a 1.7 MB single-file kernel in the separate `frankentorch` project).
+
+⇒ Confirms the prior DECISION/HANDOFF at the call level: the sole lever is the
+external, owner-gated `ft_kernel_cpu` microkernel (bd-4hc0), cross-project and beyond
+a faithful in-crate change. `franken_whisper-cc` is at its faithful-port ceiling.
+
+**Methodological note for future benchers — model-dependent benches MUST run
+locally.** `rch exec` routed this bench to remote worker `ovh-a` and **every**
+model/jfk-dependent bench SKIPped (`model tiny.en missing`): rch syncs source but not
+the 74 MB `ggml-tiny.en.bin` / `jfk.wav` fixtures, which exist only on this host.
+The real numbers above come from direct local `cargo bench` (no `rch exec`); the
+prior residency numbers in this ledger likewise came from rch's local fallback. Use
+local execution (or pre-stage the model on the worker) for `model_residency` /
+`encoder` / `decoder` / `e2e` groups; the `rch` fleet can only measure the
+model-free `mel` group. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: LAND precanonicalized resident acquire — resident model hot path drops from 14.792 µs to 24.605 ns (**601.2x**); parse+weights ORIG component ratio is **6,621,418x**.
 
 **Land-or-dig result: landed a measured in-process API-server lever without
