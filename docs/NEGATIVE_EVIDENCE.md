@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: alien-graveyard / alien-artifact-coding dig on the two sole gaps — EVERY exotic technique is either external (a `ft_kernel_cpu` kernel detail) or breaks the faithful-port contract. The binding limit is the faithful port, not missing cleverness.
+
+**Land-or-dig result: dug the advanced-technique space; no in-scope alien lever
+(load ~187, no bench anyway).** With the full e2e GEMM landscape mapped, only two
+gaps remain — the encoder small-dim attention sgemm (~22% e2e) and the decode f16
+logits bandwidth (~38% e2e). Evaluated each against the alien-graveyard /
+alien-artifact-coding catalogue; recording why none yields a `franken_whisper-cc`
+lever, so this is not re-tried:
+
+**Encoder attention GEMM `[1500,64]×[64,1500]` (K=64):**
+- *Strassen / Winograd fast-matmul* — help large square matmuls by trading mults
+  for adds; useless at **K=64** (the contraction, not the output, is small) and
+  they degrade numerics. Also a kernel-internal change = `ft_kernel_cpu`.
+- *Rank-K / panel-specialised microkernel* — the real fix, but that IS a better
+  `matrixmultiply`/`gemm` kernel → **external** (bd-4hc0 sub-target, already filed).
+- *Low-rank / Nyström attention approximation* — changes outputs; **breaks the
+  faithful port** (franker reproduces whisper.cpp's exact softmax attention).
+
+**Decode f16 logits GEMV `[1,384]×[384,51864]` (bandwidth-bound):**
+- *int4 / sub-byte weight packing* — halves bandwidth but is non-faithful (changes
+  logits) AND needs a custom dequant; int8 itself is already 0.24× without VNNI,
+  and this box has **no AVX-512/VNNI** (permanent).
+- *Sketching / top-k candidate logits (hierarchical / adaptive softmax)* — changes
+  which token argmax picks; **breaks the faithful greedy decode**.
+- *Cache-blocking the 40 MB f16 matrix* — already L3-resident (128 MB L3), so it is
+  L3-bandwidth-bound and the fused f16c dot (gemv_f16) is already at that ceiling.
+
+**⇒ The binding constraint is the FAITHFUL-PORT contract** (franken does
+whisper.cpp's exact math, only faster), not a missing optimization. Every remaining
+speedup either lives in the external `ft_kernel_cpu` GEMM kernel or requires
+changing the algorithm/output (out of contract) or VNNI hardware (absent). This
+closes the "dig harder with advanced math" angle: there is no exotic in-scope
+lever. `franken_whisper-cc` is at its faithful-port performance ceiling. No source
+change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: COMPLETE the GEMM map — the DECODE is 100% GEMV (m=1, all landed), so it has NO bd-4hc0-style sub-lever. The SOLE external GEMM lever in the whole e2e is the encoder small-dim attention shapes.
 
 **Land-or-dig result: load-immune completion of the GEMM landscape (no land; no
