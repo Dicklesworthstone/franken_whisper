@@ -62,7 +62,7 @@ norm_dim) does not touch franken's hot path. A future ft fused kernel for franke
 shapes is the most likely next free win — worth a periodic re-scan, not a per-cycle
 re-dig. AGENT_NAME=IcyWren.
 > **Periodic re-scan log** (LAND clean + ft re-scan; terse, update-in-place — not new entries):
-> - re-scans #1–5 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no `.scratch`/`.worktrees` ⇒ no change, converged. #3 ruled out new ft-core `632f657d` (in-place fused-elementwise accessor — tensor-layer infra, N/A to franken's raw-`&mut [f32]` hot path). #4: box load sustained ~15–23 across all cycles (swarm-busy) ⇒ no low-load window for a definitive ratio; operating-condition ratio ~1.24x (load ~18), theoretical low-load ~1.31x.
+> - re-scans #1–6 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no `.scratch`/`.worktrees` ⇒ no change, converged. #6 load 71/46/28 (swarm-busy) — no bench window. #3 ruled out new ft-core `632f657d` (in-place fused-elementwise accessor — tensor-layer infra, N/A to franken's raw-`&mut [f32]` hot path). #4: box load sustained ~15–23 across all cycles (swarm-busy) ⇒ no low-load window for a definitive ratio; operating-condition ratio ~1.24x (load ~18), theoretical low-load ~1.31x.
 
 ## 2026-06-28 - IcyWren: the recurring "jax: a DIFFERENT primitive" hint — definitively RULED OUT for franken_whisper-cc. GPU present (GTX 1070) but NO DRIVER (`/dev/nvidia*` absent, `nvidia-smi` missing) ⇒ unusable; and -cc is the CPU variant (GPU = the separate `gpu-frankenjax` feature/build, out of scope). fj-lax's CPU matmuls are f64/f32-accumulate EVIDENCE impls (`cz0g0_*_evidence.rs`), not perf kernels.
 
