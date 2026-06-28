@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: DECISION/HANDOFF — in-crate arc COMPLETE at the named-function level. The only remaining lever is EXTERNAL (`ft_kernel_cpu` GEMM + its rayon parallelization). Recommend the in-crate loop redirect or stop.
+
+**Land-or-dig result: terminal synthesis (no land; no in-crate lever exists).** The
+preceding entries take the franken_whisper-cc optimization to the named-function
+floor. Consolidated map of the real e2e (`e2e_tiny_jfk`, 350 ms, ~31× realtime),
+with each piece's disposition:
+
+| e2e share | component (named) | disposition |
+|---|---|---|
+| **~39%** | `matrixmultiply` sgemm (encoder GEMM) | **EXTERNAL** — shape-limited (scores K=64 ties any kernel) + bd-4hc0 faer swap ~1.14× rejected |
+| **~26%** | `crossbeam_epoch` (rayon work-steal pin+GC) | INHERENT — fewer threads regress +19%; QKV-fusion rejected; crossbeam internals = external |
+| **~9%** | `gemv_f16` (decode projections+logits) | at the 88 GB/s fused-dot ceiling; int8 dead (no VNNI) |
+| ~2.4% | `load_linear_transposed` | one-time model load (profile artifact, not per-transcribe) |
+| <2.5% ea | softmax / memset / expf / gelu | all COVERED (SIMD/uninit/logsumexp sweeps, ~0) |
+
+**The decisive synthesis:** the ~26% crossbeam is the rayon PARALLELIZATION overhead
+of the GEMM/gemv work, so the GEMM's *total* footprint (compute + its dispatch share)
+is the dominant ~half of e2e — and it lives entirely in **external `ft_kernel_cpu`**
+(franken's `nn::matmul` delegates to it; franken cannot touch the kernel or its
+parallelization). franken's own halves — `gemv_f16` (bandwidth ceiling), the mel FFT
+(optimised, 5 landed wins), and every small kernel — are at their limits.
+
+**⇒ There is NO in-crate lever anywhere in the measured pipeline.** Every level —
+kernel, phase, e2e, and now named-function — confirms `franken_whisper-cc` is at its
+faithful-port + hardware ceiling. The ONLY remaining performance lever is EXTERNAL:
+`ft_kernel_cpu`'s matmul (a better small-K/scores kernel + lower-overhead
+parallelization), which is the frankentorch swarm's domain, not this crate's. The
+in-crate land-or-dig loop has converged; recommend redirecting effort to
+`ft_kernel_cpu` or standing the loop down. Probe toolkit for any re-measurement:
+`mel_perf_probe`, `encoder_perf_probe`, `decoder_perf_probe`, `gemm_shape_probe`,
+`gemv_f16_probe` (examples/). No source change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: SYMBOLIZED real-e2e profile names every hotspot — the surprise (rayon/crossbeam epoch ~26%) is INHERENT, NOT a lever (fewer threads regress +19%; QKV-fusion already rejected). e2e fully explained.
 
 **Land-or-dig result: definitive symbolized profile + over-threading lever REJECTED
