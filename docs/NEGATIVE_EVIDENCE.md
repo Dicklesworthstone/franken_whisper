@@ -3,6 +3,31 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: thorough multi-agent LAND harvest — every worktree/branch checked; no committed faithful comparator win. The one branch that looks like a win (`cod-b-log10-land`, "+25% mel") is RELAX-PARITY (owner parity-policy gated), source reverted/stashed, and mel-only (~0.17% e2e). Nothing to land.
+
+**Land-or-dig result: LAND harvest done and empty; no source change.** With the
+component audit complete and the comparator at parity (prior entries), this cycle
+exercised the loop's primary value — the LAND guard — thoroughly across ALL agents'
+work, not just `.scratch`/`.worktrees`:
+- `origin/main == local` at `6940073`; no `.scratch`/`.worktrees` dirs; no parked
+  franken_whisper bench.
+- Every linked worktree `+1` ahead of `main` is a STALE head (their `.rs` diffs vs
+  `main` are divergence/deletions, not new wins; the `perf(...)` ones —
+  fused-f16c gemv, simd-mel projection — are already in `main`).
+- All recent local branches are docs *rejections* or stale.
+- The only branch that reads like a win — **`cod-b-log10-land`** (BlackThrush,
+  "combined relax-parity mel upside ~25%") — is **not landable**: it (1) requires
+  RELAXING the bit-exact-with-whisper parity contract (an OWNER parity-policy
+  decision — the same ≤few-ULP relaxation already accepted for the f16c dot), (2)
+  has its source REVERTED ("mel.rs == main; log10 in stash@{0}", radix-5 base case
+  only proposed), and (3) is mel-only ≈ **0.17% e2e** even at +25% mel. It is an
+  owner-gated *proposal*, not a committed faithful win.
+
+⇒ No committed faithful comparator win exists in any agent's branch; nothing to
+land. (If the owner makes the parity-policy call, the relax-parity mel path is the
+one pre-measured upside — but it is mel ≈0.17% e2e, not a comparator mover.) No
+source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: the comparator GAP vs OpenAI-Whisper is already CLOSED — measured PARITY (1.011x). "Next-biggest gap vs OpenAI-Whisper" is a gap vs theoretical peak, NOT vs OpenAI; franken already matches OpenAI-Whisper on tiny e2e, so any further speedup is a LEAD (beating PyTorch's BLAS), not closing a gap.
 
 **Land-or-dig result: LAND empty; DIG reframes the premise against the measured
