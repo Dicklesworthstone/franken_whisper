@@ -3,6 +3,42 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: SYMBOLIZED real-e2e profile names every hotspot — the surprise (rayon/crossbeam epoch ~26%) is INHERENT, NOT a lever (fewer threads regress +19%; QKV-fusion already rejected). e2e fully explained.
+
+**Land-or-dig result: definitive symbolized profile + over-threading lever REJECTED
+(no land; no in-crate lever).** Rebuilt the bench with `release-perf` (debuginfo,
+2m11s) to symbolize last entry's raw-addr ~85%. The named real-`e2e_tiny_jfk`
+breakdown (IP sampling):
+
+```text
+25.6%  matrixmultiply::sgemm_kernel::kernel_target_fma  ┐ encoder GEMM ~39%
+13.1%  matrixmultiply::gemm::gemm_loop                  ┘ (external; shape-limited/bd-4hc0)
+13.7%  crossbeam_epoch::with_handle (pin)               ┐
+ 9.0%  crossbeam_epoch::Global::try_advance (epoch GC)  ├ rayon/crossbeam ~26% (INHERENT)
+ 2.2%  crossbeam_deque::Stealer::steal + find_work etc. ┘
+ 6.2%  nn::gemv_f16  + 3.2% gemv_f16_batch              = decode gemv ~9% (88 GB/s ceiling)
+ 2.4%  encoder::load_linear_transposed   <- ONE-TIME model load (from_ggml), profile
+                                            artifact (perf captured the setup phase), not per-transcribe
+ 2.3%  nn::softmax_rows | 1.95% memset | 1.76% expf | 0.74% tanhf  <- all COVERED
+```
+
+**The 26% crossbeam was the surprise — high `try_advance` (epoch GC) is the classic
+over-threading signature. TESTED and REJECTED as a lever, two ways:**
+- **Thread count** — `RAYON_NUM_THREADS` A/B on e2e (release): **64=377 ms (best),
+  32=447 ms (+19%)**, fewer regress further. More threads is faster DESPITE the epoch
+  overhead → the parallelism is net-positive; the overhead is the inherent cost of
+  rayon's work-stealing deque (crossbeam internals — external, not franken's to tune).
+- **Fewer dispatches (QKV fusion)** — already MEASURED & REJECTED (PERF_LEDGER L:
+  1.14× component / net ~0 e2e; a prior artifact was 16% slower).
+
+**⇒ Every e2e hotspot is now NAMED and accounted for:** external sgemm (39%,
+shape-limited), inherent rayon overhead (26%, optimal at 64 threads), gemv_f16 at
+ceiling (9%), one-time-load artifact (2.4%), and small covered kernels (softmax/
+memset/expf/gelu, each <2.5%). No in-crate lever remains anywhere in the measured
+pipeline. This is the deepest the profile goes; `franken_whisper-cc` is at its
+faithful-port + hardware ceiling, confirmed at the named-function level. No source
+change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: FIRST real-e2e perf profile (not isolated phases) — the reopened decode (48%) has no new lever; every symbolized hotspot is covered.
 
 **Land-or-dig result: profiled the integrated pipeline (no land; no lever).** Last
