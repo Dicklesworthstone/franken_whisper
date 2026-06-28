@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: CONVERGENCE CAPSTONE — native engine at its CPU/faithful-port ceiling, leading OpenAI-Whisper ~1.24–1.31x via TWO landed wins. The in-scope + fused-primitive + jax/GPU search space is comprehensively closed; further speed requires owner-scoped work (a NEW frankentorch fused kernel, the GPU variant, or external GEMM). This entry consolidates the scattered per-cycle rulings so they are not re-dug.
+
+**Land-or-dig result: nothing to land (origin==local `7f5ae83`, no
+`.scratch`/`.worktrees`); the dig space is fully mapped. 0 source delta.**
+
+**LANDED wins (parity → ~1.24–1.31x vs OpenAI tiny e2e):**
+- `d44f1fa` matmul **uninit-output** (skip the dead serial zero-init before the
+  parallel GEMM) — ~20% faster encoder (uninit 138 vs zeroinit 174 ms), ~16% e2e.
+- `99feaa6` fused **SDPA encoder attention** (`ft_kernel_cpu::sdpa_forward_f32`,
+  row-tiled, one parallel call) — full attention 2.35x, ~16% faster encoder,
+  faithful (max|Δ| 1.2e-7, conformance 27+26+6 GREEN). Decode keeps per-head.
+
+**COMPREHENSIVELY CLOSED (measured-and-rejected / ruled-out — do NOT re-dig):**
+- encoder GEMM: franken `matmul` (matrixmultiply sgemm) is best; `sgemm_bt`/
+  `linear_tensor_f32` 0.47–0.87x SLOWER; mlp_fc1 already 1377 GF/s ≈ peak.
+- bmm attention: REGRESSED 62% (materialization); per-head tiling: REGRESSED.
+- conv stem: `conv2d_forward_f32` is im2col for k=3 (its no-im2col path is 1×1
+  stride-1 only) — same ceiling as franken's own im2col.
+- decode attn: head-parallel rayon + m==1 SAXPY + precomputed cross-K/V — optimal;
+  SDPA is encoder-only (tq≥64); sdpa for tq=1 is slower.
+- decoder GEMV / logits: bandwidth+orchestration bound; NUMA-pin REFUTED (per-token
+  working set evicts; per-dispatch sync kills tight-loop residency); thresholds tuned.
+- jax/GPU: GTX 1070 present but NO driver (`/dev/nvidia*` absent) + -cc is the CPU
+  variant (GPU = `gpu-frankenjax`, out of scope).
+- no fused FFN; gelu f64-only (franken f32); int8-linear VNNI-dead.
+
+**Dependency monitored:** ft-kernel-cpu HEAD `2ddced53` — sgemm/sdpa/matmul/gemv
+UNCHANGED since the SDPA build; the swarm's recent work (sort/reductions/activations/
+norm_dim) does not touch franken's hot path. A future ft fused kernel for franken's
+shapes is the most likely next free win — worth a periodic re-scan, not a per-cycle
+re-dig. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: the recurring "jax: a DIFFERENT primitive" hint — definitively RULED OUT for franken_whisper-cc. GPU present (GTX 1070) but NO DRIVER (`/dev/nvidia*` absent, `nvidia-smi` missing) ⇒ unusable; and -cc is the CPU variant (GPU = the separate `gpu-frankenjax` feature/build, out of scope). fj-lax's CPU matmuls are f64/f32-accumulate EVIDENCE impls (`cz0g0_*_evidence.rs`), not perf kernels.
 
 **Land-or-dig result: DIG investigated the recurring "jax" hint to the end; not
