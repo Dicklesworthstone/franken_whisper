@@ -52,6 +52,46 @@ provide a clean-worktree fixture path for `jfk.wav` without staging binary churn
 authorize an audited mmap/resident-weight design with eager-load fallback, or move
 the next lever to `ft-kernel-cpu` where the measured encoder GEMM gap lives.
 AGENT_NAME=BlackThrush.
+## 2026-06-27 - DuskFinch: clean ENCODER probe built + profiled — encoder is at its in-crate ceiling too (56% external sgemm; the franken-side softmax/gelu/rayon are all already covered). e2e gap vs ORIG = the external GEMM (bd-4hc0).
+
+**Land-or-dig result: DIG (profile the largest e2e slice) → confirm ceiling; LAND
+the reusable probe.** Completing the e2e profiling trilogy (mel ✓ done, decoder ✓
+ceiling, now encoder). Built `examples/encoder_perf_probe.rs` (mirrors the mel/
+decoder probes): load `tiny.en` + build one mel window once, loop
+`encoder::forward`. `perf record cycles:u` (release-perf symbols, 980 512 samples):
+
+```text
+matrixmultiply sgemm_kernel + gemm_loop + masked   56.2%   EXTERNAL ft_kernel_cpu GEMM (bd-4hc0)
+__expf_fma + franken nn::softmax_rows              ~13%    attention softmax over [1500,1500] x 6h x 4L
+crossbeam_epoch pin + GC + steal/find_work         ~12%    rayon overhead
+__tanhf (gelu) + nn::gelu                            ~3%
+__memset + nn::matmul_bias/attention_raw/norm_rows  ~3%
+```
+
+**Reading it — NO new in-crate lever; encoder is GEMM-bound + covered kernels.**
+The encoder is dominated by the **external** `ft_kernel_cpu` matrixmultiply sgemm
+(56%, QKV/MLP/attention GEMMs) — bd-4hc0, re-measured ~1.03×, owner-closed,
+out-of-crate. Every franken-side hot kernel is already covered:
+- **softmax (~13%)**: PERF_LEDGER **L8** vectorized the `exp` (3.56× isolated) but
+  measured **~0 e2e (marginally negative)**, and BlackThrush re-measured a partial-
+  SIMD softmax REGRESSION (NEG-EV 2026-06-26). Covered — not re-dug.
+- **gelu (~3%)**: same L8 (minimax `tanh`) — ~0 e2e.
+- **rayon/epoch (~12%)**: encoder `attention_raw` rayon dispatch was MEASURED-and-
+  REJECTED ~0 (PERF_LEDGER L-series); the GEMM's own rayon is external.
+- **allocation (~3% memset)**: small — NOT the mel's 28% churn; no arena lever here.
+
+**⇒ Conclusion.** All three in-crate paths — mel (optimized: radix-5 + two-for-one
++ uninit/arena reuse), decoder (fused dot + m==1 SAXPY + tuned rayon), encoder
+(softmax/gelu/rayon all covered) — are at their measured ceiling. The single
+remaining e2e gap vs ORIG is the **external `ft_kernel_cpu` matrixmultiply GEMM
+(bd-4hc0)**, out of `franken_whisper-cc` scope. `encoder_perf_probe.rs` lands as
+reusable infra. **Lead for a future calm window** (NOT re-dug now per
+stop-re-verifying): L8 rejected softmax SIMD by *wall-clock* (~0 e2e on this
+contended box) — given the wall-clock false-negative pattern (cf. the cfft/
+projection levers), a perf-instruction A/B of the SIMD `exp` on THIS encoder
+softmax (~13%, much bigger than the decoder logsumexp L8 also covered) could
+re-check whether the e2e ~0 was a noise-floor false negative. No lib change.
+AGENT_NAME=DuskFinch.
 
 ## 2026-06-27 - BlackThrush: REJECT / no-ship per-worker mel scratch arena uninit — **no same-worker measured win; ORIG ratio unchanged**
 
