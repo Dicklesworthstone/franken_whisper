@@ -3,6 +3,56 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - BlackThrush: BOLD-VERIFY blocker — no `.scratch/.worktrees` win to land; strict ORIG gap still needs fixture/unsafe-policy or `ft_kernel_cpu`, not another covered in-crate micro-lever
+
+**Land-or-dig result: no landable bench-worktree source win; DIG surfaced a
+hard measurement/ownership blocker.** The repo-local `.scratch/.worktrees` scan
+found no franken_whisper bench worktrees. The registered worktree audit found the
+same non-main heads as prior entries: docs/reject branches plus the old mel SIMD
+projection (`4dd616f`) and f16c GEMV (`134f404`) source heads, both already
+represented or superseded on current `main`. No measured source win was available
+to land without replaying covered work.
+
+**New radical lever assessment.** The current biggest strict ORIG gap remains the
+loaded-model API / encoder setup path: prior evidence is franken `0.535540 s` vs
+OpenAI loaded API `0.420035 s`, so ORIG/franken = **0.784x**. The canonical
+graveyard route points to residency / zero-copy / explicit mapped-memory
+primitives and tiled/fused matrix execution; the FrankenSuite summary requires
+evidence-ledger, fallback, and shadow/conformance gates for such changes. In this
+crate, the only still-plausible new lever is **model-resident or mmap-backed
+weights with deterministic eager-load fallback**, or moving the encoder GEMM/rayon
+kernel in `/data/projects/frankentorch/crates/ft-kernel-cpu`. Both are outside a
+safe one-turn `franken_whisper` source landing: mmap needs owner-approved audited
+`unsafe` policy, and the GEMM kernel lives in the dependency crate. Covered
+in-crate substitutes are not reopened: QKV fusion is already recorded rejected,
+decoder per-token kernels are at ceiling, and non-model hermetic kernels
+(`gelu`, `layer_norm`, `resample`, `downmix`, f16 GEMV) are already characterized.
+
+**Per-crate bench evidence.** Required form first, then executable equivalent:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+result: Cargo rejected --release (unexpected argument)
+
+AGENT_NAME=BlackThrush FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+RCH: local fallback (no admissible workers)
+build: finished release profile in 9m51s
+bench result: SKIP e2e_tiny_jfk because tests/fixtures/native/jfk.wav is absent
+also skipped: encoder_window_{tiny,large}, decoder_token_step_{tiny,large}, e2e_large_jfk
+```
+
+**Ratio vs ORIG.** No source change was kept and no loaded-model/e2e measurement
+ran, so the strict ORIG ratio remains **0.784x**. Concrete unblock is unchanged:
+provide a clean-worktree fixture path for `jfk.wav` without staging binary churn,
+authorize an audited mmap/resident-weight design with eager-load fallback, or move
+the next lever to `ft-kernel-cpu` where the measured encoder GEMM gap lives.
+AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - BlackThrush: REJECT / no-ship per-worker mel scratch arena uninit — **no same-worker measured win; ORIG ratio unchanged**
 
 **Land-or-dig result: no unlanded bench-worktree source win found, then DIG and
