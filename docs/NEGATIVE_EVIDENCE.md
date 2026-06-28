@@ -3,6 +3,30 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: REJECT bmm encoder attention — IMPLEMENTED + benched the full path; it REGRESSES ~62% (222 vs 137 ms encoder), even though the isolated scores matmul was 1.14x faster (prior entry). The batched path loses the head-parallel PIPELINING and materializes all 6 heads' 54 MB scores at once. Reverted to 0 source delta. Same lesson as NUMA: an isolated-component win doesn't survive the real integration.
+
+**Land-or-dig result: DIG implemented the prior cycle's validated bmm lever end-to-
+end and MEASURED a clear regression → reverted.** LAND: `origin == local` at
+`b0b2f5e`. Built the full `FW_ATTN_BMM` path in `attention_raw` (gather-all-heads
+rayon-parallel → `bmm` scores → per-head mask+softmax → `bmm` ×V → scatter,
+bit-identical), encoder A/B interleaved:
+```text
+A per-head : 144.04 / 137.56 ms
+B bmm      : 234.04 / 222.47 ms   (B2 CI [222.21,222.94] @ load 12 = clean, not noise)
+⇒ bmm ~62% SLOWER
+```
+**Why the 1.14x scores win evaporated:** franken's per-head scheme runs 6 threads,
+each PIPELINING its head's gather→matmul→softmax→×V over a 9 MB working set. The bmm
+path SERIALIZES the phases across all heads (gather-all, then one bmm, then softmax-
+all, then one bmm, then scatter), losing that pipelining, AND materializes all 6
+heads' scores at once (**54 MB** > 32 MB CCD L3 → memory pressure). The +14% matmul
+is dwarfed by the lost pipelining + the 54 MB materialization. ⇒ **The per-head
+head-parallel scheme is FASTER; bmm rejected for the encoder attention.** Reverted;
+conformance GREEN by construction. **Lesson (again, cf. NUMA tight-loop): an isolated
+component speedup does NOT translate when the integration changes the parallelism
+structure (pipelining) and working-set size — measure the FULL operation, not the
+kernel.** No source change kept. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: VALIDATED a real "different primitive" — `ft_kernel_cpu::bmm_tensor_contiguous_f32_into` (batched matmul, landed in frankentorch 3 days ago) is **1.14x** faster than franken's per-head attention scores (one clean dispatch vs 6 nested rayon-flooding head-threads). NOT a tight-loop artifact (direct matmul A/B). Integration is a moderate `attention_raw` refactor — ~0.5–1% e2e — deferred (bench+conformance would blow the 60-min window).
 
 **Land-or-dig result: DIG validated a modest real lever via a focused probe; the
