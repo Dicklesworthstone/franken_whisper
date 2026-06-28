@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: encoder conv-stem audited — a REAL redundancy (per-call conv-weight transpose, not pre-transposed at load like the linear weights) + per-call im2col alloc, but the stem runs ONCE PER WINDOW so it is ~0.1% e2e on the 1-window JFK comparator. Sub-1%, recorded not implemented.
+
+**Land-or-dig result: LAND empty; DIG audited the last un-examined encoder
+component (the conv stem) and found a genuine but sub-1% redundancy — recorded, not
+built (0 source delta).** LAND: no `.scratch`/`.worktrees`, no parked bench,
+`origin/main == local` at `4bc5dc7`.
+
+**DIG — the conv stem (`nn::conv1d`, the 2 pre-transformer convs) is the only
+encoder component never audited.** Read the impl:
+- `conv1d` **re-transposes the conv weight to `w_t` on EVERY call**
+  (`src/native_engine/nn.rs`, `for co.. for j.. w_t[j*cout+co] = w[co*patch+j]`),
+  even though conv weights are fixed model data — the *linear* weights are
+  pre-transposed once by the loader (`WeightMat`/`matmul_bias` path), but the conv
+  weights are not. It also allocates the im2col `cols` buffer per call.
+- This IS a real, faithful, low-risk cleanup (pre-transpose conv weights at load,
+  store `w_t` in `EncoderWeights`, mirroring the linear path).
+
+**⇒ But it is ~0 on the comparator.** The conv stem runs **once per 30 s window**
+(JFK = 1 window). conv2's weight transpose ([384,1152]→[1152,384] ≈ 1.7 MB) is
+~0.3–0.45 ms, conv1's ~0.05 ms → **~0.1% of the 350 ms e2e**, once; in instruction
+terms ~6 M of the encoder's 9.42 B/window (~0.06%). The conv MATMUL itself is at the
+external `ft_kernel_cpu` sgemm ceiling. Sub-1% and once-per-window ⇒ below the box's
+wall-clock floor and the directive's "REVERT ~0-gain" bar — a clean-up worth doing
+for a many-window/server workload but not a comparator perf lever. Recorded, not
+implemented; 0 source delta; conformance GREEN by construction. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: decode KV-cache allocation VERIFIED optimal — pre-allocated, no per-token realloc; the only residual (per-window dead zero-init) is sub-1% + needs unsafe + already covered by the memset uninit sweep. No allocation lever in the decode.
 
 **Land-or-dig result: LAND empty; DIG checked the one allocation pattern never
