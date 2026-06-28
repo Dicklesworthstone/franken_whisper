@@ -3,6 +3,47 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: REJECT kh_t-transpose elimination in encoder attention — FIRST quantification of attention's non-matmul memory overhead; the avoidable `kh_t` transpose is only 0.376 ms/layer (≤0.64% e2e, overlapped) AND needs an out-of-scope `ft_kernel_cpu::sgemm_bt` exposure ⇒ measured ~0, not built.
+
+**Land-or-dig result: LAND side empty; DIG measured a NEW non-GEMM angle to ~0 →
+nothing built (0 source delta).** LAND: no `.scratch` / `.worktrees` dirs, no parked
+franken_whisper bench output of mine, `origin/main == local` at `6287721` — nothing
+to land. The running `rch`/`cargo` procs on the box are other projects' agents.
+
+**DIG — a genuinely NEW angle the kernel-focused digs never measured.** Every prior
+encoder dig measured GEMM *GFLOP/s*; none measured the per-head MEMORY shuffling
+inside `attention_raw` (the gather + the explicit `kh_t` transpose built at
+`src/native_engine/nn.rs:1228-1236` purely to keep the scores matmul contiguous).
+`ft_kernel_cpu` has a bt sgemm (`sgemm_bt`, "bit-for-bit identical to
+materialise-transpose-then-dgemm") that would let `scores = qh @ kh^T` skip the
+`kh_t` build. Before touching anything I sized the avoidable cost with a model-free
+sub-step probe (encoder shape Tq=Tk=1500, n_state=384, d_head=64, n_head=6,
+best-of-300 on this box):
+
+```text
+(a) Q+K scale-gather : 1.672 ms / layer   [unavoidable: head deinterleave]
+(b) kh_t transpose   : 0.376 ms / layer   [AVOIDABLE via bt matmul]
+(c) V gather         : 0.072 ms / layer   [unavoidable]
+```
+
+**⇒ REJECT.** The avoidable `kh_t` transpose is **0.376 ms/layer → 2.26 ms/window
+(6 layers) ≈ 0.64% of the 350 ms e2e**, and that is an UPPER bound — the 6 heads run
+on parallel threads, so the transpose overlaps other heads' matmuls and the
+realizable wall-clock saving is strictly less. Worse, capitalizing it requires
+exposing `ft_kernel_cpu::sgemm_bt` (it lives in a private `mod gemm`; the only
+franken-callable entry, `matmul_tensor_contiguous_f32`, demands contiguous layout) —
+an out-of-`franken_whisper-cc` change in the swarmed `frankentorch` repo for a sub-1%
+overlapped gain. Below the box's wall-clock noise floor and not worth a cross-crate
+change. Not built; 0 source delta; conformance GREEN by construction.
+
+**New datum surfaced (not a covered re-verify):** the Q+K scale-gather — 1.672
+ms/layer → ~10 ms/window ≈ **2.9% e2e (upper bound)** — is the largest non-GEMM
+attention cost, but it is the head-deinterleave and is only removable by emitting the
+Q/K projections in head-major `[n_head, Tq, d_head]` layout (a faithful but
+conformance-risky data-flow refactor) or by folding `scale` into the weights (NOT
+bit-exact). Logged as the next attention-overhead candidate; not attempted this
+window. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: REJECT serial-heads encoder-attention scheduling — the default head-parallel path is **3.01x FASTER** (10.715 ms vs 32.287 ms, bit-identical); confirms the "net positive" comment with a recorded ratio and re-closes the K=64 attention gap as inherently small-core-scaling, not a scheduling bug.
 
 **Land-or-dig result: LAND side empty, DIG produced a measured REGRESSION →
