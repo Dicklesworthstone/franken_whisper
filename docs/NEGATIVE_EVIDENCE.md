@@ -35,7 +35,7 @@ norm_dim) does not touch franken's hot path. A future ft fused kernel for franke
 shapes is the most likely next free win — worth a periodic re-scan, not a per-cycle
 re-dig. AGENT_NAME=IcyWren.
 > **Periodic re-scan log** (LAND clean + ft re-scan; terse, update-in-place — not new entries):
-> - re-scans #1–2 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits; frankentorch HEAD advances but not the crate franken builds against), origin==local, no `.scratch`/`.worktrees` ⇒ no change, still converged ~1.24–1.31x.
+> - re-scans #1–3 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no `.scratch`/`.worktrees` ⇒ no change, converged ~1.24–1.31x. #3 also checked a new ft-core commit (`632f657d` in-place f32 storage accessor for fused elementwise) — tensor-layer infra for ft's tensor API, N/A to franken's raw-`&mut [f32]` hot path (already in-place gelu/layernorm); no new ft-kernel-cpu kernel uses it.
 
 ## 2026-06-28 - IcyWren: the recurring "jax: a DIFFERENT primitive" hint — definitively RULED OUT for franken_whisper-cc. GPU present (GTX 1070) but NO DRIVER (`/dev/nvidia*` absent, `nvidia-smi` missing) ⇒ unusable; and -cc is the CPU variant (GPU = the separate `gpu-frankenjax` feature/build, out of scope). fj-lax's CPU matmuls are f64/f32-accumulate EVIDENCE impls (`cz0g0_*_evidence.rs`), not perf kernels.
 
