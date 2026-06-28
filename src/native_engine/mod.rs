@@ -557,9 +557,36 @@ impl NativeWhisperModel {
         Self::load_inner(path, true)
     }
 
+    /// Load a resident model from an already-canonicalized absolute path.
+    ///
+    /// This is the hot-path companion to [`load_resident`](Self::load_resident)
+    /// for servers/model registries that resolve a model once and then acquire
+    /// it repeatedly. It deliberately skips the filesystem `canonicalize()` on
+    /// every acquire; callers are responsible for passing the canonical path
+    /// returned by [`resolve_model`] or `Path::canonicalize`. If a merely
+    /// absolute but non-canonical path is passed, correctness is unchanged but
+    /// it may occupy a separate cache slot from the file's canonical spelling.
+    ///
+    /// # Errors
+    ///
+    /// - [`FwError::InvalidRequest`] when `canonical_path` is relative.
+    /// - Whatever [`ggml::GgmlModel::load`] / [`decode::LoadedModel::from_ggml`]
+    ///   return for an unreadable, malformed, or unsupported model file.
+    pub fn load_resident_canonical(canonical_path: &Path) -> FwResult<Arc<Self>> {
+        if !canonical_path.is_absolute() {
+            return Err(FwError::InvalidRequest(
+                "resident canonical model path must be absolute".to_owned(),
+            ));
+        }
+        Self::load_canonical(canonical_path.to_path_buf(), true)
+    }
+
     fn load_inner(path: &Path, keep_resident: bool) -> FwResult<Arc<Self>> {
         let canonical = path.canonicalize()?;
+        Self::load_canonical(canonical, keep_resident)
+    }
 
+    fn load_canonical(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
         // Fast path: a live cached instance.
         {
             let mut guard = lock_cache();
@@ -1222,6 +1249,37 @@ mod tests {
         assert!(
             Arc::ptr_eq(&retained, &b),
             "resident reload must return the retained Arc"
+        );
+    }
+
+    #[test]
+    fn resident_canonical_path_reuses_resident_slot_without_recanonicalizing() {
+        let dir = TempDir::new("resident_canonical");
+        let path = write_file(
+            dir.path(),
+            "ggml-resident-canonical.bin",
+            synthetic_model_bytes(),
+        );
+        let canonical = path.canonicalize().expect("canon");
+
+        let a = NativeWhisperModel::load_resident(&path).expect("resident load");
+        let b = NativeWhisperModel::load_resident_canonical(&canonical)
+            .expect("canonical resident load");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "canonical resident acquire must return the existing resident Arc"
+        );
+        assert_eq!(b.model_path, canonical);
+    }
+
+    #[test]
+    fn resident_canonical_path_rejects_relative_path() {
+        assert!(
+            matches!(
+                NativeWhisperModel::load_resident_canonical(Path::new("ggml-relative.bin")),
+                Err(FwError::InvalidRequest(_))
+            ),
+            "relative canonical path must be rejected as invalid request"
         );
     }
 

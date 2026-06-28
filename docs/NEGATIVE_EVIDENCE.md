@@ -3,6 +3,54 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: LAND precanonicalized resident acquire — resident model hot path drops from 14.792 µs to 24.605 ns (**601.2x**); parse+weights ORIG component ratio is **6,621,418x**.
+
+**Land-or-dig result: landed a measured in-process API-server lever without
+reopening the covered GEMM/GEMV lanes.** Current `main` already proves the e2e gap
+is at the faithful-port/hardware ceiling (encoder GEMM shape limits + decode GEMV
+bandwidth; no VNNI). The one remaining franken-side component with real slack was
+the model-resident acquire path added by the prior IcyWren commit: after residency,
+each `NativeWhisperModel::load_resident(path)` still paid filesystem
+`canonicalize()` on every acquire. API servers/model registries normally resolve a
+model once and then repeatedly borrow it, so this commit adds
+`NativeWhisperModel::load_resident_canonical(canonical_path)` and splits the cache
+implementation into `load_canonical(...)`. The new API requires an absolute
+already-canonical path, returns the same bounded one-model resident `Arc`, and does
+not change normal `load` / `load_resident` semantics.
+
+**Measurement.** Per-crate bench only. The required literal command reached `rch`
+but this Cargo rejects `cargo bench --release` (`unexpected argument '--release'`);
+the executable release-profile retry was:
+
+```text
+AGENT_NAME=IcyWren
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a
+FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models
+rch exec -- cargo bench --profile release -p franken_whisper --bench native_engine_bench -- \
+  native_engine/model_residency --sample-size 10 --warm-up-time 0.1 --measurement-time 1
+```
+
+```text
+native_engine/model_residency/tiny_parse_weights_nonresident:
+  [160.22 ms 162.92 ms 165.45 ms]
+native_engine/model_residency/tiny_resident_cache_lookup:
+  [14.208 µs 14.792 µs 15.549 µs]
+native_engine/model_residency/tiny_resident_canonical_lookup:
+  [23.677 ns 24.605 ns 26.949 ns]
+```
+
+Ratios from Criterion means:
+
+```text
+resident canonical vs current resident lookup:     14.792 µs / 24.605 ns = 601.2x
+resident canonical vs parse+weights ORIG component: 162.92 ms / 24.605 ns = 6,621,418x
+```
+
+Scope caveat: this does **not** claim a new full e2e transcription win, because the
+e2e jfk gap is already accounted for by covered/ceiling GEMM and GEMV work. It is a
+real measured win for repeated in-process model acquisition after a registry has
+resolved the model path once. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - BlackThrush: REJECT no-timestamps decode logprob-vector elision — same-machine bench regressed/noise; source reverted, ORIG ratio not improved
 
 **Land-or-dig result: no unlanded bench-worktree source win; DIG found a new

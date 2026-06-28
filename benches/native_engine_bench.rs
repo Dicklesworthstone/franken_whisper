@@ -184,12 +184,15 @@ fn jfk_wav_path() -> PathBuf {
 /// This targets the loaded-model OpenAI API gap: direct parse+weight conversion
 /// approximates a short-lived caller that drops the model after each request,
 /// while `load_resident` keeps one bounded strong slot and returns an `Arc`
-/// clone on repeat calls.
+/// clone on repeat calls. `load_resident_canonical` isolates the remaining
+/// hot-path overhead once an API server has resolved/canonicalized the model
+/// path once during startup.
 fn bench_model_residency_tiny(c: &mut Criterion) {
     let Some(path) = find_model_file(MODEL_TINY) else {
         eprintln!("SKIP model_residency_tiny: model {MODEL_TINY} missing");
         return;
     };
+    let canonical = path.canonicalize().expect("canonical tiny.en model path");
 
     let mut group = c.benchmark_group("native_engine/model_residency");
     group.sample_size(10);
@@ -210,6 +213,14 @@ fn bench_model_residency_tiny(c: &mut Criterion) {
         b.iter(|| {
             let model = NativeWhisperModel::load_resident(black_box(path.as_path()))
                 .expect("resident load");
+            black_box(model.loaded().hparams.n_vocab)
+        });
+    });
+
+    group.bench_function("tiny_resident_canonical_lookup", |b| {
+        b.iter(|| {
+            let model = NativeWhisperModel::load_resident_canonical(black_box(canonical.as_path()))
+                .expect("resident canonical load");
             black_box(model.loaded().hparams.n_vocab)
         });
     });
