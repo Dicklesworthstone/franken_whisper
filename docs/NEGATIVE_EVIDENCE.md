@@ -3,6 +3,57 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - BlackThrush: REJECT no-timestamps decode logprob-vector elision — same-machine bench regressed/noise; source reverted, ORIG ratio not improved
+
+**Land-or-dig result: no unlanded bench-worktree source win; DIG found a new
+opt-in no-timestamps decode lever and rejected it by measurement.** The
+`.scratch/.worktrees` audit found no main-missing measured source win: the
+remaining non-main worktrees were docs-only reject/ratio heads or older source
+heads already represented by `main`. Agent Mail reservation was unavailable
+because the project mail DB is malformed, so this was run in the clean
+`cod-b-log10-land-clean` worktree and staged only this ledger entry.
+
+**New lever tested.** In `no_timestamps` mode every timestamp token is already
+masked, so timestamp-mass forcing is inert. I tried skipping the full-vocab
+`compute_logprobs` materialized vector and deriving only the selected token's
+logprob from the logits/logsumexp. This is a plausible decode-orchestration
+lever for the explicit no-timestamps API policy, independent of the default
+timestamped path. It was reverted because the bench did not show a win.
+
+**Per-crate bench evidence.** Required form first, then comparable local proof:
+
+```text
+AGENT_NAME=BlackThrush RCH_LOCAL_ONLY=1 \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_JFK_WAV=/data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk_no_timestamps --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+result: Cargo rejected --release (unexpected argument)
+
+baseline current main, same local target/model/fixture:
+  cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk_no_timestamps --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+  native_engine/e2e/e2e_tiny_jfk_no_timestamps: [394.16 ms 407.14 ms 434.29 ms]
+
+candidate with no-timestamps logprob-vector elision, same local target/model/fixture:
+  cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk_no_timestamps --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+  native_engine/e2e/e2e_tiny_jfk_no_timestamps: [410.66 ms 423.76 ms 450.85 ms]
+  Criterion: change [-5.2359% +3.0596% +14.906%], p = 0.64; no change detected
+```
+
+The same `rch exec -- cargo bench --profile release -p franken_whisper ...`
+attempt offloaded to `ovh-a` despite `RCH_LOCAL_ONLY=1` and skipped because the
+remote worker did not have the model/fixture at the resolved path; it is
+non-comparable and not used as proof.
+
+**Ratio vs ORIG.** OpenAI-Whisper ratio convention is `OpenAI median / franken
+median`, using the existing loaded-API anchor `0.420035 s`. Current main for
+this explicit no-timestamps bench is `0.420035 / 0.40714 = 1.032x`. The
+candidate is `0.420035 / 0.42376 = 0.991x`, and candidate/current is
+`0.40714 / 0.42376 = 0.961x`. No source change was kept.
+
 ## 2026-06-28 - DuskFinch: DECISION/HANDOFF — in-crate arc COMPLETE at the named-function level. The only remaining lever is EXTERNAL (`ft_kernel_cpu` GEMM + its rayon parallelization). Recommend the in-crate loop redirect or stop.
 
 **Land-or-dig result: terminal synthesis (no land; no in-crate lever exists).** The
