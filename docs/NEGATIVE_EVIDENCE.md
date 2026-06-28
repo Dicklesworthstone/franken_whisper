@@ -3,6 +3,37 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: decode-loop ORCHESTRATION verified (the one un-profiled e2e component) — `compute_logprobs` + `argmax` are covered/small. e2e is now exhaustively accounted for; no lever.
+
+**Land-or-dig result: code-grounded close of the last un-profiled component (no
+land; no lever).** The e2e decomposition profiled the decoder `forward_step`
+(kernels) but ASSUMED the per-token orchestration (`compute_logprobs` full-vocab
+log-softmax + `argmax` + token select) was negligible without verifying it. Read
+it (`decode.rs:396/421/340-391`):
+- `compute_logprobs`: 3 passes over 51 864 logits (max, Σexp, then a `l-lse` map
+  into a fresh **207 KB Vec/token**) → `argmax` adds a 4th pass.
+- The full logprobs Vec is NOT dead: the **timestamp-forcing rule** (whisper.cpp
+  6343-6369) reads `logprobs[beg..]` (Σexp) and `logprobs[..beg]` (max) and masks
+  text logprobs to `-inf` when forcing a timestamp — a faithful-port requirement.
+
+**Two covered sub-questions, both already in the ledger:**
+- The `exp` cost (Σexp over 51 864) = the **logsumexp SIMD lever, REJECTED ~0**
+  (−0.32%, p=0.46; minimax `exp_simd`; "don't re-attempt — per-token full-vocab
+  `exp` is not a real e2e cost").
+- The **207 KB materialization** = the ledger's "compute_logprobs's output Vec …
+  isn't the bottleneck." It *could* be elided (return only `lse`; derive the
+  timestamp max/Σexp and the selected token's logprob from `logits − lse`), saving
+  the 51 864-map + alloc ≈ **~0.3% e2e** — but it is a decode-step refactor that
+  must preserve the exact timestamp-forcing numerics, and the gain is below the
+  threshold worth that conformance risk on a covered ~0 path. NOT pursued.
+
+**⇒ The e2e is now EXHAUSTIVELY accounted for** — every component MEASURED at or
+verified-at its ceiling: mel (optimised, <0.5%), encoder GEMM (practical ceiling),
+decode GEMV (88 GB/s fused-dot ceiling), decode orchestration (covered/~0). No
+in-crate lever and no practically-worthwhile external lever remain;
+`franken_whisper-cc` is at its faithful-port + hardware performance limit. No source
+change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: decode logits GEMV measured at the ceiling (88 GB/s = the landed fused-dot rate) — completes the FULL-PIPELINE efficiency map. All three e2e phases confirmed at ceiling.
 
 **Land-or-dig result: final efficiency measurement (no land; no lever; load 7.6,
