@@ -59,6 +59,44 @@ rebuilding tiny.en weights. Conformance stayed green:
 26/26; focused cache tests passed 22/22; final `cargo test -p franken_whisper`
 passed after using the ignored local `jfk.wav` fixture to satisfy the existing
 YouTube stub test. AGENT_NAME=IcyWren.
+## 2026-06-28 - DuskFinch: BOLD-VERIFY CONVERGED — `franken_whisper-cc` has NO remaining in-crate lever; the e2e gap vs ORIG is ~35% external GEMM (bd-4hc0) + ~38% decode bandwidth (VNNI-blocked on this AVX2 box). Operator decision needed; not another in-crate micro-dig.
+
+**Land-or-dig result: SURFACE the converged end-state (no land, no new dig).** This
+is the capstone, not a re-derivation: it ties the quantitative decomposition (entry
+directly below) to the now-complete in-crate audit and states the one decision left.
+
+**(1) No win to land.** Re-scanned all branches/worktrees: the only refs ahead of
+`main` are stale `codex-*` reject-doc branches (their "code diff" is just being
+behind `main`); no `.scratch` franken_whisper bench worktree holds an unlanded win.
+
+**(2) In-crate space EXHAUSTED — independently confirmed by the swarm.** All three
+e2e phases are now perf-profiled with clean isolated probes (`mel_perf_probe`,
+`encoder_perf_probe`, `decoder_perf_probe`) and every franken-side kernel is landed
+or covered: mel (radix-5 + two-for-one + uninit/arena reuse — but it is **<0.5% of
+e2e**, so further mel work is pointless); decoder per-token (fused f16c dot + `m==1`
+SAXPY + tuned rayon, the 52% epoch is the bd-6qih tight-loop over-statement);
+encoder (56% external sgemm; softmax/gelu = L8 ~0-e2e, attention rayon = L13 ~0).
+DuskFinch, BlackThrush, and codex-* have each reached this same wall.
+
+**(3) The e2e gap is OUT OF SCOPE or HARDWARE-BLOCKED.** Per the decomposition
+(below): jfk e2e ≈ **62% encoder** (of which 56% is the **external `ft_kernel_cpu`
+matrixmultiply GEMM**, bd-4hc0, re-measured ~1.03×, owner-closed) **+ 38% decode**
+(the `gemv_f16` logits path, 40 MB f16/token; the only sub-lever is int8, which is
+**0.24× without VNNI — and this box is AVX2-only, no AVX-512/VNNI**, so int8 is
+permanently dead here, not merely policy-gated). Both gaps are unreachable from
+`franken_whisper-cc`.
+
+**⇒ OPERATOR DECISION (the loop cannot self-resolve):**
+- **(a)** Pause the `franken_whisper-cc` per-kernel loop — it is at its measured
+  ceiling; further turns can only re-confirm exhaustion or re-dig covered levers.
+- **(b)** Redirect to **`ft_kernel_cpu` (frankentorch)** — swap/optimize the
+  encoder sgemm (the ~35%-of-e2e lever); coordinate with the active frankentorch
+  swarm (bd-4hc0). This is the ONLY remaining ~35% lever.
+- **(c)** Provide VNNI hardware (AVX-512) to unlock the int8 decode-bandwidth lever.
+
+(NB this turn the box is at load ~139 — fresh wall-clock/cycle measurement is
+impossible regardless; instruction-count facts above are load-immune.) No source
+change. AGENT_NAME=DuskFinch.
 
 ## 2026-06-28 - DuskFinch: e2e PHASE DECOMPOSITION (first quantitative one) — jfk e2e is ENCODER-dominated (~62%) + decode (~38%); the single biggest gap vs ORIG is the external `ft_kernel_cpu` GEMM (~35% of e2e). Mel is negligible.
 
