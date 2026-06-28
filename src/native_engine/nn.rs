@@ -213,6 +213,29 @@ fn matmul_into_uninit(
     Ok(data)
 }
 
+/// Allocate an `[n]` f32 output buffer for a GEMV that **fully overwrites** every
+/// slot ([`gemv_f16`] / [`gemv_f16_batch`] assign each output once), skipping the
+/// dead serial zero-init — the same dead-work elision as [`matmul_into_uninit`]
+/// (d44f1fa), applied to the decode's per-token GEMV/logits outputs. Gated by
+/// `FW_DECODE_ZEROINIT` (set => zero-init, an A/B and safety fallback).
+pub fn gemv_out_buf(n: usize) -> Vec<f32> {
+    use std::sync::OnceLock;
+    static FORCE_ZEROINIT: OnceLock<bool> = OnceLock::new();
+    if *FORCE_ZEROINIT.get_or_init(|| std::env::var_os("FW_DECODE_ZEROINIT").is_some()) {
+        return vec![0.0f32; n];
+    }
+    let mut v: Vec<f32> = Vec::with_capacity(n);
+    // SAFETY: `n` elements of capacity are reserved just above; the caller's GEMV
+    // writes every one of the `n` outputs before any read (gemv_f16 assigns `*slot`
+    // for all rows; gemv_f16_batch assigns `dst[t*out+o]` for all t,o). f32 has no
+    // Drop and no invalid bit patterns. Mirrors `matmul_into_uninit`'s contract.
+    #[allow(unsafe_code, clippy::uninit_vec)]
+    unsafe {
+        v.set_len(n);
+    }
+    v
+}
+
 /// `[m,k] x [k,n] -> [m,n]` where the LHS is a **raw row-major slice**.
 ///
 /// Identical to [`matmul`] but the left operand is a flat `[m, k]` slice

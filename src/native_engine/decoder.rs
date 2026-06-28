@@ -189,7 +189,7 @@ impl Linear {
                     )));
                 }
                 let tq = x.rows;
-                let mut y = vec![0.0f32; tq * out];
+                let mut y = nn::gemv_out_buf(tq * out);
                 nn::gemv_f16_batch(data, *out, *inp, &x.data, tq, self.bias.as_deref(), &mut y);
                 Ok(Mat::from_vec(tq, *out, y))
             }
@@ -1143,7 +1143,7 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
     // the numerics-affecting arm gated by `f16_compute_enabled`.
     if let WeightMat::F16 { data, out, inp } = &w.token_embedding {
         debug_assert_eq!((*out, *inp), (n_vocab, n_state));
-        let mut logits = vec![0.0f32; *out];
+        let mut logits = nn::gemv_out_buf(*out);
         nn::gemv_f16(data, *out, *inp, &x_last.data, None, &mut logits);
         return Ok(logits);
     }

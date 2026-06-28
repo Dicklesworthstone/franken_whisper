@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: ★ LANDED decode GEMV uninit-output — the decode's per-token Linear + logits buffers were DEAD zero-inits (allocated `vec![0.0]`, then fully overwritten by `gemv_f16`). Eliminating them (the matmul-uninit pattern) is ~2–5% e2e, bit-identical. CORRECTS my own cycle-16 "~0.3%, below noise" rejection — that was load-confounded; the real-e2e profile's "memset 5.14%" was right.
+
+**Land-or-dig result: DIG re-opened a previously-rejected lever (motivated by the
+profile's memset 5.14% vs my old ~0.3% estimate) — re-measured carefully, it's REAL
+and conformance-clean ⇒ LANDED a third win.** LAND clean before this (`352503f`).
+
+**The dead-init:** `decoder.rs` allocated `let mut y = vec![0.0; tq*out]` for every
+per-token Linear projection (QKV/out/cross/MLP, ~48/token) and `let mut logits =
+vec![0.0; 51864]`, then `gemv_f16`/`gemv_f16_batch` **overwrite every slot**. The
+matmul-uninit win (d44f1fa) only covered the encoder *matmul* outputs; these decode
+GEMV outputs were a separate, un-elided zero-init. Routed both through a new gated
+`nn::gemv_out_buf(n)` (`Vec::with_capacity` + `set_len`, the same SAFETY contract as
+`matmul_into_uninit`; escape hatch `FW_DECODE_ZEROINIT`).
+
+**Measured (interleaved A/B, sdpa+uninit default vs `FW_DECODE_ZEROINIT=1`):**
+```text
+decoder_token_step_tiny : uninit 68.42 / 68.75  vs  zeroin 69.80 / 72.07 ms  (~2–5%)
+e2e_tiny_jfk            : uninit 343.02–350.05   vs  zeroin 350.25–367.69 ms
+                          ⇒ ~2% (best-of) to ~5% (median) faster e2e
+conformance             : nn lib 27/27, native_engine_e2e 6/6 — bit-identical
+clippy -D warnings      : clean
+```
+The win exceeds the raw memset bytes (~0.03 ms) because `vec![0.0; n]` also page-
+touches the buffer (esp. the 207 KB logits ×50 tokens) before the GEMV touches it
+again — uninit drops that double-touch + the allocator zero-fill. **Operating ratio
+vs OpenAI now ~1.20–1.22x (e2e ~343–350 ms @ load 16).** Source: `src/native_engine/
+nn.rs` + `decoder.rs`. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: RATIO CORRECTION — fresh e2e measurement pins the OPERATING ratio at ~1.2x (1.19–1.24x), not the ~1.31x I'd been carrying. The 1.31x was a theoretical low-load derivation never cleanly achieved on this swarm-busy box. Honest down-correction; the SDPA win itself is intact.
 
 **Land-or-dig result: DIG took a low-ish-load window to re-measure the e2e and
