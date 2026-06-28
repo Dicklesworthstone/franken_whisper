@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: conv-stem overhead MEASURED (corrects the cycle-8 estimate) — full conv2 `conv1d` = 5.398 ms/call, weight transpose = 0.737 ms (13.7%). The in-scope weight pre-transpose is ~0.22% e2e (sub-1%); the DOMINANT avoidable cost is the im2col materialization, but eliminating it needs ft_kernel_cpu's direct-conv (external).
+
+**Land-or-dig result: LAND empty; DIG = a real per-crate MEASUREMENT that corrects a
+prior reasoned estimate; sub-1% in-scope lever → not built (0 source delta).** LAND:
+`origin/main == local` at `1141f5f`, no `.scratch`/`.worktrees`, no parked bench.
+
+**DIG — measured the conv stem instead of estimating it (a model-free
+`conv1d`/transpose probe, conv2 shape cin=cout=384,k=3,t_in=3000, best-of-300):**
+
+```text
+(1) full nn::conv1d   : 5.398 ms   (transpose + im2col build + sgemm)
+(2) weight transpose  : 0.737 ms   (13.7% of the call; eliminable at load)
+```
+
+**Correction to the 2026-06-28 conv-stem entry:** the conv stem is BIGGER than the
+~0.1% e2e I reasoned. conv2 alone is ~5.4 ms/call; conv1+conv2 ≈ 7–8 ms/window ≈
+**~2% e2e** (1-window JFK). Two avoidable parts:
+- **Weight transpose** (the in-scope lever): 0.737 ms (conv2) + ~0.15 ms (conv1) ≈
+  **0.9 ms/window ≈ 0.22% e2e** — a faithful load-time pre-transpose (mirroring the
+  linear-weight path) would remove it. Measurable but sub-1% and below the box's
+  wall-clock floor ⇒ per "REVERT ~0-gain", not built.
+- **im2col materialization** (the DOMINANT avoidable cost, ~3.5 ms in conv2 ≈ ~1%+
+  e2e): this is the real chunk, but a naive direct conv1d would REGRESS vs
+  im2col+GEMM (im2col exists precisely so the GEMM stays optimal). The only win is a
+  specialized direct-conv microkernel = `ft_kernel_cpu`'s no-panel direct conv
+  (`lib.rs:6123`, the `dgemm_bt`-based path) — **external** (frankentorch).
+
+⇒ The conv stem's ~2% e2e is real but splits into a sub-1% in-scope transpose
+(0.22%, below noise) and a ~1% external im2col elimination. No in-scope >1% lever.
+**Lesson: measure conv-class overhead, don't estimate — the im2col/transpose costs
+were ~5× my reasoned guess.** Probe reverted; 0 source delta; conformance GREEN.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: thorough multi-agent LAND harvest — every worktree/branch checked; no committed faithful comparator win. The one branch that looks like a win (`cod-b-log10-land`, "+25% mel") is RELAX-PARITY (owner parity-policy gated), source reverted/stashed, and mel-only (~0.17% e2e). Nothing to land.
 
 **Land-or-dig result: LAND harvest done and empty; no source change.** With the
