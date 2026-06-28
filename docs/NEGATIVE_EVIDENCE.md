@@ -3,6 +3,48 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: MEASURED per-shape encoder GEMM GFLOP/s — the attention SCORES `[1500,64]×[64,1500]` (K=64) is matrixmultiply's WORST case at **171 GFLOP/s** (~5× below peak, ~50% of encoder GEMM time). This REOPENS an IN-CRATE lever: a small-K fast path in `nn::matmul`, like the landed `m==1` path.
+
+**Land-or-dig result: DIG — a real measurement that OVERTURNS "all-external".** A
+calm window finally opened (load 8.95). I built `examples/gemm_shape_probe.rs`
+(times `nn::matmul` — the real `ft_kernel_cpu` sgemm path for M>1 — per encoder GEMM
+shape) and MEASURED what the prior entries only estimated by MAC arithmetic
+(best-of-80, two stable runs, x86-64-v3 release):
+
+```text
+encoder GEMM shape                          GFLOP/s   per-call
+proj QKV/out   [1500,384]x[384,384]          ~480      0.9 ms
+attn SCORES    [1500,64]x[64,1500]  (K=64)   ~173      1.65 ms   <-- WORST, ~5x below peak
+attn xV        [1500,1500]x[1500,64] (N=64)  ~880      0.3 ms
+mlp fc1        [1500,384]x[384,1536]         ~700      2.5 ms
+mlp fc2        [1500,1536]x[1536,384]        ~895      2.0 ms
+```
+
+**The finding — a NEW in-crate lever, not external.** Two prior entries flagged the
+"small-dim attention shapes" as an external bd-4hc0 sub-target; this measurement
+SHARPENS and RE-SCOPES it:
+- It is specifically the **scores GEMM** (K=64), NOT `×V` (N=64) — small-N is FINE
+  (~880 GFLOP/s); only the **small-K contraction** is pathological (~173). The
+  packing GEMM's pack overhead dominates when K is tiny.
+- At 24 scores GEMMs/forward (6 heads × 4 layers × 1.65 ms ≈ **40 ms ≈ ~50% of the
+  ~80 ms encoder GEMM time ≈ ~7% of e2e**), this is the single biggest concrete
+  GEMM cost in the engine.
+- Its output (9 MB scores) is **bandwidth-bound** → floor ≈ 0.45 ms (~640 GFLOP/s),
+  so `matrixmultiply` at 1.65 ms is ~3.6× ABOVE the achievable floor (pure packing
+  overhead).
+- **⇒ This is fixable IN-CRATE**, exactly like L10's landed `m==1` fast path that
+  bypasses ft sgemm for tq=1 (because packing GEMM is ~8–10× slower there): add a
+  **small-K (K ≤ ~64) fast path in `nn::matmul`** that computes `[M,64]×[64,N]`
+  directly (row-tiled, SIMD rank-K accumulation, NO packing, write output once),
+  transcription-level like `m==1`. Estimated ceiling: ~3.6× on the scores ≈ ~7%
+  e2e — the biggest concrete lever found in the whole arc.
+
+This corrects the prior "the sole lever is external" conclusion: the scores GEMM has
+an in-crate fast-path opportunity. `examples/gemm_shape_probe.rs` lands as the
+reusable per-shape GEMM measurement tool. **Next dig: implement + A/B the small-K
+`nn::matmul` path** (the kernel, then perf/GFLOP/s + transcription conformance).
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: alien-graveyard / alien-artifact-coding dig on the two sole gaps — EVERY exotic technique is either external (a `ft_kernel_cpu` kernel detail) or breaks the faithful-port contract. The binding limit is the faithful port, not missing cleverness.
 
 **Land-or-dig result: dug the advanced-technique space; no in-scope alien lever
