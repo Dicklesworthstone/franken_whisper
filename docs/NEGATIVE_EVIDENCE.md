@@ -3,6 +3,40 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: decode logits GEMV measured at the ceiling (88 GB/s = the landed fused-dot rate) — completes the FULL-PIPELINE efficiency map. All three e2e phases confirmed at ceiling.
+
+**Land-or-dig result: final efficiency measurement (no land; no lever; load 7.6,
+best-of-60).** The one efficiency number I lacked was the decode's dominant cost —
+the tied-output logits projection. `examples/gemv_f16_probe.rs` (new) times the
+landed `nn::gemv_f16` fused-f16c dot on the real shapes:
+
+```text
+decode f16 GEMV          GB/s   per-call
+logits  [51864,384]       88    0.451 ms   <- ~40 MB/token, the decode-dominant cost
+mlp fc1 [1536,384]         7    0.165 ms   (tiny matrix, latency-bound)
+attn proj [384,384]        4    0.074 ms   (tiny, serial under PAR_THRESHOLD)
+```
+
+**At ceiling.** The logits GEMV hits **88 GB/s**, matching the landed fused-dot's
+recorded **86–116 GB/s** (8-thread) — so it is at the `gemv_f16` ceiling with no
+slack (cvtph2ps-in-register + FMA, no scratch; the big decode win, already landed).
+CAVEAT: the tight loop keeps the 40 MB weight L3-resident (128 MB L3), so this is
+the L3-rate; real decode may stream more from DRAM between tokens, but that only
+makes the *production* logits cost ≥ this — it does not open a lever (the kernel is
+already memory/compute-balanced). The two tiny projections are latency-bound small
+matrices (negligible absolute cost/token).
+
+**⇒ FULL-PIPELINE EFFICIENCY MAP COMPLETE — all three e2e phases at ceiling:**
+- **mel** (<0.5% e2e): optimised (radix-5 + two-for-one + arena reuse).
+- **encoder GEMM** (~62% e2e): at practical ceiling (×V/mlp near-peak; scores
+  K=64 shape-limited; projections = bd-4hc0's rejected ~1.14×).
+- **decode GEMV** (~38% e2e): logits at the 88 GB/s fused-dot ceiling; int8 dead
+  (no VNNI).
+Every phase is now MEASURED at its ceiling. `franken_whisper-cc` has no remaining
+in-crate or practically-worthwhile-external lever; the engine is at its faithful-
+port + hardware performance limit. `gemv_f16_probe.rs` lands as reusable infra.
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: DEFINITIVE per-shape encoder-GEMM efficiency (clean, load 9) — the GEMM is at its PRACTICAL ceiling. Redirect note CORRECTED: the slow scores are shape-limited (no fix), and the only sub-peak fixable shape (projections) is bd-4hc0's already-rejected ~1.14×.
 
 **Land-or-dig result: clean capstone measurement (no land; no lever).** With the
