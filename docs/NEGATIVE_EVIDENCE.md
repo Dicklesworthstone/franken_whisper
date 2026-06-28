@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: decode cross-attn SDPA RULED OUT (already optimal) + definitive ratio confirmed — the last fused-primitive opportunity is closed; engine leads OpenAI-Whisper ~1.24x (load 15-20) to ~1.31x (low load).
+
+**Land-or-dig result: DIG closed the last "different primitive" opportunity
+(decode cross-attn) and confirmed the ratio; 0 source delta.** LAND: `origin ==
+local` at `49c1b22`.
+
+**Decode cross-attn SDPA — ruled out (code-determinable):** `decoder.rs::cross_attention`
+ALREADY parallelizes over heads (rayon `into_par_iter`, line 76, threshold 1<<13) and
+uses `nn::matmul` which for the decode's tq=1 takes the **m==1 SAXPY fast path**. A
+fused SDPA would (a) add no head-parallelism (already there) and (b) be SLOWER per
+head — its internal `sgemm_bt` packs for m=1 where the SAXPY is optimal. So the decode
+attention (precomputed cross-K/V + head-parallel + m==1 SAXPY) is already optimal;
+SDPA is encoder-only (tq≥64). No decode fused-primitive lever.
+
+**Definitive ratio (clean-ish, sdpa default, load 7→20):**
+```text
+encoder_window_tiny : 118–127 ms  (sdpa; was ~138 per-head)
+e2e_tiny_jfk        : 340.32 ms (e2e3, tight CI [338.57,342.47]) — the settled reading
+ratio vs OpenAI 0.420035 s: 340 ms ⇒ ~1.24x (load 15–20);  ~1.31x at true low load
+```
+⇒ **franken_whisper-cc leads OpenAI-Whisper ~1.24–1.31x** (load-dependent) on the tiny
+e2e comparator, via the two landed wins (matmul-uninit + fused-SDPA). The
+fused-primitive space is now COMPREHENSIVELY exhausted: encoder attention (SDPA,
+landed), encoder GEMM (matmul best; sgemm_bt slower), decode attn (optimal), no fused
+FFN / f32-gelu, int8 VNNI-dead. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: REJECT sgemm_bt for the encoder GEMM — `ft_kernel_cpu::linear_tensor_f32` (sgemm_bt) is 0.47–0.87x of franken's `matmul` (matrixmultiply packing sgemm) on all encoder shapes. franken's matmul is already the best GEMM primitive (mlp_fc1 1377 GF/s ≈ peak). The fused-primitive vein is EXHAUSTED post-SDPA.
 
 **Land-or-dig result: DIG tested the "different primitive" hint on the encoder GEMM
