@@ -3,6 +3,26 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: conv-stem direct-conv RULED OUT — `ft_kernel_cpu::conv2d_forward_f32` only skips im2col on its 1×1-stride-1 fast path; franken's conv is k=3 (stride 1/2) ⇒ falls through to im2col, same as franken's own. Last in-scope fused-primitive candidate closed.
+
+**Land-or-dig result: DIG closed the last fused-primitive candidate (conv); no free
+external win; 0 source delta.** LAND: `origin == local` at `a153764`, no
+`.scratch`/`.worktrees`.
+
+- **conv2d_forward_f32 (direct conv)** — its no-im2col path is **1×1 stride-1 only**
+  (read its body comment, src/lib.rs:6306). franken's conv1/conv2 are **k=3**
+  (stride 1 / 2), so they take the general (im2col) path — identical to franken's own
+  `nn::conv1d`. No conv1d-f32 primitive exists; conv2d-as-1D would give no benefit.
+- **sdpa_forward_f32 / sgemm UNCHANGED** since my landed SDPA build (latest
+  ft-kernel-cpu commit is cat/stack, not attention/GEMM) ⇒ no free rebuild win.
+
+⇒ **The fused-primitive space is now FULLY closed:** encoder attention (SDPA landed,
+~16% faster), encoder GEMM (matmul best; sgemm_bt 0.47–0.87x), conv (im2col, ceiling
+in both franken and ft for k=3), decode attn (head-parallel + m==1 SAXPY, optimal),
+no fused FFN / f32-gelu, int8 VNNI-dead. Engine at its CPU/faithful-port ceiling,
+leading OpenAI-Whisper ~1.24–1.31x (the two landed wins: matmul-uninit + fused-SDPA).
+No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: decode cross-attn SDPA RULED OUT (already optimal) + definitive ratio confirmed — the last fused-primitive opportunity is closed; engine leads OpenAI-Whisper ~1.24x (load 15-20) to ~1.31x (low load).
 
 **Land-or-dig result: DIG closed the last "different primitive" opportunity
