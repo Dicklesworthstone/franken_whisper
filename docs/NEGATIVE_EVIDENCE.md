@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: CONFIRM the post-matmul-win ratio (clean rebuild, multi-reading) — encoder STABLE ~138–141 ms, e2e 342–355 ms ⇒ franken LEADS OpenAI-Whisper **~1.18–1.23x** (load-dependent). Post-win inspection space re-audited exhausted; the one remaining big lever (NUMA-pinned logits L3 residency) is a multi-hour CCD-pinned-pool refactor, deferred.
+
+**Land-or-dig result: LAND empty; DIG re-audited the post-matmul-win engine and
+confirmed the landed ratio; no in-window lever; 0 source delta.** LAND:
+`origin/main == local` at `707e1d1`, no `.scratch`/`.worktrees`, no parked bench.
+
+**Measurement (clean rebuild of current `main`, best-of, load 7→28):**
+```text
+encoder_window_tiny : 140.83 / 138.04 ms  (best 137.03 — STABLE across runs/load)
+e2e_tiny_jfk        : best 354.76 ms (this run, load 16); 342.49 ms (prior, load 9.6)
+ratio vs OpenAI anchor 0.420035 s: 1.18x (354.76) .. 1.23x (342.49)  ⇒ franken LEADS
+```
+The encoder is rock-stable post-matmul-win (~140 ms, was ~174 ms pre-win). e2e is
+load-sensitive but solidly a LEAD over OpenAI-Whisper.
+
+**DIG — re-audited every decode/encoder path post-win; all exhausted:** decode
+`forward_step` orchestration is tiny copies (tq=1: three `x.clone()` of 384 f32 ≈
+1.5 KB ×3×6×50, marginal); ft-API closed (`softmax_dim` only in a doc comment);
+tiled attention regresses (~25%); dead-init mined; gather/transpose overlapped;
+decode GEMV bandwidth-bound; decode rayon inherent (L11). **The one remaining
+big-lever idea: NUMA-pinned logits residency** — the 40 MB tied-embedding
+`[51864,384]` f16 is re-streamed per token (50×) and exceeds the 32 MB per-CCD L3,
+so it likely re-reads DRAM each token (~23 ms ≈ ~7% e2e); a CCD-pinned persistent
+pool keeping each vocab-slice's embedding-slice L3-resident could win, BUT rayon
+doesn't pin to CCDs ⇒ a custom affinity-pinned pool = a multi-hour, uncertain,
+high-risk refactor, out of a 60-min window. Logged for an owner-scoped session.
+No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: REJECT row-tiled (flash-style, FAITHFUL) encoder attention — a measured ~25% REGRESSION (tiled 176 ms vs untiled 141 ms). The per-block dispatch overhead + worse GEMM parallelization beat the cache benefit; the single full-scores GEMM is more efficient. Reverted to 0 source delta.
 
 **Land-or-dig result: LAND empty; DIG = the one remaining big-lever idea (cache the
