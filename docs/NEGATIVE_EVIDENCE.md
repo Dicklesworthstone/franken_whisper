@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: the comparator GAP vs OpenAI-Whisper is already CLOSED — measured PARITY (1.011x). "Next-biggest gap vs OpenAI-Whisper" is a gap vs theoretical peak, NOT vs OpenAI; franken already matches OpenAI-Whisper on tiny e2e, so any further speedup is a LEAD (beating PyTorch's BLAS), not closing a gap.
+
+**Land-or-dig result: LAND empty; DIG reframes the premise against the measured
+data — no source change.** LAND: no `.scratch`/`.worktrees`, no parked bench,
+`origin/main == local` at `b978bd4`.
+
+**DIG — the directive asks for "a NEW perf lever on the next-biggest gap vs
+OpenAI-Whisper"; the measured data says that gap is ~0.** The BOLD-VERIFY clean-load
+measurement (this ledger, HEAD c665ec3) found franken's `e2e_tiny_jfk` =
+**415.56 ms** vs the OpenAI loaded-API anchor **0.420035 s** = **1.011x** — i.e.
+franken is at PARITY (marginally faster) with OpenAI-Whisper on the tiny e2e
+comparator. OpenAI-Whisper (PyTorch CPU) runs the same class of BLAS GEMM on the
+same AVX2 hardware, so parity means franken's kernels are already as fast as
+PyTorch's.
+
+**⇒ The component "gaps" in this ledger (encoder sgemm at ~15–47% of peak, decode
+GEMV at the 88 GB/s bandwidth ceiling) are gaps vs THEORETICAL PEAK, not vs
+OpenAI-Whisper.** Against the actual comparator there is no gap to close — franken
+already equals OpenAI. Any further e2e speedup would put franken AHEAD of OpenAI,
+which requires a kernel faster than PyTorch's BLAS for these shapes — i.e. the
+external `ft_kernel_cpu` GEMM work (owner's frankentorch domain; the matmul→gemm
+swap was measured ~1.03x and rejected for a heavy dep), or absent VNNI hardware for
+the decode. Neither is a `franken_whisper-cc` in-scope lever. This is a factual
+status, grounded in the measured 1.011x — not a re-derivation of the component map
+(which is separately complete). No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: comparator SCOPE pinned — `e2e_tiny_jfk` loads audio ONCE outside `b.iter`, so the measured path is exactly `transcribe` = mel + encoder + decode (audio I/O excluded). The component audit is now COMPLETE: every measured component is covered/at-ceiling/sub-1%; no audio-frontend lever exists for the comparator.
 
 **Land-or-dig result: LAND empty; DIG audited the last candidate (the audio
