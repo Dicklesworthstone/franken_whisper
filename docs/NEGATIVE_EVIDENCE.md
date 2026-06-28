@@ -3,6 +3,37 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: REJECT attention gather-buffer uninit (the matmul-uninit lever applied to qh/kh/kh_t/vh) — encoder A/B is BELOW the noise floor and confounded by load drift (uninit-at-high-load = zeroinit). Reverted to 0 source delta. The matmul OUTPUT was THE dead-init lever; the small head-parallel gather buffers add ~0.
+
+**Land-or-dig result: LAND empty; DIG = chased the dead-init vein from the landed
+matmul win to the next buffers, MEASURED it inconclusive, reverted.** LAND:
+`origin/main == local` at `d44f1fa`, no `.scratch`/`.worktrees`, no parked bench.
+
+**DIG — the landed `matmul_into_uninit` win (`d44f1fa`, encoder ~26%) was a dead
+output zero-init; the same pattern exists in `attention_raw`'s per-head gather
+buffers (`qh`/`kh` scaled gathers, `kh_t` transpose, `vh` copy — all `vec![0.0; …]`
+then FULLY overwritten).** Converted all four to an uninit `alloc_attn_buf` helper
+(`set_len`, escape hatch `FW_ATTN_GATHER_ZEROINIT`) and A/B'd `encoder_window_tiny`,
+interleaved:
+
+```text
+A uninit  : 138.12 / 138.77 / 146.51 ms   (A3 load-inflated)
+B zeroinit: 146.76 / 146.10 ms
+load drifted 11 -> 29 -> 36 across the run
+```
+
+**⇒ Below the noise floor + confounded.** Best-of-best is 137.44 vs 141.57 = ~4 ms
+(~3% encoder), under the box's ~5% wall-clock floor; decisively, **A3 (uninit, high
+load) = 146.51 ≈ B (146)** — at MATCHED (high) load the gap vanishes, so the apparent
+~8 ms A<B was load drift, not the lever. Unlike the matmul OUTPUT (9 MB × 36, serial
+zero-init before the parallel GEMM = Amdahl), the gather INPUT buffers are 384 KB and
+run on the 6 head-parallel threads, so their zero-init overlaps and contributes ~0.
+Per "REVERT ~0-gain" + the control-spread discipline: REVERTED to 0 source delta;
+conformance GREEN by construction. The matmul output was THE dead-init lever; the
+remaining `vec![0.0]` sites (gather buffers, conv weight transpose, cross-K/V
+precompute, decode logits) are each overlapped/small/once-per-window ⇒ no further
+>1% dead-init lever. No source change kept. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: ★ matmul UNINIT-OUTPUT — lint-harden + FULL measured impact. The lever (elide the dead per-matmul output zero-init) was implemented in `d58bedf` (concurrent agent, est. "~13% of the call"); THIS commit adds the `clippy::uninit_vec` allow (needed for `-D warnings`) and MEASURES the real end-to-end effect: encoder **~26% faster** (141 vs 178 ms, interleaved control) and **e2e ~16% faster** (342 vs 407 ms) ⇒ ratio vs OpenAI-Whisper **1.011x → ~1.23x** (parity → a clear LEAD). Bit-identical; conformance GREEN.
 
 **Land-or-dig result: the first real comparator lever of the arc — implemented in
