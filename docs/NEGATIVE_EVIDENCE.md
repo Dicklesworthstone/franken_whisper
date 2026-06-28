@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: REJECT sgemm_bt for the encoder GEMM — `ft_kernel_cpu::linear_tensor_f32` (sgemm_bt) is 0.47–0.87x of franken's `matmul` (matrixmultiply packing sgemm) on all encoder shapes. franken's matmul is already the best GEMM primitive (mlp_fc1 1377 GF/s ≈ peak). The fused-primitive vein is EXHAUSTED post-SDPA.
+
+**Land-or-dig result: DIG tested the "different primitive" hint on the encoder GEMM
+(the bulk encoder cost now, after the SDPA attention win) — the alternative is
+SLOWER; no lever; 0 source delta.** LAND: `origin == local` at `57be940`.
+
+`linear_tensor_f32` uses `gemm::sgemm_bt` (weight `[out,in]`), a genuinely different
+kernel from franken's `matmul_tensor_contiguous_f32` (`matrixmultiply::sgemm`,
+pre-transposed weight). Probe (same math, max|Δ|=0):
+```text
+proj    [1500,384]x[384,384]   matmul 677 GF/s  vs  sgemm_bt 472 GF/s  = 0.70x
+mlp_fc1 [1500,384]x[384,1536]  matmul 1377 GF/s vs  sgemm_bt 647 GF/s  = 0.47x
+mlp_fc2 [1500,1536]x[1536,384] matmul 871 GF/s  vs  sgemm_bt 754 GF/s  = 0.87x
+```
+⇒ **sgemm_bt is a regression on these shapes; franken's matmul is already optimal**
+(mlp_fc1 at 1377 GF/s is near the machine ceiling). The 2.35x SDPA win came from the
+FUSION (scores+softmax+×V, no materialization) + the K=64 small-dim where sgemm_bt's
+no-pack layout wins — NOT from sgemm_bt being a better GEMM in general; at K=384/1536
+the packing sgemm dominates.
+
+**Fused-primitive scan complete (this is where the wins were):** matmul (best for
+GEMM, uninit-output landed), SDPA (landed for encoder attention), bmm (rejected,
+materialization), sgemm_bt (rejected here), no fused FFN, gelu is f64-only (franken's
+is f32), int8-linear VNNI-dead, decode attn already optimal (precomputed cross-KV,
+m==1). ⇒ No further fused-primitive lever; engine at its CPU/faithful-port ceiling
+leading OpenAI-Whisper ~1.24–1.31x. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: CONFIRM the landed SDPA win translates to e2e — interleaved A/B (sdpa vs FW_ATTN_NO_SDPA) shows sdpa CONSISTENTLY faster on `e2e_tiny_jfk`; the ~22 ms encoder delta carries through (the last-cycle "e2e-neutral" reading was load noise). franken now leads OpenAI-Whisper ~1.24–1.31x (load-dependent).
 
 **Land-or-dig result: confirmed the prior-cycle landed win on the comparator;
