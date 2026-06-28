@@ -1,12 +1,33 @@
 # Negative Evidence Ledger
 
 This ledger records blocked, neutral, rejected, or non-comparable performance
-evidence (and, at the top, any VALIDATED-but-not-yet-landed lever). It exists to
-prevent stale optimism from being reused as proof.
+evidence. It exists to prevent stale optimism from being reused as proof.
 
-## ⚡ VALIDATED LEVER (positive, not-yet-landed) — NUMA-pinned decode GEMV
+## 2026-06-28 - IcyWren: ⚠ CORRECTION — the NUMA-pinned logits "3.55x" (prior entry below) is a TIGHT-LOOP ARTIFACT; REFUTED for the real engine. Realistic dispatch (rayon broadcast / pinned par_chunks, separated calls) gives only ~51–56 GB/s ≈ default ~42–45 GB/s; only an unrealistic 50-iter tight inner loop hits ~149–162 GB/s.
 
-## 2026-06-28 - IcyWren: ★ VALIDATED the "different primitive" lever — pinned static-partition for the decode logits GEMV is **3.55x** faster than rayon (42 → 149 GB/s) via CCD-L3 residency. This is the first beyond-safe-Rust-ceiling lever PROVEN with data; landing it needs a persistent pinned pool (owner-scoped, multi-hour).
+**Land-or-dig result: DIG CORRECTED a prior over-claim — the residency does not
+survive the per-token forward_step; 0 source delta.** LAND empty (`origin == local`
+at `8f3db8d`). A second probe added the realistic variants the first one lacked:
+```text
+(a) rayon default               : 42–45 GB/s
+(b) rayon PINNED par_chunks      : 51 GB/s   (pinned threads, STILL work-stealing)
+(c) custom static, TIGHT 50-loop : 149–162 GB/s  (UNREALISTIC: no per-iter dispatch)
+(d) PINNED pool + broadcast      : 56 GB/s   (stable per-thread band, per-call dispatch)
+```
+**Only (c) — the tight inner loop with NO scheduler round-trip between iters —
+achieves residency.** (b) and (d) (pinned + static-per-thread, but a dispatch+join
+PER ITERATION) stay at ~50 GB/s. In the engine the per-token `gemv_f16` calls are
+separated by the whole `forward_step` (6 layers of QKV/MLP GEMVs ≈ 36 MB), which
+evicts the 40 MB embedding from every cache level between tokens, so each logits gemv
+reads it cold from DRAM — exactly the (b)/(d) regime, NOT (c). ⇒ **The logits-only
+NUMA-pinned lever is REFUTED.** A whole-decode CCD-static-partition keeping the full
+~76 MB decode working set (embedding + all layer weights, < 128 MB total L3)
+CCD-resident across tokens MIGHT work, but that is a far larger, speculative refactor
+— NOT a validated 3.55x. **Lesson: a residency probe MUST interleave the realistic
+between-call working set, not loop the kernel tight.** No source change.
+AGENT_NAME=IcyWren.
+
+## 2026-06-28 - IcyWren: [SUPERSEDED — see CORRECTION above; the 3.55x is a tight-loop ARTIFACT, refuted for the engine] VALIDATED the "different primitive" lever — pinned static-partition for the decode logits GEMV measured 3.55x faster than rayon (42 → 149 GB/s) in a tight-loop probe.
 
 **Land-or-dig result: DIG VALIDATED a major lever via a bounded probe; the landable
 form is owner-scoped, so 0 source delta this cycle.** LAND: `origin/main == local` at
