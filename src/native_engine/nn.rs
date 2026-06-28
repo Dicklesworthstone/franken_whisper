@@ -213,11 +213,14 @@ fn matmul_into_uninit(
     Ok(data)
 }
 
-/// Allocate an `[n]` f32 output buffer for a GEMV that **fully overwrites** every
-/// slot ([`gemv_f16`] / [`gemv_f16_batch`] assign each output once), skipping the
-/// dead serial zero-init — the same dead-work elision as [`matmul_into_uninit`]
-/// (d44f1fa), applied to the decode's per-token GEMV/logits outputs. Gated by
-/// `FW_DECODE_ZEROINIT` (set => zero-init, an A/B and safety fallback).
+/// Allocate an `[n]` f32 buffer that the caller **fully overwrites** before any
+/// read, skipping the dead serial zero-init — the same dead-work elision as
+/// [`matmul_into_uninit`] (d44f1fa). Used for the decode's per-token GEMV/logits
+/// outputs ([`gemv_f16`]/[`gemv_f16_batch`] assign every slot) and the encoder
+/// SDPA gather buffers (qa/ka/va, each `copy_from_slice`-filled in full). NOT for
+/// accumulator buffers (the parallel per-head `out`, `+=`-merged — keep those
+/// zeroed). Gated by `FW_DECODE_ZEROINIT` (set => zero-init: an A/B and safety
+/// fallback covering all uninit-output sites).
 pub fn gemv_out_buf(n: usize) -> Vec<f32> {
     use std::sync::OnceLock;
     static FORCE_ZEROINIT: OnceLock<bool> = OnceLock::new();
@@ -1367,9 +1370,9 @@ fn attention_raw(
     // has a cache_len offset the kernel's square-causal flag does not model.
     if causal_offset.is_none() && use_sdpa_attn() && n_head >= 2 && tq >= 64 {
         let hh = n_head;
-        let mut qa = vec![0.0f32; hh * tq * d_head];
-        let mut ka = vec![0.0f32; hh * tk * d_head];
-        let mut va = vec![0.0f32; hh * tk * d_head];
+        let mut qa = gemv_out_buf(hh * tq * d_head);
+        let mut ka = gemv_out_buf(hh * tk * d_head);
+        let mut va = gemv_out_buf(hh * tk * d_head);
         qa.par_chunks_mut(tq * d_head).enumerate().for_each(|(h, blk)| {
             let base = h * d_head;
             for i in 0..tq {

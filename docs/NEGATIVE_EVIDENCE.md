@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: ★ LANDED encoder SDPA gather uninit — the qa/ka/va gather buffers (41 MB/window) were DEAD zero-inits the gather fully overwrites; eliding the memset is **~8% faster encoder** (~3% e2e), bit-identical. The fourth win in the dead-zero-init vein the profile's "memset 5.14%" opened.
+
+**Land-or-dig result: DIG continued the dead-init audit from the decode-uninit win
+into the encoder attention — LANDED.** LAND clean before (`fcd046a`).
+
+**The dead-init:** `attention_raw`'s SDPA path allocated `qa/ka/va = vec![0.0;
+hh*tk*d_head]` (3 × 2.3 MB × 6 layers = 41 MB/window), then the rayon
+`par_chunks_mut` gather `copy_from_slice`-fills **every** element. Routed all three
+through the existing `nn::gemv_out_buf` (uninit; doc widened to cover gather buffers).
+Audited the neighbours: `out` (1273) is `+=`-MERGED in the parallel per-head path
+(needs zero — left alone), `local` (1427) likewise, `layer_norm` is in-place (no
+alloc) — so qa/ka/va are the only safe targets here.
+
+**Measured (`encoder_window_tiny` A/B, uninit default vs `FW_DECODE_ZEROINIT=1`,
+which isolates the attn buffers since the encoder bench runs no decode GEMV):**
+```text
+encA uninit 108.65 (load 7)   encA2 uninit 119.87 (load 35)
+encB zeroin 132.96 (load 28)  encB2 zeroin 130.59 (load 40, CI [128.6,133.3])
+matched-load pair encA2/encB2: 119.87 vs 130.59 ms ⇒ ~8% faster (non-overlapping CIs)
+conformance: nn lib 27/27, native_engine_e2e 6/6 — bit-identical;  clippy clean
+```
+Bigger than the raw memset time because the 41 MB memset competes with the
+memory-bound SDPA for bandwidth; eliding it frees that. ~8% encoder ≈ ~3% e2e ⇒
+operating ratio nudges toward ~1.24x. **FOUR landed wins now: matmul-uninit +
+fused-SDPA + decode-GEMV-uninit + encoder-SDPA-gather-uninit.** Source:
+`src/native_engine/nn.rs`. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: ★ LANDED decode GEMV uninit-output — the decode's per-token Linear + logits buffers were DEAD zero-inits (allocated `vec![0.0]`, then fully overwritten by `gemv_f16`). Eliminating them (the matmul-uninit pattern) is ~2–5% e2e, bit-identical. CORRECTS my own cycle-16 "~0.3%, below noise" rejection — that was load-confounded; the real-e2e profile's "memset 5.14%" was right.
 
 **Land-or-dig result: DIG re-opened a previously-rejected lever (motivated by the
