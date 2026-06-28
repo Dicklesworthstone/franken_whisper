@@ -3,6 +3,46 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: small-K `nn::matmul` fast path IMPLEMENTED + MEASURED — it TIES ft sgemm (~150 GFLOP/s, both ~15% of peak). The scores GEMM is SHAPE-limited (K=64), not packing-bound; last entry's "~7% lever" is a measured ~0. REVERTED.
+
+**Land-or-dig result: implemented the flagged lever, MEASURED ~0, REVERTED.** The
+prior entry (below) measured the encoder attention scores `[1500,64]×[64,1500]`
+(K=64) at ~171 GFLOP/s and hypothesised it was `matrixmultiply` packing overhead
+that an in-crate small-K fast path (à la the landed `m==1` path) could win ~3.6×.
+I built it and tested the hypothesis with real numbers — it does NOT hold.
+
+**The kernel.** Added `nn::matmul_small_k` (K≤64): an 8×8 register-tiled microkernel
+(transpose the 8-row `a` panel so per-`kk` broadcasts are contiguous; `b` rows are
+already contiguous; accumulate each output tile in registers and write it ONCE),
+rayon-banded over disjoint output row-blocks, wired into `matmul` as a `k≤64` fast
+path (`FW_SMALLK_OFF` hatch). It is **byte-identical to the naive in-order f32
+triple loop** (`matmul_small_k_matches_naive`, covering tile + both tails) — same
+per-element `kk` order, un-fused `+`/`*`.
+
+**Measurement (gemm_shape_probe, scores shape, `FW_SMALLK_OFF` A/B, best-of-80):**
+
+```text
+single-thread small-K kernel:  56 GFLOP/s  (misleading: 1 core)
+ft sgemm (rayon, ~10 cores):  157-180 GFLOP/s
+PARALLEL small-K (rayon):     139-167 GFLOP/s   <-- TIES ft sgemm
+```
+
+**Why ~0 — the shape, not the packing.** Single-threaded my kernel is ~56 GFLOP/s
+(~3.6× ft sgemm's ~16/core), which fed the "packing overhead" hypothesis — but
+parallelised it only reaches ~150, the SAME as ft sgemm. Both sit at **~15% of the
+~960 GFLOP/s machine peak**: the scores GEMM is fundamentally microkernel-starved at
+**K=64** (the inner reduction is too short to amortise per-tile setup, and it is
+output/L2-bandwidth-bound — 9 MB scores + repeated b reads), so `matrixmultiply` is
+already ≈ the shape's ceiling. There is no in-crate win; last entry's "~7% e2e
+lever" is a measured **~0**.
+
+**REVERTED** `nn.rs` to byte-identical `main` (kernel + toggle + test removed); the
+`gemm_shape_probe` tool stays (landed `03c4ae3`). Net: this CLOSES the small-K lever
+with a real implementation+measurement (not analysis) and re-confirms the engine is
+at its faithful-port ceiling — the encoder scores GEMM's low GFLOP/s is the shape's
+intrinsic limit on AVX2, fixable only by a fundamentally better small-K kernel in
+`ft_kernel_cpu` (external) or different hardware. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: MEASURED per-shape encoder GEMM GFLOP/s — the attention SCORES `[1500,64]×[64,1500]` (K=64) is matrixmultiply's WORST case at **171 GFLOP/s** (~5× below peak, ~50% of encoder GEMM time). This REOPENS an IN-CRATE lever: a small-K fast path in `nn::matmul`, like the landed `m==1` path.
 
 **Land-or-dig result: DIG — a real measurement that OVERTURNS "all-external".** A
