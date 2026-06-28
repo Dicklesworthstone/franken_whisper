@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: REJECT serial-heads encoder-attention scheduling — the default head-parallel path is **3.01x FASTER** (10.715 ms vs 32.287 ms, bit-identical); confirms the "net positive" comment with a recorded ratio and re-closes the K=64 attention gap as inherently small-core-scaling, not a scheduling bug.
+
+**Land-or-dig result: LAND side empty, DIG produced a measured REGRESSION →
+reverted.** LAND check: no `.scratch` / `.worktrees` dirs exist; the only worktrees
+`+1` ahead of `main` are stale/superseded heads (their `perf(...)` content —
+fused-f16c gemv, simd-mel projection — is already in `main`: `nn.rs` 51 f16c refs,
+`mel.rs` 82 log10/simd refs; the rest are docs *rejections*). Nothing to land.
+
+**DIG — a NEW non-kernel lever, traced + measured.** The encoder runs
+`nn::attention` at Tq=Tk=1500, n_state=384, **n_head=6** (`src/native_engine/nn.rs`
+`attention_raw`). Its default path spawns `min(worker_count, n_head)=6` raw threads,
+and each head's inner `[1500,64]×[64,1500]` sgemm ALSO dispatches to the global
+rayon pool — i.e. 6 concurrent pool floods. Hypothesis: on a 64-core box that
+nested contention wastes cores, and running heads SERIALLY (each inner sgemm taking
+the full pool) would win. Tested it directly with an env-gated serial-heads switch
++ a model-free A/B probe (`examples/attn_sched_probe.rs`), best-of-50 on this box:
+
+```text
+head-parallel (default):  best = 10.715 ms   (repeat 11.375 ms)
+serial-heads (A/B):       best = 32.287 ms
+ratio serial/parallel  =  3.01x SLOWER        (parallel/serial = 0.332x)
+checksum both modes    =  -143998.864228      (identical ⇒ bit-identical, faithful)
+```
+
+**⇒ Serial-heads is a 3.01x REGRESSION.** The reason is exactly the K=64 weakness
+from the prior digs: a single `[1500,64]×[64,1500]` sgemm scales *sub-linearly* with
+cores (saturates ~171 GFLOP/s well below peak because K=64 starves the microkernel),
+so 6 heads run CONCURRENTLY fill the machine far better than 6 sequential full-pool
+matmuls. The existing head-parallel scheduling is therefore already near-optimal —
+the long-standing "measured net positive — see HOTSPOTS run" code comment now has a
+recorded ratio. This also re-confirms the closure at a NEW altitude: the encoder
+attention gap is not a scheduling defect; it is the inherent small-K GEMM ceiling,
+whose only further lever is the external `ft_kernel_cpu` microkernel (bd-4hc0).
+
+**Reverted to ~0 source delta; conformance GREEN by construction.** The env gate was
+removed and the probe deleted; `git diff src/native_engine/nn.rs` against HEAD is
+empty, so the crate is byte-identical to the green `main` (no conformance change).
+No source change kept. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: BOLD-VERIFY at HEAD c665ec3 — first CLEAN-LOAD (load ~3.5–8.7, not ~187) bench re-confirms the landed residency lever (**628.9x**) and the e2e tiny-JFK gap at PARITY with the OpenAI anchor (**1.011x**); the sole remaining lever is the external ft-kernel-cpu K=64 microkernel — no in-crate win to land.
 
 **Land-or-dig result: LAND side empty (no worktree holds an unlanded measured
