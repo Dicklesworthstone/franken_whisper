@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: the recurring "jax: a DIFFERENT primitive" hint — definitively RULED OUT for franken_whisper-cc. GPU present (GTX 1070) but NO DRIVER (`/dev/nvidia*` absent, `nvidia-smi` missing) ⇒ unusable; and -cc is the CPU variant (GPU = the separate `gpu-frankenjax` feature/build, out of scope). fj-lax's CPU matmuls are f64/f32-accumulate EVIDENCE impls (`cz0g0_*_evidence.rs`), not perf kernels.
+
+**Land-or-dig result: DIG investigated the recurring "jax" hint to the end; not
+applicable to -cc; 0 source delta.** LAND: `origin == local` at `8a3bc52`.
+
+- **GPU offload (the literal "jax" reading):** the box HAS an NVIDIA GTX 1070
+  (`lspci`), but `/dev/nvidia*` is absent and `nvidia-smi` is not installed ⇒ no
+  driver/CUDA ⇒ the GPU is **unusable**. Separately, `franken_whisper-cc` is the
+  CPU build; GPU is the optional `gpu-frankenjax` feature (`fj-api`/`fj-core`) — a
+  DIFFERENT variant, out of -cc's scope. So GPU is doubly excluded.
+- **frankenjax CPU primitive:** `fj-lax` has `matmul_f32_f32_accumulate` /
+  `matmul_f32_f64_accumulate` — but they live in `cz0g0_*_evidence.rs` (accumulation-
+  precision EVIDENCE/reference impls), not optimized GEMM kernels. ft's
+  `matrixmultiply` sgemm is already at the machine ceiling (mlp_fc1 1377 GF/s); a
+  reference impl will not beat it.
+
+⇒ The "jax / different primitive" frontier is **closed for the CPU crate**. The real
+"different primitive" wins were the in-tree frankentorch fused kernels: matmul
+uninit-output + fused-SDPA (both landed). Engine at its CPU/faithful-port ceiling,
+~1.24–1.31x vs OpenAI-Whisper. (GPU offload would be a NEW VARIANT requiring a driver
++ `gpu-frankenjax`, an owner-scoped effort outside franken_whisper-cc.) No source
+change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: conv-stem direct-conv RULED OUT — `ft_kernel_cpu::conv2d_forward_f32` only skips im2col on its 1×1-stride-1 fast path; franken's conv is k=3 (stride 1/2) ⇒ falls through to im2col, same as franken's own. Last in-scope fused-primitive candidate closed.
 
 **Land-or-dig result: DIG closed the last fused-primitive candidate (conv); no free
