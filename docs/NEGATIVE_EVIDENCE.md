@@ -3,6 +3,49 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: ★ matmul UNINIT-OUTPUT — lint-harden + FULL measured impact. The lever (elide the dead per-matmul output zero-init) was implemented in `d58bedf` (concurrent agent, est. "~13% of the call"); THIS commit adds the `clippy::uninit_vec` allow (needed for `-D warnings`) and MEASURES the real end-to-end effect: encoder **~26% faster** (141 vs 178 ms, interleaved control) and **e2e ~16% faster** (342 vs 407 ms) ⇒ ratio vs OpenAI-Whisper **1.011x → ~1.23x** (parity → a clear LEAD). Bit-identical; conformance GREEN.
+
+**Land-or-dig result: the first real comparator lever of the arc — implemented in
+`d58bedf`, here verified+hardened.** `nn::matmul` / `matmul_raw_lhs` (and
+`matmul_bias` via `matmul`) allocated the output with `Vec::new()` +
+`resize(m*n, 0.0)` — **zero-initializing the whole output** — then the ft sgemm
+(`beta = 0`) OVERWRITES every element, so the zero-init was 100% dead work.
+`d58bedf` switched to `Vec::with_capacity(m*n)` + `set_len` +
+`matmul_tensor_contiguous_f32_into` (the buffer's `resize` is then a no-op → no zero
+fill; the GEMM fills all), with escape hatch `FW_MATMUL_ZEROINIT`. This commit adds
+the missing `#[allow(clippy::uninit_vec)]` (the `with_capacity`+`set_len` shape trips
+the lint under `-D warnings`) and supplies the measurement `d58bedf` lacked.
+
+**Why it was big:** the encoder runs ~36 matmuls/window; the attention SCORES
+outputs are `[1500,1500]` = **9 MB each** (×36), and the zero-init was SERIAL
+(single-thread) BEFORE each PARALLEL GEMM — an Amdahl serial bottleneck + cache
+pollution. This is the bulk of the profiled `__memset_avx2` (5.14%) that the prior
+uninit/reuse sweep MISSED because it predated frankentorch's `_into` API.
+
+**Measurement (per-crate, this box).**
+```text
+component probe (MLP fc1 [1500,384]x[384,1536]):
+  allocating (zero-init) 2.574 ms  vs  reused _into 2.244 ms  = 0.329 ms / 12.8% dead; checksums identical (bit-exact)
+
+encoder_window_tiny, INTERLEAVED control (load ~6, tight CIs):
+  uninit   : 138.36 / 142.62 / 141.28 ms   (median ~141)
+  zeroinit : 174.38 / 178.72 / 185.60 ms   (median ~178)   => uninit ~26% faster (~37 ms/window)
+
+e2e_tiny_jfk (clean, tight CIs):
+  uninit   : 342.49 ms (load 9.6)
+  zeroinit : 406.80 ms (this cycle) / 415.56 ms (prior BOLD-VERIFY)  => ~16% faster
+```
+
+**Ratio vs OpenAI-Whisper.** OpenAI loaded-API anchor `0.420035 s` / franken uninit
+`0.34249 s` = **1.226x** (was `0.420035 / 0.41556 = 1.011x` parity). franken moves
+from parity to a **~22% lead** on the tiny e2e comparator.
+
+**Faithful + green.** Bit-identical (beta=0 GEMM overwrites all; probe checksums
+equal): conformance `native_engine::nn` 27/27, `conformance_comparator_tests` 26/26,
+`native_engine_e2e` 6/6 all PASS. Clippy lib clean (`#[allow(unsafe_code,
+clippy::uninit_vec)]` + SAFETY, matching the crate's `dot_f16c` pattern). Source
+change kept (`src/native_engine/nn.rs`). AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: alien-graveyard catalogue on the conv im2col (~1% e2e, last un-alien-dug measured cost) — Winograd breaks the faithful port (whisper.cpp uses GGML_OP_IM2COL, CONFIRMED), implicit-GEMM is external ft_kernel_cpu, FFT-conv inapplicable at k=3. Completes the alien-dig map; no in-scope faithful lever.
 
 **Land-or-dig result: LAND empty; DIG = alien catalogue vs the conv (the cost I

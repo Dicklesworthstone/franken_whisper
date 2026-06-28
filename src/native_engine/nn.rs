@@ -202,7 +202,9 @@ fn matmul_into_uninit(
     // sgemm below overwrites all `numel` outputs before `data` is read, so no
     // uninitialized value is ever observed (f32 has no Drop and no invalid bit
     // patterns; on a kernel error the Vec is dropped without reading elements).
-    #[allow(unsafe_code)]
+    // `clippy::uninit_vec` flags the with_capacity+set_len shape generically; it
+    // is sound here precisely because the GEMM fully initializes the buffer.
+    #[allow(unsafe_code, clippy::uninit_vec)]
     unsafe {
         data.set_len(numel);
     }
