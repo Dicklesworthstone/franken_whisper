@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: alien-graveyard catalogue on the conv im2col (~1% e2e, last un-alien-dug measured cost) — Winograd breaks the faithful port (whisper.cpp uses GGML_OP_IM2COL, CONFIRMED), implicit-GEMM is external ft_kernel_cpu, FFT-conv inapplicable at k=3. Completes the alien-dig map; no in-scope faithful lever.
+
+**Land-or-dig result: LAND empty; DIG = alien catalogue vs the conv (the cost I
+measured last cycle), completing the alien coverage; 0 source delta.** LAND:
+`origin/main == local` at `4616a9c`, no `.scratch`/`.worktrees`, no parked bench.
+
+**DIG — ran the alien-graveyard symptom-match against the conv im2col** (last
+cycle's measurement: ~3.5 ms/window conv2 im2col ≈ ~1% e2e, the largest avoidable
+conv cost). Each candidate:
+- **Winograd `F(2,3)`/`F(4,3)`** — fewer conv mults AND no im2col, the textbook
+  small-kernel conv win. But it (a) changes the summation/rounding ⇒ not bit-exact,
+  and (b) **deviates from the faithful reference**: whisper.cpp's conv1d is
+  `GGML_OP_IM2COL` (im2col+GEMM), confirmed in `legacy_whispercpp/.../llama-arch.cpp`
+  (`{LLM_TENSOR_CONV1D, ... GGML_OP_IM2COL}`). Faithful franken must match im2col,
+  not Winograd. ⇒ out of contract.
+- **Implicit GEMM** (im2col on-the-fly in the microkernel, same numerics, no
+  materialization) — the only materialization-avoidance that stays bit-exact, but it
+  IS `ft_kernel_cpu`'s no-panel direct conv (`lib.rs:6123`, `dgemm_bt`-based) ⇒
+  **external** (frankentorch).
+- **FFT-convolution** — useful for large kernels; at **k=3** the FFT transform
+  overhead dwarfs the 3-tap dot ⇒ inapplicable.
+
+⇒ No in-scope faithful conv lever; the conv im2col's ~1% is either external
+(implicit-GEMM) or out-of-contract (Winograd). **This completes the alien-catalogue
+coverage map:** GEMM/GEMV math (DuskFinch), parallelism mechanism (cycle-6 concurrency
+dig), and now conv — every exotic technique across all measured costs is external or
+breaks the faithful port. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: conv-stem overhead MEASURED (corrects the cycle-8 estimate) — full conv2 `conv1d` = 5.398 ms/call, weight transpose = 0.737 ms (13.7%). The in-scope weight pre-transpose is ~0.22% e2e (sub-1%); the DOMINANT avoidable cost is the im2col materialization, but eliminating it needs ft_kernel_cpu's direct-conv (external).
 
 **Land-or-dig result: LAND empty; DIG = a real per-crate MEASUREMENT that corrects a
