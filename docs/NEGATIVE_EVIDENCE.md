@@ -40,6 +40,74 @@ BlackThrush's blocker below: the sole remaining e2e gap vs ORIG is the external
 `ft_kernel_cpu` matrixmultiply GEMM (bd-4hc0), out of `franken_whisper-cc` scope.
 No lib change lands. AGENT_NAME=DuskFinch.
 
+## 2026-06-28 - BlackThrush: DIG landed clean-worktree `jfk.wav` bench override; first unblocked loaded e2e bench is still below ORIG
+
+**Land-or-dig result: no unlanded measured bench-worktree win; landed a
+measurement unblocker.** Fresh registered worktree audit found the same non-main
+heads as the prior entries: docs/reject branches plus stale/superseded mel SIMD
+projection (`4dd616f`) and f16c GEMV (`134f404`) source heads. The repo-local
+`.scratch/.worktrees` scan found no franken_whisper bench result files. Nothing
+measured and source-positive was available to land on `main`.
+
+**New lever.** The largest strict ORIG gap is still the loaded-model API/e2e
+path, but the crate bench kept skipping in clean worktrees because
+`tests/fixtures/native/jfk.wav` is gitignored and absent. I added a bench-only
+fixture override:
+
+```text
+FRANKEN_WHISPER_JFK_WAV=/path/to/jfk.wav
+```
+
+The existing in-repo fixture path remains the deterministic fallback, so CI
+without the audio fixture still skips visibly rather than failing. This is not a
+runtime speedup claim; it removes the measurement blocker so future loaded/e2e
+work can be compared without copying binary audio into clean worktrees.
+
+**Per-crate bench evidence.** Required form first, then executable equivalent:
+
+```text
+AGENT_NAME=BlackThrush FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_JFK_WAV=/data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+result: remote hz2 executed Cargo and Cargo rejected --release (unexpected argument)
+
+AGENT_NAME=BlackThrush RCH_LOCAL_ONLY=1 \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  FRANKEN_WHISPER_JFK_WAV=/data/projects/franken_whisper/tests/fixtures/native/jfk.wav \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-b \
+  rch exec -- cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/e2e/e2e_tiny_jfk --sample-size 10 --warm-up-time 0.1 --measurement-time 3
+RCH: local fallback (no admissible workers)
+native_engine/e2e/e2e_tiny_jfk: [858.48 ms 1.0142 s 1.0929 s]
+```
+
+**Ratio vs ORIG.** Against the existing OpenAI loaded-API anchor
+`0.420035 s`, this newly unblocked franken loaded e2e bench has
+`0.420035 / 1.0142 = 0.414x` ORIG/franken. This does not supersede the prior
+stricter same-session loaded-API ratio (`0.784x`) because the harness shape is
+not identical; it is a current negative bench-harness datapoint and confirms the
+remaining gap still belongs in loaded/e2e work, not another covered mel/decoder
+micro-lever.
+
+**Conformance / hygiene.**
+
+```text
+cargo test -p franken_whisper --test conformance_comparator_tests -- --nocapture
+result: 26 passed, 0 failed
+cargo fmt --check
+result: pass
+git diff --check -- benches/native_engine_bench.rs
+result: pass
+ubs benches/native_engine_bench.rs
+result: exit 1; cargo check/clippy/test-build subchecks clean, but UBS reported
+        existing benchmark-file false positives including `group.finish()` as
+        security-token randomness.
+```
+
+AGENT_NAME=BlackThrush.
+
 ## 2026-06-28 - BlackThrush: BOLD-VERIFY blocker — no `.scratch/.worktrees` win to land; strict ORIG gap still needs fixture/unsafe-policy or `ft_kernel_cpu`, not another covered in-crate micro-lever
 
 **Land-or-dig result: no landable bench-worktree source win; DIG surfaced a

@@ -17,6 +17,8 @@
 //! absent the group prints a visible `SKIP` to stderr and registers no
 //! measurements, so CI without models stays green. Only `mel_30s` is fully
 //! hermetic (synthetic audio + synthetic filterbank).
+//! Set `FRANKEN_WHISPER_JFK_WAV=/path/to/jfk.wav` to point clean worktrees at an
+//! external checked fixture without copying binary audio into the worktree.
 //!
 //! # How to A/B (round-2 f16 passes)
 //! Save a pre-change baseline once:
@@ -37,6 +39,7 @@
 //! numbers for the f16 levers specifically.
 
 use std::hint::black_box;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -165,17 +168,28 @@ fn load_model(short_name: &str) -> Option<LoadedModel> {
     }
 }
 
+fn jfk_wav_path() -> PathBuf {
+    std::env::var_os("FRANKEN_WHISPER_JFK_WAV")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/native/jfk.wav"
+            ))
+        })
+}
+
 /// Read the jfk fixture as mono 16 kHz f32, or `None` (with a SKIP) when absent.
 ///
 /// Uses `hound` (a first-class dependency) rather than the crate-private wav
 /// reader so the bench needs no extra visibility widening. The fixture is a
 /// 16 kHz mono i16 WAV (verified); we assert that and normalize to `[-1, 1]`.
 fn load_jfk_samples() -> Option<Vec<f32>> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/native/jfk.wav");
-    let mut reader = match hound::WavReader::open(path) {
+    let path = jfk_wav_path();
+    let mut reader = match hound::WavReader::open(&path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("SKIP: jfk.wav not readable ({e})");
+            eprintln!("SKIP: jfk.wav not readable at {} ({e})", path.display());
             return None;
         }
     };
