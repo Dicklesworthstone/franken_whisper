@@ -3,6 +3,37 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: CLOSE the encoder-attention gather line — IN-CONTEXT A/B shows skipping ALL per-head gather+transpose saves only ~0.4 ms/layer (≈0.69% e2e), because the 6 head-threads OVERLAP the gathers. The 2.9% upper bound from the isolated probe is overlapped away. REJECT; not worth the head-major refactor.
+
+**Land-or-dig result: LAND empty; DIG converts last cycle's surfaced gather lever
+from an estimate into a MEASURED reject (don't re-surface → measured-and-closed).**
+LAND: no `.scratch`/`.worktrees`, no parked bench, `origin/main == local` at
+`ef35f81`. Last cycle surfaced the Q+K gather (~2.9% e2e *isolated* upper bound) as
+the next candidate; per "don't re-surface" I measured its REALIZABLE in-context cost
+rather than re-listing it.
+
+**Method.** Added a timing-only `FRANKEN_WHISPER_ATTN_SKIPGATHER` gate in
+`attention_raw` (skips the per-head deinterleave/transpose; wrong output, valid
+timing) and A/B'd `nn::attention` on the encoder shape (Tq=Tk=1500, n_head=6,
+best-of-60, this box):
+
+```text
+full (default, real gather):  best = 10.992 ms   (drift control 11.270 ms)
+skip-gather (timing only):    best = 10.580 ms
+realizable gather+transpose on critical path = ~0.41 ms / layer
+```
+
+**⇒ The isolated 2.05 ms/layer (last entry) is mostly OVERLAPPED.** The six per-head
+gathers run concurrently on the six head-threads, so removing ALL of them shortens
+the critical path by only ~0.41 ms/layer (barely above the ~0.28 ms drift noise) →
+×6 layers ≈ **2.4 ms ≈ 0.69% of the 350 ms e2e, upper bound.** The Q+K-gather-only
+head-major-layout refactor (faithful but conformance-risky, >60 min) would capture
+*less* than that. Sub-1%, below the box's wall-clock floor ⇒ **REJECT; do not pursue
+the head-major projection refactor.** This closes the entire attention non-matmul
+overhead line (transpose rejected last entry, gather measured-overlapped here).
+Timing gate + probe reverted; `git diff src/native_engine/nn.rs` vs HEAD empty;
+conformance GREEN by construction. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: REJECT kh_t-transpose elimination in encoder attention — FIRST quantification of attention's non-matmul memory overhead; the avoidable `kh_t` transpose is only 0.376 ms/layer (≤0.64% e2e, overlapped) AND needs an out-of-scope `ft_kernel_cpu::sgemm_bt` exposure ⇒ measured ~0, not built.
 
 **Land-or-dig result: LAND side empty; DIG measured a NEW non-GEMM angle to ~0 →
