@@ -34,6 +34,8 @@ UNCHANGED since the SDPA build; the swarm's recent work (sort/reductions/activat
 norm_dim) does not touch franken's hot path. A future ft fused kernel for franken's
 shapes is the most likely next free win — worth a periodic re-scan, not a per-cycle
 re-dig. AGENT_NAME=IcyWren.
+> **Periodic re-scan log** (LAND clean + ft re-scan; terse, update-in-place — not new entries):
+> - re-scan #1: ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no worktrees ⇒ no change, still converged.
 
 ## 2026-06-28 - IcyWren: the recurring "jax: a DIFFERENT primitive" hint — definitively RULED OUT for franken_whisper-cc. GPU present (GTX 1070) but NO DRIVER (`/dev/nvidia*` absent, `nvidia-smi` missing) ⇒ unusable; and -cc is the CPU variant (GPU = the separate `gpu-frankenjax` feature/build, out of scope). fj-lax's CPU matmuls are f64/f32-accumulate EVIDENCE impls (`cz0g0_*_evidence.rs`), not perf kernels.
 
