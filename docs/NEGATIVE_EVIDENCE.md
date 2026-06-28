@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: alien-graveyard CONCURRENCY catalogue on the decode's ~26% crossbeam-epoch overhead (the next-biggest, alien-uncovered gap) — the candidate (swap `gemv_f16`'s rayon par_iter for a static `std::thread::scope` band split) is REFUTED by the code's own documented L11 decision. Epoch overhead is the irreducible cost of the OPTIMAL mechanism.
+
+**Land-or-dig result: LAND empty; DIG extends the alien-dig coverage to the
+parallelism MECHANISM (DuskFinch's alien dig covered GEMM/GEMV math; this covers
+concurrency) — no in-scope lever; 0 source delta.** LAND: no `.scratch`/`.worktrees`,
+no parked bench, `origin/main == local` at `3d9f95a`.
+
+**DIG — alien-graveyard concurrency/thread-pool catalogue vs the largest non-kernel
+cost.** The decode profile's ~26% crossbeam-epoch (rayon work-steal pin/GC) is the
+biggest e2e cost that is not a GEMM/GEMV kernel, and `nn::gemv_f16` (the big
+per-token logits GEMV) is *franken's own* code — so unlike the encoder sgemm its
+parallelism is in-scope. Candidate (alien "lower-overhead parallel-for / static
+partitioning / avoid epoch reclamation"): replace `gemv_f16`'s rayon
+`par_chunks_mut` with a static `std::thread::scope` row-band split (as
+`attention_raw` and `gemv_f16_batch` already do), eliminating crossbeam-epoch for
+that dispatch.
+
+**⇒ REFUTED by the code's documented history (no need to re-bench — re-measuring is
+covered).** `gemv_f16`'s `PAR_THRESHOLD` comment records the exact arc: the ORIGINAL
+path WAS `std::thread::scope`, and it was **spawn-bound** (per-call spawn/join
+dominated ~20 µs of compute, so serial beat it, −9.5% e2e at L9); **L11 deliberately
+switched to rayon's PERSISTENT global pool** precisely to kill the per-call spawn
+("what whisper.cpp's pool does"), after which **rayon beats serial 1.40×**. So the
+static-thread::scope mechanism I'd propose is the *rejected predecessor*; the
+crossbeam-epoch cost is the irreducible overhead of the BEST available mechanism (a
+persistent pool), and removing it means an epoch-free persistent pool = reimplementing
+rayon = external. The decode GEMV is thus at ceiling on BOTH axes: kernel (fused
+f16c `vcvtph2ps`+FMA dot, the 2.5–5× lever, conformance-gated) and parallelism
+(rayon persistent pool, L11). Also confirmed in passing: `layer_norm` already has a
+SIMD path (`layer_norm_simd_matches_scalar`) — covered, not a lever.
+
+This **completes the alien-dig coverage map**: GEMM/GEMV *math* (DuskFinch:
+external/faithful-bound) + parallelism *mechanism* (here: optimal mechanism already
+in place) are both closed. No exotic in-scope concurrency lever exists; the
+`franken_whisper-cc` decode is at its faithful-port + AVX2 ceiling. No source change.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: CLOSE the encoder-attention gather line — IN-CONTEXT A/B shows skipping ALL per-head gather+transpose saves only ~0.4 ms/layer (≈0.69% e2e), because the 6 head-threads OVERLAP the gathers. The 2.9% upper bound from the isolated probe is overlapped away. REJECT; not worth the head-major refactor.
 
 **Land-or-dig result: LAND empty; DIG converts last cycle's surfaced gather lever
