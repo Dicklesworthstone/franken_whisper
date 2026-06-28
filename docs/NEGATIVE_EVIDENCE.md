@@ -3,6 +3,37 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: REJECT row-tiled (flash-style, FAITHFUL) encoder attention — a measured ~25% REGRESSION (tiled 176 ms vs untiled 141 ms). The per-block dispatch overhead + worse GEMM parallelization beat the cache benefit; the single full-scores GEMM is more efficient. Reverted to 0 source delta.
+
+**Land-or-dig result: LAND empty; DIG = the one remaining big-lever idea (cache the
+9 MB scores via row-tiling) MEASURED a regression, reverted.** LAND:
+`origin/main == local` at `fa9b634`, no `.scratch`/`.worktrees`, no parked bench.
+ft-API audit closed too: `softmax_dim_tensor_contiguous_f32` is only referenced in a
+module DOC comment (never called); the matmul was the sole hot suboptimal ft call.
+
+**DIG — the encoder scores `[1500,1500]` (9 MB) is materialized then round-tripped
+(matmul write → softmax → ×V read), and under `n_head`-way concurrency (54 MB > the
+32 MB per-CCD L3) it spills to DRAM.** Implemented a BIT-IDENTICAL row-tiled path
+(`FW_ATTN_TILED`): process query rows in `TILE=256` blocks so each block's
+`[256, Tk]` scores stay cache-resident; full-row causal mask + full-row softmax per
+block (identical math). Build OK; encoder A/B (interleaved):
+
+```text
+A untiled: 142.38 / 140.20 ms   (stable)
+B tiled  : 176.39 ms            (~25% SLOWER)
+```
+
+**⇒ Clear REGRESSION (~25%), not noise.** Tiling replaces one efficient
+`[1500,64]×[64,1500]` GEMM with six `[256,64]×[64,1500]` GEMMs: more rayon dispatches
+(epoch overhead) AND worse parallelization (M=256 fills fewer cores than M=1500), and
+the cache benefit does not materialize — the matmul-uninit lever already removed the
+dead 9 MB zero-init, so the remaining single scores write is efficient and softmax/×V
+read it back within the head's serial chain (cache-warm). **Materializing the full
+scores is FASTER than tiling here.** Per "REVERT ~0-gain": REVERTED to 0 source
+delta; conformance GREEN by construction. ⇒ The encoder attention is at its
+faithful-port ceiling (matmul-uninit landed; tiling regresses; gather/transpose
+overlapped). No source change kept. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: REJECT decode gemv-output uninit (matmul-uninit lever applied to the decode logits + per-layer projections) — e2e A/B INCONCLUSIVE: adjacent interleaved pairs contradict under load drift; expected ≈0.3% e2e (logits dead-init is ~10 MB vs the matmul's ~324 MB/window). Reverted to 0 source delta. The decode has no big dead-init (tq=1 ⇒ small outputs).
 
 **Land-or-dig result: LAND empty; DIG extended the dead-init vein to the decode,
