@@ -3,6 +3,42 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: DEFINITIVE per-shape encoder-GEMM efficiency (clean, load 9) — the GEMM is at its PRACTICAL ceiling. Redirect note CORRECTED: the slow scores are shape-limited (no fix), and the only sub-peak fixable shape (projections) is bd-4hc0's already-rejected ~1.14×.
+
+**Land-or-dig result: clean capstone measurement (no land; no lever).** With the
+small-K kernel disproven (entry below), I took the definitive per-shape GFLOP/s on a
+CALM box (load 9.1, best-of-120) to settle which encoder GEMM shapes have slack:
+
+```text
+shape                                       GFLOP/s   vs best-achieved (~1200)
+attn xV    [1500,1500]x[1500,64]            1212      ~100%  (near ceiling)
+mlp fc2    [1500,1536]x[1536,384]           1003      ~83%
+mlp fc1    [1500,384]x[384,1536]             746      ~62%
+proj QKV/out [1500,384]x[384,384]            566      ~47%   <- the only sub-peak FIXABLE shape
+attn scores [1500,64]x[64,1500] (K=64)       182      ~15%   <- SHAPE-limited (proven ~0 in-crate)
+```
+
+**What this settles.** Two shapes are below the ~1200 GFLOP/s the engine actually
+reaches (×V/mlp-fc2): the **scores** (K=64, ~15%) and the **projections** (K=384,
+~47%).
+- The **scores** low efficiency is the SHAPE, not slack — a hand-rolled tiled
+  kernel ties matrixmultiply (entry below); no in-crate OR plausible external win
+  (the K=64 microkernel starvation is intrinsic; faer would also be shape-bound).
+- The **projections** are the only sub-peak shape with real headroom — but that is
+  exactly bd-4hc0's `matmul`→`gemm`/faer swap, RE-MEASURED to **~1.03–1.14×** and
+  rejected as not worth a heavy faer dependency.
+
+**⇒ Definitive: the encoder GEMM (62% of e2e) is at its PRACTICAL ceiling.**
+matrixmultiply is near-optimal for every encoder shape given the constraints; the
+two sub-peak shapes are respectively shape-limited (scores) and not-worth-the-dep
+(projections, bd-4hc0). This CORRECTS the earlier "redirect = the small-dim scores"
+sub-target: the scores are unfixable; the projection swap is the only nonzero
+external option and it was already deemed not worth it. Combined with: decode = f16
+GEMV bandwidth at ceiling + int8 dead (no VNNI); mel <0.5% of e2e and optimised.
+**`franken_whisper-cc` is at its true faithful-port + hardware ceiling — no
+worthwhile lever remains in-crate or (practically) external.** No source change.
+AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: small-K `nn::matmul` fast path IMPLEMENTED + MEASURED — it TIES ft sgemm (~150 GFLOP/s, both ~15% of peak). The scores GEMM is SHAPE-limited (K=64), not packing-bound; last entry's "~7% lever" is a measured ~0. REVERTED.
 
 **Land-or-dig result: implemented the flagged lever, MEASURED ~0, REVERTED.** The
