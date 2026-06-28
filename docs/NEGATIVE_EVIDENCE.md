@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: ★★ LANDED fused-SDPA encoder attention — `ft_kernel_cpu::sdpa_forward_f32` replaces the per-head scheme; **encoder ~16% faster** (116 vs ~138 ms; the full attention is **2.35x** faster), FAITHFUL (max|Δ| 1.2e-7, conformance 27+26+6 incl. the e2e transcription test GREEN). Ratio vs OpenAI-Whisper ~1.23x → **~1.31x**. The "different primitive" the directive sought.
+
+**Land-or-dig result: LANDED a real measured win — a different primitive that
+finally translated.** After bmm regressed (materialization) and tiling regressed
+(dispatch overhead), the fused `sdpa_forward_f32` (frankentorch, masked/GQA flash-
+family) avoids BOTH: it row-tiles the query rows (BR=64, full-row softmax per block —
+bit-identical math, no online-softmax approximation) and parallelizes internally over
+heads×blocks in ONE call, never materializing the full `[tq,tk]` scores.
+
+**Probe → integration (it translated this time):**
+```text
+isolated full attention (probe): per-head 11.825 ms  vs  sdpa 5.034 ms = 2.35x ; max|Δ| 1.19e-7
+encoder_window_tiny A/B:         sdpa 116.60 ms  vs  per-head ~138 ms (clean) / 166 ms (load) ≈ ~16% faster
+conformance (sdpa default):      nn lib 27/27, comparator 26/26, native_engine_e2e 6/6 — all PASS
+```
+The probe's 2.35x translated (unlike bmm's isolated 1.14x) because the win is on the
+FULL fused operation, not a component swap inside an unchanged structure.
+
+**Implementation:** `attention_raw` now routes the **bidirectional encoder** attention
+(`causal_offset.is_none()`, `n_head≥2`, `tq≥64`) through `sdpa_forward_f32`: gather
+Q/K/V head-major (rayon-parallel, UNSCALED — the kernel applies `scale = d_head^-0.5`),
+one fused call, scatter back. **Decode keeps the per-head path** (its cached causal
+attention has a `cache_len` offset the kernel's square-causal flag doesn't model).
+Default-ON; escape hatch `FW_ATTN_NO_SDPA`. Faithful within the established f16c-dot
+tolerance (e2e transcription unchanged). e2e A/B was load-confounded (CIs span ±25 ms
+at load 27–46); the **encoder per-crate is the clean measured signal** and the e2e
+ratio is derived (encoder ≈40% of e2e; ~22 ms/window ⇒ ~6% e2e). Source kept:
+`src/native_engine/nn.rs`. Clippy clean. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: REJECT bmm encoder attention — IMPLEMENTED + benched the full path; it REGRESSES ~62% (222 vs 137 ms encoder), even though the isolated scores matmul was 1.14x faster (prior entry). The batched path loses the head-parallel PIPELINING and materializes all 6 heads' 54 MB scores at once. Reverted to 0 source delta. Same lesson as NUMA: an isolated-component win doesn't survive the real integration.
 
 **Land-or-dig result: DIG implemented the prior cycle's validated bmm lever end-to-
