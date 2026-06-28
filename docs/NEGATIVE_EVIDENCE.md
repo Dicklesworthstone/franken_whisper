@@ -1,7 +1,57 @@
 # Negative Evidence Ledger
 
 This ledger records blocked, neutral, rejected, or non-comparable performance
-evidence. It exists to prevent stale optimism from being reused as proof.
+evidence (and, at the top, any VALIDATED-but-not-yet-landed lever). It exists to
+prevent stale optimism from being reused as proof.
+
+## ⚡ VALIDATED LEVER (positive, not-yet-landed) — NUMA-pinned decode GEMV
+
+## 2026-06-28 - IcyWren: ★ VALIDATED the "different primitive" lever — pinned static-partition for the decode logits GEMV is **3.55x** faster than rayon (42 → 149 GB/s) via CCD-L3 residency. This is the first beyond-safe-Rust-ceiling lever PROVEN with data; landing it needs a persistent pinned pool (owner-scoped, multi-hour).
+
+**Land-or-dig result: DIG VALIDATED a major lever via a bounded probe; the landable
+form is owner-scoped, so 0 source delta this cycle.** LAND: `origin/main == local` at
+`29c925f`, no `.scratch`/`.worktrees`. (`fj`/frankenjax is GPU-only, `gpu-frankenjax`
+feature, unused on this CPU box — not the "jax" lever.)
+
+**The hypothesis (from the prior cycle):** the 40 MB f16 tied-embedding
+`[51864,384]` is re-streamed per decode token (~50×); it exceeds one CCD's 32 MB L3,
+and under rayon's WORK-STEALING the thread→row mapping is unstable across tokens ⇒ no
+per-CCD residency ⇒ cross-CCD/DRAM re-reads (the measured 88 GB/s ceiling, ~44% of
+DRAM peak). A pinned static partition (each thread owns a fixed row band, pinned to a
+core) would keep its embedding-slice CCD-L3-resident across tokens.
+
+**Bounded probe (`examples/logits_numa_probe.rs`, reverted; f32 80 MB analog of the
+f16 40 MB embedding, 50 iters, `nix::sched_setaffinity`):**
+```text
+(a) rayon par_iter   (no residency):  94.9 ms   42 GB/s
+(b) pinned static band (residency):   26.8 ms  149 GB/s
+speedup a/b = 3.55x
+```
+**⇒ The lever is REAL: pinned-static is 3.55x faster** — the band stays in the core's
+CCD L3 (149 GB/s) instead of thrashing DRAM cross-CCD (42 GB/s). This is the
+"DIFFERENT primitive, never safe-Rust-ceiling" the directive pointed at: rayon's
+work-stealing/epoch global pool is the ceiling; a PINNED static-partition pool breaks
+it.
+
+**Targets:** the decode logits GEMV (~7% e2e, bandwidth-bound) + the per-layer decode
+GEMVs (the ~25%-of-decode rayon overhead is largely cross-CCD/dispatch cost a pinned
+pool removes) ⇒ plausibly ~5–15% e2e, pushing franken from ~1.2x toward ~1.3–1.4x vs
+OpenAI-Whisper.
+
+**LANDABLE FORM (owner-scoped, multi-hour — NOT a 60-min change):** a PERSISTENT
+pinned worker pool — `W` threads spawned once, each pinned (`nix`/`core_affinity`)
+and owning a fixed output band, fed work across the 50 per-token `gemv_f16` calls via
+a submit/wait channel — replacing `out_slice.par_chunks_mut` in `gemv_f16`'s parallel
+path FOR THE LOGITS SHAPE. Persistence is essential: a fresh `std::thread::scope` per
+call gives no cross-token residency (that is the L11-rejected per-call-spawn path).
+Conformance is bit-identical (disjoint output bands, same dot). No source change kept
+this cycle. AGENT_NAME=IcyWren.
+
+---
+
+## previously: blocked/neutral/rejected evidence
+
+This ledger records blocked, neutral, rejected, or non-comparable performance
 
 ## 2026-06-28 - IcyWren: CONFIRM the post-matmul-win ratio (clean rebuild, multi-reading) — encoder STABLE ~138–141 ms, e2e 342–355 ms ⇒ franken LEADS OpenAI-Whisper **~1.18–1.23x** (load-dependent). Post-win inspection space re-audited exhausted; the one remaining big lever (NUMA-pinned logits L3 residency) is a multi-hour CCD-pinned-pool refactor, deferred.
 
