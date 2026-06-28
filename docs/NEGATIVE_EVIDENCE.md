@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: VALIDATED a real "different primitive" — `ft_kernel_cpu::bmm_tensor_contiguous_f32_into` (batched matmul, landed in frankentorch 3 days ago) is **1.14x** faster than franken's per-head attention scores (one clean dispatch vs 6 nested rayon-flooding head-threads). NOT a tight-loop artifact (direct matmul A/B). Integration is a moderate `attention_raw` refactor — ~0.5–1% e2e — deferred (bench+conformance would blow the 60-min window).
+
+**Land-or-dig result: DIG validated a modest real lever via a focused probe; the
+landable form is a moderate refactor, so 0 source delta this cycle.** LAND:
+`origin == local` at `e49783c`, no `.scratch`/`.worktrees`; ft-kernel-cpu sgemm
+unchanged since 2026-06-18 (no free encoder win).
+
+**The probe** (`examples/bmm_attn_probe.rs`, reverted) compared the encoder
+attention scores (6 heads of `[1500,64]×[64,1500]`), best-of-50:
+```text
+(a) head-parallel (6× nn::matmul, 6 nested threads): 2.285 ms  756 GFLOP/s
+(b) bmm (one batched dispatch)                      : 2.008 ms  861 GFLOP/s
+speedup a/b = 1.14x
+```
+**This is REAL (not artifact):** a direct A/B of the matmul, no tight inner loop.
+franken's `attention_raw` runs 6 per-head `nn::matmul` calls on 6
+`std::thread::scope` threads, each flooding the rayon sgemm (the cycle-15 nested
+contention); the new `bmm` does all heads in one dispatch with cleaner internal
+parallelism (+14%). The same applies to the per-head ×V matmul ⇒ scores+×V ≈ ~1% e2e.
+
+**HONEST scope (learning from the NUMA over-claim):** the 1.14x is the ISOLATED
+scores matmul. Landing it = restructure `attention_raw` to `bmm` all heads
+(parallel gather-all → `bmm` scores → per-head mask+softmax → `bmm` ×V → scatter),
+keeping the gather/softmax rayon-parallel so the head-parallelism isn't lost.
+Bit-identical (same per-head GEMM math). Net e2e is LIKELY ~0.5–1% (the matmul win
+should translate since gather/softmax stay parallel), but must be confirmed by an
+in-engine encoder A/B — NOT yet measured end-to-end. A clean, faithful, in-scope
+next lever for a bounded session. No source change kept. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: ⚠ CORRECTION — the NUMA-pinned logits "3.55x" (prior entry below) is a TIGHT-LOOP ARTIFACT; REFUTED for the real engine. Realistic dispatch (rayon broadcast / pinned par_chunks, separated calls) gives only ~51–56 GB/s ≈ default ~42–45 GB/s; only an unrealistic 50-iter tight inner loop hits ~149–162 GB/s.
 
 **Land-or-dig result: DIG CORRECTED a prior over-claim — the residency does not
