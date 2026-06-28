@@ -179,6 +179,44 @@ fn jfk_wav_path() -> PathBuf {
         })
 }
 
+/// Measure the safe resident-model lever for in-process API use.
+///
+/// This targets the loaded-model OpenAI API gap: direct parse+weight conversion
+/// approximates a short-lived caller that drops the model after each request,
+/// while `load_resident` keeps one bounded strong slot and returns an `Arc`
+/// clone on repeat calls.
+fn bench_model_residency_tiny(c: &mut Criterion) {
+    let Some(path) = find_model_file(MODEL_TINY) else {
+        eprintln!("SKIP model_residency_tiny: model {MODEL_TINY} missing");
+        return;
+    };
+
+    let mut group = c.benchmark_group("native_engine/model_residency");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(1));
+
+    group.bench_function("tiny_parse_weights_nonresident", |b| {
+        b.iter(|| {
+            let ggml = GgmlModel::load(black_box(path.as_path())).expect("load ggml tiny.en");
+            let loaded = LoadedModel::from_ggml(ggml).expect("load weights tiny.en");
+            black_box(loaded.hparams.n_vocab)
+        });
+    });
+
+    let resident = NativeWhisperModel::load_resident(&path).expect("resident tiny.en warmup");
+    black_box(resident.loaded().hparams.n_vocab);
+    group.bench_function("tiny_resident_cache_lookup", |b| {
+        b.iter(|| {
+            let model = NativeWhisperModel::load_resident(black_box(path.as_path()))
+                .expect("resident load");
+            black_box(model.loaded().hparams.n_vocab)
+        });
+    });
+
+    group.finish();
+}
+
 /// Read the jfk fixture as mono 16 kHz f32, or `None` (with a SKIP) when absent.
 ///
 /// Uses `hound` (a first-class dependency) rather than the crate-private wav
@@ -754,6 +792,7 @@ criterion_group!(
     benches,
     bench_mel_30s,
     bench_mel_30s_realistic,
+    bench_model_residency_tiny,
     bench_chunk_frames,
     bench_window_to_time_major,
     bench_encoder_window_tiny,

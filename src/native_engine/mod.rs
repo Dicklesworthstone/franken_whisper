@@ -491,10 +491,13 @@ pub(crate) fn ensure_default_rayon_pool() {
 /// # Memory model
 ///
 /// A loaded large-v3 model is roughly **3 GB of f32 weights**; even
-/// `large-v3-turbo` is well over 1 GB. The global cache holds only [`Weak`]
+/// `large-v3-turbo` is well over 1 GB. The normal global cache holds [`Weak`]
 /// references, so the weights live exactly as long as some caller holds an
-/// `Arc<NativeWhisperModel>`. When the last `Arc` drops, the memory is freed
-/// immediately and the cache slot becomes a dangling `Weak`. Every
+/// `Arc<NativeWhisperModel>`. [`load_resident`](Self::load_resident) is the
+/// explicit exception: it keeps one strong process-wide slot alive for API
+/// servers that want loaded-model residency. When the last non-resident `Arc`
+/// drops, the memory is freed immediately and the cache slot becomes a dangling
+/// `Weak`. Every
 /// [`load`](Self::load) that inserts a new entry also prunes **all** dead
 /// `Weak`s from the cache (not just the slot being re-loaded), so the
 /// `HashMap` cannot accumulate entries for models that have all been dropped —
@@ -512,10 +515,17 @@ pub struct NativeWhisperModel {
 
 /// Global, process-wide model cache keyed by canonical path.
 ///
-/// `Weak` values mean a cache entry never keeps a model alive on its own: it is
-/// purely an opportunistic dedup of concurrently-/repeatedly-used models. See
-/// the [`NativeWhisperModel`] memory-model docs.
-static MODEL_CACHE: Mutex<Option<HashMap<PathBuf, Weak<NativeWhisperModel>>>> = Mutex::new(None);
+/// `Weak` values mean normal [`load`](NativeWhisperModel::load) never keeps a
+/// model alive on its own. [`load_resident`](NativeWhisperModel::load_resident)
+/// adds one bounded strong slot for in-process API users who explicitly want
+/// OpenAI-style loaded-model residency without mmap/unsafe.
+#[derive(Default)]
+struct ModelCache {
+    weak: HashMap<PathBuf, Weak<NativeWhisperModel>>,
+    resident: Option<(PathBuf, Arc<NativeWhisperModel>)>,
+}
+
+static MODEL_CACHE: Mutex<Option<ModelCache>> = Mutex::new(None);
 
 impl NativeWhisperModel {
     /// Load (or fetch from the global cache) the model at `path`.
@@ -533,15 +543,38 @@ impl NativeWhisperModel {
     /// - Whatever [`ggml::GgmlModel::load`] / [`decode::LoadedModel::from_ggml`]
     ///   return for a malformed or unsupported model.
     pub fn load(path: &Path) -> FwResult<Arc<Self>> {
+        Self::load_inner(path, false)
+    }
+
+    /// Load a model and keep one process-wide strong resident slot alive.
+    ///
+    /// This is the safe, bounded residency path for reusable in-process API
+    /// servers: repeated calls for the same canonical path return an `Arc` clone
+    /// even if the previous caller dropped its handle. Loading a different path
+    /// replaces the resident slot, so memory retention is capped to one model.
+    /// Plain [`load`](Self::load) keeps the original Weak-only semantics.
+    pub fn load_resident(path: &Path) -> FwResult<Arc<Self>> {
+        Self::load_inner(path, true)
+    }
+
+    fn load_inner(path: &Path, keep_resident: bool) -> FwResult<Arc<Self>> {
         let canonical = path.canonicalize()?;
 
         // Fast path: a live cached instance.
         {
             let mut guard = lock_cache();
-            let cache = guard.get_or_insert_with(HashMap::new);
-            if let Some(weak) = cache.get(&canonical)
+            let cache = guard.get_or_insert_with(ModelCache::default);
+            if let Some((resident_path, resident)) = &cache.resident
+                && resident_path == &canonical
+            {
+                return Ok(Arc::clone(resident));
+            }
+            if let Some(weak) = cache.weak.get(&canonical)
                 && let Some(existing) = weak.upgrade()
             {
+                if keep_resident {
+                    cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                }
                 return Ok(existing);
             }
         }
@@ -562,17 +595,28 @@ impl NativeWhisperModel {
         // Re-check under the lock: a racing thread may have populated the slot
         // while we were parsing. If so, prefer the already-published instance.
         let mut guard = lock_cache();
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(weak) = cache.get(&canonical)
+        let cache = guard.get_or_insert_with(ModelCache::default);
+        if let Some((resident_path, resident)) = &cache.resident
+            && resident_path == &canonical
+        {
+            return Ok(Arc::clone(resident));
+        }
+        if let Some(weak) = cache.weak.get(&canonical)
             && let Some(existing) = weak.upgrade()
         {
+            if keep_resident {
+                cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+            }
             return Ok(existing);
         }
         // Prune every dead `Weak` (models whose last `Arc` has dropped), not
         // just the slot we are about to overwrite, so the cache cannot grow
         // unbounded with stale entries for models that are never reloaded.
-        cache.retain(|_, w| w.strong_count() > 0);
-        cache.insert(canonical, Arc::downgrade(&model));
+        cache.weak.retain(|_, w| w.strong_count() > 0);
+        cache.weak.insert(canonical.clone(), Arc::downgrade(&model));
+        if keep_resident {
+            cache.resident = Some((canonical, Arc::clone(&model)));
+        }
         drop(guard);
 
         // Warm the version tag on a background thread: the SHA-256 of a
@@ -640,8 +684,7 @@ impl NativeWhisperModel {
 /// Lock the global cache, recovering from a poisoned mutex (a panic in another
 /// thread while holding the lock must not wedge the whole engine — the cache is
 /// pure dedup state and safe to keep using).
-fn lock_cache() -> std::sync::MutexGuard<'static, Option<HashMap<PathBuf, Weak<NativeWhisperModel>>>>
-{
+fn lock_cache() -> std::sync::MutexGuard<'static, Option<ModelCache>> {
     MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1160,6 +1203,26 @@ mod tests {
         // Fresh instance after the cache slot's Weak expired.
         assert!(weak.upgrade().is_none());
         assert_eq!(c.model_path, path.canonicalize().expect("canon"));
+    }
+
+    #[test]
+    fn resident_cache_keeps_one_model_alive_after_drop() {
+        let dir = TempDir::new("resident_cache");
+        let path = write_file(dir.path(), "ggml-resident.bin", synthetic_model_bytes());
+
+        let a = NativeWhisperModel::load_inner(&path, true).expect("resident load a");
+        let _ = a.version_tag();
+        let weak = Arc::downgrade(&a);
+        drop(a);
+
+        let retained = weak
+            .upgrade()
+            .expect("resident cache must keep the model alive after caller drop");
+        let b = NativeWhisperModel::load_inner(&path, true).expect("resident load b");
+        assert!(
+            Arc::ptr_eq(&retained, &b),
+            "resident reload must return the retained Arc"
+        );
     }
 
     #[test]

@@ -3,6 +3,63 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-27 - IcyWren: LAND bounded resident model cache — model reload component collapses **12,393.7x**, full loaded-API ORIG gap still GEMM-limited
+
+**Land-or-dig result: no unlanded measured bench-worktree source win found, then
+DIG and LAND.** A repo-local `.scratch/.worktrees` search stayed empty, and the
+remaining sibling `franken_whisper-*` bench worktrees were either already
+represented on current `main`, superseded by the landed mel/SIMD/decoder work,
+or docs/reject snapshots. The new lever came from the `/alien-graveyard` +
+`/alien-artifact-coding` + `/extreme-software-optimization` pass over the
+largest remaining measured product gap: OpenAI-style loaded-model API residency.
+
+The landed code adds `NativeWhisperModel::load_resident(path)`, a safe explicit
+API for in-process servers that want model residency. Normal `load(path)` keeps
+the Weak-only cache path; `load_resident` keeps exactly one strong process-wide
+slot alive, promotes an existing live weak-cached model when possible, and
+evicts the prior resident model when a different canonical path is loaded. This
+is not mmap or unsafe; it is a bounded ownership lever for the previously
+repeated parse/weight-conversion part of the loaded API path.
+
+**Measurement.** Per-crate bench only, `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`.
+The user-requested `cargo bench --release` form is not accepted by this Cargo, so
+it was captured as a parser failure and the executable equivalent used
+`--profile release`.
+
+```text
+AGENT_NAME=IcyWren CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/model_residency --sample-size 10 --warm-up-time 0.1 --measurement-time 1
+result: Cargo rejected --release (unexpected argument)
+
+AGENT_NAME=IcyWren CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a \
+  FRANKEN_WHISPER_MODEL_DIR=/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/models \
+  rch exec -- cargo bench --profile release -p franken_whisper --bench native_engine_bench \
+    -- native_engine/model_residency --sample-size 10 --warm-up-time 0.1 --measurement-time 1
+RCH: local (no admissible workers: insufficient_slots=3,hard_preflight=1)
+
+native_engine/model_residency/tiny_parse_weights_nonresident:
+  [174.55 ms 184.22 ms 194.56 ms]
+native_engine/model_residency/tiny_resident_cache_lookup:
+  [14.392 us 14.864 us 15.657 us]
+isolated residency component ratio:
+  184.22 ms / 14.864 us = 12,393.7x
+```
+
+**Ratio vs ORIG.** The current strict loaded API comparator remains the product
+gap yardstick: OpenAI Whisper loaded API `0.420035 s` vs franken native loaded API
+`0.535540 s`, ORIG/franken = **0.784x**. This commit does **not** claim that full
+comparator is now closed, because the measured decoder/encoder route still
+points to external `ft_kernel_cpu` GEMM. What it lands is the bounded
+same-process residency lever for the reload component of that gap: repeated
+in-process model acquisition now measures **12,393.7x** faster than reparsing and
+rebuilding tiny.en weights. Conformance stayed green:
+`cargo test -p franken_whisper --test conformance_comparator_tests` passed
+26/26; focused cache tests passed 22/22; final `cargo test -p franken_whisper`
+passed after using the ignored local `jfk.wav` fixture to satisfy the existing
+YouTube stub test. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - DuskFinch: e2e PHASE DECOMPOSITION (first quantitative one) — jfk e2e is ENCODER-dominated (~62%) + decode (~38%); the single biggest gap vs ORIG is the external `ft_kernel_cpu` GEMM (~35% of e2e). Mel is negligible.
 
 **Land-or-dig result: DIG (measure where the e2e gap actually is) → SURFACE the
@@ -47,7 +104,6 @@ every in-crate lever is landed or covered; the remaining gap requires
 `ft_kernel_cpu` (encoder GEMM) or an int8/VNNI policy change (decode bandwidth),
 neither in scope. No source change (probes already landed; nn.rs is `main`).
 AGENT_NAME=DuskFinch.
-
 ## 2026-06-28 - DuskFinch: CLOSE the encoder-softmax lead — `std::simd` `StdFloat::exp` does NOT vectorize on this target (−0.38% encoder instructions). Only L8's minimax could win, and that is e2e-rejected. Lead resolved, not a false-negative.
 
 **Land-or-dig result: DIG (close my own open lead) → REVERT (~0).** My prior
@@ -242,7 +298,6 @@ projection levers), a perf-instruction A/B of the SIMD `exp` on THIS encoder
 softmax (~13%, much bigger than the decoder logsumexp L8 also covered) could
 re-check whether the e2e ~0 was a noise-floor false negative. No lib change.
 AGENT_NAME=DuskFinch.
-
 ## 2026-06-27 - BlackThrush: REJECT / no-ship per-worker mel scratch arena uninit — **no same-worker measured win; ORIG ratio unchanged**
 
 **Land-or-dig result: no unlanded bench-worktree source win found, then DIG and
