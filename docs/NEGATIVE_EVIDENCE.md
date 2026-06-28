@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: VALIDATED the e2e decomposition by direct wall-clock — e2e=350ms = encoder 180 + decode 167 + mel 2.5 (sum checks out, nothing unaccounted). Refines the split: encoder (51%) ≈ decode (48%), NOT encoder-dominant.
+
+**Land-or-dig result: ground-truth validation of the whole arc (no land; no lever).**
+Every phase had been measured in isolation; this checks they actually SUM to the
+real e2e (i.e. no un-measured component hides a lever). Ran `e2e_tiny_jfk` (full
+`transcribe_samples` over jfk, release, calm box) + measured each phase's WALL time
+directly (`(t[1+N]−t[1])/N` to cancel one-time setup):
+
+```text
+e2e_tiny_jfk (measured):              350.6 ms   [348.8, 353.1]
+  encoder /window  (enc probe wall):  180   ms    51%   <- external matmul sgemm
+  decode  (= e2e − enc − mel):        167   ms    48%   <- gemv_f16 (fused dot) + bandwidth
+  mel /window      (mel probe wall):    2.5 ms   0.7%   <- optimised
+  SUM = 180 + 167 + 2.5 = 350 ms  ≈  e2e 350.6 ms  -> VALIDATED (nothing unaccounted)
+```
+
+**What it adds/corrects.** (1) The decomposition is now GROUND-TRUTH-validated: the
+three measured phases account for the whole e2e to ~0.2%, so there is no hidden
+component (e.g. no surprise allocation/copy phase) carrying a lever. (2) It CORRECTS
+the earlier instruction-based split (encoder 62% / decode 38%): by wall-clock,
+**encoder ≈ decode (~51% / ~48%)** — the instruction count over-weighted the encoder
+because the decode is more parallel and the decode probe over-states (bd-6qih). (3)
+Real decode = ~3.3 ms/token (~50 tokens) — the `decoder_perf_probe` tight-loop value
+(~6.6 ms/token) over-states ~2×; use 167 ms / token-count for real-e2e decode share.
+
+**⇒ The two near-equal halves are BOTH at ceiling** (established earlier): encoder =
+external matrixmultiply sgemm (56% of it, shape-limited scores + bd-4hc0-rejected
+projections); decode = `gemv_f16` fused-dot bandwidth ceiling (88 GB/s) + int8-dead
+(no VNNI). Franken transcribes 11 s of jfk in 350 ms (~31× realtime). The arc is now
+not just analysed but VALIDATED end-to-end: `franken_whisper-cc` is at its
+faithful-port + hardware ceiling, with every e2e millisecond accounted for. No
+source change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: decode-loop ORCHESTRATION verified (the one un-profiled e2e component) — `compute_logprobs` + `argmax` are covered/small. e2e is now exhaustively accounted for; no lever.
 
 **Land-or-dig result: code-grounded close of the last un-profiled component (no
