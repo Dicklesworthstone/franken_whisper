@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: comparator SCOPE pinned — `e2e_tiny_jfk` loads audio ONCE outside `b.iter`, so the measured path is exactly `transcribe` = mel + encoder + decode (audio I/O excluded). The component audit is now COMPLETE: every measured component is covered/at-ceiling/sub-1%; no audio-frontend lever exists for the comparator.
+
+**Land-or-dig result: LAND empty; DIG audited the last candidate (the audio
+frontend) and found it OUTSIDE the measured path — component map complete; 0 source
+delta.** LAND: no `.scratch`/`.worktrees`, no parked bench, `origin/main == local`
+at `7829c8d`.
+
+**DIG — pinned the comparator scope to rule out an audio-frontend lever.**
+`benches/native_engine_bench.rs::bench_e2e_tiny_jfk` calls `load_jfk_samples()`
+**once, before** the timed `b.iter`, then the timed body is solely
+`model.transcribe(&samples, &params, &noop)` (params `n_threads: 8`, which
+`encoder.rs:459` documents as *informational* — the heavy GEMMs run on the rayon
+global pool, not capped at 8). So wav decode / resample / sample loading are NOT in
+the comparator. ⇒ The measured e2e is exactly **mel + encoder + decode**, and those
+three are now each fully audited:
+- **mel** (<0.7% e2e): exhausted (SIMD log10, cfft arena, fft-out reuse — all landed).
+- **encoder** (~51%): external `ft_kernel_cpu` sgemm (covered, ~1.03× swap rejected)
+  + attention scheduling (3.01× regression), gather/transpose (overlapped ~0.69%),
+  softmax (L8, overlapped/regresses), gelu/layernorm (SIMD/covered), conv stem
+  (~0.1%, once/window).
+- **decode** (~48%): gemv_f16 fused-f16c at the bandwidth ceiling + rayon persistent
+  pool (L11 optimal), KV-cache pre-allocated (no per-token alloc), expf 1.67%
+  (covered/rejected).
+
+⇒ **No in-scope comparator lever remains at any measured component.** The only
+residual gaps are external (`ft_kernel_cpu` GEMM, owner's frankentorch domain,
+~1.03×) or hardware-gated (no AVX-512/VNNI ⇒ int8 decode dead). No source change.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: encoder conv-stem audited — a REAL redundancy (per-call conv-weight transpose, not pre-transposed at load like the linear weights) + per-call im2col alloc, but the stem runs ONCE PER WINDOW so it is ~0.1% e2e on the 1-window JFK comparator. Sub-1%, recorded not implemented.
 
 **Land-or-dig result: LAND empty; DIG audited the last un-examined encoder
