@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: int8-weight decode GEMV — the ONE "different primitive" that could attack the bandwidth-bound decode (the biggest gap). REJECTED on FAITHFULNESS, not VNNI. Corrects the earlier "int8 VNNI-dead" framing for the memory-bound case.
+
+**Land-or-dig result: DIG re-analyzed the recurring "jax: a DIFFERENT primitive"
+hint at the decode bottleneck; the only real candidate breaks the faithful port.
+0 source delta.** LAND clean (`62252c2`), ft-kernel-cpu still `2ddced53`.
+
+The decode is bandwidth-bound — the logits GEMV streams the **40 MB f16** vocab
+embedding every token; per-layer weights another ~36 MB. The seductive "different
+primitive": store those weights **int8** (20 MB) ⇒ bandwidth ~halves ⇒ the GEMV could
+run ~2x. Crucially, **VNNI is irrelevant here** — the kernel is memory-bound, so we
+just load int8 + dequant-to-f32 + f32-accumulate; no int8·int8 dot product is needed.
+So the earlier "int8 VNNI-dead" reasoning (which applies to *compute*-bound int8) does
+NOT block this.
+
+**But it breaks faithfulness.** int8 symmetric quantization of the embedding injects
+~0.4% per-weight error ⇒ ~1e-4–1e-3 relative on each logit — **~100x the established
+f16c-dot tolerance (~3e-6)**. Whisper decode is greedy argmax + logsumexp; a
+perturbation that large flips close-call tokens ⇒ different transcription ⇒
+conformance FAIL. So int8 weights are **faithfulness-dead** for franken_whisper-cc
+(the faithful CPU port). It would only be valid in a separate, explicitly-lossy "fast"
+variant — owner-scoped, not -cc. (ft has no int8 *gemv* anyway; only
+`linear_int8_dynamic_f32`, which is also compute-path/VNNI-oriented.)
+
+⇒ The decode bandwidth floor is **f16** (2 bytes, the faithful precision floor); it
+cannot be lowered without changing the numerics. This closes the last "different
+primitive" idea against the decode. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: CONVERGENCE CAPSTONE — native engine at its CPU/faithful-port ceiling, leading OpenAI-Whisper ~1.24–1.31x via TWO landed wins. The in-scope + fused-primitive + jax/GPU search space is comprehensively closed; further speed requires owner-scoped work (a NEW frankentorch fused kernel, the GPU variant, or external GEMM). This entry consolidates the scattered per-cycle rulings so they are not re-dug.
 
 **Land-or-dig result: nothing to land (origin==local `7f5ae83`, no
@@ -35,7 +62,7 @@ norm_dim) does not touch franken's hot path. A future ft fused kernel for franke
 shapes is the most likely next free win — worth a periodic re-scan, not a per-cycle
 re-dig. AGENT_NAME=IcyWren.
 > **Periodic re-scan log** (LAND clean + ft re-scan; terse, update-in-place — not new entries):
-> - re-scans #1–4 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no `.scratch`/`.worktrees` ⇒ no change, converged. #3 ruled out new ft-core `632f657d` (in-place fused-elementwise accessor — tensor-layer infra, N/A to franken's raw-`&mut [f32]` hot path). #4: box load sustained ~15–23 across all cycles (swarm-busy) ⇒ no low-load window for a definitive ratio; operating-condition ratio ~1.24x (load ~18), theoretical low-load ~1.31x.
+> - re-scans #1–5 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no `.scratch`/`.worktrees` ⇒ no change, converged. #3 ruled out new ft-core `632f657d` (in-place fused-elementwise accessor — tensor-layer infra, N/A to franken's raw-`&mut [f32]` hot path). #4: box load sustained ~15–23 across all cycles (swarm-busy) ⇒ no low-load window for a definitive ratio; operating-condition ratio ~1.24x (load ~18), theoretical low-load ~1.31x.
 
 ## 2026-06-28 - IcyWren: the recurring "jax: a DIFFERENT primitive" hint — definitively RULED OUT for franken_whisper-cc. GPU present (GTX 1070) but NO DRIVER (`/dev/nvidia*` absent, `nvidia-smi` missing) ⇒ unusable; and -cc is the CPU variant (GPU = the separate `gpu-frankenjax` feature/build, out of scope). fj-lax's CPU matmuls are f64/f32-accumulate EVIDENCE impls (`cz0g0_*_evidence.rs`), not perf kernels.
 
