@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: COMPLETE the GEMM map — the DECODE is 100% GEMV (m=1, all landed), so it has NO bd-4hc0-style sub-lever. The SOLE external GEMM lever in the whole e2e is the encoder small-dim attention shapes.
+
+**Land-or-dig result: load-immune completion of the GEMM landscape (no land; no
+in-crate lever; box at load ~187, no measurement possible).** Last entry mapped the
+ENCODER GEMM by shape and flagged the small-dim attention shapes as the unmeasured
+bd-4hc0 sub-target. This closes the other ~38% of e2e — the DECODE — by shape, so
+the external-lever question is fully answered.
+
+**The decode is 100% GEMV (m=1), all already landed.** At decode time `tq=1`, so
+every decode matmul is a GEMV, NOT a packing GEMM — there is no bd-4hc0 (matmul-vs-
+gemm) opportunity in the decode at all:
+
+```text
+Q/K/V/out/MLP-fc1/fc2 proj  [1,K]x[K,N], f16 weights  -> nn::gemv_f16 (fused f16c dot)   LANDED 1d6af83/4e84513
+self-/cross-attn scores+xV  [1,K]x[K,N], f32          -> nn::matmul m==1 SAXPY           LANDED bd-6qih
+logits                      [1,384]x[384,51864], f16  -> nn::gemv_f16 (parallel)          LANDED
+```
+
+None of these go through the `ft_kernel_cpu` packing sgemm (the `m==1` fast path
+bypasses it precisely because a packing GEMM is ~8–10× slower for `m=1` — see the
+`nn::matmul` comment). So the decode's ~38% of e2e is bandwidth-bound f16 GEMV
+(fused dot, at ceiling) + the VNNI-blocked int8 path (dead on this AVX2 box).
+
+**⇒ The COMPLETE e2e GEMM landscape (both phases mapped by shape):**
+- **encoder (~62% e2e):** packing sgemm via `ft_kernel_cpu`. Projections/MLP (~61%
+  of encoder GEMM) = bd-4hc0 ~1.03× (measured, not worth it). **Attention scores/×V
+  (~39% of encoder GEMM ≈ ~22% e2e, K/N=64) = UNMEASURED, matrixmultiply's worst
+  case — the ONE concrete external sub-lever left.**
+- **decode (~38% e2e):** 100% GEMV, all landed, no packing-GEMM lever; bandwidth
+  bound; int8 hardware-blocked.
+
+So across the entire e2e there is exactly ONE remaining lever, and it is external:
+the encoder attention small-dim sgemm in `ft_kernel_cpu` (frankentorch). Everything
+in `franken_whisper-cc` is landed or covered. No source change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: SHARPEN the bd-4hc0 redirect — the encoder GEMM is ~39% small-dim ATTENTION shapes (K=64 / N=64) that bd-4hc0 NEVER measured; its "~1.03×" was only the K≥384 projection/MLP shapes. A concrete unmeasured external sub-lever (~22% of e2e).
 
 **Land-or-dig result: load-immune ANALYSIS that makes the redirect concrete (no new
