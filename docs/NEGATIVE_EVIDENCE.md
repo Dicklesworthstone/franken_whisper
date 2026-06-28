@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: CLOSE the encoder-softmax lead — `std::simd` `StdFloat::exp` does NOT vectorize on this target (−0.38% encoder instructions). Only L8's minimax could win, and that is e2e-rejected. Lead resolved, not a false-negative.
+
+**Land-or-dig result: DIG (close my own open lead) → REVERT (~0).** My prior
+encoder entry (`fcff967`) flagged the ~13% attention softmax as a possible
+wall-clock false-negative worth a perf re-check (PERF_LEDGER L8 rejected a
+*minimax* SIMD softmax at e2e ~0). First: `.scratch/.worktrees` scan — no
+franken_whisper bench worktree holds an unlanded win (only `*reject*` doc
+branches), so nothing to LAND. Then I resolved the softmax lead with the cheapest
+*new* measurement: swap `softmax_rows`' scalar `(*v-max).exp()` for an 8-lane
+`std::simd` `StdFloat::exp` (the portable path L8 did NOT test — L8 wrote a custom
+minimax) behind `FW_SOFTMAX_SCALAR`, and perf-stat the encoder probe.
+
+```text
+INSTRUCTIONS/iter (deterministic), encoder_perf_probe:
+  scalar libm exp      9,375,996,375
+  std::simd StdFloat   9,340,454,684   = -0.38%  (~0)
+```
+
+**~0. REVERTED.** `std::simd`'s `exp` on `x86-64-v3` (no `libmvec` linked) lowers
+to PER-LANE `expf` libcalls — the same `__expf_fma` the profile already showed for
+the scalar loop — so it removes essentially no instructions (the −0.38% is just the
+loop restructure). The ONLY way to vectorize the softmax `exp` is a hand-rolled
+**minimax** polynomial, which is exactly what L8 implemented (3.56× isolated) and
+measured at **e2e ~0 / marginally negative** — and BlackThrush re-confirmed a
+partial-SIMD softmax REGRESSION. So the softmax is genuinely covered at the e2e
+level; the lead I raised was NOT a wall-clock false-negative (unlike the cfft /
+projection levers, which had real instruction reductions). `nn.rs` restored
+byte-identical to `main`.
+
+**⇒ This closes the last open in-crate lead.** All three paths are now exhaustively
+profiled + at ceiling (mel optimized; decoder fused-dot+SAXPY+tuned-rayon; encoder
+external-GEMM + L8/L13-covered softmax/gelu/rayon), with this turn's perf-instrument
+check ruling out the one remaining false-negative suspect. Consistent with
+BlackThrush's blocker below: the sole remaining e2e gap vs ORIG is the external
+`ft_kernel_cpu` matrixmultiply GEMM (bd-4hc0), out of `franken_whisper-cc` scope.
+No lib change lands. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - BlackThrush: BOLD-VERIFY blocker — no `.scratch/.worktrees` win to land; strict ORIG gap still needs fixture/unsafe-policy or `ft_kernel_cpu`, not another covered in-crate micro-lever
 
 **Land-or-dig result: no landable bench-worktree source win; DIG surfaced a
