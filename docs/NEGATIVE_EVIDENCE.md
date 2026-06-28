@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: decode KV-cache allocation VERIFIED optimal — pre-allocated, no per-token realloc; the only residual (per-window dead zero-init) is sub-1% + needs unsafe + already covered by the memset uninit sweep. No allocation lever in the decode.
+
+**Land-or-dig result: LAND empty; DIG checked the one allocation pattern never
+examined and found it already optimal — 0 source delta, no bench needed
+(code-determinable).** LAND: no `.scratch`/`.worktrees`, no parked bench,
+`origin/main == local` at `5c6beff`.
+
+**DIG — allocation churn was the source of the BIGGEST landed levers in this project
+(the mel cfft arena, −10.64% instructions), so I checked the one alloc pattern never
+audited: the decode self-attention `KvCache`.** Verified by reading `nn.rs`:
+- `KvCache` is **pre-allocated** once to `capacity_tokens × n_state`
+  (`nn.rs:1006-1014`); `append` is a `copy_from_slice` into that buffer
+  (`nn.rs:1064-1068`); `reset` retains the allocation (`nn.rs:1035`). ⇒ **No
+  per-token realloc/grow** — the autoregressive decode pays zero allocation per
+  token. The mel-style per-batch-malloc lever does NOT recur here.
+
+The only residual is the `vec![0.0; capacity_tokens*n_state]` zero-init: it is a
+DEAD write (the cache only ever reads `[0..len]`, which `append` overwrites first),
+the same shape as the landed FFT-uninit levers. But it is **per-`DecoderState`**
+(once per 30 s window — once for the 1-window JFK comparator ≈ 0.23% e2e), it would
+need `unsafe` `MaybeUninit` under the crate's unsafe policy, and the documented
+memset/alloc-zeroing **uninit sweep (`e93a9d0`/`894cf1f`) already drove alloc-zeroing
+to ~0 e2e**. Sub-1%, covered, unsafe-requiring ⇒ not worth it. ⇒ The decode has no
+allocation lever; `DecoderState::new`'s cross-K/V precompute is the documented
+one-time per-window SETUP, not a per-token cost. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: alien-graveyard CONCURRENCY catalogue on the decode's ~26% crossbeam-epoch overhead (the next-biggest, alien-uncovered gap) — the candidate (swap `gemv_f16`'s rayon par_iter for a static `std::thread::scope` band split) is REFUTED by the code's own documented L11 decision. Epoch overhead is the irreducible cost of the OPTIMAL mechanism.
 
 **Land-or-dig result: LAND empty; DIG extends the alien-dig coverage to the
