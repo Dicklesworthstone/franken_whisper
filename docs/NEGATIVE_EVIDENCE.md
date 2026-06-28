@@ -3,6 +3,26 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: RATIO CORRECTION — fresh e2e measurement pins the OPERATING ratio at ~1.2x (1.19–1.24x), not the ~1.31x I'd been carrying. The 1.31x was a theoretical low-load derivation never cleanly achieved on this swarm-busy box. Honest down-correction; the SDPA win itself is intact.
+
+**Land-or-dig result: DIG took a low-ish-load window to re-measure the e2e and
+correct an over-optimistic ratio; 0 source delta.** LAND clean (`4d793c5`),
+ft-kernel-cpu still `2ddced53`.
+
+Fresh `e2e_tiny_jfk` (sdpa default, load 15→22), three consistent readings:
+```text
+e2e1 353.28  e2e2 352.17  e2e3 355.94 ms   (best 346.57)
+⇒ ratio vs OpenAI 0.420035 s = ~1.19x (median) … ~1.21x (best)
+```
+Combined with the cycle-28 reading (338.57–342.47 ms ⇒ ~1.24x), the **measured
+operating ratio is ~1.2x (1.19–1.24x)** at the box's real load (15–22). This is NOT a
+regression: the SDPA win was measured as **−56 ms vs per-head in a matched-load
+interleaved A/B** and −22 ms on the encoder per-crate; the absolute e2e simply swings
+~12 ms with load. The earlier "~1.31x" came from extrapolating the encoder delta to a
+~320 ms low-load e2e that this perpetually-busy box never actually delivers (lowest
+seen ~338 ms @ load 15). **Going forward cite ~1.2x operating** (lead from the two
+landed wins: matmul-uninit + fused-SDPA; was parity). AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: int8-weight decode GEMV — the ONE "different primitive" that could attack the bandwidth-bound decode (the biggest gap). REJECTED on FAITHFULNESS, not VNNI. Corrects the earlier "int8 VNNI-dead" framing for the memory-bound case.
 
 **Land-or-dig result: DIG re-analyzed the recurring "jax: a DIFFERENT primitive"
@@ -62,7 +82,7 @@ norm_dim) does not touch franken's hot path. A future ft fused kernel for franke
 shapes is the most likely next free win — worth a periodic re-scan, not a per-cycle
 re-dig. AGENT_NAME=IcyWren.
 > **Periodic re-scan log** (LAND clean + ft re-scan; terse, update-in-place — not new entries):
-> - re-scans #1–7 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no `.scratch`/`.worktrees` ⇒ no change, converged. Box load swings 12–71 across cycles (swarm-busy) — no stable low window for a definitive ratio; operating ~1.24x. #3 ruled out new ft-core `632f657d` (in-place fused-elementwise accessor — tensor-layer infra, N/A to franken's raw-`&mut [f32]` hot path). #4: box load sustained ~15–23 across all cycles (swarm-busy) ⇒ no low-load window for a definitive ratio; operating-condition ratio ~1.24x (load ~18), theoretical low-load ~1.31x.
+> - re-scans #1–8 (2026-06-28): ft-kernel-cpu still `2ddced53` (0 new commits), origin==local, no `.scratch`/`.worktrees` ⇒ no change, converged. #8 re-measured e2e (load 15–22) ⇒ operating ratio CORRECTED to ~1.2x (1.19–1.24x), see entry above; box load swings 12–71 (swarm-busy) so the theoretical ~1.31x low-load value is never realized. #3 ruled out new ft-core `632f657d` (in-place fused-elementwise accessor — tensor-layer infra, N/A to franken's raw-`&mut [f32]` hot path). #4: box load sustained ~15–23 across all cycles (swarm-busy) ⇒ no low-load window for a definitive ratio; operating-condition ratio ~1.24x (load ~18), theoretical low-load ~1.31x.
 
 ## 2026-06-28 - IcyWren: the recurring "jax: a DIFFERENT primitive" hint — definitively RULED OUT for franken_whisper-cc. GPU present (GTX 1070) but NO DRIVER (`/dev/nvidia*` absent, `nvidia-smi` missing) ⇒ unusable; and -cc is the CPU variant (GPU = the separate `gpu-frankenjax` feature/build, out of scope). fj-lax's CPU matmuls are f64/f32-accumulate EVIDENCE impls (`cz0g0_*_evidence.rs`), not perf kernels.
 
