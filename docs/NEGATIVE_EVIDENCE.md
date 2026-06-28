@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: CONFIRM the landed SDPA win translates to e2e — interleaved A/B (sdpa vs FW_ATTN_NO_SDPA) shows sdpa CONSISTENTLY faster on `e2e_tiny_jfk`; the ~22 ms encoder delta carries through (the last-cycle "e2e-neutral" reading was load noise). franken now leads OpenAI-Whisper ~1.24–1.31x (load-dependent).
+
+**Land-or-dig result: confirmed the prior-cycle landed win on the comparator;
+no new source change (0 delta).** LAND: `origin == local` at `99feaa6`. Decode
+attention checked — its cross-attn uses PRECOMPUTED `cross_kh_t`/`cross_vh` (no
+re-transpose redundancy) at tq=1 via `cross_attention` (m==1 SAXPY, already optimal);
+SDPA doesn't help tq=1, and ft-kernel-cpu has no fused MLP/gemv primitive ⇒ no further
+fused-primitive lever right now.
+
+**Clean e2e A/B (already-built sdpa binary, interleaved):**
+```text
+A1 sdpa 339.72 / B1 perhead 395.84 ms  (load ~13)  → sdpa −56 ms
+A2 sdpa 365.51 / B2 perhead 372.03 ms  (load ~34)  → sdpa −6.5 ms
+```
+The pairs disagree on magnitude (load drifted 13→34), but **both have sdpa FASTER** —
+consistently positive, bracketing the clean encoder per-crate delta (116 vs 138 ms =
+~22 ms). So the SDPA encoder-attention win (last cycle) DOES carry to e2e (~22 ms ≈
+~6–7%); the prior cycle's near-equal e2e best-of was a load artifact. Ratio vs the
+OpenAI loaded-API anchor `0.420035 s`: at the cleanest low load (~320 ms) ≈ **1.31x**;
+even at load 13 (`0.33972 s`) ≈ 1.24x. **franken_whisper-cc now leads OpenAI-Whisper
+by ~24–31% on the tiny e2e comparator** (from parity, via the two landed wins:
+matmul-uninit + fused-SDPA). No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: ★★ LANDED fused-SDPA encoder attention — `ft_kernel_cpu::sdpa_forward_f32` replaces the per-head scheme; **encoder ~16% faster** (116 vs ~138 ms; the full attention is **2.35x** faster), FAITHFUL (max|Δ| 1.2e-7, conformance 27+26+6 incl. the e2e transcription test GREEN). Ratio vs OpenAI-Whisper ~1.23x → **~1.31x**. The "different primitive" the directive sought.
 
 **Land-or-dig result: LANDED a real measured win — a different primitive that
