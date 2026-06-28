@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - DuskFinch: FIRST real-e2e perf profile (not isolated phases) — the reopened decode (48%) has no new lever; every symbolized hotspot is covered.
+
+**Land-or-dig result: profiled the integrated pipeline (no land; no lever).** Last
+entry rebalanced decode to ~48% of e2e (vs the 38% I'd assumed), so I profiled the
+REAL `e2e_tiny_jfk` run — the first profile of the integrated pipeline (all prior
+profiles were isolated phase probes). `perf record` IP-sampling (the `-g`
+call-graph unwind across the rayon fan-out is too heavy and produced 0 samples):
+
+```text
+real-e2e top symbols (libc/libm symbolised; franken+deps are raw addrs, release):
+  5.14%  __memset_avx2  (alloc zeroing)        <- COVERED: kernel uninit/reuse sweep
+                                                  (e93a9d0 layer_norm SoA ~0; 894cf1f
+                                                  fft_out REJECTED) — memset overlaps
+                                                  compute, eliding it didn't help.
+  1.67%  __expf_fma     (compute_logprobs lse) <- COVERED: logsumexp-SIMD REJECTED ~0.
+  ~85%   raw-addr franken/deps clusters        <- matmul sgemm + gemv_f16 (at ceiling)
+                                                  + crossbeam (decode rayon).
+```
+
+**The two open sub-questions, both already settled — no rebuild needed:**
+- **Decode rayon overhead** (the tight-loop `decoder_perf_probe` over-states it 52%):
+  bd-6qih already MEASURED that serialising the decode (raising the par threshold)
+  **REGRESSES e2e +2.7%**, so the parallelism is net-positive regardless of its
+  overhead share — no lever. (The raw-addr crossbeam frames here can't be ≥ that.)
+- **memset 5.14%**: the measurable-kernel uninit/reuse sweep closed at ~0 (the
+  zeroing overlaps with compute / buffers are bandwidth-bound) — not a lever.
+
+**⇒ The reopened decode (48% e2e) holds no new lever** — its real-e2e hotspots are
+`gemv_f16` (88 GB/s ceiling), the covered logsumexp, covered allocation-zeroing, and
+net-positive rayon. Both e2e halves remain at ceiling. Symbolising the raw-addr
+frames needs the release-perf bench (7m51s rebuild) and would only re-confirm
+gemv/sgemm dominance, so not pursued at load 23. No source change. AGENT_NAME=DuskFinch.
+
 ## 2026-06-28 - DuskFinch: VALIDATED the e2e decomposition by direct wall-clock — e2e=350ms = encoder 180 + decode 167 + mel 2.5 (sum checks out, nothing unaccounted). Refines the split: encoder (51%) ≈ decode (48%), NOT encoder-dominant.
 
 **Land-or-dig result: ground-truth validation of the whole arc (no land; no lever).**
