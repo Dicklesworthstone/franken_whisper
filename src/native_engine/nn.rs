@@ -687,8 +687,29 @@ pub fn gemv_f16_batch(
     // amortized over `tq * out * inp` MACs. `1 << 19` keeps small prefills
     // serial while still parallelizing the realistic multi-token prompt batches.
     const PAR_THRESHOLD: usize = 1 << 21;
-    let workers = gemv_worker_count(out);
-    if tq * out * inp < PAR_THRESHOLD || workers < 2 {
+    // Unlike the m=1 gemv (dispatch-bound, cap8), a COMPUTE-bound BATCHED gemv
+    // (tq>1, large work — e.g. cross-KV at tq=1500, ~2.4 GFLOP, and long prompt
+    // prefills) scales past the m=1 cap: MEASURED 1.50× at 16 vs 8 (32 plateaus).
+    // Use 16 once the work clears a compute-bound bar; small prefills keep the
+    // m=1 cap (`gemv_worker_count`). `FW_BATCH_GEMV_CAP` overrides.
+    const COMPUTE_BOUND_MACS: usize = 1 << 26; // ~67M: cross-KV (2.4G) + long prompts
+    let avail = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let work = tq.saturating_mul(out).saturating_mul(inp);
+    let workers = std::env::var("FW_BATCH_GEMV_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&c| c >= 1)
+        .map(|c| avail.min(c))
+        .unwrap_or_else(|| {
+            if work >= COMPUTE_BOUND_MACS {
+                avail.min(16)
+            } else {
+                gemv_worker_count(out)
+            }
+        });
+    if work < PAR_THRESHOLD || workers < 2 {
         compute_band(0, out, out_slice);
         return;
     }

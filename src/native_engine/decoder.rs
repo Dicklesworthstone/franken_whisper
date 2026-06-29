@@ -59,6 +59,8 @@
 
 use rayon::prelude::*;
 
+use ft_core::Float16;
+
 use super::nn::{self, KvCache, WeightMat};
 use super::{Mat, WhisperHParams};
 use crate::error::{FwError, FwResult};
@@ -608,6 +610,15 @@ pub struct DecoderState {
     /// Per-`(layer, head)` gathered cross-value head `[enc_frames, d_head]`
     /// (in `layer * n_head + head` order). See [`Self::cross_kh_t`].
     cross_vh: Vec<Mat>,
+    /// f16 cross-attention K/V (bd-b4hp): natural cross-key `[enc_frames, d_head]`
+    /// and transposed cross-value `[d_head, enc_frames]`, per `(layer, head)`.
+    /// These layouts let the per-step cross path run the existing `nn::gemv_f16`
+    /// (f16c fused dot) for BOTH matmuls — half the per-token K/V bandwidth of the
+    /// f32 `nn::matmul` path AND no dead scores zero-init (the f32 m=1 matmul
+    /// `vec![0.0; enc_frames]`s a ~1500-elt buffer per head/token). Default path;
+    /// `FW_CROSS_F16=0` falls back to the f32 `cross_kh_t`/`cross_vh` above.
+    cross_kh_f16: Vec<Vec<Float16>>,
+    cross_vh_f16: Vec<Vec<Float16>>,
     /// Number of tokens currently in the self-attention cache.
     len: usize,
     /// Number of encoder frames (cross-attention key/value length).
@@ -727,6 +738,11 @@ impl DecoderState {
         let d_head = w.n_state / n_head;
         let mut cross_kh_t: Vec<Mat> = Vec::with_capacity(n_layer * n_head);
         let mut cross_vh: Vec<Mat> = Vec::with_capacity(n_layer * n_head);
+        // bd-b4hp f16 layouts: natural K [enc_frames, d_head] (rows = key positions,
+        // for `scores = gemv_f16(K, qh)`) and transposed V [d_head, enc_frames]
+        // (rows = output dims, for `out = gemv_f16(Vt, scores)`).
+        let mut cross_kh_f16: Vec<Vec<Float16>> = Vec::with_capacity(n_layer * n_head);
+        let mut cross_vh_f16: Vec<Vec<Float16>> = Vec::with_capacity(n_layer * n_head);
         for li in 0..n_layer {
             let ck = &cross_k[li];
             let cv = &cross_v[li];
@@ -734,20 +750,30 @@ impl DecoderState {
                 let base = h * d_head;
                 // kh_t [d_head, enc_frames]: kh_t[d][j] = ck.row(j)[base + d].
                 let mut kh_t = vec![0.0f32; d_head * enc_frames];
+                // k_nat [enc_frames, d_head] f16: row j = ck.row(j)[base..base+d_head].
+                let mut k_nat = Vec::<Float16>::with_capacity(enc_frames * d_head);
                 for j in 0..enc_frames {
                     let src = &ck.row(j)[base..base + d_head];
                     for (d, &s) in src.iter().enumerate() {
                         kh_t[d * enc_frames + j] = s;
+                        k_nat.push(Float16::from_f32(s));
                     }
                 }
                 cross_kh_t.push(Mat::from_vec(d_head, enc_frames, kh_t));
+                cross_kh_f16.push(k_nat);
                 // vh [enc_frames, d_head]: row j = cv.row(j)[base..base+d_head].
                 let mut vh = vec![0.0f32; enc_frames * d_head];
+                // v_t [d_head, enc_frames] f16: v_t[d][j] = cv.row(j)[base + d].
+                let mut v_t = vec![Float16::from_bits(0); d_head * enc_frames];
                 for j in 0..enc_frames {
                     let src = &cv.row(j)[base..base + d_head];
                     vh[j * d_head..(j + 1) * d_head].copy_from_slice(src);
+                    for (d, &s) in src.iter().enumerate() {
+                        v_t[d * enc_frames + j] = Float16::from_f32(s);
+                    }
                 }
                 cross_vh.push(Mat::from_vec(enc_frames, d_head, vh));
+                cross_vh_f16.push(v_t);
             }
         }
 
@@ -755,6 +781,8 @@ impl DecoderState {
             kv,
             cross_kh_t,
             cross_vh,
+            cross_kh_f16,
+            cross_vh_f16,
             len: 0,
             enc_frames,
             n_state: w.n_state,
@@ -858,10 +886,20 @@ fn embed_tokens(w: &DecoderWeights, tokens: &[i32], cache_len: usize) -> FwResul
 ///
 /// When `record` is set, `recorded` is populated with one
 /// `[tokens, enc_frames]` matrix per head (in head order).
+/// Escape hatch `FW_CROSS_F16=0` restores the f32 `nn::matmul` cross-attention.
+fn cross_f16_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_CROSS_F16").as_deref() != Ok("0"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cross_attention(
     q: &Mat,
     cross_kh_t: &[Mat],
     cross_vh: &[Mat],
+    cross_kh_f16: &[Vec<Float16>],
+    cross_vh_f16: &[Vec<Float16>],
     tk: usize,
     n_head: usize,
     record: bool,
@@ -876,6 +914,7 @@ fn cross_attention(
     let tq = q.rows;
     let d_head = n_state / n_head;
     let q_scale = (d_head as f32).powf(-0.25);
+    let use_f16 = cross_f16_enabled();
 
     // Compute one head's scores [tq, tk] and output [tq, d_head]. Per-head
     // math (scaled q·k^T → softmax → @v) is byte-for-byte the serial path;
@@ -888,7 +927,38 @@ fn cross_attention(
     let compute_head = |h: usize| -> FwResult<(Mat, Mat)> {
         let base = h * d_head;
 
-        // Scaled query head [tq, d_head].
+        if use_f16 {
+            // f16 path (bd-b4hp): both matmuls via the existing f16c `gemv_f16`
+            // over natural-K `[tk, d_head]` and transposed-V `[d_head, tk]`. Per
+            // query row this is `scores = gemv_f16(K, qh)` → softmax → `out =
+            // gemv_f16(Vt, scores)`; no dead scores zero-init (gemv_out_buf is
+            // uninit), half the K/V bandwidth (f16). Numerics-affecting (f16
+            // dequant + dot8 order) — transcription-tolerance, like the rest of
+            // the f16 decode path.
+            let mut scores_all = Vec::with_capacity(tq * tk);
+            let mut out_all = Vec::with_capacity(tq * d_head);
+            let mut qh = vec![0.0f32; d_head];
+            for i in 0..tq {
+                let src = &q.row(i)[base..base + d_head];
+                for (d, &s) in qh.iter_mut().zip(src) {
+                    *d = s * q_scale;
+                }
+                let mut srow = nn::gemv_out_buf(tk);
+                nn::gemv_f16(&cross_kh_f16[h], tk, d_head, &qh, None, &mut srow);
+                let mut sm = Mat::from_vec(1, tk, srow);
+                nn::softmax_rows(&mut sm);
+                let mut oh = nn::gemv_out_buf(d_head);
+                nn::gemv_f16(&cross_vh_f16[h], d_head, tk, &sm.data, None, &mut oh);
+                scores_all.extend_from_slice(&sm.data);
+                out_all.extend_from_slice(&oh);
+            }
+            return Ok((
+                Mat::from_vec(tq, tk, scores_all),
+                Mat::from_vec(tq, d_head, out_all),
+            ));
+        }
+
+        // f32 path (escape hatch FW_CROSS_F16=0). Scaled query head [tq, d_head].
         let mut qh = vec![0.0f32; tq * d_head];
         for i in 0..tq {
             let src = &q.row(i)[base..base + d_head];
@@ -1108,6 +1178,8 @@ pub fn forward_step(
                 &qc,
                 &st.cross_kh_t[h0..h0 + w.n_head],
                 &st.cross_vh[h0..h0 + w.n_head],
+                &st.cross_kh_f16[h0..h0 + w.n_head],
+                &st.cross_vh_f16[h0..h0 + w.n_head],
                 st.enc_frames,
                 w.n_head,
                 st.record_cross_attn,

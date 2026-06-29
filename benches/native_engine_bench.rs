@@ -736,6 +736,32 @@ fn bench_f16_gemv_dequant(c: &mut Criterion) {
         });
     }
 
+    // BATCHED f16 gemv (tq>1, the compute-bound path used by cross-KV precompute
+    // and prompt processing). cross-KV shape for large: tq=1500 enc frames,
+    // out=inp=1280. ~2.4 GFLOP — the `FW_BATCH_GEMV_CAP` worker-count lever shows
+    // up here (m=1 dispatch-bound cap8 vs compute-bound scaling).
+    {
+        let (tq, out, inp) = (1500usize, 1280usize, 1280usize);
+        let w = f16_normal_weight(out, inp);
+        let x: Vec<f32> = (0..tq * inp).map(|i| (i as f32 * 0.0001).sin()).collect();
+        let mut out_buf = vec![0.0f32; tq * out];
+        group.throughput(criterion::Throughput::Elements((tq * out * inp) as u64));
+        group.bench_function("f16_gemv_batch_1500x1280x1280", |b| {
+            b.iter(|| {
+                nn::gemv_f16_batch(
+                    black_box(&w),
+                    out,
+                    inp,
+                    black_box(&x),
+                    tq,
+                    None,
+                    &mut out_buf,
+                );
+                black_box(out_buf[0])
+            });
+        });
+    }
+
     group.finish();
 }
 
