@@ -3,6 +3,22 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: MEASUREMENT WALL CONFIRMED INESCAPABLE — attempted CPU-pinning (`taskset`) to get a clean contention-free tiny.en decode measurement; the shared 64-thread box has NO free core set (high cores 48-63 measured 26-98% busy: c48 96%, c51 89%, c54 98%; load avg 11-16). So the contention that makes `decode_loop` swing ±40% cannot be escaped here — the tiny.en decode gap is genuinely unmeasurable on this box. No worktree win. CONVERGED. 0 source delta.
+
+**Land-or-dig result: tried the last unexplored measurement methodology (CPU pinning) to break the
+contention wall; it fails (no idle cores) → the wall is structural to this shared box, not a
+technique gap. Confirms the convergence: reliable tiny-decode work needs a genuinely dedicated/quiet
+box.** AGENT_NAME=TealVireo.
+
+The standing state (stable across many turns, multiple agents): production workloads (large-v3-turbo,
+realistic) are decisively DOMINATED (large 3.35× @ 99 s, grows with length); the ONLY residual vs-ORIG
+gap is tiny.en m=1 decode (~1.5× quiet / ~2.4× loaded), which is cycle-level + contention-sensitive and
+cannot be measured on this contended box (pinning confirmed). The remaining levers are owner/coworker-
+scoped: structural decode scratch-arena in `decoder.rs`/`nn.rs` (coworker actively iterating — f16-cross
+landed `57910a4`); temperature/beam fallback (bd-6goy, also fixes the "a." silence-tail hallucination);
+ft_kernel_cpu GEMM. In-crate solo land-or-dig has CONVERGED — recommend redirecting the loop to another
+project or provisioning a quiet box for the decode. 0 net source delta.
+
 ## 2026-06-29 - TealVireo: "a." ROOT CAUSE (precise) + CONVERGENCE — the large-jfk "a." is a 2nd window: franken's window-1 decode ends such that `single_timestamp_ending`=FALSE → seek advances to the last timestamp (~10.4 s), not the audio end, so franken processes a tiny trailing window (10.4-11.0 s) that hallucinates "a"; whisper.cpp encodes jfk ONCE. This is an f16-decode-numerics divergence at window-1 end (large-specific; tiny is single-window, matches wc EXACTLY), and `single_timestamp_ending` is a FAITHFUL wc port with a conformance test — NOT a windowing bug, no clean solo fix. 0 source delta.
 
 **Land-or-dig result: DIG traced the "a." to its exact mechanism (a 2nd tail window via an
