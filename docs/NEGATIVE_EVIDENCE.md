@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: LEAD SHARPENED — the rayon-pool decode win is idle-worker SPIN, NOT per-GEMV over-threading: `FW_WIDE_GEMV_CAP=12` (logits→12, pool stays 16) HURTS (~218 vs ~210 ms), while only `RAYON=12` (pool→12) helps. So the fix is a PARKED/sleeping decode pool (fewer LIVE threads), not cap tuning — confirming the lever lives in held `nn.rs`/`decoder.rs`, not in any per-GEMV knob. 0 source delta.
+
+**Land-or-dig result: DIG sharpened the prior pool lead by isolating the mechanism.** No worktree win
+(2 reject branches). `nn.rs` edited by the other agent 13:17, still contended. AGENT_NAME=TealVireo.
+
+### Mechanism isolation (3-way interleaved, gated_e2e_jfk `decode_loop`, 5 rounds)
+```text
+A default (pool16, logits→16)        210.9 203.8 208.9 212.7 216.3   mean ~210.5
+B FW_WIDE_GEMV_CAP=12 (pool16, logits→12)  219.6 207.0 223.3 229.6 213.7   mean ~218.6  (WORSE)
+C RAYON_NUM_THREADS=12 (pool12)      181.3 256.5 197.7 193.4 200.6   mean ~205.9 (~193 ex-outlier)
+```
+B isolates "logits uses fewer threads" WITHOUT shrinking the pool → it REGRESSES (matches the prior
+`FW_WIDE_GEMV_CAP=32`-optimal entry: the logits GEMV genuinely wants ≥16). Only C (fewer LIVE pool
+threads) helps. ⇒ the win is **rayon idle-worker spin overhead** during the 8-way m=1 GEMVs (the
+spare 8 of 16 workers spin-poll, stealing memory bandwidth), addressable ONLY by reducing live
+threads — which a per-GEMV cap (B) and a 2nd scoped pool (adds threads) both cannot do.
+
+### Why still NOT landed (unchanged + reinforced)
+A global pool shrink helps decode-heavy (long-form, the gap) but REGRESSES short/encode-heavy clips
+(encoder wants ≥16) and is unverified on large-v3-turbo (no large decode test in the gated suite;
+needs a held-bench build + 1.5 GB run). It is a workload tradeoff requiring owner judgment, not a
+clean unilateral win. The clean landable form — a parked (non-spinning) worker pool for the m=1
+decode path — lives in the held `nn.rs`/`decoder.rs` (the other agent's live work). `RAYON_NUM_THREADS`
+already exposes the per-machine knob today.
+
+### Earlier this session — original pool lead (full data)
 ## 2026-06-29 - TealVireo: LEAD (measured, NOT landed) — the global rayon pool (`default_threads()`=16 on this 64-thread box) is OVER-THREADED for the memory-bound m=1 decode: `RAYON_NUM_THREADS=12` cuts `decode_loop` ~10.5% (6/6 interleaved), likely rayon idle-worker spin/poll overhead. NOT landable as a global default (regresses encoder + risks large); it points the held `nn.rs` work at a real lever. 0 source delta.
 
 **Land-or-dig result: DIG found the first MECHANISTIC, measurable bd-b4hp lead from a free-file knob
