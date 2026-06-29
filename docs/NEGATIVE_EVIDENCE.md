@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: BLOCKER SURFACED — the biggest remaining MEASURED CPU gap (encoder proj/fc2 GEMMs at 47–60% peak) needs the `gemm`/faer microkernel crate, a DIFFERENT GEMM primitive — but it is NOT in the frankensuite (no lockfile/cache/sibling uses it) ⇒ a NEW external dep, owner-scoped (memory bd-4hc0 rejected it). No in-scope CPU lever remains without a new dep, the GPU, or a faithfulness break.
+
+**Land-or-dig result: DIG located the next radical lever and its blocker; it is
+owner-scoped, so surfacing (not parking — 5 wins landed, in-scope exhausted).** LAND
+clean (`4870f57`), ft-kernel-cpu HEAD `7ee2a507` (new commit is `max_dim`/argmax,
+N/A — franken's argmax carries the suppress mask + a 207 KB max-reduce is negligible).
+
+**The gap (per cycle-25 `gemm_shape_probe`, measured):**
+```text
+proj    [1500,384]x[384,384]   677 GF/s  (~47% of peak)  ← small-N microkernel-limited
+mlp_fc2 [1500,1536]x[1536,384] 871 GF/s  (~60%)
+mlp_fc1 [1500,384]x[384,1536] 1377 GF/s  (~peak)         ← already optimal
+```
+matrixmultiply (ft's sgemm) under-fills its microkernel for the small N=384 proj
+shape. The fix is a better GEMM kernel (`gemm`/faer, hand-tuned unsafe microkernels =
+the "different primitive, beyond safe-Rust" the directive asks for): bd-4hc0 estimated
+~1.14x ⇒ ~1.5–2% e2e on the ~28 ms of sub-peak proj+fc2 GEMMs. **Blocked:** `gemm` is
+absent from the whole frankensuite — adding it is a new-dependency decision the owner
+must make, not an in-crate change. In-scope alternatives are exhausted: `sgemm_bt`
+slower (rejected), QKV-fusion rejected, worker-cap maxed (logits cap-32 landed; the
+small gemvs / cross-attn / logprob-exp are dispatch-bound, all measured-and-rejected).
+The other radical paths — GPU (`gpu-frankenjax`, no driver) and a new ft fused
+gemm+gelu kernel — are also owner-scoped. **Recommendation:** owner decides the `gemm`
+dep (or a frankentorch-side faer-microkernel sgemm) to reclaim the proj-GEMM gap;
+otherwise the engine is at its faithful CPU floor (~1.34x, five landed wins). No
+source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: parallel `compute_logprobs` (vocab log-softmax exp) REJECTED — regresses ~8 ms (~2.5%). The serial scalar exp over 51864 logits is NOT the ~4% bottleneck I estimated; parallelizing it adds buffer-alloc + per-token rayon dispatch that CONTENDS with the decode's existing rayon (logits gemv at cap32 + fc1/fc2). Reverted to 0 source delta.
 
 **Land-or-dig result: DIG parallelized the per-token vocab log-softmax exp (bit-
