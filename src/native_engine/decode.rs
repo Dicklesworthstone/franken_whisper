@@ -260,7 +260,7 @@ fn process_logits(
     has_ts: bool,
     seek_delta_cs: i64,
     tokens_in_window: usize,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, f32) {
     let n = logits.len();
     let beg = tk.timestamp_begin;
     let is_initial = prev_tokens.is_empty();
@@ -358,23 +358,38 @@ fn process_logits(
         }
     }
 
-    // log-softmax over the (filtered) logits (whisper.cpp 6138-6158, 6341).
-    let mut logprobs = compute_logprobs(&logits);
+    // Log-softmax normalizer Z = logsumexp(filtered logits) (whisper.cpp
+    // 6138-6158, 6341). `logprob(i) = logits[i] - Z`; the full [n_vocab] vector
+    // is no longer materialized — only Z is carried out (see `compute_logsumexp`).
+    // `FW_NO_LOGPROB_SLIM=1` keeps the old full-vector alloc (A/B + escape hatch).
+    let (z, _legacy_keepalive) = if logprob_slim_enabled() {
+        (compute_logsumexp(&logits), None)
+    } else {
+        let (v, z) = compute_logprobs_legacy(&logits);
+        (z, Some(core::hint::black_box(v)))
+    };
 
     // sum-of-timestamp-probs vs max-text-prob forcing rule (whisper.cpp
-    // 6343-6369), implemented in log space exactly as upstream.
+    // 6343-6369), in log space exactly as upstream. Each `logprob` below is
+    // `logits[k] - Z` evaluated on the fly (bit-identical to the old materialized
+    // vector); Z cancels in the comparison but is applied per-term to preserve
+    // the exact two-step rounding of the original.
     {
         let beg_u = beg.max(0) as usize;
         // logsumexp over the timestamp logprobs.
         let mut ts_logprob = f32::NEG_INFINITY;
-        if beg_u < logprobs.len() {
-            let logprob_max = logprobs[beg_u..]
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
+        if beg_u < logits.len() {
+            let logprob_max = logprob_at(
+                logits[beg_u..]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max),
+                z,
+            );
             if logprob_max.is_finite() {
                 let mut logsumexp = 0.0f32;
-                for &lp in &logprobs[beg_u..] {
+                for &l in &logits[beg_u..] {
+                    let lp = logprob_at(l, z);
                     if lp > f32::NEG_INFINITY {
                         logsumexp += (lp - logprob_max).exp();
                     }
@@ -384,26 +399,38 @@ fn process_logits(
                 }
             }
         }
-        let max_text_logprob = logprobs[..beg_u]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_text_logprob = logprob_at(
+            logits[..beg_u]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max),
+            z,
+        );
 
         if ts_logprob > max_text_logprob {
-            // force a timestamp: mask all text logits/logprobs.
+            // force a timestamp: mask all text logits.
             for i in 0..beg_u {
                 logits[i] = f32::NEG_INFINITY;
-                logprobs[i] = f32::NEG_INFINITY;
             }
         }
     }
 
-    (logits, logprobs)
+    (logits, z)
 }
 
-/// Numerically-stable log-softmax (whisper.cpp `whisper_compute_logprobs`,
-/// lines 6138-6158). `-inf` logits map to `-inf` logprobs.
-fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
+/// Scalar log-softmax **normalizer** `Z = logsumexp(logits)` (whisper.cpp
+/// `whisper_compute_logprobs`, lines 6138-6158). The per-token log-softmax is
+/// `logprob(i) = logits[i] - Z` for finite logits and `-inf` otherwise
+/// ([`logprob_at`]). The chosen token's `plog`, the no_speech prob, and the
+/// timestamp-pairing rule all derive from this single scalar **without
+/// materializing the full `[n_vocab]` logprob vector every step**. That vector
+/// was a 51864-elt (`~207 KB`) heap alloc PER TOKEN — above glibc's mmap
+/// threshold, so an `mmap`+page-faults+`munmap` per decoded token — even though
+/// only ONE element of it (`logprobs[argmax]`) is ever read downstream.
+/// Computing the scalar `Z` and deriving the handful of needed logprobs on the
+/// fly is bit-identical (`logits[i] - Z` is the exact op the old `.map()` arm
+/// used) and drops the alloc. `FW_NO_LOGPROB_SLIM=1` restores the full vector.
+fn compute_logsumexp(logits: &[f32]) -> f32 {
     let logit_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut logsumexp = 0.0f32;
     for &l in logits {
@@ -411,24 +438,45 @@ fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
             logsumexp += (l - logit_max).exp();
         }
     }
-    let logsumexp = logsumexp.ln() + logit_max;
-    logits
-        .iter()
-        .map(|&l| {
-            if l > f32::NEG_INFINITY {
-                l - logsumexp
-            } else {
-                f32::NEG_INFINITY
-            }
-        })
-        .collect()
+    logsumexp.ln() + logit_max
+}
+
+/// Log-softmax of a single logit given the normalizer `Z` from
+/// [`compute_logsumexp`]. Bit-identical to the old full-vector map's per-element
+/// arm: `-inf` logits stay `-inf`; finite logits map to `logit - Z`.
+#[inline]
+fn logprob_at(logit: f32, z: f32) -> f32 {
+    if logit > f32::NEG_INFINITY {
+        logit - z
+    } else {
+        f32::NEG_INFINITY
+    }
+}
+
+/// Legacy full-vector log-softmax (the pre-slim path), returning the
+/// materialized `[n_vocab]` logprobs AND the normalizer `Z`. Used only under
+/// `FW_NO_LOGPROB_SLIM=1` — kept so the slimming can be A/B-toggled in one binary
+/// and as a numeric escape hatch. `Z` is bit-identical to [`compute_logsumexp`];
+/// the vector to the old `compute_logprobs`.
+fn compute_logprobs_legacy(logits: &[f32]) -> (Vec<f32>, f32) {
+    let z = compute_logsumexp(logits);
+    let v = logits.iter().map(|&l| logprob_at(l, z)).collect();
+    (v, z)
+}
+
+/// Whether to use the slim scalar-normalizer log-softmax (default) or the legacy
+/// full-vector path (`FW_NO_LOGPROB_SLIM=1`).
+fn logprob_slim_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_NO_LOGPROB_SLIM").as_deref() != Ok("1"))
 }
 
 /// Argmax over `logits`, returning `(id, logprob_of_id)`. Mirrors
 /// `whisper_sample_token(best=true)` (whisper.cpp 6503-6510): the chosen id is
 /// the argmax of the (post-filter) probabilities — equivalently logits — and
 /// `plog` is its log-softmax value.
-fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
+fn argmax(logits: &[f32], z: f32) -> (i32, f32) {
     let mut best_i = 0usize;
     let mut best = f32::NEG_INFINITY;
     for (i, &l) in logits.iter().enumerate() {
@@ -439,7 +487,7 @@ fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
     }
     (
         i32::try_from(best_i).unwrap_or(0),
-        logprobs.get(best_i).copied().unwrap_or(0.0),
+        logits.get(best_i).map_or(0.0, |&l| logprob_at(l, z)),
     )
 }
 
@@ -923,10 +971,10 @@ pub fn transcribe_samples(
             &format!("\"prompt_tokens\":{}", prompt.len()),
         );
         let no_speech_prob = {
-            let lp = compute_logprobs(&prefill_logits);
+            let z = compute_logsumexp(&prefill_logits);
             usize::try_from(tk.no_speech)
                 .ok()
-                .and_then(|i| lp.get(i).copied())
+                .and_then(|i| prefill_logits.get(i).map(|&l| logprob_at(l, z)))
                 .map_or(0.0, |x| f64::from(x.exp()))
         };
 
@@ -940,7 +988,7 @@ pub fn transcribe_samples(
         let mut step_logits = prefill_logits;
 
         for i in 0..n_max_tokens {
-            let (filtered, logprobs) = process_logits(
+            let (filtered, z) = process_logits(
                 tk,
                 &cfg,
                 step_logits,
@@ -949,7 +997,7 @@ pub fn transcribe_samples(
                 seek_delta_cs,
                 decoded.len(),
             );
-            let (tok, plog) = argmax(&filtered, &logprobs);
+            let (tok, plog) = argmax(&filtered, z);
             decoded.push(tok);
             plogs.push(plog);
 
@@ -1722,9 +1770,9 @@ mod tests {
         for l in &mut logits[beg..beg + 3] {
             *l = -5.0;
         }
-        let (out, lp) = process_logits(&tk, &cfg, logits, &[2], false, 0, 0);
+        let (out, z) = process_logits(&tk, &cfg, logits, &[2], false, 0, 0);
         assert!(!is_suppressed(&out, 2), "strong text not masked");
-        let (tok, _) = argmax(&out, &lp);
+        let (tok, _) = argmax(&out, z);
         assert_eq!(tok, 2, "argmax selects the strong text token");
     }
 
@@ -2391,5 +2439,91 @@ mod tests {
         let a = transcribe_samples(&model, &samples, &params, &noop).unwrap();
         let b = transcribe_samples(&model, &samples, &params, &noop).unwrap();
         assert_eq!(a.word_timings, b.word_timings);
+    }
+
+    // ----- bd-b4hp sampler-layer probes (run with --ignored --nocapture) -----
+
+    /// Primitive-level A/B: the per-token log-softmax normalizer, slim (scalar Z,
+    /// no alloc) vs legacy (full [n_vocab] materialized vector). The exp pass is
+    /// identical in both, so the measured delta is purely the per-token 207 KB
+    /// alloc + materialize the slim path removes. `cargo test -p franken_whisper
+    /// --release --lib probe_logprob_normalizer_ab -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe"]
+    fn probe_logprob_normalizer_ab() {
+        let n = 51_864usize; // tiny.en vocab
+        let mut logits = vec![0.0f32; n];
+        for (i, l) in logits.iter_mut().enumerate() {
+            // realistic-ish spread; one clear peak so argmax/normalizer are stable.
+            *l = ((i as f32) * 0.012_345).sin() * 5.0 - 2.0;
+        }
+        logits[1234] = 18.0;
+        for i in 0..60 {
+            logits[i] = f32::NEG_INFINITY; // suppressed tokens (NEG_INF arm)
+        }
+        let iters = 30_000;
+        let mut acc = 0.0f32;
+        // warm both paths.
+        for _ in 0..200 {
+            acc += compute_logsumexp(std::hint::black_box(&logits));
+            let (v, z) = compute_logprobs_legacy(std::hint::black_box(&logits));
+            acc += z + v[123];
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            acc += compute_logsumexp(std::hint::black_box(&logits));
+        }
+        let slim = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let (v, z) = compute_logprobs_legacy(std::hint::black_box(&logits));
+            acc += z + v[std::hint::black_box(123usize)];
+        }
+        let legacy = t.elapsed();
+        std::hint::black_box(acc);
+        let sc = slim.as_secs_f64() * 1e6 / iters as f64;
+        let lc = legacy.as_secs_f64() * 1e6 / iters as f64;
+        eprintln!(
+            "PROBE normalizer x{iters}: slim={sc:.3}us/call legacy={lc:.3}us/call \
+             delta={:.3}us/call ({:.1}% of legacy)",
+            lc - sc,
+            (lc - sc) / lc * 100.0
+        );
+    }
+
+    /// End-to-end A/B on a multi-window workload (jfk repeated to ~5 min) so the
+    /// per-token saving accumulates over real decode-token volume. Toggle the
+    /// path across two process runs via `FW_NO_LOGPROB_SLIM`:
+    /// `FW_NO_LOGPROB_SLIM=1 cargo test ... probe_e2e_longform_timing -- --ignored --nocapture`
+    /// vs unset. Prints wall time + token count.
+    #[test]
+    #[ignore = "timing probe"]
+    fn probe_e2e_longform_timing() {
+        let (Some(model), Some(base)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP probe_e2e_longform: tiny.en model or jfk.wav missing");
+            return;
+        };
+        // jfk is ~11 s; repeat to ~5 min so the decode token count is realistic.
+        let reps = 27usize;
+        let mut samples = Vec::with_capacity(base.len() * reps);
+        for _ in 0..reps {
+            samples.extend_from_slice(&base);
+        }
+        let params = e2e_params();
+        let slim = std::env::var("FW_NO_LOGPROB_SLIM").as_deref() != Ok("1");
+        // one warm run, then 3 timed.
+        let _ = transcribe_samples(&model, &samples, &params, &noop).expect("warm");
+        let mut best = f64::INFINITY;
+        let mut total_tokens = 0usize;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let out = transcribe_samples(&model, &samples, &params, &noop).expect("run");
+            let s = t.elapsed().as_secs_f64();
+            best = best.min(s);
+            total_tokens = out.windows.iter().map(|w| w.tokens).sum();
+        }
+        eprintln!(
+            "PROBE e2e longform ({reps}x jfk, slim={slim}): best={best:.3}s tokens={total_tokens}"
+        );
     }
 }

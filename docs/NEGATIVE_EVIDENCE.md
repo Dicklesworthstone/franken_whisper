@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: LANDED (BIT-EXACT) — bd-b4hp sampler-layer slim: drop the per-token full `[n_vocab]` log-softmax vector (51864-elt ~207 KB heap alloc EVERY decoded token, mmap-backed under glibc) and carry only the scalar normalizer `Z`; `decode.rs` (a FREE file, different primitive from the coordination-held `nn.rs`/`decoder.rs` transformer).
+
+**Land-or-dig result: LAND — a STRUCTURAL decode-overhead reduction outside the held files.**
+AGENT_NAME=TealVireo. Committed: `src/native_engine/decode.rs` ONLY (nn.rs/decoder.rs/bench
+remain the other agent's uncommitted f16-cross + batch-gemv work — untouched).
+
+### The lever (different primitive: sampler-layer allocation, not the held transformer GEMVs)
+The greedy decode loop calls `process_logits` per token, whose `compute_logprobs` materialized a
+**full 51864-element log-softmax `Vec<f32>` (~207 KB) every token** — above glibc's 128 KB
+`M_MMAP_THRESHOLD`, so an `mmap`+page-faults+`munmap` PER DECODED TOKEN — even though only ONE
+element of it is ever read downstream (`argmax` selects on raw LOGITS; it reads `logprobs[best_i]`
+for the chosen token's `plog`). The timestamp-pairing forcing rule used the vector internally, but
+`logprob[i] = logits[i] - Z` is a constant offset, so the rule's comparison (`ts_logprob >
+max_text_logprob`) and its logsumexp are computable from `logits` + the scalar `Z` — **the
+normalizer cancels exactly**. New path: `compute_logsumexp` returns scalar `Z`; logprobs derived on
+the fly only where needed (argmax single element, ts-rule tail/head). `FW_NO_LOGPROB_SLIM=1`
+restores the full-vector path.
+
+### Bit-exactness (proven by conformance, not just argued)
+Every derived logprob uses the IDENTICAL op the old `.map()` arm used (`logit - Z`), in the same
+order, so the chosen `plog`, `no_speech_prob`, and the timestamp-forcing decision are byte-identical.
+`cargo test -p franken_whisper --lib native_engine::decode` (model dir set) = **47 passed / 0
+failed**, incl. `gated_e2e_jfk_tiny_en_matches_reference` (EXACT transcript), the DTW word-timestamp,
+deterministic, and multi-window-monotonic gated e2e tests. argmax selecting on raw logits means the
+change CANNOT alter token choice; it strictly removes per-token alloc work on the default path.
+
+### Honesty caveat (what is NOT yet measured)
+This turn confirmed bit-exactness + conformance but did **NOT** land a headline e2e number (the
+`probe_e2e_longform_timing` / `probe_logprob_normalizer_ab` `#[ignore]` probes are committed for the
+next session to quantify). The win is mechanism-sound (strictly fewer per-token mmap syscalls +
+materialization) and cannot regress the default path, but the vs-whisper.cpp ratio movement on tiny.en
+5min long-form (currently **~1.73×** behind) is **pending measurement** — claimed as a bit-exact
+structural reduction, not a measured speedup. The exp pass (the real ~80% of `compute_logprobs`) is
+untouched (owner-gated bit-exact-with-whisper invariant; no approximation introduced).
+
 ## 2026-06-29 - BlackThrush: NEW WORKLOAD COVERAGE — DTW word-timestamps (captions) measured vs whisper.cpp. franken's DTW recording is LEAN (+3.4%) vs whisper.cpp's (+16.6%, flash-attn-gated); franken word-ts e2e ~1.6× behind on tiny long-form (tracks the greedy gap — same bd-b4hp decode overhead, NO DTW-specific lever). 0 source delta.
 
 **Land-or-dig result: DIG covered the last uncovered realistic workload (word-timestamps /
