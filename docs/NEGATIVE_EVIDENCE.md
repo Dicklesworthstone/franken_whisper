@@ -3,6 +3,23 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: caught a rare low-load window (4.84) — clean ENCODER 110.03 ms (tight CI), confirming the cumulative ~20% encoder win (~138 pre-session → 110, SDPA + qa/ka/va). But the e2e bench is too long to fit the window: load spiked to 21–31 the moment each e2e run started ⇒ the definitive low-load e2e is UNREALIZABLE on this swarm-busy box. Operating ratio ~1.18–1.25x (load-dependent); the ~1.30x low-load value stays theoretical.
+
+**Land-or-dig result: full audit complete, ft unchanged — used a rare idle window to
+get the cleanest encoder data point; the e2e stays load-bound. 0 source delta.** LAND
+clean (`8cdc3d8`), ft-kernel-cpu still `2ddced53`.
+```text
+encoder_window_tiny : 110.03 ms (CI [109.86,110.40]) @ load 4.84  ← cleanest yet
+e2e_tiny_jfk        : e2e1 349.71 (load 21) / e2e2 369 / e2e3 364  ← load spiked mid-run
+```
+Methodological note for future cycles: the **encoder bench (~110 ms × samples) fits a
+brief idle dip; the e2e bench (~350 ms × 15 samples ≈ 50 s/run) does not** — on this
+box the swarm reclaims the cores within ~10 s, so a low-load e2e never completes
+clean. Cite the encoder (110 ms clean) + the operating e2e ratio ~1.18–1.25x; the
+~1.30x low-load figure is an extrapolation (110 enc + ~180 decode + ~30 overhead ≈
+323 ms), not a measurement. Engine at the faithful-port floor (audit exhaustive). No
+source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: mel frontend (last unaudited component) verified ALREADY OPTIMIZED — radix-2 Cooley-Tukey FFT (N_FFT=400=16×25, fully factored: radix-2 for 16 + a radix-5 base case that already replaced the naive 25×25 DFT ~1.8x), vectorized twiddles. NOT a naive O(N²) DFT ⇒ the one plausibly-big remaining lever is a dead end. Full-engine audit COMPLETE.
 
 **Land-or-dig result: DIG audited the mel STFT (the last unchecked hot-path
