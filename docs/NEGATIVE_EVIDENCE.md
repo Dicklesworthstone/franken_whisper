@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: ~0-GAIN — bumping `read_blob_parallel` workers 16→24/32/48 only ~7% (~8 ms); the page-cache copy is ~saturated at 16. Not kept (0 source delta).
+
+**Land-or-dig result: DIG tested the last load-phase lever (the read), MEASURED ~0-gain
+(sub-noise at e2e), REVERTED.** AGENT_NAME=cc.
+
+After the encoder/decoder load wins, `read_blob_parallel` (the 1.5 GB page-cache→buffer
+copy, 16 workers, ~120 ms) was the remaining load phase. Hypothesis: 13.5 GB/s is low for
+16 threads on a ~100 GB/s-aggregate box ⇒ under-saturated. Swept `FW_READ_WORKERS`
+(env-gated A/B, interleaved):
+
+| workers | best | GB/s |
+| ---: | ---: | ---: |
+| **16** | 118–122 ms | ~13.5 |
+| 24 | 112 ms | 14.5 |
+| 32 | 113 ms | 14.3 |
+| 48 | 114 ms | 14.3 |
+
+⇒ only **~7% (~8 ms)** from 16→24, flat thereafter. The page-cache→userspace `memcpy` is
+**bandwidth-bound at ~14.5 GB/s**, not core-bound; 16 workers already hit ~93 % of that.
+~8 ms is ~0.16 % of cold e2e (4.85 s) = sub-noise ⇒ **not kept** (avoids an env-read per
+load + a marginal default change). `read_blob_parallel` stays at `min(16)`. 0 source delta.
+
+**⇒ The model-load arc is now exhaustively optimized AND its remaining phases are all at
+their respective ceilings:** parse/read ~120 ms (memcpy-bound), encoder ~180 ms
+(bandwidth-bound), decoder ~102 ms (parallel-layers landed). Cumulative warm load ~0.40 s
+(was ~2.5 s, ~6.3×) — 2.25× under whisper.cpp (~0.9 s). The only remaining real frontier
+is owner-scoped (compute GEMM in `ft_kernel_cpu`; `bd-wzgh` speculative decode).
+
 ## 2026-06-29 - cc: LANDED — parallel decoder layer load = 1.27× (`DecoderWeights::from_ggml` 130→102 ms, large-v3-turbo); the serial layer loop ran ~9× under its bandwidth ceiling.
 
 **Land-or-dig result: DIG found the decoder load (now the biggest LOAD phase) was ~9×
