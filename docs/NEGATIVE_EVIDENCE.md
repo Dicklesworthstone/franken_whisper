@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: CERT + IMPASSE — f16-cross (`57910a4`) certified GREEN across the FULL native_engine surface (194/0, not just the 47 gated decode tests); and an honest statement that the cleanly-measurable bd-b4hp levers are exhausted on this contended box. The remaining gap is cycle-level (dispatch + owner-gated softmax exp + recycled allocs), which CANNOT be measured here. 0 source delta.
+
+**Land-or-dig result: no worktree win; the measurable free-file + thread levers are exhausted, so
+the honest outcome is a CERT of the recent landing + a precise impasse — NOT another speculative
+land-then-revert.** AGENT_NAME=TealVireo. Coworker quiet ~1 h (decoder.rs untouched since 13:24).
+
+### Concrete deliverable — independent broad cert of the numerics-affecting f16-cross
+`native_engine::` full lib suite on current main (`d43c499`, includes `57910a4`): **194 passed / 0
+failed** (model dir set). The f16 cross-attention K/V landing is solid across encoder/decoder/nn/mel
+unit tests + all gated e2e, not merely the 47 decode-gated tests I'd previously run. Current main is
+certified.
+
+### Why no dig this turn (the measurement wall, stated plainly)
+Everything cleanly-landable has been tried and resolved this session:
+- free-file primitives (mel, encode, load, DTW, sampler, orchestration): all at-parity-or-winning vs
+  a verified-fair ORIG — NO gap (the closing audit, `dadedb5`).
+- decode thread count: load-dependent ~0-gain, CLOSED after 3 reverts (`d43c499`).
+- sampler alloc-slim: bit-exact but sub-noise (the 207 KB/token vectors are glibc-recycled — equal
+  page-faults proven), reverted (`f575c26`).
+The residual tiny.en decode gap (~1.5× wc quiet / ~2.4× loaded) is now **cycle-level**: per-op rayon
+dispatch overhead + the owner-gated softmax/`exp` (numerics-affecting, needs transcription-tolerance
+sign-off) + per-GEMV machinery — all in the coworker's actively-iterated `decoder.rs`/`nn.rs`. Cycle
+overhead is NOT contention-invariant, and this shared 64-thread box swings `decode_loop` ±40% with
+background load (proven repeatedly), so it cannot be measured here.
+
+### The one honest path forward (recommendation)
+Reliable bd-b4hp progress needs EITHER (a) a QUIET/dedicated box to measure cycle-level decode changes
+(thread count, prefetch, KV-cache f16, planned scratch graph) without the load confound, OR (b) the
+coworker's continued structural decode work (they own and are iterating this path; f16-cross is the
+latest). On this shared box, further solo land-or-dig on the decode keeps hitting the same wall.
+large-v3-turbo / realistic workloads remain DOMINATED. 0 net source delta.
+
 ## 2026-06-29 - TealVireo: ~0-GAIN (REVERTED) — decode thread-count avenue CONCLUSIVELY CLOSED (3rd resolution). Implemented a model-gated scoped decode pool (cap small-model decode at 12, large untouched; bit-exact, conformance 47/0 both modes) — but the new default (auto-12) ties forced-16 at lower load (~175 vs ~173 ms, mixed 3/7); the ~18% "win" only appears under heavy load. Load-dependent robustness, not an intrinsic win. Reverted.
 
 **Land-or-dig result: DIG built the safe model-gated form of the decode-thread lever, MEASURED it at
