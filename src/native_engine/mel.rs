@@ -1289,6 +1289,18 @@ fn compute_8_columns(
 /// # Errors
 /// Returns [`FwError::InvalidRequest`] if the filterbank's bin count does not
 /// match the expected `N_FFT/2 + 1 = 201`, or if it has zero mel bins.
+/// Optional `FW_MEL_THREADS` override for the mel worker count (A/B sweep).
+fn mel_threads_override() -> Option<usize> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FW_MEL_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+    })
+}
+
 pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> FwResult<Mel> {
     if filters.n_fft_bins != N_FREQ_BINS {
         return Err(FwError::InvalidRequest(format!(
@@ -1312,7 +1324,13 @@ pub fn log_mel(samples: &[f32], filters: &MelFilterbank, n_threads: usize) -> Fw
 
     let mut data = vec![0.0f32; n_mel * n_frames];
 
-    let n_threads = n_threads.max(1).min(n_frames.max(1));
+    // mel is compute-bound FFT-per-frame (embarrassingly parallel) and the output
+    // is bit-identical for any thread count, so it can use more workers than the
+    // decode's `n_threads` hint. `FW_MEL_THREADS` overrides for the A/B sweep.
+    let n_threads = mel_threads_override()
+        .unwrap_or(n_threads)
+        .max(1)
+        .min(n_frames.max(1));
 
     // The output is mel-major (data[mel * n_frames + frame]), so disjoint frame
     // ranges still map to interleaved backing indices and the slice can't be

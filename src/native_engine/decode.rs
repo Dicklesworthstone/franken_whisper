@@ -750,8 +750,16 @@ pub fn transcribe_samples(
     let tk = &m.tokenizer;
 
     // Full-audio log-mel spectrogram (whisper computes once, then windows it).
+    // mel is compute-bound FFT-per-frame (bit-identical for ANY thread count), and
+    // its measured optimum is ~16 workers (8 under-utilizes ~1.39×; >16 cross-CCD-
+    // regresses on this Zen box), so decouple it from the decode's `n_threads` hint.
+    // `FW_MEL_THREADS` (inside `log_mel`) overrides.
+    let mel_threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(16);
     let t_mel = std::time::Instant::now();
-    let full_mel = mel::log_mel(samples_16k_mono, &m.filters, params.n_threads)?;
+    let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
     super::perf_span("mel", t_mel.elapsed().as_secs_f64() * 1e3, "");
 
     // Window bounds in centiseconds: seek runs [0, seek_end) where seek_end is

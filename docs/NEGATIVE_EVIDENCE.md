@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: LANDED — mel uses 16 workers (was the decode's 8-thread hint) = 1.39× on `mel_30s` (4.04→2.91 ms). The COMPUTE-side win the "load-only" closeout missed: mel was thread-under-utilized.
+
+**Land-or-dig result: DIG re-examined the one in-scope COMPUTE phase not owner-scoped
+(mel FFT) — its THREAD COUNT (not just "is it parallel") — MEASURED 1.39×, LANDED.**
+AGENT_NAME=cc. (Corrects the prior closeout, which marked mel "covered/parallel" without
+checking its worker count.)
+
+Production mel (`decode.rs`) called `log_mel(.., params.n_threads)` = 8 on the e2e path,
+but mel is compute-bound FFT-per-frame (embarrassingly parallel) and **bit-identical for
+any thread count** (the existing `log_mel(1)==log_mel(4)` determinism tests prove it), so
+it can use far more than the decode's hint. Added an `FW_MEL_THREADS` override and swept
+the hermetic `mel_30s` bench (per-crate, interleaved, 2 pairs):
+
+| threads | `mel_30s` best |
+| ---: | ---: |
+| **8** | 4.04 ms |
+| **16** | **2.91 ms** |
+| 32 | 2.73 ms clean / up to 3.72 ms (cross-CCD spikes) |
+
+⇒ **16 = 1.39× over 8** (stable across both pairs); 32 is marginally faster when clean
+but high-variance (cross-CCD, not load-robust — same Zen signature as the encoder-load /
+wide-GEMV cap findings). Landed: production mel uses `min(16, cores)`, decoupled from the
+decode `n_threads` hint; `FW_MEL_THREADS` overrides. **Bit-IDENTICAL** (thread-count
+invariant): `native_engine::mel` 14/0, `decode` 47/0, `conformance_comparator_tests` 26/0,
+rustfmt + clippy clean.
+
+mel is on the e2e critical path (computed once over the WHOLE audio before encode/decode)
+and scales O(audio length), so this cuts the realistic long-audio mel phase ~1.39×
+(e.g. ~480→~345 ms on a 1 h file). For short clips mel is small (e2e impact modest), but
+the per-crate ratio is a clean measured win. With this, mel is the 7th landed cc win.
+Files: `src/native_engine/mel.rs`, `src/native_engine/decode.rs`.
+
 ## 2026-06-29 - cc: CONVERGENCE CLOSEOUT — checked the LAST unexamined in-scope component (DTW: covered, no lever); EVERY in-scope avenue now landed/covered/owner-scoped. Session: 6 landed load wins (~7.4×) + comprehensive dominance. Recommend redirect to owner-scoped beads.
 
 **Land-or-dig result: DIG checked DTW (the last unexamined component) — covered, no lever;
