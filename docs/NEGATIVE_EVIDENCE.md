@@ -3,6 +3,31 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: external-GEMM investigation CLOSED — after faer was refuted, checked for a tuned BLAS (the AMD-Zen-optimized next candidate): NONE installed (only the slow netlib reference `libblas.so.3`; no OpenBLAS/MKL/BLIS, no cached crate). Also ruled out the cross-KV transpose as a real lever. No in-scope CPU GEMM lever remains.
+
+**Land-or-dig result: DIG checked the last external-GEMM avenue (tuned BLAS) and the
+last in-scope micro-lever (cross-KV transpose); both closed. 0 source delta.** LAND
+clean (`ccc88ae`).
+
+- **Tuned BLAS:** box is AMD Zen (`AuthenticAMD`), where OpenBLAS's Zen kernels would
+  be the strongest CPU GEMM — but OpenBLAS/MKL/BLIS are NOT present (only netlib
+  `libblas.so.3`, which is unblocked-reference-slow), and no `openblas-src`/`blas-src`
+  crate is cached. Installing/building OpenBLAS is an owner-scoped system action
+  (sudo/apt or a from-source build needing gfortran). And it's UNCERTAIN to even win:
+  faer (a top-tier pure-Rust GEMM) was already 0.59–0.72x SLOWER than ft's
+  matrixmultiply here (prior entry), so matrixmultiply is genuinely strong on this AVX2
+  target.
+- **cross-KV transpose** (`DecoderState::new`, serial `for j { for d }`): runs ONCE
+  per 30 s window, so although `decoder_token_step` (which re-builds the state per
+  iteration) over-weights it ~50x, the real e2e impact is ~0.1% — below the bar,
+  not worth parallelizing.
+
+⇒ Every GEMM avenue is now measured-or-checked: ft matmul (best available), sgemm_bt
+(slower), QKV-fusion (rejected), faer gemm (slower), tuned BLAS (absent). The engine
+is at its faithful CPU floor **~1.34x** (five landed wins); the only paths left are
+owner-scoped: install OpenBLAS-Zen (uncertain), the GPU variant (no driver), or a
+frankentorch AVX2-microkernel improvement. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: gemm/faer crate REFUTED — MEASURED 0.59–0.72x SLOWER than ft's matrixmultiply sgemm on every encoder shape (this AVX2 box; faer is AVX512-tuned, falls back to slow AVX2). The long-standing bd-4hc0 "~1.14x" estimate was WRONG. The encoder GEMM is at its ceiling; the "different GEMM primitive" lever I surfaced last cycle is a DEAD END, not just dep-blocked.
 
 **Land-or-dig result: DIG actually TESTED the radical lever (faer gemm crate, cached
