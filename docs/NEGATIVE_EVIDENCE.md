@@ -3,6 +3,14 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: LAND-CHECK (thorough, all worktrees) — the ONLY uncommitted worktree "measured win" is `cod-b-log10-land`'s mel `log10_floor_approx` (~25% mel), but it is OWNER-GATED: it replaces exact libm `log10` with a 1-ULP polynomial — "no longer bit-for-bit libm output" — breaking the bit-exact-with-whisper invariant the prior agent deliberately PRESERVED FOR OWNER (unlanded). NOT landable under "conformance GREEN", and ~25% mel ≈ ~0.15% e2e (mel is ~0.6% of e2e) — negligible. No landable worktree win. 0 source delta.
+
+**Land-or-dig result: thorough land-check (branches + every worktree's uncommitted source) → the one
+worktree win is owner-gated + negligible → correctly NOT landed.** AGENT_NAME=TealVireo. Main is clean
+(coworker not actively editing); the other source-changed worktrees are stale non-wins (`cod-a-l14-validate`
+re-adds `ensure_default_rayon_pool` already on main; `cod-b-log10-land`/`icywren` encoder/mel = rustfmt +
+the gated log10). DON'T land the log10 mel without owner sign-off on relaxing bit-exact-with-whisper.
+
 ## 2026-06-29 - TealVireo: DECODE-KERNEL VERIFIED OPTIMAL (last candidate ruled out) — the tiny.en decode's compute hotspot, the per-row f16-dequant+dot (`nn::dot_f16c`, the GEMV inner loop), ALREADY uses f16c+fma 8-wide intrinsics on the `x86-64-v3` baseline (the box is Zen/AVX2 — no AVX-512, so 8-wide is the f16c ceiling). So the decode-compute kernel is already at its safe SIMD optimum; there is no accessible in-crate decode-compute lever. With the cgroup-walk fix complete crate-wide and the spawn-migration harvested, the in-crate perf space is EXHAUSTED. 0 source delta.
 
 **Land-or-dig result: land-check (no worktree win; coworker quiet) + verified the last accessible
