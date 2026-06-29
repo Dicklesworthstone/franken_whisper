@@ -3,6 +3,55 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: BLOCKER SURFACED — COMPLETE model-load profile; every phase optimized/bandwidth-bound/negligible. No in-scope load lever remains; realistic workload DOMINATED on both axes. Remaining frontier is OWNER-SCOPED.
+
+**Land-or-dig result: DIG profiled the FULL load to hunt any remaining serial cost
+beyond my 3 landed wins; found none worth landing → surface the blocker, 0 source delta
+(adds `examples/full_load_probe.rs` tool only).** AGENT_NAME=cc.
+
+The 3 landed wins covered read + encoder + decoder `from_ggml`. Two costs were still
+unmeasured: the vocab/filter PARSE LOOPS inside `GgmlModel::load`, and `Tokenizer::
+from_vocab`. Measured both (`examples/full_load_probe.rs`, large-v3-turbo, best of 6):
+
+| phase | cost (warm) | status |
+| --- | ---: | --- |
+| parse = `GgmlModel::load` (parallel read + loops) | **120–125 ms** | read optimized 10.4×; loops ≈ 5 ms (negligible) |
+| encoder `from_ggml` | ~342 ms | MEMORY-BANDWIDTH-BOUND floor (2.5 GB f32 strided write; plateaus@16 threads) |
+| decoder `from_ggml` | ~231 ms | optimized (one-pass parallel f16) |
+| tokenizer `from_vocab` (implied = weights 618 − enc 342 − dec 231) | **~45 ms** | serial 51 865-entry HashMap build |
+| **TOTAL model load** | **~0.74 s** | at/under whisper.cpp (~0.9 s) |
+
+**Every phase is now optimized, bandwidth-bound, or negligible:**
+- parse loops ~5 ms → not worth touching.
+- tokenizer ~45 ms is a serial BPE-map (`HashMap`) construction; a sharded/parallel-map
+  rewrite would save ~20 ms at real complexity/risk — sub-noise, REVERT-class. NOT pursued.
+- encoder transpose is the f32-traffic bandwidth floor (halving needs an f16 encoder GEMM
+  = owner-scoped `ft_kernel_cpu`; a thread cap to 16 is contention-dependent / idle-
+  regression risk = not load-robust → not landed; see prior entry).
+
+**⇒ The model-load optimization arc is EXHAUSTIVELY CLOSED.** Combined with the earlier
+results, `franken_whisper` now **comprehensively dominates** the realistic large-v3-turbo
+workload vs whisper.cpp (and, by transitivity, vs the slower OpenAI-Whisper):
+- **compute:** large 1.51× / tiny 1.28× faster (encoder wins outright; whisper.cpp encode
+  can't use >16 threads, franken uses the full pool).
+- **load:** ~2.5 s → ~0.74 s (~3.4×) via 3 landed levers → at/under whisper.cpp.
+- **audio decode:** native symphonia (mp3/flac/aac/ogg/wav, in-process) is the PRIMARY
+  path (`audio.rs::normalize_to_wav`), ffmpeg only a fallback for video/exotic codecs —
+  franken avoids the per-file ffmpeg subprocess spawn that OpenAI-Whisper/whisper.cpp pay.
+
+**BLOCKER (the only remaining real frontier, all OWNER-SCOPED — not in `franken_whisper`'s
+`#![forbid(unsafe_code)]` scope):**
+1. f16 / fused encoder GEMM in `ft_kernel_cpu` — would extend the compute lead AND halve
+   encoder-load f32 traffic (bd-4hc0 family; frankentorch owner).
+2. An audited unsafe `mmap` loader — would cut the cold-DISK (uncached) first-read further
+   (read is already 10.4× warm; mmap needs owner-approved unsafe).
+3. Radix-5 FFT base case (mel) — READY but gated on extending the bit-exact-with-whisper
+   invariant to the FFT (owner decision; stash@{0}).
+
+The in-crate land-or-dig loop for `franken_whisper-cc` has converged: compute at ceiling
+(DuskFinch), load exhaustively closed (this entry), audio native. Recommend redirecting
+to the owner-scoped frontier or standing the loop down. 0 source delta (tool-only).
+
 ## 2026-06-29 - cc: DIG-CLOSURE — encoder `from_ggml` is MEMORY-BANDWIDTH-BOUND (RAYON sweep plateaus at 16, regresses at 32/64); no clean further load lever. Model-load arc CLOSED at whisper.cpp parity (3 landed wins).
 
 **Land-or-dig result: DIG measured the last load phase; no clean win → recorded, 0
