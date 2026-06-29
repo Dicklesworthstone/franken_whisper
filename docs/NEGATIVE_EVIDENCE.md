@@ -3,6 +3,28 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: PERF-VEIN CONSOLIDATION — the syscall/spawn-profiling vein (contention-invariant, escapes the decode_loop wall) is HARVESTED this session: 3 bit-exact wins + the principle. The cgroup-walk fix is now COMPLETE crate-wide (audited: 0 uncached `available_parallelism` outside the 2 OnceLock helpers). The tiny.en decode gap is COMPUTE-bound on the f16-dequant+dot (coworker's GEMV kernel), not dispatch/alloc/syscall. 0 source delta.
+
+**Land-or-dig result: land-check (no worktree win) + crate-wide audit confirming the accessible perf
+vein is exhausted; the decode gap is coworker-kernel-compute-bound.** AGENT_NAME=TealVireo.
+
+### Session wins (all bit-exact, conformance 47/0, contention-invariant measurement)
+```text
+1e149b2  decode GEMV-dispatch: cache available_parallelism (sched_getaffinity) + FW_BATCH_GEMV_CAP env
+4bf26c9  load path: cache the SAME (ggml per-tensor / mel / default_threads)  → openat 15193→31 (−99.8%)
+a8eeea9  encoder layer_norm/gelu: per-call thread::scope spawn → rayon pool   → clone3 −120, ~4% + stable
+```
+### Principle (so the next agent doesn't re-tread)
+- `available_parallelism()` re-walks the cgroup CFS-quota hierarchy (~8 file opens) per call — cache it.
+  AUDITED: no uncached caller remains anywhere in `src/` (only `nn::avail_parallelism`/`mod::host_parallelism`).
+- Spawn migration (`thread::scope`→rayon) helps ONLY SPAWN-BOUND cheap ops (layer_norm/gelu); the
+  COMPUTE-bound `gemv_f16_batch`/attention/softmax/mel/ggml-dequant REGRESS (`de58137`) — spawn amortized,
+  rayon overhead exceeds it. DON'T migrate those. ALWAYS A/B the wall (clone3 count ≠ wall).
+- The decode gap is COMPUTE: each tiny token streams ~37 MB f16 weights but runs ~6 ms (~14× the
+  ~0.42 ms/88 GB·s bandwidth floor) ⇒ the f16-dequant+dot kernel (coworker's ft_kernel/f16-gemv), not
+  bandwidth/dispatch. The remaining levers are coworker-kernel, owner-gated softmax `exp`, or the
+  bd-6goy temp/beam-fallback quality feature (unmeasurable on the clean-audio conformance suite). 0 delta.
+
 ## 2026-06-29 - TealVireo: ~REGRESSION (REVERTED) — extending the thread::scope→rayon migration to `gemv_f16_batch` (the encoder's batched GEMM, ~160 spawns/window) cut `clone3` 261→133 (−128) BUT REGRESSED encoder_window ~7% (main warm ~116 ms → ~124 ms). Unlike the cheap `layer_norm`/`gelu` (spawn-bound), the batched GEMV is COMPUTE-bound: the spawn was amortized over the big matmul, and rayon's `into_par_iter` collect/work-stealing overhead EXCEEDS the spawn it replaced. The coworker's `thread::scope` choice for the batched path is correct. Reverted (conformance was 47/0; reverted for the wall regression). 0 source delta.
 
 **Land-or-dig result: DIG extended the (winning) spawn-migration to the biggest remaining clone3
