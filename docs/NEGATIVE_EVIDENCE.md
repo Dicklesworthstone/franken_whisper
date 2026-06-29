@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: ~0-GAIN — overlapping the tokenizer build with the enc‖dec join (3-way `rayon::join`) does NOT help (the enc‖dec already saturates all cores). Reverted to 0 source delta.
+
+**Land-or-dig result: DIG tried the last cross-phase overlap (tokenizer ‖ enc‖dec),
+MEASURED ~0-gain/slight-regression, REVERTED.** AGENT_NAME=cc.
+
+After landing the enc‖dec overlap, the tokenizer build (`Tokenizer::from_vocab`, a serial
+HashMap, ran *before* the join) was the last independent serial slice. Hypothesis: make it
+3-way (`rayon::join(tok, join(enc, dec))`) so the tokenizer hides behind the ~180 ms
+encoder. Measured (`full_load_probe` on `LoadedModel::from_ggml`, best of 7, interleaved
+A/B, heavy contention):
+
+| | best |
+| --- | ---: |
+| tokenizer serial (prior, kept) | 515 / 594 / 559 ms |
+| tokenizer 3-way concurrent | 553 / 575 / 586 ms |
+
+⇒ **no win — mixed / slightly worse.** Why: the enc‖dec `rayon::join` already saturates
+all 64 cores, so the tokenizer's extra thread finds **no idle core to hide in** — it just
+adds contention (the same "concurrent-with-a-saturated-pool = no gain" lesson as the
+rejected parallel-logprobs/bmm). The enc‖dec overlap won precisely because the encoder
+alone (32 layer-tasks) left cores for the decoder; adding a third independent build past
+full saturation buys nothing. Reverted `LoadedModel::from_ggml` to the serial-tokenizer +
+enc‖dec form. 0 source delta.
+
+**⇒ The model load is now FULLY overlapped to core saturation** (enc‖dec concurrent;
+tokenizer fills no remaining gap). Cumulative warm load ~0.34 s (was ~2.5 s, ~7.4×),
+~2.6× under whisper.cpp. The load arc is closed on BOTH the per-phase and cross-phase
+axes. Remaining frontier owner-scoped (ft_kernel_cpu compute GEMM; bd-wzgh speculative
+decode).
+
 ## 2026-06-29 - cc: LANDED — concurrent encoder‖decoder weight build (`rayon::join`) = 1.20× on `LoadedModel::from_ggml` (cross-phase overlap; the decoder hides behind the encoder).
 
 **Land-or-dig result: DIG found a CROSS-PHASE overlap the per-phase work missed;
