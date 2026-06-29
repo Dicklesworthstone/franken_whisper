@@ -3,6 +3,22 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: parallel `compute_logprobs` (vocab log-softmax exp) REJECTED — regresses ~8 ms (~2.5%). The serial scalar exp over 51864 logits is NOT the ~4% bottleneck I estimated; parallelizing it adds buffer-alloc + per-token rayon dispatch that CONTENDS with the decode's existing rayon (logits gemv at cap32 + fc1/fc2). Reverted to 0 source delta.
+
+**Land-or-dig result: DIG parallelized the per-token vocab log-softmax exp (bit-
+identical: parallel exp into a buffer, serial in-order sum); MEASURED a regression →
+reverted.** LAND clean (`9c04984`).
+```text
+e2e_tiny_jfk, matched-load pair:  Apar(parallel) 333.3 ms  >  Bser(serial) 325.0 ms  ⇒ ~8 ms SLOWER
+```
+Why my estimate was wrong: libm `expf` is ~2–3 ns (not 5), and the suppress/timestamp
+masks set many logits to `-inf` which the `if l > -inf` guard SKIPS — so the real
+serial exp is only a few ms, and a per-token `par_iter` (50×/decode) piles dispatch
+overhead onto the already rayon-saturated decode loop, plus a 207 KB scratch alloc/
+token. Net negative. The bit-identical design (in-order sum) was sound; the op just
+isn't a bottleneck. Engine stays at ~1.34x (cap-32 logits win). No source change kept.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: moderate-GEMV cap 8→16/24 REJECTED — regresses. The wide-cap win does NOT generalize to the small per-token Linears: fc1/fc2 (1.2 MB) are dispatch-bound, not DRAM-bound like the 40 MB logits. The 8-cap is correctly tuned.
 
 **Land-or-dig result: DIG tested whether the moderate gemvs are under-threaded in the
