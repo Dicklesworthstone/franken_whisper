@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: ~0-GAIN (REVERTED) — bd-b4hp tiny.en long-form decode is OVERHEAD-bound (~6.8 ms/tok, ~10× the bandwidth floor) but the overhead is NOT the mlp-GEMV parallel dispatch (serial-mlp = +2.3% ≈ noise) NOR logits parallelism (already optimal at 32; reducing it HURTS). Narrows bd-b4hp; 0 source delta.
+
+**Land-or-dig result: DIG profiled the bd-b4hp tiny-long-form loss and ruled out the two
+obvious dispatch suspects; the residual overhead is diffuse in `forward_step`. Reverted the
+~0-gain threshold change.** AGENT_NAME=BlackThrush.
+
+### Profile (FRANKEN_WHISPER_PERF_SPANS=1, tiny.en 5 min, 11 windows)
+Per-window phase totals: **decode_loop ≈ 476 ms/window (70 tok) = ~6.8 ms/tok ⇒ ~80 % of e2e**;
+encoder_window ~97 ms (~16 %); cross_kv ~22 ms; mel ~24 ms once. So the tiny long-form loss is
+the DECODE LOOP, not per-window setup (mel/encoder/cross-kv are minor) — encoder is actually
+FASTER than whisper.cpp here (~1067 ms vs 1517 ms over 11 windows). franken decode ~5.2 s vs
+whisper.cpp tiny decode ~1.2 s ⇒ **~4.3× slower per token**.
+
+### Why it's overhead-bound
+Per-token memory-bandwidth floor ≈ 0.63 ms (logits 40 MB f16 / 88 GB/s = 0.45 ms + 4 layers
+~16 MB = 0.18 ms). Actual ~6.8 ms/tok = **~10× the floor** ⇒ dominated by per-token OVERHEAD
+(dispatch / allocation / per-op call cost), not compute or bandwidth.
+
+### Suspects RULED OUT (measured, no-rebuild env sweeps + one rebuild)
+- **Logits GEMV parallelism** (`FW_WIDE_GEMV_CAP`, tiny 5 min): 32→6.96 s, 16→6.93 s, 8→7.28 s,
+  4→7.56 s, 1→8.87 s. Already optimal at 32; **reducing it HURTS**. Not the cause.
+- **mlp GEMV parallel dispatch** — raised `gemv_f16`'s `PAR_THRESHOLD` 1<<19→1<<20 so the
+  tiny.en mlp GEMVs (`[1536,384]`/`[384,1536]`=590 k MACs) run SERIAL (large mlp 6.5 M + logits
+  20 M stay parallel). tiny 5 min: 1<<19 ~6.92 s → 1<<20 ~6.76 s = **+2.3 %, within the ±1.5 %
+  run-noise ⇒ ~0-gain**; 1<<23 ~6.74 s (no further gain); large-v3 2 min unchanged (22.5 vs
+  22.6 s). **REVERTED** (`src/native_engine/nn.rs` restored to `1<<19`; 0 net source delta).
+  The L11 isolated-microbench "rayon 1.40× over serial" does NOT reproduce in the real
+  sequential decode loop, but serial isn't a win either — the mlp dispatch is not the dominant
+  overhead.
+
+### Residual / next
+The ~6 ms/token overhead is DIFFUSE in `decoder::forward_step` (m=1 self/cross-attn over 1500
+audio ctx per layer, per-call `Mat`/`Vec` allocations, per-op dispatch) — not a single knob.
+Closing it needs a structural decode-loop change (pool-resident scratch, fused per-layer m=1
+path, fewer per-token allocations), tracked on **bd-b4hp** (P1, now narrowed). Conformance
+unaffected (0 source delta this entry). Methodology note: tiny.en's tiny per-op work makes it
+a dispatch/alloc microscope — the same overhead is invisible on large-v3-turbo (big per-op
+compute amortizes it; large WINS long-form 1.22×).
+
 ## 2026-06-29 - BlackThrush: MEASURED e2e head-to-head vs whisper.cpp(OpenAI-class) — franken WINS greedy short (tiny 1.07×, large 1.12×) + large long-form (1.22×) but **LOSES tiny.en long-form 1.84× (5min)**; AND (source-verified) the native engine is GREEDY/temp-0 ONLY so beam-search/temp-fallback (the realistic DEFAULTS) are UNRUNNABLE on the fast path. Two real uncovered-workload findings; both filed as br beads.
 
 **Land-or-dig result: e2e workload audit found the biggest genuinely-UNCOVERED realistic
