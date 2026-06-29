@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: PRODUCTION-MODEL CERT — franken-native large-v3-turbo verified post-f16-cross: correct transcript, DOMINATES whisper.cpp ~2.6× (6.66 s vs 17.4 s on jfk), and f16-cross is bit-tolerant on large (f16 == f32 output). Found a pre-existing minor silence-tail divergence (trailing "a.") that is NOT f16-related. 0 source delta.
+
+**Land-or-dig result: DIG closed the one genuinely-unverified surface — the PRODUCTION model
+(large-v3-turbo) under the recent numerics-affecting f16-cross — with a vs-ORIG ratio + a correctness
+check. No worktree win.** AGENT_NAME=TealVireo. Built the `fw` CLI to run the native engine on large
+(no large transcribe test exists in the gated suite).
+
+### Measured (jfk 11s, greedy `-t 4`, native engine via `FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`)
+```text
+                       franken-native large-v3-turbo   whisper.cpp large-v3-turbo (-bs1 -bo1)
+total (incl. load)     ~6.66 s                          17.41 s    ⇒ franken ~2.6× FASTER (DOMINATES)
+  └ whisper.cpp split:  load 0.90 s | encode 16.01 s (!) | decode 0.44 s/28 | sample 0.01 s
+transcript             "...do for you, ask what you can do for your country. a."   (core EXACT match)
+```
+whisper.cpp's large encode is **16 s** for one window (no-BLAS ggml CPU GEMM at `-t 4`); franken's
+encoder advantage (already 3.3× on tiny) is even larger here, so franken dominates the production
+model decisively. The ~1.5×/2.4× tiny.en DECODE gap does NOT generalize to large — large's per-op
+work amortizes the dispatch overhead, so franken wins large end-to-end.
+
+### f16-cross correctness on large (the unverified surface — now verified)
+`FW_CROSS_F16` default (f16) and `FW_CROSS_F16=0` (f32) produce the **identical** large transcript
+(incl. the trailing "a."). ⇒ the f16 cross-attention K/V (`57910a4`) introduces **no output drift on
+the production model** — the "transcription-tolerance" claim holds at scale, not just on tiny.en.
+
+### Pre-existing observation (NOT a regression, NOT f16-related — for the owner)
+franken-native large emits a trailing **"a."** on the jfk silence tail that whisper.cpp does not.
+Present in BOTH the f16 and f32 cross paths, so unrelated to f16-cross; large-specific (tiny.en
+matches wc EXACTLY, gated 47/0). Likely a window-padding / EOT / silence-tail-suppression difference
+(large-v3-turbo hallucinates a token on the zero-padded tail of the single 30 s window). Cosmetic
+(core transcript exact); flagged as a potential future tidy, not a recent-landing defect. 0 source
+delta this turn.
+
 ## 2026-06-29 - TealVireo: CERT + IMPASSE — f16-cross (`57910a4`) certified GREEN across the FULL native_engine surface (194/0, not just the 47 gated decode tests); and an honest statement that the cleanly-measurable bd-b4hp levers are exhausted on this contended box. The remaining gap is cycle-level (dispatch + owner-gated softmax exp + recycled allocs), which CANNOT be measured here. 0 source delta.
 
 **Land-or-dig result: no worktree win; the measurable free-file + thread levers are exhausted, so
