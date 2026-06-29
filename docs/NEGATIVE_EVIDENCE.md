@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: ~0-GAIN (REVERTED) — decode thread-count avenue CONCLUSIVELY CLOSED (3rd resolution). Implemented a model-gated scoped decode pool (cap small-model decode at 12, large untouched; bit-exact, conformance 47/0 both modes) — but the new default (auto-12) ties forced-16 at lower load (~175 vs ~173 ms, mixed 3/7); the ~18% "win" only appears under heavy load. Load-dependent robustness, not an intrinsic win. Reverted.
+
+**Land-or-dig result: DIG built the safe model-gated form of the decode-thread lever, MEASURED it at
+two load regimes, and confirmed the win is purely load-dependent → REVERT (per "REVERT ~0-gain").**
+AGENT_NAME=TealVireo. The decode-thread-count avenue is now CLOSED — do not re-open it. No worktree win.
+
+### Implemented (clean, bit-exact — just doesn't help at measurable load)
+`decode_threads(n_state)` + a per-count cached `decode_pool` + `forward_step_pooled` wrapping the
+m=1 loop forward in a dedicated rayon pool, default-capping ONLY small models (`n_state <= 512`) to
+12 threads while the encoder keeps the global 16; `FW_DECODE_THREADS` overrides. Compiles clean
+(`DecoderState: Send`); CONFORMANCE GREEN both modes (`native_engine::decode` 47/0 default auto-cap
+AND `FW_DECODE_THREADS=16`).
+
+### The A/B that killed it (interleaved, gated_e2e_jfk `decode_loop`, two load regimes same session)
+```text
+load ~13-17 (decode-only sweep earlier this turn):  16 ~226 ms | 12 ~185 | 8 ~175   (12/8 win ~18-22%, 7/7)
+load ~8     (new-default vs forced-16, this A/B):    default(auto-12) ~175 | forced-16 ~173  (TIE, mixed 3/7)
+last turn, load ~8:                                  16 ~127 (≈ 12)        (also a tie at low load)
+```
+⇒ The 12-vs-16 gap is ENTIRELY load-dependent: a ~18% win under heavy load, ~0 at lower load. Same
+signature as the earlier RETRACTED RAYON=12 lead — fewer threads only helps when the box is busy
+(less contention), as expected for parallel work with free cores. It is a **contention-robustness**
+property, NOT an intrinsic speedup, and cannot be reliably measured (let alone landed as a clean
+default win) on this shared 64-thread box.
+
+### Conclusion — thread-count avenue CLOSED (3 independent resolutions this session)
+1. `RAYON=12` global (87911c1/2acaec1) — retracted, contention artifact.
+2. `FW_DECODE_THREADS=12` scoped (c205b4c) — ~0-gain at then-current load, reverted.
+3. model-gated auto-12 (this entry) — ~0-gain at low load, ~18% only under heavy load, reverted.
+The decode is contention-SENSITIVE (the real finding, 8eabfda: franken 16-thread rayon vs wc 4-thread
+OpenMP), but capping threads is a robustness knob with no intrinsic-speedup payoff measurable here.
+`RAYON_NUM_THREADS` already exposes it for operators on loaded boxes. **Settling whether fewer decode
+threads is intrinsically better needs a QUIET/dedicated box** (the only env where the load confound
+vanishes). bd-b4hp's clean decode lever remains the structural one (per-token alloc/op reduction in
+decoder.rs/nn.rs), now unblocked (`57910a4`). tiny.en decode is ~1.5× wc quiet / ~2.4× loaded. 0 net
+source delta.
+
 ## 2026-06-29 - TealVireo: ROOT-CAUSE (vs-ORIG ratio update, post-f16-cross) — franken's decode is CONTENTION-SENSITIVE because it runs the m=1 decode on a 16-thread rayon pool vs whisper.cpp's 4-thread OpenMP. franken `decode_loop` swings 127↔205 ms with background load while whisper.cpp's decode+sample stays ~85 ms; so the vs-ORIG per-token ratio is load-dependent (~1.5× quiet, ~2.4× loaded), and wc with 4 threads beats franken with 16. The decode is OVER-THREADED for a memory-bound workload. 0 source delta.
 
 **Land-or-dig result: DIG re-baselined the decode vs-ORIG ratio now that the held f16-cross landed
