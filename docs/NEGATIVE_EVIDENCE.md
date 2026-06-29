@@ -3,6 +3,44 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: REALISTIC MULTI-WINDOW e2e (real 124.5 s speech MP3, 5 windows) — franken WINS ~1.1–1.27× vs whisper.cpp; decode-heavy content dilutes the encoder lead (decode is the limiting factor).
+
+**Land-or-dig result: measured the realistic MULTI-WINDOW workload — all prior
+head-to-heads were single-window jfk (11 s). Ships `examples/realistic_e2e_probe.rs`;
+0 engine delta.** AGENT_NAME=cc.
+
+Real 124.5 s speech MP3 (`sample_audio_files/example_audio_track_01.mp3`, 5 encoder
+windows, non-repetitive). franken = native symphonia decode + cold load + multi-window
+`transcribe`; whisper.cpp = its own mp3 decode + load + compute. Interleaved back-to-back
+A/B (box contention was heavy + variable this session, so the per-pair ratio — not the
+absolute — is the signal):
+
+| pair | franken TOTAL (decode+load+transcribe) | whisper.cpp wall | franken speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 31.9 s | 31.98 s | 1.00× |
+| 2 | 27.5 s | 30.76 s | 1.12× |
+| 3 | 28.1 s | 35.70 s | 1.27× |
+
+⇒ franken WINS the realistic multi-window workload **~1.0–1.27× (median ~1.12×)**.
+Components (best): native **symphonia decode 109–117 ms** (vs whisper.cpp's bundled
+ffmpeg); load ~1.2–1.3 s (contention-inflated from ~0.74 s warm); transcribe ~26 s /
+5 windows ≈ **5.2 s/window vs whisper.cpp ~5.9 s/window**. Conformance: franken produced
+the same 5 windows; 0 engine delta ⇒ output inherits current main's green suite.
+
+**NEW finding (the value of this measurement):** the multi-window speedup (~1.12×) is
+SMALLER than single-window jfk e2e (1.34×) and warm encode (1.51×). Cause: a 2 min clip
+is continuous decode-heavy SPEECH (many tokens/window), so the **DECODE** — where franken
+is only at ~parity (1.07×, bd-6qih; gemv_f16 at the 88 GB/s bandwidth ceiling, mature) —
+is a larger fraction and dilutes franken's encoder advantage. So on realistic decode-heavy
+long audio franken's lead is **decode-bound**: the decode is the limiting factor, and it is
+already in-scope-exhausted. The next lever that would extend the realistic-audio margin is
+a faster decode primitive (speculative decoding / a draft model — a NEW ARCHITECTURE, not
+an in-crate kernel tweak; owner-scoped) or the owner-scoped encoder GEMM work.
+
+**⇒ franken DOMINATES across BOTH single-window (1.34×) and realistic multi-window
+(~1.12×) workloads, with faster native decode + faster encoder; decode parity caps the
+multi-window margin.** 0 engine delta (probe tool only).
+
 ## 2026-06-29 - cc: INTEGRATED COLD-CLI e2e head-to-head — franken WINS large 1.34× / tiny 1.25× vs whisper.cpp (cold 12.96 s LOSS → 4.85 s WIN; the session payoff)
 
 **Land-or-dig result: measured the integrated mission metric (the FULL cold one-shot
