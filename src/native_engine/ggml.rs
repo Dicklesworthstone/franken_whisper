@@ -465,6 +465,37 @@ impl GgmlModel {
             dequant_f16_to_halves_parallel(raw, n_elements),
         ))
     }
+
+    /// Borrow a tensor's raw little-endian f16 bytes (shape + `&[u8]`) with NO
+    /// `Vec<u16>` copy — for a fused dequant-transpose that reads straight from
+    /// the blob. Errors exactly like [`Self::tensor_f16`] (unknown / f32-stored /
+    /// size-mismatched).
+    pub fn tensor_f16_bytes(&self, name: &str) -> FwResult<(Vec<usize>, &[u8])> {
+        let entry = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| FwError::InvalidRequest(format!("unknown tensor '{name}'")))?;
+        if entry.dtype != GgmlDType::F16 {
+            return Err(FwError::InvalidRequest(format!(
+                "tensor '{name}' is stored as f32, not f16"
+            )));
+        }
+        let raw = self
+            .blob
+            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
+            .ok_or_else(|| {
+                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
+            })?;
+        let n_elements = entry.n_elements();
+        if raw.len() != n_elements * 2 {
+            return Err(FwError::InvalidRequest(format!(
+                "tensor '{name}' f16 byte length {} != {} elements * 2",
+                raw.len(),
+                n_elements
+            )));
+        }
+        Ok((entry.shape.clone(), raw))
+    }
 }
 
 /// Read an entire file into one `Vec<u8>` using SEVERAL threads, each issuing

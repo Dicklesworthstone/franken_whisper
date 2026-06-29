@@ -3,6 +3,42 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: LANDED — raw-bytes fused dequant-transpose for the encoder load = 1.33× (`EncoderWeights::from_ggml` 238→179 ms, large-v3-turbo); eliminates the `Vec<u16>` intermediate.
+
+**Land-or-dig result: DIG completed my own fused-transpose landing — removed the
+`Vec<u16>` intermediate, MEASURED 1.33×, LANDED.** AGENT_NAME=cc.
+
+The landed fused dequant-transpose (`8bfc212`) still called `tensor_f16` — a serial
+bytes→`Vec<u16>` copy — before the tiled transpose. New `ggml::tensor_f16_bytes` borrows
+the raw f16 byte slice from the blob (no copy); `dequant_transpose_f16_bytes` reads
+`u16::from_le_bytes` inline during the transposed write — ONE pass, no intermediate, no
+per-weight allocation. That removes a full linear pass over the ~1.25 GB of encoder f16
+weights on this bandwidth-bound load.
+
+**MEASURED (`encoder_load_probe`, large-v3-turbo, best of 7, interleaved A/B, same
+contention):**
+
+| path | best |
+| --- | ---: |
+| `Vec<u16>` intermediate (prior) | 237–240 ms |
+| **raw bytes (landed)** | **178.7 / 178.7 / 187.7 ms** |
+
+⇒ **1.33× faster** encoder weight load (~58 ms off), consistent across 3 interleaved
+pairs. Stacks on the prior 2.46× fused-transpose: `EncoderWeights::from_ggml`
+**832 → 342 → ~180 ms** across the session (~4.6× total). **Bit-IDENTICAL** (same
+`Float16::from_bits` of the same LE byte pairs; unit test updated to exercise the
+raw-bytes path).
+
+**Conformance GREEN:** `fused_dequant_transpose_*` unit test (4 shapes, NaN-safe bitwise,
+now on the raw-bytes path) PASS; `native_engine::encoder` **11/0**, `ggml` **15/0**;
+rustfmt + clippy clean. Removed the now-dead `Vec<u16>` transpose variant. Compute path
+untouched.
+
+**Cumulative cold-start LOAD (large-v3-turbo, warm):** parse ~120 + encoder ~180 +
+decoder ~231 ≈ **~0.53 s** (was ~0.69 s, ~2.5 s originally). Files (mine only):
+`src/native_engine/ggml.rs` (`tensor_f16_bytes`), `src/native_engine/encoder.rs`
+(raw-bytes path + test).
+
 ## 2026-06-29 - cc: REJECTED — wider worker cap for the LARGE decoder mlp gemv (fc/proj, 13 MB). MEASURED monotonic regression (cap8 best; 16 +46 %, 24 +76 %, 32 +85 %). cap8 is correctly tuned even for large; reverted to 0 source delta.
 
 **Land-or-dig result: DIG tested an in-scope decode lever (the realistic-audio limiter),
