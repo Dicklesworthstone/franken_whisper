@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - SlateHeron: BLOCKER (build-infra) + UNTESTED LEVER flagged — land-check reconfirms NO uncommitted source win (working tree = `.beads/` churn only; the log10 mel candidate stays OWNER-GATED per HEAD 45c0d51). 0 source delta this session.
+
+**Land-or-dig result: land-check clean (no win) → DIG attempted on the decode kernel but BLOCKED by build
+infra inside the window.** AGENT_NAME=SlateHeron.
+
+### The blocker (so the next session pre-empts it)
+`rch` remote offload **times out at the 30 s sync ceiling** when syncing the `franken_whisper` project dir
+to a worker, because the dir now carries the **1.5 GB `legacy_whispercpp/.../ggml-large-v3-turbo.bin`**
+(plus sibling worktrees). Every `cargo` build falls back to a **cold local build in the rch target dir**
+(`/data/projects/.rch-targets/whisper-cc`, freshly created → full from-scratch compile, ~3–5 min). That
+single cold build consumed the measurement window; no attribution/A-B data could be produced. Inline
+`VAR=val cargo …` and `RCH_ENABLED=0 cargo …` prefixes are **mangled by rch's local-fallback `sh -c`**
+(`sh: 1: VAR=…: not found`) — wrap env in a script (`exec cargo …`) instead. NEXT session: pre-warm the
+rch target dir (`/data/projects/.rch-targets/whisper-cc`) or add the 1.5 GB model to an rch sync-ignore so
+offload doesn't time out, BEFORE attempting any measure→change→rebuild loop.
+
+### The untested lever (concrete, do not re-tread as "ceiling")
+The ledger's "decode kernel is at the AVX2 8-wide ceiling" framing conflates **SIMD width** (genuinely 8
+under f16c, settled) with **accumulator count**. `nn::dot_f16c` (the decode/logits GEMV inner dot) uses
+only **4** independent FMA accumulator chains (`a0..a3`, 32 elts/iter, `nn.rs:485-500`). On Zen FMA is
+~4–5 c latency × 2/c throughput → saturation needs ~8–10 in-flight FMAs; 4 chains can be **latency-bound,
+not throughput-bound**, especially for the SHORT contraction of the per-token GEMVs (n_state=384 tiny /
+1280 turbo → only 12 / 40 loop iters per row before a serial horizontal reduction). **Untested
+hypothesis:** widening to 6–8 accumulators (or row-blocking B rows to share the `x` loads + multiply
+in-flight chains) lifts the per-token logits/QKV GEMV. CAVEAT: this CHANGES the f32 FMA reduction order →
+a numerics-affecting edit on the f16 path (already gated by `f16_compute_enabled`, tol <1e-4), so it must
+clear the **exact-transcript conformance** suite (argmax-tie robustness), not just the tolerance gate.
+This was NOT measured this session (build blocker above) — it is a hypothesis for the next dig, not a
+result. Bench handle exists: `logits_gemv_large` (criterion) + `examples/decoder_attrib` (per-sub split).
+
 ## 2026-06-29 - TealVireo: LAND-CHECK (thorough, all worktrees) — the ONLY uncommitted worktree "measured win" is `cod-b-log10-land`'s mel `log10_floor_approx` (~25% mel), but it is OWNER-GATED: it replaces exact libm `log10` with a 1-ULP polynomial — "no longer bit-for-bit libm output" — breaking the bit-exact-with-whisper invariant the prior agent deliberately PRESERVED FOR OWNER (unlanded). NOT landable under "conformance GREEN", and ~25% mel ≈ ~0.15% e2e (mel is ~0.6% of e2e) — negligible. No landable worktree win. 0 source delta.
 
 **Land-or-dig result: thorough land-check (branches + every worktree's uncommitted source) → the one
