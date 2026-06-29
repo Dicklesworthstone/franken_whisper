@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: gemm/faer crate REFUTED — MEASURED 0.59–0.72x SLOWER than ft's matrixmultiply sgemm on every encoder shape (this AVX2 box; faer is AVX512-tuned, falls back to slow AVX2). The long-standing bd-4hc0 "~1.14x" estimate was WRONG. The encoder GEMM is at its ceiling; the "different GEMM primitive" lever I surfaced last cycle is a DEAD END, not just dep-blocked.
+
+**Land-or-dig result: DIG actually TESTED the radical lever (faer gemm crate, cached
+locally as `gemm-0.18.2`) via a dev-dep probe instead of re-surfacing — it
+REGRESSES. Reverted dev-dep + probe + Cargo.lock to 0 source delta.** LAND clean
+(`8124d74`).
+```text
+ft matrixmultiply  vs  faer gemm  (best-of-80, synthetic):
+proj   [1500,384]x[384,384]   765 GF/s  vs  550   = 0.72x  (gemm slower)
+fc2    [1500,1536]x[1536,384] 1681 GF/s vs  985   = 0.59x
+fc1    [1500,384]x[384,1536]  1385 GF/s vs  863   = 0.62x
+crossk [1500,384]x[384,384]   770 GF/s  vs  517   = 0.67x
+max|Δ| 3e-5–9e-5 (faithful, but moot — slower)
+```
+Two corrections fall out: (1) ft's matmul is actually well-tuned — fc2 hits **1681
+GF/s (~peak)**, so cycle-25's "47–60% peak" reading was load-confounded, not a real
+gap; (2) faer's `gemm` (state-of-the-art *on AVX512*) loses to matrixmultiply on
+AVX2-only hardware. So the encoder GEMM has NO remaining lever — in-scope (sgemm_bt,
+QKV-fusion) AND the external gemm-crate are all measured-slower. The faithful CPU
+floor stands at ~1.34x (five landed wins); further perf genuinely requires the GPU
+(`gpu-frankenjax`, no driver) or a frankentorch-side AVX2 microkernel improvement —
+both owner-scoped. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: BLOCKER SURFACED — the biggest remaining MEASURED CPU gap (encoder proj/fc2 GEMMs at 47–60% peak) needs the `gemm`/faer microkernel crate, a DIFFERENT GEMM primitive — but it is NOT in the frankensuite (no lockfile/cache/sibling uses it) ⇒ a NEW external dep, owner-scoped (memory bd-4hc0 rejected it). No in-scope CPU lever remains without a new dep, the GPU, or a faithfulness break.
 
 **Land-or-dig result: DIG located the next radical lever and its blocker; it is
