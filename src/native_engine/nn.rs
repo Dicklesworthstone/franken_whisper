@@ -115,8 +115,25 @@ fn gemv_worker_count(out: usize) -> usize {
     // Only the vocab-class GEMV (tens of thousands of rows) is bandwidth-bound
     // enough to want >8 threads; below that the 8-cap wins (see fn docs).
     const WIDE_OUT_THRESHOLD: usize = 1 << 14; // 16384 rows
-    let cap = if out >= WIDE_OUT_THRESHOLD { 12 } else { 8 };
+    let cap = if out >= WIDE_OUT_THRESHOLD { wide_gemv_cap() } else { 8 };
     avail.min(cap)
+}
+
+/// Worker cap for the vocab-class (bandwidth-bound) GEMV. **32** (measured optimum):
+/// the old 12 left the logits GEMV at ~16 GB/s, well under the controller ceiling —
+/// raising to 32 saturates ~4 CCDs' memory channels for ~1.4–1.8x on logits_gemv_large
+/// and ~6–8% e2e (and far more load-robust). 48/64 regress (cross-CCD sync), and a
+/// 24-thread CCD-split is a local minimum. Overridable via `FW_WIDE_GEMV_CAP`.
+fn wide_gemv_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FW_WIDE_GEMV_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&c: &usize| c >= 1)
+            .unwrap_or(32)
+    })
 }
 
 /// Map a FrankenTorch `KernelError` into [`FwError`].

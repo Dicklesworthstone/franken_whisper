@@ -3,6 +3,30 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: ★ LANDED wide-GEMV worker cap 12→32 — the vocab logits GEMV under-saturated DRAM at 12 threads (~16 GB/s); 32 threads = ~1.4–1.8x on logits_gemv_large (per-crate) and ~6–8% e2e + far more load-robust. Bit-identical (worker count doesn't change the disjoint-band output). Ratio vs OpenAI-Whisper ~1.25x → ~1.34x.
+
+**Land-or-dig result: LANDED a real measured win — the "12-cap" heuristic in
+`gemv_worker_count` was never tuned past 12.** LAND clean before (`96e3468`).
+`gemv_worker_count` capped the bandwidth-class GEMV (`out ≥ 16384`, i.e. the 51864-row
+logits) at 12 workers; the doc noted it ran "~50 GB/s, well under the controller
+ceiling" but stopped there. Sweep of `logits_gemv_large` ([51865,1280] f16, 133 MB):
+```text
+cap12 5.9–8.4 ms   cap16 4.52 ms   cap24 4.7–5.7 (CCD-split anomaly)
+cap32 4.20–4.59 ms (BEST)   cap48 5.65 ms   cap64 6.46 ms   ⇒ 32 is the optimum
+```
+Tiny `e2e_tiny_jfk` interleaved A/B (load-noisy but decisive):
+```text
+cap12: 333.9 (best, load14) → 418 (load31)   ← degrades badly under load
+cap32: 315.4 (load33) / 314.0 tight CI (load40) ← STAYS ~314 ms even at load 40
+```
+cap32 is both faster (~314 vs ~334 ms low-load = ~6%) AND load-robust (32 threads
+clear the bandwidth-bound logits fast, so less time contending with the swarm; cap12
+balloons to 418). 48/64 regress (cross-CCD sync). Bit-identical: worker count only
+changes the parallel split of disjoint output-row bands, each row's dot order
+unchanged — conformance nn lib 27/27. fc1/fc2 (out<16384) stay at 8 (unaffected).
+**Operating ratio ~1.25x → ~1.34x** (e2e ~314 ms). `FW_WIDE_GEMV_CAP` override kept.
+Source: `src/native_engine/nn.rs`. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: caught a rare low-load window (4.84) — clean ENCODER 110.03 ms (tight CI), confirming the cumulative ~20% encoder win (~138 pre-session → 110, SDPA + qa/ka/va). But the e2e bench is too long to fit the window: load spiked to 21–31 the moment each e2e run started ⇒ the definitive low-load e2e is UNREALIZABLE on this swarm-busy box. Operating ratio ~1.18–1.25x (load-dependent); the ~1.30x low-load value stays theoretical.
 
 **Land-or-dig result: full audit complete, ft unchanged — used a rare idle window to
