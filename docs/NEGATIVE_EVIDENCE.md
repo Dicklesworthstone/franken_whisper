@@ -3,6 +3,40 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: SURFACE (component vs-ORIG attribution) — matched-GREEDY tiny.en split proves franken WINS every free-file primitive (mel 5.4×, encoder 3.3× faster than whisper.cpp) and loses ONLY the per-token decode (8.64 vs 2.88 ms/tok, 3.0× slower) — which is the coordination-held + ACTIVELY-CONTENDED `decoder.rs`/`nn.rs`. No free-file lever exists on the gap. 0 source delta.
+
+**Land-or-dig result: DIG → profiled → SURFACE. No worktree win to land (only 2 `reject`
+branches ahead of main); the biggest gap vs ORIG is unreachable in a free file this turn.**
+AGENT_NAME=TealVireo.
+
+### Why no dig was possible (the honest blocker, in one line)
+The only gap vs ORIG is the per-token decode transformer, and `nn.rs`/`decoder.rs` were modified
+by another agent **5 minutes before this turn** (mtime 12:41) — actively contended, not just held.
+
+### NEW data — matched-greedy component attribution (tiny.en, jfk 11s, `-t 4`, bs1/bo1)
+franken via `FRANKEN_WHISPER_PERF_SPANS=1`; whisper.cpp via `whisper_print_timings` (greedy):
+```text
+component        franken      whisper.cpp     verdict
+mel              2.39 ms      12.99 ms        franken 5.4× FASTER   (free, mel.rs — at ceiling)
+encode (cold)    134.91 ms    442.91 ms       franken 3.3× FASTER   (free, encoder.rs — NOT a gap)
+decode / token   8.64 ms      2.88 ms         franken 3.0× SLOWER   (HELD, decoder.rs — the gap)
+                 (233.5/27)   (77.7/27 runs)
+cross_kv         44.01 ms     (folded)        HELD (decoder.rs; coworker doing FW_CROSS_F16)
+overall (jfk)    ~426 ms      622 ms          franken 1.46× faster HERE (encoder win dominates 27-tok clip)
+```
+On the short jfk clip franken is faster overall because the cold-encode win (−308 ms) outweighs the
+decode loss (+147 ms); the tiny.en **5-min long-form** flips to ~1.73× slower because decode-token
+volume grows ~75× while the encoder runs only 10× — so the 3.0×/token decode gap dominates.
+
+### Conclusion (prevents future wasted digs)
+- **Do NOT chase the encoder or mel** — franken already beats whisper.cpp 3.3× / 5.4× there; they are
+  WINS, not gaps. Optimizing them does not reduce a vs-ORIG gap and risks the bit-exact paths.
+- **The entire tiny.en gap is the per-token decode** (forward_step GEMVs + cross-attn), all in the
+  coordination-held + actively-edited `decoder.rs`/`nn.rs`. The sampler (`decode.rs`, free) is
+  exp-bound (owner-gated) and was proven sub-noise the prior entry. So bd-b4hp has **no clean
+  free-file lever**; it needs the held structural decode change (scratch-arena / batched m=1 gemvs),
+  which is the other agent's live work. tiny.en 5min stays ~1.73× behind.
+
 ## 2026-06-29 - TealVireo: ~0-GAIN (REVERTED, `b509c14` → reverted) — bd-b4hp sampler-layer slim (scalar log-softmax normalizer, drop the per-token full `[n_vocab]` logprob alloc) is BIT-EXACT and 3.1% faster on the ISOLATED op, but the per-call saving (5.5 µs) is too small to clear noise at e2e. Reverted per the project's sub-noise discipline; the original `compute_logprobs` is a faithful `whisper_compute_logprobs` port.
 
 **Land-or-dig result: DIG → MEASURED → REVERT. I landed `b509c14` last turn WITHOUT measuring it;
