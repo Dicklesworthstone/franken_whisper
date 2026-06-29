@@ -3,6 +3,52 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: ~0-GAIN (REVERTED) — bd-b4hp decode overhead is DIFFUSE across sub-parts (mlp 32% / cross_attn 19.5% / self_qkv 14.5% / logits 14%); no single-lever fix clears noise. `project_qkv` scope→rayon::join = +2.6% (sub-noise, one run regressed), reverted. Needs a STRUCTURAL decode change, not point fixes. 0 source delta.
+
+**Land-or-dig result: DIG got a precise per-sub-part attribution of the bd-b4hp tiny
+long-form decode and proved the overhead is DIFFUSE — the two biggest non-compute suspects
+(project_qkv thread-spawn) reverted as ~0-gain.** AGENT_NAME=BlackThrush.
+
+### Precise decode attribution (`FRANKEN_WHISPER_PERF_SPANS=1` + `decoder::take_sub_ns()`, tiny.en 5 min, 6570 ms decode)
+```text
+sub-part            ms        %      shape (tiny.en, m=1 per token)
+mlp_fc_gelu_proj    2104    32.0%    fc[1536,384] gemv + gelu(1536) + proj[384,1536] gemv (both parallel-8)
+cross_attn          1279    19.5%    6 heads × (q[1,64]·K[1500,64]^T → softmax(1500) → @V[1500,64])
+self_qkv_proj        954    14.5%    project_qkv: q‖k‖v, each [1,384]×[384,384] (serial gemv)
+logits_gemv          916    13.9%    tied [51864,384] gemv (parallel-32)
+cross_out_proj       374     5.7% ;  self_out_proj 355 5.4% ; cross_q_proj 325 4.9% ; self_attn 233 3.5%
+ln+clone (×3) + embed + final_ln  < 0.5% total
+```
+For contrast, large-v3-turbo 2 min decode is more even (mlp 23.5%, self_qkv 20.2%, logits 13.4%,
+cross_attn 11.5%, …) — and large WINS long-form (1.22×) because each sub-part's per-op compute
+is big enough to amortize the per-op overhead that dominates tiny.
+
+### Key finding: the gap is DIFFUSE per-op overhead, not one hotspot
+The biggest single sub-part is 32%, but the largest *addressable* overhead in any one sub-part
+is only a few % of e2e. `perf` flat profile agrees: no symbol > 3% (top named = `__expf_fma`
+softmax 3%, `memset` alloc-zero ~1–2%). Per-token cost (~6.8 ms) is ~10× the ~0.63 ms
+bandwidth floor ⇒ overhead (per-op dispatch + per-call `Mat`/`Vec` allocation across ~13
+sub-parts × 4 layers), exactly what whisper.cpp's pre-planned graph/arena avoids.
+
+### Point-fixes tried and REVERTED (~0-gain on the contended 64-core box)
+- **`project_qkv`: `std::thread::scope` (per-call 2-OS-thread spawn) → `rayon::join`** (persistent
+  pool). Hypothesis: ~240 µs/call spawn at ~3080 calls. Same-binary A/B (`FW_QKV_SCOPE` toggle),
+  tiny 5 min interleaved ×3: OLD median 7.46 s → NEW 7.18 s (**+3.8 %**) BUT one run regressed
+  (NEW 8.01 > all OLD); `self_qkv_proj` sub-part 954→785 ms (−170 ms = only ~2.6 % e2e). Below
+  the keep bar on this box; **reverted** (decoder.rs 0 net delta). rayon::join's own work-steal
+  overhead ≈ the spawn it removes at this tiny task size.
+- (prior, same bead) **mlp `PAR_THRESHOLD` 1<<19→1<<20** (serial tiny mlp) = +2.3 %, reverted.
+- **logits `FW_WIDE_GEMV_CAP`** already optimal at 32; reducing it hurts.
+
+### ⇒ bd-b4hp needs a STRUCTURAL decode change, not point fixes
+No single sub-part fix clears the noise bar. Real closure requires cutting per-op overhead
+*across* sub-parts at once: (a) **batch the per-layer m=1 GEMVs** (fuse q/k/v + the two mlp
+gemvs into fewer dispatches), (b) **pool-resident scratch** to kill per-token `Mat`/`Vec`
+allocation, or (c) a **planned decode graph** (whisper.cpp/GGML-style) that pre-allocates and
+schedules once. Tracked on bd-b4hp (P1). Conformance unaffected (0 source delta). Methodology:
+tiny.en's tiny per-op work is a dispatch/alloc microscope — the same overhead is sub-noise on
+large (which already wins long-form), so this is a small-model-long-form-specific gap.
+
 ## 2026-06-29 - BlackThrush: ~0-GAIN (REVERTED) — bd-b4hp tiny.en long-form decode is OVERHEAD-bound (~6.8 ms/tok, ~10× the bandwidth floor) but the overhead is NOT the mlp-GEMV parallel dispatch (serial-mlp = +2.3% ≈ noise) NOR logits parallelism (already optimal at 32; reducing it HURTS). Narrows bd-b4hp; 0 source delta.
 
 **Land-or-dig result: DIG profiled the bd-b4hp tiny-long-form loss and ruled out the two
