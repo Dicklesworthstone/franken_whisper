@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: SURFACE (reference-VALIDITY + WARM-encode) — verified the ORIG reference (legacy whisper.cpp) is FAIRLY built (Release, `GGML_NATIVE` → AVX2/F16C/FMA/REPACK at runtime, no-BLAS), so every vs-ORIG ratio in this ledger is valid; and franken's encoder win HOLDS WARM (whisper.cpp 435.6 ms/window steady-state over 4 windows — not a cold/thread-spawn artifact). Re-confirms bd-b4hp has NO free-file lever. 0 source delta.
+
+**Land-or-dig result: DIG → measured the two open questions (is the reference fair? does the
+encoder win survive warm?) → both resolved → SURFACE.** No worktree win (only 2 `reject` branches).
+`nn.rs`/`decoder.rs` edited by the other agent at 12:51 (this turn 12:54) — still actively
+contended. AGENT_NAME=TealVireo. Extends the component-attribution entry below.
+
+### (1) The ORIG reference IS fairly built — the vs-ORIG methodology is VALID (new; never checked before)
+`whisper-cli` `system_info`: `AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | OPENMP = 1 |
+REPACK = 1`. `build/CMakeCache.txt`: `CMAKE_BUILD_TYPE=Release`, `GGML_NATIVE=ON` (so `-march=native`
+turns on AVX2/F16C/FMA at compile time even though the explicit `GGML_AVX2` flag reads OFF —
+confirmed by the runtime `AVX2=1`), `GGML_BLAS=OFF` (ggml's own REPACK CPU GEMM, not a naive path).
+⇒ The reference is a legitimate Release AVX2 build, NOT handicapped. The project's "franken wins
+mel/encode, loses decode" picture is measured against a fair ORIG — the ratios stand.
+
+### (2) Encoder win is WARM, not a cold artifact (closes the open question from the prior entry)
+99 s clip (jfk×9 = 4 encoder windows), greedy `-t 4`:
+```text
+whisper.cpp encode = 1742.54 ms / 4 runs = 435.64 ms/window (WARM steady-state)
+   (vs 442.91 ms cold 1-window — i.e. essentially the same; whisper.cpp's tiny encode is GENUINELY
+    ~435 ms/window, it was never thread-spawn cold-start inflation)
+franken encoder    = ≤ 134.91 ms/window (cold 1-window; warm can only be ≤ this)
+   ⇒ franken wins the encoder ≥ 3.2× WARM too. Encoder is NOT a gap under any warmup state.
+whisper.cpp decode = 825.91 ms / 238 = 3.47 ms/tok ; franken ~8.6 ms/tok (the held gap, unchanged)
+```
+
+### (3) Window orchestration (`decode.rs`, free) has no waste
+`transcribe_samples`: `full_mel` is computed ONCE before the window loop; per-window
+`encoder::forward_from_full_mel_window` (franken wins) + `DecoderState::new` (held cross_kv) are
+both necessary. No redundant per-window allocation/recompute to claw back in the free file.
+
+### ⇒ Status
+bd-b4hp confirmed to have NO clean free-file lever across cold+warm encode, mel, the sampler (prior
+entry), and the window orchestration. The entire residual gap is the per-token decode transformer in
+the coordination-held + actively-edited `decoder.rs`/`nn.rs` (the other agent's live scratch-arena /
+f16-cross / batch-gemv work). tiny.en 5min stays ~1.73× behind whisper.cpp. 0 net source delta.
+
 ## 2026-06-29 - TealVireo: SURFACE (component vs-ORIG attribution) — matched-GREEDY tiny.en split proves franken WINS every free-file primitive (mel 5.4×, encoder 3.3× faster than whisper.cpp) and loses ONLY the per-token decode (8.64 vs 2.88 ms/tok, 3.0× slower) — which is the coordination-held + ACTIVELY-CONTENDED `decoder.rs`/`nn.rs`. No free-file lever exists on the gap. 0 source delta.
 
 **Land-or-dig result: DIG → profiled → SURFACE. No worktree win to land (only 2 `reject`
