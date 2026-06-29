@@ -3,6 +3,27 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: softmax_rows scalar `.exp()` examined (the "vectorized exp" different-primitive idea) — marginal AND faithfulness-risky. Post-SDPA it is DECODE-ONLY (the encoder softmax now lives inside `sdpa_forward_f32`), 6-way head-parallel, compute-bound ~0.7% e2e; a SIMD/poly exp saves ~0.5% (below the bar) and perturbs the bit-accurate libm exp ⇒ could flip a greedy-argmax token. Not pursued.
+
+**Land-or-dig result: DIG examined the last scalar hot loop (softmax exp); both the
+payoff (~0.5%) and the faithfulness risk reject it. 0 source delta.** LAND clean
+(`16faa54`), ft-kernel-cpu still `2ddced53`.
+
+`softmax_rows` (`(*v-max).exp()` per element) is scalar — but the profile's "expf
+1.67%" was ENCODER-dominated (6 layers × 1500×1500 exp), and that softmax now runs
+INSIDE the fused SDPA (ft's vectorized exp). What remains in `softmax_rows` is the
+decode cross/self attention: 6 heads × 6 layers × 50 tokens × ~1500 = 2.7M exp, but
+`cross_attention` runs the heads via rayon `into_par_iter`, so wall-clock ≈ 2.7M/6 ×
+~5 ns ≈ 2.25 ms ≈ **~0.7% e2e**. Unlike the dead-init gather wins (bandwidth-
+contention, which surprised 8x over estimate), exp is COMPUTE-bound and deterministic
+— no hidden upside. A vectorized exp would shave ~0.5% e2e (sub-noise, doesn't move
+the ratio) and replaces the **bit-accurate libm exp** with a polynomial whose error
+could flip a close greedy-argmax token (faithfulness). `wide::f32x8::exp` exists but
+is a transitive dep + unproven precision; ft exposes only f64 `exp_f64x4`. **Hot-loop
+audit complete:** every hot loop is either an optimal primitive (matmul/SDPA/gemv),
+in-place SIMD (layer_norm, gelu), or faithful-scalar-and-marginal (softmax). Engine
+at ~1.25x, faithful-port floor. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: decode crossbeam ~26% (profile's biggest decode cost) re-examined fresh — NOT a tuning miss. `gemv_worker_count` already caps workers at 8 (small m=1 gemvs) / 12 (vocab logits), so the small decode GEMVs are NOT over-threaded; the 26% is irreducible rayon sync over the ~950 necessary per-decode dispatches. Confirmed inherent — no lever.
 
 **Land-or-dig result: DIG re-examined the decode's biggest profiled cost (crossbeam
