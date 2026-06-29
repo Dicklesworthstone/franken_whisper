@@ -795,13 +795,13 @@ pub fn layer_norm(x: &mut Mat, w: &[f32], b: &[f32], eps: f32) {
         return;
     }
     let band_rows = rows.div_ceil(worker_count()).max(1);
-    std::thread::scope(|s| {
-        for band in x.data.chunks_mut(band_rows * cols) {
-            s.spawn(move || {
-                norm_rows(band, cols, w, b, eps);
-            });
-        }
-    });
+    // Persistent rayon pool instead of `thread::scope` (which spawned/joined N OS
+    // threads PER CALL — ~12 layer_norms/encoder-window × 16 = a clone3 storm at
+    // ~30 µs each, often dwarfing this cheap O(elements) op). Same contiguous band
+    // split ⇒ byte-identical (`layer_norm_simd_matches_scalar` + conformance gate).
+    x.data
+        .par_chunks_mut(band_rows * cols)
+        .for_each(|band| norm_rows(band, cols, w, b, eps));
 }
 
 /// Layer-norm a contiguous block of `block.len() / cols` rows in place.
@@ -929,11 +929,9 @@ pub fn gelu(x: &mut Mat) {
         return;
     }
     let chunk = n.div_ceil(worker_count()).max(1);
-    std::thread::scope(|s| {
-        for band in x.data.chunks_mut(chunk) {
-            s.spawn(move || gelu_slice(band));
-        }
-    });
+    // Persistent rayon pool, not a per-call `thread::scope` spawn/join (same
+    // disjoint contiguous chunks ⇒ byte-identical). gelu is ~4/encoder-window.
+    x.data.par_chunks_mut(chunk).for_each(gelu_slice);
 }
 
 /// In-place numerically-stable per-row softmax (max-subtract).

@@ -3,6 +3,32 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: LANDED (MEASURED, bit-exact) — encoder `layer_norm`/`gelu` spawned N OS threads PER CALL via `std::thread::scope` (~12 layer_norms + ~4 gelus per encoder window × ~8 bands ≈ a `clone3` storm). Migrated both to rayon's PERSISTENT pool (`par_chunks_mut` — same contiguous band split ⇒ byte-identical). MEASURED: gated jfk `clone3` **381 → 261 (−120, −31%)**; encoder_window OLD **124–228 ms (noisy — spawn storm spikes under load)** → NEW **119–125 ms (stable)**; ~4% faster warm AND far more contention-ROBUST. Conformance 47/0.
+
+**Land-or-dig result: DIG — `strace -e clone3` found the decode-path was SERIAL (no spawn) but the
+ENCODER spawned ~120 OS threads/window; migrated to rayon → measured win, LANDED.** AGENT_NAME=TealVireo.
+Files: `src/native_engine/nn.rs` only.
+
+### The discovery (clone3 profiling, contention-invariant)
+`strace -e clone3`: gated jfk (load+1 transcribe) = 381, deterministic (load+2) = 665 → ~284 spawns
+PER transcribe. The DECODE is serial for m=1 (layer_norm 384 elts, gelu 1536, gemv all below their
+PAR_THRESHOLDs → no spawn), so the spawns are the ENCODER's batched (1500-row) `layer_norm`/`gelu`,
+which used `std::thread::scope` (spawn+join N OS threads per call, ~20-30 µs each). For these cheap
+O(elements) ops the spawn cost rivals the compute — and rayon's persistent pool was already the
+established choice for the gemv path (`nn.rs:600` comment: thread::scope was "SPAWN-BOUND").
+
+### Measured (release; `strace -e clone3`; PERF_SPANS `encoder_window`, deterministic 3 runs)
+```text
+clone3 (gated jfk):       381 → 261        (−120 = the layer_norm ×12 + gelu ×4 per-window spawns)
+encoder_window OLD:       228/198 | 196/126 | 130/124 ms   (noisy: thread::scope spawn latency is
+                                                            CONTENTION-sensitive — spikes under load)
+encoder_window NEW:       125/119 | 124/118 | 125/119 ms   (STABLE ±1 ms; ~4% faster warm, least-contended)
+```
+The headline is ROBUSTNESS: the OLD per-call spawn storm made the encode contention-sensitive (spiking
+to ~200-228 ms under load); the rayon pool holds ~120 ms regardless. Encoder is 31.6% of tiny.en e2e,
+so ~4% warm ≈ ~1.3% e2e, plus the stability (matters for shared/concurrent serving). Bit-exact: same
+band split → identical `norm_rows`/`gelu_slice` per band (conformance 47/0, incl. exact-transcript e2e).
+
 ## 2026-06-29 - TealVireo: ~0-GAIN (two candidates MEASURED & rejected) — (1) decode ARGMAX over the 51864 vocab is compute/branch-bound (21.9 µs/call, ≫ the ~1 µs L2 floor) BUT only ~0.4–0.8% of decode; the only SAFE reformulation under `#![forbid(unsafe_code)]` (`fold(f32::max)`+`position(==max)`, bit-exact incl. tie→lowest-index) is just ~8% faster (rustc won't vectorize NaN-aware `fmax`) ⇒ sub-noise. (2) `ggml` per-tensor `thread::scope` dequant spawns scale on LARGE cold-load, but tiny tensors go serial (<1M elts), the load arc is closed, and load is at PARITY with wc. Neither is a clean lever. 0 source delta.
 
 **Land-or-dig result: DIG measured the two remaining mine-and-accessible candidates with standalone
