@@ -3,6 +3,24 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: mel frontend (last unaudited component) verified ALREADY OPTIMIZED — radix-2 Cooley-Tukey FFT (N_FFT=400=16×25, fully factored: radix-2 for 16 + a radix-5 base case that already replaced the naive 25×25 DFT ~1.8x), vectorized twiddles. NOT a naive O(N²) DFT ⇒ the one plausibly-big remaining lever is a dead end. Full-engine audit COMPLETE.
+
+**Land-or-dig result: DIG audited the mel STFT (the last unchecked hot-path
+component, where a naive DFT would have been a ~48x lever); it is already a properly
+factored FFT. 0 source delta.** LAND clean (`3742254`), ft-kernel-cpu still
+`2ddced53`.
+
+`mel.rs` implements whisper.cpp's exact recursive FFT: radix-2 split for even
+lengths down to the `N==25` base case, which a **radix-5** (25=5×5) Cooley-Tukey
+already handles (replacing the naive 25×25 DFT, ~1.8x), with vectorized twiddle
+factors to avoid the scalar-libm cost. Validated against an independent naive DFT.
+So `400 = 2^4·5^2` is fully factored — no naive O(N²) anywhere on the hot path, and
+the mel is once-per-window (~1% e2e) regardless. **Engine audit now exhaustive across
+every component:** encoder (SDPA + ceiling matmul + dead-init-elided gathers), decode
+(GEMV bandwidth floor + tuned dispatch + dead-init-elided outputs + faithful scalar
+softmax), mel (factored FFT). Four landed wins → ~1.25x operating vs OpenAI-Whisper;
+the remaining gap is the faithful-port floor. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: softmax_rows scalar `.exp()` examined (the "vectorized exp" different-primitive idea) — marginal AND faithfulness-risky. Post-SDPA it is DECODE-ONLY (the encoder softmax now lives inside `sdpa_forward_f32`), 6-way head-parallel, compute-bound ~0.7% e2e; a SIMD/poly exp saves ~0.5% (below the bar) and perturbs the bit-accurate libm exp ⇒ could flip a greedy-argmax token. Not pursued.
 
 **Land-or-dig result: DIG examined the last scalar hot loop (softmax exp); both the
