@@ -3,6 +3,37 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: SYSCALL-PROFILING VEIN HARVESTED (rejection) — after the two cgroup-walk caching wins, the remaining decode syscalls are RAYON idle-worker spin (~1.05M `sched_yield` + ~160k `futex` per deterministic 2-transcribe run; ~20% of `perf` samples in the kernel scheduler). It is ~0-gain on the MAIN-thread wall (idle workers spin on OTHER cores; the decode thread's own futex wake/wait is ~2/parallel-GEMV ≈ small) and is the RETIRED thread-count avenue. No franken/dep busy-wait exists (audited). No new clean syscall lever. 0 source delta.
+
+**Land-or-dig result: DIG — `strace -c` + `perf record` profiled the post-caching decode; the dominant
+residual is rayon idle-spin (~0-gain main-thread wall, retired) → REJECTED as a clean lever.** No
+worktree win. AGENT_NAME=TealVireo.
+
+### Measured (release; `strace -f -c`, `perf record -F 999 -g`; gated/deterministic decode)
+```text
+sched_yield  ~1.05M / 2-transcribe run  (rayon work-stealing idle-spin; NO franken yield_now/spin_loop)
+futex        ~160k                       (mostly worker sleep/wake; main-thread ~2/parallel-GEMV)
+perf kernel  ~20% of samples in [k] scheduler addrs (the spin); userspace stripped (release -C strip)
+```
+Reducing it needs fewer LIVE pool threads — the thread-count avenue, RETIRED across 3 reverts
+(`d43c499`): ~0-gain at the measurable wall, only a contention-robustness/CPU-efficiency effect (idle
+workers burn CPU on free cores — matters for CONCURRENT throughput, not single-request latency, and
+that's load-dependent/unmeasurable here). whisper.cpp's 4-thread OpenMP has no work-stealing spin, so
+this is a franken CPU-efficiency trait, not a single-request latency gap.
+
+### Lead noted (NOT dug — closed load arc + deliberate design)
+`clone3` (OS-thread spawns) = 381 on the tiny gated test: the `ggml` per-tensor dequant uses
+`std::thread::scope` (spawn N / join per tensor > 8 MB). Scales to ~thousands on large-v3-turbo
+cold-load (~30 µs/spawn). A persistent pool would cut it — but `thread::scope` is the DELIBERATE choice
+to avoid oversubscribing the rayon-parallel inner work, the LOAD arc is "exhaustively closed", and load
+is at PARITY with wc (not a vs-ORIG gap). Owner-eval only; not a clean solo land.
+
+### ⇒ Status
+The two cgroup-walk wins this session (`1e149b2` decode + `4bf26c9` load, ~71k syscalls/run, bit-exact)
+are the clean harvest of the syscall-profiling vein. Remaining decode overhead = rayon idle-spin
+(retired) + GEMV COMPUTE (coworker's ft_kernel/f16-gemv domain) + the owner-gated softmax `exp`.
+bd-b4hp decode is now free of the cgroup-walk overhead; the rest is coworker/owner-scoped. 0 source delta.
+
 ## 2026-06-29 - TealVireo: LANDED (MEASURED, bit-exact) — finish the cgroup-walk caching: `available_parallelism()` walks the cgroup CPU-quota hierarchy (`/proc/self/cgroup` + ~7 `cpu.max` opens) PER CALL, not just a `sched_getaffinity` syscall. Cached the remaining LOAD-path callers (`ggml` per-tensor dequant ×2, `read_blob`, `decode::mel_threads`, `mod::default_threads`) via a shared `host_parallelism()` OnceLock. Combined with the prior `nn.rs` decode caching, the gated jfk test (load+decode) drops **openat 15193→31, statx 13025→29, read 21702→42, lseek/close ~10850→~20, sched_getaffinity 2551→385 (~71k syscalls removed, −99.8% file I/O)**. Bit-identical; conformance 47/0.
 
 **Land-or-dig result: DIG — strace-profiled the decode/load syscall mix (contention-INVARIANT, escapes
