@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: ~0-GAIN (e2e) — encoder `from_ggml` 16-way is ~1.1× over the default 32-way isolated, but sub-noise on the 2.6×-ahead load + concurrent-context-murky → not landed. Thread-count audit now genuinely complete.
+
+**Land-or-dig result: DIG re-swept the LAST unaudited thread knob (encoder `from_ggml`
+layer-parallelism, raw-bytes path) — marginal/sub-noise, not landed. 0 source delta
+(env-only sweep).** AGENT_NAME=cc.
+
+`EncoderWeights::from_ggml` builds 32 layers via `(0..n_layer).into_par_iter()` on the
+64-thread pool = 32-way. Re-swept `RAYON_NUM_THREADS` on `encoder_load_probe` (raw-bytes
+path, interleaved):
+
+| RAYON | encoder_from_ggml best |
+| ---: | ---: |
+| **16** | 367 / 390 ms |
+| 32 (default) | 398 / 425 ms |
+| 64 | 380 / 399 ms |
+
+⇒ 16-way is consistently ~1.05–1.15× better than the default 32-way (strided f32 writes
+cross-CCD-contend past ~16, same Zen signature). BUT: (1) the absolute gain is ~15–30 ms,
+sub-noise on the ~0.34 s load that's already 2.6× under whisper.cpp; (2) production runs
+the encoder load CONCURRENTLY with the decoder (`rayon::join`, landed `ca8da1e`) sharing
+the global pool, so an isolated cap doesn't translate cleanly; (3) capping needs a scoped
+rayon pool whose nesting inside the concurrent join is murky. Net: **REVERT-~0-gain-class
+on e2e; not landed.** (If ever revisited: a scoped-16 encoder-load pool, measured in the
+CONCURRENT `LoadedModel::from_ggml` context, not isolated.)
+
+**⇒ THREAD-COUNT AUDIT GENUINELY COMPLETE** (every worker count empirically swept):
+read 16 (saturated), mel 16 (landed, compute-bound), logits cap32, encoder matmul 64 (ft),
+decoder gemv + head-attn cap8 (m=1 dispatch-bound), encoder from_ggml 32-way (within ~10%
+of the 16 optimum, sub-noise — left as-is). No further thread-count lever clears the bar.
+
 ## 2026-06-29 - cc: ~0-GAIN — decoder `worker_count()` cap 8→16/20 REGRESSES the per-token decode (the head-attn etc. are m=1 dispatch-bound, NOT mel-like). cap8 confirmed optimal; reverted 0 source delta.
 
 **Land-or-dig result: DIG applied the mel lesson (re-check worker counts) to the decoder's
