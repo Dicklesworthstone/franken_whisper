@@ -3,6 +3,24 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: dead-init audit COMPLETE — last candidate (`cross_kh_t`/`cross_vh` in DecoderState::new, 27.6 MB) is a dead-init but a SERIAL transpose fills it ONCE per window ⇒ ~0.8% e2e ceiling, likely ~0 (the `out` precedent). Not pursued, by the refined rule. The vein is fully mined: 4 wins captured every big buffer whose serial memset precedes PARALLEL/bandwidth-bound work.
+
+**Land-or-dig result: completed the dead-init audit; the remaining candidate is
+marginal/serial ⇒ judged not worth the build+gate cycle. 0 source delta.** LAND
+clean (`d06e607`), ft-kernel-cpu still `2ddced53`.
+
+`cross_kh_t = vec![0.0; d_head*enc_frames]` (×36) + `cross_vh` (×36) = ~27.6 MB
+allocated in `DecoderState::new`, then a `for j { for d { kh_t[..] = .. } }` SERIAL
+transpose overwrites every element. It IS a dead zero-init, but (a) once per 30 s
+window (the JFK e2e calls it once), and (b) the memset precedes a SERIAL transpose,
+not the bandwidth-bound PARALLEL kernel that made qa/ka/va pay 8%. Estimated ceiling
+~2.8 ms / 337 ms ≈ 0.8% e2e, and the `out`-uninit precedent (a similarly-positioned
+small/serial buffer measured ~0) says it's probably below noise. Per "REVERT ~0-gain"
++ the refined rule, not implemented. **Dead-init vein status: EXHAUSTED** — the four
+landed wins (encoder matmul, decode GEMV, SDPA qa/ka/va, [and matmul-uninit]) hold
+every buffer where the pattern pays. Engine at ~1.25x operating. No source change.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: CUMULATIVE RATIO after the 4 landed wins — fresh HEAD rebuild + e2e pins the operating ratio at **~1.25x** (e2e ~333–341 ms @ load 15–20), up from ~1.19x at cycle 37 (before decode-GEMV-uninit + qa/ka/va landed). The two newer dead-init wins moved it ~4% e2e. Positive confirmation, 0 source delta.
 
 **Land-or-dig result: dead-init vein tapped (4 wins captured the big serial-memset-
