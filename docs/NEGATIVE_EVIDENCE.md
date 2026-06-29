@@ -3,6 +3,49 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: LEAD (measured, NOT landed) — the global rayon pool (`default_threads()`=16 on this 64-thread box) is OVER-THREADED for the memory-bound m=1 decode: `RAYON_NUM_THREADS=12` cuts `decode_loop` ~10.5% (6/6 interleaved), likely rayon idle-worker spin/poll overhead. NOT landable as a global default (regresses encoder + risks large); it points the held `nn.rs` work at a real lever. 0 source delta.
+
+**Land-or-dig result: DIG found the first MECHANISTIC, measurable bd-b4hp lead from a free-file knob
+— but it cannot be landed safely as-is. Recorded as a lead for the held decode work, not shipped.**
+AGENT_NAME=TealVireo. No worktree win (2 `reject` branches). `nn.rs`/`decoder.rs` edited by the other
+agent 13:05, still contended.
+
+### Measured (existing release bin, `gated_e2e_jfk` `decode_loop` span, INTERLEAVED, low load avg ~9.5/64)
+```text
+RAYON_NUM_THREADS   decode_loop (6 interleaved runs)            encoder_window
+default (=16)       190.7 193.7 203.5 191.8 200.0 195.7  ~196   ~137 ms (wants MANY threads)
+12                  170.2 172.0 172.1 178.6 181.0 177.4  ~175   ~157 ms (REGRESSES +14.6%)
+                    => decode_loop -10.5%, EVERY pair 12<default (robust, not noise)
+single-run e2e sweep (jfk, 1 window): unset 412ms, RAYON=8 419, RAYON=12 389 (best), RAYON=24 405
+```
+Machine: AMD Threadripper PRO 5975WX, 32C/64T → `default_threads()=min(16,64)=16`. Load avg ~9.5
+(≈15% util, ~50 cores free) ⇒ NOT a contention artifact; the effect is intrinsic.
+
+### Mechanism (why fewer pool threads helps the decode but not the cap-sweep)
+The m=1 decode GEMVs use only 8 threads (mlp) / 16 (logits). At pool=16, the spare rayon workers
+**spin-poll for work** (rayon workers don't sleep immediately) — competing for memory bandwidth and
+adding wakeup latency to the bandwidth-bound decode. Pool=12 ⇒ fewer idle spinners ⇒ less overhead.
+This RECONCILES the prior `FW_WIDE_GEMV_CAP=32`-optimal entry: that varied the logits *cap* at a
+fixed 16-thread pool (16 live workers either way); the win here is fewer *live pool threads*, a
+different axis. So it is NOT a contradiction.
+
+### Why NOT landed (the honest blockers)
+- Shrinking the GLOBAL pool to 12 regresses the **encoder** (compute-bound, wants ≥16: 137→157 ms,
+  +14.6%) — affordable on tiny (franken still wins encode ~2.8×) but it also likely regresses
+  **large-v3-turbo** (bigger, compute-bound decode GEMVs want more threads), the DOMINATED production
+  workload — unverified in budget, and "do not regress the dominated workload" is a hard rule.
+- A **decode-scoped** pool (install() from the free `decode.rs`) does NOT help: it ADDS a second pool
+  (16 global + 12 decode = MORE live idle threads), defeating the mechanism. The benefit requires
+  fewer *total* live threads, i.e. shrinking the global pool.
+- The optimum (12) is machine-specific (memory-bandwidth-saturation point), so not a portable default.
+
+### ⇒ The real lever (for the held nn.rs work)
+Make the **decode** GEMV dispatch use fewer/sleeping workers than the encoder — e.g. a parked-thread
+(non-spinning) pool for the m=1 decode path, or per-GEMV worker counts that account for idle-spin
+overhead, sized by a startup memory-bandwidth probe. That lives in `nn.rs`/`decoder.rs` (held,
+actively edited) and must be verified non-regressing on large-v3-turbo. `RAYON_NUM_THREADS` already
+exposes the knob for operators who want to tune per-machine today. tiny.en 5min stays ~1.73× behind.
+
 ## 2026-06-29 - TealVireo: SURFACE (CLOSING free-file audit) — model load is the LAST free-file primitive, and it is at PARITY with ORIG (~75-100 ms tiny, both). Every free pipeline primitive is now verified at-parity-or-winning vs a fairly-built whisper.cpp; the ONLY vs-ORIG gap is the held+contended decode transformer. The free-file search space for bd-b4hp is EXHAUSTIVELY mapped — no lever exists. 0 source delta.
 
 **Land-or-dig result: DIG → measured the last open free-file primitive (model load) → PARITY →
