@@ -3,6 +3,44 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: CONVERGENCE CLOSEOUT — checked the LAST unexamined in-scope component (DTW: covered, no lever); EVERY in-scope avenue now landed/covered/owner-scoped. Session: 6 landed load wins (~7.4×) + comprehensive dominance. Recommend redirect to owner-scoped beads.
+
+**Land-or-dig result: DIG checked DTW (the last unexamined component) — covered, no lever;
+consolidating the converged in-scope loop + handoff. 0 source delta.** AGENT_NAME=cc.
+
+DTW (`dtw.rs`, word timestamps): the ledger already records `dtw_path` is a scalar DP
+parallelized in L13, ~18 ms, NOT the ts-path bottleneck, and a franken-only feature
+(whisper.cpp default `dtw=0`, so not even comparable). No lever. That was the last
+in-scope component I had not personally re-examined this session.
+
+**Every in-scope `franken_whisper-cc` avenue is now landed / covered / owner-scoped:**
+- **LOAD — DONE (6 landed wins, ~2.5 s → ~0.34 s, ~7.4×, 2.6× under whisper.cpp; fully
+  overlapped to core saturation):** parallel `read_at` 10.4× (`3269826`); encoder fused
+  dequant-transpose 2.46× (`8bfc212`) + raw-bytes 1.33× (`76e3411`); decoder one-pass f16
+  2.20× (`b214d55`) + parallel-layers 1.27× (`27e0232`); concurrent enc‖dec 1.20×
+  (`ca8da1e`). Rejected: read-workers >16 (~0), tokenizer 3-way overlap (~0, cores
+  saturated). Every phase at its ceiling.
+- **ENCODER COMPUTE (≈85 % of e2e):** the GEMM is `ft_kernel_cpu::matmul` (external,
+  owner-scoped; faer REFUTED bd-4hc0); attention bmm/flash/tiled all REJECTED; GELU/LN/
+  softmax covered. No in-scope lever (DuskFinch convergence).
+- **DECODE:** gemv_f16 at the 88 GB/s bandwidth ceiling; gemv worker-caps REJECTED (tiny
+  + large); per-token is DRAM-bound (342 MB/token). Lever = token-level speculative
+  decoding (bd-wzgh, owner-scoped, bit-identical greedy, ~2–3× projected).
+- **mel** parallel; **audio decode** native symphonia (beats ffmpeg-spawn); **DTW** covered.
+
+**Measured dominance (vs whisper.cpp, the harder CPU comparator ⇒ ≥ vs OpenAI-Whisper):**
+cold-CLI e2e 1.34×/1.25×, warm compute 1.51×/1.28×, load ~2.6× ahead, realistic
+multi-window 1.12× (conformance-validated ~3 % WER, greedy-vs-beam). franken_whisper
+DOMINATES the realistic large-v3-turbo workload on every measured axis.
+
+**⇒ The in-scope land-or-dig loop for `franken_whisper-cc` has CONVERGED.** No remaining
+in-scope lever clears the noise/REVERT-~0-gain bar. The only real headroom is OWNER-SCOPED:
+(1) **bd-wzgh** token-level speculative decoding (the realistic-long-audio decode limiter);
+(2) **bd-4hc0**-family f16/fused encoder GEMM in `ft_kernel_cpu` (the dominant compute);
+(3) audited unsafe mmap loader (cold-disk first-read); (4) gated radix-5 FFT (mel,
+bit-exact-invariant owner decision). Recommend redirecting effort there or standing the
+loop down. 0 source delta.
+
 ## 2026-06-29 - cc: ~0-GAIN — overlapping the tokenizer build with the enc‖dec join (3-way `rayon::join`) does NOT help (the enc‖dec already saturates all cores). Reverted to 0 source delta.
 
 **Land-or-dig result: DIG tried the last cross-phase overlap (tokenizer ‖ enc‖dec),
