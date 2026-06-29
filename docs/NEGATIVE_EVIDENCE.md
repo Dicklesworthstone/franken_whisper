@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: LANDED (MEASURED, bit-exact) — finish the cgroup-walk caching: `available_parallelism()` walks the cgroup CPU-quota hierarchy (`/proc/self/cgroup` + ~7 `cpu.max` opens) PER CALL, not just a `sched_getaffinity` syscall. Cached the remaining LOAD-path callers (`ggml` per-tensor dequant ×2, `read_blob`, `decode::mel_threads`, `mod::default_threads`) via a shared `host_parallelism()` OnceLock. Combined with the prior `nn.rs` decode caching, the gated jfk test (load+decode) drops **openat 15193→31, statx 13025→29, read 21702→42, lseek/close ~10850→~20, sched_getaffinity 2551→385 (~71k syscalls removed, −99.8% file I/O)**. Bit-identical; conformance 47/0.
+
+**Land-or-dig result: DIG — strace-profiled the decode/load syscall mix (contention-INVARIANT, escapes
+the wall), found `available_parallelism()` does ~8 cgroup FILE opens per call, and LANDED the caching.**
+AGENT_NAME=TealVireo. Files: `mod.rs` + `ggml.rs` + `decode.rs` (own/free files).
+
+### The discovery (why this is much bigger than "one syscall")
+`strace -e openat` on the gated decode showed `/proc/self/cgroup` + 7 distinct `.../cpu.max` paths
+opened **2169× each** (≈ the `available_parallelism` call count). Rust's `available_parallelism()` is
+NOT cached by std and, on Linux, re-walks the cgroup CFS-quota hierarchy every call (to honor
+container CPU limits) — ~8 `openat` + `statx` + `read` + `lseek` + `close` PER CALL on top of
+`sched_getaffinity`. The prior entry's "−2121 sched_getaffinity" was the tip: it also removed ~14k
+`openat` from the decode. This entry finishes the LOAD path.
+
+### Measured (release, `strace -f -c`, gated jfk = load + decode)
+```text
+syscall            full-uncached baseline   ALL cached (this+prior)   reduction
+openat             15193                     31                        −99.8%
+statx              13025                     29                        −99.8%
+read               21702                     42                        −99.8%
+lseek              10847                     17                        −99.8%
+close              10855                     25                        −99.8%
+sched_getaffinity   2551                    385                        −85% (385 residual = rayon, not us)
+```
+Attribution: `nn.rs` decode caching (`1e149b2`) removed the per-GEMV (~2000) calls; THIS commit removes
+the LOAD-path calls (`sched_getaffinity` 430→385 on tiny ≈ ~45 calls). It SCALES with tensor count —
+large-v3-turbo (hundreds of tensors through the `ggml` per-tensor dequant) sheds hundreds of cgroup
+walks at cold-load. Contention-INVARIANT (syscall count), so reproducible unlike `decode_loop` wall.
+
+### Bit-exactness
+`host_parallelism()` caches a process constant (CPU count) → identical worker counts → identical GEMV/
+load band splits → byte-identical output and weights. Conformance `native_engine::decode` **47/0**.
+
 ## 2026-06-29 - TealVireo: LANDED (MEASURED, bit-exact) — cache the per-call GEMV-DISPATCH lookups in `nn.rs`. `gemv_worker_count` / `gemv_f16_batch` queried `std::thread::available_parallelism()` (a `sched_getaffinity` SYSCALL, NOT cached by std) and `env::var("FW_BATCH_GEMV_CAP")` on EVERY one of the ~70 m=1 GEMVs/token. Cached both in `OnceLock`s (the CPU count + env var are process constants; the existing `FW_WIDE_GEMV_CAP` was already cached). MEASURED: gated jfk decode `sched_getaffinity` **2551 → 430 = −83% (−2121 syscalls)**. Bit-identical (worker count → band split unchanged; conformance 47/0). Escapes the contention wall (syscall count is load-INVARIANT).
 
 **Land-or-dig result: DIG found the first MEASURABLE decode lever that escapes the measurement wall —

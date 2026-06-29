@@ -518,10 +518,7 @@ pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
 
     // Below this size the thread spawn/join costs more than the copy it saves.
     const MIN_PARALLEL: usize = 8 * 1024 * 1024;
-    let workers = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(16);
+    let workers = super::host_parallelism().min(16);
     if len < MIN_PARALLEL || workers < 2 {
         read_exact_at(&file, &mut blob, 0)?;
         return Ok(blob);
@@ -601,10 +598,7 @@ fn dequant_f16_to_halves_parallel(raw: &[u8], n_elements: usize) -> Vec<Float16>
         }
     };
     let mut values = vec![Float16::from_bits(0); n_elements];
-    let workers = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(16);
+    let workers = super::host_parallelism().min(16);
     if n_elements < PAR_THRESHOLD || workers < 2 {
         serial(raw, &mut values);
         return values;
@@ -636,10 +630,7 @@ fn dequant_f16_parallel(raw: &[u8], n_elements: usize) -> Vec<f32> {
         }
     };
     let mut values = vec![0.0f32; n_elements];
-    let workers = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(8);
+    let workers = super::host_parallelism().min(8);
     if n_elements < PAR_THRESHOLD || workers < 2 {
         serial(raw, &mut values);
         return values;

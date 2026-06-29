@@ -454,10 +454,26 @@ fn header_ftype_ok(path: &Path) -> bool {
 /// `BackendParams.threads` through and only fall back to this when unset.
 #[must_use]
 pub fn default_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
-        .min(16)
+    host_parallelism().min(16)
+}
+
+/// Host parallelism, queried ONCE and cached for the process.
+///
+/// `std::thread::available_parallelism()` is NOT cached by std and, on Linux,
+/// walks the cgroup CPU-quota hierarchy on every call — `/proc/self/cgroup` plus
+/// a `cpu.max` open+read at each level (~8 file opens) on top of a
+/// `sched_getaffinity` syscall. That cost was paid per worker-count decision in
+/// the per-tensor load path (`ggml`) and per mel/decode setup; the value is a
+/// process constant, so caching it is behavior-identical (worker counts, and
+/// thus every band split, are unchanged) and removes the repeated cgroup I/O.
+pub(crate) fn host_parallelism() -> usize {
+    use std::sync::OnceLock;
+    static P: OnceLock<usize> = OnceLock::new();
+    *P.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    })
 }
 
 /// Initialize Rayon before inference kernels touch the global pool.
