@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: decode crossbeam ~26% (profile's biggest decode cost) re-examined fresh — NOT a tuning miss. `gemv_worker_count` already caps workers at 8 (small m=1 gemvs) / 12 (vocab logits), so the small decode GEMVs are NOT over-threaded; the 26% is irreducible rayon sync over the ~950 necessary per-decode dispatches. Confirmed inherent — no lever.
+
+**Land-or-dig result: DIG re-examined the decode's biggest profiled cost (crossbeam
+26%) with a fresh look at the worker-count logic; already tuned ⇒ no lever. 0 source
+delta.** LAND clean (`fbad583`), ft-kernel-cpu still `2ddced53`.
+
+The "cap workers for the small gemvs" hypothesis is already implemented:
+`gemv_worker_count(out)` returns `min(avail, 8)` for `out < 16384` and `min(avail,
+12)` for the vocab-class logits — NOT 64. So the per-token MLP gemvs (fc1 590k,
+fc2 590k MACs at m=1) dispatch over only 8 threads, and the QKV/out projections
+(147k MACs) stay serial (below the 1<<19 threshold). The residual crossbeam-epoch /
+work-steal cost over the ~950 dispatches a faithful 50-token decode must issue (6
+layers × {fc1, fc2, cross-attn-head-parallel} + logits) is inherent to rayon's
+sync model, and the memory already records: 64 threads beat 32 by 19% (more threads
+help, so it's not over-threading), QKV-fusion rejected, MLP-threshold tuned. **No
+new dispatch lever.** Engine remains at ~1.25x operating, comprehensively at its
+faithful-port floor (fused primitives optimal, dead-init vein exhausted, dispatch
+tuned, bandwidth/int8 floor faithful). No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: dead-init audit COMPLETE — last candidate (`cross_kh_t`/`cross_vh` in DecoderState::new, 27.6 MB) is a dead-init but a SERIAL transpose fills it ONCE per window ⇒ ~0.8% e2e ceiling, likely ~0 (the `out` precedent). Not pursued, by the refined rule. The vein is fully mined: 4 wins captured every big buffer whose serial memset precedes PARALLEL/bandwidth-bound work.
 
 **Land-or-dig result: completed the dead-init audit; the remaining candidate is
