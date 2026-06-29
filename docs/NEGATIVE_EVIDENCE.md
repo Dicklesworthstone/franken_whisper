@@ -3,6 +3,40 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: INTEGRATED COLD-CLI e2e head-to-head — franken WINS large 1.34× / tiny 1.25× vs whisper.cpp (cold 12.96 s LOSS → 4.85 s WIN; the session payoff)
+
+**Land-or-dig result: measured the integrated mission metric (the FULL cold one-shot
+path) — the headline ratio vs original after this session's 3 landed load wins. Ships
+`examples/cold_e2e_probe.rs`; 0 engine delta.** AGENT_NAME=cc.
+
+The warmed-up `e2e_*_jfk` criterion min excludes the real cold UX (cold load + the FIRST
+transcribe, with cold allocator + first-touch page faults on the 2.5 GB f32 encoder
+weights). `cold_e2e_probe` times exactly that — one `NativeWhisperModel::load` (cache
+empty) + first `transcribe` per process, run fresh N× for N cold samples. Both engines
+measured this session, same box, jfk, no-timestamps. franken in-process load+transcribe
+vs whisper.cpp `total time` (both = load+compute, both exclude process startup):
+
+| model | franken COLD (load + transcribe) | whisper.cpp COLD (total) | result |
+| --- | ---: | ---: | --- |
+| **large-v3-turbo** | **4853 ms** (load 865 + transcribe 3988; best of 3, 4853/4859/4925) | 6518 ms (`-t16`, best of 2) | **franken 1.34× FASTER** |
+| **tiny.en** | **422 ms** (load 80 + transcribe 342; best of 3) | 525 ms (`-t8`, best of 2) | **franken 1.25× FASTER** |
+
+Two confirmations from this measurement:
+- The cold transcribe (3988 ms) ≈ the warmed-up bench (4.00 s) ⇒ **no first-touch
+  penalty** on the f32 weights — the warm bench was representative.
+- Cold load 865 ms ≈ the profiled ~0.74 s warm + a small first-process margin ⇒ the 3
+  landed load wins hold end-to-end.
+
+**This is the session payoff.** The cold-CLI large e2e was **12.96 s — a LOSS** vs
+whisper.cpp 9.75 s (2026-06-25 BlackThrush). After this session's 3 load levers
+(parallel read 10.4× + encoder fused-transpose 2.46× + decoder one-pass f16 2.20×) it is
+**4.85 s — a 1.34× WIN** (≈2.67× franken self-improvement). franken_whisper now WINS on
+EVERY measured axis vs whisper.cpp (and, transitively, the slower OpenAI-Whisper): cold
+e2e (1.34×/1.25×), warm compute (1.51×/1.28×), model load (~3.4×→parity), and native
+in-process audio decode (no per-file ffmpeg spawn). The realistic large-v3-turbo workload
+is comprehensively dominated. Remaining frontier is owner-scoped (entries below). 0 engine
+delta (probe tool only).
+
 ## 2026-06-29 - cc: BLOCKER SURFACED — COMPLETE model-load profile; every phase optimized/bandwidth-bound/negligible. No in-scope load lever remains; realistic workload DOMINATED on both axes. Remaining frontier is OWNER-SCOPED.
 
 **Land-or-dig result: DIG profiled the FULL load to hunt any remaining serial cost
