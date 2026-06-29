@@ -3,6 +3,47 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: LANDED — PARALLEL model-blob read (safe `read_at`) = 10.4× on the biggest load phase (1.5 GB read 1254→120 ms); full warm model load ~2.46→0.76 s
+
+**Land-or-dig result: DIG → a NEW different-primitive lever, MEASURED + LANDED.**
+AGENT_NAME=cc. Continuing the cold-start LOAD attack (the only place franken loses vs
+whisper.cpp). After the encoder-load fusion (entry below), I profiled the post-fix
+full-load breakdown (large-v3-turbo, warm; `examples/model_load_probe.rs`):
+`parse 1359 ms | encoder_from_ggml 342 ms (fused) | decoder_from_ggml 305 ms
+(f16-resident)` ⇒ **`parse` — the single `std::fs::read` of the 1.5 GB blob — is now the
+dominant phase**, and warm (page-cached) it is pure memory-copy, single-threaded.
+
+mmap (whisper.cpp's trick) is OUT: `memmap2::Mmap::map` is `unsafe` and this crate is
+`#![forbid(unsafe_code)]` (owner-gated; ledger 2026-06-28). A SAFE DIFFERENT primitive:
+a **parallel positioned read**. `ggml::read_blob_parallel` opens the file once,
+preallocates the `Vec<u8>`, splits it into N disjoint contiguous bands, and fills each
+band from a `std::thread::scope` worker via `std::os::unix::fs::FileExt::read_at` (SAFE
+— no `unsafe`). 16 workers; serial fallback below 8 MB / on non-unix.
+
+**MEASURED (large-v3-turbo, 1,624,555,275-byte blob, best of 7, interleaved A/B under
+identical box contention):**
+
+| read | best | spread |
+| --- | ---: | --- |
+| serial `std::fs::read` | 1253.6 ms | 1254–1351 ms |
+| **parallel `read_at` (landed)** | **120.1 ms** | 120–129 ms (rock-stable) |
+
+⇒ **10.4× faster** the 1.5 GB blob read (single-thread ~1.3 GB/s under contention →
+16-way ~13.5 GB/s). **Byte-IDENTICAL** (asserted all 1,624,555,275 bytes equal to
+`std::fs::read`; disjoint exhaustive bands ⇒ same bytes ⇒ bit-identical parsed model).
+
+**Cumulative cold-start LOAD (large-v3-turbo, warm):** parse 1359→~150 ms (this) +
+encoder 832→342 ms (prior fix) + decoder 305 ms ⇒ **~2.46 s → ~0.76 s total model load
+(~3.2×)**. Closes franken's cold-start deficit vs whisper.cpp (was franken 12.96 s vs
+9.75 s e2e cold; ~3.2 s of that was load). Helps EVERY invocation and every model.
+
+**Conformance GREEN:** byte-identity asserted in-probe; `native_engine::ggml` **15/0**,
+`encoder` **11/0**, `decoder` **10/0**; the real large model loads + `from_ggml`
+succeed in the probe. rustfmt clean (`ggml.rs`). Compute path untouched (franken still
+WINS large compute 1.51×).
+
+Files (mine only): `src/native_engine/ggml.rs` (parallel read), `examples/model_load_probe.rs`.
+
 ## 2026-06-29 - cc: LANDED — FUSED dequant-transpose for encoder weight load = 2.46× on the biggest cold-start gap (`EncoderWeights::from_ggml` 832→339 ms, large-v3-turbo)
 
 **Land-or-dig result: DIG → a NEW different-primitive lever, MEASURED + LANDED.**

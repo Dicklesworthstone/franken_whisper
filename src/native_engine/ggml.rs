@@ -124,7 +124,7 @@ impl GgmlModel {
     ///   structure, or trailing bytes after the tensor directory.
     /// - [`FwError::Unsupported`] for a quantized `ftype`.
     pub fn load(path: &Path) -> FwResult<Self> {
-        let blob = std::fs::read(path)?;
+        let blob = read_blob_parallel(path)?;
         Self::parse(blob)
     }
 
@@ -423,6 +423,93 @@ impl GgmlModel {
             .collect();
         Ok((entry.shape.clone(), bits))
     }
+}
+
+/// Read an entire file into one `Vec<u8>` using SEVERAL threads, each issuing
+/// positioned `read_at` calls into a disjoint, contiguous band of the output
+/// buffer.
+///
+/// The whisper model blob is up to ~1.5 GB and a single-threaded `std::fs::read`
+/// is memory-bandwidth-bound — on a busy host it is the dominant cold-start cost
+/// (the `parse` phase, measured ~1.36 s warm for large-v3-turbo). Splitting the
+/// copy across bands recovers idle memory bandwidth. The bytes are identical to
+/// `std::fs::read` (positioned reads of disjoint, exhaustively-filled ranges
+/// covering `[0, len)`), so the parsed model is bit-identical. `read_at`
+/// (`std::os::unix::fs::FileExt`) is SAFE Rust — no `unsafe`, unlike mmap (which
+/// this `#![forbid(unsafe_code)]` crate cannot use).
+#[cfg(unix)]
+pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut blob = vec![0u8; len];
+
+    // Below this size the thread spawn/join costs more than the copy it saves.
+    const MIN_PARALLEL: usize = 8 * 1024 * 1024;
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(16);
+    if len < MIN_PARALLEL || workers < 2 {
+        read_exact_at(&file, &mut blob, 0)?;
+        return Ok(blob);
+    }
+
+    let band = len.div_ceil(workers);
+    let file_ref = &file;
+    let mut first_err: Option<std::io::Error> = None;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = blob
+            .chunks_mut(band)
+            .enumerate()
+            .map(|(i, chunk)| s.spawn(move || read_exact_at(file_ref, chunk, (i * band) as u64)))
+            .collect();
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(_) => {
+                    first_err.get_or_insert_with(|| {
+                        std::io::Error::other("model-blob reader thread panicked")
+                    });
+                }
+            }
+        }
+    });
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(blob),
+    }
+}
+
+/// Non-unix fallback: positioned reads need `FileExt`, so just read serially.
+#[cfg(not(unix))]
+pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
+/// Fill `buf` completely from `file` starting at `offset`, looping over short
+/// reads and retrying on `Interrupted`. Errors if EOF arrives before `buf` is
+/// full (a truncated/raced model file).
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match file.read_at(&mut buf[filled..], offset + filled as u64) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early EOF while reading model blob",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Dequantize a little-endian f16 byte stream to `f32`, splitting large
