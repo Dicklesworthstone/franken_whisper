@@ -433,10 +433,15 @@ impl DecoderWeights {
         let ln = load_layer_norm(model, "decoder.ln", n_state)?;
 
         let mlp_hidden = 4 * n_state; // whisper MLP expansion factor is 4.
-        let mut layers = Vec::with_capacity(n_layer);
-        for i in 0..n_layer {
+        // PARALLEL layer load (cc, 2026-06-29): the old serial layer loop loaded
+        // each layer's weights one after another (each weight using ≤16
+        // within-weight workers), leaving most cores idle — DecoderWeights::
+        // from_ggml ran at ~1.5 GB/s, ~9× under the ~13.5 GB/s the parallel read
+        // achieves. Spreading few layers across rayon (see the gate below) recovers
+        // it (measured 1.27× on large-v3-turbo). Each layer is independent.
+        let build_layer = |i: usize| -> FwResult<DecoderLayer> {
             let p = format!("decoder.blocks.{i}");
-            let layer = DecoderLayer {
+            Ok(DecoderLayer {
                 attn_ln: load_layer_norm(model, &format!("{p}.attn_ln"), n_state)?,
                 attn_q: load_linear(
                     model,
@@ -510,9 +515,27 @@ impl DecoderWeights {
                     n_state,
                     mlp_hidden,
                 )?,
-            };
-            layers.push(layer);
-        }
+            })
+        };
+        // Spread the layers across rayon when there are FEW of them: each
+        // `build_layer` still uses ≤16 within-weight workers (`thread::scope`), so
+        // the product (n_layer × 16) must stay near the core count to avoid
+        // oversubscription. ≤8 layers (turbo/tiny/base = 4) → ~64 threads, the
+        // measured 1.27× win; >8 (medium 24 / large-v3 32) keeps the serial loop
+        // (32×16 = 512 would thrash). Output is identical (layers independent;
+        // `collect` preserves order).
+        const MAX_PAR_LAYERS: usize = 8;
+        let layers: Vec<DecoderLayer> = if n_layer <= MAX_PAR_LAYERS {
+            use rayon::prelude::*;
+            (0..n_layer)
+                .into_par_iter()
+                .map(build_layer)
+                .collect::<FwResult<Vec<_>>>()?
+        } else {
+            (0..n_layer)
+                .map(build_layer)
+                .collect::<FwResult<Vec<_>>>()?
+        };
 
         Ok(Self {
             token_embedding,

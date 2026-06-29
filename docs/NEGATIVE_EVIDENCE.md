@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: LANDED — parallel decoder layer load = 1.27× (`DecoderWeights::from_ggml` 130→102 ms, large-v3-turbo); the serial layer loop ran ~9× under its bandwidth ceiling.
+
+**Land-or-dig result: DIG found the decoder load (now the biggest LOAD phase) was ~9×
+under its bandwidth ceiling; parallelized the layer loop, MEASURED 1.27×, LANDED.**
+AGENT_NAME=cc.
+
+After the encoder raw-bytes win, the full-load profile put `DecoderWeights::from_ggml` as
+the biggest LOAD phase. It moved only **~1.5 GB/s** effective (~231 ms for ~341 MB f16),
+vs the **~13.5 GB/s** the parallel read achieves — i.e. NOT bandwidth-bound. Cause: the
+**serial `for i in 0..n_layer` loop** loaded each layer's weights one after another (each
+weight using ≤16 within-weight workers), so only ~16 of 64 cores were busy at a time. The
+encoder already avoids this (parallel ACROSS its 32 layers).
+
+**Fix:** build the layers via `(0..n_layer).into_par_iter()` when `n_layer ≤ 8`. The guard
+matters: each `build_layer` still spawns ≤16 within-weight workers (`thread::scope`), so
+the product must stay near the core count — turbo/tiny/base (4 layers) → ~64 threads (the
+win); medium (24) / large-v3 (32) keep the serial loop (32×16 = 512 would thrash). Output
+identical (layers independent; `collect` preserves order).
+
+**MEASURED (`full_load_probe`, large-v3-turbo, `DecoderWeights::from_ggml`, best of 7,
+interleaved A/B, same contention):**
+
+| layer load | best |
+| --- | ---: |
+| serial (prior) | 129.5 / 134.1 / 146.0 ms |
+| **parallel ≤8 (landed)** | **101.6 / 101.6 / 106.1 ms** |
+
+⇒ **~1.27–1.32× faster** decoder weight load (~30 ms off), consistent across 3 pairs.
+Bit-IDENTICAL (`decoder` lib **10/0**, `conformance_comparator_tests` **26/0**, clippy +
+rustfmt clean).
+
+**Cumulative cold-start LOAD (large-v3-turbo, warm), all stacked cc levers:** parse ~120
+(parallel read 10.4×) + encoder ~180 (fused-transpose 2.46× + raw-bytes 1.33×) + decoder
+~102 (one-pass f16 2.20× + parallel-layers 1.27×) ≈ **~0.40 s** (was ~2.5 s originally,
+~6.3×) — far under whisper.cpp's ~0.9 s. Files (mine only): `src/native_engine/decoder.rs`,
+`examples/full_load_probe.rs`.
+
 ## 2026-06-29 - cc: LANDED — raw-bytes fused dequant-transpose for the encoder load = 1.33× (`EncoderWeights::from_ggml` 238→179 ms, large-v3-turbo); eliminates the `Vec<u16>` intermediate.
 
 **Land-or-dig result: DIG completed my own fused-transpose landing — removed the
