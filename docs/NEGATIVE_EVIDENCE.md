@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: ~0-GAIN — decoder `worker_count()` cap 8→16/20 REGRESSES the per-token decode (the head-attn etc. are m=1 dispatch-bound, NOT mel-like). cap8 confirmed optimal; reverted 0 source delta.
+
+**Land-or-dig result: DIG applied the mel lesson (re-check worker counts) to the decoder's
+`worker_count()`=8 ops — MEASURED a regression, REVERTED.** AGENT_NAME=cc.
+
+After the mel 8→16 win, I audited the other thread-count knobs. The decoder's per-token
+ops that use `nn::worker_count()` (=8) — chiefly the head-attention (`decoder.rs:956`,
+which bands over **20 heads** for large, the most "mel-like" many-units case) — were the
+prime suspect. Added `FW_WORKER_CAP` and swept `decoder_token_step_large` (interleaved):
+
+| FW_WORKER_CAP | decoder_token_step_large (best) |
+| ---: | ---: |
+| **8** | **152 ms** |
+| 16 | 195 ms (+28 %) |
+| 20 | 176 ms (+16 %) |
+
+⇒ cap8 is OPTIMAL; 16/20 REGRESS. Unlike mel (compute-bound FFT, large per-unit work →
+scales to 16), the decode head-attn is **m=1** (single query token): tiny per-head work,
+so more workers just add `thread::scope` spawn overhead — the same dispatch-bound
+signature as the rejected gemv worker-caps. The mel/decode split confirms the principle:
+**per-unit work size, not unit count, decides the optimal worker cap** — big-work phases
+(mel FFT, vocab logits) want 16/32; m=1 ops (attn heads, layer gemvs) want 8. Reverted
+`worker_count()` to `min(8)`. 0 source delta.
+
+**⇒ Thread-count audit COMPLETE:** read 16 (saturated), mel 16 (landed, compute-bound),
+logits cap32 (bandwidth-class), encoder matmul 64 (ft, compute-bound), decoder gemv +
+head-attn cap8 (m=1 dispatch-bound). Every worker count is now empirically at its optimum.
+
 ## 2026-06-29 - cc: LANDED — mel uses 16 workers (was the decode's 8-thread hint) = 1.39× on `mel_30s` (4.04→2.91 ms). The COMPUTE-side win the "load-only" closeout missed: mel was thread-under-utilized.
 
 **Land-or-dig result: DIG re-examined the one in-scope COMPUTE phase not owner-scoped
