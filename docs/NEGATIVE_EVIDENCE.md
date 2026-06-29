@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: CUMULATIVE RATIO after the 4 landed wins — fresh HEAD rebuild + e2e pins the operating ratio at **~1.25x** (e2e ~333–341 ms @ load 15–20), up from ~1.19x at cycle 37 (before decode-GEMV-uninit + qa/ka/va landed). The two newer dead-init wins moved it ~4% e2e. Positive confirmation, 0 source delta.
+
+**Land-or-dig result: dead-init vein tapped (4 wins captured the big serial-memset-
+before-parallel buffers); measured the cumulative ratio.** LAND clean (`dbf99a0`),
+ft-kernel-cpu still `2ddced53`.
+
+Rebuilt HEAD (binary was stale from the reverted out-uninit) and measured:
+```text
+encoder_window_tiny : 124.05 ms (wide, load 10→33; ~118 at low load)
+e2e_tiny_jfk        : e2e1 340.84  e2e2 337.58 (tight [333.4,339.8])  e2e3 390 (load-spike, discard)
+                      best 333.39 ms @ load 15–20  ⇒  ratio 0.420035/0.337 = ~1.25x (1.24–1.26x)
+```
+Progress this session (all from parity): matmul-uninit (~16% e2e) + fused-SDPA
+(~16% encoder) got to ~1.2x; decode-GEMV-uninit (~2–5%) + encoder-SDPA-gather-uninit
+(~8% encoder) pushed to **~1.25x operating**. The dead-init audit rule (`dbf99a0`):
+wins live at big GATHER/OUTPUT buffers whose SERIAL memset precedes PARALLEL/bandwidth-
+bound work; the remaining `vec![0.0]` sites are small (attn `out` ~0) or need their
+zeros (conv im2col padding) ⇒ vein exhausted. No source change. AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: attention `out` uninit — REVERTED, ~0-gain. Refines the dead-init rule: eliding a memset only wins when the buffer is READ by a memory-bound kernel the memset CONTENDS with (qa/ka/va, gathered just before the SDPA reads them → 8%); an OUTPUT buffer written *after* the kernel (the attention `out`, scattered post-SDPA) doesn't contend → ~0.
 
 **Land-or-dig result: DIG continued the dead-init audit to the attention `out`
