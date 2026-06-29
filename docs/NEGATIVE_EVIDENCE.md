@@ -3,6 +3,73 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: MEASURED e2e head-to-head vs whisper.cpp(OpenAI-class) — franken WINS greedy short (tiny 1.07×, large 1.12×) + large long-form (1.22×) but **LOSES tiny.en long-form 1.84× (5min)**; AND (source-verified) the native engine is GREEDY/temp-0 ONLY so beam-search/temp-fallback (the realistic DEFAULTS) are UNRUNNABLE on the fast path. Two real uncovered-workload findings; both filed as br beads.
+
+**Land-or-dig result: e2e workload audit found the biggest genuinely-UNCOVERED realistic
+workload = beam-search / temperature-fallback decode — a CAPABILITY gap, not a speed gap.**
+AGENT_NAME=BlackThrush. Filed as a br bead.
+
+### Source-verified capability gap (no build needed)
+`src/native_engine/decode.rs:1-9` — *"Greedy decode loop … a faithful port of the **greedy /
+temperature-0 path** of whisper.cpp"*; `DecodeParams` doc — *"(greedy, temperature 0)"*;
+`grep -rni beam src/native_engine/` = **0 hits**. Beam search (`--beam-size`), best-of
+sampling (`--best-of`), and temperature fallback are **whisper.cpp-backend-only** features
+(`src/cli.rs:392` *"Beam search width (whisper.cpp)"*, `src/backend/whisper_cpp.rs`). The
+optimized in-process engine (`native_engine::transcribe_samples`) cannot do them.
+
+**Why this matters for the mission:** OpenAI Whisper defaults to **beam_size=5 + temperature
+fallback**; `whisper-cli` defaults to **`--beam-size 5 --best-of 5`**. The prior
+"franken DOMINATES" claims (1.28×/1.51×) are all **greedy-vs-greedy** — a fair *speed* test
+but NOT the default realistic-*quality* config users actually run. Franken cannot match
+default-quality transcription regardless of speed. This is the single biggest uncovered
+realistic-e2e gap; speed micro-levers on the greedy path do not close it.
+
+### Comparator baselines measured this turn (whisper-cli, GREEDY `-bs 1 -bo 1 -l en`, best threads)
+OpenAI-Whisper-class CPU comparator (whisper.cpp; ≥ OpenAI Python). whisper.cpp `total time`
+(mel+encode+decode, model-load excluded), tiled-jfk long-form:
+```text
+                       encode      decode      TOTAL        RTF      threads(opt)
+tiny.en  jfk  11s      209 ms      56 ms       368 ms       0.033    t=16
+tiny.en  5min          1517 ms     1207 ms     3712 ms      0.0125   t=16
+tiny.en  30min         8830 ms     6787 ms     21384 ms     0.0119   t=16
+large-v3-turbo jfk 11s 3438 ms     223 ms      4614 ms      0.42     t=32
+large-v3-turbo 2min    22886 ms    2815 ms     27659 ms     0.229    t=32
+```
+**Thread caveat (real):** whisper.cpp regresses CATASTROPHICALLY above its sweet spot on this
+64-core box — tiny.en jfk `t=48` → 1661 ms, `t=64` → 17115 ms (decode thread-thrash). So the
+honest comparator uses whisper.cpp's *optimal* threads (t=16 tiny / t=32 large), not 64.
+**Long-form caveat:** tiled-identical jfk can trip whisper.cpp's compression-ratio fallback,
+inflating its long-form *decode*; the *encode* column is content-independent and clean.
+
+### MEASURED franken-vs-OpenAI(whisper.cpp) e2e, greedy compute (franken `transcribe_samples` vs whisper-cli `total time`)
+Franken native engine via `examples/e2e_probe.rs` (greedy, timestamps on), same audio,
+`x86-64-v3`, model-load excluded both sides:
+```text
+workload            whisper-cli   franken    ratio(wc/fr)   verdict
+tiny.en  jfk 11s    368 ms        345 ms     1.07x          franken WINS (short)
+tiny.en  5min       3712 ms       6836 ms    0.54x          *** franken 1.84x SLOWER ***  <-- REGRESSION
+large-v3 jfk 11s    4614 ms       4134 ms    1.12x          franken WINS (short)
+large-v3 2min       27659 ms      22624 ms   1.22x          franken WINS (long-form)
+```
+**VERDICT — the e2e domination claim is NOT universal across realistic workloads:**
+1. **franken WINS** greedy on short clips (tiny 1.07×, large 1.12×) AND on large-model
+   long-form (large 2min 1.22×) — confirms the prior compute-domination on those shapes.
+2. **franken LOSES on tiny.en long-form (5min: 1.84× SLOWER, RTF 0.023 vs 0.0125).** The gap
+   *grows with length on the small model*: whisper.cpp's tiny RTF more than halves with length
+   (0.033→0.0125) while franken's barely improves (0.031→0.023). Root-cause hypothesis: a
+   per-window FIXED overhead (full-audio mel computed upfront; per-window rayon dispatch / pool
+   spin; window setup) that whisper.cpp amortizes but franken re-pays — invisible on cheap
+   single windows, dominant once tiny's per-window compute is small relative to that overhead.
+   On large models the per-window compute is big enough to amortize it (large wins long-form).
+   This is the biggest genuinely-uncovered realistic-e2e SPEED gap and a real loss vs OpenAI on
+   the small-model long-form (podcast/youtube) workload. Filed as a br bead.
+
+Caveats: long-form audio is tiled-jfk (identical windows) — can trip whisper.cpp's
+compression-ratio fallback inflating ITS decode, so the franken-loss on tiny 5min is if
+anything UNDERSTATED (whisper.cpp's real long-form non-repeating decode would be faster still).
+The win is small (1.07–1.22×, within the realistic-noise band on a contended 64-core box) and
+greedy-only; the tiny-long-form LOSS (1.84×) is large and the actionable finding.
+
 ## 2026-06-29 - BlackThrush: REFUTED (MEASURED) — bd-4hc0 `matrixmultiply`→`gemm`/faer "3.75×" encoder lever is a MIRAGE. The `gemm` crate (faer's backend) is **TIED (1.01×) on the exact shape the bead names** and **1.37×–3.13× SLOWER** on the production large-v3-turbo encoder shapes. Swapping would REGRESS the encoder, not speed it up. bd-4hc0 closed. 0 source delta.
 
 **Land-or-dig result: DIG measured the project's nominally-largest open lever (bd-4hc0,
