@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: REJECTED — wider worker cap for the LARGE decoder mlp gemv (fc/proj, 13 MB). MEASURED monotonic regression (cap8 best; 16 +46 %, 24 +76 %, 32 +85 %). cap8 is correctly tuned even for large; reverted to 0 source delta.
+
+**Land-or-dig result: DIG tested an in-scope decode lever (the realistic-audio limiter),
+MEASURED a regression, REVERTED.** AGENT_NAME=cc.
+
+**Hypothesis:** the decode is the realistic-long-audio limiter (DRAM-bound, prior entry),
+and the per-token layer gemvs stream the bulk (~210 MB/token: 4 layers × mlp fc/proj at
+13 MB + attn). The worker cap is 8 for everything except the ≥16384-row logits
+(`gemv_worker_count`), and the cap8→16/24 widening REJECT (9c04984) was measured on
+**tiny's 1.2 MB fc** (dispatch-bound). For **large** the mlp fc [5120,1280] / proj
+[1280,5120] are 13 MB f16 (6.5M elems) — never tuned — so maybe DRAM-under-saturated at 8.
+
+**Measured (added an `FW_MID_GEMV_CAP` mid-tier gated on `out*inp`≥4.2M, swept on new
+`f16_gemv_dequant_mlp_{fc,proj}` benches, synthetic f16 weights, criterion):**
+
+| cap | mlp_fc [5120,1280] | mlp_proj [1280,5120] |
+| ---: | ---: | ---: |
+| **8** | **252 µs** | **246 µs** |
+| 16 | 365 µs (+46 %) | 373 µs (+49 %) |
+| 24 | 445 µs (+76 %) | 440 µs (+79 %) |
+| 32 | 467 µs (+85 %) | 465 µs (+89 %) |
+
+⇒ **MONOTONIC REGRESSION** — cap8 is the optimum, widening is strictly worse. **Why:** the
+m=1 gemv is only ~250 µs, and `gemv_f16` spawns fresh `std::thread::scope` OS threads per
+call; beyond 8 the spawn/join + cross-CCD scheduling cost dominates the bandwidth gain,
+**regardless of the 13 MB weight size**. Same mechanism as the tiny reject — it is NOT
+weight-size-specific. The 8-cap is correctly tuned for ALL non-logits decoder gemvs
+(only the 133 MB logits, ~2 ms+, amortizes 32 threads).
+
+**⇒ The decoder layer gemvs are at their correct per-call worker cap; there is no
+thread-cap lever in the decode.** The decode parity (1.07×) is a genuine DRAM-bandwidth +
+per-call-dispatch floor; the only amortization remains token-level speculative decoding
+(bd-wzgh, owner-scoped, batches m=K to share the spawn AND the weight read). Reverted
+`gemv_worker_count` + bench shapes to 0 source delta.
+
 ## 2026-06-29 - cc: RADICAL LEVER IDENTIFIED + FILED — token-level SPECULATIVE DECODING (draft model) to amortize the DRAM-bound decode (the realistic-long-audio limiter). Bit-identical (greedy), ~2–3× projected decode; OWNER-SCOPED.
 
 **Land-or-dig result: DIG identified the one radical DIFFERENT primitive for the biggest
