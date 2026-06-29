@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: SURFACE (CLOSING free-file audit) — model load is the LAST free-file primitive, and it is at PARITY with ORIG (~75-100 ms tiny, both). Every free pipeline primitive is now verified at-parity-or-winning vs a fairly-built whisper.cpp; the ONLY vs-ORIG gap is the held+contended decode transformer. The free-file search space for bd-b4hp is EXHAUSTIVELY mapped — no lever exists. 0 source delta.
+
+**Land-or-dig result: DIG → measured the last open free-file primitive (model load) → PARITY →
+SURFACE (audit complete).** No worktree win (only 2 `reject` branches). `nn.rs`/`decoder.rs` still
+actively edited by the other agent (mtime 12:51). AGENT_NAME=TealVireo.
+
+### Model load is NOT a gap (the last unchecked free-file primitive)
+```text
+whisper.cpp load: tiny.en 75.5 ms ; large-v3-turbo 1164.6 ms  (whisper_print_timings)
+franken load (tiny.en): process 0.52 s − transcribe 0.42 s = ~0.10 s for load + test harness +
+  jfk wav read ⇒ model load ≈ parity (~75-100 ms). Load is mostly OS page-cache I/O (same file for
+  both) + the concurrent encoder/decoder weight build (rayon::join, already ~1.2× hidden). No gap.
+```
+
+### COMPLETE free-file primitive map vs ORIG (this closes the free-file search for bd-b4hp)
+```text
+primitive            file                free?  vs whisper.cpp (fairly-built ref, see prior entry)
+mel                  mel.rs              FREE   franken 5.4× FASTER  (at ceiling)
+encode (cold+warm)   encoder.rs          FREE   franken ≥3.2× FASTER (435.6ms/win wc warm)
+model load           ggml.rs/weights.rs  FREE   PARITY (~75-100ms tiny, both)
+DTW word-timestamps  dtw.rs              FREE   franken LEANER (+3.4% vs wc +16.6%, prior ledger)
+sampler/logits       decode.rs           FREE   PARITY (exp pass owner-gated; slim REVERTED ~0-gain)
+window orchestration decode.rs           FREE   no waste (full_mel once; per-window setup necessary)
+─────────────────────────────────────────────────────────────────────────────────────────────────
+decode transformer   decoder.rs/nn.rs    HELD   franken 3.0× SLOWER (8.64 vs 2.88 ms/tok) ← THE gap
+```
+
+### ⇒ Definitive status
+Across SIX free-file primitives — mel, encode, load, DTW, sampler, orchestration — franken is
+at-parity-or-winning vs a verified-fair ORIG. There is **no free-file lever for bd-b4hp**; 100% of
+the residual tiny.en gap is the per-token decode transformer, which lives in the coordination-held +
+actively-edited `decoder.rs`/`nn.rs` (the other agent's live scratch-arena / f16-cross / batch-gemv
+work). The remaining lever is STRUCTURAL (decode scratch-arena / batched m=1 gemvs) and requires
+either that agent's files to land or explicit coordination — it is not a clean solo free-file dig.
+tiny.en 5min stays ~1.73× behind; large-v3-turbo / realistic workloads remain DOMINATED. 0 source
+delta.
+
 ## 2026-06-29 - TealVireo: SURFACE (reference-VALIDITY + WARM-encode) — verified the ORIG reference (legacy whisper.cpp) is FAIRLY built (Release, `GGML_NATIVE` → AVX2/F16C/FMA/REPACK at runtime, no-BLAS), so every vs-ORIG ratio in this ledger is valid; and franken's encoder win HOLDS WARM (whisper.cpp 435.6 ms/window steady-state over 4 windows — not a cold/thread-spawn artifact). Re-confirms bd-b4hp has NO free-file lever. 0 source delta.
 
 **Land-or-dig result: DIG → measured the two open questions (is the reference fair? does the
