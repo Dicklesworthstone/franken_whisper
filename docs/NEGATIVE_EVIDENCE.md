@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: STAND-DOWN — elementwise ops (gelu/LayerNorm) are the last thread category and are sub-noise (gelu 0.74% e2e); thread-count audit fully complete to the elementwise level. In-scope `franken_whisper-cc` loop converged; recommend redirect to owner-scoped beads.
+
+**Land-or-dig result: DIG checked the LAST thread category (elementwise gelu/LN) — sub-noise,
+not pursued; in-scope optimization is exhausted. 0 source delta.** AGENT_NAME=cc.
+
+`nn::gelu` is already SIMD'd (16-lane) and parallel via `worker_count()`=8; the encoder
+GELU `[1500,5120]` is compute-bound (mel-analogous), so 16 workers *might* help it — BUT
+gelu is only **~0.74 % of e2e** (DuskFinch tanhf profile) and `layer_norm` is similarly
+small + already covered (SoA/L4 ~0). A mel-style 8→16 bump would be ~0.3 % e2e = sub-noise
+(REVERT-~0-gain), and there is no isolated gelu/LN bench for a clean per-crate ratio. Not
+pursued. (mel WAS worth it because it is a SEPARATE critical-path phase, hermetic-benchable,
+and scales O(audio length); the elementwise ops are neither.)
+
+**⇒ IN-SCOPE OPTIMIZATION EXHAUSTED — full evidence map:**
+- **LOAD (6 wins, ~2.5 s → ~0.34 s ~7.4×, fully overlapped):** parallel read 10.4×;
+  encoder fused-transpose 2.46× + raw-bytes 1.33×; decoder one-pass f16 2.20× +
+  parallel-layers 1.27×; concurrent enc‖dec 1.20×.
+- **COMPUTE:** mel 16-threads 1.39× (7th win); encoder/decoder GEMM = `ft_kernel_cpu`
+  sgemm/SDPA (owner-scoped; faer refuted); attention bmm/flash/tiled rejected; elementwise
+  (gelu/LN) sub-noise.
+- **THREAD-COUNT AUDIT COMPLETE:** read 16 (saturated), mel 16 (compute-bound), logits 32,
+  encoder matmul 64 (ft), decoder gemv+head-attn 8 (m=1 dispatch-bound), encoder from_ggml
+  32 (16 ~1.1× but sub-noise), gelu/LN 8 (sub-noise). Principle: per-unit work SIZE sets
+  the cap.
+- **Rejected/gated:** gemm/faer, gemv/head-attn/read-worker/tokenizer-overlap caps (~0);
+  radix-5 FFT + log10-SIMD + f32-pipeline (bit-exact-with-whisper invariant — owner-gated).
+
+**Measured dominance vs whisper.cpp (⇒ ≥ vs OpenAI-Whisper):** cold-CLI e2e 1.34×/1.25×,
+warm compute 1.51×/1.28×, load ~2.6× ahead, realistic multi-window 1.12× (conformance ~3 %
+WER). Full lib suite 3236/0.
+
+**⇒ RECOMMEND STAND-DOWN of the in-scope `franken_whisper-cc` land-or-dig loop.** No
+remaining in-scope lever clears the noise/REVERT-~0-gain bar. The only real headroom is
+OWNER-SCOPED: (1) **bd-wzgh** token-level speculative decoding (the realistic-long-audio
+decode limiter, ~2–3× projected); (2) **bd-4hc0** f16/fused encoder GEMM in `ft_kernel_cpu`;
+(3) un-gate **radix-5 FFT** (ready measured mel win, blocked on extending the bit-exact
+invariant to `fft_twiddle_table` — owner decision); (4) audited unsafe mmap loader. 0 source
+delta.
+
 ## 2026-06-29 - cc: ~0-GAIN (e2e) — encoder `from_ggml` 16-way is ~1.1× over the default 32-way isolated, but sub-noise on the 2.6×-ahead load + concurrent-context-murky → not landed. Thread-count audit now genuinely complete.
 
 **Land-or-dig result: DIG re-swept the LAST unaudited thread knob (encoder `from_ggml`
