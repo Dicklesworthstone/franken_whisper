@@ -3,6 +3,24 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: moderate-GEMV cap 8→16/24 REJECTED — regresses. The wide-cap win does NOT generalize to the small per-token Linears: fc1/fc2 (1.2 MB) are dispatch-bound, not DRAM-bound like the 40 MB logits. The 8-cap is correctly tuned.
+
+**Land-or-dig result: DIG tested whether the moderate gemvs are under-threaded in the
+real (L3-evicting) decode like the logits were; they are NOT — raising the cap
+regresses. Reverted to 0 source delta (wide-cap 32 stays landed).** LAND clean
+(`2f23b45`).
+```text
+e2e_tiny_jfk, moderate cap:  mod8 best 335.2 ms  <  mod16 378.3  <  mod24 493.3
+```
+Monotonic regression with more threads — opposite of the logits. Why: the per-token
+Linears (fc1 [384→1536], fc2 [1536→384] = 1.2 MB f16 each) are SMALL; even when the
+40 MB logits evicts them from L3, re-reading 1.2 MB is cheap, and >8 threads just add
+crossbeam dispatch/sync overhead (the isolated `f16_gemv_dequant_1280x1280` +29% for
+>8 was right after all). The wide-cap win (logits, 40 MB, 51864 rows → 32 threads)
+was specific to the BIG bandwidth-class GEMV; the 16384-row `WIDE_OUT_THRESHOLD`
+correctly keeps fc1/fc2 at 8. No source change kept. Engine stays at ~1.34x (the
+landed cap-32 logits win). AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: ★ LANDED wide-GEMV worker cap 12→32 — the vocab logits GEMV under-saturated DRAM at 12 threads (~16 GB/s); 32 threads = ~1.4–1.8x on logits_gemv_large (per-crate) and ~6–8% e2e + far more load-robust. Bit-identical (worker count doesn't change the disjoint-band output). Ratio vs OpenAI-Whisper ~1.25x → ~1.34x.
 
 **Land-or-dig result: LANDED a real measured win — the "12-cap" heuristic in
