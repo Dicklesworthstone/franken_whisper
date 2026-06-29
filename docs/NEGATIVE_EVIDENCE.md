@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-28 - IcyWren: attention `out` uninit — REVERTED, ~0-gain. Refines the dead-init rule: eliding a memset only wins when the buffer is READ by a memory-bound kernel the memset CONTENDS with (qa/ka/va, gathered just before the SDPA reads them → 8%); an OUTPUT buffer written *after* the kernel (the attention `out`, scattered post-SDPA) doesn't contend → ~0.
+
+**Land-or-dig result: DIG continued the dead-init audit to the attention `out`
+buffer; MEASURED ~0 (within ±3 ms noise) → reverted to 0 source delta.** LAND clean
+(`ccecd57`). Implemented `attn_out_buf` (uninit, `FW_ATTN_OUT_ZEROINIT` gate) + a
+parallel-path `out.fill(0.0)`, A/B'd the encoder in isolation:
+```text
+first run (load 33–49, contradictory):  encA 126.1 vs encB 121.8 ; encA2 110.9 vs encB2 122.3
+tiebreak (load 7→38):  A uninit 117.1 / A2 uninit 111.8  vs  B zeroin 114.2  ⇒ uninit STRADDLES zeroin
+```
+The uninit reading swung 111–117 around the stable zeroin (114), i.e. **within noise**
+— the one tight pair that looked like 9% was a load artifact (also implausible: `out`
+is 13.8 MB/window, 1/3 of qa/ka/va's 41 MB, yet "matched" their 8%). Reverted; conformance
+was green (bit-identical, 27/27) but perf ~0. **Rule learned:** the dead-zero-init vein
+pays at GATHER/INPUT buffers feeding a bandwidth-bound kernel, not at post-kernel
+outputs. The four landed dead-init wins already captured the contending buffers
+(encoder matmul outputs, decode GEMV outputs, SDPA gather qa/ka/va). No source change.
+AGENT_NAME=IcyWren.
+
 ## 2026-06-28 - IcyWren: ★ LANDED encoder SDPA gather uninit — the qa/ka/va gather buffers (41 MB/window) were DEAD zero-inits the gather fully overwrites; eliding the memset is **~8% faster encoder** (~3% e2e), bit-identical. The fourth win in the dead-zero-init vein the profile's "memset 5.14%" opened.
 
 **Land-or-dig result: DIG continued the dead-init audit from the decode-uninit win
