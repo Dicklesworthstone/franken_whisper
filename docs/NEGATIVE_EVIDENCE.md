@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: NEW WORKLOAD COVERAGE — DTW word-timestamps (captions) measured vs whisper.cpp. franken's DTW recording is LEAN (+3.4%) vs whisper.cpp's (+16.6%, flash-attn-gated); franken word-ts e2e ~1.6× behind on tiny long-form (tracks the greedy gap — same bd-b4hp decode overhead, NO DTW-specific lever). 0 source delta.
+
+**Land-or-dig result: DIG covered the last uncovered realistic workload (word-timestamps /
+captions), with a vs-ORIG ratio. No new lever — the DTW path is already efficient.**
+AGENT_NAME=BlackThrush. (No unlanded worktree win: re-verified only 2 `reject` branches ahead
+of main. nn.rs still holds another agent's uncommitted work — structural decode lever still
+coordination-gated, per the prior entry.)
+
+### Measured (tiny.en 5min, greedy, back-to-back same-box)
+```text
+DTW-recording overhead (on vs off):   franken +3.4%      whisper.cpp +16.6%
+                                       (7.93 vs 7.67 s)   (4342 vs 3725 ms, -nfa)
+DTW word-timestamp e2e (tiny 5min):    franken 6.70-7.08 s   whisper.cpp 4.20-4.23 s   = ~1.6x slower
+```
+**whisper.cpp gotcha:** `-dtw <model>` is SILENTLY DISABLED by default flash-attn
+(`dtw_token_timestamps is not supported with flash_attn - disabling`, `dtw = 0`); a fair DTW
+comparison REQUIRES `-nfa` (disable flash-attn) — without it whisper.cpp reports DTW timings
+but computes none. franken's DTW (cross-attn weight recording + alignment) is always real.
+
+### Conclusion
+The word-timestamp (captions/subtitles) workload is NOT a distinct franken weakness:
+- franken's DTW recording is **~5× leaner than whisper.cpp's** (+3.4% vs +16.6%), so franken's
+  RELATIVE position on word-timestamps (~1.6×) is slightly BETTER than greedy (~1.73×).
+- The residual gap is the SAME overhead-bound tiny-decode issue (bd-b4hp), not anything
+  DTW-specific. **Do NOT chase a "DTW recording is slow" lever — it is already efficient**
+  (`gated_e2e_dtw_word_timestamps_*` green; the recording cost is paid only when enabled).
+- large-v3-turbo DTW tracks its greedy WIN. Realistic captions on the production model are
+  dominated; the low-resource (tiny) captions case inherits bd-b4hp's structural decode gap.
+
 ## 2026-06-29 - BlackThrush: SURFACE — no unlanded worktree win exists (verified); fused-QKV (`845c168`) confirmed fully GREEN (gated e2e 47/0 + comparator 26/0); projection-fusion EXHAUSTED; the remaining bd-b4hp decode lever is STRUCTURAL and blocked on `nn.rs` coordination (another agent's uncommitted work), not a clean solo land.
 
 **Land-or-dig result: SURFACE — verified there is nothing left to LAND cleanly this turn, and
