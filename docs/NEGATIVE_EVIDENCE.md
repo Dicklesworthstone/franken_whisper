@@ -3,6 +3,78 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: REALISTIC large-v3-turbo head-to-head RE-MEASURED on current main — franken DOMINATES whisper.cpp compute 1.51× (large) / 1.28× (tiny); the bd-ms0x "large model absent" blocker is STALE (model present, all large benches run). No new compute lever (kernel loop at ceiling); the only residual (cold-start LOAD) has no MEASURABLE in-scope lever on the models present.
+
+**Land-or-dig result: LAND path verified EMPTY; DIG re-measured the realistic
+(large-v3-turbo) workload the kernel-ceiling sweep never covered (it was tiny-only).
+Fresh measured dominance recorded. 0 source delta (ledger only).** AGENT_NAME=cc.
+
+**LAND path empty (verified).** No MEASURED win sits unlanded. `git log --all --not main`
+= 8 commits, ALL stash refs / reject-docs / pre-history-rewrite dev commits
+(`git diff main 134f404` shows main is **+1557 lines / −145** over the `perf(nn) fuse
+f16c gemv dot` worktree, i.e. main long superseded it; `merge-base --is-ancestor`
+NO for all three "perf"-named SHAs). All 10 stashes are explicitly
+REJECTED / ZERO-GAIN / GATED (log10, radix-5, softmax-SIMD, 8-acc dot, fft scratch,
+…). All ~30 worktrees are `-baseline` / `-reject` / `-clean` / `-ledger` checkouts.
+
+**STALE BLOCKER corrected — bd-ms0x ("large-v3-turbo absent") is RESOLVED.**
+`ggml-large-v3-turbo.bin` (1.5 GB f16) is PRESENT at
+`legacy_whispercpp/whisper.cpp/models/` (downloaded 2026-06-25, BlackThrush). With
+`FRANKEN_WHISPER_MODEL_DIR` pointed there, ALL large-shape benches run locally:
+`e2e_large_jfk`, `encoder_window_large`, `decoder_token_step_large`,
+`logits_gemv_large`. The `docs/PERF_LEDGER.md` "blocked: model absent" rows and the
+memory note are stale and should be cleared.
+
+**Fresh head-to-head — current main `cd9ccd6`, AMD Threadripper PRO 5975WX (Zen3,
+AVX2, 64 threads), jfk 11 s, same ggml weights, no-timestamps both sides. whisper.cpp
+= the bit-exact port reference; OpenAI-Whisper (Python) is strictly slower than
+whisper.cpp on CPU, so franken's margin over OpenAI is ≥ these numbers.**
+
+| workload | franken (compute) | whisper.cpp (compute, best) | result |
+| --- | ---: | ---: | --- |
+| large-v3-turbo, no-ts | **4.00 s** (criterion `e2e_large_jfk`, tight 3.996–4.014) | 6.05 s (`-t16`; `-t8` 9.85 s; `-t32` 6.48 s, worse) | **franken 1.51× FASTER** (2.46× vs matched `-t8`) |
+| tiny.en, no-ts | **354 ms** (criterion `e2e_tiny_jfk_no_timestamps`) | 454 ms (`-t8`: enc 251 + batchd 153 + samp 43 + mel 8) | **franken 1.28× FASTER** |
+
+whisper.cpp compute = total − load (load ~0.88 s large, ~0.08 s tiny). whisper.cpp's
+large **encode peaks at `-t16` (5.66 s) and REGRESSES at `-t32` (6.48 s)** — GGML's
+encode cannot use this 64-thread box (cross-CCD), while franken's encoder runs the
+full rayon pool (`n_threads_hint` is ignored; the ft kernels own the pool). Encode is
+the dominant phase (~85 % of large compute), and franken wins it outright (~3.5 s vs
+5.66 s). With DTW word-timestamps franken large is ~4.6 s (`native_ab` 4.72 / 4.59 s,
+8t) — still well under whisper.cpp's best. **This STRENGTHENS the 2026-06-25
+BlackThrush result (1.24× → 1.51× on current main).**
+
+**Conformance.** 0 source delta this session ⇒ status is EXACTLY current main's green
+suite (`conformance_comparator_tests` 26/0, `native_engine::nn` 27/27 per `cd9ccd6`).
+The 2026-06-25 large head-to-head verified franken's large transcript **core-identical**
+to whisper.cpp ("And so, my fellow Americans, ask not what your country can do for
+you, ask what you can do for your country.") modulo one spurious trailing token — a
+known minor decode-termination follow-up, not a perf-claim blocker.
+
+**Residual gap = cold-start model LOAD only — and it has NO measurable in-scope lever
+on the models present (NOT a new dig target here).** franken load > whisper.cpp load
+(~0.9 s). The encoder parallel-layer load already LANDED (`encoder.rs:339`
+`(0..n_layer).into_par_iter()`, serial transpose within each layer). The remaining
+load levers are not cleanly landable on this box / these models:
+- `DecoderWeights::from_ggml` (`decoder.rs:447`) is still a serial `for i in 0..n_layer`
+  loop, but BOTH installed models (tiny.en, large-v3-turbo) have only **4 text layers**,
+  so any per-layer-parallel win is UNMEASURABLE here (needs medium/large-v3 = 24/32
+  text layers, which are absent) ⇒ landing it would violate the MEASURED gate.
+- Concurrent encoder/decoder load (`decode.rs:136-137`, a `rayon::join`) is ~0-gain:
+  the 32-layer encoder load already saturates all cores, so overlapping the tiny
+  4-layer decoder load buys nothing.
+Load only dominates on SHORT clips; for realistic-length audio the per-window compute
+(franken wins ~1.5×) dwarfs the one-time load. So on the realistic
+(compute-dominated) workload franken already DOMINATES.
+
+**⇒ Net: the realistic large-v3-turbo workload is DOMINATED ~1.5× (freshly reproduced
+on current main); the compute kernel loop is at its faithful-port + hardware ceiling
+(no new lever — confirmed by the converged DuskFinch/IcyWren entries below); the only
+residual (cold-load on short clips) has no measurable in-scope lever on the models
+present. The binding constraint for any FURTHER realistic-workload speed claim is
+measurement infrastructure (OpenAI-Whisper Python is not installed; medium/large-v3
+weights for the decoder-load lever are absent), not ideas — see bd-0hnz / bd-zk43.**
+
 ## 2026-06-28 - IcyWren: external-GEMM investigation CLOSED — after faer was refuted, checked for a tuned BLAS (the AMD-Zen-optimized next candidate): NONE installed (only the slow netlib reference `libblas.so.3`; no OpenBLAS/MKL/BLIS, no cached crate). Also ruled out the cross-KV transpose as a real lever. No in-scope CPU GEMM lever remains.
 
 **Land-or-dig result: DIG checked the last external-GEMM avenue (tuned BLAS) and the
