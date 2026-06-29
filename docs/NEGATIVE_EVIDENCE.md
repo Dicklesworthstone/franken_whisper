@@ -3,6 +3,111 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: REFUTED (MEASURED) — bd-4hc0 `matrixmultiply`→`gemm`/faer "3.75×" encoder lever is a MIRAGE. The `gemm` crate (faer's backend) is **TIED (1.01×) on the exact shape the bead names** and **1.37×–3.13× SLOWER** on the production large-v3-turbo encoder shapes. Swapping would REGRESS the encoder, not speed it up. bd-4hc0 closed. 0 source delta.
+
+**Land-or-dig result: DIG measured the project's nominally-largest open lever (bd-4hc0,
+P0, "the single biggest remaining e2e lever") and decisively REFUTED it.** AGENT_NAME=BlackThrush.
+
+This converts the prior ledger's *assertion* ("faer refuted", yet still listing bd-4hc0 as
+"the only real headroom #2") into a correctness-gated, reproducible **measurement** — and
+removes bd-4hc0 from the remaining-headroom list.
+
+### The claim under test (bd-4hc0)
+> "the GEMM (`ft_kernel_cpu::matmul_tensor_contiguous_f32`) uses matrixmultiply 0.3 which is
+> 3.75× SLOWER than gemm/faer for the encoder shape [1500,384]×[384,1536]: matrixmultiply
+> 187 GFLOP/s vs gemm/faer 701 GFLOP/s … ~3.75× the sgemm → ~2× the encoder → ~1.2× e2e."
+
+### Method
+Standalone probe (`scratchpad/gemm_probe`, source inlined below) that pits the **real
+production kernel** `ft_kernel_cpu::matmul_tensor_contiguous_f32` (matrixmultiply 0.3 wrapped
+in ft-kernel-cpu's tuned rayon 2-D/column blocking) against the **`gemm` 0.19 crate**
+(`gemm::gemm` with `Parallelism::Rayon(0)` → confirmed `rayon::current_num_threads()`=64 via
+gemm-common gemm.rs:388-390) on the actual Whisper encoder GEMM shapes. Built with the
+production flag `RUSTFLAGS="-C target-cpu=x86-64-v3"` on the 64-core host. Row-major C=A@B.
+**Correctness-gated:** both backends are checked against a naive triple-loop reference
+(maxabs 1.19e-7 each) — gemm computes the *correct* matmul (no layout bug penalizing it);
+their mutual max-abs-diff is pure f32 rounding (~2–6e-5 on |out|~5–19).
+
+### Measured result (gemm-time ÷ mm-time; >1.00× ⇒ gemm SLOWER ⇒ regression)
+```text
+correctness vs naive (7x5x9): mm maxabs=1.19e-7  gemm maxabs=1.19e-7   (both ~0 ✓)
+
+== tiny.en encoder (d=384, d_ff=1536, ctx=1500) ==
+tiny attn q/k/v/out  m=1500 k=384  n=384  | mm 113 GF/s | gemm 110 GF/s | gemm-vs-mm 1.02x | tied
+tiny mlp fc          m=1500 k=384  n=1536 | mm 254 GF/s | gemm 252 GF/s | gemm-vs-mm 1.01x | TIED  <-- the EXACT shape bd-4hc0 names; "3.75x" predicted, 1.01x measured
+tiny mlp proj        m=1500 k=1536 n=384  | mm 298 GF/s | gemm 126 GF/s | gemm-vs-mm 2.36x | gemm 2.4x SLOWER
+
+== large-v3-turbo encoder (d=1280, d_ff=5120, ctx=1500) ==  [the production model]
+large attn q/k/v/out m=1500 k=1280 n=1280 | mm 442 GF/s | gemm 223 GF/s | gemm-vs-mm 1.98x | gemm 2.0x SLOWER
+large mlp fc         m=1500 k=1280 n=5120 | mm 509 GF/s | gemm 371 GF/s | gemm-vs-mm 1.37x | gemm 1.4x SLOWER
+large mlp proj       m=1500 k=5120 n=1280 | mm 634 GF/s | gemm 203 GF/s | gemm-vs-mm 3.13x | gemm 3.1x SLOWER
+
+== square sanity ==
+sq 1024  | mm 357 GF/s | gemm 165 GF/s | gemm-vs-mm 2.16x
+sq 2048  | mm 521 GF/s | gemm 358 GF/s | gemm-vs-mm 1.46x
+```
+(A first, non-correctness-gated run under variable host load showed the identical direction —
+gemm 0.33×–0.74× the throughput of mm everywhere; the large mlp proj 3.0×-slower result was
+stable across both runs. Absolute GF/s drift between runs = 64-core host contention; the
+back-to-back A/B ratio is the robust quantity and it never favors gemm.)
+
+### Verdict: REFUTED. bd-4hc0 would REGRESS the encoder by 1.4×–3.1× on production shapes.
+**Root cause of the bead's error:** the bead's "matrixmultiply = 187 GF/s" baseline measured
+*raw* `matrixmultiply::sgemm` (single-call). That is **not** what franken_whisper runs.
+`ft_kernel_cpu::matmul_tensor_contiguous_f32` wraps matrixmultiply in heavily-tuned rayon
+2-D/column blocking (kgs4.48/kgs4.61) specialized for these tall-skinny encoder shapes on
+many-core hosts — it gets **254 GF/s on the exact named shape (not 187), and 442–634 GF/s on
+the production large shapes**, already *beating* the gemm crate. The `gemm` crate IS faer's
+matmul backend (faer-the-library wraps the same AVX2/FMA microkernels), so faer-the-library
+cannot exceed the gemm-crate compute ceiling measured here; only its dispatch heuristics could
+differ, and these problems are large enough that dispatch is not the bottleneck for the large
+shapes. AVX-512 is not on the table: the build is pinned to `x86-64-v3` (AVX2) for portability
+and `#![forbid(unsafe_code)]` rules out runtime feature dispatch (see `.cargo/config.toml`).
+
+**⇒ bd-4hc0 is closed as REFUTED. The encoder GEMM is at/above the best available
+pure-Rust library; there is no encoder-GEMM lever here.** This *strengthens* the standing
+"engine at safe AVX2 ceiling" conclusion with a direct, correctness-gated measurement that
+prior sessions had only asserted. 0 source delta; conformance unaffected (no code touched).
+
+### Reproduction (`scratchpad/gemm_probe`)
+```toml
+# Cargo.toml
+[dependencies]
+ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu" }
+ft-core       = { path = "../frankentorch/crates/ft-core" }
+gemm = "0.19"
+rayon = "1.10"
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+```
+```rust
+// baseline = the real production kernel:
+fn baseline(m,k,n,a,b) -> Vec<f32> {
+    let am = TensorMeta::from_shape(vec![m,k], DType::F32, Device::Cpu);
+    let bm = TensorMeta::from_shape(vec![k,n], DType::F32, Device::Cpu);
+    ft_kernel_cpu::matmul_tensor_contiguous_f32(a, b, &am, &bm).unwrap()
+}
+// candidate = the gemm crate (faer backend), all 64 cores, row-major C=A@B:
+fn candidate(m,k,n,a,b) -> Vec<f32> {
+    let mut c = vec![0.0f32; m*n];
+    unsafe { gemm::gemm(m, n, k,
+        c.as_mut_ptr(), 1, n as isize, false,          // dst: cs=1, rs=n
+        a.as_ptr(),     1, k as isize,                  // lhs: cs=1, rs=k
+        b.as_ptr(),     1, n as isize,                  // rhs: cs=1, rs=n
+        0.0f32, 1.0f32, false, false, false,
+        gemm::Parallelism::Rayon(0)); }                 // 0 => current_num_threads()=64
+    c
+}
+// best-of-N timing per shape; correctness-gated vs a naive triple loop.
+```
+```bash
+RUSTFLAGS="-C target-cpu=x86-64-v3" \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankenwhisper-cc-gemmprobe \
+  cargo run --release        # full source preserved in session scratchpad
+```
+
 ## 2026-06-29 - cc: STAND-DOWN — elementwise ops (gelu/LayerNorm) are the last thread category and are sub-noise (gelu 0.74% e2e); thread-count audit fully complete to the elementwise level. In-scope `franken_whisper-cc` loop converged; recommend redirect to owner-scoped beads.
 
 **Land-or-dig result: DIG checked the LAST thread category (elementwise gelu/LN) — sub-noise,
