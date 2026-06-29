@@ -41,6 +41,13 @@ in-scope lever clears the noise/REVERT-~0-gain bar. The only real headroom is OW
 bit-exact-invariant owner decision). Recommend redirecting effort there or standing the
 loop down. 0 source delta.
 
+**FULL-SUITE VALIDATION (cc, this turn):** `cargo test -p franken_whisper --lib` =
+**3236 passed / 0 failed** (66 s) on current main — confirms the session's 6 landed
+`native_engine` load wins are COLLECTIVELY conformance-safe at full-suite scope (not just
+the targeted per-commit tests). The pre-existing `orchestrator::…stage_budget_timeout`
+failure noted at session start (3223/1) is also resolved (3236/0). Cumulative session work
+verified green.
+
 ## 2026-06-29 - cc: ~0-GAIN — overlapping the tokenizer build with the enc‖dec join (3-way `rayon::join`) does NOT help (the enc‖dec already saturates all cores). Reverted to 0 source delta.
 
 **Land-or-dig result: DIG tried the last cross-phase overlap (tokenizer ‖ enc‖dec),
