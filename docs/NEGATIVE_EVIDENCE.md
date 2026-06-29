@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: "a." ROOT CAUSE (precise) + CONVERGENCE — the large-jfk "a." is a 2nd window: franken's window-1 decode ends such that `single_timestamp_ending`=FALSE → seek advances to the last timestamp (~10.4 s), not the audio end, so franken processes a tiny trailing window (10.4-11.0 s) that hallucinates "a"; whisper.cpp encodes jfk ONCE. This is an f16-decode-numerics divergence at window-1 end (large-specific; tiny is single-window, matches wc EXACTLY), and `single_timestamp_ending` is a FAITHFUL wc port with a conformance test — NOT a windowing bug, no clean solo fix. 0 source delta.
+
+**Land-or-dig result: DIG traced the "a." to its exact mechanism (a 2nd tail window via an
+f16-numerics seek-advance divergence) and confirmed it is not a clean lever. No worktree win.**
+AGENT_NAME=TealVireo.
+
+### Mechanism (PERF_SPANS on the `fw` CLI, large-v3-turbo jfk — TWO windows, with AND without `--language en`)
+```text
+window 1 (0→~10.4 s): encoder_window 5011 ms(cold) | cross_kv 160 | decode_loop 797 (main speech)
+window 2 (~10.4→11 s): encoder_window 485 ms(warm) | cross_kv 11 (tail-truncated ctx) | decode_loop 115 → "a."
+```
+`seek_advance_cs = if single_ts_ending { to-end } else { seek_delta }` (decode.rs:1031). For large,
+window-1's greedy decode ends with a token shape that makes `single_timestamp_ending`=FALSE, so seek
+advances only to ~10.4 s, leaving a 0.6 s tail window. tiny.en's window-1 decode ends differently
+(single window, matches wc, no "a."). The divergence is the f16 decode numerics (franken's `dot8`
+order ≠ ggml's) at a low-confidence end-of-window token, NOT the windowing logic (a faithful port,
+`single_timestamp_ending_matches_upstream_semantics` test green). RETRACTION: an earlier read of
+"franken large decode 5.9 ms/tok" was WRONG — that 165 ms span is the ~1-token tail window, not a
+warm multi-token decode; the warm large decode/tok is not cleanly extractable from this run.
+
+### Why NOT fixed
+A "skip a very-short trailing window" heuristic would remove the spurious "a." + the ~485 ms tail
+encode and match wc's practical behavior, BUT it deviates from the faithful `single_timestamp_ending`
+port, risks dropping real content on clips with a short-but-real tail, and the conformance suite
+(tiny.en, single-window) does not exercise it — an owner-judgment quality change tied to the known
+greedy-only / no-temp-fallback gap (bd-6goy), not a clean solo land. Cosmetic on jfk (core transcript
+exact); large still DOMINATES (3.35× @ 99 s).
+
+### ⇒ Convergence note
+This closes the "a." question. Consistent with the prior load-arc + compute-ceiling conclusions, the
+in-crate land-or-dig for `franken_whisper-cc` has CONVERGED: production workloads (large-v3-turbo,
+realistic) are decisively DOMINATED; the only residual vs-ORIG gap is tiny.en m=1 decode, which is
+cycle-level + contention-sensitive and CANNOT be measured on this shared box; and the remaining levers
+are owner/coworker-scoped (structural decode in decoder.rs/nn.rs — coworker actively iterating; temp
+fallback bd-6goy; ft_kernel GEMM). Recommend redirecting the loop or settling the decode on a quiet
+box. 0 net source delta.
+
 ## 2026-06-29 - TealVireo: PRODUCTION-MODEL CERT @ LENGTH — franken-native large-v3-turbo DOMINATES whisper.cpp ~3.35× on a realistic-length 99 s clip (27.35 s vs 91.55 s); dominance GROWS with length (2.6× @ 11 s → 3.35× @ 99 s) as wc's 16.8 s/window encode compounds. Multi-window transcript CORRECT (9× JFK verbatim). The single-window "a." is characterized: an end-of-real-audio f16-decode tolerance divergence (absent in continuous audio). 0 source delta.
 
 **Land-or-dig result: DIG measured the realistic-length production vs-ORIG ratio with the new `fw`
