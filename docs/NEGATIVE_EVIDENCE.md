@@ -3,6 +3,46 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: ROOT-CAUSE (vs-ORIG ratio update, post-f16-cross) — franken's decode is CONTENTION-SENSITIVE because it runs the m=1 decode on a 16-thread rayon pool vs whisper.cpp's 4-thread OpenMP. franken `decode_loop` swings 127↔205 ms with background load while whisper.cpp's decode+sample stays ~85 ms; so the vs-ORIG per-token ratio is load-dependent (~1.5× quiet, ~2.4× loaded), and wc with 4 threads beats franken with 16. The decode is OVER-THREADED for a memory-bound workload. 0 source delta.
+
+**Land-or-dig result: DIG re-baselined the decode vs-ORIG ratio now that the held f16-cross landed
+(`57910a4`), and found the ROOT CAUSE of the noisy thread-count measurements — franken over-threads
+the m=1 decode. Cannot settle the optimum on this shared box (wall-clock unreliable); surfaced with
+the external reference (wc uses 4).** No worktree win. AGENT_NAME=TealVireo.
+
+### f16-cross (57910a4) status
+Landed on main by the other agent; CONFORMANCE GREEN (my prior-turn `native_engine::decode` 47/0 ran
+on this exact binary — the default f16 cross path is on). decoder.rs/nn.rs now committed/clean (the
+bd-b4hp coordination block is lifted).
+
+### Measured (interleaved franken `decode_loop` vs whisper.cpp decode+sample, jfk ~27 tok, greedy -t4)
+```text
+load avg ~8:    franken decode_loop ~127 ms (~4.7 ms/tok)  | wc ~85 ms (~3.1 ms/tok)  ⇒ ~1.5×
+load avg ~13:   franken decode_loop ~199 ms (~7.4 ms/tok)  | wc ~85 ms (stable)       ⇒ ~2.4×
+   franken swings 56% with load; whisper.cpp (-t 4 OpenMP) is FLAT ~80-98 ms.
+```
+⇒ The remaining tiny.en decode gap is **largely contention sensitivity**, not raw per-op cost:
+franken's 16-thread rayon decode competes with background load and gains little throughput (the m=1
+GEMVs are memory-bandwidth bound), whereas wc's 4 OpenMP threads are robust. On a QUIET box franken
+is ~1.5× (much closer than the previously-recorded ~3×, which was measured under load); under load it
+degrades to ~2.4×.
+
+### Why this is NOT a wall-clock thread-tune (the retracted-lead trap, avoided)
+Reducing franken's decode threads MIGHT both speed it up and de-sensitize it to load — wc's 4-thread
+choice is strong external evidence that ~4 is right for this memory-bound m=1 path (I previously only
+tested 12, near the 16 default, which is why it looked like ~0-gain/artifact). BUT this CANNOT be
+settled on this shared box: `decode_loop` wall swings ±40% with other agents' load, so any sweep is
+unreliable (proven by the retracted RAYON=12 lead). It needs a QUIET/dedicated box, or a
+contention-invariant decode-only instruction count (requires a probe build). Recommendation for the
+decode owner: A/B franken decode at 4/6/8 vs 16 threads on an idle box; if a low count matches wc's
+stability without losing idle throughput, cap the DECODE pool (distinct from the encoder's 16) — the
+clean form is a per-phase thread count in the decode dispatch (decoder.rs/nn.rs).
+
+### ⇒ Status
+bd-b4hp narrowed and re-characterized: on a quiet box franken tiny.en decode is ~1.5× wc (not ~3×);
+the residual is dominated by over-threading-driven contention sensitivity, settleable only off this
+shared box. large-v3-turbo / realistic remain DOMINATED. 0 net source delta.
+
 ## 2026-06-29 - TealVireo: ~0-GAIN (REVERTED) + RETRACTION — the "RAYON=12 −10.5% decode" lead was a CONTENTION ARTIFACT. Implemented a bit-exact free-file scoped decode pool (`FW_DECODE_THREADS`, decode.rs) to capture it WITHOUT touching held files — but the A/B shows it ~0-gain, and the prior "win" does NOT reproduce (RAYON=12 now HURTS). Reverted; the two prior pool-lead entries below are RETRACTED.
 
 **Land-or-dig result: DIG → built the clean free-file form of the pool lever, MEASURED it, found the
