@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: DIG-CLOSURE — encoder `from_ggml` is MEMORY-BANDWIDTH-BOUND (RAYON sweep plateaus at 16, regresses at 32/64); no clean further load lever. Model-load arc CLOSED at whisper.cpp parity (3 landed wins).
+
+**Land-or-dig result: DIG measured the last load phase; no clean win → recorded, 0
+source delta.** AGENT_NAME=cc. After the 3 landed load wins (parallel read, encoder
+fused-transpose, decoder one-pass f16), `encoder_from_ggml` (~342 ms warm) was the
+biggest remaining load phase. Tested whether finer parallelism helps (32 layers underfill
+64 cores) via a `RAYON_NUM_THREADS` sweep on `examples/encoder_load_probe.rs` (large-v3-
+turbo, best of 5, under box contention):
+
+| RAYON_NUM_THREADS | 8 | 16 | 32 | 64 |
+| --- | ---: | ---: | ---: | ---: |
+| `encoder_from_ggml` best (ms) | 638.7 | **565.7** | 667.6 | 653.5 |
+
+⇒ **plateaus at ~16 and REGRESSES at 32/64** — the strided f32-transpose write (2.5 GB
+for the large encoder) is **memory-bandwidth-bound**, and >16 threads cross-CCD-contend
+(same Zen-CCD signature as the wide-GEMV cap and whisper.cpp's encode regressing past
+`-t16`). It is NOT under-parallelized.
+
+**Why no clean lever:**
+- A scoped 16-thread cap would help UNDER contention (565 vs 667) but risks regressing
+  the idle-startup case (16 threads may not saturate bandwidth when the box is idle;
+  earlier I measured ~342 ms at default-32 under low contention). Load-dependent tradeoff,
+  not load-robust ⇒ NOT landed.
+- Halving the traffic needs f16-resident encoder weights + an f16 GEMM (the encoder does
+  big `m=1500` GEMMs, not GEMV) — there is no f16 GEMM in `ft_kernel_cpu` and writing one
+  is owner-scoped (bd-4hc0 family). The f32 transpose is at its in-scope floor.
+- Concurrent encoder/decoder `from_ggml` (`rayon::join`) is ~0-gain: both are
+  bandwidth-bound, so overlapping them just splits the same memory bus.
+
+**⇒ Model-load optimization arc CLOSED.** Cumulative cold-start load (large-v3-turbo,
+warm), three landed cc wins: parse 1359→~120 ms (parallel `read_at`, 10.4×) + encoder
+832→342 ms (fused dequant-transpose, 2.46×) + decoder 305→~231 ms (one-pass f16, 2.20×)
+⇒ **~2.5 s → ~0.69 s (~3.6×)** — franken now loads at/under whisper.cpp (~0.9 s). With
+compute already won (large 1.51×, tiny 1.28×), **the realistic large-v3-turbo workload is
+comprehensively dominated** on both axes. Remaining load is bandwidth-bound (read ~120 +
+encoder ~342 + decoder ~231 ms); further in-scope gain is sub-noise. Next real frontier is
+owner-scoped (ft_kernel_cpu f16/fused GEMM, or an audited mmap/unsafe loader). No source
+change this entry.
+
 ## 2026-06-29 - cc: LANDED — PARALLEL one-pass f16 decoder weight load (`tensor_f16_halves`) = 2.20× on the token-embedding load (135→61 ms)
 
 **Land-or-dig result: DIG → a NEW lever, MEASURED + LANDED.** AGENT_NAME=cc. Third
