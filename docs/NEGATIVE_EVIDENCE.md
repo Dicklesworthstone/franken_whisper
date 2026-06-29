@@ -3,6 +3,53 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: LANDED — FUSED dequant-transpose for encoder weight load = 2.46× on the biggest cold-start gap (`EncoderWeights::from_ggml` 832→339 ms, large-v3-turbo)
+
+**Land-or-dig result: DIG → a NEW different-primitive lever, MEASURED + LANDED.**
+AGENT_NAME=cc. This SUPERSEDES the prior cc entry's "cold-start LOAD has no MEASURABLE
+in-scope lever" conclusion — that was wrong: there WAS one. The one place franken still
+LOSES vs whisper.cpp is cold-start model LOAD (whisper.cpp mmaps f16; franken
+converts+transposes weights to f32). Attacked it with a DIFFERENT primitive — a fused
+dequant-transpose — instead of touching the already-winning compute path.
+
+**Before (main, two-pass per encoder linear `[out,in]`):** (1) `tensor_f32` /
+`dequant_f16_parallel` dequantized f16→f32 into an intermediate f32 `[out,in]` buffer
+using its OWN `thread::scope` (≤8 OS threads PER WEIGHT); (2) `transpose_serial` did a
+second strided read+write pass to f32 `[in,out]`. Inside the 32-way layer rayon loop
+this nests to ~256 OS threads on 64 cores AND allocates a full extra ~26 MB buffer per
+large weight.
+
+**After (`encoder.rs`, fused):** read the raw f16 bits (`tensor_f16`) and convert each
+element to f32 DIRECTLY into the transposed `[in,out]` slot in ONE tiled (64×64) pass —
+no intermediate f32 buffer, no second read, no per-weight `thread::scope` nesting (only
+the coarse 32-way layer parallelism). Bit-identical: same `Float16::to_f32` per element,
+same permutation indices as `transpose_serial`. f32-stored tensors keep the old path.
+
+**MEASURED — isolated `EncoderWeights::from_ggml` over a pre-parsed ggml (file I/O
+excluded), best of 7, contended 64-core Threadripper; `examples/encoder_load_probe.rs`:**
+
+| variant | best | spread |
+| --- | ---: | --- |
+| baseline (two-pass) | 832.5 ms | 832–993 ms (noisy) |
+| **fused (landed)** | **338.7 ms** | 338–374 ms (tight) |
+
+⇒ **2.46× faster** encoder weight load, and far more stable (the nested
+oversubscription was also the variance source). ~0.5 s shaved off EVERY cold large
+load — the dominant in-scope slice of the cold-start gap vs whisper.cpp (was franken
+12.96 s vs whisper.cpp 9.75 s e2e cold; ~3.2 s of that is franken's load). Helps every
+transcribe and every f16 model (all linears), not just large. The COMPUTE path is
+untouched (franken still WINS large compute 1.51× — see the entry below).
+
+**Conformance GREEN:** new unit test `fused_dequant_transpose_is_bit_identical_to_dequant_then_transpose`
+(4 shapes incl non-tile-aligned + a 1-row case, NaN-safe bitwise compare) PASS;
+`native_engine::encoder` lib tests **11/0**. Bit-identity of the loaded weights ⇒
+identical encoder output ⇒ identical transcription (a stronger proof than a single-model
+e2e WER check; the repo's real-model comparator gate skips here — it hard-codes a macOS
+`/opt/homebrew/bin/whisper-cli` path). rustfmt clean on `encoder.rs`.
+
+Files (mine only): `src/native_engine/encoder.rs` (fused primitive + unit test),
+`examples/encoder_load_probe.rs` (the isolation harness).
+
 ## 2026-06-29 - cc: REALISTIC large-v3-turbo head-to-head RE-MEASURED on current main — franken DOMINATES whisper.cpp compute 1.51× (large) / 1.28× (tiny); the bd-ms0x "large model absent" blocker is STALE (model present, all large benches run). No new compute lever (kernel loop at ceiling); the only residual (cold-start LOAD) has no MEASURABLE in-scope lever on the models present.
 
 **Land-or-dig result: LAND path verified EMPTY; DIG re-measured the realistic
