@@ -3,40 +3,48 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-06-29 - TealVireo: LANDED (BIT-EXACT) — bd-b4hp sampler-layer slim: drop the per-token full `[n_vocab]` log-softmax vector (51864-elt ~207 KB heap alloc EVERY decoded token, mmap-backed under glibc) and carry only the scalar normalizer `Z`; `decode.rs` (a FREE file, different primitive from the coordination-held `nn.rs`/`decoder.rs` transformer).
+## 2026-06-29 - TealVireo: ~0-GAIN (REVERTED, `b509c14` → reverted) — bd-b4hp sampler-layer slim (scalar log-softmax normalizer, drop the per-token full `[n_vocab]` logprob alloc) is BIT-EXACT and 3.1% faster on the ISOLATED op, but the per-call saving (5.5 µs) is too small to clear noise at e2e. Reverted per the project's sub-noise discipline; the original `compute_logprobs` is a faithful `whisper_compute_logprobs` port.
 
-**Land-or-dig result: LAND — a STRUCTURAL decode-overhead reduction outside the held files.**
-AGENT_NAME=TealVireo. Committed: `src/native_engine/decode.rs` ONLY (nn.rs/decoder.rs/bench
-remain the other agent's uncommitted f16-cross + batch-gemv work — untouched).
+**Land-or-dig result: DIG → MEASURED → REVERT. I landed `b509c14` last turn WITHOUT measuring it;
+this turn I measured it and it is ~0-gain at e2e, so I reverted it (intellectual-honesty correction).**
+AGENT_NAME=TealVireo. Reverted files: `src/native_engine/decode.rs` (back to the faithful port) +
+this ledger. nn.rs/decoder.rs remain the other agent's uncommitted work (untouched throughout).
 
-### The lever (different primitive: sampler-layer allocation, not the held transformer GEMVs)
-The greedy decode loop calls `process_logits` per token, whose `compute_logprobs` materialized a
-**full 51864-element log-softmax `Vec<f32>` (~207 KB) every token** — above glibc's 128 KB
-`M_MMAP_THRESHOLD`, so an `mmap`+page-faults+`munmap` PER DECODED TOKEN — even though only ONE
-element of it is ever read downstream (`argmax` selects on raw LOGITS; it reads `logprobs[best_i]`
-for the chosen token's `plog`). The timestamp-pairing forcing rule used the vector internally, but
-`logprob[i] = logits[i] - Z` is a constant offset, so the rule's comparison (`ts_logprob >
-max_text_logprob`) and its logsumexp are computable from `logits` + the scalar `Z` — **the
-normalizer cancels exactly**. New path: `compute_logsumexp` returns scalar `Z`; logprobs derived on
-the fly only where needed (argmax single element, ts-rule tail/head). `FW_NO_LOGPROB_SLIM=1`
-restores the full-vector path.
+### The lever (real, but tiny)
+`process_logits` (greedy decode, per token) materialized a full 51864-elt log-softmax `Vec<f32>`
+(~207 KB) via `compute_logprobs`, of which only ONE element is read downstream (argmax selects on
+raw LOGITS). The slim path returned a scalar normalizer `Z` and derived logprobs on the fly
+(timestamp-forcing rule's `Z` cancels), bit-exactly. Conformance was GREEN (`native_engine::decode`
+47/0 incl. exact-transcript `gated_e2e_jfk_tiny_en`).
 
-### Bit-exactness (proven by conformance, not just argued)
-Every derived logprob uses the IDENTICAL op the old `.map()` arm used (`logit - Z`), in the same
-order, so the chosen `plog`, `no_speech_prob`, and the timestamp-forcing decision are byte-identical.
-`cargo test -p franken_whisper --lib native_engine::decode` (model dir set) = **47 passed / 0
-failed**, incl. `gated_e2e_jfk_tiny_en_matches_reference` (EXACT transcript), the DTW word-timestamp,
-deterministic, and multi-window-monotonic gated e2e tests. argmax selecting on raw logits means the
-change CANNOT alter token choice; it strictly removes per-token alloc work on the default path.
+### Why reverted — the measurement (release, `target-cpu=x86-64-v3`, model local)
+```text
+Primitive micro-bench (single-thread, deterministic, x30000):
+    compute_logsumexp (slim)  173.97 us/call
+    compute_logprobs (legacy) 179.51 us/call   -> delta 5.53 us/call (3.1% of the op)
+    => the exp pass over 51864 logits DOMINATES (~174 us); the removed materialization is only ~3%.
 
-### Honesty caveat (what is NOT yet measured)
-This turn confirmed bit-exactness + conformance but did **NOT** land a headline e2e number (the
-`probe_e2e_longform_timing` / `probe_logprob_normalizer_ab` `#[ignore]` probes are committed for the
-next session to quantify). The win is mechanism-sound (strictly fewer per-token mmap syscalls +
-materialization) and cannot regress the default path, but the vs-whisper.cpp ratio movement on tiny.en
-5min long-form (currently **~1.73×** behind) is **pending measurement** — claimed as a bit-exact
-structural reduction, not a measured speedup. The exp pass (the real ~80% of `compute_logprobs`) is
-untouched (owner-gated bit-exact-with-whisper invariant; no approximation introduced).
+e2e A/B (perf stat, 27x jfk ~5min, 1 warm + 3 timed, --test-threads=1, FW_NO_LOGPROB_SLIM toggle):
+    metric          slim(default)        legacy(=1)        delta
+    minor-faults    195,349              193,022           slim +2,327  (WORSE / noise)
+    instructions    1,114,104,859,603    1,113,650,510,896 slim +454M (+0.04%, WORSE / noise)
+    wall best       8.743 s              8.611 s           slim +0.132 s (+1.5%, WORSE / noise)
+    task-clock      475.2 s              464.1 s           (run-to-run rayon variance ~2.3%)
+```
+The e2e deltas are all WITHIN parallel-run (rayon, 13-CPU) scheduling noise AND lean the *wrong*
+way — i.e. the change is invisible at e2e. The decode-token volume is the cause: jfk-repeat is
+sparse speech (~13 tokens/window → 358 tokens total), so the workload is **encoder-bound**; even a
+decode-DENSE real 5min (~2-3k tokens) bounds the saving at `5.5 µs × tokens ≈ 11-16 ms` on a
+multi-second decode = **<0.3%, sub-noise**. The big cost (the 51864-wide `exp` pass, ~80% of the
+op) is owner-gated (bit-exact-with-whisper invariant) and was left untouched.
+
+### Takeaway for bd-b4hp
+The sampler-layer (the ~20% of tiny.en decode OUTSIDE the held `forward_step` transformer) is NOT a
+clean free-file lever: its cost is the vocab-wide `exp` (owner-gated to approximate) + the argmax
+scan, not the allocation. Removing the alloc is bit-exact but sub-noise. The real bd-b4hp headroom
+remains the STRUCTURAL decode change in the coordination-held `nn.rs`/`decoder.rs` (scratch-arena /
+batched m=1 gemvs), per the prior entries. tiny.en 5min stays ~1.73× behind whisper.cpp; 0 net
+source delta this turn.
 
 ## 2026-06-29 - BlackThrush: NEW WORKLOAD COVERAGE — DTW word-timestamps (captions) measured vs whisper.cpp. franken's DTW recording is LEAN (+3.4%) vs whisper.cpp's (+16.6%, flash-attn-gated); franken word-ts e2e ~1.6× behind on tiny long-form (tracks the greedy gap — same bd-b4hp decode overhead, NO DTW-specific lever). 0 source delta.
 
