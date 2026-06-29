@@ -3,6 +3,44 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: RADICAL LEVER IDENTIFIED + FILED — token-level SPECULATIVE DECODING (draft model) to amortize the DRAM-bound decode (the realistic-long-audio limiter). Bit-identical (greedy), ~2–3× projected decode; OWNER-SCOPED.
+
+**Land-or-dig result: DIG identified the one radical DIFFERENT primitive for the biggest
+measured gap (decode), backed by established measurements; filed as a bead. 0 source
+delta.** AGENT_NAME=cc.
+
+**The gap (measured):** on realistic decode-heavy long audio the margin is DECODE-bound
+(prior entries: multi-window 1.12× vs single-window 1.34×; franken decode ~1.07× = parity
+with whisper.cpp, bd-6qih). **Why it's parity (DRAM-bound):** each autoregressive token
+(m=1) streams the decoder's f16 weights from DRAM — **~342 MB/token** = 105 M layer params
+(4 layers × [self+cross attn 4×1280² + mlp 2×1280×5120]) + 66 M tied logits [51865×1280],
+all f16. That exceeds cache, so the full weight set re-streams every token at the measured
+**~88 GB/s ceiling** (DuskFinch) ⇒ ~3.9 ms/token of pure weight bandwidth. whisper.cpp
+pays the identical cost ⇒ parity. No single-token kernel tweak can beat this — it's a
+bandwidth floor, not a microkernel gap.
+
+**The DIFFERENT primitive (the only amortization):** TOKEN-LEVEL **speculative decoding**.
+A small draft model (e.g. `tiny.en` for `large-v3-turbo`) proposes K tokens; the target
+verifies all K in ONE batched (m=K) forward pass, reading the 342 MB weights **once for K
+tokens** ⇒ ~K× less target weight-bandwidth for accepted tokens. **Greedy verification is
+BIT-IDENTICAL** to greedy target decoding (accepts only tokens the target itself would
+emit) ⇒ conformance preserved. At Whisper's typical ~70–90 % acceptance this is a
+projected **~2–3× decode speedup** (literature + the bandwidth math), which on
+decode-heavy realistic audio lifts the e2e win well above the current ~1.12×.
+
+**DISTINCT from existing speculation work:** `src/speculation.rs` + bd-3vhz (long-form
+window scheduler) + bd-kdg7 (streaming TTFT) are WINDOW/STREAMING-level (fast model emits
+early, slow model confirms a whole window). This is TOKEN-level *within* a single decode —
+a different mechanism targeting the per-token DRAM bandwidth.
+
+**Scope:** OWNER-SCOPED / multi-session — needs draft-model load + acceptance loop + dual
+KV-cache in `src/native_engine/decode.rs`/`decoder.rs`; not a 60-min in-crate lever.
+**Filed as bd-wzgh** (token-level speculative decoding). The other owner-scoped frontiers
+remain: f16/fused encoder GEMM in `ft_kernel_cpu` (extends the encoder lead), audited
+unsafe mmap loader (cold-disk read), gated radix-5 FFT. The in-crate `franken_whisper-cc`
+optimization loop is converged; this is the highest-value next step and it lives one layer
+out (draft model + decode rework). 0 source delta.
+
 ## 2026-06-29 - cc: MULTI-WINDOW CONFORMANCE validated — franken transcript ≈ whisper.cpp on the real 124.5 s speech (≈3% WER, within the greedy-vs-beam gate). The ~1.12× multi-window win is on CORRECT output.
 
 **Land-or-dig result: completed the multi-window evidence — validated CORRECTNESS of the
