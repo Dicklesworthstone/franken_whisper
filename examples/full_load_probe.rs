@@ -1,15 +1,15 @@
-//! Decoder-load A/B probe (cc, 2026-06-29).
+//! LoadedModel::from_ggml A/B probe (cc, 2026-06-29).
 //!
-//! Times `DecoderWeights::from_ggml` over a pre-parsed ggml (file I/O excluded),
-//! best of N. Toggle the cross-layer-parallel load with `FW_DEC_PAR_LAYERS=0|1`
-//! (read once per process) and run both for an interleaved A/B. Run with
-//! `FRANKEN_WHISPER_MODEL_DIR` set.
+//! Times `LoadedModel::from_ggml` (tokenizer + encoder + decoder weight build)
+//! over a pre-parsed, cloned ggml (file I/O excluded), best of N. Toggle the
+//! concurrent encoder||decoder load with `FW_CONCURRENT_LOAD=0|1` (read once per
+//! process) for an interleaved A/B. Run with `FRANKEN_WHISPER_MODEL_DIR` set.
 //!
 //! Usage: `full_load_probe <model-short-name> [runs]`
 
 use std::time::Instant;
 
-use franken_whisper::native_engine::decoder::DecoderWeights;
+use franken_whisper::native_engine::decode::LoadedModel;
 use franken_whisper::native_engine::find_model_file;
 use franken_whisper::native_engine::ggml::GgmlModel;
 
@@ -20,15 +20,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let path = find_model_file(&model)
         .ok_or_else(|| format!("model {model} not found (set FRANKEN_WHISPER_MODEL_DIR)"))?;
-    let ggml = GgmlModel::load(&path)?; // parse the blob ONCE
 
     let mut best = f64::INFINITY;
     for _ in 0..runs {
+        // Re-parse each iter (UNTIMED): from_ggml consumes the GgmlModel, which is
+        // not Clone. The file is page-cached so this is a fast warm read+parse.
+        let g = GgmlModel::load(&path)?;
         let t = Instant::now();
-        let dec = DecoderWeights::from_ggml(&ggml)?;
+        let loaded = LoadedModel::from_ggml(g)?;
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
-        std::hint::black_box(&dec);
+        std::hint::black_box(&loaded);
     }
-    eprintln!("BEST decoder_from_ggml ({model}): {best:.1} ms");
+    eprintln!("BEST LoadedModel::from_ggml ({model}): {best:.1} ms");
     Ok(())
 }

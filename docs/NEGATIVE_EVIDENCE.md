@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: LANDED — concurrent encoder‖decoder weight build (`rayon::join`) = 1.20× on `LoadedModel::from_ggml` (cross-phase overlap; the decoder hides behind the encoder).
+
+**Land-or-dig result: DIG found a CROSS-PHASE overlap the per-phase work missed;
+MEASURED 1.20×, LANDED.** AGENT_NAME=cc.
+
+`LoadedModel::from_ggml` built the encoder weights (~180 ms) THEN the decoder weights
+(~102 ms) serially. They are independent (disjoint tensors → separate structs) and
+neither saturates RAM bandwidth (~14 GB/s vs ~100+ aggregate), so the decoder build can
+hide behind the encoder. Replaced the serial pair with `rayon::join(enc, dec)`.
+
+**MEASURED (`full_load_probe`, `LoadedModel::from_ggml` = tokenizer + encoder + decoder,
+large-v3-turbo, best of 7, interleaved A/B, heavy box contention):**
+
+| | best |
+| --- | ---: |
+| serial enc-then-dec (prior) | 469–497 ms |
+| **concurrent `rayon::join` (landed)** | **391–417 ms** |
+
+⇒ **~1.20× faster** (~80 ms off), consistent across 3 pairs. (Absolutes are
+contention-inflated; the interleaved ratio is the signal. At low contention the overlap
+hides ~the full decoder ~102 ms.) **Bit-IDENTICAL** — disjoint tensors, separate output
+structs; `rayon::join` runs serially on a 1-thread pool (safe everywhere). The decoder's
+own parallel-layer path is gated `n_layer ≤ 8`, so the concurrent encoder (32 tasks) +
+decoder don't pathologically oversubscribe for big-decoder models.
+
+**Conformance GREEN:** `native_engine::decode` **47/0**, `conformance_comparator_tests`
+**26/0**, rustfmt + clippy clean. Compute path untouched.
+
+**Cumulative cold-start LOAD (large-v3-turbo, warm):** parse/read ~120 + (encoder ‖
+decoder overlapped ~180, was 282) + tokenizer ~45 ≈ **~0.34 s** (was ~2.5 s originally,
+~7.4×) — ~2.6× under whisper.cpp (~0.9 s). Files (mine only):
+`src/native_engine/decode.rs`, `examples/full_load_probe.rs`.
+
 ## 2026-06-29 - cc: ~0-GAIN — bumping `read_blob_parallel` workers 16→24/32/48 only ~7% (~8 ms); the page-cache copy is ~saturated at 16. Not kept (0 source delta).
 
 **Land-or-dig result: DIG tested the last load-phase lever (the read), MEASURED ~0-gain
