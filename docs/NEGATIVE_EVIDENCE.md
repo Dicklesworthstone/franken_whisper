@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: SCRATCH-ARENA HYPOTHESIS RETIRED — with the coworker's decode work now COMMITTED + quiet ~2 h (decoder.rs/nn.rs clean, coordination block LIFTED), I assessed the long-standing "bd-b4hp lever = structural decode scratch-arena, blocked on coordination" claim. It is ~0-GAIN: the per-token Mat/Vec allocs are glibc-RECYCLED — `f575c26` already PROVED equal minor-faults removing the biggest one (207 KB/token logits vector), and the ~50 smaller buffers are sub-128 KB → small-bin recycled (~1.75 µs/token total = deep sub-noise vs the 37 MB/token weight stream). The real bd-b4hp overhead is per-call GEMV DISPATCH (rayon scope setup per m=1 call) in `nn.rs`, not allocations. 0 source delta.
+
+**Land-or-dig result: the coordination block lifted (coworker committed + quiet 2 h), so I finally
+assessed the touted scratch-arena lever — and RETIRED it as ~0-gain by the already-proven recycling
+evidence. No worktree win.** AGENT_NAME=TealVireo.
+
+### The retirement (corrects a multi-session ledger assumption)
+Prior entries repeatedly named the decode scratch-arena (reuse per-token buffers instead of ~50
+`Mat`/`Vec` allocs/token) as THE remaining bd-b4hp lever, "blocked on `nn.rs` coordination." Now that
+those files are committed and stable, the assessment:
+- The BIGGEST per-token alloc — the 51864-elt (207 KB) logits/logprobs vector — was directly
+  measured under `perf` (`f575c26` sampler-slim A/B): removing it gave **equal minor-faults** (195 K
+  vs 193 K) and equal wall ⇒ glibc RECYCLES the mmap region; alloc removal is ~0-gain.
+- The other ~50 per-token buffers are all sub-128 KB (`[1,n_state]`, `[1,mlp_hidden]`, attn scores) ⇒
+  glibc SMALL-BIN allocations: no page faults, ~20-50 ns each ⇒ ~1.75 µs/token for all 50, which is
+  ~0.03% of the ~6 ms/token tiny decode. A scratch-arena eliminating them is sub-noise BY
+  CONSTRUCTION; the intermediate buffers (≤6 KB) are also cache-noise next to the 37 MB f16 weight
+  stream the GEMVs re-read every token.
+⇒ The scratch-arena was an OVERESTIMATE; it is not the lever. Do NOT spend a large refactor on it.
+
+### Where the bd-b4hp overhead actually is (unchanged conclusion, now better-attributed)
+The tiny.en m=1 decode runs ~15-19× its ~0.42 ms/token weight-bandwidth floor — pure per-OP
+overhead, dominated by **rayon dispatch** (scope setup / worker wake per m=1 GEMV call, ~30 calls/
+token) in `nn.rs`. That is the coworker's active f16-gemv domain (fused-QKV `845c168`, f16-cross
+`57910a4`, `FW_BATCH_GEMV_CAP` are all theirs), it is cycle-bound (not instruction- or alloc-bound),
+and cycle measurement is contention-walled on this shared box (prior entry: CPU-pinning can't escape
+it). So bd-b4hp remains coworker-scoped + measurement-walled — but the SCRATCH-ARENA red herring is
+now retired. 0 net source delta.
+
 ## 2026-06-29 - TealVireo: MEASUREMENT WALL CONFIRMED INESCAPABLE — attempted CPU-pinning (`taskset`) to get a clean contention-free tiny.en decode measurement; the shared 64-thread box has NO free core set (high cores 48-63 measured 26-98% busy: c48 96%, c51 89%, c54 98%; load avg 11-16). So the contention that makes `decode_loop` swing ±40% cannot be escaped here — the tiny.en decode gap is genuinely unmeasurable on this box. No worktree win. CONVERGED. 0 source delta.
 
 **Land-or-dig result: tried the last unexplored measurement methodology (CPU pinning) to break the
