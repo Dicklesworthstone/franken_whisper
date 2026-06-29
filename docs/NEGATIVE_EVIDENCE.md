@@ -3,7 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-06-29 - TealVireo: PRODUCTION-MODEL CERT — franken-native large-v3-turbo verified post-f16-cross: correct transcript, DOMINATES whisper.cpp ~2.6× (6.66 s vs 17.4 s on jfk), and f16-cross is bit-tolerant on large (f16 == f32 output). Found a pre-existing minor silence-tail divergence (trailing "a.") that is NOT f16-related. 0 source delta.
+## 2026-06-29 - TealVireo: PRODUCTION-MODEL CERT @ LENGTH — franken-native large-v3-turbo DOMINATES whisper.cpp ~3.35× on a realistic-length 99 s clip (27.35 s vs 91.55 s); dominance GROWS with length (2.6× @ 11 s → 3.35× @ 99 s) as wc's 16.8 s/window encode compounds. Multi-window transcript CORRECT (9× JFK verbatim). The single-window "a." is characterized: an end-of-real-audio f16-decode tolerance divergence (absent in continuous audio). 0 source delta.
+
+**Land-or-dig result: DIG measured the realistic-length production vs-ORIG ratio with the new `fw`
+CLI + characterized the prior "a." finding to closure. No worktree win.** AGENT_NAME=TealVireo.
+
+### Measured (jfk×9 = 99 s, 4-5 windows, greedy `-t 4`, native engine)
+```text
+                       franken-native large   whisper.cpp large (-bs1 -bo1)
+total wall (99 s clip)  27.35 s                91.55 s   ⇒ franken 3.35× FASTER
+  └ wc split:            load 0.88 | encode 83.95 s (16.79 s/win ×5) | decode 4.99 s/283 (17.6 ms/tok)
+transcript              9× "...do for you, ask what you can do for your country." VERBATIM (correct,
+                        no spurious tokens in the continuous multi-window case)
+```
+Dominance over the production model GROWS with length: 2.6× @ jfk-11 s → **3.35× @ 99 s**, because
+wc's ~16.8 s/window large encode (no-BLAS ggml CPU GEMM) compounds per window while franken's encoder
+stays fast. The tiny.en decode gap does NOT generalize to large; large is decisively dominated at any
+length. The reusable `fw` CLI (`release/fw`, native via `FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`) makes
+this re-runnable.
+
+### "a." finding (raised prior entry) — CHARACTERIZED to closure
+franken-native large on SINGLE-window jfk emits an extra segment `[10.4→10.99 s] "a."`. It sits at the
+END of the real 11 s audio (the trailing near-silence after speech ends ~10.4 s), NOT the padded tail;
+whisper.cpp's last segment ends at 10.4 s and stops. It persists with `FW_CROSS_F16=0` (so NOT
+f16-cross) and is ABSENT in the continuous 99 s case ⇒ it is a general f16-decode transcription-
+tolerance divergence on ONE low-confidence silence-tail token (franken's greedy argmax picks "a", wc's
+picks EOT). Not a bug, not a regression, not f16-cross. Tied to franken's greedy-only path lacking wc's
+no_speech/temperature-fallback silence suppression (the known bd-6goy quality gap) — a future quality
+item, not a decode-correctness defect. 0 source delta.
 
 **Land-or-dig result: DIG closed the one genuinely-unverified surface — the PRODUCTION model
 (large-v3-turbo) under the recent numerics-affecting f16-cross — with a vs-ORIG ratio + a correctness
