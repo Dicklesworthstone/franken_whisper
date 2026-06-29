@@ -3,6 +3,50 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: SURFACE — no unlanded worktree win exists (verified); fused-QKV (`845c168`) confirmed fully GREEN (gated e2e 47/0 + comparator 26/0); projection-fusion EXHAUSTED; the remaining bd-b4hp decode lever is STRUCTURAL and blocked on `nn.rs` coordination (another agent's uncommitted work), not a clean solo land.
+
+**Land-or-dig result: SURFACE — verified there is nothing left to LAND cleanly this turn, and
+mapped the remaining lever precisely.** AGENT_NAME=BlackThrush. 0 source delta.
+
+### (1) No unlanded measured win in any worktree (directive's first branch — CHECKED)
+`git rev-list --count main..<branch>` over all 30+ worktree branches: only **two** are ahead of
+main, and both are `docs(negative-evidence): reject log-mel stitch transpose` (rejections, not
+wins). Every substantive prior win (mel arc, f16c, radix5, log10, the load wins) is already on
+main. Nothing to land from `.scratch`/`.worktrees`.
+
+### (2) Fused-QKV (`845c168`, landed last turn) — conformance fully confirmed this turn
+`cargo test -p franken_whisper --lib native_engine::dec` (model-dir set) = **47 passed / 0
+failed**, incl. `gated_e2e_jfk_tiny_en_matches_reference`, `gated_e2e_dtw_word_timestamps_*`,
+`gated_e2e_deterministic_across_runs`, `gated_e2e_multi_window_monotonic_timestamps`; plus
+`conformance_comparator_tests` 26/0. The bit-identical claim holds end-to-end.
+
+### (3) Projection-fusion is EXHAUSTED; the other hot sub-parts are already optimized
+QKV was the ONLY group of independent same-input projections (fusable). The rest:
+- `logits_gemv` (14%) already runs the **f16 fused-dequant GEMV** (`logits_last` f16 arm), 32-way
+  — `FW_WIDE_GEMV_CAP` sweep confirmed 32 optimal (reducing hurts).
+- `cross_attn` (19.5%) already **parallelizes its heads via rayon's persistent pool** (serial-tiny
+  was measured-rejected +2.7%); per-head matmuls aren't fusable (distinct cached K/V per head).
+- `mlp` (32%) = fc→gelu→proj — the two GEMVs are **sequential** (gelu between), not fusable;
+  serial-mlp was ~0-gain (+2.3%, prior turn).
+- `self_out`/`cross_q`/`cross_out` are single projections of distinct inputs — nothing to fuse.
+
+### (4) The remaining bd-b4hp lever is STRUCTURAL + cross-territory (the honest blocker)
+Closing the residual diffuse per-op overhead needs a **decode scratch-arena / planned graph**:
+reuse per-token buffers instead of ~50 `Mat`/`Vec` allocs/token, and cut per-call GEMV machinery.
+That requires threading `&mut` scratch through the GEMV/attention primitives — which live in
+**`nn.rs`**, currently holding **another agent's uncommitted changes** (`gemv_f16_batch`
+`FW_BATCH_GEMV_CAP` rework). Editing `nn.rs` now would entangle their work (violates "git add ONLY
+own files"). So this lever is **blocked on coordination**, not on ideas. The only conformance-gated
+alternative (softmax-`exp` polynomial in `cross_attn`, the `__expf` 3% hotspot) is high-risk:
+softmax feeds token probabilities, so an approx error risks WER drift — not worth it without the
+owner's transcription-tolerance sign-off.
+
+### ⇒ Status
+Realistic large-v3-turbo (the youtube workload) is DOMINATED; tiny.en long-form (low-resource) is
+now **~1.73× behind whisper.cpp** (improved from 1.86× via fused-QKV this session). Further closure
+is owner/coordination-gated (the decode scratch-arena needs `nn.rs`). bd-b4hp stays P1 with the
+precise lever map. 0 source delta this entry.
+
 ## 2026-06-29 - BlackThrush: LANDED (MEASURED) — FUSED QKV projection (one `[3·n_state, n_state]` GEMV/layer instead of 3 calls + 2 OS-thread spawns) shrinks the bd-b4hp tiny long-form decode gap: self_qkv −38% (deterministic), tiny.en 5-min e2e ~6% (all runs), large ~3% (all runs), BIT-IDENTICAL. A DIFFERENT primitive (weight fusion), not thread tuning.
 
 **Land-or-dig result: LAND — a structural decode lever (fused Q/K/V) measured a consistent
