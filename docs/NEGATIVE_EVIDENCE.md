@@ -3,6 +3,48 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: ~0-GAIN (REVERTED) + RETRACTION — the "RAYON=12 −10.5% decode" lead was a CONTENTION ARTIFACT. Implemented a bit-exact free-file scoped decode pool (`FW_DECODE_THREADS`, decode.rs) to capture it WITHOUT touching held files — but the A/B shows it ~0-gain, and the prior "win" does NOT reproduce (RAYON=12 now HURTS). Reverted; the two prior pool-lead entries below are RETRACTED.
+
+**Land-or-dig result: DIG → built the clean free-file form of the pool lever, MEASURED it, found the
+underlying lead was a contention artifact → REVERT (per "REVERT ~0-gain").** AGENT_NAME=TealVireo.
+Intellectual-honesty correction of my own prior two entries.
+
+### What was built (and works, just doesn't help)
+`forward_step_pooled` wraps the decode loop's `decoder::forward_step` in a dedicated rayon pool
+(`FW_DECODE_THREADS=N`, default off = unchanged global path) — `install()` from the FREE `decode.rs`,
+no held-file edit, no-op cancel hook inside (between-token `checkpoint()?` still bounds cancellation).
+Compiles clean (`DecoderState: Send`, `DecoderWeights: Sync`); CONFORMANCE GREEN both modes
+(`native_engine::decode` 47/0 default AND `FW_DECODE_THREADS=12` — bit-exact, exact-transcript gate).
+
+### The A/B that killed it (interleaved, gated_e2e_jfk `decode_loop`, CURRENT machine load)
+```text
+A default (global 16)            127  130  124  126  127  128   mean 127.3 ms
+B FW_DECODE_THREADS=12 (scoped)  128  126  129  126  130  127   mean 127.5 ms  ⇒ ~0-gain vs A
+C RAYON_NUM_THREADS=12 (global)  158  155  157  157  162  153   mean 156.7 ms  ⇒ now WORSE than A
+```
+Compare to my PRIOR turns: default `decode_loop` was ~196–210 ms and RAYON=12 ~175–193 ms (RAYON=12
+"better"). Now default is ~127 ms and RAYON=12 ~157 ms (RAYON=12 WORSE). The default dropped ~36%
+and the sign of the RAYON=12 effect FLIPPED — purely from machine state (shared 64-thread box, other
+agents' load varies). ⇒ the prior 6/6-interleaved "RAYON=12 −10.5%" was a CONTENTION ARTIFACT, not an
+intrinsic memory-bandwidth effect. At lower load, fewer threads simply means less parallelism = slower.
+
+### Lessons (retraction)
+- **RETRACT** the two entries immediately below (`87911c1` pool LEAD, `2acaec1` SHARPEN): the premise
+  ("m=1 decode is over-threaded at pool 16") does not hold under varying load; interleaving controls
+  for slow drift but NOT for the load regime, which shifts the optimum.
+- **Do NOT thread-tune the decode by wall-clock on this shared box** — `decode_loop` swings ~36% with
+  background load; only a contention-invariant measure (perf instructions on an isolated box) could
+  settle it, and the likely answer is "default 16 is fine." `RAYON_NUM_THREADS` remains the operator
+  knob. The `FW_DECODE_THREADS` plumbing was reverted (no default benefit, dead complexity).
+- bd-b4hp's residual gap is NOT a thread-count lever. It remains the structural decode work
+  (scratch-arena / fewer per-token allocs), per the component attribution. 0 net source delta.
+- **UNBLOCKING:** as of this turn the other agent's decode work began LANDING on main — `57910a4`
+  (f16 cross-attention K/V for the per-step decoder cross path, bd-b4hp; `decoder.rs`+74/`nn.rs`+25).
+  The decode path is no longer fully coordination-blocked; the next turn should RE-MEASURE the vs-ORIG
+  decode/token ratio on a quiet box (the 36% swing above means re-baseline first) and resume the
+  structural decode lever now that those files are committed.
+
+### (RETRACTED — kept for the audit trail) prior pool lead
 ## 2026-06-29 - TealVireo: LEAD SHARPENED — the rayon-pool decode win is idle-worker SPIN, NOT per-GEMV over-threading: `FW_WIDE_GEMV_CAP=12` (logits→12, pool stays 16) HURTS (~218 vs ~210 ms), while only `RAYON=12` (pool→12) helps. So the fix is a PARKED/sleeping decode pool (fewer LIVE threads), not cap tuning — confirming the lever lives in held `nn.rs`/`decoder.rs`, not in any per-GEMV knob. 0 source delta.
 
 **Land-or-dig result: DIG sharpened the prior pool lead by isolating the mechanism.** No worktree win
