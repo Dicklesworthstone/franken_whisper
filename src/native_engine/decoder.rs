@@ -305,17 +305,6 @@ fn transpose(m: &Mat) -> Mat {
     )
 }
 
-/// Reinterpret a vector of raw little-endian IEEE-754 half bit patterns as
-/// typed [`ft_core::Float16`] (= `half::f16`). Zero numeric change — each
-/// `from_bits(b)` is the identity on the bit pattern — but it gives the GEMV
-/// kernels a `&[Float16]` so they can use the SIMD bulk `convert_to_f32_slice`
-/// dequant. One-time at model load.
-fn bits_to_halves(bits: &[u16]) -> Vec<ft_core::Float16> {
-    bits.iter()
-        .map(|&b| ft_core::Float16::from_bits(b))
-        .collect()
-}
-
 /// Load a whisper linear layer (`[out, in]` weight) plus an optional `[out]`
 /// bias.
 ///
@@ -338,15 +327,16 @@ fn load_linear(
             .is_some_and(|t| t.dtype == crate::native_engine::GgmlDType::F16);
 
     let w = if want_f16 {
-        // Natural [out, in] f16 bits — skip the transpose entirely.
-        let (shape, data) = model.tensor_f16(weight_name)?;
+        // Natural [out, in] f16 bits — skip the transpose entirely. Decode the
+        // raw bytes straight to f16-resident `Vec<Float16>` in one parallel pass.
+        let (shape, data) = model.tensor_f16_halves(weight_name)?;
         if shape != [out_dim, in_dim] {
             return Err(FwError::InvalidRequest(format!(
                 "decoder f16 tensor '{weight_name}' shape {shape:?} != expected [{out_dim}, {in_dim}]"
             )));
         }
         WeightMat::F16 {
-            data: bits_to_halves(&data),
+            data,
             out: out_dim,
             inp: in_dim,
         }
@@ -379,14 +369,14 @@ fn load_embedding(
             .tensor(name)
             .is_some_and(|t| t.dtype == crate::native_engine::GgmlDType::F16);
     if want_f16 {
-        let (shape, data) = model.tensor_f16(name)?;
+        let (shape, data) = model.tensor_f16_halves(name)?;
         if shape != [n_vocab, n_state] {
             return Err(FwError::InvalidRequest(format!(
                 "decoder f16 tensor '{name}' shape {shape:?} != expected [{n_vocab}, {n_state}]"
             )));
         }
         Ok(WeightMat::F16 {
-            data: bits_to_halves(&data),
+            data,
             out: n_vocab,
             inp: n_state,
         })

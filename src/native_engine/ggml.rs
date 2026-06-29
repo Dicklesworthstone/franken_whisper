@@ -423,6 +423,48 @@ impl GgmlModel {
             .collect();
         Ok((entry.shape.clone(), bits))
     }
+
+    /// Like [`Self::tensor_f16`] but converts the raw f16 bytes DIRECTLY to
+    /// `Vec<Float16>` in one PARALLEL pass — no intermediate `Vec<u16>` and no
+    /// serial follow-up conversion.
+    ///
+    /// This is the f16-resident decoder load path. The big `[n_vocab, n_state]`
+    /// token embedding (~133 MB for large-v3) dominated decoder load when it was
+    /// copied twice serially (`tensor_f16` → `bits_to_halves`); a single
+    /// threaded pass recovers idle memory bandwidth. Bit-identical: each
+    /// `Float16` is `from_bits(le u16)` of the same byte pair in the same flat
+    /// order. Errors identically to [`Self::tensor_f16`] (unknown / f32-stored /
+    /// size-mismatched tensors).
+    pub fn tensor_f16_halves(&self, name: &str) -> FwResult<(Vec<usize>, Vec<Float16>)> {
+        let entry = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| FwError::InvalidRequest(format!("unknown tensor '{name}'")))?;
+        if entry.dtype != GgmlDType::F16 {
+            return Err(FwError::InvalidRequest(format!(
+                "tensor '{name}' is stored as f32, not f16; use tensor_f32 \
+                 (f16-compute path applies only to f16-stored tensors)"
+            )));
+        }
+        let raw = self
+            .blob
+            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
+            .ok_or_else(|| {
+                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
+            })?;
+        let n_elements = entry.n_elements();
+        if raw.len() != n_elements * 2 {
+            return Err(FwError::InvalidRequest(format!(
+                "tensor '{name}' f16 byte length {} != {} elements * 2",
+                raw.len(),
+                n_elements
+            )));
+        }
+        Ok((
+            entry.shape.clone(),
+            dequant_f16_to_halves_parallel(raw, n_elements),
+        ))
+    }
 }
 
 /// Read an entire file into one `Vec<u8>` using SEVERAL threads, each issuing
@@ -510,6 +552,39 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::
         }
     }
     Ok(())
+}
+
+/// Convert a little-endian f16 byte stream to `Vec<Float16>` (the f16-resident
+/// representation), splitting large tensors across threads. Each
+/// `Float16::from_bits` is a pure bit reinterpret and chunk boundaries are
+/// element-aligned, so the result is bit-identical to the serial loop regardless
+/// of thread count. Mirrors [`dequant_f16_parallel`] but keeps f16 (half the
+/// output bytes — a near-`memcpy`), so it scales to more workers.
+fn dequant_f16_to_halves_parallel(raw: &[u8], n_elements: usize) -> Vec<Float16> {
+    const PAR_THRESHOLD: usize = 1 << 20; // 1M elements: below this, serial wins.
+    let serial = |bytes: &[u8], out: &mut [Float16]| {
+        let (chunks, remainder) = bytes.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        for (c, o) in chunks.iter().zip(out.iter_mut()) {
+            *o = Float16::from_bits(u16::from_le_bytes(*c));
+        }
+    };
+    let mut values = vec![Float16::from_bits(0); n_elements];
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(16);
+    if n_elements < PAR_THRESHOLD || workers < 2 {
+        serial(raw, &mut values);
+        return values;
+    }
+    let chunk = n_elements.div_ceil(workers);
+    std::thread::scope(|s| {
+        for (bytes, out) in raw.chunks(chunk * 2).zip(values.chunks_mut(chunk)) {
+            s.spawn(move || serial(bytes, out));
+        }
+    });
+    values
 }
 
 /// Dequantize a little-endian f16 byte stream to `f32`, splitting large

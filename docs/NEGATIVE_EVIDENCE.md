@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: LANDED — PARALLEL one-pass f16 decoder weight load (`tensor_f16_halves`) = 2.20× on the token-embedding load (135→61 ms)
+
+**Land-or-dig result: DIG → a NEW lever, MEASURED + LANDED.** AGENT_NAME=cc. Third
+cold-start LOAD lever. After the parallel read + encoder fusion, the decoder `from_ggml`
+(~305 ms) was the next phase. The decoder is f16-resident (no transpose), but it loaded
+each f16 weight in TWO serial passes: `tensor_f16` (bytes→`Vec<u16>`) then
+`bits_to_halves` (`Vec<u16>`→`Vec<Float16>`). For the `[n_vocab, n_state]` token
+embedding (66.4 M elems = 133 MB, loaded ONCE outside any layer loop, fully serial)
+that's two serial 133 MB copies — the bulk of decoder load.
+
+**Fix:** `ggml::tensor_f16_halves` reads the raw f16 bytes DIRECTLY to `Vec<Float16>` in
+ONE pass, parallelized across 16 `thread::scope` workers
+(`dequant_f16_to_halves_parallel`, mirroring `dequant_f16_parallel`). No intermediate
+`Vec<u16>`, no serial follow-up. The now-dead `bits_to_halves` is removed. Bit-identical
+(each `Float16::from_bits(le u16)`, element-aligned bands, same flat order).
+
+**MEASURED (token embedding `[51865×1280]` = 133 MB, best of 9, interleaved A/B, same
+box contention; `examples/model_load_probe.rs`):**
+
+| token-embedding load | best |
+| --- | ---: |
+| old two-pass (`tensor_f16` + serial convert) | 135.5 ms |
+| **new one-pass parallel (`tensor_f16_halves`)** | **61.5 ms** |
+
+⇒ **2.20×**, byte-IDENTICAL (asserted all 66,388,480 f16 elements equal). Decoder
+`from_ggml` ~305→~231 ms.
+
+**Cumulative cold-start LOAD (large-v3-turbo, warm), all three cc levers stacked:**
+parse 1359→~120 ms (parallel read) + encoder 832→342 ms (fused dequant-transpose) +
+decoder 305→~231 ms ⇒ **~2.5 s → ~0.69 s total model load (~3.6×)** — franken now loads
+at/under whisper.cpp (~0.9 s), erasing the last cold-start deficit.
+
+**Conformance GREEN:** byte-identity asserted in-probe; `native_engine::ggml` **15/0**,
+`decoder` **10/0**; rustfmt + clippy clean. Compute path untouched.
+
+Files (mine only): `src/native_engine/ggml.rs` (`tensor_f16_halves` + parallel
+converter), `src/native_engine/decoder.rs` (use it; drop `bits_to_halves`),
+`examples/model_load_probe.rs`.
+
 ## 2026-06-29 - cc: LANDED — PARALLEL model-blob read (safe `read_at`) = 10.4× on the biggest load phase (1.5 GB read 1254→120 ms); full warm model load ~2.46→0.76 s
 
 **Land-or-dig result: DIG → a NEW different-primitive lever, MEASURED + LANDED.**

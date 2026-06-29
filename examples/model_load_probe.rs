@@ -10,8 +10,6 @@
 
 use std::time::Instant;
 
-use franken_whisper::native_engine::decoder::DecoderWeights;
-use franken_whisper::native_engine::encoder::EncoderWeights;
 use franken_whisper::native_engine::find_model_file;
 use franken_whisper::native_engine::ggml::{self, GgmlModel};
 
@@ -52,20 +50,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("run {r}: serial fs::read {ser_ms:.1} ms | parallel read_at {par_ms:.1} ms");
     }
 
-    // Post-fix from_ggml phases (context).
-    let ggml_model = GgmlModel::load(&path)?;
-    let t = Instant::now();
-    let enc = EncoderWeights::from_ggml(&ggml_model)?;
-    let enc_ms = t.elapsed().as_secs_f64() * 1e3;
-    std::hint::black_box(&enc);
-    let t = Instant::now();
-    let dec = DecoderWeights::from_ggml(&ggml_model)?;
-    let dec_ms = t.elapsed().as_secs_f64() * 1e3;
-    std::hint::black_box(&dec);
-
     eprintln!(
-        "BEST ({model}): serial_read {ser_best:.1} ms | parallel_read {par_best:.1} ms | ratio {:.2}x | (encoder_from_ggml {enc_ms:.1} | decoder_from_ggml {dec_ms:.1})",
+        "BEST READ ({model}): serial_read {ser_best:.1} ms | parallel_read {par_best:.1} ms | ratio {:.2}x",
         ser_best / par_best
+    );
+
+    // ── Decoder token-embedding f16 load A/B (the [n_vocab, n_state] tensor that
+    // dominates decoder load): OLD two-pass (tensor_f16 bytes->Vec<u16> then a
+    // serial second copy, == bits_to_halves cost) vs NEW one-pass parallel
+    // tensor_f16_halves. Interleaved, best-of-N, same contention; bytes asserted.
+    let ggml_model = GgmlModel::load(&path)?;
+    let emb = "decoder.token_embedding.weight";
+    let base0 = ggml_model.tensor_f16(emb)?.1; // Vec<u16>
+    let cand0 = ggml_model.tensor_f16_halves(emb)?.1; // Vec<Float16>
+    let cand0_bits: Vec<u16> = cand0.iter().map(|h| h.to_bits()).collect();
+    assert_eq!(
+        cand0_bits, base0,
+        "tensor_f16_halves diverged from tensor_f16"
+    );
+    eprintln!(
+        "token-embedding byte-identity: OK ({} f16 elems)",
+        base0.len()
+    );
+    drop((base0, cand0, cand0_bits));
+
+    let (mut old_best, mut new_best) = (f64::INFINITY, f64::INFINITY);
+    for _ in 0..runs {
+        let t = Instant::now();
+        let b = ggml_model.tensor_f16(emb)?.1; // serial bytes->u16
+        let conv: Vec<u16> = b.iter().copied().collect(); // serial 2nd pass (== bits_to_halves traffic)
+        let old_ms = t.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box((b.len(), conv.len()));
+
+        let t = Instant::now();
+        let c = ggml_model.tensor_f16_halves(emb)?.1; // one parallel pass
+        let new_ms = t.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(c.len());
+
+        old_best = old_best.min(old_ms);
+        new_best = new_best.min(new_ms);
+    }
+    eprintln!(
+        "BEST TOKEN-EMB LOAD ({model}): old two-pass {old_best:.1} ms | new parallel {new_best:.1} ms | ratio {:.2}x",
+        old_best / new_best
     );
     Ok(())
 }
