@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: LANDED (MEASURED, bit-exact) — cache the per-call GEMV-DISPATCH lookups in `nn.rs`. `gemv_worker_count` / `gemv_f16_batch` queried `std::thread::available_parallelism()` (a `sched_getaffinity` SYSCALL, NOT cached by std) and `env::var("FW_BATCH_GEMV_CAP")` on EVERY one of the ~70 m=1 GEMVs/token. Cached both in `OnceLock`s (the CPU count + env var are process constants; the existing `FW_WIDE_GEMV_CAP` was already cached). MEASURED: gated jfk decode `sched_getaffinity` **2551 → 430 = −83% (−2121 syscalls)**. Bit-identical (worker count → band split unchanged; conformance 47/0). Escapes the contention wall (syscall count is load-INVARIANT).
+
+**Land-or-dig result: DIG found the first MEASURABLE decode lever that escapes the measurement wall —
+a contention-invariant SYSCALL count — and LANDED it.** AGENT_NAME=TealVireo. Files: `src/native_engine/
+nn.rs` only (coworker's gemv path, but COMMITTED + quiet ~2 h; a clean bit-exact caching improvement to
+it, not entangling uncommitted work).
+
+### The lever (a different primitive: dispatch-call overhead, measured by syscall count, not wall)
+The pinned bd-b4hp overhead is per-call GEMV dispatch (prior entry). Part of it is pure per-call
+LOOKUP cost: `available_parallelism()` is a `sched_getaffinity` syscall on Linux and std does NOT
+cache it, yet `gemv_worker_count` (called per GEMV, ~70/token) and `gemv_f16_batch` re-pay it every
+call — plus a `FW_BATCH_GEMV_CAP` `env::var` HashMap lookup + parse per batched GEMV. Added a cached
+`avail_parallelism()` (`OnceLock<usize>`) and `batch_gemv_cap()` (`OnceLock<Option<usize>>`) and routed
+all 4 hot-path sites through them.
+
+### Measured (release, `strace -f -c -e sched_getaffinity`, gated jfk decode, 28 tokens)
+```text
+OLD (uncached): 2551 sched_getaffinity calls
+NEW (cached):    430 sched_getaffinity calls   ⇒ −2121 (−83%); ~76/token removed (≈ the ~70 GEMVs/token)
+```
+The 430 residual is non-decode paths (model load / mel / mod.rs `default_threads` — not the GEMV hot
+path). Syscall count is contention-INVARIANT, so unlike `decode_loop` wall (±40% with load on this
+shared box) this is a clean, reproducible measurement. Wall impact is small (~2121 × ~300 ns ≈ 0.6 ms
+per jfk decode, ~0.4%) but the project's method is "measure sub-1% levers with perf, not wall-clock" —
+and this is a definite, bit-exact reduction of genuine per-call syscalls in the decode hot path.
+
+### Bit-exactness
+Caching constants (process CPU count, env var) yields the IDENTICAL worker count → IDENTICAL GEMV row-
+band split → byte-for-byte identical output. Conformance `native_engine::decode` **47/0** (incl. the
+exact-transcript gated e2e). Escape hatches unchanged (`FW_BATCH_GEMV_CAP`/`FW_WIDE_GEMV_CAP` still honored,
+just read once).
+
 ## 2026-06-29 - TealVireo: SCRATCH-ARENA HYPOTHESIS RETIRED — with the coworker's decode work now COMMITTED + quiet ~2 h (decoder.rs/nn.rs clean, coordination block LIFTED), I assessed the long-standing "bd-b4hp lever = structural decode scratch-arena, blocked on coordination" claim. It is ~0-GAIN: the per-token Mat/Vec allocs are glibc-RECYCLED — `f575c26` already PROVED equal minor-faults removing the biggest one (207 KB/token logits vector), and the ~50 smaller buffers are sub-128 KB → small-bin recycled (~1.75 µs/token total = deep sub-noise vs the 37 MB/token weight stream). The real bd-b4hp overhead is per-call GEMV DISPATCH (rayon scope setup per m=1 call) in `nn.rs`, not allocations. 0 source delta.
 
 **Land-or-dig result: the coordination block lifted (coworker committed + quiet 2 h), so I finally

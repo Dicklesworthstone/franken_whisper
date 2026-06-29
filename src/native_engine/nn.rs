@@ -70,12 +70,28 @@ fn meta_2d(rows: usize, cols: usize) -> TensorMeta {
 /// `std::thread::scope` workers, mirroring [`transpose_parallel`]. The cap
 /// keeps us from oversubscribing the (already rayon-parallel) inner sgemm and
 /// matches the empirically-tuned ceiling used elsewhere in this module.
+/// Host parallelism, queried ONCE and cached for the process.
+///
+/// `std::thread::available_parallelism()` is a `sched_getaffinity` syscall on
+/// Linux and is **not** cached by std — every GEMV-dispatch call in the decode
+/// hot path (~70 m=1 GEMVs/token via [`gemv_worker_count`] / [`gemv_f16_batch`])
+/// otherwise re-pays it. The value is a process constant (the kernels are tuned
+/// around it; the `FW_*_GEMV_CAP` overrides are already `OnceLock`-cached), so
+/// caching is bit-identical — the derived worker count, and thus the GEMV band
+/// split, is unchanged.
+fn avail_parallelism() -> usize {
+    use std::sync::OnceLock;
+    static A: OnceLock<usize> = OnceLock::new();
+    *A.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+    })
+}
+
 #[inline]
 pub(crate) fn worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(8)
+    avail_parallelism().min(8)
 }
 
 /// Worker count for the fused-dequant f16 GEMV ([`gemv_f16`] / its batch form),
@@ -109,9 +125,7 @@ pub(crate) fn worker_count() -> usize {
 /// only scheduling changes. The split is purely a performance knob.
 #[inline]
 fn gemv_worker_count(out: usize) -> usize {
-    let avail = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
+    let avail = avail_parallelism();
     // Only the vocab-class GEMV (tens of thousands of rows) is bandwidth-bound
     // enough to want >8 threads; below that the 8-cap wins (see fn docs).
     const WIDE_OUT_THRESHOLD: usize = 1 << 14; // 16384 rows
@@ -133,6 +147,20 @@ fn wide_gemv_cap() -> usize {
             .and_then(|s| s.parse().ok())
             .filter(|&c: &usize| c >= 1)
             .unwrap_or(32)
+    })
+}
+
+/// Cached `FW_BATCH_GEMV_CAP` override (env read ONCE, not per batched-GEMV call).
+/// `None` ⇒ no override; same value the per-call `env::var` returned, so the
+/// derived worker count is unchanged (bit-identical band split).
+fn batch_gemv_cap() -> Option<usize> {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FW_BATCH_GEMV_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&c| c >= 1)
     })
 }
 
@@ -693,14 +721,9 @@ pub fn gemv_f16_batch(
     // Use 16 once the work clears a compute-bound bar; small prefills keep the
     // m=1 cap (`gemv_worker_count`). `FW_BATCH_GEMV_CAP` overrides.
     const COMPUTE_BOUND_MACS: usize = 1 << 26; // ~67M: cross-KV (2.4G) + long prompts
-    let avail = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
+    let avail = avail_parallelism();
     let work = tq.saturating_mul(out).saturating_mul(inp);
-    let workers = std::env::var("FW_BATCH_GEMV_CAP")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&c| c >= 1)
+    let workers = batch_gemv_cap()
         .map(|c| avail.min(c))
         .unwrap_or_else(|| {
             if work >= COMPUTE_BOUND_MACS {
@@ -1581,10 +1604,7 @@ pub(crate) fn transpose_parallel(data: &[f32], rows: usize, cols: usize) -> Vec<
         }
     };
 
-    let workers = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(8);
+    let workers = avail_parallelism().min(8);
     if rows * cols < PAR_THRESHOLD || workers < 2 {
         tile_band(0..rows, &mut out);
         return out;
