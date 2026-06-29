@@ -3,6 +3,23 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: DECODE-KERNEL VERIFIED OPTIMAL (last candidate ruled out) — the tiny.en decode's compute hotspot, the per-row f16-dequant+dot (`nn::dot_f16c`, the GEMV inner loop), ALREADY uses f16c+fma 8-wide intrinsics on the `x86-64-v3` baseline (the box is Zen/AVX2 — no AVX-512, so 8-wide is the f16c ceiling). So the decode-compute kernel is already at its safe SIMD optimum; there is no accessible in-crate decode-compute lever. With the cgroup-walk fix complete crate-wide and the spawn-migration harvested, the in-crate perf space is EXHAUSTED. 0 source delta.
+
+**Land-or-dig result: land-check (no worktree win; coworker quiet) + verified the last accessible
+decode-compute candidate (the f16c dot) is already optimal → no lever.** AGENT_NAME=TealVireo.
+
+### Where each gap stands (so the loop can redirect or wait, not re-tread)
+- DECODE latency gap (tiny.en ~1.5× wc quiet): compute-bound on `dot_f16c` (f16c+fma 8-wide, OPTIMAL
+  for AVX2) + the rayon idle-spin (retired thread-count avenue) + owner-gated softmax `exp`. No
+  accessible in-crate lever; needs the coworker's kernel work (e.g. a different f16-GEMV scheme) or a
+  faster ISA. Large-v3-turbo / realistic remain DOMINATED (3.35× @ 99 s).
+- QUALITY gap (greedy-only vs wc's beam+temp-fallback default, bd-6goy): a real gap but a large feature
+  whose benefit is UNMEASURABLE on the clean-audio conformance suite (greedy passes → no fallback → 0
+  delta), so it cannot be landed under "REVERT ~0-gain" without hard-audio test infra first.
+⇒ The in-crate land-or-dig has converged AGAIN after the syscall-profiling sub-arc (3 wins). Next real
+progress needs the coworker's GEMV kernel, a quiet/dedicated box (for the cycle-level thread-count
+question), or owner sign-off on bd-6goy/exp-approximation. Recommend redirect or wait.
+
 ## 2026-06-29 - TealVireo: PERF-VEIN CONSOLIDATION — the syscall/spawn-profiling vein (contention-invariant, escapes the decode_loop wall) is HARVESTED this session: 3 bit-exact wins + the principle. The cgroup-walk fix is now COMPLETE crate-wide (audited: 0 uncached `available_parallelism` outside the 2 OnceLock helpers). The tiny.en decode gap is COMPUTE-bound on the f16-dequant+dot (coworker's GEMV kernel), not dispatch/alloc/syscall. 0 source delta.
 
 **Land-or-dig result: land-check (no worktree win) + crate-wide audit confirming the accessible perf
