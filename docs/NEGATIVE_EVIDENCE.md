@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: ~0-GAIN (two candidates MEASURED & rejected) — (1) decode ARGMAX over the 51864 vocab is compute/branch-bound (21.9 µs/call, ≫ the ~1 µs L2 floor) BUT only ~0.4–0.8% of decode; the only SAFE reformulation under `#![forbid(unsafe_code)]` (`fold(f32::max)`+`position(==max)`, bit-exact incl. tie→lowest-index) is just ~8% faster (rustc won't vectorize NaN-aware `fmax`) ⇒ sub-noise. (2) `ggml` per-tensor `thread::scope` dequant spawns scale on LARGE cold-load, but tiny tensors go serial (<1M elts), the load arc is closed, and load is at PARITY with wc. Neither is a clean lever. 0 source delta.
+
+**Land-or-dig result: DIG measured the two remaining mine-and-accessible candidates with standalone
+micro-benches; both ~0-gain → rejected (don't re-evaluate).** No worktree win. AGENT_NAME=TealVireo.
+
+### (1) decode argmax — MEASURED (standalone `rustc -O -C target-cpu=native`, 51864 logits ×20000)
+```text
+scalar (`if l > best`):                 20.7 µs/call
+safe maxpos (`fold(max)`+`position`):   19.1 µs/call   (~8% — rustc does NOT auto-vectorize f32::max,
+                                                         which is NaN-aware `fmax`, not `maxps`; 2 passes)
+```
+The argmax is genuinely compute-bound (~22 µs ≫ ~1 µs L2-read floor), but it is only ~0.4–0.8% of the
+per-token decode (forward_step GEMV dominates). A safe (no-unsafe) bit-exact speedup is only ~8%, and
+AVX2 intrinsics are blocked by `#![forbid(unsafe_code)]`. ⇒ ~0-gain on decode; rejected.
+
+### (2) ggml dequant thread-spawn — assessed (not a clean lever)
+`dequant_f16_parallel` / the `Float16` variant `thread::scope`-spawn N OS threads PER tensor >1M elts.
+On large-v3-turbo cold-load that's ~thousands of `clone3` (~30 µs each). BUT: tiny.en tensors are mostly
+<1M elts → serial (no spawn), so the tiny gated test's 381 `clone3` are NOT from dequant; the LOAD arc
+is "exhaustively closed" (prior agents chose `thread::scope` deliberately); and load is at PARITY with
+whisper.cpp (not a vs-ORIG gap). A persistent-pool rewrite risks the tuned concurrent load for a
+non-gap workload. Owner-eval only.
+
+### ⇒ Status (unchanged)
+The clean accessible wins are the two cgroup-walk caches this session (`1e149b2`+`4bf26c9`). Remaining
+decode overhead = rayon idle-spin (retired) + GEMV COMPUTE (coworker's ft_kernel/f16-gemv) + owner-gated
+softmax `exp`. No clean solo in-crate lever left; further progress needs the coworker's GEMM, the
+bd-6goy temp/beam-fallback feature, or a quiet box. 0 source delta.
+
 ## 2026-06-29 - TealVireo: SYSCALL-PROFILING VEIN HARVESTED (rejection) — after the two cgroup-walk caching wins, the remaining decode syscalls are RAYON idle-worker spin (~1.05M `sched_yield` + ~160k `futex` per deterministic 2-transcribe run; ~20% of `perf` samples in the kernel scheduler). It is ~0-gain on the MAIN-thread wall (idle workers spin on OTHER cores; the decode thread's own futex wake/wait is ~2/parallel-GEMV ≈ small) and is the RETIRED thread-count avenue. No franken/dep busy-wait exists (audited). No new clean syscall lever. 0 source delta.
 
 **Land-or-dig result: DIG — `strace -c` + `perf record` profiled the post-caching decode; the dominant
