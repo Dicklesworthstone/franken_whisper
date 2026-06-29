@@ -3,6 +3,28 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - TealVireo: ~REGRESSION (REVERTED) — extending the thread::scope→rayon migration to `gemv_f16_batch` (the encoder's batched GEMM, ~160 spawns/window) cut `clone3` 261→133 (−128) BUT REGRESSED encoder_window ~7% (main warm ~116 ms → ~124 ms). Unlike the cheap `layer_norm`/`gelu` (spawn-bound), the batched GEMV is COMPUTE-bound: the spawn was amortized over the big matmul, and rayon's `into_par_iter` collect/work-stealing overhead EXCEEDS the spawn it replaced. The coworker's `thread::scope` choice for the batched path is correct. Reverted (conformance was 47/0; reverted for the wall regression). 0 source delta.
+
+**Land-or-dig result: DIG extended the (winning) spawn-migration to the biggest remaining clone3
+source, A/B-measured it, found a ~7% REGRESSION → REVERT. clone3 count ≠ wall benefit.** No worktree
+win. AGENT_NAME=TealVireo.
+
+### Measured (release, same-session A/B, deterministic encoder_window, warm)
+```text
+main (a8eeea9, gemv_f16_batch = thread::scope):  117.5/116.1 | 123.1/112.7 | 120.3/119.6 | 125.1/117.0  → ~116 ms
+NEW  (gemv_f16_batch → rayon into_par_iter):      131.9/122.7 | 128.6/123.1 | 124.4/126.7              → ~124 ms (+7%)
+clone3 (gated jfk):  261 → 133 (−128 spawns)      ← real, but does NOT translate to a wall win
+```
+### The principle (why this differs from the layer_norm/gelu WIN it follows)
+Spawn migration helps ONLY when the op is SPAWN-BOUND — cheap O(elements) ops (layer_norm ~µs, gelu)
+where the ~20-30 µs `thread::scope` spawn dominates the compute. `gemv_f16_batch` is COMPUTE-bound (a
+[1500,384]×[384,384]-class matmul, ~ms); the spawn is a small amortized fraction, and rayon's
+`into_par_iter` (Vec-of-ranges collect + work-stealing + Vec<parts> collect) costs MORE than the
+`thread::scope` direct handles it replaced. This validates the existing split: m=1 `gemv_f16` → rayon
+(`628`, dispatch-bound), batched `gemv_f16_batch` → `thread::scope` (`744`, compute-bound). DON'T
+migrate the batched GEMM. The clone3 storm there is benign (amortized). The spawn-migration vein is
+now harvested: only the cheap encoder ops (layer_norm/gelu, landed `a8eeea9`) qualified.
+
 ## 2026-06-29 - TealVireo: LANDED (MEASURED, bit-exact) — encoder `layer_norm`/`gelu` spawned N OS threads PER CALL via `std::thread::scope` (~12 layer_norms + ~4 gelus per encoder window × ~8 bands ≈ a `clone3` storm). Migrated both to rayon's PERSISTENT pool (`par_chunks_mut` — same contiguous band split ⇒ byte-identical). MEASURED: gated jfk `clone3` **381 → 261 (−120, −31%)**; encoder_window OLD **124–228 ms (noisy — spawn storm spikes under load)** → NEW **119–125 ms (stable)**; ~4% faster warm AND far more contention-ROBUST. Conformance 47/0.
 
 **Land-or-dig result: DIG — `strace -e clone3` found the decode-path was SERIAL (no spawn) but the
