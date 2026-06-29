@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: LANDED (MEASURED) — FUSED QKV projection (one `[3·n_state, n_state]` GEMV/layer instead of 3 calls + 2 OS-thread spawns) shrinks the bd-b4hp tiny long-form decode gap: self_qkv −38% (deterministic), tiny.en 5-min e2e ~6% (all runs), large ~3% (all runs), BIT-IDENTICAL. A DIFFERENT primitive (weight fusion), not thread tuning.
+
+**Land-or-dig result: LAND — a structural decode lever (fused Q/K/V) measured a consistent
+win on BOTH models, bit-identical, conformance GREEN.** AGENT_NAME=BlackThrush.
+
+### The lever (different primitive: weight fusion / batched projection)
+The self-attention Q/K/V are three independent projections of the same input. The f16 decode
+path ran them as **three separate `gemv_f16_batch` calls + two `std::thread::scope` OS-thread
+spawns** per layer per token (`project_qkv`). [`fuse_qkv`] now concatenates the three f16
+weights into ONE `[3·n_state, n_state]` weight (+ fused bias `[q_b | 0 | v_b]`) at load
+(`build_layer`); `project_qkv` issues **one GEMV** then splits each output row's `[3·n_state]`
+into q|k|v. Bit-identical: each fused output row is the same `dot(W_row, x)+bias` as the
+separate projection — concatenation changes neither the per-row `dot8` order nor the bias.
+Escape hatch `FW_NO_QKV_FUSE=1`; the f32 path keeps the separate projections.
+
+### Measured (deterministic per-sub-part accumulator + interleaved e2e A/B, `FW_NO_QKV_FUSE` toggle)
+```text
+self_qkv_proj sub-part (tiny.en 5min, take_sub_ns): OLD 904.6 ms (16.6%) -> NEW 556.5 ms (11.0%)  = -38%
+forward_step SUM (tiny.en 5min):                    OLD 5447.8 ms        -> NEW 5057.5 ms          = -7.2%
+
+tiny.en 5min e2e (transcribe, interleaved x3):  OLD 7.174/6.853/6.847 s -> NEW 6.432/6.473/6.391 s  (NEW faster ALL runs, ~6%)
+large-v3-turbo 2min e2e (interleaved x2):       OLD 22.990/22.854 s     -> NEW 22.159/22.114 s       (NEW faster ALL runs, ~3%)
+```
+**vs ORIG (whisper.cpp greedy):** tiny.en 5-min was 6.9 s vs whisper.cpp 3.71 s = 1.86× slower;
+now ~6.43 s = **~1.73× slower** — closes ~6% of the bd-b4hp gap. large-v3-turbo stays a WIN and
+improves. The win holds on both models because the fusion removes per-CALL GEMV overhead + the
+OS-thread spawns regardless of size (large's fused GEMV also parallelizes better over 3·1280
+rows). Conformance GREEN (`conformance_comparator_tests`) — bit-identical decode path.
+
+### Why this worked where the prior point-fixes didn't
+Last turns: mlp `PAR_THRESHOLD` (+2.3%) and `project_qkv` scope→`rayon::join` (+2.6%, one run
+regressed) were ~0-gain because they only swapped HOW the 3 separate calls dispatched.
+Fusion removes the separate calls ENTIRELY (3 GEMV-call setups + 2 spawns → 1 GEMV), so it
+cuts the per-op overhead the attribution flagged as diffuse. Remaining bd-b4hp headroom is the
+same fusion idea applied to the other m=1 sub-parts (cross-attn heads, mlp) + a planned/arena
+decode graph.
+
 ## 2026-06-29 - BlackThrush: ~0-GAIN (REVERTED) — bd-b4hp decode overhead is DIFFUSE across sub-parts (mlp 32% / cross_attn 19.5% / self_qkv 14.5% / logits 14%); no single-lever fix clears noise. `project_qkv` scope→rayon::join = +2.6% (sub-noise, one run regressed), reverted. Needs a STRUCTURAL decode change, not point fixes. 0 source delta.
 
 **Land-or-dig result: DIG got a precise per-sub-part attribution of the bd-b4hp tiny

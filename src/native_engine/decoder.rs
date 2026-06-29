@@ -219,6 +219,11 @@ struct DecoderLayer {
     /// Self-attention key projection — **no bias** in whisper.
     attn_k: Linear,
     attn_v: Linear,
+    /// Fused `[3*n_state, n_state]` Q|K|V projection (f16 path only): lets a
+    /// per-token step issue ONE GEMV instead of three. `None` on the f32 path or
+    /// any shape mismatch, in which case `project_qkv` falls back to the separate
+    /// concurrent projections. Built by [`fuse_qkv`]. bd-b4hp.
+    attn_qkv: Option<Linear>,
     attn_out: Linear,
 
     cross_attn_ln: LayerNorm,
@@ -441,7 +446,7 @@ impl DecoderWeights {
         // it (measured 1.27× on large-v3-turbo). Each layer is independent.
         let build_layer = |i: usize| -> FwResult<DecoderLayer> {
             let p = format!("decoder.blocks.{i}");
-            Ok(DecoderLayer {
+            let mut layer = DecoderLayer {
                 attn_ln: load_layer_norm(model, &format!("{p}.attn_ln"), n_state)?,
                 attn_q: load_linear(
                     model,
@@ -464,6 +469,7 @@ impl DecoderWeights {
                     n_state,
                     n_state,
                 )?,
+                attn_qkv: None, // populated below once q/k/v exist
                 attn_out: load_linear(
                     model,
                     &format!("{p}.attn.out.weight"),
@@ -515,7 +521,9 @@ impl DecoderWeights {
                     n_state,
                     mlp_hidden,
                 )?,
-            })
+            };
+            layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v);
+            Ok(layer)
         };
         // Spread the layers across rayon when there are FEW of them: each
         // `build_layer` still uses ≤16 within-weight workers (`thread::scope`), so
@@ -1068,7 +1076,14 @@ pub fn forward_step(
         // Each `forward` is unchanged, so the outputs are bit-identical.
         let (q, k, v) = timed!(
             Sub::SelfQkv,
-            project_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v, &h)?
+            project_qkv(
+                layer.attn_qkv.as_ref(),
+                &layer.attn_q,
+                &layer.attn_k,
+                &layer.attn_v,
+                w.n_state,
+                &h,
+            )?
         );
         let attn = timed!(
             Sub::SelfAttn,
@@ -1219,20 +1234,90 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
 /// serially. Each [`Linear::forward`] is the unchanged matmul, so the results
 /// are bit-identical to computing them in sequence. `k` returns first in the
 /// tuple-build order but ordering is irrelevant (disjoint outputs).
+/// Concatenate the three self-attention Q/K/V f16 projections into one
+/// `[3*n_state, n_state]` weight (+ fused bias `[q_b | 0 | v_b]`), so a per-token
+/// step issues ONE GEMV instead of three calls plus two OS-thread spawns.
+///
+/// Returns `None` unless all three are F16-resident with matching `inp`/`out`
+/// (the f32 path keeps the separate matmuls). Bit-identical: each fused output
+/// row is the same `dot(W_row, x) + bias` as the matching separate projection —
+/// concatenation changes neither the per-row [`dot8`] order nor the bias.
+/// bd-b4hp (BlackThrush, 2026-06-29).
+fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
+    let f16 = |w: &WeightMat| match w {
+        WeightMat::F16 { data, out, inp } => Some((data.clone(), *out, *inp)),
+        WeightMat::F32(_) => None,
+    };
+    let (qd, qo, qi) = f16(&q.w)?;
+    let (kd, ko, ki) = f16(&k.w)?;
+    let (vd, vo, vi) = f16(&v.w)?;
+    if qi != ki || qi != vi || qo != ko || qo != vo {
+        return None;
+    }
+    let (inp, out) = (qi, qo + ko + vo);
+    let mut data = Vec::with_capacity(qd.len() + kd.len() + vd.len());
+    data.extend_from_slice(&qd);
+    data.extend_from_slice(&kd);
+    data.extend_from_slice(&vd);
+    let mut bias = vec![0.0f32; out];
+    if let Some(b) = &q.bias {
+        bias[..qo].copy_from_slice(b);
+    }
+    if let Some(b) = &k.bias {
+        bias[qo..qo + ko].copy_from_slice(b);
+    }
+    if let Some(b) = &v.bias {
+        bias[qo + ko..].copy_from_slice(b);
+    }
+    Some(Linear {
+        w: WeightMat::F16 { data, out, inp },
+        bias: Some(bias),
+    })
+}
+
+/// Escape hatch `FW_NO_QKV_FUSE=1` forces the legacy separate-projection path.
+fn qkv_fuse_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FW_NO_QKV_FUSE").is_some())
+}
+
 fn project_qkv(
+    fused: Option<&Linear>,
     q_lin: &Linear,
     k_lin: &Linear,
     v_lin: &Linear,
+    n_state: usize,
     h: &Mat,
 ) -> FwResult<(Mat, Mat, Mat)> {
-    // Two workers + the current thread: k and v on spawned threads while q
-    // computes here, so all three run concurrently.
-    // NB (bd-6qih, BlackThrush): serializing these for tiny.en was MEASURED ~0 at
-    // e2e (566 vs 571 ms, p=0.55) — the L9 MLP-threshold fix already captured the
-    // decoder's spawn-bound win, and `project_qkv`'s contention doesn't bite in
-    // the real e2e (decode interspersed with mel/encode) the way it did in
-    // decoder_attrib's tight loop. Kept concurrent because it helps large models
-    // (the 3 projections are [1280,1280]=1.6 M MACs each there).
+    // Fused f16 path: one GEMV over the `[3*n_state, n_state]` weight, then split
+    // each output row's `[3*n_state]` into q|k|v `[n_state]`. Bit-identical to the
+    // separate projections (same per-row dot + bias), and no per-call OS-thread
+    // spawn. bd-b4hp.
+    if let Some(qkv) = fused {
+        if !qkv_fuse_disabled() {
+            let out = qkv.forward(h)?; // [tq, 3*n_state]
+            let tq = out.rows;
+            let mut qd = Vec::with_capacity(tq * n_state);
+            let mut kd = Vec::with_capacity(tq * n_state);
+            let mut vd = Vec::with_capacity(tq * n_state);
+            for r in 0..tq {
+                let base = r * 3 * n_state;
+                qd.extend_from_slice(&out.data[base..base + n_state]);
+                kd.extend_from_slice(&out.data[base + n_state..base + 2 * n_state]);
+                vd.extend_from_slice(&out.data[base + 2 * n_state..base + 3 * n_state]);
+            }
+            return Ok((
+                Mat::from_vec(tq, n_state, qd),
+                Mat::from_vec(tq, n_state, kd),
+                Mat::from_vec(tq, n_state, vd),
+            ));
+        }
+    }
+
+    // Fallback (f32 path / fusion disabled): k and v on spawned threads while q
+    // computes here, so all three run concurrently. Kept for the f32 path and as
+    // the `FW_NO_QKV_FUSE` escape hatch.
     std::thread::scope(|s| {
         let kh = s.spawn(|| k_lin.forward(h));
         let vh = s.spawn(|| v_lin.forward(h));
@@ -1314,6 +1399,7 @@ mod tests {
                 attn_q: lin(&mut rng, N_STATE, N_STATE, true),
                 attn_k: lin(&mut rng, N_STATE, N_STATE, false),
                 attn_v: lin(&mut rng, N_STATE, N_STATE, true),
+                attn_qkv: None,
                 attn_out: lin(&mut rng, N_STATE, N_STATE, true),
                 cross_attn_ln: ln(&mut rng),
                 cross_attn_q: lin(&mut rng, N_STATE, N_STATE, true),
