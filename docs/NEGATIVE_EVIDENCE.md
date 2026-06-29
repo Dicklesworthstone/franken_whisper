@@ -3,6 +3,26 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - cc: MULTI-WINDOW CONFORMANCE validated — franken transcript ≈ whisper.cpp on the real 124.5 s speech (≈3% WER, within the greedy-vs-beam gate). The ~1.12× multi-window win is on CORRECT output.
+
+**Land-or-dig result: completed the multi-window evidence — validated CORRECTNESS of the
+realistic-audio win (a fast wrong transcript is not dominance). Ships the
+`FW_PROBE_TRANSCRIPT` flag on `realistic_e2e_probe`; 0 engine delta.** AGENT_NAME=cc.
+
+Diffed franken vs whisper.cpp joined transcripts on
+`sample_audio_files/example_audio_track_01.mp3` (124.5 s, 5 windows; both lower-cased,
+punctuation-stripped). **Substantially identical** — franken 1337 chars vs whisper.cpp
+1407, ~8 word-level diffs over ~250 words (≈3% WER, well under the
+`NATIVE_ROLLOUT_MAX_WER` 0.10 gate). All diffs are the documented greedy-vs-beam
+behaviour (DISC-003): whisper.cpp (beam) keeps a few more filler `uh`/`um`; franken
+(greedy) renders `frankensearch`/`franco` vs `franken search`/`franca` and one
+`it's to`→`you do`. Core content matches verbatim.
+
+⇒ The realistic multi-window speedup (~1.12×, prior entry) is on a CORRECT, faithful
+transcript — the dominance is real, not a fast-but-wrong artifact. franken_whisper's
+realistic-workload dominance is now MEASURED on BOTH speed and correctness, single- and
+multi-window. 0 engine delta (probe flag only).
+
 ## 2026-06-29 - cc: REALISTIC MULTI-WINDOW e2e (real 124.5 s speech MP3, 5 windows) — franken WINS ~1.1–1.27× vs whisper.cpp; decode-heavy content dilutes the encoder lead (decode is the limiting factor).
 
 **Land-or-dig result: measured the realistic MULTI-WINDOW workload — all prior

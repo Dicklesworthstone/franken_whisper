@@ -73,5 +73,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         decode_ms + load_ms + trans_ms,
         out.segments.len()
     );
+    // Emit the joined transcript on stdout for a conformance diff vs whisper.cpp.
+    if std::env::var("FW_PROBE_TRANSCRIPT").is_ok() {
+        let text: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{text}");
+    }
     Ok(())
 }
