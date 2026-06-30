@@ -3,6 +3,47 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: REJECTED (regression) — pre-dequantize cache-resident weights to f32 (skip per-token `vcvtph2ps`) is **1.41× SLOWER**; the decode GEMV is LOAD-bound, not cvtph-bound.
+
+**Land-or-dig result: land-check clean (the 2-row win already landed at 50059ef; all worktree
+deltas are known non-wins — `cod-b-log10-land` owner-gated, `icywren-simdaccum-reject` rejected,
+`cod-a-l14-validate` = REJECTED ~0 + closed thread-count avenue) → DIG → measured negative → reverted.**
+AGENT_NAME=BlackThrush.
+
+### Hypothesis (from the 2-row landing's IPC profile, now FALSIFIED)
+After landing `dot_f16c_2row` (1.29×), the attn `[384,384]` kernel sat at IPC 3.2 (~46% of single-core
+FMA peak). The standing guess was "cvtph-throughput-bound": the f16 GEMV re-runs `vcvtph2ps` on the SAME
+attn/MLP weights every token, and there is no AVX512-FP16 on this box (no native f16 FMA), so the only way
+to skip cvtph is to pre-dequantize the cache-resident weights to f32 once at load and use a pure-f32 2-row
+dot. Hypothesis: that lifts the per-token attn/QKV/MLP GEMVs ~2×.
+
+### Measurement (perf stat, interleaved f16-2row vs f32-2row, attn [384,384], 20000 iters x5)
+A fair f32 analog of `dot_f16c_2row` (4 chains/row, shared `x` loads, `_mm256_loadu_ps` weights, NO
+cvtph; checksum bit-matches the f16 path on the probe data) over PRE-dequantized f32 weights:
+```
+                instructions        cycles        wall      IPC
+  f16 2-row     1,477 M            ~465 M        ~0.121 s   3.18   (landed path)
+  f32 2-row       934 M  (-37%)    ~668 M (+43%) ~0.171 s   1.40   (pre-dequant)
+```
+The f32 kernel retires **37% FEWER instructions** (no cvtph) yet runs **1.41× SLOWER** (cycles & wall),
+collapsing IPC 3.18→1.40. Reason: f32 weights are **2× the bytes** (590 KB vs 295 KB for `[384,384]`), so
+the kernel becomes **load/L2-bandwidth-bound** — the extra weight traffic dwarfs the cvtph saving, and on
+the f16 path the cvtph work hides under the load latency (cvtph is effectively free here).
+
+### Consequences (do not re-tread)
+1. The cache-resident decode GEMV is **LOAD-bound, not compute/cvtph-bound**. f16 storage is a **speed
+   win**, not just a memory win — halving weight bytes matters more than the dequant cost. This is the
+   same reason the 40-130 MB logits stream MUST stay f16/single-row.
+2. Pre-dequant-to-f32 (blanket or for cache-resident weights) is **rejected on speed alone**, before even
+   counting its prohibitive memory cost (~2× model size → unacceptable for the dominant large-v3-turbo).
+3. The landed `dot_f16c_2row` is therefore **near-optimal for these shapes**: load-bound, f16-narrow,
+   register-blocked to share `x`. Further per-row register blocking won't help (cvtph/compute is already
+   hidden; the bottleneck is weight load bandwidth, fixed by the f16 byte count). NOT a "ceiling" claim —
+   a specific load-bound profile result for the `[n_state,n_state]` decode projections.
+4. Next genuinely-new vein to probe (unmeasured): the mlp/logits **rayon dispatch** cost per GEMV call
+   (IPC ~0.4 under load) — but that is the load-dependent thread-count avenue (closed on shared boxes);
+   only re-open on a QUIET box, and as a per-call DISPATCH-amortization refactor, not a thread-count knob.
+
 ## 2026-06-29 - BlackThrush: WIN LANDED — 2-row register-blocked f16 GEMV (`dot_f16c_2row`) = **1.29× on the serial attention/QKV projection kernel**, bit-exact, the lever SlateHeron flagged.
 
 **Land-or-dig result: the uncommitted working-tree change WAS a measured win → bench-verified → LANDED.**
