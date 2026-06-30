@@ -3,6 +3,53 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: PROFILE + REJECTED (regression) — extending the bandwidth-class wide GEMV cap (32 workers) to the MLP/QKV decode GEMVs is **+30–33% SLOWER** on those components; band-granularity (rows/band), not byte volume, gates the wide cap.
+
+**Land-or-dig result: land-check clean → profiled the real decode gap vs ORIG → DUG the biggest
+component (MLP) → measured REGRESSION → reverted.** AGENT_NAME=BlackThrush. Bit-identical change
+(worker count is order-preserving), so this was a pure perf knob; rejected on speed.
+
+### The profile (the reusable artifact — real `large-v3-turbo`, `decoder_attrib`, 150 steps, WITH the landed 2-row kernel)
+Per-token decode attribution (n_state=1280, n_head=20, **n_layer=4**, n_vocab=51866, enc_frames=1500),
+~11.8 ms/token in a calm window:
+```
+sub-part              ms/tok   %     nature
+mlp_fc_gelu_proj      3.33    28.3%  fc1[5120,1280]+gelu+fc2[1280,5120], rayon@8, ~31 GFLOP/s
+logits_gemv           2.52    21.4%  tied emb [51866,1280] = 132 MB/tok, rayon@32 (wide cap)
+self_qkv_proj         1.25    10.6%  fused [3840,1280] serial 2-row    } the 31% of decode the
+self_out_proj         0.96     8.2%  [1280,1280] serial 2-row          } LANDED 2-row kernel
+cross_q_proj          0.76     6.5%  [1280,1280] serial 2-row          } already lifted 1.29x
+cross_out_proj        0.70     6.0%  [1280,1280] serial 2-row          }
+self_attn             0.95     8.1%  per-head causal scores·softmax·V (short-contraction 2-row)
+cross_attn            1.20    10.2%  per-head enc-KV gemv (short-contraction 2-row)
+layernorms+clones    ~0.10    ~0.8%  negligible
+```
+TAKEAWAY: decode is dominated by **memory-bandwidth-bound GEMVs** — MLP (28%) + logits (21%) = ~49%
+re-read 105 MB + 132 MB of f16 weights/token; the compute-bound projections (31%) are already at the
+2-row optimum; attention compute (18%) is short-contraction 2-row. The only big bytes-cutting lever left
+is **f16→int8 weight quantization** of MLP+logits (numerics-changing → OWNER-GATED, must clear
+exact-transcript conformance), not an in-crate perf knob.
+
+### The rejected dig (do not re-tread)
+Hypothesis: the MLP fc1 `[5120,1280]`/fc2 `[1280,5120]` (13 MB each) and fused-QKV `[3840,1280]` (9.8 MB)
+are bandwidth-class like the logits GEMV (which uses a landed, load-robust **32-worker** wide cap for
++6–8% e2e), but are gated out of it by `out >= 16384` (their `out` is 5120/1280/3840) and stuck at 8
+workers. Tried: widen the cap by **read volume** (`out*inp >= 1<<22` = 8 MB f16, with a 512-row floor)
+so MLP/QKV qualify. Measured via interleaved `decoder_attrib` B/C ×3 (rounds 1–2 clean; round-3 baseline
+hit a host-load spike):
+```
+                baseline(8)   wide-cap(32)
+  mlp_fc_gelu   ~3.9–4.0 ms   ~5.3 ms   (+33%)
+  self_qkv      ~1.7–1.8 ms   ~2.2–2.4 ms (+30%)
+  per-step      ~12.8–13.6 ms ~15.0 ms  (+15%)
+```
+REASON: byte volume is the wrong gate — **band-granularity (rows/band) is.** logits has 51866 rows → 1620
+rows/band even at 32 workers, amortizing the 32-thread dispatch/sync barrier (~150 µs, observed). MLP
+fc2 has 1280 rows → 40 rows/band; fc1 5120 → 160; QKV 3840 → 120 — too little sequential work per band,
+so the barrier overhead swamps any extra memory-channel bandwidth. This is the **load-dependent decode
+thread-count avenue** the ledger already closed, reconfirmed from the byte-volume angle: the wide cap is
+a ROW-COUNT (vocab-class) lever, NOT a byte-volume one. Keep `out >= 16384`.
+
 ## 2026-06-29 - BlackThrush: REJECTED (regression) — pre-dequantize cache-resident weights to f32 (skip per-token `vcvtph2ps`) is **1.41× SLOWER**; the decode GEMV is LOAD-bound, not cvtph-bound.
 
 **Land-or-dig result: land-check clean (the 2-row win already landed at 50059ef; all worktree
