@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: REJECTED (~0, −0.84% p=0.14) — column-blocked batched GEMV (`dot_f16c_2col`, share weight `cvtph` across 2 token rows) on the encoder/prefill `gemv_f16_batch`. cvtph is NOT the batched bottleneck either.
+
+**Land-or-dig result: dug the batched f16 GEMV (encoder is 32 turbo layers — the dominant turbo compute,
+untouched by the m=1 2-row landing) → criterion bench → ~0 → reverted.** AGENT_NAME=BlackThrush. The
+change was **bit-identical** (each token keeps `dot_f16c`'s 4-accumulator reduction order, so
+`dot_f16c_2col(w,x0,x1) == (dot_f16c(w,x0), dot_f16c(w,x1))` bit-for-bit) → conformance trivially green.
+
+### The lever
+`gemv_f16_batch`'s inner loop dots each weight row against `tq` token rows and **re-`vcvtph2ps`-converts
+the SAME f16 weight row every token** (it admits "no whole-row dequant to amortize across `tq`"). For the
+encoder (`tq=1500`) each row is converted 1500×. `dot_f16c_2col` converts each weight chunk ONCE and
+FMAs it into TWO tokens' accumulator sets — halving the per-row conversion. The complement of the landed
+`dot_f16c_2row` (which shares X-loads across 2 weight rows). Wired into `compute_band` (token pairs +
+single-token tail), gated `f16c`+`fma`.
+
+### Measurement (criterion `f16_gemv_batch_1500x1280x1280`, the encoder GEMM shape, synthetic — no model)
+First A/B looked like a −16% regression, but that was **cross-time host-load drift** (candidate's first
+run hit a load spike → 20.1 ms). Re-measured close-in-time against a fresh baseline:
+```
+  baseline (single-dot per (o,t))   16.827 ms  [16.69, 16.97]
+  candidate (dot_f16c_2col)         16.685 ms  [16.57, 16.82]
+  change                            −0.84%  (p = 0.14 > 0.05)  -> NO CHANGE
+```
+(Lesson logged: trust criterion's `--baseline` close-in-time comparison, not two runs minutes apart on
+this contended box.)
+
+### Why ~0 (do not re-tread) — third confirmation that f16 GEMV cvtph is FREE
+The batched GEMV keeps `w_row` **L1-hot across the whole `tq` loop**, so its `cvtph` already hits L1 and
+overlaps the x-streaming loads; halving it saves nothing, and the tq-loop already exposes ample ILP for
+the OOO engine (no reduction-latency to hide, unlike the m=1 case the 2-row win exploited). This is the
+**same load/stream-bound conclusion** as the pre-dequant-to-f32 rejection: **f16-weight `cvtph` is never
+the GEMV bottleneck** (m=1 OR batched) — it hides under the activation/weight loads. Weight-conversion-
+amortization levers (pre-dequant, 2col) are dead crate-wide. The 2-row win was real because it shared
+ACTIVATION loads + interleaved reductions (latency hiding), which the batched path doesn't need.
+
 ## 2026-06-29 - BlackThrush: REJECTED (~0 e2e) — SIMD-vectorizing the attention softmax `exp` (cephes 8-lane `expf` matching ggml's `ggml_v_expf`) is a real KERNEL speedup but **~0 decode gain**: decode attention is GEMV/overhead-bound, NOT exp-bound.
 
 **Land-or-dig result: dug the biggest non-GEMV decode op (attention softmax exp) → measured ~0 e2e →
