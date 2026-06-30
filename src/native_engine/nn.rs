@@ -521,6 +521,93 @@ fn dot_f16c(w: &[Float16], x: &[f32]) -> f32 {
     }
 }
 
+/// Two GEMV row dots over **two** contiguous f16 weight rows against the **same**
+/// activation `x` (register-blocked GEMV). Each row keeps its OWN four AVX/F16C
+/// accumulators reduced in the byte-identical order of [`dot_f16c`], so
+/// `dot_f16c_2row(w0, w1, x) == (dot_f16c(w0, x), dot_f16c(w1, x))` **bit-for-bit**
+/// — this is purely an instruction-scheduling reshape, NOT a numerics change.
+///
+/// The win over two separate [`dot_f16c`] calls: the `x[i..]` loads are issued
+/// once and reused for both rows (halving activation L1 traffic), and the two
+/// rows' independent FMA chains + horizontal-reduction tails interleave, hiding
+/// the per-row reduction latency that dominates SHORT contractions (n_state/d_head
+/// = 64..1280). Measured 1.17–1.27× on the cache-resident decode GEMVs (mlp fc/proj,
+/// self/cross projections, turbo attention). Restricted by the caller to weights
+/// that fit cache — the 40–130 MB logits stream is memory-bound and REGRESSES
+/// ~2× under the two-stream access pattern, so it stays on the single-row path.
+///
+/// Compiled only under `f16c`+`fma` (same cfg/inlining contract as [`dot_f16c`]).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_f16c_2row(w0: &[Float16], w1: &[Float16], x: &[f32]) -> (f32, f32) {
+    use core::arch::x86_64::*;
+    let n = w0.len().min(w1.len()).min(x.len());
+    let xp = x.as_ptr();
+    let p0 = w0.as_ptr();
+    let p1 = w1.as_ptr();
+    // SAFETY: identical in-bounds contract to `dot_f16c`, applied to both rows;
+    // every load is bounded by the i+32 / i+8 / i<n guards over n = min of the
+    // three lengths. Float16 is repr(transparent) u16; f16c/fma guaranteed by cfg.
+    unsafe {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut b0 = _mm256_setzero_ps();
+        let mut b1 = _mm256_setzero_ps();
+        let mut b2 = _mm256_setzero_ps();
+        let mut b3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            let xa = _mm256_loadu_ps(xp.add(i));
+            let xb = _mm256_loadu_ps(xp.add(i + 8));
+            let xc = _mm256_loadu_ps(xp.add(i + 16));
+            let xd = _mm256_loadu_ps(xp.add(i + 24));
+            a0 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i).cast())), xa, a0);
+            a1 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 8).cast())), xb, a1);
+            a2 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 16).cast())), xc, a2);
+            a3 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 24).cast())), xd, a3);
+            b0 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i).cast())), xa, b0);
+            b1 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 8).cast())), xb, b1);
+            b2 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 16).cast())), xc, b2);
+            b3 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 24).cast())), xd, b3);
+            i += 32;
+        }
+        let acc0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let acc1 = _mm256_add_ps(_mm256_add_ps(b0, b1), _mm256_add_ps(b2, b3));
+        let mut t = [0.0f32; 8];
+        _mm256_storeu_ps(t.as_mut_ptr(), acc0);
+        let mut s0 =
+            ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+        _mm256_storeu_ps(t.as_mut_ptr(), acc1);
+        let mut s1 =
+            ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+        while i + 8 <= n {
+            let xv = _mm256_loadu_ps(xp.add(i));
+            let p = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i).cast())), xv);
+            let mut u = [0.0f32; 8];
+            _mm256_storeu_ps(u.as_mut_ptr(), p);
+            s0 += ((u[0] + u[1]) + (u[2] + u[3])) + ((u[4] + u[5]) + (u[6] + u[7]));
+            let q = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i).cast())), xv);
+            _mm256_storeu_ps(u.as_mut_ptr(), q);
+            s1 += ((u[0] + u[1]) + (u[2] + u[3])) + ((u[4] + u[5]) + (u[6] + u[7]));
+            i += 8;
+        }
+        while i < n {
+            let xv = x[i];
+            s0 += w0[i].to_f32() * xv;
+            s1 += w1[i].to_f32() * xv;
+            i += 1;
+        }
+        (s0, s1)
+    }
+}
+
 /// One GEMV row dot over an f16 weight row and f32 activation: the fused f16c
 /// path when available ([`dot_f16c`], a safe call — its `unsafe` is internal),
 /// else the portable two-pass (`convert_to_f32_slice` into `scratch`, then
@@ -538,6 +625,58 @@ fn dequant_row_dot(w_row: &[Float16], x: &[f32], scratch: &mut [f32], use_fused:
     let _ = use_fused;
     w_row.convert_to_f32_slice(scratch);
     dot8(scratch, x)
+}
+
+/// Whether the register-blocked two-row fused dot ([`dot_f16c_2row`]) is both
+/// available (f16c/fma) and beneficial for a `[out, inp]` weight. The win is on
+/// cache-resident weights; the 40–130 MB logits projection is memory-bandwidth
+/// bound and regresses ~2× under the two-stream pattern, so weights at/above the
+/// threshold stay on the single-row path. `1<<22` elements = 8 MB of f16 weight
+/// cleanly separates the per-token decode GEMVs (mlp 590 k, qkv 147 k, turbo attn
+/// 1.6 M — all blocked) from the logits GEMV (tiny 20 M / turbo 66 M — single-row).
+#[inline]
+fn two_row_blocked(out: usize, inp: usize, use_fused: bool) -> bool {
+    const TWO_ROW_MAX_ELEMS: usize = 1 << 22;
+    let _ = (out, inp);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    ))]
+    {
+        return use_fused && out * inp < TWO_ROW_MAX_ELEMS;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = use_fused;
+        false
+    }
+}
+
+/// Two contiguous GEMV row dots against the same `x`, register-blocked when the
+/// fused f16c path is available ([`dot_f16c_2row`], bit-identical to two
+/// [`dequant_row_dot`] calls), else the portable two-pass per row. Callers gate
+/// the blocked path via [`two_row_blocked`], so the fallback here is only reached
+/// on non-f16c targets (where it preserves correctness).
+#[inline]
+fn dequant_2row_dot(
+    w0: &[Float16],
+    w1: &[Float16],
+    x: &[f32],
+    scratch: &mut [f32],
+    use_fused: bool,
+) -> (f32, f32) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    ))]
+    if use_fused {
+        return dot_f16c_2row(w0, w1, x);
+    }
+    let s0 = dequant_row_dot(w0, x, scratch, use_fused);
+    let s1 = dequant_row_dot(w1, x, scratch, use_fused);
+    (s0, s1)
 }
 
 /// Fused dequant + GEMV: `out[o] = bias[o] + dot(W[o, :], x)` for a natural
@@ -594,6 +733,43 @@ pub fn gemv_f16(
         }
     };
 
+    // Register-blocked two-row dot for cache-resident weights (mlp/qkv/attn
+    // projections): bit-identical to two `row_dot`s, but shares the `x` loads and
+    // interleaves the two reduction tails (1.17–1.27× on the short-contraction
+    // decode GEMVs). Gated OFF for the memory-bound logits stream by
+    // `two_row_blocked`. Fills output rows `[o_base, o_base+slice.len())`.
+    let use_2row = two_row_blocked(out, inp, use_fused);
+    let fill_rows = |o_base: usize, slice: &mut [f32], scratch: &mut [f32]| {
+        if use_2row {
+            let n = slice.len();
+            let mut i = 0usize;
+            while i + 2 <= n {
+                let o = o_base + i;
+                let (mut s0, mut s1) = dequant_2row_dot(
+                    &w_f16[o * inp..(o + 1) * inp],
+                    &w_f16[(o + 1) * inp..(o + 2) * inp],
+                    x,
+                    scratch,
+                    use_fused,
+                );
+                if let Some(b) = bias {
+                    s0 += b[o];
+                    s1 += b[o + 1];
+                }
+                slice[i] = s0;
+                slice[i + 1] = s1;
+                i += 2;
+            }
+            if i < n {
+                slice[i] = row_dot(o_base + i, scratch);
+            }
+        } else {
+            for (i, slot) in slice.iter_mut().enumerate() {
+                *slot = row_dot(o_base + i, scratch);
+            }
+        }
+    };
+
     // MACs of real work = out * inp; below the threshold, parallel dispatch isn't
     // worth it. History (bd-6qih): the original M4 Pro sweep chose `1<<19`; L9
     // raised it to `1<<21` because the per-token mid GEMVs (`[384,1536]`=590 k)
@@ -618,9 +794,7 @@ pub fn gemv_f16(
         } else {
             vec![0.0f32; inp]
         };
-        for (o, slot) in out_slice.iter_mut().enumerate() {
-            *slot = row_dot(o, &mut scratch);
-        }
+        fill_rows(0, out_slice, &mut scratch);
         return;
     }
     let band = out.div_ceil(workers).max(1);
@@ -635,9 +809,7 @@ pub fn gemv_f16(
             } else {
                 vec![0.0f32; inp]
             };
-            for (i, slot) in band_slice.iter_mut().enumerate() {
-                *slot = row_dot(o_base + i, &mut scratch);
-            }
+            fill_rows(o_base, band_slice, &mut scratch);
         });
 }
 

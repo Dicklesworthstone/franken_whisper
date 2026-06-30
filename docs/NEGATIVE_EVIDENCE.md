@@ -3,6 +3,49 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: WIN LANDED — 2-row register-blocked f16 GEMV (`dot_f16c_2row`) = **1.29× on the serial attention/QKV projection kernel**, bit-exact, the lever SlateHeron flagged.
+
+**Land-or-dig result: the uncommitted working-tree change WAS a measured win → bench-verified → LANDED.**
+AGENT_NAME=BlackThrush. This implements SlateHeron's untested hypothesis (one entry below: *"row-blocking
+B rows to share the `x` loads"*) — but in the **bit-exact** form, not the numerics-changing accumulator-
+widening form SlateHeron warned about.
+
+### What landed
+`nn::dot_f16c_2row` + `two_row_blocked` gate + `dequant_2row_dot` + `gemv_f16`'s `fill_rows` (src/native_engine/nn.rs).
+Two contiguous weight rows are dotted against the **same** `x` in one pass: the `x[i..]` AVX loads are
+issued **once** and reused for both rows (halves activation L1 traffic), and the two rows' independent
+4-chain FMA + horizontal-reduction tails interleave (hides the per-row reduction latency that dominates
+the SHORT per-token contractions). Each row keeps its OWN 4 accumulators reduced in the **byte-identical
+order** of `dot_f16c` → `dot_f16c_2row(w0,w1,x) == (dot_f16c(w0,x), dot_f16c(w1,x))` bit-for-bit. This is
+a pure instruction-scheduling reshape, NOT a numerics change — so f32 outputs are byte-identical and
+conformance is **definitionally unchanged** (the 26/0 bit-exact comparator cannot move; verified
+structurally by reading both reduction trees). Gated OFF (`two_row_blocked`, `out*inp < 1<<22`) for the
+40–130 MB logits stream, which is memory-bandwidth-bound and regresses ~2× under the two-stream pattern.
+
+### Measurement (perf stat, this contended 64-core box; instructions = contention-independent)
+A/B = working-tree candidate vs `git show HEAD:nn.rs` baseline, identical build (`x86-64-v3`), same
+`examples/gemv_2row_perf` fixed-iteration driver (20 000 `gemv_f16` calls/run), both binaries saved and
+run **interleaved** B/C to cancel cross-time box-load drift.
+
+```
+attn [384,384] SERIAL  (the 2-row path, L2-resident, compute-bound — clean kernel signal)
+  perf -r12 single-build:  insns 1,667,956,123 -> 1,477,114,966  (-11.4%, det. +-0.00%)
+                           cycles  633,889,726 ->   448,548,376  (1.41x)   IPC 2.63 -> 3.29
+                           wall      0.1577s    ->     0.1156s    (1.36x)
+  interleaved B/C x5 (mean):  cycles 579M -> 448M (1.29x);  wall 0.1444s -> 0.1118s (1.29x)
+                              candidate wins EVERY pair (range 1.25-1.41x). Robust >> ~1% noise.
+mlp [1536,384] PARALLEL (rayon, IPC~0.4 — dispatch-dominated, real decode path)
+  interleaved B/C x5: cycles consistently SLIGHTLY LOWER for candidate; wall a wash-to-slight-win.
+                      NO regression (the earlier "+7%" was cross-time drift, gone when interleaved).
+logits [51864,384]      single-row path (gated out) — UNCHANGED control.
+```
+
+### Why it matters vs OpenAI-Whisper (ORIG)
+Per the component-attribution memory, franken already DOMINATES ORIG on encoder/mel; the ONLY residual
+gap is **per-token decode**, and the attention Q/K/V/output projections are exactly the serial `[n_state,
+n_state]` GEMVs this lifts 1.29×. mlp/logits already parallelize via rayon, so the projection kernel was
+the remaining serial decode hot spot. Bit-exact, no regression on any path → landed on main.
+
 ## 2026-06-29 - SlateHeron: BLOCKER (build-infra) + UNTESTED LEVER flagged — land-check reconfirms NO uncommitted source win (working tree = `.beads/` churn only; the log10 mel candidate stays OWNER-GATED per HEAD 45c0d51). 0 source delta this session.
 
 **Land-or-dig result: land-check clean (no win) → DIG attempted on the decode kernel but BLOCKED by build
