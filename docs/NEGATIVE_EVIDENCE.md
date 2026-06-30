@@ -3,6 +3,38 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-29 - BlackThrush: REJECTED (~0 e2e) — SIMD-vectorizing the attention softmax `exp` (cephes 8-lane `expf` matching ggml's `ggml_v_expf`) is a real KERNEL speedup but **~0 decode gain**: decode attention is GEMV/overhead-bound, NOT exp-bound.
+
+**Land-or-dig result: dug the biggest non-GEMV decode op (attention softmax exp) → measured ~0 e2e →
+reverted.** AGENT_NAME=BlackThrush. The change was conformance-eligible (the f16 decode path is
+transcription-tolerance, and ggml's own softmax vectorizes exp — so this was reference-faithful, not a
+fresh approximation), but it bought nothing.
+
+### Hypothesis (FALSIFIED)
+`nn::softmax_rows` used per-element scalar `(*v-max).exp()` (libm). Cross-attention softmaxes over
+`enc_frames=1500` per head × n_head=20 × n_layer=4 ≈ **120 k `expf`/token**, which I estimated at ~0.6 ms
+(~50% of the 1.20 ms cross_attn sub). Replaced the exp+sum with an 8-lane cephes `expf` (range-reduce to
+`2^n·poly`, ~1 ULP; `[-88,88]` clamp maps causal-mask `-inf`→~0). Correctness canary: softmax row sums to
+1.000000.
+
+### Measurement (decoder_attrib, real large-v3-turbo, interleaved B/C ×3, % of per-step to normalize host load)
+```
+              baseline(scalar exp)   candidate(SIMD exp)
+  self_attn      7.0 / 7.1 / 7.0 %     6.7 / 6.1 / 6.7 %   -> ~7.0% -> ~6.5% (−0.5pp ≈ −0.05 ms/tok)
+  cross_attn    10.1 /10.5 /10.7 %    11.2 / 8.8 /12.7 %   -> flat, noise-dominated (NO improvement)
+  per-step      13.0 /13.2 /13.2 ms   13.6 /14.7 /13.6 ms  -> flat (candidate rounds hit higher host load)
+```
+self_attn shrank a consistent ~0.5 pp (~0.05 ms/tok); **cross_attn — which has the MOST exp — did not
+improve at all.** Net e2e ≈ 0 (well inside the ±0.2–0.3 ms host-load noise).
+
+### Why (do not re-tread)
+The decode attention is **GEMV/overhead-bound, not exp-bound**: per head it runs two serial `gemv_f16`s
+(scores `[1500,64]` + output `[64,1500]`, ~0.6 ms/tok total) plus per-head `gemv_out_buf`/`Mat`/`scores_all`
+allocs and the softmax. The scalar `expf` loop overlaps with that memory/compute, so collapsing it to SIMD
+frees latency that was already hidden — cross_attn is unchanged. Vectorizing softmax exp is a real kernel
+win in isolation but a **~0 e2e lever** here; not worth the numerics change. Reverted (no source delta).
+The remaining bytes-cutting decode lever stays f16→int8 weight quant (owner-gated).
+
 ## 2026-06-29 - BlackThrush: PROFILE + REJECTED (regression) — extending the bandwidth-class wide GEMV cap (32 workers) to the MLP/QKV decode GEMVs is **+30–33% SLOWER** on those components; band-granularity (rows/band), not byte volume, gates the wide cap.
 
 **Land-or-dig result: land-check clean → profiled the real decode gap vs ORIG → DUG the biggest
