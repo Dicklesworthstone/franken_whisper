@@ -2676,10 +2676,42 @@ pub fn evaluate_backend_selection(
     let (recommended_order, rollout_forced_static) =
         gate_recommended_order_for_rollout(request.diarize, recommended_order_raw, rollout_stage);
 
-    let evidence_ledger = outcome.audit_entry.to_evidence_ledger();
-    let evidence_entries = serde_json::to_value(&evidence_ledger)
+    // franken-decision can emit an internally-inconsistent decision audit for
+    // the degenerate native-only fallback state (`observed_state == 2`: no
+    // external bridge backend present), whose `to_evidence_ledger()` then
+    // panics via an internal `.expect()`. The evidence ledger is a diagnostic,
+    // not the result, and must never kill a transcription. Two guards, mirroring
+    // the router's existing "diagnostics never kill transcription" pattern
+    // (failed posterior update; contract-validation fallback):
+    //   1. Skip the conversion when the audit's posterior snapshot is empty or
+    //      unnormalized — the observed degeneracy — so the common native-only
+    //      path avoids the panic (and its stderr backtrace) entirely.
+    //   2. Still `catch_unwind` as a safety net for any other malformed audit.
+    // Either way we degrade to no evidence entry (the serde-failure default that
+    // already existed here) and record the anomaly.
+    let posterior_sum: f64 = outcome.audit_entry.posterior_snapshot.iter().sum();
+    let audit_convertible = !outcome.audit_entry.posterior_snapshot.is_empty()
+        && (posterior_sum - 1.0).abs() <= 1e-6;
+    let evidence_entries = if audit_convertible {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            outcome.audit_entry.to_evidence_ledger()
+        }))
+        .ok()
+        .and_then(|ledger| serde_json::to_value(&ledger).ok())
         .map(|v| vec![v])
-        .unwrap_or_default();
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if evidence_entries.is_empty() {
+        record_router_evidence_event(
+            "evidence_ledger_conversion_failed",
+            "decision audit could not be converted to an evidence ledger \
+             (empty/unnormalized posterior or invalid entry); proceeding \
+             without an evidence entry (transcription preserved)",
+            trace_id,
+        );
+    }
 
     let static_order = auto_priority(request.diarize);
     let loss_matrix_hash = loss_matrix_content_hash(&contract.losses);
