@@ -31,12 +31,14 @@ yet isolated (see blocker). `Float16::from_bits/from_f32` use IEEE round-to-near
 rounding, so the table is bit-identical to whisper's by construction; unit test `gelu_known_values` updated
 to the table-exact expectation.
 
-### BLOCKER (one sentence, honest — validation-completeness, not a known regression)
-Local full-transcript re-validation (`native_ab` jfk vs the whisper-cli reference) could not run this window:
-a CONCURRENT rustup toolchain install by another tenant on this shared box broke the local nightly rustc
-mid-build (rust-docs component conflict); the rch remote build compiled the lib + probe cleanly, and the
-change is conformance-improving-by-construction (franken→exactly whisper's GELU), so the transcript is
-expected to match the reference at least as well — to be reconfirmed once the toolchain settles.
+### Conformance VALIDATED GREEN (blocker resolved same session)
+Local `native_ab` jfk (rebuilt at HEAD with the table GELU, after pinning
+`RUSTUP_TOOLCHAIN=nightly-x86_64-unknown-linux-gnu` to dodge the concurrent shared-box rustup install that
+had broken local rustc): **tiny.en transcript is byte-identical to the whisper-cli golden reference**
+(`jfk_tiny_reference.json`): "And so my fellow Americans ask not what your country can do for you ask what
+you can do for your country." **large-v3-turbo** produces its expected output unchanged (the trailing " a."
+is turbo's pre-existing jfk artifact, not from this change). So the GELU table is faster (3.46×), bit-exact
+with whisper by construction, AND transcript-conformant on both models. No blocker remains.
 
 ## 2026-07-01 - BlackThrush: fresh post-int8 decode profile — logits int8 CONFIRMED LIVE (2.52→1.37ms, 1.84×); residual gap is shared-box CONTENTION, not a kernel lever (decode parallelism already optimally tuned).
 
