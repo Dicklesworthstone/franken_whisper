@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license-file = "LICENSE"
 description = "Agent-first Rust ASR orchestration stack with ffmpeg normalization and frankensqlite-backed persistence"
