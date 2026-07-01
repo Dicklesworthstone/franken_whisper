@@ -158,6 +158,22 @@ fn floor_secs(seconds: f64) -> u64 {
     }
 }
 
+/// Sanitize a segment timestamp before JSON serialization.
+///
+/// Finite, real timestamps (including an exact `0.0`) pass through unchanged.
+/// Non-finite values (`NaN`/`±Inf`) and subnormal/denormal magnitudes — e.g. the
+/// `2.225e-308` a collapsed alignment can emit — are mapped to `None`, so the
+/// JSON sidecar never carries a bogus denormal (or a `NaN` silently coerced to
+/// `null` with the underlying corruption unrepaired).
+fn sanitize_timestamp(value: Option<f64>) -> Option<f64> {
+    let v = value?;
+    if v == 0.0 || (v.is_finite() && v.abs() >= f64::MIN_POSITIVE.next_up()) {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 /// Convert yt-dlp's `YYYYMMDD` to `YYYY-MM-DD`. Returns the input unchanged if
 /// it is not exactly 8 ASCII digits.
 fn format_upload_date(raw: &str) -> String {
@@ -475,9 +491,11 @@ fn description_intro(description: Option<&str>) -> Option<String> {
 ///
 /// `utterances` is one entry **per raw segment** (count is preserved); it is
 /// not the Markdown paragraph grouping. `None`-valued optional video/run fields
-/// are omitted entirely rather than serialized as `null`. Per-utterance numeric
-/// fields (`start_sec`, `end_sec`, `confidence`) are passed through verbatim,
-/// including `null`, so the raw segment shape round-trips faithfully.
+/// are omitted entirely rather than serialized as `null`. `confidence` is passed
+/// through verbatim (including `null`); `start_sec`/`end_sec` pass through
+/// verbatim for finite, real values but are `null`-ed when non-finite or
+/// subnormal/denormal (defense-in-depth so a collapsed alignment never emits a
+/// bogus denormal timestamp into the artifact).
 #[must_use]
 pub fn render_json(input: &RenderInput<'_>) -> Value {
     let v = &input.video;
@@ -513,8 +531,11 @@ pub fn render_json(input: &RenderInput<'_>) -> Value {
         .map(|(i, seg)| {
             let mut u = Map::new();
             u.insert("i".into(), json!(i));
-            u.insert("start_sec".into(), json!(seg.start_sec));
-            u.insert("end_sec".into(), json!(seg.end_sec));
+            u.insert(
+                "start_sec".into(),
+                json!(sanitize_timestamp(seg.start_sec)),
+            );
+            u.insert("end_sec".into(), json!(sanitize_timestamp(seg.end_sec)));
             u.insert("text".into(), json!(seg.text));
             // Confidence is passed through verbatim, including null.
             u.insert("confidence".into(), json!(seg.confidence));
@@ -973,6 +994,42 @@ mod tests {
         assert!(utts[1].get("confidence").unwrap().is_null());
         // No speaker -> field omitted entirely.
         assert!(!utts[0].as_object().unwrap().contains_key("speaker"));
+    }
+
+    #[test]
+    fn json_sanitizes_nonfinite_and_denormal_timestamps() {
+        // A collapsed alignment can stamp NaN or the 2.225e-308 denormal onto
+        // segment offsets; render_json must never emit those as a bogus denormal,
+        // while finite real offsets (including an exact 0.0) pass through unchanged.
+        let segs = vec![
+            TranscriptionSegment {
+                start_sec: Some(f64::MIN_POSITIVE), // 2.225e-308 denormal marker
+                end_sec: Some(f64::NAN),
+                text: "degenerate".to_owned(),
+                speaker: None,
+                confidence: Some(0.5),
+            },
+            TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(4.4),
+                text: "authoritative".to_owned(),
+                speaker: None,
+                confidence: Some(0.9),
+            },
+        ];
+        let input = RenderInput {
+            video: sample_video(),
+            run: sample_run(),
+            segments: &segs,
+        };
+        let val = render_json(&input);
+        let utts = val.get("utterances").unwrap().as_array().unwrap();
+        // Denormal start_sec and NaN end_sec are null-ed, never a bogus denormal.
+        assert!(utts[0].get("start_sec").unwrap().is_null());
+        assert!(utts[0].get("end_sec").unwrap().is_null());
+        // Finite real offsets (including exact 0.0) pass through unchanged.
+        assert_eq!(utts[1].get("start_sec").unwrap().as_f64().unwrap(), 0.0);
+        assert_eq!(utts[1].get("end_sec").unwrap().as_f64().unwrap(), 4.4);
     }
 
     // --- atomic write ----------------------------------------------------

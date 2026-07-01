@@ -2142,6 +2142,12 @@ fn probe_version_for_kind(kind: BackendKind) -> Option<String> {
 // BackendSelectionContract — formal DecisionContract for backend routing
 // ---------------------------------------------------------------------------
 
+/// A large but finite loss used to fail-closed when a computed backend
+/// selection loss is non-finite (NaN/Inf). Large enough to deprioritize the
+/// offending action without violating `LossMatrix::new`'s finiteness and
+/// non-negativity invariants.
+const LARGE_FINITE_PENALTY: f64 = 1.0e6;
+
 struct BackendSelectionContract {
     states: Vec<String>,
     actions: Vec<String>,
@@ -2231,13 +2237,54 @@ impl BackendSelectionContract {
                         2 => 1000.0,
                         _ => 1000.0,
                     };
-                    values.push(base + availability_penalty);
+                    let v = base + availability_penalty;
+                    values.push(if v.is_finite() {
+                        v.max(0.0)
+                    } else {
+                        LARGE_FINITE_PENALTY
+                    });
                 }
             }
         }
 
-        let losses = LossMatrix::new(states.clone(), actions.clone(), values)
-            .expect("valid backend selection loss matrix");
+        // Fail-closed: the values above are already sanitized to finite,
+        // non-negative numbers, so this constructor should always succeed. If
+        // it ever rejects the matrix anyway, build a well-formed
+        // static-priority fallback matrix instead of panicking and aborting the
+        // whole transcription.
+        let losses = match LossMatrix::new(states.clone(), actions.clone(), values) {
+            Ok(matrix) => matrix,
+            Err(err) => {
+                tracing::warn!(
+                    target: "franken_whisper::routing::evidence",
+                    evidence_type = "loss_matrix_construction_failed",
+                    error = err.to_string().as_str(),
+                    "backend selection loss matrix rejected; using static-priority fallback matrix"
+                );
+                let mut fallback_values = Vec::with_capacity(3 * n_actions);
+                for state_idx in 0..3 {
+                    let availability_penalty = match state_idx {
+                        0 => 0.0,
+                        1 => 333.0,
+                        _ => 1000.0,
+                    };
+                    for action_idx in 0..n_actions {
+                        if action_idx >= action_backends.len() {
+                            fallback_values.push(match state_idx {
+                                0 => 1000.0,
+                                1 => 500.0,
+                                _ => 5.0,
+                            });
+                        } else {
+                            // Ascending base preserves static-priority ordering.
+                            fallback_values.push(action_idx as f64 + availability_penalty);
+                        }
+                    }
+                }
+                LossMatrix::new(states.clone(), actions.clone(), fallback_values)
+                    .expect("static-priority fallback loss matrix is well-formed")
+            }
+        };
 
         let policy =
             FallbackPolicy::new(0.7, 20.0, 0.5).expect("valid backend selection fallback policy");
@@ -2276,12 +2323,19 @@ impl BackendSelectionContract {
                 // Add pseudo-observations proportional to sample count,
                 // capped to avoid overwhelming the prior too quickly.
                 let empirical_weight = (metrics.sample_count as f64).min(20.0);
-                alpha += metrics.success_rate * empirical_weight;
-                beta += (1.0 - metrics.success_rate) * empirical_weight;
+                // Sanitize the empirical success rate: a non-finite value would
+                // poison alpha/beta and, via the loss, the LossMatrix.
+                let success_rate = if metrics.success_rate.is_finite() {
+                    metrics.success_rate.clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                alpha += success_rate * empirical_weight;
+                beta += (1.0 - success_rate) * empirical_weight;
 
                 // Blend empirical latency into the proxy. Use a weighted
                 // average: 60% prior estimate, 40% empirical.
-                if metrics.avg_latency_ms > 0.0 {
+                if metrics.avg_latency_ms.is_finite() && metrics.avg_latency_ms > 0.0 {
                     let empirical_latency_secs = metrics.avg_latency_ms / 1000.0;
                     latency_cost = (0.6 * latency_cost) + (0.4 * empirical_latency_secs);
                 }
@@ -2300,7 +2354,12 @@ impl BackendSelectionContract {
         let failure_cost = (1.0 - p_success) * 100.0;
         let quality_cost = (1.0 - quality_score) * 100.0;
 
-        (0.45 * latency_cost) + (0.35 * quality_cost) + (0.20 * failure_cost)
+        let loss = (0.45 * latency_cost) + (0.35 * quality_cost) + (0.20 * failure_cost);
+        if loss.is_finite() {
+            loss.max(0.0)
+        } else {
+            LARGE_FINITE_PENALTY
+        }
     }
 
     /// Backward-compatible base loss without adaptive state (used by tests).
@@ -2614,7 +2673,24 @@ pub fn evaluate_backend_selection(
     let decision_random = (uuid::Uuid::new_v4().as_u128()) & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
     let decision_id = DecisionId::from_parts(ts_ms, decision_random);
 
-    let ci_width = posterior.entropy() / 3.0_f64.log2();
+    // A degenerate posterior (non-finite or subnormal probabilities, or
+    // probabilities that do not sum to ~1) makes `entropy()` silently drop
+    // those lanes, yielding a near-zero ci_width that reads as MAXIMAL
+    // confidence and DEFEATS the fallback trigger. Force a wide interval
+    // (fallback) on any degeneracy; otherwise compute as usual.
+    let posterior_degenerate = {
+        let ps = posterior.probs();
+        let sum: f64 = ps.iter().sum();
+        ps.iter().any(|p| !p.is_finite() || p.is_subnormal()) || (sum - 1.0).abs() > 1e-6
+    };
+    let mut ci_width = if posterior_degenerate {
+        1.0
+    } else {
+        posterior.entropy() / 3.0_f64.log2()
+    };
+    if !ci_width.is_finite() {
+        ci_width = 1.0;
+    }
 
     // SPRT-style e-process: inverse of the posterior margin, clamped to a sane
     // range.  When the margin between the best and second-best state is large
@@ -2622,7 +2698,8 @@ pub fn evaluate_backend_selection(
     // uniform posterior), e_process grows toward the cap, signaling weak
     // evidence for any state.  This feeds into FallbackPolicy::should_fallback
     // which triggers fallback when e_process > breach_threshold.
-    let margin = (max_prob - second_prob).max(1e-6);
+    let diff = max_prob - second_prob;
+    let margin = if diff.is_finite() { diff.max(1e-6) } else { 1e-6 };
     let e_process = (1.0 / margin).clamp(1.0, 100.0);
 
     let ctx = EvalContext {
@@ -2692,6 +2769,15 @@ pub fn evaluate_backend_selection(
     let posterior_sum: f64 = outcome.audit_entry.posterior_snapshot.iter().sum();
     let audit_convertible = !outcome.audit_entry.posterior_snapshot.is_empty()
         && (posterior_sum - 1.0).abs() <= 1e-6;
+    // Sanitize the posterior snapshot that is logged/persisted: a degenerate
+    // (empty / unnormalized / subnormal) audit snapshot must not leak into the
+    // routing log or evidence ledger. Fall back to the locally-built,
+    // guaranteed-normalized posterior when the audit copy is not convertible.
+    let posterior_snapshot: Vec<f64> = if audit_convertible {
+        outcome.audit_entry.posterior_snapshot.clone()
+    } else {
+        posterior.probs().to_vec()
+    };
     let evidence_entries = if audit_convertible {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             outcome.audit_entry.to_evidence_ledger()
@@ -2749,7 +2835,7 @@ pub fn evaluate_backend_selection(
         "fallback_active": fallback_active,
         "fallback_reason": fallback_reason,
         "expected_losses": outcome.expected_losses,
-        "posterior_snapshot": outcome.audit_entry.posterior_snapshot,
+        "posterior_snapshot": posterior_snapshot,
         "calibration_score": calibration_score,
         "brier_score": brier_score,
         "brier_threshold": ADAPTIVE_FALLBACK_BRIER_THRESHOLD,
@@ -2809,7 +2895,7 @@ pub fn evaluate_backend_selection(
             .collect(),
         fallback_active,
         fallback_reason: fallback_reason.clone(),
-        posterior_snapshot: outcome.audit_entry.posterior_snapshot.clone(),
+        posterior_snapshot: posterior_snapshot.clone(),
         calibration_score,
         brier_score,
         e_process,
@@ -2908,7 +2994,14 @@ fn latency_proxy(kind: BackendKind, duration_seconds: f64, diarize: bool) -> f64
         BackendKind::WhisperDiarization => 18.0,
         BackendKind::Auto => 20.0,
     };
-    base + (duration_seconds.sqrt() * multiplier)
+    // Sanitize the duration: a NaN/Inf feeds sqrt() -> NaN -> a NaN base loss
+    // -> LossMatrix::new() rejection. Negative durations are also nonsensical.
+    let d = if duration_seconds.is_finite() {
+        duration_seconds.max(0.0)
+    } else {
+        30.0
+    };
+    base + (d.sqrt() * multiplier)
 }
 
 fn posterior_success_probability(
@@ -2928,7 +3021,16 @@ fn posterior_success_probability(
 
     let alpha = alpha_prior + (quality_score * 2.0) + diarize_boost;
     let beta = beta_prior + ((1.0 - quality_score) * 2.0) + translate_penalty;
-    alpha / (alpha + beta)
+    // Floor the denominator to avoid 0/0 = NaN, then guard the quotient: a
+    // non-finite result must not reach the LossMatrix (its clamp/validation
+    // panics on NaN under the current toolchain).
+    let denom = (alpha + beta).max(1e-9);
+    let p = alpha / denom;
+    if p.is_finite() {
+        p.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 pub fn extract_segments_from_json(root: &Value) -> Vec<TranscriptionSegment> {
@@ -2984,7 +3086,9 @@ fn extract_word_level_segments(chunks: &[Value]) -> Vec<TranscriptionSegment> {
                 let confidence = word_node
                     .get("confidence")
                     .or_else(|| word_node.get("probability"))
-                    .and_then(Value::as_f64);
+                    .and_then(Value::as_f64)
+                    .filter(|c| c.is_finite())
+                    .map(|c| c.clamp(0.0, 1.0));
                 let speaker = word_node
                     .get("speaker")
                     .and_then(Value::as_str)
@@ -3013,7 +3117,11 @@ fn extract_word_level_segments(chunks: &[Value]) -> Vec<TranscriptionSegment> {
                     .trim()
                     .to_owned(),
                 speaker: chunk_speaker,
-                confidence: chunk.get("confidence").and_then(Value::as_f64),
+                confidence: chunk
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .filter(|c| c.is_finite())
+                    .map(|c| c.clamp(0.0, 1.0)),
             });
         }
     }
@@ -3055,7 +3163,9 @@ fn segments_from_nodes(nodes: &[Value]) -> Vec<TranscriptionSegment> {
                 .get("confidence")
                 .or_else(|| node.get("probability"))
                 .or_else(|| node.get("score"))
-                .and_then(Value::as_f64);
+                .and_then(Value::as_f64)
+                .filter(|c| c.is_finite())
+                .map(|c| c.clamp(0.0, 1.0));
 
             TranscriptionSegment {
                 start_sec: start,
@@ -4292,6 +4402,28 @@ mod tests {
     }
 
     #[test]
+    fn extract_segments_clamps_out_of_range_confidence() {
+        // Out-of-range confidences must be clamped into [0, 1]. NaN cannot
+        // appear in JSON, but a finite denormal must stay finite and in range.
+        let input = serde_json::json!({
+            "segments": [
+                {"start": 0.0, "end": 1.0, "text": "high", "confidence": 5.0},
+                {"start": 1.0, "end": 2.0, "text": "low", "confidence": -3.0},
+                {"start": 2.0, "end": 3.0, "text": "denormal", "confidence": 2.225073858507201e-308}
+            ]
+        });
+        let segments = extract_segments_from_json(&input);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].confidence, Some(1.0));
+        assert_eq!(segments[1].confidence, Some(0.0));
+        let denormal = segments[2].confidence.expect("denormal confidence retained");
+        assert!(
+            denormal.is_finite() && (0.0..=1.0).contains(&denormal),
+            "denormal confidence should stay finite and in range: {denormal}"
+        );
+    }
+
+    #[test]
     fn extract_segments_transcription_with_offsets_ms() {
         let input = serde_json::json!({
             "transcription": [
@@ -5008,9 +5140,54 @@ mod tests {
     }
 
     #[test]
+    fn latency_proxy_non_finite_and_negative_return_finite() {
+        // NaN/Inf/negative/denormal durations must not produce a NaN latency,
+        // which would poison the backend-selection loss matrix.
+        for duration in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            f64::MIN_POSITIVE,
+        ] {
+            for &kind in &[
+                BackendKind::WhisperCpp,
+                BackendKind::InsanelyFast,
+                BackendKind::WhisperDiarization,
+            ] {
+                for diarize in [false, true] {
+                    let latency = latency_proxy(kind, duration, diarize);
+                    assert!(
+                        latency.is_finite() && latency >= 0.0,
+                        "latency_proxy({kind:?}, {duration}, {diarize}) not finite/non-negative: {latency}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn posterior_success_probability_unavailable_is_zero() {
         let prob = posterior_success_probability(7.0, 3.0, 0.8, false, false, false);
         assert_eq!(prob, 0.0);
+    }
+
+    #[test]
+    fn posterior_success_probability_nan_quality_returns_finite() {
+        // A non-finite quality_score must not yield a NaN probability, which
+        // would panic the downstream loss-matrix clamp on the current toolchain.
+        for quality in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for diarize in [false, true] {
+                for translate in [false, true] {
+                    let p =
+                        posterior_success_probability(7.0, 3.0, quality, diarize, translate, true);
+                    assert!(
+                        p.is_finite() && (0.0..=1.0).contains(&p),
+                        "quality={quality}, diarize={diarize}, translate={translate} => {p}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5417,6 +5594,53 @@ mod tests {
                 "loss for {:?} should be non-negative: {loss}",
                 backend
             );
+        }
+    }
+
+    #[test]
+    fn backend_base_loss_finite_for_pathological_durations() {
+        let request = test_request(false);
+        for duration in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            f64::MIN_POSITIVE,
+        ] {
+            for &backend in &[
+                BackendKind::WhisperCpp,
+                BackendKind::InsanelyFast,
+                BackendKind::WhisperDiarization,
+            ] {
+                let loss =
+                    BackendSelectionContract::backend_base_loss(backend, &request, duration);
+                assert!(
+                    loss.is_finite() && loss >= 0.0,
+                    "loss for {backend:?} at duration {duration} not finite/non-negative: {loss}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contract_construction_survives_non_finite_duration() {
+        // Constructing the contract must never panic on a NaN/Inf/denormal
+        // duration, and every loss-matrix cell must remain finite and
+        // non-negative so LossMatrix::new accepts it (no expect() abort).
+        for duration in [f64::NAN, f64::INFINITY, f64::MIN_POSITIVE, -1.0] {
+            for diarize in [false, true] {
+                let contract = BackendSelectionContract::new(&test_request(diarize), duration);
+                let matrix = contract.loss_matrix();
+                for s in 0..matrix.n_states() {
+                    for a in 0..matrix.n_actions() {
+                        let v = matrix.get(s, a);
+                        assert!(
+                            v.is_finite() && v >= 0.0,
+                            "loss[{s}][{a}] not finite/non-negative for duration {duration}: {v}"
+                        );
+                    }
+                }
+            }
         }
     }
 

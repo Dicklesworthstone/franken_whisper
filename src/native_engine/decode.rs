@@ -404,9 +404,18 @@ fn process_logits(
 /// Numerically-stable log-softmax (whisper.cpp `whisper_compute_logprobs`,
 /// lines 6138-6158). `-inf` logits map to `-inf` logprobs.
 fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
+    // Sanitize non-finite logits to `-inf` up front. A `+inf` activation
+    // (overflow) would otherwise drive `logit_max` to `+inf`, making
+    // `(l - logit_max).exp() = exp(+inf - +inf) = exp(NaN) = NaN` and poisoning
+    // every logprob (and, downstream, the confidence/avg_logprob/no_speech math).
+    // Mapping NaN/+inf to `-inf` makes them behave like already-masked lanes.
+    let logits: Vec<f32> = logits
+        .iter()
+        .map(|&l| if l.is_finite() { l } else { f32::NEG_INFINITY })
+        .collect();
     let logit_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut logsumexp = 0.0f32;
-    for &l in logits {
+    for &l in &logits {
         if l > f32::NEG_INFINITY {
             logsumexp += (l - logit_max).exp();
         }
@@ -584,7 +593,9 @@ fn confidence(plogs: &[f32]) -> Option<f64> {
         return None;
     }
     let mean = plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / plogs.len() as f64;
-    Some(mean.exp().clamp(0.0, 1.0))
+    // `clamp` panics on NaN under the current nightly; guard the exp result.
+    let c = mean.exp();
+    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
 }
 
 /// Per-segment **text** confidence (fix #8): `exp(mean text-token logprob)`
@@ -603,6 +614,7 @@ fn text_confidence(tk: &Tokenizer, tokens: &[i32], plogs: &[f32]) -> Option<f64>
         if tok < tk.timestamp_begin
             && !tk.is_special(tok)
             && let Some(&p) = plogs.get(i)
+            && p.is_finite()
         {
             sum += f64::from(p);
             count += 1;
@@ -612,7 +624,9 @@ fn text_confidence(tk: &Tokenizer, tokens: &[i32], plogs: &[f32]) -> Option<f64>
         return None;
     }
     let mean = sum / count as f64;
-    Some(mean.exp().clamp(0.0, 1.0))
+    // `clamp` panics on NaN under the current nightly; guard the exp result.
+    let c = mean.exp();
+    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
 }
 
 /// Construct a [`TranscriptionSegment`] from centisecond bounds + text.
@@ -924,7 +938,12 @@ pub fn transcribe_samples(
             usize::try_from(tk.no_speech)
                 .ok()
                 .and_then(|i| lp.get(i).copied())
-                .map_or(0.0, |x| f64::from(x.exp()))
+                .map_or(0.0, |x| {
+                    // Defense-in-depth: a non-finite logprob must not export a
+                    // NaN no_speech_prob into the silence gate / routing snapshot.
+                    let p = f64::from(x.exp());
+                    if p.is_finite() { p } else { 0.0 }
+                })
         };
 
         // Greedy decode loop.
@@ -1002,6 +1021,14 @@ pub fn transcribe_samples(
             EMPTY_WINDOW_AVG_LOGPROB
         } else {
             result_plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / result_plogs.len() as f64
+        };
+        // A non-finite mean (a NaN/inf plog escaping the decoder) degrades to the
+        // finite empty-window sentinel so the silence gate and routing snapshot
+        // never see NaN (a NaN would silently read as "not silence").
+        let avg_logprob = if avg_logprob.is_finite() {
+            avg_logprob
+        } else {
+            EMPTY_WINDOW_AVG_LOGPROB
         };
 
         // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
@@ -1891,6 +1918,41 @@ mod tests {
     }
 
     #[test]
+    fn text_confidence_finite_on_nan_plog() {
+        // A NaN token logprob must be skipped (not summed into the mean) and the
+        // clamp must never see NaN. `hello world` with a good and a NaN plog →
+        // confidence reflects only the finite plog and stays a finite [0, 1].
+        let tk = synth_tokenizer();
+        let tokens = vec![2i32, 3i32];
+        let plogs = vec![0.0f32, f32::NAN];
+        let conf = text_confidence(&tk, &tokens, &plogs).expect("finite text token present");
+        assert!(conf.is_finite(), "confidence must be finite, got {conf}");
+        assert!((0.0..=1.0).contains(&conf), "confidence in [0,1], got {conf}");
+        assert!((conf - 1.0).abs() < 1e-9, "only the finite plog (0.0) counts → exp(0)=1");
+
+        // Every text-token plog non-finite → all skipped → None (no NaN mean, no
+        // clamp panic).
+        assert!(text_confidence(&tk, &tokens, &[f32::NAN, f32::INFINITY]).is_none());
+    }
+
+    #[test]
+    fn compute_logprobs_finite_on_positive_inf_logit() {
+        // A `+inf` logit (activation overflow) must not manufacture NaN logprobs
+        // via `exp(+inf - +inf)`. The `+inf` lane is sanitized to a masked
+        // (`-inf`) lane; the finite lanes must still yield finite logprobs
+        // instead of a NaN-poisoned whole vector.
+        let lp = compute_logprobs(&[f32::INFINITY, 0.0, -1.0]);
+        assert!(lp[1].is_finite(), "logprob for finite logit 0.0 must be finite, got {}", lp[1]);
+        assert!(lp[2].is_finite(), "logprob for finite logit -1.0 must be finite, got {}", lp[2]);
+        assert!(!lp[1].is_nan() && !lp[2].is_nan(), "no NaN logprobs");
+
+        // A NaN logit is likewise neutralized (mapped to a masked lane) rather
+        // than poisoning the finite lanes.
+        let lp2 = compute_logprobs(&[f32::NAN, 0.0, -1.0]);
+        assert!(lp2[1].is_finite() && lp2[2].is_finite(), "NaN logit must not poison finite lanes");
+    }
+
+    #[test]
     fn segments_two_pairs() {
         let tk = synth_tokenizer();
         let beg = tk.timestamp_begin;
@@ -2096,6 +2158,15 @@ mod tests {
         let c = confidence(&[-2.0, -2.0]).unwrap();
         assert!(c > 0.0 && c < 1.0);
         assert!(confidence(&[]).is_none());
+    }
+
+    #[test]
+    fn confidence_finite_on_nan_plog() {
+        // A NaN plog makes the mean NaN; the guarded clamp must not panic on the
+        // current nightly and must degrade to a finite 0.0.
+        let c = confidence(&[f32::NAN, 0.0]).expect("non-empty plogs → Some");
+        assert!(c.is_finite(), "confidence must be finite on NaN input, got {c}");
+        assert_eq!(c, 0.0);
     }
 
     // -----------------------------------------------------------------------

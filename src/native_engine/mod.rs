@@ -338,14 +338,87 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 /// set `$FRANKEN_WHISPER_MODEL_DIR`) is obvious. A canonicalization failure on
 /// an existing path surfaces as [`FwError::Io`].
 pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
+    // Tolerate blank/whitespace specs — a common "dumb error" is `--model ""`
+    // from an empty shell variable. Treat those as "no model specified" rather
+    // than trying to open a file literally named "" (which fails obscurely).
+    let spec = spec.trim();
+
     // Form 1: an existing path wins, even if it happens to look like a name.
-    let as_path = Path::new(spec);
-    if as_path.is_file() {
-        return Ok(as_path.canonicalize()?);
+    if !spec.is_empty() {
+        let as_path = Path::new(spec);
+        if as_path.is_file() {
+            return Ok(as_path.canonicalize()?);
+        }
     }
 
-    // Form 2: short-name lookup across the shared search dirs.
-    resolve_model_in_dirs(spec, &model_search_dirs())
+    let dirs = model_search_dirs();
+
+    // "Unspecified" (blank, or the `default` sentinel): try the conventional
+    // `ggml-default.bin`, then fall back to auto-discovering ANY ggml model
+    // already on disk so the tool just works instead of hard-failing on a
+    // missing default. An *explicit* short-name that is missing still errors
+    // below — silently substituting a different model would betray the request.
+    if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
+        if let Ok(p) = resolve_model_in_dirs("default", &dirs) {
+            return Ok(p);
+        }
+        if let Some(p) = discover_any_model(&dirs) {
+            tracing::info!(
+                model = %p.display(),
+                "no model specified and no ggml-default.bin found; auto-selected an available ggml model"
+            );
+            return Ok(p.canonicalize()?);
+        }
+        // Nothing on disk at all: return the conventional, actionable error.
+        return resolve_model_in_dirs("default", &dirs);
+    }
+
+    // Form 2: explicit short-name lookup across the shared search dirs.
+    resolve_model_in_dirs(spec, &dirs)
+}
+
+/// Auto-discover any usable `ggml-*.bin` model already on disk. Used **only**
+/// when the caller specified no model (blank / `default`) and no
+/// `ggml-default.bin` exists, so a machine that has *a* model transcribes
+/// instead of erroring. Scans [`model_search_dirs`] in precedence order and,
+/// within the first dir that holds any models, picks deterministically by a
+/// quality preference (best first) so the choice is stable across runs. Never
+/// downloads — it only ever selects a file the operator already placed (the
+/// "data never leaves the machine" stance is preserved).
+fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
+    // Best-first preference; unknown names sort last but stay eligible, so an
+    // operator's custom `ggml-<x>.bin` is still used when it is all that exists.
+    const PREF: &[&str] = &[
+        "large-v3-turbo", "large-v3", "large-v2", "large", "medium.en", "medium", "small.en",
+        "small", "base.en", "base", "tiny.en", "tiny",
+    ];
+    for dir in dirs {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut found: Vec<(usize, String, PathBuf)> = Vec::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(short) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("ggml-"))
+                .and_then(|n| n.strip_suffix(".bin"))
+            {
+                let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
+                found.push((rank, short.to_string(), path));
+            }
+        }
+        if !found.is_empty() {
+            // Rank first, then name, for a stable tie-break within a rank.
+            found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            return Some(found.into_iter().next().expect("non-empty").2);
+        }
+    }
+    None
 }
 
 /// Resolve a short-name `spec` against an explicit, ordered list of search

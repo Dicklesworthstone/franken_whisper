@@ -1225,7 +1225,11 @@ pub fn softmax_rows(x: &mut Mat) {
         }
         let mut sum = 0.0f32;
         for v in row.iter_mut() {
+            // A NaN score (e.g. from an upstream overflow) would make
+            // `(*v - max).exp()` NaN, poison `sum`, skip normalization, and
+            // leave NaN in the row. Treat non-finite contributions as 0.
             let e = (*v - max).exp();
+            let e = if e.is_finite() { e } else { 0.0 };
             *v = e;
             sum += e;
         }
@@ -2321,6 +2325,22 @@ mod tests {
         let s: f32 = x.row(0).iter().sum();
         assert!((s - 1.0).abs() < 1e-5, "sum {s}");
         assert!(x.data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn softmax_rows_sanitizes_nan() {
+        // A NaN score must not leave NaN in the output row (upstream overflow
+        // could otherwise poison the whole decoder residual stream).
+        let mut x = Mat::from_vec(1, 3, vec![f32::NAN, 1.0, 0.0]);
+        softmax_rows(&mut x);
+        assert!(
+            x.data.iter().all(|v| v.is_finite()),
+            "no NaN/inf in output row"
+        );
+        // The NaN lane contributes 0; the finite lanes normalize to sum 1.
+        let s: f32 = x.row(0).iter().sum();
+        assert!((s - 1.0).abs() < 1e-5, "sum {s}");
+        assert_eq!(x.row(0)[0], 0.0, "NaN lane maps to 0");
     }
 
     #[allow(clippy::too_many_arguments)]

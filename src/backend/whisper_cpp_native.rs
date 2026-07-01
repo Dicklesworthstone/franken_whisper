@@ -700,8 +700,10 @@ fn group_word_segments_by_len(
         current_text.push_str(word);
         current_end = segment.end_sec;
         if let Some(conf) = segment.confidence {
-            confidence_sum += conf;
-            confidence_count += 1;
+            if conf.is_finite() {
+                confidence_sum += conf;
+                confidence_count += 1;
+            }
         }
     }
 
@@ -734,7 +736,9 @@ fn finalize_segments(
             end_sec: if no_timestamps { None } else { seg.end_sec },
             text: seg.text.trim().to_owned(),
             speaker: None,
-            confidence: seg.confidence.map(|c| c.clamp(0.0, 1.0)),
+            confidence: seg
+                .confidence
+                .map(|c| if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 }),
         });
     }
     Ok(out)
@@ -1106,6 +1110,41 @@ mod tests {
     }
 
     #[test]
+    fn group_word_segments_by_len_ignores_nan_confidence() {
+        // One poisoned per-word confidence must not corrupt the grouped average:
+        // the NaN is dropped from the mean, leaving a finite result.
+        let words = vec![
+            TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.0),
+                text: "alpha".to_owned(),
+                speaker: None,
+                confidence: Some(0.8),
+            },
+            TranscriptionSegment {
+                start_sec: Some(1.0),
+                end_sec: Some(2.0),
+                text: "beta".to_owned(),
+                speaker: None,
+                confidence: Some(f64::NAN),
+            },
+            TranscriptionSegment {
+                start_sec: Some(2.0),
+                end_sec: Some(3.0),
+                text: "gamma".to_owned(),
+                speaker: None,
+                confidence: Some(0.6),
+            },
+        ];
+        let grouped = group_word_segments_by_len(&words, 100, None).expect("group");
+        assert_eq!(grouped.len(), 1);
+        let conf = grouped[0].confidence.expect("finite confidence");
+        assert!(conf.is_finite(), "grouped confidence must be finite: {conf}");
+        // Mean of the two finite confidences (0.8, 0.6), NaN excluded.
+        assert!((conf - 0.7).abs() < 1e-9, "unexpected mean: {conf}");
+    }
+
+    #[test]
     fn build_segments_word_mode_splits_real_segments() {
         let engine_segments = vec![seg(0.0, 3.0, "hello there world")];
         let out = build_segments(
@@ -1149,6 +1188,21 @@ mod tests {
                 .iter()
                 .all(|s| s.start_sec.is_none() && s.end_sec.is_none())
         );
+    }
+
+    #[test]
+    fn finalize_segments_sanitizes_nan_confidence() {
+        // A NaN confidence must be sanitized to a safe finite value rather than
+        // panicking under the nightly clamp-on-NaN behavior.
+        let segs = vec![TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(1.0),
+            text: "hello".to_owned(),
+            speaker: None,
+            confidence: Some(f64::NAN),
+        }];
+        let out = finalize_segments(&segs, false, None).expect("finalize");
+        assert_eq!(out[0].confidence, Some(0.0));
     }
 
     #[test]

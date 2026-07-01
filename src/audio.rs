@@ -729,13 +729,20 @@ fn append_decoded_audio_to_mono(
     let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
     sample_buffer.copy_interleaved_ref(decoded);
     let interleaved = sample_buffer.samples();
+    // NaN/Inf/denormal entry point: IEEE-754 float PCM can legitimately carry
+    // non-finite samples. Sanitize once at ingestion so the downstream downmix,
+    // resampler, and WAV writer only ever see finite values (no hot-loop guards).
+    let clean: Vec<f32> = interleaved
+        .iter()
+        .map(|&x| if x.is_finite() { x } else { 0.0 })
+        .collect();
 
     if channel_count <= 1 {
-        destination.extend_from_slice(interleaved);
+        destination.extend_from_slice(&clean);
         return;
     }
 
-    destination.extend_from_slice(&downmix_to_mono(interleaved, channel_count));
+    destination.extend_from_slice(&downmix_to_mono(&clean, channel_count));
 }
 
 /// Average `channels` interleaved samples per frame down to mono. Bit-exact with
@@ -782,6 +789,12 @@ pub fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
 /// harness can measure it directly; not part of the stable API.
 pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if input.is_empty() {
+        return Vec::new();
+    }
+    // Guard divisors before any rate arithmetic: dst_rate==0 -> ratio=+Inf and
+    // output_len=Inf.ceil() as usize (capacity-overflow panic); src_rate==0 ->
+    // 0/0=NaN flowing into the clamp. Fail closed with an empty buffer.
+    if src_rate == 0 || dst_rate == 0 {
         return Vec::new();
     }
     if src_rate == dst_rate {
@@ -853,7 +866,11 @@ fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResul
     };
     let mut writer = hound::WavWriter::create(path, spec).map_err(hound_error_to_fw)?;
     for sample in samples {
-        let quantized = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        // Sanitize before clamp: on the current nightly toolchain `f32::clamp`
+        // panics when `self` is NaN. NaN/Inf/denormal-class inputs map to 0.0
+        // (silence) so quantization stays finite and cannot abort the writer.
+        let s = if sample.is_finite() { *sample } else { 0.0 };
+        let quantized = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
         writer.write_sample(quantized).map_err(hound_error_to_fw)?;
     }
     writer.finalize().map_err(hound_error_to_fw)?;
@@ -1173,6 +1190,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn write_mono_wav_i16_sanitizes_non_finite_samples() {
+        use super::write_mono_wav_i16;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sanitized.wav");
+        // NaN / +Inf / -Inf must NOT panic the clamp on the current nightly and
+        // must be written as silence (0); finite subnormals/normals pass through.
+        let samples = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1), // smallest positive subnormal (finite)
+            1.0,
+            -1.0,
+            0.0,
+            f32::MIN_POSITIVE,
+        ];
+        write_mono_wav_i16(&path, &samples, 16_000).expect("write should not panic");
+
+        let reader = hound::WavReader::open(&path).expect("open sanitized wav");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.channels, 1);
+        let got: Vec<i16> = reader
+            .into_samples::<i16>()
+            .collect::<Result<_, _>>()
+            .expect("read i16 samples");
+        // Non-finite -> 0; ~0 subnormals -> 0; ±1.0 -> ±full scale.
+        assert_eq!(got, vec![0, 0, 0, 0, 32_767, -32_767, 0, 0]);
+    }
+
+    #[test]
+    fn resample_mono_linear_zero_rate_returns_empty() {
+        use super::resample_mono_linear;
+        let input = [0.1f32, 0.2, 0.3, 0.4];
+        // dst_rate==0 would make ratio=+Inf and output_len=usize::MAX (alloc
+        // panic); src_rate==0 would make ratio=NaN. Both must fail closed.
+        assert!(resample_mono_linear(&input, 16_000, 0).is_empty());
+        assert!(resample_mono_linear(&input, 0, 16_000).is_empty());
+    }
+
+    #[test]
+    fn builtin_decoder_sanitizes_non_finite_float_samples() {
+        use super::normalize_to_wav_with_builtin_decoder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input_wav = dir.path().join("nan_float.wav");
+        let output_wav = dir.path().join("normalized.wav");
+
+        // A 16 kHz mono IEEE-float WAV carrying NaN/Inf alongside finite samples.
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&input_wav, spec).expect("create float wav");
+        for i in 0..16_000 {
+            let s = match i % 4 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                _ => 0.25,
+            };
+            writer.write_sample(s).expect("write");
+        }
+        writer.finalize().expect("finalize");
+
+        normalize_to_wav_with_builtin_decoder(&input_wav, &output_wav, None)
+            .expect("builtin decoder should sanitize NaN and not panic");
+
+        // Output must be valid 16 kHz mono PCM; NaN/Inf were mapped to silence so
+        // every quantized sample stays within full scale (all i16, all finite).
+        let reader = hound::WavReader::open(&output_wav).expect("open normalized wav");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16_000);
+        let out: Vec<i16> = reader
+            .into_samples::<i16>()
+            .collect::<Result<_, _>>()
+            .expect("read normalized samples");
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|&s| (-32_767..=32_767).contains(&s)));
     }
 
     #[test]
