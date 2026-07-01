@@ -3,6 +3,42 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: int8/Q8 decoder-MLP GEMV REJECTED — the MLP fits L3, so int8 REGRESSES it (fc1 0.86×, fc2 1.17×); int8 only wins on tensors that SPILL L3 (logits).
+
+**Land-or-dig result: the "extend int8 to the MLP" plan (28% of decode) is a NON-WIN — rejected on a
+model-free kernel probe.** AGENT_NAME=BlackThrush. Integration was fully written (separate
+`FRANKEN_WHISPER_INT8_MLP` gate in mod.rs, `Linear::w_i8`/`quantized()` + tq==1 decode path in decoder.rs,
+bias param on `gemv_i8` in nn.rs) then REVERTED after the probe; the three source files are back to
+bit-identical HEAD. Kept only the evidence artifact `examples/int8_mlp_probe.rs`.
+
+### Measured (single-thread, real MLP shapes, f16c dot vs autovec int8 dot; large-v3-turbo n_state=1280)
+```
+  mlp.fc1 [5120,1280]  f16 0.216 ms (60.6 GB/s)  vs  int8 0.253 ms (25.9 GB/s)  = 0.86× (SLOWER)
+  mlp.fc2 [1280,5120]  f16 0.274 ms (47.8 GB/s)  vs  int8 0.235 ms (27.9 GB/s)  = 1.17× (marginal)
+```
+Combined fc1+fc2 ≈ **neutral-to-negative**. Contrast the LANDED logits int8: 1.86× single-thread on
+`[51866,1280]`.
+
+### Why (the mechanistic principle — the important part)
+int8 only pays off when the weight tensor **spills the L3 to DRAM**, because its whole value is halving the
+*bytes read from DRAM*. Each MLP linear is `[5120,1280]`/`[1280,5120]` f16 = **13.1 MB**, which fits the
+128 MB L3 of this Threadripper 5975WX; the f16 path therefore already runs at **L3 bandwidth (48–60 GB/s)**,
+and the int8 kernel — compute-bound at ~26 GB/s (i32-accumulating `vpmaddwd`, no VNNI) — cannot beat
+L3-resident f16 (it even LOSES on fc1). The logits are `[51866,1280]` f16 = **132.8 MB > L3**, so they spill
+to DRAM and int8's byte-halving wins. **RULE: int8/Q8 is a DRAM-spill lever, not a blanket "decode is
+bandwidth-bound" lever — it wins on vocab-class (>L3) tensors and regresses cache-resident ones.** This also
+falsifies the earlier framing that lumped "logits(21%)+MLP(28%)=49% memory-bound ⇒ both int8-able": only
+the >L3 logits qualified.
+
+### Caveat / open question (why "reject" not "impossible")
+The probe keeps ONE 13 MB shape L3-hot in isolation. Real per-token decode runs 4 layers' MLPs (~104 MB) +
+the 132 MB logits, so the L3 is polluted and the MLP weights may in fact SPILL per token → int8 could recover
+to ~1.3–1.5× in real *parallel* decode. Confirming that needs the model-resident `decoder_token_step_large`
+/ `decoder_attrib` A/B (FRANKEN_WHISPER_INT8_MLP=1 vs off), which is blocked this window by the
+model-local/rch split (rch builds remote, doesn't sync the bench binary back; the model is local-only). The
+ISOLATED evidence is negative-to-marginal, so nothing was landed; a quiet-local-box cycle can measure real
+decode to settle whether the L3-pollution case flips it positive. Probe kept for that re-dig.
+
 ## 2026-07-01 - BlackThrush: WIN LANDED (default ON) — int8/Q8 logits GEMV is now the DEFAULT decode path: int8 transcript == the whisper-cli GOLDEN REFERENCE (jfk, tiny.en + turbo), and whisper.cpp itself runs `MATMUL_INT8`.
 
 **Land-or-dig result: the previously-gated int8 logits lever (e9daa40) is ACTIVATED by default** —
