@@ -3,6 +3,43 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: fresh post-int8 decode profile — logits int8 CONFIRMED LIVE (2.52→1.37ms, 1.84×); residual gap is shared-box CONTENTION, not a kernel lever (decode parallelism already optimally tuned).
+
+**Land-or-dig result: dug a fresh post-int8 decode profile to find the biggest remaining gap; it is the
+documented-closed contention wall, no landable compute win.** AGENT_NAME=BlackThrush. `examples/decoder_attrib`
+rebuilt LOCALLY at HEAD (int8 logits default-ON), 200 steps, turbo + tiny.
+
+### POSITIVE — landed int8 logits confirmed in the REAL decode (not just the tight bench)
+`logits_gemv` on turbo is now **1.37 ms/token (11.7%)** vs the pre-int8 **2.52 ms** (memory, real-decode f16)
+= **1.84×**, matching the ~1.86× int8 prototype. So the default-ON logits int8 (3fd75a0) delivers its win
+live; it also drops logits from ~21% → 11.7% of decode.
+
+### turbo profile (per-token 11.70 ms, int8 logits ON)
+```
+  mlp_fc_gelu_proj 27.3% (3.19ms)   self_out_proj 13.7% (1.61)   logits_gemv 11.7% (1.37)
+  self_attn 11.1% (1.30)   self_qkv_proj 10.6% (1.24)   cross_attn 10.5% (1.23)
+  cross_q_proj 7.3% (0.85)   cross_out_proj 7.0% (0.81)
+```
+
+### The `self_out_proj` 2× anomaly is CONTENTION, not structure (diagnostic)
+`self_out`, `cross_out`, `cross_q` are all identical `[1280,1280]` m=1 forwards, yet self_out=1.61 ms is 2×
+cross_out=0.81 / cross_q=0.85. Diagnostic: on **tiny** (n_state=384, `[384,384]`=147k is BELOW the gemv
+`PAR_THRESHOLD` 1<<19 → runs SERIAL) the three are **equal and cheap** (0.133 / 0.160 / 0.135 ms) — no
+anomaly. The 2× appears only on turbo where `[1280,1280]`=1.6M is ABOVE the threshold → PARALLEL. self_out is
+the first parallel gemv after the compute-heavy `self_attn` burst, so it pays rayon **cold-wakeup** when the
+OS has descheduled the pool's workers — and the box is at **load average 10.45** (64 cores, shared). Every
+parallel gemv is contention-inflated here (mlp ~8 GB/s, projections ~4 GB/s, far below quiet-box rates).
+
+### Serializing the mid GEMVs is NOT a win (already exhaustively tuned)
+The `gemv_f16` `PAR_THRESHOLD` history (bd-6qih / L9 / L11, in-code) already settled this: with rayon's
+PERSISTENT global pool (no per-call spawn), **parallel beats serial 1.35–1.40× even on a contended host**
+for the mid GEMVs; 1<<19 is the measured threshold (mlp/logits parallelize, `[384,384]` stays serial).
+`[1280,1280]` is correctly parallel — tiny-scaling puts serial `[1280,1280]` ≈1.45 ms > the parallel 0.81 ms.
+So the residual decode cost is **shared-box CONTENTION on the parallel dispatch**, i.e. exactly the
+load-dependent wall in the decode-overthreaded notes (thread avenue CLOSED, 3 reverts, "can't settle on a
+shared box"). BLOCKER (one sentence): the decode parallel-dispatch levers are unmeasurable/unsettleable at
+load 10.45 — they need a QUIET box (load < ~2), which is not available this window. No source changed.
+
 ## 2026-07-01 - BlackThrush: int8/Q8 decoder-MLP GEMV REJECTED — the MLP fits L3, so int8 REGRESSES it (fc1 0.86×, fc2 1.17×); int8 only wins on tensors that SPILL L3 (logits).
 
 **Land-or-dig result: the "extend int8 to the MLP" plan (28% of decode) is a NON-WIN — rejected on a
