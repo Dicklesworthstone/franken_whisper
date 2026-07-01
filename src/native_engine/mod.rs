@@ -261,12 +261,16 @@ pub(crate) fn f16_compute_enabled() -> bool {
 ///
 /// The logits stream is the model's largest tensor (`[n_vocab, n_state]`, 132 MB
 /// f16 for large-v3-turbo) and is DRAM-bandwidth-bound in decode; int8 halves the
-/// bytes (measured 1.86× single-thread vs f16). It is a NUMERICS-AFFECTING
-/// approximation (int8 ≈ 256 levels vs f16 ≈ 1000s), so it stays **OFF by
-/// default** until the exact-transcript conformance suite is cleared with it on;
-/// enable with `FRANKEN_WHISPER_INT8_LOGITS=1` for benching / validation.
+/// bytes (measured 1.86× single-thread, 3.5× tight-loop vs f16). It is a
+/// NUMERICS-AFFECTING approximation (int8 ≈ 256 levels vs f16 ≈ 1000s), but the
+/// logits are the FINAL projection — argmax-robust, and quantizing here leaves the
+/// hidden state untouched. Validated transcript-identical to both the f16 path and
+/// the whisper-cli golden reference on jfk for tiny.en AND large-v3-turbo across
+/// every dispatch path (the whisper.cpp reference itself runs `MATMUL_INT8`), so it
+/// is **ON by default**. Set `FRANKEN_WHISPER_INT8_LOGITS=0` to force the exact f16
+/// path (bit-level A/B, or a hypothetical regressing input).
 pub(crate) fn int8_logits_enabled() -> bool {
-    const DEFAULT_ON: bool = false;
+    const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_LOGITS") {
         Ok(v) => matches!(

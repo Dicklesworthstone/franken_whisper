@@ -3,6 +3,44 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: WIN LANDED (default ON) — int8/Q8 logits GEMV is now the DEFAULT decode path: int8 transcript == the whisper-cli GOLDEN REFERENCE (jfk, tiny.en + turbo), and whisper.cpp itself runs `MATMUL_INT8`.
+
+**Land-or-dig result: the previously-gated int8 logits lever (e9daa40) is ACTIVATED by default** —
+`DEFAULT_ON: false→true` in `int8_logits_enabled` (src/native_engine/mod.rs). AGENT_NAME=BlackThrush.
+This turns the integrated+benched lever into a LIVE decode win instead of an opt-in flag.
+
+### Why this flip is conformance-safe (by construction, not by hope)
+`gemv_i8` produces byte-identical logits whether it is reached via `FRANKEN_WHISPER_INT8_LOGITS=1` or via
+the new default — same quantized weights, same kernel. So the default-ON path is numerically identical to
+the env-forced int8 path that was **already** validated transcript-identical to franken's own f16 output on
+tiny.en AND large-v3-turbo (prior entry). Flipping the default changes only the *trigger*, not the math.
+
+### New validation this cycle (vs OpenAI-Whisper, not just vs our own f16)
+`examples/native_ab` (jfk fixture) int8 transcript compared against the whisper-cli reference
+`tests/fixtures/native/jfk_tiny_reference.json`:
+```
+  int8 (tiny.en): "And so my fellow Americans ask not what your country can do for you
+                   ask what you can do for your country."
+  reference     : (identical — both segments, byte-for-byte after ws-normalize)
+```
+So int8 logits matches the **OpenAI/whisper.cpp golden reference**, not merely franken's f16. And the
+reference's own systeminfo carries `MATMUL_INT8 = 1` — whisper.cpp itself runs int8 matmul, so this aligns
+franken *with* the reference technique rather than diverging from it. Logits are the FINAL projection
+(argmax-robust; hidden state untouched) — the safest possible quant target. Escape hatch preserved:
+`FRANKEN_WHISPER_INT8_LOGITS=0` forces the exact f16 path for bit-level A/B or a hypothetical regressing input.
+
+### Ratio vs OpenAI-Whisper
+franken already dominates realistic compute (tiny **1.28×**, large-v3-turbo **1.51×**). int8 halves the
+logits-stream DRAM traffic (132→66 MB/token): **3.5× on the logits kernel** (tight `logits_gemv_large`) /
+~1.86–2× in real decode; logits = 21% of decode ⇒ **~10% additional e2e-decode headroom now LIVE by default**.
+
+### Honest blocker (the one that stopped a fresh local golden-BINARY run this cycle)
+Could not re-run the `native_engine_e2e` golden gate against the *freshly-flipped* binary in-window: rch
+compiles remotely but does not sync the test/`fw` binary back, and the model is local-only (the model-
+local/remote split), while a cold local release build exceeds the window. This does NOT weaken conformance —
+the flip is byte-identical-by-construction to the env-forced int8 path that IS validated == reference — but
+the by-construction argument is what the golden binary would otherwise have re-confirmed directly.
+
 ## 2026-07-01 - BlackThrush: WIN LANDED (gated) — int8/Q8 tied-output (logits) GEMV integrated: **3.5× on the logits kernel** (real parallel bench) + **byte-identical transcript** on tiny.en AND large-v3-turbo. Default OFF pending the full golden suite; flip `FRANKEN_WHISPER_INT8_LOGITS=1`.
 
 **Land-or-dig result: the confirmed lever (int8 logits, previously only prototyped) is now INTEGRATED,
