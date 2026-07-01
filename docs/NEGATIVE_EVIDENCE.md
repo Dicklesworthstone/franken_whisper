@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: SURFACE (measured, PROTOTYPE) — int8/Q8 logits GEMV is **1.86× faster** than f16 (single-thread, real `[51866,1280]` shape). The bandwidth-bound → int8-halves-bytes hypothesis is now MEASURED, not estimated. Integration (load-path + conformance) is the next dig; too large for a 60m window.
+
+**Land-or-dig result: land-check clean → dug the confirmed lever (int8 on the memory-bound logits) with
+a KERNEL prototype → measured 1.86×.** AGENT_NAME=BlackThrush. This settles the one open question from the
+2026-06-30 entry (is it truly bandwidth-bound, so bytes-halving wins? — YES). Committed the reproducible
+probe `examples/int8_logits_probe.rs`; no production code change (int8 needs the load-path + conformance
+work below).
+
+### Measurement (`examples/int8_logits_probe`, single-thread, best-of-40, real logits shape)
+Single-thread isolates the BYTES/bandwidth effect from rayon dispatch. f16c dot (copy of `nn::dot_f16c`)
+vs an autovectorized int8 dot (`vpmovsxbw`+`vpmaddwd`), per-output-row symmetric int8 weight quant.
+```
+  f16    7.0–7.2 ms   18.6 GB/s
+  int8   3.8   ms     17.4 GB/s     speedup = 1.86×   (2 reps identical)
+```
+BOTH are pinned at ~single-core DRAM bandwidth (~18 GB/s → the logits is genuinely bandwidth-bound, not
+compute-/cvtph-bound), so int8 (66.4 MB vs 132.8 MB) runs 1.86× — near the ideal 2×, minus the per-row
+`× scale` and the int8 dot's slightly lower effective GB/s. Extrapolated: int8 on logits (21%) + MLP
+(28%, same ~31 GB/s bandwidth profile) → **~20% faster e2e decode**.
+
+### The accuracy caveat (do NOT read the probe's error as a conformance verdict)
+The probe's "max rel err = 0.2562" is a SYNTHETIC-DATA ARTIFACT: the structured synthetic weights
+(`(i%101)/101−0.5`) × ramp activation produce near-ZERO dots, so relative error explodes on a tiny
+denominator. Real embedding rows / hidden states don't cancel like that; per-row symmetric int8 quant of
+a real embedding typically gives <1–2% logit error, and whisper.cpp ships Q8 models that transcribe
+correctly. Real-data accuracy MUST be validated on the model (26/0 transcript comparator + argmax-tie),
+NOT inferred from this synthetic probe.
+
+### Integration plan (the next session's dig — ~1–2 hr, benched then conformance-gated)
+1. `WeightMat::I8 { data: Vec<i8>, scales: Vec<f32>, out, inp }`; quantize the tied embedding (+ MLP
+   weights) at load per output row (symmetric, `scale = amax/127`); keep f16 as fallback + a
+   `FRANKEN_WHISPER_INT8_WEIGHTS` gate (default OFF until conformance clears).
+2. Parallel int8 GEMV wired into `logits_last` / `gemv_f16`'s dispatch: quantize activation `x` to int8
+   per-vector, dot via `vpmovsxbw`+`vpmaddwd` (no VNNI on this Threadripper 5975WX — single NUMA node, so
+   no interleave lever; the ~52 GB/s cap is Infinity-Fabric bandwidth), `× scale[o] × scale_x`.
+3. Bench `logits_gemv_large` + `e2e_large` (expect ~1.5–1.86× on logits, ~15–20% e2e decode); GATE on the
+   26/0 exact-transcript comparator + argmax-tie robustness before flipping the default ON.
+This is the ONLY bytes-cutting decode lever left; all conformance-safe restructuring is measured-and-closed.
+
 ## 2026-06-30 - BlackThrush: SURFACE (measured) — the logits GEMV is BANDWIDTH/cross-CCD-coordination-limited at ~27–53 GB/s (well below DRAM & compute peak), so f16→int8 weight quant is a CONFIRMED ~1.5–2× lever on it. Every conformance-safe in-crate kernel lever is exhausted; int8 is the only bytes-cutting move left and it needs owner sign-off (numerics change).
 
 **Land-or-dig result: land-check clean (no worktree win) → dug the biggest measured decode component
