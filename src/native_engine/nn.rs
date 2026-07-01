@@ -813,6 +813,103 @@ pub fn gemv_f16(
         });
 }
 
+/// Per-output-row symmetric-int8-quantized weight (`[out, in]` row-major) with a
+/// per-row f32 scale. Cuts the resident bytes in HALF vs [`WeightMat::F16`] — the
+/// lever for the memory-bandwidth-bound vocab-class logits GEMV (measured 1.86×
+/// single-thread vs f16 on `[51866,1280]`; the logits stream is DRAM-bandwidth-
+/// bound, so halving the bytes ~halves the time). Numerics-affecting (int8 ≈ 256
+/// levels): built + used only behind [`super::int8_logits_enabled`].
+#[derive(Debug, Clone)]
+pub struct I8Mat {
+    /// Quantized weights, `out * in` elements row-major, each in `[-127, 127]`.
+    pub data: Vec<i8>,
+    /// Per-output-row dequant scale (`amax_row / 127`), `out` elements.
+    pub scales: Vec<f32>,
+    /// Output dimension (rows).
+    pub out: usize,
+    /// Input dimension (contraction length).
+    pub inp: usize,
+}
+
+/// Per-output-row symmetric int8 quantization of a natural `[out, in]` f16
+/// weight: `scale[o] = max_i |w[o,i]| / 127`, `q[o,i] = round(w[o,i]/scale[o])`.
+/// Parallel over rows (each independent). The inverse `w ≈ q * scale` is what
+/// [`gemv_i8`] reconstructs.
+pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
+    debug_assert_eq!(w.len(), out * inp);
+    let mut data = vec![0i8; out * inp];
+    let mut scales = vec![0.0f32; out];
+    data.par_chunks_mut(inp)
+        .zip(scales.par_iter_mut())
+        .enumerate()
+        .for_each(|(o, (drow, s))| {
+            let wrow = &w[o * inp..(o + 1) * inp];
+            let amax = wrow
+                .iter()
+                .map(|h| h.to_f32().abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-9);
+            let sc = amax / 127.0;
+            *s = sc;
+            let inv = 1.0 / sc;
+            for (d, h) in drow.iter_mut().zip(wrow) {
+                *d = (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        });
+    I8Mat { data, scales, out, inp }
+}
+
+/// Signed int8 dot. LLVM lowers this to `vpmovsxbw`+`vpmaddwd` under x86-64-v3;
+/// the int8 compute far outruns the DRAM read rate, so the GEMV stays memory-
+/// bound (the point: half the weight bytes of the f16 path).
+#[inline]
+fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+    let mut acc: i32 = 0;
+    for (a, b) in w.iter().zip(x.iter()) {
+        acc += (*a as i32) * (*b as i32);
+    }
+    acc
+}
+
+/// Fused int8 GEMV: `out[o] = (Σ_i q_w[o,i] · q_x[i]) · scale_w[o] · scale_x`.
+/// Quantizes the activation `x` to int8 per-vector (symmetric), then dots each
+/// weight row. Parallelizes over output-row bands exactly like [`gemv_f16`]
+/// (wide worker cap for the vocab-class logits). A numerics-affecting int8
+/// approximation of the f16 GEMV — the caller gates it ([`super::int8_logits_enabled`]).
+pub fn gemv_i8(w: &I8Mat, x: &[f32], out_slice: &mut [f32]) {
+    let (out, inp) = (w.out, w.inp);
+    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8 weight shape mismatch");
+    debug_assert_eq!(x.len(), inp, "gemv_i8 x length mismatch");
+    debug_assert_eq!(out_slice.len(), out, "gemv_i8 out length mismatch");
+    // Quantize the activation once (per-vector symmetric), shared by all rows.
+    let xamax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+    let xs = xamax / 127.0;
+    let xinv = 1.0 / xs;
+    let xi8: Vec<i8> = x
+        .iter()
+        .map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+
+    let fill = |o_base: usize, slice: &mut [f32]| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            let o = o_base + i;
+            *slot = dot_i8(&w.data[o * inp..(o + 1) * inp], &xi8) as f32 * w.scales[o] * xs;
+        }
+    };
+
+    const PAR_THRESHOLD: usize = 1 << 19;
+    let workers = gemv_worker_count(out);
+    if out * inp < PAR_THRESHOLD || workers < 2 {
+        fill(0, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
+}
+
 /// Batched fused dequant + GEMV: `out[t, o] = bias[o] + dot(W[o, :], x[t, :])`
 /// for `tq` activation rows `x` (`[tq, in]` row-major) against a natural
 /// `[out, in]` f16 weight, producing `[tq, out]` row-major.

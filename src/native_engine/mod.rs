@@ -256,6 +256,27 @@ pub(crate) fn f16_compute_enabled() -> bool {
     )
 }
 
+/// Whether to run the tied-output (logits) projection through the int8/Q8
+/// weight-quantized GEMV ([`nn::gemv_i8`]) instead of the f16 fused GEMV.
+///
+/// The logits stream is the model's largest tensor (`[n_vocab, n_state]`, 132 MB
+/// f16 for large-v3-turbo) and is DRAM-bandwidth-bound in decode; int8 halves the
+/// bytes (measured 1.86× single-thread vs f16). It is a NUMERICS-AFFECTING
+/// approximation (int8 ≈ 256 levels vs f16 ≈ 1000s), so it stays **OFF by
+/// default** until the exact-transcript conformance suite is cleared with it on;
+/// enable with `FRANKEN_WHISPER_INT8_LOGITS=1` for benching / validation.
+pub(crate) fn int8_logits_enabled() -> bool {
+    const DEFAULT_ON: bool = false;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_LOGITS") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Emit one measurement-only span line (see [`perf_spans_enabled`]).
 pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
     if perf_spans_enabled() {

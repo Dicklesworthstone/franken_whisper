@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: WIN LANDED (gated) — int8/Q8 tied-output (logits) GEMV integrated: **3.5× on the logits kernel** (real parallel bench) + **byte-identical transcript** on tiny.en AND large-v3-turbo. Default OFF pending the full golden suite; flip `FRANKEN_WHISPER_INT8_LOGITS=1`.
+
+**Land-or-dig result: the confirmed lever (int8 logits, previously only prototyped) is now INTEGRATED,
+benched, and transcript-validated → landed gated.** AGENT_NAME=BlackThrush. Real production code, not a
+surface: `nn::I8Mat` + `quantize_f16_to_i8` + `gemv_i8` (nn.rs), `int8_logits_enabled` gate (mod.rs),
+optional `DecoderWeights::token_embedding_i8` built at load + used in `logits_last` (decoder.rs).
+
+### What landed
+Per-output-row symmetric int8 quant of the tied embedding (`scale[o]=amax_row/127`), built ONCE at load
+behind `FRANKEN_WHISPER_INT8_LOGITS` (default OFF). `gemv_i8` quantizes the activation per-vector, dots
+via an autovectorized int8 kernel (`vpmovsxbw`+`vpmaddwd`), parallelized over row bands exactly like
+`gemv_f16` (wide cap). Default OFF ⇒ `token_embedding_i8 = None` ⇒ `logits_last` takes the unchanged f16
+arm ⇒ the default path is **bit-identical** (conformance 26/0 with flag off).
+
+### Measured (criterion `logits_gemv_large`, real large-v3-turbo `[51866,1280]`)
+```
+  f16  (flag off)   5.25 ms
+  int8 (flag on)    1.50 ms      change −70.1% (p=0.00)  = 3.5× on the logits kernel
+```
+The 3.5× (> the 1.86× single-thread prototype) is because int8 = 66 MB fits the 128 MB L3 in the tight
+bench loop while f16 = 132 MB spills to DRAM; in real decode (L3 polluted between tokens) expect the
+conservative ~1.86–2×. Logits is 21% of decode → est. ~10% e2e decode; +MLP (same profile, not yet
+quantized) the full int8 path is ~20%.
+
+### Conformance (transcript, `examples/native_ab`, jfk fixture)
+```
+  tiny.en          f16 vs int8:  TRANSCRIPT IDENTICAL (byte-for-byte)
+  large-v3-turbo   f16 vs int8:  TRANSCRIPT IDENTICAL (byte-for-byte)
+```
+Per-row symmetric int8 embedding quant preserved the exact transcript on BOTH the smallest and the real
+deployment model. Still DEFAULT OFF: validated on one audio clip — the flip-default-ON gate is the full
+exact-transcript golden suite (all fixtures/languages) + argmax-tie robustness with the flag on. NEXT:
+(1) run the golden suite with `FRANKEN_WHISPER_INT8_LOGITS=1`; if green, flip `DEFAULT_ON=true`.
+(2) extend int8 to the MLP weights (`WeightMat`-level, same 1.86–2× profile) for the rest of the ~20%.
+
 ## 2026-07-01 - BlackThrush: SURFACE (measured, PROTOTYPE) — int8/Q8 logits GEMV is **1.86× faster** than f16 (single-thread, real `[51866,1280]` shape). The bandwidth-bound → int8-halves-bytes hypothesis is now MEASURED, not estimated. Integration (load-path + conformance) is the next dig; too large for a 60m window.
 
 **Land-or-dig result: land-check clean → dug the confirmed lever (int8 on the memory-bound logits) with

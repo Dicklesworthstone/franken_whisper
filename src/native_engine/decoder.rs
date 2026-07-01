@@ -256,6 +256,12 @@ pub struct DecoderWeights {
     /// natural rows. Otherwise it is a plain f32 [`WeightMat::F32`] in the same
     /// `[n_vocab, n_state]` orientation.
     token_embedding: WeightMat,
+    /// Optional int8/Q8 copy of the tied output (logits) projection, built at
+    /// load only when [`super::int8_logits_enabled`] is set and the embedding is
+    /// f16. When present, [`logits_last`] runs the memory-halved [`nn::gemv_i8`]
+    /// instead of the f16 GEMV. `None` (the default) leaves the f16 path exactly
+    /// as-is (bit-identical, conformance unchanged).
+    token_embedding_i8: Option<nn::I8Mat>,
     /// Learned positional embedding `[n_text_ctx, n_state]`.
     positional_embedding: Mat,
     layers: Vec<DecoderLayer>,
@@ -435,6 +441,14 @@ impl DecoderWeights {
 
         let token_embedding =
             load_embedding(model, "decoder.token_embedding.weight", n_vocab, n_state)?;
+        // Optional int8 copy of the tied logits projection (the model's largest,
+        // DRAM-bandwidth-bound tensor). Built once at load, gated OFF by default.
+        let token_embedding_i8 = match (&token_embedding, super::int8_logits_enabled()) {
+            (WeightMat::F16 { data, out, inp }, true) => {
+                Some(nn::quantize_f16_to_i8(data, *out, *inp))
+            }
+            _ => None,
+        };
         let positional_embedding =
             load_mat(model, "decoder.positional_embedding", n_text_ctx, n_state)?;
         let ln = load_layer_norm(model, "decoder.ln", n_state)?;
@@ -549,6 +563,7 @@ impl DecoderWeights {
 
         Ok(Self {
             token_embedding,
+            token_embedding_i8,
             positional_embedding,
             layers,
             ln,
@@ -1235,6 +1250,16 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
     let n_vocab = w.n_vocab;
     let n_state = w.n_state;
 
+    // int8 tied-output path (opt-in, `int8_logits_enabled`): the memory-halved
+    // GEMV over the per-row-quantized embedding. Numerics-affecting approximation
+    // of the f16 arm; present only when the gate was on at load.
+    if let Some(i8) = &w.token_embedding_i8 {
+        debug_assert_eq!((i8.out, i8.inp), (n_vocab, n_state));
+        let mut logits = nn::gemv_out_buf(i8.out);
+        nn::gemv_i8(i8, &x_last.data, &mut logits);
+        return Ok(logits);
+    }
+
     // f16-resident embedding: fused dequant-GEMV directly over the natural
     // `[n_vocab, n_state]` rows. `out[o] = dot(emb[o, :], x_last)`, contiguous
     // rows, dequant-in-loop — half the weight-memory traffic of the f32 path,
@@ -1485,6 +1510,7 @@ mod tests {
         }
         DecoderWeights {
             token_embedding: WeightMat::F32(rng.mat(N_VOCAB, N_STATE)),
+            token_embedding_i8: None,
             positional_embedding: rng.mat(N_CTX, N_STATE),
             layers,
             ln: ln(&mut rng),
