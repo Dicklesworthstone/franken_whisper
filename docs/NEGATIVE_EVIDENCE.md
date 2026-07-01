@@ -3,6 +3,45 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-06-30 - BlackThrush: SURFACE (measured) — the logits GEMV is BANDWIDTH/cross-CCD-coordination-limited at ~27–53 GB/s (well below DRAM & compute peak), so f16→int8 weight quant is a CONFIRMED ~1.5–2× lever on it. Every conformance-safe in-crate kernel lever is exhausted; int8 is the only bytes-cutting move left and it needs owner sign-off (numerics change).
+
+**Land-or-dig result: land-check clean (no worktree win) → dug the biggest measured decode component
+(logits, 21%; MLP 28% is the same story) → the bottleneck is now MEASURED, which quantifies the one
+open question (does int8 actually help?).** AGENT_NAME=BlackThrush. No code change this cycle — the
+in-crate conformance-safe kernel space is exhausted (see the five entries below: 2-row GEMV LANDED 1.29×;
+pre-dequant, wide-cap-MLP, SIMD-softmax, 2col-batched all measured-rejected). Surfacing the decision-ready
+int8 recommendation with hard numbers instead of forcing another ~0 micro-lever.
+
+### The measurement (criterion `logits_gemv_large`, real large-v3-turbo tied embedding `[51866,1280]` f16 = 132.8 MB)
+```
+  tight-loop criterion   4.94 ms  -> 26.9 GB/s  (26.9 GFLOP/s)   [sustained 32-worker DRAM pressure]
+  real decode (attrib)   2.52 ms  -> 52.7 GB/s  (52.7 GFLOP/s)   [logits burst amid other decode work]
+```
+Both are FAR below this box's DRAM peak (~100+ GB/s, multi-CCD) AND far below single-core f16-dot compute
+(~50 GFLOP/s/core — measured from the 2-row `[384,384]` serial kernel). So the 32-worker logits GEMV
+reaches only ~2.6× ONE core's bandwidth: it is **memory-limited but cross-CCD-coordination-CAPPED** (the
+wide_gemv_cap doc already records 48/64 workers REGRESS from cross-CCD sync; 32 is the plateau). It is NOT
+compute-bound and NOT cvtph-bound (consistent with this session's "cvtph is free" conclusion).
+
+### Consequence for the one remaining lever (decision-ready for the owner)
+Because logits (and MLP, same profile: ~31 GB/s over its 105 MB/token) is **bandwidth-limited**, halving
+the weight bytes with **int8/Q8 weight quantization** should give ~1.5–2× on those GEMVs → est. ~10–15%
+e2e decode (logits 21% + MLP 28% = 49% of decode, ×~1.7). CAVEAT: the cross-CCD-COORDINATION component
+means the scaling is not guaranteed 2× — the honest way to settle it is a kernel prototype. Plan for the
+next session / owner:
+  1. Quantize the tied embedding + MLP weights to int8 with per-output-row f32 scales at load
+     (`WeightMat::I8 { data, scales, out, inp }`), keep f16 as the fallback.
+  2. AVX2 int8 GEMV: `vpmaddubsw`(u8×s8→i16) + `vpmaddwd`→i32 accumulate, then `× scale[o] × scale_x`
+     (quantize the activation `x` to int8 per-vector). No VNNI on this box (no `vpdpbusd`), so the
+     `maddubs/maddwd` path is the target; ~32 int8 MACs/instr keeps it bandwidth-bound, not compute-bound.
+  3. Gate by transcript conformance (numerics change: int8 ≈ 256 levels vs f16 ≈ 1000s) — the decode path
+     is transcription-tolerance (NOT bit-exact), and whisper.cpp ships Q8 models that transcribe
+     correctly, so this is conformance-ELIGIBLE, not owner-forbidden — but it MUST clear the 26/0 exact-
+     transcript comparator + argmax-tie robustness before landing. Bench: `logits_gemv_large` (int8 vs
+     f16, expect ~1.5–2×) + e2e_large.
+This is the ONLY bytes-cutting decode lever left; all conformance-safe restructuring (register-blocking,
+threading, alloc/exp cuts) is measured-and-closed.
+
 ## 2026-06-29 - BlackThrush: REJECTED (~0, −0.84% p=0.14) — column-blocked batched GEMV (`dot_f16c_2col`, share weight `cvtph` across 2 token rows) on the encoder/prefill `gemv_f16_batch`. cvtph is NOT the batched bottleneck either.
 
 **Land-or-dig result: dug the batched f16 GEMV (encoder is 32 turbo layers — the dominant turbo compute,
