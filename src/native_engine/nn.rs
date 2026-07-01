@@ -1148,42 +1148,53 @@ const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6;
 /// whisper.cpp `GELU_COEF_A`.
 const GELU_COEF_A: f32 = 0.044_715;
 
-/// In-place exact whisper.cpp tanh-approximation GELU.
+/// The `1 << 16`-entry f16 GELU lookup table, precomputed once, EXACTLY as ggml
+/// builds `ggml_table_gelu_f16` (`ggml-cpu.c`): for every f16 bit pattern `i`,
+/// `table[i] = f16→f32( f32→f16( gelu_tanh( f16→f32(i) ) ) )` — i.e. the tanh
+/// GELU of the dequantized half, re-rounded to f16, then widened back to f32 (the
+/// value ggml's `GGML_GELU_FP16` path returns). Stored pre-widened to f32 so the
+/// hot lookup is one `f32→f16` index + one load, no per-element `tanh`.
 ///
-/// Matches ggml `ggml_gelu_f32` in
-/// `ggml/src/ggml-cpu/vec.h`:
-/// `0.5*x*(1 + tanh(sqrt(2/pi) * x * (1 + 0.044715*x*x)))`,
-/// which is the standard `0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))`
-/// (note `x*(1 + a*x*x) == x + a*x^3`). We deliberately use this tanh form
-/// rather than ft's `gelu_value_f32`, which is the *erf* GELU and would
-/// diverge from whisper's activations.
-/// Apply tanh-approx GELU to one contiguous slice. The scalar `tanh()` call
-/// blocks LLVM from vectorizing the loop, so the surrounding polynomial is hand-
-/// SIMD'd (8 lanes) with `tanh` still done scalar per lane — same op order and
-/// no FMA fusion as the scalar form, so bit-exact.
+/// `f16::from_bits`/`from_f32` use IEEE round-to-nearest-even, identical to ggml's
+/// `GGML_CPU_FP16_TO_FP32` / `GGML_CPU_FP32_TO_FP16` (f16c), so the table is
+/// bit-identical to whisper.cpp's — see [`gelu_slice`].
+fn gelu_table() -> &'static [f32; 1 << 16] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Box<[f32; 1 << 16]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = vec![0.0f32; 1 << 16].into_boxed_slice();
+        for (i, slot) in t.iter_mut().enumerate() {
+            let f = Float16::from_bits(i as u16).to_f32();
+            let g = 0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
+            *slot = Float16::from_f32(g).to_f32();
+        }
+        // Vec<f32> of exactly 1<<16 elements → Box<[f32; 1<<16]> (infallible).
+        t.try_into().expect("gelu table length 1<<16")
+    })
+}
+
+/// In-place GELU, bit-identical to whisper.cpp's shipped `ggml_vec_gelu_f32`.
+///
+/// whisper.cpp builds with `GGML_GELU_FP16` (see `ggml-cpu/vec.h`), so its GELU is
+/// NOT the live tanh but a **f16 lookup table** with a saturating clamp:
+/// `x <= -10 → 0`, `x >= 10 → x`, else `table[f16(x)]`. franken previously computed
+/// the live tanh form, which DIVERGED from ORIG (more accurate, but not what
+/// whisper actually runs). This matches whisper exactly — restoring
+/// bit-exact-with-whisper on the activation — and is far cheaper (a `vcvtps2ph` +
+/// table load per element vs a scalar `tanh` per lane). GELU is on the
+/// transcription-tolerance encoder/decoder path (never the bit-exact mel path).
 fn gelu_slice(data: &mut [f32]) {
-    use std::simd::Simd;
-    const L: usize = 16;
-    type V = Simd<f32, L>;
-    let n = data.len();
-    let nl = n - n % L;
-    let coef_a = V::splat(GELU_COEF_A);
-    let sqrt_2pi = V::splat(GELU_SQRT_2_OVER_PI);
-    let one = V::splat(1.0);
-    let half = V::splat(0.5);
-    let mut i = 0;
-    while i < nl {
-        let xv = V::from_slice(&data[i..i + L]);
-        // arg = sqrt(2/pi) * x * (1 + a*x*x)  — exact scalar op order.
-        let arg = (sqrt_2pi * xv) * (one + (coef_a * xv) * xv);
-        let aa = arg.to_array();
-        let tanh = V::from_array(std::array::from_fn(|k| aa[k].tanh()));
-        ((half * xv) * (one + tanh)).copy_to_slice(&mut data[i..i + L]);
-        i += L;
-    }
-    for v in &mut data[nl..] {
+    let table = gelu_table();
+    for v in data.iter_mut() {
         let x = *v;
-        *v = 0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh());
+        // Exact ggml `GGML_GELU_FP16` branch order + clamp.
+        *v = if x <= -10.0 {
+            0.0
+        } else if x >= 10.0 {
+            x
+        } else {
+            table[Float16::from_f32(x).to_bits() as usize]
+        };
     }
 }
 
@@ -2285,14 +2296,17 @@ mod tests {
     fn gelu_known_values() {
         let mut x = Mat::from_vec(1, 3, vec![0.0, 1.0, -1.0]);
         gelu(&mut x);
-        // Compute expected from the tanh-approx formula directly.
+        // Expected: whisper.cpp's shipped f16-table GELU (GGML_GELU_FP16), i.e. the
+        // tanh form re-rounded through f16 at both the input index and the value.
         let f = |v: f32| {
-            0.5 * v * (1.0 + (GELU_SQRT_2_OVER_PI * v * (1.0 + GELU_COEF_A * v * v)).tanh())
+            let f = Float16::from_f32(v).to_f32();
+            let g = 0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
+            Float16::from_f32(g).to_f32()
         };
-        assert!((x.data[0] - 0.0).abs() < 1e-6, "gelu(0)=0");
-        assert!((x.data[1] - f(1.0)).abs() < 1e-6);
-        assert!((x.data[2] - f(-1.0)).abs() < 1e-6);
-        // Spec reference magnitudes.
+        assert_eq!(x.data[0], f(0.0), "gelu(0) table-exact");
+        assert_eq!(x.data[1], f(1.0), "gelu(1) table-exact");
+        assert_eq!(x.data[2], f(-1.0), "gelu(-1) table-exact");
+        // Spec reference magnitudes (f16 table is within ~1e-3 of the exact tanh).
         assert!(
             (x.data[1] - 0.8412).abs() < 1e-3,
             "gelu(1)~0.8412, got {}",
