@@ -3,6 +3,20 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: NEGATIVE (DIRECT measurement) — **naive int8 GEMM LOSES to blocked f32 at EVERY encoder shape (0.38–0.42×)**. The encoder int8 lever needs a matrixmultiply-class BLOCKED int8 microkernel (owner-scoped); the naive `gemv_i8_batch` that won the decode is the WRONG tool for the compute-bound encoder.
+
+**Land-or-dig result: dug the BIGGEST lever (encoder = 76% e2e, "int8×int8 GEMM" per memory) by racing naive int8 vs the real blocked-f32 path at encoder shapes — CONCLUSIVE loss, and it corrects an earlier inference.** AGENT_NAME=BlackThrush. `examples/encoder_i8_gemm_probe.rs` benches, at tq=1500, the current encoder path `nn::matmul` (matrixmultiply, BLOCKED) vs `gemv_i8_batch` (naive int8) vs `gemv_f16_batch` (naive f16), best-of-60 @32t:
+
+| shape | f32 blocked | int8 naive | f16 naive |
+|---|---|---|---|
+| QKV/out [1280,1280] | **882 GFLOP/s** (5.57 ms) | 332 (0.38×) | 309 (0.35×) |
+| MLP fc1 [5120,1280] | **1037** (18.96 ms) | 408 (0.39×) | 336 (0.32×) |
+| MLP fc2 [1280,5120] | **1134** (17.34 ms) | 476 (0.42×) | 134 (0.12×) |
+
+**Corrects my own prior inference:** a first pass (no direct f32; extrapolated cross_kv's 2.25× f32/f16-naive factor) suggested int8-naive "wins" at fc2. FALSE — that factor is only valid at inp=1280; at fc2 (inp=5120) the f16-NAIVE path is pathological (134 GFLOP/s: it re-reads the 30 MB f32 activation per output column), but the blocked f32 matmul is NOT (1134 GFLOP/s). Direct measurement (Mat is pub at `native_engine::Mat`, so `nn::matmul` is callable) shows int8-naive loses 0.42× at fc2 too. **Lesson: never infer a GEMM ratio across contraction lengths — measure the target path directly.**
+
+**Why (structural):** matrixmultiply runs blocked f32 at 882–1134 GFLOP/s (register+cache-blocked, operands stay hot). Naive `gemv_i8_batch` reads each weight row once but streams the whole `[1500, inp]` activation per output-row band → cache-thrash; int8's 4× per-instruction MAC (`vpmaddwd`) can't overcome the ~2.6× blocking deficit. This is the COMPUTE-bound mirror of last cycle's boundary [[project_int8_mlp_fc1_default_on]]: naive int8-batch WINS only in the DECODE's m=1/bandwidth-bound regime; the encoder's tq=1500 GEMM is compute-bound where BLOCKING dominates. **Encoder int8 therefore requires a blocked int8 microkernel (int8 packing + register blocking, matrixmultiply-class) — a real owner-scoped effort with a ~2–3× ceiling (blocked int8 could ~2–4× f32's FLOP/s) AND a transcript-quality gate (int8 activation over 32 layers). NOT a naive drop-in.** Confirms + quantifies memory's "int8×int8 GEMM (owner-gated)". `encoder_i8_gemm_probe.rs` committed as the reusable bench (also records blocked-f32 encoder peak = 882–1134 GFLOP/s ≈ 24–31% of the box's ~3.7 TFLOP/s aggregate = the known 37% multi-thread scaling wall).
+
 ## 2026-07-02 - BlackThrush: NEGATIVE — extending the int8 batch to **fc2 (block-wise) REGRESSES** the `tq>1` path (opposite of the per-row `gemv_i8_batch` win). Kernel written + proven bit-identical, then REVERTED; fc2 stays f16 for `tq>1`.
 
 **Land-or-dig result: dug the natural next step (batch the biggest decode op, fc2, to complete int8-batch coverage) — measured a clear REGRESSION and reverted the wiring; kept only the inline doc + this entry.** AGENT_NAME=BlackThrush. Wrote `nn::gemv_i8w_f32a_blocked_batch` (batched analog of `gemv_i8w_f32a_blocked`: weight row + per-block scales read once, dotted against all `tq` f32 rows).
