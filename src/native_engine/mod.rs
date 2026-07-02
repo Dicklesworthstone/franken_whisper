@@ -685,15 +685,24 @@ fn header_ftype_ok(path: &Path) -> bool {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The default inference thread count: the machine's available parallelism,
-/// capped at 16.
+/// capped at 32.
 ///
-/// The cap reflects diminishing returns past ~16 threads for whisper's matmul
-/// sizes and keeps a single transcription from monopolizing very large hosts.
-/// Falls back to `1` when parallelism cannot be queried. Callers should plumb
-/// `BackendParams.threads` through and only fall back to this when unset.
+/// The cap was 16, but that MEASURED as far too low for the large-v3-turbo
+/// encoder (the dominant ~82% cost, big `[1500,1280]×[1280,K]` sgemms). Fresh
+/// sweep on a 64-core box (`examples/encoder_scale_probe.rs`, min-of-N):
+/// encoder::forward best 4100 ms/win @16 → **3022 ms/win @32 (1.34×)**, then
+/// regresses (48 → 3304, 64 → 3991 ms; cross-CCD sync — same wall whisper.cpp
+/// `-t64` hits). matmul thread-count does not change per-element k-accumulation
+/// order, so this is BYTE-EXACT: turbo transcript IDENTICAL @16 vs @32 (jfk×3
+/// and jfk×6, `e2e_probe`), e2e **~1.23–1.28×** (jfk×6 14.56 s → 11.3–12.3 s).
+/// 32 is the perf optimum AND still leaves half a 64-core host free (48/64
+/// regress anyway), preserving the "don't fully monopolize" intent. Falls back
+/// to `1` when parallelism cannot be queried. Callers should plumb
+/// `BackendParams.threads` through and only fall back to this when unset;
+/// `RAYON_NUM_THREADS` still overrides the pool entirely.
 #[must_use]
 pub fn default_threads() -> usize {
-    host_parallelism().min(16)
+    host_parallelism().min(32)
 }
 
 /// Host parallelism, queried ONCE and cached for the process.
@@ -1434,7 +1443,7 @@ mod tests {
     #[test]
     fn default_threads_in_bounds() {
         let n = default_threads();
-        assert!((1..=16).contains(&n), "threads {n} must be 1..=16");
+        assert!((1..=32).contains(&n), "threads {n} must be 1..=32");
     }
 
     // ─────────────────────────────────────────────────────────────────────

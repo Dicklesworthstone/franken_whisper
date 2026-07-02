@@ -3,6 +3,16 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **LANDED WIN vs whisper.cpp — encoder thread cap 16→32 = ~1.23–1.28× e2e, BYTE-EXACT.** The global rayon pool was capped at `host_parallelism().min(16)` (mod.rs `default_threads`), so on a 64-core box the turbo encoder sgemm (~82% of runtime) ran on only 16 cores — 48 idle. Raising the cap to its measured optimum (32) is a free byte-exact speedup on the dominant phase.
+
+**Land-or-dig result: LANDED a real code win — the encoder was silently under-threaded.** AGENT_NAME=BlackThrush. matmul thread-count does NOT change per-element k-accumulation order ⇒ byte-exact; **turbo transcript IDENTICAL @16 vs @32** (jfk×3 AND jfk×6, `e2e_probe` PROBE_DUMP_TEXT diff — verified, not assumed).
+
+**MEASURED (this 64-core box, ggml-large-v3-turbo, FRANKEN_WHISPER_MODEL_DIR local):**
+- Isolated encoder (`examples/encoder_scale_probe.rs`, min-of-N): `encoder::forward` best **4100 ms/win @16 → 3022 ms/win @32 = 1.34×**, then REGRESSES: 48 → 3304, 64 → 3991 ms (cross-CCD sync — the same wall whisper.cpp `-t64` thrashing hits). So 32 is the perf *optimum*, not just "more."
+- e2e (`e2e_probe`, turbo jfk×6 = 66 s, timestamp mode): 16-thr **14.545 / 14.568 s** → 32-thr **11.342 / 12.283 s** = **~1.23–1.28×**, transcript byte-identical. (jfk×3: 7.038 → 6.428 s = 1.095×; e2e ratio rises with encoder fraction, i.e. longer/more-window audio.)
+
+**Why it was hidden:** the old cap's doc claimed "diminishing returns past ~16 threads" — REFUTED for turbo's big encoder GEMMs (32 is 1.34×). 32 still leaves half a 64-core host free (and 48/64 regress anyway), so the "don't fully monopolize very large hosts" intent is preserved. `RAYON_NUM_THREADS` still overrides. This stacks on top of ALL prior byte-exact decode/cross-kv wins; it is the single largest e2e lever landed this session and applies to EVERY turbo transcribe. Also raises the fair-comparison bar vs whisper.cpp (prior ~1.2× timestamped / ~1.8× no_ts numbers were measured at the OLD 16-thread cap — the real franken advantage is now larger).
+
 ## 2026-07-02 - BlackThrush: NEGATIVE — the **logits-GEMV worker cap** (`FW_WIDE_GEMV_CAP`, default 32) does NOT have a landable higher optimum on this 8-CCD/64-core box. cap=64 is *tail-robust* (~1.07× mean over 32) but the difference is within box noise, e2e impact is <0.1%, and the doc-comment's own "48/64 regress" from a prior load DIRECTLY CONFLICTS with today's "64 is best" — which PROVES the cap is load/schedule-dependent and unsettleable on a contended shared box. Keep 32. Harness: `examples/logits_cap_probe.rs`.
 
 **Land-or-dig result: measured a NEW lever (the bandwidth-bound logits GEMV worker cap on this many-CCD box), found no safe win — confirms the closed "decode thread-count won't settle on a shared box" avenue with fresh data.** AGENT_NAME=BlackThrush. Byte-exact throughout (the band split is order-preserving ⇒ identical logits for any cap).
