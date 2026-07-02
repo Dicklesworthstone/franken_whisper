@@ -3,6 +3,21 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: PERF sub-op profile of the encoder (first actual `perf record`, not inferred) — **franken_whisper's own encoder code is <1%**; the cost is 77% third-party matrixmultiply + 11% sibling ft_kernel_cpu. Definitively exhausts the franken-side AND quantifies two cross-crate/owner levers.
+
+**Land-or-dig result: measured the exact encoder sub-op split; confirms no franken_whisper-side lever, surfaces quantified dep levers.** AGENT_NAME=BlackThrush. `perf record -F 999 -g` on `encoder_scale_probe` @32t (2800 ms/win, 543 k samples), self-time:
+- **matrixmultiply `sgemm_kernel::kernel_target_fma` = 57.4%** (the FMA microkernel — third-party, at peak per the single-thread 64-81% measurement).
+- **matrixmultiply `gemm_loop` = 19.8%** (packing/blocking/coordination — surprisingly high; at k=1280 the pack cost isn't fully amortized, and this is where the 37% multi-thread scaling loss lives).
+- `ft_kernel_cpu::sdpa_forward_f32` = 5.7% (sibling crate).
+- **`__expf_fma` = 5.4%** — the SDPA softmax exp is **SCALAR** libm `expf` (~1.44e9 calls/window: 1500×1500×20heads×32layers).
+- franken_whisper's own code (layer_norm/gelu/gather/residual) = **<1% combined** (`load_linear_transposed` 0.82% is one-time probe warmup, not per-window).
+
+**Two quantified OWNER/cross-crate levers (surfaced, NOT unilaterally taken — memory [[project_engine_at_safe_ceiling]]: owner closed the per-kernel loop; and ft_kernel_cpu is a shared FrankenSuite crate):**
+1. **SDPA softmax exp → SIMD.** Scalar `__expf_fma` is 5.4%; a vectorized (8-wide polynomial) exp cuts ~85% of it → **~4.6% encoder ≈ ~3.5% e2e**. Softmax normalizes (exp/Σexp) so a ~1e-6 approx is very likely TRANSCRIPT-NEUTRAL (the SDPA is already a 1.2e-7 approx). Lives in `ft_kernel_cpu::sdpa_forward_f32`. Best-EV dep lever.
+2. **matrixmultiply packing (gemm_loop 20%).** A GEMM that packs less / reuses packed panels across the multi-thread split could recover some of the 37%→higher scaling. Third-party crate; harder.
+
+**Conclusion: franken_whisper owns <1% of its dominant phase — the byte-exact franken-side search is PROVEN complete by perf, not just asserted.** Remaining encoder upside is entirely in deps (owner-scoped). Decode's only real upside is draft decoding (product).
+
 ## 2026-07-02 - BlackThrush: **int4 LOGITS is DEAD on AVX2 — 2–3× SLOWER than int8, not faster.** Built the kernel + benched it (executing the #1 owner-gated lever, not asking): int4 has NO speed upside even before the argmax-quality risk, so the whole lever is off the table.
 
 **Land-or-dig result: implemented `gemv_i4` + benched vs `gemv_i8` on the real logits shape; MEASURED a clear loss. The top decision-menu item is refuted on SPEED.** AGENT_NAME=BlackThrush. `examples/logits_int4_probe.rs` (`gemv_i4` mirrors `gemv_i8` exactly — quantize x once, per-row dot × scales, parallel over output rows — with packed int4 weights).
