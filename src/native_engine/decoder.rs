@@ -1129,6 +1129,17 @@ fn cross_f16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FW_CROSS_F16").as_deref() != Ok("0"))
 }
 
+/// Kill-switch (default OFF) that forces `cross_attention` to accumulate the full
+/// `[tq, tk]` softmax scores even when NOT recording DTW word timestamps — i.e.
+/// the pre-optimization behavior. Default (unset) skips that pure-waste alloc on
+/// the steady-state decode path (see `cross_attention`). Set `FW_CROSS_SCORES_KEEP=1`
+/// to restore the old behavior for A/B timing; it does not affect numerics.
+fn cross_scores_keep_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_CROSS_SCORES_KEEP").is_some())
+}
+
 /// Per-layer head slice of the (optionally empty) int8 cross K/V. Empty vec (gate
 /// off) ⇒ `&[]`, which `cross_attention` reads as "use the f16 path".
 fn cross_kv_i8_slice(all: &[nn::I8Mat], h0: usize, n_head: usize) -> &[nn::I8Mat] {
@@ -1189,6 +1200,9 @@ fn cross_attention(
     let d_head = n_state / n_head;
     let q_scale = (d_head as f32).powf(-0.25);
     let use_f16 = cross_f16_enabled();
+    // Build the full softmax-scores matrix only when a consumer exists: DTW
+    // recording (`record`), or the A/B kill-switch. Otherwise it is discarded.
+    let build_scores = record || cross_scores_keep_enabled();
 
     // Compute one head's scores [tq, tk] and output [tq, d_head]. Per-head
     // math (scaled q·k^T → softmax → @v) is byte-for-byte the serial path;
@@ -1214,7 +1228,15 @@ fn cross_attention(
             // input vector internally, so the DRAM read of the encoder K/V is
             // halved. Otherwise the f16c `gemv_f16` path.
             let use_i8 = !cross_kh_i8.is_empty();
-            let mut scores_all = Vec::with_capacity(tq * tk);
+            // `scores_all` (the full `[tq, tk]` softmax weights) is ONLY consumed
+            // when recording DTW word-timestamp attention (`record`). In the
+            // steady-state decode path (`record == false`, the default) the caller
+            // takes `(_, out_h)` and drops the scores, so accumulating them is pure
+            // waste — at tq=1 a tk≈1500-float alloc + memcpy per head, i.e. per
+            // token 32 layers × 20 heads = 640 discarded ~6 KB vecs. Skip it when
+            // not recording; the numeric path (scale → gemv → softmax → gemv) is
+            // untouched, so `out_h` and the transcript are BIT-IDENTICAL.
+            let mut scores_all = if build_scores { Vec::with_capacity(tq * tk) } else { Vec::new() };
             let mut out_all = Vec::with_capacity(tq * d_head);
             let mut qh = vec![0.0f32; d_head];
             for i in 0..tq {
@@ -1236,11 +1258,13 @@ fn cross_attention(
                 } else {
                     nn::gemv_f16(&cross_vh_f16[h], d_head, tk, &sm.data, None, &mut oh);
                 }
-                scores_all.extend_from_slice(&sm.data);
+                if build_scores {
+                    scores_all.extend_from_slice(&sm.data);
+                }
                 out_all.extend_from_slice(&oh);
             }
             return Ok((
-                Mat::from_vec(tq, tk, scores_all),
+                Mat::from_vec(tq, if build_scores { tk } else { 0 }, scores_all),
                 Mat::from_vec(tq, d_head, out_all),
             ));
         }
