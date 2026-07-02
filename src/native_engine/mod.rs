@@ -335,6 +335,25 @@ pub(crate) fn int8_attn_enabled() -> bool {
     })
 }
 
+/// Route the per-window cross-K/V PROJECTIONS (encoder_out @ Wk/Wv, tq=1500)
+/// through dequant-once f32 tiled sgemm instead of the f16 batched GEMV
+/// ([`gemv_f16_batch`]). MEASURED 2.25× faster on the turbo cross shape
+/// (233.96 → 103.95 ms for the 8 GEMMs, `cross_f16path_probe`) — the same reason
+/// the ENCODER dequants-once to f32. NOT bit-exact (different accumulation order,
+/// max|Δ| ~6.9e-6), so this is gated and must be proven transcript-neutral
+/// against the golden corpus before defaulting on. `FRANKEN_WHISPER_CROSS_PROJ_F32`.
+pub(crate) fn cross_proj_f32_enabled() -> bool {
+    const DEFAULT_ON: bool = false;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// PROBE (default off): int4 (block-wise, 4-bit weight × f32 activation) for
 /// `mlp_0`/fc1. fc1 feeds GELU, whose saturation absorbed int8 weight error to
 /// byte-exactness (fc1-only int8); this tests whether 4-bit is ALSO absorbed. If
