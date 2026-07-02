@@ -3,6 +3,14 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: the SMT-thrash mechanism is UNPROVEN (confined A/B inconclusive) → the `get_physical()` cap generalization is CLOSED. Walks back the prior "48/64 regress = SMT oversubscription" to "32 is the empirical optimum; the regression above it is multi-causal and not isolable on this contended box."
+
+**Land-or-dig result: tried to PROVE the SMT mechanism (to justify a `get_physical()` cap) — inconclusive; closed the avenue.** AGENT_NAME=BlackThrush. Byte-exact (measurement only).
+
+**Confined A/B (`encoder_scale_probe`, `taskset -c 0-7,32-39` = CCD0's 8 physical cores + their 8 SMT siblings, cpu0 sibling confirmed = cpu32):** 8 threads (1/phys core) = **5730 / 6578 ms** (~15% run variance) vs 16 threads (2/phys core = SMT) = **6041 ms**. The 8-thread runs BRACKET the 16-thread run ⇒ **wash within noise** — SMT oversubscription is NOT demonstrably the cause of the full-box 48/64 encoder regression. On this contended shared box a confined 8-core test is noise-dominated, so the mechanism can't be isolated here.
+
+**Consequences:** (1) I over-attributed last entry — the 48/64 regression is **multi-causal** (SMT + rayon work-steal/sync + DRAM bandwidth at high thread counts); the robust, actionable fact is simply that **32 = the empirical encoder optimum** on this box (already landed as the cap), independent of mechanism. (2) The `num_cpus::get_physical().min(N)` cap idea (flagged last cycle as a future-session follow-up) is **CLOSED, not landed**: its premise (avoid SMT thrash on small SMT boxes) is unproven, AND `get_physical()` does NOT respect cgroup CPU quotas the way `available_parallelism()` does — swapping it would over-subscribe in cgroup-limited containers, a real regression. `default_threads` stays `host_parallelism().min(32)` (cgroup-aware). Do NOT re-open the physical-core-cap avenue.
+
 ## 2026-07-02 - BlackThrush: FRESH PROFILE at the new 32-thread default + CORRECTION — **the biggest DECODE cost is the MLP (fc2 block-wise Q8_0), NOT the logits GEMV** as long assumed. Confirms no byte-exact franken-owned decode lever >~0.5% e2e remains; the crate is encoder-bound (76%) at the physical-core ceiling.
 
 **Land-or-dig result: re-profiled at the new default (the 16→32 win shifted the mix); found the next hotspot is owner-gated, corrected a stated assumption.** AGENT_NAME=BlackThrush. Byte-exact investigation (measurement only).
