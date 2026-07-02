@@ -3,6 +3,17 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: MEASURED the encoder sgemm efficiency → the "BLAS could give ~1.5×" lever (surfaced last entry) is REFUTED. The ft_kernel_cpu kernel is EXCELLENTLY tuned (single-thread 64–72% of peak); the 30%-of-theoretical at 32 threads is a **multi-thread SCALING wall**, not a slow kernel — a faster library hits the same wall.
+
+**Land-or-dig result: substantiated the last owner-gated encoder lever with a clean measurement; it does not pan out — the kernel is not the bottleneck.** AGENT_NAME=BlackThrush. Model-free microbench (`encoder_int8_gemm_probe`, real turbo GEMM shapes), best-of-N (min-time iter = least-contended ⇒ contention-robust on this shared box, contra my prior "unmeasurable" claim).
+
+**MEASURED (f32 `nn::matmul` = the real encoder path):**
+- **Single thread** (`RAYON_NUM_THREADS=1 taskset -c 0`, best-of-15): proj [1500,1280]×[1280,1280] **93 GF/s**, mlp fc1 **92**, mlp fc2 **91**. Single-core AVX2 peak on this 5975WX ≈ 115 GF/s @3.6 GHz … 144 @4.5 GHz boost ⇒ **64–81% of peak = a very well-tuned kernel** (real sgemm rarely exceeds this).
+- **32 threads** (best-of-40): proj **~1100 GF/s**, fc1 **~1075**, fc2 **~1245** — i.e. only **~37% scaling efficiency** vs 32× the single-thread rate (~30% of theoretical multi-core peak).
+- int8 is **0.45× single-thread / 0.71–0.85× at 32 threads** (SLOWER — the i32 `vpmaddwd` dot can't match f32 FMA without AVX512-VNNI; confirms prior).
+
+**Conclusion (corrects the prior entry's hand-wave):** the sgemm KERNEL is near per-core peak, so a hand-tuned/BLAS kernel would NOT give the ~1.5× I speculated — the ceiling is **multi-thread scaling** (only 37% at 32 cores). And it is NOT DRAM-bandwidth (a tiled sgemm's arithmetic intensity needs ~10 GB/s of the box's ~200 GB/s) — it's cross-CCD L3 coherency + parallelization overhead across the 4 CCDs. A different library *might* scale marginally better, but the well-tuned single-thread number says the kernel is competent; multi-thread GEMM scaling on a 4-CCD box is a hard, uncertain, dep-scoped target (frankentorch), still not byte-exact. **The encoder is at the hardware's multi-thread-scaling ceiling, confirmed with numbers — not merely asserted.**
+
 ## 2026-07-02 - BlackThrush: encoder op-by-op code audit COMPLETE — gelu was the last unexamined op, confirmed optimal. No byte-exact franken-owned encoder lever remains; the only remaining encoder lever is a faster GEMM *kernel*, which is dep-scoped (ft_kernel_cpu) + not byte-exact = owner-gated.
 
 **Land-or-dig result: examined the final encoder op (gelu); optimal — closes the encoder search.** AGENT_NAME=BlackThrush. `nn::gelu_slice` is a SIMD AVX2/f16c path: f32→f16, `_mm256_i32gather_ps` from the `1<<16` ggml gelu table (built EXACTLY as `ggml_table_gelu_f16`), with the ggml ±10 clamp — 8-wide, rayon-parallel over `worker_count()`. Byte-exact-LOCKED to the table (a direct-tanh recompute gives different values than the f16-rounded table ⇒ would break conformance), so there is no faster byte-exact gelu.
