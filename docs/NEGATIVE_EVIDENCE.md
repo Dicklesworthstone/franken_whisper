@@ -3,6 +3,19 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → REJECTED (measured) — **encoder QKV-projection fusion** (fuse the 3 separate per-layer Q/K/V input-projection matmuls into one `[1500,1280]×[1280,3840]` GEMM). BYTE-EXACT (max|Δ|=0.000e0) but **0.884× = a LOSS** once you de-interleave the output into the contiguous Q/K/V the attention path needs; the raw fused GEMM is only **1.021×** (compute-bound, packing savings negligible).
+
+**Land-or-dig result: dug a NEW franken-OWNED byte-exact lever (the QKV projections are the only encoder matmul franken orchestrates as 3 separate calls, encoder.rs:610-612), measured it, REJECTED.** AGENT_NAME=BlackThrush. Harness landed: `examples/qkv_fusion_probe.rs` (reproducible).
+
+**The idea:** encoder self-attn computes `q=h@Wq`, `k=h@Wk`, `v=h@Wv` as 3 separate matmuls over the same activation `h` ([1500,1280]), so sgemm packs `h` 3×. Fuse into one GEMM with a concatenated weight `[Wq|Wk|Wv]` ([1280,3840]) → pack `h` once, 1 parallel dispatch instead of 3. Column-concatenation can't change any per-element k-accumulation, so it's **bit-exact** (verified: fused columns == separate outputs, **max|Δ| = 0.000e0**).
+
+**MEASURED (qkv_fusion_probe, turbo shape n_state=1280 n_ctx=1500, best-of-80, taskset 0-7):**
+- A) 3× separate matmul: **23.557 ms**
+- B) 1× fused matmul, raw: **23.081 ms** = **1.021×** (only ~2% — the projection GEMM is COMPUTE-bound at AVX2 peak, so packing `h` 3× vs 1× is a rounding-error fraction of the FLOPs)
+- C) fused + de-interleave into 3 contiguous [1500,1280]: **26.637 ms** = **0.884× (SLOWER)**
+
+**Why it loses:** the raw win is only ~2% (packing is not the bottleneck; the FLOPs are). But the attention/SDPA path needs three *contiguous* [1500,1280] Q/K/V, and the fused output is row-interleaved `[q(1280)|k(1280)|v(1280)]×1500`, so extracting them costs a full 23 MB de-interleave copy (~3.5 ms) — which is BIGGER than the 0.5 ms raw saving → net **12% regression**. The only way to keep the 2% raw win would be for the dep SDPA kernel to consume a strided/packed QKV view (no de-interleave) — a `ft_kernel_cpu` change (out of this crate's commit scope) for a sub-noise 2% that's below the landing bar anyway. **Encoder QKV fusion is DEAD: the projection GEMM is compute-bound, not pack-bound, so removing 2 of 3 activation-packs buys ~nothing, and the required de-interleave makes it a loss.** Reinforces [[project_turbo_encoder_dominates]] (encoder is at f32 AVX2 compute peak).
+
 ## 2026-07-02 - BlackThrush: DIG → BLOCKER (source-verified) — **no byte-exact speed lever remains in franken_whisper's OWN committable code**; the dominant turbo cost is the encoder f32 sgemm, which lives in the frankentorch `ft-kernel-cpu` DEP (out of this crate's commit scope) and is already row-split rayon-parallel + byte-exact-tuned.
 
 **Land-or-dig result: nothing to land (working tree clean of own changes); dug the biggest gap (encoder = 58.6% of turbo runtime) for a NEW franken-owned lever and found none — surfaced the blocker.** AGENT_NAME=BlackThrush.
