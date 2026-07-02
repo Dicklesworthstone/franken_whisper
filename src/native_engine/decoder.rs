@@ -305,6 +305,29 @@ impl Linear {
                 return Ok(Mat::from_vec(1, w_i8.out, y));
             }
         }
+        // Prefill / multi-token (tq>1): int8 BATCHED GEMV for the pure-int8
+        // linears (qkv / cross_q / self_out / cross_out, and mlp_0 when int4 is
+        // off) — half the f16 batch's weight bytes, and BIT-IDENTICAL to running
+        // the batch as `tq` per-token `gemv_i8` calls (same quant those linears
+        // use at tq==1). Skipped when a block (`w_i8_block`) or int4 (`w_i4_pack`)
+        // copy is present, so those stay on their f16 batch path (as before).
+        if x.rows > 1
+            && super::i8_batch_enabled()
+            && self.w_i4_pack.is_none()
+            && self.w_i8_block.is_none()
+        {
+            if let Some(w_i8) = &self.w_i8 {
+                if x.cols != w_i8.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8-batch) forward: x.cols {} != in {}",
+                        x.cols, w_i8.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(x.rows * w_i8.out);
+                nn::gemv_i8_batch(w_i8, &x.data, x.rows, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(x.rows, w_i8.out, y));
+            }
+        }
         match &self.w {
             WeightMat::F32(w_t) => nn::matmul_bias(x, w_t, self.bias.as_deref()),
             WeightMat::F16 { data, out, inp } => {
