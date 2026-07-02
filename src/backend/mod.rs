@@ -2433,7 +2433,15 @@ impl DecisionContract for BackendSelectionContract {
     }
 
     fn fallback_action(&self) -> usize {
-        3 // fallback_error
+        // When the adaptive router is untrusted (`should_fallback`), degrade to the TOP
+        // static-priority backend (index 0 = try_whisper_cpp, served by the native engine),
+        // NOT `fallback_error` (index 3). fallback_error emits no transcription and is only
+        // correct when no backend is available — a case already handled by `choose_action` /
+        // the loss matrix (fallback_error becomes min-loss only as real-backend availability
+        // drops). Returning 3 unconditionally made a merely-uncertain router (e.g. a confident
+        // posterior whose ci_width still exceeds the 0.5 threshold) emit 0 utterances, which
+        // broke the `youtube`/`transcribe` happy path once native execution became the default.
+        0
     }
 
     fn fallback_policy(&self) -> &FallbackPolicy {
@@ -4069,7 +4077,9 @@ mod tests {
         assert_eq!(contract.action_set().len(), 4);
         assert_eq!(contract.loss_matrix().n_states(), 3);
         assert_eq!(contract.loss_matrix().n_actions(), 4);
-        assert_eq!(contract.fallback_action(), 3);
+        // Uncertainty fallback degrades to the top static-priority backend (index 0),
+        // not fallback_error (3) — see BackendSelectionContract::fallback_action.
+        assert_eq!(contract.fallback_action(), 0);
     }
 
     #[test]
