@@ -3,6 +3,19 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → BLOCKER (source-verified) — **no byte-exact speed lever remains in franken_whisper's OWN committable code**; the dominant turbo cost is the encoder f32 sgemm, which lives in the frankentorch `ft-kernel-cpu` DEP (out of this crate's commit scope) and is already row-split rayon-parallel + byte-exact-tuned.
+
+**Land-or-dig result: nothing to land (working tree clean of own changes); dug the biggest gap (encoder = 58.6% of turbo runtime) for a NEW franken-owned lever and found none — surfaced the blocker.** AGENT_NAME=BlackThrush.
+
+**The dig (all verified by reading the PINNED dep source `c305306` + `src/native_engine/nn.rs` this cycle, not recalled):**
+- **Encoder projection GEMMs** → dep `ft_kernel_cpu::matmul_tensor_contiguous_f32` → `gemm::sgemm`, which is **already** a tuned rayon-parallel block-split: WIDE→col-parallel, square/tall→row-split (turbo's k=1280 > `F32_2D_MAX_K`≈1024 takes the row split), byte-exact-preserving (n-block K-accum == single call), tuning IDs `kgs4.48/kgs4.61`. Fully core-utilized. NOT editable in this crate.
+- **Encoder attention** (O(ctx²·d), large at ctx=1500) → dep `ft_kernel_cpu::sdpa_forward_f32` fused kernel, **default-ON** (`use_sdpa_attn()`, escape hatch `FW_ATTN_NO_SDPA`), max|Δ|~1.2e-7. NOT editable here.
+- **GELU** (encoder MLP, ~245M evals/window) → franken `gelu_slice`: **already** 8-wide `vcvtps2ph`+AVX2 f16 gather, byte-exact with whisper (`GGML_GELU_FP16`), verified **max|Δ|=0** in `examples/gelu_probe`, 1.38× vs scalar. Done.
+- **layer_norm** → franken `norm_rows`: **already** vertical `f64x8` SIMD (one row/lane), byte-exact (`layer_norm_simd_matches_scalar`), band-parallel. Done.
+- **Decode per-token GEMVs** → **already** int8 default-ON + 2-row register-blocked, tuned worker caps ([[project_int8_mlp_fc1_default_on]], [[project_2row_gemv_landed]]). Done.
+
+**Blocker (one sentence):** every franken_whisper-OWNED hot op is already SIMD + byte-exact-tuned, so the only remaining turbo cost worth chasing — the f32 sgemm encoder projections at ~AVX2 f32 peak — sits entirely in the frankentorch `ft-kernel-cpu` dependency (already parallel + byte-exact-tuned, and out of scope for a franken_whisper-crate commit), leaving **no byte-exact lever in this crate's committable code**; the only paths left are OWNER-GATED (int8 encoder GEMM needs AVX512-VNNI + quality sign-off — MEASURED 0.75-0.89× = SLOWER on this AVX2 box; draft/speculative decoding is a product decision). See [[project_turbo_encoder_dominates]], [[project_engine_at_safe_ceiling]].
+
 ## 2026-07-02 - BlackThrush: DIG → REJECTED (measured REGRESSION, reverted) — **speculative timestamp-mode pipelining** (extend the no_ts pipelining win to the default timestamped path by assuming a `CHUNK_CS` advance). MEASURED **0 hits / 2 misses and ~30% SLOWER** on jfk×6; byte-exact but a perf LOSS. Reverted; the no_timestamps pipelining win is untouched.
 
 **Land-or-dig result: dug the extension of the landed pipelining to timestamp mode (the default CLI path); implemented, verified byte-exact, MEASURED — it regresses. Reverted the engine change (decode.rs back to landed state); kept only the probe's `FW_PROBE_TIMESTAMPS` flag.** AGENT_NAME=BlackThrush.
