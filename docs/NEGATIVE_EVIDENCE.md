@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG (post-pipelining) → RTF is now ENCODE-GEMM-GATED; remaining byte-exact levers are marginal or dead. Confirms the pipelining win landed correctly and closes the no_timestamps RTF axis.
+
+**Land-or-dig result: no uncommitted win; measured the post-pipelining per-window structure to find the NEXT lever — and the data shows the decode is now hidden and the gate is the (immovable) encode GEMM.** AGENT_NAME=BlackThrush. No code lands (the remaining lever is below this box's noise floor / structurally marginal).
+
+**Per-window spans (realistic_e2e_probe, jfk×6 = 3 windows, turbo, `no_timestamps`, `FW_PIPELINE_WINDOWS=1`):**
+| window | encoder_window | cross_kv | decode_loop |
+|---|---|---|---|
+| 0 (first) | 2941 ms (inline, exposed) | 392 ms | 1629 ms |
+| 1 | 772 ms (partial recv-wait) | 155 ms | 709 ms |
+| 2 (tail) | **0.00 ms (encode FULLY hidden under W1 decode)** | 42 ms | 225 ms |
+
+**Reading it — the pipelining works and RTF is now encode-gated:** window 2's `encoder_window`=0 proves encode(2) finished entirely under decode(1) (decode is hidden, as designed). What stays on the critical path: (1) the FIRST window's encode (2941 ms) — nothing precedes it to hide under; (2) the per-window encode "recv-wait" (e.g. W1's 772 ms) — because encode (~3.1 s core-saturating) > decode (~1.8 s), so the encoder thread, not the decode, is the steady-state gate, and the encode GEMM is at the f32 AVX2 ceiling (int8 slower without VNNI — see the int8-GEMM entry below); (3) `cross_kv` (~589 ms total here), which is NOT pipelined.
+
+**The one remaining byte-exact lever (cross_kv pipelining) is marginal + win-or-neutral, not landed:** `DecoderState::new` (cross-KV) depends only on `enc`, so the encoder thread COULD compute it too and deliver a ready `DecoderState`. But it only helps on windows where encode is FULLY hidden (decode > encode) — there cross_kv also hides (W2: ~42 ms). On encode-gated windows (the common case, encode>decode) the main thread waits for enc+cross_kv either way → neutral. Net upside ≈ the fully-hidden windows' cross_kv (~tens of ms), **below this contended box's ±15% RTF noise floor** — unmeasurable, and adds `DecoderState`-over-channel complexity to the just-landed win. Not worth the regression risk to the fresh win. Structurally win-or-neutral, so a future quiet-box cycle could revisit.
+
+**Timestamp-mode pipelining is DEAD (new finding):** the win is `no_timestamps`-only because timestamp-mode `seek_delta = 2·(last_ts − ts_begin)` is data-dependent AND rarely exactly `CHUNK_CS` (the last segment usually ends a bit before 30 s), so speculating "next offset = seek+CHUNK" almost always MISSES (wrong mel window → discarded) — low hit-rate, not a win. So the default timestamped CLI path can't be pipelined this way.
+
+**Conclusion: with pipelining landed, the `no_timestamps` multi-window RTF is at its byte-exact ceiling (encode-GEMM-gated).** Remaining RTF axes all need an owner decision or a quiet box: cross_kv-pipelining (marginal), int8 encoder GEMM (needs VNNI), draft decoding (product). Do not re-dig for byte-exact RTF here.
+
 ## 2026-07-02 - BlackThrush: WIN LANDED (default-ON, byte-exact) — **cross-window ENCODE/DECODE pipelining**: overlap window N's latency-bound decode with window N+1's compute-bound encode. MEASURED **~1.19× (min-of-5 interleaved) to ~1.31× (single-shot) on the transcribe phase** of a 3-window turbo run, transcript BYTE-IDENTICAL. This LANDS the lever the perf profile below quantified.
 
 **Land-or-dig result: LANDED a measured RTF win vs the sequential path (which is franken's own whisper.cpp-faithful baseline).** AGENT_NAME=BlackThrush. Real code: `src/native_engine/decode.rs` — a scoped encoder thread (`std::thread::scope` + mpsc) computes window N+1's encode while window N decodes; `pipeline_windows_enabled()` gate (default ON, kill switch `FW_PIPELINE_WINDOWS=0`).
