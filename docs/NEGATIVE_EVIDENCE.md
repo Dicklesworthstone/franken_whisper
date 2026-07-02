@@ -3,6 +3,20 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → **LANDED** (measured, byte-exact) — **parallelize the cross-K/V int8-quantize outer loop** (decoder.rs:930, `.iter()` → `.par_iter()`). MEASURED **1.87×** on the cross-cache quantize (7.15 → 3.82 ms/window, ~3.3 ms saved) and **byte-identical** (i8 data + scales bit-equal to the serial form). Fixes a serial-loop oversight — every other similar loop in the crate is already parallel.
+
+**Land-or-dig result: LANDED a measured byte-exact RTF win.** AGENT_NAME=BlackThrush. Harness: `examples/cross_quant_probe.rs`.
+
+**The bug/lever:** the per-window cross-attention cache is int8-quantized once per window (default-ON, `int8_cross_kv_enabled`) by a **serial** outer loop (`cross_kh_f16.iter().map(quantize_f16_to_i8).collect()`) over ~n_layer×n_head small per-head mats (turbo: 4×20 = 80 K-mats `[1500,64]` + 80 V-mats `[64,1500]`). `quantize_f16_to_i8` IS internally parallel (`par_chunks_mut` over rows), but for the K mats that inner parallelism is over 1500 tiny 64-element rows (rayon-overhead-bound), and running 160 such calls one-at-a-time compounds it. Fanning the **outer** loop across rayon (each mat then quantized on a single worker — coarse grain) is the right granularity.
+
+**MEASURED (`cross_quant_probe`, turbo cross-cache shapes, best-of-150, taskset 0-7):**
+- A) serial-outer, par-inner (old): **7.148 ms**
+- B) par-outer, par-inner (the landed `.par_iter()`, nested): **3.816 ms = 1.87×**
+- C) par-outer, serial-inner (coarse): 3.811 ms = 1.88×
+- **byte-exact:** serial-inner `quant_serial` produces i8 `data` + `scales` **bit-equal** to the crate's par-inner `quantize_f16_to_i8` (`data=true scales=true`); `collect` from an indexed parallel iterator preserves layer/head order ⇒ the whole cross-cache is bit-identical ⇒ transcript unchanged.
+
+**Honest magnitude:** the minimal `.par_iter()` change (B) captures the full win with the least risk (nested rayon costs nothing here). Absolute e2e impact is small (~3.3 ms/window, exposed in the DEFAULT timestamp path where cross_kv is NOT hidden by pipelining; hidden under encode N+1 in no_timestamps) — but unlike the alloc-churn reject this is a CLEAN, reproducible 1.87× on a deterministic op with a byte-exactness PROOF and a 2-line near-zero-risk change, so it is landed (not noise). Conformance: transcript byte-identical (change is bit-exact by construction).
+
 ## 2026-07-02 - BlackThrush: DIG → REJECTED (measured, noise-dominated) — **encoder buffer-reuse / alloc-churn** (`encoder_block` allocs ~92 MB fresh per turbo layer × 32 = ~2.9 GB/window: 2× `x.clone()` + fresh `matmul_bias` outputs + a 30.7 MB mlp_h). Isolated alloc cost **63 ms/window (~2% of encode)**, but the zero-risk malloc-tuning proxy for reuse is **noise-dominated + inconsistent** on the real workload (some rounds REGRESS) → not a landable win; glibc's dynamic mmap threshold already mitigates.
 
 **Land-or-dig result: dug a NEW franken-OWNED byte-exact lever (encoder per-layer allocation churn, explicitly flagged in `encoder_perf_probe`'s docstring), measured it two ways, REJECTED — below this box's noise floor and unverifiable on rch (model benches are local-only).** AGENT_NAME=BlackThrush. Harness landed: `examples/encoder_alloc_probe.rs`.

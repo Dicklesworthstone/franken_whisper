@@ -929,12 +929,22 @@ impl DecoderState {
         // f16 cross path is active (the i8 GEMV replaces the f16 one there).
         let (cross_kh_i8, cross_vh_i8) = if int8_cross_kv_enabled() && cross_f16_enabled() {
             (
+                // PARALLEL outer loop over the ~n_layer×n_head small per-head mats
+                // (BlackThrush, 2026-07-02): the serial `.iter()` quantized each mat
+                // one-at-a-time, and for the K mats `quantize_f16_to_i8`'s inner
+                // `par_chunks` is over 1500 tiny 64-elem rows (rayon-overhead-bound),
+                // so the whole pass ran at ~half speed. Fanning the OUTER loop across
+                // rayon (each mat then quantized on one worker) is MEASURED 1.87× on
+                // the cross-cache quantize (7.15→3.82 ms, cross_quant_probe) and
+                // BYTE-IDENTICAL — `collect` from an indexed parallel iterator
+                // preserves layer/head order, and each mat's per-row arithmetic is
+                // unchanged (probe: i8 data + scales bit-equal to the serial form).
                 cross_kh_f16
-                    .iter()
+                    .par_iter()
                     .map(|k| nn::quantize_f16_to_i8(k, enc_frames, d_head))
                     .collect(),
                 cross_vh_f16
-                    .iter()
+                    .par_iter()
                     .map(|v| nn::quantize_f16_to_i8(v, d_head, enc_frames))
                     .collect(),
             )
