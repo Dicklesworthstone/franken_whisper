@@ -3,6 +3,26 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → DEFINITIVE perf PROFILE — a turbo transcribe is **58.6% matrixmultiply f32 sgemm (at AVX2 peak) + ~8% rayon scheduling (mostly decode idle-core spin)**. No standalone byte-exact kernel lever exists; the only byte-exact structural win is window-pipelining (fill the idle decode cores), upside now quantified at ~20-27% on turbo multi-window.
+
+**Land-or-dig result: no uncommitted win; ran a function-level `perf record` (152k samples, dwarf call-graph) on a turbo transcribe — the first flat CPU breakdown, confirming with hard data what span-level probes only implied.** AGENT_NAME=BlackThrush. No code lands (profile-only; the engine is at its byte-exact ceiling).
+
+**Flat self-time (native_ab large-v3-turbo, release-perf, `perf -F 999 --call-graph=dwarf`):**
+| symbol | self % | nature |
+|---|---|---|
+| `matrixmultiply::sgemm_kernel::kernel_target_fma` | 36.1% | f32 GEMM compute (AVX2 FMA) |
+| `matrixmultiply::gemm::gemm_loop::<KernelFmaAvx2>` | 22.6% | f32 GEMM packing/driver |
+| `crossbeam_epoch::…with_handle` + `try_advance` | 4.8% | rayon deque epoch GC |
+| `__expf_fma` (libm) | 3.8% | softmax exp (SDPA + sampler) |
+| `encoder::load_linear_transposed` | 3.5% | ONE-TIME load dequant-transpose |
+| `ft_kernel_cpu::sdpa_forward_f32` | 3.4% | fused attention |
+| rayon `find_work` + deque `steal` | 3.5% | idle-worker spin |
+| `gemv_f16_batch` / `gemv_i8` / `gelu` / `norm_rows` | <2% each | decode + elementwise |
+
+**Reading it:** (1) **58.6% is the f32 sgemm** — at ~1000-1290 GF/s = AVX2 f32 peak (see int8-GEMM entry below), so it is the immovable wall; a byte-exact speedup is impossible (sum order) and int8 is slower on AVX2 (no VNNI). (2) **~8.3% is rayon/crossbeam** — the epoch GC (4.8%) and find_work/steal (3.5%) are dominated by IDLE WORKERS spinning during the latency-bound, single-stream decode (cores sit idle → threads steal/pin → epoch churn). This is not "overhead to delete"; it is the *measured idle-core fraction*. (3) `expf` (3.8%) is gated (SIMD-poly exp isn't byte-exact — cf. the gated log10 stash); the SDPA softmax needs it and the sampler exp is owner-gated ([[sampler]]). (4) `load_linear_transposed` (3.5%) is a ONE-TIME load cost (amortizes to ~0 over a multi-window/multi-file run), already fused (1.33×).
+
+**Implication — quantifies the window-pipelining lever (the sole byte-exact structural win):** on turbo, sequential per-window = enc(~3.1 s, core-saturating) + dec(~1.8 s, ~2-4 of 8 cores, the idle-spin above) ≈ 4.9 s. Overlapping decode-N with encode-N+1 packs decode's core-work into encode's idle capacity → steady-state ≈ total-core-work/8 ≈ (3.1·8 + 1.8·~3)/8 ≈ **3.5 s/window (~20-27% e2e win), BYTE-EXACT**. Still `no_timestamps`-only (timestamp-mode seek is data-dependent) and a real rayon-concurrency restructure of decode.rs — the profile now justifies that investment with a concrete number. **Everything else (GEMM, expf, load) is at its ceiling or gated. Do not re-dig kernels.**
+
 ## 2026-07-02 - BlackThrush: DIG → MEASURED NEGATIVE (self-correction) — **int8 encoder GEMM is 0.75-0.89× (SLOWER) than the f32 sgemm** on this AVX2 box. Refutes my own prior-cycle "int8xint8 ~2-4× f32" claim: matrixmultiply's f32 sgemm is already at ~AVX2 f32 PEAK; int8's denser-MAC edge needs VNNI (absent under x86-64-v3) + a tiled int8 kernel. The turbo-encoder lever is CLOSED on this hardware.
 
 **Land-or-dig result: no uncommitted win; dug the top turbo lever (int8 encoder GEMM, flagged owner-gated last cycle) and MEASURED it — it's a regression, not a win.** AGENT_NAME=BlackThrush. Real code landed: `examples/encoder_int8_gemm_probe.rs` (reusable int8-vs-f32 GEMM benchmark on the turbo encoder shapes; faithful row/col-symmetric-quantized int8 GEMM, LLVM-autovec `vpmaddwd` dot, parallel over output rows — NOT a per-row `gemv_i8` proxy).
