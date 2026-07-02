@@ -3,6 +3,12 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **SDPA gather/scatter MEASURED (was never split before) — it's ~20% of attn_sdpa (my arithmetic said ~3%, WRONG by ~5×), but BANDWIDTH-bound: serial gather is 4.5× SLOWER, so the fine parallel is already optimal. attn_sdpa at ceiling. Zero-cost split-profiler landed.**
+
+**Land-or-dig result: the meta-lesson (my estimates keep being wrong — MEASURE) drove me to split the one never-measured encoder chunk, `attn_sdpa` (the fused-SDPA attention, ~20% of encoder), into gather/kernel/scatter.** AGENT_NAME=BlackThrush. Added a byte-exact zero-cost split profiler (`st!` timing in `nn::attention_raw`'s SDPA branch + `drain_sdpa_split`, printed by the encoder profiler under `FRANKEN_WHISPER_PERF_SPANS=1`).
+
+**MEASURED (turbo jfk×6, per-window):** sdpa_kernel **76–84%** (external `ft_kernel_cpu::sdpa_forward_f32`), **sdpa_gather 11–17%** (53–112 ms/window), sdpa_scatter 5–7%. So the franken-side gather+scatter is **~20–24% of attn_sdpa ≈ 4% of encoder ≈ ~3% e2e** — my earlier arithmetic ("gather ~2.7%, ~20 ms") was **~5× too low** (the strided per-head transpose is slower than a sequential copy). **The interleaved↔head-major gather looked dispatch-bound (~7 GB/s), so I A/B'd a SERIAL gather/scatter — MEASURED 4.5× SLOWER (gather ~100 → ~450 ms/window; attn_sdpa ~640 → ~1120 ms), transcript BYTE-IDENTICAL.** So it is BANDWIDTH-bound, not dispatch-bound: the fine `par_chunks_mut` correctly spreads the strided copy across memory channels; one core can't. **The current parallel gather/scatter is already optimal ⇒ attn_sdpa is at ceiling (76–84% external kernel + optimal-parallel franken transpose). No lever.** Serial branch reverted; the split profiler kept (zero-cost, complements the encoder sub-op profiler — future cycles get the split for free). Meta-lesson reinforced BOTH ways this cycle: measuring caught a 5×-wrong size estimate AND a wrong "serial wins" fix.
+
 ## 2026-07-02 - BlackThrush: **HEAD-TO-HEAD VALIDATION (the directive's ratio metric) — this session's 5 cycles did NOT regress the lead; encoder still tied, franken decode faster. int4-logits re-confirmed DEAD (ledger check-first). BLOCKER: at AVX2 hardware ceiling.**
 
 **Land-or-dig result: no landable in-crate win remains, so I (a) dug int4-logits and (b) ran a fresh head-to-head vs whisper.cpp — the directive's core "ratio" metric — to validate the session.** AGENT_NAME=BlackThrush.

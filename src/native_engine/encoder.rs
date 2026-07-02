@@ -630,6 +630,18 @@ fn forward_time_major(
             eprintln!("  {:<12} {:>8.1} ms (encoder sub-op total)", "SUM", total as f64 / 1e6);
         });
         ENC_PROF.with(|p| *p.borrow_mut() = [0; 12]);
+        // Split attn_sdpa into gather / kernel / scatter (sum over layers).
+        let sp = nn::drain_sdpa_split();
+        let stot: u128 = sp.iter().sum();
+        if stot > 0 {
+            let labels = ["sdpa_gather", "sdpa_kernel", "sdpa_scatter"];
+            eprintln!("  -- attn_sdpa internal split --");
+            for (i, lbl) in labels.iter().enumerate() {
+                let ms = sp[i] as f64 / 1e6;
+                let pct = sp[i] as f64 / stot as f64 * 100.0;
+                eprintln!("  {lbl:<14} {ms:>8.1} ms  {pct:>5.1}% of attn_sdpa");
+            }
+        }
     }
 
     Ok(x)
