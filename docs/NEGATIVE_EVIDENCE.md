@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-05 - BlackThrush: REJECTED (reverted) — serializing decode `cross_attention` (re-test of bd-6qih AFTER the int8 cross-KV win). Parallel is still 2× faster; the per-head 1500-wide work genuinely needs the spawn. **Decode kernel is now at its floor.**
+
+**Land-or-dig result: re-examined a pre-int8 finding under new conditions, confirmed it, and consolidated that the
+decode kernel is exhausted.** AGENT_NAME=BlackThrush. No code landed (decoder.rs = HEAD); env hook
+`FW_CROSS_ATTN_PAR` prototyped for the A/B then reverted.
+
+**Why re-test.** bd-6qih found serial cross-attn regressed e2e, but that predated the int8 cross-KV win (e9c9416)
+which halved the per-head K/V bandwidth. Cheaper per-head work could have moved the parallel/serial crossover (as
+it did for the projections). Re-measured: it did NOT. `decoder_attrib` turbo 200, INTERLEAVED parallel(1<<13) vs
+serial, min-of-8: cross_attn parallel **0.96** vs serial **1.95 ms/token — parallel 2.0× faster**. The 1500-wide ×
+20-head per-token work amortizes the spawn even at half the bytes. (Aside: serial is contention-STABLE ~1.95 while
+parallel bounces 0.96–1.82 under load — but parallel's min wins decisively.) Confirmed; do not serialize cross-attn.
+
+**Consolidation — the per-token decode kernel is at its floor after this session's 8 landed wins.** Current
+turbo-200 attribution and where each span stands:
+- `mlp_fc_gelu_proj` (~29%): fc1 int8 + GELU-table + **fc2 f16** — fc2 is bandwidth-bound (13 MB f16/token) and
+  must stay f16 (int8 `mlp_2` breaks turbo exactness). FLOOR.
+- `logits_gemv` (~15%): int8, 66 MB/token, bandwidth-bound. FLOOR (int4 would risk argmax; whisper.cpp uses Q8).
+- `cross_attn` (~10%): int8 K/V + softmax over 1500; parallel confirmed optimal (this entry). FLOOR.
+- `self_qkv_proj` (~10%): int8 4.9 M, 8-way parallel confirmed optimal. FLOOR.
+- `self_attn` (~7%): alloc-light rewrite landed (3d9c9b4). FLOOR.
+- projections `self_out`/`cross_q`/`cross_out` (~5% each): int8 + serial (87848da). FLOOR.
+- LN+clone / final_ln / embed (<1% each): dominated by the f64-accumulated LN math, not the clone.
+
+**What remains is off the in-crate decode-kernel axis:** (a) owner-gated — faer/better sgemm for the f16 fc2 and
+prefill, or int4 logits (conformance-risky); (b) algorithmic — fewer decode tokens (speculative/draft), a product
+change; (c) sub-1% micro-opts (e.g. tq==1 cross-attn direct-write instead of private-buffer+merge) that the shared
+box (load ~20, per-step noise ±15%) cannot measure reliably. **Blocker for further decode wins: a quiet box for
+sub-1% levers, or owner sign-off for the gated axes.** Encoder/mel are already franken wins (don't chase).
+
 ## 2026-07-05 - BlackThrush: REJECTED (inconclusive/near-zero, reverted) — narrowing the `gemv_worker_count` cap (8→4) for the mid decode GEMVs (`qkv` 4.9 M, `mlp_0` 6.5 M). The 8-cap is fine; unlike the tiny projections, these amortize the rayon spawn.
 
 **Land-or-dig result: dug the worker-cap follow-on to the projection-threshold win, measured, REJECTED, reverted.**
