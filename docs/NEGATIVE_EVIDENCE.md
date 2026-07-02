@@ -3,6 +3,19 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → MEASURED NEGATIVE (self-correction) — **int8 encoder GEMM is 0.75-0.89× (SLOWER) than the f32 sgemm** on this AVX2 box. Refutes my own prior-cycle "int8xint8 ~2-4× f32" claim: matrixmultiply's f32 sgemm is already at ~AVX2 f32 PEAK; int8's denser-MAC edge needs VNNI (absent under x86-64-v3) + a tiled int8 kernel. The turbo-encoder lever is CLOSED on this hardware.
+
+**Land-or-dig result: no uncommitted win; dug the top turbo lever (int8 encoder GEMM, flagged owner-gated last cycle) and MEASURED it — it's a regression, not a win.** AGENT_NAME=BlackThrush. Real code landed: `examples/encoder_int8_gemm_probe.rs` (reusable int8-vs-f32 GEMM benchmark on the turbo encoder shapes; faithful row/col-symmetric-quantized int8 GEMM, LLVM-autovec `vpmaddwd` dot, parallel over output rows — NOT a per-row `gemv_i8` proxy).
+
+**Measurement (release-perf, best-of-30, 2 stable runs, turbo shapes n_state=1280 / n_mlp=5120 / n_ctx=1500):**
+| shape | f32 sgemm | int8 GEMM | int8 speedup |
+|---|---|---|---|
+| proj QKV/out `[1500,1280]x[1280,1280]` | 4.4 ms (~1100 GF/s) | 5.9 ms (~820 GF/s) | **0.75×** |
+| mlp fc1 `[1500,1280]x[1280,5120]` | 19.2 ms (~1025 GF/s) | 21.7 ms (~907 GF/s) | **0.88×** |
+| mlp fc2 `[1500,5120]x[5120,1280]` | 15.3 ms (~1286 GF/s) | 17.6 ms (~1120 GF/s) | **0.87×** |
+
+**Why int8 LOSES here (corrects my own analysis):** (1) matrixmultiply's f32 sgemm is a TILED/PACKED kernel with near-peak cache reuse and FMA-port utilization — ~1000-1290 GF/s is essentially the AVX2 f32 ceiling for this box, so there is NO f32 headroom to reclaim. (2) `vpmaddwd`'s denser MACs only pay off with a TILED/PACKED int8 kernel; a naive triple-loop int8 GEMM (even LLVM-vectorized) has worse cache behavior than the packed f32 kernel and loses. (3) The big int8 throughput multipliers assume **AVX512-VNNI (`vpdpbusd`)**, which `target-cpu=x86-64-v3` (AVX2) does NOT have. So on this hardware int8 encoder GEMM would need a hand-tiled int8 kernel just to REACH f32 sgemm, and even then the ceiling is marginal (no VNNI). Not worth it. **The turbo encoder (~3.1 s/window, [[the profile-correction entry below]]) is at its f32 compute ceiling; int8 is not the unlock on AVX2.** (A VNNI/AVX512 box, or adopting a tiled int8 GEMM crate, would change this — re-measure there before revisiting.)
+
 ## 2026-07-02 - BlackThrush: DIG → PROFILE CORRECTION — on **large-v3-turbo the ENCODER (~3.1 s / full window) DOMINATES decode (~1.8 s)**, NOT the reverse. The "encoder is a settled 3.3× win, don't chase" belief was tiny-based (4 enc layers); turbo has 32. The turbo speed lever is the encoder GEMM, which is f32 sgemm (byte-exact but compute-bound) → the real unlock is int8/quantized encoder GEMM = OWNER-gated (quality), same class whisper.cpp-Q8 already uses.
 
 **Land-or-dig result: no uncommitted win (HEAD 06d67b4 synced); profiled the full turbo pipeline fresh and found the per-window cost model was mischaracterized in memory. No code lands — corrected-profile + lever surface.** AGENT_NAME=BlackThrush.
