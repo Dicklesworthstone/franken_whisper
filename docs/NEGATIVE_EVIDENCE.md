@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-05 - BlackThrush: REJECTED (inconclusive/near-zero, reverted) — narrowing the `gemv_worker_count` cap (8→4) for the mid decode GEMVs (`qkv` 4.9 M, `mlp_0` 6.5 M). The 8-cap is fine; unlike the tiny projections, these amortize the rayon spawn.
+
+**Land-or-dig result: dug the worker-cap follow-on to the projection-threshold win, measured, REJECTED, reverted.**
+AGENT_NAME=BlackThrush. No code landed (nn.rs = HEAD); env hook `FW_GEMV_NARROW_CAP` prototyped for the A/B then
+reverted.
+
+**Hypothesis.** The `1<<21` threshold win serialized the 1.6 M projections. The next question: do the GEMVs that
+DO parallelize (`qkv` out=3840, `mlp_0` out=5120, both <16384 so capped at 8 workers) over-dispatch at 8? Maybe 4
+workers = less rayon coordination, same effective parallelism.
+
+**Measurement (interleaved cap=8 vs cap=4, `decoder_attrib` turbo 200; box loaded, per-step inflated to 17–24 ms
+vs ~9.5 clean).** Inconclusive, and the DECISIVE tell: **`mlp` (which uses the identical cap via `mlp_0`+`fc2`)
+was flat between cap8 and cap4 (min 6.01 vs 6.00 ms)**. If a lower cap reduced dispatch cost, the same-cap `mlp`
+span would move — it didn't. `qkv`'s apparent cap4 edge (1.73→1.38) is therefore load noise, not a cap effect. So
+for the 4.9–6.5 M mid GEMVs the 8-way split's per-worker compute already dominates its spawn; nothing to gain.
+Reverted per "revert near-zero gains." Contrast with the projections (1.6 M, ~0.03 ms/worker) where the spawn DID
+dominate → serial won. The crossover is between ~1.6 M (serial) and ~4.9 M (8-way parallel); the current
+`1<<21` threshold + 8-cap already sits in the right place. Don't re-tune the narrow cap.
+
 ## 2026-07-05 - BlackThrush: WIN LANDED (default, BIT-IDENTICAL) — `gemv_i8` was OVER-parallelizing the small decode projections; raising the rayon threshold `1<<19`→`1<<21` runs them serial. **1.53× on the three projection spans combined** (~9.7% e2e decode). Zero numeric change.
 
 **Land-or-dig result: confirmed and landed the live lead from the dot_i8 rejection.** AGENT_NAME=BlackThrush.
