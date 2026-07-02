@@ -3,6 +3,19 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → **LANDED** (measured, byte-exact) — **parallelize the per-head cross-K/V BUILD loop** (decoder.rs:892, the transpose+gather+f16-convert nested loop that feeds the quantize). MEASURED **4.99×** (63.1 → 12.7 ms/window, ~50 ms saved — roughly half the whole cross_kv span) and **byte-identical**. Same granularity-flip principle as the sibling quantize win (b22f8ae), applied to the bigger sibling loop.
+
+**Land-or-dig result: LANDED a second, LARGER measured byte-exact RTF win by applying last cycle's principle systematically.** AGENT_NAME=BlackThrush. Harness: `examples/cross_build_probe.rs`.
+
+**The lever:** right before the (now-parallel) cross-cache quantize, the window-constant per-head cross K/V buffers are built by a **serial nested loop** `for li in 0..n_layer { for h in 0..n_head { … } }` (turbo: 4×20 = 80 independent pairs), each pair building FOUR buffers (`kh_t [d_head,enc]`, `k_nat [enc,d_head] f16`, `vh [enc,d_head]`, `v_t [d_head,enc] f16`) with per-element f16 conversions over enc×d_head = 96 K elems. That's ~30 M element-ops + f16 converts, fully serial. Each (layer,head) is independent → fan the OUTER loop across rayon (`(0..n_layer*n_head).into_par_iter().map(build).collect()`, push in index order).
+
+**MEASURED (`cross_build_probe`, turbo cross shapes, best-of-100, taskset 0-7):**
+- A) serial nested loop (old): **63.116 ms**
+- B) par-outer over the 80 pairs (landed): **12.650 ms = 4.99×**
+- **byte-exact:** parallel build == serial build for ALL FOUR buffers of every pair (`parallel == serial -> true`); indexed `collect` preserves the li-major/h-minor push order ⇒ cross_kh_t/cross_kh_f16/cross_vh/cross_vh_f16 are bit-identical ⇒ transcript unchanged. Verified e2e: jfk×6 turbo transcript byte-identical + correct in BOTH timestamp and no_timestamps modes.
+
+**Magnitude:** ~50 ms/window is substantial — the cross_kv precompute span was ~116 ms/window, so this halves the biggest serial chunk of it. Exposed in the DEFAULT timestamp path (cross_kv is hidden under encode N+1 in no_timestamps). Combined with the quantize win (b22f8ae), the cross_kv per-window precompute is now largely parallel. **Principle reconfirmed: a serial `for`/`.iter()` over many independent per-head/per-layer tensor builds should fan the OUTER loop across rayon.**
+
 ## 2026-07-02 - BlackThrush: DIG → **LANDED** (measured, byte-exact) — **parallelize the cross-K/V int8-quantize outer loop** (decoder.rs:930, `.iter()` → `.par_iter()`). MEASURED **1.87×** on the cross-cache quantize (7.15 → 3.82 ms/window, ~3.3 ms saved) and **byte-identical** (i8 data + scales bit-equal to the serial form). Fixes a serial-loop oversight — every other similar loop in the crate is already parallel.
 
 **Land-or-dig result: LANDED a measured byte-exact RTF win.** AGENT_NAME=BlackThrush. Harness: `examples/cross_quant_probe.rs`.
