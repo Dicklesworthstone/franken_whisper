@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: BLOCKER — shared-box rustc toolchain bump broke ALL builds this cycle (rch pool + local); the dug lever (ENCODER softmax SIMD-exp) is written but UNMEASURED.
+
+**Land-or-dig result: SURFACING A BLOCKER (no build possible this cycle) + recording a promising untested
+lever.** AGENT_NAME=BlackThrush.
+
+### Blocker (one sentence)
+A concurrent rustc bump on this shared box (`1.98.0-nightly 654079540 2026-06-12` → `f46ec5218 2026-06-30`)
+left the rch pool target `/data/tmp/rch-targets-pool/whisper-cc` with **stale dep rmeta** (`regex_syntax`
+→ `regex-automata` "please recompile ... consider running cargo clean first") that neither the rch remote
+build nor the local-fallback recompiles without a full `cargo clean` of a *shared* pool — and earlier the
+same churn broke the local toolchain with a rustup `rust-docs` component conflict — so NO build/measurement
+ran this cycle. (Resolution once the toolchain settles: `cargo clean` the pool, or point CARGO_TARGET_DIR at
+a fresh dir for a cold rebuild.)
+
+### The dug lever (written, ready, unmeasured): ENCODER self-attention softmax SIMD-exp
+The memory "softmax-exp SIMD REJECTED ~0" result (189822b) was measured **only on DECODE**, where softmax
+is tiny (`[1, cache_len≈200]`) and overlaps the GEMVs → the scalar `libm expf` hides under latency. The
+**ENCODER** self-attention softmax is a different regime entirely: `[1500,1500]` scores × n_head × n_layer
+(turbo: 20 heads × 32 layers), **compute-bound and NOT GEMV-overlapped**. Rough cycle estimate puts encoder
+softmax exp on the order of the encoder attention's GEMM cost, so an 8-lane exp could be a real encoder cut
+— the decode rejection does not transfer. `examples/softmax_probe.rs` (kept, local) A/Bs franken's scalar
+`libm expf` softmax vs an 8-lane Cephes-poly-exp softmax on the `[1500,1500]` encoder-scores shape,
+model-free + best-of (contention-robust) — it was BLOCKED from compiling by the toolchain churn above, so it
+is unverified/unmeasured. NEXT (once builds work): run the probe; if the kernel win is large, gate SIMD-exp
+in `softmax_rows` + A/B `encoder_perf_probe` under `perf stat -e instructions` (deterministic under load);
+match ggml's `ggml_v_expf` poly exactly for bit-exact-with-whisper (the GELU-table pattern). Do NOT re-apply
+to the DECODE softmax (that stays scalar — the 189822b ~0 result holds there).
+
 ## 2026-07-01 - BlackThrush: WIN LANDED — f16-table GELU (whisper.cpp's shipped `GGML_GELU_FP16`): **3.46× faster kernel** AND restores bit-exact-with-whisper (franken was diverging ~2e-3 with live tanh).
 
 **Land-or-dig result: replaced franken's live-tanh GELU with whisper.cpp's actual f16 lookup-table GELU —
