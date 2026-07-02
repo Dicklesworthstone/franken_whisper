@@ -3,6 +3,12 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: encoder op-by-op code audit COMPLETE — gelu was the last unexamined op, confirmed optimal. No byte-exact franken-owned encoder lever remains; the only remaining encoder lever is a faster GEMM *kernel*, which is dep-scoped (ft_kernel_cpu) + not byte-exact = owner-gated.
+
+**Land-or-dig result: examined the final encoder op (gelu); optimal — closes the encoder search.** AGENT_NAME=BlackThrush. `nn::gelu_slice` is a SIMD AVX2/f16c path: f32→f16, `_mm256_i32gather_ps` from the `1<<16` ggml gelu table (built EXACTLY as `ggml_table_gelu_f16`), with the ggml ±10 clamp — 8-wide, rayon-parallel over `worker_count()`. Byte-exact-LOCKED to the table (a direct-tanh recompute gives different values than the f16-rounded table ⇒ would break conformance), so there is no faster byte-exact gelu.
+
+**Encoder audit is now complete at the code level** (every hot op examined, not inferred): GEMM = ft_kernel_cpu sgemm at its kernel peak (int8 measured SLOWER, no VNNI); layer_norm = fused-into-uninit (LANDED win c0d74de); residual add = serial-optimal (warm/auto-vectorized, parallelizing lost); gelu = SIMD f16-table-gather (this entry); SDPA = fused kernel + par_chunks gather; threading = 32 = physical-core optimum. **The single remaining encoder lever is a faster GEMM kernel (e.g. a hand-tuned/BLAS sgemm vs the current ft_kernel_cpu one) — it lives in the frankentorch dep, and a different microkernel changes accumulation order (not byte-exact, transcript-neutrality unverified), so it is OWNER-GATED. Its efficiency can't be cleanly benchmarked on this contended shared box (per-thread throughput is contention-confounded).** Everything franken owns in the encoder is at its byte-exact ceiling.
+
 ## 2026-07-02 - BlackThrush: NEGATIVE — parallelizing the encoder residual `add_in_place` is a wash/slight-loss; kept SERIAL. Distinguishes WHY the sibling fused-LN win worked (cold memcpy) and this doesn't (warm add).
 
 **Land-or-dig result: dug the same memory-movement vein as the fused-LN win; this one measured negative, reverted.** AGENT_NAME=BlackThrush. Byte-exact (element-wise add order-independent), so it was a pure perf question.
