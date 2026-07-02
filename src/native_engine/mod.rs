@@ -359,6 +359,35 @@ pub(crate) fn cross_proj_f32_enabled() -> bool {
     )
 }
 
+/// Route the prefill / multi-token (`tq > 1`) per-row-int8 projections through
+/// the int8 BATCHED GEMV ([`nn::gemv_i8_batch`]) instead of the f16 batched GEMV
+/// ([`nn::gemv_f16_batch`]). Reads HALF the weight bytes of the f16 path and is
+/// BIT-IDENTICAL to running the prompt batch as `tq` separate per-token
+/// [`nn::gemv_i8`] calls (same per-row activation quant + per-row weight scale).
+/// Applies only to linears whose `tq == 1` path is already `gemv_i8` (qkv /
+/// cross_q / self_out / cross_out, and mlp_0 when int4 is off) — i.e. those with
+/// a `w_i8` copy and neither a block nor int4 copy — so prefill uses the SAME
+/// quantization those linears already use per token. It also raises the
+/// draft-decoding amortization ceiling (`examples/draft_amortization_probe.rs`).
+/// Changes prefill numerics f16→int8, so gated + transcript-checked before any
+/// default flip. Proven transcript BYTE-IDENTICAL gate-on vs gate-off (turbo
+/// jfk×6, timestamp mode) AND bit-identical to per-token `gemv_i8` (0/15360
+/// entries differ, `examples/gemv_i8_batch_probe.rs`), so defaulted ON. MEASURED
+/// 3–12% faster on the cold-weight `tq>1` path (`examples/draft_amortization_probe.rs`,
+/// best-of-60: K=2 +12%, K=4 +2.9%, K=8 +5.0%). `FRANKEN_WHISPER_INT8_BATCH=0` restores f16.
+pub(crate) fn i8_batch_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_BATCH") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            _ => DEFAULT_ON,
+        },
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// PROBE (default off): int4 (block-wise, 4-bit weight × f32 activation) for
 /// `mlp_0`/fc1. fc1 feeds GELU, whose saturation absorbed int8 weight error to
 /// byte-exactness (fc1-only int8); this tests whether 4-bit is ALSO absorbed. If

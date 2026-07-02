@@ -930,6 +930,107 @@ pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]
         .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
 }
 
+/// Batched fused int8 GEMV for the prefill / multi-token path (`tq > 1`) — the
+/// int8 analog of [`gemv_f16_batch`]. Each weight row `w[o]` is read ONCE and
+/// dotted against ALL `tq` activation rows, so the (bandwidth-bound) weight read
+/// is amortized over the batch at HALF the bytes of the f16 batch path. Each
+/// activation ROW is quantized per-vector by its OWN amax, exactly as [`gemv_i8`]
+/// does per token, and each output row keeps its own weight scale — so every
+/// `(t, o)` entry equals `gemv_i8`'s and the result is BIT-IDENTICAL to running
+/// the batch as `tq` separate [`gemv_i8`] calls. `out_slice` is `[tq, out]`
+/// row-major (same layout as [`gemv_f16_batch`]). Quantifies + captures the
+/// draft-decoding amortization (`examples/draft_amortization_probe.rs`).
+pub fn gemv_i8_batch(
+    w: &I8Mat,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+) {
+    let (out, inp) = (w.out, w.inp);
+    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8_batch weight shape mismatch");
+    debug_assert_eq!(x.len(), tq * inp, "gemv_i8_batch x length mismatch");
+    debug_assert_eq!(out_slice.len(), tq * out, "gemv_i8_batch out length mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8_batch bias length mismatch");
+    if tq == 1 {
+        gemv_i8(w, x, bias, out_slice);
+        return;
+    }
+
+    // Per-ROW activation quantization (each row by its own amax → identical to the
+    // per-token gemv_i8), shared by every output row.
+    let mut xi8 = vec![0i8; tq * inp];
+    let mut xs = vec![0.0f32; tq];
+    for t in 0..tq {
+        let row = &x[t * inp..(t + 1) * inp];
+        let xamax = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+        let s = xamax / 127.0;
+        xs[t] = s;
+        let inv = 1.0 / s;
+        for (d, &v) in xi8[t * inp..(t + 1) * inp].iter_mut().zip(row) {
+            *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    // Disjoint-column-band structure identical to gemv_f16_batch; the only change
+    // is the per-(o,t) value = `dot_i8(w[o], xi8[t]) * scale_w[o] * scale_x[t] + b`,
+    // in the SAME product order as gemv_i8 (bit-identical).
+    let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
+        for o in o0..o1 {
+            let wrow = &w.data[o * inp..(o + 1) * inp];
+            let so = w.scales[o];
+            let b = bias.map_or(0.0, |bb| bb[o]);
+            for t in 0..tq {
+                dst[t * out + o] =
+                    dot_i8(wrow, &xi8[t * inp..(t + 1) * inp]) as f32 * so * xs[t] + b;
+            }
+        }
+    };
+
+    const PAR_THRESHOLD: usize = 1 << 21;
+    const COMPUTE_BOUND_MACS: usize = 1 << 26;
+    let avail = avail_parallelism();
+    let work = tq.saturating_mul(out).saturating_mul(inp);
+    let workers = batch_gemv_cap()
+        .map(|c| avail.min(c))
+        .unwrap_or_else(|| {
+            if work >= COMPUTE_BOUND_MACS {
+                avail.min(16)
+            } else {
+                gemv_worker_count(out)
+            }
+        });
+    if work < PAR_THRESHOLD || workers < 2 {
+        compute_band(0, out, out_slice);
+        return;
+    }
+
+    // Each worker fills a private [tq, out] buffer for its band, then disjoint-merge
+    // (each column written by exactly one worker → `0.0 + x == x`), same as gemv_f16_batch.
+    let band = out.div_ceil(workers).max(1);
+    let parts: Vec<(usize, usize, Vec<f32>)> = std::thread::scope(|s| {
+        let compute_band = &compute_band;
+        let mut handles = Vec::new();
+        let mut o0 = 0;
+        while o0 < out {
+            let o1 = (o0 + band).min(out);
+            handles.push(s.spawn(move || {
+                let mut local = vec![0.0f32; tq * out];
+                compute_band(o0, o1, &mut local);
+                (o0, o1, local)
+            }));
+            o0 = o1;
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (o0, o1, local) in parts {
+        for t in 0..tq {
+            out_slice[t * out + o0..t * out + o1]
+                .copy_from_slice(&local[t * out + o0..t * out + o1]);
+        }
+    }
+}
+
 /// Dot of an int8 weight row against an **f32** activation (no activation
 /// quantization): `Σ_i (w[i] as f32) · x[i]`. Scalar fallback.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]

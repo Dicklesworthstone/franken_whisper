@@ -3,6 +3,20 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **LANDED `gemv_i8_batch` (default-ON, transcript BYTE-IDENTICAL) — int8 batched GEMV for the prefill/`tq>1` path, 3–12% faster cold-weight; captures the draft-decoding amortization** (the `gemv_i8_batch` first-step surfaced last cycle, now implemented + measured).
+
+**Land-or-dig result: implemented the byte-exact wedge I surfaced last cycle and LANDED it default-ON.** AGENT_NAME=BlackThrush. New kernel `nn::gemv_i8_batch` = int8 analog of `gemv_f16_batch` (each weight row read ONCE, dotted against all `tq` rows; per-ROW activation quant identical to `gemv_i8`; disjoint-column-band parallel merge identical to the f16 batch). Wired into `Linear::forward` for `tq>1` on the pure-`w_i8` linears (qkv / cross_q / self_out / cross_out, and mlp_0 when int4 off — block/int4 linears untouched, stay f16). Gate `FRANKEN_WHISPER_INT8_BATCH` (default ON; `=0` restores f16).
+
+**Proofs / measurements (all committed probes):**
+- **BIT-IDENTICAL** to running the batch as `tq` per-token `gemv_i8` calls: `examples/gemv_i8_batch_probe.rs` → **0 / 15360 entries differ, max|Δ|=0** (QKV `[3840,1280]`, tq=4). So it inherits the per-token int8 path's transcript-neutrality by construction.
+- **TRANSCRIPT BYTE-IDENTICAL** gate-ON vs gate-OFF: turbo jfk×6 timestamp mode, both 685 chars, `diff` empty. Safe to default ON.
+- **Cold-weight `tq>1` SPEEDUP** (`draft_amortization_probe`, real turbo forward, best-of-60): t(tq=K) OFF→ON = K2 11.53→10.16 (**+12%**), K4 13.59→13.19 (+2.9%), K8 18.19→17.27 (**+5.0%**). Raises the draft-decoding amortization ceiling R(8) **2.64→2.91×**.
+- **e2e (turbo jfk×6 timestamp, best-of-many, HEAVILY contended box): WITHIN NOISE** (OFF min 9.995 s vs ON min 9.854 s; interleaved runs alternate winners). Prefill is a small e2e fraction on this workload, so the isolated `tq>1` win doesn't resolve at e2e here — the reliable number is the isolated best-of-60 above. NOT overclaimed as a big e2e ratio move.
+
+**Why the WARM isolated kernel bench (`gemv_i8_batch_probe`, 0.95×) DISAGREES with the cold win:** a tight reuse loop keeps the 4.9 MB weight L3-resident, so neither f16 nor int8 is DRAM-bound and int8's half-bytes buys nothing (the [[project_int8_mlp_fc1_default_on]]/int4-logits "not-bandwidth-bound-at-this-size" regime). In the REAL decode/prefill each layer's weight is COLD (evicted by the ~922 MB streamed since it was last used), where reading half the bytes DOES win — hence the `draft_amortization_probe` (real forward) shows the gain the warm microbench hides. **Lesson: benchmark weight-streaming kernels COLD (real forward), not in a warm reuse loop.**
+
+**Net:** a byte-exact, transcript-neutral kernel that is faster-or-equal on every `tq>1` call and is the concrete building block for draft decoding (the one bandwidth-wall-beating decode lever). Landed default-ON; the draft-ceiling improvement is now live for when the speculate/verify loop is built.
+
 ## 2026-07-02 - BlackThrush: **MEASURED the draft-decoding amortization ceiling** — the only bandwidth-wall-beating decode lever, now quantified with hard numbers (not the prior ~1.5-2× estimate). Also re-verified (code-level) that every byte-exact structural path is already optimal: QKV is fused+int8+parallel, KV cache is pre-alloc no-copy, self-attn is alloc-light, all encoder LNs are fused.
 
 **Land-or-dig result: no new byte-exact franken lever exists (re-proven at the code level), so I MEASURED the upside of the one owner/product lever that remains — draft/speculative decoding — to turn the decision-menu estimate into data.** AGENT_NAME=BlackThrush. New committed probe `examples/draft_amortization_probe.rs` times one `tq=K` decoder forward vs `K` sequential `tq=1` steps at a fixed cache (best-of-N min = contention-robust). The ratio `R(K)=K·t1/tK` is draft decoding's decode-slice speedup CEILING (realized × the draft accept-rate: accepted tokens are byte-exact with greedy).
