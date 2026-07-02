@@ -602,10 +602,37 @@ fn add_pos_emb(x: &mut Mat, pos_emb: &Mat, n_ctx: usize) {
 /// `x = x + attn_out(attn(ln_attn(x)))` then `x = x + mlp(ln_mlp(x))`. The
 /// attention is bidirectional (no causal mask): every output row depends on
 /// every input row.
+/// Default-ON gate for the fused `layer_norm`-into-uninit path (kill switch
+/// `FW_ENCODER_FUSED_LN=0` restores `x.clone()` + in-place `layer_norm`).
+fn fused_ln_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENCODER_FUSED_LN").as_deref() != Ok("0"))
+}
+
+/// `layer_norm(x)` returning a fresh `[rows, cols]` `Mat`. Fused path writes the
+/// normalized rows straight into an uninitialized buffer (no clone memcpy);
+/// clone path is the byte-identical legacy `x.clone()` + in-place norm.
+#[inline]
+fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
+    if fused_ln_enabled() {
+        let mut data = nn::gemv_out_buf(x.rows * x.cols);
+        nn::layer_norm_into(x, &mut data, w, b, LN_EPS);
+        Mat::from_vec(x.rows, x.cols, data)
+    } else {
+        let mut h = x.clone();
+        nn::layer_norm(&mut h, w, b, LN_EPS);
+        h
+    }
+}
+
 fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<()> {
     // ── self-attention residual ──
-    let mut h = x.clone();
-    nn::layer_norm(&mut h, &layer.attn_ln_w, &layer.attn_ln_b, LN_EPS);
+    // `h = layer_norm(x)` into a fresh uninit buffer — byte-identical to
+    // `x.clone()` + in-place `layer_norm`, minus the clone's redundant memcpy
+    // (x is preserved for the residual `add_in_place` below regardless).
+    // Kill switch FW_ENCODER_FUSED_LN=0 restores the clone path (A/B + escape).
+    let h = ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b);
 
     let q = nn::matmul_bias(&h, &layer.attn_q_w, Some(&layer.attn_q_b))?;
     let k = nn::matmul_bias(&h, &layer.attn_k_w, None)?; // no key bias
@@ -616,9 +643,8 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     let attn = nn::matmul_bias(&attn, &layer.attn_out_w, Some(&layer.attn_out_b))?;
     add_in_place(x, &attn);
 
-    // ── MLP residual ──
-    let mut h = x.clone();
-    nn::layer_norm(&mut h, &layer.mlp_ln_w, &layer.mlp_ln_b, LN_EPS);
+    // ── MLP residual ── (same fused layer_norm-into-uninit, no clone memcpy)
+    let h = ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b);
     let mut h = nn::matmul_bias(&h, &layer.mlp_fc_w, Some(&layer.mlp_fc_b))?;
     nn::gelu(&mut h);
     let h = nn::matmul_bias(&h, &layer.mlp_proj_w, Some(&layer.mlp_proj_b))?;
