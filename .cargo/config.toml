@@ -23,5 +23,11 @@
 # TRADE-OFF / REVERT: this raises the minimum CPU to AVX2 (2013+). To target older
 # CPUs, delete this file (reverts to portable SSE2 `x86-64`) or lower to
 # `x86-64-v2`. See docs/PERF_LEDGER.md (lever L7).
-[build]
+# CRITICAL: gate this to x86_64 ONLY. `target-cpu=x86-64-v3` is an x86 CPU name; passing it
+# to an aarch64 target (Apple Silicon, arm64 linux) is invalid ("not a recognized processor
+# ... ignoring processor") and CORRUPTS aarch64 codegen — it manifests as spurious
+# `f32/f64::clamp`/`is_finite` panics ("min > max, or either was NaN" on valid finite bounds).
+# A global `[build] rustflags` applied it to every target; scope it so aarch64 uses correct
+# default codegen while x86_64 (linux/windows/intel-mac) keeps the AVX2/FMA win.
+[target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]

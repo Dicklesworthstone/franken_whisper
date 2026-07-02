@@ -866,11 +866,13 @@ fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResul
     };
     let mut writer = hound::WavWriter::create(path, spec).map_err(hound_error_to_fw)?;
     for sample in samples {
-        // Sanitize before clamp: on the current nightly toolchain `f32::clamp`
-        // panics when `self` is NaN. NaN/Inf/denormal-class inputs map to 0.0
-        // (silence) so quantization stays finite and cannot abort the writer.
+        // Sanitize non-finite inputs to 0.0 (silence). NOTE: use max().min() rather than
+        // f32::clamp — the aarch64 nightly toolchains (Apr–Jun 2026) miscompile `clamp` in
+        // context (a spurious "min > max, or either was NaN" panic on valid finite bounds
+        // like -1.0/1.0); max().min() lowers to plain fmin/fmax and is unaffected. x86 is fine
+        // either way; this keeps the native engine correct on Apple Silicon.
         let s = if sample.is_finite() { *sample } else { 0.0 };
-        let quantized = (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        let quantized = (s.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
         writer.write_sample(quantized).map_err(hound_error_to_fw)?;
     }
     writer.finalize().map_err(hound_error_to_fw)?;
