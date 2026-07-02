@@ -3,6 +3,16 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: FRESH PROFILE at the new 32-thread default + CORRECTION — **the biggest DECODE cost is the MLP (fc2 block-wise Q8_0), NOT the logits GEMV** as long assumed. Confirms no byte-exact franken-owned decode lever >~0.5% e2e remains; the crate is encoder-bound (76%) at the physical-core ceiling.
+
+**Land-or-dig result: re-profiled at the new default (the 16→32 win shifted the mix); found the next hotspot is owner-gated, corrected a stated assumption.** AGENT_NAME=BlackThrush. Byte-exact investigation (measurement only).
+
+**Top-level spans (`e2e_probe` FRANKEN_WHISPER_PERF_SPANS=1, turbo jfk×6 timestamp mode, 32-thread default):** encoder_window **11931 ms (76%)**, decode_loop **3227 ms (20.6%)**, cross_kv 310 ms (2%), prefill 193 ms (1.2%), mel 8 ms (0.05%). (Timestamp mode re-encodes ~6 overlapping 30 s windows via data-dependent seek — vs no_ts chunk-advance's ~2-3 — so encoder share is even higher here.)
+
+**Decode forward_step sub-parts (sum over all tokens, 3366 ms):** `mlp_fc_gelu_proj` **1075 ms (31.9%)** ← biggest; `logits_gemv` 694 ms (20.6%); `cross_attn` 408 ms (12.1%); `self_qkv_proj` 406 ms (12.0%); `self_attn` 199 ms (5.9%); `self_out_proj` 190 ; `cross_q_proj` 178 ; `cross_out_proj` 176 ; (LN/clone/embed all <0.6%).
+
+**Key correction & why no lever:** I'd repeatedly written "logits dominates decode." It does NOT — the **MLP does (31.9% vs 20.6%)**, despite logits having ~5× the weight bytes (66 MB vs 13 MB/token). The MLP is compute-bound, not bandwidth-bound (13 MB/tok ⇒ ~0.19 ms at 67 GB/s, but measured ~4.6× that): fc2 is **block-wise Q8_0** (per-block dequant+FMA, more ops/byte than per-row) — and block-wise was REQUIRED for turbo transcript ([[project_int8_mlp_fc1_default_on]]; per-row broke turbo), so it's owner-gated. logits int4 is owner-gated (argmax quality). `cross_attn`/`self_attn` are already head-parallel + int8-cached (prior BlackThrush wins bd-6qih / cross-kv). The remaining projection GEMVs (self_qkv, self/cross out) are per-row int8, bandwidth-bound, cap-tuned. **Net: every decode sub-part >0.5% e2e is either owner-gated or already-optimized; the crate is encoder-bound at the 32-physical-core ceiling. No byte-exact franken-owned speed lever remains — the blocker is now profile-confirmed at the new default.**
+
 ## 2026-07-02 - BlackThrush: NEGATIVE (thread pinning) + CORRECTION (the "cross-CCD wall" was really SMT oversubscription). Tested pinning the 32 encoder rayon workers one-per-physical-core; it's a LOSS on this contended shared box. And the topology proves 32 is optimal because it = the **physical-core count**, not a cross-CCD limit.
 
 **Land-or-dig result: dug a NEW byte-exact lever (physical-core thread pinning), MEASURED negative; corrected the mechanism behind the 48/64 encoder regression.** AGENT_NAME=BlackThrush.
