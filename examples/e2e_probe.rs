@@ -87,7 +87,7 @@ fn main() {
     let params = DecodeParams {
         language: Some("en".to_string()),
         translate: false,
-        timestamps: true,
+        timestamps: std::env::var("PROBE_NO_TS").as_deref() != Ok("1"),
         n_threads: 0,
         max_text_ctx: None,
         word_timestamps: wordts,
@@ -117,6 +117,10 @@ fn main() {
     }
 
     let chars: usize = out.segments.iter().map(|s| s.text.len()).sum();
+    if std::env::var("PROBE_DUMP_TEXT").as_deref() == Ok("1") {
+        let full: String = out.segments.iter().map(|s| s.text.as_str()).collect();
+        eprintln!("TRANSCRIPT>>>{full}<<<");
+    }
     let rtf = dt / audio_sec;
     println!(
         "model={model_short} wav={wav} repeat={repeat} wordts={wordts} ch={ch} | audio={audio_sec:.1}s load={load_ms:.0}ms | transcribe={:.3}s RTF={rtf:.4} | segs={} chars={chars}",
