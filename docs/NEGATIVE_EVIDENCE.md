@@ -3,6 +3,24 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **CORRECTION + authoritative turbo decode breakdown — `self_attn` is 10.7% of decode (NOT the ~negligible I'd reasoned by MAC count), the largest non-projection cost.** Its levers are all transcript-neutrality questions (non-byte-exact), each ~1-2% e2e.
+
+**Land-or-dig result: dug the decode sub-part profile (FRANKEN_WHISPER_PERF_SPANS=1, turbo jfk×2), correcting a mischaracterization and identifying the one remaining decode sub-part with headroom.** AGENT_NAME=BlackThrush. Authoritative per-token breakdown (sum over 277 tokens):
+
+| sub-part | % decode | nature |
+|---|---|---|
+| mlp (fc1+gelu+fc2) | **31.9%** | int8 GEMV, bandwidth-bound, optimized |
+| logits_gemv | 19.1% | int8 GEMV, optimized |
+| self_qkv_proj | 12.7% | int8 GEMV (fused), optimized |
+| **self_attn** | **10.7%** | **f32 KV-cache read + scalar softmax/dots** ← the surprise |
+| self_out / cross_out / cross_q | 6.8 / 6.7 / 6.6% | int8 GEMV, optimized |
+| cross_attn | 4.4% | softmax over 1500 enc frames + int8 cross-KV read |
+| LNs + embed | ~1.1% | negligible |
+
+**The correction:** I (and earlier reasoning) dismissed `self_attn` as ~0.06% by MAC count (512K MACs/token vs 922M for weights). WRONG — MEASURED 10.7% (0.90 ms/token). MAC count ignored that it is NOT a weight-GEMV: it reads the **f32 KV cache** and runs **scalar** work. Arithmetic split (avg cache len ~93): **35% = f32 KV-cache read (~31 MB/token @97 GB/s = 0.31 ms)**, **65% = scalar `exp` softmax + scalar dots + strided per-head cache access (0.59 ms)**. `cross_attn` (softmax over 1500 frames — my hypothesis entering this cycle) is only 4.4%, so that wasn't the lever. This corrects [[project_decode_structural_alloc]] (the alloc-light 1.54× rewrite IS in place — `attention_decode_step` allocs once — but the op is still 10.7%, cache-read + scalar-compute bound, not alloc-bound).
+
+**Levers for the 10.7% — ALL non-byte-exact (transcript-neutrality must be measured), each ~1-2% e2e:** (a) **f16 or int8 KV cache** — halves the 31 MB/token cache read (~1.9% decode); [[project_decode_structural_alloc]] says "KvCache stays f32" but I find NO record it was transcript-TESTED (vs assumed) — worth a gated measurement. (b) **SIMD softmax exp** (currently scalar libm `expf`, `nn.rs:softmax_rows`) — approximation, same owner-gate class as the encoder SDPA exp. (c) **SIMD dots in `attention_decode_step`** (currently scalar sequential order) — a SIMD dot changes the sum order (canonical `dot_f16c` tree order ≠ sequential) → non-byte-exact, measurable. **Next-cycle highest-EV decode dig = gate an f16 KV cache + measure transcript-neutrality (reuses `dot_f16c`, less lossy than int8 → most likely neutral).** The projections (83.8% of decode) are confirmed int8-optimized — no lever there.
+
 ## 2026-07-02 - BlackThrush: **MEASURED — the shipped cross-window pipelining (default-ON, `FW_PIPELINE_WINDOWS`) delivers ~1.18× e2e in no_timestamps mode, transcript BYTE-IDENTICAL.** Confirms the last byte-exact structural lever with an authoritative ratio (was only ESTIMATED in memory) — and it is ALREADY landed, not a pending lever.
 
 **Land-or-dig result: set out to measure/build the "last byte-exact lever" (window pipelining), discovered it is ALREADY implemented + default-ON in `decode.rs`, then measured that it works — a landed, byte-exact e2e win.** AGENT_NAME=BlackThrush. Nearly re-dug a done feature (as with encoder-int8 last cycle); the guard is to grep the CODE for the feature before probing. Delivered two real measurements:
