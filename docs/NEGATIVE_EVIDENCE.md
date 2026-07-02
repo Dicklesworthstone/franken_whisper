@@ -3,6 +3,14 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: NEGATIVE — parallelizing the encoder residual `add_in_place` is a wash/slight-loss; kept SERIAL. Distinguishes WHY the sibling fused-LN win worked (cold memcpy) and this doesn't (warm add).
+
+**Land-or-dig result: dug the same memory-movement vein as the fused-LN win; this one measured negative, reverted.** AGENT_NAME=BlackThrush. Byte-exact (element-wise add order-independent), so it was a pure perf question.
+
+**Hypothesis:** the two encoder residuals (`x += y`, `[1500,1280]`, ~23 MB/call, ~1.5 GB/window) ran single-threaded → parallelize for bandwidth. **MEASURED (`encoder_scale_probe`, turbo, 32 threads, best-of-8, 3 interleaved rounds via `FW_ENCODER_PAR_ADD` gate):** par-add **2870.0 / 2917.5 / 2791.4** vs serial **2876.2 / 2838.5 / 2781.7** ms/win — serial wins 2 of 3 rounds; averages favor serial (~2832 vs ~2860). **Rejected.**
+
+**Why (and why it differs from the fused-LN win):** `add_in_place` operands are **cache-warm** — `y` was just written by the preceding `matmul_bias`, `x` by the previous residual — and LLVM auto-vectorizes the loop (AVX2, 8 f32/instr), so single-threaded it's already ~fast; rayon `par_chunks` dispatch overhead then outweighs any gain. The fused-LN win was real because the `x.clone()` it removed was a **cold** dedicated memcpy pass (writing a fresh buffer), not a warm in-cache op. **Lesson: memory-movement wins come from removing *cold/redundant* passes, not from parallelizing *warm* auto-vectorized ones.** Reverted; `add_in_place` stays serial with a "do not re-parallelize" comment.
+
 ## 2026-07-02 - BlackThrush: **LANDED WIN — fused encoder layer_norm (no clone memcpy) = ~1.9% encoder, BYTE-EXACT.** Each encoder layer did `x.clone()` + in-place `layer_norm` twice; the clone is a redundant full-buffer memcpy (x is preserved for the residual regardless). New `layer_norm_into` writes normalized rows straight into an uninitialized buffer, fusing away ~985 MB/window of memcpy.
 
 **Land-or-dig result: LANDED real code — distinct from the previously-rejected encoder alloc-reuse.** AGENT_NAME=BlackThrush. The old rejection tested *malloc tuning* (alloc reuse) and was noise-dominated — which is the tell that the ~63ms "isolated alloc cost" is data-movement (the clone's memcpy), NOT allocation. This lever removes the *copy*, which malloc tuning couldn't.

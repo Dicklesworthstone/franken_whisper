@@ -654,6 +654,12 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
 }
 
 /// In-place element-wise `x += y` for matrices of identical shape.
+///
+/// Kept SERIAL deliberately: parallelizing this was MEASURED a wash/slight-loss
+/// (2026-07-02, BlackThrush) — the residual operands are cache-warm from the
+/// matmul that just produced them and LLVM auto-vectorizes the loop, so rayon
+/// dispatch overhead outweighs any bandwidth gain (unlike the fused-LN clone,
+/// which was a *cold* memcpy pass). Do not re-parallelize.
 fn add_in_place(x: &mut Mat, y: &Mat) {
     debug_assert_eq!(
         (x.rows, x.cols),
