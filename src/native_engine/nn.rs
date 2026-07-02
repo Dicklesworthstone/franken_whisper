@@ -899,9 +899,27 @@ pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]
         }
     };
 
-    const PAR_THRESHOLD: usize = 1 << 19;
+    // Parallelize only GEMVs whose `out*inp` clears this bar. At `1<<19` the small
+    // decode projections (`self_out`/`cross_q`/`cross_out` = n_state² = 1.64 M for
+    // large/turbo) were parallelized, but their per-row int8 dot is ~0.03 ms of
+    // compute — `par_chunks_mut`'s rayon coordination cost DOMINATED it (MEASURED
+    // serial 1.3–1.8× faster on those spans, min-of-8). `1<<21` (2.10 M) keeps them
+    // serial while `qkv` (4.9 M), `mlp_0` (6.5 M) and the vocab logits (66 M) — which
+    // genuinely amortize the spawn — stay parallel (also for medium's 3.15 M `qkv`).
+    // Bit-identical: parallel vs serial is a disjoint output-row partition, same math.
+    // Escape hatch / tuner: `FW_GEMV_I8_PAR`.
+    let par_threshold = {
+        use std::sync::OnceLock;
+        static T: OnceLock<usize> = OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("FW_GEMV_I8_PAR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 21)
+        })
+    };
     let workers = gemv_worker_count(out);
-    if out * inp < PAR_THRESHOLD || workers < 2 {
+    if out * inp < par_threshold || workers < 2 {
         fill(0, out_slice);
         return;
     }

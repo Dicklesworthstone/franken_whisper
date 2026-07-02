@@ -3,6 +3,34 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-05 - BlackThrush: WIN LANDED (default, BIT-IDENTICAL) — `gemv_i8` was OVER-parallelizing the small decode projections; raising the rayon threshold `1<<19`→`1<<21` runs them serial. **1.53× on the three projection spans combined** (~9.7% e2e decode). Zero numeric change.
+
+**Land-or-dig result: confirmed and landed the live lead from the dot_i8 rejection.** AGENT_NAME=BlackThrush.
+Real code: `gemv_i8` PAR_THRESHOLD `1<<19`→`1<<21` (env-tunable via `FW_GEMV_I8_PAR`), nn.rs.
+
+**The lever.** The prior cycle proved the int8 projections were neither dot- nor bandwidth-bound; the suspect was
+`gemv_i8`'s `par_chunks_mut`. Confirmed: it parallelized any GEMV with `out*inp >= 1<<19` (524288), so the small
+decode projections `self_out`/`cross_q`/`cross_out` (= n_state² = 1.64 M for large/turbo) were split across ~8
+rayon workers — but their per-row int8 dot is only ~0.03 ms of compute, so the `par_chunks_mut` coordination cost
+DOMINATED. Raising the bar to `1<<21` (2.10 M) keeps those three serial while `qkv` (4.9 M), `mlp_0` (6.5 M) and
+the vocab logits (66 M) — which do amortize the spawn — stay parallel (also keeps medium's 3.15 M `qkv` parallel).
+
+**Conformance (bit-identical, not just tolerant).** Parallel vs serial `gemv_i8` is a disjoint output-row
+partition of the identical per-row dots — same arithmetic, no reordering. `native_ab` transcript BYTE-IDENTICAL on
+both tiny.en and large-v3-turbo; real-CLI e2e `tests/native_engine_e2e.rs` = **6 passed, 0 failed**.
+
+**Ratio.** `decoder_attrib large-v3-turbo 200`, INTERLEAVED A/B (alternating configs per rep to cancel the
+shared-box load drift — load swung 12→67 this cycle, so batched min-of-N was unreliable; interleaving fixed it).
+Sum of the three projection spans, every paired rep serial-faster: default 2.646 → **1.728 ms/token = 1.53×**
+(Δ 0.918). Of ~9.5 ms/token per-step → **~9.7% off e2e decode**. Per-span (min-of-8 earlier batch): self_out
+0.96→0.53 (1.82×), cross_q 0.74→0.53 (1.40×), cross_out 0.70→0.55 (1.26×). The serial spans are contention-
+INSENSITIVE (single-threaded, no core contention), which is why their measurement stayed clean while the parallel
+spans/per-step were noisy — a useful measurement note: on a loaded box, serial-execution spans are the reliable signal.
+
+**Method note for the ledger.** This corrects a general assumption: MORE parallelism is not free. For GEMVs whose
+per-worker compute is < the rayon dispatch cost (~tens of µs), serial WINS. The `1<<19` bar was tuned before the
+int8 projections existed; the int8 dot is ~2× denser than f16 per byte so the crossover moved up.
+
 ## 2026-07-04 - BlackThrush: REJECTED (near-zero, reverted) — explicit AVX2 `vpmovsxbw`+`vpmaddwd` `dot_i8` ≈ the LLVM auto-vectorized scalar loop. The scalar int8 dot was NOT the decode bottleneck.
 
 **Land-or-dig result: dug the int8-GEMV kernel, measured, REJECTED, reverted.** AGENT_NAME=BlackThrush. No code
