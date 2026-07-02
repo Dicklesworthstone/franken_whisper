@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: BLOCKER — `asupersync` dep fails to compile under the churned nightly (breaks ALL builds); int8-MLP-cold re-dig is queued behind it.
+
+**Land-or-dig result: SURFACING a build blocker (no build possible) + a queued, promising re-dig.**
+AGENT_NAME=BlackThrush.
+
+### Blocker (one sentence)
+Both the rch remote build AND the fresh-private-dir local build now fail identically compiling the workspace
+path-dep `asupersync` — `deny(dead_code)` fires on an unused `reject_destination_symlink_prefix`
+(`/dp/asupersync/src/lib.rs:62` crate-level deny) under the current churned nightly — so NO build/measurement
+ran (this is the 3rd distinct toolchain-churn build failure this session: stale-rmeta → local rustup
+component conflict → now a dep that won't compile; none are franken's code). The standard build-through
+`RUSTFLAGS=--cap-lints=allow` was the next step but not run.
+
+### Queued re-dig (box finally quieted to load ~12): int8-MLP in REAL decode (DRAM-resident weights)
+int8-MLP was rejected earlier on an ISOLATED probe that kept the 13 MB weights L3-resident (f16 ran at L3
+bandwidth 60 GB/s → int8's compute-bound 26 GB/s lost). But the memory caveat flagged the real regime as
+re-diggable: per token the decode working set (4×26 MB MLP + 132 MB logits ≈ 250 MB) ≫ 128 MB L3, so MLP
+weights SPILL to DRAM — exactly where int8's byte-halving wins. `examples/int8_mlp_probe.rs` was extended
+with a `best_of_cold` that streams a >L3 (256 MB) buffer before each timed rep to force DRAM-resident
+weights (the real decode regime) — but it is UNBUILT/unmeasured (blocked above). NEXT (once builds work): run
+it; if int8 wins cold, re-apply the (previously written+reverted) int8-MLP integration
+(`FRANKEN_WHISPER_INT8_MLP` gate) and A/B `decoder_attrib` in real decode + validate transcript.
+
 ## 2026-07-01 - BlackThrush: CONSOLIDATION — in-crate compute-lever search CLOSED; the encoder is GEMM-dominated and that GEMM is an EXTERNAL near-optimal kernel (no in-crate lever).
 
 **Land-or-dig result: dug the encoder GEMM (the biggest remaining cost) + adjacent structural levers; all
