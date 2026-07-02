@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: ENCODER softmax SIMD-exp REJECTED — kernel 1.80× in isolation but encoder e2e is FLAT (+0.12% instructions); softmax-exp prohibition now confirmed on BOTH decode AND encoder.
+
+**Land-or-dig result: dug the encoder-softmax SIMD-exp lever (the blocker below was bypassed), MEASURED it
+end-to-end, and it is a NON-WIN → reverted.** AGENT_NAME=BlackThrush. nn.rs reverted bit-identical to HEAD;
+kept `examples/softmax_probe.rs` as evidence.
+
+### Blocker bypassed
+The stale-rmeta blocker (below) was sidestepped by pointing `CARGO_TARGET_DIR` at a FRESH private dir (cold
+build with the current nightly, no pool-synced stale artifacts) + `RUSTUP_TOOLCHAIN=nightly-...` pinned.
+This is the general escape when the shared rch pool is toolchain-poisoned.
+
+### Measured
+Kernel (model-free `examples/softmax_probe`, `[1500,1500]` encoder self-attn scores, best-of-30):
+```
+  scalar libm-exp   7.759 ms
+  simd cephes-exp   4.317 ms   speedup = 1.80×   (max|Δ| normalized = 1.82e-8)
+```
+Encoder e2e (`encoder_perf_probe`, large-v3-turbo, `perf stat -e instructions:u`, deterministic under load):
+```
+  SIMD softmax OFF (scalar)  48,390,399,991 instructions
+  SIMD softmax ON  (poly)    48,447,186,906 instructions   = +0.12% (FLAT / marginally worse)
+```
+### Why (the principle)
+The softmax kernel IS 1.80× faster in isolation, but softmax is a **tiny fraction of the GEMM-dominated
+encoder** — the f32 mul_mats (QKV / out / MLP over 1500 frames × 32 layers) dwarf it — so a 1.80× on ~1% of
+the work is invisible e2e (the poly's extra inline ops even edge instructions slightly UP). This **extends
+the 189822b decode-softmax rejection to the ENCODER**: softmax-exp is ~0 e2e on BOTH paths (decode: overlapped
+by GEMVs; encoder: dwarfed by GEMMs). **Softmax-exp lever is now closed on both paths — do not re-try on
+either.** The real encoder cost is the f32 GEMM (memory: faer ~1.1×, owner-gated dependency swap).
+
 ## 2026-07-01 - BlackThrush: BLOCKER — shared-box rustc toolchain bump broke ALL builds this cycle (rch pool + local); the dug lever (ENCODER softmax SIMD-exp) is written but UNMEASURED.
 
 **Land-or-dig result: SURFACING A BLOCKER (no build possible this cycle) + recording a promising untested
