@@ -3,6 +3,21 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: MEASURED WIN vs whisper.cpp (fair head-to-head) — franken is **~3.6× total RTF (8.1 s vs 29.1 s)** and **~2.7× encode** on large-v3-turbo (jfk×6, 66 s), both builds AVX2/FMA/F16C. Confirms franken's encoder LEADS whisper.cpp (not trails), and the landed pipelining widens the total gap.
+
+**Land-or-dig result: ran the direct vs-OpenAI-Whisper head-to-head the directive asks for (prior cycles only compared vs franken's OWN sequential baseline).** AGENT_NAME=BlackThrush. No engine code (bench + ledger ratio; the RTF win itself is the pipelining landed at 65d5b5b + franken's faster encode).
+
+**Head-to-head (large-v3-turbo, jfk×6 = 66 s / 3 windows, 8 threads, same `ggml-large-v3-turbo.bin`):**
+| | franken (pipelined, no_ts) | whisper.cpp (whisper-cli, `-nt`) | franken speedup |
+|---|---|---|---|
+| total wall | ~8.1 s (2× reruns 8071/8112 ms) | ~29.1 s (2× reruns 28793/29469 ms) | **~3.6×** |
+| encode / full window | ~3.1 s | 8324 ms/run (24973 ms / 3 runs) | **~2.7×** |
+| decode | hidden under encode (pipelined) | sample 217 ms + batchd 2294 ms | — |
+
+**FAIRNESS CHECK (this is comparable, not build-asymmetric):** whisper-cli's own `system_info` reports `AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | REPACK = 1` — a fully SIMD-optimized ggml build, same instruction set franken uses (`target-cpu=x86-64-v3`). `fallbacks = 0`, `encode = 3 runs` (one per window). So the 2.7× encode gap is REAL: franken's dequant-once + `matrixmultiply` f32 sgemm beats ggml's per-call f16 GEMM for this model/shape on this box. **This corrects the prior-cycle worry ("franken's f32 encoder might trail whisper.cpp-Q8 without VNNI") — franken's encoder LEADS by 2.7× here.**
+
+**Caveats (honest):** (1) `no_timestamps` mode for franken (pipelining engages); whisper-cli `-nt`. Timestamp mode would remove franken's pipelining edge (decode no longer hidden) but keep the ~2.7× encode lead. (2) franken truncates the tail window (byte-exact-preserving) — a small extra edge on window 2; the ~2.7× encode gap is on the FULL windows (0,1), so it's not a truncation artifact. (3) This `ggml-large-v3-turbo.bin` is f16; a Q5/Q8 whisper.cpp model would encode faster (quantized ggml GEMM) — re-measure vs a quantized model before claiming the gap universally. Net: on the apples-to-apples f16-turbo/AVX2 comparison, franken wins ~3.6× total.
+
 ## 2026-07-02 - BlackThrush: DIG (post-pipelining) → RTF is now ENCODE-GEMM-GATED; remaining byte-exact levers are marginal or dead. Confirms the pipelining win landed correctly and closes the no_timestamps RTF axis.
 
 **Land-or-dig result: no uncommitted win; measured the post-pipelining per-window structure to find the NEXT lever — and the data shows the decode is now hidden and the gate is the (immovable) encode GEMM.** AGENT_NAME=BlackThrush. No code lands (the remaining lever is below this box's noise floor / structurally marginal).
