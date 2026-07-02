@@ -335,6 +335,25 @@ pub(crate) fn int8_attn_enabled() -> bool {
     })
 }
 
+/// PROBE (default off): int4 (block-wise, 4-bit weight × f32 activation) for
+/// `mlp_0`/fc1. fc1 feeds GELU, whose saturation absorbed int8 weight error to
+/// byte-exactness (fc1-only int8); this tests whether 4-bit is ALSO absorbed. If
+/// byte-exact it halves fc1's weight bandwidth again — a quality-neutral win past
+/// the Q8 floor. `FRANKEN_WHISPER_INT4_MLP0=1`.
+pub(crate) fn int4_mlp0_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRANKEN_WHISPER_INT4_MLP0")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
 /// Whether to run `mlp_2` (fc2, the MLP down-projection) through the MIXED
 /// BLOCK-WISE int8-weight × f32-activation GEMV ([`nn::gemv_i8w_f32a_blocked`]) on
 /// the per-token decode path. fc2's weight is the bandwidth-bound operand (13 MB

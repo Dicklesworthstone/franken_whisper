@@ -224,6 +224,20 @@ impl Linear {
         self
     }
 
+    /// PROBE: attach a BLOCK-WISE **int4** weight copy (mixed 4-bit weight × f32
+    /// activation), iff `enabled`. Overrides any per-row `w_i8` in `forward` (which
+    /// checks `w_i8_block` first). For the `mlp_0` int4 GELU-absorption probe
+    /// (see `int4_mlp0_enabled`).
+    fn quantize_i4w_f32a_blocked_if(mut self, enabled: bool) -> Self {
+        const BLOCK: usize = 32;
+        if enabled {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                self.w_i8_block = Some(nn::quantize_f16_to_i4_blocked(data, *out, *inp, BLOCK));
+            }
+        }
+        self
+    }
+
     /// Apply `y = x @ W^T + b` over `x` (`[tq, in]`), returning `[tq, out]`.
     fn forward(&self, x: &Mat) -> FwResult<Mat> {
         // Per-token decode (tq==1) with an int8 copy present: the memory-halved int8
@@ -608,7 +622,10 @@ impl DecoderWeights {
                     mlp_hidden,
                     n_state,
                 )?
-                .quantized(),
+                .quantized()
+                // int4 probe: GELU absorbs mlp_0 error, so 4-bit MAY stay byte-exact.
+                // Overrides the full-int8 path above when enabled (forward prefers block).
+                .quantize_i4w_f32a_blocked_if(super::int4_mlp0_enabled()),
                 // mlp_2 (down-proj) writes DIRECTLY into the residual stream. Full
                 // int8 (weight+activation) broke turbo (6c4b53d) — the per-vector
                 // activation scale crushed the GELU-hidden outliers. The MIXED

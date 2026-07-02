@@ -3,7 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-07-06 - BlackThrush: CONSOLIDATION / BLOCKER — decode is now FULLY int8 (fc2 was the last f16 weight, 33f3a5b) → at the **Q8 weight-bandwidth floor**, i.e. parity with whisper.cpp's own Q8 decode. No measurable quality-neutral in-crate decode lever remains; box too loaded (49) to resolve sub-1%.
+## 2026-07-07 - BlackThrush: BREAKTHROUGH (finding + gated scaffold) — **int4 `mlp_0`/fc1 is transcript BYTE-EXACT** (GELU absorbs 4-bit weight error) on tiny.en AND turbo. The Q8 floor is NOT the ceiling: fc1 can go int4 quality-neutrally. Perf win pending the packed-nibble kernel (this lands the proven-conformance scaffold).
+
+**Land-or-dig result: falsified my own "Q8 floor = ceiling" (below) — probed int4 and fc1 clears the byte-exact bar.**
+AGENT_NAME=BlackThrush. Real code (gated, default off): `quantize_f16_to_i4_blocked` (+ the shared
+`quantize_f16_to_int_blocked(max_level)` refactor, nn.rs), `Linear::quantize_i4w_f32a_blocked_if`,
+`int4_mlp0_enabled` gate (mod.rs), `mlp_0` wired to override its full-int8 path when on.
+
+**The insight.** Last cycle concluded decode was at the Q8 (int8) bandwidth floor. But fc1 (`mlp_0`, up-proj) feeds
+GELU, and GELU's saturation is exactly why fc1-only int8 was byte-exact (b54065d). Hypothesis: GELU absorbs 4-bit
+error too. Tested via the block infra at 4-bit range (levels [-7,7], `amax/7` scale, block=32) fed through the
+existing `gemv_i8w_f32a_blocked` (mixed weight × f32 act): **`native_ab` int4-fc1 vs int8-fc1 BYTE-IDENTICAL on
+BOTH tiny.en and large-v3-turbo**, and the real-CLI e2e suite with int4 ON = **6 passed, 0 failed** (matches the
+whisper-cli golden). So 4-bit fc1 is quality-neutral — a door past the Q8 floor that the int8-only analysis missed. (Only fc1 feeds GELU; fc2/attention/logits are NOT GELU-absorbed and int4 there would need
+separate testing — likely breaks, per the mlp_2 precision sensitivity.)
+
+**What this landing IS and ISN'T.** The probe stores int4 VALUES in int8 bytes and runs the int8 block dot, so it
+proves 4-bit PRECISION is byte-exact but does NOT yet reduce bandwidth (still 1 byte/weight). The measured win
+needs a PACKED-nibble kernel (2 int4/byte, Q4_0 layout: `w[i]` low + `w[i+16]` high per 32-block) with a SIMD
+unpack — fc1 6.5 MB → 3.25 MB/token, ~1.2–1.3× on the fc1 portion (~3–5% e2e decode) IF the SIMD unpack doesn't
+eat it (scalar unpack would — it must be vectorized). That kernel is the scoped follow-up; the gate + int4 quantize
++ block-dot integration landed here is its scaffold, and the hard/uncertain part (conformance) is now PROVEN.
+
+## 2026-07-06 - BlackThrush: CONSOLIDATION / BLOCKER (superseded — fc1 int4 breaks the floor, above) — decode is now FULLY int8 (fc2 was the last f16 weight, 33f3a5b) → at the **Q8 weight-bandwidth floor**, i.e. parity with whisper.cpp's own Q8 decode. No measurable quality-neutral in-crate decode lever remains; box too loaded (49) to resolve sub-1%.
 
 **Land-or-dig result: dug the post-fc2 decode; confirmed exhaustion at the Q8 floor and surfaced the two real next
 axes.** AGENT_NAME=BlackThrush. No code landed (this is the blocker surface).

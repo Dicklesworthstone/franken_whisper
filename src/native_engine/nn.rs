@@ -1032,6 +1032,24 @@ pub struct I8BlockMat {
 /// columns share a symmetric `amax/127` scale). Mirrors [`quantize_f16_to_i8`]
 /// but per block, so the whisper.cpp-Q8_0-class accuracy on wide rows.
 pub fn quantize_f16_to_i8_blocked(w: &[Float16], out: usize, inp: usize, block: usize) -> I8BlockMat {
+    quantize_f16_to_int_blocked(w, out, inp, block, 127.0)
+}
+
+/// Block-wise 4-bit variant (levels in `[-7, 7]`, stored one-per-`i8` — the
+/// values still ride the [`gemv_i8w_f32a_blocked`] dot, so this measures 4-bit
+/// PRECISION without the packed-nibble kernel). For probing whether a GELU-absorbed
+/// weight (`mlp_0`) tolerates int4 byte-exactly before writing the packed kernel.
+pub fn quantize_f16_to_i4_blocked(w: &[Float16], out: usize, inp: usize, block: usize) -> I8BlockMat {
+    quantize_f16_to_int_blocked(w, out, inp, block, 7.0)
+}
+
+fn quantize_f16_to_int_blocked(
+    w: &[Float16],
+    out: usize,
+    inp: usize,
+    block: usize,
+    max_level: f32,
+) -> I8BlockMat {
     debug_assert_eq!(w.len(), out * inp);
     debug_assert!(block > 0);
     let n_blocks = inp.div_ceil(block);
@@ -1050,11 +1068,11 @@ pub fn quantize_f16_to_i8_blocked(w: &[Float16], out: usize, inp: usize, block: 
                     .map(|h| h.to_f32().abs())
                     .fold(0.0f32, f32::max)
                     .max(1e-9);
-                let sc = amax / 127.0;
+                let sc = amax / max_level;
                 srow[b] = sc;
                 let inv = 1.0 / sc;
                 for i in s..e {
-                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-max_level, max_level) as i8;
                 }
             }
         });
