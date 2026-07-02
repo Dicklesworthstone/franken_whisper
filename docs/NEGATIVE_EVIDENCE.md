@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-04 - BlackThrush: REJECTED (near-zero, reverted) — explicit AVX2 `vpmovsxbw`+`vpmaddwd` `dot_i8` ≈ the LLVM auto-vectorized scalar loop. The scalar int8 dot was NOT the decode bottleneck.
+
+**Land-or-dig result: dug the int8-GEMV kernel, measured, REJECTED, reverted.** AGENT_NAME=BlackThrush. No code
+change landed (nn.rs restored to HEAD); this entry is the deliverable.
+
+**Hypothesis (plausible, wrong).** Post-int8, the attention projection spans looked overhead-bound: `self_out`
+(1280×1280 int8) ~1.07 ms/token was as slow as / slower than `qkv` (3840×1280, 3× bigger) ~0.94 — impossible if
+compute-bound. And `dot_i8` (nn.rs) is written as a plain scalar loop `acc += (a as i32)*(b as i32)`. Inference:
+the int8 dot is scalar-bound; an explicit AVX2 widening dot (`_mm256_cvtepi8_epi16` → `_mm256_madd_epi16` →
+i32 accumulate, two accumulators, bit-identical since integer add is exact/associative and products ≤127² never
+overflow i32) would speed up EVERY int8 GEMV (logits, MLP fc1, all projections ≈ most of decode).
+
+**Measurement (clean A/B, same target, `--cfg fw_force_scalar_i8` toggle, `decoder_attrib` turbo 200, min-of-7).**
+Byte-identical transcript both models (integer bit-exact, as predicted). But the perf A/B is a WASH:
+| span         | scalar min | AVX2 min | ratio |
+|--------------|-----------:|---------:|------:|
+| logits_gemv  |    1.3983  |  1.3547  | 1.03× |
+| self_out_proj|    0.8077  |  0.9296  | 0.87× (SLOWER) |
+| self_qkv_proj|    0.9407  |  0.8721  | 1.08× |
+| per-step     |    9.801   |  9.516   | 1.03× |
+Inconsistent and within noise (self_out regressed, logits flat, per-step ~3% but load differed). **Root cause:
+LLVM already auto-vectorizes the scalar `dot_i8` into a widening multiply-add under `-C target-cpu=x86-64-v3`**, so
+the hand-written intrinsics add unsafe code for no reliable gain. Reverted per "revert near-zero gains." (Note:
+this corrects the stale memory claim that `gemv_i8` was already hand-SIMD — the source is scalar, but the
+compiler makes it moot.)
+
+**Live lead for next cycle (unmeasured, do NOT assume a win).** The projections are NOT dot-compute-bound and
+NOT bandwidth-bound (1.6–4.9 MB int8), so their ~0.8–1.0 ms is likely `gemv_i8`'s rayon dispatch: it parallelizes
+at `out*inp >= 1<<19` (524288), so `self_out`/`cross_q` (1.6 M), `qkv` (4.9 M), `mlp_0` (6.5 M) all pay
+`par_chunks_mut` coordination for a ~0.03 ms compute. Raising the threshold so only vocab-class logits (66 M)
+parallelizes, projections stay serial, is the hypothesis to A/B next (env hook `FW_GEMV_I8_PAR` was prototyped
+then reverted unmeasured — ran out of turn). If real it would be a clean bit-identical win across ~35% of decode.
+
 ## 2026-07-04 - BlackThrush: WIN LANDED (default-ON, BIT-IDENTICAL) — allocation-light decode self-attention (`tq==1`): drop the per-head `kh`/`kh_t`/`vh` gather+transpose+alloc, read K/V straight from the cache with a per-key dot. **1.54× on the self_attn span** (~4% e2e decode). Zero conformance risk.
 
 **Land-or-dig result: the first STRUCTURAL (non-int8) decode win — self-attention was overhead-bound, not
