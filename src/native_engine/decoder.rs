@@ -245,6 +245,23 @@ impl Linear {
         self
     }
 
+    /// Dequantize an f16 weight to f32 and pre-transpose to `[in, out]`, so
+    /// `forward` runs the tiled f32 sgemm ([`nn::matmul_bias`]) instead of the f16
+    /// batched GEMV ([`nn::gemv_f16_batch`]), iff `enabled`. For the per-window
+    /// cross-K/V projections (encoder_out @ Wk/Wv, tq=1500): MEASURED 2.25× faster
+    /// on turbo (`examples/cross_f16path_probe.rs`), the same win the ENCODER gets
+    /// from dequant-once-to-f32. NOT bit-exact (different accumulation, max|Δ|
+    /// ~6.9e-6), so gated by [`super::cross_proj_f32_enabled`] + golden-checked.
+    fn dequant_to_f32_if(mut self, enabled: bool) -> Self {
+        if enabled {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                let natural: Vec<f32> = data.iter().map(|h| h.to_f32()).collect();
+                self.w = WeightMat::F32(transpose(&Mat::from_vec(*out, *inp, natural)));
+            }
+        }
+        self
+    }
+
     /// Apply `y = x @ W^T + b` over `x` (`[tq, in]`), returning `[tq, out]`.
     fn forward(&self, x: &Mat) -> FwResult<Mat> {
         // Per-token decode (tq==1) with an int8 copy present: the memory-halved int8
@@ -618,14 +635,16 @@ impl DecoderWeights {
                     None, // key has no bias
                     n_state,
                     n_state,
-                )?,
+                )?
+                .dequant_to_f32_if(super::cross_proj_f32_enabled()),
                 cross_attn_v: load_linear(
                     model,
                     &format!("{p}.cross_attn.value.weight"),
                     Some(&format!("{p}.cross_attn.value.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .dequant_to_f32_if(super::cross_proj_f32_enabled()),
                 cross_attn_out: load_linear(
                     model,
                     &format!("{p}.cross_attn.out.weight"),

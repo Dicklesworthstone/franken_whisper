@@ -3,6 +3,19 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → **LANDED (gated, transcript-verified)** — **cross-K/V projection via dequant-once f32 sgemm instead of f16 batched-GEMV**. MEASURED **2.25×** on the projection (233.96 → 103.95 ms for the 8 turbo GEMMs) and **TRANSCRIPT BYTE-IDENTICAL** on jfk×6 turbo (timestamp/conformance mode) despite max|Δ|~6.9e-6 — the divergence is fully absorbed. Gated `FRANKEN_WHISPER_CROSS_PROJ_F32` (default OFF pending full-golden sign-off to flip on).
+
+**Land-or-dig result: LANDED a gated, transcript-verified speed win** (real code: a new `Linear::dequant_to_f32_if` + `cross_proj_f32_enabled` gate, wired to cross_attn_k/v). AGENT_NAME=BlackThrush. Harnesses: `examples/cross_f16path_probe.rs`, `examples/cross_gemm_probe.rs`.
+
+**The lever:** cross_attn_k/v are F16-stored + unquantized, so `Linear::forward` runs `nn::gemv_f16_batch` for the per-window cross projection (encoder_out @ Wk/Wv, tq=1500). For a GEMM-shaped tq=1500 problem an f16 batched-GEMV is memory-bound vs a tiled f32 sgemm — the EXACT reason the ENCODER dequants-once to f32 ([[project_turbo_encoder_dominates]]). Routing cross_attn_k/v through dequant-once f32 (`WeightMat::F32` → `matmul_bias`) gets the tiled kernel.
+
+**MEASURED:**
+- **Speed** (`cross_f16path_probe`, turbo cross shape, 8 GEMMs, best-of-80): f16 `gemv_f16_batch` **233.96 ms** vs f32 sgemm **103.95 ms** = **2.25×**. (`cross_gemm_probe` separately confirmed the existing `thread::scope` band-concurrency for these GEMMs is already optimal — sequential is 0.98×, byte-exact — so no scheduling change needed.)
+- **Numerics:** f32-sgemm vs f16-gemv max|Δ| = **6.9e-6** — NOT bit-exact (different accumulation order), so this is an owner-class tolerance trade like the encoder's.
+- **Conformance:** with the gate ON, the jfk×6 turbo transcript (timestamp mode — the DEFAULT/golden path) is **BYTE-IDENTICAL** to gate-OFF (`diff` empty). e2e transcribe faster same run (22338 → 18230 ms; magnitude noisy on a loaded box, but direction + the 2.25× isolated are solid).
+
+**Why gated default-OFF (not yet default-ON):** the change is NOT bit-exact, so per project discipline it flips default-on only after the FULL golden corpus (`conformance_harness`, all assets) clears — jfk×6 (1 asset, 3 windows) byte-identical is strong but not the whole gate, and "no more building" this turn precludes running it. Shipped gated + measured; flipping the default is a clean follow-up once the golden is run. `FRANKEN_WHISPER_CROSS_PROJ_F32=1` enables the 2.25× projection today.
+
 ## 2026-07-02 - BlackThrush: DIG → **LANDED** (measured, byte-exact) — **parallelize the per-head cross-K/V BUILD loop** (decoder.rs:892, the transpose+gather+f16-convert nested loop that feeds the quantize). MEASURED **4.99×** (63.1 → 12.7 ms/window, ~50 ms saved — roughly half the whole cross_kv span) and **byte-identical**. Same granularity-flip principle as the sibling quantize win (b22f8ae), applied to the bigger sibling loop.
 
 **Land-or-dig result: LANDED a second, LARGER measured byte-exact RTF win by applying last cycle's principle systematically.** AGENT_NAME=BlackThrush. Harness: `examples/cross_build_probe.rs`.
