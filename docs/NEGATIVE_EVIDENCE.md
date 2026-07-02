@@ -3,6 +3,14 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **int4 LOGITS is DEAD on AVX2 — 2–3× SLOWER than int8, not faster.** Built the kernel + benched it (executing the #1 owner-gated lever, not asking): int4 has NO speed upside even before the argmax-quality risk, so the whole lever is off the table.
+
+**Land-or-dig result: implemented `gemv_i4` + benched vs `gemv_i8` on the real logits shape; MEASURED a clear loss. The top decision-menu item is refuted on SPEED.** AGENT_NAME=BlackThrush. `examples/logits_int4_probe.rs` (`gemv_i4` mirrors `gemv_i8` exactly — quantize x once, per-row dot × scales, parallel over output rows — with packed int4 weights).
+
+**MEASURED (turbo logits `[51866,1280]`, best-of-250, 32 threads, 3 runs):** int8 **1.16–1.40 ms (47–57 GB/s)** vs int4 **3.03–3.25 ms (10 GB/s) = 0.36–0.46× (int4 is 2–3× SLOWER)** — despite int4 reading HALF the bytes (33 vs 66 MB).
+
+**Why (structural, not a kernel-tuning artifact):** (1) AVX2 has no int4 math, so int4 must UNPACK nibbles→int8 (shift+sign-extend) THEN run the same dot — strictly MORE work than int8's already-`vpmaddwd`-vectorized `dot_i8`. (2) The halved bytes buy nothing because int8 is NOT bandwidth-bound here: 47–57 GB/s is far under the box's ~200 GB/s DRAM (it's per-worker dot-throughput / 32-worker-coordination-bound), so there is no bandwidth win to trade for the unpack cost. A hand-tuned SIMD unpack would narrow the gap but cannot reverse it (can't beat dot-alone). **Extends [[project_decode_structural_alloc]]'s int4-fc1 "packed kernel wash" to the logits — and it's worse there: a clear LOSS.** int4 logits only ever wins on hardware where the logits GEMV is truly DRAM-bandwidth-bound (not this 32-core box). **Decision-menu update: item #1 (int4 logits) is REMOVED — no speed upside on AVX2, so its quality risk isn't even worth measuring. Draft decoding remains the only real upside.**
+
 ## 2026-07-02 - BlackThrush: NEGATIVE — lowering the `gemv_i8` parallelization threshold (`FW_GEMV_I8_PAR`, default `1<<21`) to parallelize the decode's serial `out=1280` projection GEMVs does NOT help; `par-all` REGRESSES (nested rayon). Threshold is correctly tuned; byte-exact throughout.
 
 **Land-or-dig result: dug a NEW byte-exact lever (decode gemv parallelism threshold), measured negative.** AGENT_NAME=BlackThrush. The band split is order-preserving ⇒ byte-identical for any threshold, so it was a pure perf question — env-tunable, no rebuild.
