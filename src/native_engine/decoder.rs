@@ -310,7 +310,10 @@ impl Linear {
         // off) — half the f16 batch's weight bytes, and BIT-IDENTICAL to running
         // the batch as `tq` per-token `gemv_i8` calls (same quant those linears
         // use at tq==1). Skipped when a block (`w_i8_block`) or int4 (`w_i4_pack`)
-        // copy is present, so those stay on their f16 batch path (as before).
+        // copy is present: fc2's BLOCK-batch was MEASURED to REGRESS the tq>1 path
+        // (batching already amortizes the weight read, so int8's half-bytes edge
+        // vanishes and the per-block-scale + int8→f32 overhead loses to the f16c
+        // fused dot — see NEGATIVE_EVIDENCE), so those stay on the f16 batch path.
         if x.rows > 1
             && super::i8_batch_enabled()
             && self.w_i4_pack.is_none()
