@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 decoder **attention input projections** (fused self-`qkv` + `cross_q`): transcript byte-exact vs f16 on BOTH models. **1.43× on the self_qkv_proj span** (~4.7% e2e decode combined).
+
+**Land-or-dig result: extended the fc1-only int8 principle to the attention path.** AGENT_NAME=BlackThrush.
+Real code: new `int8_attn_enabled` gate + `Linear::quantize_if(bool)` (mod.rs/decoder.rs), `.quantize_if(int8_attn_enabled())`
+on the fused `attn_qkv` and `cross_attn_q` at load; output projections (`self_out`, `cross_out`) stay f16.
+
+**The lever.** After int8 logits + int8-MLP-fc1 landed, the decode attribution's largest remaining GEMVs were the
+attention projections. Same DRAM-resident-bandwidth basis as the MLP: large-v3-turbo's 4-layer decoder weight set
+(~180 MB) ≫ 128 MB L3, so `qkv` (9.8 MB/layer) and `cross_q` (3.3 MB) are streamed from DRAM every token — int8
+halves the bytes. Safety by the fc1-only rule: **input projections feed attention SCORES → softmax (error-robust),
+never the residual directly**; the output projections (which DO feed the residual, the `mlp_2`/`self_out` failure
+mode) are excluded. The fused `qkv` also carries V (which reaches the attention output), but softmax-weighted
+averaging bounds that error enough to stay byte-exact — validated, not assumed.
+
+**Conformance (the gate for default-on).** `native_ab` A/B, int8-attn on (`FRANKEN_WHISPER_INT8_ATTN=1`, default)
+vs f16 attn (`=0`), jfk fixture (int8-MLP on in both, so this isolates the attention delta):
+- large-v3-turbo: transcript BYTE-IDENTICAL.
+- tiny.en:        transcript BYTE-IDENTICAL.
+Real-CLI e2e suite `tests/native_engine_e2e.rs` with the NEW default (no env override) = **6 passed, 0 failed**
+(matches the whisper-cli golden `jfk_tiny_reference.json`).
+
+**Ratio (vs f16; whisper.cpp Q8_0 quantizes attention too).** `decoder_attrib large-v3-turbo 200`, min-of-7
+(contention filter, box load ~29):
+- self_qkv_proj: 1.5330 → 1.0712 ms/token → **1.43×** (Δ 0.462; clean cluster split, on ~1.07–1.25 vs off ~1.53–1.87).
+- cross_q_proj:  0.8062 → 0.7228 ms/token → 1.12× (Δ 0.083; small, near noise but byte-exact and DRAM-resident, kept).
+Combined Δ ≈ 0.545 ms/token of 11.57 → **~4.7% off e2e decode**. self_qkv is the bulk; qkv is more DRAM-bound than
+the MLP linears (bigger relative to per-token reuse), so the ratio exceeds the fc1 1.20×.
+
+**Cumulative decode picture.** With int8 logits + fc1-MLP + attention-input all default-on, the per-token decode
+GEMVs that remain f16 are the two OUTPUT/residual projections (`self_out`, `cross_out`) — deliberately, to keep the
+residual stream exact. Those are the next candidates ONLY if a residual-safe quant (or an empirical byte-exact test)
+clears them; do not quantize them blind (mlp_2 lesson).
+
 ## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 decoder-MLP **fc1-only** GEMV: transcript byte-exact vs f16 on BOTH models → flipped default-on. ~1.20× on the MLP-GEMV span (~4.6% e2e decode).
 
 **Land-or-dig result: the gated both-quant int8-MLP (6c4b53d) is refined to a byte-exact subset and promoted

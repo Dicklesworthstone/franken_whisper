@@ -310,6 +310,31 @@ pub(crate) fn int8_mlp_enabled() -> bool {
     })
 }
 
+/// Whether to run the decoder **attention** input projections (fused self `qkv`
+/// and `cross_attn_q`) through the int8/Q8 GEMV on the per-token decode path
+/// (`tq == 1`). The output projections (`self_out`, `cross_out`) stay f16.
+///
+/// Same DRAM-resident-bandwidth rationale as [`int8_mlp_enabled`]: in real decode
+/// the 4-layer weight set ≫ L3, so these projection weights are streamed from DRAM
+/// each token and int8 halves the bytes. Safety mirrors the fc1-only MLP finding —
+/// the input projections feed attention SCORES → softmax (error-robust, like
+/// `mlp_0`→GELU), whereas the output projections write the residual directly (the
+/// `mlp_2` failure mode) and are excluded. The fused `qkv` also carries V (which
+/// reaches the attention output), but softmax-weighted averaging bounds that error;
+/// the byte-exact-vs-f16 golden gate is what validates the default flip. Disable
+/// with `FRANKEN_WHISPER_INT8_ATTN=0`. Prefill (`tq > 1`) keeps the f16 path.
+pub(crate) fn int8_attn_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_ATTN") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Emit one measurement-only span line (see [`perf_spans_enabled`]).
 pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
     if perf_spans_enabled() {

@@ -189,8 +189,14 @@ impl Linear {
     /// GEMV, when [`super::int8_mlp_enabled`] is on. No-op on f32/gate-off (so the
     /// forward stays bit-identical to f16). Applied only to the bandwidth-bound MLP
     /// up-projection (`mlp_0`), never `mlp_2` or the small attention projections.
-    fn quantized(mut self) -> Self {
-        if super::int8_mlp_enabled() {
+    fn quantized(self) -> Self {
+        self.quantize_if(super::int8_mlp_enabled())
+    }
+
+    /// Attach the int8 copy iff `enabled`. Lets attention projections gate on
+    /// [`super::int8_attn_enabled`] while the MLP gates on [`super::int8_mlp_enabled`].
+    fn quantize_if(mut self, enabled: bool) -> Self {
+        if enabled {
             if let WeightMat::F16 { data, out, inp } = &self.w {
                 self.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
             }
@@ -529,13 +535,16 @@ impl DecoderWeights {
                     n_state,
                 )?,
                 cross_attn_ln: load_layer_norm(model, &format!("{p}.cross_attn_ln"), n_state)?,
+                // Cross-attn query feeds only the attention scores (softmax), never
+                // the residual — safe to int8 (see `int8_attn_enabled`).
                 cross_attn_q: load_linear(
                     model,
                     &format!("{p}.cross_attn.query.weight"),
                     Some(&format!("{p}.cross_attn.query.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .quantize_if(super::int8_attn_enabled()),
                 cross_attn_k: load_linear(
                     model,
                     &format!("{p}.cross_attn.key.weight"),
@@ -579,7 +588,8 @@ impl DecoderWeights {
                     mlp_hidden,
                 )?,
             };
-            layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v);
+            layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v)
+                .map(|l| l.quantize_if(super::int8_attn_enabled()));
             Ok(layer)
         };
         // Spread the layers across rayon when there are FEW of them: each
