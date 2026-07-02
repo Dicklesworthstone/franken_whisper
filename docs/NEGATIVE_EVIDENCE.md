@@ -3,6 +3,17 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: MEASURED WIN vs whisper.cpp — **franken's no-timestamps (text-only) mode is ~1.8× faster** (7367 vs 13327 ms), via cross-window pipelining + chunk-advance windowing that whisper.cpp lacks. The fair timestamped ratio is ~1.2× (prior entry); this is franken's BEST fair win, for the common "just want text" use case.
+
+**Land-or-dig result: measured franken's strongest fair advantage over whisper.cpp — the no_timestamps path (~1.8×).** AGENT_NAME=BlackThrush. Both engines produce timestamp-free text; matched threads; current HEAD (2c58bf0).
+
+**MEASURED (jfk×6, ggml-large-v3-turbo f16, this 64-core box, all cores / whisper -t48):**
+- **Text-only (no timestamps):** franken no_ts **7367 ms** transcribe (7945 ms incl load) vs whisper `-t48 -nt` **13327 ms** = **~1.81× (transcribe) / ~1.68× (incl load)**.
+- **Timestamped:** franken **11805 ms** vs whisper `-t48` **13750 ms** = **~1.16×** (prior entry — encode tied, int8 decode is the edge).
+- **franken no_ts vs franken timestamp = 1.60×** (11805 → 7367): the pipelining win (decode hidden under encode N+1, [[project_window_pipelining_lever]]) PLUS chunk-advance windowing (30 s CHUNK advance → fewer, non-overlapping windows vs timestamp mode's data-dependent overlapping re-encode). whisper.cpp always uses timestamp-seek windowing internally (even with `-nt`, confirmed: `-nt` 13327 ≈ `-t48` 13750), so it cannot match either advantage.
+
+**Takeaway:** franken's headline fair win over whisper.cpp turbo is **~1.8× for text-only transcription** (the common case), narrowing to **~1.2× when timestamps are required** (where windowing must match and only the int8 decode edge remains; encoder tied). Both are honest, matched-thread, current-HEAD numbers — cite THESE, not the retired 3.6×.
+
 ## 2026-07-02 - BlackThrush: MEASURED head-to-head vs whisper.cpp — **CORRECTS the "3.6× total / 2.7× encode" overclaim**. At MATCHED high thread counts franken leads only **~1.1–1.26× total**, the ENCODE is **~tied**, and franken's real edge is its **int8 decode (~2.4×)**. The old 3.6× compared against whisper.cpp at LOW thread count.
 
 **Land-or-dig result: fresh, methodologically-clean head-to-head (current HEAD f00cd0c) — franken still WINS vs whisper.cpp turbo, but by ~1.2×, not 3.6×.** AGENT_NAME=BlackThrush. This is a measured win vs the baseline AND a correction of a stale overclaim.
