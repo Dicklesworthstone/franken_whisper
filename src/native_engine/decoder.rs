@@ -687,6 +687,11 @@ pub struct DecoderState {
     /// `FW_CROSS_F16=0` falls back to the f32 `cross_kh_t`/`cross_vh` above.
     cross_kh_f16: Vec<Vec<Float16>>,
     cross_vh_f16: Vec<Vec<Float16>>,
+    /// int8/Q8 copies of `cross_kh_f16`/`cross_vh_f16` (same layout, per head),
+    /// built when [`int8_cross_kv_enabled`] is on. Empty ⇒ f16 path. Halves the
+    /// per-token DRAM read of the encoder K/V. See [`int8_cross_kv_enabled`].
+    cross_kh_i8: Vec<nn::I8Mat>,
+    cross_vh_i8: Vec<nn::I8Mat>,
     /// Number of tokens currently in the self-attention cache.
     len: usize,
     /// Number of encoder frames (cross-attention key/value length).
@@ -845,12 +850,33 @@ impl DecoderState {
             }
         }
 
+        // int8/Q8 the window-constant cross K/V once (gated). K is [enc_frames,
+        // d_head] (per-key-row scale), V is [d_head, enc_frames] (per-output-dim
+        // scale) — the exact `out×inp` layouts `gemv_i8` consumes. Only when the
+        // f16 cross path is active (the i8 GEMV replaces the f16 one there).
+        let (cross_kh_i8, cross_vh_i8) = if int8_cross_kv_enabled() && cross_f16_enabled() {
+            (
+                cross_kh_f16
+                    .iter()
+                    .map(|k| nn::quantize_f16_to_i8(k, enc_frames, d_head))
+                    .collect(),
+                cross_vh_f16
+                    .iter()
+                    .map(|v| nn::quantize_f16_to_i8(v, d_head, enc_frames))
+                    .collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         Ok(Self {
             kv,
             cross_kh_t,
             cross_vh,
             cross_kh_f16,
             cross_vh_f16,
+            cross_kh_i8,
+            cross_vh_i8,
             len: 0,
             enc_frames,
             n_state: w.n_state,
@@ -961,6 +987,42 @@ fn cross_f16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FW_CROSS_F16").as_deref() != Ok("0"))
 }
 
+/// Per-layer head slice of the (optionally empty) int8 cross K/V. Empty vec (gate
+/// off) ⇒ `&[]`, which `cross_attention` reads as "use the f16 path".
+fn cross_kv_i8_slice(all: &[nn::I8Mat], h0: usize, n_head: usize) -> &[nn::I8Mat] {
+    if all.is_empty() {
+        &[]
+    } else {
+        &all[h0..h0 + n_head]
+    }
+}
+
+/// Whether to int8/Q8 the window-constant cross-attention K/V (encoder keys and
+/// values) on the per-token decode path. The encoder K/V (~30 MB f16 for turbo)
+/// are read in full every decode token, so they are DRAM-resident and int8 halves
+/// that bandwidth — the same lever as the weight GEMVs, applied to the largest
+/// per-token-resident *activation* cache. Built once per window in
+/// [`DecoderState::new`]. Numerics: K feeds the cross scores → softmax
+/// (error-robust); V feeds the cross output → `cross_out` → residual, but the
+/// encoder values are bounded and the softmax weights sum to 1, so the byte-exact
+/// golden gate validates safety. Requires the f16 cross path (`FW_CROSS_F16` != 0).
+/// Disable with `FRANKEN_WHISPER_INT8_CROSS_KV=0`. Prefill (`tq > 1`) is unaffected
+/// (the same per-row GEMVs run for each query row).
+fn int8_cross_kv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    // Default ON: measured 1.31× on the cross_attn span and transcript byte-exact
+    // vs f16 on tiny.en + large-v3-turbo (e2e golden 6/6). `=0` restores f16.
+    *ON.get_or_init(|| !matches!(
+        std::env::var("FRANKEN_WHISPER_INT8_CROSS_KV")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cross_attention(
     q: &Mat,
@@ -968,6 +1030,8 @@ fn cross_attention(
     cross_vh: &[Mat],
     cross_kh_f16: &[Vec<Float16>],
     cross_vh_f16: &[Vec<Float16>],
+    cross_kh_i8: &[nn::I8Mat],
+    cross_vh_i8: &[nn::I8Mat],
     tk: usize,
     n_head: usize,
     record: bool,
@@ -1003,6 +1067,11 @@ fn cross_attention(
             // uninit), half the K/V bandwidth (f16). Numerics-affecting (f16
             // dequant + dot8 order) — transcription-tolerance, like the rest of
             // the f16 decode path.
+            // int8/Q8 the two GEMVs when the quantized K/V are present (gated in
+            // `DecoderState::new`); `gemv_i8` quantizes the query/softmax-weight
+            // input vector internally, so the DRAM read of the encoder K/V is
+            // halved. Otherwise the f16c `gemv_f16` path.
+            let use_i8 = !cross_kh_i8.is_empty();
             let mut scores_all = Vec::with_capacity(tq * tk);
             let mut out_all = Vec::with_capacity(tq * d_head);
             let mut qh = vec![0.0f32; d_head];
@@ -1012,11 +1081,19 @@ fn cross_attention(
                     *d = s * q_scale;
                 }
                 let mut srow = nn::gemv_out_buf(tk);
-                nn::gemv_f16(&cross_kh_f16[h], tk, d_head, &qh, None, &mut srow);
+                if use_i8 {
+                    nn::gemv_i8(&cross_kh_i8[h], &qh, None, &mut srow);
+                } else {
+                    nn::gemv_f16(&cross_kh_f16[h], tk, d_head, &qh, None, &mut srow);
+                }
                 let mut sm = Mat::from_vec(1, tk, srow);
                 nn::softmax_rows(&mut sm);
                 let mut oh = nn::gemv_out_buf(d_head);
-                nn::gemv_f16(&cross_vh_f16[h], d_head, tk, &sm.data, None, &mut oh);
+                if use_i8 {
+                    nn::gemv_i8(&cross_vh_i8[h], &sm.data, None, &mut oh);
+                } else {
+                    nn::gemv_f16(&cross_vh_f16[h], d_head, tk, &sm.data, None, &mut oh);
+                }
                 scores_all.extend_from_slice(&sm.data);
                 out_all.extend_from_slice(&oh);
             }
@@ -1248,6 +1325,8 @@ pub fn forward_step(
                 &st.cross_vh[h0..h0 + w.n_head],
                 &st.cross_kh_f16[h0..h0 + w.n_head],
                 &st.cross_vh_f16[h0..h0 + w.n_head],
+                cross_kv_i8_slice(&st.cross_kh_i8, h0, w.n_head),
+                cross_kv_i8_slice(&st.cross_vh_i8, h0, w.n_head),
                 st.enc_frames,
                 w.n_head,
                 st.record_cross_attn,

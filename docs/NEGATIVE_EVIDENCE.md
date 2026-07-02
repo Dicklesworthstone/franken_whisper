@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 the **cross-attention K/V cache** (encoder keys+values, the biggest per-token-resident ACTIVATION, not a weight): byte-exact vs f16 on BOTH models. **1.31× on the cross_attn span** (~2.7% e2e decode).
+
+**Land-or-dig result: extended the int8 bandwidth lever from weights to the largest per-token-resident
+activation.** AGENT_NAME=BlackThrush. Real code: `int8_cross_kv_enabled` gate (default-on) + `cross_kh_i8`/
+`cross_vh_i8` I8Mat fields built once per window in `DecoderState::new`, and a `use_i8` branch in
+`cross_attention` that swaps the two per-query-row `gemv_f16` calls for `gemv_i8` (mod.rs unchanged; decoder.rs).
+
+**The lever (a new class).** All prior int8 wins were WEIGHTS. This is the first ACTIVATION: the cross-attention
+K/V are the encoder keys/values, constant for the whole audio window but read IN FULL every decode token — for
+large-v3-turbo that's enc_frames(1500) × d_head(64) × n_head(20) × n_layer(4) × 2(K,V) × 2 B ≈ 30 MB streamed
+from DRAM per token, dwarfing any single weight. Same DRAM-bandwidth basis: int8 halves the bytes. `gemv_i8`
+quantizes the query / softmax-weight input vector internally, so no extra plumbing. Built once per window
+(`quantize_f16_to_i8` on the existing `cross_kh_f16`/`cross_vh_f16` layouts), so the per-token path is unchanged
+except int8 dot vs f16 dot.
+
+**Conformance.** `native_ab` A/B, `FRANKEN_WHISPER_INT8_CROSS_KV` on (default) vs off, jfk: large-v3-turbo
+BYTE-IDENTICAL, tiny.en BYTE-IDENTICAL. Real-CLI e2e `tests/native_engine_e2e.rs` with the new default =
+**6 passed, 0 failed** (matches whisper-cli golden `jfk_tiny_reference.json`). Safety by the magnitude rule: K→softmax is robust; V→residual but encoder values are
+bounded and softmax weights sum to 1, so the int8 error stays under the argmax margin.
+
+**Ratio.** `decoder_attrib large-v3-turbo 200`, min-of-7 (load ~20; cleanest split yet — off all ≥1.30, on all
+≤1.16): cross_attn span 1.3023 → 0.9963 ms/token = **1.31×** (Δ 0.306). Of ~11 ms/token per-step → **~2.7% off
+e2e decode**. Only the f16 cross path is quantized (`FW_CROSS_F16` != 0, the default); the f32 escape hatch is
+untouched.
+
+**Where this leaves decode.** int8 now covers every DRAM-bandwidth-bound per-token tensor: all decode weight
+GEMVs (logits/mlp_0/qkv/cross_q/self_out/cross_out) AND the cross K/V activation cache. The self-attention KV
+cache is the remaining un-int8'd activation, but for short windows it is tiny (grows with generated tokens, not
+enc_frames) so the lever there is marginal except on very long single-window generations. mlp_2 stays f16.
+
 ## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 decoder **attention OUTPUT projections** (`self_out` + `cross_out`): byte-exact vs f16 on BOTH models — surprising, since these feed the residual (the `mlp_2` failure mode). ~1.15× on the two output-proj spans (~2.3% e2e decode). **Completes the per-token decode-GEMV int8 sweep.**
 
 **Land-or-dig result: tested the last two f16 decode GEMVs — the residual-feeding output projections — and they
