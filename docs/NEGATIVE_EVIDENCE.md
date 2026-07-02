@@ -3,6 +3,16 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: NEGATIVE (thread pinning) + CORRECTION (the "cross-CCD wall" was really SMT oversubscription). Tested pinning the 32 encoder rayon workers one-per-physical-core; it's a LOSS on this contended shared box. And the topology proves 32 is optimal because it = the **physical-core count**, not a cross-CCD limit.
+
+**Land-or-dig result: dug a NEW byte-exact lever (physical-core thread pinning), MEASURED negative; corrected the mechanism behind the 48/64 encoder regression.** AGENT_NAME=BlackThrush.
+
+**Topology (this box):** AMD Threadripper PRO 5975WX = **32 physical cores + SMT2 = 64 logical**, 4 CCDs × 8 cores (128 MiB L3 in 4 instances), **1 NUMA node** (uniform memory — cpu0 & cpu32 share L3=0 ⇒ SMT siblings of one core). So at 32 threads ALL 4 CCDs are already in use; the 48/64 encoder regression ([[the 16→32 win]]) is **SMT oversubscription** (2 threads/core contending for one core's FMA units on compute-bound GEMM), NOT "cross-CCD sync" as I'd written. 32 = 1 thread per physical core = the sweet spot.
+
+**MEASURED (`encoder_scale_probe`, turbo, best-of-8):** floating `RAYON_NUM_THREADS=32` = **2861/2868 ms/win** vs `taskset -c 0-31` (pinned to the 32 physical cores, no SMT siblings) = **3221 ms/win — pinning is ~12% SLOWER.** On a shared/contended box the OS scheduler's freedom to place threads on whatever cores are idle beats any SMT-avoidance benefit of a fixed pin; pinning to cpu 0-31 forces threads onto cores other tenants may be running. (This is a DIFFERENT, valid test from the retired `taskset -c 0-7` oversubscription artifact — here it's 32 threads on 32 cores, 1:1.) Byte-exact throughout (pinning changes scheduling only). **Do NOT pin rayon workers as a default** — it only helps on a dedicated box, and franken must run well on shared hosts.
+
+**Actionable generalization (documented, unmeasurable here):** the flat `default_threads` cap `.min(32)` happens to equal this box's physical-core count, so it's optimal HERE — but on a differently-shaped SMT box it isn't: a 16-physical/32-logical box gets `min(32_logical,32)=32` = all logical = SMT thrash (should be 16), and a 64-physical/128-logical box gets 32 = only half the physical cores. A principled cap is `num_cpus::get_physical().min(<upper-bound>)`. It's a NO-OP on this box (logical 64 / physical 32 both yield 32 ⇒ no measurable local delta, so NOT landed as a "win"), but it's the correct generalization for a future session running on a non-32-physical-core host.
+
 ## 2026-07-02 - BlackThrush: **the 16→32 encoder-cap win pays off MORE in no_timestamps mode — 1.36× default e2e (vs 1.2× timestamped), BYTE-EXACT.** no_ts RTF is encode-gated (pipelining hides decode under encode N+1), so the encoder's 1.34× translates almost fully to e2e; timestamp mode exposes decode so it dilutes to ~1.2×.
 
 **MEASURED (`e2e_probe` PROBE_NO_TS=1, turbo jfk×6 = 66 s, this 64-core box):**
