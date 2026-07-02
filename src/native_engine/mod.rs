@@ -281,6 +281,30 @@ pub(crate) fn int8_logits_enabled() -> bool {
     })
 }
 
+/// Whether to run the decoder MLP linears (fc1 `[4·n_state, n_state]`, fc2
+/// `[n_state, 4·n_state]`) through the int8/Q8 GEMV ([`nn::gemv_i8`]) on the
+/// per-token decode path (`tq == 1`).
+///
+/// The MLP is ~27% of decode. In real per-token decode the working set (4×26 MB
+/// MLP + 132 MB logits ≈ 250 MB) ≫ 128 MB L3, so the MLP weights are DRAM-resident
+/// and int8 (half the bytes) is MEASURED 1.65–1.76× on both linears (cache-cold
+/// probe). Unlike the logits (final projection, argmax-robust), MLP output feeds
+/// the residual stream so quant error can compound across layers — a SEPARATE gate,
+/// **OFF by default** until the exact-transcript golden suite is cleared with it on
+/// (whisper.cpp's Q8_0 models quantize the MLP, so it is a proven-safe target).
+/// Enable with `FRANKEN_WHISPER_INT8_MLP=1`. Prefill (`tq > 1`) keeps the f16 path.
+pub(crate) fn int8_mlp_enabled() -> bool {
+    const DEFAULT_ON: bool = false;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_MLP") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Emit one measurement-only span line (see [`perf_spans_enabled`]).
 pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
     if perf_spans_enabled() {

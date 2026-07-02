@@ -3,6 +3,35 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: WIN LANDED (gated) — int8/Q8 decoder-MLP GEMV: **1.58× on the MLP component in REAL parallel decode** (~10% e2e decode), tiny.en transcript byte-exact.
+
+**Land-or-dig result: the reversed int8-MLP lever (below) is INTEGRATED, benched in real decode, and landed
+gated.** AGENT_NAME=BlackThrush. Real code: `gemv_i8` bias param (nn.rs), `int8_mlp_enabled` gate (mod.rs),
+`Linear::w_i8`/`quantized()` + `tq==1` decode path built at load for the MLP linears (decoder.rs).
+
+### Measured (`examples/decoder_attrib`, large-v3-turbo, 150 steps, real parallel decode)
+```
+                       int8 MLP OFF (f16)   int8 MLP ON
+  mlp_fc_gelu_proj        3.378 ms/token      2.140 ms/token   = 1.58× on the MLP component
+  per-step (total)       12.733 ms/token     10.134 ms/token
+```
+The MLP-component drop (−1.24 ms/token) alone is ~10% of the 12.7 ms/token decode; the larger per-step drop
+partly reflects run-to-run variance at box load ~28 (lean on the component number). Confirms the cache-cold
+probe (1.65–1.76×): the MLP weights are DRAM-resident in real decode (~250 MB working set ≫ L3), so int8's
+byte-halving pays off — unlike the isolated L3-hot probe that mis-rejected it.
+
+### Conformance (`native_ab` jfk, int8 MLP ON)
+```
+  tiny.en          transcript BYTE-IDENTICAL to the whisper-cli golden reference
+  large-v3-turbo   core transcript identical; trailing silence-hallucination " a." → " a. a." (one extra
+                   repeat — a numerics sensitivity in the end-of-audio silence region)
+```
+DEFAULT OFF ⇒ `w_i8 = None` ⇒ the f16 MLP path is unchanged ⇒ the default is **bit-identical** (conformance
+definitionally preserved). Gated (not default-on) because MLP output feeds the residual stream (errors can
+compound, unlike the argmax-robust logits) and turbo shows a minor trailing-artifact sensitivity — the
+flip-default gate is the full exact-transcript golden suite across more audio, exactly as int8 logits was
+first landed gated (e9daa40) then flipped. Enable with `FRANKEN_WHISPER_INT8_MLP=1`.
+
 ## 2026-07-02 - BlackThrush: int8-MLP REJECTION REVERSED — it WINS 1.65–1.76× when weights are DRAM-resident (the real per-token decode regime), not L3-hot (the isolated probe).
 
 **Land-or-dig result: the earlier int8-MLP rejection was an ISOLATED-PROBE ARTIFACT; with a cache-cold

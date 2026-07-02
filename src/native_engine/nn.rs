@@ -876,11 +876,12 @@ fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
 /// weight row. Parallelizes over output-row bands exactly like [`gemv_f16`]
 /// (wide worker cap for the vocab-class logits). A numerics-affecting int8
 /// approximation of the f16 GEMV — the caller gates it ([`super::int8_logits_enabled`]).
-pub fn gemv_i8(w: &I8Mat, x: &[f32], out_slice: &mut [f32]) {
+pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
     let (out, inp) = (w.out, w.inp);
     debug_assert_eq!(w.data.len(), out * inp, "gemv_i8 weight shape mismatch");
     debug_assert_eq!(x.len(), inp, "gemv_i8 x length mismatch");
     debug_assert_eq!(out_slice.len(), out, "gemv_i8 out length mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8 bias length mismatch");
     // Quantize the activation once (per-vector symmetric), shared by all rows.
     let xamax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
     let xs = xamax / 127.0;
@@ -893,7 +894,8 @@ pub fn gemv_i8(w: &I8Mat, x: &[f32], out_slice: &mut [f32]) {
     let fill = |o_base: usize, slice: &mut [f32]| {
         for (i, slot) in slice.iter_mut().enumerate() {
             let o = o_base + i;
-            *slot = dot_i8(&w.data[o * inp..(o + 1) * inp], &xi8) as f32 * w.scales[o] * xs;
+            let acc = dot_i8(&w.data[o * inp..(o + 1) * inp], &xi8) as f32 * w.scales[o] * xs;
+            *slot = acc + bias.map_or(0.0, |b| b[o]);
         }
     };
 

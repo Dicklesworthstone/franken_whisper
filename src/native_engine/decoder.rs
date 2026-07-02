@@ -176,11 +176,45 @@ struct Linear {
     w: WeightMat,
     /// Optional bias, length `out`.
     bias: Option<Vec<f32>>,
+    /// Optional int8/Q8 copy of an f16 `w` (built by [`Linear::quantized`] when
+    /// [`super::int8_mlp_enabled`] is on). Present ⇒ the per-token decode forward
+    /// (`tq == 1`) takes the memory-halved [`nn::gemv_i8`]; `None` ⇒ f16/f32 path
+    /// unchanged (bit-identical default). Only the MLP linears carry it.
+    w_i8: Option<nn::I8Mat>,
 }
 
 impl Linear {
+    /// Attach an int8-quantized copy of an f16 weight for the memory-halved decode
+    /// GEMV, when [`super::int8_mlp_enabled`] is on. No-op on f32/gate-off (so the
+    /// default keeps `w_i8 = None` and the forward is bit-identical). Applied only
+    /// to the bandwidth-bound MLP fc1/fc2, never the small attention projections.
+    fn quantized(mut self) -> Self {
+        if super::int8_mlp_enabled() {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                self.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
+            }
+        }
+        self
+    }
+
     /// Apply `y = x @ W^T + b` over `x` (`[tq, in]`), returning `[tq, out]`.
     fn forward(&self, x: &Mat) -> FwResult<Mat> {
+        // Per-token decode (tq==1) with an int8 copy present: the memory-halved int8
+        // GEMV (weights are DRAM-resident at decode time → int8 ~1.7×). Bias fuses in
+        // as the f16 path adds it. Prefill (tq>1) falls through to the f16 batch.
+        if x.rows == 1 {
+            if let Some(w_i8) = &self.w_i8 {
+                if x.cols != w_i8.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8) forward: x.cols {} != in {}",
+                        x.cols, w_i8.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(w_i8.out);
+                nn::gemv_i8(w_i8, &x.data, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(1, w_i8.out, y));
+            }
+        }
         match &self.w {
             WeightMat::F32(w_t) => nn::matmul_bias(x, w_t, self.bias.as_deref()),
             WeightMat::F16 { data, out, inp } => {
@@ -362,7 +396,7 @@ fn load_linear(
         Some(name) => Some(load_vec(model, name, out_dim)?),
         None => None,
     };
-    Ok(Linear { w, bias })
+    Ok(Linear { w, bias, w_i8: None })
 }
 
 /// Load the token embedding `[n_vocab, n_state]` in its NATURAL orientation
@@ -529,14 +563,16 @@ impl DecoderWeights {
                     Some(&format!("{p}.mlp.0.bias")),
                     mlp_hidden,
                     n_state,
-                )?,
+                )?
+                .quantized(),
                 mlp_2: load_linear(
                     model,
                     &format!("{p}.mlp.2.weight"),
                     Some(&format!("{p}.mlp.2.bias")),
                     n_state,
                     mlp_hidden,
-                )?,
+                )?
+                .quantized(),
             };
             layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v);
             Ok(layer)
@@ -1256,7 +1292,7 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
     if let Some(i8) = &w.token_embedding_i8 {
         debug_assert_eq!((i8.out, i8.inp), (n_vocab, n_state));
         let mut logits = nn::gemv_out_buf(i8.out);
-        nn::gemv_i8(i8, &x_last.data, &mut logits);
+        nn::gemv_i8(i8, &x_last.data, None, &mut logits);
         return Ok(logits);
     }
 
@@ -1369,6 +1405,7 @@ fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
     Some(Linear {
         w: WeightMat::F16 { data, out, inp },
         bias: Some(bias),
+        w_i8: None,
     })
 }
 
@@ -1476,6 +1513,7 @@ mod tests {
             Linear {
                 w: WeightMat::F32(rng.mat(inp, out)),
                 bias: if bias { Some(rng.vec(out)) } else { None },
+                w_i8: None,
             }
         };
         let ln = |rng: &mut Lcg| LayerNorm {
