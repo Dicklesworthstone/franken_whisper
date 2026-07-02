@@ -3,7 +3,22 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-07-07 - BlackThrush: BREAKTHROUGH (finding + gated scaffold) — **int4 `mlp_0`/fc1 is transcript BYTE-EXACT** (GELU absorbs 4-bit weight error) on tiny.en AND turbo. The Q8 floor is NOT the ceiling: fc1 can go int4 quality-neutrally. Perf win pending the packed-nibble kernel (this lands the proven-conformance scaffold).
+## 2026-07-07 - BlackThrush: DIG → NEGATIVE + CORRECTION — the **packed-nibble int4 fc1 kernel** (the scoped follow-up below) is IMPLEMENTED and byte-exact vs the probe, but MEASURED a **wash/regression** on decode, and int4 fc1 is **NOT byte-exact on tiny.en**. int4-fc1 avenue **CLOSED** for in-crate perf.
+
+**Land-or-dig result: dug the packed-nibble kernel; it works and is correct but yields no speedup — the SIMD unpack cost cancels the halved fc1 bandwidth.** AGENT_NAME=BlackThrush. Real code (gated default-off, REPLACES the misleading probe): `I4BlockMat` + `quantize_f16_to_i4_packed` + `gemv_i4_packed_f32a` (AVX2 nibble-unpack: `and`/`srli_epi16`/`(nib^8)-8` 4-bit sign-extend → the SAME four-accumulator fmadd + tree-reduce as `dot_i8w_f32`), nn.rs; `Linear::w_i4_pack` + `quantize_i4_packed_if`, decoder.rs; `mlp_0` rewired probe→packed. Unit test `i4_packed_gemv_bit_identical_to_probe` proves packed == probe bit-for-bit (load-independent) for d_model ∈ {384,768,1280} incl. bias.
+
+**This is the real Q4_0** (2 nibbles/byte, `w[j]` low + `w[j+16]` high per 32-block; fc1 weight read 6.5→3.25 MB/token). It supersedes the prior probe (8ca4378), which stored int4 VALUES in int8 bytes and thus read FULL int8 bandwidth — the probe could not demonstrate the bandwidth question at all; this kernel can, and the answer is negative.
+
+**MEASUREMENT (`decoder_attrib`, large-v3-turbo, 150 steps, INTERLEAVED A/B, 8 reps, `FW_GEMV_I8_PAR` default):**
+- mlp span (`mlp_fc_gelu_proj` = int8-fc1 + gelu + int8-fc2): int8 min 2.60 vs int4 min 2.83 ms/tok; **int4 SLOWER in 7/8 interleaved pairs.**
+- per-step: **int4 slower in 6/8 interleaved pairs** (one low int4 sample tied the raw min, but the pairwise drift-canceling comparator leans int8-faster).
+→ Halving fc1's DRAM read did NOT speed it up. The AVX2 unpack (mask/shift/xor/sub + 2× `cvtepi8_epi32` per 32 weights) adds enough ALU that the fc1 GEMV is **unpack/compute-bound at 8-way parallel, NOT bandwidth-bound**. The follow-up's own "IF the SIMD unpack doesn't eat it" caveat is confirmed: it eats it. (Unpack IS vectorized; a scalar unpack would be far worse.)
+
+**CONFORMANCE CORRECTION to the 8ca4378 entry below:** its "int4 fc1 byte-exact on BOTH tiny.en and turbo" is REVISED. Because the packed kernel == probe (unit-proven), this is also the probe's true e2e behavior: **turbo IS byte-identical**, but **tiny.en shifts 2 segment TIMESTAMPS** (8.0→7.74 and 10.99→10.7; transcript TEXT is identical, and the int8 baseline is deterministic run-to-run). So int4 fc1 is text-preserving but not timestamp-exact on the small model — a quality tradeoff, not free. Default stays int8 (gate `FRANKEN_WHISPER_INT4_MLP0` default OFF → conformance GREEN, e2e 6/6).
+
+**Conclusion: int4 fc1 is a DEAD END for in-crate decode perf** — no speedup (unpack-bound) and not byte-exact on tiny. Kept gated-off as the reference Q4_0 impl + guard test. Do NOT re-attempt packed int4 on fc1, and don't expect int4 to help the other decode GEMVs — same unpack-bound regime, and they aren't GELU-absorbed so they'd also lose byte-exactness. **Decode is back at the confirmed Q8 floor (below).**
+
+## 2026-07-07 - BlackThrush: BREAKTHROUGH (finding + gated scaffold) — **int4 `mlp_0`/fc1 is transcript BYTE-EXACT** (GELU absorbs 4-bit weight error) on tiny.en AND turbo. The Q8 floor is NOT the ceiling: fc1 can go int4 quality-neutrally. Perf win pending the packed-nibble kernel (this lands the proven-conformance scaffold).  *(↑ SUPERSEDED 2026-07-07: the packed kernel measured a WASH and tiny.en is NOT timestamp-exact — see entry above.)*
 
 **Land-or-dig result: falsified my own "Q8 floor = ceiling" (below) — probed int4 and fc1 clears the byte-exact bar.**
 AGENT_NAME=BlackThrush. Real code (gated, default off): `quantize_f16_to_i4_blocked` (+ the shared

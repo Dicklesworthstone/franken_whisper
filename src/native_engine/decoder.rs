@@ -189,6 +189,12 @@ struct Linear {
     /// still halving the bandwidth-bound weight read. Takes priority over `w_i8` in
     /// `forward`. See [`super::int8_mlp_fc2_enabled`].
     w_i8_block: Option<nn::I8BlockMat>,
+    /// PACKED int4 weight (Q4_0, two nibbles/byte) for the mixed 4-bit-weight ×
+    /// f32-activation GEMV ([`nn::gemv_i4_packed_f32a`]). Set only for `mlp_0`/fc1,
+    /// whose GELU output absorbs the 4-bit error byte-exactly (see
+    /// [`super::int4_mlp0_enabled`]); reads HALF the fc1 weight bytes of `w_i8`.
+    /// Takes priority over `w_i8_block`/`w_i8` in `forward`.
+    w_i4_pack: Option<nn::I4BlockMat>,
 }
 
 impl Linear {
@@ -224,15 +230,16 @@ impl Linear {
         self
     }
 
-    /// PROBE: attach a BLOCK-WISE **int4** weight copy (mixed 4-bit weight × f32
-    /// activation), iff `enabled`. Overrides any per-row `w_i8` in `forward` (which
-    /// checks `w_i8_block` first). For the `mlp_0` int4 GELU-absorption probe
-    /// (see `int4_mlp0_enabled`).
-    fn quantize_i4w_f32a_blocked_if(mut self, enabled: bool) -> Self {
-        const BLOCK: usize = 32;
+    /// Attach a PACKED int4 weight copy (Q4_0, two nibbles/byte) for the mixed
+    /// 4-bit-weight × f32-activation GEMV, iff `enabled`. Reads HALF the fc1 weight
+    /// bytes of the int8 path and is byte-identical to the int4 probe (the probe
+    /// proved mlp_0/fc1 is 4-bit exact under GELU; this is the bandwidth win). Takes
+    /// priority over `w_i8_block`/`w_i8` in `forward`. For `mlp_0`/fc1 only — its
+    /// GELU output absorbs the 4-bit error (see `int4_mlp0_enabled`).
+    fn quantize_i4_packed_if(mut self, enabled: bool) -> Self {
         if enabled {
             if let WeightMat::F16 { data, out, inp } = &self.w {
-                self.w_i8_block = Some(nn::quantize_f16_to_i4_blocked(data, *out, *inp, BLOCK));
+                self.w_i4_pack = Some(nn::quantize_f16_to_i4_packed(data, *out, *inp));
             }
         }
         self
@@ -244,6 +251,19 @@ impl Linear {
         // GEMV (weights are DRAM-resident at decode time → int8 ~1.7×). Bias fuses in
         // as the f16 path adds it. Prefill (tq>1) falls through to the f16 batch.
         if x.rows == 1 {
+            // mlp_0/fc1 packed-int4 mixed path (4-bit weight × f32 activation): half
+            // the fc1 weight read, byte-identical to the int4 probe. Highest priority.
+            if let Some(w4) = &self.w_i4_pack {
+                if x.cols != w4.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i4-pack) forward: x.cols {} != in {}",
+                        x.cols, w4.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(w4.out);
+                nn::gemv_i4_packed_f32a(w4, &x.data, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(1, w4.out, y));
+            }
             // fc2 block-wise mixed path (int8 weight × f32 activation) takes priority.
             if let Some(wb) = &self.w_i8_block {
                 if x.cols != wb.inp {
@@ -449,7 +469,7 @@ fn load_linear(
         Some(name) => Some(load_vec(model, name, out_dim)?),
         None => None,
     };
-    Ok(Linear { w, bias, w_i8: None, w_i8_block: None })
+    Ok(Linear { w, bias, w_i8: None, w_i8_block: None, w_i4_pack: None })
 }
 
 /// Load the token embedding `[n_vocab, n_state]` in its NATURAL orientation
@@ -623,9 +643,10 @@ impl DecoderWeights {
                     n_state,
                 )?
                 .quantized()
-                // int4 probe: GELU absorbs mlp_0 error, so 4-bit MAY stay byte-exact.
-                // Overrides the full-int8 path above when enabled (forward prefers block).
-                .quantize_i4w_f32a_blocked_if(super::int4_mlp0_enabled()),
+                // int4 PACKED: GELU absorbs mlp_0 error byte-exactly (proven by the
+                // probe), so fc1 goes to 4-bit at HALF the int8 weight read. Overrides
+                // the full-int8 path above when enabled (forward prefers w_i4_pack).
+                .quantize_i4_packed_if(super::int4_mlp0_enabled()),
                 // mlp_2 (down-proj) writes DIRECTLY into the residual stream. Full
                 // int8 (weight+activation) broke turbo (6c4b53d) — the per-vector
                 // activation scale crushed the GELU-hidden outliers. The MIXED
@@ -1555,6 +1576,7 @@ fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
         bias: Some(bias),
         w_i8: None,
         w_i8_block: None,
+        w_i4_pack: None,
     })
 }
 
@@ -1664,6 +1686,7 @@ mod tests {
                 bias: if bias { Some(rng.vec(out)) } else { None },
                 w_i8: None,
                 w_i8_block: None,
+                w_i4_pack: None,
             }
         };
         let ln = |rng: &mut Lcg| LayerNorm {

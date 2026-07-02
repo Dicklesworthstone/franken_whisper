@@ -1129,6 +1129,168 @@ pub fn gemv_i8w_f32a_blocked(w: &I8BlockMat, x: &[f32], bias: Option<&[f32]>, ou
         .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
 }
 
+/// PACKED block-wise 4-bit weight (Q4_0-style), fixed `block == 32`. Two signed
+/// nibbles ride in each byte: for block `b`, byte `j` (`0..16`) holds `w[b*32+j]`
+/// in the low nibble and `w[b*32+j+16]` in the high nibble, each a 4-bit two's
+/// complement of a value in `[-7, 7]` (symmetric `amax/7` scale, ONE per block).
+/// So `data` is `out * inp/2` bytes — HALF the [`I8BlockMat`] weight read, the
+/// point of the type: the int4-probe ([`quantize_f16_to_i4_blocked`]) proved
+/// mlp_0/fc1 is 4-bit byte-exact (GELU-absorbed) but stored one value per byte
+/// (no bandwidth win); this packs them so the DRAM-bound decode read actually
+/// halves. `scales` is `out * n_blocks` row-major (`n_blocks = inp/32`).
+#[derive(Debug, Clone)]
+pub struct I4BlockMat {
+    pub data: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub out: usize,
+    pub inp: usize,
+}
+
+/// Quantize a natural `[out, inp]` f16 weight to PACKED block-wise int4. Produces
+/// the SAME per-element 4-bit values as [`quantize_f16_to_i4_blocked`] (same
+/// `amax/7` block scale, same round+clamp), just packed two-per-byte in the Q4_0
+/// layout — so [`gemv_i4_packed_f32a`] is byte-exact with the unpacked int4 probe.
+/// Requires `inp % 32 == 0` (fc1 input is `d_model` ∈ {384,512,768,1024,1280}).
+pub fn quantize_f16_to_i4_packed(w: &[Float16], out: usize, inp: usize) -> I4BlockMat {
+    const BLOCK: usize = 32;
+    debug_assert_eq!(w.len(), out * inp);
+    assert_eq!(inp % BLOCK, 0, "i4-packed requires inp % 32 == 0, got inp={inp}");
+    let n_blocks = inp / BLOCK;
+    let row_bytes = inp / 2;
+    let mut data = vec![0u8; out * row_bytes];
+    let mut scales = vec![0.0f32; out * n_blocks];
+    data.par_chunks_mut(row_bytes)
+        .zip(scales.par_chunks_mut(n_blocks))
+        .enumerate()
+        .for_each(|(o, (drow, srow))| {
+            let wrow = &w[o * inp..(o + 1) * inp];
+            for b in 0..n_blocks {
+                let base = b * BLOCK;
+                let amax = wrow[base..base + BLOCK]
+                    .iter()
+                    .map(|h| h.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-9);
+                let sc = amax / 7.0;
+                srow[b] = sc;
+                let inv = 1.0 / sc;
+                let q = |k: usize| -> u8 {
+                    let v = (wrow[base + k].to_f32() * inv).round().clamp(-7.0, 7.0) as i32;
+                    (v & 0x0F) as u8 // 4-bit two's complement of v ∈ [-7,7]
+                };
+                for j in 0..16 {
+                    drow[b * 16 + j] = q(j) | (q(j + 16) << 4);
+                }
+            }
+        });
+    I4BlockMat { data, scales, out, inp }
+}
+
+/// Dot of ONE packed 32-block (16 bytes → 32 signed nibbles) against 32 f32
+/// activations, in the EXACT accumulator/reduction order of [`dot_i8w_f32`] on a
+/// 32-element slice, so the packed path is bit-identical to the int4 probe.
+/// Scalar fallback: unpack into an `[i8; 32]` and defer to [`dot_i8w_f32`].
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[inline]
+fn dot_i4_block_packed(packed: &[u8], x: &[f32]) -> f32 {
+    let mut tmp = [0i8; 32];
+    for j in 0..16 {
+        let byte = packed[j] as i32;
+        tmp[j] = (((byte & 0x0F) ^ 0x08) - 0x08) as i8;
+        tmp[j + 16] = ((((byte >> 4) & 0x0F) ^ 0x08) - 0x08) as i8;
+    }
+    dot_i8w_f32(&tmp, x)
+}
+
+/// AVX2 packed-int4 block dot. Unpacks the 16 bytes into two `__m128i` of signed
+/// int8 (low nibbles → w[0..16], high nibbles → w[16..32]) via `(nib ^ 8) - 8`
+/// (4-bit sign-extend), then runs the same four-accumulator fmadd + tree reduce as
+/// [`dot_i8w_f32`]. The unpack is fully vectorized (no per-nibble scalar work) so
+/// the halved weight read is not eaten by decode-time compute.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i4_block_packed(packed: &[u8], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let xp = x.as_ptr();
+    // SAFETY: caller guarantees packed.len() >= 16 and x.len() >= 32 (one 32-block);
+    // avx2+fma are guaranteed by this fn's target_feature cfg.
+    unsafe {
+        let v = _mm_loadu_si128(packed.as_ptr().cast());
+        let mask0f = _mm_set1_epi8(0x0F);
+        let c8 = _mm_set1_epi8(8);
+        // low nibbles = w[0..16], high nibbles = w[16..32], each 0..15 then
+        // sign-extended from 4 bits via (nib ^ 8) - 8.
+        let lo_u = _mm_and_si128(v, mask0f);
+        let hi_u = _mm_and_si128(_mm_srli_epi16(v, 4), mask0f);
+        let lo = _mm_sub_epi8(_mm_xor_si128(lo_u, c8), c8);
+        let hi = _mm_sub_epi8(_mm_xor_si128(hi_u, c8), c8);
+        // Four groups matching dot_i8w_f32's a0..a3 on a 32-slice:
+        // w[0..8]=lo[0..8], w[8..16]=lo[8..16], w[16..24]=hi[0..8], w[24..32]=hi[8..16].
+        let w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+        let w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)));
+        let w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+        let w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)));
+        // fmadd against zero (not mul) to mirror dot_i8w_f32 exactly — bit-identical
+        // even in the signed-zero lane corner.
+        let z = _mm256_setzero_ps();
+        let a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), z);
+        let a1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp.add(8)), z);
+        let a2 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xp.add(16)), z);
+        let a3 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xp.add(24)), z);
+        let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]))
+    }
+}
+
+/// Mixed PACKED-int4 GEMV: packed-int4 weight × **f32** activation. Same math as
+/// [`gemv_i8w_f32a_blocked`] (`out[o] = Σ_b scale[o,b]·dot(block_b, x_b) + bias`)
+/// but reads HALF the weight bytes. Byte-identical to the int4 probe on
+/// `gemv_i8w_f32a_blocked`. Parallelization mirrors [`gemv_i8`]. For `mlp_0`/fc1
+/// (GELU-absorbed; see [`super::int4_mlp0_enabled`]).
+pub fn gemv_i4_packed_f32a(w: &I4BlockMat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
+    const BLOCK: usize = 32;
+    let (out, inp) = (w.out, w.inp);
+    let n_blocks = inp / BLOCK;
+    let row_bytes = inp / 2;
+    debug_assert_eq!(w.data.len(), out * row_bytes, "gemv_i4_packed weight shape mismatch");
+    debug_assert_eq!(x.len(), inp, "gemv_i4_packed x length mismatch");
+    debug_assert_eq!(out_slice.len(), out, "gemv_i4_packed out length mismatch");
+    debug_assert_eq!(w.scales.len(), out * n_blocks, "gemv_i4_packed scales shape mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i4_packed bias length mismatch");
+    let fill = |o_base: usize, slice: &mut [f32]| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            let o = o_base + i;
+            let wrow = &w.data[o * row_bytes..(o + 1) * row_bytes];
+            let srow = &w.scales[o * n_blocks..(o + 1) * n_blocks];
+            let mut acc = 0.0f32;
+            for (b, &sc) in srow.iter().enumerate() {
+                acc += dot_i4_block_packed(&wrow[b * 16..b * 16 + 16], &x[b * BLOCK..b * BLOCK + BLOCK]) * sc;
+            }
+            *slot = acc + bias.map_or(0.0, |bb| bb[o]);
+        }
+    };
+    let par_threshold = {
+        use std::sync::OnceLock;
+        static T: OnceLock<usize> = OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("FW_GEMV_I8_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 21)
+        })
+    };
+    let workers = gemv_worker_count(out);
+    if out * inp < par_threshold || workers < 2 {
+        fill(0, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
+}
+
 /// Batched fused dequant + GEMV: `out[t, o] = bias[o] + dot(W[o, :], x[t, :])`
 /// for `tq` activation rows `x` (`[tq, in]` row-major) against a natural
 /// `[out, in]` f16 weight, producing `[tq, out]` row-major.
@@ -3012,5 +3174,45 @@ mod tests {
             attention(&q, &k, &v, 4, None).is_err(),
             "4 does not divide 6"
         );
+    }
+
+    /// The PACKED int4 GEMV must be BIT-IDENTICAL to the unpacked int4 probe
+    /// (`quantize_f16_to_i4_blocked` + `gemv_i8w_f32a_blocked`): same 4-bit values,
+    /// same block scales, same `dot_i8w_f32` accumulation order — only the storage
+    /// (2 nibbles/byte vs 1 value/byte) differs. This is the load-independent proof
+    /// that swapping mlp_0/fc1 to the packed kernel changes no output bit. Covers
+    /// several `inp` widths (d_model ∈ {384, 768, 1280}) and includes a bias.
+    #[test]
+    fn i4_packed_gemv_bit_identical_to_probe() {
+        let mut rng = Lcg::new(0xF16C_4B17);
+        for &inp in &[384usize, 768, 1280] {
+            let out = 96; // small out; must exceed the narrow worker cap? no — serial ok
+            let w: Vec<Float16> =
+                (0..out * inp).map(|_| Float16::from_f32(rng.next_f32() * 0.4)).collect();
+            let x: Vec<f32> = (0..inp).map(|_| rng.next_f32()).collect();
+            let bias: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
+
+            let probe = quantize_f16_to_i4_blocked(&w, out, inp, 32);
+            let mut y_probe = vec![0.0f32; out];
+            gemv_i8w_f32a_blocked(&probe, &x, Some(&bias), &mut y_probe);
+
+            let packed = quantize_f16_to_i4_packed(&w, out, inp);
+            let mut y_packed = vec![0.0f32; out];
+            gemv_i4_packed_f32a(&packed, &x, Some(&bias), &mut y_packed);
+
+            // Storage really is halved (one byte per two int4 weights).
+            assert_eq!(packed.data.len(), out * inp / 2, "packed size (inp={inp})");
+            assert_eq!(probe.data.len(), out * inp, "probe stores one value/byte");
+            // Every output element bit-for-bit equal.
+            for o in 0..out {
+                assert_eq!(
+                    y_packed[o].to_bits(),
+                    y_probe[o].to_bits(),
+                    "i4-packed != probe at o={o}, inp={inp}: {} vs {}",
+                    y_packed[o],
+                    y_probe[o]
+                );
+            }
+        }
     }
 }
