@@ -182,13 +182,13 @@ struct Linear {
     /// unchanged (bit-identical). Only the MLP up-projection (`mlp_0`) carries it;
     /// `mlp_2` stays f16 to keep the residual stream exact (see `int8_mlp_enabled`).
     w_i8: Option<nn::I8Mat>,
-    /// When true, the `w_i8` decode path uses the MIXED [`nn::gemv_i8w_f32a`]
-    /// (int8 weight × f32 activation, no activation quant) instead of the full-int8
-    /// [`nn::gemv_i8`]. Set for `mlp_2` (fc2): its GELU-hidden input has outliers
-    /// that the per-vector `x` scale would crush (the full-int8 turbo break), but
-    /// the WEIGHT is the bandwidth-bound operand, so quantizing only it captures the
-    /// win. See [`super::int8_mlp_fc2_enabled`].
-    i8_f32act: bool,
+    /// Block-wise int8 weight for the MIXED decode GEMV ([`nn::gemv_i8w_f32a_blocked`]:
+    /// block-int8 weight × f32 activation). Set for `mlp_2` (fc2): its GELU-hidden
+    /// input has outliers, and even a per-row int8 WEIGHT scale (`w_i8`) is too coarse
+    /// (breaks turbo); block scales (Q8_0-style) are fine enough to stay exact while
+    /// still halving the bandwidth-bound weight read. Takes priority over `w_i8` in
+    /// `forward`. See [`super::int8_mlp_fc2_enabled`].
+    w_i8_block: Option<nn::I8BlockMat>,
 }
 
 impl Linear {
@@ -211,13 +211,14 @@ impl Linear {
         self
     }
 
-    /// Attach an int8 weight copy used via the MIXED int8-weight × f32-activation
-    /// GEMV (`i8_f32act`), iff `enabled`. For `mlp_2`/fc2 (see `int8_mlp_fc2_enabled`).
-    fn quantize_i8w_f32a_if(mut self, enabled: bool) -> Self {
+    /// Attach a BLOCK-WISE int8 weight copy for the mixed block-int8-weight ×
+    /// f32-activation GEMV, iff `enabled`. For `mlp_2`/fc2 (see `int8_mlp_fc2_enabled`).
+    /// Block size 32 matches whisper.cpp's Q8_0.
+    fn quantize_i8w_f32a_blocked_if(mut self, enabled: bool) -> Self {
+        const BLOCK: usize = 32;
         if enabled {
             if let WeightMat::F16 { data, out, inp } = &self.w {
-                self.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
-                self.i8_f32act = true;
+                self.w_i8_block = Some(nn::quantize_f16_to_i8_blocked(data, *out, *inp, BLOCK));
             }
         }
         self
@@ -229,6 +230,18 @@ impl Linear {
         // GEMV (weights are DRAM-resident at decode time → int8 ~1.7×). Bias fuses in
         // as the f16 path adds it. Prefill (tq>1) falls through to the f16 batch.
         if x.rows == 1 {
+            // fc2 block-wise mixed path (int8 weight × f32 activation) takes priority.
+            if let Some(wb) = &self.w_i8_block {
+                if x.cols != wb.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8-block) forward: x.cols {} != in {}",
+                        x.cols, wb.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(wb.out);
+                nn::gemv_i8w_f32a_blocked(wb, &x.data, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(1, wb.out, y));
+            }
             if let Some(w_i8) = &self.w_i8 {
                 if x.cols != w_i8.inp {
                     return Err(FwError::InvalidRequest(format!(
@@ -237,11 +250,7 @@ impl Linear {
                     )));
                 }
                 let mut y = nn::gemv_out_buf(w_i8.out);
-                if self.i8_f32act {
-                    nn::gemv_i8w_f32a(w_i8, &x.data, self.bias.as_deref(), &mut y);
-                } else {
-                    nn::gemv_i8(w_i8, &x.data, self.bias.as_deref(), &mut y);
-                }
+                nn::gemv_i8(w_i8, &x.data, self.bias.as_deref(), &mut y);
                 return Ok(Mat::from_vec(1, w_i8.out, y));
             }
         }
@@ -426,7 +435,7 @@ fn load_linear(
         Some(name) => Some(load_vec(model, name, out_dim)?),
         None => None,
     };
-    Ok(Linear { w, bias, w_i8: None, i8_f32act: false })
+    Ok(Linear { w, bias, w_i8: None, w_i8_block: None })
 }
 
 /// Load the token embedding `[n_vocab, n_state]` in its NATURAL orientation
@@ -614,7 +623,7 @@ impl DecoderWeights {
                     n_state,
                     mlp_hidden,
                 )?
-                .quantize_i8w_f32a_if(super::int8_mlp_fc2_enabled()),
+                .quantize_i8w_f32a_blocked_if(super::int8_mlp_fc2_enabled()),
             };
             layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v)
                 .map(|l| l.quantize_if(super::int8_attn_enabled()));
@@ -1528,7 +1537,7 @@ fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
         w: WeightMat::F16 { data, out, inp },
         bias: Some(bias),
         w_i8: None,
-        i8_f32act: false,
+        w_i8_block: None,
     })
 }
 
@@ -1637,7 +1646,7 @@ mod tests {
                 w: WeightMat::F32(rng.mat(inp, out)),
                 bias: if bias { Some(rng.vec(out)) } else { None },
                 w_i8: None,
-                i8_f32act: false,
+                w_i8_block: None,
             }
         };
         let ln = |rng: &mut Lcg| LayerNorm {

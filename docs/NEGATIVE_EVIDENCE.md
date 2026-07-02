@@ -3,7 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
-## 2026-07-06 - BlackThrush: WIN LANDED (GATED) — mixed int8-weight × f32-activation GEMV for `mlp_2`/fc2: **1.25× on the mlp span** (~7% e2e decode), byte-exact on tiny.en. Gated (default OFF) because per-row int8 WEIGHT still breaks turbo — flip-default needs block-wise (Q8_0) weight quant.
+## 2026-07-06 - BlackThrush: WIN LANDED (default-ON) — **BLOCK-WISE** int8-weight × f32-activation GEMV for `mlp_2`/fc2: transcript byte-exact vs f16 on BOTH models → flipped default-on. ~1.25× on the mlp span (~7% e2e decode). **Breaks the fc2 f16 floor — the last big decode span is now int8.**
+
+**Land-or-dig result: landed the flip-default that the gated per-row mixed (below) pointed to.** AGENT_NAME=BlackThrush.
+Real code: `I8BlockMat` + `quantize_f16_to_i8_blocked` + `gemv_i8w_f32a_blocked` (nn.rs, block=32, per-block dot
+reuses `dot_i8w_f32`), `Linear::w_i8_block` + `quantize_i8w_f32a_blocked_if`, `int8_mlp_fc2_enabled` flipped ON,
+`mlp_2` wired to it (replacing the per-row mixed field `i8_f32act`).
+
+**The fix.** The gated per-row mixed fc2 (c11041b) proved fc2's weight is bandwidth-reducible (~1.25× mlp span) but
+a single per-ROW int8 scale is too coarse for the residual-feeding fc2 — it reproduced the turbo trailing artifact.
+Block-wise scales (one f16 scale per 32 consecutive weights, whisper.cpp's Q8_0 layout) keep fine resolution in the
+calm blocks so the wide-row outliers don't blow the whole-row scale. Result: transcript BYTE-IDENTICAL to f16 on
+BOTH tiny.en and large-v3-turbo (the turbo artifact is gone), so it goes default-on.
+
+**Conformance.** `native_ab` block-wise-fc2 vs f16: large-v3-turbo BYTE-IDENTICAL, tiny.en BYTE-IDENTICAL. Real-CLI
+e2e `tests/native_engine_e2e.rs` with the new default = **6 passed, 0 failed** (matches the whisper-cli golden).
+
+**Ratio.** Same ~1.25× on the mlp span as the per-row mixed (block adds only a cheap per-block scale mult over the
+same int8 dot). `decoder_attrib` turbo 200 clean pair (box was at load 55, contention-noisy): mlp span f16 3.407 →
+block-i8 2.675 = 1.27×; the per-row A/B established 3.337 → 2.666 = 1.25× (Δ 0.67) rigorously (interleaved min-of-8).
+→ **~7% off e2e decode**. Every per-token decode weight GEMV is now int8 including fc2 — only the tiny LN/embed
+math stays f32.
+
+## 2026-07-06 - BlackThrush: WIN LANDED (GATED, superseded above) — mixed int8-weight × f32-activation GEMV for `mlp_2`/fc2: **1.25× on the mlp span** (~7% e2e decode), byte-exact on tiny.en. Gated (default OFF) because per-row int8 WEIGHT still breaks turbo — flip-default needs block-wise (Q8_0) weight quant.
 
 **Land-or-dig result: broke the "fc2 must stay f16" floor partway — real bandwidth win landed gated, with the exact
 blocker to default-on identified.** AGENT_NAME=BlackThrush. Real code: `gemv_i8w_f32a` + `dot_i8w_f32` kernel

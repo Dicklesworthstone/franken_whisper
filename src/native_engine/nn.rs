@@ -1014,25 +1014,79 @@ fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
     }
 }
 
-/// Mixed GEMV: int8 weight (per-row dequant scale) × **f32** activation.
-/// `out[o] = (Σ_i w_i8[o,i]·x[i]) · scale[o] + bias[o]`. Same output as
-/// [`gemv_i8`] but WITHOUT quantizing the activation — so it keeps `gemv_i8`'s
-/// halved weight-bandwidth win while dropping the per-vector activation-quant
-/// error. Intended for `mlp_2`/fc2, whose GELU-hidden input has outliers that the
-/// per-vector `x` scale crushes (the mlp_2 full-int8 turbo break); the weight is
-/// the bandwidth-bound operand (13 MB f16 → 6.5 MB int8 per token) so this is
-/// where the win lives. Parallelization mirrors [`gemv_i8`].
-pub fn gemv_i8w_f32a(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
-    let (out, inp) = (w.out, w.inp);
-    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8w_f32a weight shape mismatch");
-    debug_assert_eq!(x.len(), inp, "gemv_i8w_f32a x length mismatch");
-    debug_assert_eq!(out_slice.len(), out, "gemv_i8w_f32a out length mismatch");
-    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8w_f32a bias length mismatch");
+/// Block-wise int8 weight (Q8_0-style): int8 data plus ONE dequant scale per
+/// `block` consecutive input columns per row, so a wide row with outliers keeps
+/// fine resolution in the calm blocks. `scales` is `out * n_blocks` row-major
+/// (`n_blocks = ceil(inp/block)`). Used for `mlp_2`/fc2, where a single per-row
+/// scale (`I8Mat`) is too coarse (breaks turbo) but block scales are byte-exact.
+#[derive(Debug, Clone)]
+pub struct I8BlockMat {
+    pub data: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub out: usize,
+    pub inp: usize,
+    pub block: usize,
+}
+
+/// Quantize a natural `[out, inp]` f16 weight to block-wise int8 (`block`
+/// columns share a symmetric `amax/127` scale). Mirrors [`quantize_f16_to_i8`]
+/// but per block, so the whisper.cpp-Q8_0-class accuracy on wide rows.
+pub fn quantize_f16_to_i8_blocked(w: &[Float16], out: usize, inp: usize, block: usize) -> I8BlockMat {
+    debug_assert_eq!(w.len(), out * inp);
+    debug_assert!(block > 0);
+    let n_blocks = inp.div_ceil(block);
+    let mut data = vec![0i8; out * inp];
+    let mut scales = vec![0.0f32; out * n_blocks];
+    data.par_chunks_mut(inp)
+        .zip(scales.par_chunks_mut(n_blocks))
+        .enumerate()
+        .for_each(|(o, (drow, srow))| {
+            let wrow = &w[o * inp..(o + 1) * inp];
+            for b in 0..n_blocks {
+                let s = b * block;
+                let e = ((b + 1) * block).min(inp);
+                let amax = wrow[s..e]
+                    .iter()
+                    .map(|h| h.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-9);
+                let sc = amax / 127.0;
+                srow[b] = sc;
+                let inv = 1.0 / sc;
+                for i in s..e {
+                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        });
+    I8BlockMat { data, scales, out, inp, block }
+}
+
+/// Mixed block-wise GEMV: block-int8 weight × **f32** activation.
+/// `out[o] = Σ_b (scale[o,b] · Σ_{i∈b} w_i8[o,i]·x[i]) + bias[o]`. Keeps
+/// [`gemv_i8`]'s halved weight-bandwidth win but with per-block weight scales and
+/// a full-precision activation, so it is accurate enough for the residual-feeding
+/// `mlp_2`/fc2 (the per-row [`I8Mat`] variant broke turbo). Parallelization mirrors
+/// [`gemv_i8`]; the per-block dot reuses [`dot_i8w_f32`].
+pub fn gemv_i8w_f32a_blocked(w: &I8BlockMat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
+    let (out, inp, block) = (w.out, w.inp, w.block);
+    let n_blocks = inp.div_ceil(block);
+    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8w_f32a_blocked weight shape mismatch");
+    debug_assert_eq!(x.len(), inp, "gemv_i8w_f32a_blocked x length mismatch");
+    debug_assert_eq!(out_slice.len(), out, "gemv_i8w_f32a_blocked out length mismatch");
+    debug_assert_eq!(w.scales.len(), out * n_blocks, "gemv_i8w_f32a_blocked scales shape mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8w_f32a_blocked bias length mismatch");
     let fill = |o_base: usize, slice: &mut [f32]| {
         for (i, slot) in slice.iter_mut().enumerate() {
             let o = o_base + i;
-            let acc = dot_i8w_f32(&w.data[o * inp..(o + 1) * inp], x) * w.scales[o];
-            *slot = acc + bias.map_or(0.0, |b| b[o]);
+            let wrow = &w.data[o * inp..(o + 1) * inp];
+            let srow = &w.scales[o * n_blocks..(o + 1) * n_blocks];
+            let mut acc = 0.0f32;
+            for (b, &sc) in srow.iter().enumerate() {
+                let s = b * block;
+                let e = ((b + 1) * block).min(inp);
+                acc += dot_i8w_f32(&wrow[s..e], &x[s..e]) * sc;
+            }
+            *slot = acc + bias.map_or(0.0, |bb| bb[o]);
         }
     };
     let par_threshold = {

@@ -336,14 +336,16 @@ pub(crate) fn int8_attn_enabled() -> bool {
 }
 
 /// Whether to run `mlp_2` (fc2, the MLP down-projection) through the MIXED
-/// int8-weight × f32-activation GEMV ([`nn::gemv_i8w_f32a`]) on the per-token
-/// decode path. fc2's weight is the bandwidth-bound operand (13 MB f16 → 6.5 MB
-/// int8 per token), so quantizing ONLY the weight captures that win; the
-/// activation stays f32, avoiding the per-vector quant error on the GELU-hidden
-/// outliers that broke full-int8 `mlp_2` (turbo trailing artifact, 6c4b53d). OFF
-/// by default until the golden gate clears with it on. `FRANKEN_WHISPER_INT8_MLP_FC2=1`.
+/// BLOCK-WISE int8-weight × f32-activation GEMV ([`nn::gemv_i8w_f32a_blocked`]) on
+/// the per-token decode path. fc2's weight is the bandwidth-bound operand (13 MB
+/// f16 → 6.5 MB int8 per token), so quantizing ONLY the weight captures that win;
+/// the activation stays f32. A per-ROW int8 weight scale was too coarse and broke
+/// turbo (the trailing artifact, like full-int8 `mlp_2` at 6c4b53d), but per-BLOCK
+/// scales (32-elt, whisper.cpp-Q8_0-class) are transcript BYTE-EXACT vs f16 on both
+/// tiny.en and large-v3-turbo — hence **ON by default**. ~1.25× on the MLP-GEMV
+/// span (~7% e2e decode). Disable with `FRANKEN_WHISPER_INT8_MLP_FC2=0`.
 pub(crate) fn int8_mlp_fc2_enabled() -> bool {
-    const DEFAULT_ON: bool = false;
+    const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_MLP_FC2") {
         Ok(v) => matches!(
