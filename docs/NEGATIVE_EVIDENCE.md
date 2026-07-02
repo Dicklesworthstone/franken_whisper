@@ -3,6 +3,19 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: WIN LANDED (default-ON, byte-exact) — **cross-window ENCODE/DECODE pipelining**: overlap window N's latency-bound decode with window N+1's compute-bound encode. MEASURED **~1.19× (min-of-5 interleaved) to ~1.31× (single-shot) on the transcribe phase** of a 3-window turbo run, transcript BYTE-IDENTICAL. This LANDS the lever the perf profile below quantified.
+
+**Land-or-dig result: LANDED a measured RTF win vs the sequential path (which is franken's own whisper.cpp-faithful baseline).** AGENT_NAME=BlackThrush. Real code: `src/native_engine/decode.rs` — a scoped encoder thread (`std::thread::scope` + mpsc) computes window N+1's encode while window N decodes; `pipeline_windows_enabled()` gate (default ON, kill switch `FW_PIPELINE_WINDOWS=0`).
+
+**Why byte-exact:** in `no_timestamps` mode timestamp tokens are masked, so `seek_delta_cs` is always `CHUNK_CS` → window N+1's mel offset is known before decode-N runs. The prefetched encode is the SAME `forward_from_full_mel_window` with the SAME args as the inline path (the speculative prefetch just swaps the cancellation checkpoint for a no-op), so the `Mat` is bit-identical and the decode consumes it identically. VERIFIED: pipelined vs sequential transcript on a 3-window (66 s, jfk×6) `no_timestamps` turbo run is BYTE-IDENTICAL; e2e conformance suite 6/6 with pipelining default-ON.
+
+**Measurement (realistic_e2e_probe, jfk×6 = 66 s / 3 windows, large-v3-turbo, `timestamps=false`):**
+- single-shot: transcribe 9987 → 7618 ms (**1.31×**), total 10635 → 8212 ms (1.29×).
+- interleaved A/B min-of-5 (drift-canceling): transcribe 8706 → 7324 ms = **1.19×**; ON faster in 5/5 pairs.
+The win comes from the decode's idle cores (perf profile below: ~8% idle rayon-worker samples) now running the next window's encode. Bounded by how much encode fits in decode's idle capacity.
+
+**Scope / limits (honest):** engages ONLY in `no_timestamps` mode (timestamp-mode seek is data-dependent → inert there, conformance path untouched) and only for multi-window audio (>30 s; single-window audio takes the inline path unchanged). So it does NOT speed up the default timestamped CLI path — it's a win for the `timestamps=false` / streaming-style workload. Gated default-ON with `FW_PIPELINE_WINDOWS=0` kill switch; owner can flip to default-off if the added core-path concurrency is unwanted.
+
 ## 2026-07-02 - BlackThrush: DIG → DEFINITIVE perf PROFILE — a turbo transcribe is **58.6% matrixmultiply f32 sgemm (at AVX2 peak) + ~8% rayon scheduling (mostly decode idle-core spin)**. No standalone byte-exact kernel lever exists; the only byte-exact structural win is window-pipelining (fill the idle decode cores), upside now quantified at ~20-27% on turbo multi-window.
 
 **Land-or-dig result: no uncommitted win; ran a function-level `perf record` (152k samples, dwarf call-graph) on a turbo transcribe — the first flat CPU breakdown, confirming with hard data what span-level probes only implied.** AGENT_NAME=BlackThrush. No code lands (profile-only; the engine is at its byte-exact ceiling).

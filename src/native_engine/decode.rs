@@ -667,6 +667,28 @@ fn tail_truncate_enabled() -> bool {
     })
 }
 
+/// Cross-window ENCODE/DECODE pipelining (default ON; kill switch `FW_PIPELINE_WINDOWS=0`).
+///
+/// In `no_timestamps` mode the seek advance is always a full `CHUNK_CS` (timestamp
+/// tokens are masked, so `seek_delta_cs` never changes), which makes window N+1's
+/// mel offset known BEFORE window N is decoded. Since window N's decode is a
+/// latency-bound single stream that leaves cores idle (NEGATIVE_EVIDENCE 2026-07-02
+/// perf profile: ~8% of samples are idle rayon workers), we compute window N+1's
+/// (compute-bound, core-hungry) encode CONCURRENTLY on those idle cores via a
+/// scoped encoder thread. The prefetched encode is byte-identical to the inline one
+/// (same fn, same args), so transcripts are unchanged — a pure RTF lever. MEASURED
+/// ~1.19-1.31× on the transcribe phase of a 3-window turbo run, transcript
+/// byte-identical. Inert in timestamp mode (next offset is data-dependent) and for
+/// single-window audio, so the conformance path (timestamps=true) is untouched.
+fn pipeline_windows_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FW_PIPELINE_WINDOWS")
+            .map_or(true, |v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+    })
+}
+
 /// Derive this window's encoder context (in encoder frames) from the real
 /// (unpadded) audio frame count remaining in the window.
 ///
@@ -852,6 +874,41 @@ pub fn transcribe_samples(
     // Tail-window encoder-context truncation kill switch, resolved once.
     let tail_truncate = tail_truncate_enabled();
 
+    // Cross-window pipelining (no_timestamps only; default off): a persistent
+    // scoped encoder thread computes the NEXT window's encode while THIS window
+    // decodes on the calling thread. The while loop stays lexically top-level in
+    // the scope closure, so its break/continue/`?` still target the loop, and
+    // `thread::scope` joins the encoder thread on ANY exit (incl. `?`). Byte-exact:
+    // the prefetched encode is the same fn+args as the inline one. See
+    // `pipeline_windows_enabled`.
+    let pipeline = pipeline_windows_enabled() && cfg.no_timestamps;
+    let enc_n_threads = params.n_threads;
+    let pipe_result: FwResult<()> = std::thread::scope(|scope| {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<FwResult<super::Mat>>();
+        let _enc_worker = if pipeline {
+            let enc_w = &m.encoder;
+            let mel_ref = &full_mel;
+            Some(scope.spawn(move || {
+                // Speculative prefetch: use a no-op checkpoint (cancellation of the
+                // MAIN decode still gates progress; a wasted prefetch is harmless).
+                let noop = || Ok(());
+                while let Ok((off, mf)) = req_rx.recv() {
+                    let r = encoder::forward_from_full_mel_window(
+                        enc_w, mel_ref, off, mf, enc_n_threads, &noop,
+                    );
+                    if res_tx.send(r).is_err() {
+                        break;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        // The frame_offset already dispatched to the encoder thread (its result is
+        // in flight / waiting on `res_rx`), or None when nothing is prefetched.
+        let mut prefetched: Option<usize> = None;
+
     let mut seek_cs: i64 = 0;
     while seek_cs + DELTA_MIN < seek_end_cs {
         checkpoint()?;
@@ -883,14 +940,37 @@ pub fn transcribe_samples(
             );
         }
         let t_enc = std::time::Instant::now();
-        let enc = encoder::forward_from_full_mel_window(
-            &m.encoder,
-            &full_mel,
-            frame_offset,
-            mel_frames,
-            params.n_threads,
-            checkpoint,
-        )?;
+        // Take the prefetched encode if the pipeline already computed THIS window
+        // (overlapped with the previous window's decode); otherwise encode inline.
+        let enc = if pipeline && prefetched == Some(frame_offset) {
+            match res_rx.recv() {
+                Ok(r) => r?,
+                Err(_) => encoder::forward_from_full_mel_window(
+                    &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
+                )?,
+            }
+        } else {
+            encoder::forward_from_full_mel_window(
+                &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
+            )?
+        };
+        // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
+        // no_timestamps advance is always CHUNK_CS, so the next offset is known and
+        // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
+        prefetched = None;
+        if pipeline {
+            let next_seek = seek_cs + CHUNK_CS;
+            if next_seek + DELTA_MIN < seek_end_cs {
+                let next_off = frame_offset + CHUNK_CS as usize;
+                let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
+                    .unwrap_or(0)
+                    .min(FRAMES_PER_CHUNK);
+                let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
+                if req_tx.send((next_off, next_ctx * 2)).is_ok() {
+                    prefetched = Some(next_off);
+                }
+            }
+        }
         super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
         let t_xkv = std::time::Instant::now();
         let mut st = DecoderState::new(&m.decoder, &enc)?;
@@ -1127,6 +1207,13 @@ pub fn transcribe_samples(
         // adjusted) advance, NOT the emission delta (fix #5).
         seek_cs += seek_advance_cs.max(DELTA_MIN);
     }
+
+        // Close the encoder-thread channel so the scoped worker exits; `scope`
+        // then joins it before returning.
+        drop(req_tx);
+        Ok(())
+    });
+    pipe_result?;
 
     // English-only models never report a language; multilingual report the used
     // (possibly auto-detected) one.
