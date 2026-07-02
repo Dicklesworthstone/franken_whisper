@@ -3,6 +3,23 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **MEASURED the draft-decoding amortization ceiling** — the only bandwidth-wall-beating decode lever, now quantified with hard numbers (not the prior ~1.5-2× estimate). Also re-verified (code-level) that every byte-exact structural path is already optimal: QKV is fused+int8+parallel, KV cache is pre-alloc no-copy, self-attn is alloc-light, all encoder LNs are fused.
+
+**Land-or-dig result: no new byte-exact franken lever exists (re-proven at the code level), so I MEASURED the upside of the one owner/product lever that remains — draft/speculative decoding — to turn the decision-menu estimate into data.** AGENT_NAME=BlackThrush. New committed probe `examples/draft_amortization_probe.rs` times one `tq=K` decoder forward vs `K` sequential `tq=1` steps at a fixed cache (best-of-N min = contention-robust). The ratio `R(K)=K·t1/tK` is draft decoding's decode-slice speedup CEILING (realized × the draft accept-rate: accepted tokens are byte-exact with greedy).
+
+**MEASURED (turbo, cache_len=16, best-of-60, 32t, 2 runs):** per-token cost falls sharply as K grows —
+
+| K | t(tq=K) ms | per-token ms | R(K) ceiling |
+|---|-----------|-------------|--------------|
+| 1 | 6.2–6.6 | 6.2–6.6 | 1.00× |
+| 2 | 11.4–11.6 | 5.7–5.8 | 1.08–1.14× |
+| 4 | 13.6–14.1 | 3.4–3.5 | **1.75–1.95×** |
+| 8 | 18.2–18.6 | 2.3–2.4 | **2.71–2.85×** |
+
+**Reading it:** the ~922 MB/token weight stream (the [[project_decode_overthreaded_rayon_lead]] bandwidth wall) is read ONCE per `tq=K` pass, so per-token cost drops ~2.7× at K=8. A draft decoder verifying K-token chunks against turbo would realize `R(K) × accept_rate` on the decode slice (~20% e2e); whisper greedy transcription is locally predictable, so K=4–8 with ~60-80% accept ⇒ ~1.4–2× decode ≈ **~8-15% e2e**. **This is the biggest remaining lever, and now it has numbers.** CAVEAT/sub-lever: the `tq>1` path is the **f16** batched GEMV today (2 bytes/weight); an **int8 batched GEMV (`gemv_i8_batch`, not yet written)** would read 1 byte/weight once and raise every R(K) — and it is likely byte-exact on its own (same per-row int8 quant as the transcript-neutral per-token path), so it's a concrete, in-crate, landable FIRST STEP toward draft decoding that also speeds prefill (1.2% e2e). Draft decoding itself stays owner/product-scoped (draft model + speculate/verify/rollback loop).
+
+**Re-verification (this cycle, code-level — closes the byte-exact structural search):** traced the last-unexamined decode/encoder structures. (a) **QKV projection already fused + int8 + parallel:** `fuse_qkv` row-stacks Wq/Wk/Wv → `[3·1280,1280]`, `.quantize_if(int8_attn_enabled())` attaches the int8 copy, so `project_qkv` runs ONE `gemv_i8` (out=3840 > the `1<<21` parallel threshold → one fork/join) and splits into 3 contiguous slices (zero de-interleave — the "QKV-fusion-is-dead" note was the *encoder* f32 GEMM, not this). 1× activation-quant, 4.9 MB int8, byte-exact. (b) **KV cache is pre-allocated** (`vec![0.;cap·n_state]`, `append`=`copy_from_slice`, no realloc) and consumed via `key_slice()/value_slice()` (no-copy borrows); `keys()/values()` `.to_vec()` survive only in a test. (c) **`attention_decode_step` is alloc-light** (allocs out/qh/scores ONCE, not per head) and correctly SERIAL over the 20 heads (attention compute is ~0.06% of the per-token weight stream — parallelizing = pure fork/join loss). (d) **Every encoder LN site is optimal:** the 2 per-block residual LNs use the fused `ln_into` (this session's win), `ln_post` is in-place on a consumed `x` (no clone). **No byte-exact franken-owned lever remains; the decode is at the int8-weight bandwidth wall and only tq=K batching beats it.**
+
 ## 2026-07-02 - BlackThrush: PERF profile of the DECODE — the eye-catching "40% rayon coordination" is IDLE-WORKER SPIN, not a wall-clock lever (timed cap sweep disproves it). Decode is latency-bound; no franken wall-clock lever. Methodological: perf self-time overstates wall-clock for idle-spin in latency-bound parallel code.
 
 **Land-or-dig result: first function-level perf of the turbo decode; the big rayon self-time is idle-spin, confirmed by a timed disproof.** AGENT_NAME=BlackThrush. `perf record` on `decoder_perf_probe` (now model-selectable via `FW_PROBE_MODEL` + reports ms/step) @turbo:
