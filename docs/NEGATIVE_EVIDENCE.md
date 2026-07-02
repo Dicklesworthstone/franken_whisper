@@ -3,6 +3,18 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → REJECTED (measured REGRESSION, reverted) — **speculative timestamp-mode pipelining** (extend the no_ts pipelining win to the default timestamped path by assuming a `CHUNK_CS` advance). MEASURED **0 hits / 2 misses and ~30% SLOWER** on jfk×6; byte-exact but a perf LOSS. Reverted; the no_timestamps pipelining win is untouched.
+
+**Land-or-dig result: dug the extension of the landed pipelining to timestamp mode (the default CLI path); implemented, verified byte-exact, MEASURED — it regresses. Reverted the engine change (decode.rs back to landed state); kept only the probe's `FW_PROBE_TIMESTAMPS` flag.** AGENT_NAME=BlackThrush.
+
+**The idea + why it fails.** The no_ts pipelining win (65d5b5b) is `no_timestamps`-only because timestamp-mode `seek_delta = 2·(last_ts − ts_begin)` is data-dependent. Hypothesis: for continuous speech that FILLS a 30 s window, the model emits the max timestamp (30.00 s) as the last, so the advance is exactly `CHUNK_CS` → speculate `seek+CHUNK` during decode; on a HIT use it, on a MISS discard + inline (BYTE-EXACT either way — verified: timestamp transcript identical speculate-on vs -off on jfk×6).
+
+**Measurement (realistic_e2e_probe, jfk×6, turbo, `timestamps=true`, `FW_PIPELINE_SPECULATE`):**
+- hit tally: **hits=0, miss=2** (both windows' advance ≠ CHUNK_CS).
+- transcribe: OFF 10686 ms → ON 13899 ms = **~1.3× SLOWER (regression)**.
+
+**Why 0 hits + why it regresses:** jfk×6 is jfk (11 s speech + trailing silence) repeated — i.e. speech WITH PAUSES, not gap-free speech. So the model's last in-window timestamp lands where speech ended, NOT at 30.00 s → advance < CHUNK → every speculation MISSES. And a MISS is NOT free: the wasted speculative encode (core-saturating) runs concurrently with the decode and STEALS its cores, so the decode slows → net ~30% regression. So the "assume CHUNK advance" heuristic is wrong for any audio with intra-window pauses (a very common real case), and no reliable heuristic exists (the next offset is genuinely unpredictable in timestamp mode). **Timestamp-mode pipelining is DEAD — confirmed by measurement now, not just analysis.** The pipelining win stays `no_timestamps`-only; the default timestamped CLI path cannot be pipelined this way.
+
 ## 2026-07-02 - BlackThrush: MEASURED WIN vs whisper.cpp (fair head-to-head) — franken is **~3.6× total RTF (8.1 s vs 29.1 s)** and **~2.7× encode** on large-v3-turbo (jfk×6, 66 s), both builds AVX2/FMA/F16C. Confirms franken's encoder LEADS whisper.cpp (not trails), and the landed pipelining widens the total gap.
 
 **Land-or-dig result: ran the direct vs-OpenAI-Whisper head-to-head the directive asks for (prior cycles only compared vs franken's OWN sequential baseline).** AGENT_NAME=BlackThrush. No engine code (bench + ledger ratio; the RTF win itself is the pipelining landed at 65d5b5b + franken's faster encode).
