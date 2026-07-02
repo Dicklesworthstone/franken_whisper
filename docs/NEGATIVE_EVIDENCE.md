@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: MEASURED head-to-head vs whisper.cpp — **CORRECTS the "3.6× total / 2.7× encode" overclaim**. At MATCHED high thread counts franken leads only **~1.1–1.26× total**, the ENCODE is **~tied**, and franken's real edge is its **int8 decode (~2.4×)**. The old 3.6× compared against whisper.cpp at LOW thread count.
+
+**Land-or-dig result: fresh, methodologically-clean head-to-head (current HEAD f00cd0c) — franken still WINS vs whisper.cpp turbo, but by ~1.2×, not 3.6×.** AGENT_NAME=BlackThrush. This is a measured win vs the baseline AND a correction of a stale overclaim.
+
+**whisper.cpp turbo scales with threads (jfk×6, ggml-large-v3-turbo f16, full-SIMD build AVX2/FMA/F16C/REPACK):**
+- `-t 8`: total **37345 ms** (encode 10683 ms/win) ← the regime the old "3.6×" was measured in
+- `-t 32`: total **14700 ms** (encode 3619 ms/win)
+- `-t 48`: total **13750 ms** (encode 3169 ms/win) ← whisper's best
+- `-t 64`: total **140547 ms** (thrashes — cross-CCD/oversubscription on this contended 64-core box)
+
+**franken (current HEAD, all cores, jfk×6 turbo timestamp mode):** transcribe **11805 ms**, TOTAL (incl load) **12454 ms** (consistent across runs).
+
+**Fair comparison at matched high threads (franken all-cores vs whisper `-t48`):**
+- **Total:** franken 12454 ms vs whisper 13750 ms = **~1.10× (transcribe-only 11805 → ~1.16×)**.
+- **Encode:** franken ~3.1 s/win vs whisper 3.17 s/win = **~1.02× (essentially TIED)** — CORRECTS the memory "franken encoder LEADS 2.7×" (that was vs low-thread whisper; at matched threads the encoders are ~equal, both ~AVX2 f32/f16 GEMM at peak).
+- **Decode:** franken ~0.6 s/win vs whisper (13750−9508)/3 = ~1.41 s/win = **franken ~2.4× faster** — this (int8 decode) is franken's genuine edge and the source of the total lead.
+
+**Takeaway:** franken's win over whisper.cpp turbo is REAL but modest (~1.2×) at matched threads, driven by int8 decode, NOT the encoder (tied). The encoder-bound blocker stands: both engines are encoder-limited at the same f32/f16-GEMM-at-AVX2-peak ceiling. Do NOT cite 3.6×/2.7× — those were low-thread-whisper artifacts. Corrects [[project_turbo_encoder_dominates]].
+
 ## 2026-07-02 - BlackThrush: DIG → **CLEAN 64-core profile corrects an oversubscription artifact + refines the encoder-bound blocker**. Real encoder ≈3.1–3.5 s/window (NOT the 6 s my `taskset -c 0-7` runs showed — that was rayon oversubscription: 64 threads pinned to 8 cores). No new byte-exact franken-owned lever; decode-cap re-tune is a closed load-dependent avenue on this shared box.
 
 **Land-or-dig result: methodological correction + refined blocker (no new lever).** The box is **64 cores** (load ~10, so free capacity); all my session's ABSOLUTE numbers under `taskset -c 0-7` are ~2× inflated by oversubscription — RATIOS (2.25×/4.99×/1.87×, all min-of-N) and byte-exactness are unaffected, but the phase-time absolutes were not real. AGENT_NAME=BlackThrush.
