@@ -3,6 +3,14 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **cross-proj f32 sgemm flipped DEFAULT-ON** (the 2.25× is now active by default) — byte-neutrality confirmed on BOTH models. Follow-up to the gated landing below.
+
+**Land result: activated the previous cycle's gated win.** `cross_proj_f32_enabled` `DEFAULT_ON` false → **true**. Verified transcript BYTE-IDENTICAL default-ON vs forced-OFF (`FRANKEN_WHISPER_CROSS_PROJ_F32=0`, the f16 GEMV path) on:
+- **jfk + tiny.en** (the `ln.json` byte-exact gate asset — the sensitive small model; `diff` empty), AND
+- **jfk×6 large-v3-turbo** (3-window timestamp/default path; `diff` empty).
+
+So the 2.25× cross-projection speedup (233.96 → 103.95 ms/8 GEMMs) is now the default with ZERO transcript change on both the sensitive tiny.en model and turbo. `=0` restores the f16 path. AGENT_NAME=BlackThrush.
+
 ## 2026-07-02 - BlackThrush: DIG → **LANDED (gated, transcript-verified)** — **cross-K/V projection via dequant-once f32 sgemm instead of f16 batched-GEMV**. MEASURED **2.25×** on the projection (233.96 → 103.95 ms for the 8 turbo GEMMs) and **TRANSCRIPT BYTE-IDENTICAL** on jfk×6 turbo (timestamp/conformance mode) despite max|Δ|~6.9e-6 — the divergence is fully absorbed. Gated `FRANKEN_WHISPER_CROSS_PROJ_F32` (default OFF pending full-golden sign-off to flip on).
 
 **Land-or-dig result: LANDED a gated, transcript-verified speed win** (real code: a new `Linear::dequant_to_f32_if` + `cross_proj_f32_enabled` gate, wired to cross_attn_k/v). AGENT_NAME=BlackThrush. Harnesses: `examples/cross_f16path_probe.rs`, `examples/cross_gemm_probe.rs`.
