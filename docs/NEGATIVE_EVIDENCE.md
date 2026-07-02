@@ -3,6 +3,18 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → **profile confirms ENCODER-BOUND blocker + validates the session's cross_kv wins**; the one remaining franken-owned f16-gemv site (prefill) is low-EV + risky.
+
+**Land-or-dig result: fresh phase profile (turbo jfk×6, timestamp/default mode) — the encoder is ~91% and dep-owned, so no franken-owned lever with meaningful e2e impact remains; the session's 3 cross_kv wins are e2e-CONFIRMED.** AGENT_NAME=BlackThrush.
+
+**Phase breakdown (cumulative_ms per window, `FRANKEN_WHISPER_PERF_SPANS=1`):**
+- `encoder_window`: 6079 / 5508 / 3947 = **15534 ms (~91% of the transcribe)** — dep `ft_kernel_cpu` f32 sgemm at ~AVX2 peak ([[project_turbo_encoder_dominates]]). Not editable in this crate.
+- `cross_kv`: 102 / 92 / 75 = **270 ms (~90 ms/win, was ~116 ms)** — the session's 3 wins (build 4.99×, quantize 1.87×, projection f32-sgemm 2.25×) are **e2e-confirmed** (span dropped).
+- `decode_loop`: 412 / 417 / 395 = 1224 ms — ≈ the int8 tied-logits GEMV (66 MB/token, DRAM-bandwidth-bound; int4 would halve it again but is argmax-quality owner-gated).
+- `decoder_prefill`: 15 / 107 / 98 = 220 ms (grows with the prev-text prompt).
+
+**The one remaining franken-owned f16-gemv-at-tq>1 site = prefill (decoder.rs `forward` gates int8 on `x.rows == 1`, so prefill tq>1 falls to `gemv_f16_batch`).** Same class as the landed cross-projection win, BUT NOT pursued: (a) ~1.3% e2e (220 ms/window, capped by whisper's ~224-token prompt); (b) prefill projections feed the RESIDUAL stream (unlike cross-K/V which feed only the softmax), so an f32-sgemm sum-order change is far more likely to shift the transcript — NOT safely byte-neutral; (c) it needs either f32 weight copies (memory) or a new batched-int8 GEMV kernel. Low EV × higher risk → skip. **Blocker (one sentence): the crate is encoder-bound (~91% dep f32-sgemm at AVX2 peak) and every franken-owned exposed phase is now either tuned (cross_kv, this session) or bandwidth/quality-owner-gated (logits int4) — no byte-exact franken-owned lever with material e2e impact remains.**
+
 ## 2026-07-02 - BlackThrush: **cross-proj f32 sgemm flipped DEFAULT-ON** (the 2.25× is now active by default) — byte-neutrality confirmed on BOTH models. Follow-up to the gated landing below.
 
 **Land result: activated the previous cycle's gated win.** `cross_proj_f32_enabled` `DEFAULT_ON` false → **true**. Verified transcript BYTE-IDENTICAL default-ON vs forced-OFF (`FRANKEN_WHISPER_CROSS_PROJ_F32=0`, the f16 GEMV path) on:
