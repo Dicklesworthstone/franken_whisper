@@ -3,6 +3,41 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 decoder-MLP **fc1-only** GEMV: transcript byte-exact vs f16 on BOTH models → flipped default-on. ~1.20× on the MLP-GEMV span (~4.6% e2e decode).
+
+**Land-or-dig result: the gated both-quant int8-MLP (6c4b53d) is refined to a byte-exact subset and promoted
+to default-on.** AGENT_NAME=BlackThrush. Real code: drop `.quantized()` from `mlp_2` (decoder.rs), flip
+`int8_mlp_enabled` `DEFAULT_ON=false→true` (mod.rs), doc updates.
+
+**The lever.** The both-quant variant landed gated (6c4b53d) because large-v3-turbo showed a trailing artifact
+(" a." → " a. a.") — a real transcript divergence, so it could not go default-on. Root cause: `mlp_2` (the MLP
+DOWN-projection) writes DIRECTLY into the residual stream, so its per-token int8 rounding compounds across the
+32 layers × N tokens and eventually flips a token. `mlp_0` (the UP-projection) instead feeds GELU, whose
+saturation absorbs the small quant error before it reaches the residual. So: **quantize ONLY `mlp_0`, keep
+`mlp_2` in f16.** This directly answers the earlier gating caution ("MLP feeds the residual stream") — the
+residual-feeding projection is no longer quantized.
+
+**Conformance (the gate for the default flip).** `native_ab` A/B, int8 (`FRANKEN_WHISPER_INT8_MLP=1`) vs f16
+baseline (`=0`), on the jfk fixture:
+- large-v3-turbo: transcript BYTE-IDENTICAL (the " a. a." artifact is GONE).
+- tiny.en:        transcript BYTE-IDENTICAL.
+And the real-CLI e2e conformance suite `tests/native_engine_e2e.rs` run with the NEW default (no env override)
+= **6 passed, 0 failed** — it compares jfk/tiny.en against the whisper-cli golden `jfk_tiny_reference.json`, so
+default-on int8-MLP matches OpenAI-Whisper's reference transcript exactly.
+
+**Ratio (vs f16 baseline; whisper.cpp Q8_0 also quantizes the MLP, so this is a proven-safe class).**
+`decoder_attrib large-v3-turbo 200`, span `mlp_fc_gelu_proj`, min-of-5 (contention filter, box load ~24):
+- f16:       3.2624 ms/token
+- int8 fc1:  2.7281 ms/token   → **1.196× on the MLP-GEMV+GELU span** (Δ 0.534 ms/token).
+MLP span is 28.2% of per-step (11.57 ms/token), so ~4.6% off e2e decode — above noise (the two 5-run
+distributions cleanly separate: min 2.73 vs 3.26). Half the both-quant span-win (1.58×) as expected, since only
+one of the two MLP GEMVs is now int8; the other half is traded away to keep the transcript exact.
+
+**Why fc1-only over both-quant.** The both-quant path (1.58× span) is measurably faster but not byte-exact on
+turbo, so it stayed gated (no user got it). fc1-only is byte-exact → default-on → EVERY decode now gets the
+~4.6% for free, vs the prior state where the gated win shipped OFF. A live half-win beats a gated full-win.
+Prefill (`tq > 1`) still uses f16; the int8 path is per-token decode (`tq == 1`) only.
+
 ## 2026-07-02 - BlackThrush: WIN LANDED (gated) — int8/Q8 decoder-MLP GEMV: **1.58× on the MLP component in REAL parallel decode** (~10% e2e decode), tiny.en transcript byte-exact.
 
 **Land-or-dig result: the reversed int8-MLP lever (below) is INTEGRATED, benched in real decode, and landed

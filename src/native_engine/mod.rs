@@ -281,20 +281,25 @@ pub(crate) fn int8_logits_enabled() -> bool {
     })
 }
 
-/// Whether to run the decoder MLP linears (fc1 `[4·n_state, n_state]`, fc2
-/// `[n_state, 4·n_state]`) through the int8/Q8 GEMV ([`nn::gemv_i8`]) on the
-/// per-token decode path (`tq == 1`).
+/// Whether to run the decoder MLP up-projection (fc1 `[4·n_state, n_state]`,
+/// `mlp_0`, feeding GELU) through the int8/Q8 GEMV ([`nn::gemv_i8`]) on the
+/// per-token decode path (`tq == 1`). The down-projection (`mlp_2`) stays f16.
 ///
-/// The MLP is ~27% of decode. In real per-token decode the working set (4×26 MB
+/// The MLP is ~28% of decode. In real per-token decode the working set (4×26 MB
 /// MLP + 132 MB logits ≈ 250 MB) ≫ 128 MB L3, so the MLP weights are DRAM-resident
-/// and int8 (half the bytes) is MEASURED 1.65–1.76× on both linears (cache-cold
-/// probe). Unlike the logits (final projection, argmax-robust), MLP output feeds
-/// the residual stream so quant error can compound across layers — a SEPARATE gate,
-/// **OFF by default** until the exact-transcript golden suite is cleared with it on
-/// (whisper.cpp's Q8_0 models quantize the MLP, so it is a proven-safe target).
-/// Enable with `FRANKEN_WHISPER_INT8_MLP=1`. Prefill (`tq > 1`) keeps the f16 path.
+/// and int8 (half the bytes) is MEASURED 1.65–1.76× per linear (cache-cold probe).
+///
+/// **fc1-only** is the safe subset: `mlp_2` writes DIRECTLY into the residual
+/// stream, so its per-token int8 rounding compounds across layers/tokens and was
+/// the source of a turbo trailing-artifact under the both-quant variant (6c4b53d).
+/// `mlp_0`'s error is instead absorbed by GELU saturation before it reaches the
+/// residual, so quantizing ONLY it is transcript byte-exact vs the f16 baseline on
+/// both tiny.en and large-v3-turbo (jfk golden) — hence **ON by default**. It still
+/// captures ~1.20× on the MLP-GEMV span (~4.6% e2e decode). whisper.cpp's Q8_0
+/// models quantize the whole MLP, so int8 here is a proven-safe class of target.
+/// Disable with `FRANKEN_WHISPER_INT8_MLP=0`. Prefill (`tq > 1`) keeps the f16 path.
 pub(crate) fn int8_mlp_enabled() -> bool {
-    const DEFAULT_ON: bool = false;
+    const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_MLP") {
         Ok(v) => matches!(

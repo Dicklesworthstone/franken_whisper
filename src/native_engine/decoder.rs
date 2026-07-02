@@ -179,15 +179,16 @@ struct Linear {
     /// Optional int8/Q8 copy of an f16 `w` (built by [`Linear::quantized`] when
     /// [`super::int8_mlp_enabled`] is on). Present ⇒ the per-token decode forward
     /// (`tq == 1`) takes the memory-halved [`nn::gemv_i8`]; `None` ⇒ f16/f32 path
-    /// unchanged (bit-identical default). Only the MLP linears carry it.
+    /// unchanged (bit-identical). Only the MLP up-projection (`mlp_0`) carries it;
+    /// `mlp_2` stays f16 to keep the residual stream exact (see `int8_mlp_enabled`).
     w_i8: Option<nn::I8Mat>,
 }
 
 impl Linear {
     /// Attach an int8-quantized copy of an f16 weight for the memory-halved decode
     /// GEMV, when [`super::int8_mlp_enabled`] is on. No-op on f32/gate-off (so the
-    /// default keeps `w_i8 = None` and the forward is bit-identical). Applied only
-    /// to the bandwidth-bound MLP fc1/fc2, never the small attention projections.
+    /// forward stays bit-identical to f16). Applied only to the bandwidth-bound MLP
+    /// up-projection (`mlp_0`), never `mlp_2` or the small attention projections.
     fn quantized(mut self) -> Self {
         if super::int8_mlp_enabled() {
             if let WeightMat::F16 { data, out, inp } = &self.w {
@@ -565,14 +566,18 @@ impl DecoderWeights {
                     n_state,
                 )?
                 .quantized(),
+                // mlp_2 (down-proj) writes DIRECTLY into the residual stream, so
+                // its per-token int8 rounding accumulates across layers/tokens and
+                // was the source of the turbo trailing-artifact under the both-quant
+                // variant (6c4b53d). Keep it f16; quantize only mlp_0 (up-proj),
+                // whose error is absorbed by the GELU saturation before the residual.
                 mlp_2: load_linear(
                     model,
                     &format!("{p}.mlp.2.weight"),
                     Some(&format!("{p}.mlp.2.bias")),
                     n_state,
                     mlp_hidden,
-                )?
-                .quantized(),
+                )?,
             };
             layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v);
             Ok(layer)
