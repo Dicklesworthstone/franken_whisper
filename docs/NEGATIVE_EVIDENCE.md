@@ -3,6 +3,18 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: NEGATIVE — the **logits-GEMV worker cap** (`FW_WIDE_GEMV_CAP`, default 32) does NOT have a landable higher optimum on this 8-CCD/64-core box. cap=64 is *tail-robust* (~1.07× mean over 32) but the difference is within box noise, e2e impact is <0.1%, and the doc-comment's own "48/64 regress" from a prior load DIRECTLY CONFLICTS with today's "64 is best" — which PROVES the cap is load/schedule-dependent and unsettleable on a contended shared box. Keep 32. Harness: `examples/logits_cap_probe.rs`.
+
+**Land-or-dig result: measured a NEW lever (the bandwidth-bound logits GEMV worker cap on this many-CCD box), found no safe win — confirms the closed "decode thread-count won't settle on a shared box" avenue with fresh data.** AGENT_NAME=BlackThrush. Byte-exact throughout (the band split is order-preserving ⇒ identical logits for any cap).
+
+**Rationale for the dig:** the decode bottleneck is the tied-logits GEMV (int8 `[51866,1280]`, ~66 MB streamed/token, DRAM-bandwidth-bound). `wide_gemv_cap()`=32 was tuned "48/64 regress (cross-CCD sync)" on a ~4-CCD box; THIS box is 64c/likely 8 CCDs, where more workers should reach more memory channels. Since `gemv_worker_count` = `avail.min(cap)`, the cap only bites when avail>32, and the split is order-preserving (byte-identical), so a faster cap would have been a free pick.
+
+**MEASURED (`examples/logits_cap_probe.rs`, turbo logits shape [51866,1280] int8, min-of-N, this contended 64-core box):**
+- First sweep (min-of-400): cap 8→46.8, 16→51.4, 24→64.4, 32→**55.6**, 48→59.9, 64→**75.4** GB/s — looked like a clean ~1.35× for cap=64.
+- 4 confirmation runs (min-of-500) told the real story: **cap=32** 59.7/62.7/64.3/66.5 (avg ~63, high variance), **cap=48** 66.8/53.4/68.0/63.0 (noisy), **cap=64** 69.1/67.2/66.5/67.2 (avg ~67, **tight**). cap=32's *best* run (66.5) matches cap=64 — the gap is scheduling variance, not a throughput ceiling.
+
+**Why not landable:** (a) mean gain ~1.07× is within run-to-run box noise; (b) e2e is negligible — the logits GEMV is ~1 ms/token, so 1.07× saves ~0.07 ms/tok × ~200 tok ≈ 14 ms/window out of ~412 ms decode out of a ~15 534 ms transcribe = **<0.1% e2e**; (c) a global default 32→64 would RISK the doc-comment's previously-measured "48/64 regress" on 4-CCD / differently-loaded topologies (the cap only bites on >32-core boxes, exactly where cross-CCD sync is most variable). The 32 default is a defensible middle that never regresses badly. cap=64's only real merit here is *variance reduction* under contention — not a throughput win, and not worth a topology-risky default flip. Confirms [[project_decode_overthreaded_rayon_lead]] (thread-count avenue is load-dependent, can't settle on a shared box) specifically for the logits-GEMV bandwidth cap.
+
 ## 2026-07-02 - BlackThrush: MEASURED WIN vs whisper.cpp — **franken's no-timestamps (text-only) mode is ~1.8× faster** (7367 vs 13327 ms), via cross-window pipelining + chunk-advance windowing that whisper.cpp lacks. The fair timestamped ratio is ~1.2× (prior entry); this is franken's BEST fair win, for the common "just want text" use case.
 
 **Land-or-dig result: measured franken's strongest fair advantage over whisper.cpp — the no_timestamps path (~1.8×).** AGENT_NAME=BlackThrush. Both engines produce timestamp-free text; matched threads; current HEAD (2c58bf0).
