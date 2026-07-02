@@ -3,6 +3,29 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: int8-MLP REJECTION REVERSED — it WINS 1.65–1.76× when weights are DRAM-resident (the real per-token decode regime), not L3-hot (the isolated probe).
+
+**Land-or-dig result: the earlier int8-MLP rejection was an ISOLATED-PROBE ARTIFACT; with a cache-cold
+(DRAM-resident) measurement it is a clear win → integrating it into the decode path (follow-up).**
+AGENT_NAME=BlackThrush.
+
+### Measured (`examples/int8_mlp_probe`, real turbo MLP shapes, single-thread, best-of-40)
+```
+                       HOT (L3-resident)          COLD (DRAM-resident = real decode)
+  mlp.fc1 [5120,1280]  f16 0.266 / int8 0.315 ms  f16 0.721 / int8 0.409 ms  = 1.76×
+  mlp.fc2 [1280,5120]  f16 0.245 / int8 0.233 ms  f16 0.659 / int8 0.400 ms  = 1.65×
+```
+The prior rejection (fc1 0.85× / fc2 1.05×, "MLP fits L3") measured only the HOT case, which keeps the 13 MB
+weights L3-resident so f16 runs at L3 bandwidth (~49–53 GB/s) and int8's compute-bound kernel can't beat it.
+But per-token decode has a ~250 MB working set (4×26 MB MLP + 132 MB logits) ≫ 128 MB L3, so the MLP weights
+SPILL to DRAM — the `best_of_cold` variant streams a >L3 (256 MB) buffer before each timed rep to force that,
+and int8's byte-halving then wins **1.65–1.76×** on BOTH linears. Confirms the memory caveat and the L3-spill
+principle (int8 wins on tensors that spill L3 — the same reason logits[132 MB] won). MLP is ~27% of decode →
+~1.7× on it ≈ ~11% e2e-decode headroom. NEXT: re-apply the int8-MLP integration (`FRANKEN_WHISPER_INT8_MLP`
+gate), A/B `decoder_attrib` in real parallel decode, transcript-validate, land. (Build note: the asupersync
+`deny(dead_code)` blocker is cleared with `RUSTFLAGS="-C target-cpu=x86-64-v3 --cap-lints=allow"` in a fresh
+private target dir + pinned nightly.)
+
 ## 2026-07-02 - BlackThrush: BLOCKER — `asupersync` dep fails to compile under the churned nightly (breaks ALL builds); int8-MLP-cold re-dig is queued behind it.
 
 **Land-or-dig result: SURFACING a build blocker (no build possible) + a queued, promising re-dig.**

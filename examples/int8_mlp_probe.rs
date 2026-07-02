@@ -74,6 +74,29 @@ fn best_of(iters: usize, mut f: impl FnMut()) -> f64 {
     best
 }
 
+/// Best-of with L3 EVICTION before each timed rep: stream a >L3 buffer (untimed)
+/// so the weights are DRAM-resident when `f()` runs — the REAL per-token decode
+/// regime (working set 4×MLP + logits ≈ 250 MB ≫ 128 MB L3), unlike the hot loop.
+fn best_of_cold(iters: usize, pollute: &[f32], mut f: impl FnMut()) -> f64 {
+    let mut best = f64::INFINITY;
+    for _ in 0..iters {
+        let mut s = 0.0f32;
+        let mut j = 0;
+        while j < pollute.len() {
+            s += pollute[j];
+            j += 16; // touch one per cache line, sweep the whole >L3 buffer
+        }
+        black_box(s);
+        let t0 = Instant::now();
+        f();
+        let dt = t0.elapsed().as_secs_f64();
+        if dt < best {
+            best = dt;
+        }
+    }
+    best
+}
+
 fn probe(label: &str, out: usize, inp: usize, iters: usize) {
     // f16 weights + f32 activation (the current path). Structured but non-cancelling.
     let wf16: Vec<Float16> = (0..out * inp)
@@ -97,6 +120,8 @@ fn probe(label: &str, out: usize, inp: usize, iters: usize) {
     let xi8: Vec<i8> = xf.iter().map(|v| (v / xs).round().clamp(-127.0, 127.0) as i8).collect();
 
     let mut buf = vec![0.0f32; out];
+    // >L3 eviction buffer (256 MB f32) to force DRAM-resident weights (real decode).
+    let pollute: Vec<f32> = (0..64 * 1024 * 1024).map(|i| (i & 0xff) as f32).collect();
 
     let f16_ms = best_of(iters, || {
         for o in 0..out {
@@ -111,6 +136,25 @@ fn probe(label: &str, out: usize, inp: usize, iters: usize) {
         }
         black_box(&buf);
     }) * 1e3;
+
+    // COLD (DRAM-resident weights): the real per-token decode regime.
+    let f16_cold = best_of_cold(iters, &pollute, || {
+        for o in 0..out {
+            buf[o] = dot_f16c(&wf16[o * inp..(o + 1) * inp], &xf);
+        }
+        black_box(&buf);
+    }) * 1e3;
+
+    let i8_cold = best_of_cold(iters, &pollute, || {
+        for o in 0..out {
+            buf[o] = dot_i8(&wi8[o * inp..(o + 1) * inp], &xi8) as f32 * wscale[o] * xs;
+        }
+        black_box(&buf);
+    }) * 1e3;
+    println!(
+        "  COLD (DRAM-resident): f16 {f16_cold:6.3} ms  int8 {i8_cold:6.3} ms  speedup={:.2}x",
+        f16_cold / i8_cold
+    );
 
     let f16_gb = (out * inp * 2) as f64 / (f16_ms / 1e3) / 1e9;
     let i8_gb = (out * inp) as f64 / (i8_ms / 1e3) / 1e9;
