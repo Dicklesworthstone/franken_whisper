@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Agent-first Rust ASR orchestration stack with ffmpeg normalization and frankensqlite-backed persistence"
@@ -81,6 +81,14 @@ flat_map_option = "warn"
 implicit_clone = "warn"
 semicolon_if_nothing_returned = "warn"
 unused_self = "warn"
+
+# GPU acceleration on Apple Silicon: the native engine's matmuls auto-offload to
+# the Metal tiled-GEMM kernel at runtime when a GPU is present (see
+# native_engine::nn). macOS-only and isolated behind ft-kernel-metal's safe API,
+# so franken_whisper keeps `#![deny(unsafe_code)]`. Non-macOS targets never see
+# this dep and stay on the optimized CPU path.
+[target.'cfg(target_os = "macos")'.dependencies]
+ft-kernel-metal = { path = "../frankentorch/crates/ft-kernel-metal" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

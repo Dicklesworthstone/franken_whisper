@@ -8,6 +8,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## [0.3.0] - 2026-07-02
+
+### GPU acceleration — automatic, hardware-selected (Apple Silicon)
+
+- **The native engine now auto-offloads its large matmuls to the Metal GPU on Apple Silicon, enabled by default.** A new `ft-kernel-metal` crate (sibling to `ft-kernel-cpu`) provides a shared-memory + register-blocked tiled f32 Metal GEMM (~1.5–1.9 TFLOP/s on an M4 Pro, ~5–8× the naive kernel); all `unsafe` Metal FFI is contained there so `franken_whisper` keeps `#![deny(unsafe_code)]`. At runtime `nn::matmul_bias` routes a GEMM to the GPU when (1) the target is macOS, (2) a Metal device is present, and (3) the matmul is large enough (`m·k·n ≥ 2e9`) that the compute win beats the launch/sync overhead — otherwise it stays on the already-fast multi-threaded CPU kernel. **Auto-selection by hardware + workload:** Apple Silicon large models → Metal GPU; x86-64-v3 (incl. AMD Threadripper) → the optimized AVX2/FMA CPU path; everything else → portable CPU. No config required. Override with `FRANKEN_WHISPER_GPU=0` to force CPU.
+- **Measured (M4 Pro):** `large-v3-turbo` transcribe ~34% faster wall-clock (offloading ~3× the CPU compute), output byte-identical to the CPU path (transcription-level conformance holds). Small models (e.g. `tiny.en`) are unchanged — their GEMMs stay on the CPU, so there is no regression, and non-macOS builds are entirely unaffected (the Metal dep is target-gated out). This is a GEMM-only first cut; a batched/overlapped GPU pipeline (and an f16 path) would widen the win.
+
+Everything in v0.2.1 (native-default engine, NaN-hardening, the aarch64 `target-cpu` codegen fix, the routing fallback fix, and the CPU int8/GELU perf work) is included.
+
 ## [Unreleased] (since v0.1.0)
 
 152 commits since v0.1.0

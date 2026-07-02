@@ -253,10 +253,57 @@ fn matmul_into_uninit(
     unsafe {
         data.set_len(numel);
     }
+    // GPU auto-offload (Apple Silicon): route large GEMMs to the Metal tiled
+    // kernel when a GPU is present. Falls through to the CPU sgemm on any error,
+    // for small matmuls (launch overhead), or when disabled by
+    // `FRANKEN_WHISPER_GPU=0`. All Metal/unsafe is isolated in ft-kernel-metal, so
+    // this crate keeps `#![deny(unsafe_code)]`.
+    #[cfg(target_os = "macos")]
+    {
+        let m = lhs_meta.shape()[0];
+        let k = lhs_meta.shape()[1];
+        let n = rhs_meta.shape()[1];
+        // Size check first (cheap) so small/short models never even probe for a
+        // GPU — `metal_offload_enabled()` builds the Metal context (device +
+        // kernel compile) on first call, which would otherwise tax a fast tiny.en
+        // run that has no GEMM large enough to offload anyway.
+        if m.saturating_mul(k).saturating_mul(n) >= METAL_MIN_MKN
+            && metal_offload_enabled()
+            && ft_kernel_metal::sgemm(lhs, rhs, &mut data, m, k, n).is_ok()
+        {
+            return Ok(data);
+        }
+    }
     ft_kernel_cpu::matmul_tensor_contiguous_f32_into(&mut data, lhs, rhs, lhs_meta, rhs_meta)
         .map_err(kernel_err)?;
     Ok(data)
 }
+
+/// Runtime gate for GPU matmul offload (Apple Silicon). `true` iff a Metal GPU is
+/// present and the user hasn't set `FRANKEN_WHISPER_GPU=0`. Probed once, cached.
+#[cfg(target_os = "macos")]
+fn metal_offload_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let disabled = matches!(
+            std::env::var("FRANKEN_WHISPER_GPU").ok().as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
+        );
+        !disabled && ft_kernel_metal::is_available()
+    })
+}
+
+/// Below this `m*k*n`, per-call GPU launch/sync + buffer-copy overhead outweighs
+/// the compute win, so the matmul stays on the (already fast, multi-threaded) CPU.
+/// MEASURED on an M4 Pro: tiny.en GEMMs (≤9e8) run *slower* on the GPU, while
+/// large-v3-class GEMMs (≥2.5e9) win ~15% wall-clock and offload ~3× the CPU work.
+/// The threshold sits between them so only large models auto-offload — small
+/// models keep the optimal CPU path, with no regression. (This is a GEMM-only
+/// first cut; a batched/overlapped GPU pipeline would widen the win and lower the
+/// break-even, at which point this constant should drop.)
+#[cfg(target_os = "macos")]
+const METAL_MIN_MKN: usize = 2_000_000_000;
 
 /// Allocate an `[n]` f32 buffer that the caller **fully overwrites** before any
 /// read, skipping the dead serial zero-init — the same dead-work elision as
