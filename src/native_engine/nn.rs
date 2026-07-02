@@ -1183,11 +1183,58 @@ fn gelu_table() -> &'static [f32; 1 << 16] {
 /// bit-exact-with-whisper on the activation — and is far cheaper (a `vcvtps2ph` +
 /// table load per element vs a scalar `tanh` per lane). GELU is on the
 /// transcription-tolerance encoder/decoder path (never the bit-exact mel path).
+///
+/// x86-64-v3 path: 8-wide `vcvtps2ph` (round-to-nearest-even → the same f16 index
+/// as the scalar `Float16::from_f32`) → widen → AVX2 gather from the table → blend
+/// the clamp. Bit-identical to the scalar fallback (verified max|Δ|=0 in
+/// `examples/gelu_probe`), 1.38× faster than it / 4.4× faster than the old tanh.
+#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn gelu_slice(data: &mut [f32]) {
+    use core::arch::x86_64::*;
+    let table = gelu_table();
+    let tp = table.as_ptr();
+    let n = data.len();
+    // SAFETY: all loads/stores are bounded by the `i+8<=n` guard; the gather index
+    // is a widened f16 bit pattern (always 0..=65535, in-bounds for the 1<<16 table);
+    // f16c/avx2 are guaranteed by this fn's target_feature cfg.
+    unsafe {
+        let neg10 = _mm256_set1_ps(-10.0);
+        let pos10 = _mm256_set1_ps(10.0);
+        let zero = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            let x = _mm256_loadu_ps(data.as_ptr().add(i));
+            let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
+            let idx = _mm256_cvtepu16_epi32(h);
+            let g = _mm256_i32gather_ps::<4>(tp, idx);
+            // Clamp (ggml GGML_GELU_FP16): x>=10 → x, x<=-10 → 0, else gathered.
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
+            let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
+            let r = _mm256_blendv_ps(g, x, ge);
+            let r = _mm256_blendv_ps(r, zero, le);
+            _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
+            i += 8;
+        }
+        for v in &mut data[i..] {
+            let x = *v;
+            *v = if x <= -10.0 {
+                0.0
+            } else if x >= 10.0 {
+                x
+            } else {
+                table[Float16::from_f32(x).to_bits() as usize]
+            };
+        }
+    }
+}
+
+/// Scalar fallback (non-x86 / no f16c+avx2): exact ggml `GGML_GELU_FP16` branch + clamp.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2")))]
 fn gelu_slice(data: &mut [f32]) {
     let table = gelu_table();
     for v in data.iter_mut() {
         let x = *v;
-        // Exact ggml `GGML_GELU_FP16` branch order + clamp.
         *v = if x <= -10.0 {
             0.0
         } else if x >= 10.0 {

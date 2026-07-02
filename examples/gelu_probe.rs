@@ -66,6 +66,44 @@ fn gelu_table(data: &mut [f32], table: &[f32]) {
     }
 }
 
+/// 8-wide table GELU: vcvtps2ph (rne) → widen → AVX2 gather → blend clamp.
+/// Bit-identical to `gelu_table`: same rne f16 index, same table, same clamp.
+#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn gelu_simd(data: &mut [f32], table: &[f32]) {
+    use core::arch::x86_64::*;
+    let n = data.len();
+    let tp = table.as_ptr();
+    unsafe {
+        let neg10 = _mm256_set1_ps(-10.0);
+        let pos10 = _mm256_set1_ps(10.0);
+        let zero = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            let x = _mm256_loadu_ps(data.as_ptr().add(i));
+            let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
+            let idx = _mm256_cvtepu16_epi32(h);
+            let g = _mm256_i32gather_ps::<4>(tp, idx);
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
+            let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
+            let r = _mm256_blendv_ps(g, x, ge);
+            let r = _mm256_blendv_ps(r, zero, le);
+            _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
+            i += 8;
+        }
+        for k in i..n {
+            let x = data[k];
+            data[k] = if x <= -10.0 {
+                0.0
+            } else if x >= 10.0 {
+                x
+            } else {
+                table[ft_core::Float16::from_f32(x).to_bits() as usize]
+            };
+        }
+    }
+}
+
 fn best_of(iters: usize, mut f: impl FnMut()) -> f64 {
     for _ in 0..2 {
         f();
@@ -109,6 +147,19 @@ fn main() {
         black_box(&buf2);
     }) * 1e3;
 
+    let mut buf3 = base.clone();
+    let simd_ms = best_of(iters, || {
+        buf3.copy_from_slice(&base);
+        gelu_simd(&mut buf3, &table);
+        black_box(&buf3);
+    }) * 1e3;
+    // Confirm SIMD == scalar table exactly.
+    let mut sa = base.clone();
+    let mut sb = base.clone();
+    gelu_table(&mut sa, &table);
+    gelu_simd(&mut sb, &table);
+    let simd_maxdiff = sa.iter().zip(&sb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+
     // Accuracy canary: max |Δ| tanh-form vs table-form over the full panel.
     let mut a = base.clone();
     let mut b = base.clone();
@@ -118,7 +169,9 @@ fn main() {
 
     let mb = (n * 4) as f64 / 1e6;
     println!("gelu panel n={n} ({mb:.1} MB f32) best-of-{iters}");
-    println!("  tanh (old)  {tanh_ms:7.3} ms");
-    println!("  table (new) {table_ms:7.3} ms   speedup={:.2}x", tanh_ms / table_ms);
+    println!("  tanh  (old)     {tanh_ms:7.3} ms");
+    println!("  table (scalar)  {table_ms:7.3} ms   speedup={:.2}x", tanh_ms / table_ms);
+    println!("  table (simd)    {simd_ms:7.3} ms   speedup={:.2}x (vs tanh) / {:.2}x (vs scalar table)", tanh_ms / simd_ms, table_ms / simd_ms);
     println!("  max |Δ| tanh-vs-table = {maxdiff:.5}  (f16-quant error, expect ~1e-3)");
+    println!("  max |Δ| simd-vs-scalar-table = {simd_maxdiff:.6}  (must be 0)");
 }

@@ -20,10 +20,16 @@ can regress from this.
 
 ### Measured (model-free `examples/gelu_probe`, encoder panel 1500×5120 = 7.68M f32, best-of-50)
 ```
-  tanh  (old)   26.103 ms
-  table (new)    7.552 ms      speedup = 3.46×
+  tanh  (old)      26.103 ms
+  table (scalar)    7.552 ms     speedup = 3.46× vs tanh
+  table (SIMD)      6.209 ms     speedup = 4.40× vs tanh / 1.38× vs scalar table
   max |Δ| tanh-vs-table = 0.00202   (= the f16-quant gap franken was OFF from whisper)
+  max |Δ| SIMD-vs-scalar-table = 0.000000  (bit-identical → no conformance re-check needed)
 ```
+FOLLOW-UP LANDED: `gelu_slice` is now an 8-wide `vcvtps2ph`(rne)→AVX2-gather→blend-clamp kernel on
+x86-64-v3 (scalar table kept as the non-f16c/avx2 fallback). BIT-IDENTICAL to the scalar table (Δ=0 over
+7.68M elts), so the tiny.en==reference / turbo transcript validation above still holds unchanged — a free
+1.38× on top.
 Best-of on a CPU-bound loop is contention-robust (box was at load ~17). The table lookup is a `vcvtps2ph` +
 one load per element vs a scalar `tanh` per lane. GELU runs in every encoder MLP (large-v3-turbo:
 1500×5120×32 layers/pass) + every decoder MLP, so this is a broad instruction-count cut; e2e fraction not
