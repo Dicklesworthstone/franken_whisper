@@ -3,6 +3,36 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-06 - BlackThrush: CONSOLIDATION / BLOCKER — decode is now FULLY int8 (fc2 was the last f16 weight, 33f3a5b) → at the **Q8 weight-bandwidth floor**, i.e. parity with whisper.cpp's own Q8 decode. No measurable quality-neutral in-crate decode lever remains; box too loaded (49) to resolve sub-1%.
+
+**Land-or-dig result: dug the post-fc2 decode; confirmed exhaustion at the Q8 floor and surfaced the two real next
+axes.** AGENT_NAME=BlackThrush. No code landed (this is the blocker surface).
+
+**State after this session's wins.** Every per-token decode WEIGHT GEMV is int8 (logits, mlp_0, mlp_2/fc2 [block],
+qkv, cross_q, self_out, cross_out) + the cross-attn K/V activation cache; self-attn is alloc-light; projections
+serial; qkv/mlp/cross parallel confirmed optimal. Per-token decode now reads ≈ 89 MB of int8 weights/token
+(logits 66 + fc1 6.5 + fc2 6.5 + qkv 5 + 3×1.6) — that read is DRAM-bandwidth-bound and is the SAME ≈Q8 volume
+whisper.cpp reads for a Q8 model. So franken decode is at parity with whisper.cpp-Q8 on bandwidth, and wins e2e via
+the encoder (~3.3× tiny) and mel (~5.4×). The remaining spans are either that Q8-floor read or the <1% f32 LN/embed
+math.
+
+**Why no more in-crate lever (each ruled out this session):** int8 dot already LLVM-vectorized (dot_i8 reject);
+gemv worker-cap tuned (projections serial 87848da, mid/cross parallel confirmed); self-attn alloc-light landed;
+cross-attn parallel 2× > serial confirmed; fc2 int8'd via block-wise. self-KV cache is f32 but int8-ing it saves
+<0.1 ms for short windows (grows with generated tokens, not enc_frames) — only matters for very long single-window
+generations, which the jfk bench can't exercise. GELU is a tiny SIMD table gather.
+
+**The two real next axes (both OFF the quality-neutral in-crate path — need a decision, not just code):**
+1. **int4 (Q4_0) for the big weights (logits, mlp).** Halves the ~89 MB → ~45 MB, the only way past the Q8 floor.
+   But int4 is NOT byte-exact vs f16 (coarser) — it changes transcripts (whisper.cpp Q4 models are measurably
+   lower quality). Needs OWNER sign-off on a quality/speed tradeoff; the block-wise infra (`I8BlockMat`) landed this
+   session is the scaffold (Q4_0 = same block layout, 4-bit).
+2. **Draft/speculative decoding.** Fewer target-model forward passes — the only algorithmic win. A product change
+   (needs a draft model + accept/reject loop), not a kernel lever.
+Plus a measurement blocker: sub-1% micro-opts (e.g. tq==1 cross-attn direct-write vs private-buffer+merge; fused
+gelu into the fc1 output) are real but the shared box (load 16–55 all session, per-step noise ±40%) can't measure
+them — they need a quiet box. **Do not re-dig the decode kernel for quality-neutral wins; it is at the Q8 floor.**
+
 ## 2026-07-06 - BlackThrush: WIN LANDED (default-ON) — **BLOCK-WISE** int8-weight × f32-activation GEMV for `mlp_2`/fc2: transcript byte-exact vs f16 on BOTH models → flipped default-on. ~1.25× on the mlp span (~7% e2e decode). **Breaks the fc2 f16 floor — the last big decode span is now int8.**
 
 **Land-or-dig result: landed the flip-default that the gated per-row mixed (below) pointed to.** AGENT_NAME=BlackThrush.
