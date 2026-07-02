@@ -3,6 +3,21 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **REJECTED — the f16 KV-cache STORAGE rewrite is a decode COMPUTE REGRESSION (self_attn 2× SLOWER: 156.8→320.9 ms), despite a BYTE-IDENTICAL transcript.** The bandwidth hypothesis was the wrong bottleneck: per-element `f16→f32` conversion inside the scalar dot loops costs more than the halved cache read saves. Code committed GATED default-OFF (`FW_KV_F16`); do NOT enable or re-attempt the naive scalar version.
+
+**Land-or-dig result: BUILT the f16 KV-cache storage rewrite that was scoped-but-held last cycle (52440a3), measured it end-to-end, REJECTED it as a self_attn regression.** AGENT_NAME=BlackThrush. Completed the ~100-line dual-field `KvCache` (f32 XOR f16, gate `FW_KV_F16` at `new()`) + `attention_decode_step_f16` (reads `k`/`v: &[Float16]` DIRECTLY in the hot path, `.to_f32()` in the two dot loops — NOT dequant-to-scratch, so the alloc-light 1.54× path is preserved) + prefill dequant-to-f32-scratch (rare `tq>1`) + an `is_f16()` branch in `attention_with_cache`. Compiles clean; default-OFF path is the pre-existing f32 code untouched (baseline transcript unchanged).
+
+**MEASURED (turbo jfk×6, `FRANKEN_WHISPER_PERF_SPANS=1`, `FW_KV_F16=1` vs baseline, 183 decode tokens over 3 windows):**
+
+| span | baseline (f32 KV) | f16 KV | Δ |
+|---|---|---|---|
+| **self_attn** | 156.8 ms | **320.9 ms** | **+105% (2× SLOWER)** |
+| forward_step total | 1953.3 ms | 2155.5 ms | +10.3% |
+| e2e transcribe | 11.041 s | 10.979 s | within noise (encoder-dominated) |
+| transcript | — | **BYTE-IDENTICAL** | ✓ neutral (as the SIM predicted) |
+
+**Why it lost:** the bandwidth model (self_attn ≈ 35% f32-KV read; halving it → ~1.9% decode) picked the WRONG bottleneck. At avg cache-len ~93 the cache read is small; the loop is scalar-COMPUTE-bound (the 65% already measured in c6382fb). Storing f16 ADDS a per-element `half::f16::to_f32` in the innermost score AND output dot loops — that conversion swamps the DRAM saving and DOUBLES self_attn. e2e is unmoved only because the encoder (~76%) hides the decode regression; on a decode-heavier path (no_timestamps, long-form) this is a net e2e LOSS. **Precision was neutral (byte-identical — confirms the 52440a3 SIM), but the lever is compute-NEGATIVE.** The only design that could win is a VECTORIZED dequant (F16C `vcvtph2ps`, 8-lane, dequant a whole key-row into f32 scratch → existing SIMD dot) — but that revives the per-step scratch the alloc-light rewrite killed, chasing a ~0.4-1% e2e prize below the hot-path risk. **f16 KV cache is DEAD absent that redesign; do not re-attempt the naive scalar `.to_f32()`-in-loop version.** Code kept gated as the reproducible artifact. Closes the self_attn KV thread ([[project_self_attn_kv_cache_lever]] lever #1).
+
 ## 2026-07-02 - BlackThrush: **DE-RISKED — f16 KV-cache precision is TRANSCRIPT-NEUTRAL (both modes, byte-identical).** The self_attn lever (10.7% of decode) is quality-safe; the storage rewrite that captures its ~1.9%-decode bandwidth win is scoped but held (hot-path, ~0.4-1% e2e).
 
 **Land-or-dig result: executed the transcript-neutrality de-risking for the f16 KV-cache lever surfaced last cycle (c6382fb) — PROVEN neutral, isolating the quality question from the storage rewrite.** AGENT_NAME=BlackThrush. Committed a gated probe `FW_KV_F16_SIM=1` (`nn.rs` `KvCache::append`): rounds each appended k/v row through f16 precision (`f32→f16→f32`) while still STORING f32 — so it tests the PRECISION question without the storage-bandwidth rewrite. Default off (production append byte-unchanged).

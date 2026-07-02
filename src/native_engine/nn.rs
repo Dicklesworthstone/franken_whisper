@@ -2016,16 +2016,18 @@ pub fn conv1d(
     matmul_bias(&im2col, &w_t, Some(bias))
 }
 
-/// PROBE gate (`FW_KV_F16_SIM=1`, default off): round each appended KV-cache row
-/// through f16 precision (`f32→f16→f32`) while still STORING f32. This isolates
-/// the transcript-neutrality QUESTION of an f16 KV cache (self_attn = 10.7% of
-/// decode, 35% of it the f32 cache read) from the storage rewrite that would
-/// actually halve the cache-read bandwidth. If the turbo transcript is byte-
-/// identical with the sim on, the full f16-storage path is worth building.
-fn kv_f16_sim_enabled() -> bool {
+/// f16 KV-cache storage gate (`FW_KV_F16=1`, default off). Stores the
+/// self-attention key/value cache as f16 instead of f32 — HALF the per-step
+/// DRAM read of the cache (self_attn = 10.7% of decode, 35% of it the cache
+/// read). Proven TRANSCRIPT-NEUTRAL: the f16-rounded values are bit-identical to
+/// the `FW_KV_F16_SIM` round-through-f16 probe (which was byte-identical to f32
+/// in both modes), because `f16→f32` is exact — so `k16[d].to_f32()` equals the
+/// sim's stored value exactly. f16 is finer than the already-neutral int8 decode
+/// weights. Read at [`KvCache::new`]; process-wide.
+fn kv_f16_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FW_KV_F16_SIM").is_some())
+    *ON.get_or_init(|| std::env::var_os("FW_KV_F16").is_some())
 }
 
 /// Incremental key/value cache for autoregressive self-attention.
@@ -2034,10 +2036,17 @@ fn kv_f16_sim_enabled() -> bool {
 /// major buffers; [`KvCache::append`] copies new per-token rows in and
 /// advances `len`. [`KvCache::keys`] / [`KvCache::values`] expose the
 /// populated prefix as a `[len, n_state]` [`Mat`] for [`attention`].
+///
+/// When [`kv_f16_enabled`] is on the storage is f16 (`k16`/`v16`, `k`/`v`
+/// empty), halving the per-step cache-read bandwidth; otherwise f32
+/// (`k`/`v`, `k16`/`v16` empty). The mode is fixed at construction.
 #[derive(Debug, Clone)]
 pub struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
+    k16: Vec<Float16>,
+    v16: Vec<Float16>,
+    f16: bool,
     len: usize,
     capacity_tokens: usize,
     n_state: usize,
@@ -2048,13 +2057,37 @@ impl KvCache {
     /// `n_state`.
     #[must_use]
     pub fn new(capacity_tokens: usize, n_state: usize) -> Self {
+        let f16 = kv_f16_enabled();
+        let n = capacity_tokens * n_state;
         Self {
-            k: vec![0.0; capacity_tokens * n_state],
-            v: vec![0.0; capacity_tokens * n_state],
+            k: if f16 { Vec::new() } else { vec![0.0; n] },
+            v: if f16 { Vec::new() } else { vec![0.0; n] },
+            k16: if f16 { vec![Float16::from_f32(0.0); n] } else { Vec::new() },
+            v16: if f16 { vec![Float16::from_f32(0.0); n] } else { Vec::new() },
+            f16,
             len: 0,
             capacity_tokens,
             n_state,
         }
+    }
+
+    /// Whether this cache stores f16 (vs f32).
+    #[must_use]
+    pub fn is_f16(&self) -> bool {
+        self.f16
+    }
+
+    /// Borrow the populated f16 key prefix (`[len, n_state]` row-major). Only
+    /// valid when [`Self::is_f16`]; panics otherwise (empty `k16`).
+    #[must_use]
+    pub fn key_slice_f16(&self) -> &[Float16] {
+        &self.k16[..self.len * self.n_state]
+    }
+
+    /// Borrow the populated f16 value prefix. See [`Self::key_slice_f16`].
+    #[must_use]
+    pub fn value_slice_f16(&self) -> &[Float16] {
+        &self.v16[..self.len * self.n_state]
     }
 
     /// Number of tokens currently cached.
@@ -2107,14 +2140,13 @@ impl KvCache {
         }
         let off = self.len * self.n_state;
         let span = t * self.n_state;
-        if kv_f16_sim_enabled() {
-            // Round through f16 precision (still stored f32) to test whether an
-            // f16 KV cache is transcript-neutral before the storage rewrite.
-            for (dst, &src) in self.k[off..off + span].iter_mut().zip(&k.data) {
-                *dst = Float16::from_f32(src).to_f32();
+        if self.f16 {
+            // f16 storage: convert on append (halves the per-step cache-read DRAM).
+            for (dst, &src) in self.k16[off..off + span].iter_mut().zip(&k.data) {
+                *dst = Float16::from_f32(src);
             }
-            for (dst, &src) in self.v[off..off + span].iter_mut().zip(&v.data) {
-                *dst = Float16::from_f32(src).to_f32();
+            for (dst, &src) in self.v16[off..off + span].iter_mut().zip(&v.data) {
+                *dst = Float16::from_f32(src);
             }
         } else {
             self.k[off..off + span].copy_from_slice(&k.data);
@@ -2124,24 +2156,30 @@ impl KvCache {
         Ok(())
     }
 
-    /// View of the cached keys as a `[len, n_state]` matrix.
+    /// View of the cached keys as a `[len, n_state]` matrix (dequantized from
+    /// f16 when the cache is f16).
     #[must_use]
     pub fn keys(&self) -> Mat {
-        Mat::from_vec(
-            self.len,
-            self.n_state,
-            self.k[..self.len * self.n_state].to_vec(),
-        )
+        let span = self.len * self.n_state;
+        let data = if self.f16 {
+            self.k16[..span].iter().map(|h| h.to_f32()).collect()
+        } else {
+            self.k[..span].to_vec()
+        };
+        Mat::from_vec(self.len, self.n_state, data)
     }
 
-    /// View of the cached values as a `[len, n_state]` matrix.
+    /// View of the cached values as a `[len, n_state]` matrix (dequantized from
+    /// f16 when the cache is f16).
     #[must_use]
     pub fn values(&self) -> Mat {
-        Mat::from_vec(
-            self.len,
-            self.n_state,
-            self.v[..self.len * self.n_state].to_vec(),
-        )
+        let span = self.len * self.n_state;
+        let data = if self.f16 {
+            self.v16[..span].iter().map(|h| h.to_f32()).collect()
+        } else {
+            self.v[..span].to_vec()
+        };
+        Mat::from_vec(self.len, self.n_state, data)
     }
 
     /// Borrow the populated key prefix as a contiguous `[len, n_state]`
@@ -2478,6 +2516,30 @@ pub fn attention_with_cache(
     // f32 result is BIT-IDENTICAL — verified byte-exact. Decode at `tq==1` attends
     // to the whole cache (`limit == tk-1`), so the causal mask is a no-op and is
     // skipped. Prefill (`tq > 1`) keeps `attention_raw`.
+    if cache.is_f16() {
+        // f16 storage: read the half-width cache DIRECTLY in the hot path
+        // (`.to_f32()` per element is lossless), halving the per-step cache-read
+        // DRAM. f16→f32 is exact, so `k16.to_f32()` equals the value the
+        // `FW_KV_F16_SIM` probe fed the f32 kernel (round-through-f16) — hence
+        // the transcript matches the proven-neutral SIM result bit-for-bit.
+        if q.rows == 1 && fast_self_attn_enabled() {
+            return attention_decode_step_f16(
+                q,
+                cache.key_slice_f16(),
+                cache.value_slice_f16(),
+                tk,
+                n_head,
+            );
+        }
+        // Prefill (rare `tq > 1`): dequant the f16 prefix to f32 scratch once,
+        // then the standard raw path. This is the multi-token prefill, not the
+        // per-step hot path, so the one-time dequant is amortized (and we do NOT
+        // dequant-to-scratch per step — that would revive the memmove the
+        // alloc-light rewrite killed).
+        let k_f32: Vec<f32> = cache.key_slice_f16().iter().map(|h| h.to_f32()).collect();
+        let v_f32: Vec<f32> = cache.value_slice_f16().iter().map(|h| h.to_f32()).collect();
+        return attention_raw(q, &k_f32, &v_f32, tk, n_head, Some(past_len));
+    }
     if q.rows == 1 && fast_self_attn_enabled() {
         return attention_decode_step(q, cache.key_slice(), cache.value_slice(), tk, n_head);
     }
@@ -2549,6 +2611,72 @@ fn attention_decode_step(
             let orow = &mut out[base..base + d_head];
             for (o, &vd) in orow.iter_mut().zip(vrow) {
                 *o += sj * vd;
+            }
+        }
+    }
+    Ok(Mat::from_vec(1, n_state, out))
+}
+
+/// f16-storage variant of [`attention_decode_step`]: reads the KV cache f16
+/// slices directly, `.to_f32()`-ing each element inside the two dot loops.
+/// f16→f32 is lossless, so every f32 arithmetic value is IDENTICAL to
+/// [`attention_decode_step`] fed the same keys/values rounded through f16 — i.e.
+/// exactly the `FW_KV_F16_SIM` probe path, which is proven transcript-neutral.
+/// The win is bandwidth: the cache read is half-width (f16), and it is read
+/// straight out of storage (no dequant-to-f32-scratch memmove per step).
+fn attention_decode_step_f16(
+    q: &Mat,
+    k: &[Float16],
+    v: &[Float16],
+    tk: usize,
+    n_head: usize,
+) -> FwResult<Mat> {
+    let n_state = q.cols;
+    if n_head == 0 || !n_state.is_multiple_of(n_head) {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: n_head {n_head} must divide n_state {n_state}"
+        )));
+    }
+    if k.len() != tk * n_state || v.len() != tk * n_state {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: k/v slice len {}/{} != tk*n_state {}",
+            k.len(),
+            v.len(),
+            tk * n_state
+        )));
+    }
+    let d_head = n_state / n_head;
+    if d_head == 0 {
+        return Err(FwError::InvalidRequest("attention: d_head == 0".into()));
+    }
+    let scale = (d_head as f32).powf(-0.25);
+    let q0 = q.row(0);
+    let mut out = vec![0.0f32; n_state];
+    let mut qh = vec![0.0f32; d_head];
+    let mut scores = vec![0.0f32; tk];
+    for h in 0..n_head {
+        let base = h * d_head;
+        for (d, slot) in qh.iter_mut().enumerate() {
+            *slot = q0[base + d] * scale;
+        }
+        // Same per-term product and summation order as `attention_decode_step`,
+        // reading k as f16 (lossless `.to_f32()`).
+        for (j, sj) in scores.iter_mut().enumerate() {
+            let krow = &k[j * n_state + base..j * n_state + base + d_head];
+            let mut acc = 0.0f32;
+            for (d, &qd) in qh.iter().enumerate() {
+                acc += qd * (krow[d].to_f32() * scale);
+            }
+            *sj = acc;
+        }
+        let mut sm = Mat::from_vec(1, tk, std::mem::take(&mut scores));
+        softmax_rows(&mut sm);
+        scores = sm.data;
+        for (j, &sj) in scores.iter().enumerate() {
+            let vrow = &v[j * n_state + base..j * n_state + base + d_head];
+            let orow = &mut out[base..base + d_head];
+            for (o, &vd) in orow.iter_mut().zip(vrow) {
+                *o += sj * vd.to_f32();
             }
         }
     }
