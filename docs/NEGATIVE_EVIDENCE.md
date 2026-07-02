@@ -3,6 +3,12 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **LANDED WIN — fused encoder layer_norm (no clone memcpy) = ~1.9% encoder, BYTE-EXACT.** Each encoder layer did `x.clone()` + in-place `layer_norm` twice; the clone is a redundant full-buffer memcpy (x is preserved for the residual regardless). New `layer_norm_into` writes normalized rows straight into an uninitialized buffer, fusing away ~985 MB/window of memcpy.
+
+**Land-or-dig result: LANDED real code — distinct from the previously-rejected encoder alloc-reuse.** AGENT_NAME=BlackThrush. The old rejection tested *malloc tuning* (alloc reuse) and was noise-dominated — which is the tell that the ~63ms "isolated alloc cost" is data-movement (the clone's memcpy), NOT allocation. This lever removes the *copy*, which malloc tuning couldn't.
+
+**MEASURED (`encoder_scale_probe`, turbo, 32 threads, best-of-8, 3 interleaved rounds, same binary via `FW_ENCODER_FUSED_LN` gate):** fused **2866.7 / 2899.2 / 2867.3 ms/win** vs clone **2939.6 / 2914.2 / 2941.9** — fused < clone EVERY round, ~54 ms/window (~1.9% encoder, best-of 2.5%). Encoder is ~76% of e2e ⇒ ~1.4% e2e. **BYTE-EXACT: turbo transcript byte-IDENTICAL fused vs clone** (`e2e_probe` PROBE_DUMP_TEXT diff, jfk×3); `norm_rows_into` is the identical f64 SoA math (same order, same band split) as `norm_rows`, just src→dst. Default-ON, kill switch `FW_ENCODER_FUSED_LN=0`. Small but real, and it stacks on the 16→32 cap win.
+
 ## 2026-07-02 - BlackThrush: the SMT-thrash mechanism is UNPROVEN (confined A/B inconclusive) → the `get_physical()` cap generalization is CLOSED. Walks back the prior "48/64 regress = SMT oversubscription" to "32 is the empirical optimum; the regression above it is multi-causal and not isolable on this contended box."
 
 **Land-or-dig result: tried to PROVE the SMT mechanism (to justify a `get_physical()` cap) — inconclusive; closed the avenue.** AGENT_NAME=BlackThrush. Byte-exact (measurement only).

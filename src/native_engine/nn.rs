@@ -1524,6 +1524,100 @@ fn norm_rows(block: &mut [f32], cols: usize, w: &[f32], b: &[f32], eps: f64) {
     }
 }
 
+/// Out-of-place [`layer_norm`]: read `src` `[rows, cols]`, write normalized rows
+/// into `dst` (`len == rows*cols`). Byte-identical to `x.clone()` +
+/// `layer_norm(&mut x)` (same per-row f64 SoA math, same contiguous band split),
+/// but skips the intermediate clone's full-buffer memcpy — the encoder does two
+/// `x.clone()`s per layer purely to preserve `x` for the residual, and that copy
+/// is a redundant pass this fuses into the normalize (~985 MB/window of memcpy
+/// removed on turbo). `dst` may be uninitialized (every element is written).
+pub fn layer_norm_into(src: &Mat, dst: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
+    let cols = src.cols;
+    debug_assert_eq!(dst.len(), src.rows * cols, "layer_norm_into: dst len mismatch");
+    if cols == 0 || w.len() != cols || b.len() != cols {
+        // Degenerate no-op mirrors in-place `layer_norm` (which leaves x
+        // untouched) ⇒ dst must equal src, since the clone would have copied it.
+        dst.copy_from_slice(&src.data);
+        return;
+    }
+    let eps = f64::from(eps);
+    const PAR_THRESHOLD: usize = 1 << 16;
+    let rows = src.rows;
+    if rows * cols < PAR_THRESHOLD || worker_count() < 2 {
+        norm_rows_into(&src.data, dst, cols, w, b, eps);
+        return;
+    }
+    let band_rows = rows.div_ceil(worker_count()).max(1);
+    // Same contiguous band split as `layer_norm` (byte-identical), reading the
+    // matching `src` band and writing the `dst` band.
+    dst.par_chunks_mut(band_rows * cols)
+        .zip(src.data.par_chunks(band_rows * cols))
+        .for_each(|(dband, sband)| norm_rows_into(sband, dband, cols, w, b, eps));
+}
+
+/// Out-of-place `norm_rows`: identical f64 SoA math, reading `src` and writing
+/// `dst` (both `[nrows, cols]`) instead of mutating in place.
+fn norm_rows_into(src: &[f32], dst: &mut [f32], cols: usize, w: &[f32], b: &[f32], eps: f64) {
+    const L: usize = 8;
+    type V = Simd<f64, L>;
+    let n = cols as f64;
+    let nrows = src.len() / cols;
+    let nfull = nrows - nrows % L;
+
+    let mut soa = vec![V::splat(0.0); cols]; // reused per 8-row group
+    let mut g = 0;
+    while g < nfull {
+        for (j, s) in soa.iter_mut().enumerate() {
+            let mut a = [0.0f64; L];
+            for (lane, al) in a.iter_mut().enumerate() {
+                *al = f64::from(src[(g + lane) * cols + j]);
+            }
+            *s = V::from_array(a);
+        }
+        let mut sum = V::splat(0.0);
+        for s in &soa {
+            sum += *s;
+        }
+        let mean = sum / V::splat(n);
+        let mut var = V::splat(0.0);
+        for s in &soa {
+            let d = *s - mean;
+            var += d * d;
+        }
+        var /= V::splat(n);
+        let inv = V::splat(1.0) / (var + V::splat(eps)).sqrt();
+        for (j, s) in soa.iter().enumerate() {
+            let normed = (*s - mean) * inv * V::splat(f64::from(w[j])) + V::splat(f64::from(b[j]));
+            let arr = normed.to_array();
+            for (lane, &val) in arr.iter().enumerate() {
+                dst[(g + lane) * cols + j] = val as f32;
+            }
+        }
+        g += L;
+    }
+
+    for r in nfull..nrows {
+        let srow = &src[r * cols..(r + 1) * cols];
+        let drow = &mut dst[r * cols..(r + 1) * cols];
+        let mut sum = 0.0f64;
+        for &v in srow.iter() {
+            sum += f64::from(v);
+        }
+        let mean = sum / n;
+        let mut var = 0.0f64;
+        for &v in srow.iter() {
+            let d = f64::from(v) - mean;
+            var += d * d;
+        }
+        var /= n;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for ((d, &s), (&wi, &bi)) in drow.iter_mut().zip(srow.iter()).zip(w.iter().zip(b.iter())) {
+            let normed = (f64::from(s) - mean) * inv_std;
+            *d = (normed * f64::from(wi) + f64::from(bi)) as f32;
+        }
+    }
+}
+
 /// whisper.cpp coefficient `sqrt(2/pi)` (`SQRT_2_OVER_PI` in ggml `vec.h`).
 const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6;
 /// whisper.cpp `GELU_COEF_A`.
