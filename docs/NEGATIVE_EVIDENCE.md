@@ -3,6 +3,37 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-04 - BlackThrush: WIN LANDED (default-ON, BIT-IDENTICAL) — allocation-light decode self-attention (`tq==1`): drop the per-head `kh`/`kh_t`/`vh` gather+transpose+alloc, read K/V straight from the cache with a per-key dot. **1.54× on the self_attn span** (~4% e2e decode). Zero conformance risk.
+
+**Land-or-dig result: the first STRUCTURAL (non-int8) decode win — self-attention was overhead-bound, not
+bandwidth-bound.** AGENT_NAME=BlackThrush. Real code: `attention_decode_step` + `fast_self_attn_enabled` gate
+(nn.rs); `attention_with_cache` routes `tq==1` to it. Prefill (`tq>1`) keeps `attention_raw`; the encoder is
+untouched (it never uses `KvCache`).
+
+**The diagnosis that redirected the dig.** After the int8 bandwidth sweep, `self_attn` (~1.24 ms/token) was the
+2nd-largest span. First hypothesis: f16/int8 the self-KV cache (it is f32). Rejected by arithmetic BEFORE coding:
+at the cross-KV measured rate (~0.02 ms saved per MB halved), the self-KV read for a short window (tk~100 →
+~4 MB/token) would save only ~0.04 ms — negligible. So self_attn is NOT bandwidth-bound. Its cost is OVERHEAD:
+`attention_raw` allocates ~6 buffers per head per token (`qh`, `kh`, `kh_t`, `scores`, `vh`, out) and does a
+scalar per-head gather of K AND an explicit `kh_t` transpose — 480 heap allocs/token (20 heads × 4 layers × 6)
+plus O(tk·d_head) transpose writes, for matmuls that are already GEMV-fast (the m=1 SAXPY path).
+
+**The rewrite (bit-identical, not merely tolerant).** For `tq==1` the m=1 SAXPY `scores[j] += qh[d]·kh_t[d,j]`
+sums over `d` in the SAME order as a direct `dot(qh, k_row_j)`, so computing scores straight from the cache
+(`acc += qh[d] * (k[j,base+d] * scale)`) is the identical float expression term-for-term — no rounding change.
+Likewise the output `out[base+d] += scores[j] · v[j,base+d]` matches the m=1 SAXPY over `j`. The causal mask is a
+no-op at `tq==1` (query attends to the whole cache), so it is skipped. Net: no `kh`/`kh_t`/`vh` buffers, no
+transpose, 2 reused scratch buffers (`qh`, `scores`) instead of ~6 allocs/head.
+
+**Conformance.** `native_ab` transcript BYTE-IDENTICAL to the `attention_raw` path on both tiny.en and
+large-v3-turbo (as designed — bit-identical). Real-CLI e2e `tests/native_engine_e2e.rs` = **6 passed, 0 failed**, and the nn unit suite (28 tests, incl.
+`kv_cache_incremental_equals_full_recompute` and the attention reference checks) is green with the fast path on.
+
+**Ratio.** `decoder_attrib large-v3-turbo 200`, min-of-7 (load ~25): self_attn span 1.3283 → 0.8612 ms/token =
+**1.54×** (Δ 0.467; ON cluster very tight 0.86–0.91 vs OFF 1.33–1.47). per-step min 10.626 → 10.248 (~3.6%). Of
+~11 ms/token → **~4% off e2e decode**. Biggest single-span win of the session AND the only one with zero numeric
+change. Confirms the overhead diagnosis: eliminating alloc+transpose (not bytes) is what moved it.
+
 ## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 the **cross-attention K/V cache** (encoder keys+values, the biggest per-token-resident ACTIVATION, not a weight): byte-exact vs f16 on BOTH models. **1.31× on the cross_attn span** (~2.7% e2e decode).
 
 **Land-or-dig result: extended the int8 bandwidth lever from weights to the largest per-token-resident

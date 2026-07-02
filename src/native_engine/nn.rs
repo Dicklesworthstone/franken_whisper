@@ -1851,6 +1851,13 @@ fn attention_raw(
 ///
 /// # Errors
 /// Propagates [`KvCache::append`] and [`attention`] errors.
+/// Escape hatch `FW_FAST_SELF_ATTN=0` restores the `attention_raw` decode path.
+fn fast_self_attn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_FAST_SELF_ATTN").as_deref() != Ok("0"))
+}
+
 pub fn attention_with_cache(
     q: &Mat,
     k_new: &Mat,
@@ -1866,6 +1873,17 @@ pub fn attention_with_cache(
     // path reads the identical bytes in the identical order, so the result is
     // bit-identical to the `Mat`-based attention.
     let tk = cache.len();
+    // Per-token (`tq == 1`) fast path: read K/V straight out of the cache with a
+    // per-key dot / per-key SAXPY, so no `kh`/`kh_t`/`vh` gather+transpose+alloc
+    // per head (`attention_raw` allocates ~6 buffers/head/token and transposes K).
+    // The summation order is identical to `attention_raw`'s m=1 SAXPY (sum over
+    // `d_head` ascending for scores, over `tk` ascending for the output), so the
+    // f32 result is BIT-IDENTICAL — verified byte-exact. Decode at `tq==1` attends
+    // to the whole cache (`limit == tk-1`), so the causal mask is a no-op and is
+    // skipped. Prefill (`tq > 1`) keeps `attention_raw`.
+    if q.rows == 1 && fast_self_attn_enabled() {
+        return attention_decode_step(q, cache.key_slice(), cache.value_slice(), tk, n_head);
+    }
     attention_raw(
         q,
         cache.key_slice(),
@@ -1874,6 +1892,70 @@ pub fn attention_with_cache(
         n_head,
         Some(past_len),
     )
+}
+
+/// Allocation-light single-token (`tq == 1`) causal self-attention over a cache
+/// prefix. Bit-identical to [`attention_raw`] with `causal_offset == Some(tk-1)`.
+fn attention_decode_step(
+    q: &Mat,
+    k: &[f32],
+    v: &[f32],
+    tk: usize,
+    n_head: usize,
+) -> FwResult<Mat> {
+    let n_state = q.cols;
+    if n_head == 0 || !n_state.is_multiple_of(n_head) {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: n_head {n_head} must divide n_state {n_state}"
+        )));
+    }
+    if k.len() != tk * n_state || v.len() != tk * n_state {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: k/v slice len {}/{} != tk*n_state {}",
+            k.len(),
+            v.len(),
+            tk * n_state
+        )));
+    }
+    let d_head = n_state / n_head;
+    if d_head == 0 {
+        return Err(FwError::InvalidRequest("attention: d_head == 0".into()));
+    }
+    let scale = (d_head as f32).powf(-0.25);
+    let q0 = q.row(0);
+    let mut out = vec![0.0f32; n_state];
+    let mut qh = vec![0.0f32; d_head];
+    let mut scores = vec![0.0f32; tk];
+    for h in 0..n_head {
+        let base = h * d_head;
+        // Scaled query head (`qh[d] = q[d] * scale`), matching `attention_raw`.
+        for (d, slot) in qh.iter_mut().enumerate() {
+            *slot = q0[base + d] * scale;
+        }
+        // scores[j] = sum_d qh[d] * (k[j,base+d] * scale). Same per-term product
+        // and same summation order (d ascending) as the m=1 SAXPY over `kh_t`.
+        for (j, sj) in scores.iter_mut().enumerate() {
+            let krow = &k[j * n_state + base..j * n_state + base + d_head];
+            let mut acc = 0.0f32;
+            for (d, &qd) in qh.iter().enumerate() {
+                acc += qd * (krow[d] * scale);
+            }
+            *sj = acc;
+        }
+        // No causal mask: at tq==1 the query attends to every cached key.
+        let mut sm = Mat::from_vec(1, tk, std::mem::take(&mut scores));
+        softmax_rows(&mut sm);
+        scores = sm.data;
+        // out[base+d] += sum_j scores[j] * v[j,base+d] (j ascending == m=1 SAXPY).
+        for (j, &sj) in scores.iter().enumerate() {
+            let vrow = &v[j * n_state + base..j * n_state + base + d_head];
+            let orow = &mut out[base..base + d_head];
+            for (o, &vd) in orow.iter_mut().zip(vrow) {
+                *o += sj * vd;
+            }
+        }
+    }
+    Ok(Mat::from_vec(1, n_state, out))
 }
 
 /// Cache-blocked, multi-threaded out-of-place transpose: `data` viewed as
