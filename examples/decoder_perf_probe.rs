@@ -21,11 +21,14 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
 
-    let path =
-        find_model_file("tiny.en").expect("set FRANKEN_WHISPER_MODEL_DIR to the ggml models dir");
+    // Model selectable via FW_PROBE_MODEL (default tiny.en); use large-v3-turbo
+    // for the real 32-layer/n_state=1280 decode function mix.
+    let model_name = std::env::var("FW_PROBE_MODEL").unwrap_or_else(|_| "tiny.en".to_string());
+    let path = find_model_file(&model_name)
+        .expect("set FRANKEN_WHISPER_MODEL_DIR to the ggml models dir");
     let model = GgmlModel::load(&path)
         .and_then(LoadedModel::from_ggml)
-        .expect("load tiny.en");
+        .expect("load model");
 
     // Synthetic 30 s audio → mel window → encoder output. The per-token decode
     // cost is determined by the model shapes, not the audio content, so synthetic
@@ -48,8 +51,16 @@ fn main() {
     let seq: Vec<i32> = (0..8).map(|i| if i == 0 { sot } else { 1 + i }).collect();
     let mut st = DecoderState::new(w, &enc_out).expect("decoder state");
 
+    // Warm.
+    for _ in 0..3 {
+        st.reset();
+        for &tok in &seq {
+            std::hint::black_box(decoder::forward_step(w, &mut st, &[tok], &noop).expect("step").len());
+        }
+    }
     // TIMED region: pure per-token decode (reset retains cross-K/V, regrows cache 0->8).
     let mut acc = 0usize;
+    let t = std::time::Instant::now();
     for _ in 0..iters {
         st.reset();
         for &tok in &seq {
@@ -57,9 +68,14 @@ fn main() {
             acc = acc.wrapping_add(logits.len());
         }
     }
+    let dt = t.elapsed().as_secs_f64();
     std::hint::black_box(acc);
-    eprintln!(
-        "decoder_perf_probe: iters={iters} steps={} acc={acc}",
-        iters * seq.len()
+    let steps = iters * seq.len();
+    println!(
+        "decoder_perf_probe[{}]: {steps} steps in {:.0} ms = {:.3} ms/step  (wide_gemv_cap={})",
+        model_name,
+        dt * 1e3,
+        dt * 1e3 / steps as f64,
+        std::env::var("FW_WIDE_GEMV_CAP").unwrap_or_else(|_| "default".into())
     );
 }
