@@ -3,6 +3,31 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-06 - BlackThrush: WIN LANDED (GATED) — mixed int8-weight × f32-activation GEMV for `mlp_2`/fc2: **1.25× on the mlp span** (~7% e2e decode), byte-exact on tiny.en. Gated (default OFF) because per-row int8 WEIGHT still breaks turbo — flip-default needs block-wise (Q8_0) weight quant.
+
+**Land-or-dig result: broke the "fc2 must stay f16" floor partway — real bandwidth win landed gated, with the exact
+blocker to default-on identified.** AGENT_NAME=BlackThrush. Real code: `gemv_i8w_f32a` + `dot_i8w_f32` kernel
+(nn.rs, AVX2 `vpmovsxbd`→`cvtdq2ps`→`fmadd`, scalar fallback), `Linear::i8_f32act` + `quantize_i8w_f32a_if`,
+`int8_mlp_fc2_enabled` gate (mod.rs), `mlp_2` load wired to it.
+
+**The idea.** fc2 (MLP down-proj) was kept f16 because full int8 (`gemv_i8`) broke turbo (6c4b53d). fc2's WEIGHT
+is the bandwidth-bound operand (13 MB f16 → 6.5 MB int8/token); the activation is tiny (5120 f32). Hypothesis: the
+turbo break came from `gemv_i8` also quantizing the ACTIVATION (per-vector scale crushing GELU-hidden outliers), so
+a MIXED int8-weight × f32-activation GEMV would keep the bandwidth win while dropping that error.
+
+**Result — win real, hypothesis half-right.** `decoder_attrib` turbo 200, INTERLEAVED, min-of-8: mlp span
+f16-fc2 3.3369 → mixed-i8-fc2 2.6655 ms/token = **1.25×** (Δ 0.67; every paired rep faster) → ~7% e2e decode. The
+mixed kernel IS the bandwidth win. BUT conformance: `native_ab` mixed-fc2 vs f16 — **tiny.en BYTE-IDENTICAL,
+large-v3-turbo DIFFERS** (" a." → " a. a.", the same trailing artifact as full int8). So the turbo break is NOT
+activation-dominated as hypothesized — the per-row int8 WEIGHT rounding alone is too coarse for the residual-feeding
+fc2. Landed GATED (default off, `FRANKEN_WHISPER_INT8_MLP_FC2=1`); default path is bit-identical f16 (e2e 6/6).
+
+**Flip-default path (the real next lever, well-motivated now).** Per-row int8 weight is too coarse; whisper.cpp's
+Q8_0 uses BLOCK-WISE scales (one f16 scale per 32 weights). Block-wise weight quant for fc2 (per-block dequant in
+the dot) would give the same ~7% bandwidth win at much finer precision → likely byte-exact on turbo → default-on.
+That's the scoped follow-up: a `quantize_f16_to_i8_blocked` + a block-dequant variant of `dot_i8w_f32`. The mixed
+per-row kernel landed here is the integration scaffold (gate, field, forward branch) that block-wise slots into.
+
 ## 2026-07-05 - BlackThrush: REJECTED (reverted) — serializing decode `cross_attention` (re-test of bd-6qih AFTER the int8 cross-KV win). Parallel is still 2× faster; the per-head 1500-wide work genuinely needs the spawn. **Decode kernel is now at its floor.**
 
 **Land-or-dig result: re-examined a pre-int8 finding under new conditions, confirmed it, and consolidated that the

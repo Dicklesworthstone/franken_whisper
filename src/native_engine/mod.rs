@@ -335,6 +335,25 @@ pub(crate) fn int8_attn_enabled() -> bool {
     })
 }
 
+/// Whether to run `mlp_2` (fc2, the MLP down-projection) through the MIXED
+/// int8-weight × f32-activation GEMV ([`nn::gemv_i8w_f32a`]) on the per-token
+/// decode path. fc2's weight is the bandwidth-bound operand (13 MB f16 → 6.5 MB
+/// int8 per token), so quantizing ONLY the weight captures that win; the
+/// activation stays f32, avoiding the per-vector quant error on the GELU-hidden
+/// outliers that broke full-int8 `mlp_2` (turbo trailing artifact, 6c4b53d). OFF
+/// by default until the golden gate clears with it on. `FRANKEN_WHISPER_INT8_MLP_FC2=1`.
+pub(crate) fn int8_mlp_fc2_enabled() -> bool {
+    const DEFAULT_ON: bool = false;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_MLP_FC2") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Whether to int8-quantize the attention **output** projections (`self_out`,
 /// `cross_out`) on the per-token decode path. These write DIRECTLY into the
 /// residual stream — the `mlp_2` failure mode — so they were expected to break

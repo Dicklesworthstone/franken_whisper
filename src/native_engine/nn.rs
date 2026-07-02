@@ -930,6 +930,133 @@ pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]
         .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
 }
 
+/// Dot of an int8 weight row against an **f32** activation (no activation
+/// quantization): `Σ_i (w[i] as f32) · x[i]`. Scalar fallback.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
+    let n = w.len().min(x.len());
+    let mut acc = 0.0f32;
+    for i in 0..n {
+        acc += (w[i] as f32) * x[i];
+    }
+    acc
+}
+
+/// AVX2 int8-weight × f32-activation dot: sign-extend 8 int8 → i32
+/// (`vpmovsxbd`) → f32 (`vcvtdq2ps`) → `vfmadd` against the f32 activation. Four
+/// accumulators reduced in the same `((0+1)+(2+3))+((4+5)+(6+7))` order as
+/// [`dot_f16c`], so it is the f16-dot with the weight source swapped from f16 to
+/// int8 — the win is bandwidth (int8 weight = half the f16 bytes), the activation
+/// stays full precision (unlike `gemv_i8`, which also quantizes `x`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = w.len().min(x.len());
+    let xp = x.as_ptr();
+    // SAFETY: every load is bounded by the `i+32`/`i+8`/`i<n` guards over
+    // n = min(w.len, x.len); avx2+fma are guaranteed by this fn's target_feature cfg.
+    unsafe {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            // Each 64-bit load holds 8 int8; cvtepi8_epi32 widens to 8 i32.
+            let w0 = _mm_loadl_epi64(w.as_ptr().add(i).cast());
+            let w1 = _mm_loadl_epi64(w.as_ptr().add(i + 8).cast());
+            let w2 = _mm_loadl_epi64(w.as_ptr().add(i + 16).cast());
+            let w3 = _mm_loadl_epi64(w.as_ptr().add(i + 24).cast());
+            a0 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w0)),
+                _mm256_loadu_ps(xp.add(i)),
+                a0,
+            );
+            a1 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w1)),
+                _mm256_loadu_ps(xp.add(i + 8)),
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w2)),
+                _mm256_loadu_ps(xp.add(i + 16)),
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w3)),
+                _mm256_loadu_ps(xp.add(i + 24)),
+                a3,
+            );
+            i += 32;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        while i + 8 <= n {
+            let p = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(w.as_ptr().add(i).cast()))),
+                _mm256_loadu_ps(xp.add(i)),
+            );
+            let mut t = [0.0f32; 8];
+            _mm256_storeu_ps(t.as_mut_ptr(), p);
+            s += ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+            i += 8;
+        }
+        while i < n {
+            s += (w[i] as f32) * x[i];
+            i += 1;
+        }
+        s
+    }
+}
+
+/// Mixed GEMV: int8 weight (per-row dequant scale) × **f32** activation.
+/// `out[o] = (Σ_i w_i8[o,i]·x[i]) · scale[o] + bias[o]`. Same output as
+/// [`gemv_i8`] but WITHOUT quantizing the activation — so it keeps `gemv_i8`'s
+/// halved weight-bandwidth win while dropping the per-vector activation-quant
+/// error. Intended for `mlp_2`/fc2, whose GELU-hidden input has outliers that the
+/// per-vector `x` scale crushes (the mlp_2 full-int8 turbo break); the weight is
+/// the bandwidth-bound operand (13 MB f16 → 6.5 MB int8 per token) so this is
+/// where the win lives. Parallelization mirrors [`gemv_i8`].
+pub fn gemv_i8w_f32a(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
+    let (out, inp) = (w.out, w.inp);
+    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8w_f32a weight shape mismatch");
+    debug_assert_eq!(x.len(), inp, "gemv_i8w_f32a x length mismatch");
+    debug_assert_eq!(out_slice.len(), out, "gemv_i8w_f32a out length mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8w_f32a bias length mismatch");
+    let fill = |o_base: usize, slice: &mut [f32]| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            let o = o_base + i;
+            let acc = dot_i8w_f32(&w.data[o * inp..(o + 1) * inp], x) * w.scales[o];
+            *slot = acc + bias.map_or(0.0, |b| b[o]);
+        }
+    };
+    let par_threshold = {
+        use std::sync::OnceLock;
+        static T: OnceLock<usize> = OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("FW_GEMV_I8_PAR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 21)
+        })
+    };
+    let workers = gemv_worker_count(out);
+    if out * inp < par_threshold || workers < 2 {
+        fill(0, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
+}
+
 /// Batched fused dequant + GEMV: `out[t, o] = bias[o] + dot(W[o, :], x[t, :])`
 /// for `tq` activation rows `x` (`[tq, in]` row-major) against a natural
 /// `[out, in]` f16 weight, producing `[tq, out]` row-major.

@@ -182,6 +182,13 @@ struct Linear {
     /// unchanged (bit-identical). Only the MLP up-projection (`mlp_0`) carries it;
     /// `mlp_2` stays f16 to keep the residual stream exact (see `int8_mlp_enabled`).
     w_i8: Option<nn::I8Mat>,
+    /// When true, the `w_i8` decode path uses the MIXED [`nn::gemv_i8w_f32a`]
+    /// (int8 weight × f32 activation, no activation quant) instead of the full-int8
+    /// [`nn::gemv_i8`]. Set for `mlp_2` (fc2): its GELU-hidden input has outliers
+    /// that the per-vector `x` scale would crush (the full-int8 turbo break), but
+    /// the WEIGHT is the bandwidth-bound operand, so quantizing only it captures the
+    /// win. See [`super::int8_mlp_fc2_enabled`].
+    i8_f32act: bool,
 }
 
 impl Linear {
@@ -204,6 +211,18 @@ impl Linear {
         self
     }
 
+    /// Attach an int8 weight copy used via the MIXED int8-weight × f32-activation
+    /// GEMV (`i8_f32act`), iff `enabled`. For `mlp_2`/fc2 (see `int8_mlp_fc2_enabled`).
+    fn quantize_i8w_f32a_if(mut self, enabled: bool) -> Self {
+        if enabled {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                self.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
+                self.i8_f32act = true;
+            }
+        }
+        self
+    }
+
     /// Apply `y = x @ W^T + b` over `x` (`[tq, in]`), returning `[tq, out]`.
     fn forward(&self, x: &Mat) -> FwResult<Mat> {
         // Per-token decode (tq==1) with an int8 copy present: the memory-halved int8
@@ -218,7 +237,11 @@ impl Linear {
                     )));
                 }
                 let mut y = nn::gemv_out_buf(w_i8.out);
-                nn::gemv_i8(w_i8, &x.data, self.bias.as_deref(), &mut y);
+                if self.i8_f32act {
+                    nn::gemv_i8w_f32a(w_i8, &x.data, self.bias.as_deref(), &mut y);
+                } else {
+                    nn::gemv_i8(w_i8, &x.data, self.bias.as_deref(), &mut y);
+                }
                 return Ok(Mat::from_vec(1, w_i8.out, y));
             }
         }
@@ -403,7 +426,7 @@ fn load_linear(
         Some(name) => Some(load_vec(model, name, out_dim)?),
         None => None,
     };
-    Ok(Linear { w, bias, w_i8: None })
+    Ok(Linear { w, bias, w_i8: None, i8_f32act: false })
 }
 
 /// Load the token embedding `[n_vocab, n_state]` in its NATURAL orientation
@@ -577,18 +600,21 @@ impl DecoderWeights {
                     n_state,
                 )?
                 .quantized(),
-                // mlp_2 (down-proj) writes DIRECTLY into the residual stream, so
-                // its per-token int8 rounding accumulates across layers/tokens and
-                // was the source of the turbo trailing-artifact under the both-quant
-                // variant (6c4b53d). Keep it f16; quantize only mlp_0 (up-proj),
-                // whose error is absorbed by the GELU saturation before the residual.
+                // mlp_2 (down-proj) writes DIRECTLY into the residual stream. Full
+                // int8 (weight+activation) broke turbo (6c4b53d) — the per-vector
+                // activation scale crushed the GELU-hidden outliers. The MIXED
+                // int8-weight × f32-activation path (`quantize_i8w_f32a_if`) keeps
+                // the activation full-precision while still halving the (bandwidth-
+                // bound) weight read; gated on `int8_mlp_fc2_enabled` (default off
+                // until the golden gate clears). Off ⇒ f16, bit-identical.
                 mlp_2: load_linear(
                     model,
                     &format!("{p}.mlp.2.weight"),
                     Some(&format!("{p}.mlp.2.bias")),
                     n_state,
                     mlp_hidden,
-                )?,
+                )?
+                .quantize_i8w_f32a_if(super::int8_mlp_fc2_enabled()),
             };
             layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v)
                 .map(|l| l.quantize_if(super::int8_attn_enabled()));
@@ -1502,6 +1528,7 @@ fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
         w: WeightMat::F16 { data, out, inp },
         bias: Some(bias),
         w_i8: None,
+        i8_f32act: false,
     })
 }
 
@@ -1610,6 +1637,7 @@ mod tests {
                 w: WeightMat::F32(rng.mat(inp, out)),
                 bias: if bias { Some(rng.vec(out)) } else { None },
                 w_i8: None,
+                i8_f32act: false,
             }
         };
         let ln = |rng: &mut Lcg| LayerNorm {
