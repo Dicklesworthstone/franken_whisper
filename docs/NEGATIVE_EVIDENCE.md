@@ -3,6 +3,21 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **AUTHORITATIVE turbo ENCODER sub-op breakdown (first in this session, on-box) + reusable profiler landed — encoder is 79% f32 sgemm (compute-bound at ft's ~47%-of-peak AVX2 microkernel ceiling, EXTERNAL) + 15.5% fused SDPA (optimized). No in-crate encoder lever. QKV-fusion re-confirmed DEAD by the pre-existing 9086a48 measurement (the check-code-first rule worked).**
+
+**Land-or-dig result: the meta-lesson ("ceiling claims were wrong when someone MEASURED; profile, don't assume") drove me to actually profile the TURBO encoder — no cycle in this session had (I'd leaned on cross-session tiny.en profiles).** AGENT_NAME=BlackThrush. Added a byte-exact, zero-cost-when-off encoder sub-op profiler (`FRANKEN_WHISPER_PERF_SPANS=1`, thread-local wall-time accumulation across all 32 layers, `et!` timing macro in `encoder_block`/`forward_time_major`) — the encoder was a black box (only the aggregate `encoder_window` span existed, unlike the decoder's `Sub::` breakdown). Transcript BYTE-IDENTICAL spans-off vs -on (233 B, verified). **AUTHORITATIVE breakdown (turbo jfk×6, window 1, 4852 ms, `FRANKEN_WHISPER_PERF_SPANS=1`):**
+
+| sub-op | % enc | shape / note |
+|---|---|---|
+| mlp_proj | 27.4% | sgemm `[1500,5120]×[5120,1280]` |
+| mlp_fc | 27.2% | sgemm `[1500,1280]×[1280,5120]` |
+| qkv_proj | 18.3% | **3× separate** sgemm `[1500,1280]×[1280,1280]` |
+| attn_sdpa | 15.5% | fused `ft_kernel_cpu::sdpa_forward_f32` (optimized) |
+| attn_out | 6.5% | sgemm `[1500,1280]×[1280,1280]` |
+| conv/gelu/LN/resid | ~5% | franken-side, small |
+
+**Findings:** (1) sgemm = **79%** of the encoder (mlp_proj+mlp_fc+qkv+attn_out), all running ~470–530 GFLOP/s = **~47% of the ~1000–1100 GFLOP/s achievable f32 peak** on this box — the ft `matrixmultiply` microkernel's shape ceiling on AVX2, confirmed EXTERNAL (gemm/faer swap already 1.37–3.13× SLOWER on these exact turbo shapes, [[project_engine_at_safe_ceiling]]). (2) `attn_sdpa` (15.5%) is the fused SDPA (2.35× win, already landed). (3) `qkv_proj` (18.3%) is the ONLY franken-orchestrated 3-call structure — but **fusing it is DEAD**, already MEASURED at 9086a48: raw fused GEMM only **1.021×** (packing is negligible; the GEMM is COMPUTE-bound, so wider N does NOT push toward peak — my in-cycle "wider-N amortizes the panel" hypothesis was REFUTED by that data), and **0.884× (a 12% LOSS)** after the required 23 MB de-interleave into contiguous Q/K/V. The check-code/ledger-before-digging rule stopped me from re-measuring it. **CONCLUSION: the turbo encoder is at its ceiling — 79% external-sgemm-compute-bound + 15.5% already-fused SDPA + ~5% small franken-side ops; no in-crate lever. The profiler is committed so future cycles get the breakdown for free (no re-instrumentation).**
+
 ## 2026-07-02 - BlackThrush: **CEILING RE-CONFIRMED — three plausible byte-exact levers dug and CLOSED by reasoning (no code): logits already 32-worker-tuned, encoder QKV-fusion is a wash, decode LN-clone fusion is sub-noise. The remaining >1% levers are ALL owner/hardware-gated. Recorded to stop future re-digs.**
 
 **Land-or-dig result: after the cross_attn scores-skip win, profiled for the NEXT byte-exact lever across the top decode spans + the 76%-of-e2e encoder; all three candidates fail on measurement-grounded reasoning.** AGENT_NAME=BlackThrush. No commit-worthy code; documenting the closed doors IS the deliverable (prevents the recurring re-dig pattern).
