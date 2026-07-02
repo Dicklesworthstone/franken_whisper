@@ -3,6 +3,19 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: **STATUS — byte-exact franken-owned search EXHAUSTED (every hot op audited); the remaining levers ALL need an owner decision. Decision menu with EVs below.**
+
+**Where we are.** Session landed 2 byte-exact wins on the DEFAULT path: encoder thread cap 16→32 (~1.2× ts / ~1.36× no_ts) + fused layer_norm-into-uninit (~1.9% encoder). Profile at the new default: encoder **76%** (at its multi-thread-scaling ceiling — kernel is 64-81% of single-core peak, 37% scaling at 32t, NOT DRAM-bound; measured), decode **20.6%**, cross_kv 2%, prefill 1.2%, mel 0.05%. Every hot op is examined at the CODE level and is byte-exact-optimal or owner-gated: encoder {GEMM=scaling-wall, layer_norm=fused-win, add=serial-optimal-warm, gelu=SIMD-ggml-table, SDPA=fused+parallel, threads=32=physical}; decode {logits+mlp+proj all int8 default-on, cross/self-attn head-parallel+int8-cached, gemv thresholds correct}. **No franken-owned byte-exact lever >0.3% e2e remains.**
+
+**Owner decision menu (all NON-byte-exact or product-scoped — need owner sign-off; rough EV on turbo timestamp e2e):**
+1. **int4 logits GEMV** — halves the 66 MB/token logits read → ~decode-logits 20% faster ≈ **~1-3% e2e**. RISK: HIGH — int4 error hits argmax DIRECTLY (no absorbing nonlinearity), likely changes transcript. Needs owner quality bar + a WER check.
+2. **MLP fc2 per-row int8** (vs current block-wise Q8_0) — the biggest single decode op (31.9% of decode); per-row is cheaper but **already MEASURED to break turbo transcript**. Needs owner to accept the quality delta (or a better-than-Q8_0 scheme).
+3. **Draft / speculative decoding** — product-scoped, non-byte-exact but *lossless* if verified against the target model; potential **~1.5-2× on decode** (the 20% slice) with a small draft model. Biggest upside, biggest scope. Owner/product call.
+4. **int8×int8 encoder GEMM** — needs AVX512-VNNI (absent on x86-64-v3); re-measure only on a VNNI box. Dead here.
+5. **Dedicated-box thread pinning / NUMA** — only helps off a contended shared host; not a portable default.
+
+**Recommendation (expected-loss):** the only *large* remaining upside is (3) draft decoding (decode is now the un-optimizable-further 20%); (1)/(2) are small + quality-risky. Everything franken can do byte-exactly on this AVX2/4-CCD hardware is DONE and on main. Further RTF gains require an owner quality/product decision — this is the blocker.
+
 ## 2026-07-02 - BlackThrush: MEASURED the encoder sgemm efficiency → the "BLAS could give ~1.5×" lever (surfaced last entry) is REFUTED. The ft_kernel_cpu kernel is EXCELLENTLY tuned (single-thread 64–72% of peak); the 30%-of-theoretical at 32 threads is a **multi-thread SCALING wall**, not a slow kernel — a faster library hits the same wall.
 
 **Land-or-dig result: substantiated the last owner-gated encoder lever with a clean measurement; it does not pan out — the kernel is not the bottleneck.** AGENT_NAME=BlackThrush. Model-free microbench (`encoder_int8_gemm_probe`, real turbo GEMM shapes), best-of-N (min-time iter = least-contended ⇒ contention-robust on this shared box, contra my prior "unmeasurable" claim).
