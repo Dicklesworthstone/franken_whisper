@@ -340,18 +340,23 @@ pub(crate) fn int8_attn_enabled() -> bool {
 /// ([`gemv_f16_batch`]). MEASURED 2.25× faster on the turbo cross shape
 /// (233.96 → 103.95 ms for the 8 GEMMs, `cross_f16path_probe`) — the same reason
 /// the ENCODER dequants-once to f32. NOT bit-exact (different accumulation order,
-/// max|Δ| ~6.9e-6), so this is gated and must be proven transcript-neutral
-/// against the golden corpus before defaulting on. `FRANKEN_WHISPER_CROSS_PROJ_F32`.
+/// max|Δ| ~6.9e-6), so it is gated and was proven transcript-neutral before
+/// defaulting on: jfk+tiny.en (the `ln.json` byte-exact gate asset) AND jfk×6
+/// large-v3-turbo both produce a BYTE-IDENTICAL transcript gate-ON vs gate-OFF
+/// (the 6.9e-6 divergence is fully absorbed). `=0` restores the f16 GEMV path.
 pub(crate) fn cross_proj_f32_enabled() -> bool {
-    const DEFAULT_ON: bool = false;
+    const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        ),
-        Err(_) => DEFAULT_ON,
-    })
+    *ON.get_or_init(
+        || match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                _ => DEFAULT_ON,
+            },
+            Err(_) => DEFAULT_ON,
+        },
+    )
 }
 
 /// PROBE (default off): int4 (block-wise, 4-bit weight × f32 activation) for
