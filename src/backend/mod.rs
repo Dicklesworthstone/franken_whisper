@@ -1498,9 +1498,18 @@ fn native_runtime_metadata(kind: BackendKind) -> BackendRuntimeMetadata {
 }
 
 fn native_execution_enabled() -> bool {
-    std::env::var(NATIVE_EXECUTION_ENV_VAR)
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    // The pure-Rust native engine is the DEFAULT execution path — it is the whole point of
+    // franken_whisper, and after the NaN-hardening it produces correct, deep-linked
+    // timestamps with zero panics. Combined with the `Primary` rollout stage this yields
+    // `NativePreferred` (native first, external bridge only as a fallback). Opt OUT with
+    // `FRANKEN_WHISPER_NATIVE_EXECUTION=0` (or `false`/`no`/`off`) to force the bridges.
+    match std::env::var(NATIVE_EXECUTION_ENV_VAR).ok() {
+        Some(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+        }
+        None => true,
+    }
 }
 
 fn bridge_native_recovery_from_raw(raw: Option<&str>) -> bool {
