@@ -545,22 +545,55 @@ pub fn forward_from_full_mel_window(
     forward_time_major(w, x, checkpoint)
 }
 
+// ── THROWAWAY encoder sub-op profiler (gated on FRANKEN_WHISPER_PERF_SPANS) ──
+// Accumulates wall-time per sub-op across all layers into a thread-local, emitted
+// once at the end of forward_time_major. Zero cost when perf spans are off.
+thread_local! {
+    static ENC_PROF: std::cell::RefCell<[u128; 12]> = const { std::cell::RefCell::new([0; 12]) };
+}
+const ENC_PROF_LABELS: [&str; 12] = [
+    "conv_stem", "pos_emb", "attn_ln", "qkv_proj", "attn_sdpa", "attn_out",
+    "attn_resid", "mlp_ln", "mlp_fc", "gelu", "mlp_proj", "mlp_resid",
+];
+fn enc_prof_add(i: usize, ns: u128) {
+    ENC_PROF.with(|p| p.borrow_mut()[i] += ns);
+}
+
 fn forward_time_major(
     w: &EncoderWeights,
     x: Mat,
     checkpoint: &dyn Fn() -> FwResult<()>,
 ) -> FwResult<Mat> {
+    let measure = crate::native_engine::perf_spans_enabled();
+    macro_rules! et {
+        ($i:expr, $b:expr) => {{
+            if measure {
+                let __t = std::time::Instant::now();
+                let __r = $b;
+                enc_prof_add($i, __t.elapsed().as_nanos());
+                __r
+            } else {
+                $b
+            }
+        }};
+    }
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
-    let mut x = nn::conv1d(
-        &x, &w.conv1_w, w.n_state, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
-    )?;
-    nn::gelu(&mut x);
+    let mut x = et!(0, {
+        let mut x = nn::conv1d(
+            &x, &w.conv1_w, w.n_state, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
+        )?;
+        nn::gelu(&mut x);
+        x
+    });
 
     // conv2 (stride 2): [3000, n_state] -> [1500, n_state], +gelu.
-    let mut x = nn::conv1d(
-        &x, &w.conv2_w, w.n_state, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
-    )?;
-    nn::gelu(&mut x);
+    let mut x = et!(0, {
+        let mut x = nn::conv1d(
+            &x, &w.conv2_w, w.n_state, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
+        )?;
+        nn::gelu(&mut x);
+        x
+    });
 
     let n_ctx = x.rows;
     if n_ctx > w.n_ctx {
@@ -571,7 +604,7 @@ fn forward_time_major(
     }
 
     // Add positional embedding (file tensor), sliced to the first n_ctx rows.
-    add_pos_emb(&mut x, &w.pos_emb, n_ctx);
+    et!(1, add_pos_emb(&mut x, &w.pos_emb, n_ctx));
 
     // Residual transformer blocks.
     for layer in &w.layers {
@@ -581,6 +614,23 @@ fn forward_time_major(
 
     // Final ln_post.
     nn::layer_norm(&mut x, &w.ln_post_w, &w.ln_post_b, LN_EPS);
+
+    if measure {
+        ENC_PROF.with(|p| {
+            let a = p.borrow();
+            let total: u128 = a.iter().sum();
+            eprintln!("--- encoder sub-op breakdown (sum over layers, one window) ---");
+            for (i, lbl) in ENC_PROF_LABELS.iter().enumerate() {
+                if a[i] > 0 {
+                    let ms = a[i] as f64 / 1e6;
+                    let pct = if total > 0 { a[i] as f64 / total as f64 * 100.0 } else { 0.0 };
+                    eprintln!("  {lbl:<12} {ms:>8.1} ms  {pct:>5.1}%");
+                }
+            }
+            eprintln!("  {:<12} {:>8.1} ms (encoder sub-op total)", "SUM", total as f64 / 1e6);
+        });
+        ENC_PROF.with(|p| *p.borrow_mut() = [0; 12]);
+    }
 
     Ok(x)
 }
@@ -627,28 +677,44 @@ fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
 }
 
 fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<()> {
+    let measure = crate::native_engine::perf_spans_enabled();
+    macro_rules! et {
+        ($i:expr, $b:expr) => {{
+            if measure {
+                let __t = std::time::Instant::now();
+                let __r = $b;
+                enc_prof_add($i, __t.elapsed().as_nanos());
+                __r
+            } else {
+                $b
+            }
+        }};
+    }
     // ── self-attention residual ──
     // `h = layer_norm(x)` into a fresh uninit buffer — byte-identical to
     // `x.clone()` + in-place `layer_norm`, minus the clone's redundant memcpy
     // (x is preserved for the residual `add_in_place` below regardless).
     // Kill switch FW_ENCODER_FUSED_LN=0 restores the clone path (A/B + escape).
-    let h = ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b);
+    let h = et!(2, ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b));
 
-    let q = nn::matmul_bias(&h, &layer.attn_q_w, Some(&layer.attn_q_b))?;
-    let k = nn::matmul_bias(&h, &layer.attn_k_w, None)?; // no key bias
-    let v = nn::matmul_bias(&h, &layer.attn_v_w, Some(&layer.attn_v_b))?;
+    let (q, k, v) = et!(3, {
+        let q = nn::matmul_bias(&h, &layer.attn_q_w, Some(&layer.attn_q_b))?;
+        let k = nn::matmul_bias(&h, &layer.attn_k_w, None)?; // no key bias
+        let v = nn::matmul_bias(&h, &layer.attn_v_w, Some(&layer.attn_v_b))?;
+        (q, k, v)
+    });
 
     // Bidirectional self-attention: causal_offset = None.
-    let attn = nn::attention(&q, &k, &v, n_head, None)?;
-    let attn = nn::matmul_bias(&attn, &layer.attn_out_w, Some(&layer.attn_out_b))?;
-    add_in_place(x, &attn);
+    let attn = et!(4, nn::attention(&q, &k, &v, n_head, None)?);
+    let attn = et!(5, nn::matmul_bias(&attn, &layer.attn_out_w, Some(&layer.attn_out_b))?);
+    et!(6, add_in_place(x, &attn));
 
     // ── MLP residual ── (same fused layer_norm-into-uninit, no clone memcpy)
-    let h = ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b);
-    let mut h = nn::matmul_bias(&h, &layer.mlp_fc_w, Some(&layer.mlp_fc_b))?;
-    nn::gelu(&mut h);
-    let h = nn::matmul_bias(&h, &layer.mlp_proj_w, Some(&layer.mlp_proj_b))?;
-    add_in_place(x, &h);
+    let h = et!(7, ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b));
+    let mut h = et!(8, nn::matmul_bias(&h, &layer.mlp_fc_w, Some(&layer.mlp_fc_b))?);
+    et!(9, nn::gelu(&mut h));
+    let h = et!(10, nn::matmul_bias(&h, &layer.mlp_proj_w, Some(&layer.mlp_proj_b))?);
+    et!(11, add_in_place(x, &h));
 
     Ok(())
 }
