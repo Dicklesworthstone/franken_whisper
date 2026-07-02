@@ -3,6 +3,18 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: DIG → **CLEAN 64-core profile corrects an oversubscription artifact + refines the encoder-bound blocker**. Real encoder ≈3.1–3.5 s/window (NOT the 6 s my `taskset -c 0-7` runs showed — that was rayon oversubscription: 64 threads pinned to 8 cores). No new byte-exact franken-owned lever; decode-cap re-tune is a closed load-dependent avenue on this shared box.
+
+**Land-or-dig result: methodological correction + refined blocker (no new lever).** The box is **64 cores** (load ~10, so free capacity); all my session's ABSOLUTE numbers under `taskset -c 0-7` are ~2× inflated by oversubscription — RATIOS (2.25×/4.99×/1.87×, all min-of-N) and byte-exactness are unaffected, but the phase-time absolutes were not real. AGENT_NAME=BlackThrush.
+
+**CLEAN phase breakdown (all 64 cores, no taskset, `PERF_SPANS`, turbo jfk×6 timestamp mode):**
+- `encoder_window`: 3556 / 3133 / 2902 = **9591 ms (~82%)** — real ~3.1 s/window (matches the old quiet measurement; the tasksetted 6079 ms was oversubscription). Dep f32 sgemm, not editable here.
+- `decode_loop`: 592 / 593 / 554 = **1739 ms (~15%)** — RELATIVELY BIGGER on 64 cores (was ~412 ms/win tasksetted) because it's latency-bound (doesn't scale) and its per-token rayon coordination over a 64-thread pool costs more. Dominated by the int8 vocab-logits GEMV (bandwidth-bound; int4 is argmax-quality owner-gated) — decode thread-count/cap re-tune is a CLOSED load-dependent avenue ([[project_decode_overthreaded_rayon_lead]]), unresolvable on a contended shared box.
+- `cross_kv`: 73 / 54 / 46 = **173 ms (~1.5%)** — the session's 3 wins confirmed small-but-real.
+- `decoder_prefill`: 18 / 73 / 70 = 161 ms (~1.4%).
+
+**Refined blocker (one sentence):** on a real many-core box the crate is ~82% dep f32-sgemm encoder (immovable) + ~15% latency-bound decode (bandwidth-bound logits GEMV + rayon-pool coordination, both owner-gated/closed) — no byte-exact franken-owned lever with material e2e impact remains; **future cycles: do NOT `taskset -c 0-7` (oversubscription inflates absolutes ~2×) — run on all cores or a matched thread cap.**
+
 ## 2026-07-02 - BlackThrush: DIG → **profile confirms ENCODER-BOUND blocker + validates the session's cross_kv wins**; the one remaining franken-owned f16-gemv site (prefill) is low-EV + risky.
 
 **Land-or-dig result: fresh phase profile (turbo jfk×6, timestamp/default mode) — the encoder is ~91% and dep-owned, so no franken-owned lever with meaningful e2e impact remains; the session's 3 cross_kv wins are e2e-CONFIRMED.** AGENT_NAME=BlackThrush.
