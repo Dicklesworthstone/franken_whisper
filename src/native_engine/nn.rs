@@ -2317,6 +2317,23 @@ fn use_sdpa_attn() -> bool {
     *EN.get_or_init(|| std::env::var_os("FW_ATTN_NO_SDPA").is_none())
 }
 
+// THROWAWAY: split the fused-SDPA encoder attention into gather/kernel/scatter
+// wall-time (gated on FRANKEN_WHISPER_PERF_SPANS). Drained + printed by the
+// encoder profiler. Zero cost when perf spans are off.
+thread_local! {
+    static SDPA_SPLIT: std::cell::RefCell<[u128; 3]> = const { std::cell::RefCell::new([0; 3]) };
+}
+pub(crate) fn drain_sdpa_split() -> [u128; 3] {
+    SDPA_SPLIT.with(|p| {
+        let v = *p.borrow();
+        *p.borrow_mut() = [0; 3];
+        v
+    })
+}
+fn sdpa_split_add(i: usize, ns: u128) {
+    SDPA_SPLIT.with(|p| p.borrow_mut()[i] += ns);
+}
+
 fn attention_raw(
     q: &Mat,
     k: &[f32],
@@ -2443,41 +2460,61 @@ fn attention_raw(
     // Encoder-only (causal_offset.is_none()): the decode's cached causal attention
     // has a cache_len offset the kernel's square-causal flag does not model.
     if causal_offset.is_none() && use_sdpa_attn() && n_head >= 2 && tq >= 64 {
+        let split = crate::native_engine::perf_spans_enabled();
+        macro_rules! st {
+            ($i:expr, $b:expr) => {{
+                if split {
+                    let __t = std::time::Instant::now();
+                    let __r = $b;
+                    sdpa_split_add($i, __t.elapsed().as_nanos());
+                    __r
+                } else {
+                    $b
+                }
+            }};
+        }
         let hh = n_head;
         let mut qa = gemv_out_buf(hh * tq * d_head);
         let mut ka = gemv_out_buf(hh * tk * d_head);
         let mut va = gemv_out_buf(hh * tk * d_head);
-        qa.par_chunks_mut(tq * d_head).enumerate().for_each(|(h, blk)| {
-            let base = h * d_head;
-            for i in 0..tq {
-                blk[i * d_head..(i + 1) * d_head].copy_from_slice(&q.row(i)[base..base + d_head]);
-            }
-        });
-        ka.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
-            let base = h * d_head;
-            for j in 0..tk {
-                blk[j * d_head..(j + 1) * d_head]
-                    .copy_from_slice(&k[j * n_state + base..j * n_state + base + d_head]);
-            }
-        });
-        va.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
-            let base = h * d_head;
-            for j in 0..tk {
-                blk[j * d_head..(j + 1) * d_head]
-                    .copy_from_slice(&v[j * n_state + base..j * n_state + base + d_head]);
-            }
+        // The per-head gather/scatter is a strided memcpy transpose (interleaved
+        // [tq, n_state] <-> head-major [hh, tq, d_head]). It is ~20% of attn_sdpa
+        // and BANDWIDTH-bound: the fine `par_chunks_mut` over heads is CORRECT —
+        // serial (one core) was MEASURED 4.5x SLOWER (multiple memory channels
+        // beat one core on the strided copy). See NEGATIVE_EVIDENCE.
+        st!(0, {
+            qa.par_chunks_mut(tq * d_head).enumerate().for_each(|(h, blk)| {
+                let base = h * d_head;
+                for i in 0..tq {
+                    blk[i * d_head..(i + 1) * d_head].copy_from_slice(&q.row(i)[base..base + d_head]);
+                }
+            });
+            ka.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
+                let base = h * d_head;
+                for j in 0..tk {
+                    blk[j * d_head..(j + 1) * d_head]
+                        .copy_from_slice(&k[j * n_state + base..j * n_state + base + d_head]);
+                }
+            });
+            va.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
+                let base = h * d_head;
+                for j in 0..tk {
+                    blk[j * d_head..(j + 1) * d_head]
+                        .copy_from_slice(&v[j * n_state + base..j * n_state + base + d_head]);
+                }
+            });
         });
         let sdpa_scale = (d_head as f32).powf(-0.5);
-        let o = ft_kernel_cpu::sdpa_forward_f32(
+        let o = st!(1, ft_kernel_cpu::sdpa_forward_f32(
             &qa, &ka, &va, hh, tq, tk, d_head, d_head, sdpa_scale, false,
-        );
-        out.par_chunks_mut(n_state).enumerate().for_each(|(i, orow)| {
+        ));
+        st!(2, out.par_chunks_mut(n_state).enumerate().for_each(|(i, orow)| {
             for h in 0..hh {
                 orow[h * d_head..(h + 1) * d_head].copy_from_slice(
                     &o[h * tq * d_head + i * d_head..h * tq * d_head + (i + 1) * d_head],
                 );
             }
-        });
+        }));
         return Ok(Mat::from_vec(tq, n_state, out));
     }
 
