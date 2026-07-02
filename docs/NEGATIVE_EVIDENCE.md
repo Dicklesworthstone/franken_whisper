@@ -3,6 +3,16 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-02 - BlackThrush: NEGATIVE — extending the int8 batch to **fc2 (block-wise) REGRESSES** the `tq>1` path (opposite of the per-row `gemv_i8_batch` win). Kernel written + proven bit-identical, then REVERTED; fc2 stays f16 for `tq>1`.
+
+**Land-or-dig result: dug the natural next step (batch the biggest decode op, fc2, to complete int8-batch coverage) — measured a clear REGRESSION and reverted the wiring; kept only the inline doc + this entry.** AGENT_NAME=BlackThrush. Wrote `nn::gemv_i8w_f32a_blocked_batch` (batched analog of `gemv_i8w_f32a_blocked`: weight row + per-block scales read once, dotted against all `tq` f32 rows).
+
+**Correctness (pass):** `gemv_i8_batch_probe` block section = **0/5120 entries differ** from per-token `gemv_i8w_f32a_blocked` (fc2 `[1280,5120]`, tq=4) — bit-identical, so it was NOT a quality question, purely perf.
+
+**MEASURED REGRESSION (`draft_amortization_probe`, turbo, best-of-60):** gate ON *with* fc2-block-batch vs gate OFF: K4 **14.05 vs 13.42 ms (SLOWER)**, K8 **20.22 vs 18.71 ms (SLOWER ~8%)**. Contrast: gate ON *without* fc2 (last entry, qkv/proj only) BEAT OFF (K8 17.27 < 18.19). So the fc2 block-batch is the regression.
+
+**Why (structural — the boundary of where int8-batch helps):** batching ALREADY amortizes the weight read across `tq` tokens, so int8's HALF-BYTES advantage (the whole point at m=1) is gone — the `tq>1` fc2 is now COMPUTE-bound, and there the block path's per-32-block scale loop + int8→f32 sign-extend/convert LOSES to `gemv_f16_batch`'s single f16c-fused dot over the full row. The per-ROW `gemv_i8_batch` (qkv) WINS in the same regime only because its `dot_i8` is int8×int8 `vpmaddwd` with NO block structure and a once-quantized activation. **Rule: int8-batch helps ONLY where the per-token kernel is `vpmaddwd`-class (per-row `gemv_i8`); the block/`dot_i8w_f32` path (fc2) must stay f16 for `tq>1`.** Extends [[project_int8_mlp_fc1_default_on]] (fc2 needs block-wise) with the batched-regime corollary. fc2 kept on the f16 batch path; `gemv_i8w_f32a_blocked_batch` removed (no good use — draft decoding would batch fc2 in the same regime).
+
 ## 2026-07-02 - BlackThrush: **LANDED `gemv_i8_batch` (default-ON, transcript BYTE-IDENTICAL) — int8 batched GEMV for the prefill/`tq>1` path, 3–12% faster cold-weight; captures the draft-decoding amortization** (the `gemv_i8_batch` first-step surfaced last cycle, now implemented + measured).
 
 **Land-or-dig result: implemented the byte-exact wedge I surfaced last cycle and LANDED it default-ON.** AGENT_NAME=BlackThrush. New kernel `nn::gemv_i8_batch` = int8 analog of `gemv_f16_batch` (each weight row read ONCE, dotted against all `tq` rows; per-ROW activation quant identical to `gemv_i8`; disjoint-column-band parallel merge identical to the f16 batch). Wired into `Linear::forward` for `tq>1` on the pure-`w_i8` linears (qkv / cross_q / self_out / cross_out, and mlp_0 when int4 off — block/int4 linears untouched, stay f16). Gate `FRANKEN_WHISPER_INT8_BATCH` (default ON; `=0` restores f16).
