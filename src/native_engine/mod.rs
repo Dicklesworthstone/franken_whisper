@@ -335,6 +335,29 @@ pub(crate) fn int8_attn_enabled() -> bool {
     })
 }
 
+/// Whether to int8-quantize the attention **output** projections (`self_out`,
+/// `cross_out`) on the per-token decode path. These write DIRECTLY into the
+/// residual stream — the `mlp_2` failure mode — so they were expected to break
+/// exactness. Empirically they do NOT: transcript is byte-exact vs f16 on both
+/// tiny.en and large-v3-turbo (jfk), INCLUDING the exact turbo clip where the
+/// both-quant MLP produced a trailing artifact. The difference is magnitude — the
+/// attention output is a softmax-weighted average of value vectors (bounded, 1280-d),
+/// so its per-token int8 rounding is far smaller than `mlp_2`'s 5120-d GELU-hidden
+/// input and stays under the argmax margin. Hence **ON by default**; ~1.15× on the
+/// two output-proj spans (~2.3% e2e decode). Disable with
+/// `FRANKEN_WHISPER_INT8_ATTN_OUT=0`. Prefill (`tq > 1`) keeps the f16 path.
+pub(crate) fn int8_attn_out_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_ATTN_OUT") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Emit one measurement-only span line (see [`perf_spans_enabled`]).
 pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
     if perf_spans_enabled() {

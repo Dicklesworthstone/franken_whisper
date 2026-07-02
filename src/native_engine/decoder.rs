@@ -533,7 +533,8 @@ impl DecoderWeights {
                     Some(&format!("{p}.attn.out.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .quantize_if(super::int8_attn_out_enabled()),
                 cross_attn_ln: load_layer_norm(model, &format!("{p}.cross_attn_ln"), n_state)?,
                 // Cross-attn query feeds only the attention scores (softmax), never
                 // the residual — safe to int8 (see `int8_attn_enabled`).
@@ -565,7 +566,8 @@ impl DecoderWeights {
                     Some(&format!("{p}.cross_attn.out.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .quantize_if(super::int8_attn_out_enabled()),
                 mlp_ln: load_layer_norm(model, &format!("{p}.mlp_ln"), n_state)?,
                 mlp_0: load_linear(
                     model,

@@ -3,6 +3,39 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 decoder **attention OUTPUT projections** (`self_out` + `cross_out`): byte-exact vs f16 on BOTH models — surprising, since these feed the residual (the `mlp_2` failure mode). ~1.15× on the two output-proj spans (~2.3% e2e decode). **Completes the per-token decode-GEMV int8 sweep.**
+
+**Land-or-dig result: tested the last two f16 decode GEMVs — the residual-feeding output projections — and they
+cleared the byte-exact bar.** AGENT_NAME=BlackThrush. Real code: `int8_attn_out_enabled` gate (default-on) +
+`.quantize_if(int8_attn_out_enabled())` on `attn_out`/`cross_attn_out` (mod.rs/decoder.rs).
+
+**The finding (a genuine surprise, worth recording).** By the `mlp_2` lesson I EXPECTED these to break: `self_out`
+and `cross_out` write directly into the residual stream, so per-token int8 rounding compounds across layers/tokens
+— exactly what produced the turbo trailing-artifact (" a." → " a. a.") when the MLP down-projection was quantized
+(6c4b53d). They do NOT break: transcript is BYTE-IDENTICAL to the f16 baseline on both tiny.en AND large-v3-turbo,
+including the very turbo clip where `mlp_2` diverged. **Why the residual class is safe HERE but not for `mlp_2`:
+magnitude.** The attention output is a softmax-weighted average of value vectors — bounded, low-variance, 1280-d.
+`mlp_2`'s input is the 5120-d GELU hidden (larger range/magnitude), so its 5120-term int8-accumulated error is
+several× bigger and occasionally crosses the argmax margin. The residual-feeding property is NOT the discriminator;
+the INPUT magnitude/width is. This refines the earlier "don't quant residual-feeding projections" rule to
+"don't quant residual-feeding projections whose INPUT is wide/high-magnitude (GELU hidden); narrow bounded-input
+ones (attention output) are fine — but always verify byte-exact."
+
+**Conformance.** `native_ab` A/B, `FRANKEN_WHISPER_INT8_ATTN_OUT` on (default) vs off, jfk (all other int8 gates
+on in both): large-v3-turbo BYTE-IDENTICAL, tiny.en BYTE-IDENTICAL. Real-CLI e2e `tests/native_engine_e2e.rs`
+with the new default = **6 passed, 0 failed** (matches the whisper-cli golden `jfk_tiny_reference.json`).
+
+**Ratio.** `decoder_attrib large-v3-turbo 200`, min-of-7 (load ~15→47, contention-noisy; min filters it):
+- self_out_proj:  1.2325 → 1.0537 ms/token → 1.17× (Δ 0.179; span includes the cheap residual add).
+- cross_out_proj: 0.7650 → 0.6780 ms/token → 1.13× (Δ 0.087).
+Combined ~0.27 ms/token of 11.5 → **~2.3% off e2e decode**. Smaller than the input-proj/MLP wins (these matrices
+are the smaller `[n_state,n_state]`), but real and byte-exact.
+
+**Decode-GEMV int8 sweep now COMPLETE.** Every per-token (`tq==1`) decode GEMV is int8 by default: logits (tied
+output), MLP fc1, self-`qkv`, `cross_q`, and now `self_out`+`cross_out`. `mlp_2` (wide GELU-hidden input) stays f16
+— the one GEMV that genuinely breaks exactness. Prefill (`tq>1`) stays f16 throughout. No further decode-GEMV
+int8 lever remains; the next decode gap is structural (per-token alloc/op) or the cross-attn KV, not weight bandwidth.
+
 ## 2026-07-03 - BlackThrush: WIN LANDED (default-ON) — int8/Q8 decoder **attention input projections** (fused self-`qkv` + `cross_q`): transcript byte-exact vs f16 on BOTH models. **1.43× on the self_qkv_proj span** (~4.7% e2e decode combined).
 
 **Land-or-dig result: extended the fc1-only int8 principle to the attention path.** AGENT_NAME=BlackThrush.
