@@ -3,6 +3,33 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+## 2026-07-01 - BlackThrush: CONSOLIDATION — in-crate compute-lever search CLOSED; the encoder is GEMM-dominated and that GEMM is an EXTERNAL near-optimal kernel (no in-crate lever).
+
+**Land-or-dig result: dug the encoder GEMM (the biggest remaining cost) + adjacent structural levers; all
+are non-levers or owner/environment-gated → surfacing the closed state (box at load 51, wall-clock
+unmeasurable; only perf-instructions viable).** AGENT_NAME=BlackThrush. No code changed.
+
+### Why the encoder has no in-crate lever
+The encoder is GEMM-dominated (last entry: softmax is a tiny fraction). Its f32 GEMM goes through
+`ft_kernel_cpu::matmul_tensor_contiguous_f32_into` — an EXTERNAL packed-microkernel sgemm — and franken has
+already applied the two in-crate wins around it: the `m==1` GEMV bypass (`nn::matmul`, decode attention:
+sgemm-for-GEMV was ~8–10× slower) and the uninit-output-buffer elision (skips the dead zero-init, ~12.8% on
+the MLP shape). The kernel itself is not franken's to tune, and the earlier faer swap measured only ~1.1×
+(dependency + owner decision). QKV-fusion is a NON-lever here: sgemm LHS packing is ≈ `1/n + 1/m` ≈ 0.14% of
+the GEMM compute at `[1500,1280]` shapes, so fusing 3 projections into one saves <0.1%.
+
+### The full in-crate compute map is now closed (this + prior entries)
+- **Landed:** 2-row f16c GEMV; int8 logits (default ON, 1.84× live); GELU f16-table (scalar 3.46× + SIMD
+  gather 1.38× more, bit-exact-with-whisper).
+- **Rejected/measured-0:** int8 MLP (L3-resident); softmax-exp SIMD (decode overlapped + encoder GEMM-dwarfed,
+  BOTH paths); pre-dequant; wide-cap; 2-col; SIMD-softmax (old); accumulator-widening reasoning (load-bound).
+- **Gated / not-franken's:** encoder f32 GEMM (external kernel; faer ~1.1× = owner dep-swap); decode
+  thread-count (load-dependent, quiet-box only — box is at load 51); sampler vocab-exp (owner-gated); mel
+  FFT/log10 (bit-exact-with-whisper).
+**Remaining levers all require an owner decision (faer dep) or a quiet box (decode threads) — none are a
+clean in-crate compute win. Future cycles: don't re-dig the above; the door is the faer GEMM or a quiet-box
+decode-thread re-measure.**
+
 ## 2026-07-01 - BlackThrush: ENCODER softmax SIMD-exp REJECTED — kernel 1.80× in isolation but encoder e2e is FLAT (+0.12% instructions); softmax-exp prohibition now confirmed on BOTH decode AND encoder.
 
 **Land-or-dig result: dug the encoder-softmax SIMD-exp lever (the blocker below was bypassed), MEASURED it
