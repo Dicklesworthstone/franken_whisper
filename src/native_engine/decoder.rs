@@ -889,10 +889,21 @@ impl DecoderState {
         // (rows = output dims, for `out = gemv_f16(Vt, scores)`).
         let mut cross_kh_f16: Vec<Vec<Float16>> = Vec::with_capacity(n_layer * n_head);
         let mut cross_vh_f16: Vec<Vec<Float16>> = Vec::with_capacity(n_layer * n_head);
-        for li in 0..n_layer {
-            let ck = &cross_k[li];
-            let cv = &cross_v[li];
-            for h in 0..n_head {
+        // PARALLEL per-head build (BlackThrush, 2026-07-02): the n_layer×n_head
+        // (layer,head) pairs are independent; the serial nested loop ran ~63 ms/
+        // window on turbo (4×20 pairs, each 4 buffer builds with f16 conversions
+        // over enc×d_head = 96 K elems). Fanning the OUTER loop across rayon is
+        // MEASURED 4.99× (63.1→12.7 ms, `examples/cross_build_probe.rs`) and
+        // BYTE-IDENTICAL — the indexed `collect` preserves the li-major/h-minor
+        // push order and each pair's per-element arithmetic is unchanged (probe:
+        // parallel == serial for all four buffers). Same granularity-flip as the
+        // sibling cross-cache quantize below (b22f8ae).
+        let built: Vec<(Vec<f32>, Vec<Float16>, Vec<f32>, Vec<Float16>)> = (0..n_layer * n_head)
+            .into_par_iter()
+            .map(|idx| {
+                let (li, h) = (idx / n_head, idx % n_head);
+                let ck = &cross_k[li];
+                let cv = &cross_v[li];
                 let base = h * d_head;
                 // kh_t [d_head, enc_frames]: kh_t[d][j] = ck.row(j)[base + d].
                 let mut kh_t = vec![0.0f32; d_head * enc_frames];
@@ -905,8 +916,6 @@ impl DecoderState {
                         k_nat.push(Float16::from_f32(s));
                     }
                 }
-                cross_kh_t.push(Mat::from_vec(d_head, enc_frames, kh_t));
-                cross_kh_f16.push(k_nat);
                 // vh [enc_frames, d_head]: row j = cv.row(j)[base..base+d_head].
                 let mut vh = vec![0.0f32; enc_frames * d_head];
                 // v_t [d_head, enc_frames] f16: v_t[d][j] = cv.row(j)[base + d].
@@ -918,9 +927,14 @@ impl DecoderState {
                         v_t[d * enc_frames + j] = Float16::from_f32(s);
                     }
                 }
-                cross_vh.push(Mat::from_vec(enc_frames, d_head, vh));
-                cross_vh_f16.push(v_t);
-            }
+                (kh_t, k_nat, vh, v_t)
+            })
+            .collect();
+        for (kh_t, k_nat, vh, v_t) in built {
+            cross_kh_t.push(Mat::from_vec(d_head, enc_frames, kh_t));
+            cross_kh_f16.push(k_nat);
+            cross_vh.push(Mat::from_vec(enc_frames, d_head, vh));
+            cross_vh_f16.push(v_t);
         }
 
         // int8/Q8 the window-constant cross K/V once (gated). K is [enc_frames,
