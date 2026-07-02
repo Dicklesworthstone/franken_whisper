@@ -2016,6 +2016,18 @@ pub fn conv1d(
     matmul_bias(&im2col, &w_t, Some(bias))
 }
 
+/// PROBE gate (`FW_KV_F16_SIM=1`, default off): round each appended KV-cache row
+/// through f16 precision (`f32→f16→f32`) while still STORING f32. This isolates
+/// the transcript-neutrality QUESTION of an f16 KV cache (self_attn = 10.7% of
+/// decode, 35% of it the f32 cache read) from the storage rewrite that would
+/// actually halve the cache-read bandwidth. If the turbo transcript is byte-
+/// identical with the sim on, the full f16-storage path is worth building.
+fn kv_f16_sim_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_KV_F16_SIM").is_some())
+}
+
 /// Incremental key/value cache for autoregressive self-attention.
 ///
 /// Stores keys and values as contiguous `[capacity_tokens, n_state]` row-
@@ -2095,8 +2107,19 @@ impl KvCache {
         }
         let off = self.len * self.n_state;
         let span = t * self.n_state;
-        self.k[off..off + span].copy_from_slice(&k.data);
-        self.v[off..off + span].copy_from_slice(&v.data);
+        if kv_f16_sim_enabled() {
+            // Round through f16 precision (still stored f32) to test whether an
+            // f16 KV cache is transcript-neutral before the storage rewrite.
+            for (dst, &src) in self.k[off..off + span].iter_mut().zip(&k.data) {
+                *dst = Float16::from_f32(src).to_f32();
+            }
+            for (dst, &src) in self.v[off..off + span].iter_mut().zip(&v.data) {
+                *dst = Float16::from_f32(src).to_f32();
+            }
+        } else {
+            self.k[off..off + span].copy_from_slice(&k.data);
+            self.v[off..off + span].copy_from_slice(&v.data);
+        }
         self.len += t;
         Ok(())
     }
