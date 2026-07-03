@@ -4,6 +4,18 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → SURFACED (measured, not landed) — **`half::f16::from_f32` is SOFTWARE on this build: batched F16C `_mm256_cvtps_ph` is 3.1–3.7× faster, BYTE-IDENTICAL. But an audit of EVERY scalar-conversion site shows no landable e2e win — all are one-time-at-load, pipelining-hidden, or sub-noise per-token. The GEMV hot paths already use F16C intrinsics.**
+
+**Land-or-dig result.** AGENT_NAME=BlackThrush. `examples/f16_convert_probe`: scalar `Float16::from_f32` (= `half::f16::from_f32`) vs batched `_mm256_cvtps_ph::<0>` (RNE) — **1.50× (n=64), 3.70× (n=1500), 3.14× (n=96000), 0 differing bits.** So `half`'s scalar conversion does NOT lower to hardware `vcvtps2ph`; it's software bit-twiddling, and 8-wide F16C batching wins 3×. Reusable antipattern — BUT I grepped every `to_f32`/`from_f32` site in nn/decoder/encoder and NONE clears the landing bar:
+- **Weight quantize** (`quantize_f16_to_i8` nn.rs:885, block-wise/int4 siblings): ONE-TIME at model load, amortized over the whole run. Not hot.
+- **Cross-attn build** (decoder.rs:961/972 `k_nat`/`v_t`): per-WINDOW (12.7 ms, already 4.99× parallel), decode-side ⇒ pipelining-hidden ([[project_window_pipelining_lever]]); conversions are ~0.1% of decode. And `v_t`/`kh_t` are strided transposes (scatter-store, doesn't vectorize).
+- **Token embedding** (decoder.rs:1105 `tb.to_f32()+p`): per-token but 1280 elems, part of the ~1.1% "LN+embed" ⇒ sub-noise.
+- **f16 KV cache read** (nn.rs:2379/2790): the DEAD f16-KV path (KV stays f32).
+- **GEMV inner dots** (`dot_f16c`, `gemv_f16`): ALREADY `_mm256_cvtph_ps`-vectorized — the antipattern is already exploited where it's hot.
+
+⇒ Landing any of these would repeat the sampler-slim mistake (isolated-op win, sub-noise e2e → reverted, [[project_decode_sampler_slim_landed]]). SURFACED not landed. The one place scalar f16 conversion mattered was the GEMV dots, and that's long done. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **SDPA encoder gather ACCESS-ORDER: row-major (contiguous q read, strided head-major write) is 0.57× — a LOSS. The live head-band-major gather is optimal on the access-order axis. Byte-identical.**
 
 **Land-or-dig result.** AGENT_NAME=BlackThrush. `attention_raw`'s fused-SDPA gather (nn.rs ~2610, ~20% of `attn_sdpa`, ENCODER-side so NOT pipelining-hidden) reads q in head-band-major order (strided by n_state). Memory closed the *parallelism-count* axis (real-encoder HOTSPOTS: serial 4.5× SLOWER — bandwidth wants many channels); this probes the *access-order* axis. `examples/sdpa_gather_probe` (turbo hh=20, tq=1500, d_head=64, 64 threads, best-of-300): **row-major = 0.57× (LOSS)** — trading the current head-major's strided *reads* for strided *writes* to the head-major dst is worse (scatter-write beats gather-read on Zen3). **0 differing of 1.92M (byte-identical).** Access-order is dead; the live gather is optimal on this axis.
