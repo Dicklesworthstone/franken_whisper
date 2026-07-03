@@ -531,19 +531,87 @@ fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Argmax over `logits`, returning `(id, logprob_of_id)`. Mirrors
-/// `whisper_sample_token(best=true)` (whisper.cpp 6503-6510): the chosen id is
-/// the argmax of the (post-filter) probabilities — equivalently logits — and
-/// `plog` is its log-softmax value.
-fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
+/// First index of the maximum over `logits` (scalar reference: strict `>`, so ties keep the
+/// FIRST index). LLVM does NOT autovectorize this — the running `best_i` is a loop-carried
+/// data dependency — so on the 51866-vocab sampler pass (SERIAL critical path, per token) it
+/// stays scalar. See [`argmax_idx`] for the AVX2 form.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn argmax_idx(l: &[f32]) -> usize {
     let mut best_i = 0usize;
     let mut best = f32::NEG_INFINITY;
-    for (i, &l) in logits.iter().enumerate() {
-        if l > best {
-            best = l;
+    for (i, &v) in l.iter().enumerate() {
+        if v > best {
+            best = v;
             best_i = i;
         }
     }
+    best_i
+}
+
+/// AVX2 first-index argmax, BYTE-EXACT vs the scalar loop in ALL cases (finite / `-inf` /
+/// NaN / empty): the strict `_CMP_GT_OQ` blend skips NaN and `-inf` exactly as scalar `>`
+/// does, and per lane keeps the first index in that lane's stride; the horizontal reduce then
+/// takes the max value and the MIN index among ties ⇒ the global FIRST index. MEASURED 5.1×
+/// over 51866 (`examples/sampler_maxargmax_probe`), ~14.6 µs/token off the serial sampler.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn argmax_idx(l: &[f32]) -> usize {
+    use core::arch::x86_64::*;
+    let n = l.len();
+    let n8 = n & !7;
+    // SAFETY: avx2 guaranteed by this fn's cfg; every load is bounded by `i < n8 <= n`
+    // (i advances by 8, i+8 <= n8) and the `< 8` remainder runs scalar.
+    unsafe {
+        let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+        let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let mut vidx = _mm256_setzero_si256();
+        let mut i = 0usize;
+        while i < n8 {
+            let v = _mm256_loadu_ps(l.as_ptr().add(i));
+            let gt = _mm256_cmp_ps::<_CMP_GT_OQ>(v, vmax); // strict > ⇒ keep first, skip NaN/-inf
+            vmax = _mm256_blendv_ps(vmax, v, gt);
+            let idx = _mm256_add_epi32(_mm256_set1_epi32(i as i32), lane);
+            vidx = _mm256_castps_si256(_mm256_blendv_ps(
+                _mm256_castsi256_ps(vidx),
+                _mm256_castsi256_ps(idx),
+                gt,
+            ));
+            i += 8;
+        }
+        let mut vals = [0.0f32; 8];
+        let mut idxs = [0i32; 8];
+        _mm256_storeu_ps(vals.as_mut_ptr(), vmax);
+        _mm256_storeu_si256(idxs.as_mut_ptr().cast(), vidx);
+        // Max value across lanes; among lanes tied at that value, the MIN index (= global first).
+        let mut best = f32::NEG_INFINITY;
+        let mut best_i = usize::MAX;
+        for k in 0..8 {
+            let (v, ix) = (vals[k], idxs[k] as usize);
+            if v > best || (v == best && ix < best_i) {
+                best = v;
+                best_i = ix;
+            }
+        }
+        if best_i == usize::MAX {
+            best_i = 0; // empty or all-(-inf)/NaN: match scalar's initial best_i = 0
+        }
+        while i < n {
+            if l[i] > best {
+                best = l[i];
+                best_i = i;
+            }
+            i += 1;
+        }
+        best_i
+    }
+}
+
+/// Argmax over `logits`, returning `(id, logprob_of_id)`. Mirrors
+/// `whisper_sample_token(best=true)` (whisper.cpp 6503-6510): the chosen id is
+/// the argmax of the (post-filter) probabilities — equivalently logits — and
+/// `plog` is its log-softmax value. The index scan is [`argmax_idx`] (AVX2, byte-exact).
+fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
+    let best_i = argmax_idx(logits);
     (
         i32::try_from(best_i).unwrap_or(0),
         logprobs.get(best_i).copied().unwrap_or(0.0),
@@ -1813,6 +1881,52 @@ mod tests {
         }
         // All-masked (-inf, max=-inf) → sum exactly 0 (mask zeroes the NaN lanes).
         assert_eq!(logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn argmax_idx_matches_scalar() {
+        // The AVX2 `argmax_idx` must return the SAME first-max index as the scalar loop in
+        // every case: SIMD body + <8 tail, ties (first index wins), -inf and NaN lanes
+        // (skipped exactly as scalar `>`), and empty/all-masked (index 0). This is the token
+        // selection (whisper greedy = argmax of raw logits) so it must be bit-for-bit.
+        fn scalar(l: &[f32]) -> usize {
+            let mut best_i = 0usize;
+            let mut best = f32::NEG_INFINITY;
+            for (i, &v) in l.iter().enumerate() {
+                if v > best {
+                    best = v;
+                    best_i = i;
+                }
+            }
+            best_i
+        }
+        let mut st = 0x0F0F_1234_DEAD_BEEFu64;
+        let mut nf = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 60.0
+        };
+        for &n in &[0usize, 1, 2, 7, 8, 9, 15, 16, 17, 31, 1000, 51866] {
+            let mut v: Vec<f32> = (0..n)
+                .map(|_| {
+                    let u = (nf() + 30.0) / 60.0; // back to [0,1)
+                    if u < 0.08 { f32::NEG_INFINITY } else { nf() }
+                })
+                .collect();
+            // Force a duplicate maximum to exercise the first-index tie-break.
+            if n >= 20 {
+                v[5] = 1000.0;
+                v[17] = 1000.0; // scalar keeps index 5 (first)
+            }
+            assert_eq!(argmax_idx(&v), scalar(&v), "n={n}");
+        }
+        // NaN lanes must be skipped exactly like scalar `>` (NaN > x is false).
+        let with_nan = vec![f32::NAN, -1.0, 3.0, f32::NAN, 2.0, 3.0, f32::NAN, 0.0, -5.0];
+        assert_eq!(argmax_idx(&with_nan), scalar(&with_nan)); // first 3.0 at index 2
+        // Empty and all-masked → 0 (matches scalar initial best_i).
+        assert_eq!(argmax_idx(&[]), 0);
+        assert_eq!(argmax_idx(&vec![f32::NEG_INFINITY; 20]), 0);
     }
 
     #[test]
