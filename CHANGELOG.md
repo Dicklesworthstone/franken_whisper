@@ -8,6 +8,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## [0.4.0] - 2026-07-03
+
+### Fused GPU encoder — the whole transformer stack on the GPU (Apple Silicon)
+
+- **On Apple Silicon with a large model the entire encoder now runs on the GPU**, replacing v0.3.0's per-matmul offload. A new `ft-kernel-metal::fused` module keeps activations **resident on the GPU** (`GpuTensor`) and encodes each layer's ops — layernorm, q/k/v projections, multi-head attention, output projection, residual, MLP (fc → GELU → proj), residual — into **one command buffer with a single CPU↔GPU sync per layer**, instead of the CPU running layernorm/attention/GELU and blocking on the GPU for every matmul. Weights are uploaded once and cached per model. Enabled by default for `n_state ≥ 1024` (medium/large; `tiny/base/small` keep the CPU path); `FRANKEN_WHISPER_GPU=0` forces CPU, `FRANKEN_WHISPER_FUSED_ENC=0` falls back to the v0.3.0 GEMM-only offload.
+- **Measured (M4 Pro, 120s clip, large-v3-turbo):** fused encoder **29.5s vs 35.7s GEMM-only vs 57.0s CPU** — **48% faster than CPU and 17% faster than the v0.3.0 GEMM-only path**. Killing the per-op ping-pong is the win.
+- **Correctness:** the GPU encoder tracks the CPU encoder closely (jfk transcript identical; on long audio the transcript is valid-but-not-bit-identical, like any GPU backend). A subtle bug was fixed along the way: MSL `tanh` overflows to NaN for large arguments, so the GPU GELU now uses ggml's `GGML_GELU_FP16` clamp (`x≥10→x`, `x≤−10→0`), matching the CPU exactly. All Metal `unsafe` stays in `ft-kernel-metal`, so franken_whisper keeps `#![deny(unsafe_code)]`; non-macOS builds are unaffected.
+- Follow-up: the attention kernels are still naive (un-tiled); a tiled/flash-attention kernel would widen the win further.
+
 ## [0.3.0] - 2026-07-02
 
 ### GPU acceleration — automatic, hardware-selected (Apple Silicon)

@@ -683,6 +683,14 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
 
+    // `FRANKEN_WHISPER_FUSED_ENC=0` disables just the fused encoder (the per-matmul
+    // GEMM offload in `nn` still applies) — for A/B against the fused path.
+    if matches!(
+        std::env::var("FRANKEN_WHISPER_FUSED_ENC").ok().as_deref(),
+        Some("0")
+    ) {
+        return false;
+    }
     if w.n_state < GPU_ENCODER_MIN_N_STATE || !gpu_encoder_enabled() {
         return false;
     }
@@ -734,25 +742,8 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
         Arc::clone(guard.get(&key).expect("just inserted"))
     };
 
-    let orig = x.data.clone();
     match enc.forward(&x.data, x.rows) {
         Ok(out) => {
-            if std::env::var_os("FWDBG_ENC").is_some() {
-                let mut cx = Mat::from_vec(x.rows, x.cols, orig);
-                for layer in &w.layers {
-                    let _ = encoder_block(&mut cx, layer, w.n_head);
-                }
-                let maxd = out
-                    .iter()
-                    .zip(&cx.data)
-                    .map(|(g, c)| (g - c).abs())
-                    .fold(0.0f32, f32::max);
-                eprintln!(
-                    "FWDBG_ENC maxdiff={maxd:.4} gpu={:?} cpu={:?}",
-                    &out[..4.min(out.len())],
-                    &cx.data[..4.min(cx.data.len())]
-                );
-            }
             x.data = out;
             true
         }
