@@ -71,6 +71,34 @@ unsafe fn i8_peak(a: &[i8], b: &[i8], iters: usize) -> i32 {
     tmp.iter().sum()
 }
 
+/// int8 via VPMOVSXBW + VPMADDWD — the WIDENING path `nn::dot_i8` and the prior TILED encoder
+/// int8 GEMM (examples/encoder_int8_gemm_probe) use. Signed-symmetric int8 (no sign-offset
+/// needed), but ~16 MAC per (2 loads + 2 sign-extends + 1 madd + 1 add) vs maddubs' ~32 MAC.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn i8_peak_widening(a: &[i8], b: &[i8], iters: usize) -> i32 {
+    let mut acc = [_mm256_setzero_si256(); 8];
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    for _ in 0..iters {
+        let mut k = 0;
+        // each 128-bit load = 16 int8 → sign-extend to 16 int16 → madd → 8 int32.
+        while k + 128 <= K {
+            for (j, ac) in acc.iter_mut().enumerate() {
+                let off = k + j * 16;
+                let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(pa.add(off).cast()));
+                let vb = _mm256_cvtepi8_epi16(_mm_loadu_si128(pb.add(off).cast()));
+                *ac = _mm256_add_epi32(*ac, _mm256_madd_epi16(va, vb));
+            }
+            k += 128;
+        }
+    }
+    let mut s = _mm256_setzero_si256();
+    for ac in acc { s = _mm256_add_epi32(s, ac); }
+    let mut tmp = [0i32; 8];
+    _mm256_storeu_si256(tmp.as_mut_ptr().cast(), s);
+    tmp.iter().sum()
+}
+
 fn main() {
     let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
     let mut st = 0x243F_6A88_85A3_08D3u64;
@@ -91,16 +119,20 @@ fn main() {
         for _ in 0..7 { let t = Instant::now(); black_box(f32_peak(&af, &bf, iters)); tf = tf.min(t.elapsed().as_secs_f64()); }
         let mut ti = f64::INFINITY;
         for _ in 0..7 { let t = Instant::now(); black_box(i8_peak(&ai, &bi, iters)); ti = ti.min(t.elapsed().as_secs_f64()); }
+        black_box(i8_peak_widening(&ai, &bi, 2000));
+        let mut tw = f64::INFINITY;
+        for _ in 0..7 { let t = Instant::now(); black_box(i8_peak_widening(&ai, &bi, iters)); tw = tw.min(t.elapsed().as_secs_f64()); }
         let gf = macs_f / tf / 1e9;
         let gi = macs_i / ti / 1e9;
-        println!("=== int8 (VPMADDUBSW+VPMADDWD) vs f32 (VFMADD) COMPUTE ceiling — AVX2, no VNNI, L1-resident, 1 core ===");
-        println!("  f32 FMA peak      : {gf:>7.1} GMAC/s");
-        println!("  int8 maddubs+madd : {gi:>7.1} GMAC/s");
-        println!("  int8 / f32 ratio  : {:.2}x  [{}]", gi / gf,
-            if gi / gf >= 1.5 { "int8 encoder GEMM has real headroom — a blocked microkernel is worth building" }
-            else if gi / gf >= 1.15 { "modest int8 headroom — marginal vs the microkernel effort + quality gate" }
-            else { "int8 ~= f32 on AVX2-no-VNNI — owner-gated int8 encoder GEMM is DEAD (needs VNNI/GPU)" });
+        let gw = macs_i / tw / 1e9;
+        println!("=== int8 COMPUTE ceiling: maddubs vs widening vs f32 — AVX2, no VNNI, L1-resident, 1 core ===");
+        println!("  f32 VFMADD                        : {gf:>7.1} GMAC/s   (1.00x baseline)");
+        println!("  int8 VPMOVSXBW+VPMADDWD (widening) : {gw:>7.1} GMAC/s   {:.2}x  ← nn::dot_i8 / prior TILED int8 GEMM", gw / gf);
+        println!("  int8 VPMADDUBSW+VPMADDWD (maddubs) : {gi:>7.1} GMAC/s   {:.2}x  ← untried for the encoder", gi / gf);
+        println!("  maddubs / widening                : {:.2}x  [{}]", gi / gw,
+            if gi / gw >= 1.4 { "maddubs is the missing ingredient — prior tiled int8 (0.89x) used the SLOW widening op" }
+            else { "maddubs ~= widening — the int8 gap is NOT the inner op" });
         println!("  (upper bound: peak instruction throughput, no GEMM load/store/blocking overhead;");
-        println!("   real blocked int8 GEMM would be <= this; multi-thread clock-throttle applies to both.)");
+        println!("   real blocked int8 GEMM would be <= this; multi-thread clock-throttle applies to all.)");
     }
 }
