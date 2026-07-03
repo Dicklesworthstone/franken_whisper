@@ -852,16 +852,27 @@ fn tail_truncate_enabled() -> bool {
 /// **encoder frames** (e.g. 100 ≈ 2 s of trailing context); unset ⇒ `None` ⇒
 /// first window stays full (byte-identical default).
 ///
-/// MEASURED on large-v3-turbo, jfk×1 (single/first window), 2026-07-03: `margin=0`
-/// (maximal truncation) is a **~1.9× e2e win AND a quality win** — the full-pad
-/// first window HALLUCINATES a trailing `a.` segment from the 19 s of zero-padding
-/// (segs=2, 110 ch) exactly like the tail-window silence-hallucination the landed
-/// [`tail_enc_ctx`] tail path already fixes; truncation stops clean (segs=1, 108 ch)
-/// with the closing period intact, needing NO margin. (This corrects the older
-/// tiny.en note that first-window truncation "drops the closing period" — that is
-/// model-specific; turbo is strictly better truncated.) Still an owner opt-in
-/// because it is non-byte-exact vs the golden and validated per-model by A/B —
-/// exactly whisper.cpp's `-ac` applied to the first window.
+/// MEASURED on large-v3-turbo (jfk, 2026-07-03): `margin=0` is a **~1.9× e2e win
+/// on an 11 s single-window clip** (enc ctx 1500→~550), transcript preserved. It
+/// is now PURELY a speed lever — the anti-hallucination benefit it once carried
+/// (the full-pad first window emitting a spurious `a.` segment) is now handled by
+/// DEFAULT via the [`single_timestamp_ending`] fix (commit 53e4fb6), so a clip
+/// does NOT need this opt-in to be clean.
+///
+/// ⚠ SAFE-REGIME FLOOR (measured 2026-07-03, CORRECTS an earlier "needs NO margin"
+/// overclaim): first-window truncation is transcript-safe only when the clip has
+/// enough real audio that `base = real/2` stays well above `MIN_ENC_CTX` — i.e.
+/// moderate single-window clips (≈5–25 s). On VERY SHORT clips (≲5 s) it is
+/// UNSTABLE at every margin below full: jfk truncated to 0.5 s / 1 s collapse to
+/// "." and 2 s (base=100) is non-monotonic across margins (enc_ctx 100→"And so my",
+/// 200→EMPTY, 300→"…Americans,", 500→"…Americans…") — none reproduce the full-window
+/// transcript. The 30 s encoder is trained/positional-embedded for long context;
+/// truncating below ~a few-hundred frames degrades it. So this knob is for
+/// moderate-length single-window / streaming clips, NOT sub-5 s ones.
+///
+/// Kept an owner opt-in because it is non-byte-exact vs the full-pad golden and
+/// must be validated per-model AND per-clip-length by A/B — whisper.cpp's `-ac`
+/// applied to the first window, with the same short-clip caveat.
 fn first_window_margin() -> Option<usize> {
     use std::sync::OnceLock;
     static M: OnceLock<Option<usize>> = OnceLock::new();
