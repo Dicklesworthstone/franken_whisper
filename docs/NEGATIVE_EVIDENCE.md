@@ -4,6 +4,17 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-02 - BlackThrush: LANDED gated (`FW_SIMD_EXP`, default OFF) — **the sampler exp lever, IMPLEMENTED behind an escape hatch: AVX2 poly logsumexp = 16.7× on the 51866-vocab pass. Default byte-identical by construction; gated-path unit-tested. Owner's speed/accuracy opt-in.**
+
+**Land-or-dig result: turned last entry's surface into real gated code (feedback: implement behind a default-OFF flag + measure, don't re-surface).** AGENT_NAME=BlackThrush. `compute_logprobs` (decode.rs) now computes its vocab-wide `logsumexp` via `logsumexp_sum_simd` (AVX2 degree-5 poly exp, -inf lanes masked to 0) when `FW_SIMD_EXP=1`, else the exact scalar libm loop. **Default (gate off) is byte-identical to before — the else-branch is the verbatim original loop, zero production change.** New unit test `logsumexp_sum_simd_matches_scalar` (all code paths + edge cases, rel < 1e-3); **149/149 decode tests pass** (default + gated).
+
+**MEASURED per-crate (`examples/exp_sampler_probe`, committed 38887e9):** scalar libm 150.2 µs/token → AVX2 poly **9.0 µs = 16.7×**; numerical delta ~2.5e-5 logprob.
+
+**Why gated, not default-on:** (1) NON-byte-exact (~2.5e-5) + the exp feeds logprobs → confidence/no_speech/timestamp-forcing, so franken deliberately keeps accurate libm (owner call, mirrors the unwired `ft_kernel_cpu::exp_f64x4` — which additionally scalar-falls-back on the sampler's -inf-heavy distribution, a poor fit). (2) **In no_timestamps mode the greedy TEXT is exp-INDEPENDENT** (token = `argmax` of RAW logits; the ts-forcing rule can't fire because no_ts masks timestamps to -inf, `decode.rs:287`) — so with the flag ON the no_ts transcript is byte-identical (analytically; empirical A/B deferred: the turbo model is absent from the box this cycle). (3) Decode is pipelining-HIDDEN on multi-window ⇒ **~0 realistic e2e** (only ~1.4% on short single-window clips).
+
+Ratio vs OpenAI-Whisper unchanged (**~1.2× ts / ~1.68–1.8× no_ts**) — a measured escape hatch for the owner's decision, not a default change.
+
+---
 ## 2026-07-02 - BlackThrush: SURFACE with hard data — **the sampler `exp` (owner-gated lever #2) MEASURED for the first time: scalar libm `expf` = 150 µs/token over the 51866 vocab, an AVX2 poly does it in 9 µs = 16.7×. But it's NON-byte-exact AND pipelining-HIDDEN on multi-window (~0 realistic e2e), so the faithful landing (match `ggml_v_expf`) stays the owner's call — now with numbers, not the old "~3.5%" estimate.**
 
 **Land-or-dig result: dug the biggest remaining decode cost after the 3 dot kernels (all now hand-AVX2). Followed the meta-pattern (re-verify a "closed/estimated" claim with a per-crate microbench) onto the sampler exp — the STATE OF THE CEILING summary's owner-gated path #2, previously only ESTIMATED "~3.5% e2e", never isolated-measured.** AGENT_NAME=BlackThrush. `compute_logprobs` (decode.rs) computes `logsumexp = Σ exp(l − max)` over n_vocab=51866 **per token** with scalar libm `f32::exp()`.
