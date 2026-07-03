@@ -3,6 +3,25 @@
 This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
+---
+## ★ STATE OF THE CEILING (2026-07-02, BlackThrush) — owner decision summary
+
+**franken_whisper is at this box's hardware ceiling; every CPU lever is closed BY MEASUREMENT. The only acceleration paths left are two OWNER hardware/policy decisions.** Ratio vs OpenAI-Whisper (whisper.cpp turbo, matched high threads): **~1.2× e2e (timestamp) / ~1.8× (no_timestamps)** — encoder TIED at the AVX2 GEMM peak (same silicon), franken's lead is the **int8 decode (~2×/token)**.
+
+**Where the time goes (turbo, on-box):** encoder **76–80% e2e** (79% f32 sgemm + 15.5% fused SDPA), decode ~20% (int8, greedy). Structurally, window-pipelining overlaps decode-N with encode-N+1, so on MULTI-window files decode is HIDDEN and only the encoder matters; decode counts only for short single-window clips.
+
+**Encoder ceiling = the CPU all-core PACKAGE POWER LIMIT (measured, not asserted):** at 32 cores the 5975WX throttles to **2022 MHz = 45% of the 4562 MHz boost**; the GEMM still scales ~80% at that clock, so the "37% scaling wall" is 0.45(clock)×0.8(scaling). NOT bandwidth (DRAM <6 GB/s ≪ 204 peak), NOT cross-CCD (single NUMA node), NOT a governor misconfig (powersave/amd-pstate-epp/balance_performance, uncapped, root-gated). 32 threads is the measured optimum (24/28 are 7–13% slower). Closed by measurement: naive int8 GEMM (0.38×), QKV-fusion (0.884×), column-panel cache-block (0.27–0.98×), **one-level Strassen (0.27–0.34×)**, BLAS/faer (slower), thread sweep. No in-crate f32-sgemm lever exists (it's the external `ft_kernel_cpu` matrixmultiply microkernel at its shape peak).
+
+**Decode ceiling = int8 dot/bandwidth wall, fully tuned:** logits worker-cap swept {8..64}→32 optimal; int4 logits 0.36–0.46× (AVX2 unpack cost, no VNNI); f16 KV cache 2× slower (scalar dequant); projections int8 + fused-QKV + parallel-optimal; self-attn alloc-light (landed 1.54×); cross-KV int8-cached + parallel; LN-clones negligible at tq=1. No byte-exact franken-owned lever remains.
+
+**⇒ The two owner-gated acceleration paths (in EV order):**
+1. **GPU offload.** The bench box HAS an **NVIDIA GTX 1070** (`/dev/dri/renderD128`), but on **nouveau** with NO compute stack (no CUDA/OpenCL/Vulkan). This is the direct Linux analog of the owner's v0.3.0 Metal work (`ft-kernel-metal`). Unlock: proprietary NVIDIA driver + CUDA, a `ft-kernel-cuda` crate, reuse the existing `nn::matmul_into_uninit` offload seam (today `cfg(macos)`) for a `cfg(linux+cuda)` path. Breaks the encoder power ceiling (76–80% of e2e). Not doable from an agent cycle (root driver install + a kernel crate).
+2. **SIMD-poly softmax/sampler exp (~3.5% e2e).** frankentorch already HAS a SIMD-exp helper (lib.rs:2458) explicitly commented "intentionally NOT wired into production exp/sigmoid/softmax" — a **deliberate owner decision**, not an oversight. Wiring it is the owner's call (non-byte-exact; needs a transcript-quality gate). Plus a VNNI machine (absent here) would make int8 encoder GEMM + int4 logits viable.
+
+**Everything else is a faithful-port constraint** (franken reproduces whisper.cpp's exact math): workload reduction (VAD, mel truncation), low-rank/sketched attention, and hierarchical softmax all change outputs and are out of contract. See the dated entries below for each measurement.
+
+---
+
 ## 2026-07-02 - BlackThrush: DIG → REJECTED (measured) — **one-level Strassen on the encoder MLP GEMMs (the FLOP-count lever every prior cycle held fixed). 0.27–0.34× = a 3–3.7× LOSS. Numerics were FINE (max|Δ|~1e-6); the 12.5% mult saving is real but dwarfed by Strassen's O(n²) extraction/sum/assembly overhead at these sizes.**
 
 **Land-or-dig result: this session MEASURED the encoder is FREQUENCY/POWER-bound (not bandwidth), which for the first time made a FLOP-REDUCING lever worth trying — every prior encoder lever held the n³ FLOP count fixed and executed it faster (int8/blocking/threads), all hitting the power ceiling. Strassen does 7 mults not 8 (12.5% fewer). Built it, measured it, REJECTED.** AGENT_NAME=BlackThrush. The prior ledger dismissal of Strassen was for the WRONG target — the K=64 attention GEMM (contraction too small) — and by reasoning; this measures it at the RIGHT target (MLP GEMMs, K=1280/5120) and FRANKEN-SIDE (recursion calls `nn::matmul` for the 7 sub-products, NOT an ft_kernel_cpu change). Harness landed: `examples/strassen_probe.rs`.
