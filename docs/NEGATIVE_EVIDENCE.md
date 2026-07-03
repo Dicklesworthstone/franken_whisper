@@ -4,6 +4,18 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **LayerNorm normalize/affine in f32 (ggml/PyTorch scheme) instead of franken's f64 is NOT faster (0.99×): LN is DRAM-bound (read x once + write once per row), so narrowing the compute width is fully hidden. And it would COST faithfulness — franken's f64 is MORE precise than the references (976K/1.92M elements differ, max|Δ|=4.8e-7).**
+
+**Land-or-dig result.** AGENT_NAME=BlackThrush. Fresh angle, never profiled for speed: franken's `layer_norm` accumulates mean/var in f64 (faithful) AND does the normalize+affine `(x-mean)*inv*w+b` in **f64** (4-wide SIMD), whereas **ggml** (`ggml_compute_forward_norm_f32`) and **PyTorch** accumulate mean/var in double but do the normalize+affine in **f32** (8-wide). So franken is strictly *more* precise there. Hypothesis: an f32 normalize/affine (mean/var still f64) would be faster via f32x8 vs f64x4 AND land closer to the references. `examples/ln_f32_affine_probe` (turbo encoder LN shape [1500,1280], 1 thread, min-of-500, `target-cpu=native` so the map-loop autovectorizes to f64x4 / f32x8 — the reductions stay scalar-f64 and are identical in both):
+
+| scheme | µs | vs f64 |
+|--|--|--|
+| full-f64 (franken, current) | 3369 | 1.00× |
+| f64-mean/var + f32-normalize/affine (ggml-style) | 3387 | **0.99×** |
+
+**Two reasons this is DEAD.** (1) **No speed:** 0.99× — the normalize+affine write-loop (the ONLY part that differs) is DRAM-bound: per row it reads x (~5 KB, L1-resident after the mean/var passes) and writes 5 KB of f32 output; the arithmetic width (f64x4 vs f32x8) is entirely hidden behind that read+write, so shrinking it buys nothing. Same DRAM-bound floor as the encoder LN in the real engine (x is f32 in memory regardless of the register precision). (2) **Costs faithfulness:** the two schemes are NOT byte-exact — 976397 of 1920000 elements differ (max|Δ|=4.77e-7). Franken's full-f64 LN is *more* precise than both ggml and PyTorch, so switching would be a numerics REGRESSION relative to franken's own golden for zero speed. Single-pass mean+variance (Welford / Σx,Σx²) is likewise non-byte-exact (cancellation) AND wouldn't help — x is already L1-cached per row, so the "second read" is not DRAM traffic. LN is at its bandwidth floor with no byte-exact lever. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts; default untouched).
+
+---
 ## 2026-07-03 - BlackThrush: LANDED byte-exact DEFAULT-ON — **cross-attn build skips the unused f32 `kh_t`/`vh` buffers when `FW_CROSS_F16` is on (default): 1.95× on the cross-build (5.41→2.77 ms/window), f16 buffers bit-identical.**
 
 **Land result.** AGENT_NAME=BlackThrush. `DecoderState::new`'s per-window cross build made FOUR buffers per (layer,head): `kh_t` [d_head, enc_frames] f32 (a LARGE-STRIDE transpose), `k_nat` f16, `vh` f32, `v_t` f16. But `kh_t`/`vh` are consumed ONLY by the `FW_CROSS_F16=0` escape-hatch path (`cross_step`'s `!use_f16` branch, decoder.rs:1284/1288); the default f16/i8 path uses only `k_nat`/`v_t` (DTW `scores_all` is built in the f16 path too). So when `FW_CROSS_F16` is on (default), `kh_t` (strided transpose) + `vh` were built every window and NEVER read. Now gated on `need_f32 = !cross_f16_enabled()` (mirrors the exact `use_f16` dispatch gate); empty 0×0 placeholder Mats when skipped (never indexed). `examples/cross_f32skip_probe`: **1.95× (5.41→2.77 ms/window), 0 differing f16 pairs.** 21 decoder/cross tests pass incl. `cross_attn_recording_shape_and_normalization` + `cross_attn_dependence_on_encoder_out`.
