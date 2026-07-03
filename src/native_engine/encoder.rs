@@ -614,10 +614,15 @@ fn forward_time_major(
     // Add positional embedding (file tensor), sliced to the first n_ctx rows.
     et!(1, add_pos_emb(&mut x, &w.pos_emb, n_ctx));
 
-    // Residual transformer blocks.
-    for layer in &w.layers {
-        encoder_block(&mut x, layer, w.n_head)?;
-        checkpoint()?;
+    // Residual transformer blocks. On Apple Silicon with a large model the whole
+    // stack runs on the GPU (fused: activations resident, one command buffer/sync
+    // per layer instead of per-op CPU<->GPU ping-pong); every other case uses the
+    // CPU blocks. `FRANKEN_WHISPER_GPU=0` forces the CPU path.
+    if !gpu_encode_stack(&mut x, w) {
+        for layer in &w.layers {
+            encoder_block(&mut x, layer, w.n_head)?;
+            checkpoint()?;
+        }
     }
 
     // Final ln_post.
@@ -665,6 +670,119 @@ fn add_pos_emb(x: &mut Mat, pos_emb: &Mat, n_ctx: usize) {
             *v += p;
         }
     }
+}
+
+/// Run the encoder transformer stack on the GPU (Apple Silicon), keeping
+/// activations resident and batching each layer into one command buffer (one
+/// sync/layer). Returns `false` — so the caller uses the CPU blocks — off macOS,
+/// with no GPU, on a small model, or when disabled via `FRANKEN_WHISPER_GPU=0`.
+/// Weights are uploaded once and cached per model. All Metal lives in
+/// `ft-kernel-metal`, so this crate keeps `#![deny(unsafe_code)]`.
+#[cfg(target_os = "macos")]
+fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    if w.n_state < GPU_ENCODER_MIN_N_STATE || !gpu_encoder_enabled() {
+        return false;
+    }
+
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<ft_kernel_metal::fused::EncoderGpu>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = std::ptr::from_ref(w) as usize;
+
+    let enc = {
+        let mut guard = match cache.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if !guard.contains_key(&key) {
+            let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
+                .layers
+                .iter()
+                .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
+                    ln1_g: &l.attn_ln_w,
+                    ln1_b: &l.attn_ln_b,
+                    wq: &l.attn_q_w.data,
+                    bq: &l.attn_q_b,
+                    wk: &l.attn_k_w.data,
+                    wv: &l.attn_v_w.data,
+                    bv: &l.attn_v_b,
+                    wo: &l.attn_out_w.data,
+                    bo: &l.attn_out_b,
+                    ln2_g: &l.mlp_ln_w,
+                    ln2_b: &l.mlp_ln_b,
+                    w1: &l.mlp_fc_w.data,
+                    b1: &l.mlp_fc_b,
+                    w2: &l.mlp_proj_w.data,
+                    b2: &l.mlp_proj_b,
+                })
+                .collect();
+            match ft_kernel_metal::fused::EncoderGpu::new(
+                w.n_state,
+                w.n_head,
+                w.n_state * 4,
+                &refs,
+            ) {
+                Ok(enc) => {
+                    guard.insert(key, Arc::new(enc));
+                }
+                Err(_) => return false,
+            }
+        }
+        Arc::clone(guard.get(&key).expect("just inserted"))
+    };
+
+    let orig = x.data.clone();
+    match enc.forward(&x.data, x.rows) {
+        Ok(out) => {
+            if std::env::var_os("FWDBG_ENC").is_some() {
+                let mut cx = Mat::from_vec(x.rows, x.cols, orig);
+                for layer in &w.layers {
+                    let _ = encoder_block(&mut cx, layer, w.n_head);
+                }
+                let maxd = out
+                    .iter()
+                    .zip(&cx.data)
+                    .map(|(g, c)| (g - c).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "FWDBG_ENC maxdiff={maxd:.4} gpu={:?} cpu={:?}",
+                    &out[..4.min(out.len())],
+                    &cx.data[..4.min(cx.data.len())]
+                );
+            }
+            x.data = out;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gpu_encode_stack(_x: &mut Mat, _w: &EncoderWeights) -> bool {
+    false
+}
+
+/// Minimum `n_state` (model width) for the GPU encoder: medium/large whisper
+/// models (large-v3 = 1280). Smaller models keep the CPU path — their encoder is
+/// already fast and GPU launch overhead would not pay off.
+#[cfg(target_os = "macos")]
+const GPU_ENCODER_MIN_N_STATE: usize = 1024;
+
+/// Whether the GPU encoder is usable and enabled (probed once, cached).
+#[cfg(target_os = "macos")]
+fn gpu_encoder_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        let disabled = matches!(
+            std::env::var("FRANKEN_WHISPER_GPU").ok().as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
+        );
+        !disabled && ft_kernel_metal::fused::is_available()
+    })
 }
 
 /// One residual encoder block, mutating `x` (`[n_ctx, n_state]`) in place.
