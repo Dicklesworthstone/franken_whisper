@@ -4,6 +4,13 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: LANDED byte-exact DEFAULT-ON — **cross-attn build skips the unused f32 `kh_t`/`vh` buffers when `FW_CROSS_F16` is on (default): 1.95× on the cross-build (5.41→2.77 ms/window), f16 buffers bit-identical.**
+
+**Land result.** AGENT_NAME=BlackThrush. `DecoderState::new`'s per-window cross build made FOUR buffers per (layer,head): `kh_t` [d_head, enc_frames] f32 (a LARGE-STRIDE transpose), `k_nat` f16, `vh` f32, `v_t` f16. But `kh_t`/`vh` are consumed ONLY by the `FW_CROSS_F16=0` escape-hatch path (`cross_step`'s `!use_f16` branch, decoder.rs:1284/1288); the default f16/i8 path uses only `k_nat`/`v_t` (DTW `scores_all` is built in the f16 path too). So when `FW_CROSS_F16` is on (default), `kh_t` (strided transpose) + `vh` were built every window and NEVER read. Now gated on `need_f32 = !cross_f16_enabled()` (mirrors the exact `use_f16` dispatch gate); empty 0×0 placeholder Mats when skipped (never indexed). `examples/cross_f32skip_probe`: **1.95× (5.41→2.77 ms/window), 0 differing f16 pairs.** 21 decoder/cross tests pass incl. `cross_attn_recording_shape_and_normalization` + `cross_attn_dependence_on_encoder_out`.
+
+**Byte-exact / same class as the conv w_t hoist** (redundant-work elimination, load-INDEPENDENT — not a thread-count tune). **EV honest:** the cross build is per-window decode-side, so pipelining-HIDDEN on multi-window ([[project_window_pipelining_lever]]) ⇒ ~0 realistic multi-window e2e; ~2.64 ms/window helps only exposed decode (short single-window clips, last window). Smaller than conv (~0.4% e2e, encoder-side) but a clean default-on elimination with zero risk (strictly less work, FW_CROSS_F16=0 path byte-identical). Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: CORRECTION (measured) — **the FW_SDPA_GATHER_CHUNKS gather flip is NOT Pareto-safe and its benefit is WITHIN THE SHARED-BOX NOISE FLOOR: 16 is 0.81× (WORSE) in the cache-hot regime, and the cold benefit swung 1.73× → 1.03× between runs as other-agent load changed. The earlier 1.73× was a high-contention artifact. DEFINITELY keep gated + default-off; needs a QUIET box + model.**
 
 **Correction to my own prior entries.** AGENT_NAME=BlackThrush. To test whether flipping `FW_SDPA_GATHER_CHUNKS=16` is safe regardless of q-placement, `examples/sdpa_gather_regime_probe` measures the gather at fixed chunk counts across BOTH cache regimes in one run:
