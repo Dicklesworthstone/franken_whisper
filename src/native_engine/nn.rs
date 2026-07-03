@@ -1027,6 +1027,48 @@ fn quantize_act_i8_into(x: &[f32], xinv: f32, out: &mut [i8]) {
     }
 }
 
+/// `o[d] += a * x[d]` for every `d`. BYTE-IDENTICAL to the scalar loop
+/// `for (o, x) { *o += a * x }`: `*o += a*x` is mul-then-add (TWO IEEE roundings),
+/// and the AVX2 path uses SEPARATE `_mm256_mul_ps` + `_mm256_add_ps` — **not**
+/// `fmadd`, which would fuse to a single rounding and diverge in the last ULP.
+/// The vectorization is across the INDEPENDENT output slots `d`, so for each
+/// `o[d]` the accumulation order over successive calls (the decode `j`-ascending
+/// score·V SAXPY) is preserved exactly. See `axpy_f32_into_matches_scalar`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn axpy_f32_into(o: &mut [f32], a: f32, x: &[f32]) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(o.len(), x.len(), "axpy_f32_into len mismatch");
+    let n = o.len();
+    let xp = x.as_ptr();
+    let op = o.as_mut_ptr();
+    // SAFETY: avx2 guaranteed by cfg; loads/stores bounded by `i+8<=n`, remainder scalar.
+    unsafe {
+        let va = _mm256_set1_ps(a);
+        let mut i = 0;
+        while i + 8 <= n {
+            let ov = _mm256_loadu_ps(op.add(i));
+            let xv = _mm256_loadu_ps(xp.add(i));
+            // mul then add — two roundings, matching the scalar `*o += a*x`.
+            let r = _mm256_add_ps(ov, _mm256_mul_ps(va, xv));
+            _mm256_storeu_ps(op.add(i), r);
+            i += 8;
+        }
+        while i < n {
+            *o.get_unchecked_mut(i) += a * *x.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
+/// Scalar fallback (non-avx2): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn axpy_f32_into(o: &mut [f32], a: f32, x: &[f32]) {
+    for (oo, &xx) in o.iter_mut().zip(x) {
+        *oo += a * xx;
+    }
+}
+
 /// Fused int8 GEMV: `out[o] = (Σ_i q_w[o,i] · q_x[i]) · scale_w[o] · scale_x`.
 /// Quantizes the activation `x` to int8 per-vector (symmetric), then dots each
 /// weight row. Parallelizes over output-row bands exactly like [`gemv_f16`]
@@ -2815,12 +2857,13 @@ fn attention_decode_step(
         softmax_rows(&mut sm);
         scores = sm.data;
         // out[base+d] += sum_j scores[j] * v[j,base+d] (j ascending == m=1 SAXPY).
+        // AVX2 `axpy_f32_into` vectorizes across the INDEPENDENT output slots `d`
+        // (separate mul+add, NOT fmadd) so the per-slot j-ascending sum is
+        // bit-identical to the scalar `*o += sj*vd` loop it replaces.
         for (j, &sj) in scores.iter().enumerate() {
             let vrow = &v[j * n_state + base..j * n_state + base + d_head];
             let orow = &mut out[base..base + d_head];
-            for (o, &vd) in orow.iter_mut().zip(vrow) {
-                *o += sj * vd;
-            }
+            axpy_f32_into(orow, sj, vrow);
         }
     }
     Ok(Mat::from_vec(1, n_state, out))
@@ -3227,6 +3270,43 @@ mod tests {
         let mut got = vec![0i8; x.len()];
         quantize_act_i8_into(&x, 1.0, &mut got);
         assert_eq!(got, vec![1i8, 2, 3, -1, -2, -3, 127, -127]);
+    }
+
+    #[test]
+    fn axpy_f32_into_matches_scalar_reference() {
+        // `axpy_f32_into` (the decode score·V output SAXPY) must be BIT-identical to
+        // the scalar `*o += a*x` loop — separate mul+add (two roundings), NOT fmadd.
+        // Exercise the SIMD body, the <8 tail, and repeated accumulation (the real
+        // use accumulates over j into the same `o`). d_head=64 is the live shape.
+        fn scalar(o: &mut [f32], a: f32, x: &[f32]) {
+            for (oo, &xx) in o.iter_mut().zip(x) {
+                *oo += a * xx;
+            }
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0
+        };
+        for &n in &[0usize, 1, 7, 8, 9, 15, 16, 64, 65, 128] {
+            let x: Vec<f32> = (0..n).map(|_| nf()).collect();
+            let init: Vec<f32> = (0..n).map(|_| nf()).collect();
+            let mut got = init.clone();
+            let mut want = init;
+            // Accumulate several SAXPYs (as the real j-loop does) — order must match.
+            for _ in 0..5 {
+                let a = nf();
+                axpy_f32_into(&mut got, a, &x);
+                scalar(&mut want, a, &x);
+            }
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "axpy_f32_into bit mismatch at n={n}"
+            );
+        }
     }
 
     #[test]
