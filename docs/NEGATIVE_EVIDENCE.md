@@ -4,6 +4,16 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-02 - BlackThrush: DIG → REJECTED (measured) — **`dot_i8` 2-row register-blocking (share the activation sign-extension across 2 weight rows) is a WASH-to-LOSS: 0.62–0.75× on the DRAM-bound logits, 0.95–0.96× on mlp_0, only ~1.06× on the fully-cached qkv. Byte-identical. The int8 GEMV is WEIGHT-BANDWIDTH-bound (streaming shapes), not x-conversion-bound.**
+
+**Land-or-dig result: the 4-acc wash (prior entry) suggested `dot_i8` was `vpmovsxbw`-bound; since HALF those conversions are the re-loaded activation `x`, a 2-row kernel that converts `x` ONCE and reuses it for two weight rows SHOULD cut conversions 4→3/row (like the landed f16 2-row win [[project_2row_gemv_landed]]). Built it, MEASURED it, REJECTED.** AGENT_NAME=BlackThrush. `examples/dot_i8_probe` (best-of-N, 1 thread, `dot_i8_avx2_2row` returns two integer-identical dots):
+- **logits [51866,1280]** (DRAM-bound): **0.62–0.75×** — 2-row streams 2 rows' weights per iter, so it's MORE bandwidth-bound, and the (cache-hot) x-conversion saving can't offset it.
+- **mlp_0 [5120,1280]**: **0.95–0.96×** (wash). **qkv [1280,1280]** (fully L2-resident): **~1.06×** — the only shape where the x-conversion saving shows, and it's marginal + noisy.
+- **Byte-identical: 0 differing rows vs the 1-row kernel** (integer-exact).
+
+⇒ The bottleneck is SHAPE-DEPENDENT: weight DRAM bandwidth (streaming logits/mlp) or conversion (only the smallest fully-cached qkv), so row-blocking's shared-x saving is net-negative wherever weights stream. **`dot_i8` is fully at its Zen3 ceiling — neither more accumulators NOR row-blocking helps.** Don't re-dig. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-02 - BlackThrush: DIG → confirmed at ceiling (measured, not reasoned) — **`dot_i8`'s landed 2-accumulator layout is OPTIMAL: 4 accumulators are a WASH (0.98–1.01×, within run-to-run noise). The int8 dot is vpmovsxbw/load-bound, not accumulator-latency-bound. Byte-identical (integer-exact).**
 
 **Land-or-dig result: applied "measure, don't reason" to my own landed `dot_i8` — I'd picked 2 accumulators by REASONING it was conversion-bound (vs `dot_i8w_f32`'s 4). Measured it instead.** AGENT_NAME=BlackThrush. `examples/dot_i8_probe` now A/Bs 2-acc (landed) vs 4-acc (64-elem/iter), best-of-N, 1 thread:
