@@ -401,6 +401,97 @@ fn process_logits(
     (logits, logprobs)
 }
 
+/// Sampler `exp` acceleration gate (`FW_SIMD_EXP=1`, default OFF — an owner
+/// escape hatch, NOT a default change). When on, [`compute_logprobs`] computes its
+/// vocab-wide `logsumexp` with a vectorized AVX2 degree-5 poly exp instead of scalar
+/// libm `f32::exp` — MEASURED 16.7× on the 51866-vocab pass (`examples/exp_sampler_probe`).
+/// NON-byte-exact (~2.5e-5 logprob delta), so kept off by default: franken deliberately
+/// runs the accurate libm exp (mirrors frankentorch's deliberately-unwired
+/// `ft_kernel_cpu::exp_f64x4`; the owner's accuracy/speed call). NOTE: in
+/// no_timestamps mode the greedy TEXT is exp-INDEPENDENT (the token is `argmax` of the
+/// RAW logits, and the timestamp-forcing rule cannot fire because timestamps are masked
+/// to -inf), so with this ON the no_ts transcript is byte-identical (verified by diff);
+/// only timestamp-mode boundaries and logprob metadata can shift.
+fn simd_exp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_SIMD_EXP").is_some())
+}
+
+/// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
+/// (matching the scalar `l > -inf` guard). AVX2 degree-5 poly exp: range-reduce
+/// `x = k·ln2 + r`, `exp(r)` via Horner, `2^k` by float-bit construction. Numerics-
+/// affecting (~2.5e-5 vs libm) — only reached under [`simd_exp_enabled`].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[allow(unsafe_code)]
+fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
+    use core::arch::x86_64::*;
+    let n = logits.len();
+    let lp = logits.as_ptr();
+    // SAFETY: avx2+fma guaranteed by this fn's cfg; every load is bounded by the
+    // `i+8<=n` guard and the `< 8` remainder runs scalar.
+    unsafe {
+        let vmax = _mm256_set1_ps(max);
+        let ninf = _mm256_set1_ps(f32::NEG_INFINITY);
+        let log2e = _mm256_set1_ps(1.442_695_f32);
+        let ln2 = _mm256_set1_ps(0.693_147_2_f32);
+        let lo = _mm256_set1_ps(-87.3365_f32);
+        let c0 = _mm256_set1_ps(1.0);
+        let c1 = _mm256_set1_ps(1.0);
+        let c2 = _mm256_set1_ps(0.5);
+        let c3 = _mm256_set1_ps(0.166_666_67_f32);
+        let c4 = _mm256_set1_ps(0.041_666_66_f32);
+        let c5 = _mm256_set1_ps(0.008_333_33_f32);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let l = _mm256_loadu_ps(lp.add(i));
+            let keep = _mm256_cmp_ps::<_CMP_GT_OQ>(l, ninf); // l > -inf
+            let xv = _mm256_max_ps(_mm256_sub_ps(l, vmax), lo);
+            let kf = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+                _mm256_mul_ps(xv, log2e),
+            );
+            let r = _mm256_fnmadd_ps(kf, ln2, xv);
+            let mut p = _mm256_fmadd_ps(c5, r, c4);
+            p = _mm256_fmadd_ps(p, r, c3);
+            p = _mm256_fmadd_ps(p, r, c2);
+            p = _mm256_fmadd_ps(p, r, c1);
+            p = _mm256_fmadd_ps(p, r, c0);
+            let ki = _mm256_cvtps_epi32(kf);
+            let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+                ki,
+                _mm256_set1_epi32(127),
+            )));
+            let e = _mm256_and_ps(_mm256_mul_ps(p, pow2), keep); // zero masked lanes
+            acc = _mm256_add_ps(acc, e);
+            i += 8;
+        }
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        let mut s = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        while i < n {
+            let l = logits[i];
+            if l > f32::NEG_INFINITY {
+                s += (l - max).exp();
+            }
+            i += 1;
+        }
+        s
+    }
+}
+
+/// Scalar fallback (non-avx2): identical to the default libm loop.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
+    let mut s = 0.0f32;
+    for &l in logits {
+        if l > f32::NEG_INFINITY {
+            s += (l - max).exp();
+        }
+    }
+    s
+}
+
 /// Numerically-stable log-softmax (whisper.cpp `whisper_compute_logprobs`,
 /// lines 6138-6158). `-inf` logits map to `-inf` logprobs.
 fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
@@ -414,13 +505,20 @@ fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
         .map(|&l| if l.is_finite() { l } else { f32::NEG_INFINITY })
         .collect();
     let logit_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut logsumexp = 0.0f32;
-    for &l in &logits {
-        if l > f32::NEG_INFINITY {
-            logsumexp += (l - logit_max).exp();
+    // Default (gate off): exact scalar libm — byte-identical to before. Gate on:
+    // vectorized poly exp (16.7×, ~2.5e-5 delta), the owner's opt-in escape hatch.
+    let logsumexp_raw = if simd_exp_enabled() {
+        logsumexp_sum_simd(&logits, logit_max)
+    } else {
+        let mut s = 0.0f32;
+        for &l in &logits {
+            if l > f32::NEG_INFINITY {
+                s += (l - logit_max).exp();
+            }
         }
-    }
-    let logsumexp = logsumexp.ln() + logit_max;
+        s
+    };
+    let logsumexp = logsumexp_raw.ln() + logit_max;
     logits
         .iter()
         .map(|&l| {
@@ -1674,6 +1772,48 @@ mod tests {
     }
 
     // ----- Rule 1: blank + eot suppression at step 0 only -----
+
+    #[test]
+    fn logsumexp_sum_simd_matches_scalar() {
+        // The FW_SIMD_EXP path (`logsumexp_sum_simd`) must match the scalar libm
+        // Σ exp(l−max) within the poly tolerance across all code paths (SIMD body,
+        // <8 scalar tail) and edge cases, and treat -inf lanes as EXACTLY 0 (matching
+        // the default loop's `l > -inf` guard). Guards the gated escape hatch.
+        fn scalar(logits: &[f32], max: f32) -> f32 {
+            let mut s = 0.0f32;
+            for &l in logits {
+                if l > f32::NEG_INFINITY {
+                    s += (l - max).exp();
+                }
+            }
+            s
+        }
+        let mut st = 0x1357_9BDF_2468_ACE0u64;
+        let mut nf = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / (1u64 << 24) as f32
+        };
+        for &n in &[0usize, 1, 7, 8, 9, 15, 16, 17, 1000, 51866] {
+            let mut v: Vec<f32> = (0..n)
+                .map(|_| {
+                    let u = nf();
+                    if u < 0.1 { f32::NEG_INFINITY } else { -30.0 * nf() }
+                })
+                .collect();
+            if n > 0 {
+                v[n / 2] = 0.0; // a finite max at 0
+            }
+            let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let got = logsumexp_sum_simd(&v, max);
+            let want = scalar(&v, max);
+            let rel = (got - want).abs() / want.abs().max(1e-30);
+            assert!(rel < 1e-3, "n={n}: simd {got} vs scalar {want} rel {rel:.2e}");
+        }
+        // All-masked (-inf, max=-inf) → sum exactly 0 (mask zeroes the NaN lanes).
+        assert_eq!(logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY), 0.0);
+    }
 
     #[test]
     fn blank_and_eot_suppressed_at_step0() {
