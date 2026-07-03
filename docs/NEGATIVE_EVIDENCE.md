@@ -4,6 +4,23 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: CORRECTION (measured) — **the FW_SDPA_GATHER_CHUNKS gather flip is NOT Pareto-safe and its benefit is WITHIN THE SHARED-BOX NOISE FLOOR: 16 is 0.81× (WORSE) in the cache-hot regime, and the cold benefit swung 1.73× → 1.03× between runs as other-agent load changed. The earlier 1.73× was a high-contention artifact. DEFINITELY keep gated + default-off; needs a QUIET box + model.**
+
+**Correction to my own prior entries.** AGENT_NAME=BlackThrush. To test whether flipping `FW_SDPA_GATHER_CHUNKS=16` is safe regardless of q-placement, `examples/sdpa_gather_regime_probe` measures the gather at fixed chunk counts across BOTH cache regimes in one run:
+
+| chunks | HOT (best) vs legacy | COLD (mean) vs legacy |
+|--|--|--|
+| 0(=20, legacy) | 186 µs 1.00× | 644 µs 1.00× |
+| 8 | 171 µs 1.09× | 639 µs 1.01× |
+| 16 | 229 µs **0.81×** | 626 µs 1.03× |
+| 20 | 182 µs 1.02× | 632 µs 1.02× |
+| 32 | 174 µs 1.07× | 693 µs 0.93× |
+
+**NOT Pareto: 16 is 0.81× (worse) hot, only 1.03× cold.** And COLD is now FLAT (638–693 µs, ±5%) — the earlier `sdpa_gather_cold_probe`'s 1.73× (16 vs 20) is GONE: that run measured 20-way at 1105 µs, this one at 644 µs for the SAME config. That ~1.7× swing is other-agent load on the shared box — exactly the "can't settle thread-count on a shared box" hazard ([[project_decode_overthreaded_rayon_lead]], 3 reverts). Byte-identical throughout.
+
+**Conclusion:** the gather/scatter chunk lever's benefit is UNRELIABLE here (load-artifact, not stable) and NOT Pareto-safe (regime-dependent, can regress the hot path). The landed `FW_SDPA_GATHER_CHUNKS` mechanism (default 0 = byte-identical) STAYS default-off — correct as-is. The prior "~1–1.5% e2e" was a high-contention upper bound, not a dependable win. Only a QUIET box + the turbo model can determine if it helps the real encoder at all. This is the empirical vindication of the shared-box thread-count discipline. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → RIGHT-SIZED (measured) — **the FW_SDPA_GATHER_CHUNKS lever is worth ~1% e2e, not 1.5%: at the FULL-OP level (gather + external kernel + scatter) chunks=16 is 1.061× (the kernel dominates ~94% of the op). Byte-identical THROUGH the external kernel.**
 
 **Land-or-dig result.** AGENT_NAME=BlackThrush. The isolated reshape probes showed 16 chunks beats legacy by 1.73× (gather) / 1.6× (scatter), but the reshape is only part of `attn_sdpa`. `examples/sdpa_full_op_cold_probe` runs the WHOLE op (gather → `ft_kernel_cpu::sdpa_forward_f32` → scatter) for one turbo encoder layer, cold (276 MB pool >> L3): legacy 20.80 ms/op vs 16-chunks 19.60 ms/op = **1.061× full-op, 0 differing** (the external kernel yields identical output regardless of chunking). The kernel is ~94% of the op (~19.6 ms), so the reshape's ~1.65× only moves the op ~6%.
