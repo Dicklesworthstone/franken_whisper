@@ -4,6 +4,22 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-02 - BlackThrush: SURFACE with hard data — **the sampler `exp` (owner-gated lever #2) MEASURED for the first time: scalar libm `expf` = 150 µs/token over the 51866 vocab, an AVX2 poly does it in 9 µs = 16.7×. But it's NON-byte-exact AND pipelining-HIDDEN on multi-window (~0 realistic e2e), so the faithful landing (match `ggml_v_expf`) stays the owner's call — now with numbers, not the old "~3.5%" estimate.**
+
+**Land-or-dig result: dug the biggest remaining decode cost after the 3 dot kernels (all now hand-AVX2). Followed the meta-pattern (re-verify a "closed/estimated" claim with a per-crate microbench) onto the sampler exp — the STATE OF THE CEILING summary's owner-gated path #2, previously only ESTIMATED "~3.5% e2e", never isolated-measured.** AGENT_NAME=BlackThrush. `compute_logprobs` (decode.rs) computes `logsumexp = Σ exp(l − max)` over n_vocab=51866 **per token** with scalar libm `f32::exp()`.
+
+**MEASURED (`examples/exp_sampler_probe`, 1 thread, best-of-300, realistic post-mask logits):**
+- scalar libm `expf`: **150.2 µs** per logsumexp pass.
+- AVX2 degree-5 poly (range-reduce + `2^k` bit-construct): **9.0 µs = 16.7×**.
+- numerical delta (my generic poly vs libm): sum rel-err **2.46e-5**, logprob (ln-sum) delta **2.48e-5**.
+
+**Why it does NOT land default-on (two independent blockers):**
+1. **NON-byte-exact + faithfulness-gated.** The exp feeds logprobs → the timestamp-forcing rule (`ts_logprob` vs `max_text_logprob`) and no_speech/avg_logprob, so a poly can (rarely) flip a token. The CORRECT faithful landing is to match **`ggml_v_expf`'s exact poly** — whisper.cpp uses that SIMD poly on AVX2, so franken's current **libm** exp ALREADY diverges from whisper here (more accurate than upstream); matching ggml would be MORE faithful AND 16× faster (the exact gelu situation). But franken deliberately runs libm (frankentorch HAS the SIMD-exp helper, `lib.rs:2458`, explicitly left unwired) — a considered owner accuracy decision. Wiring MY generic poly instead would diverge from BOTH libm and ggml = a faithfulness REGRESSION. So the landing hinges on the owner's exp-faithfulness contract + the exact ggml coefficients.
+2. **Pipelining-HIDDEN ⇒ low realistic EV.** Decode is ~20% of e2e and is fully overlapped behind the dominant encoder by window-pipelining on MULTI-window files ([[project_window_pipelining_lever]]), so a 141 µs/token sampler saving is **~0 e2e on the realistic multi-window workload**; it only surfaces on SHORT single-window clips (~7% of per-token decode there ⇒ ~1.4% e2e). This likely explains WHY the owner declined to wire it — it doesn't help the workload that matters.
+
+**⇒ Refines the ledger:** the "~3.5%" estimate is now a hard **16.7× / 150 µs/token** kernel figure, correctly re-scoped as ~0 realistic e2e (pipelining-hidden) + faithfulness-gated. Harness `examples/exp_sampler_probe.rs` lets the owner A/B a real ggml-matching poly when they choose. Ratio vs OpenAI-Whisper unchanged (**~1.2× ts / ~1.68–1.8× no_ts**); this lever, even fully wired, would not move the realistic multi-window ratio.
+
+---
 ## 2026-07-02 - BlackThrush: LANDED byte-exact — **int8 GEMV inner dot (`dot_i8`): hand AVX2 (vpmovsxbw+vpmaddwd, 2 i32 accumulators) replaces LLVM's under-vectorized scalar reduction. 1.13× (DRAM-bound logits) → 1.8× (cache-resident mlp/qkv) on the decode's inner kernel, byte-identical (integer-exact), default-on.**
 
 **Land-or-dig result: LANDED a real byte-exact win on the DECODE inner kernel — bigger than the gelu gather. `dot_i8` is dotted per output-row by EVERY int8 decode GEMV (`gemv_i8` per-token + `gemv_i8_batch` prefill/draft): logits, mlp_0, mlp_2/fc2, qkv, cross_q, self_out, cross_out.** AGENT_NAME=BlackThrush.
