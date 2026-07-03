@@ -2051,6 +2051,99 @@ pub fn gelu(x: &mut Mat) {
     x.data.par_chunks_mut(chunk).for_each(gelu_slice);
 }
 
+/// Poly-exp softmax gate — shares the sampler's `FW_SIMD_EXP` env var (default OFF,
+/// an owner opt-in). When set, [`softmax_rows`] replaces the per-element scalar libm
+/// `.exp()` with an AVX2 poly (same Taylor/`ln2`-range-reduced poly family as
+/// `decode::logsumexp_sum_simd`). NON-byte-exact ⇒ owner/faithfulness-gated; default off
+/// is byte-identical to the pure-libm path. Measured 6.25× on the per-token decode softmax
+/// workload (`examples/decode_softmax_exp_probe`), cross-attn-dominated; the sampler's
+/// existing flag only covered `compute_logprobs`, so this captures the larger cross/self
+/// attention softmax exp (see docs/NEGATIVE_EVIDENCE.md 2026-07-03).
+fn simd_exp_softmax_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_SIMD_EXP").is_some())
+}
+
+/// AVX2 poly-exp softmax numerator: writes `exp(row[i]-max)` into `row` and returns the
+/// sum. `-inf`/NaN lanes map to 0 (via the `l > -inf` keep-mask, matching the scalar
+/// finite-guard: `NaN > -inf` and `-inf > -inf` are both false). Only reached under
+/// [`simd_exp_softmax_enabled`]; NON-byte-exact vs libm (poly + reordered sum).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[allow(unsafe_code)]
+fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
+    use core::arch::x86_64::*;
+    let n = row.len();
+    let p = row.as_mut_ptr();
+    // SAFETY: avx2+fma guaranteed by this fn's cfg; every load/store is bounded by the
+    // `i+8<=n` guard and the `< 8` remainder runs scalar. `x = row[i]-max <= 0` (max is the
+    // row max) so the pow2 scale never overflows; only the low clamp `lo` is needed.
+    unsafe {
+        let vmax = _mm256_set1_ps(max);
+        let ninf = _mm256_set1_ps(f32::NEG_INFINITY);
+        let log2e = _mm256_set1_ps(1.442_695_f32);
+        let ln2 = _mm256_set1_ps(0.693_147_2_f32);
+        let lo = _mm256_set1_ps(-87.3365_f32);
+        let c0 = _mm256_set1_ps(1.0);
+        let c1 = _mm256_set1_ps(1.0);
+        let c2 = _mm256_set1_ps(0.5);
+        let c3 = _mm256_set1_ps(0.166_666_67_f32);
+        let c4 = _mm256_set1_ps(0.041_666_66_f32);
+        let c5 = _mm256_set1_ps(0.008_333_33_f32);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let l = _mm256_loadu_ps(p.add(i));
+            let keep = _mm256_cmp_ps::<_CMP_GT_OQ>(l, ninf); // false for -inf AND NaN
+            let xv = _mm256_max_ps(_mm256_sub_ps(l, vmax), lo);
+            let kf = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+                _mm256_mul_ps(xv, log2e),
+            );
+            let r = _mm256_fnmadd_ps(kf, ln2, xv);
+            let mut pp = _mm256_fmadd_ps(c5, r, c4);
+            pp = _mm256_fmadd_ps(pp, r, c3);
+            pp = _mm256_fmadd_ps(pp, r, c2);
+            pp = _mm256_fmadd_ps(pp, r, c1);
+            pp = _mm256_fmadd_ps(pp, r, c0);
+            let ki = _mm256_cvtps_epi32(kf);
+            let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+                ki,
+                _mm256_set1_epi32(127),
+            )));
+            let e = _mm256_and_ps(_mm256_mul_ps(pp, pow2), keep); // zero masked lanes
+            _mm256_storeu_ps(p.add(i), e);
+            acc = _mm256_add_ps(acc, e);
+            i += 8;
+        }
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        while i < n {
+            // <8-element tail: libm exp (negligible count; the sum is non-byte-exact anyway).
+            let e = (row[i] - max).exp();
+            let e = if e.is_finite() { e } else { 0.0 };
+            row[i] = e;
+            s += e;
+            i += 1;
+        }
+        s
+    }
+}
+
+/// Scalar fallback (non-avx2 build): identical to the default libm loop.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
+    let mut s = 0.0f32;
+    for v in row.iter_mut() {
+        let e = (*v - max).exp();
+        let e = if e.is_finite() { e } else { 0.0 };
+        *v = e;
+        s += e;
+    }
+    s
+}
+
 /// In-place numerically-stable per-row softmax (max-subtract).
 ///
 /// Each row is softmaxed independently: subtract the row max before
@@ -2062,25 +2155,33 @@ pub fn softmax_rows(x: &mut Mat) {
     if cols == 0 {
         return;
     }
-    // Per-row max-subtract / exp / normalize, order unchanged. Rows are
-    // independent, so fan out over contiguous row bands (disjoint slices of
-    // `x.data`). Threshold in elements keeps small score matrices serial.
-    let softmax_row = |row: &mut [f32]| {
+    // Default: per-row max-subtract / scalar-libm exp / normalize, order unchanged
+    // (byte-identical). `FW_SIMD_EXP` swaps the exp numerator for the AVX2 poly
+    // (owner-gated, non-byte-exact). Rows are independent, so fan out over contiguous
+    // row bands (disjoint slices of `x.data`); threshold in elements keeps small
+    // score matrices serial.
+    let use_simd = simd_exp_softmax_enabled();
+    let softmax_row = move |row: &mut [f32]| {
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         if !max.is_finite() {
             // All -inf (e.g. fully masked row): leave as-is to avoid NaNs.
             return;
         }
-        let mut sum = 0.0f32;
-        for v in row.iter_mut() {
-            // A NaN score (e.g. from an upstream overflow) would make
-            // `(*v - max).exp()` NaN, poison `sum`, skip normalization, and
-            // leave NaN in the row. Treat non-finite contributions as 0.
-            let e = (*v - max).exp();
-            let e = if e.is_finite() { e } else { 0.0 };
-            *v = e;
-            sum += e;
-        }
+        let sum = if use_simd {
+            softmax_row_poly_numer(row, max)
+        } else {
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                // A NaN score (e.g. from an upstream overflow) would make
+                // `(*v - max).exp()` NaN, poison `sum`, skip normalization, and
+                // leave NaN in the row. Treat non-finite contributions as 0.
+                let e = (*v - max).exp();
+                let e = if e.is_finite() { e } else { 0.0 };
+                *v = e;
+                sum += e;
+            }
+            sum
+        };
         if sum > 0.0 {
             let inv = 1.0 / sum;
             for v in row.iter_mut() {
@@ -3722,6 +3823,67 @@ mod tests {
         let s: f32 = x.row(0).iter().sum();
         assert!((s - 1.0).abs() < 1e-5, "sum {s}");
         assert_eq!(x.row(0)[0], 0.0, "NaN lane maps to 0");
+    }
+
+    /// The gated `FW_SIMD_EXP` poly softmax numerator must match the scalar libm
+    /// softmax within a tight tolerance, over lengths that exercise the AVX2 body +
+    /// the `< 8` scalar tail, and must map `-inf`/NaN lanes to 0 exactly like scalar.
+    #[test]
+    fn softmax_row_poly_numer_matches_scalar() {
+        let mut rng = Lcg::new(0xB1AC_5017);
+        // Reference scalar softmax over one row (in place), returns the row.
+        let scalar = |v: &[f32]| -> Vec<f32> {
+            let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if !max.is_finite() {
+                return v.to_vec();
+            }
+            let mut row: Vec<f32> = v
+                .iter()
+                .map(|&x| {
+                    let e = (x - max).exp();
+                    if e.is_finite() {
+                        e
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let sum: f32 = row.iter().sum();
+            if sum > 0.0 {
+                let inv = 1.0 / sum;
+                for r in &mut row {
+                    *r *= inv;
+                }
+            }
+            row
+        };
+        // Lengths hit 1..=40 (tails 0..7) plus the 1500-wide cross-attn shape.
+        for &len in &[1usize, 4, 7, 8, 9, 15, 16, 33, 64, 128, 1500] {
+            let base: Vec<f32> = (0..len).map(|_| rng.next_f32() * 6.0).collect();
+            let want = scalar(&base);
+            let mut got = base.clone();
+            let max = got.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum = super::softmax_row_poly_numer(&mut got, max);
+            if sum > 0.0 {
+                let inv = 1.0 / sum;
+                for g in &mut got {
+                    *g *= inv;
+                }
+            }
+            let maxd = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(maxd < 1e-5, "len {len}: poly vs scalar max|Δ|={maxd:e}");
+        }
+        // Masked/NaN lanes -> 0 in the poly numerator (matches scalar finite-guard).
+        let mut row = vec![1.0f32, f32::NEG_INFINITY, 2.0, f32::NAN, 0.5, 3.0, -1.0, 4.0, 0.0];
+        let max = 4.0f32;
+        super::softmax_row_poly_numer(&mut row, max);
+        assert_eq!(row[1], 0.0, "-inf lane -> 0");
+        assert_eq!(row[3], 0.0, "NaN lane -> 0");
+        assert!(row.iter().all(|v| v.is_finite()), "no NaN/inf in poly output");
     }
 
     #[allow(clippy::too_many_arguments)]
