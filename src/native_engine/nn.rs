@@ -2129,6 +2129,11 @@ pub fn softmax_rows(x: &mut Mat) {
 /// `bias.len() != cout`, `stride == 0`, or the padded input is shorter than
 /// the kernel (empty output).
 #[allow(clippy::too_many_arguments)]
+/// 1-D convolution with the weight in ggml `[Cout, Cin*K]` order. Transposes the weight
+/// to `[Cin*K, Cout]` and delegates to [`conv1d_wt`]. For the encoder stem the conv weights
+/// are CONSTANT across windows — prefer pre-transposing once at load and calling
+/// [`conv1d_wt`] directly; this entry re-transposes on every call (kept for the standalone
+/// API and as the byte-exact reference for [`conv1d_wt`]).
 pub fn conv1d(
     x: &Mat,
     w: &[f32],
@@ -2139,17 +2144,50 @@ pub fn conv1d(
     stride: usize,
     pad: usize,
 ) -> FwResult<Mat> {
+    let patch = cin * k;
+    if w.len() != cout * patch {
+        return Err(FwError::InvalidRequest(format!(
+            "conv1d: weight len {} != cout*cin*k = {}",
+            w.len(),
+            cout * patch
+        )));
+    }
+    // Reshape/transpose weights [Cout, Cin*K] -> w_t [Cin*K, Cout].
+    let mut w_t = vec![0.0f32; patch * cout];
+    for co in 0..cout {
+        for j in 0..patch {
+            w_t[j * cout + co] = w[co * patch + j];
+        }
+    }
+    conv1d_wt(x, &Mat::from_vec(patch, cout, w_t), cin, k, bias, stride, pad)
+}
+
+/// 1-D convolution taking the weight ALREADY transposed to `[Cin*K, Cout]` (the layout
+/// [`matmul_bias`] consumes) — skips the per-call weight transpose. The encoder stem
+/// pre-transposes its constant conv weights once at load ([`EncoderWeights::from_ggml`])
+/// and calls this, avoiding a redundant ~15 ms/window strided transpose on turbo (conv2).
+/// Byte-identical to [`conv1d`] fed the same weight (the transpose is a pure permutation).
+pub fn conv1d_wt(
+    x: &Mat,
+    w_t: &Mat,
+    cin: usize,
+    k: usize,
+    bias: &[f32],
+    stride: usize,
+    pad: usize,
+) -> FwResult<Mat> {
+    let patch = cin * k;
+    let cout = w_t.cols;
     if x.cols != cin {
         return Err(FwError::InvalidRequest(format!(
             "conv1d: x.cols {} != cin {cin}",
             x.cols
         )));
     }
-    if w.len() != cout * cin * k {
+    if w_t.rows != patch {
         return Err(FwError::InvalidRequest(format!(
-            "conv1d: weight len {} != cout*cin*k = {}",
-            w.len(),
-            cout * cin * k
+            "conv1d: w_t rows {} != cin*k = {patch}",
+            w_t.rows
         )));
     }
     if bias.len() != cout {
@@ -2175,7 +2213,6 @@ pub fn conv1d(
     // `cols[o*patch..(o+1)*patch]` band, so the construction fans out over
     // contiguous output-row bands. Each row reads disjoint output but shared
     // (read-only) `x`. Threshold in elements keeps small convs serial.
-    let patch = cin * k;
     let mut cols = vec![0.0f32; t_out * patch];
     let fill_row = |o: usize, row: &mut [f32]| {
         let start = o * stride; // position in the padded input
@@ -2205,8 +2242,8 @@ pub fn conv1d(
         let band_rows = t_out.div_ceil(worker_count()).max(1);
         std::thread::scope(|s| {
             let fill_row = &fill_row;
-            for (w, band) in cols.chunks_mut(band_rows * patch).enumerate() {
-                let o_base = w * band_rows;
+            for (wi, band) in cols.chunks_mut(band_rows * patch).enumerate() {
+                let o_base = wi * band_rows;
                 s.spawn(move || {
                     for (i, row) in band.chunks_mut(patch).enumerate() {
                         fill_row(o_base + i, row);
@@ -2217,17 +2254,8 @@ pub fn conv1d(
     }
     let im2col = Mat::from_vec(t_out, patch, cols);
 
-    // Reshape weights [Cout, Cin*K] -> w_t [Cin*K, Cout] (transpose).
-    let mut w_t = vec![0.0f32; patch * cout];
-    for co in 0..cout {
-        for j in 0..patch {
-            w_t[j * cout + co] = w[co * patch + j];
-        }
-    }
-    let w_t = Mat::from_vec(patch, cout, w_t);
-
     // [T_out, Cin*K] x [Cin*K, Cout] -> [T_out, Cout], then add bias.
-    matmul_bias(&im2col, &w_t, Some(bias))
+    matmul_bias(&im2col, w_t, Some(bias))
 }
 
 /// f16 KV-cache storage gate (`FW_KV_F16=1`, default off). Stores the
@@ -3385,6 +3413,30 @@ mod tests {
                 "gather diverged at chunks={chunks}"
             );
         }
+    }
+
+    #[test]
+    fn conv1d_wt_matches_conv1d() {
+        // conv1d_wt fed the externally-transposed weight must be BIT-identical to conv1d
+        // fed the ggml-order weight (the encoder pre-transposes at load via transpose_serial).
+        let (cout, cin, k) = (12usize, 5usize, 3usize);
+        let (t_in, stride, pad) = (17usize, 2usize, 1usize);
+        let patch = cin * k;
+        let mut s = 0x243F_6A88_85A3_08D3u64;
+        let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 };
+        let x = Mat::from_vec(t_in, cin, (0..t_in * cin).map(|_| nf()).collect());
+        let w: Vec<f32> = (0..cout * patch).map(|_| nf()).collect();
+        let bias: Vec<f32> = (0..cout).map(|_| nf()).collect();
+        // Pre-transpose w [cout, patch] -> [patch, cout] (transpose_serial == conv1d's inline).
+        let w_t = Mat::from_vec(patch, cout, transpose_serial(&w, cout, patch));
+        let a = conv1d(&x, &w, cout, cin, k, &bias, stride, pad).unwrap();
+        let b = conv1d_wt(&x, &w_t, cin, k, &bias, stride, pad).unwrap();
+        assert_eq!((a.rows, a.cols), (b.rows, b.cols));
+        assert_eq!(
+            a.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "conv1d_wt diverged from conv1d"
+        );
     }
 
     #[test]
