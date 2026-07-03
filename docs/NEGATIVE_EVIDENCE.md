@@ -4,6 +4,21 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → OWNER-GATED LEVER SIZED — **the int8 encoder GEMM is NOT dead on this AVX2-no-VNNI box: int8 compute (VPMADDUBSW+VPMADDWD) hits 84.5 GMAC/s vs f32 FMA, and against the encoder's BLOCKED f32 (~40 GMAC/s) that is ~2× single-core headroom. The "naive int8 = 0.38×" was an unblocked/quantize artifact, not the ceiling — a BLOCKED int8 microkernel is worth ~2× on the 80% encoder (~1.5–1.6× e2e), owner-gated on impl effort + a model quality A/B.**
+
+**Dig result (sizing the largest owner-gated lever).** AGENT_NAME=BlackThrush. Before anyone invests in a blocked int8 encoder microkernel, `examples/int8_vs_f32_compute_ceiling_probe` measures the raw AVX2 MAC/s ceiling (L1-resident, 8 independent accumulators, min-of-7, 1 core):
+
+| kernel | GMAC/s | regime |
+|--|--|--|
+| f32 VFMADD (unblocked, streaming a·b) | 17.3 | LOAD-port-bound (2 f32 vec-loads / 8 MACs) |
+| int8 VPMADDUBSW+VPMADDWD (unblocked) | **84.5** | ~compute-bound (32 int8/vector ⇒ 1 load / 16 MACs) |
+| raw ratio | **4.89×** | — |
+
+**Honest regime correction (don't quote the 4.89× as the encoder win):** the 4.89× is the UNBLOCKED/load-bound ratio — it mostly reflects int8's 4× data density (1 byte vs 4). The encoder's real f32 GEMM is `matrixmultiply`, which is Goto-BLOCKED and COMPUTE-bound at ~40 GMAC/s (64–81% of the 57.6 f32 peak, per [[project_turbo_encoder_dominates]]/[[project_encoder_wall_is_clock_throttle]]). int8 maddubs is already near its instruction peak even unblocked (light load pressure), so a blocked int8 GEMM ≈ 84–100 GMAC/s. **Realistic BLOCKED ratio ≈ 84.5/40 ≈ ~2–2.5× single-core.** VPMADDUBSW does 32 MAC/instr @ ~1/cyc vs VFMADD 16 MAC/2-units/cyc — a ~2× compute-peak edge even without VNNI (VPDPBUSD would be ~4×). Multi-thread clock-throttle applies to BOTH (same 256-bit AVX2 power class), so the ~2× roughly survives to 32 threads.
+
+**Conclusion — the lever is REAL and mis-filed as dead.** A BLOCKED int8×int8 encoder GEMM is worth ~2× on the ~80% encoder ⇒ encoder ~80%→~40% ⇒ **~1.5–1.6× e2e**. The prior "naive int8 = 0.38× (needs VNNI)" was an UNBLOCKED + per-window-quantize-overhead artifact, NOT the hardware ceiling — this box's int8 compute clearly beats f32. It stays OWNER-GATED on two real costs: (1) implementing a Goto-blocked int8 microkernel competitive with matrixmultiply (days, not a cycle — the [[project_engine_at_safe_ceiling]] "external kernel is off-limits" seam), and (2) int8 is non-byte-exact ⇒ needs the turbo model for a transcript-quality A/B (absent from this box). This is now the #1 sized owner-gated lever, ABOVE the softmax-exp poly. Ratio vs OpenAI-Whisper unchanged today (no code change; ~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → CLASS CLOSED — **after the AVX2 argmax landing, the softmax/cross_attn/sampler BYTE-EXACT lever class is fully mined: the index-reduction antipattern has no other hot instance, and every remaining sampler/softmax sub-op is sub-noise (autovec'd / already-measured-reverted) or byte-locked exp (owner-gated poly, landed).**
 
 **Dig result (completing the antipattern hunt the argmax opened).** AGENT_NAME=BlackThrush. Grepping the whole engine for the `if x > best { best_i = i }` index-tracking-reduction antipattern (the one that just paid 5.10× on `argmax`) finds **no other hot instance** — the only other `argmax` in `nn.rs`/`decoder.rs`/`encoder.rs` is a test assertion. Sizing the rest of the softmax/cross_attn/sampler neighborhood:
