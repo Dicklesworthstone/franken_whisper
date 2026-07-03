@@ -4,6 +4,16 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-02 - BlackThrush: RATIO RE-VALIDATED (fresh head-to-head) — **franken 1.68× vs whisper.cpp's BEST (-t48) on no_ts jfk×6; transcripts content-identical. The session's 11 commits did NOT regress the lead or correctness.**
+
+**Land-or-dig result: validated the directive's core metric (ratio vs OpenAI-Whisper) with a fresh on-box head-to-head — the STATE OF THE CEILING summary's ratio rested on prior load-27+ runs; this re-confirms it and doubles as a session regression check.** AGENT_NAME=BlackThrush. Identical 66 s audio (jfk tiled ×6 = 3 windows) to BOTH engines, no_timestamps, tightly interleaved, min-of-2:
+- **franken** (`e2e_probe`, RAYON=32): **7.21 s** (also 7.48/7.84 in an earlier round) — transcript CORRECT ("And so, my fellow Americans, ask not what your country can do for you…" ×6).
+- **whisper.cpp** (`whisper-cli`, its BEST -t48): **12.10 s** (−t32 = 12.31 s) — same transcript content.
+- ⇒ **franken 1.68× on no_timestamps** (12.10/7.21). Consistent with the standing **~1.8× no_ts** ([[project_window_pipelining_lever]]); the slight compression is the load-35 contention squeezing franken's overlapped-decode edge. Correctness confirmed byte-content-identical to whisper.cpp, so the lead is REAL, not a quality shortcut.
+
+**Caveats (honest):** load was ~35 (contended) so absolutes are inflated but the RATIO is interleave-robust; this is the no_ts figure (the ~1.2× timestamp figure has a window-count mode-mismatch confound — franken correctly adds a trailing seek window whisper `-nt` suppresses). whisper measured at its own optimum (-t48). **Confirms the owner-decision summary below and that this session (1 profiler landed + 10 measured closes/surfaces) is lead-neutral and correctness-neutral.**
+
+---
 ## ★ STATE OF THE CEILING (2026-07-02, BlackThrush) — owner decision summary
 
 **franken_whisper is at this box's hardware ceiling; every CPU lever is closed BY MEASUREMENT. The only acceleration paths left are two OWNER hardware/policy decisions.** Ratio vs OpenAI-Whisper (whisper.cpp turbo, matched high threads): **~1.2× e2e (timestamp) / ~1.8× (no_timestamps)** — encoder TIED at the AVX2 GEMM peak (same silicon), franken's lead is the **int8 decode (~2×/token)**.
