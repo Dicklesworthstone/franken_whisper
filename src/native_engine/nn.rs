@@ -1808,29 +1808,47 @@ fn gelu_table() -> &'static [f32; 1 << 16] {
 /// transcription-tolerance encoder/decoder path (never the bit-exact mel path).
 ///
 /// x86-64-v3 path: 8-wide `vcvtps2ph` (round-to-nearest-even → the same f16 index
-/// as the scalar `Float16::from_f32`) → widen → AVX2 gather from the table → blend
-/// the clamp. Bit-identical to the scalar fallback (verified max|Δ|=0 in
-/// `examples/gelu_probe`), 1.38× faster than it / 4.4× faster than the old tanh.
+/// as the scalar `Float16::from_f32`) → widen to 8 u32 indices → **8 explicit
+/// scalar table-loads** (NOT `vgatherdps`) → blend the clamp. On Zen3 (this box's
+/// 5975WX) `vgatherdps ymm` is microcoded and caps at ~2.2 Gelem/s even cache-hot;
+/// scalar loads from the L2-resident 256 KiB table pipeline at ~2-3/cyc and are
+/// byte-identical (same indices, same lane order), for a measured **1.18×
+/// cache-resident / 1.13× streaming** speedup over the gather (`examples/gelu_gather_probe`,
+/// max|Δ|=0 over 7.68M elems spanning both clamp regions). Bit-identical to the
+/// scalar fallback (max|Δ|=0 in `examples/gelu_probe`), ~4.4× faster than the old tanh.
 #[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2"))]
 #[allow(unsafe_code)]
 fn gelu_slice(data: &mut [f32]) {
     use core::arch::x86_64::*;
     let table = gelu_table();
-    let tp = table.as_ptr();
     let n = data.len();
-    // SAFETY: all loads/stores are bounded by the `i+8<=n` guard; the gather index
-    // is a widened f16 bit pattern (always 0..=65535, in-bounds for the 1<<16 table);
-    // f16c/avx2 are guaranteed by this fn's target_feature cfg.
+    // SAFETY: all loads/stores are bounded by the `i+8<=n` guard; each table index
+    // is a widened f16 bit pattern (always 0..=65535, in-bounds for the 1<<16 table,
+    // so `get_unchecked` is sound); f16c/avx2 are guaranteed by this fn's
+    // target_feature cfg.
     unsafe {
         let neg10 = _mm256_set1_ps(-10.0);
         let pos10 = _mm256_set1_ps(10.0);
         let zero = _mm256_setzero_ps();
         let mut i = 0;
+        let mut idxs = [0u32; 8];
         while i + 8 <= n {
             let x = _mm256_loadu_ps(data.as_ptr().add(i));
             let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
             let idx = _mm256_cvtepu16_epi32(h);
-            let g = _mm256_i32gather_ps::<4>(tp, idx);
+            // 8 scalar table-loads instead of `vgatherdps` (microcoded on Zen3).
+            // `_mm256_set_ps` lane j = table[idxs[j]] ⇒ identical to the gather.
+            _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
+            let g = _mm256_set_ps(
+                *table.get_unchecked(idxs[7] as usize),
+                *table.get_unchecked(idxs[6] as usize),
+                *table.get_unchecked(idxs[5] as usize),
+                *table.get_unchecked(idxs[4] as usize),
+                *table.get_unchecked(idxs[3] as usize),
+                *table.get_unchecked(idxs[2] as usize),
+                *table.get_unchecked(idxs[1] as usize),
+                *table.get_unchecked(idxs[0] as usize),
+            );
             // Clamp (ggml GGML_GELU_FP16): x>=10 → x, x<=-10 → 0, else gathered.
             let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
             let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
