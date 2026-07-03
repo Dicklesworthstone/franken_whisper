@@ -4,6 +4,15 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: LANDED byte-exact DEFAULT-ON — **conv stem weight transpose was recomputed EVERY window (~15.5 ms/window on turbo, pure redundant work); now pre-transposed ONCE at model load. Encoder-side (NOT pipelining-hidden).**
+
+**Land result.** AGENT_NAME=BlackThrush. `nn::conv1d` transposed its weight `[Cout, Cin*K] → [Cin*K, Cout]` (serial strided loop) on EVERY call to feed `matmul_bias`. But conv weights are CONSTANT and conv1d runs once per encoder window — so this ran every window for nothing (unlike the LINEAR weights, pre-transposed once at load). `examples/conv_wt_transpose_probe`: the transpose costs **conv1 ~0.7 ms + conv2 ~15.0 ms = ~15.5 ms/window** (conv2 = a [3840,1280] strided transpose, 5 KB stride ⇒ cache/TLB-thrashing). Fix: split `conv1d` into `conv1d` (transpose-then-delegate, byte-exact reference) + `conv1d_wt` (takes the `[Cin*K, Cout]` weight, skips the transpose); `EncoderWeights::from_ggml` now pre-transposes conv1/conv2 ONCE via `transpose_serial` (bit-identical to the inline transpose) and the per-window encode calls `conv1d_wt`.
+
+**Byte-exact:** unit tests `conv1d_wt_matches_conv1d` (pre-transposed path == ggml-order path, bit-for-bit) + `conv1d_matches_naive` (refactored conv1d still matches the naive reference) both pass. The load-time transpose is the SAME work moved off the hot path (one-time at model load, amortized to ~0). DEFAULT-ON (no gate) — pure redundant-work elimination, no thread-count/precision risk.
+
+**EV:** ~15.5 ms/window off the encoder (~3100 ms/window turbo) = **~0.5% encoder / ~0.4% e2e, EVERY window, encoder-side (NOT pipelining-hidden)** — a genuine default-on speedup (unlike the gated gather/scatter which await validation). Ratio vs OpenAI-Whisper nudges up within noise (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: LANDED gated (byte-exact, default = current) — **SDPA output SCATTER has the SAME oversubscription: the per-row (1500 fine chunks) scatter is 1.6× SLOWER than ~12 balanced chunks on cold data. Now shares the `FW_SDPA_GATHER_CHUNKS` knob with the gather; default per-row UNCHANGED.**
 
 **Land result.** AGENT_NAME=BlackThrush. After the gather cold-probe finding, checked the sibling scatter (`out.par_chunks_mut(n_state)`, tq=1500 fine chunks → ~32-way on the pool). `examples/sdpa_scatter_cold_probe` (same 461 MB pool >> L3, MEAN):

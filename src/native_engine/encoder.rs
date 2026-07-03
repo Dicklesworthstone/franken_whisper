@@ -117,11 +117,13 @@ pub struct EncoderWeights {
     n_head: usize,
     /// Maximum audio context (`hparams.n_audio_ctx`, e.g. 1500).
     n_ctx: usize,
-    /// `conv1` flat weight `[n_state, n_mels, K]` and bias `[n_state]`.
-    conv1_w: Vec<f32>,
+    /// `conv1` weight PRE-TRANSPOSED to `[n_mels*K, n_state]` (the `[Cin*K, Cout]` layout
+    /// `nn::conv1d_wt` / `matmul_bias` consume) + bias `[n_state]`. Transposed once at load
+    /// so the per-window encode never re-transposes it.
+    conv1_wt: Mat,
     conv1_b: Vec<f32>,
-    /// `conv2` flat weight `[n_state, n_state, K]` and bias `[n_state]`.
-    conv2_w: Vec<f32>,
+    /// `conv2` weight PRE-TRANSPOSED to `[n_state*K, n_state]` + bias `[n_state]`.
+    conv2_wt: Mat,
     conv2_b: Vec<f32>,
     /// Positional embedding `[n_ctx, n_state]` (file tensor, row-major).
     pos_emb: Mat,
@@ -369,11 +371,17 @@ impl EncoderWeights {
         }
         let mlp_hidden = n_state * MLP_RATIO;
 
-        // Conv stem: ggml shapes are [Cout, Cin, K]; nn::conv1d wants this flat
-        // [Cout, Cin, K] order verbatim, so no transpose.
-        let conv1_w = load_shaped(model, "encoder.conv1.weight", &[n_state, n_mels, CONV_K])?;
+        // Conv stem: ggml shapes are [Cout, Cin, K] = flat [Cout, Cin*K]. Pre-transpose
+        // ONCE here to [Cin*K, Cout] (what `nn::conv1d_wt`/`matmul_bias` consume) so the
+        // per-window encode skips the (redundant, ~15 ms/window on turbo conv2) transpose.
+        // `transpose_serial([Cout, Cin*K])` is bit-identical to conv1d's inline transpose.
+        let conv1_patch = n_mels * CONV_K;
+        let conv1_raw = load_shaped(model, "encoder.conv1.weight", &[n_state, n_mels, CONV_K])?;
+        let conv1_wt = Mat::from_vec(conv1_patch, n_state, nn::transpose_serial(&conv1_raw, n_state, conv1_patch));
         let conv1_b = load_vec(model, "encoder.conv1.bias", n_state)?;
-        let conv2_w = load_shaped(model, "encoder.conv2.weight", &[n_state, n_state, CONV_K])?;
+        let conv2_patch = n_state * CONV_K;
+        let conv2_raw = load_shaped(model, "encoder.conv2.weight", &[n_state, n_state, CONV_K])?;
+        let conv2_wt = Mat::from_vec(conv2_patch, n_state, nn::transpose_serial(&conv2_raw, n_state, conv2_patch));
         let conv2_b = load_vec(model, "encoder.conv2.bias", n_state)?;
 
         // Positional embedding: file tensor [n_ctx, n_state], used verbatim.
@@ -450,9 +458,9 @@ impl EncoderWeights {
             n_state,
             n_head,
             n_ctx,
-            conv1_w,
+            conv1_wt,
             conv1_b,
-            conv2_w,
+            conv2_wt,
             conv2_b,
             pos_emb,
             layers,
@@ -579,8 +587,8 @@ fn forward_time_major(
     }
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
     let mut x = et!(0, {
-        let mut x = nn::conv1d(
-            &x, &w.conv1_w, w.n_state, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
+        let mut x = nn::conv1d_wt(
+            &x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
         )?;
         nn::gelu(&mut x);
         x
@@ -588,8 +596,8 @@ fn forward_time_major(
 
     // conv2 (stride 2): [3000, n_state] -> [1500, n_state], +gelu.
     let mut x = et!(0, {
-        let mut x = nn::conv1d(
-            &x, &w.conv2_w, w.n_state, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
+        let mut x = nn::conv1d_wt(
+            &x, &w.conv2_wt, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
         )?;
         nn::gelu(&mut x);
         x
@@ -819,9 +827,9 @@ mod tests {
             n_state,
             n_head,
             n_ctx: pe_ctx,
-            conv1_w: rng.vec(n_state * n_mels * CONV_K, s),
+            conv1_wt: rng.mat(n_mels * CONV_K, n_state, s),
             conv1_b: rng.vec(n_state, s),
-            conv2_w: rng.vec(n_state * n_state * CONV_K, s),
+            conv2_wt: rng.mat(n_state * CONV_K, n_state, s),
             conv2_b: rng.vec(n_state, s),
             pos_emb: rng.mat(pe_ctx, n_state, s),
             layers,
