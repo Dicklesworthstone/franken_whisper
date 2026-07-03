@@ -1322,6 +1322,21 @@ pub fn transcribe_samples(
             // Use only the result_len tokens for emission (drop a trailing eot).
             let take = result_len.min(decoded.len());
             let result_tokens = &decoded[..take];
+            // Debug hook (`PROBE_DUMP_TOKENS=1`): emit this window's raw token ids
+            // to stderr for offline analysis (e.g. prompt-lookup/n-gram speculation
+            // accept-rate simulation). Off by default, zero cost when unset.
+            if std::env::var_os("PROBE_DUMP_TOKENS").is_some() {
+                use std::fmt::Write as _;
+                let mut line = String::from("TOKENS>>>");
+                for (i, &t) in result_tokens.iter().enumerate() {
+                    if i > 0 {
+                        line.push(',');
+                    }
+                    let _ = write!(line, "{t}");
+                }
+                line.push_str("<<<");
+                eprintln!("{line}");
+            }
             let result_token_plogs = &plogs[..take];
             let win_segments = build_segments(
                 tk,
