@@ -943,6 +943,14 @@ impl DecoderState {
         // push order and each pair's per-element arithmetic is unchanged (probe:
         // parallel == serial for all four buffers). Same granularity-flip as the
         // sibling cross-cache quantize below (b22f8ae).
+        // The f32 kh_t/vh buffers are consumed ONLY by the `FW_CROSS_F16=0` escape-hatch
+        // cross path (`cross_step`'s `!use_f16` branch); the default f16/i8 path uses only
+        // k_nat/v_t (+ DTW `scores_all`, built in the f16 path too). So when the f16 path is
+        // active (default), skip building kh_t (a large-stride transpose) + vh entirely —
+        // MEASURED 1.95× on the cross-build (`examples/cross_f32skip_probe`), the f16 buffers
+        // bit-identical. `need_f32` mirrors the exact `use_f16` gate in `cross_step`, so the
+        // (empty) kh_t/vh are never read.
+        let need_f32 = !cross_f16_enabled();
         let built: Vec<(Vec<f32>, Vec<Float16>, Vec<f32>, Vec<Float16>)> = (0..n_layer * n_head)
             .into_par_iter()
             .map(|idx| {
@@ -950,24 +958,34 @@ impl DecoderState {
                 let ck = &cross_k[li];
                 let cv = &cross_v[li];
                 let base = h * d_head;
-                // kh_t [d_head, enc_frames]: kh_t[d][j] = ck.row(j)[base + d].
-                let mut kh_t = vec![0.0f32; d_head * enc_frames];
+                // kh_t [d_head, enc_frames]: kh_t[d][j] = ck.row(j)[base + d] (f32 path only).
+                let mut kh_t = if need_f32 { vec![0.0f32; d_head * enc_frames] } else { Vec::new() };
                 // k_nat [enc_frames, d_head] f16: row j = ck.row(j)[base..base+d_head].
                 let mut k_nat = Vec::<Float16>::with_capacity(enc_frames * d_head);
-                for j in 0..enc_frames {
-                    let src = &ck.row(j)[base..base + d_head];
-                    for (d, &s) in src.iter().enumerate() {
-                        kh_t[d * enc_frames + j] = s;
-                        k_nat.push(Float16::from_f32(s));
+                if need_f32 {
+                    for j in 0..enc_frames {
+                        let src = &ck.row(j)[base..base + d_head];
+                        for (d, &s) in src.iter().enumerate() {
+                            kh_t[d * enc_frames + j] = s;
+                            k_nat.push(Float16::from_f32(s));
+                        }
+                    }
+                } else {
+                    for j in 0..enc_frames {
+                        let src = &ck.row(j)[base..base + d_head];
+                        for &s in src {
+                            k_nat.push(Float16::from_f32(s));
+                        }
                     }
                 }
-                // vh [enc_frames, d_head]: row j = cv.row(j)[base..base+d_head].
-                let mut vh = vec![0.0f32; enc_frames * d_head];
-                // v_t [d_head, enc_frames] f16: v_t[d][j] = cv.row(j)[base + d].
+                // vh [enc_frames, d_head] (f32 path only); v_t [d_head, enc_frames] f16.
+                let mut vh = if need_f32 { vec![0.0f32; enc_frames * d_head] } else { Vec::new() };
                 let mut v_t = vec![Float16::from_bits(0); d_head * enc_frames];
                 for j in 0..enc_frames {
                     let src = &cv.row(j)[base..base + d_head];
-                    vh[j * d_head..(j + 1) * d_head].copy_from_slice(src);
+                    if need_f32 {
+                        vh[j * d_head..(j + 1) * d_head].copy_from_slice(src);
+                    }
                     for (d, &s) in src.iter().enumerate() {
                         v_t[d * enc_frames + j] = Float16::from_f32(s);
                     }
@@ -976,9 +994,18 @@ impl DecoderState {
             })
             .collect();
         for (kh_t, k_nat, vh, v_t) in built {
-            cross_kh_t.push(Mat::from_vec(d_head, enc_frames, kh_t));
+            // Empty (0×0) placeholders when the f32 path is inactive — never indexed.
+            cross_kh_t.push(if need_f32 {
+                Mat::from_vec(d_head, enc_frames, kh_t)
+            } else {
+                Mat::from_vec(0, 0, Vec::new())
+            });
             cross_kh_f16.push(k_nat);
-            cross_vh.push(Mat::from_vec(enc_frames, d_head, vh));
+            cross_vh.push(if need_f32 {
+                Mat::from_vec(enc_frames, d_head, vh)
+            } else {
+                Mat::from_vec(0, 0, Vec::new())
+            });
             cross_vh_f16.push(v_t);
         }
 
