@@ -4,6 +4,17 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → CLASS CLOSED — **after the AVX2 argmax landing, the softmax/cross_attn/sampler BYTE-EXACT lever class is fully mined: the index-reduction antipattern has no other hot instance, and every remaining sampler/softmax sub-op is sub-noise (autovec'd / already-measured-reverted) or byte-locked exp (owner-gated poly, landed).**
+
+**Dig result (completing the antipattern hunt the argmax opened).** AGENT_NAME=BlackThrush. Grepping the whole engine for the `if x > best { best_i = i }` index-tracking-reduction antipattern (the one that just paid 5.10× on `argmax`) finds **no other hot instance** — the only other `argmax` in `nn.rs`/`decoder.rs`/`encoder.rs` is a test assertion. Sizing the rest of the softmax/cross_attn/sampler neighborhood:
+- **max folds** (`compute_logprobs:507`, timestamp-forcing `374/390`, `softmax_rows`): plain `fold(-inf, f32::max)`, MEASURED only **1.35×** (2.27→1.68 µs on 51866, `sampler_maxargmax_probe`) — LLVM already partly autovectorizes them; ~0.6 µs/token, sub-noise. Fusing `compute_logprobs`'s max with `argmax`'s internal max is only valid in no_timestamps mode (timestamp-forcing masks `filtered` after `compute_logprobs` runs) and saves the same ~0.6 µs — not worth the sampler-path risk.
+- **logprob alloc + map pass**: already MEASURED sub-noise and REVERTED (`f575c26`, [[project_decode_sampler_slim_landed]]) — the sampler cost is the vocab-wide exp, not the alloc/map.
+- **`gemv_i8` input absmax** (nn.rs:1084, hit on every projection + cross/self GEMV): a `map(abs).fold(max)` reduction, but it is a small prelude to a weight/dot-DOMINATED int8 GEMV (absmax over [1280]/[1500] vs streaming [out×1280] int8), so even the ~1.35× autovec headroom is sub-noise.
+- **the exp** (softmax + logsumexp): byte-LOCKED to libm; the only speedup is the non-byte-exact AVX2 poly, LANDED gated behind `FW_SIMD_EXP` for BOTH the sampler and (this session) `softmax_rows` — owner-gated on a model A/B.
+
+**Conclusion:** `argmax` (5.10×, ~14.6 µs/token, byte-exact default-on) was the LAST byte-exact win in this class. What remains is owner-gated (exp poly default-flip) or hardware (encoder clock-throttle / GPU). Don't re-dig softmax/cross_attn/sampler for byte-exact levers. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts; default byte-identical).
+
+---
 ## 2026-07-03 - BlackThrush: LANDED byte-exact DEFAULT-ON — **the sampler `argmax` (greedy token selection) was SCALAR; an AVX2 first-index argmax is 5.10× (18.1→3.6 µs over 51866, ~14.6 µs/token) BYTE-IDENTICAL, on the SERIAL sampler critical path (full wall-clock weight, unlike the parallelized attention).**
 
 **Land result.** AGENT_NAME=BlackThrush. `argmax` (decode.rs:538 — whisper greedy = argmax of the raw logits) scans 51866 logits for the first index of the max with a scalar `if l > best` loop. LLVM does NOT autovectorize it (the running `best_i` is a loop-carried dependency), so it stays scalar on the SERIAL sampler path (per token, NOT parallelized — so its full time is on the wall-clock critical path, unlike the head-parallel attention softmax that I mis-sized earlier). `examples/sampler_maxargmax_probe` (min-of-4000, 51866 vocab): **scalar 18.13 µs → AVX2 3.56 µs = 5.10×, index IDENTICAL (22960)**.
