@@ -24,6 +24,18 @@ evidence. It exists to prevent stale optimism from being reused as proof.
 ⇒ The `vpmovsxbw` sign-extensions (4 per 32 elements) are the throughput limiter, not the `vpaddd` accumulation chain, so extra accumulators add nothing — the 2-accumulator kernel is at its Zen3 ceiling. **Confirms the landed [[project_dot_i8_avx2_landed]] choice with data; closes the accumulator-count question.** This closes the byte-exact-reorderable kernel space: integer/table ops (dot_i8, gelu) are the only reorderable-and-mineable kernels and BOTH are now at ceiling; float dots (dot_f16c, dot_i8w_f32) are byte-exactness-LOCKED (can't reorder f32 sums) and already hand-tuned. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
 
 ---
+## 2026-07-03 - BlackThrush: LANDED byte-exact — **`gemv_i8` activation quantize: scalar `.round()` map → AVX2 `copysign(0.5,v)+trunc`. 5.1–5.5× on the quantize, byte-identical, default-on. A NEW hot-path win after 3 confirm-at-ceiling negatives.**
+
+**Land-or-dig result: dug a genuinely new spot — the int8 GEMV's per-call activation quantize (not the dot).** AGENT_NAME=BlackThrush. `gemv_i8` quantized `x` via `x.iter().map(|v| (v*xinv).round().clamp(-127,127) as i8).collect()` — run ~7×/token in decode. **`f32::round` is round-HALF-AWAY, which has NO direct AVX rounding mode (`roundps` only does nearest/floor/ceil/trunc), so LLVM scalarizes the map to per-element `roundf`.** Replaced with an explicit AVX2 `trunc(v + copysign(0.5,v))` (= round-half-away = `f32::round` for finite inputs) + clamp + saturating-pack to i8, in `quantize_act_i8_into` (avx2 primary + scalar fallback, `gelu_slice` pattern).
+
+**MEASURED (`examples/quant_i8_probe`, 1 thread, best-of-N, byte-exactness asserted):**
+- **[1280]** (qkv/mlp_0/proj/cross activations): 1.02 → 0.20 µs = **5.1×**.
+- **[5120]** (fc2 activation): 4.04 → 0.75 µs = **5.4×**.
+- **Byte-identical: 0 differing of 1280/5120** over ±127-clamp-spanning inputs. Unit test `quantize_act_i8_matches_scalar_reference` locks all code paths + the half-away `.5` cases (2.5→3, NOT round-to-even's 2) + clamp edges; 7/7 lib tests pass. (Assumes finite activations — always true post-GEMM; documented.)
+
+**Honest EV:** the quantize is small (~10 µs/token scalar → ~2 µs, save ~8 µs/token), and decode is pipelining-HIDDEN on multi-window ⇒ ~0 realistic e2e, ~sub-1% on short single-window clips — but it's a real BYTE-EXACT default-on win (the `f32::round`-doesn't-vectorize antipattern is a clean, general lesson). Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-02 - BlackThrush: DIG → REJECTED (load-insensitive) — **the `FW_SIMD_EXP` poly's ~2.5e-5 accuracy is NOT improvable by poly degree or range reduction: degree-6 (added 1/720 term) AND Cody-Waite 2-part ln2 BOTH leave it at 2.49e-5 unchanged. A simple f32 fast-exp is inherently ~2.5e-5; libm-quality (~1e-7) needs ggml_v_expf's exact minimax (owner territory).**
 
 **Land-or-dig result: box at load 40 (wall-clock unreliable), so did the load-INSENSITIVE thing — the gated exp poly's accuracy is deterministic regardless of load. Tried to tighten it toward libm (the one clear quality gap in landed code, better for the owner's enable decision).** AGENT_NAME=BlackThrush. `examples/exp_sampler_probe`:

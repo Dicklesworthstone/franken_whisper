@@ -974,6 +974,59 @@ fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     acc
 }
 
+/// Symmetric int8 quantize of an activation into `out` (`len == x.len()`):
+/// `out[i] = (x[i]·xinv).round().clamp(-127,127) as i8`. The AVX2 path computes
+/// `round()` as `trunc(v + copysign(0.5, v))` (= round-HALF-AWAY = `f32::round`
+/// for finite `v` — activations are always finite post-GEMM), then clamps and
+/// saturating-packs to i8 — **byte-identical** to the scalar map but **~5× faster**
+/// (`f32::round` has no direct AVX rounding mode, so LLVM scalarizes the map;
+/// measured `examples/quant_i8_probe`, 0-diff over ±127 clamp edges). Runs ~7×/token
+/// in decode.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn quantize_act_i8_into(x: &[f32], xinv: f32, out: &mut [i8]) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(x.len(), out.len(), "quantize_act_i8_into len mismatch");
+    let n = x.len();
+    let xp = x.as_ptr();
+    // SAFETY: avx2 guaranteed by cfg; every load/store is bounded by the `i+8<=n`
+    // guard and the `< 8` remainder runs scalar.
+    unsafe {
+        let vinv = _mm256_set1_ps(xinv);
+        let half = _mm256_set1_ps(0.5);
+        let signmask = _mm256_set1_ps(-0.0); // 0x80000000
+        let c127 = _mm256_set1_ps(127.0);
+        let cm127 = _mm256_set1_ps(-127.0);
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_mul_ps(_mm256_loadu_ps(xp.add(i)), vinv);
+            let vh = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, signmask)));
+            let r = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(vh);
+            let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
+            let ri = _mm256_cvtps_epi32(r);
+            let lo = _mm256_castsi256_si128(ri);
+            let hi = _mm256_extracti128_si256::<1>(ri);
+            let i16s = _mm_packs_epi32(lo, hi); // order-preserving: [lo0..3, hi0..3]
+            let i8s = _mm_packs_epi16(i16s, i16s); // low 8 bytes = elems 0..7
+            _mm_storel_epi64(out.as_mut_ptr().add(i) as *mut __m128i, i8s);
+            i += 8;
+        }
+        while i < n {
+            *out.get_unchecked_mut(i) =
+                (*x.get_unchecked(i) * xinv).round().clamp(-127.0, 127.0) as i8;
+            i += 1;
+        }
+    }
+}
+
+/// Scalar fallback (non-avx2): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn quantize_act_i8_into(x: &[f32], xinv: f32, out: &mut [i8]) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o = (v * xinv).round().clamp(-127.0, 127.0) as i8;
+    }
+}
+
 /// Fused int8 GEMV: `out[o] = (Σ_i q_w[o,i] · q_x[i]) · scale_w[o] · scale_x`.
 /// Quantizes the activation `x` to int8 per-vector (symmetric), then dots each
 /// weight row. Parallelizes over output-row bands exactly like [`gemv_f16`]
@@ -989,10 +1042,8 @@ pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]
     let xamax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
     let xs = xamax / 127.0;
     let xinv = 1.0 / xs;
-    let xi8: Vec<i8> = x
-        .iter()
-        .map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8)
-        .collect();
+    let mut xi8 = vec![0i8; inp];
+    quantize_act_i8_into(x, xinv, &mut xi8);
 
     let fill = |o_base: usize, slice: &mut [f32]| {
         for (i, slot) in slice.iter_mut().enumerate() {
@@ -3146,6 +3197,36 @@ mod tests {
             }
             assert!((got[o] - acc).abs() < 1e-3, "row {o} mismatch");
         }
+    }
+
+    #[test]
+    fn quantize_act_i8_matches_scalar_reference() {
+        // The AVX2 quantize must be BIT-identical to the scalar map for finite
+        // activations, across all code paths (SIMD body, <8 tail) and the ±127 clamp
+        // edges, and must round HALF-AWAY (f32::round), NOT round-to-even.
+        fn scalar(x: &[f32], xinv: f32) -> Vec<i8> {
+            x.iter().map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8).collect()
+        }
+        let mut s = 0x243F_6A88_85A3_08D3u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0
+        };
+        for &n in &[0usize, 1, 5, 7, 8, 9, 15, 16, 17, 1280, 5120] {
+            let x: Vec<f32> = (0..n).map(|_| nf()).collect();
+            let amax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let xinv = 127.0 / amax; // maps amax -> ±127 (exercise the clamp edge)
+            let mut got = vec![0i8; n];
+            quantize_act_i8_into(&x, xinv, &mut got);
+            assert_eq!(got, scalar(&x, xinv), "quantize mismatch at n={n}");
+        }
+        // Exact-.5 inputs: half-AWAY (2.5->3), not round-to-even (which gives 2).
+        let x = vec![0.5f32, 1.5, 2.5, -0.5, -1.5, -2.5, 126.5, -126.5];
+        let mut got = vec![0i8; x.len()];
+        quantize_act_i8_into(&x, 1.0, &mut got);
+        assert_eq!(got, vec![1i8, 2, 3, -1, -2, -3, 127, -127]);
     }
 
     #[test]
