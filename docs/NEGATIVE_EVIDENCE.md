@@ -4,6 +4,13 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → RIGHT-SIZED (measured) — **the FW_SDPA_GATHER_CHUNKS lever is worth ~1% e2e, not 1.5%: at the FULL-OP level (gather + external kernel + scatter) chunks=16 is 1.061× (the kernel dominates ~94% of the op). Byte-identical THROUGH the external kernel.**
+
+**Land-or-dig result.** AGENT_NAME=BlackThrush. The isolated reshape probes showed 16 chunks beats legacy by 1.73× (gather) / 1.6× (scatter), but the reshape is only part of `attn_sdpa`. `examples/sdpa_full_op_cold_probe` runs the WHOLE op (gather → `ft_kernel_cpu::sdpa_forward_f32` → scatter) for one turbo encoder layer, cold (276 MB pool >> L3): legacy 20.80 ms/op vs 16-chunks 19.60 ms/op = **1.061× full-op, 0 differing** (the external kernel yields identical output regardless of chunking). The kernel is ~94% of the op (~19.6 ms), so the reshape's ~1.65× only moves the op ~6%.
+
+**Right-sizes the lever:** attn_sdpa ≈ 16% of e2e (32 layers × ~20.8 ms/layer = ~665 ms/window / ~3100 ms encoder — matches the 15.5% memory figure), so a validated `FW_SDPA_GATHER_CHUNKS=16` is **~6% × 16% ≈ ~1% e2e, byte-exact** — real, but ~1% not the ~1.5% the isolated-reshape number implied. Still the largest byte-exact e2e lever pending, still gated (cold-regime assumption + shared-box thread-count unreliability ⇒ needs a model + quiet box to confirm the real q-placement regime). Confirms byte-exactness end-to-end through the kernel. Ratio vs OpenAI-Whisper unchanged today (default byte-identical; ~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **conv2 im2col is NOT oversubscribed: at ~32 bands (current) it is already optimal (flat 8–32 chunks, ~32 GB/s; 12 only 1.04× = noise). Bounds the SDPA gather/scatter finding — only LARGE-STRIDE reshapes oversubscribe.**
 
 **Land-or-dig result.** AGENT_NAME=BlackThrush. Completing the encoder reshape audit after the conv w_t hoist (108d3cd): the remaining per-window conv cost is the im2col (input-derived, legitimately per-window), parallelized over ~worker_count()≈32 bands. `examples/conv_im2col_cold_probe` (turbo conv2, cold 614 MB pool >> L3, MEAN): chunks 8/12/16/24/32 = 30.4/32.9/32.5/31.8/31.6 GB/s — **FLAT; the current ~32 is within noise of the 12-chunk peak (1.04×).** Byte-identical. Only serial (0.31×) and very-high (64 = 0.81×) fan-out lose.
