@@ -4,6 +4,22 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → OWNER-GATED LEVER MADE ACTIONABLE — **the prior tiled int8 encoder GEMM (0.89×) used the SLOW widening inner op (VPMOVSXBW+VPMADDWD); MADDUBS is 1.79× faster (measured) — the untried maddubs+sign-offset path plausibly lifts a tiled int8 GEMM from 0.89× to ~1.6× f32. That's the concrete fix for the #1 owner-gated lever.**
+
+**Dig result (making last cycle's int8-ceiling finding actionable).** AGENT_NAME=BlackThrush. Last cycle sized the int8 compute ceiling (~2×) but flagged it "empirically unrealized (best real kernel 0.89×)". Checked WHY: `encoder_int8_gemm_probe` (the 0.75–0.89× tiled kernel) uses `nn::dot_i8`'s inner op = **VPMOVSXBW+VPMADDWD (widening)** — sign-extend int8→int16, then madd. That is NOT the fastest AVX2 int8 path. Extended `int8_vs_f32_compute_ceiling_probe` to measure both int8 inner ops (L1-resident, 8 accumulators, min-of-7, 1 core):
+
+| inner op | GMAC/s | vs unblocked f32 (22.9) |
+|--|--|--|
+| f32 VFMADD | 22.9 | 1.00× |
+| int8 VPMOVSXBW+VPMADDWD (widening — what dot_i8 / prior tiled GEMM use) | 57.1 | 2.49× |
+| int8 VPMADDUBSW+VPMADDWD (maddubs — UNTRIED for the encoder) | **102.5** | 4.47× |
+| **maddubs / widening** | — | **1.79×** |
+
+**Honest blocked-regime framing (don't quote 4.47×):** vs the encoder's real BLOCKED f32 (~45 GMAC/s, matrixmultiply), widening compute is only ~1.27× and maddubs ~2.28×. The prior widening kernel achieved 0.89× of blocked f32 ⇒ ~0.70 overhead efficiency (0.89/1.27). Applying the SAME efficiency to maddubs: 2.28 × 0.70 ≈ **~1.6× f32** — i.e. maddubs alone plausibly turns the int8 encoder GEMM from a 0.89× LOSS into a ~1.6× WIN. maddubs needs one operand unsigned (uint8×int8), handled by the standard sign-offset trick (offset activations +128 → uint8, subtract 128·Σweights per output row once — cheap, gemmlowp/oneDNN-style).
+
+**Conclusion — the #1 owner-gated lever is now ACTIONABLE, not just sized.** The concrete recommendation: a blocked int8 encoder GEMM should use MADDUBS + sign-offset (measured 1.79× over the widening op the 0.89× attempt used), targeting ~1.6× f32 ⇒ ~1.4× e2e on the 80% encoder. Still owner-gated on: (1) writing the blocked maddubs microkernel with sign-correction (days, but now with a clear approach + a concrete target), and (2) a turbo-model transcript-quality A/B (int8 non-byte-exact; model absent here). This supersedes the "int8 ≈ dead" belief with a specific, promising, untried path. Ratio vs OpenAI-Whisper unchanged today (no code change; ~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **the SDPA gather (last un-audited encoder franken-side op) is at its memory floor: a byte-exact i-outer traversal is only 1.08× single-thread (and doesn't map to the parallel path), SW prefetch HURTS (0.88×). Gather is ~0.5% encoder ⇒ sub-noise; the encoder franken-side is fully mined.**
 
 **Land-or-dig result.** AGENT_NAME=BlackThrush. `sdpa_gather_head_major` (nn.rs:2661) reshapes q/k/v `[1500,1280]` → head-major `[20,1500,64]` per window with h-outer/i-inner traversal = **strided src read** (n_state=1280 stride) + contiguous dst write. `examples/sdpa_gather_traversal_probe` (1 thread, min-of-4000, byte-diff=0 throughout):
