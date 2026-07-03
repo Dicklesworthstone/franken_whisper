@@ -4,6 +4,13 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **conv2 im2col is NOT oversubscribed: at ~32 bands (current) it is already optimal (flat 8–32 chunks, ~32 GB/s; 12 only 1.04× = noise). Bounds the SDPA gather/scatter finding — only LARGE-STRIDE reshapes oversubscribe.**
+
+**Land-or-dig result.** AGENT_NAME=BlackThrush. Completing the encoder reshape audit after the conv w_t hoist (108d3cd): the remaining per-window conv cost is the im2col (input-derived, legitimately per-window), parallelized over ~worker_count()≈32 bands. `examples/conv_im2col_cold_probe` (turbo conv2, cold 614 MB pool >> L3, MEAN): chunks 8/12/16/24/32 = 30.4/32.9/32.5/31.8/31.6 GB/s — **FLAT; the current ~32 is within noise of the 12-chunk peak (1.04×).** Byte-identical. Only serial (0.31×) and very-high (64 = 0.81×) fan-out lose.
+
+**Key bound:** unlike the SDPA gather/scatter — where per-head (20) / per-row (1500) chunking was a 1.6–1.73× contention trough — the im2col writes are **stride-K=3 (quasi-contiguous, 3 interleaved streams in a cache line)**, so it sustains ~32 GB/s at 32-way with no oversubscription. So the reshape-oversubscription lever ([[project_sdpa_gather_threadcount_lead]]) applies ONLY to LARGE-STRIDE (≥ cache-line, e.g. the 5 KB n_state stride) transposes, NOT small-stride gathers. The conv reshape path is fully audited: w_t hoist LANDED (108d3cd), im2col already optimal. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: LANDED byte-exact DEFAULT-ON — **conv stem weight transpose was recomputed EVERY window (~15.5 ms/window on turbo, pure redundant work); now pre-transposed ONCE at model load. Encoder-side (NOT pipelining-hidden).**
 
 **Land result.** AGENT_NAME=BlackThrush. `nn::conv1d` transposed its weight `[Cout, Cin*K] → [Cin*K, Cout]` (serial strided loop) on EVERY call to feed `matmul_bias`. But conv weights are CONSTANT and conv1d runs once per encoder window — so this ran every window for nothing (unlike the LINEAR weights, pre-transposed once at load). `examples/conv_wt_transpose_probe`: the transpose costs **conv1 ~0.7 ms + conv2 ~15.0 ms = ~15.5 ms/window** (conv2 = a [3840,1280] strided transpose, 5 KB stride ⇒ cache/TLB-thrashing). Fix: split `conv1d` into `conv1d` (transpose-then-delegate, byte-exact reference) + `conv1d_wt` (takes the `[Cin*K, Cout]` weight, skips the transpose); `EncoderWeights::from_ggml` now pre-transposes conv1/conv2 ONCE via `transpose_serial` (bit-identical to the inline transpose) and the per-window encode calls `conv1d_wt`.
