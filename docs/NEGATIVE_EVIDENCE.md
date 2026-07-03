@@ -4,6 +4,19 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **the SDPA gather (last un-audited encoder franken-side op) is at its memory floor: a byte-exact i-outer traversal is only 1.08× single-thread (and doesn't map to the parallel path), SW prefetch HURTS (0.88×). Gather is ~0.5% encoder ⇒ sub-noise; the encoder franken-side is fully mined.**
+
+**Land-or-dig result.** AGENT_NAME=BlackThrush. `sdpa_gather_head_major` (nn.rs:2661) reshapes q/k/v `[1500,1280]` → head-major `[20,1500,64]` per window with h-outer/i-inner traversal = **strided src read** (n_state=1280 stride) + contiguous dst write. `examples/sdpa_gather_traversal_probe` (1 thread, min-of-4000, byte-diff=0 throughout):
+
+| traversal | µs | vs current |
+|--|--|--|
+| h-outer (current: strided read, contiguous write) | 188.1 | 1.00× |
+| i-outer (contiguous src read, strided dst write) | 174.5 | **1.08×** |
+| h-outer + SW prefetch (T0, 8 rows ahead) | 213.0 | 0.88× (HURTS) |
+
+**Not worth landing:** (1) 1.08× on the gather, which is ~half of gather+scatter ≈ ~6% of attn_sdpa ≈ ~0.5% encoder ⇒ **~0.04% e2e**; (2) it's a SINGLE-THREAD number — the real gather is `par_chunks_mut` over head-major dst row-bands, so each worker already does the h-outer pattern within its contiguous chunk; i-outer scatters writes across all 20 head-blocks and doesn't fit that partitioning. Prefetch actively hurts (the hardware prefetcher + full-cache-line 256 B reads already saturate; explicit T0 just adds µops). So the gather is at its bandwidth floor (reads src once + writes dst once, every byte used — a necessary transpose that weight-column-permutation CANNOT eliminate, since head-major is an i↔h transpose not a within-row permute). **The encoder franken-side is now fully mined** (conv/gelu/LN/gather/scatter/residual all landed or floored); only the external f32 sgemm (79%) + external SDPA kernel (94% of attn_sdpa) remain, both off-limits + at ceiling. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts; default byte-identical).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → OWNER-GATED LEVER SIZED — **the int8 encoder GEMM is NOT dead on this AVX2-no-VNNI box: int8 compute (VPMADDUBSW+VPMADDWD) hits 84.5 GMAC/s vs f32 FMA, and against the encoder's BLOCKED f32 (~40 GMAC/s) that is ~2× single-core headroom. The "naive int8 = 0.38×" was an unblocked/quantize artifact, not the ceiling — a BLOCKED int8 microkernel is worth ~2× on the 80% encoder (~1.5–1.6× e2e), owner-gated on impl effort + a model quality A/B.**
 
 **Dig result (sizing the largest owner-gated lever).** AGENT_NAME=BlackThrush. Before anyone invests in a blocked int8 encoder microkernel, `examples/int8_vs_f32_compute_ceiling_probe` measures the raw AVX2 MAC/s ceiling (L1-resident, 8 independent accumulators, min-of-7, 1 core):
