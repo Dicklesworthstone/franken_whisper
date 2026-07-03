@@ -2501,6 +2501,48 @@ fn sdpa_split_add(i: usize, ns: u128) {
     SDPA_SPLIT.with(|p| p.borrow_mut()[i] += ns);
 }
 
+/// Target chunk count for the fused-SDPA q/k/v gather, tunable via
+/// `FW_SDPA_GATHER_CHUNKS`. Default `0` means "one chunk per head" — byte-identical
+/// to the historical `par_chunks_mut(t*d_head)` gather. A positive value splits the
+/// gather into that many balanced row-bands instead.
+///
+/// Motivation (`examples/sdpa_gather_cold_probe`, cold/DRAM-bound): the gather is
+/// memory-bandwidth-bound and this 8-channel box saturates near ~16 concurrent
+/// streams; the per-head chunking (n_head=20 on turbo) sits at a contention local
+/// minimum — MEASURED 1.73× SLOWER than 16 balanced chunks (byte-identical). Left
+/// OFF by default: thread-count is load-dependent and unreliable on the shared bench
+/// box (prior decode thread-count digs reverted 3×), and this could not be e2e-verified
+/// on the real encoder without the turbo model. Flip to 16 to A/B on a quiet box.
+fn sdpa_gather_chunks() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_SDPA_GATHER_CHUNKS").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Gather `src` (interleaved `[t, n_state]`, row stride `n_state`) into the head-major
+/// `dst` (`[hh, t, d_head]`): `dst[h*t*d_head + i*d_head + d] = src[i*n_state + h*d_head + d]`.
+/// Parallelized over `chunks` balanced row-bands of the flat `[hh*t, d_head]` output
+/// (each output row copied whole). `chunks == 0` ⇒ one band per head (== the historical
+/// `par_chunks_mut(t*d_head)`, bit-identical). Pure data movement — output is independent
+/// of `chunks`. See [`sdpa_gather_chunks`] / `sdpa_gather_head_major_chunk_invariant`.
+fn sdpa_gather_head_major(dst: &mut [f32], src: &[f32], hh: usize, t: usize, d_head: usize, n_state: usize, chunks: usize) {
+    let total_rows = hh * t;
+    let n = if chunks == 0 { hh } else { chunks.min(total_rows).max(1) };
+    let chunk_rows = total_rows.div_ceil(n).max(1);
+    dst.par_chunks_mut(chunk_rows * d_head).enumerate().for_each(|(c, blk)| {
+        let row0 = c * chunk_rows;
+        for (local, out_row) in blk.chunks_mut(d_head).enumerate() {
+            let r = row0 + local;
+            let h = r / t;
+            let i = r % t;
+            let base = i * n_state + h * d_head;
+            out_row.copy_from_slice(&src[base..base + d_head]);
+        }
+    });
+}
+
 fn attention_raw(
     q: &Mat,
     k: &[f32],
@@ -2646,30 +2688,16 @@ fn attention_raw(
         let mut va = gemv_out_buf(hh * tk * d_head);
         // The per-head gather/scatter is a strided memcpy transpose (interleaved
         // [tq, n_state] <-> head-major [hh, tq, d_head]). It is ~20% of attn_sdpa
-        // and BANDWIDTH-bound: the fine `par_chunks_mut` over heads is CORRECT —
-        // serial (one core) was MEASURED 4.5x SLOWER (multiple memory channels
-        // beat one core on the strided copy). See NEGATIVE_EVIDENCE.
+        // and BANDWIDTH-bound: serial (one core) was MEASURED 4.5x SLOWER. Chunk count
+        // is `FW_SDPA_GATHER_CHUNKS` (default 0 == one-band-per-head, bit-identical to
+        // the historical gather); cold/DRAM-bound probe shows ~16 balanced chunks is
+        // 1.73x faster than per-head (n_head=20 = a contention local min). See
+        // `sdpa_gather_head_major` / NEGATIVE_EVIDENCE.
+        let gchunks = sdpa_gather_chunks();
         st!(0, {
-            qa.par_chunks_mut(tq * d_head).enumerate().for_each(|(h, blk)| {
-                let base = h * d_head;
-                for i in 0..tq {
-                    blk[i * d_head..(i + 1) * d_head].copy_from_slice(&q.row(i)[base..base + d_head]);
-                }
-            });
-            ka.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
-                let base = h * d_head;
-                for j in 0..tk {
-                    blk[j * d_head..(j + 1) * d_head]
-                        .copy_from_slice(&k[j * n_state + base..j * n_state + base + d_head]);
-                }
-            });
-            va.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
-                let base = h * d_head;
-                for j in 0..tk {
-                    blk[j * d_head..(j + 1) * d_head]
-                        .copy_from_slice(&v[j * n_state + base..j * n_state + base + d_head]);
-                }
-            });
+            sdpa_gather_head_major(&mut qa, &q.data, hh, tq, d_head, n_state, gchunks);
+            sdpa_gather_head_major(&mut ka, k, hh, tk, d_head, n_state, gchunks);
+            sdpa_gather_head_major(&mut va, v, hh, tk, d_head, n_state, gchunks);
         });
         let sdpa_scale = (d_head as f32).powf(-0.5);
         let o = st!(1, ft_kernel_cpu::sdpa_forward_f32(
@@ -3305,6 +3333,37 @@ mod tests {
                 got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "axpy_f32_into bit mismatch at n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdpa_gather_head_major_chunk_invariant() {
+        // The gather output must be IDENTICAL for any chunk count (pure data movement)
+        // and must equal the historical per-head reference. Covers chunks < / == / > hh
+        // and a non-divisor of hh*t.
+        let (hh, t, d_head) = (20usize, 37usize, 64usize);
+        let n_state = hh * d_head;
+        let mut s = 0x243F_6A88_85A3_08D3u64;
+        let src: Vec<f32> = (0..t * n_state)
+            .map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 })
+            .collect();
+        // Reference: the historical per-head gather.
+        let mut want = vec![0.0f32; hh * t * d_head];
+        for h in 0..hh {
+            let base = h * d_head;
+            for i in 0..t {
+                want[h * t * d_head + i * d_head..h * t * d_head + (i + 1) * d_head]
+                    .copy_from_slice(&src[i * n_state + base..i * n_state + base + d_head]);
+            }
+        }
+        for &chunks in &[0usize, 1, 3, 7, 16, 20, 23, 64, 100000] {
+            let mut got = vec![0.0f32; hh * t * d_head];
+            sdpa_gather_head_major(&mut got, &src, hh, t, d_head, n_state, chunks);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "gather diverged at chunks={chunks}"
             );
         }
     }
