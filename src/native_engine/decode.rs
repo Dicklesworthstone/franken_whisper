@@ -407,11 +407,18 @@ fn process_logits(
 /// libm `f32::exp` — MEASURED 16.7× on the 51866-vocab pass (`examples/exp_sampler_probe`).
 /// NON-byte-exact (~2.5e-5 logprob delta), so kept off by default: franken deliberately
 /// runs the accurate libm exp (mirrors frankentorch's deliberately-unwired
-/// `ft_kernel_cpu::exp_f64x4`; the owner's accuracy/speed call). NOTE: in
-/// no_timestamps mode the greedy TEXT is exp-INDEPENDENT (the token is `argmax` of the
-/// RAW logits, and the timestamp-forcing rule cannot fire because timestamps are masked
-/// to -inf), so with this ON the no_ts transcript is byte-identical (verified by diff);
-/// only timestamp-mode boundaries and logprob metadata can shift.
+/// `ft_kernel_cpu::exp_f64x4`; the owner's accuracy/speed call). NOTE: this same
+/// flag ALSO gates the attention `exp` (`nn::softmax_rows` poly, cross+self) since
+/// b276b89, which — unlike the sampler exp — perturbs the RAW logits themselves
+/// (attention weights feed the hidden states). The sampler exp is provably
+/// no_ts-neutral (the token is `argmax` of the RAW logits and the timestamp-forcing
+/// rule cannot fire because timestamps are masked to -inf); the attention-softmax
+/// perturbation is only EMPIRICALLY sub-margin. Both together were MODEL-VERIFIED
+/// byte-identical for the no_ts transcript: turbo `FW_SIMD_EXP` off-vs-on over jfk
+/// ×1/×3/×8 (108/288/978 chars, multi-window) diffs to zero, and timestamp-mode
+/// jfk×3 text+segments also matched. Only timestamp boundaries / logprob metadata
+/// can shift in principle (the ~2.5e-5 delta), and e2e wall-clock is within noise
+/// (the exp is parallelized ~20-way), so this stays a default-OFF escape hatch.
 fn simd_exp_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();

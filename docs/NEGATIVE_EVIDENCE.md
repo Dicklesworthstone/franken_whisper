@@ -4,6 +4,23 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → MODEL A/B DONE (measured) — **the long-pending blocker on `FW_SIMD_EXP` ("needs a quiet-box + model A/B") is now RESOLVED with the turbo model on-box: `FW_SIMD_EXP=1` (poly-exp for BOTH the sampler AND the attention softmax, after b276b89) produces a BYTE-IDENTICAL no_timestamps transcript across multi-window decode — AND e2e wall-clock is within noise. So the flag correctly stays a default-OFF escape hatch (no measurable win to justify the timestamp-metadata faithfulness cost), and — importantly — my own b276b89 softmax_rows landing did NOT break the documented no_ts safety.**
+
+**Land-or-dig result — completing an owner-gated A/B that was blocked only on model availability.** AGENT_NAME=BlackThrush. `ggml-large-v3-turbo.bin` is present on-box (`legacy_whispercpp/whisper.cpp/models/`), so the A/B that [[project_sampler_exp_measured]] flagged as "only a quiet-box + model A/B of `FW_SIMD_EXP=1` remains" can finally run. Freshly built `examples/e2e_probe` (release-perf, includes b276b89 + the argmax landing), `FW_SIMD_EXP` off vs on, `PROBE_NO_TS=1 PROBE_DUMP_TEXT=1`, turbo:
+
+| input | mode | chars | windows | off-vs-on |
+|--|--|--|--|--|
+| jfk ×1 | no_ts | 108 | 1 | **byte-identical** |
+| jfk ×3 | no_ts | 288 | 2 | **byte-identical** |
+| jfk ×8 | no_ts | 978 | multi | **byte-identical** |
+| test_10s_speech | no_ts | 2 | 1 | **byte-identical** |
+| jfk ×3 | **timestamp** | 324 (3 segs) | 2 | **byte-identical (text+segs)** |
+
+**Why this A/B mattered (a self-check I owed):** the pre-existing `decode.rs` note argued the no_ts text is exp-neutral because "the token is `argmax` of the RAW logits." That reasoning covers the SAMPLER exp only. My b276b89 landing made `FW_SIMD_EXP` ALSO gate `nn::softmax_rows` (the cross/self **attention** softmax), which runs BEFORE the logits and therefore perturbs the RAW logits themselves — so the note's reasoning did NOT automatically extend to my change, and I could have silently broken the documented no_ts guarantee. The A/B settles it empirically: the combined perturbation (softmax numerators max|Δ|<1e-5, logprobs ~2.5e-5) stays below the argmax margin on every one of ~1376 decoded chars spanning the pipelined multi-window path. Note at `decode.rs:404` updated to state this honestly (attention path is sub-margin *empirically*, not provably, and is model-verified).
+
+**Why it still doesn't flip default-on:** e2e RTF was within noise both ways (no_ts jfk×1: 0.291 vs 0.293; ts jfk×3: 0.170 vs 0.173) — confirming [[project_sampler_exp_measured]]'s prediction that the isolated 6.25× exp win is invisible at e2e because the sampler/softmax exp is parallelized ~20-way (wall-clock ≈ work/20). With no measurable speed and a real (if tiny) timestamp-metadata delta in ts mode, franken keeps the accurate libm exp by default — the owner's deliberate faithfulness call, now backed by a measurement rather than a guess. Ratio vs OpenAI-Whisper unchanged (no default change; ~1.2× ts / ~1.68–1.8× no_ts, default byte-identical).
+
+---
 ## 2026-07-03 - BlackThrush: RETRACTION (measured) — **the maddubs int8 "fix" (prior entry, 4cfcd56) is WRONG: VPMADDUBSW SATURATES its int16 intermediate for full-range int8×int8 — 100% of rows differ from the exact dot, max|error|=146793 at K=1280. The prior kernel used the widening op BECAUSE it's correct (int32-safe), not by oversight. int8 encoder GEMM on AVX2-no-VNNI is back to marginal/dead (widening ~1.27× blocked-f32 compute, eaten to 0.89×).**
 
 **Correction to my own 4cfcd56 entry (below).** AGENT_NAME=BlackThrush. Last cycle I measured VPMADDUBSW (maddubs) at 1.79× the VPMOVSXBW+VPMADDWD (widening) op and recommended maddubs+sign-offset for the int8 encoder GEMM. **That measurement was throughput-only and I missed a correctness wall:** VPMADDUBSW sums two `u8·i8` products into an **int16** intermediate, which SATURATES — with u8∈[0,255], i8∈[-128,127] each product ∈[-32640,32385] and adjacent pair-sums reach ±65k ≫ int16's ±32767. `examples/gemv_i8_maddubs_saturation_probe` (maddubs+sign-offset vs exact widening dot, K=1280, 4096 rows): **4096/4096 rows differ, max|error|=146793** (≈0.7% of the ~20.6M dot magnitude — saturation clipping). VPMADDWD (the widening path) accumulates int16→**int32**, which cannot overflow here, so it is EXACT. The only non-saturating single-instruction `u8·i8→i32` op is VNNI's VPDPBUSD, which this box LACKS.
