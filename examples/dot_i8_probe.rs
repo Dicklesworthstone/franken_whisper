@@ -83,6 +83,57 @@ unsafe fn dot_i8_avx2(w: &[i8], x: &[i8]) -> i32 {
     }
 }
 
+/// 4-accumulator / 64-elem-per-iter variant (test whether the landed 2-acc dot_i8
+/// is vpmovsxbw-bound or accumulator-latency-bound). Byte-identical (integer sum).
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+unsafe fn dot_i8_avx2_4acc(w: &[i8], x: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    unsafe {
+        let n = w.len();
+        let (wp, xp) = (w.as_ptr(), x.as_ptr());
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut a2 = _mm256_setzero_si256();
+        let mut a3 = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 64 <= n {
+            let l = |o: usize| _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(o) as *const __m128i));
+            let r = |o: usize| _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(o) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(l(i), r(i)));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(l(i + 16), r(i + 16)));
+            a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(l(i + 32), r(i + 32)));
+            a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(l(i + 48), r(i + 48)));
+            i += 64;
+        }
+        while i + 16 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            i += 16;
+        }
+        let s = _mm256_add_epi32(_mm256_add_epi32(a0, a1), _mm256_add_epi32(a2, a3));
+        let lo = _mm256_castsi256_si128(s);
+        let hi = _mm256_extracti128_si256::<1>(s);
+        let q = _mm_add_epi32(lo, hi);
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+        let mut acc = _mm_cvtsi128_si32(q);
+        while i < n {
+            acc += (*w.get_unchecked(i) as i32) * (*x.get_unchecked(i) as i32);
+            i += 1;
+        }
+        acc
+    }
+}
+
+fn gemv_4acc(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
+    for (o, slot) in out.iter_mut().enumerate() {
+        *slot = unsafe { dot_i8_avx2_4acc(&w[o * k..(o + 1) * k], x) };
+    }
+    let _ = n;
+}
+
 fn gemv_scalar(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     for (o, slot) in out.iter_mut().enumerate() {
         *slot = dot_i8_scalar(&w[o * k..(o + 1) * k], x);
@@ -128,14 +179,20 @@ fn bench(name: &str, n: usize, k: usize, iters: usize) {
         }
         best
     };
+    let mut o4 = vec![0i32; n];
+    gemv_4acc(&w, &x, n, k, &mut o4);
+    let diff4 = oa.iter().zip(o4.iter()).filter(|(a, b)| a != b).count();
     let ts = run(gemv_scalar, &mut os);
     let ta = run(gemv_avx2, &mut oa);
+    let t4 = run(gemv_4acc, &mut o4);
     let bytes = (n * k) as f64; // 1 byte/weight, streamed once
     println!("{name}  [{n}x{k}] ({:.1} MiB int8)  best-of-{iters} @ 1 thread", bytes / (1 << 20) as f64);
-    println!("  byte-exact: {diff} differing rows of {n}  [{}]", if diff == 0 { "IDENTICAL" } else { "DIVERGENT" });
+    println!("  byte-exact: 2acc vs scalar {diff} diff, 4acc vs 2acc {diff4} diff  [{}]",
+        if diff == 0 && diff4 == 0 { "ALL IDENTICAL" } else { "DIVERGENT" });
     println!("  scalar-autovec : {:>7.3} ms  {:>6.1} GB/s", ts * 1e3, bytes / ts / 1e9);
-    println!("  hand AVX2      : {:>7.3} ms  {:>6.1} GB/s  {:.2}x  [{}]",
-        ta * 1e3, bytes / ta / 1e9, ts / ta, if ta < ts { "WIN" } else { "loss" });
+    println!("  hand AVX2 2acc : {:>7.3} ms  {:>6.1} GB/s  {:.2}x", ta * 1e3, bytes / ta / 1e9, ts / ta);
+    println!("  hand AVX2 4acc : {:>7.3} ms  {:>6.1} GB/s  {:.2}x vs2acc  [{}]",
+        t4 * 1e3, bytes / t4 / 1e9, ta / t4, if t4 < ta { "4acc WINS" } else { "2acc optimal" });
 }
 
 fn main() {

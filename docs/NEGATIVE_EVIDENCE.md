@@ -4,6 +4,16 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-02 - BlackThrush: DIG → confirmed at ceiling (measured, not reasoned) — **`dot_i8`'s landed 2-accumulator layout is OPTIMAL: 4 accumulators are a WASH (0.98–1.01×, within run-to-run noise). The int8 dot is vpmovsxbw/load-bound, not accumulator-latency-bound. Byte-identical (integer-exact).**
+
+**Land-or-dig result: applied "measure, don't reason" to my own landed `dot_i8` — I'd picked 2 accumulators by REASONING it was conversion-bound (vs `dot_i8w_f32`'s 4). Measured it instead.** AGENT_NAME=BlackThrush. `examples/dot_i8_probe` now A/Bs 2-acc (landed) vs 4-acc (64-elem/iter), best-of-N, 1 thread:
+- **logits [51866,1280]** (DRAM-bound): 2acc 3.23 ms vs 4acc 3.29 ms = **0.98×** (noisy, DRAM-floored either way).
+- **mlp_0 [5120,1280] / qkv [1280,1280]** (cache-resident): 2acc vs 4acc = **1.00–1.01×** (negligible).
+- **Byte-identical: 0 differing rows 4acc-vs-2acc** (integer add associative).
+
+⇒ The `vpmovsxbw` sign-extensions (4 per 32 elements) are the throughput limiter, not the `vpaddd` accumulation chain, so extra accumulators add nothing — the 2-accumulator kernel is at its Zen3 ceiling. **Confirms the landed [[project_dot_i8_avx2_landed]] choice with data; closes the accumulator-count question.** This closes the byte-exact-reorderable kernel space: integer/table ops (dot_i8, gelu) are the only reorderable-and-mineable kernels and BOTH are now at ceiling; float dots (dot_f16c, dot_i8w_f32) are byte-exactness-LOCKED (can't reorder f32 sums) and already hand-tuned. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-02 - BlackThrush: LANDED gated (`FW_SIMD_EXP`, default OFF) — **the sampler exp lever, IMPLEMENTED behind an escape hatch: AVX2 poly logsumexp = 16.7× on the 51866-vocab pass. Default byte-identical by construction; gated-path unit-tested. Owner's speed/accuracy opt-in.**
 
 **Land-or-dig result: turned last entry's surface into real gated code (feedback: implement behind a default-OFF flag + measure, don't re-surface).** AGENT_NAME=BlackThrush. `compute_logprobs` (decode.rs) now computes its vocab-wide `logsumexp` via `logsumexp_sum_simd` (AVX2 degree-5 poly exp, -inf lanes masked to 0) when `FW_SIMD_EXP=1`, else the exact scalar libm loop. **Default (gate off) is byte-identical to before — the else-branch is the verbatim original loop, zero production change.** New unit test `logsumexp_sum_simd_matches_scalar` (all code paths + edge cases, rel < 1e-3); **149/149 decode tests pass** (default + gated).
