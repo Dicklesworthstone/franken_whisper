@@ -4,6 +4,22 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: HEAD-TO-HEAD ratio RE-CONFIRMED post-fixes (no regression) + a contention-noise TRAP debunked — **on a semi-quiet box, franken beats whisper.cpp large-v3-turbo ~1.27× on jfk×3 at MATCHED 32 threads; the "franken is 0.77× SLOWER on x3" reading earlier this cycle was pure contention artifact (franken and whisper measured at different load moments). No regression from v0.4.0 (Apple-GPU encoder, Linux-inert) or the two decode fixes this session. franken's edge = tail-truncation (2080 encode-ctx vs whisper's 3000) + leaner int8 decode; the fresh decode profile shows ZERO hotspot drift.**
+
+**Dig result — no new byte-exact CPU lever, so validated the ledger's core metric (the ratio) on the now-quieter box.** AGENT_NAME=BlackThrush. Fresh `PERF_SPANS` profile (turbo jfk×3): encoder_window still external matrixmultiply (mlp_fc 27% / mlp_proj 23% / qkv 20% / attn_out 6.5% ≈ 77%) + external `ft_kernel_cpu` sdpa_kernel (73% of attn_sdpa); decode ~10.4 ms/tok int8-bandwidth-bound; cross_kv/mel/prefill sub-2%. No franken-owned hot code — the CPU byte-exact frontier stays exhausted ([[project_single_timestamp_ending_fix]], [[project_engine_at_safe_ceiling]]).
+
+**Head-to-head (in-repo `whisper-cli` turbo greedy `-bs 1 -bo 1 -t 32` vs `e2e_probe` 32t, both compute-only = total−load, best-of-N):**
+
+| clip | franken | whisper.cpp | franken speedup | note |
+|--|--|--|--|--|
+| jfk×1 (1 window) | ~3.55 s | ~5.3 s | ~1.5× | franken's single-window win is biggest (leaner decode/overhead) |
+| jfk×3 (2 windows) | **6.57 s** | **8.34 s** | **1.27×** | interleaved back-to-back (shares the load window) — the trustworthy number |
+
+**Window accounting (why franken wins, not luck):** franken x3 = 2 encoder passes = window 1 full (1500 ctx, 4578 ms) + window 2 tail-TRUNCATED (~580 ctx, 1957 ms) = 2080 ctx; whisper x3 = 2 FULL passes (3000 ctx, 2×3803 ms). Same total decode tokens (franken 58+28=86 ≈ whisper's 85 runs). So franken's `-ac`-equivalent tail-truncation is the measured edge.
+
+**Measurement LESSON (the trap):** an earlier "best of 3" gave franken x3 = 10.34 s vs whisper 8.01 s ("franken 0.77× slower") — FALSE. It compared franken (measured while load spiked to ~27) against whisper (measured at a calmer moment); a clean run was 6.57–7.79 s. On a SHARED box, only INTERLEAVED back-to-back runs (franken and reference alternating within one load window) give a valid ratio; sequential best-of-N per engine can be off by 30–60%. Ratio vs OpenAI-Whisper unchanged (no code change; ~1.2× ts / ~1.68–1.8× no_ts — whisper.cpp ≈ OpenAI-Whisper as the speed reference; the 1.27× here is the matched-thread turbo-ts figure).
+
+---
 ## 2026-07-03 - BlackThrush: LANDED default-on FAITHFULNESS FIX (byte-level, verified vs whisper.cpp) — **franken's full-pad DEFAULT diverged from whisper.cpp on short clips: it emitted a spurious extra window over the post-speech zero-padding, hallucinating a trailing `a.` on jfk (turbo). Root cause: `single_timestamp_ending` was tested on the FULL `decoded` (which still holds the loop-terminating EOT) instead of the `result_len`-truncated sequence whisper.cpp resizes to (whisper.cpp 7534). Fixed to match upstream; turbo jfk×1 now byte-matches whisper.cpp AND the clean golden. Not a perf micro-op — a correctness fix that ALSO removes the wasted spurious-window encode+decode.**
 
 **Land-or-dig result — this cycle turned my just-landed gated encoder-truncation lever (37cbef4) into a real root-cause fix.** AGENT_NAME=BlackThrush. 37cbef4 documented that franken's full-pad first window "hallucinates `a.`" and truncation "fixes" it. This cycle asked the sharper question: does franken's PORT TARGET, whisper.cpp, also hallucinate that? **Ran whisper.cpp (in-repo `whisper-cli`, large-v3-turbo, greedy `-bs 1 -bo 1`) on jfk → CLEAN** `…for your country.` (one segment `[00:00.000→10.400]`, no `a.`). So franken's full-pad default was UNFAITHFUL, not whisper.cpp-faithful — a real bug, and encoder-truncation was only masking the symptom.
