@@ -4,6 +4,18 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: MEASURED a LANDED lever (turbo, positive) — **the tail-truncation encoder lever (LANDED default-on, `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE`) is worth 1.39–1.90× e2e on multi-window turbo (last-window-partial-dependent) AND is a QUALITY win, not a tradeoff: the full-pad (OFF) path HALLUCINATES tokens from the 30 s zero-padding ("Ah!", "Thank you."), while truncation (ON) stops correctly. Both undocumented on turbo (comments cited tiny.en / speed only).**
+
+**Land-or-dig result — finally benched the landed lever the last cycle couldn't (box now quieter).** AGENT_NAME=BlackThrush. `tail_enc_ctx` truncates the encoder to real-audio length for non-first partially-filled windows (= whisper.cpp `-ac`). A/B on-vs-off, freshly rebuilt turbo `e2e_probe`, timestamp mode, box load ~16 (ratio is contention-robust — both runs share load):
+
+| clip | last-window tail | ON (truncate) | OFF (full-pad) | e2e speedup | transcript |
+|--|--|--|--|--|--|
+| jfk×3 | 3 s | 6.52 s / 324 ch | 12.36 s / 327 ch | **1.90×** | OFF adds "Ah!" (padding hallucination) |
+| jfk×5 | 25 s | 11.22 s / 540 ch | 15.55 s / 550 ch | **1.39×** | OFF adds "Thank you." (padding hallucination) |
+
+**Two findings, both new for turbo:** (1) the speedup scales with how partial the last window is (3 s tail → 1.90×; 25 s tail → 1.39×) — it saves the wasted encoder pass over silence AND the wasted decode (a full-pad 30 s window makes the decoder emit timestamps across 30 s of silence, not the 3 s of real audio). (2) It is a QUALITY IMPROVEMENT: feeding the encoder 27 s of zero-padding makes the model HALLUCINATE trailing tokens from the silence (the classic Whisper silence-hallucination); truncating to real audio removes that. So the landed default is faster AND cleaner than full-pad — the code's "hotspot #1 / -ac" framing undersold it (it's also an anti-hallucination fix on the tail; only the FIRST window's truncation is quality-negative, hence the non-first restriction). This is a big chunk of franken's multi-window advantage over a full-pad whisper.cpp (which hallucinates the same tail tokens unless run with `-ac`). Ratio vs OpenAI-Whisper unchanged (no code change — measuring a landed lever; ~1.2× ts / ~1.68–1.8× no_ts at MATCHED settings, but franken's DEFAULT beats a `-ac`-less reference on partial-tail multi-window both in speed and tail-quality).
+
+---
 ## 2026-07-03 - BlackThrush: CONVERGENCE (code-verified) — **the CPU byte-exact optimization loop has CONVERGED: code-verified the last decode kernel (`quantize_act_i8_into` is fully AVX2 — mul/round-half-away/clamp/pack/store, no scalar step), so both the encoder (external GEMM + external `ft_kernel_cpu` SDPA) and the decode int8 path (`gemv_i8`/`dot_i8`/quantize all vectorized) are fully mined. The productive frontier is now OFF-CPU: GPU offload, then owner-gated quality tradeoffs. Priority-ordered map below.**
 
 **Session capstone (synthesizing ~a dozen dig cycles into one owner-facing decision).** AGENT_NAME=BlackThrush. Every byte-exact CPU lever is landed or code-verified-closed: encoder conv/gelu/LN/gather/scatter/residual (landed or floored) + external f32 GEMM + external SDPA kernel (`ft_kernel_cpu::sdpa_forward_f32`, code-verified this session); decode `gemv_i8`/`dot_i8`/`quantize_act_i8_into` (all AVX2, quantize code-verified this cycle) + argmax + softmax-poly gate + tail-truncation; pipelining (no_ts). The full `FW_*` flag audit found no un-validated opportunity, and the on-box model settled the two flags that needed an A/B (`FW_SIMD_EXP` neutral→stays-off, self-attn SIMD unsafe→reverted).
