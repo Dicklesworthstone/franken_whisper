@@ -2501,18 +2501,20 @@ fn sdpa_split_add(i: usize, ns: u128) {
     SDPA_SPLIT.with(|p| p.borrow_mut()[i] += ns);
 }
 
-/// Target chunk count for the fused-SDPA q/k/v gather, tunable via
-/// `FW_SDPA_GATHER_CHUNKS`. Default `0` means "one chunk per head" — byte-identical
-/// to the historical `par_chunks_mut(t*d_head)` gather. A positive value splits the
-/// gather into that many balanced row-bands instead.
+/// Target chunk count for the fused-SDPA q/k/v gather AND output scatter, tunable via
+/// `FW_SDPA_GATHER_CHUNKS`. Default `0` means the historical per-op chunking (gather:
+/// one band per head; scatter: one band per output row) — byte-identical to the legacy
+/// code. A positive value splits BOTH reshape passes into that many balanced row-bands.
 ///
-/// Motivation (`examples/sdpa_gather_cold_probe`, cold/DRAM-bound): the gather is
-/// memory-bandwidth-bound and this 8-channel box saturates near ~16 concurrent
-/// streams; the per-head chunking (n_head=20 on turbo) sits at a contention local
-/// minimum — MEASURED 1.73× SLOWER than 16 balanced chunks (byte-identical). Left
-/// OFF by default: thread-count is load-dependent and unreliable on the shared bench
-/// box (prior decode thread-count digs reverted 3×), and this could not be e2e-verified
-/// on the real encoder without the turbo model. Flip to 16 to A/B on a quiet box.
+/// Motivation (`examples/sdpa_gather_cold_probe` + `sdpa_scatter_cold_probe`, cold/
+/// DRAM-bound): the gather/scatter are memory-bandwidth-bound and this 8-channel box
+/// saturates near ~12–16 concurrent streams. The legacy chunkings OVERSUBSCRIBE: the
+/// per-head gather (n_head=20) is a contention local min (MEASURED 1.73× slower than 16
+/// chunks) and the per-row scatter (tq=1500 fine chunks) is 1.6× slower than ~12 chunks —
+/// both byte-identical. Left OFF by default: thread-count is load-dependent and unreliable
+/// on the shared bench box (prior decode thread-count digs reverted 3×), and this could
+/// not be e2e-verified on the real encoder without the turbo model. Flip to 16 to A/B on
+/// a quiet box.
 fn sdpa_gather_chunks() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
@@ -2539,6 +2541,26 @@ fn sdpa_gather_head_major(dst: &mut [f32], src: &[f32], hh: usize, t: usize, d_h
             let i = r % t;
             let base = i * n_state + h * d_head;
             out_row.copy_from_slice(&src[base..base + d_head]);
+        }
+    });
+}
+
+/// Inverse of [`sdpa_gather_head_major`]: scatter head-major `o` (`[hh, t, d_head]`) into
+/// interleaved `out` (`[t, n_state]`): `out[i*n_state + h*d_head + d] = o[h*t*d_head + i*d_head + d]`.
+/// Parallelized over `chunks` balanced output-row bands (`chunks == 0` ⇒ one band per output
+/// row, == the historical `par_chunks_mut(n_state)` scatter, bit-identical). Pure data
+/// movement — output independent of `chunks`. See `sdpa_scatter_interleaved_chunk_invariant`.
+fn sdpa_scatter_interleaved(out: &mut [f32], o: &[f32], hh: usize, t: usize, d_head: usize, n_state: usize, chunks: usize) {
+    let n = if chunks == 0 { t } else { chunks.min(t).max(1) };
+    let rows_per = t.div_ceil(n).max(1);
+    out.par_chunks_mut(rows_per * n_state).enumerate().for_each(|(c, blk)| {
+        let i0 = c * rows_per;
+        for (local, orow) in blk.chunks_mut(n_state).enumerate() {
+            let i = i0 + local;
+            for h in 0..hh {
+                orow[h * d_head..(h + 1) * d_head]
+                    .copy_from_slice(&o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head]);
+            }
         }
     });
 }
@@ -2703,13 +2725,10 @@ fn attention_raw(
         let o = st!(1, ft_kernel_cpu::sdpa_forward_f32(
             &qa, &ka, &va, hh, tq, tk, d_head, d_head, sdpa_scale, false,
         ));
-        st!(2, out.par_chunks_mut(n_state).enumerate().for_each(|(i, orow)| {
-            for h in 0..hh {
-                orow[h * d_head..(h + 1) * d_head].copy_from_slice(
-                    &o[h * tq * d_head + i * d_head..h * tq * d_head + (i + 1) * d_head],
-                );
-            }
-        }));
+        // Scatter head-major `o` back to interleaved `out` — same FW_SDPA_GATHER_CHUNKS
+        // knob as the gather (per-row default is bit-identical; cold probe shows ~12
+        // chunks is 1.6× faster than the 1500 per-row fine chunks). See NEGATIVE_EVIDENCE.
+        st!(2, sdpa_scatter_interleaved(&mut out, &o, hh, tq, d_head, n_state, gchunks));
         return Ok(Mat::from_vec(tq, n_state, out));
     }
 
@@ -3364,6 +3383,35 @@ mod tests {
                 got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "gather diverged at chunks={chunks}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdpa_scatter_interleaved_chunk_invariant() {
+        // Scatter output must be IDENTICAL for any chunk count and equal the per-row
+        // reference (pure data movement). Covers chunks < / == / > t and non-divisors.
+        let (hh, t, d_head) = (20usize, 37usize, 64usize);
+        let n_state = hh * d_head;
+        let mut s = 0xD1B5_4A32_D192_ED03u64;
+        let o: Vec<f32> = (0..hh * t * d_head)
+            .map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 })
+            .collect();
+        // Reference: the historical per-row scatter.
+        let mut want = vec![0.0f32; t * n_state];
+        for i in 0..t {
+            for h in 0..hh {
+                want[i * n_state + h * d_head..i * n_state + (h + 1) * d_head]
+                    .copy_from_slice(&o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head]);
+            }
+        }
+        for &chunks in &[0usize, 1, 3, 12, 16, 37, 50, 1000] {
+            let mut got = vec![0.0f32; t * n_state];
+            sdpa_scatter_interleaved(&mut got, &o, hh, t, d_head, n_state, chunks);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "scatter diverged at chunks={chunks}"
             );
         }
     }

@@ -4,6 +4,22 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: LANDED gated (byte-exact, default = current) — **SDPA output SCATTER has the SAME oversubscription: the per-row (1500 fine chunks) scatter is 1.6× SLOWER than ~12 balanced chunks on cold data. Now shares the `FW_SDPA_GATHER_CHUNKS` knob with the gather; default per-row UNCHANGED.**
+
+**Land result.** AGENT_NAME=BlackThrush. After the gather cold-probe finding, checked the sibling scatter (`out.par_chunks_mut(n_state)`, tq=1500 fine chunks → ~32-way on the pool). `examples/sdpa_scatter_cold_probe` (same 461 MB pool >> L3, MEAN):
+
+| chunks | mean µs | vs live(row) | GB/s |
+|--|--|--|--|
+| row(1500) LIVE | 803 | 1.00× | 19.1 |
+| 32 | 612 | 1.31× | 25.1 |
+| 20 | 627 | 1.28× | 24.5 |
+| 16 | 535 | 1.50× | 28.7 |
+| **12** | **501** | **1.60×** | **30.6** |
+| 8 | 524 | 1.53× | 29.3 |
+
+All byte-IDENTICAL. Same story as the gather: the fine per-row chunking oversubscribes the 8-channel box (peaks ~8–16 streams); ~12 chunks is 1.6× faster. New `nn::sdpa_scatter_interleaved` reuses the SAME `FW_SDPA_GATHER_CHUNKS` knob (default 0 = per-row = bit-identical; unit test `sdpa_scatter_interleaved_chunk_invariant`). Default LEFT at per-row for the same reasons as the gather (shared-box thread-count unreliability + no model to e2e-verify). Combined with the gather, a validated `FW_SDPA_GATHER_CHUNKS=16` reshapes both passes at the bandwidth sweet spot — the full ~20% of `attn_sdpa` spent in reshape gets ~1.5–1.7×, ⇒ **~1.5% e2e byte-exact encoder-side**. Ratio vs OpenAI-Whisper unchanged today (default byte-identical; ~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: LANDED gated (byte-exact, default = current) — **SDPA gather thread-count RESOLVED on cold/DRAM-bound data: the live per-head (n_head=20) gather is a bandwidth-contention LOCAL MINIMUM — 16 balanced chunks is 1.73× faster. Shipped as `FW_SDPA_GATHER_CHUNKS` (default 0 = per-head, bit-identical); default UNCHANGED pending quiet-box/model e2e validation.**
 
 **Land result.** AGENT_NAME=BlackThrush. The prior gather probe was L3-hot/single-CCD confounded (serial looked fastest). `examples/sdpa_gather_cold_probe` forces the DRAM-bound regime (rotates a 461 MB q+qa pool >> 128 MB L3, reports MEAN) and sweeps rayon pool size on the real turbo shape (hh=20, tq=1500, d_head=64):
