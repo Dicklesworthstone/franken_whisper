@@ -68,7 +68,13 @@ fn main() {
 
     // Fixed cache length L for BOTH measurements (fair: same cross-attn / same
     // self-attn cache depth). One `tq == L` prefill call fills the cache to L.
-    let prefill_len = 16usize;
+    // `FW_PROBE_CACHE_LEN` sweeps L to test whether the amortization ceiling R(K)
+    // holds at realistic segment depths (16 was the original point; segments grow
+    // to 200+ tokens where self-attn tq×tk work scales up).
+    let prefill_len = std::env::var("FW_PROBE_CACHE_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16usize);
     let prefill: Vec<i32> = (0..prefill_len)
         .map(|i| if i == 0 { sot } else { 1 + i as i32 })
         .collect();
