@@ -906,9 +906,65 @@ pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
     I8Mat { data, scales, out, inp }
 }
 
-/// Signed int8 dot. LLVM lowers this to `vpmovsxbw`+`vpmaddwd` under x86-64-v3;
-/// the int8 compute far outruns the DRAM read rate, so the GEMV stays memory-
-/// bound (the point: half the weight bytes of the f16 path).
+/// Signed int8 dot → i32. Explicit AVX2 (`vpmovsxbw`+`vpmaddwd`+`vpaddd`, 2
+/// independent i32 accumulators) instead of the scalar loop: LLVM's autovec of the
+/// scalar reduction caps at **~28 GB/s** cache-resident (compute-bound, too few
+/// accumulators to hide `vpmaddwd` latency), while this hits **~50 GB/s** = **1.8×**
+/// cache-resident and **1.13×** on the DRAM-bound `[51866,1280]` logits stream
+/// (`examples/dot_i8_probe`). **Bit-identical to the scalar loop**: i8·i8 ∈
+/// `[-16129,16129]` and decode contraction `≤5120` ⇒ `|Σ| ≤ 82.6M < 2³¹`, so there
+/// is NO i32 overflow and integer add is associative — the vectorized pairwise-i32
+/// sum equals the scalar sum exactly (verified 0-diff over the full logits matrix).
+/// Feeds every int8 decode GEMV ([`gemv_i8`], [`gemv_i8_batch`]) at half the f16
+/// weight bytes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(w.len(), x.len(), "dot_i8 length mismatch");
+    let n = w.len();
+    let (wp, xp) = (w.as_ptr(), x.as_ptr());
+    // SAFETY: avx2 guaranteed by this fn's cfg; every 128-bit load is bounded by the
+    // `i+16<=n` / `i+32<=n` guard and the `< 16` remainder runs scalar; no overflow
+    // (see doc), so the reduction is bit-identical to the scalar path.
+    unsafe {
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 32 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+            let x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i + 16) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(w1, x1));
+            i += 32;
+        }
+        while i + 16 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            i += 16;
+        }
+        // Horizontal sum (exact integer add, order-independent).
+        let s = _mm256_add_epi32(a0, a1);
+        let lo = _mm256_castsi256_si128(s);
+        let hi = _mm256_extracti128_si256::<1>(s);
+        let q = _mm_add_epi32(lo, hi);
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+        let mut acc = _mm_cvtsi128_si32(q);
+        while i < n {
+            acc += (*w.get_unchecked(i) as i32) * (*x.get_unchecked(i) as i32);
+            i += 1;
+        }
+        acc
+    }
+}
+
+/// Scalar fallback (non-x86 / no avx2): the reference the AVX2 path reproduces exactly.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
 fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     let mut acc: i32 = 0;
@@ -3090,6 +3146,39 @@ mod tests {
             }
             assert!((got[o] - acc).abs() < 1e-3, "row {o} mismatch");
         }
+    }
+
+    #[test]
+    fn dot_i8_matches_scalar_reference() {
+        // The AVX2 `dot_i8` (x86) must be BIT-identical to the scalar reference for
+        // every decode contraction length, across all three code paths (32-wide,
+        // 16-wide tail, <16 scalar tail). Integer-exact: i8·i8 ∈ [-16129,16129] and
+        // n ≤ 5120 ⇒ |Σ| ≤ 82.6M < 2³¹, so no i32 overflow and the vectorized
+        // pairwise sum equals the scalar sum exactly (guards the gemv_i8 win landing).
+        fn scalar(w: &[i8], x: &[i8]) -> i32 {
+            let mut acc = 0i32;
+            for (a, b) in w.iter().zip(x) {
+                acc += (*a as i32) * (*b as i32);
+            }
+            acc
+        }
+        let mut s = 0xC0FF_EE12_3456_789Au64;
+        let mut ni8 = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 24) as i32 % 255 - 127) as i8
+        };
+        for &n in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 384, 1280, 5120] {
+            let w: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let x: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            assert_eq!(dot_i8(&w, &x), scalar(&w, &x), "dot_i8 mismatch at n={n}");
+        }
+        // Worst-case magnitude at the max decode length.
+        let w = vec![127i8; 5120];
+        let x = vec![-127i8; 5120];
+        assert_eq!(dot_i8(&w, &x), scalar(&w, &x));
+        assert_eq!(dot_i8(&w, &x), -82_580_480); // 5120 · 127 · (−127)
     }
 
     #[test]
