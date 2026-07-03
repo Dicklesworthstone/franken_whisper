@@ -1121,9 +1121,9 @@ pub fn gemv_i8_batch(
         let s = xamax / 127.0;
         xs[t] = s;
         let inv = 1.0 / s;
-        for (d, &v) in xi8[t * inp..(t + 1) * inp].iter_mut().zip(row) {
-            *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
-        }
+        // Same AVX2 copysign+trunc quantize as gemv_i8 (byte-identical to the scalar
+        // `.round()` map for finite activations; ~5× — f32::round doesn't vectorize).
+        quantize_act_i8_into(row, inv, &mut xi8[t * inp..(t + 1) * inp]);
     }
 
     // Disjoint-column-band structure identical to gemv_f16_batch; the only change
