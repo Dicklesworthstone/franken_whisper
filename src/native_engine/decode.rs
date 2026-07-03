@@ -1104,7 +1104,24 @@ pub fn transcribe_samples(
     let mut prompt_past: Vec<i32> = Vec::new();
 
     // Tail-window encoder-context truncation kill switch, resolved once.
-    let tail_truncate = tail_truncate_enabled();
+    //
+    // Truncation is gated to TIMESTAMP mode. In timestamp mode it is a quality
+    // *and* speed win (whisper.cpp `-ac`): timestamp tokens give the decode
+    // structure/stopping, and truncating the trailing zero-padding stops the
+    // classic silence-hallucination across the padded tail (measured: jfk×3
+    // 1.90×, ×5 1.39×, both cleaner). In no_timestamps mode the effect INVERTS
+    // and truncation becomes a content-loss bug: with timestamp tokens
+    // suppressed, the trailing silence is the greedy decoder's only end-of-speech
+    // cue, so truncating a partial tail window to real-audio length removes that
+    // cue and the (temperature-fallback-free) greedy loop repetition-loops over
+    // the short truncated context to the token cap — the garbage window is then
+    // gated out, DROPPING the real tail (jfk×3: window 2 decodes 220 tokens →
+    // dropped → "…ask what you can do for your country." lost; ×5: a spurious 6th
+    // sentence). whisper.cpp does NOT apply `-ac` by default, so full-pad is the
+    // faithful no_ts behavior AND the correct one (franken truncate-off matches
+    // whisper.cpp `-nt` on jfk×3/×5; truncate-on diverges). Timestamp-mode golden
+    // is unchanged (params.timestamps == true ⇒ identical to before).
+    let tail_truncate = tail_truncate_enabled() && params.timestamps;
 
     // Cross-window pipelining (no_timestamps only; default off): a persistent
     // scoped encoder thread computes the NEXT window's encode while THIS window
