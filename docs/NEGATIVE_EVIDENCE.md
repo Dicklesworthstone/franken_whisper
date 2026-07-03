@@ -4,6 +4,16 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → NO LEVER (silence-path faithfulness) — **franken MATCHES whisper.cpp on the previously-buggy silence path across ALL three silence types: pure silence (both hallucinate "Thank you."), LEADING silence (both 1 clean segment), and trailing silence (fixed last cycle, 53e4fb6). No divergence to exploit, and the `single_timestamp_ending` fix did NOT over-correct (franken doesn't drop content or over-suppress vs upstream).**
+
+**Dig result — extended the franken↔whisper.cpp real-audio vein to the un-covered silence edge cases** (the class where the "a." bug lived), synthesizing test audio since only jfk was on hand. AGENT_NAME=BlackThrush. `whisper-cli` turbo greedy vs `e2e_probe`, transcript-level (load-independent):
+- **pure silence 10 s** (digital zeros): whisper.cpp emits `Thank you.` (its own classic silence-hallucination — the no_speech gate doesn't fire on synthetic zeros); franken emits `Thank you.` too — **byte-match**, franken faithfully reproduces upstream's behavior rather than diverging.
+- **5 s leading silence + jfk**: whisper.cpp → 1 segment `[0→16]` "And so…country."; franken → 1 clean segment, same text — **match** (no spurious lead-silence window, no timestamp blow-up).
+- **jfk×1 sanity**: still clean `…country.` (the 53e4fb6 fix survived the rebuild).
+
+So silence handling is faithful across pure / leading / trailing — the fix generalizes and does NOT over-suppress. NO franken-specific wasted work or divergence on silence ⇒ no lever here; don't re-dig silence/VAD as a franken-vs-wc gap. (Note: `whisper-cli` itself hallucinating on pure zeros means "match wc" ≠ "correct" — a real VAD/no_speech improvement would be an owner quality call, DEVIATING from the port, not a faithful-port lever.) Ratio vs OpenAI-Whisper unchanged (no code change; ~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → NO LEVER (threading audit) — **the "per-call OS-thread spawn" angle (memory hint: decode GEMV "spawns fresh thread::scope OS threads per call") is ALREADY CLOSED on every hot path: the per-token decode GEMV (`gemv_i8`) uses `par_chunks_mut` on the PERSISTENT rayon pool, and head-level attention parallelism is the caller's `into_par_iter` (decoder.rs:1390, "no per-token spawn"). The `thread::scope`→rayon migration that won −9.5% (nn.rs:823) already covered the hot GEMVs. The 4 residual `std::thread::scope` sites are all OFF the per-token loop → sub-noise; don't convert.**
 
 **Dig result — audited the actual threading (not memory) after a hint that fresh-OS-thread spawns might still cost on the hot path.** AGENT_NAME=BlackThrush. Grepped every `thread::scope`/`par_*` in nn.rs + decoder.rs and traced hotness:
