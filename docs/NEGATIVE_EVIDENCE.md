@@ -4,6 +4,23 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → NO LEVER (fresh per-token decode sub-op breakdown) — **`cross_attn` (12% of decode, the one non-GEMV compute) ALREADY uses AVX2 int8 `gemv_i8` for BOTH its q·K and scores·V dots (decoder.rs 1276/1284) — no scalar-dot lever there (unlike the float self-attn dot, which was byte-unsafe). The decode is ~85% int8-AVX2 weight GEMVs (bandwidth-floored) + already-AVX2 cross_attn + a 2.1% byte-exact self_attn scalar floor. No franken-owned decode lever, freshly re-confirmed at sub-op granularity.**
+
+**Dig result — pulled a FRESH `forward_step` sub-part breakdown (turbo jfk×1, ts, sum over tokens) to hunt any franken-owned decode hotspot; the one candidate (cross_attn) is already vectorized.** AGENT_NAME=BlackThrush:
+
+| sub-op | ms | % | nature |
+|--|--|--|--|
+| mlp_fc_gelu_proj | 89.7 | 31.2% | int8 AVX2 GEMV (weight bandwidth) |
+| logits_gemv | 60.9 | 21.2% | int8 AVX2 GEMV (66 M tied-embed) |
+| self_qkv_proj | 36.2 | 12.6% | int8 AVX2 GEMV (fused) |
+| **cross_attn** | 34.5 | 12.0% | q·K + softmax + ·V — **q·K & ·V are `gemv_i8` (AVX2 int8), heads parallel** |
+| cross_out/self_out/cross_q | 55.9 | 19.4% | int8 AVX2 GEMV |
+| self_attn | 5.9 | 2.1% | f32-KV scalar dot (byte-exact floor; SIMD reverted transcript-unsafe) |
+| LNs + embed | ~4 | 1.4% | negligible |
+
+I checked cross_attn specifically because an INTEGER int8 dot is exactly associative → a SIMD version WOULD be byte-exact (unlike the reverted FLOAT self-attn dot). But it's already `nn::gemv_i8` on the int8 cross-KV cache (decoder.rs:1276 q·K over `cross_kh_i8`, :1284 scores·V over `cross_vh_i8`), per-head parallel (:1517). So the only scalar compute left is self_attn (2.1%, f32-KV, byte-exact — SIMD is owner-gated non-byte-exact), and everything else is int8-AVX2 bandwidth-floored. Zero drift from the documented ceiling; no byte-exact decode lever. Ratio vs OpenAI-Whisper unchanged (no code change; ~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → NO LEVER (silence-path faithfulness) — **franken MATCHES whisper.cpp on the previously-buggy silence path across ALL three silence types: pure silence (both hallucinate "Thank you."), LEADING silence (both 1 clean segment), and trailing silence (fixed last cycle, 53e4fb6). No divergence to exploit, and the `single_timestamp_ending` fix did NOT over-correct (franken doesn't drop content or over-suppress vs upstream).**
 
 **Dig result — extended the franken↔whisper.cpp real-audio vein to the un-covered silence edge cases** (the class where the "a." bug lived), synthesizing test audio since only jfk was on hand. AGENT_NAME=BlackThrush. `whisper-cli` turbo greedy vs `e2e_probe`, transcript-level (load-independent):
