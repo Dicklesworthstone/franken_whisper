@@ -840,6 +840,38 @@ fn tail_truncate_enabled() -> bool {
     })
 }
 
+/// First-window encoder-context truncation margin (experimental, default OFF).
+///
+/// [`tail_enc_ctx`] leaves the **first** window full by default because that is
+/// how the golden references were produced (whisper.cpp with no `-ac`), so a
+/// truncated first window is NON-byte-exact against the golden — that, not a
+/// quality regression, is why it is an opt-in. This escape hatch lets a partial
+/// FIRST window (a single sub-30 s clip — the streaming / short-utterance case)
+/// truncate to `real/2 + margin` encoder frames, killing the wasted encoder pass
+/// (and decode) over the zero-padding. `FW_FIRST_WINDOW_MARGIN` = the margin in
+/// **encoder frames** (e.g. 100 ≈ 2 s of trailing context); unset ⇒ `None` ⇒
+/// first window stays full (byte-identical default).
+///
+/// MEASURED on large-v3-turbo, jfk×1 (single/first window), 2026-07-03: `margin=0`
+/// (maximal truncation) is a **~1.9× e2e win AND a quality win** — the full-pad
+/// first window HALLUCINATES a trailing `a.` segment from the 19 s of zero-padding
+/// (segs=2, 110 ch) exactly like the tail-window silence-hallucination the landed
+/// [`tail_enc_ctx`] tail path already fixes; truncation stops clean (segs=1, 108 ch)
+/// with the closing period intact, needing NO margin. (This corrects the older
+/// tiny.en note that first-window truncation "drops the closing period" — that is
+/// model-specific; turbo is strictly better truncated.) Still an owner opt-in
+/// because it is non-byte-exact vs the golden and validated per-model by A/B —
+/// exactly whisper.cpp's `-ac` applied to the first window.
+fn first_window_margin() -> Option<usize> {
+    use std::sync::OnceLock;
+    static M: OnceLock<Option<usize>> = OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("FW_FIRST_WINDOW_MARGIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    })
+}
+
 /// Cross-window ENCODE/DECODE pipelining (default ON; kill switch `FW_PIPELINE_WINDOWS=0`).
 ///
 /// In `no_timestamps` mode the seek advance is always a full `CHUNK_CS` (timestamp
@@ -892,17 +924,33 @@ fn pipeline_windows_enabled() -> bool {
 /// contract.
 ///
 /// Returns `FULL_ENC_CTX` (1500) whenever truncation is disabled, the window is
-/// the first window, or the window is full (`real_frames >= FRAMES_PER_CHUNK`),
-/// so the caller's behavior is byte-identical to the pre-optimization path in
-/// those cases. Pure / hermetic — unit-tested without a model.
+/// full (`real_frames >= FRAMES_PER_CHUNK`), or the window is the first window
+/// **and** the experimental [`first_window_margin`] escape hatch is unset (the
+/// default), so the caller's behavior is byte-identical to the pre-optimization
+/// path in those cases. Hermetic apart from that one cached env read (unset in
+/// tests ⇒ first window full), so the unit tests need no model.
 fn tail_enc_ctx(real_frames: usize, is_first: bool, enabled: bool) -> usize {
-    if !enabled || is_first || real_frames >= FRAMES_PER_CHUNK {
+    if !enabled || real_frames >= FRAMES_PER_CHUNK {
         return FULL_ENC_CTX;
     }
     // `enc_ctx = ceil(real_frames / 2)` = `(real_frames + 1) / 2`: round up so
     // the truncated ctx still covers an odd final mel frame (the conv stem maps
     // 2 mel frames → 1 encoder frame), then clamp to the [MIN, FULL] band.
-    real_frames.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX)
+    let base = real_frames.div_ceil(2);
+    if is_first {
+        // The first window stays FULL by default: the golden was produced full-pad,
+        // so a truncated first window is non-byte-exact against it (see
+        // [`first_window_margin`] for the measured turbo speed+quality win). The
+        // experimental `FW_FIRST_WINDOW_MARGIN` escape hatch truncates it to
+        // `base + margin`, keeping `margin` encoder frames of trailing context.
+        // Unset ⇒ `None` ⇒ full first window (byte-identical default). Env read
+        // once (cached); tests leave it unset.
+        return match first_window_margin() {
+            Some(m) => (base + m).clamp(MIN_ENC_CTX, FULL_ENC_CTX),
+            None => FULL_ENC_CTX,
+        };
+    }
+    base.clamp(MIN_ENC_CTX, FULL_ENC_CTX)
 }
 
 // ---------------------------------------------------------------------------
