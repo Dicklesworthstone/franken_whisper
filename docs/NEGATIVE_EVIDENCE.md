@@ -4,6 +4,22 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → LEVER DE-RISKED (measured) — **the #1 remaining lever (draft/speculative decoding) has its amortization ceiling R(K) MEASURED across realistic segment depth for the first time (memory only had cache_len=16): R(8) stays 3.3–3.8× and R(4) 2.2–2.4× from cache_len 16 → 224 (a full segment). It does NOT erode as the KV cache grows — so the ~8–15% e2e draft-decoding EV is robust at real depths; the only blocker is the speculate/verify loop + draft model (owner/product), NOT a cache-depth risk.**
+
+**Dig result — sweeping the one open parameter on the biggest remaining lever.** AGENT_NAME=BlackThrush. [[project_draft_decoding_amortization]] measured the draft-decoding decode-slice ceiling `R(K)=K·t(tq=1)/t(tq=K)` (weights read ONCE for K verified tokens) at a SINGLE cache depth (16). Real segments grow to 200+ tokens, where the self-attn `tq×tk` work and the f32-KV read scale up — an open question was whether that erodes R(K). Made `prefill_len` env-configurable (`FW_PROBE_CACHE_LEN`) and swept on-box turbo (`examples/draft_amortization_probe`, best-of-40, 32t):
+
+| cache_len | t(tq=1) ms | R(2) | R(4) | R(8) |
+|--|--|--|--|--|
+| 16  | 7.90  | 1.35× | 2.35× | 3.76× |
+| 64  | 7.61  | 1.14× | 2.17× | 3.28× |
+| 128 | 9.12  | 1.31× | 2.40× | 3.80× |
+| 224 | 10.48 | 1.20× | 2.19× | 3.72× |
+
+**R(K) is STABLE across depth — it does not erode.** The tq=1 baseline grows 7.90→10.48 ms (the self-attn + KV read cost with cache length), but the tq=K forward grows proportionally (both are dominated by the depth-independent per-token weight stream), so the ratio is preserved. R(8) ~3.3–3.8×, R(4) ~2.2–2.4× at EVERY depth including a full 224-token segment. (Absolute R is at or above [[project_draft_decoding_amortization]]'s cache_len=16 figure of R(8)=2.71–2.91× — consistent given the now-default-on `gemv_i8_batch` int8 kernel + a quieter box; the robust finding is the depth-invariance, not the exact absolute, which carries shared-box noise.)
+
+**So the draft-decoding EV is de-risked:** the ~8–15% e2e estimate (R×accept-rate, K=4–8) holds at realistic segment lengths, removing the "does the ceiling survive a long cache?" uncertainty. What remains is unchanged and owner/product-scoped: the speculate→verify→rollback loop + a draft source. (A draft-model-FREE variant — prompt-lookup / n-gram self-speculation — is very likely dead for ASR: transcription output is non-repetitive, so the suffix-match hit rate is ~0 outside pathological tiled audio; PLD pays off only when output copies input, which ASR does not.) Ratio vs OpenAI-Whisper unchanged (probe-only change, no engine code touched; ~1.2× ts / ~1.68–1.8× no_ts, default byte-identical).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → IMPLEMENTED, A/B'd, REVERTED (measured) — **the self-attn scores dot is LATENCY-bound (a 4-accum AVX2 FMA dot is 5.1–6.3× the scalar chain), NOT bandwidth-bound — which finally kills f16-KV for the RIGHT reason (F16C dequant fixes the 2.4× dead path but is a WASH vs f32, 0.99–1.05×, because the KV read hides behind the add chain). BUT the SIMD dot reorders the 64-elem sum (~1e-5) and is TRANSCRIPT-UNSAFE: it flips a token into a repetition HALLUCINATION on tiled jfk×3. Only 1.29× on the full self_attn span (~0.2–0.3% e2e). Not worth landing even gated; crate change reverted, probe kept.**
 
 **Land-or-dig result — implemented behind a flag, A/B'd on-box, reverted.** AGENT_NAME=BlackThrush. The last un-vectorized scalar arithmetic in decode is `attention_decode_step`'s self-attn scores dot (nn.rs:3023): `Σ_d qh[d]·(k[d]·scale)` over d_head=64 per cached key. Cross-attn already uses vectorized `gemv_i8`/`gemv_f16`; only self-attn stayed scalar. Two findings from `examples/self_attn_f16c_dequant_probe` (turbo shapes n_state=1280, n_head=20, d_head=64, all heads):
