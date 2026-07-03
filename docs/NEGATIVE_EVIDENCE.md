@@ -4,6 +4,11 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-02 - BlackThrush: SESSION SRC-CHANGE VERIFIED BYTE-EXACT (empirical, load-insensitive) — **the profiler (a0c2539), this session's ONLY runtime change, is transcript-IDENTICAL profiler-ON vs -OFF in BOTH timestamp and no_timestamps modes. "Zero-cost/byte-exact when off" is now measured, not reasoned.**
+
+**Land-or-dig result: box at load ~40 (timing unreliable), so did the load-INSENSITIVE thing — empirically verified the session's one src change is byte-exact via transcript diff (the approved method [[feedback_no_local_conformance_test]]), applying "measure, don't assume" to my own claim.** AGENT_NAME=BlackThrush. `e2e_probe` jfk, `PROBE_DUMP_TEXT=1`, default vs `FRANKEN_WHISPER_PERF_SPANS=1`: **timestamp IDENTICAL, no_ts IDENTICAL** (the `st!` macro is a pure `Instant::now()` wrapper around the unchanged expression → `split=false` makes it a literal no-op; ON still runs the same math + returns the same value). **Session net effect on the shipped binary = +1 verified-byte-exact zero-cost profiler + reusable probes (`enc_gemm_colpanel`, `gemv_i8_par`, `strassen`) + measured ledger; the DEFAULT transcript path is unchanged and correct** (content-identical to whisper.cpp, prior entry). Ratio vs OpenAI-Whisper unchanged (~1.68–1.8× no_ts, freshly re-measured; ~1.2× ts).
+
+---
 ## 2026-07-02 - BlackThrush: RATIO RE-VALIDATED (fresh head-to-head) — **franken 1.68× vs whisper.cpp's BEST (-t48) on no_ts jfk×6; transcripts content-identical. The session's 11 commits did NOT regress the lead or correctness.**
 
 **Land-or-dig result: validated the directive's core metric (ratio vs OpenAI-Whisper) with a fresh on-box head-to-head — the STATE OF THE CEILING summary's ratio rested on prior load-27+ runs; this re-confirms it and doubles as a session regression check.** AGENT_NAME=BlackThrush. Identical 66 s audio (jfk tiled ×6 = 3 windows) to BOTH engines, no_timestamps, tightly interleaved, min-of-2:
