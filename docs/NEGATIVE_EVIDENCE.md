@@ -4,6 +4,25 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: LANDED gated (byte-exact, default = current) — **SDPA gather thread-count RESOLVED on cold/DRAM-bound data: the live per-head (n_head=20) gather is a bandwidth-contention LOCAL MINIMUM — 16 balanced chunks is 1.73× faster. Shipped as `FW_SDPA_GATHER_CHUNKS` (default 0 = per-head, bit-identical); default UNCHANGED pending quiet-box/model e2e validation.**
+
+**Land result.** AGENT_NAME=BlackThrush. The prior gather probe was L3-hot/single-CCD confounded (serial looked fastest). `examples/sdpa_gather_cold_probe` forces the DRAM-bound regime (rotates a 461 MB q+qa pool >> 128 MB L3, reports MEAN) and sweeps rayon pool size on the real turbo shape (hh=20, tq=1500, d_head=64):
+
+| threads | mean µs | vs live(20) | GB/s |
+|--|--|--|--|
+| 1 | 1750 | 0.63× | 8.8 |
+| 8 | 724 | 1.53× | 21.2 |
+| 12 | 658 | 1.68× | 23.3 |
+| **16** | **638** | **1.73×** | **24.1** |
+| 20 (LIVE) | 1105 | 1.00× | 13.9 |
+| 32 | 978 | 1.13× | 15.7 |
+| 64 | 1234 | 0.90× | 12.4 |
+
+All byte-IDENTICAL. The gather is DRAM-bandwidth-bound; this 8-channel box peaks near ~16 concurrent streams, and per-head chunking (20 = one-per-head) sits at a contention local min — WORSE than both 16 and 32. So the memory's "serial 4.5× slower" was right that parallel beats serial, but WRONG that per-head is optimal. New `nn::sdpa_gather_head_major` chunks the gather into `FW_SDPA_GATHER_CHUNKS` balanced row-bands (unit test `sdpa_gather_head_major_chunk_invariant`: output bit-identical for chunks ∈ {0,1,3,7,16,20,23,64,…}).
+
+**Default LEFT at per-head (env unset)** — NOT flipped to 16 — because: (1) thread-count is load-dependent and unreliable on the SHARED bench box (prior decode thread-count digs reverted 3×, `project_decode_overthreaded_rayon_lead`); (2) no turbo model on the box ⇒ can't e2e-verify on the real encoder, only the cold proxy. The gather is ~20% of `attn_sdpa` (~15.5% e2e) ⇒ a validated 1.73× would be **~1.3% e2e, byte-exact, encoder-side (NOT pipelining-hidden)** — the largest byte-exact e2e lever found. Flip `FW_SDPA_GATHER_CHUNKS=16` and A/B on a quiet box with a model to land the default. Ratio vs OpenAI-Whisper unchanged today (~1.2× ts / ~1.68–1.8× no_ts; default behavior byte-identical).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → SURFACED (measured, not landed) — **`half::f16::from_f32` is SOFTWARE on this build: batched F16C `_mm256_cvtps_ph` is 3.1–3.7× faster, BYTE-IDENTICAL. But an audit of EVERY scalar-conversion site shows no landable e2e win — all are one-time-at-load, pipelining-hidden, or sub-noise per-token. The GEMV hot paths already use F16C intrinsics.**
 
 **Land-or-dig result.** AGENT_NAME=BlackThrush. `examples/f16_convert_probe`: scalar `Float16::from_f32` (= `half::f16::from_f32`) vs batched `_mm256_cvtps_ph::<0>` (RNE) — **1.50× (n=64), 3.70× (n=1500), 3.14× (n=96000), 0 differing bits.** So `half`'s scalar conversion does NOT lower to hardware `vcvtps2ph`; it's software bit-twiddling, and 8-wide F16C batching wins 3×. Reusable antipattern — BUT I grepped every `to_f32`/`from_f32` site in nn/decoder/encoder and NONE clears the landing bar:
