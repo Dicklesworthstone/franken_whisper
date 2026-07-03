@@ -4,6 +4,15 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: LANDED byte-exact (default-on) — **decode self-attn score·V output SAXPY now AVX2 (mul+add over the independent `d_head` slots) — 1.53–2.62× on the isolated pass, BIT-IDENTICAL.** The prior cycle's `kv_f16c_probe` surfaced that the live decode dots were scalar; this lands the half that vectorizes byte-exactly.
+
+**Land result.** AGENT_NAME=BlackThrush. `attention_decode_step`'s output accumulation is `out[d] += scores[j]·v[j,d]` summed over `j` (keys); the inner `d`(=d_head) writes are INDEPENDENT accumulators. New `nn::axpy_f32_into` vectorizes across `d` with 8-wide **`_mm256_mul_ps` + `_mm256_add_ps` — NOT fmadd** (the scalar `*o += a·v` is mul-then-add = two roundings; fmadd would fuse to one and diverge). So each `out[d]`'s `j`-ascending sum is preserved bit-for-bit. `examples/saxpy_f32_probe` (turbo d_head=64, best-of-4000, 1 thread): **2.62× (tk=64), 1.53× (256), 1.56× (448), 0 differing bit-patterns** at every size. Unit test `axpy_f32_into_matches_scalar_reference` locks it (SIMD body + <8 tail + 5-way accumulation, bit-compared). NOT the 11× the pure-compute probe teased: at larger tk the V-streaming read is bandwidth-bound.
+
+**Left scalar (byte-exactness blocker):** the QK **scores** dot reduces over contiguous `d`, so any SIMD reorders its f32 sum → non-byte-exact vs the `attention_raw` reference. Only the output half was byte-exact-vectorizable.
+
+**Honest EV:** self_attn is 10.7% of decode ([[project_self_attn_kv_cache_lever]]); the output SAXPY is ~half its scalar dots. Decode is pipelining-HIDDEN on multi-window ([[project_window_pipelining_lever]]) ⇒ ~0 realistic multi-window e2e, sub-1% on short single-window clips. Real byte-exact default-on win nonetheless. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **f16 KV-cache dequant is DEAD even with hardware F16C: vectorized f16 (`_mm256_cvtph_ps`, 0.23–1.07µs) is SLOWER than plain vectorized f32 (0.19–0.94µs) at every cache size. The decode self-attn QK dot fits L2, so it is compute/latency-bound, NOT DRAM-bound — the halved read never pays and the `cvtph` just adds latency. Closes the last flagged-open KV-f16 question.**
 
 **Land-or-dig result.** AGENT_NAME=BlackThrush. `project_self_attn_kv_cache_lever` left ONE open lever: the naive f16 KV cache was 2× slower from SCALAR `.to_f32()` dequant, so a *vectorized F16C* dequant might turn the halved cache read into a win. Built `examples/kv_f16c_probe` (turbo d_head=64, tk∈{64,256,448}, 1 thread, best-of-6000) with 4 variants: (1) f32 scalar = the live `attention_decode_step` dot; (2) f32 AVX2 FMA; (3) f16 scalar dequant = the live `attention_decode_step_f16`; (4) f16 F16C AVX2 (`_mm256_cvtph_ps`+FMA) = THE LEVER.
