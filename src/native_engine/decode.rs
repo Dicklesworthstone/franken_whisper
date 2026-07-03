@@ -1347,8 +1347,20 @@ pub fn transcribe_samples(
             &format!("\"tokens\":{}", decoded.len()),
         );
         // and compute a separate `seek_advance_cs` for the window step.
+        //
+        // whisper.cpp resizes the sequence to `result_len` (dropping the
+        // loop-terminating EOT and anything past the last closed timestamp)
+        // BEFORE this test (whisper.cpp 7534, `sequence.tokens.resize(result_len)`).
+        // Testing the full `decoded` — which still holds the EOT the loop pushed
+        // at line ~1270 before breaking — makes an EOT-closed window that ends
+        // "…text <|ts|> <eot>" read as "(ts, eot)" instead of "(text, ts)", so the
+        // skip-rest-of-chunk NEVER fires on EOT-terminated windows. That spawns a
+        // spurious extra window over the post-speech zero-padding (jfk: a
+        // hallucinated "a." second window that whisper.cpp does not emit). Match
+        // upstream exactly: run the test on the `result_len`-truncated slice.
+        let result_decoded: &[i32] = &decoded[..result_len.min(decoded.len())];
         let single_ts_ending = single_timestamp_ending(
-            &decoded,
+            result_decoded,
             tk.timestamp_begin,
             params.timestamps,
             user_max_tokens,
