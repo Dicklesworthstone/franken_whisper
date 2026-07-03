@@ -4,6 +4,24 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-03 - BlackThrush: DIG → REJECTED (measured) — **the sampler's `logit_max = logits.fold(NEG_INFINITY, f32::max)` (decode.rs:514) is NOT an argmax-class scalarization: LLVM ALREADY autovectorizes `f32::max` reductions (`llvm.vector.reduce.fmax`), so an explicit AVX2 `maxps` tree is only 1.21× / 0.32 µs per token = sub-noise. The argmax win has NO siblings — only INDEX-tracking reductions stay scalar; max/min/sum autovectorize. Fresh full-engine profile re-confirms the ceiling.**
+
+**Land-or-dig result.** AGENT_NAME=BlackThrush. After the argmax landing (5.10×, scalar because `best_i` is a loop-carried index dep), I hunted the same antipattern on the OTHER per-token serial-sampler reduction: `compute_logprobs`'s `logit_max` fold over the 51866 vocab. Hypothesis: `f32::max` has `fmaxf` NaN semantics (returns the *other* operand on NaN) which differ from `_mm256_max_ps` (returns the 2nd operand), so LLVM *might* refuse to vectorize it — and since the input is pre-sanitized (all non-finite→`-inf`) and max is EXACTLY associative over reals (no float-reorder issue like `+`), an AVX2 `maxps` tree would be byte-identical. `examples/logit_max_reduce_probe` (N=51866, sanitized w/ masked `-inf` lanes, min-of-7, 1 core):
+
+| reduction | µs/call | vs scalar |
+|--|--|--|
+| scalar `fold(f32::max)` | 1.87 | 1.00× |
+| AVX2 `maxps` tree (4 accum) | 1.55 | **1.21×** |
+
+bits **IDENTICAL** (byte-exact, as predicted). BUT the scalar fold is ALREADY ~7 elem/cycle (1.87 µs for 51866 f32 ≈ 7500 cycles) — i.e. LLVM lowered it to a vectorized `llvm.vector.reduce.fmax`, NOT a scalar `maxss` chain. So the 1.21× is just tail/latency-hiding, **0.32 µs/token saved ≈ ~0.01% e2e** — far below the argmax win (14.5 µs/token) and not worth landing. **Reusable principle: the argmax scalarization (5.10×) is unique to INDEX-tracking reductions; plain value reductions (max/min, and float-`+` where reorder is *legal*) already autovectorize — do NOT re-hunt `fold(f32::max)`/`fold(f32::min)` as argmax-class levers.**
+
+**Fresh full-engine profile (turbo, jfk, `FRANKEN_WHISPER_PERF_SPANS=1`, this cycle's release-perf build with ALL landings) re-confirms the ceiling — no new byte-exact target:**
+- **Encoder** (dominates e2e): 74% is external f32 sgemm (mlp_fc 26% + mlp_proj 21% + qkv_proj 20% + attn_out 7%) + external SDPA kernel (76% of attn_sdpa) — all off-limits/at-ceiling ([[project_turbo_encoder_dominates]]).
+- **Decode** (exposed only in timestamp mode; pipelining-hidden in no_ts): entirely int8-weight-bandwidth-bound and fully landed — `mlp_fc_gelu_proj` 32%, `logits_gemv` 19% (streams the 66 MB 1280×51866 int8 vocab weight/token — int4 re-confirmed dead), `self_qkv_proj` 13%, `cross_attn` 11%, all int8 GEMV ([[project_int8_mlp_fc1_default_on]]).
+
+Every byte-exact micro-lever is closed (argmax/round/gather/conv landed; max-fold autovectorizes; LN/gather floored; softmax/exp gated + A/B'd). The only >1% levers left are owner/infra-gated: int8 encoder GEMM (0.89× dead on AVX2-no-VNNI), GPU offload (nouveau, no compute stack), draft decoding (needs a draft model). Ratio vs OpenAI-Whisper unchanged (no code change; ~1.2× ts / ~1.68–1.8× no_ts, default byte-identical).
+
+---
 ## 2026-07-03 - BlackThrush: DIG → MODEL A/B DONE (measured) — **the long-pending blocker on `FW_SIMD_EXP` ("needs a quiet-box + model A/B") is now RESOLVED with the turbo model on-box: `FW_SIMD_EXP=1` (poly-exp for BOTH the sampler AND the attention softmax, after b276b89) produces a BYTE-IDENTICAL no_timestamps transcript across multi-window decode — AND e2e wall-clock is within noise. So the flag correctly stays a default-OFF escape hatch (no measurable win to justify the timestamp-metadata faithfulness cost), and — importantly — my own b276b89 softmax_rows landing did NOT break the documented no_ts safety.**
 
 **Land-or-dig result — completing an owner-gated A/B that was blocked only on model availability.** AGENT_NAME=BlackThrush. `ggml-large-v3-turbo.bin` is present on-box (`legacy_whispercpp/whisper.cpp/models/`), so the A/B that [[project_sampler_exp_measured]] flagged as "only a quiet-box + model A/B of `FW_SIMD_EXP=1` remains" can finally run. Freshly built `examples/e2e_probe` (release-perf, includes b276b89 + the argmax landing), `FW_SIMD_EXP` off vs on, `PROBE_NO_TS=1 PROBE_DUMP_TEXT=1`, turbo:
