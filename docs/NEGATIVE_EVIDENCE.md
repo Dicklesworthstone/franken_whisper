@@ -4,6 +4,89 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DECODE ROOFLINE CORRECTED (158 MB/tok, latency-bound not DRAM-bound) + QKV-fusion×int8 already composed — **worktree audit: NO unlanded measured win (all sibling worktrees are landed-under-other-hashes, rejects, or a stale 9-day ratio-doc). Fresh roofline REVISES memory's "922 MB/token, bandwidth-bound": the turbo decoder is only ~158 MB int8/token (66 MB tied logits + 4×22.9 MB layers), and at ~5 ms/tok quiet that's ~31 GB/s achieved = 1/3 of the ~92 GB/s aggregate DRAM wall ⇒ decode is LATENCY-bound (many small per-layer GEMVs that don't stream long enough to saturate DRAM), NOT bandwidth-saturated. The one fusion lever this implies — decode self-attn QKV — is ALREADY int8-fused: `fuse_qkv` concatenates q/k/v then `quantize_if(int8_attn_enabled=default-on)` builds the per-row int8 (byte-identical to concatenating pre-quantized int8, since I8Mat scales are per-output-row), and `Linear::forward` at tq==1 runs `gemv_i8` over it. No further same-input independent GEMV group exists to fuse (MLP fc/proj are sequential, cross-K/V are precomputed, self_out/cross_q/cross_out have distinct inputs). No new byte-exact lever; surface the blocker.**
+
+**Land-or-dig result — no worktree win to land; dug the decode roofline for a latency-bound fusion lever, found it already composed.** AGENT_NAME=BlackThrush.
+- **Worktree audit (directive step 1):** `git worktree list` → 30+ sibling worktrees from prior sessions; the only commits not reachable from origin/main are 7-9 days old and are (a) rejects (`reject f16c unroll8`, `reject log-mel stitch transpose`), (b) a stale ratio-doc (`Record OpenAI ratio after mel twiddle`, 9d), or (c) perf commits whose content is ALREADY on main under other hashes (`dot_f16c`, `power_and_project_simd8` both present, main is *ahead*). **No unlanded measured win exists.**
+- **Roofline (fresh, this cycle):** decoder int8 weight bytes/token computed from the turbo config = 158 MB (memory's 922 MB was wrong for this 4-layer model). Measured decode_loop 386 ms / 27 tok under heavy contention (encoder_window 9869 ms vs 3569 ms baseline ≈ 2.8× load); de-loaded ≈ 5 ms/tok ⇒ ~31 GB/s, ~1/3 of the DRAM wall. **STRATEGIC CORRECTION: the decode is latency-bound (small-GEMV startup), not DRAM-bandwidth-saturated — so the productive decode lever is AMORTIZATION (longer/fewer GEMVs via draft/speculative decoding, owner-gated), NOT bandwidth reduction (int4 only helps the streaming fraction and is a measured dequant-wash + non-byte-exact).**
+- **QKV fusion × int8 already compose:** the fused-QKV path (bd-b4hp) is not "f16-only" (the code comment misleads) — `quantize_if` at decoder.rs:712 quantizes the fused matrix to int8 when `int8_attn_enabled()` (default on), and per-row I8Mat scales make concatenate-then-quantize byte-identical to quantize-then-concatenate. Decode QKV already runs one int8 GEMV. Verified, no lever.
+
+**Blocker (ship-or-surface within 60m).** The biggest measured gap vs the original is the encoder-dominated single-window path (whisper.cpp ~1.04× faster, `9b1efb8`); the encoder is 95% external GEMM/SDPA at the AVX2-FMA + frequency-throttle ceiling and its only radical levers (a custom int8/f16 GEMM microkernel to BEAT matrixmultiply, ToMe/token-pruning, GPU) are each owner/quality/multi-day-gated. The decode is latency-bound with its one fusion lever already composed; its remaining lever (draft-decoding amortization, R(8)≈2.7×) is owner-gated (needs a draft model). **No conformance-green solo-landable-in-60min radical lever exists** — the frontier is owner-scoped. Ratio vs OpenAI-Whisper unchanged (~1.2× ts / ~1.68–1.8× no_ts; fresh `9b1efb8`: 1.25× no_ts multi-window).
+
+---
+## 2026-07-04 - BlackThrush: LAND-OR-DIG blocker surfaced — no unlanded measured bench-worktree win remains; the only new radical lever class is an owner/calibration-gated adaptive scheduler, so no runtime code was merged
+
+**Land-or-dig result.** AGENT_NAME=BlackThrush. I ancestry-checked sibling bench
+worktrees against current `main` and inspected the non-contained heads rather
+than re-verifying covered wins:
+
+- `franken_whisper-fused-f16c` / `134f404` is a stale source head; current
+  `src/native_engine/nn.rs` already contains the fused F16C GEMV path and the
+  later ledger records its accepted/retested magnitude.
+- `franken_whisper-cod-b-fft-clean-daa0cf9` / `4dd616f` is the stale log-mel
+  SIMD projection source head; the current ledger already contains the accepted
+  projection-fusion entry and later mel-ceiling evidence.
+- `franken_whisper-cod-a-main-measure` / `766f5f1` is patch-equivalent to
+  current `main` (`git cherry` reports `-`), so it is not a landable commit.
+- The remaining non-contained heads I found are rejection/evidence branches
+  (`443bc4f`, `c902858`, `db5f059`), not measured wins to land.
+
+**New radical lever dug, then blocked by contract.** The current measured
+original-vs-franken gap is no longer a byte-exact kernel: current `main` has a
+real text-only multi-window win vs the in-repo legacy `whisper-cli`
+(`8.0855 s` mean vs `10.1212 s`, **1.25 +/- 0.20x**; median **1.31x**), while
+the one-window timestamp control remains a noisy no-win where legacy was
+**1.04 +/- 0.26x** faster. The measured profiles in the adjacent entries put
+the remaining timestamp-mode wall time in external encoder GEMM/SDPA and already
+mined decode kernels.
+
+Applying `/alien-graveyard` + `/alien-artifact-coding` + `/extreme-software-optimization`
+points to one plausible class instead of another micro-kernel: a
+learning-augmented online scheduler for first-window/tail truncation and
+long-form window policy, with a conservative deterministic fallback, conformal
+coverage ledger, and off-policy evaluation gate. That maps directly to the
+graveyard's learning-augmented online algorithms (§10.3), conformal prediction
+(§12.1), and off-policy evaluation contract (§12.12). It is **not mergeable in
+this session** because the adaptive-controller contract requires a calibration
+corpus, outcome/loss matrix, confidence terms, subgroup coverage, and fallback
+trigger before behavior changes. The available in-repo audio has already been
+exhausted in the entries above, and the existing default-off first-window
+truncation knob is known to be unsafe below about 5 s. Shipping an uncalibrated
+default-on controller would violate the project's own alien-artifact contract.
+
+**Per-crate RCH bench evidence.**
+
+```text
+AGENT_NAME=BlackThrush
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a
+rch exec -- cargo bench --release -p franken_whisper \
+  --bench native_engine_bench -- native_engine/mel/mel_30s_realistic --sample-size 10
+```
+
+Remote `ovh-a` accepted the job but Cargo rejected the exact requested flag:
+`error: unexpected argument '--release' found`. The supported repo-equivalent
+release bench was then run per-crate on the same worker/target dir:
+
+```text
+AGENT_NAME=BlackThrush
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a
+rch exec -- cargo bench --profile release-perf -p franken_whisper \
+  --bench native_engine_bench -- native_engine/mel/mel_30s_realistic --sample-size 10
+```
+
+Result: remote `ovh-a`, cold build `5m50s`, total RCH wall `411.5s`,
+`native_engine/mel/mel_30s_realistic` = **[1.4091 ms 1.4119 ms 1.4148 ms]**.
+Model-gated benches were skipped on the worker because the ignored ggml model
+files are not present there. No code variant was retained; original-vs-franken
+ratio remains the current-HEAD measured ratio above.
+
+**Verdict.** No measured worktree win is waiting to land on `main`; no
+conformance-safe, calibration-free radical lever was found. The surfaced blocker
+is owner/data-plane: provide a calibration/evaluation corpus and accept a
+non-byte-exact adaptive scheduler contract, or provide GPU/CUDA-capable
+infrastructure for the encoder-dominant path.
+
+---
 ## 2026-07-04 - BlackThrush: DIG → 3 more paths verified faithful/optimal (prefill logits, language auto-detect, multi-window word-ts) — **closed three previously-unexamined paths, all already correct: (1) prefill computes the 51866-wide logits GEMV for the LAST position only (`logits_last`, decoder.rs doc 40-45) — no wasted logits on prompt tokens, faithful to whisper.cpp; (2) language auto-detect (`detect_language_from_enc`) argmaxes the language-token LOGITS, and since softmax is monotonic argmax(logits)==argmax(softmax)==whisper.cpp's detected language — franken detects `en` on jfk == whisper.cpp `en (p=0.960)`; (3) multi-window word-ts (jfk×3) is structurally correct — window-2 words are correctly seek-offset (`And` [11.500→11.840]), monotonic, no reset/jump (only the documented ~0.5 s inherent DTW numeric divergence remains). No bug, no lever.**
 
 **Dig result — audited three code paths never examined this session, none via a rebuild (two code-read, one existing-tooling run).** AGENT_NAME=BlackThrush.
