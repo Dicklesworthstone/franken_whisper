@@ -1715,10 +1715,16 @@ fn project_qkv(
     n_state: usize,
     h: &Mat,
 ) -> FwResult<(Mat, Mat, Mat)> {
-    // Fused f16 path: one GEMV over the `[3*n_state, n_state]` weight, then split
-    // each output row's `[3*n_state]` into q|k|v `[n_state]`. Bit-identical to the
-    // separate projections (same per-row dot + bias), and no per-call OS-thread
-    // spawn. bd-b4hp.
+    // Fused path: one GEMV over the `[3*n_state, n_state]` weight, then split
+    // each output row's `[3*n_state]` into q|k|v `[n_state]`. The GEMV runs
+    // through `Linear::forward`, so at tq==1 with `int8_attn_enabled()` (the
+    // DEFAULT) it takes the int8 `gemv_i8` over the fused matrix's `w_i8` (built
+    // by `quantize_if` at construction, decoder.rs ~712) — i.e. fusion and int8
+    // COMPOSE; it is NOT an f16-only path. Only when int8_attn is off (or tq>1
+    // prefill) does it use the fused f16 weight. Concatenate-then-quantize is
+    // byte-identical to quantize-then-concatenate because `I8Mat` scales are
+    // per-output-row. Bit-identical to the separate projections (same per-row dot
+    // + bias), and no per-call OS-thread spawn. bd-b4hp.
     if let Some(qkv) = fused {
         if !qkv_fuse_disabled() {
             let out = qkv.forward(h)?; // [tq, 3*n_state]
