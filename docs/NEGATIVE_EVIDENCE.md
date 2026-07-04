@@ -4,6 +4,43 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LANDED M4-register-blocked maddubs-i7 encoder GEMM = 1.11-1.31x over M1, BIT-IDENTICAL (weight-bandwidth lever)
+
+**Ratio vs OpenAI-Whisper/whisper.cpp: IMPROVED on the int8 encoder path (gated).** A NEW measured WIN
+that CORRECTS the standing "int8 encoder GEMM near compute ceiling, accumulator lever exhausted" claim
+(469cebb) — AND supersedes the sibling "no solo-landable lever remains" audit immediately below (that
+audit did not test M4 register-blocking). The landed `matmul_bias_i7` was a NAIVE m-outer loop: for each
+of m=1500 activation rows it re-streams the ENTIRE weight matrix once => the weight is read from L3 ~m
+times per GEMM. matrixmultiply (the f32 baseline) blocks B and does not. So the int8 kernel was partly
+WEIGHT-STREAMING-bound, not fully compute-bound.
+
+**Lever — M4 register-blocking:** process 4 activation rows per weight load. New `dot_maddubs_i7_m4`
+(4 activation rows x ONE weight row, weight `_mm256_loadu` ONCE per 32-lane chunk, 4 independent
+maddubs->madd->add chains = same ILP as the 1-row 4-accumulator form) cuts weight L3 re-reads 4x with
+IDENTICAL compute op-count. `matmul_bias_i7` rewritten to iterate row-blocks of 4 (scalar tail for the
+<4 remainder). Because the i32 product set and the f32 dequant order are unchanged, each output is
+BIT-IDENTICAL to the per-row form.
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe`, mad4-vs-mad1, 3 runs, load 16-24):**
+
+| GEMM | shape | f32 | mad1 (M1) | mad4 (M4) | M4-vs-M1 |
+|------|-------|-----|-----------|-----------|----------|
+| proj    | [1500,1280]x[1280,1280] | 1.0x | 1.15-1.16x | 1.28-1.30x | **1.11-1.31x** |
+| mlp fc1 | [1500,1280]x[1280,5120] | 1.0x | 1.20-1.40x | 1.45-1.59x | **1.12-1.20x** |
+| mlp fc2 | [1500,5120]x[5120,1280] | 1.0x | 1.77-2.23x | 2.20-2.59x | **1.12-1.24x** |
+
+`m4_diff=0` on every shape (bit-identical to M1). e2e jfk (int8 vs f32 default, loaded): 8.710s ->
+7.374s = 1.18x, transcript BYTE-IDENTICAL to the f32 golden ("And so, my fellow Americans..."). More
+valuable UNDER LOAD (M4 reduces L3 contention: mad4-vs-mad1 hit 1.31x at load 24).
+
+**Landed on the existing `FRANKEN_WHISPER_ENC_INT8` path (still default-off = f32 = byte-identical golden;
+M4 only speeds the int8 path, which stays bit-identical to the pre-M4 int8 path).** No new flag. The
+"accumulator lever exhausted / near compute ceiling" note was wrong — the naive m-outer loop left ~12-14%
+in L3 weight bandwidth. NEXT open: M8/N-blocking (diminishing; the port is closer to saturated now) or
+owner's default-flip quality sweep. Files: nn.rs (dot_maddubs_i7_m4 + matmul_bias_i7), probe.
+
+---
+
 ## 2026-07-04 - BlackThrush: LAND-OR-DIG AUDIT after `e806b38` — no unlanded measured worktree win; remaining frontier is owner/infra-blocked, not a solo in-crate lever
 
 **Ratio vs ORIG: UNCHANGED.** Latest shipped `main` evidence still stands: `FRANKEN_WHISPER_ENC_INT8=1`
@@ -40,6 +77,7 @@ changed; no new bench was run because the only candidate ratios are already cove
 directive explicitly says to stop re-verifying covered work. `AGENT_NAME=BlackThrush`.
 
 ---
+
 ## 2026-07-04 - BlackThrush: DIG → int8 SDPA (encoder attention) MEASURED-DEAD (scores 0.14x, out 0.77x) — closes the encoder int8-compute frontier
 
 **Ratio vs OpenAI-Whisper: UNCHANGED.** A measured negative dig on the biggest IMPROVABLE remaining

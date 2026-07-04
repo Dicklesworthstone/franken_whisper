@@ -530,6 +530,92 @@ fn dot_maddubs_i7(a: &[u8], w: &[i8]) -> i32 {
     a.iter().zip(w).map(|(&x, &y)| (x as i32) * (y as i32)).sum()
 }
 
+/// M4-register-blocked `u8·i7` dot: FOUR activation rows against ONE weight row,
+/// the weight vector loaded ONCE per 32-lane chunk (the naive m-outer loop re-reads
+/// the whole weight matrix once PER activation row = m× L3 traffic; M4 cuts weight
+/// re-reads 4×). Each lane's result is BIT-IDENTICAL to [`dot_maddubs_i7`] (same set
+/// of i32 products, same accumulation) so the int8 transcript is UNCHANGED — this is
+/// a pure weight-bandwidth lever. 4 independent maddubs→madd→add chains hide the op
+/// latency (same ILP as the 1-row 4-accumulator form). Measured ~1.11–1.31× over M1
+/// on the encoder linear GEMMs (`encoder_maddubs_i7_gemm_probe`, `m4_diff=0`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+#[inline]
+fn dot_maddubs_i7_m4(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w: &[i8]) -> [i32; 4] {
+    use std::arch::x86_64::*;
+    let k = w.len();
+    let (p0, p1, p2, p3, pw) = (a0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), w.as_ptr());
+    // SAFETY: AVX2 in the base target features; all four activation slices and the
+    // weight slice have length k (caller invariant); 32-lane steps guarded by
+    // `x + 32 <= k`, scalar tail after.
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut c0 = _mm256_setzero_si256();
+        let mut c1 = _mm256_setzero_si256();
+        let mut c2 = _mm256_setzero_si256();
+        let mut c3 = _mm256_setzero_si256();
+        let mut x = 0;
+        while x + 32 <= k {
+            let wv = _mm256_loadu_si256(pw.add(x) as *const __m256i);
+            c0 = _mm256_add_epi32(
+                c0,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p0.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            c1 = _mm256_add_epi32(
+                c1,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p1.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            c2 = _mm256_add_epi32(
+                c2,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p2.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            c3 = _mm256_add_epi32(
+                c3,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p3.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            x += 32;
+        }
+        let hsum = |acc: __m256i| -> i32 {
+            let mut t = [0i32; 8];
+            _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, acc);
+            t.iter().sum()
+        };
+        let mut r = [hsum(c0), hsum(c1), hsum(c2), hsum(c3)];
+        while x < k {
+            let wx = w[x] as i32;
+            r[0] += (a0[x] as i32) * wx;
+            r[1] += (a1[x] as i32) * wx;
+            r[2] += (a2[x] as i32) * wx;
+            r[3] += (a3[x] as i32) * wx;
+            x += 1;
+        }
+        r
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_maddubs_i7_m4(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w: &[i8]) -> [i32; 4] {
+    [
+        dot_maddubs_i7(a0, w),
+        dot_maddubs_i7(a1, w),
+        dot_maddubs_i7(a2, w),
+        dot_maddubs_i7(a3, w),
+    ]
+}
+
 /// Affine projection `x @ w^T (+ bias)` via the maddubs 7-bit int8 GEMM.
 ///
 /// `x` is `[m, in]` f32; `w` is an [`I7Mat`] (`[out, in]`). The activation is
@@ -575,18 +661,56 @@ pub fn matmul_bias_i7(x: &Mat, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat>
                 *d = (i8v + 128) as u8;
             }
         });
+    // M4-register-blocked: process activation rows in blocks of 4, streaming each
+    // weight row ONCE per block (4× less weight L3 traffic than the m-outer naive
+    // loop). Bit-identical to the per-row form (same i32 dot + same f32 dequant
+    // order), so the int8 transcript is unchanged. Parallel over row-blocks.
     let mut c = vec![0.0f32; m * out];
-    c.par_chunks_mut(out).enumerate().for_each(|(r, crow)| {
-        let xr = &xu[r * inp..(r + 1) * inp];
-        let sar = sa[r];
-        for (o, cv) in crow.iter_mut().enumerate() {
-            let wrow = &w.data[o * inp..(o + 1) * inp];
-            let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
-            let mut val = dot as f32 * sar * w.scale[o];
-            if let Some(b) = bias {
-                val += b[o];
+    c.par_chunks_mut(4 * out).enumerate().for_each(|(blk, cblk)| {
+        let r0 = blk * 4;
+        let rows = (m - r0).min(4);
+        if rows == 4 {
+            let x0 = &xu[r0 * inp..(r0 + 1) * inp];
+            let x1 = &xu[(r0 + 1) * inp..(r0 + 2) * inp];
+            let x2 = &xu[(r0 + 2) * inp..(r0 + 3) * inp];
+            let x3 = &xu[(r0 + 3) * inp..(r0 + 4) * inp];
+            let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
+            for o in 0..out {
+                let wrow = &w.data[o * inp..(o + 1) * inp];
+                let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
+                let off = 128 * w.colsum[o];
+                let sc = w.scale[o];
+                let mut v0 = (raw[0] - off) as f32 * s0 * sc;
+                let mut v1 = (raw[1] - off) as f32 * s1 * sc;
+                let mut v2 = (raw[2] - off) as f32 * s2 * sc;
+                let mut v3 = (raw[3] - off) as f32 * s3 * sc;
+                if let Some(b) = bias {
+                    let bo = b[o];
+                    v0 += bo;
+                    v1 += bo;
+                    v2 += bo;
+                    v3 += bo;
+                }
+                cblk[o] = v0;
+                cblk[out + o] = v1;
+                cblk[2 * out + o] = v2;
+                cblk[3 * out + o] = v3;
             }
-            *cv = val;
+        } else {
+            for j in 0..rows {
+                let r = r0 + j;
+                let xr = &xu[r * inp..(r + 1) * inp];
+                let sar = sa[r];
+                for o in 0..out {
+                    let wrow = &w.data[o * inp..(o + 1) * inp];
+                    let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
+                    let mut val = dot as f32 * sar * w.scale[o];
+                    if let Some(b) = bias {
+                        val += b[o];
+                    }
+                    cblk[j * out + o] = val;
+                }
+            }
         }
     });
     Ok(Mat::from_vec(m, out, c))
