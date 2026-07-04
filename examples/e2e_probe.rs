@@ -134,6 +134,19 @@ fn main() {
             );
         }
     }
+    // Word-level DTW timestamp dump (PROBE_DUMP_WORDS=1, needs the `wordts` arg):
+    // one line per word as `WORD [t0 -> t1] text`, for a franken-vs-whisper.cpp
+    // (`-dtw <model> -ml 1`) word-timestamp diff.
+    if std::env::var("PROBE_DUMP_WORDS").as_deref() == Ok("1") {
+        match out.word_timings.as_ref() {
+            Some(wt) => {
+                for w in wt.iter().flatten() {
+                    eprintln!("WORD [{:.3} -> {:.3}] {}", w.start_sec, w.end_sec, w.text);
+                }
+            }
+            None => eprintln!("WORD (none — word_timestamps not enabled; pass `wordts`)"),
+        }
+    }
     let rtf = dt / audio_sec;
     println!(
         "model={model_short} wav={wav} repeat={repeat} wordts={wordts} ch={ch} | audio={audio_sec:.1}s load={load_ms:.0}ms | transcribe={:.3}s RTF={rtf:.4} | segs={} chars={chars}",
