@@ -319,4 +319,12 @@ fn main() {
     bench("proj", 1500, 1280, 1280, iters);
     bench("mlp fc1", 1500, 1280, 5120, iters);
     bench("mlp fc2", 1500, 5120, 1280, iters);
+    // SDPA (per-head, d_head=64) — the biggest IMPROVABLE encoder gap once the
+    // linear GEMMs are int8'd. scores = Q@K^T (K=d_head=64, SHORT dot => maddubs
+    // setup overhead likely dominates); out = probs@V (K=n_ctx=1500, LONG dot,
+    // N=64 => V^T fits L2). Sizes whether int8 attention is worth un-fusing the
+    // external f32 SDPA for.
+    println!("-- SDPA per-head shapes (d_head=64) --");
+    bench("sdpa_scores", 1500, 64, 1500, iters);
+    bench("sdpa_out", 1500, 1500, 64, iters);
 }
