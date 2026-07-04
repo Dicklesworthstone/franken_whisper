@@ -4,6 +4,57 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LAND-OR-DIG blocker - fresh pipeline `has_stage` bitmask lever selected, but the required `whisper-cod` target dir is held by a peer bench before baseline
+
+**Ratio vs ORIG: UNCHANGED / NO NEW MEASUREMENT.** No runtime files changed and
+no usable bench sample was produced, so the shipped original-lineage ratio
+remains the latest landed envelope (~1.2x timestamped / ~1.68-1.8x
+no-timestamps on the covered runs). This entry records an infrastructure
+blocker, not a speed claim.
+
+`AGENT_NAME=BlackThrush git status --short --branch` was clean
+(`## main...origin/main`), so the requested "commit unstaged now" step had
+nothing to commit. Agent Mail registration/reservation was retried for
+`docs/NEGATIVE_EVIDENCE.md`, `src/native_engine/**`, and
+`benches/native_engine_bench.rs`, but the archive SQLite corruption circuit
+breaker still refused writes (`database disk image is malformed`). Worktree
+ancestry was checked against current `main` (`01084bf`): the only non-contained
+heads remain the already-classified stale/reject/source-equivalent set
+(`766f5f1`, `db5f059`, `4dd616f`, `443bc4f`, `134f404`, `c902858`), so there
+was no measured `.scratch`/worktree win to land.
+
+Fresh dig target deliberately avoided the already covered native-engine
+micro-kernel families. The new candidate was an orchestrator bitmask for
+`PipelineConfig::has_stage`: current code stores only `Vec<PipelineStage>` and
+`has_stage` linearly scans it, while `pipeline_bench` already has a model-free
+`pipeline/has_stage_lookup` bench. I attempted the required short per-crate
+baseline with the requested target dir:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench pipeline_bench -- pipeline/has_stage_lookup \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 1 \
+    --output-format bencher --noplot
+```
+
+RCH selected `vmi1149989`, synced dependencies, then timed out syncing
+`/data/projects/franken_whisper` after 30 s and fell back local. Local Cargo
+blocked on the required `/data/projects/.rch-targets/whisper-cod` build lock.
+`ps` showed a separate live franken_whisper bench already compiling under that
+same target dir:
+`cargo bench -p franken_whisper --profile release --bench native_engine_bench -- native_engine/mel/chunk_frames ...`.
+I interrupted only my waiting baseline (`SIGINT`, exit 130) and did not disturb
+peer work. Because no baseline exists, I did not patch the bitmask lever.
+
+**Verdict.** No code landed and no ratio changed. The next non-park action is
+to rerun the `pipeline/has_stage_lookup` baseline once `/data/projects/.rch-targets/whisper-cod`
+is unlocked or once RCH can sync this repo remotely, then apply the cached stage
+bitmask only if the before/after bench shows a real short per-crate win.
+
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-04 - BlackThrush: SHORT per-crate dig after target unlock — fresh `window_to_time_major` sample is NEGATIVE, f16 GEMV filter still cannot complete as a short bench under current local/RCH pressure
 
 **Ratio vs ORIG: UNCHANGED / NO NEW WIN.** No runtime files changed. The
