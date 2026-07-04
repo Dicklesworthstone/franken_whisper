@@ -4,6 +4,42 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: CONFORMANCE GREEN certified on the NEW toolchain (nightly roll did NOT perturb byte-exactness) + ToMe-ceiling dig pre-empted by tripwire
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** No engine change.
+
+**Net-new certification the cache rebuild opened.** Last cycle's fix (f0c7842) rebuilt the whole
+dep graph under a freshly-rolled nightly (rustc 1.98.0-nightly c397dae80). A compiler change can
+silently alter float rounding (FMA contraction / reassociation) — which would break this port's
+ENTIRE reason to exist (byte-exact faithfulness), invisibly. Never verified post-rebuild. Verified
+now (rebuilt e2e_probe, PROBE_DUMP_TEXT):
+- **jfk×1 ts → EXACT golden byte-match** (`"And so, my fellow Americans, ask not what your country
+  can do for you, ask what you can do for your country."`).
+- jfk×1 no_ts → same golden sentence. jfk×3 ts → the golden sentence ×3, byte-identical repetitions.
+- jfk×3 no_ts → the sentence ×3 with the KNOWN no_ts segment-concatenation formatting
+  (`"…for you,Ask what…"` at a join); the TS decode is byte-clean, so this is the pre-existing
+  join cosmetic ([[project_segment_ts_consecutive_fix]] / [[project_no_ts_tail_truncation_fix]]),
+  NOT a toolchain numeric drift.
+- **VERDICT: byte-exactness SURVIVED the nightly roll. Conformance GREEN on the new toolchain.**
+  (For a faithfulness port, certifying this after a forced full rebuild is real risk-retirement,
+  not a formality — a silent FMA-contraction change would have shifted the int8/f32 numerics.)
+
+**This cycle's dig candidate was PRE-EMPTED by the tripwire (worked as intended).** I considered
+measuring the encoder SEQUENCE-reduction ceiling (encoder wall-clock vs n_audio_ctx) to put a number
+on the ToMe / token-pruning upside — then ran the mandatory `rg NEGATIVE_EVIDENCE.md` tripwire and
+found it ALREADY CLOSED: encoder FLOP-reduction is "empirically closed" (depth-pruning measured-fatal
+d161b8b/37cbef4 — skipping even 4 of 32 encoder layers loops the transcript; ToMe explicitly
+"low-odds" because turbo's encoder has NO depth/sequence redundancy after 32→4 decoder distillation).
+Dropped without a wasted probe. `examples/encoder_scale_probe.rs` already exists.
+
+**Frontier reaffirmed owner-scoped:** every in-lane lever is closed (byte-exact swept, self_attn
+transcript-unsafe, draft-model-free measured-dead 1b0be65, ToMe/pruning empirically closed); the
+only >1% paths need an owner unblock (GPU driver + ft-kernel-cuda; a vocab-compatible trained draft
+model; VNNI hardware). No BlackThrush win unlanded. Owner-preventable: pin a dated nightly so the
+next roll can't silently risk byte-exactness (this cert is per-roll).
+
+---
+
 ## 2026-07-04 - BlackThrush: layer-skip self-draft ACCEPT RATE MEASURED = 0% / 0% / 11.8% (k=1/2/3) → draft-model-FREE speculative decode is DEAD (last open leg of the #1 owner-gated decode lever, closed)
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — a default-OFF gated
