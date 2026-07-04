@@ -40,6 +40,54 @@ principle (MSE-clip/EF2/Hadamard regressed sjobs → rejected; fc2 regresses tra
 DON'T re-dig fc2 block-EF or other block-reset EF variants; the per-row (full-dim carry) is the right granularity.
 
 ---
+## 2026-07-04 - BlackThrush: LAND-OR-DIG audit after `360afea` — no measured worktree win missing from main; fresh long-form lever is model-artifact blocked, short per-crate RCH bench completed
+
+**Ratio vs ORIG: UNCHANGED.** Current shipped evidence remains the latest measured envelope:
+~1.2x timestamped / ~1.68-1.8x no-timestamps vs the original lineage on the covered runs, while
+the long-form no-timestamps `0.85x` result is still **not a win** because `bd-r0qd` drops the
+final coherent tail. No runtime code changed in this pass, so no new product speed claim is made.
+
+**Land branch checked.** Repo-local `.scratch/.worktrees` and `/data/projects/.scratch` /
+`/data/projects/.worktrees` had no franken_whisper bench win. The non-contained sibling worktree
+heads remain the already-ledgered stale set: `766f5f1` (docs-only OpenAI ratio), `db5f059`
+(f16c unroll8 reject), `4dd616f` (old mel SIMD projection source, superseded on current main by
+the later real-FFT/twiddle/sparse-projection path), `443bc4f`/`c902858` (log-mel stitch rejects),
+and `134f404` (old fused-F16C predecessor; current `nn.rs` already has the fused dot plus later
+two-row enhancement). No measured code win was available to land. Agent Mail registration was
+attempted with `AGENT_NAME=BlackThrush` but the existing archive SQLite corruption circuit breaker
+refused writes, so no reservation artifact could be created.
+
+**Fresh dig.** The only materially new, not-just-rehashed lever is the `bd-r0qd` final-window
+tail bug: `FW_NO_CONTEXT=1` is already present as a default-off escape hatch and its code comment
+documents the hypothesis that dropping previous-window prompt context restores the missing tail
+on the affected long-form no-timestamps clip. This is the correct next validation target because
+it could turn the current invalid long-form speed result into a real comparator. It could not be
+validated in this session: local model search dirs are absent, and the already-built local
+`e2e_probe tiny.en tests/fixtures/native/jfk.wav 1` fails before inference with
+`model tiny.en not found in search dirs`. The remote bench worker likewise skipped every
+model-gated native-engine bench because `tiny.en` / `large-v3-turbo` ggml files are missing there.
+
+**Required short per-crate bench evidence.** Exact requested spelling was attempted:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod rch exec --
+cargo bench --release -p franken_whisper --bench native_engine_bench -- native_engine/mel/mel_30s_realistic
+--sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`.
+RCH fell local first (`no admissible workers`) and Cargo rejected the flag: `error: unexpected
+argument '--release' found`. The supported release-profile form then ran remotely on `ovh-a`
+with the requested project target dir (RCH rewrote it to the worker-scoped path):
+`cargo bench -p franken_whisper --profile release --bench native_engine_bench --
+native_engine/mel/mel_30s_realistic --sample-size 10 --warm-up-time 0.1 --measurement-time 1
+--output-format bencher --noplot`. Result: build `6m13s`, total RCH wall `420.8s`,
+`native_engine/mel/mel_30s_realistic` = **1,413,526 ns/iter (+/- 14,093)**. This is a
+model-free baseline anchor only; it does not test the `FW_NO_CONTEXT` lever or change the
+original-vs-franken ratio.
+
+**Verdict.** No stale worktree win is missing from main, and the only fresh in-repo lever with a
+credible path to a real ratio is blocked on ggml model artifacts for the long-form repro. Do not
+re-run the closed CPU micro-kernel set; next useful action is to provide the model files to this
+checkout/worker and A/B `FW_NO_CONTEXT` on the `bd-r0qd` MP3-derived long-form fixture, then either
+promote a narrowly-scoped prompt reset or reject it with transcript evidence.
+
+---
 ## 2026-07-04 - BlackThrush: LAND (validated WIN) — error-feedback weight quant for the DEFAULT-ON DECODER int8 (`FW_DEC_EF`), applying the proven encoder EF-weights scheme to the decoder's static per-row weights + cross-KV.
 
 **Ratio vs ORIG: UNCHANGED speed (~1.2× ts / ~1.68-1.8× no_ts vs OpenAI-Whisper/whisper.cpp) — EF is load-time
