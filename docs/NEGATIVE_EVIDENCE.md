@@ -4,6 +4,45 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DROP masked-logits-row-skip (byte-exact in no_ts, MEASURED sub-noise) + hot-kernel antipattern sweep = fully exploited
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — dropped lever + a
+sweep, no engine change.
+
+**NEW lever dug + benched → DROP: masked-logits-row-skip.** In NO_TIMESTAMPS mode
+`process_logits` masks every timestamp token (`timestamp_begin..vocab`, 1501 rows for
+large-v3-turbo) to −∞ BEFORE the greedy argmax, so those rows of the tied 51866×1280 int8
+logits GEMV can never be selected — computing only rows `[0..50365]` is therefore BYTE-EXACT
+in no_ts and skips 1501/51866 = 2.89% of the single biggest per-token decode op. Built
+model-free per-crate (`examples/logits_row_skip_probe.rs`, same `nn::gemv_i8`, COLD >L3
+rotating pool = the honest DRAM-streamed regime). **MEASURED (20 passes, 32t): full
+[51866×1280] 1422 µs @ 46.7 GB/s vs skip [50365×1280] 1554 µs @ 41.5 GB/s → 0.92× — the
+"skip" config is actually SLOWER.** The 2.89% row saving sits BELOW the cold-GEMV op-to-op
+noise floor (±~9% from band-alignment / pool-rotation / cache regime at 50365 vs 51866 rows),
+so it is unmeasurably small even before the ÷(29% logits-of-decode)÷(15% decode-of-e2e)
+no_ts-only dilution ⇒ **sub-0.1% e2e at best, negative in this run. DROP:** not worth a
+row-range `gemv_i8` variant + a no_ts-only branch on the hottest, most correctness-sensitive
+decode kernel.
+
+**Hot-kernel LLVM-antipattern sweep = FULLY EXPLOITED (closes the "grep other sites" TODO from
+[[project_argmax_avx2_landed]] / [[project_round_doesnt_vectorize]]).** Grepped all four hot
+files (nn/decode/decoder/encoder) for the four exploited antipatterns; EVERY remaining match is
+already covered: argmax-class loop-carried reductions → none left (all AVX2, 4771a64);
+`.round()/.floor()` → only one-time weight-quant (nn.rs:929), the DEAD int4 path
+(nn.rs:1564, ±7 clamp), a unit-test scalar reference (nn.rs:3610), and the AVX2 remainder tails
+(nn.rs:1047/1057 — already vectorized, 7939ee6); `.powf(-0.25/-0.5)` → per-attention-CALL
+scalar scale factors (one op, not per-element); `.exp()/.tanh()` → the FW_SIMD_EXP-gated poly
+path + its <8 tail + the byte-exact scalar-libm default + the table-based gelu fallback. **No
+uncovered hot scalar site remains** — the "LLVM leaves perf on the table" vein is dry.
+
+**Standing blocker (unchanged):** no BlackThrush win sits unlanded; the only >1% levers left are
+owner/infra-gated — GPU (nouveau, no compute stack), a real cheap multilingual draft model
+(none on-box), an int8 encoder microkernel (needs VNNI, absent on Zen3), or ToMe/low-rank
+(non-byte-exact, quality-fatal risk on already-distilled turbo). Encoder sgemm stays
+clock-throttle-bound at 32t. Worktrees ahead of origin/main are OTHER agents'/owner's work.
+
+---
+
 ## 2026-07-04 - BlackThrush: bd-r0qd hatch VERIFIED WIRED — `FW_NO_CONTEXT=1` changes a real multi-window transcript (A/B); benign-clip no-op; encoder frontier re-confirmed exhausted
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — the hatch (landed
