@@ -4,6 +4,36 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: bd-r0qd on-box candidate list EXHAUSTED — the 66s clip is a 3rd negative; tripwire prevented re-running the already-tested Steve Jobs keynote
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** Measurement-only
+(existing PROBE_NO_TS / FW_NO_CONTEXT hooks; no engine change).
+
+**Attempted to advance the one real open bug (bd-r0qd final-window tail-drop) via the two on-box
+long-form candidates the memory listed as UNTESTED (a 66 s clip, the Steve Jobs keynote).** Used a
+self-contained A/B — no whisper.cpp reference needed — since the bd-r0qd mechanism is that DEFAULT
+(carried prompt) drops the tail while FW_NO_CONTEXT=1 (no prompt) keeps it, so a longer/more-
+complete no-context tail = trigger + hatch-recovery confirmation.
+
+- **Steve Jobs keynote (840.5 s = 28 windows): TRIPWIRE — already tested (d01b0d6), a negative**
+  (native ends "…switch from portrait to landscape", matches the standalone-slice diagnostic; the
+  full run has one EXTRA token, never fewer). The `rg NEGATIVE_EVIDENCE.md` tripwire caught this
+  BEFORE the expensive 28-window A/B ran — the discipline working as intended.
+- **66 s clip: NEW 3rd negative.** no_ts default vs FW_NO_CONTEXT=1 = the IDENTICAL complete 652-char
+  transcript (only a cosmetic join capitalization "notwhat"→"notWhat"); both end
+  "…ask what you can do for your country." No tail-drop. (Its 6 s final window is short-tail-cleared
+  anyway, and the content is jfk-derived.) Confirms the hatch is a safe no-op on a 3rd non-trigger
+  clip.
+
+**VERDICT: all on-box long-form candidates are now EXHAUSTED as bd-r0qd triggers** (track01 124 s/
+4-window bb9d287, Steve Jobs 840 s/28-window d01b0d6, the 66 s clip here — THREE independent
+negatives spanning 4→28 windows). Re-confirms bd-r0qd is CONTENT-SPECIFIC to the owner's clip120
+(finance/interview, NOT on-box); the on-box repro is definitively closed. The FW_NO_CONTEXT hatch
+(landed 0b7d6db, verified-wired 1d2089a) remains the ready mitigation; CONFIRMING it recovers a real
+dropped tail still needs the owner's triggering clip. No BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: reduced-head decode lever CHARACTERIZED (measured vocab usage) → modest ~1.5-2% e2e ts, non-byte-exact, owner-scoped (the last un-measured decode direction)
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** Measurement-only
