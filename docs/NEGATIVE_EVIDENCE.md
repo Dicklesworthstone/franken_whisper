@@ -4,6 +4,43 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → logits-GEMV latency-hiding (prefetch + 2-row streaming) MEASURED-DEAD — no byte-exact lever, HW prefetcher already saturates the contiguous streams
+
+**Ratio vs ORIG: UNCHANGED (measured negative).** Pivoted off the (closed) encoder to the biggest
+DEFAULT-ON decode op: the tied vocab logits GEMV `[51866,1280]` int8 = 63 MB streamed EVERY token on the
+serial decode critical path. Memory flagged it at ~55 GB/s vs the box's ~204 GB/s DRAM peak + decode
+IPC 0.53 (memory-stalled) — suggesting latency-bound with headroom. Tested two byte-exact latency-hiding
+levers on a CLEAN box (load 9): software prefetch (`_mm_prefetch T0`, ahead 256/512/1024) and 2-row
+streaming (`dot_i8_2row` = 2 concurrent weight streams => more MLP). Both bit-identical (integer i8 dot;
+maxdiff=0.00 vs real `nn::gemv_i8`).
+
+**MEASURED (`examples/logits_gemv_bw_probe`, best-of-40, 2 runs):**
+
+| variant | GB/s run1 | GB/s run2 |
+|---------|-----------|-----------|
+| baseline `nn::gemv_i8` | 49.4 | 64.8 |
+| prefetch ahead=256 | 47.0 | 70.6 |
+| prefetch ahead=512 | 49.9 | 60.2 |
+| prefetch ahead=1024 | 45.2 | 64.6 |
+| 2-row (2 streams) | 51.0 | 56.9 |
+
+**Verdict — no lever, DEAD.** Prefetch and 2-row are WITHIN NOISE of the baseline (run-to-run variance
+49-65 GB/s swamps any effect; no variant consistently wins), bit-identical. The GEMV IS latency-bound
+(~2 GB/s/core = 63MB/32c/~1ms, far below a Zen3 core's DRAM capability => memory-stalled, not
+compute-bound), BUT software prefetch does NOT help because `gemv_i8` parallelizes over CONTIGUOUS
+output-row bands (row-major weight => each core streams one long ~2MB contiguous run), so the HARDWARE
+prefetcher already runs ahead and issues the outstanding loads — adding software prefetch is redundant,
+and 2-row interleaving (2 non-adjacent streams) doesn't beat one HW-prefetched contiguous stream. The
+~50-65 GB/s is the EFFECTIVE DRAM bandwidth for this per-token short-duration (~1ms) streaming pattern
+(dispatch + ramp-up + SMT overhead on 63MB), not a fixable kernel inefficiency. **The logits GEMV is at
+its achievable bandwidth; no byte-exact latency-hiding lever exists.** (Consistent with the already-tuned
+32-worker cap + AVX2 2-accumulator dot_i8 + int4-logits-dead + row-skip-dead history.) Probe committed
+for reproducibility; nn.rs unchanged. No BlackThrush win unlanded. LESSON: contiguous streaming already
+engages the HW prefetcher — software prefetch only helps IRREGULAR/pointer-chasing access, not a
+row-major GEMV.
+
+---
+
 ## 2026-07-04 - BlackThrush: DIG → i5 delayed-widening maddubs MEASURED-DEAD (0.56-0.83x vs M4xN2-i7) — delayed widening's 2x accumulators conflict with register blocking
 
 **Ratio vs ORIG: UNCHANGED (measured negative).** Attacked the ONE remaining int8 encoder GEMM compute
