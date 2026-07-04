@@ -450,10 +450,26 @@ pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
             *s = sc;
             let inv = 1.0 / sc;
             let mut acc = 0i32;
-            for (i, d) in drow.iter_mut().enumerate() {
-                let q = (w_t.data[i * out + o] * inv).round().clamp(-63.0, 63.0) as i32;
-                *d = q as i8;
-                acc += q;
+            if crate::native_engine::enc_ef_quant() {
+                // Error-feedback (error-diffusion) rounding: carry each element's
+                // rounding residual (in QUANTIZED units) into the next, so the
+                // per-column dot Σ q_i·a_i has less accumulated quantization bias
+                // than independent round-to-nearest. Same i7 format/scale/colsum.
+                let mut err = 0.0f32;
+                for (i, d) in drow.iter_mut().enumerate() {
+                    let target = w_t.data[i * out + o] * inv + err;
+                    let q = target.round().clamp(-63.0, 63.0);
+                    err = target - q; // residual carried forward
+                    let qi = q as i32;
+                    *d = qi as i8;
+                    acc += qi;
+                }
+            } else {
+                for (i, d) in drow.iter_mut().enumerate() {
+                    let q = (w_t.data[i * out + o] * inv).round().clamp(-63.0, 63.0) as i32;
+                    *d = q as i8;
+                    acc += q;
+                }
             }
             *cs = acc;
         });

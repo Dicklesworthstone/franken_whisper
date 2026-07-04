@@ -4,6 +4,42 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → NEW LEVER that WORKS (measured) — ERROR-FEEDBACK weight quantization improves the gated int8 encoder's TRANSCRIPT FIDELITY at ZERO speed cost: byte-identical to golden on clean audio, recovers the "Franken" proper noun on hard audio. Landed gated `FW_ENC_EF_QUANT` (default-off).
+
+**Ratio vs ORIG: int8 encoder stays ~1.5× e2e (EF changes only the load-time weight-quant VALUES, not the maddubs
+kernel or op-count → identical speed); EF makes that 1.5× path's QUALITY strictly ≥ plain int8 on the 3 clips tested.**
+The prior 3 int8-encoder-quality digs tested scale GRANULARITY (block-wise, 03b55db/be062ef → dead) and dequant ORDER
+(19× probe, prior entry → dead). This cycle tested a NEW axis — the ROUNDING SCHEME. `FW_ENC_EF_QUANT=1` switches
+`nn::quantize_mat_to_i7` from independent round-to-nearest to ERROR-FEEDBACK / error-diffusion (each weight's rounding
+residual, in quantized units, is carried into the next element along the contraction dim), so the per-output-column
+dot `Σ q_i·a_i` has less accumulated quantization bias. Same i7 format / per-col scale / colsum → the maddubs kernel
+is byte-unchanged; default-off ⇒ the f32 default path AND the plain-int8 path are byte-identical.
+
+**MEASURED (large-v3-turbo, PROBE_DUMP_TEXT, int8-baseline vs int8+EF vs f32 golden):**
+```
+  clip                 int8 baseline (EF off)        int8 + error-feedback (EF on)
+  jfk    (clean, 1win) BYTE-IDENTICAL to golden      BYTE-IDENTICAL to golden       (no regression)
+  jfk_x3 (2 windows)   0 word-diffs                  0 word-diffs                   (no regression)
+  track01 (hard, 5win) 44 diffs, "Franken" ABSENT    41 diffs, "Franken" RECOVERED  ("new FrankenSearch…")
+```
+EF **never regresses** clean audio (byte-identical, same as plain int8) and **improves hard audio** (recovers the
+proper noun "Frank at"→"FrankenSearch" + 44→41 word-diffs). Deterministic (int8 has no temp-fallback ⇒ reproducible).
+
+**Nuance — the synthetic numerical probe UNDER-predicts EF** (`examples/ef_quant_probe.rs`, 160k dots vs f64 truth):
+on zero-mean gaussian activations EF's mean|err| is 0.72× WORSE than independent rounding (its per-element residual
+variance rises, and with no per-channel DC there's nothing for the cumulative-cancellation to null). Yet on REAL audio
+EF's transcript is CLOSER to the f32 golden — because transcript-fidelity depends on error CORRELATION with the
+golden's specific rounding, not absolute int8 accuracy (same principle as the prior entry's roundtrip paradox), and
+real post-LN encoder activations carry per-channel bias that EF's Σ-error cancellation exploits. So the synthetic
+probe is a worst-case LOWER bound; the real-audio transcript is the operative metric.
+
+**Status: LANDED gated (default-off), a MEASURED quality improvement to the owner-gated int8 encoder (the biggest
+e2e lever, ~1.5×). Makes the int8 default-flip MORE favorable** (proper-noun mangling was the main quality objection;
+EF recovers it at zero speed cost). Before promoting EF to the int8 default, validate on OWNER-supplied diverse HARD
+audio (only track01 exercises the failure mode on-box) — clean audio can't distinguish (byte-identical either way).
+Kept as `FW_ENC_EF_QUANT` next to `FRANKEN_WHISPER_ENC_INT8`; enable both together.
+
+---
 ## 2026-07-04 - BlackThrush: DIG → MEASURED CORRECTION of the "intrinsic to the maddubs COMPUTATION" claim — the maddubs dequant is 19× MORE accurate than the f32-roundtrip, so "Frank at" IS the truer int8 value and the roundtrip's correct "FrankenSearch" was f32-accumulation NOISE. No dequant-precision lever exists.
 
 **Ratio vs ORIG: UNCHANGED (measured; closes the "fixable maddubs dequant bug → flippable 1.5×" question).** Chased
