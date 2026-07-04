@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: SHORT per-crate dig after target unlock — fresh `window_to_time_major` sample is NEGATIVE, f16 GEMV filter still cannot complete as a short bench under current local/RCH pressure
+
+**Ratio vs ORIG: UNCHANGED / NO NEW WIN.** No runtime files changed. The
+fresh completed sample is an in-crate model-free microbench only and does not
+improve the original-lineage ratio.
+
+`AGENT_NAME=BlackThrush git status --short --branch` was clean
+(`## main...origin/main`), so there was no unstaged work to commit. The local
+target lock from the prior pass had cleared. RCH then had no admissible workers
+for this project (`critical_pressure=2, insufficient_slots=8,
+active_project_exclusion=1`), so the requested per-crate bench fell back local
+under the required target dir:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod rch exec -- cargo bench -p franken_whisper --profile release --bench native_engine_bench -- native_engine/f16_gemv/f16_gemv_dequant_384x384 --sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`.
+That filtered f16 GEMV run spent ~10 minutes compiling/linking through
+`franken_whisper`/`asupersync` and produced no Criterion sample, so I interrupted
+only my own process (`SIGINT`, exit 130) rather than parking.
+
+A concurrent `window_to_time_major` short bench did finish writing Criterion
+artifacts under the same required target dir. Fresh sample:
+`native_engine_mel/window_to_time_major_old_chunk_then_transpose` median
+**236,721.832 ns**, mean **243,269.649 ns**;
+`native_engine_mel/window_to_time_major_fused` median **300,846.509 ns**, mean
+**309,055.089 ns**. Ratio: fused/old = **1.2709x slower**; old/fused =
+**0.7869x**. This is not a win, and it is already a covered mel/window family,
+so no code should be landed from it.
+
+**Verdict.** No measured `.scratch`/worktree win is missing from main; the only
+fresh completed short bench is negative, and the attempted f16 GEMV filter is
+not short on the current local target under fleet pressure. Leave runtime code
+unchanged. Next useful action is either a true remote slot with warmed
+`whisper-cod` artifacts or a smaller no-LTO harness; do not treat this entry as
+an original-vs-franken ratio change.
+
+---
 ## 2026-07-04 - BlackThrush: FOLLOW-UP LAND-OR-DIG blocker — fail-closed RCH still selects `vmi1227854` and times out syncing this repo; required target dir remains occupied by peer bench
 
 **Ratio vs ORIG: UNCHANGED / NO NEW MEASUREMENT.** This pass made no runtime
