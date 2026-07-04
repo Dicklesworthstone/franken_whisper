@@ -700,10 +700,17 @@ fn build_segments(
                 segments.push(make_segment(t0, t1, text, conf));
             }
             t0 = t1;
-            // Skip a run of consecutive timestamp tokens (whisper.cpp 7684-7690).
+            // Skip a run of consecutive timestamp tokens WITHOUT recomputing t0:
+            // whisper.cpp (7675-7679) advances the index past the run but keeps
+            // `t0 = t1` — the FIRST (closing) timestamp of the run. Recomputing t0
+            // to the LAST timestamp of the run (as this loop previously did)
+            // inserts a spurious gap at any within-window consecutive-timestamp
+            // segment boundary: for `text <|10.38|> <|10.80|> text` the next
+            // segment opened at 10.80 instead of whisper.cpp's 10.38 (+420 ms on
+            // jfk×3 seg 1). This now matches both whisper.cpp and the sibling
+            // consecutive-timestamp skip in the word-timing path below.
             while i + 1 < tokens.len() && tokens[i + 1] > beg {
                 i += 1;
-                t0 = clamp(seek_cs + 2 * i64::from(tokens[i] - beg));
             }
             i0 = i + 1;
         }
