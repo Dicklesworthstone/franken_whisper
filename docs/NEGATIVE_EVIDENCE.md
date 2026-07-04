@@ -4,6 +4,53 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: SHORT per-crate dig measured `chunk_frames` copy baseline - no ORIG-ratio win to land
+
+**Ratio vs ORIG: UNCHANGED / NO NEW WIN.** No runtime files changed. The fresh
+sample measures an in-crate row-major mel window copy only; it is useful routing
+evidence for the OpenAI/PyTorch strided-view gap, but it does not change the
+shipped original-lineage ratio envelope (~1.2x timestamped / ~1.68-1.8x
+no-timestamps on the covered runs).
+
+`AGENT_NAME=BlackThrush git status --short --branch` was clean
+(`## main...origin/main`) before the dig. No repo-local `.scratch/.worktrees`,
+`/data/projects/.scratch`, or `/data/projects/.worktrees` franken_whisper bench
+worktree win was found missing from `main`; the known sibling heads remain the
+already-ledgered stale/reject set. Agent Mail registration/reservation remains
+blocked by the archive SQLite corruption circuit breaker (`database disk image
+is malformed`).
+
+Short per-crate bench command, using the required project target dir:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench native_engine_bench -- native_engine/mel/chunk_frames \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 1 \
+    --output-format bencher --noplot
+```
+
+RCH selected `hz2`, synced dependency roots, then timed out syncing
+`/data/projects/franken_whisper` after 30 s and fell back local. The local run
+completed after the existing shared-target build pressure:
+
+```text
+Finished `release` profile [optimized] target(s) in 8m 23s
+test native_engine/mel/chunk_frames_80x3000_mid ... bench: 34507 ns/iter (+/- 7222)
+```
+
+Criterion artifact:
+`/data/projects/.rch-targets/whisper-cod/criterion/native_engine_mel/chunk_frames_80x3000_mid/new/estimates.json`.
+Median **34,507.767 ns**, mean **32,352.976 ns**, median confidence interval
+**25,114.742..37,990.142 ns**. There is no safe landed lever here: the current
+implementation already copies each row with `extend_from_slice`, while the
+original-lineage comparator for this surface is a view/copy-avoidance shape,
+not a same-function Rust variant. Leave runtime code unchanged and do not count
+this as a product speedup.
+
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-04 - BlackThrush: LAND-OR-DIG blocker - fresh pipeline `has_stage` bitmask lever selected, but the required `whisper-cod` target dir is held by a peer bench before baseline
 
 **Ratio vs ORIG: UNCHANGED / NO NEW MEASUREMENT.** No runtime files changed and
