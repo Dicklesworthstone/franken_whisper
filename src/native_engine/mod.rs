@@ -365,19 +365,23 @@ pub(crate) fn enc_act_roundtrip() -> Option<Option<usize>> {
     })
 }
 
-/// NEW lever (default OFF): `FW_ENC_EF_QUANT=1` switches the int8 encoder WEIGHT quantization
-/// (`nn::quantize_mat_to_i7`) from independent round-to-nearest to ERROR-FEEDBACK (error-diffusion /
-/// sigma-delta) rounding along the contraction dim — each weight's rounding residual is carried into
-/// the next element, so the per-output-column DOT `Σ q_i·a_i` has less accumulated quantization bias.
-/// Only affects the load-time i7 weight table; the maddubs kernel (i7 format, per-col scale, colsum)
-/// is unchanged, so this is a drop-in quality experiment for the gated int8 encoder. Still
-/// NON-byte-exact (owner-gated); the question it answers is whether error-diffusion recovers the
-/// proper-noun errors ("Frank at"→"Franken") that scale-granularity and dequant-order could NOT.
+/// Error-feedback WEIGHT quantization for the int8 encoder — now the DEFAULT within the (gated,
+/// default-off) int8 path, kill-switch `FW_ENC_EF_QUANT=0`. Switches `nn::quantize_mat_to_i7` from
+/// independent round-to-nearest to ERROR-FEEDBACK (error-diffusion / sigma-delta) rounding along the
+/// contraction dim — each weight's rounding residual is carried into the next element, so the
+/// per-output-column DOT `Σ q_i·a_i` has less accumulated quantization bias. Only affects the
+/// load-time i7 weight table; the maddubs kernel (i7 format, per-col scale, colsum) is unchanged, so
+/// this is ZERO e2e speed cost (the ~1.5× int8 encoder speedup is intact). MEASURED strictly ≥ plain
+/// int8 on 4 clips: jfk/jfk_x3 BYTE-IDENTICAL to f32 golden, track01 44→41 diffs (+recovers
+/// "Frank at"→"FrankenSearch"), sjobs_16k (13-min) 179→125 = 30% fewer errors (see
+/// docs/NEGATIVE_EVIDENCE.md). Default-ON-within-int8 because it is validated strictly better; the
+/// f32 default path (enc_int8 off) is UNAFFECTED. `FW_ENC_EF_QUANT=0` restores plain round-to-nearest.
 pub(crate) fn enc_ef_quant() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("FW_ENC_EF_QUANT") {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
-        Err(_) => false,
+        // Kill-switch: explicit 0/off/false/no restores plain round-to-nearest int8.
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        Err(_) => true, // default: EF on (validated strictly ≥ plain int8, zero speed cost)
     })
 }
 
