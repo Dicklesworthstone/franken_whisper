@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: REJECT MSE-optimal weight CLIPPING for the int8 encoder — neutral on track01, REGRESSES the diverse 13-min sjobs (125→201 diffs). Same failure mode as EF-activations; the one standard int8 quality technique missing from the ledger is now measured DEAD. Code reverted (byte-identical to HEAD).
+
+**Ratio vs ORIG: NO CHANGE — int8 encoder stays ~1.5-1.63× e2e; f32 default path byte-identical; `nn.rs`+`mod.rs`
+reverted to HEAD (no code shipped).** The int8 i7 weight scale is `amax/63` — maps the largest weight to ±63 and
+NEVER clips. That is MSE-optimal only for uniform weights; for the heavy-tailed (near-Gaussian + outliers)
+distributions transformer weights actually have, a few outliers stretch `amax` and starve the bulk of i7 levels,
+so *per-weight* MSE says a smaller (clipping) scale is better. I implemented it gated (`FW_ENC_CLIP_MSE`,
+default-off): per-output-column grid-search of the clip fraction α∈[0.55,1.0] (19 candidates; α=1.0 == the current
+`amax/63`) picking the scale that minimizes Σ(w−dequant(quant(w)))². Load-time only, zero runtime cost, composes
+with EF. This is the standard "optimal clipping / MSE calibration" int8 technique — conspicuously absent from the
+ledger (grep-confirmed). MEASURED (word-diffs vs f32 golden, same methodology as the EF entries below):
+```
+  clip            track01 (hard, 5win)    sjobs_16k (13-min, diverse)
+  int8+EF         41 diffs                125 diffs
+  int8+EF+MSEclip 41 diffs (NEUTRAL)      201 diffs  (+61% WORSE)
+```
+Byte-identity: clip-OFF (default) BYTE-IDENTICAL to the pre-change binary on track01+jfk_x3 (the flag was provably
+inert when off). VERDICT: **REJECTED — reverts the exact pattern of the EF-ACTIVATIONS rejection below** (neutral/
+helps short audio, severely regresses long diverse audio). ROOT CAUSE: minimizing *per-weight* MSE by clipping
+outliers to ±63 sacrifices the outlier weights that carry disproportionate signal; the per-weight objective is NOT
+aligned with the dot-product/transcript objective, and the induced error compounds through the 32 encoder layers on
+long audio — precisely why the finer-quant EF-activations also regressed sjobs. This CONFIRMS the standing finding
+([[project_turbo_encoder_dominates]]) that the int8 encoder proper-noun error is intrinsic to the maddubs
+computation and NOT recoverable by weight-quant scale/granularity tuning: EF-weights (the ONE technique that helped,
+because it targets *accumulated dot bias* not per-weight error) remains the only quality win; scale-clipping, block
+granularity, and EF-activations are all measured-dead. Code reverted; the owner-gated int8 quality gap is unmoved.
+
+---
+
 ## 2026-07-04 - BlackThrush: RE-CONFIRM the SDPA gather has no byte-exact lever — the ~18 GB/s apparent rate is a cold/DRAM-latency floor, NOT slack. (CORRECTION: the access-order axis was ALREADY rejected in cf1b7b3; this adds the mechanism + the full chunk curve + tiling.)
 
 **Ratio vs ORIG: NO CHANGE — encoder stays at its external-kernel ceiling; the SDPA gather has no in-crate
