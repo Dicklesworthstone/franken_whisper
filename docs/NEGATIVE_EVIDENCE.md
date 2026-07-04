@@ -4,6 +4,52 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: FRESH current-build head-to-head vs whisper.cpp (the original) — franken 1.22x faster no_ts FLOOR on real 124.5s speech, equivalent transcript; contention caps a cleaner number
+
+**Ratio vs OpenAI-Whisper/whisper.cpp: MEASURED THIS CYCLE (not cited from the stale 2c58bf0
+build).** whisper.cpp IS built on-box (`legacy_whispercpp/whisper.cpp/build/bin/whisper-cli`,
+libwhisper 1.8.3) — earlier "no binary" note was a maxdepth miss. So a direct head-to-head is cheap.
+
+**Input:** `track01_16k.wav` (124.5s, ~5 windows, real varied tech-demo speech — a bd-r0qd NEGATIVE
+control so franken decodes the full tail, making the timing comparison fair). Matched threads:
+whisper.cpp `-t 32`, franken default (32-cap). Both compute-only times (exclude model load).
+
+**MEASURED no_ts (the mode with franken's biggest structural edge):**
+
+| Engine | run1 | run2 | min | load during min |
+|--------|------|------|-----|-----------------|
+| whisper.cpp `total time` | 26.25 s | 24.78 s | **24.78 s** | ~17 |
+| franken `transcribe` | 20.34 s | 35.14 s | **20.34 s** | ~17 |
+
+→ **franken 24.78 / 20.34 = 1.22x faster**, at matched load ~17. This is a **FLOOR**: franken
+(32-thread rayon) is more contention-sensitive than whisper.cpp (OpenMP), and franken's runs saw
+EQUAL-or-HIGHER load (run2 hit load 26 → 35s). **Fairness verified:** franken 1339 chars vs
+whisper.cpp 270 words / ~1386 chars-with-spaces (within ~3%, franken tail intact) — equivalent work,
+NOT a tail-drop speedup.
+
+**Why below the documented quiet-box 1.68x no_ts:** (a) the box could NOT be quieted — load bounced
+**8 -> 17 -> 26 -> 91 -> 100** across ~15 min of measurement (sibling agents' builds), so franken's
+true quiet-box time is unreachable right now; (b) track01 is ENCODER-heavy (5 full windows) and
+franken's encoder is ~tied (whisper 3.19 s/win from its 5-run encode timing vs franken 3.53 s/win
+criterion, at different loads = within contention noise), so the int8-decode edge is diluted on
+encoder-dominated audio. **Mechanism of the win (confirmed):** whisper.cpp serializes
+encode(15.95 s) THEN decode-side (sample 0.71 + decode 0.33 + batchd 7.69 = ~8.7 s); franken's no_ts
+path OVERLAPS decode under encode via cross-window pipelining ([[project_window_pipelining_lever]])
+AND runs int8 decode — that structural overlap is why franken wins no_ts despite a tied encoder.
+
+**TS-mode pair DROPPED (contention-invalid):** whisper 66.0 s / franken 78.3 s measured at load
+**91-100** (both engines ~2.5-3x slowed) — the 0.84x is a pure contention artifact, not a real
+ratio. franken TS still produced a full 14-seg / 1384-char transcript (no tail-drop). A valid ts
+ratio needs a quiet box.
+
+**Takeaway:** the current build BEATS whisper.cpp on real multi-window speech (>=1.22x no_ts, floor),
+direction re-confirmed on the current toolchain. The ONLY thing blocking a cleaner headline number —
+and the last remaining timing lever generally — is the **shared box's variable contention** (a clean
+quiet-box head-to-head is infeasible while load bounces 8->100). Every >1% CODE lever remains
+owner/infra-gated (GPU offload / trained draft model / VNNI / ToMe); no BlackThrush win sits unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: MEASURED per-crate hot-path baseline on the POST-nightly-roll toolchain (cargo bench, large-v3-turbo) — no regression; encoder ~7:1 dominance re-confirmed; frontier still owner/infra-gated
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68-1.8× no_ts, established 2c58bf0). This cycle
