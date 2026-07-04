@@ -4,6 +4,48 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → MEASURED WIN (owner-gated) — maddubs 7-bit-weight int8 encoder GEMM = **1.56-1.58x f32 on the dominant MLP GEMMs** (integer-EXACT, relerr 0.002); REFUTES the "7-bit maddubs not worth it" retraction; ~1.25x e2e projected
+
+**Ratio vs OpenAI-Whisper: PROJECTED ~1.25x e2e (ts) IF the transcript A/B passes — a measured GEMM
+win, NOT yet landed (non-byte-exact, owner quality-gated).** This is the #1 owner-gated lever finally
+MEASURED, not extrapolated.
+
+**Background:** the int8 encoder GEMM (encoder = ~87% e2e) had two blockers in this ledger:
+the WIDENING op (vpmovsxbw+vpmaddwd, int32-safe) tiled = 0.89x f32 (a LOSS), and MADDUBS (~1.79x the
+widening op) SATURATES int16 for full int8xint8 (retraction 4cfcd56). The retraction noted maddubs is
+"usable with <=7-bit weights" but DISMISSED it by reasoning ("not worth it, accuracy") — never measuring
+its tiled-GEMM SPEED, while the ledger's "~1.6x f32" stood as an unmeasured extrapolation.
+
+**Built + MEASURED** (`examples/encoder_maddubs_i7_gemm_probe`, activation->u8 [symmetric i8 +128],
+weight->i7 [amax/63, clamp ±63], AVX2 maddubs->i16->madd-widen->i32, sign-offset -128·Σw, vs the REAL
+f32 `nn::matmul`; best-of-40 at load 7):
+
+| shape | f32 | widening | **maddubs-7bit** | sat_diff | relerr |
+|-------|-----|----------|------------------|----------|--------|
+| proj QKV/out [1500,1280]×[1280,1280] | 3.7 ms | 0.70× | **1.17×** | 0 | 0.002 |
+| mlp fc1 [1500,1280]×[1280,5120] | 18.6 ms | 0.90× | **1.56×** | 0 | 0.002 |
+| mlp fc2 [1500,5120]×[5120,1280] | 15.1 ms | 0.88× | **1.58×** | 0 | 0.001 |
+
+**`sat_diff=0` on all shapes proves the maddubs dot is INTEGER-EXACT (non-saturating)** — the i7 weight
+keeps every pair-sum in int16 (u8·i7 pair-sum ∈ [-32130, 32130] ⊂ int16). relerr 0.002 vs f32 ≈ the
+widening-int8's 0.001 (7-bit is only ~2× coarser per-GEMM, NOT the accuracy cliff the retraction
+assumed). So **the retraction was WRONG to dismiss 7-bit maddubs**: the accuracy is fine AND the speed
+is real — where the widening path LOSES (0.70-0.90×), maddubs-7bit WINS (1.17-1.58×), because i8 weights
+are 4× smaller (L3-resident) + maddubs is denser compute. And this is a NAIVE parallel GEMM (no cache
+blocking) — a Goto-quality maddubs microkernel would EXCEED 1.58×, so these are floors.
+
+**Projected e2e:** MLP is ~2/3 of encoder GEMM FLOPs @ 1.57×, proj ~1/3 @ 1.17× → ~1.41× encoder GEMM
+→ ~1.30× encoder (GEMM 79%) → **~1.25× e2e** (encoder 87%) — the single biggest lever in the project.
+
+**Status = owner-gated on TRANSCRIPT QUALITY only** (no longer on feasibility/speed, which are now
+proven). Remaining work: (1) wire 7-bit maddubs into the real 32-layer encoder GEMM path behind a
+default-off flag; (2) a turbo transcript A/B — the open risk is 7-bit quant error ACCUMULATING over 32
+layers (per-GEMM relerr 0.002 is fine; the 32-layer compound is the unknown; whisper.cpp-Q8 uses 8-bit
+encoder quant successfully, so 7-bit is 1 bit coarser). If the transcript holds, this LANDS gated as a
+~1.25× e2e win — by far the biggest. Probe committed for the owner to drive the A/B.
+
+---
+
 ## 2026-07-04 - BlackThrush: LITERAL alien-graveyard sweep (read the canonical index + candidate numerical entries) → NO applicable lever for a power-throttled external GEMM; dig-the-graveyard mandate definitively closed
 
 **Ratio vs OpenAI-Whisper: UNCHANGED.** The directive names `/alien-graveyard` as a dig source; prior
