@@ -4,6 +4,39 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: tq==1 cross-attn DIRECT-WRITE (alloc+merge elimination) is byte-exact but SUB-NOISE — the self-attn alloc-light playbook does NOT transfer to cross-attn (compute-bound, not overhead-bound). Implemented, verified byte-identical, REVERTED.
+
+**Ratio vs ORIG: UNCHANGED (measured negative, reverted — no net code change).** The landed self-attn alloc-light
+rewrite ([[project_decode_structural_alloc]], 3d9c9b4) got **1.54×** by killing per-head buffer allocs+transposes
+on an OVERHEAD-bound span. The obvious follow-on: `cross_attention`'s steady-state (tq==1) parallel path allocates
+a `vec![0.0; n_state]` private buffer per head-band then disjoint-merges (`*o += *l`). At tq==1 `out` is a single
+[n_state] row and head h owns the CONTIGUOUS column slice [h·d_head, (h+1)·d_head), so a head-band owns a contiguous
+slice of `out` → workers can `par_chunks_mut` and write DIRECTLY (copy_from_slice, exactly the serial `scatter`),
+eliminating the per-band alloc + the full merge pass. Implemented behind `FW_CROSS_DIRECT_WRITE` (default on) + the
+tq==1 fast path in decoder.rs.
+
+**Byte-exact: VERIFIED (transcript-identical on vs off, jfk x1/x3, ts + no_ts, non-empty 125-342 B).** The direct
+copy replicates the serial-path `scatter` semantics exactly (each column written once), bit-identical to the
+canonical serial reference.
+
+**But the e2e/span benefit is SUB-NOISE — REVERTED.** Two independent reasons:
+(1) **ARITHMETIC (decisive, load-invariant):** cross-attn per head = 2 GEMVs (int8 `gemv_i8` over the ~96 KB
+window-constant K/V), = ~1.9 MB/token/layer of K/V reads across 20 heads. The eliminated overhead = ~workers (≈10)
+private-buffer allocs of ~5 KB + one merge pass of ~10×1280 f32 ≈ well under 1% of the span's memory traffic. So
+removing it is structurally sub-noise, unlike self-attn where the alloc/transpose overhead DOMINATED the tiny
+KV-cache compute (short-window per-token dots).
+(2) **MEASURED (load ~90, cross_attn span ms, interleaved):** direct 389.8/357.5 vs merge 364.7/347.0 — direct
+marginally SLOWER, i.e. within contention noise (±30 ms at this load), no resolvable benefit. (Box ran load 53→99
+all cycle; a quiet-box A/B is pointless here because reason (1) caps the benefit sub-noise regardless of load.)
+
+**LESSON (reusable): the alloc-light playbook transfers to OVERHEAD-bound spans (self-attn: tiny compute, big
+alloc/transpose overhead → 1.54×) but NOT to COMPUTE-bound spans (cross-attn: big window-constant K/V GEMV reads
+dwarf the alloc/merge → sub-noise).** Before porting an alloc-elimination win to another span, check the
+overhead:compute ratio — cross-attn's is tiny. The change is byte-exact + never-negative but not worth the tq==1
+special-case + flag for 0 measurable gain, so reverted per "revert ~0-gain." Don't re-attempt cross-attn
+alloc-elimination. This closes the "tq==1 cross-attn direct-write" sub-1% lead named in
+[[project_decode_structural_alloc]].
+
 ## 2026-07-04 - BlackThrush: LANDED default-on — SDPA gather/scatter chunking (`FW_SDPA_GATHER_CHUNKS` default 0→16), quiet-box settled, byte-exact ~0.5% e2e encoder win
 
 **Ratio vs ORIG: encoder reshape 1.159× (byte-exact), ~+0.5% on the ~1.2× ts / ~1.68× no_ts default-path lead.**
