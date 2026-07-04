@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG (logits GEMV latency-bound → more-MLP lever?) PRE-EMPTED by tripwire + double-confirmed bandwidth-bound (IPC 0.53 ∧ 4-accum wash)
+
+**Ratio vs OpenAI-Whisper: UNCHANGED.** No build spent — the mandatory `rg docs/NEGATIVE_EVIDENCE.md`
+tripwire pre-empted a re-dig, and the result resolves a loose end from ec1ce40.
+
+**Hypothesis this cycle:** ec1ce40 measured the logits GEMV at IPC 0.53 (memory-stalled) but I doubted
+its "bandwidth wall" wording — the op achieves only ~57 GB/s aggregate vs the box's ~160-200 GB/s
+8-channel DDR4 ceiling, which LOOKS latency-bound (unhidden L3 latency), and a latency-bound streaming
+dot is helped by more memory-level parallelism (extra i32 accumulators) — which would be BYTE-EXACT
+(integer add is associative, unlike f32). A clean potential lever on the biggest decode op.
+
+**TRIPWIRE VERDICT — already measured, REFUTED (2026-07-02, ledger ~L777-784):** the 4-accumulator AND
+2-row-register-blocked `dot_i8` variants were built and benched on the streaming logits shape =
+**WASH-to-LOSS** (2-row 0.62-0.75× on logits; "neither more accumulators NOR row-blocking helps... the
+int8 GEMV is WEIGHT-BANDWIDTH-bound (streaming shapes), don't re-dig"). So more MLP does NOT raise the
+logits GEMV's rate — the hypothesis is dead, and I spent no build (the `rg` tripwire caught it, as
+[[feedback_read_memory_before_digging]] prescribes).
+
+**Reconciliation (closes ec1ce40's open doubt):** the "57 of ~200 GB/s" gap is NOT reachable latency
+headroom — it is the ACHIEVABLE ceiling for this int8-streaming access pattern (the vpmovsxbw/vpmaddwd
+unpack ALU consumes issue slots between loads, so per-core bandwidth stays low and extra accumulators
+don't help, as measured). So ec1ce40's "bandwidth-bound" was CORRECT, now double-confirmed by two
+independent methods: (1) perf IPC 0.53 this session, (2) the 2026-07-02 4-accum/2-row wash. The logits
+GEMV — the single biggest decode op — is definitively at its bandwidth floor; the only byte-reducers
+(int4) are dead, and the only escape is off-CPU (GPU, owner). No BlackThrush win unlanded; every >1%
+path stays owner/infra-gated.
+
+---
+
 ## 2026-07-04 - BlackThrush: DIG the logits-GEMV "30-vs-50 GB/s gap" with perf HW counters → REFUTED (memory-stalled IPC 0.53); complete IPC map proves decode has NO compute headroom + explains the contention inversion
 
 **Ratio vs OpenAI-Whisper: UNCHANGED.** A DIG (hypothesis → contention-invariant measurement →
