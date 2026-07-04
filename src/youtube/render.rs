@@ -531,10 +531,7 @@ pub fn render_json(input: &RenderInput<'_>) -> Value {
         .map(|(i, seg)| {
             let mut u = Map::new();
             u.insert("i".into(), json!(i));
-            u.insert(
-                "start_sec".into(),
-                json!(sanitize_timestamp(seg.start_sec)),
-            );
+            u.insert("start_sec".into(), json!(sanitize_timestamp(seg.start_sec)));
             u.insert("end_sec".into(), json!(sanitize_timestamp(seg.end_sec)));
             u.insert("text".into(), json!(seg.text));
             // Confidence is passed through verbatim, including null.

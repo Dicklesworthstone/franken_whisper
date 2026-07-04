@@ -68,7 +68,11 @@ fn gelu_table(data: &mut [f32], table: &[f32]) {
 
 /// 8-wide table GELU: vcvtps2ph (rne) → widen → AVX2 gather → blend clamp.
 /// Bit-identical to `gelu_table`: same rne f16 index, same table, same clamp.
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "avx2"
+))]
 #[allow(unsafe_code)]
 fn gelu_simd(data: &mut [f32], table: &[f32]) {
     use core::arch::x86_64::*;
@@ -121,7 +125,10 @@ fn best_of(iters: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let n = 1500 * 5120; // one large-v3-turbo encoder MLP activation panel.
     // Realistic post-layernorm activations: roughly unit-scale, spread over [-6,6].
     let base: Vec<f32> = (0..n)
@@ -158,20 +165,35 @@ fn main() {
     let mut sb = base.clone();
     gelu_table(&mut sa, &table);
     gelu_simd(&mut sb, &table);
-    let simd_maxdiff = sa.iter().zip(&sb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let simd_maxdiff = sa
+        .iter()
+        .zip(&sb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
 
     // Accuracy canary: max |Δ| tanh-form vs table-form over the full panel.
     let mut a = base.clone();
     let mut b = base.clone();
     gelu_tanh(&mut a);
     gelu_table(&mut b, &table);
-    let maxdiff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let maxdiff = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
 
     let mb = (n * 4) as f64 / 1e6;
     println!("gelu panel n={n} ({mb:.1} MB f32) best-of-{iters}");
     println!("  tanh  (old)     {tanh_ms:7.3} ms");
-    println!("  table (scalar)  {table_ms:7.3} ms   speedup={:.2}x", tanh_ms / table_ms);
-    println!("  table (simd)    {simd_ms:7.3} ms   speedup={:.2}x (vs tanh) / {:.2}x (vs scalar table)", tanh_ms / simd_ms, table_ms / simd_ms);
+    println!(
+        "  table (scalar)  {table_ms:7.3} ms   speedup={:.2}x",
+        tanh_ms / table_ms
+    );
+    println!(
+        "  table (simd)    {simd_ms:7.3} ms   speedup={:.2}x (vs tanh) / {:.2}x (vs scalar table)",
+        tanh_ms / simd_ms,
+        table_ms / simd_ms
+    );
     println!("  max |Δ| tanh-vs-table = {maxdiff:.5}  (f16-quant error, expect ~1e-3)");
     println!("  max |Δ| simd-vs-scalar-table = {simd_maxdiff:.6}  (must be 0)");
 }

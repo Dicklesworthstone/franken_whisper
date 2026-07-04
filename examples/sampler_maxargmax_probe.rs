@@ -11,10 +11,10 @@
 //! whether they are scalar levers (byte-exact, default-on-able) or already vectorized.
 //! Usage: `sampler_maxargmax_probe [iters]` (default 3000).
 #![allow(unsafe_code)]
-use std::hint::black_box;
-use std::time::Instant;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::hint::black_box;
+use std::time::Instant;
 
 /// franken's exact scalar max fold (decode.rs:507).
 fn max_scalar(l: &[f32]) -> f32 {
@@ -107,7 +107,9 @@ fn argmax_simd(l: &[f32]) -> usize {
 }
 
 fn timeit<T>(f: impl Fn(&[f32]) -> T, l: &[f32], iters: usize) -> f64 {
-    for _ in 0..5 { black_box(f(l)); }
+    for _ in 0..5 {
+        black_box(f(l));
+    }
     let mut best = f64::INFINITY;
     for _ in 0..iters {
         let t = Instant::now();
@@ -118,30 +120,62 @@ fn timeit<T>(f: impl Fn(&[f32]) -> T, l: &[f32], iters: usize) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
     let n = 51866usize; // whisper large-v3 n_vocab
     let mut s = 0x243F_6A88_85A3_08D3u64;
-    let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 30.0 };
+    let mut nf = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 30.0
+    };
     let mut logits: Vec<f32> = (0..n).map(|_| nf()).collect();
     // sprinkle a few -inf (suppressed tokens) — must NOT break byte-exactness (no NaN post-sanitize)
-    for &j in &[7usize, 100, 5000, 51865] { logits[j] = f32::NEG_INFINITY; }
+    for &j in &[7usize, 100, 5000, 51865] {
+        logits[j] = f32::NEG_INFINITY;
+    }
 
     println!("=== sampler over n_vocab={n}: scalar vs byte-exact AVX2 (serial critical path) ===");
     #[cfg(target_arch = "x86_64")]
     {
         let (ms, mv) = (max_scalar(&logits), max_simd(&logits));
         let (as_, av) = (argmax_scalar(&logits), argmax_simd(&logits));
-        println!("  byte-exact: max scalar={ms:.6} simd={mv:.6} [{}] | argmax scalar={as_} simd={av} [{}]",
-            if ms.to_bits() == mv.to_bits() { "IDENTICAL" } else { "DIVERGENT" },
-            if as_ == av { "IDENTICAL" } else { "DIVERGENT" });
+        println!(
+            "  byte-exact: max scalar={ms:.6} simd={mv:.6} [{}] | argmax scalar={as_} simd={av} [{}]",
+            if ms.to_bits() == mv.to_bits() {
+                "IDENTICAL"
+            } else {
+                "DIVERGENT"
+            },
+            if as_ == av { "IDENTICAL" } else { "DIVERGENT" }
+        );
         let tms = timeit(max_scalar, &logits, iters);
         let tmv = timeit(max_simd, &logits, iters);
         let tas = timeit(argmax_scalar, &logits, iters);
         let tav = timeit(argmax_simd, &logits, iters);
-        println!("  max fold : scalar {:>6.2} µs | AVX2 {:>6.2} µs | {:.2}x [{}]",
-            tms * 1e6, tmv * 1e6, tms / tmv, if tmv < tms { "WIN" } else { "already-vectorized/loss" });
-        println!("  argmax   : scalar {:>6.2} µs | AVX2 {:>6.2} µs | {:.2}x [{}]",
-            tas * 1e6, tav * 1e6, tas / tav, if tav < tas { "WIN" } else { "loss" });
-        println!("  (per-token, SERIAL sampler critical path — full wall-clock weight, not parallelized.)");
+        println!(
+            "  max fold : scalar {:>6.2} µs | AVX2 {:>6.2} µs | {:.2}x [{}]",
+            tms * 1e6,
+            tmv * 1e6,
+            tms / tmv,
+            if tmv < tms {
+                "WIN"
+            } else {
+                "already-vectorized/loss"
+            }
+        );
+        println!(
+            "  argmax   : scalar {:>6.2} µs | AVX2 {:>6.2} µs | {:.2}x [{}]",
+            tas * 1e6,
+            tav * 1e6,
+            tas / tav,
+            if tav < tas { "WIN" } else { "loss" }
+        );
+        println!(
+            "  (per-token, SERIAL sampler critical path — full wall-clock weight, not parallelized.)"
+        );
     }
 }

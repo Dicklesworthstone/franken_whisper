@@ -26,10 +26,14 @@ use std::time::Instant;
 fn bench(name: &str, out: usize, inp: usize, iters: usize) {
     let mut s = 0xBEEF_1234u64;
     let mut nextf = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     };
-    let wf16: Vec<f16> = (0..out * inp).map(|_| f16::from_f32(nextf() * 0.1)).collect();
+    let wf16: Vec<f16> = (0..out * inp)
+        .map(|_| f16::from_f32(nextf() * 0.1))
+        .collect();
     let w_i8 = nn::quantize_f16_to_i8(&wf16, out, inp);
     let x: Vec<f32> = (0..inp).map(|_| nextf()).collect();
     let bias: Vec<f32> = (0..out).map(|_| nextf() * 0.1).collect();
@@ -55,7 +59,10 @@ fn bench(name: &str, out: usize, inp: usize, iters: usize) {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let thr = std::env::var("FW_GEMV_I8_PAR").unwrap_or_else(|_| "(default 1<<21)".into());
     println!(
         "=== gemv_i8 per-token min-of-{iters} @ {}t, FW_GEMV_I8_PAR={thr} ===",

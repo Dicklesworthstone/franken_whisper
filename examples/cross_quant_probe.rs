@@ -63,8 +63,12 @@ fn main() {
     // turbo cross cache: 4 layers × 20 heads, K=[1500,64], V=[64,1500].
     let (n_layer, n_head, d_head, enc) = (4usize, 20usize, 64usize, 1500usize);
     let nmats = n_layer * n_head; // 80 K + 80 V
-    let ks: Vec<Vec<f16>> = (0..nmats).map(|i| mk(enc, d_head, 0x100 + i as u64)).collect();
-    let vs: Vec<Vec<f16>> = (0..nmats).map(|i| mk(d_head, enc, 0x900 + i as u64)).collect();
+    let ks: Vec<Vec<f16>> = (0..nmats)
+        .map(|i| mk(enc, d_head, 0x100 + i as u64))
+        .collect();
+    let vs: Vec<Vec<f16>> = (0..nmats)
+        .map(|i| mk(d_head, enc, 0x900 + i as u64))
+        .collect();
     println!(
         "turbo cross cache: {nmats} K[{enc},{d_head}] + {nmats} V[{d_head},{enc}]  ({} elems)",
         nmats * enc * d_head * 2
@@ -99,20 +103,38 @@ fn main() {
 
     // A) serial outer, par inner (current).
     let a = run("A) serial-outer par-inner", &|| {
-        let k: Vec<_> = ks.iter().map(|k| nn::quantize_f16_to_i8(k, enc, d_head)).collect();
-        let v: Vec<_> = vs.iter().map(|v| nn::quantize_f16_to_i8(v, d_head, enc)).collect();
+        let k: Vec<_> = ks
+            .iter()
+            .map(|k| nn::quantize_f16_to_i8(k, enc, d_head))
+            .collect();
+        let v: Vec<_> = vs
+            .iter()
+            .map(|v| nn::quantize_f16_to_i8(v, d_head, enc))
+            .collect();
         k.len() + v.len()
     });
     // B) par outer, par inner (minimal change; nested rayon).
     let b = run("B) par-outer par-inner", &|| {
-        let k: Vec<_> = ks.par_iter().map(|k| nn::quantize_f16_to_i8(k, enc, d_head)).collect();
-        let v: Vec<_> = vs.par_iter().map(|v| nn::quantize_f16_to_i8(v, d_head, enc)).collect();
+        let k: Vec<_> = ks
+            .par_iter()
+            .map(|k| nn::quantize_f16_to_i8(k, enc, d_head))
+            .collect();
+        let v: Vec<_> = vs
+            .par_iter()
+            .map(|v| nn::quantize_f16_to_i8(v, d_head, enc))
+            .collect();
         k.len() + v.len()
     });
     // C) par outer, serial inner (coarse grain).
     let c = run("C) par-outer serial-inner", &|| {
-        let k: Vec<_> = ks.par_iter().map(|k| quant_serial(k, enc, d_head)).collect();
-        let v: Vec<_> = vs.par_iter().map(|v| quant_serial(v, d_head, enc)).collect();
+        let k: Vec<_> = ks
+            .par_iter()
+            .map(|k| quant_serial(k, enc, d_head))
+            .collect();
+        let v: Vec<_> = vs
+            .par_iter()
+            .map(|v| quant_serial(v, d_head, enc))
+            .collect();
         k.len() + v.len()
     });
 

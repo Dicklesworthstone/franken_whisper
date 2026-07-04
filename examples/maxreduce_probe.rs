@@ -68,7 +68,11 @@ fn bench(name: &str, n: usize, iters: usize) {
         s ^= s >> 7;
         s ^= s << 17;
         let u = (s >> 40) as f32 / (1u64 << 24) as f32;
-        if u < 0.1 { f32::NEG_INFINITY } else { -30.0 * u } // sanitized: finite or -inf
+        if u < 0.1 {
+            f32::NEG_INFINITY
+        } else {
+            -30.0 * u
+        } // sanitized: finite or -inf
     };
     let mut x: Vec<f32> = (0..n).map(|_| nf()).collect();
     x[n / 3] = 0.0; // a finite max
@@ -78,7 +82,9 @@ fn bench(name: &str, n: usize, iters: usize) {
     let bitmatch = a.to_bits() == b.to_bits();
 
     let run = |f: &dyn Fn(&[f32]) -> f32| -> f64 {
-        for _ in 0..3 { black_box(f(&x)); }
+        for _ in 0..3 {
+            black_box(f(&x));
+        }
         let mut best = f64::INFINITY;
         for _ in 0..iters {
             let t = Instant::now();
@@ -90,14 +96,28 @@ fn bench(name: &str, n: usize, iters: usize) {
     let ts = run(&max_scalar);
     let ta = run(&|x| unsafe { max_avx2(x) });
     println!("{name}  n={n}  best-of-{iters}");
-    println!("  byte-exact: scalar={a} avx={b}  [{}]", if bitmatch { "BIT-IDENTICAL" } else { "DIVERGENT" });
+    println!(
+        "  byte-exact: scalar={a} avx={b}  [{}]",
+        if bitmatch {
+            "BIT-IDENTICAL"
+        } else {
+            "DIVERGENT"
+        }
+    );
     println!("  scalar fold(f32::max) : {:>8.3} µs", ts * 1e6);
-    println!("  AVX2 vmaxps           : {:>8.3} µs  {:.2}x  [{}]",
-        ta * 1e6, ts / ta, if ta < ts { "WIN" } else { "loss" });
+    println!(
+        "  AVX2 vmaxps           : {:>8.3} µs  {:.2}x  [{}]",
+        ta * 1e6,
+        ts / ta,
+        if ta < ts { "WIN" } else { "loss" }
+    );
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
     println!("=== sampler max-reduce: scalar fold(f32::max) vs AVX2 vmaxps (1 thread) ===");
     bench("vocab logits [51866]", 51866, iters);
 }

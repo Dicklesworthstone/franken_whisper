@@ -23,10 +23,14 @@ use std::time::Instant;
 fn bench(name: &str, out: usize, inp: usize, seq: usize, iters: usize) {
     let mut s = 0x1234_5678u64;
     let mut nextf = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     };
-    let wf16: Vec<f16> = (0..out * inp).map(|_| f16::from_f32(nextf() * 0.1)).collect();
+    let wf16: Vec<f16> = (0..out * inp)
+        .map(|_| f16::from_f32(nextf() * 0.1))
+        .collect();
     // Wt [inp, out] f32 = transpose of the natural [out, inp] weight, as nn::matmul wants.
     let mut wt = vec![0.0f32; inp * out];
     for o in 0..out {
@@ -63,16 +67,41 @@ fn bench(name: &str, out: usize, inp: usize, seq: usize, iters: usize) {
         black_box((&y_i8, &y_f16));
     }
     let gflop = 2.0 * seq as f64 * out as f64 * inp as f64 / 1e9;
-    let verdict = if bi8 < bf32 { "int8 WINS — pursue encoder int8" } else { "int8 LOSES — needs blocked int8 kernel" };
+    let verdict = if bi8 < bf32 {
+        "int8 WINS — pursue encoder int8"
+    } else {
+        "int8 LOSES — needs blocked int8 kernel"
+    };
     println!("{name}  [seq={seq}] out={out} inp={inp}  ({gflop:.2} GFLOP)  best-of-{iters}:");
-    println!("  f32 matmul (BLOCKED): {:>7.3} ms  {:>6.0} GFLOP/s   [encoder path]", bf32 * 1e3, gflop / bf32);
-    println!("  int8 batch (naive):   {:>7.3} ms  {:>6.0} GFLOP/s   {:.2}x vs f32   [{}]", bi8 * 1e3, gflop / bi8, bf32 / bi8, verdict);
-    println!("  f16 batch (naive):    {:>7.3} ms  {:>6.0} GFLOP/s   {:.2}x vs f32", bf16 * 1e3, gflop / bf16, bf32 / bf16);
+    println!(
+        "  f32 matmul (BLOCKED): {:>7.3} ms  {:>6.0} GFLOP/s   [encoder path]",
+        bf32 * 1e3,
+        gflop / bf32
+    );
+    println!(
+        "  int8 batch (naive):   {:>7.3} ms  {:>6.0} GFLOP/s   {:.2}x vs f32   [{}]",
+        bi8 * 1e3,
+        gflop / bi8,
+        bf32 / bi8,
+        verdict
+    );
+    println!(
+        "  f16 batch (naive):    {:>7.3} ms  {:>6.0} GFLOP/s   {:.2}x vs f32",
+        bf16 * 1e3,
+        gflop / bf16,
+        bf32 / bf16
+    );
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
-    println!("=== encoder GEMM shapes @ {} threads (f32=blocked matrixmultiply, int8/f16=naive) ===", rayon::current_num_threads());
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    println!(
+        "=== encoder GEMM shapes @ {} threads (f32=blocked matrixmultiply, int8/f16=naive) ===",
+        rayon::current_num_threads()
+    );
     bench("QKV/out proj", 1280, 1280, 1500, iters);
     bench("MLP fc1", 5120, 1280, 1500, iters);
     bench("MLP fc2", 1280, 5120, 1500, iters);

@@ -114,7 +114,10 @@ fn best_of(iters: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
     let (rows, cols) = (1500usize, 1500usize); // one encoder self-attn head's scores.
     let base: Vec<f32> = (0..rows * cols)
         .map(|i| {
@@ -150,10 +153,17 @@ fn main() {
     for r in b.chunks_mut(cols) {
         softmax_simd(r);
     }
-    let maxdiff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let maxdiff = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
 
     println!("softmax {rows}x{cols} (encoder self-attn head) best-of-{iters}");
     println!("  scalar libm-exp   {scalar_ms:7.3} ms");
-    println!("  simd cephes-exp   {simd_ms:7.3} ms   speedup={:.2}x", scalar_ms / simd_ms);
+    println!(
+        "  simd cephes-exp   {simd_ms:7.3} ms   speedup={:.2}x",
+        scalar_ms / simd_ms
+    );
     println!("  max |Δ| normalized softmax = {maxdiff:.2e}");
 }

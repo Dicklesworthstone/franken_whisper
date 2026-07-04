@@ -45,34 +45,34 @@ fn gelu_table() -> Box<[f32; 1 << 16]> {
 unsafe fn gelu_gather(data: &mut [f32], table: &[f32; 1 << 16]) {
     use core::arch::x86_64::*;
     unsafe {
-    let tp = table.as_ptr();
-    let n = data.len();
-    let neg10 = _mm256_set1_ps(-10.0);
-    let pos10 = _mm256_set1_ps(10.0);
-    let zero = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= n {
-        let x = _mm256_loadu_ps(data.as_ptr().add(i));
-        let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
-        let idx = _mm256_cvtepu16_epi32(h);
-        let g = _mm256_i32gather_ps::<4>(tp, idx);
-        let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
-        let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
-        let r = _mm256_blendv_ps(g, x, ge);
-        let r = _mm256_blendv_ps(r, zero, le);
-        _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for v in &mut data[i..] {
-        let x = *v;
-        *v = if x <= -10.0 {
-            0.0
-        } else if x >= 10.0 {
-            x
-        } else {
-            table[Float16::from_f32(x).to_bits() as usize]
-        };
-    }
+        let tp = table.as_ptr();
+        let n = data.len();
+        let neg10 = _mm256_set1_ps(-10.0);
+        let pos10 = _mm256_set1_ps(10.0);
+        let zero = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            let x = _mm256_loadu_ps(data.as_ptr().add(i));
+            let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
+            let idx = _mm256_cvtepu16_epi32(h);
+            let g = _mm256_i32gather_ps::<4>(tp, idx);
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
+            let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
+            let r = _mm256_blendv_ps(g, x, ge);
+            let r = _mm256_blendv_ps(r, zero, le);
+            _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
+            i += 8;
+        }
+        for v in &mut data[i..] {
+            let x = *v;
+            *v = if x <= -10.0 {
+                0.0
+            } else if x >= 10.0 {
+                x
+            } else {
+                table[Float16::from_f32(x).to_bits() as usize]
+            };
+        }
     }
 }
 
@@ -83,54 +83,60 @@ unsafe fn gelu_gather(data: &mut [f32], table: &[f32; 1 << 16]) {
 unsafe fn gelu_scalar_loads(data: &mut [f32], table: &[f32; 1 << 16]) {
     use core::arch::x86_64::*;
     unsafe {
-    let n = data.len();
-    let neg10 = _mm256_set1_ps(-10.0);
-    let pos10 = _mm256_set1_ps(10.0);
-    let zero = _mm256_setzero_ps();
-    let mut i = 0;
-    let mut idxs = [0u32; 8];
-    while i + 8 <= n {
-        let x = _mm256_loadu_ps(data.as_ptr().add(i));
-        let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
-        let idx = _mm256_cvtepu16_epi32(h);
-        _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
-        let g = _mm256_set_ps(
-            *table.get_unchecked(idxs[7] as usize),
-            *table.get_unchecked(idxs[6] as usize),
-            *table.get_unchecked(idxs[5] as usize),
-            *table.get_unchecked(idxs[4] as usize),
-            *table.get_unchecked(idxs[3] as usize),
-            *table.get_unchecked(idxs[2] as usize),
-            *table.get_unchecked(idxs[1] as usize),
-            *table.get_unchecked(idxs[0] as usize),
-        );
-        let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
-        let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
-        let r = _mm256_blendv_ps(g, x, ge);
-        let r = _mm256_blendv_ps(r, zero, le);
-        _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    for v in &mut data[i..] {
-        let x = *v;
-        *v = if x <= -10.0 {
-            0.0
-        } else if x >= 10.0 {
-            x
-        } else {
-            table[Float16::from_f32(x).to_bits() as usize]
-        };
-    }
+        let n = data.len();
+        let neg10 = _mm256_set1_ps(-10.0);
+        let pos10 = _mm256_set1_ps(10.0);
+        let zero = _mm256_setzero_ps();
+        let mut i = 0;
+        let mut idxs = [0u32; 8];
+        while i + 8 <= n {
+            let x = _mm256_loadu_ps(data.as_ptr().add(i));
+            let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
+            let idx = _mm256_cvtepu16_epi32(h);
+            _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
+            let g = _mm256_set_ps(
+                *table.get_unchecked(idxs[7] as usize),
+                *table.get_unchecked(idxs[6] as usize),
+                *table.get_unchecked(idxs[5] as usize),
+                *table.get_unchecked(idxs[4] as usize),
+                *table.get_unchecked(idxs[3] as usize),
+                *table.get_unchecked(idxs[2] as usize),
+                *table.get_unchecked(idxs[1] as usize),
+                *table.get_unchecked(idxs[0] as usize),
+            );
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
+            let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
+            let r = _mm256_blendv_ps(g, x, ge);
+            let r = _mm256_blendv_ps(r, zero, le);
+            _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
+            i += 8;
+        }
+        for v in &mut data[i..] {
+            let x = *v;
+            *v = if x <= -10.0 {
+                0.0
+            } else if x >= 10.0 {
+                x
+            } else {
+                table[Float16::from_f32(x).to_bits() as usize]
+            };
+        }
     }
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(60);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
     let table = gelu_table();
     // Encoder fc1 output shape [1500, 5120] = 7.68M elements. Override with
     // GELU_BUF_ELEMS to test a cache-resident (compute-bound) size, isolating the
     // gather's compute cost from the 29 MiB-streaming DRAM-bandwidth floor.
-    let n = std::env::var("GELU_BUF_ELEMS").ok().and_then(|s| s.parse().ok()).unwrap_or(1500 * 5120);
+    let n = std::env::var("GELU_BUF_ELEMS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1500 * 5120);
     // Realistic-ish activation spread; span the clamp regions so both variants
     // exercise the x<=-10 / x>=10 paths (proves byte-exactness there too).
     let mut s = 0x2545_F491_4F6C_DD1Du64;
@@ -154,7 +160,11 @@ fn main() {
         .zip(b.iter())
         .filter(|(x, y)| x.to_bits() != y.to_bits())
         .count();
-    let maxd = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let maxd = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
 
     let bench = |f: unsafe fn(&mut [f32], &[f32; 1 << 16])| -> f64 {
         let mut buf = base.clone();
@@ -177,10 +187,28 @@ fn main() {
     let ts = bench(gelu_scalar_loads);
     let gelem = n as f64 / 1e9;
     println!("=== GELU inner kernel: AVX2 vgatherdps vs 8 scalar table-loads (Zen3, 1 thread) ===");
-    println!("buffer = {n} f32 ({:.1} MiB), best-of-{iters}", (n * 4) as f64 / (1 << 20) as f64);
-    println!("byte-exactness: {bitdiff} differing elems (of {n}), max|d| = {maxd:.2e}  [{}]",
-        if bitdiff == 0 { "BYTE-IDENTICAL" } else { "DIVERGENT" });
-    println!("  vgatherdps      : {:>7.3} ms  {:>6.2} Gelem/s", tg * 1e3, gelem / tg);
-    println!("  scalar-loads    : {:>7.3} ms  {:>6.2} Gelem/s  {:.2}x  [{}]",
-        ts * 1e3, gelem / ts, tg / ts, if ts < tg { "WIN" } else { "loss" });
+    println!(
+        "buffer = {n} f32 ({:.1} MiB), best-of-{iters}",
+        (n * 4) as f64 / (1 << 20) as f64
+    );
+    println!(
+        "byte-exactness: {bitdiff} differing elems (of {n}), max|d| = {maxd:.2e}  [{}]",
+        if bitdiff == 0 {
+            "BYTE-IDENTICAL"
+        } else {
+            "DIVERGENT"
+        }
+    );
+    println!(
+        "  vgatherdps      : {:>7.3} ms  {:>6.2} Gelem/s",
+        tg * 1e3,
+        gelem / tg
+    );
+    println!(
+        "  scalar-loads    : {:>7.3} ms  {:>6.2} Gelem/s  {:.2}x  [{}]",
+        ts * 1e3,
+        gelem / ts,
+        tg / ts,
+        if ts < tg { "WIN" } else { "loss" }
+    );
 }

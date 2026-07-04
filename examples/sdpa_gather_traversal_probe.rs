@@ -11,10 +11,10 @@
 //! fastest single-thread (isolating the pattern from shared-box thread noise). Turbo:
 //! t=1500, n_state=1280, hh=20, d_head=64. Usage: `sdpa_gather_traversal_probe [iters]`.
 #![allow(unsafe_code)]
-use std::hint::black_box;
-use std::time::Instant;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::hint::black_box;
+use std::time::Instant;
 
 const T: usize = 1500;
 const N_STATE: usize = 1280;
@@ -51,14 +51,18 @@ fn gather_h_outer_prefetch(dst: &mut [f32], src: &[f32]) {
         let base = i * N_STATE + h * D_HEAD;
         let ni = i + PF;
         if ni < T {
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(sp.add(ni * N_STATE + h * D_HEAD).cast()); }
+            unsafe {
+                _mm_prefetch::<_MM_HINT_T0>(sp.add(ni * N_STATE + h * D_HEAD).cast());
+            }
         }
         dst[r * D_HEAD..(r + 1) * D_HEAD].copy_from_slice(&src[base..base + D_HEAD]);
     }
 }
 
 fn run(f: &dyn Fn(&mut [f32], &[f32]), dst: &mut [f32], src: &[f32], iters: usize) -> f64 {
-    for _ in 0..5 { f(dst, src); }
+    for _ in 0..5 {
+        f(dst, src);
+    }
     let mut best = f64::INFINITY;
     for _ in 0..iters {
         let t = Instant::now();
@@ -70,31 +74,63 @@ fn run(f: &dyn Fn(&mut [f32], &[f32]), dst: &mut [f32], src: &[f32], iters: usiz
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
     let mut s = 0x243F_6A88_85A3_08D3u64;
-    let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 };
+    let mut nf = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s >> 40) as f32 / (1u64 << 24) as f32
+    };
     let src: Vec<f32> = (0..T * N_STATE).map(|_| nf()).collect();
     let mut a = vec![0.0f32; HH * T * D_HEAD];
     let mut b = vec![0.0f32; HH * T * D_HEAD];
     gather_h_outer(&mut a, &src);
     gather_i_outer(&mut b, &src);
-    let diff = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    let diff = a
+        .iter()
+        .zip(&b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
 
     println!("=== SDPA gather [1500,1280]→[20,1500,64] traversal order (1 thread, byte-exact) ===");
-    println!("  byte-diff (h-outer vs i-outer): {diff}  [{}]", if diff == 0 { "IDENTICAL" } else { "DIVERGENT" });
+    println!(
+        "  byte-diff (h-outer vs i-outer): {diff}  [{}]",
+        if diff == 0 { "IDENTICAL" } else { "DIVERGENT" }
+    );
     let th = run(&gather_h_outer, &mut a, &src, iters);
     let ti = run(&gather_i_outer, &mut b, &src, iters);
-    println!("  h-outer (current: strided read, contiguous write): {:>6.1} µs", th * 1e6);
-    println!("  i-outer (contiguous read, strided write)         : {:>6.1} µs  {:.2}x [{}]",
-        ti * 1e6, th / ti, if ti < th { "WIN" } else { "loss" });
+    println!(
+        "  h-outer (current: strided read, contiguous write): {:>6.1} µs",
+        th * 1e6
+    );
+    println!(
+        "  i-outer (contiguous read, strided write)         : {:>6.1} µs  {:.2}x [{}]",
+        ti * 1e6,
+        th / ti,
+        if ti < th { "WIN" } else { "loss" }
+    );
     #[cfg(target_arch = "x86_64")]
     {
         let mut c = vec![0.0f32; HH * T * D_HEAD];
         gather_h_outer_prefetch(&mut c, &src);
-        let pdiff = a.iter().zip(&c).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let pdiff = a
+            .iter()
+            .zip(&c)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
         let tp = run(&gather_h_outer_prefetch, &mut c, &src, iters);
-        println!("  h-outer + SW prefetch (T0, 8 rows ahead)         : {:>6.1} µs  {:.2}x [{}] byte-diff={pdiff}",
-            tp * 1e6, th / tp, if tp < th { "WIN" } else { "loss" });
+        println!(
+            "  h-outer + SW prefetch (T0, 8 rows ahead)         : {:>6.1} µs  {:.2}x [{}] byte-diff={pdiff}",
+            tp * 1e6,
+            th / tp,
+            if tp < th { "WIN" } else { "loss" }
+        );
     }
-    println!("  (gather+scatter ≈ ~6% of attn_sdpa ≈ ~0.5% encoder; byte-exact traversal reorder.)");
+    println!(
+        "  (gather+scatter ≈ ~6% of attn_sdpa ≈ ~0.5% encoder; byte-exact traversal reorder.)"
+    );
 }

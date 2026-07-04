@@ -45,7 +45,9 @@ fn pack_panel(wt: &[f32], k: usize, n: usize, j0: usize, pw: usize) -> Vec<f32> 
 fn bench(name: &str, k: usize, n: usize, seq: usize, panels: &[usize], iters: usize) {
     let mut s = 0x1234_5678u64;
     let mut nextf = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     };
     // wt [K, N] row-major (as nn::matmul's rhs wants: inner dim K = rows).
@@ -89,17 +91,26 @@ fn bench(name: &str, k: usize, n: usize, seq: usize, panels: &[usize], iters: us
         let packed: Vec<Vec<f32>> = (0..p)
             .map(|pi| pack_panel(&wt, k, n, pi * pw, pw))
             .collect();
-        let panel_mats: Vec<Mat> = packed.iter().map(|pk| Mat::from_vec(k, pw, pk.clone())).collect();
+        let panel_mats: Vec<Mat> = packed
+            .iter()
+            .map(|pk| Mat::from_vec(k, pw, pk.clone()))
+            .collect();
 
         // (b) panel raw: P ft matmuls, keep panel outputs separate (no scatter).
         let mut braw = f64::INFINITY;
         for _ in 0..3 {
-            let outs: Vec<Mat> = panel_mats.iter().map(|pm| nn::matmul(&h_mat, pm).unwrap()).collect();
+            let outs: Vec<Mat> = panel_mats
+                .iter()
+                .map(|pm| nn::matmul(&h_mat, pm).unwrap())
+                .collect();
             black_box(outs);
         }
         for _ in 0..iters {
             let t = Instant::now();
-            let outs: Vec<Mat> = panel_mats.iter().map(|pm| nn::matmul(&h_mat, pm).unwrap()).collect();
+            let outs: Vec<Mat> = panel_mats
+                .iter()
+                .map(|pm| nn::matmul(&h_mat, pm).unwrap())
+                .collect();
             braw = braw.min(t.elapsed().as_secs_f64());
             black_box(outs);
         }
@@ -118,7 +129,10 @@ fn bench(name: &str, k: usize, n: usize, seq: usize, panels: &[usize], iters: us
         };
         for _ in 0..iters {
             let t = Instant::now();
-            let outs: Vec<Mat> = panel_mats.iter().map(|pm| nn::matmul(&h_mat, pm).unwrap()).collect();
+            let outs: Vec<Mat> = panel_mats
+                .iter()
+                .map(|pm| nn::matmul(&h_mat, pm).unwrap())
+                .collect();
             scatter(&outs, &mut assembled);
             bscat = bscat.min(t.elapsed().as_secs_f64());
             black_box(&assembled);
@@ -145,7 +159,10 @@ fn bench(name: &str, k: usize, n: usize, seq: usize, panels: &[usize], iters: us
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     println!(
         "=== encoder GEMM column-panel cache-blocking @ {} threads ===",
         rayon::current_num_threads()

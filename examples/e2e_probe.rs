@@ -7,9 +7,9 @@
 //!   repeat:      tile the audio N times to synthesize long-form
 //!   wordts:      pass the literal "wordts" to enable DTW word timestamps
 
-use franken_whisper::native_engine::decode::{transcribe_samples, DecodeParams, LoadedModel};
-use franken_whisper::native_engine::ggml::GgmlModel;
+use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel, transcribe_samples};
 use franken_whisper::native_engine::find_model_file;
+use franken_whisper::native_engine::ggml::GgmlModel;
 use std::time::Instant;
 
 /// Minimal robust WAV reader: locate the `data` chunk, parse PCM16 mono/stereo,
@@ -25,8 +25,12 @@ fn read_wav_mono16k(path: &str) -> (Vec<f32>, u32, u16) {
     let mut data: &[u8] = &[];
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let sz = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
-            as usize;
+        let sz = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let body = pos + 8;
         if id == b"fmt " {
             channels = u16::from_le_bytes([bytes[body + 2], bytes[body + 3]]);
@@ -102,7 +106,7 @@ fn main() {
     // Per-sub-part decode attribution (only populated under
     // FRANKEN_WHISPER_PERF_SPANS=1; thread-local on this calling thread).
     if std::env::var("FRANKEN_WHISPER_PERF_SPANS").as_deref() == Ok("1") {
-        use franken_whisper::native_engine::decoder::{take_sub_ns, SUB_LABELS};
+        use franken_whisper::native_engine::decoder::{SUB_LABELS, take_sub_ns};
         let ns = take_sub_ns();
         let total: u128 = ns.iter().sum();
         eprintln!("--- forward_step sub-part breakdown (sum over all tokens) ---");
@@ -110,10 +114,18 @@ fn main() {
         idx.sort_by(|&a, &b| ns[b].cmp(&ns[a]));
         for i in idx {
             let ms = ns[i] as f64 / 1e6;
-            let pct = if total > 0 { ns[i] as f64 / total as f64 * 100.0 } else { 0.0 };
+            let pct = if total > 0 {
+                ns[i] as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
             eprintln!("  {:<18} {:>8.1} ms  {:>5.1}%", SUB_LABELS[i], ms, pct);
         }
-        eprintln!("  {:<18} {:>8.1} ms (forward_step total)", "SUM", total as f64 / 1e6);
+        eprintln!(
+            "  {:<18} {:>8.1} ms (forward_step total)",
+            "SUM",
+            total as f64 / 1e6
+        );
     }
 
     // Layer-skip self-draft accept rate (only when FW_DRAFT_ACCEPT_LAYERS is set).

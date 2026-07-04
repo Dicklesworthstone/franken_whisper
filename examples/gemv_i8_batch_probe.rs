@@ -12,14 +12,19 @@ use std::hint::black_box;
 use std::time::Instant;
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
     let (out, inp) = (3 * 1280usize, 1280usize); // turbo fused QKV
     let tq = 4usize;
 
     // Synthetic f16 weight + f32 activation batch.
     let mut s = 0x51EDu64;
     let mut nextf = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     };
     let wf16: Vec<f16> = (0..out * inp).map(|_| f16::from_f32(nextf())).collect();
@@ -49,7 +54,11 @@ fn main() {
         mismatches,
         tq * out,
         max_abs_diff,
-        if mismatches == 0 { "BIT-IDENTICAL ✓" } else { "MISMATCH ✗" }
+        if mismatches == 0 {
+            "BIT-IDENTICAL ✓"
+        } else {
+            "MISMATCH ✗"
+        }
     );
 
     // (b) Speed: int8 batch vs f16 batch (same weight), best-of-iters (min).
@@ -76,7 +85,11 @@ fn main() {
         "QKV [{out},{inp}] tq={tq} best-of-{iters} @ {} threads:",
         rayon::current_num_threads()
     );
-    println!("  f16 batch: {:.4} ms  ({:.1} GB/s weight)", b_f16 * 1e3, bytes_f16 / b_f16 / 1e9);
+    println!(
+        "  f16 batch: {:.4} ms  ({:.1} GB/s weight)",
+        b_f16 * 1e3,
+        bytes_f16 / b_f16 / 1e9
+    );
     println!(
         "  int8 batch: {:.4} ms  ({:.1} GB/s weight)  speedup {:.2}x",
         b_i8 * 1e3,

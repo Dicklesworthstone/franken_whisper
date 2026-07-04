@@ -63,16 +63,27 @@ fn simulate(tokens: &[i32], n: usize, k: usize) -> (usize, usize, usize) {
 }
 
 fn main() {
-    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
-    let k: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let n: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let k: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input).expect("read stdin");
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .expect("read stdin");
 
     let mut streams: Vec<Vec<i32>> = Vec::new();
     for line in input.lines() {
         if let (Some(a), Some(b)) = (line.find("TOKENS>>>"), line.find("<<<")) {
             let body = &line[a + 9..b];
-            let toks: Vec<i32> = body.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            let toks: Vec<i32> = body
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
             if !toks.is_empty() {
                 streams.push(toks);
             }
@@ -82,7 +93,9 @@ fn main() {
         eprintln!("no TOKENS>>>...<<< lines on stdin");
         return;
     }
-    println!("=== prompt-lookup (n-gram) self-speculation accept rate — ASR decode (ngram={n}, maxspec={k}) ===");
+    println!(
+        "=== prompt-lookup (n-gram) self-speculation accept rate — ASR decode (ngram={n}, maxspec={k}) ==="
+    );
     let (mut tot_pass, mut tot_len, mut tot_hits, mut tot_steps) = (0usize, 0usize, 0usize, 0usize);
     for (idx, s) in streams.iter().enumerate() {
         let (passes, len, hits) = simulate(s, n, k);
@@ -103,6 +116,10 @@ fn main() {
     );
     println!(
         "  ⇒ PLD decode speedup = {tpp:.3}× [{}]",
-        if tpp >= 1.15 { "VIABLE — free byte-exact decode amortization" } else { "DEAD for ASR — output too novel; needs a real draft model" }
+        if tpp >= 1.15 {
+            "VIABLE — free byte-exact decode amortization"
+        } else {
+            "DEAD for ASR — output too novel; needs a real draft model"
+        }
     );
 }

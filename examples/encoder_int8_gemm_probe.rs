@@ -58,7 +58,15 @@ fn quant_rows(a: &[f32], rows: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
 /// pre-transposed to `[n,k]` row-major (so each output dot is contiguous). The
 /// inner scalar i32 dot is what LLVM lowers to `vpmovsxbw`+`vpmaddwd` under
 /// target-cpu=x86-64-v3 (see `nn::dot_i8`). Parallel over output rows.
-fn gemm_i8(qa: &[i8], sa: &[f32], qbt: &[i8], sb: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+fn gemm_i8(
+    qa: &[i8],
+    sa: &[f32],
+    qbt: &[i8],
+    sb: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
     c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
         let arow = &qa[i * k..(i + 1) * k];
@@ -127,7 +135,10 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
     // large-v3-turbo encoder shapes: n_state=1280, n_mlp=5120, n_ctx=1500.
     println!("== turbo encoder GEMM: int8 vs f32, best-of-{iters} ==");
     bench("proj QKV/out", 1500, 1280, 1280, iters);

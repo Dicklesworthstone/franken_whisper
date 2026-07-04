@@ -77,7 +77,8 @@ unsafe fn logsumexp_avx2(x: &[f32], max: f32) -> f32 {
         }
         let mut tmp = [0.0f32; 8];
         _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
-        let mut s = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
         while i < n {
             let l = *x.get_unchecked(i);
             if l > f32::NEG_INFINITY {
@@ -90,7 +91,10 @@ unsafe fn logsumexp_avx2(x: &[f32], max: f32) -> f32 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let n = 51866usize;
     // Realistic post-softmax-input logits: a few high, most low, ~10% masked -inf.
     let mut s = 0x1234_5678_9ABC_DEF0u64;
@@ -135,12 +139,12 @@ fn main() {
     };
     let ts = bench(&|| logsumexp_scalar(&x, max));
     let ta = bench(&|| unsafe { logsumexp_avx2(&x, max) });
-    println!("=== sampler logsumexp: scalar libm expf vs AVX2-poly exp (n_vocab={n}, 1 thread) ===");
+    println!(
+        "=== sampler logsumexp: scalar libm expf vs AVX2-poly exp (n_vocab={n}, 1 thread) ==="
+    );
     println!("best-of-{iters}");
     println!("  scalar libm : {:>8.3} µs", ts * 1e6);
     println!("  AVX2 poly   : {:>8.3} µs  {:.2}x", ta * 1e6, ts / ta);
-    println!(
-        "  numerical delta: sum rel-err {rel:.2e}  |  logprob (ln-sum) delta {ln_delta:.2e}"
-    );
+    println!("  numerical delta: sum rel-err {rel:.2e}  |  logprob (ln-sum) delta {ln_delta:.2e}");
     println!("  scalar sum={ref_s:.6}  avx sum={avx_s:.6}");
 }
