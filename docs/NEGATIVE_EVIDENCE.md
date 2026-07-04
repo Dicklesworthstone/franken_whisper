@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → MEASURED CORRECTION of the "intrinsic to the maddubs COMPUTATION" claim — the maddubs dequant is 19× MORE accurate than the f32-roundtrip, so "Frank at" IS the truer int8 value and the roundtrip's correct "FrankenSearch" was f32-accumulation NOISE. No dequant-precision lever exists.
+
+**Ratio vs ORIG: UNCHANGED (measured; closes the "fixable maddubs dequant bug → flippable 1.5×" question).** Chased
+the anomaly the prior entry left dangling: on the SAME binary, the actual int8 maddubs mangles the proper noun
+("my new **Frank at** search library", 60 diffs) while the BOTH-operand f32-GEMM roundtrip of the SAME per-operand
+quantization PRESERVES it ("my new **FrankenSearch** library", 45 diffs). Since both apply byte-identical quant
+(verified in code: `matmul_bias_i7` act-quant `amax/127`,round,clamp±127 == `u8_act_roundtrip`; `quantize_mat_to_i7`
+weight-quant `amax/63`,round,clamp±63 == `i7_roundtrip`; SDPA is f32 in BOTH paths), the ONLY difference is the
+dequant ARITHMETIC ORDER: maddubs computes the exact integer dot `D=Σ a_int·w` then `(D as f32)·sa·sc`; the roundtrip
+does `Σ(a_int·sa)·(w·sc)` accumulated in f32 over 1280 terms. Opening hypothesis: maybe the maddubs cast/scale loses
+precision (a FIXABLE bug) and a higher-precision dequant recovers "FrankenSearch" → int8 becomes quality-acceptable →
+flip the 1.5×. **FALSIFIED by measurement** (`examples/dequant_precision_probe.rs`, standalone rustc, 91,805
+representative (r,o) dequants vs an f64 ground truth):
+```
+  max |D| (integer dot)   = 142,040   ≪ 2^24 (16,777,216)   → (D as f32) cast is EXACT for real encoder data
+  maddubs   mean|err|     = 1.69e-8    (vs f64 truth)
+  roundtrip mean|err|     = 3.22e-7    = 19.1× LARGER
+  maddubs closer to f64   = 93.9%  of samples      roundtrip closer = 1.3%
+```
+**DECISIVE: the maddubs dequant is 19× MORE accurate than the f32-roundtrip.** The integer dot never approaches the
+f32-cast precision threshold (max|D|=142K ≪ 2^24), so `(D as f32)` is exact and the maddubs realizes the int8-quantized
+value near-optimally. The roundtrip's f32-accumulation (~3e-7 error over 1280 terms) is the LESS accurate computation;
+its "FrankenSearch" is a COINCIDENCE — accumulation noise that happened to nudge one borderline proper-noun token back
+to the golden spelling. **"Frank at" is the truer int8 answer.** No dequant reordering (f64 scale, precompute sa·sc,
+etc.) recovers "FrankenSearch" because the maddubs is already ~exact; the only ways to move the token are higher
+operand precision (defeats int8) or ADDING accumulation noise (unprincipled — would randomly perturb OTHER tokens).
+
+**Verdict — CORRECTS the prior entry's "intrinsic to the maddubs COMPUTATION" framing:** the maddubs adds essentially
+ZERO error over the exact int8 dequant; the proper-noun regression is intrinsic to int8 PRECISION itself (8-bit
+activation × 7-bit weight on hard content), which the maddubs faithfully realizes. There is NO fixable dequant bug and
+NO dequant-precision lever. The int8 encoder's ~1.5× stays a fundamental owner-gated quality tradeoff — now proven at
+the arithmetic level (not just the granularity level of 03b55db/be062ef). Probe kept as a reproducible harness.
+
+---
 ## 2026-07-04 - BlackThrush: DIG → block-wise ENCODER quant DEFINITIVELY CLOSED — the int8 encoder's proper-noun error is NOT weight- OR activation-quant granularity; it's intrinsic to the int8 maddubs computation. No block-wise scale fixes it.
 
 **Ratio vs ORIG: UNCHANGED (measured; closes the block-wise-encoder thread of 66418f9/03b55db).** Completes the
