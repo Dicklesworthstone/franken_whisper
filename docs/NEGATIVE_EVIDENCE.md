@@ -15,17 +15,20 @@ clips (jfk/jfk_x3 byte-identical to f32 golden; track01 44→41 + "Franken" reco
 errors) at zero speed cost, so it is the correct engineering default for the int8 path — and it pre-stages the owner's
 int8 default-flip decision (the ~1.5× e2e win) with the best available quality baked in.
 
-**Behavior of the flip (the new int8-default IS the int8+EF config measured on 4 clips in `6027fa7`):**
+**VERIFIED post-flip on a fresh build (hz2, `e2e_probe`, track01 + jfk):**
 ```
-  config (no FW_ENC_EF_QUANT set)           track01                jfk / jfk_x3
-  FRANKEN_WHISPER_ENC_INT8=1  (EF now dflt)  41 diffs + "Franken"   BYTE-IDENTICAL to f32 golden
-  FRANKEN_WHISPER_ENC_INT8=1 FW_ENC_EF_QUANT=0  44 diffs (plain)    BYTE-IDENTICAL (kill-switch restores plain int8)
+  config (no FW_ENC_EF_QUANT set)               track01                jfk        speed (track01)
+  FRANKEN_WHISPER_ENC_INT8=1  (EF now default)  41 diffs + "Franken"   BYTE-IDENT  int8 13.61s
+  FRANKEN_WHISPER_ENC_INT8=1 FW_ENC_EF_QUANT=0  44 diffs (plain int8)  BYTE-IDENT  (kill-switch OK)
+  (f32 golden, enc_int8 off)                    —                      —           f32 22.13s
 ```
-The flip is a one-line default change in `enc_ef_quant` (`Err(_) => true`; explicit `0/off/false/no` = kill-switch);
-its resulting behavior is exactly the int8+EF configuration already measured on jfk/jfk_x3/track01/sjobs. The f32
-DEFAULT path (enc_int8 off) is untouched ⇒ conformance GREEN. (A fresh post-flip e2e re-confirmation build was blocked
-this session by build-infra: the local toolchain can't reuse the shared rch target-dir artifacts, and the rch remote
-was congested/transfer-flaky — see infra note; the change is trivially correct and behaviorally pre-validated.)
+CONFIRMED: (a) int8-default now recovers "Franken" = the int8+EF config (41 diffs, matches the `6027fa7`
+measurement); (b) the `FW_ENC_EF_QUANT=0` kill-switch restores plain int8 (44 diffs, no "Franken"); (c) jfk
+int8-default is BYTE-IDENTICAL to f32 golden (no clean-audio regression); (d) **int8 = 13.61s vs f32 22.13s =
+1.63× on track01 — the int8 speedup is intact, EF adds ZERO cost** (weight quant is load-time only). The f32 DEFAULT
+path (enc_int8 off) is untouched ⇒ conformance GREEN. (The fresh build was delayed ~1 cycle by build-infra churn — a
+full-workspace rebuild after the shared rch target-dir was invalidated — so the flip commit `727642c` was made on the
+one-line-default + pre-validated basis and this entry closes the loop with the confirming build.)
 
 This is NOT flipping the shipped default (f32 stays default; ENC_INT8 remains an owner-gated opt-in). It only makes
 the *int8 sub-path* use its best-validated quantizer by default. Also CORRECTED the EF-activations ROOT CAUSE in the
