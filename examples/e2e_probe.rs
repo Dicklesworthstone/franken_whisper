@@ -121,6 +121,19 @@ fn main() {
         let full: String = out.segments.iter().map(|s| s.text.as_str()).collect();
         eprintln!("TRANSCRIPT>>>{full}<<<");
     }
+    // Segment-level timestamp dump (PROBE_DUMP_SEGS=1): one line per segment as
+    // `SEG i [t0 -> t1] text`, matching whisper.cpp's `[HH:MM:SS.mmm -->
+    // HH:MM:SS.mmm]` layout for a franken-vs-whisper.cpp timestamp diff.
+    if std::env::var("PROBE_DUMP_SEGS").as_deref() == Ok("1") {
+        for (i, s) in out.segments.iter().enumerate() {
+            eprintln!(
+                "SEG {i} [{:.3} -> {:.3}] {}",
+                s.start_sec.unwrap_or(f64::NAN),
+                s.end_sec.unwrap_or(f64::NAN),
+                s.text.trim()
+            );
+        }
+    }
     let rtf = dt / audio_sec;
     println!(
         "model={model_short} wav={wav} repeat={repeat} wordts={wordts} ch={ch} | audio={audio_sec:.1}s load={load_ms:.0}ms | transcribe={:.3}s RTF={rtf:.4} | segs={} chars={chars}",
