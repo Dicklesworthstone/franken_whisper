@@ -466,6 +466,39 @@ pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
     }
 }
 
+/// Quantize `w_t` (`[inp, out]`, element `w_t.data[i*out + o]`) to i7 then DEQUANTIZE
+/// back to f32, returning the perturbed weight. `block == None` ⇒ one scale per output
+/// column `o` over the whole `inp` dim (== [`quantize_mat_to_i7`] granularity = the current
+/// int8 encoder). `block == Some(b)` ⇒ one scale per `b`-element block along `inp` (the
+/// Q8_0 / block-wise granularity). Feasibility harness ONLY: running the EXISTING f32 GEMM
+/// on the roundtripped weights isolates the WEIGHT-quant-granularity effect on the transcript
+/// (does block-wise recover the int8 encoder's proper-noun errors?) without the multi-hour
+/// block-wise maddubs kernel. Serial: one-time load cost. See `examples/blockwise_i7_quant_probe`.
+pub fn i7_roundtrip(w_t: &Mat, block: Option<usize>) -> Mat {
+    let inp = w_t.rows;
+    let out = w_t.cols;
+    let b = block.unwrap_or(inp).max(1);
+    let mut data = vec![0.0f32; inp * out];
+    for o in 0..out {
+        let mut i0 = 0;
+        while i0 < inp {
+            let i1 = (i0 + b).min(inp);
+            let mut amax = 1e-9f32;
+            for i in i0..i1 {
+                amax = amax.max(w_t.data[i * out + o].abs());
+            }
+            let sc = amax / 63.0;
+            let inv = 1.0 / sc;
+            for i in i0..i1 {
+                let q = (w_t.data[i * out + o] * inv).round().clamp(-63.0, 63.0);
+                data[i * out + o] = q * sc;
+            }
+            i0 = i1;
+        }
+    }
+    Mat::from_vec(inp, out, data)
+}
+
 /// maddubs `u8·i7` dot `Σ a[x]·w[x]`. Non-saturating for i7 weights (see [`I7Mat`]).
 /// Base target-features include AVX2 (`target-cpu=x86-64-v3`), so this inlines
 /// without a `#[target_feature]` attribute (same pattern as [`dot_f16c`]).

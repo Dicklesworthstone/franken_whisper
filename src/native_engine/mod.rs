@@ -330,6 +330,24 @@ pub(crate) fn enc_int8_enabled() -> bool {
     })
 }
 
+/// Feasibility harness (default OFF): `FW_ENC_WEIGHT_ROUNDTRIP` replaces every f32 encoder
+/// GEMM weight with its i7 quantize→dequantize roundtrip at load, so the EXISTING f32 encoder
+/// measures the WEIGHT-quant-granularity effect on the transcript (does block-wise recover the
+/// int8 encoder's proper-noun errors?) without the block-wise maddubs kernel. Returns
+/// `Some(None)` for `row` (per-output-column scale = current int8 granularity), `Some(Some(n))`
+/// for a positive `n` (block size along the contraction dim, e.g. 32), `None` when unset/off.
+pub(crate) fn enc_weight_roundtrip() -> Option<Option<usize>> {
+    static V: OnceLock<Option<Option<usize>>> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("FW_ENC_WEIGHT_ROUNDTRIP") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "off" => None,
+            "row" | "col" | "percol" | "perrow" => Some(None),
+            other => other.parse::<usize>().ok().filter(|&n| n > 0).map(Some),
+        },
+        Err(_) => None,
+    })
+}
+
 /// Whether to run the decoder **attention** input projections (fused self `qkv`
 /// and `cross_attn_q`) through the int8/Q8 GEMV on the per-token decode path
 /// (`tq == 1`). The output projections (`self_out`, `cross_out`) stay f16.

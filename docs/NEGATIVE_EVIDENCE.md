@@ -4,6 +4,39 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → MEASURED CORRECTION of the block-wise-weight lever — the int8 encoder's proper-noun error is from ACTIVATION quantization (u8), NOT weight-quant granularity. Block-wise WEIGHT scales do NOT recover track01. Kernel NOT worth building.
+
+**Ratio vs ORIG: UNCHANGED (measured; corrects the prior cycle's block-wise-weight hypothesis, 66418f9).** Last
+cycle FOUNDED block-wise int7 weight scales on the reasoning that SKIP_FIRST=2 (first 2 layers f32) recovers
+track01's proper nouns ⇒ "early-layer WEIGHT-quant error", + a probe showing block-wise cuts weight-quant RMS error
+3.9×. **Built the DECISIVE test to check that reasoning before the multi-hour maddubs kernel:** a load-time weight
+quantize→dequantize roundtrip (`FW_ENC_WEIGHT_ROUNDTRIP=row|<N>`, nn.rs `i7_roundtrip`, default-off byte-neutral)
+run through the EXISTING f32 encoder — isolating the WEIGHT-quant-granularity effect on the transcript (the maddubs
+kernel isn't needed to answer "does finer weight quant recover the proper nouns?").
+
+**MEASURED (track01 124s, vs f32 golden "…FrankenSearch library…Franken projects…"):**
+```
+  config            quant applied              "Franken"        word-diffs vs golden
+  golden (f32)      none                        ✓ correct         0
+  row-roundtrip     WEIGHT only (per-col)       ✓ PRESERVED       37
+  blk32-roundtrip   WEIGHT only (block-32)      ✓ PRESERVED       42   (slightly WORSE than row)
+  int8 encoder      WEIGHT + ACTIVATION(u8)     ✗ "Frank at"      60
+```
+**Isolation is clean:** row-roundtrip and int8 use the SAME per-column weight granularity; the ONLY difference is
+int8's u8 ACTIVATION quantization + integer maddubs. Weight-quant alone (row OR block, f32 GEMM) PRESERVES "Franken";
+adding activation-quant MANGLES it. maddubs is integer-exact given its inputs ⇒ **the proper-noun error is the u8
+ACTIVATION quantization, not the weight quantization.** And block-wise WEIGHT granularity is transcript-irrelevant
+(blk32 42 ≥ row 37 diffs; both ~40-word perturbations, neither closer to golden, both keep "Franken").
+
+**Verdict — block-wise-WEIGHT encoder kernel is DEAD for quality; NOT worth the multi-hour build (saved).** The
+prior cycle's 3.9× weight-error reduction is REAL but does not move the transcript, because weight-quant isn't the
+error source. **Redirect:** the int8 encoder's quality gap is the u8 ACTIVATION quant (per-row amax over post-LN
+activations, which have outliers) — a finer/block-wise ACTIVATION scheme is the real (harder) lever, bounded by
+u8's 8-bit range; SKIP_FIRST recovered proper nouns precisely because it drops early-layer ACTIVATION quant, not
+weight quant. Harness kept default-off (byte-identical, conformance GREEN jfk x3 ts+no_ts) as the reproducible
+diagnostic (cf. `FW_ENCODER_LAYERS`). Supersedes the block-wise-weight recommendation in
+[[project_turbo_encoder_dominates]].
+
 ## 2026-07-04 - BlackThrush: DIG → NEW HIGH-EV LEVER FOUNDED (measured) — BLOCK-WISE int7 scales for the int8 ENCODER GEMM could recover proper-noun accuracy while KEEPING the 1.5× power dodge (weight-quant error −3.9× mean / −5× worst in the outlier regime)
 
 **Ratio vs ORIG: no change yet (feasibility measured; kernel is the multi-hour follow-up).** The gated maddubs
