@@ -60,6 +60,97 @@ fn quant_rows_u8(a: &[f32], rows: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
     (q, sc)
 }
 
+/// AVX2 u8 activation quantize (row): round-half-away via trunc(v+copysign(0.5,v)),
+/// clamp [-127,127], +128, unsigned-pack to u8. Byte-identical to the scalar
+/// `(v*inv).round().clamp(-127,127) as i32 + 128 as u8`. Mirrors nn::quantize_act_i8_into
+/// with a +128/packus tail (the fix the encoder matmul_bias_i7 quantize is MISSING).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn quant_row_u8_avx2(x: &[f32], inv: f32, out: &mut [u8]) {
+    unsafe {
+        let n = x.len();
+        let xp = x.as_ptr();
+        let vinv = _mm256_set1_ps(inv);
+        let half = _mm256_set1_ps(0.5);
+        let signmask = _mm256_set1_ps(-0.0);
+        let c127 = _mm256_set1_ps(127.0);
+        let cm127 = _mm256_set1_ps(-127.0);
+        let c128 = _mm256_set1_epi32(128);
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_mul_ps(_mm256_loadu_ps(xp.add(i)), vinv);
+            let vh = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, signmask)));
+            let r = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(vh);
+            let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
+            let ri = _mm256_add_epi32(_mm256_cvtps_epi32(r), c128);
+            let lo = _mm256_castsi256_si128(ri);
+            let hi = _mm256_extracti128_si256::<1>(ri);
+            let i16s = _mm_packs_epi32(lo, hi);
+            let u8s = _mm_packus_epi16(i16s, i16s);
+            _mm_storel_epi64(out.as_mut_ptr().add(i) as *mut __m128i, u8s);
+            i += 8;
+        }
+        while i < n {
+            let q = (x[i] * inv).round().clamp(-127.0, 127.0) as i32;
+            out[i] = (q + 128) as u8;
+            i += 1;
+        }
+    }
+}
+
+/// Parallel u8 activation quantize matching matmul_bias_i7's structure. `avx2=true`
+/// uses the vectorized round; `false` = scalar `.round()` (the antipattern).
+fn quant_act_u8(a: &[f32], m: usize, k: usize, avx2: bool) -> (Vec<u8>, Vec<f32>) {
+    let mut q = vec![0u8; m * k];
+    let mut sc = vec![0.0f32; m];
+    q.par_chunks_mut(k).zip(sc.par_iter_mut()).enumerate().for_each(|(r, (qr, s))| {
+        let row = &a[r * k..(r + 1) * k];
+        let amax = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-9);
+        let scale = amax / 127.0;
+        *s = scale;
+        let inv = 1.0 / scale;
+        if avx2 {
+            #[cfg(target_arch = "x86_64")]
+            unsafe { quant_row_u8_avx2(row, inv, qr) };
+            #[cfg(not(target_arch = "x86_64"))]
+            for (d, &x) in qr.iter_mut().zip(row) {
+                let i8v = (x * inv).round().clamp(-127.0, 127.0) as i32;
+                *d = (i8v + 128) as u8;
+            }
+        } else {
+            for (d, &x) in qr.iter_mut().zip(row) {
+                let i8v = (x * inv).round().clamp(-127.0, 127.0) as i32;
+                *d = (i8v + 128) as u8;
+            }
+        }
+    });
+    (q, sc)
+}
+
+fn quant_bench(name: &str, m: usize, k: usize, iters: usize) {
+    let a = fill(m * k, 0xABCD);
+    // byte-identity check
+    let (qs, _) = quant_act_u8(&a, m, k, false);
+    let (qv, _) = quant_act_u8(&a, m, k, true);
+    let diff = qs.iter().zip(&qv).filter(|(x, y)| x != y).count();
+    let mut best_s = f64::INFINITY;
+    let mut best_v = f64::INFINITY;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        black_box(quant_act_u8(&a, m, k, false));
+        best_s = best_s.min(t0.elapsed().as_secs_f64());
+        let t1 = Instant::now();
+        black_box(quant_act_u8(&a, m, k, true));
+        best_v = best_v.min(t1.elapsed().as_secs_f64());
+    }
+    println!(
+        "quant {name:<10} [{m},{k}]  scalar {:.3}ms  avx2 {:.3}ms ({:.2}x)  byte_diff={diff}",
+        best_s * 1e3,
+        best_v * 1e3,
+        best_s / best_v,
+    );
+}
+
 /// Symmetric per-row 7-bit (amax/63, clamp [-63,63]) weight quant. Returns (i7-in-i8 q, scale,
 /// per-row weight SUM for the sign-offset correction).
 fn quant_rows_i7(b: &[f32], rows: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
@@ -789,4 +880,11 @@ fn main() {
     println!("-- SDPA per-head shapes (d_head=64) --");
     bench("sdpa_scores", 1500, 64, 1500, iters);
     bench("sdpa_out", 1500, 1500, 64, iters);
+    // Activation-quantize lever: matmul_bias_i7 uses scalar .round() (f32::round
+    // doesn't vectorize => scalarized roundf). AVX2 trunc+copysign is byte-identical
+    // and ~5×. Encoder GEMM-input shapes: [1500,1280] (proj/fc1/qkv/attn_out input),
+    // [1500,5120] (fc2 input, gelu output).
+    println!("-- activation quantize (scalar .round() vs AVX2) --");
+    quant_bench("in1280", 1500, 1280, iters);
+    quant_bench("in5120", 1500, 5120, iters);
 }

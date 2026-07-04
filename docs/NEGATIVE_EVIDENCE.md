@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → encoder activation-quantize AVX2 vectorization = MEASURED SUB-NOISE (1.10-1.24x isolated, memory-bound) — decode's 5x round-fix does NOT transfer
+
+**Ratio vs ORIG: UNCHANGED (measured negative).** matmul_bias_i7 (my int8 encoder GEMM, nn.rs:740)
+quantizes the activation with scalar `.round()` — the exact f32::round-doesn't-vectorize antipattern that
+got the DECODE gemv_i8 quantize a ~5x AVX2 win (d2d034a, project_round_doesnt_vectorize). Natural
+follow-on: apply the same trunc+copysign AVX2 fix to the encoder quantize. Wrote a byte-identical AVX2 u8
+quantize (`quant_row_u8_avx2`: round-half-away via trunc(v+copysign(0.5,v)), clamp[-127,127], +128,
+packus to u8) and benched it against the scalar path on the real encoder GEMM-input shapes.
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe` quant_bench, parallel over rows, 3 runs load ~58):**
+
+| quantize input | shape | scalar | AVX2 | speedup | byte_diff |
+|----------------|-------|--------|------|---------|-----------|
+| proj/fc1/qkv/attn_out in | [1500,1280] | 0.54-0.64 ms | 0.46-0.53 ms | **1.13-1.21x** | 0 |
+| fc2 in (gelu out) | [1500,5120] | 1.98-2.17 ms | 1.68-1.97 ms | **1.10-1.24x** | 0 |
+
+**Verdict — sub-noise e2e, NOT landed.** The antipattern IS present, but the fix gives only ~1.15x here
+(not 5x) because the encoder quantizes in BULK ([1500,1280]/[1500,5120] streamed from DRAM) => it's
+MEMORY-BOUND (read ~7.7MB f32 + write ~1.9MB u8/call), so vectorizing the scalar round is hidden behind
+the memory traffic. The decode's 5x was on a SINGLE L1-resident row (1280 elems) => COMPUTE-bound on
+roundf, where the round IS the bottleneck. Quantize is also only ~12% of the proj matmul_bias_i7 call
+(0.5ms quant vs ~3.5ms GEMM), so 1.15x on 12% = ~1.6% of the call = **~0.9% of the gated int8 encoder =
+sub-noise.** Matches the project_decode_sampler_slim precedent (isolated win, sub-noise e2e => revert).
+byte_diff=0 confirms the AVX2 u8 quantize is byte-identical (ready if ever wanted, e.g. a q/k/v
+quantize-once dedup that shares one u8 buffer across the 3 attn projections — a separate ~1.6% structural
+lever, also gated-path-only, not pursued). LESSON: the round-doesn't-vectorize fix only pays off on
+COMPUTE-bound (small/L1-resident) quantizes; bulk streamed quantizes are memory-bound. Probe keeps
+quant_bench; nn.rs unchanged (~0-gain reverted per directive). No BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: DIG → L2 weight-panel cache-blocking MEASURED-DEAD (0.82-0.95x vs M4xN2) — int8 encoder GEMM is COMPUTE-bound after M4, not L3-bandwidth-bound
 
 **Ratio vs ORIG: UNCHANGED (measured negative).** Dug the remaining structural encoder lever the M4xN2
