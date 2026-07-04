@@ -4,6 +4,30 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LAND (validated WIN) — error-feedback weight quant for the DEFAULT-ON DECODER int8 (`FW_DEC_EF`), applying the proven encoder EF-weights scheme to the decoder's static per-row weights + cross-KV.
+
+**Ratio vs ORIG: UNCHANGED speed (~1.2× ts / ~1.68-1.8× no_ts vs OpenAI-Whisper/whisper.cpp) — EF is load-time
+only ⇒ ZERO runtime cost; the int8 GEMV kernel is byte-for-byte the same. This is a DEFAULT-PATH FAITHFULNESS
+win, not a speed one: the decoder int8 is DEFAULT-ON and diverges from the f32 decoder (≈ whisper.cpp's f16
+reference) by a MEASURED gap, and EF SHRINKS that gap on BOTH clips.** The encoder EF-weights lever (carry each
+weight's rounding residual forward along the contraction dim → less accumulated dot bias) was validated strictly
+≥ plain int8 on STATIC operands; the decoder per-row weights (`quantize_f16_to_i8`: logits, mlp_0, qkv, cross_q,
+self_out, cross_out) AND the cross-KV K/V are static/per-window-static, so EF is stable here (the encoder lesson:
+EF fails only on DYNAMIC operands — EF-activations regressed). MEASURED (word-diffs vs the f32-DECODER golden;
+f32 encoder in every row so only decoder precision varies):
+```
+  scheme                track01 (hard, 5win)    sjobs_16k (13-min, diverse)
+  int8-decoder plain     32 diffs                312 diffs
+  int8-decoder + EF      20 diffs (−37.5%)       301 diffs (−3.5%)
+```
+BOTH improve — unlike every int8-ENCODER-quality dig this session (all regressed sjobs), EF holds on the diverse
+clip because it is the proven scheme on the operand class it was designed for. Byte-identity: `FW_DEC_EF`-OFF
+(default) BYTE-IDENTICAL to the pre-change binary on track01+jfk_x3 (inert when off), so conformance stays GREEN.
+LANDED gated `FW_DEC_EF` default-off: a validated, zero-cost, opt-in faithfulness improvement, promotable to
+default (owner-gated — it changes the shipped transcript so it needs an A/B vs actual whisper.cpp) exactly as the
+encoder EF-weights lever was staged gated → promoted. Code KEPT (nn.rs EF branch + mod.rs `dec_ef_quant` flag).
+
+---
 ## 2026-07-04 - BlackThrush: REJECT HADAMARD (QuaRot/SpinQuant) incoherence rotation for the int8 encoder — helps track01 (41→38) but REGRESSES the diverse 13-min sjobs (125→247, +98%). The SOTA outlier-spreading technique FAILS; the int8-encoder quality space is now EXHAUSTED across all 5 axes. Code reverted (byte-identical to HEAD).
 
 **Ratio vs ORIG: NO CHANGE — int8 encoder ~1.5-1.63× e2e; f32 default byte-identical (encoder-int8-only, gated);

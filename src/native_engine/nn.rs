@@ -1467,6 +1467,7 @@ pub struct I8Mat {
 /// [`gemv_i8`] reconstructs.
 pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
     debug_assert_eq!(w.len(), out * inp);
+    let ef = crate::native_engine::dec_ef_quant();
     let mut data = vec![0i8; out * inp];
     let mut scales = vec![0.0f32; out];
     data.par_chunks_mut(inp)
@@ -1482,8 +1483,22 @@ pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
             let sc = amax / 127.0;
             *s = sc;
             let inv = 1.0 / sc;
-            for (d, h) in drow.iter_mut().zip(wrow) {
-                *d = (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+            if ef {
+                // Error-feedback weight quant (FW_DEC_EF; same scheme as encoder
+                // EF-weights): carry each weight's rounding residual forward along the
+                // contraction dim so the per-row dot has less accumulated quant bias.
+                // Static operand ⇒ stable. Same i8 format/scale ⇒ gemv_i8 kernel unchanged.
+                let mut err = 0.0f32;
+                for (d, h) in drow.iter_mut().zip(wrow) {
+                    let target = h.to_f32() * inv + err;
+                    let q = target.round().clamp(-127.0, 127.0);
+                    err = target - q; // residual carried forward
+                    *d = q as i8;
+                }
+            } else {
+                for (d, h) in drow.iter_mut().zip(wrow) {
+                    *d = (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+                }
             }
         });
     I8Mat { data, scales, out, inp }

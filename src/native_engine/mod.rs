@@ -330,6 +330,27 @@ pub(crate) fn enc_int8_enabled() -> bool {
     })
 }
 
+/// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
+/// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
+/// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from
+/// the f32 decoder by a MEASURED ~32 word-diffs on track01 (the f32 decoder ≈ whisper.cpp's f16
+/// reference), so this gap is a faithfulness cost paid for int8 speed. Error-feedback (the same
+/// scheme validated strictly ≥ plain int8 for the ENCODER weights, [`enc_ef_quant`]) carries each
+/// weight's rounding residual forward along the contraction dim, reducing accumulated dot bias —
+/// STABLE here because the weight is a STATIC operand (the encoder lesson: EF only on static
+/// operands; EF-activations was dynamic and regressed). Load-time only ⇒ ZERO runtime cost; the
+/// int8 GEMV kernel is unchanged. If it reduces the decoder int8 gap it improves the DEFAULT
+/// path's faithfulness for free (owner-gated to flip default since it changes the transcript).
+pub(crate) fn dec_ef_quant() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_DEC_EF").ok().as_deref().map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
 /// Feasibility harness (default OFF): `FW_ENC_WEIGHT_ROUNDTRIP` replaces every f32 encoder
 /// GEMM weight with its i7 quantize→dequantize roundtrip at load, so the EXISTING f32 encoder
 /// measures the WEIGHT-quant-granularity effect on the transcript (does block-wise recover the
