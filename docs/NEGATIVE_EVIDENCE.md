@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → NEW HIGH-EV LEVER FOUNDED (measured) — BLOCK-WISE int7 scales for the int8 ENCODER GEMM could recover proper-noun accuracy while KEEPING the 1.5× power dodge (weight-quant error −3.9× mean / −5× worst in the outlier regime)
+
+**Ratio vs ORIG: no change yet (feasibility measured; kernel is the multi-hour follow-up).** The gated maddubs
+int8 encoder (`FRANKEN_WHISPER_ENC_INT8`, ~1.5× e2e power-throttle dodge) is BYTE-IDENTICAL on easy audio (jfk ×1,
+re-confirmed; ledger 589) and fails only on HARD proper nouns (track01: "Franken"→"Frank at"). The existing
+SKIP_FIRST=2 result (ledger 152: first 2 layers f32 RECOVERS the proper nouns) localizes the damage to **early-layer
+WEIGHT-QUANTIZATION error** — but SKIP_FIRST forfeits the whole speed win (any f32 layer re-triggers the all-core
+power throttle, [[project_encoder_wall_is_clock_throttle]]). The ONE un-tried fix: **BLOCK-WISE int7 scales** (one
+amax/63 per 32-weight block = the Q8_0 layout that made decode fc2 byte-exact where per-row broke it,
+[[project_int8_mlp_fc1_default_on]]) replacing the current PER-ROW `I7Mat.scale` — finer scales in EVERY layer,
+staying all-int8 (power dodge intact).
+
+**MEASURED feasibility (`examples/blockwise_i7_quant_probe.rs`, standalone, block=32):** RMS dequant error, per-row
+vs per-block, on realistic weight rows:
+```
+  gaussian (no outliers)     : per-row 3.21e-4  per-block 2.15e-4  → 1.49× mean, 2.08× worst-row
+  gaussian + sparse outliers : per-row 1.04e-3  per-block 2.69e-4  → 3.88× mean, 5.06× worst-row
+```
+**Mechanism CONFIRMED:** transformer projection rows carry occasional large OUTLIER weights; a per-ROW amax is
+inflated by one outlier → coarse quant step → the many small weights lose precision (= proper-noun-class errors). A
+per-BLOCK amax isolates the outlier to its 32-wide block, sparing the rest of the row → **−3.9× mean / −5× worst-row
+weight error in the realistic regime.** That is the exact error class SKIP_FIRST proved responsible for the
+proper-noun flips, so block-wise plausibly recovers them WITHOUT any f32 layer.
+
+**Verdict — HIGHEST-EV remaining in-crate lever, founded but NOT built (multi-hour, out of a 60-min loaded-box
+window).** Needs: `quantize_mat_to_i7_blocked` (per-32 scales + colsums) + a block-wise maddubs dot that applies the
+per-block scale during accumulation (the sign-offset `−128·Σw` and the f32 scale both become per-block, changing the
+current single-row-scale maddubs structure) + wiring into `matmul_bias_i7`, then a track01 quality A/B. **If it
+recovers track01's proper nouns it converts the gated 1.5× encoder tradeoff into a NEAR-byte-exact default-on 1.5×
+e2e win — by far the biggest available lever** (vs the ~0.5% byte-exact scraps left). Distinct from the standing
+blocker's owner/infra legs (draft model / GPU / VNNI): this is IN-CRATE, CPU, and now de-risked by measured
+error-reduction. Probe kept as the reference harness; no engine code changed (default byte-identical, conformance
+GREEN). Re-confirmed en route: encoder layer-pruning DEAD (ledger 1414), int8 encoder jfk+10s_speech byte-identical.
+
 ## 2026-07-04 - BlackThrush: tq==1 cross-attn DIRECT-WRITE (alloc+merge elimination) is byte-exact but SUB-NOISE — the self-attn alloc-light playbook does NOT transfer to cross-attn (compute-bound, not overhead-bound). Implemented, verified byte-identical, REVERTED.
 
 **Ratio vs ORIG: UNCHANGED (measured negative, reverted — no net code change).** The landed self-attn alloc-light
