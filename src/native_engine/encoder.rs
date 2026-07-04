@@ -478,6 +478,25 @@ impl EncoderWeights {
             });
         }
 
+        // FEASIBILITY HARNESS (off by default): `FW_ENC_WEIGHT_ROUNDTRIP=row|<N>` replaces
+        // every f32 GEMM weight with its i7 quantize→dequantize roundtrip, so the EXISTING
+        // f32 encoder measures the WEIGHT-quant-granularity effect on the transcript.
+        // `row` = per-output-column scale (current int8 encoder granularity); `<N>` = block
+        // size along the contraction dim (e.g. `32` = the proposed block-wise scheme). Lets a
+        // track01 A/B answer "does block-wise recover the int8 encoder's proper-noun errors?"
+        // WITHOUT the block-wise maddubs kernel. Run with FRANKEN_WHISPER_ENC_INT8 unset.
+        if let Some(mode) = super::enc_weight_roundtrip() {
+            let block = mode; // None => per-column, Some(n) => n-block
+            layers.par_iter_mut().for_each(|l| {
+                l.attn_q_w = nn::i7_roundtrip(&l.attn_q_w, block);
+                l.attn_k_w = nn::i7_roundtrip(&l.attn_k_w, block);
+                l.attn_v_w = nn::i7_roundtrip(&l.attn_v_w, block);
+                l.attn_out_w = nn::i7_roundtrip(&l.attn_out_w, block);
+                l.mlp_fc_w = nn::i7_roundtrip(&l.mlp_fc_w, block);
+                l.mlp_proj_w = nn::i7_roundtrip(&l.mlp_proj_w, block);
+            });
+        }
+
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;
 
