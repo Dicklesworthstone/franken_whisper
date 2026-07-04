@@ -504,6 +504,85 @@ fn gemm_maddubs_m4n2(
     c
 }
 
+/// L2 weight-panel cache-blocked maddubs GEMM (on top of the M4xN2 microkernel).
+/// Each parallel TASK owns a contiguous row-range and loops L2-sized weight PANELS
+/// outer, reusing each panel across all its 4-row sub-blocks => each core loads the
+/// weight ~once (reuse factor = rows_per_task/4) instead of the naive once-per-row-
+/// block (m/4x). Cuts L3 weight traffic ~(rows_per_task/4)x. Bit-identical (same
+/// dots, reordered loops, each output written once).
+fn gemm_maddubs_l2(
+    qa: &[u8], sa: &[f32], qw: &[i8], sw: &[f32], wsum: &[i32], m: usize, k: usize, n: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    let pc = ((256 * 1024 / k).max(2)) & !1usize; // even panel width, weight panel ~256KB in L2
+    let threads = rayon::current_num_threads().max(1);
+    let mut rpt = m.div_ceil(threads);
+    rpt = rpt.div_ceil(4) * 4; // multiple of 4 rows
+    rpt = rpt.max(4);
+    c.par_chunks_mut(rpt * n).enumerate().for_each(|(ti, cblk)| {
+        let r_base = ti * rpt;
+        let task_rows = (m - r_base).min(rpt);
+        let mut o0 = 0;
+        while o0 < n {
+            let pend = (o0 + pc).min(n);
+            let mut rr = 0;
+            while rr + 4 <= task_rows {
+                let r0 = r_base + rr;
+                let a: [&[u8]; 4] = std::array::from_fn(|j| &qa[(r0 + j) * k..(r0 + j + 1) * k]);
+                let mut o = o0;
+                while o + 2 <= pend {
+                    let w0 = &qw[o * k..(o + 1) * k];
+                    let w1 = &qw[(o + 1) * k..(o + 2) * k];
+                    #[cfg(target_arch = "x86_64")]
+                    let raw = unsafe { dot_maddubs_m4n2(a, w0, w1, k) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let raw: [i32; 8] = {
+                        let mut z = [0i32; 8];
+                        for i in 0..4 { z[i] = dot_ref(a[i], w0); z[4 + i] = dot_ref(a[i], w1); }
+                        z
+                    };
+                    let (off0, off1) = (128 * wsum[o], 128 * wsum[o + 1]);
+                    for i in 0..4 {
+                        cblk[(rr + i) * n + o] = (raw[i] - off0) as f32 * sa[r0 + i] * sw[o];
+                        cblk[(rr + i) * n + o + 1] = (raw[4 + i] - off1) as f32 * sa[r0 + i] * sw[o + 1];
+                    }
+                    o += 2;
+                }
+                while o < pend {
+                    let wrow = &qw[o * k..(o + 1) * k];
+                    #[cfg(target_arch = "x86_64")]
+                    let raw = unsafe { dot_maddubs_m4(a[0], a[1], a[2], a[3], wrow, k) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let raw = [dot_ref(a[0], wrow), dot_ref(a[1], wrow), dot_ref(a[2], wrow), dot_ref(a[3], wrow)];
+                    let off = 128 * wsum[o];
+                    for i in 0..4 {
+                        cblk[(rr + i) * n + o] = (raw[i] - off) as f32 * sa[r0 + i] * sw[o];
+                    }
+                    o += 1;
+                }
+                rr += 4;
+            }
+            while rr < task_rows {
+                let r = r_base + rr;
+                let arow = &qa[r * k..(r + 1) * k];
+                let mut o = o0;
+                while o < pend {
+                    let wrow = &qw[o * k..(o + 1) * k];
+                    #[cfg(target_arch = "x86_64")]
+                    let raw = unsafe { dot_maddubs(arow, wrow, k) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let raw = dot_ref(arow, wrow);
+                    cblk[rr * n + o] = (raw - 128 * wsum[o]) as f32 * sa[r] * sw[o];
+                    o += 1;
+                }
+                rr += 1;
+            }
+            o0 = pend;
+        }
+    });
+    c
+}
+
 fn max_rel_err(a: &[f32], b: &[f32]) -> f32 {
     let mut m = 0.0f32;
     for (&x, &y) in a.iter().zip(b) {
@@ -654,6 +733,18 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
         best_m4n2 = best_m4n2.min(t0.elapsed().as_secs_f64());
         black_box(r);
     }
+    // L2 weight-panel cache-blocked (on M4xN2 microkernel)
+    let cl2 = gemm_maddubs_l2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+    for _ in 0..3 {
+        black_box(gemm_maddubs_l2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n));
+    }
+    let mut best_l2 = f64::INFINITY;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let r = gemm_maddubs_l2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        best_l2 = best_l2.min(t0.elapsed().as_secs_f64());
+        black_box(r);
+    }
     let mut m8_diff = 0.0f32;
     for (&x, &y) in cmad8.iter().zip(&cmad) {
         m8_diff = m8_diff.max((x - y).abs());
@@ -662,22 +753,25 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
     for (&x, &y) in cmad4n2.iter().zip(&cmad) {
         m4n2_diff = m4n2_diff.max((x - y).abs());
     }
+    let mut l2_diff = 0.0f32;
+    for (&x, &y) in cl2.iter().zip(&cmad) {
+        l2_diff = l2_diff.max((x - y).abs());
+    }
 
     let err_wide = max_rel_err(&cwide, &cf32.data);
     let err_mad = max_rel_err(&cmad, &cf32.data);
     println!(
-        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  mad1 {:.2}x  mad4 {:.2}x ({:.2}vs1)  mad8 {:.2}x ({:.2}vs4)  m4n2 {:.2}x ({:.2}vs4)  | diffs m4={m4_diff:.0} m8={m8_diff:.0} m4n2={m4n2_diff:.0} relmad={:.3}",
+        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  mad4 {:.2}x  m4n2 {:.2}x ({:.2}vs4)  L2 {:.1}ms {:.2}x ({:.2}vs-m4n2)  | diffs m4={m4_diff:.0} m8={m8_diff:.0} m4n2={m4n2_diff:.0} L2={l2_diff:.0} relmad={:.3}",
         best_f32 * 1e3,
-        best_f32 / best_mad,
         best_f32 / best_mad4,
-        best_mad / best_mad4,
-        best_f32 / best_mad8,
-        best_mad4 / best_mad8,
         best_f32 / best_m4n2,
         best_mad4 / best_m4n2,
+        best_l2 * 1e3,
+        best_f32 / best_l2,
+        best_m4n2 / best_l2,
         err_mad,
     );
-    let _ = (best_wide, err_wide);
+    let _ = (best_wide, err_wide, best_mad, best_mad8);
 }
 
 fn main() {

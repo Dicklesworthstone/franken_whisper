@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → L2 weight-panel cache-blocking MEASURED-DEAD (0.82-0.95x vs M4xN2) — int8 encoder GEMM is COMPUTE-bound after M4, not L3-bandwidth-bound
+
+**Ratio vs ORIG: UNCHANGED (measured negative).** Dug the remaining structural encoder lever the M4xN2
+landing (a560705) flagged as next: a Goto-style L2 weight-panel cache-block. The M4/M4xN2 kernel
+re-streams the whole weight matrix once per 4-row block (m/4=375x per GEMM ~= 2.4GB of L3 traffic). New
+`gemm_maddubs_l2`: each parallel TASK owns a contiguous row-range and loops L2-sized weight PANELS outer,
+reusing each panel across all its 4-row sub-blocks => each core loads the weight ~once (reuse factor
+rows_per_task/4 ~= 12x), cutting L3 weight traffic ~12x. Bit-identical (same dots, reordered loops, each
+output written once; L2_diff=0).
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe`, L2-vs-M4xN2, 3 runs, CLEAN load 11-29 — trustworthy):**
+
+| GEMM | shape | M4xN2 | L2-blocked | L2-vs-M4xN2 |
+|------|-------|-------|-----------|-------------|
+| proj    | [1500,1280]x[1280,1280] | 1.44-1.61x | 1.35-1.50x | **0.87-1.04x** (wash/loss) |
+| mlp fc1 | [1500,1280]x[1280,5120] | 1.63-1.70x | 1.46-1.56x | **0.88-0.95x** (LOSS) |
+| mlp fc2 | [1500,5120]x[5120,1280] | 3.05-3.22x | 2.63-2.86x | **0.82-0.90x** (LOSS) |
+
+**Verdict — L2 cache-blocking DEAD; the int8 encoder GEMM is COMPUTE-bound (maddubs port), NOT
+L3-bandwidth-bound.** Cutting L3 weight traffic ~12x gave NO speedup (a slight loss from the restructure's
+scattered output writes + loop overhead). If the kernel were bandwidth-bound, a 12x traffic cut would win
+even with an imperfect impl; it lost => the 2.4GB of L3 weight re-traffic is served FASTER than the
+maddubs units consume it (the 6.5MB weight is L3-resident in the 32MB CCD L3; Zen3 aggregate L3 BW >>
+maddubs MAC rate). **M4 register-blocking already made weight re-streaming cheap; the remaining bottleneck
+is maddubs throughput, which no data-movement lever (L2-block, prefetch, Goto microkernel) can improve.**
+This CLOSES the "L2 weight-panel cache-blocking (larger effort)" NEXT lever from a560705 — do NOT attempt
+a Goto-style blocked int8 microkernel; it cannot beat compute-bound. The int8 encoder GEMM is now at its
+maddubs compute ceiling (would need VNNI vpdpbusd or GPU to go further). Probe keeps `gemm_maddubs_l2` for
+reproducibility; not wired (~0-gain reverted per directive). No BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: LANDED M4xN2 2D-register-tile maddubs-i7 GEMM (gated out<=in) = ~1.3-1.5x over M4 on proj+fc2, BIT-IDENTICAL
 
 **Ratio vs OpenAI-Whisper/whisper.cpp: further IMPROVED on the int8 encoder path (gated).** Follow-on to
