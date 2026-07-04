@@ -425,6 +425,32 @@ fn simd_exp_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_SIMD_EXP").is_some())
 }
 
+/// Disable conditioning the decode on previously-decoded text (`FW_NO_CONTEXT=1`,
+/// default OFF). The port of whisper.cpp's `params.no_context` / whisper-cli
+/// `--no-context` (`condition_on_previous_text = false`). By default each
+/// non-first window prepends the prior windows' text as a `[sot_prev, …past…]`
+/// prompt (the prompt build below) to improve cross-window coherence; when this
+/// is set that carried prompt is suppressed and every window starts from a clean
+/// `sot_sequence`. Default OFF = conditioning ON = whisper.cpp's own default =
+/// **byte-identical** to prior behaviour — and single-window clips (jfk×1) carry
+/// no prompt at all, so it is a proven no-op there regardless.
+///
+/// This is the **bd-r0qd escape hatch** (owner-confirmed faithfulness bug): the
+/// accumulated previous-window prompt can bias the greedy / temperature-0
+/// (fallback-free) native decoder toward an early `eot` on a *final full* window
+/// and drop ~40 words of coherent tail (the sole differing input vs the same
+/// audio decoded standalone is `prompt_past`; whisper.cpp recovers via
+/// temperature fallback + prompt reset, native — the deliberate temp-0 port —
+/// cannot). Setting `FW_NO_CONTEXT=1` drops the carry and restores the tail on
+/// affected clips, matching whisper-cli `--no-context`. Mirrors the established
+/// gated-lever idiom ([`simd_exp_enabled`]); the *proper* fix (per-window
+/// temperature fallback) remains owner-scoped.
+fn condition_on_prev_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FW_NO_CONTEXT").is_some())
+}
+
 /// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
 /// (matching the scalar `l > -inf` guard). AVX2 degree-5 poly exp: range-reduce
 /// `x = k·ln2 + r`, `exp(r)` via Horner, `2^k` by float-bit construction. Numerics-
@@ -1253,7 +1279,10 @@ pub fn transcribe_samples(
             params.timestamps,
         );
         let mut prompt: Vec<i32> = Vec::new();
-        if !prompt_past.is_empty() && max_prompt_ctx > 1 {
+        // Carry the prior-window text prompt unless conditioning is disabled
+        // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
+        // `FW_NO_CONTEXT=1`). Default (unset) keeps the carry ⇒ byte-identical.
+        if !condition_on_prev_disabled() && !prompt_past.is_empty() && max_prompt_ctx > 1 {
             prompt.push(tk.sot_prev);
             let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
             prompt.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
