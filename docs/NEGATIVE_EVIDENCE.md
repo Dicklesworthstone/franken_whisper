@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: BLOCKER RESOLVED — toolchain-broken `.rch-targets` cache rebuilt (was blocking ALL engine builds + transcript A/B)
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — infrastructure fix, no
+engine change.
+
+**Acting on the blocker I SURFACED last cycle (157011d / 56735d2), not just re-surfacing it.**
+The shared `/data/projects/franken_whisper/.rch-targets` cargo cache was toolchain-broken: the
+nightly auto-rolled and the whole release dep graph (version_check / autocfg / cc / matrixmultiply
+/ blake3 / crc32c / generic-array / memoffset / …) had been compiled by an incompatible older
+rustc (E0514), so `cargo build` errored instead of rebuilding, blocking EVERY franken_whisper
+engine build + transcript A/B for all agents. `cargo clean -p <crate>` removed 0 files (shared
+fingerprints), confirming a full clean was required.
+
+**Fix (safe — verified no franken_whisper build was running; the only active cargo procs were a
+different project, franken_numpy, in a separate target dir):** `cargo clean --release` on
+`.rch-targets` (removed 4523 files / 2.0 GiB) → full rebuild `cargo build --release --example
+e2e_probe` with the current nightly (rustc 1.98.0-nightly c397dae80), **Finished in 5m01s**.
+FUNCTIONAL VERIFY: `PROBE_DUMP_TEXT=1 e2e_probe large-v3-turbo jfk.wav 1` (ts) →
+`"And so, my fellow Americans, ask not what your country can do for you, ask what you can do for
+your country."` = the golden transcript. Cache is GREEN; engine builds + A/B unblocked.
+
+**NOTE (nightly churn):** the pin is `rust-toolchain.toml`'s `nightly` channel (floating), so a
+future nightly roll can re-break the cache the same way — the recovery is always `cargo clean
+--release` + rebuild (~5 min), NOT a code problem. A pinned dated nightly would prevent recurrence
+(owner call). No BlackThrush win sits unlanded; the CPU perf frontier remains exhausted (self_attn
+fully closed 56735d2), only owner/infra levers (GPU / draft model / VNNI int8 encoder) remain.
+
+---
+
 ## 2026-07-04 - BlackThrush: CORRECTION to 157011d (SAME CYCLE) — the self-attn score-dot SIMD lever was ALREADY done at 2eee24f: TRANSCRIPT-UNSAFE, DEAD (I re-derived it)
 
 **Correcting my own commit 157011d from minutes earlier.** It measured the self-attn score-dot
