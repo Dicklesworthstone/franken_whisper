@@ -619,7 +619,14 @@ fn forward_time_major(
     // per layer instead of per-op CPU<->GPU ping-pong); every other case uses the
     // CPU blocks. `FRANKEN_WHISPER_GPU=0` forces the CPU path.
     if !gpu_encode_stack(&mut x, w) {
-        for layer in &w.layers {
+        // Optional depth truncation (`FW_ENCODER_LAYERS=N`): run only the first N
+        // of the model's encoder transformer blocks. NON-byte-exact (fewer
+        // refinements → different encoder output) — a VIABILITY PROBE for encoder
+        // layer-pruning, default = all layers (byte-identical). If a truncated
+        // depth keeps the transcript within conformance it is a direct encoder
+        // FLOP win (≈ pruned_layers / n_layers of the block stack).
+        let n_run = encoder_layer_limit().unwrap_or(w.layers.len()).min(w.layers.len());
+        for layer in w.layers.iter().take(n_run) {
             encoder_block(&mut x, layer, w.n_head)?;
             checkpoint()?;
         }
@@ -787,6 +794,20 @@ fn fused_ln_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("FW_ENCODER_FUSED_LN").as_deref() != Ok("0"))
+}
+
+/// Optional encoder-depth cap `FW_ENCODER_LAYERS=N` (viability probe for encoder
+/// layer-pruning). `None` (unset / unparsable / `0`) ⇒ run all layers
+/// (byte-identical default). Resolved once.
+fn encoder_layer_limit() -> Option<usize> {
+    use std::sync::OnceLock;
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_ENCODER_LAYERS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
 }
 
 /// `layer_norm(x)` returning a fresh `[rows, cols]` `Mat`. Fused path writes the
