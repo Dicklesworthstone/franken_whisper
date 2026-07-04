@@ -99,6 +99,43 @@ OpenAI-Whisper/whisper.cpp ASR ratio. The table variant was removed from `src/or
 `benches/pipeline_bench.rs`; no hash-rendering code from this dig remains. `AGENT_NAME=BlackThrush`.
 
 ---
+## 2026-07-04 - BlackThrush: DIG -> M8 register-blocked maddubs-i7 GEMM is MEASURED-LOSS on encoder linear GEMMs (0.66-0.94x vs M4); drop variant
+
+**Ratio vs ORIG: UNCHANGED.** This clean M8-vs-M4 probe does NOT improve the legacy/original ratio.
+It is now superseded by the separately landed M4xN2 path above, but it records the discarded branch:
+reuse each weight load across 8 activation rows instead of 4. It is integer-exact (`m8_diff=0`
+everywhere), but the extra register pressure and accumulator traffic beat the reduced weight traffic
+on the encoder linear GEMMs, so the variant was dropped and no runtime code was landed.
+
+**Required command outcome:** `AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod rch exec -- cargo bench --release -p franken_whisper`
+reached worker `vmi1152480` but Cargo rejected it before compilation: `error: unexpected argument
+'--release' found`. The crate-scoped equivalent probe was then run under rch:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod rch exec -- cargo run --release -p franken_whisper --example encoder_maddubs_i7_gemm_probe -- 7`.
+That remote command completed and printed timings; rch later returned `RCH-E309`/exit 102 only while
+retrieving custom-target artifacts, after `Remote command finished: exit=0`.
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe`, best-of-7, worker `vmi1149989`):**
+
+| GEMM | shape | M4 vs f32 | M8 vs f32 | M8-vs-M4 | exactness |
+|------|-------|-----------|-----------|----------|-----------|
+| proj | [1500,1280]x[1280,1280] | 1.84x | 1.22x | **0.66x** | `m8_diff=0` |
+| mlp fc1 | [1500,1280]x[1280,5120] | 2.86x | 2.68x | **0.94x** | `m8_diff=0` |
+| mlp fc2 | [1500,5120]x[5120,1280] | 2.13x | 1.95x | **0.92x** | `m8_diff=0` |
+| sdpa_scores | [1500,64]x[64,1500] | 0.53x | 0.70x | 1.31x | `m8_diff=0` |
+| sdpa_out | [1500,1500]x[1500,64] | 6.59x | 6.21x | **0.94x** | `m8_diff=0` |
+
+**Verdict:** reject M8/N-blocking for the current encoder GEMM path. The only positive shape is
+`sdpa_scores`, but SDPA int8 is already measured-dead as a runtime path (scores remains slower than
+f32 even with M8: 0.70x). Linear encoder GEMMs are the actual shipped target and all regress versus
+M4. The probe code was removed before commit; this entry is the evidence artifact.
+
+**Conformance note:** `rch exec -- cargo check -p franken_whisper --lib` passed on `hz1` (one existing
+`unused_mut` warning in `src/native_engine/encoder.rs`). A broader `rch exec -- cargo check -p
+franken_whisper --all-targets` attempted during this dig was blocked by pre-existing non-doc failures
+on the then-current base: an `EncoderLayer` test initializer missing the newer int8 fields and
+unsafe-code errors in `examples/self_attn_score_dot_probe.rs`.
+
+---
 ## 2026-07-04 - BlackThrush: LANDED M4-register-blocked maddubs-i7 encoder GEMM = 1.11-1.31x over M1, BIT-IDENTICAL (weight-bandwidth lever)
 
 **Ratio vs OpenAI-Whisper/whisper.cpp: IMPROVED on the int8 encoder path (gated).** A NEW measured WIN
