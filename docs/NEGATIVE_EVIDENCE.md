@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → block-wise ENCODER quant DEFINITIVELY CLOSED — the int8 encoder's proper-noun error is NOT weight- OR activation-quant granularity; it's intrinsic to the int8 maddubs computation. No block-wise scale fixes it.
+
+**Ratio vs ORIG: UNCHANGED (measured; closes the block-wise-encoder thread of 66418f9/03b55db).** Completes the
+activation-quant leg. Added a forward-pass ACTIVATION roundtrip (`FW_ENC_ACT_ROUNDTRIP=row|<N>`, nn::u8_act_roundtrip
+in enc_linear's f32 path, default-off byte-identical, conformance GREEN) matching the int8 path's exact u8 quant
+(`amax/127`, round, clamp ±127) — the activation analog of last cycle's weight roundtrip. Ran golden vs each operand
+alone vs BOTH, per-row through block-8, on track01 (vs f32 golden "…FrankenSearch library…"):
+```
+  config                       "Franken"      word-diffs vs golden
+  golden (f32)                 ✓ correct        0
+  weight-only  row / blk32     ✓ / ✓            37 / 42     (last cycle 03b55db)
+  activation-only row/32/16/8  ✓ / ✓ / ✓ / ✓    43 / 44 / 43 / 35
+  BOTH  row                    ✓ PRESERVED      45
+  BOTH  block-8                ✓ PRESERVED      55            (finest both-operand granularity — STILL preserves "Franken")
+  ── actual int8 encoder ──    ✗ "Frank at"     60
+```
+**DECISIVE: NO f32-GEMM roundtrip of the int8 quantization reproduces the error** — weight-only, activation-only,
+OR both operands, at ANY granularity (per-row → block-8), ALL preserve "Franken" (~35-45 word perturbations). Only
+the actual int8 MADDUBS path (identical per-operand quantization + integer accumulation) mangles it (60 diffs). Since
+the roundtrips apply the SAME per-operand quantization the int8 path uses, the extra error that flips "Franken"→"Frank
+at" comes from the int8 maddubs COMPUTATION (compound u8×i7 quantization combined in the integer accumulate/scale),
+NOT from weight- or activation-scale GRANULARITY.
+
+**Verdict — the block-wise ENCODER lever is DEAD in full (weight AND activation), NOT worth the multi-hour maddubs
+kernel.** Finer per-operand scales address the ~40-diff pure-quant error (which never touches "Franken"); they cannot
+address the maddubs-specific compound error that does. The int8 encoder's ~1.5× stays a FUNDAMENTAL owner-gated
+quality tradeoff — the proper-noun regression is intrinsic to int8×int8 maddubs on hard content, not a fixable
+granularity artifact. This closes the block-wise-encoder thread (founded 66418f9 → weight-falsified 03b55db →
+activation+compound falsified here). Harnesses kept default-off (FW_ENC_WEIGHT_ROUNDTRIP + FW_ENC_ACT_ROUNDTRIP) as
+reproducible diagnostics (cf. FW_ENCODER_LAYERS). Supersedes the block-wise recommendations in
+[[project_turbo_encoder_dominates]].
+
 ## 2026-07-04 - BlackThrush: DIG → MEASURED CORRECTION of the block-wise-weight lever — the int8 encoder's proper-noun error is from ACTIVATION quantization (u8), NOT weight-quant granularity. Block-wise WEIGHT scales do NOT recover track01. Kernel NOT worth building.
 
 **Ratio vs ORIG: UNCHANGED (measured; corrects the prior cycle's block-wise-weight hypothesis, 66418f9).** Last

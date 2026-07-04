@@ -499,6 +499,37 @@ pub fn i7_roundtrip(w_t: &Mat, block: Option<usize>) -> Mat {
     Mat::from_vec(inp, out, data)
 }
 
+/// Roundtrip each row of `x` ([m, inp]) through the int8 encoder's ACTIVATION quantization
+/// (symmetric u8: per-row `amax/127`, `round().clamp(-127,127)`, dequant) — the EXACT scheme
+/// [`matmul_bias_i7`] applies to activations. `block == None` ⇒ per-row scale (== the current
+/// int8 path); `block == Some(b)` ⇒ per-`b`-channel-block amax along the contraction dim.
+/// Feasibility harness ONLY: running the EXISTING f32 GEMM on activation-roundtripped inputs
+/// isolates the ACTIVATION-quant effect on the transcript (last cycle 03b55db proved the int8
+/// encoder's proper-noun error is activation- not weight-quant; this tests whether block-wise
+/// activation granularity recovers it, or whether it is the u8 8-bit precision itself).
+pub fn u8_act_roundtrip(x: &Mat, block: Option<usize>) -> Mat {
+    let m = x.rows;
+    let inp = x.cols;
+    let b = block.unwrap_or(inp).max(1);
+    let mut data = vec![0.0f32; m * inp];
+    data.par_chunks_mut(inp).enumerate().for_each(|(r, drow)| {
+        let xr = &x.data[r * inp..(r + 1) * inp];
+        let mut c0 = 0;
+        while c0 < inp {
+            let c1 = (c0 + b).min(inp);
+            let amax = xr[c0..c1].iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let scale = amax / 127.0;
+            let inv = 1.0 / scale;
+            for c in c0..c1 {
+                let q = (xr[c] * inv).round().clamp(-127.0, 127.0);
+                drow[c] = q * scale;
+            }
+            c0 = c1;
+        }
+    });
+    Mat::from_vec(m, inp, data)
+}
+
 /// maddubs `u8·i7` dot `Σ a[x]·w[x]`. Non-saturating for i7 weights (see [`I7Mat`]).
 /// Base target-features include AVX2 (`target-cpu=x86-64-v3`), so this inlines
 /// without a `#[target_feature]` attribute (same pattern as [`dot_f16c`]).
