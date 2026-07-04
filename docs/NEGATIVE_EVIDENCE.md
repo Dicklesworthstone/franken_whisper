@@ -38,6 +38,74 @@ unchanged. Next useful action is either a true remote slot with warmed
 an original-vs-franken ratio change.
 
 ---
+## 2026-07-04 - BlackThrush: LAND-OR-DIG surface - no missing measured worktree win; fresh short bench produced only negative/blocked evidence
+
+**Ratio vs ORIG: UNCHANGED.** No runtime source changed, so the shipped
+mainline ratio remains the latest landed envelope (~1.2x timestamped /
+~1.68-1.8x no-timestamps vs the original lineage on the covered runs). This
+pass found no new keepable speed ratio. The only numeric ratio from the fresh
+short bench is a **loss** on a covered micro-surface: local fallback measured
+`window_to_time_major_fused` at `300846 ns/iter` versus the old comparator at
+`236721 ns/iter`, so fused/old in that run was `236721 / 300846 = 0.787x`
+(1.27x slower). Against the historic OpenAI compact-copy anchor
+(`15.3064 us`), that local fallback sample would be `15.3064 / 300.846 =
+0.0509x`; it is rejection/blocker evidence only, not a product ratio update.
+
+`AGENT_NAME=BlackThrush git status --short --branch` was clean
+(`## main...origin/main`) after the required `git pull --rebase`/push sync, so
+there was no unstaged work to commit at the start. Agent Mail
+registration/reservation was retried but the archive SQLite corruption circuit
+breaker still refused writes (`database disk image is malformed`). The
+repo-local `.scratch/.worktrees`, `/data/projects/.scratch`, and
+`/data/projects/.worktrees` audit found no franken_whisper bench worktree win
+missing from `main`; the remaining non-contained sibling heads are the same
+stale/docs/reject set already classified in this ledger (`766f5f1`, `db5f059`,
+`4dd616f`, `443bc4f`, `134f404`, `c902858`).
+
+Required short per-crate bench evidence used the requested target dir. The
+literal requested Cargo spelling was attempted first:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench -- window_to_time_major --sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`.
+RCH selected `vmi1227854`, timed out syncing this repo, fell back local, and
+Cargo rejected `--release` (`unexpected argument '--release' found`). The
+executable release-profile form then completed after the local build:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod rch exec -- cargo bench -p franken_whisper --profile release --bench native_engine_bench -- window_to_time_major --sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`.
+Result:
+
+```text
+native_engine/mel/window_to_time_major_old_chunk_then_transpose  236721 ns/iter (+/- 20261)
+native_engine/mel/window_to_time_major_fused                     300846 ns/iter (+/- 33438)
+```
+
+This does not justify changing the product path. The window-prep family is
+already covered by multiple same-target-dir keep/reject entries, including
+no-fill, 32/128-frame tiles, and index-strength reduction rejects. I attempted
+one stronger rerun (`--sample-size 20 --measurement-time 3`) only because this
+short local sample inverted older fused-vs-old evidence; RCH again selected
+`vmi1227854`, timed out during project sync after 30 s, then fell back local and
+blocked on the required `/data/projects/.rch-targets/whisper-cod` Cargo lock.
+`ps` showed a separate live `f16_gemv_dequant_384x384` cargo/rustc job holding
+that target dir, so I interrupted only my own waiting rerun and did not disturb
+peer work.
+
+**Fresh dig routing.** The requested alien-graveyard / alien-artifact-coding /
+extreme-optimization pass does not point to a new safe in-crate micro-kernel
+after this audit. The remaining largest measured gaps are still blocked outside
+this checkout's immediately landable surface: (1) the model-artifact-gated
+`FW_NO_CONTEXT` / `bd-r0qd` final-window tail validation needs ggml model files
+and the long-form fixture on the worker, and (2) the external
+`ft_kernel_cpu`/rayon GEMM substrate is the remaining loaded-API/encoder gap.
+Do not re-dig the covered mel/window, resample/downmix, GELU/layer-norm, f16
+GEMV, or decoder-LN clone families without new model artifacts, a different
+target crate, or a clean same-worker profile that invalidates the current
+ledger.
+
+Conformance note: no runtime code changed in this pass, so there is no new
+behavior delta to gate. The first per-crate bench binary built and ran; the
+second rerun was stopped while waiting behind peer target-dir work.
+
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-04 - BlackThrush: FOLLOW-UP LAND-OR-DIG blocker — fail-closed RCH still selects `vmi1227854` and times out syncing this repo; required target dir remains occupied by peer bench
 
 **Ratio vs ORIG: UNCHANGED / NO NEW MEASUREMENT.** This pass made no runtime
