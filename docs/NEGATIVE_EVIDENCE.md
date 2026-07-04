@@ -4,6 +4,25 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-05 - BlackThrush: DIG → MEASURED FLOOR (self-speculative layer-skip decode is structurally capped by the "logits tax") — **the ledger de-risked draft decoding on the VERIFY side (R(K)≈3.7× depth-invariant, [[project_draft_decoding_amortization]]) and killed the n-gram/PLD free variant for ASR (~0% hit), but the DRAFT side was never measured. MEASURED per-crate (`examples/self_draft_logits_tax_probe`, model-free, turbo int8 shapes, min-of-7, 32t): the 51866×1280 logits GEMV is 1867 µs = 63% of the 2966 µs per-token weight-GEMV forward (a full decoder layer's 4 GEMVs = only 275 µs). So a self-draft that SKIPS DECODER DEPTH still pays the full logits head every attempt: the cheapest 1-layer draft costs 0.72× a full token (2-layer 0.81×, 3-layer 0.91×), needing >72%/81%/91% draft-acceptance over a K=4 window just to break even (and MORE once verify c_v>1). Layer-skip self-speculation on the 4-layer turbo decoder is structurally DEAD — you cannot skip the logits head while still proposing a token. Probe-only change; ratio vs OpenAI-Whisper unchanged (byte-identical default; ~1.2× ts / ~1.68–1.8× no_ts).**
+
+**Dig result — quantifying the last un-measured leg of the #1 owner-gated lever (draft decoding).** AGENT_NAME=BlackThrush. Realized draft speedup = R(K) (verify amortization, MEASURED ~3.7× at K=8) × accept-rate ÷ **draft cost** — and draft cost was the missing factor. The cheapest draft that needs NO second model is a self-draft: run the first k of turbo's 4 decoder layers, then the shared output head. But every proposed token requires a full-vocab logits GEMV, so the logits cost is a fixed tax on the draft.
+
+MEASURED wall-clock (`nn::gemv_i8` on synthetic turbo int8 weights, the SAME kernel decode uses):
+
+| per-token int8 weight GEMV (turbo) | µs (min-of-7, 32t) |
+|---|---|
+| qkv `[3840,1280]` | 66.9 |
+| attn_out `[1280,1280]` | 38.6 |
+| fc1 `[5120,1280]` | 83.7 |
+| fc2 `[1280,5120]` | 85.5 |
+| **1 decoder layer (4 GEMVs)** | **274.7** |
+| **logits `[51866,1280]`** | **1866.8** |
+| **full token (4 layers + logits)** | **2965.5** |
+
+**logits = 63% of per-token GEMV time** — notably ABOVE the ledger's ~42% BYTE estimate (66 MB / 158 MB, entry below): the 51866-row GEMV is less efficient per byte than the smaller layer GEMVs (a huge output dim spread thinner across the 32-worker split). Self-draft floor = `(k·t_layer + t_logits)/t_full`: **k=1 → 0.72×, k=2 → 0.81×, k=3 → 0.91×.** Break-even accept (draft K=4, output = a+1 tokens/iter, optimistic verify c_v=1.0): **72% / 81% / 91%** — implausible for a depth-truncated draft of an already-distilled 4-layer decoder (cf. the encoder layer-pruning entry below: depth truncation of turbo collapses quality). **So draft decoding's remaining path is unchanged but now SHARPENED with data: the drafter must cut the LOGITS cost (a smaller-vocab or shared-/reduced-head drafter), not just the layer depth — a layer-skip self-draft can't win.** This measures the third and final leg of the draft-decode analysis (verify-side R(K) done; PLD free-variant dead; draft-side floor now MEASURED). Probe kept as the reference harness; no engine code touched (byte-identical default).
+
+---
 ## 2026-07-05 - BlackThrush: DIG → MEASURED REJECTION (encoder layer-pruning is quality-fatal on turbo) — **the ONE "owner-gated, multi-day, unmeasured" encoder FLOP-reducer left ([[project_encoder_flop_reduction_mapped]]) is now MEASURED and DEAD on large-v3-turbo: skipping even 4 of 32 encoder layers (`FW_ENCODER_LAYERS=28`) breaks the transcript into a repetition loop ("And so myAnd so my…"×5); 24→"and so on.", 20→"and", 16→"------". The FLOP/speed reduction is real (28→0.88×, 24→0.69×, 20→0.62×, 16→0.25× transcribe) but useless. Root cause: turbo is ALREADY distillation-pruned (its DECODER is 32→4 layers), so the 32-layer ENCODER has no depth-redundancy left — every encoder layer is load-bearing. This closes the last un-measured encoder direction; naive last-K truncation AND (by implication) adaptive ToMe fight the same absent redundancy. Gate `FW_ENCODER_LAYERS` kept default-off (all layers = byte-identical, conformance GREEN).**
 
 **Dig result — the "biggest measured gap vs the original" is the encoder (80% e2e, ~tied vs whisper.cpp); its only un-measured radical lever was depth-reduction, so I built the viability probe (a 1-line env-gated `.take(n)` on the encoder block loop, encoder.rs) and swept it.** AGENT_NAME=BlackThrush. jfk turbo, TS single window, `PROBE_DUMP_TEXT`, vs the whisper.cpp reference "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.":
