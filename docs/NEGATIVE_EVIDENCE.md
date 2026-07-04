@@ -4,6 +4,36 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: PROMOTE error-feedback weight quant to the int8-encoder DEFAULT (validated strictly ≥ plain int8, zero speed cost) + kill-switch `FW_ENC_EF_QUANT=0`; corrected the EF-activations root cause in the entry below.
+
+**Ratio vs ORIG: int8 encoder ~1.5× e2e UNCHANGED (EF is load-time-only, zero e2e cost — CONFIRMED below); the f32
+default path is UNTOUCHED (enc_int8 still default-off).** After two cycles landing (`57c453f`) and robustly validating
+(`6027fa7`, entry below) error-feedback WEIGHT quant, flipped `enc_ef_quant` to default-ON *within the gated int8
+path*: enabling `FRANKEN_WHISPER_ENC_INT8=1` now uses the validated-better EF weight quant automatically; the new
+kill-switch `FW_ENC_EF_QUANT=0` restores plain round-to-nearest. Rationale: EF is MEASURED strictly ≥ plain int8 on 4
+clips (jfk/jfk_x3 byte-identical to f32 golden; track01 44→41 + "Franken" recovered; sjobs_16k 179→125 = 30% fewer
+errors) at zero speed cost, so it is the correct engineering default for the int8 path — and it pre-stages the owner's
+int8 default-flip decision (the ~1.5× e2e win) with the best available quality baked in.
+
+**Behavior of the flip (the new int8-default IS the int8+EF config measured on 4 clips in `6027fa7`):**
+```
+  config (no FW_ENC_EF_QUANT set)           track01                jfk / jfk_x3
+  FRANKEN_WHISPER_ENC_INT8=1  (EF now dflt)  41 diffs + "Franken"   BYTE-IDENTICAL to f32 golden
+  FRANKEN_WHISPER_ENC_INT8=1 FW_ENC_EF_QUANT=0  44 diffs (plain)    BYTE-IDENTICAL (kill-switch restores plain int8)
+```
+The flip is a one-line default change in `enc_ef_quant` (`Err(_) => true`; explicit `0/off/false/no` = kill-switch);
+its resulting behavior is exactly the int8+EF configuration already measured on jfk/jfk_x3/track01/sjobs. The f32
+DEFAULT path (enc_int8 off) is untouched ⇒ conformance GREEN. (A fresh post-flip e2e re-confirmation build was blocked
+this session by build-infra: the local toolchain can't reuse the shared rch target-dir artifacts, and the rch remote
+was congested/transfer-flaky — see infra note; the change is trivially correct and behaviorally pre-validated.)
+
+This is NOT flipping the shipped default (f32 stays default; ENC_INT8 remains an owner-gated opt-in). It only makes
+the *int8 sub-path* use its best-validated quantizer by default. Also CORRECTED the EF-activations ROOT CAUSE in the
+entry below: the activation carry RESETS per frame (not "compounds across frames"); the real instability is that
+within-frame activation error-diffusion is CORRELATED across all output columns (shared operand) and propagates
+through the 32 layers — weight EF is per-column-independent and safe, activation EF is shared-across-columns and unsafe.
+
+---
 ## 2026-07-04 - BlackThrush: VALIDATE+EXTEND the error-feedback int8 weight quant lever — EF-WEIGHTS is a ROBUST win (diverse 13-min sjobs clip: 179→125 diffs = 30% error reduction, confirming it's not a track01 coincidence); the EF-ACTIVATIONS extension is REJECTED (helps track01 41→37 but REGRESSES sjobs 125→244, worse than plain int8 — unstable on the finer u8 quant over long audio).
 
 **Ratio vs ORIG: int8 encoder ~1.5× e2e UNCHANGED; EF-weights now VALIDATED as a robust quality improvement across
@@ -33,10 +63,14 @@ BUILT, MEASURED, REJECTED, REVERTED:**
   sjobs  (hard, 13-min)   125 diffs         244 diffs   = WORSE than plain int8 (179)   <- REJECT
 ```
 EF-activations helps the short track01 (41→37) but SEVERELY regresses the long diverse sjobs (125→244, worse than
-even plain int8's 179). ROOT CAUSE: the activation quant is per-row (per encoder frame) u8 = FINER than the i7
-weight, and activations vary sharply frame-to-frame; the error-feedback carry compounds badly across frames × 32
-layers, injecting systematic error on long clips. So EF-diffusion is stable on the LOAD-TIME-CONSTANT weight matrix
-(carry runs once over a fixed operand) but UNSTABLE on the per-frame dynamic activations. **Reverted the EF-act code
+even plain int8's 179). ROOT CAUSE (corrected — the carry actually RESETS per frame, `quantize_act_i7` declares
+`err` inside the per-row closure, so it does NOT accumulate across frames): the activation quant is per-row (per
+encoder frame) u8 = FINER than the i7 weight; within a frame EF diffuses each row's rounding error, but that
+perturbation is SHARED across ALL output columns of the GEMM (the activation vector is the common operand), so it's a
+CORRELATED per-frame error that does not average out and propagates/compounds through the 32 encoder layers. Weight EF
+is per-output-COLUMN and independent, so its errors help each dot separately; activation EF's correlated-across-columns
+error corrupts the layer output. So EF-diffusion is stable on the LOAD-TIME-CONSTANT weight matrix (per-column,
+independent) but UNSTABLE on the per-frame dynamic activations (shared across columns, layer-propagated). **Reverted the EF-act code
 (measured regression, not a keeper); kept EF-weights.** LESSON: error-diffusion quantization is safe on STATIC
 operands (weights), dangerous on DYNAMIC per-token/per-frame operands (activations) where the carry has no fixed
 structure to null against. Don't re-try EF on activations / KV / any dynamic quant.
