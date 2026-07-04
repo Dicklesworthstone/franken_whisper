@@ -4,6 +4,50 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: CANONICAL alien-graveyard catalog SWEPT vs the measured profile → NO un-tried byte-exact lever; CPU frontier CLOSED; owner/infra decision surface consolidated
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** Grounded dig, no engine
+change. Cache GREEN (f0c7842 fix holds; e2e_probe present + jfk×1 golden last cycle).
+
+**Did the alien-graveyard skill's PRESCRIBED method for the first time: swept the CANONICAL
+corpus** (`/data/projects/alien_cs_graveyard/alien_cs_graveyard.md`, 6092 lines) against the
+measured bottleneck (encoder = 76-80% e2e, f32 sgemm at the 32-thread all-core POWER/clock-throttle
+ceiling; decode int8 at the weight-bandwidth wall). **No un-tried BYTE-EXACT dense-GEMM accelerator
+exists in the corpus.** Every technique that could touch a dense f32 GEMM is either already in this
+ledger or a non-byte-exact quality tradeoff:
+- §9 Numeric kernels (OT / FMM / AMG / LP) + "precision escalation": the only matrix ideas are
+  **FMM / hierarchical-matrix = low-rank ATTENTION approximation** (non-byte-exact, O(N²)→O(N) but
+  N=1500 is small, quality-scoped) and **precision-escalation** (fast low-precision tier + escalate)
+  — DEAD here because the "fast tier" (int8 / f16) is SLOWER on Zen3 AVX2 (no VNNI, no f16 FMA).
+- §7 fusion trees (BMI2 `_pext`/`_pdep`): predecessor SEARCH, no bit-packed hot path in the engine
+  (int4 is the only packer and it's dead).
+- §9.4 sketching (Count-Min / HLL / KLL), §6.3 CEGIS micro-kernel synthesis: wrong problem class
+  (streaming cardinality / SMT synthesis), not dense GEMM; CEGIS can't beat hand-AVX2 already at
+  ceiling.
+- Strassen (measured-fatal), column-panel cache-blocking (rejected 171ef03), int8 encoder GEMM
+  (0.38-0.42× on AVX2), QKV-fusion (0.884× wash), BLAS/faer (slower), thread-count (32 optimal) —
+  all already in this ledger.
+
+**CPU IN-CRATE FRONTIER = CLOSED (this is the consolidation; stop re-probing per
+[[feedback_read_memory_before_digging]]).** Byte-exact micro-levers LANDED (argmax/round/gather/
+conv-pretranspose/f16c-dot/2row-gemv/dot_i8/thread-cap/pipelining) or SWEPT (all 4 antipattern
+classes, b375e0c). Structural rewrites LANDED (decode alloc-light 1.54×, cross-quant parallel).
+Every remaining op is bandwidth/power/latency-floored or transcript-unsafe (self_attn score-dot
+6-10× isolated but hallucinates, 56735d2).
+
+**OWNER/INFRA DECISION SURFACE (the only paths to >1% now — each needs an owner unblock):**
+| Lever | Expected e2e | Blocker / unblock required |
+|-------|-------------|----------------------------|
+| **GPU offload of the encoder sgemm** | LARGE (encoder is 80%) | GTX 1070 is on **nouveau** = no CUDA/OpenCL/Vulkan. Needs proprietary driver + a `ft-kernel-cuda` crate mirroring v0.3.0's `ft-kernel-metal` (reuse the `nn::matmul_into_uninit` cfg seam). |
+| **Draft/speculative decode** | ~4-7% ts-only | Needs a cheap **multilingual** draft model sharing turbo's vocab (tiny.en is English-only vocab ⇒ incompatible; self-draft layer-skip is WEAK, ~47% break-even) + the speculate/verify/rollback loop (multi-day). |
+| **int8 encoder microkernel** | moderate | Needs **VNNI / AVX-512-VNNI** (absent on Zen3); naive int8 is 0.38-0.42× on AVX2. Hardware-gated. |
+| **ToMe / token merging** | moderate | Non-byte-exact quality tradeoff on already-distilled turbo; owner quality call + multi-day. |
+
+**Also owner-preventable:** the floating `nightly` pin (`rust-toolchain.toml`) re-breaks the cache
+on every roll (see f0c7842); a pinned dated nightly stops it.
+
+---
+
 ## 2026-07-04 - BlackThrush: BLOCKER RESOLVED — toolchain-broken `.rch-targets` cache rebuilt (was blocking ALL engine builds + transcript A/B)
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — infrastructure fix, no
