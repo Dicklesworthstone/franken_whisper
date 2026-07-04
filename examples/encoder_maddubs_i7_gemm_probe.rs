@@ -311,6 +311,199 @@ fn gemm_maddubs_m4(
     c
 }
 
+/// M8-blocked maddubs dot: 8 activation rows vs ONE weight row (cuts weight L3
+/// re-reads 8x vs M1). For K>~4000 the 8 activation rows (8*K u8) spill L1.
+#[cfg(target_arch = "x86_64")]
+unsafe fn dot_maddubs_m8(a: [&[u8]; 8], w: &[i8], k: usize) -> [i32; 8] {
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_si256(); 8];
+        let pw = w.as_ptr();
+        let p: [*const u8; 8] = [
+            a[0].as_ptr(), a[1].as_ptr(), a[2].as_ptr(), a[3].as_ptr(),
+            a[4].as_ptr(), a[5].as_ptr(), a[6].as_ptr(), a[7].as_ptr(),
+        ];
+        let mut x = 0;
+        while x + 32 <= k {
+            let wv = _mm256_loadu_si256(pw.add(x) as *const __m256i);
+            for i in 0..8 {
+                acc[i] = _mm256_add_epi32(
+                    acc[i],
+                    _mm256_madd_epi16(
+                        _mm256_maddubs_epi16(_mm256_loadu_si256(p[i].add(x) as *const __m256i), wv),
+                        ones,
+                    ),
+                );
+            }
+            x += 32;
+        }
+        let hsum = |v: __m256i| -> i32 {
+            let mut t = [0i32; 8];
+            _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, v);
+            t.iter().sum()
+        };
+        let mut r = [0i32; 8];
+        for i in 0..8 {
+            r[i] = hsum(acc[i]);
+        }
+        while x < k {
+            let wx = w[x] as i32;
+            for i in 0..8 {
+                r[i] += (a[i][x] as i32) * wx;
+            }
+            x += 1;
+        }
+        r
+    }
+}
+
+/// M4xN2 2D register tile: 4 activation rows x 2 weight rows = 8 dots per pass.
+/// The L1-hot activation is reused across 2 weight rows and each weight across 4
+/// activation rows => improves the maddubs/load ratio once M4 has fixed weight
+/// bandwidth. Returns [w0: r0..r3, w1: r0..r3]. 8 accumulators.
+#[cfg(target_arch = "x86_64")]
+unsafe fn dot_maddubs_m4n2(a: [&[u8]; 4], w0: &[i8], w1: &[i8], k: usize) -> [i32; 8] {
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_si256(); 8];
+        let (p0, p1, p2, p3) = (a[0].as_ptr(), a[1].as_ptr(), a[2].as_ptr(), a[3].as_ptr());
+        let (q0, q1) = (w0.as_ptr(), w1.as_ptr());
+        let mut x = 0;
+        while x + 32 <= k {
+            let wv0 = _mm256_loadu_si256(q0.add(x) as *const __m256i);
+            let wv1 = _mm256_loadu_si256(q1.add(x) as *const __m256i);
+            let av = [
+                _mm256_loadu_si256(p0.add(x) as *const __m256i),
+                _mm256_loadu_si256(p1.add(x) as *const __m256i),
+                _mm256_loadu_si256(p2.add(x) as *const __m256i),
+                _mm256_loadu_si256(p3.add(x) as *const __m256i),
+            ];
+            for i in 0..4 {
+                acc[i] = _mm256_add_epi32(
+                    acc[i],
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(av[i], wv0), ones),
+                );
+                acc[4 + i] = _mm256_add_epi32(
+                    acc[4 + i],
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(av[i], wv1), ones),
+                );
+            }
+            x += 32;
+        }
+        let hsum = |v: __m256i| -> i32 {
+            let mut t = [0i32; 8];
+            _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, v);
+            t.iter().sum()
+        };
+        let mut r = [0i32; 8];
+        for i in 0..8 {
+            r[i] = hsum(acc[i]);
+        }
+        while x < k {
+            let (wx0, wx1) = (w0[x] as i32, w1[x] as i32);
+            for i in 0..4 {
+                r[i] += (a[i][x] as i32) * wx0;
+                r[4 + i] += (a[i][x] as i32) * wx1;
+            }
+            x += 1;
+        }
+        r
+    }
+}
+
+fn gemm_maddubs_m8(
+    qa: &[u8], sa: &[f32], qw: &[i8], sw: &[f32], wsum: &[i32], m: usize, k: usize, n: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    c.par_chunks_mut(8 * n).enumerate().for_each(|(blk, cblk)| {
+        let r0 = blk * 8;
+        let rows = (m - r0).min(8);
+        if rows == 8 {
+            let a: [&[u8]; 8] = std::array::from_fn(|j| &qa[(r0 + j) * k..(r0 + j + 1) * k]);
+            for o in 0..n {
+                let wrow = &qw[o * k..(o + 1) * k];
+                #[cfg(target_arch = "x86_64")]
+                let raw = unsafe { dot_maddubs_m8(a, wrow, k) };
+                #[cfg(not(target_arch = "x86_64"))]
+                let raw: [i32; 8] = std::array::from_fn(|j| dot_ref(a[j], wrow));
+                let off = 128 * wsum[o];
+                for (j, &rj) in raw.iter().enumerate() {
+                    cblk[j * n + o] = (rj - off) as f32 * sa[r0 + j] * sw[o];
+                }
+            }
+        } else {
+            for j in 0..rows {
+                let arow = &qa[(r0 + j) * k..(r0 + j + 1) * k];
+                for o in 0..n {
+                    let wrow = &qw[o * k..(o + 1) * k];
+                    #[cfg(target_arch = "x86_64")]
+                    let raw = unsafe { dot_maddubs(arow, wrow, k) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let raw = dot_ref(arow, wrow);
+                    cblk[j * n + o] = (raw - 128 * wsum[o]) as f32 * sa[r0 + j] * sw[o];
+                }
+            }
+        }
+    });
+    c
+}
+
+fn gemm_maddubs_m4n2(
+    qa: &[u8], sa: &[f32], qw: &[i8], sw: &[f32], wsum: &[i32], m: usize, k: usize, n: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    c.par_chunks_mut(4 * n).enumerate().for_each(|(blk, cblk)| {
+        let r0 = blk * 4;
+        let rows = (m - r0).min(4);
+        if rows == 4 {
+            let a: [&[u8]; 4] = std::array::from_fn(|j| &qa[(r0 + j) * k..(r0 + j + 1) * k]);
+            let mut o = 0;
+            while o + 2 <= n {
+                let w0 = &qw[o * k..(o + 1) * k];
+                let w1 = &qw[(o + 1) * k..(o + 2) * k];
+                #[cfg(target_arch = "x86_64")]
+                let raw = unsafe { dot_maddubs_m4n2(a, w0, w1, k) };
+                #[cfg(not(target_arch = "x86_64"))]
+                let raw: [i32; 8] = {
+                    let mut rr = [0i32; 8];
+                    for i in 0..4 { rr[i] = dot_ref(a[i], w0); rr[4 + i] = dot_ref(a[i], w1); }
+                    rr
+                };
+                let (off0, off1) = (128 * wsum[o], 128 * wsum[o + 1]);
+                for i in 0..4 {
+                    cblk[i * n + o] = (raw[i] - off0) as f32 * sa[r0 + i] * sw[o];
+                    cblk[i * n + o + 1] = (raw[4 + i] - off1) as f32 * sa[r0 + i] * sw[o + 1];
+                }
+                o += 2;
+            }
+            while o < n {
+                let wrow = &qw[o * k..(o + 1) * k];
+                for i in 0..4 {
+                    #[cfg(target_arch = "x86_64")]
+                    let raw = unsafe { dot_maddubs(a[i], wrow, k) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let raw = dot_ref(a[i], wrow);
+                    cblk[i * n + o] = (raw - 128 * wsum[o]) as f32 * sa[r0 + i] * sw[o];
+                }
+                o += 1;
+            }
+        } else {
+            for j in 0..rows {
+                let arow = &qa[(r0 + j) * k..(r0 + j + 1) * k];
+                for o in 0..n {
+                    let wrow = &qw[o * k..(o + 1) * k];
+                    #[cfg(target_arch = "x86_64")]
+                    let raw = unsafe { dot_maddubs(arow, wrow, k) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let raw = dot_ref(arow, wrow);
+                    cblk[j * n + o] = (raw - 128 * wsum[o]) as f32 * sa[r0 + j] * sw[o];
+                }
+            }
+        }
+    });
+    c
+}
+
 fn max_rel_err(a: &[f32], b: &[f32]) -> f32 {
     let mut m = 0.0f32;
     for (&x, &y) in a.iter().zip(b) {
@@ -436,20 +629,55 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
         m4_diff = m4_diff.max((x - y).abs());
     }
 
+    // M8-blocked (weight loaded once per 8 rows)
+    let cmad8 = gemm_maddubs_m8(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+    for _ in 0..3 {
+        black_box(gemm_maddubs_m8(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n));
+    }
+    let mut best_mad8 = f64::INFINITY;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let r = gemm_maddubs_m8(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        best_mad8 = best_mad8.min(t0.elapsed().as_secs_f64());
+        black_box(r);
+    }
+
+    // M4xN2 2D tile (activation reused across 2 weight rows)
+    let cmad4n2 = gemm_maddubs_m4n2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+    for _ in 0..3 {
+        black_box(gemm_maddubs_m4n2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n));
+    }
+    let mut best_m4n2 = f64::INFINITY;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let r = gemm_maddubs_m4n2(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        best_m4n2 = best_m4n2.min(t0.elapsed().as_secs_f64());
+        black_box(r);
+    }
+    let mut m8_diff = 0.0f32;
+    for (&x, &y) in cmad8.iter().zip(&cmad) {
+        m8_diff = m8_diff.max((x - y).abs());
+    }
+    let mut m4n2_diff = 0.0f32;
+    for (&x, &y) in cmad4n2.iter().zip(&cmad) {
+        m4n2_diff = m4n2_diff.max((x - y).abs());
+    }
+
     let err_wide = max_rel_err(&cwide, &cf32.data);
     let err_mad = max_rel_err(&cmad, &cf32.data);
     println!(
-        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  wide {:.2}x  mad1 {:.1}ms ({:.2}x)  mad4 {:.1}ms ({:.2}x, {:.2}x-vs-m1)  | sat={sat_diff} m4_diff={m4_diff:.0} relerr wide={:.3} mad={:.3}",
+        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  mad1 {:.2}x  mad4 {:.2}x ({:.2}vs1)  mad8 {:.2}x ({:.2}vs4)  m4n2 {:.2}x ({:.2}vs4)  | diffs m4={m4_diff:.0} m8={m8_diff:.0} m4n2={m4n2_diff:.0} relmad={:.3}",
         best_f32 * 1e3,
-        best_f32 / best_wide,
-        best_mad * 1e3,
         best_f32 / best_mad,
-        best_mad4 * 1e3,
         best_f32 / best_mad4,
         best_mad / best_mad4,
-        err_wide,
+        best_f32 / best_mad8,
+        best_mad4 / best_mad8,
+        best_f32 / best_m4n2,
+        best_mad4 / best_m4n2,
         err_mad,
     );
+    let _ = (best_wide, err_wide);
 }
 
 fn main() {

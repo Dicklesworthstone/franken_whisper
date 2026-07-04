@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LANDED M4xN2 2D-register-tile maddubs-i7 GEMM (gated out<=in) = ~1.3-1.5x over M4 on proj+fc2, BIT-IDENTICAL
+
+**Ratio vs OpenAI-Whisper/whisper.cpp: further IMPROVED on the int8 encoder path (gated).** Follow-on to
+the M4 landing (ec080af). Once M4 register-blocking removed the weight-L3 bottleneck, the next lever is
+raising the maddubs/load ratio via 2D register tiling. Probed M8 (8 rows/weight-load) and M4xN2 (4 rows x
+2 weight rows = 8 dots/pass; the L1-hot activation reused across 2 weight rows). All bit-identical to M1
+(m4_diff=m8_diff=m4n2_diff=0 on every shape).
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe`, mad-vs-mad4, 3 runs UNDER HEAVY CONTENTION load 70-94 —
+absolute ratios noisy but the win DIRECTIONS are consistent across all 3 runs):**
+
+| GEMM | shape | M8-vs-M4 | M4xN2-vs-M4 |
+|------|-------|----------|-------------|
+| proj    | [1500,1280]x[1280,1280] (out==in) | 1.13-1.33x | **1.33-1.45x WIN** |
+| mlp fc1 | [1500,1280]x[1280,5120] (out>>in) | 0.73-0.86x LOSS | 0.77-1.15x (~0.92x geomean, wash/slight-loss) |
+| mlp fc2 | [1500,5120]x[5120,1280] (out<in)  | 0.97-1.60x wash | **1.28-1.52x WIN** |
+
+**Landed M4xN2 GATED to `out <= in`** — enabled for proj (out==in, 4 of 6 GEMMs/layer: attn q/k/v/out)
+and fc2 (out<in), where the win is consistent; the wide fc1 (out>>in, register pressure makes N2 a
+wash/slight-loss) keeps plain M4. So the kernel is **strictly ≥ M4 on every shape** — worst case a no-op,
+best case the ~1.4x proj+fc2 win. M8 dropped (offers nothing M4xN2 doesn't). e2e jfk int8 transcript
+BYTE-IDENTICAL to the f32 golden ("And so, my fellow Americans...").
+
+**Contention caveat:** load 70-94 (sibling-agent builds) prevented a quiet-box absolute-speedup read; the
+LANDING is de-risked by bit-identity (zero correctness risk) + the strictly-≥-M4 gate + the win-direction
+consistency across 3 adverse-load runs, NOT by trusting the absolute ratios. NEXT: L2 weight-panel
+cache-blocking (the remaining structural lever — a Goto-style microkernel; larger effort) or owner's
+default-flip quality sweep. Files: nn.rs (dot_maddubs_i7_m4n2 + gated matmul_bias_i7), probe (M8/M4N2).
+
+---
+
 ## 2026-07-04 - BlackThrush: REJECTED sha256 lowercase-hex table encoder (orchestrator replay hashes) — 0.83-1.01x vs ORIG formatter, dropped
 
 **Ratio vs ORIG formatter path: LOSS/NOISE.** Tried a radical but behavior-preserving micro lever on the
