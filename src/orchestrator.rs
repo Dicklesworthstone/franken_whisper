@@ -35,7 +35,9 @@ pub enum PipelineStage {
     Normalize,
     /// Voice activity detection pre-filtering (bd-qla.1).
     Vad,
-    /// Source separation / vocal isolation (bd-qla.2, Demucs-inspired placeholder).
+    /// Source separation / vocal isolation (bd-qla.2): energy-based vocal-confidence
+    /// heuristic (RMS + active-speech-coverage analysis, not a neural separator;
+    /// bd-mmx3 tracks a real mask-model replacement).
     Separate,
     /// Execute the transcription backend (whisper-cpp, insanely-fast-whisper, etc.).
     Backend,
@@ -45,7 +47,9 @@ pub enum PipelineStage {
     Align,
     /// Punctuation restoration (bd-qla.4).
     Punctuate,
-    /// Speaker diarization (bd-qla.5, TitaNet-inspired placeholder).
+    /// Speaker diarization (bd-qla.5): heuristic clustering of segments by 6-D
+    /// temporal/lexical features (position, pacing, verbosity — NOT acoustic speaker
+    /// embeddings; bd-ohex tracks a real neural ECAPA-TDNN diarizer).
     Diarize,
     /// Persist the run report to frankensqlite.
     Persist,
@@ -3611,7 +3615,7 @@ async fn execute_punctuate(
 }
 
 // ---------------------------------------------------------------------------
-// Speaker diarization (bd-qla.5, TitaNet-inspired placeholder)
+// Speaker diarization (bd-qla.5): heuristic 6-D temporal/lexical segment clustering
 // ---------------------------------------------------------------------------
 
 /// Report produced by the speaker diarization stage.
@@ -3635,7 +3639,7 @@ pub(crate) struct DiarizeReport {
     pub(crate) notes: Vec<String>,
 }
 
-/// Acoustic-heuristic feature vector for a segment.
+/// Temporal/lexical-heuristic feature vector for a segment.
 ///
 /// In a real TitaNet-inspired system, this would be a high-dimensional
 /// embedding from a neural speaker encoder.  Here we use an expanded set
@@ -3792,7 +3796,7 @@ fn resolve_speaker_target(constraints: Option<&crate::model::SpeakerConstraints>
     None
 }
 
-/// Assign speaker labels to segments using acoustic-heuristic feature
+/// Assign speaker labels to segments using temporal/lexical-heuristic feature
 /// clustering.
 ///
 /// Algorithm:
@@ -3816,7 +3820,7 @@ pub(crate) fn diarize_segments(
 ) -> FwResult<DiarizeReport> {
     let total = segments.len();
     let mut notes: Vec<String> =
-        vec!["heuristic: acoustic-feature clustering without neural speaker encoder".to_owned()];
+        vec!["heuristic: temporal/lexical-feature clustering without neural speaker encoder".to_owned()];
 
     if segments.is_empty() {
         return Ok(DiarizeReport {
