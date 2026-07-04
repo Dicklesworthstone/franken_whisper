@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LANDED default-on — SDPA gather/scatter chunking (`FW_SDPA_GATHER_CHUNKS` default 0→16), quiet-box settled, byte-exact ~0.5% e2e encoder win
+
+**Ratio vs ORIG: encoder reshape 1.159× (byte-exact), ~+0.5% on the ~1.2× ts / ~1.68× no_ts default-path lead.**
+This flips the long-deferred `FW_SDPA_GATHER_CHUNKS` gated mechanism (95d640c/c54260e) to its measured optimum.
+The memory ([[project_sdpa_gather_threadcount_lead]]) held it default-off because "the 1.73× was a high-contention
+ARTIFACT ... ONLY a quiet box + turbo model can settle it." **Both conditions were finally met (load ~8-17,
+turbo model on-box), so I settled it on the REAL encoder** (`e2e_probe`, jfk, `FRANKEN_WHISPER_PERF_SPANS=1`).
+
+**MEASURED (min-of-9 interleaved A/B + a 12/16/24/32 min-of-5 sweep, sdpa_gather/scatter ms summed over 32 layers):**
+```
+              gather(ms)   scatter(ms)   reshape(ms)   ratio
+  legacy(0)     ~80          42.4          120.9        1.000
+  chunks=16     ~80          25.9          104.3        1.159   <- LANDED
+  chunks=24     ~80          23.8          103.9        1.164   (ties 16 on plateau)
+  chunks=12     ~80          26.9          110.3        1.096
+  chunks=32     ~80          25.3          108.4        1.115
+```
+**The win is ENTIRELY in the SCATTER (~1.6×): the legacy per-row scatter uses tq=1500 fine rayon bands (massive
+oversubscription); 16 bands fix it (42.4→25.9 ms). The GATHER is FLAT (~80 ms both) — legacy already uses n_head=20
+coarse bands ≈ 16, so the cold-probe's "gather 1.73×" was exactly the shared-box artifact 470fb79 flagged; it does
+NOT reproduce on the real quiet encoder.** 16 and 24 tie on the plateau (I picked 16: memory-validated, clean power
+of two, well-separated from the head count). Always-positive: never regressed across 14 reps.
+
+**Right-sized e2e:** reshape saves ~16.6 ms/window; reshape is ~5% of the 2450 ms encoder ⇒ ~0.7% of encode ⇒
+**~0.5% e2e** (encoder is ~80% of e2e, and this is encoder-side so NOT pipelining-hidden). The transcribe-total A/B
+can't resolve it (both ~2.90 s min, within ±60 ms noise) — the isolated scatter span (1.6×, reproducible 14/14) is
+the reliable signal. Small but real, byte-exact, zero-downside.
+
+**Byte-exact (guaranteed + verified):** pure data movement, output independent of chunk count (unit tests
+`sdpa_gather_head_major_chunk_invariant` + `sdpa_scatter_interleaved_chunk_invariant`). Transcript diff new-default
+(16) vs `FW_SDPA_GATHER_CHUNKS=0` (legacy): BYTE-IDENTICAL on jfk ×1 and ×3 (ts + no_ts). Set `FW_SDPA_GATHER_CHUNKS=0`
+to restore legacy. This CLOSES the "largest byte-exact e2e lever" open question — it was real but ~0.5%, not the
+hoped ~1-1.7×; the kernel (76% of attn_sdpa, external) dominates and dilutes it.
+
 ## 2026-07-04 - BlackThrush: NON-TEMPORAL logits load to keep decoder weights L3-resident is DEAD — PREFETCHNTA does NOT protect residency on Zen3 (MEASURED)
 
 **Ratio vs ORIG: UNCHANGED (measured negative, no engine change).** The one un-probed structural decode

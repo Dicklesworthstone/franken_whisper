@@ -3093,24 +3093,27 @@ fn sdpa_split_add(i: usize, ns: u128) {
 }
 
 /// Target chunk count for the fused-SDPA q/k/v gather AND output scatter, tunable via
-/// `FW_SDPA_GATHER_CHUNKS`. Default `0` means the historical per-op chunking (gather:
-/// one band per head; scatter: one band per output row) — byte-identical to the legacy
-/// code. A positive value splits BOTH reshape passes into that many balanced row-bands.
+/// `FW_SDPA_GATHER_CHUNKS`. **Default `16`** splits BOTH reshape passes into 16 balanced
+/// row-bands. Setting `0` restores the historical per-op chunking (gather: one band per
+/// head; scatter: one band per output row) — byte-identical output either way (pure data
+/// movement, unit-tested chunk-invariant).
 ///
-/// Motivation (`examples/sdpa_gather_cold_probe` + `sdpa_scatter_cold_probe`, cold/
-/// DRAM-bound): the gather/scatter are memory-bandwidth-bound and this 8-channel box
-/// saturates near ~12–16 concurrent streams. The legacy chunkings OVERSUBSCRIBE: the
-/// per-head gather (n_head=20) is a contention local min (MEASURED 1.73× slower than 16
-/// chunks) and the per-row scatter (tq=1500 fine chunks) is 1.6× slower than ~12 chunks —
-/// both byte-identical. Left OFF by default: thread-count is load-dependent and unreliable
-/// on the shared bench box (prior decode thread-count digs reverted 3×), and this could
-/// not be e2e-verified on the real encoder without the turbo model. Flip to 16 to A/B on
-/// a quiet box.
+/// QUIET-BOX MEASURED, real turbo encoder (jfk, `FRANKEN_WHISPER_PERF_SPANS=1`, min-of-9
+/// interleaved + a 12/16/24/32 min-of-5 sweep, 2026-07-04, BlackThrush): the win is
+/// **entirely in the SCATTER**. The legacy per-row scatter uses `tq`=1500 fine rayon bands
+/// (massive oversubscription) ⇒ 16 bands cut it **~1.6×** (42.4→25.9 ms summed over 32
+/// layers). The GATHER is FLAT (~80 ms both ways: legacy already uses n_head=20 coarse
+/// bands ≈ 16 — the cold-probe's "gather 1.73×" was the shared-box artifact flagged in
+/// 470fb79, it does NOT reproduce on the real quiet encoder). Net reshape **1.159×**
+/// (120.9→104.3 ms/window); 16 and 24 tie on the plateau (12 worse, 32 regresses). Reshape
+/// is ~5% of the encoder so this is ~0.7% of encode ≈ ~0.5% e2e, byte-exact, encoder-side
+/// (NOT pipelining-hidden), always-positive (never regressed in 14 reps). See
+/// NEGATIVE_EVIDENCE 2026-07-04 and `sdpa_gather_head_major` / the chunk-invariant tests.
 fn sdpa_gather_chunks() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("FW_SDPA_GATHER_CHUNKS").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+        std::env::var("FW_SDPA_GATHER_CHUNKS").ok().and_then(|s| s.parse().ok()).unwrap_or(16)
     })
 }
 
@@ -3302,10 +3305,9 @@ fn attention_raw(
         // The per-head gather/scatter is a strided memcpy transpose (interleaved
         // [tq, n_state] <-> head-major [hh, tq, d_head]). It is ~20% of attn_sdpa
         // and BANDWIDTH-bound: serial (one core) was MEASURED 4.5x SLOWER. Chunk count
-        // is `FW_SDPA_GATHER_CHUNKS` (default 0 == one-band-per-head, bit-identical to
-        // the historical gather); cold/DRAM-bound probe shows ~16 balanced chunks is
-        // 1.73x faster than per-head (n_head=20 = a contention local min). See
-        // `sdpa_gather_head_major` / NEGATIVE_EVIDENCE.
+        // is `FW_SDPA_GATHER_CHUNKS` (default 16, bit-identical to legacy; set 0 for the
+        // historical per-op chunking). The gather is ~flat 16-vs-20-bands; the WIN is the
+        // scatter (see below). Quiet-box measured — see `sdpa_gather_chunks` doc.
         let gchunks = sdpa_gather_chunks();
         st!(0, {
             sdpa_gather_head_major(&mut qa, &q.data, hh, tq, d_head, n_state, gchunks);
@@ -3317,8 +3319,9 @@ fn attention_raw(
             &qa, &ka, &va, hh, tq, tk, d_head, d_head, sdpa_scale, false,
         ));
         // Scatter head-major `o` back to interleaved `out` — same FW_SDPA_GATHER_CHUNKS
-        // knob as the gather (per-row default is bit-identical; cold probe shows ~12
-        // chunks is 1.6× faster than the 1500 per-row fine chunks). See NEGATIVE_EVIDENCE.
+        // knob (default 16). This is where the win is: the legacy per-row scatter used
+        // tq=1500 fine rayon bands (oversubscribed) → 16 bands is ~1.6× faster on the real
+        // quiet encoder (42.4→25.9 ms/window, byte-identical). See NEGATIVE_EVIDENCE 2026-07-04.
         st!(2, sdpa_scatter_interleaved(&mut out, &o, hh, tq, d_head, n_state, gchunks));
         return Ok(Mat::from_vec(tq, n_state, out));
     }
