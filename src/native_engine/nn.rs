@@ -475,17 +475,42 @@ pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
 fn dot_maddubs_i7(a: &[u8], w: &[i8]) -> i32 {
     use std::arch::x86_64::*;
     let k = a.len();
-    // SAFETY: AVX2 is in the base target features; pointers stay in-bounds (32-lane
-    // steps while `x + 32 <= k`, scalar tail after).
+    let ap = a.as_ptr();
+    let wp = w.as_ptr();
+    // SAFETY: AVX2 is in the base target features; pointers stay in-bounds (128-
+    // then 32-lane steps guarded by `x + N <= k`, scalar tail after).
     unsafe {
         let ones = _mm256_set1_epi16(1);
-        let mut acc = _mm256_setzero_si256();
+        // FOUR independent accumulators unroll the maddubs+madd by 128 elements so
+        // the `add_epi32` latency is hidden (the single-accumulator form was a
+        // serial dependency chain = latency-bound, ~25% of the maddubs compute
+        // ceiling). Integer add is associative + commutative, so each lane sums the
+        // SAME set of i32 products => the result is BIT-IDENTICAL to the 1-acc order
+        // (the int8 transcript is unchanged; this is a pure speed lever).
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut a2 = _mm256_setzero_si256();
+        let mut a3 = _mm256_setzero_si256();
         let mut x = 0;
+        let dot32 = |o: usize| {
+            _mm256_madd_epi16(
+                _mm256_maddubs_epi16(
+                    _mm256_loadu_si256(ap.add(o) as *const __m256i),
+                    _mm256_loadu_si256(wp.add(o) as *const __m256i),
+                ),
+                ones,
+            )
+        };
+        while x + 128 <= k {
+            a0 = _mm256_add_epi32(a0, dot32(x));
+            a1 = _mm256_add_epi32(a1, dot32(x + 32));
+            a2 = _mm256_add_epi32(a2, dot32(x + 64));
+            a3 = _mm256_add_epi32(a3, dot32(x + 96));
+            x += 128;
+        }
+        let mut acc = _mm256_add_epi32(_mm256_add_epi32(a0, a1), _mm256_add_epi32(a2, a3));
         while x + 32 <= k {
-            let av = _mm256_loadu_si256(a.as_ptr().add(x) as *const __m256i);
-            let wv = _mm256_loadu_si256(w.as_ptr().add(x) as *const __m256i);
-            let p = _mm256_madd_epi16(_mm256_maddubs_epi16(av, wv), ones);
-            acc = _mm256_add_epi32(acc, p);
+            acc = _mm256_add_epi32(acc, dot32(x));
             x += 32;
         }
         let mut t = [0i32; 8];

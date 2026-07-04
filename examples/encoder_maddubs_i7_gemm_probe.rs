@@ -99,15 +99,38 @@ fn dot_ref(a: &[u8], w: &[i8]) -> i32 {
 #[target_feature(enable = "avx2")]
 unsafe fn dot_maddubs(a: &[u8], w: &[i8], k: usize) -> i32 {
     unsafe {
+        // 4 independent accumulators (128-elem unroll) hide the add_epi32 latency;
+        // integer add is associative => bit-identical to the 1-acc order. Mirrors
+        // nn::dot_maddubs_i7 (landed 8996fcb, this cycle upgraded to 4-acc).
         let ones = _mm256_set1_epi16(1);
-        let mut acc = _mm256_setzero_si256();
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+        );
+        let ap = a.as_ptr();
+        let wp = w.as_ptr();
+        let d32 = |o: usize| {
+            _mm256_madd_epi16(
+                _mm256_maddubs_epi16(
+                    _mm256_loadu_si256(ap.add(o) as *const __m256i),
+                    _mm256_loadu_si256(wp.add(o) as *const __m256i),
+                ),
+                ones,
+            )
+        };
         let mut x = 0;
+        while x + 128 <= k {
+            a0 = _mm256_add_epi32(a0, d32(x));
+            a1 = _mm256_add_epi32(a1, d32(x + 32));
+            a2 = _mm256_add_epi32(a2, d32(x + 64));
+            a3 = _mm256_add_epi32(a3, d32(x + 96));
+            x += 128;
+        }
+        let mut acc = _mm256_add_epi32(_mm256_add_epi32(a0, a1), _mm256_add_epi32(a2, a3));
         while x + 32 <= k {
-            let av = _mm256_loadu_si256(a.as_ptr().add(x) as *const __m256i);
-            let wv = _mm256_loadu_si256(w.as_ptr().add(x) as *const __m256i);
-            let p16 = _mm256_maddubs_epi16(av, wv); // 16x i16, non-saturating for i7 weights
-            let p32 = _mm256_madd_epi16(p16, ones); // 8x i32
-            acc = _mm256_add_epi32(acc, p32);
+            acc = _mm256_add_epi32(acc, d32(x));
             x += 32;
         }
         let mut tmp = [0i32; 8];

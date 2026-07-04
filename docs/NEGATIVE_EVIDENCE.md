@@ -4,6 +4,39 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: FOLLOW-ON WIN (integer-EXACT) — 4-accumulator `dot_maddubs_i7` lifts the landed int8 encoder GEMM 1.56→2.02x f32 (fc1/fc2 ~2x); e2e jfk 1.30→1.48x, transcript BYTE-IDENTICAL
+
+**Ratio vs OpenAI-Whisper: ~1.6-2.4x when FRANKEN_WHISPER_ENC_INT8=1 (up from ~1.5-2.2x last cycle).**
+Pure speed lever on the just-landed int8 encoder GEMM; INTEGER-EXACT so the int8 transcript is
+UNCHANGED (default f32 path still byte-identical).
+
+**Root cause found:** the landed `nn::dot_maddubs_i7` (8996fcb) used a SINGLE accumulator — the
+`acc = add_epi32(acc, p)` chain is a serial dependency (~25% of the maddubs compute ceiling the
+`int8_vs_f32_compute_ceiling_probe` hit with 8 accumulators). Rewrote it with **4 independent
+accumulators + 128-elem unroll** (mirrored in the probe). Integer add is associative + commutative, so
+each SIMD lane sums the identical set of i32 products ⇒ **bit-identical** to the 1-acc order (verified:
+jfk int8 = golden byte-identical, track01 int8 = 1341 chars = last cycle's single-acc int8 EXACTLY).
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe`, best-of-40 at load 10; e2e at load 10-13):**
+
+| shape | f32 | single-acc (8996fcb) | **4-acc (this)** |
+|-------|-----|----------------------|------------------|
+| proj [1500,1280]×[1280,1280] | — | 1.17× | **1.81×** |
+| mlp fc1 [1500,1280]×[1280,5120] | — | 1.56× | **2.02×** |
+| mlp fc2 [1500,5120]×[5120,1280] | — | 1.58× | **2.06×** |
+| **e2e jfk** (11s) | 3.746 s | 1.30× | **1.48×** (2.538 s, transcript = golden) |
+
+`sat_diff=0` still holds (i7 non-saturating). The MLP GEMMs now run ~2× f32 (the maddubs compute
+ceiling is ~2.28× f32, so 4-acc reaches ~88% of it — near the achievable peak; a full Goto microkernel
+would gain little more). track01 e2e timing this cycle was contention-corrupted (box load 52-80; one
+interleaved round showed int8 1.14× faster, another a load-spike 0.61× — unquotable), but jfk (1.48×,
+clean) + the probe (2.02×, best-of-40) + integer-exactness are the solid evidence. **The gated int8
+encoder GEMM is now ~1.48× e2e (jfk) / ~2× on the MLP GEMMs — the biggest measured win of the project,
+now near the maddubs compute ceiling.** Default path unchanged (byte-identical); still gated pending the
+owner's broader quality sweep.
+
+---
+
 ## 2026-07-04 - BlackThrush: LANDED (gated, default-off) — maddubs 7-bit int8 ENCODER GEMM wired into the real 32-layer encoder = **1.23-1.30x e2e MEASURED** (jfk byte-IDENTICAL, track01 ~98% word-identical); the biggest measured win of the project
 
 **Ratio vs OpenAI-Whisper: ~1.5-2.2x (was ~1.2-1.8x) when FRANKEN_WHISPER_ENC_INT8=1 — a MEASURED
