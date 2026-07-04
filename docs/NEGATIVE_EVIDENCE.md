@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: self-attn SCORE-DOT is 6–10× AVX2 headroom (MEASURED) but NON-byte-exact (~1e-6) → owner-gated candidate; engine A/B blocked by toolchain-broken shared cache
+
+**Ratio vs OpenAI-Whisper: UNCHANGED this cycle (~1.2× ts / ~1.68–1.8× no_ts)** — a MEASURED
+gated-candidate lever recorded, not yet wired (blocked, see below).
+
+**NEW lever MEASURED (largest remaining decode-side COMPUTE kernel).** The per-token self-attn
+score dot in `attention_decode_step` (nn.rs:3205-3212) is a SCALAR sequential f32 reduction
+(`acc += qh[d]*(k[j,d]*scale)` over d_head=64) — loop-carried, so LLVM keeps it a serial
+`vaddss` chain (latency-bound) and does NOT multi-accumulate (would reorder the sum). The output
+SAXPY below it is already AVX2; this dot is the last scalar piece (~the "65% softmax/dots" of
+self_attn per [[project_self_attn_kv_cache_lever]]). MEMORY tagged it "owner-gated/non-byte-exact"
+by REASONING; MEASURED it per-crate (`examples/self_attn_score_dot_probe.rs`, standalone,
+turbo n_head=20 d_head=64, x86-64-v3, 4000 iters, 2 runs):
+
+| tk  | scalar µs | avx4 µs | ratio | max\|Δ\| |
+|-----|-----------|---------|-------|--------|
+| 32  | ~20.6     | ~2.0    | **~10×** | 7.2e-7 |
+| 64  | ~39.4     | ~5.6    | **~7×**  | 7.2e-7 |
+| 128 | ~78.6     | ~12.7   | **~6.2×**| 9.5e-7 |
+| 224 | ~140.8    | ~22.3   | **~6.3×**| 1.2e-6 |
+
+(4-accumulator f32x8 AVX2 dot over the contiguous d_head run — no gather/transpose.) Same
+latency-bound-reduction class as dot_i8 / dot_f16c where hand-AVX2 beat autovec; confirms the
+score dot is a real ~6-10× kernel, NOT compute-bound-at-ceiling.
+
+**But NON-byte-exact (max\|Δ\| ~1e-6, reordered 4-partial sum).** A byte-exact SIMD version needs
+the summation ORDER preserved: either a d-outer SAXPY-over-keys (strided-in-j reads ⇒ Zen3
+gather, ~2.2 Gelem/s per [[project_gelu_gather_antipattern_fixed]] ⇒ likely a wash) or a
+TRANSPOSED KV cache (KvCache-layout change, owner-scoped). So the fast path is inherently
+non-byte-exact ⇒ **owner-gated FW flag (sibling of FW_SIMD_EXP), NOT default-on.** The 1e-6
+perturbation feeds softmax→weights→hidden→logits→argmax and is ~25× SMALLER than FW_SIMD_EXP's
+proven-transcript-neutral 2.5e-5, so it is very likely transcript-safe — but that needs a jfk A/B
+to confirm before landing gated.
+
+**e2e magnitude (honest):** the score dot is ~4-5% of decode (≈65%-of-10.7% self_attn, minus the
+already-AVX2 output SAXPY + gated softmax exp); ~6× on it saves ~4% of decode ⇒ **~0.5-0.9% e2e
+in ts mode, ~0 in no_ts (decode is pipeline-hidden, [[project_window_pipelining_lever]]).** Modest
+but the largest remaining decode COMPUTE lever, and it correctly RESIZES the stale
+"self_attn at ceiling" note.
+
+**BLOCKER (surfaced, affects all agents): the shared `.rch-targets` cargo cache is
+TOOLCHAIN-BROKEN** — the nightly auto-rolled (rustc 1.98.0-nightly c397dae80, 2026-07-02) and the
+whole dependency graph (autocfg/cc/rustc_version/regex/matrixmultiply/blake3/crc32c/… build
+scripts) was compiled by an incompatible older rustc (E0514). `cargo clean -p <crate>` removes 0
+files (shared fingerprints); a FULL `cargo clean` + rebuild is needed but must NOT be forced on the
+shared dir mid-session (cod-a/cod-b/codex rely on it). So engine-wiring of `FW_SIMD_ATTN_DOT` +
+the jfk A/B is deferred to a clean cache. The MEASUREMENT is unaffected (probe built standalone
+via `rustc`, no deps). NEXT: once the cache rebuilds, add a gated AVX2 score-dot to
+`attention_decode_step`, A/B jfk ts+no_ts transcript byte-identical off-vs-on, land default-off.
+
+---
+
 ## 2026-07-04 - BlackThrush: DROP masked-logits-row-skip (byte-exact in no_ts, MEASURED sub-noise) + hot-kernel antipattern sweep = fully exploited
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — dropped lever + a
