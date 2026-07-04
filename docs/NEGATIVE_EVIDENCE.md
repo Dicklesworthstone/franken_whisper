@@ -4,6 +4,44 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: VALIDATE+EXTEND the error-feedback int8 weight quant lever — EF-WEIGHTS is a ROBUST win (diverse 13-min sjobs clip: 179→125 diffs = 30% error reduction, confirming it's not a track01 coincidence); the EF-ACTIVATIONS extension is REJECTED (helps track01 41→37 but REGRESSES sjobs 125→244, worse than plain int8 — unstable on the finer u8 quant over long audio).
+
+**Ratio vs ORIG: int8 encoder ~1.5× e2e UNCHANGED; EF-weights now VALIDATED as a robust quality improvement across
+diverse hard audio (was previously only track01).** Two-part cycle on the lever landed last commit (`57c453f`,
+`FW_ENC_EF_QUANT`):
+
+**(1) EF-WEIGHTS robustness — VALIDATED on the diverse `sjobs_16k.wav` (13-min Steve Jobs keynote, the one on-box
+clip that isn't a jfk/track01 variant):**
+```
+  clip                    int8 baseline     int8 + EF-weights
+  jfk / jfk_x3 (clean)    byte-identical    byte-identical         (no regression)
+  track01 (hard, 5win)    44 diffs          41 diffs + "Franken" recovered
+  sjobs  (hard, 13-min)   179 diffs         125 diffs   = 30% FEWER ERRORS   <- NEW, decisive
+```
+The sjobs 30% reduction (systematic — recovers dropped punctuation/small words across the whole transcript, verified by
+inspection, e.g. golden "first of all, one's" -> int8 drops the comma -> EF restores it) DECISIVELY confirms EF-weights
+is a robust quality win, not a borderline-token coincidence. 4 clips: 2 clean byte-identical, 2 hard substantially
+better. Strong enough that making EF the int8 DEFAULT is now a reasonable owner call (enc_ef_quant default stays false
+pending owner sign-off, but the evidence bar the prior entry asked for — "diverse hard audio" — is met).
+
+**(2) EF-ACTIVATIONS extension (`FW_ENC_EF_ACT`, error-feedback on the u8 activation quant in `quantize_act_i7`) —
+BUILT, MEASURED, REJECTED, REVERTED:**
+```
+  clip                    EF-weights        EF-weights + EF-activations
+  jfk (clean)             byte-identical    byte-identical         (ok)
+  track01 (hard)          41 diffs          37 diffs               (helps!)
+  sjobs  (hard, 13-min)   125 diffs         244 diffs   = WORSE than plain int8 (179)   <- REJECT
+```
+EF-activations helps the short track01 (41→37) but SEVERELY regresses the long diverse sjobs (125→244, worse than
+even plain int8's 179). ROOT CAUSE: the activation quant is per-row (per encoder frame) u8 = FINER than the i7
+weight, and activations vary sharply frame-to-frame; the error-feedback carry compounds badly across frames × 32
+layers, injecting systematic error on long clips. So EF-diffusion is stable on the LOAD-TIME-CONSTANT weight matrix
+(carry runs once over a fixed operand) but UNSTABLE on the per-frame dynamic activations. **Reverted the EF-act code
+(measured regression, not a keeper); kept EF-weights.** LESSON: error-diffusion quantization is safe on STATIC
+operands (weights), dangerous on DYNAMIC per-token/per-frame operands (activations) where the carry has no fixed
+structure to null against. Don't re-try EF on activations / KV / any dynamic quant.
+
+---
 ## 2026-07-04 - BlackThrush: DIG → NEW LEVER that WORKS (measured) — ERROR-FEEDBACK weight quantization improves the gated int8 encoder's TRANSCRIPT FIDELITY at ZERO speed cost: byte-identical to golden on clean audio, recovers the "Franken" proper noun on hard audio. Landed gated `FW_ENC_EF_QUANT` (default-off).
 
 **Ratio vs ORIG: int8 encoder stays ~1.5× e2e (EF changes only the load-time weight-quant VALUES, not the maddubs
