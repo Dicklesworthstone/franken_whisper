@@ -4,6 +4,47 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: mixed-precision int8 encoder DEAD — the int8 win is a POWER/CLOCK effect (ALL-OR-NOTHING); 2/32 f32 layers destroy the ENTIRE 1.5x speedup
+
+**Ratio vs ORIG: UNCHANGED (measured negative).** Last cycle's follow-on lever: recover the int8
+encoder's proper-noun accuracy (the quality regression that keeps ENC_INT8 gated) by keeping the
+error-sensitive EARLY encoder layers in f32 and int8-ing the rest — hoping for a quality/speed Pareto
+that makes the default-flip safe. Built a per-layer gate (`FRANKEN_WHISPER_ENC_INT8_SKIP_FIRST/LAST`,
+default 0 = quantize all; byte-identical when unused).
+
+**QUALITY looked promising** (track01 124s, vs f32 golden): all-int8 = ~1528 char-ops + proper-noun errors
+("Franken"->"Frank at"/"rank in"); SKIP_FIRST=2 = ~508 char-ops (3x closer) and RECOVERS the proper nouns
+("FrankenSearch"/"Franken projects"). jfk stays BYTE-IDENTICAL at SKIP_FIRST=2. The early layers ARE the
+most quantization-sensitive, as hypothesized.
+
+**BUT SPEED IS ALL-OR-NOTHING — the lever is DEAD.** MEASURED on jfk (identical transcript across all
+configs => total-time delta = PURE encode delta; best-of-5, load 18) + confirmed by `encoder_window`
+perf-span:
+
+| config | jfk total (best-of-5) | encoder_window span | vs f32 |
+|--------|----------------------|---------------------|--------|
+| f32 | 3.58s | — | 1.00x |
+| int8 ALL 32 layers | 2.39s | 2120 ms | **1.50x** |
+| int8, SKIP_FIRST=2 (2/32 f32) | 3.59s | 3261 ms | **1.00x (NO speedup)** |
+| int8, SKIP_FIRST=4 | 3.55s | — | 1.01x |
+
+**Keeping just 2 of 32 layers f32 destroys the ENTIRE 1.5x win** (not 2/32 of it) — the encode goes from
+2120ms back to 3261ms (~full f32). ROOT CAUSE: the int8 encoder speedup is a POWER/CLOCK effect, not a
+pure compute-reduction. The encoder is all-core-clock-THROTTLE-bound (2022 MHz = 45% of boost at 32c,
+[[project_encoder_wall_is_clock_throttle]]); the f32 sgemm is the power hog that triggers the throttle.
+int8 maddubs draws less power => less throttle => higher all-core clock => the WHOLE encode runs faster.
+Inserting even 2 f32 layers re-triggers the package power throttle and drags the clock down for the entire
+encode, so the 30 int8 layers lose their clock advantage. **The int8 win is therefore BINARY: full-int8
+(1.5x, quality-degraded) OR full-f32 (golden, slow) — no Pareto middle. Mixed-precision quality recovery
+is IMPOSSIBLE on this power-bound encoder.** This CLOSES the last-cycle follow-on and adds a KEY insight:
+**the int8 encoder's value is dodging the f32 power-throttle, NOT reducing FLOPs — so it is quality-safe
+only as an all-layers flip (owner quality call, per the prior A/B) or not at all.** Code reverted (the
+SKIP_FIRST/LAST knob gives no Pareto => dead code); finding documented. No BlackThrush win unlanded.
+LESSON: on a power-throttle-bound workload, a lower-power kernel's speedup is ALL-OR-NOTHING — partial
+adoption re-triggers the throttle and forfeits the whole win.
+
+---
+
 ## 2026-07-04 - BlackThrush: int8 ENCODER default-flip QUALITY A/B on DIVERSE audio DONE — NOT byte-neutral (mild mixed tradeoff), correctly stays gated
 
 **Ratio vs ORIG: the int8 encoder gives ~1.3-1.5x encode WHEN ON, but this A/B confirms it is an
