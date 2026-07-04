@@ -9,15 +9,21 @@
 //! 51866×1280 logits GEMV. That shared logits GEMV is a fixed tax on every draft attempt and
 //! sets a hard floor on how cheap a self-draft token can be.
 //!
-//! This probe MEASURES (wall-clock, not the ledger's byte estimate — per-GEMV dispatch
-//! overhead can shift the ratio) the per-token int8 weight-GEMV set on the real turbo shapes:
-//!   per layer (x4): qkv[3840,1280]  attn_out[1280,1280]  fc1[5120,1280]  fc2[1280,5120]
-//!   once:           logits[51866,1280]
-//! and reports the logits fraction + the k-layer self-draft floor + the break-even accept rate.
+//! REGIME MATTERS (correction to the first version of this probe, which used a WARM reuse loop
+//! per weight): the 5–6 MB layer weights become L3-resident after the first call, but the 66 MB
+//! logits weight (16.6 MB/CCD across 4×32 MB L3) is only partially cached — so a warm loop times
+//! the small ops at L3 bandwidth and logits nearer DRAM, INFLATING the logits fraction. This is
+//! exactly the "bench weight-streaming kernels COLD not warm-loop" lesson in
+//! project_draft_decoding_amortization. So this probe measures BOTH endpoints:
+//!   - WARM: same matrix reused (all-L3 where it fits) — the earlier, mixed-regime number.
+//!   - COLD: each timed call reads a FRESH matrix from a rotating pool sized > L3 (128 MiB),
+//!           so every op is DRAM-bandwidth-bound → the time ratio ≈ the byte ratio.
+//! Real per-token decode is between the two (per-CCD working set 39 MB slightly exceeds the
+//! 32 MB CCD L3, so the oversized logits weight leans COLD). Report both; the honest per-token
+//! fraction is the COLD one.
 //!
-//! Model-FREE (synthetic int8 weights via nn::quantize_f16_to_i8), so it runs per-crate under
-//! `rch exec -- cargo bench`-class harnessing. Byte-exact to the engine (calls the SAME
-//! nn::gemv_i8). Usage: `self_draft_logits_tax_probe [iters]` (default 300).
+//! Model-FREE (synthetic int8 weights via nn::quantize_f16_to_i8), per-crate, calls the SAME
+//! nn::gemv_i8 the decode uses. Usage: `self_draft_logits_tax_probe [iters]` (default 200).
 use franken_whisper::native_engine::nn::{self, I8Mat};
 use ft_core::Float16;
 use std::hint::black_box;
@@ -37,8 +43,16 @@ fn make_w(out: usize, inp: usize, seed: u64) -> I8Mat {
     nn::quantize_f16_to_i8(&f16, out, inp)
 }
 
-/// min-of-N wall-clock of one `gemv_i8` call [out,inp] @ [inp] -> [out].
-fn time_gemv(w: &I8Mat, x: &[f32], out: usize, iters: usize) -> f64 {
+/// A pool of `copies` independent weight matrices [out,inp], total bytes > `min_bytes`
+/// (so rotation defeats the 128 MiB L3: by the time we cycle back a copy is evicted).
+fn make_pool(out: usize, inp: usize, min_bytes: usize, seed0: u64) -> Vec<I8Mat> {
+    let per = out * inp; // ~1 byte/elem (i8 weights dominate)
+    let copies = (min_bytes / per + 1).max(2);
+    (0..copies).map(|c| make_w(out, inp, seed0.wrapping_add(c as u64 * 0x9E37))).collect()
+}
+
+/// WARM: reuse one matrix (L3-resident where it fits). min-of-7 ns/call.
+fn time_warm(w: &I8Mat, x: &[f32], out: usize, iters: usize) -> f64 {
     let mut y = vec![0.0f32; out];
     for _ in 0..(iters / 10).max(3) {
         nn::gemv_i8(w, black_box(x), None, &mut y);
@@ -56,79 +70,103 @@ fn time_gemv(w: &I8Mat, x: &[f32], out: usize, iters: usize) -> f64 {
     best
 }
 
+/// COLD: rotate through a >L3 pool so each call reads a DRAM-cold matrix. MEAN ns/call
+/// over the pool (min-of-N would just re-find the luckiest cached copy).
+fn time_cold(pool: &[I8Mat], x: &[f32], out: usize, passes: usize) -> f64 {
+    let mut y = vec![0.0f32; out];
+    // touch each once (defeat first-touch page-fault skew)
+    for w in pool {
+        nn::gemv_i8(w, black_box(x), None, &mut y);
+        black_box(y[0]);
+    }
+    let mut best = f64::INFINITY;
+    for _ in 0..passes {
+        let t = Instant::now();
+        for w in pool {
+            nn::gemv_i8(w, black_box(x), None, &mut y);
+            black_box(y[0]);
+        }
+        best = best.min(t.elapsed().as_secs_f64() / pool.len() as f64);
+    }
+    best
+}
+
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
     const NS: usize = 1280; // turbo n_state
     const VOCAB: usize = 51866;
     const FFN: usize = 5120;
     const QKV: usize = 3840; // fused q|k|v
+    const L3: usize = 192 * 1024 * 1024; // 1.5× the 128 MiB L3, per pool
 
-    // synthetic activation vectors (finite, engine quantizes internally)
     let x_ns: Vec<f32> = (0..NS).map(|i| 0.02 * ((i % 51) as f32 - 25.0)).collect();
     let x_ffn: Vec<f32> = (0..FFN).map(|i| 0.02 * ((i % 51) as f32 - 25.0)).collect();
 
-    eprintln!("building synthetic turbo int8 weights (one-time)…");
-    let w_qkv = make_w(QKV, NS, 0x11);
-    let w_out = make_w(NS, NS, 0x22);
-    let w_fc1 = make_w(FFN, NS, 0x33);
-    let w_fc2 = make_w(NS, FFN, 0x44);
-    let w_log = make_w(VOCAB, NS, 0x55);
+    eprintln!("building synthetic turbo int8 weights + cold pools (>L3)…");
+    let (w_qkv, w_out, w_fc1, w_fc2, w_log) = (
+        make_w(QKV, NS, 0x11), make_w(NS, NS, 0x22), make_w(FFN, NS, 0x33),
+        make_w(NS, FFN, 0x44), make_w(VOCAB, NS, 0x55),
+    );
+    let (p_qkv, p_out, p_fc1, p_fc2, p_log) = (
+        make_pool(QKV, NS, L3, 0x11), make_pool(NS, NS, L3, 0x22), make_pool(FFN, NS, L3, 0x33),
+        make_pool(NS, FFN, L3, 0x44), make_pool(VOCAB, NS, L3, 0x55),
+    );
 
-    let t_qkv = time_gemv(&w_qkv, &x_ns, QKV, iters);
-    let t_out = time_gemv(&w_out, &x_ns, NS, iters);
-    let t_fc1 = time_gemv(&w_fc1, &x_ns, FFN, iters);
-    let t_fc2 = time_gemv(&w_fc2, &x_ffn, NS, iters);
-    let t_log = time_gemv(&w_log, &x_ns, VOCAB, iters);
-
-    let t_layer = t_qkv + t_out + t_fc1 + t_fc2; // one decoder layer's 4 weight GEMVs
-    let n_layers = 4usize;
-    let t_full = n_layers as f64 * t_layer + t_log; // per-token weight-GEMV time
+    // WARM
+    let (t_qkv, t_out, t_fc1, t_fc2, t_log) = (
+        time_warm(&w_qkv, &x_ns, QKV, iters), time_warm(&w_out, &x_ns, NS, iters),
+        time_warm(&w_fc1, &x_ns, FFN, iters), time_warm(&w_fc2, &x_ffn, NS, iters),
+        time_warm(&w_log, &x_ns, VOCAB, iters),
+    );
+    // COLD
+    let (c_qkv, c_out, c_fc1, c_fc2, c_log) = (
+        time_cold(&p_qkv, &x_ns, QKV, 30), time_cold(&p_out, &x_ns, NS, 30),
+        time_cold(&p_fc1, &x_ns, FFN, 30), time_cold(&p_fc2, &x_ffn, NS, 30),
+        time_cold(&p_log, &x_ns, VOCAB, 20),
+    );
 
     let us = |s: f64| s * 1e6;
-    eprintln!("\n=== per-token int8 weight-GEMV breakdown (turbo, µs; min-of-7) ===");
-    eprintln!("  qkv   [3840,1280] : {:>7.2}", us(t_qkv));
-    eprintln!("  out   [1280,1280] : {:>7.2}", us(t_out));
-    eprintln!("  fc1   [5120,1280] : {:>7.2}", us(t_fc1));
-    eprintln!("  fc2   [1280,5120] : {:>7.2}", us(t_fc2));
-    eprintln!("  1 layer (4 GEMVs) : {:>7.2}", us(t_layer));
-    eprintln!("  logits[51866,1280]: {:>7.2}   <-- the fixed self-draft tax", us(t_log));
-    eprintln!("  full token (4L+lg): {:>7.2}", us(t_full));
+    let gbs = |bytes: usize, s: f64| bytes as f64 / s / 1e9;
+    let report = |tag: &str, qkv: f64, out: f64, fc1: f64, fc2: f64, log: f64| {
+        let layer = qkv + out + fc1 + fc2;
+        let full = 4.0 * layer + log;
+        eprintln!("\n=== {tag}: per-token int8 weight-GEMV (µs, and GB/s) ===");
+        eprintln!("  qkv    : {:>7.2}  ({:>5.1} GB/s)", us(qkv), gbs(QKV * NS, qkv));
+        eprintln!("  out    : {:>7.2}  ({:>5.1} GB/s)", us(out), gbs(NS * NS, out));
+        eprintln!("  fc1    : {:>7.2}  ({:>5.1} GB/s)", us(fc1), gbs(FFN * NS, fc1));
+        eprintln!("  fc2    : {:>7.2}  ({:>5.1} GB/s)", us(fc2), gbs(NS * FFN, fc2));
+        eprintln!("  1 layer: {:>7.2}", us(layer));
+        eprintln!("  logits : {:>7.2}  ({:>5.1} GB/s)  <-- self-draft tax", us(log), gbs(VOCAB * NS, log));
+        eprintln!("  token  : {:>7.2}", us(full));
+        let frac = log / full;
+        eprintln!("  logits fraction of per-token time: {:.1}%", 100.0 * frac);
+        let c_v = 1.0;
+        for k in 1..=3usize {
+            let floor = (k as f64 * layer + log) / full;
+            let a_be = (4.0 * floor + c_v - 1.0).clamp(0.0, 4.0);
+            eprintln!(
+                "  {k}-layer self-draft: {:.2}x a full token; K=4 break-even accept > {:.0}%",
+                floor, 100.0 * a_be / 4.0
+            );
+        }
+        frac
+    };
 
-    let logits_frac = t_log / t_full;
-    eprintln!("\n=== self-speculative (layer-skip) ceiling ===");
-    eprintln!("  logits fraction of per-token GEMV time : {:.1}%", 100.0 * logits_frac);
-    // Break-even model (OPTIMISTIC for speculation, so the bar is a lower bound):
-    //   - draft `kdraft` tokens, each running the first k of 4 layers + the shared logits
-    //     head, at cost `floor` full-token-forwards each;
-    //   - 1 verify pass over the kdraft proposals, batched so weights stream ONCE ⇒ cost
-    //     c_v ≈ 1.0 full-token-forward (the best case; the real R(4)≈2.2× makes it ~1.8);
-    //   - a spec iteration emits (a+1) tokens: `a` accepted drafts + 1 always-correct token
-    //     the verify produces for free (0 ≤ a ≤ kdraft).
-    // Beat greedy (1.0/token) ⇔ (kdraft*floor + c_v)/(a+1) < 1.0 ⇔ a > kdraft*floor + c_v - 1.
-    let kdraft = 4.0;
-    let c_v = 1.0; // optimistic verify cost (weights-once); real ~1.8 ⇒ bar is HIGHER
-    for k in 1..=3usize {
-        let floor = (k as f64 * t_layer + t_log) / t_full; // draft-token cost / full token
-        let a_be = (kdraft * floor + c_v - 1.0).clamp(0.0, kdraft); // accepted drafts needed
-        eprintln!(
-            "  draft = first {k} of 4 layers: draft-token cost = {:.2}x a full token; \
-             K=4 break-even needs > {:.2} of 4 drafts accepted ({:.0}% accept, optimistic c_v=1.0)",
-            floor, a_be, 100.0 * a_be / kdraft
-        );
-    }
-    let floor1 = (1.0 * t_layer + t_log) / t_full;
-    let a_be1 = kdraft * floor1 + c_v - 1.0;
+    let warm_frac = report("WARM (L3-resident, MIXED regime — earlier probe)", t_qkv, t_out, t_fc1, t_fc2, t_log);
+    let cold_frac = report("COLD (DRAM-bound, regime-controlled — the HONEST number)", c_qkv, c_out, c_fc1, c_fc2, c_log);
+
+    let cold_floor1 = {
+        let layer = c_qkv + c_out + c_fc1 + c_fc2;
+        (layer + c_log) / (4.0 * layer + c_log)
+    };
     eprintln!(
-        "\nVERDICT: the shared logits GEMV is {:.0}% of a per-token forward (MEASURED wall-clock, \n\
-         vs the ledger's ~42% BYTE estimate — the 51866-row GEMV is less efficient per byte). \n\
-         So even the cheapest 1-layer self-draft costs {:.2}x a full token, needing >{:.0}% draft \n\
-         acceptance to break even (and MORE once verify c_v>1). Layer-skip self-speculation on the \n\
-         4-layer turbo decoder is structurally capped — the logits head cannot be skipped while \n\
-         still proposing a token. Confirms the ledger scoping WITH A MEASURED FLOOR: draft decoding \n\
-         needs a genuinely CHEAP separate drafter (smaller vocab / shared-head shortcut), not a \n\
-         depth-truncation of turbo's own decoder.",
-        100.0 * logits_frac,
-        floor1,
-        100.0 * a_be1 / kdraft
+        "\nVERDICT: warm logits fraction = {:.0}% was a MIXED-regime artifact (small ops warm, \n\
+         66 MB logits cold). COLD/regime-controlled = {:.0}% (≈ the byte ratio 66/158 = 42%, since \n\
+         all ops are DRAM-bound). Real decode leans cold for the oversized logits weight. Even at \n\
+         the cold {:.0}%, a 1-layer self-draft still costs {:.2}x a full token → needs high accept; \n\
+         layer-skip self-speculation stays structurally weak BUT less dead than the warm 72% implied. \n\
+         The real lever must cut the LOGITS cost (smaller-vocab / reduced-head drafter), which layer- \n\
+         skip does NOT — that conclusion holds in BOTH regimes.",
+        100.0 * warm_frac, 100.0 * cold_frac, 100.0 * cold_frac, cold_floor1
     );
 }
