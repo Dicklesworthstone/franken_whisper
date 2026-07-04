@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → int8 SDPA (encoder attention) MEASURED-DEAD (scores 0.14x, out 0.77x) — closes the encoder int8-compute frontier
+
+**Ratio vs OpenAI-Whisper: UNCHANGED.** A measured negative dig on the biggest IMPROVABLE remaining
+encoder gap. With the linear GEMMs now int8 (~2x f32, near compute-ceiling, 469cebb), the SDPA is the
+largest remaining encoder compute (~26% of the reduced encoder). Sized whether int8 attention is worth
+un-fusing the external f32 SDPA for — using the same maddubs-7bit probe that de-risked the GEMM.
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe`, per-head SDPA shapes, d_head=64, best-of-40):**
+
+| SDPA matmul | shape | f32 | widening | maddubs-7bit |
+|-------------|-------|-----|----------|--------------|
+| scores (Q@K^T) | [1500,64]×[64,1500] | 0.3 ms | 0.08× | **0.14× (6× SLOWER)** |
+| out (probs@V) | [1500,1500]×[1500,64] | 0.3 ms | 0.47× | **0.77× (SLOWER)** |
+
+**Verdict — int8 SDPA is DEAD, opposite of the MLP GEMMs.** Root cause: the SDPA matmuls have
+`d_head=64` as a SMALL dimension, so they are thin/bandwidth-bound and the f32 path is ALREADY tiny
+(0.3 ms/head — matrixmultiply handles thin-K/thin-N efficiently; the real FUSED external SDPA is faster
+still). int8's win comes from compute DENSITY on LARGE dims (MLP K/N = 1280-5120), but at d_head=64 the
+per-dot maddubs setup + activation-quantize + sign-offset + dequant overhead EXCEEDS the tiny f32 time,
+and accuracy is worse (relerr 0.009 scores vs 0.002 MLP, fewer elems per quant group). scores is
+additionally OUTPUT-bandwidth-bound (writing the [1500,1500] score matrix), which int8 doesn't shrink.
+
+**Consequence — the encoder int8-compute frontier is now COMPLETE/CLOSED:** the 6 linear GEMMs are
+int8'd (~2x f32, ~88% of the maddubs compute ceiling, gated 469cebb) and the SDPA is int8-dead. No
+further encoder int8 lever exists; the SDPA stays at its f32/external-fused ceiling. Remaining encoder
+levers are all non-int8 + owner/infra (GPU, ToMe). Probe committed with the SDPA shapes for
+reproducibility. sat_diff=0 (maddubs integer-exact even here); the ~0-gain int8-SDPA variant is NOT
+wired (reverted per directive). No BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: FOLLOW-ON WIN (integer-EXACT) — 4-accumulator `dot_maddubs_i7` lifts the landed int8 encoder GEMM 1.56→2.02x f32 (fc1/fc2 ~2x); e2e jfk 1.30→1.48x, transcript BYTE-IDENTICAL
 
 **Ratio vs OpenAI-Whisper: ~1.6-2.4x when FRANKEN_WHISPER_ENC_INT8=1 (up from ~1.5-2.2x last cycle).**
