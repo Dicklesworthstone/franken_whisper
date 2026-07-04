@@ -816,6 +816,11 @@ pub struct DecoderState {
     /// per-token DRAM read of the encoder K/V. See [`int8_cross_kv_enabled`].
     cross_kh_i8: Vec<nn::I8Mat>,
     cross_vh_i8: Vec<nn::I8Mat>,
+    /// BLOCK-WISE int8 copy of `cross_vh_f16` (per head), built when
+    /// [`cross_v_block_enabled`] is on. Empty ⇒ the per-row `cross_vh_i8` (or f16)
+    /// V path runs. Finer enc-frames scales than `cross_vh_i8` + f32 activation via
+    /// [`nn::gemv_i8w_f32a_blocked`]. See [`cross_v_block_enabled`].
+    cross_vh_i8_block: Vec<nn::I8BlockMat>,
     /// Number of tokens currently in the self-attention cache.
     len: usize,
     /// Number of encoder frames (cross-attention key/value length).
@@ -1052,6 +1057,21 @@ impl DecoderState {
             (Vec::new(), Vec::new())
         };
 
+        // Block-wise int8 V (FW_CROSS_V_BLOCK): finer enc-frames scales than the
+        // per-row `cross_vh_i8` (which uses ONE scale per output-dim over all
+        // enc_frames — coarse). Block=32 matches whisper.cpp Q8_0. Only when the
+        // int8 f16 cross path is active; the per-token GEMV keeps softmax weights f32.
+        const CROSS_V_BLOCK: usize = 32;
+        let cross_vh_i8_block: Vec<nn::I8BlockMat> =
+            if cross_v_block_enabled() && int8_cross_kv_enabled() && cross_f16_enabled() {
+                cross_vh_f16
+                    .par_iter()
+                    .map(|v| nn::quantize_f16_to_i8_blocked(v, d_head, enc_frames, CROSS_V_BLOCK))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
         Ok(Self {
             kv,
             cross_kh_t,
@@ -1060,6 +1080,7 @@ impl DecoderState {
             cross_vh_f16,
             cross_kh_i8,
             cross_vh_i8,
+            cross_vh_i8_block,
             len: 0,
             enc_frames,
             n_state: w.n_state,
@@ -1236,6 +1257,16 @@ fn cross_kv_i8_slice(all: &[nn::I8Mat], h0: usize, n_head: usize) -> &[nn::I8Mat
     }
 }
 
+/// Band slice for the block-wise cross-V cache (empty ⇒ empty). See
+/// [`cross_v_block_enabled`].
+fn cross_vblock_slice(all: &[nn::I8BlockMat], h0: usize, n_head: usize) -> &[nn::I8BlockMat] {
+    if all.is_empty() {
+        &[]
+    } else {
+        &all[h0..h0 + n_head]
+    }
+}
+
 /// Whether to int8/Q8 the window-constant cross-attention K/V (encoder keys and
 /// values) on the per-token decode path. The encoder K/V (~30 MB f16 for turbo)
 /// are read in full every decode token, so they are DRAM-resident and int8 halves
@@ -1264,6 +1295,32 @@ fn int8_cross_kv_enabled() -> bool {
     })
 }
 
+/// Whether to quantize the window-constant cross-attention **V** cache BLOCK-WISE
+/// (`nn::quantize_f16_to_i8_blocked` along the enc-frames contraction) and run its
+/// per-token GEMV via [`nn::gemv_i8w_f32a_blocked`] (block-int8 weight × **f32**
+/// softmax activation) instead of the per-row [`nn::gemv_i8`]. `FW_CROSS_V_BLOCK`,
+/// default OFF = byte-identical (the block cache is empty ⇒ the existing int8/f16
+/// V path runs). WHY: the plain int8 V uses ONE scale per output-dim spanning ALL
+/// ~1500 encoder frames (`quantize_f16_to_i8(v, d_head, enc_frames)`), so a single
+/// outlier frame wrecks the resolution of every calm frame — MEASURED as the
+/// dominant decoder int8 faithfulness cost (sjobs int8-vs-f16 gap 312→43 when the
+/// whole cross-KV is f16; K is already fine at per-row-64). Block scales along
+/// enc-frames + keeping the softmax weights f32 recovers that precision at ~int8
+/// DRAM bandwidth (the int8 V bytes are unchanged; only a few % more scale floats).
+fn cross_v_block_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_CROSS_V_BLOCK")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cross_attention(
     q: &Mat,
@@ -1273,6 +1330,7 @@ fn cross_attention(
     cross_vh_f16: &[Vec<Float16>],
     cross_kh_i8: &[nn::I8Mat],
     cross_vh_i8: &[nn::I8Mat],
+    cross_vh_i8_block: &[nn::I8BlockMat],
     tk: usize,
     n_head: usize,
     record: bool,
@@ -1345,7 +1403,11 @@ fn cross_attention(
                 let mut sm = Mat::from_vec(1, tk, srow);
                 nn::softmax_rows(&mut sm);
                 let mut oh = nn::gemv_out_buf(d_head);
-                if use_i8 {
+                if !cross_vh_i8_block.is_empty() {
+                    // Block-int8 V weight × f32 softmax weights (FW_CROSS_V_BLOCK):
+                    // finer enc-frames scales + no activation quant. K stays int8.
+                    nn::gemv_i8w_f32a_blocked(&cross_vh_i8_block[h], &sm.data, None, &mut oh);
+                } else if use_i8 {
                     nn::gemv_i8(&cross_vh_i8[h], &sm.data, None, &mut oh);
                 } else {
                     nn::gemv_f16(&cross_vh_f16[h], d_head, tk, &sm.data, None, &mut oh);
@@ -1589,6 +1651,7 @@ pub fn forward_step(
                 &st.cross_vh_f16[h0..h0 + w.n_head],
                 cross_kv_i8_slice(&st.cross_kh_i8, h0, w.n_head),
                 cross_kv_i8_slice(&st.cross_vh_i8, h0, w.n_head),
+                cross_vblock_slice(&st.cross_vh_i8_block, h0, w.n_head),
                 st.enc_frames,
                 w.n_head,
                 st.record_cross_attn,

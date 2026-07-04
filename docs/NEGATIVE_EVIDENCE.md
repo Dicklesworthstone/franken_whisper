@@ -4,6 +4,46 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LAND (major faithfulness WIN) — BLOCK-WISE cross-attention V cache (`FW_CROSS_V_BLOCK`) eliminates ~94% of the DEFAULT-ON decoder int8 gap on BOTH clips at ~int8 bandwidth. Found by MEASURING per-sub-path gap attribution.
+
+**Ratio vs ORIG: speed ~UNCHANGED (~1.2× ts / ~1.68-1.8× no_ts vs OpenAI-Whisper/whisper.cpp) — block-int8 V weight
+is the SAME byte count as the per-row int8 V (only a few % more scale floats + a tiny f32 scores vector), and the
+per-token GEMV uses the fc2-proven [`nn::gemv_i8w_f32a_blocked`] kernel; the cross-V read is DRAM-bandwidth-bound
+so the int8-vs-f32 arithmetic is hidden. The WIN is a DEFAULT-PATH FAITHFULNESS leap.** Method (no-build DIAGNOSTIC
+first, using the shipped per-sub-path int8 kill-switches): attributed the decoder int8 gap (word-diffs vs the
+f32-decoder golden ≈ whisper.cpp's f16 reference) to each int8 sub-path by setting ONE to f32 at a time. Result:
+```
+  sub-path → f32     track01 (from 32)   sjobs_16k (from 312, 13-min diverse)
+  logits              13  (helps)         391  (HURTS — errors partially CANCEL, clip-dependent)
+  mlp/fc1             16  (helps)         376  (HURTS)
+  attn/qkv            16  (helps)         324  (hurts)
+  cross_kv            13  (helps)          43  (HELPS -269 !!)   <- dominant, clip-INVARIANT
+```
+Only **cross_kv** helps BOTH clips, and dominates: it is 86% of the sjobs gap. (Note the OTHER paths are clip-
+dependent — logits-f32 HELPS track01 but HURTS sjobs — because int8 errors partially cancel; this is why targeted
+per-path f32 / top-K-logits-rescore is NOT a clean lever, and why the earlier per-row EF (uniform bias reduction)
+was the only clean win.) ROOT CAUSE in the code: the cross-V is quantized `quantize_f16_to_i8(v, d_head, enc_frames)`
+= ONE scale per output-dim spanning ALL ~1500 encoder frames, so a single outlier frame wrecks the resolution of
+every calm frame (K is already fine: per-key-row over just d_head=64). FIX: quantize V BLOCK-WISE along enc-frames
+(block=32, whisper.cpp Q8_0) and run its GEMV as block-int8-weight × **f32** softmax activation (no activation quant).
+MEASURED (gated `FW_CROSS_V_BLOCK`, vs the f32-decoder golden):
+```
+  scheme                    track01      sjobs_16k (13-min diverse)
+  int8 plain (default)       32           312
+  int8 + block-V             4  (-87.5%)   19  (-93.9%)      <- BOTH clips, ~94% of the gap removed
+  f16 cross-KV (ceiling)     13            43                <- block-V BEATS f16 (f32 act > f16 dot)
+```
+block-V beats even the f16 cross-KV ceiling because block-int8-weight + f32-activation is more precise than f16-V +
+f16-dot. Byte-identity: `FW_CROSS_V_BLOCK`-OFF (default) BYTE-IDENTICAL to the int8-plain baseline on track01+jfk_x3
+(the block cache is empty ⇒ the existing int8 V path runs) — conformance GREEN. LANDED gated default-off (a validated,
+~zero-cost, opt-in faithfulness leap for the default-on int8 decoder), a STRONG promotion candidate to default
+(owner-gated: it changes the shipped transcript toward f32/wc, so it needs a decode-span speed A/B + a wc comparison).
+Code: `decoder.rs` `cross_vh_i8_block` field + `cross_v_block_enabled()` + the block build + the `gemv_i8w_f32a_blocked`
+V branch. A/B harness `scratchpad/crossv_ab.sh`. LESSON: the "decoder int8 gap" was NOT diffuse — MEASURING per-path
+attribution located 86% of it in one coarse-scale cache; the quantization GRANULARITY of a large per-token-resident
+ACTIVATION cache (not just weights) is a first-class faithfulness lever.
+
+---
 ## 2026-07-04 - BlackThrush: SHORT per-crate dig measured `chunk_frames` copy baseline - no ORIG-ratio win to land
 
 **Ratio vs ORIG: UNCHANGED / NO NEW WIN.** No runtime files changed. The fresh
