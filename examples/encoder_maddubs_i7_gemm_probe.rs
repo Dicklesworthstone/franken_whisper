@@ -183,6 +183,106 @@ fn dot_ref(a: &[u8], w: &[i8]) -> i32 {
     a.iter().zip(w).map(|(&x, &y)| (x as i32) * (y as i32)).sum()
 }
 
+/// Symmetric per-row 5-bit (amax/15, clamp [-15,15]) weight quant. i5 pair-sums stay
+/// <= 7650 (u8*i5) so up to 4 maddubs results can accumulate in int16 before widening.
+fn quant_rows_i5(b: &[f32], rows: usize, k: usize) -> (Vec<i8>, Vec<f32>, Vec<i32>) {
+    let mut q = vec![0i8; rows * k];
+    let mut sc = vec![0.0f32; rows];
+    let mut wsum = vec![0i32; rows];
+    q.par_chunks_mut(k).zip(sc.par_iter_mut()).zip(wsum.par_iter_mut()).enumerate()
+        .for_each(|(r, ((qr, s), ws))| {
+            let row = &b[r * k..(r + 1) * k];
+            let amax = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let scale = amax / 15.0;
+            *s = scale;
+            let inv = 1.0 / scale;
+            let mut acc = 0i32;
+            for (d, &x) in qr.iter_mut().zip(row) {
+                let v = (x * inv).round().clamp(-15.0, 15.0) as i32;
+                *d = v as i8;
+                acc += v;
+            }
+            *ws = acc;
+        });
+    (q, sc, wsum)
+}
+
+/// i5 maddubs dot with DELAYED widening: accumulate 4 maddubs pair-sum vectors in
+/// int16 (each <= 7650, 4x <= 30600 < 32767 = no overflow) before one madd widen to
+/// i32. Cuts multiply-port ops from 2/chunk (maddubs+madd) to ~1.25/chunk => ~1.6x
+/// the i7 kernel IF multiply-port-bound. 4 (acc16,acc32) accumulator pairs for ILP;
+/// widen every 4th chunk per accumulator (128-elem outer unroll, 512-elem widen).
+#[cfg(target_arch = "x86_64")]
+unsafe fn dot_maddubs_i5d(a: &[u8], w: &[i8], k: usize) -> i32 {
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut a16 = [_mm256_setzero_si256(); 4];
+        let mut a32 = [_mm256_setzero_si256(); 4];
+        let ap = a.as_ptr();
+        let wp = w.as_ptr();
+        let md = |o: usize| {
+            _mm256_maddubs_epi16(
+                _mm256_loadu_si256(ap.add(o) as *const __m256i),
+                _mm256_loadu_si256(wp.add(o) as *const __m256i),
+            )
+        };
+        let mut x = 0;
+        let mut fills = 0; // how many chunks accumulated into each a16
+        while x + 128 <= k {
+            a16[0] = _mm256_add_epi16(a16[0], md(x));
+            a16[1] = _mm256_add_epi16(a16[1], md(x + 32));
+            a16[2] = _mm256_add_epi16(a16[2], md(x + 64));
+            a16[3] = _mm256_add_epi16(a16[3], md(x + 96));
+            fills += 1;
+            if fills == 4 {
+                for i in 0..4 {
+                    a32[i] = _mm256_add_epi32(a32[i], _mm256_madd_epi16(a16[i], ones));
+                    a16[i] = _mm256_setzero_si256();
+                }
+                fills = 0;
+            }
+            x += 128;
+        }
+        // fold any partially-filled a16
+        for i in 0..4 {
+            a32[i] = _mm256_add_epi32(a32[i], _mm256_madd_epi16(a16[i], ones));
+        }
+        let mut acc = _mm256_add_epi32(_mm256_add_epi32(a32[0], a32[1]), _mm256_add_epi32(a32[2], a32[3]));
+        // tail chunks of 32 (widen each immediately)
+        while x + 32 <= k {
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(md(x), ones));
+            x += 32;
+        }
+        let mut t = [0i32; 8];
+        _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, acc);
+        let mut s: i32 = t.iter().sum();
+        while x < k {
+            s += (a[x] as i32) * (w[x] as i32);
+            x += 1;
+        }
+        s
+    }
+}
+
+fn gemm_maddubs_i5d(
+    qa: &[u8], sa: &[f32], qw: &[i8], sw: &[f32], wsum: &[i32], m: usize, k: usize, n: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
+        let arow = &qa[i * k..(i + 1) * k];
+        let sai = sa[i];
+        for o in 0..n {
+            let wrow = &qw[o * k..(o + 1) * k];
+            #[cfg(target_arch = "x86_64")]
+            let raw = unsafe { dot_maddubs_i5d(arow, wrow, k) };
+            #[cfg(not(target_arch = "x86_64"))]
+            let raw = dot_ref(arow, wrow);
+            crow[o] = (raw - 128 * wsum[o]) as f32 * sai * sw[o];
+        }
+    });
+    c
+}
+
 /// AVX2 maddubs dot: sum_x a[x](u8) * w[x](i7). maddubs -> i16 pair-sums (non-saturating for i7),
 /// widened to i32 via madd(_, ones) then accumulated. Returns sum over the FULL u8*i7 products
 /// (the -128*sum(w) sign-offset is applied by the caller).
@@ -756,6 +856,8 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
     // maddubs 7-bit: A->u8, weight(bt)->i7
     let (qa_u8, sa_u8) = quant_rows_u8(&a, m, k);
     let (qw_i7, sw_i7, wsum) = quant_rows_i7(&bt, n, k);
+    // maddubs 5-bit (delayed-widening): weight(bt)->i5
+    let (qw_i5, sw_i5, wsum5) = quant_rows_i5(&bt, n, k);
 
     // saturation proof: maddubs dot == exact ref dot (row 0 x a few output cols)
     let mut sat_diff: i64 = 0;
@@ -849,20 +951,43 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
         l2_diff = l2_diff.max((x - y).abs());
     }
 
+    // i5 delayed-widening (5-bit weights; NON-bit-identical to i7 — separate quant level)
+    let ci5 = gemm_maddubs_i5d(&qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, m, k, n);
+    for _ in 0..3 {
+        black_box(gemm_maddubs_i5d(&qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, m, k, n));
+    }
+    let mut best_i5 = f64::INFINITY;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let r = gemm_maddubs_i5d(&qa_u8, &sa_u8, &qw_i5, &sw_i5, &wsum5, m, k, n);
+        best_i5 = best_i5.min(t0.elapsed().as_secs_f64());
+        black_box(r);
+    }
+    // i5-delayed saturation proof: dot == exact ref over i5 weights (no int16 overflow)
+    let mut sat5: i64 = 0;
+    for o in 0..n.min(32) {
+        let wrow = &qw_i5[o * k..(o + 1) * k];
+        #[cfg(target_arch = "x86_64")]
+        let got = unsafe { dot_maddubs_i5d(&qa_u8[0..k], wrow, k) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let got = dot_ref(&qa_u8[0..k], wrow);
+        sat5 = sat5.max(((got - dot_ref(&qa_u8[0..k], wrow)) as i64).abs());
+    }
+
     let err_wide = max_rel_err(&cwide, &cf32.data);
     let err_mad = max_rel_err(&cmad, &cf32.data);
+    let err_i5 = max_rel_err(&ci5, &cf32.data);
     println!(
-        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  mad4 {:.2}x  m4n2 {:.2}x ({:.2}vs4)  L2 {:.1}ms {:.2}x ({:.2}vs-m4n2)  | diffs m4={m4_diff:.0} m8={m8_diff:.0} m4n2={m4n2_diff:.0} L2={l2_diff:.0} relmad={:.3}",
+        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  m4n2 {:.2}x  i5d {:.1}ms {:.2}x ({:.2}vs-m4n2)  | sat5={sat5} L2={l2_diff:.0} m8={m8_diff:.0} m4n2diff={m4n2_diff:.0} relmad(i7)={:.4} relmad(i5)={:.4}",
         best_f32 * 1e3,
-        best_f32 / best_mad4,
         best_f32 / best_m4n2,
-        best_mad4 / best_m4n2,
-        best_l2 * 1e3,
-        best_f32 / best_l2,
-        best_m4n2 / best_l2,
+        best_i5 * 1e3,
+        best_f32 / best_i5,
+        best_m4n2 / best_i5,
         err_mad,
+        err_i5,
     );
-    let _ = (best_wide, err_wide, best_mad, best_mad8);
+    let _ = (best_wide, err_wide, best_mad, best_mad8, best_mad4, best_l2);
 }
 
 fn main() {

@@ -4,6 +4,41 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG → i5 delayed-widening maddubs MEASURED-DEAD (0.56-0.83x vs M4xN2-i7) — delayed widening's 2x accumulators conflict with register blocking
+
+**Ratio vs ORIG: UNCHANGED (measured negative).** Attacked the ONE remaining int8 encoder GEMM compute
+lever: the `madd(maddubs(a,w),ones)` widening is a full multiply-port op done EVERY 32-elem chunk purely
+to avoid int16 overflow. With i7 weights (u8*i7 pair-sum <= 32130) you can't defer it; with **i5 weights
+(+-15, pair-sum <= 7650) up to 4 maddubs results accumulate in int16** before one widen => multiply-port
+ops drop 2/chunk -> ~1.25/chunk (~1.6x theoretical). whisper.cpp's Q5 proves 5-bit weight quality is
+viable. Built `dot_maddubs_i5d` (4 (i16,i32)-accumulator pairs, widen every 4th chunk; sat5=0 = no
+overflow, integer-exact for the i5 quant).
+
+**MEASURED (`encoder_maddubs_i7_gemm_probe`, i5d-vs-M4xN2, 3 runs, load ~54):**
+
+| GEMM | shape | M4xN2-i7 | i5-delayed | i5d-vs-M4xN2 | relerr i7 | relerr i5 |
+|------|-------|----------|-----------|--------------|-----------|-----------|
+| proj | [1500,1280]x[1280,1280] | 1.20-1.68x | 1.07-1.35x | 0.71-1.13x (~0.85x) | 0.0016 | 0.0053 |
+| fc1  | [1500,1280]x[1280,5120] | 1.28-1.79x | 0.82-1.01x | **0.56-0.64x LOSS** | 0.0018 | 0.0071 |
+| fc2  | [1500,5120]x[5120,1280] | 2.45-4.26x | 1.57-2.68x | 0.63-0.83x LOSS | 0.0008 | 0.0034 |
+
+**Verdict — i5 delayed-widening DEAD, for a STRUCTURAL reason.** Delayed widening needs TWO accumulators
+per lane (an i16 to accumulate pair-sums + an i32 to fold into) to defer the madd. The M4xN2 kernel
+already spends 8 of Zen3's 16 ymm registers on accumulators; adding delayed widening would need 16
+accumulators ALONE, leaving no registers for weights/activations => it is INCOMPATIBLE with the M4xN2
+register-blocking that provides the dominant win. The only i5-delayed form that fits registers is M1 (no
+blocking), and it LOSES to M4xN2-i7 by 0.56-0.83x because it sacrifices the blocking. The 1.6x
+multiply-port saving is real but MUTUALLY EXCLUSIVE with the >1.3x register-blocking saving on a 16-ymm
+budget, and register blocking is the bigger lever (all prior measurements). i5 also costs 3-4x accuracy
+(relerr 0.005-0.007 vs i7 0.001-0.002) => quality regression on the gated path. **CONFIRMS M4xN2-i7 is the
+OPTIMAL point in the int8 encoder GEMM design space; the maddubs compute ceiling is real and the madd
+widening overhead is irreducible without VNNI (vpdpbusd does u8*i8->i32 in ONE op, no widening, no
+accumulator doubling).** Probe keeps the i5d variant; not wired (~0-gain/loss reverted per directive). No
+BlackThrush win unlanded. LESSON: multiply-port-frequency and register-blocking both want the ymm file;
+on AVX2 (16 ymm) you get one, and blocking wins.
+
+---
+
 ## 2026-07-04 - BlackThrush: DIG → encoder activation-quantize AVX2 vectorization = MEASURED SUB-NOISE (1.10-1.24x isolated, memory-bound) — decode's 5x round-fix does NOT transfer
 
 **Ratio vs ORIG: UNCHANGED (measured negative).** matmul_bias_i7 (my int8 encoder GEMM, nn.rs:740)
