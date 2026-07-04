@@ -729,9 +729,46 @@ fn header_ftype_ok(path: &Path) -> bool {
 /// to `1` when parallelism cannot be queried. Callers should plumb
 /// `BackendParams.threads` through and only fall back to this when unset;
 /// `RAYON_NUM_THREADS` still overrides the pool entirely.
+///
+/// NOTE (Threadripper / high-core hosts): the `min(32)` above was the ENCODER
+/// optimum (encoder_scale_probe, sequential). But the e2e is decoder-dominated
+/// (~87%) and, with **window pipelining** on by default (no_timestamps — the
+/// prefetch encoder of window N+1 runs CONCURRENTLY with the decode of window N
+/// on this shared pool), 32 threads makes the compute-bound encoder and the
+/// bandwidth-bound decoder contend and serialize. Sizing the pool to the host's
+/// PHYSICAL core count lets both phases overlap — measured consistently ~15–23%
+/// faster e2e on a 64-core Threadripper 5995WX (large-v3-turbo), and the
+/// concurrent_pipeline_probe confirms ~54% reclaim of the smaller phase. SMT
+/// siblings only add bandwidth/scheduling contention on this memory-bound work,
+/// so we count physical cores, not logical. Hosts ≤32 logical are unchanged;
+/// `RAYON_NUM_THREADS` / `BackendParams.threads` still override entirely.
 #[must_use]
 pub fn default_threads() -> usize {
-    host_parallelism().min(32)
+    let host = host_parallelism();
+    if host <= 32 {
+        return host;
+    }
+    physical_cores().unwrap_or(host).max(32)
+}
+
+/// Physical core count (SMT-aware), or `None` if it can't be determined.
+///
+/// On Linux, `cpu0`'s `thread_siblings_list` gives threads-per-core directly, so
+/// `physical = logical / threads_per_core`. On other targets (and if the sysfs
+/// read fails) returns `None`; the caller then uses logical parallelism, which is
+/// correct on a non-SMT host. Queried once via [`host_parallelism`]'s cache path.
+fn physical_cores() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let sibs =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
+                .ok()?;
+        let tpc = sibs.trim().split([',', '-']).filter(|s| !s.is_empty()).count();
+        if tpc >= 1 {
+            return Some((host_parallelism() / tpc).max(1));
+        }
+    }
+    None
 }
 
 /// Host parallelism, queried ONCE and cached for the process.
