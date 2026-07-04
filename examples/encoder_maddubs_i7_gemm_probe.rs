@@ -191,6 +191,126 @@ fn gemm_maddubs(
     c
 }
 
+/// M4-blocked maddubs dot: 4 activation rows vs ONE weight row, the weight loaded
+/// ONCE per 32-elem chunk (cuts weight L3 re-reads 4x). Same compute op-count and
+/// same 4-independent-chain ILP as the M1 4-accumulator dot, so a speedup isolates
+/// WEIGHT-STREAMING bandwidth as the bottleneck (compute-bound => neutral). Each
+/// output is bit-identical to `dot_maddubs` (same i32 accumulation set).
+#[cfg(target_arch = "x86_64")]
+unsafe fn dot_maddubs_m4(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w: &[i8], k: usize) -> [i32; 4] {
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut acc2 = _mm256_setzero_si256();
+        let mut acc3 = _mm256_setzero_si256();
+        let (p0, p1, p2, p3, pw) =
+            (a0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), w.as_ptr());
+        let mut x = 0;
+        while x + 32 <= k {
+            let wv = _mm256_loadu_si256(pw.add(x) as *const __m256i);
+            acc0 = _mm256_add_epi32(
+                acc0,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p0.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            acc1 = _mm256_add_epi32(
+                acc1,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p1.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            acc2 = _mm256_add_epi32(
+                acc2,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p2.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            acc3 = _mm256_add_epi32(
+                acc3,
+                _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_loadu_si256(p3.add(x) as *const __m256i), wv),
+                    ones,
+                ),
+            );
+            x += 32;
+        }
+        let hsum = |acc: __m256i| -> i32 {
+            let mut t = [0i32; 8];
+            _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, acc);
+            t.iter().sum()
+        };
+        let mut r = [hsum(acc0), hsum(acc1), hsum(acc2), hsum(acc3)];
+        while x < k {
+            let wx = w[x] as i32;
+            r[0] += (a0[x] as i32) * wx;
+            r[1] += (a1[x] as i32) * wx;
+            r[2] += (a2[x] as i32) * wx;
+            r[3] += (a3[x] as i32) * wx;
+            x += 1;
+        }
+        r
+    }
+}
+
+/// M4-blocked maddubs GEMM: process activation rows in blocks of 4, streaming each
+/// weight row once per block. Bit-identical output to `gemm_maddubs`.
+fn gemm_maddubs_m4(
+    qa: &[u8],
+    sa: &[f32],
+    qw: &[i8],
+    sw: &[f32],
+    wsum: &[i32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    c.par_chunks_mut(4 * n).enumerate().for_each(|(blk, cblk)| {
+        let r0 = blk * 4;
+        let rows = (m - r0).min(4);
+        if rows == 4 {
+            let a0 = &qa[r0 * k..(r0 + 1) * k];
+            let a1 = &qa[(r0 + 1) * k..(r0 + 2) * k];
+            let a2 = &qa[(r0 + 2) * k..(r0 + 3) * k];
+            let a3 = &qa[(r0 + 3) * k..(r0 + 4) * k];
+            for o in 0..n {
+                let wrow = &qw[o * k..(o + 1) * k];
+                #[cfg(target_arch = "x86_64")]
+                let raw = unsafe { dot_maddubs_m4(a0, a1, a2, a3, wrow, k) };
+                #[cfg(not(target_arch = "x86_64"))]
+                let raw = [
+                    dot_ref(a0, wrow),
+                    dot_ref(a1, wrow),
+                    dot_ref(a2, wrow),
+                    dot_ref(a3, wrow),
+                ];
+                let off = 128 * wsum[o];
+                for (j, &rj) in raw.iter().enumerate() {
+                    cblk[j * n + o] = (rj - off) as f32 * sa[r0 + j] * sw[o];
+                }
+            }
+        } else {
+            for j in 0..rows {
+                let arow = &qa[(r0 + j) * k..(r0 + j + 1) * k];
+                for o in 0..n {
+                    let wrow = &qw[o * k..(o + 1) * k];
+                    #[cfg(target_arch = "x86_64")]
+                    let raw = unsafe { dot_maddubs(arow, wrow, k) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let raw = dot_ref(arow, wrow);
+                    cblk[j * n + o] = (raw - 128 * wsum[o]) as f32 * sa[r0 + j] * sw[o];
+                }
+            }
+        }
+    });
+    c
+}
+
 fn max_rel_err(a: &[f32], b: &[f32]) -> f32 {
     let mut m = 0.0f32;
     for (&x, &y) in a.iter().zip(b) {
@@ -298,15 +418,35 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
         black_box(r);
     }
 
+    // M4-blocked maddubs (weight loaded once per 4 activation rows)
+    let cmad4 = gemm_maddubs_m4(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+    for _ in 0..3 {
+        black_box(gemm_maddubs_m4(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n));
+    }
+    let mut best_mad4 = f64::INFINITY;
+    for _ in 0..iters {
+        let t0 = Instant::now();
+        let r = gemm_maddubs_m4(&qa_u8, &sa_u8, &qw_i7, &sw_i7, &wsum, m, k, n);
+        best_mad4 = best_mad4.min(t0.elapsed().as_secs_f64());
+        black_box(r);
+    }
+    // bit-identity: M4 must equal M1 maddubs exactly (same i32 accumulation set)
+    let mut m4_diff = 0.0f32;
+    for (&x, &y) in cmad4.iter().zip(&cmad) {
+        m4_diff = m4_diff.max((x - y).abs());
+    }
+
     let err_wide = max_rel_err(&cwide, &cf32.data);
     let err_mad = max_rel_err(&cmad, &cf32.data);
     println!(
-        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  wide {:.1}ms ({:.2}x)  maddubs7 {:.1}ms ({:.2}x)  | sat_diff={sat_diff} relerr wide={:.3} mad={:.3}",
+        "{name:<12} [{m},{k}]x[{k},{n}]  f32 {:.1}ms  wide {:.2}x  mad1 {:.1}ms ({:.2}x)  mad4 {:.1}ms ({:.2}x, {:.2}x-vs-m1)  | sat={sat_diff} m4_diff={m4_diff:.0} relerr wide={:.3} mad={:.3}",
         best_f32 * 1e3,
-        best_wide * 1e3,
         best_f32 / best_wide,
         best_mad * 1e3,
         best_f32 / best_mad,
+        best_mad4 * 1e3,
+        best_f32 / best_mad4,
+        best_mad / best_mad4,
         err_wide,
         err_mad,
     );
