@@ -4,6 +4,42 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LAND-OR-DIG AUDIT after `e806b38` — no unlanded measured worktree win; remaining frontier is owner/infra-blocked, not a solo in-crate lever
+
+**Ratio vs ORIG: UNCHANGED.** Latest shipped `main` evidence still stands: `FRANKEN_WHISPER_ENC_INT8=1`
+is ~1.6-2.4x vs OpenAI-Whisper on the measured path after the 4-accumulator maddubs encoder GEMM;
+vs whisper.cpp (the original C++ line) the current ledger remains contention-dependent (0.90x-1.22x
+in the interleaved track01 runs). This entry lands no speed claim because no new variant exists to
+bench honestly.
+
+**Land branch checked:** the apparent measured worktree wins are already on `origin/main`:
+`8996fcb` (gated maddubs encoder), `469cebb` (4-accumulator maddubs), and the freshly pulled
+`e806b38` (int8 SDPA measured-dead). Repo worktrees and the external `/data/projects/.scratch` /
+`/data/projects/.worktrees` pools contain no franken_whisper measured win missing from main; the
+remaining local non-main branches are reject/stale lanes, not shippable wins. Agent Mail registration
+is blocked by the existing malformed SQLite archive, so no lease artifact was possible this turn.
+
+**Dig branch checked without re-running covered benches:** the biggest measured gap is still the
+encoder-dominated path. Linear encoder GEMMs are already at the maddubs/i7 ceiling when gated
+(`469cebb`); encoder SDPA int8 is now measured slower (scores 0.14x, out 0.77x, `e806b38`);
+logits GEMV row-skip/int4/more-MLP paths are measured dead; self-attn SIMD was implemented, A/B'd,
+and reverted as transcript-unsafe; draft-model-free speculation is measured dead. The alien-graveyard /
+alien-artifact / extreme-optimization sweep therefore leaves only the same non-solo levers:
+
+| Remaining lever | Current blocker |
+|-----------------|-----------------|
+| GPU encoder/offload | No local compute stack available (`nvidia-smi`, `nvcc`, `vulkaninfo`, `clinfo` absent); Linux CUDA/OpenCL/Vulkan setup is owner/infra. |
+| AVX-512/VNNI int8 encoder microkernel | Host is Threadripper PRO 5975WX with AVX2/F16C/FMA but no AVX-512/VNNI flags. |
+| Real draft/speculative decode | Requires an owner-supplied cheap multilingual draft model sharing the turbo vocab; no on-box model satisfies it. |
+| ToMe/token merging or other FLOP-reduction | Non-byte-exact quality tradeoff on already-distilled turbo; prior depth/layer pruning was quality-fatal. |
+
+**Blocker surfaced:** no conformance-green, solo-landable-in-60-minutes radical lever remains in this
+repo checkout. The next real move requires owner/infra input: provide a GPU compute stack, provide a
+compatible draft model, provide VNNI hardware, or approve a non-byte-exact quality experiment. No code
+changed; no new bench was run because the only candidate ratios are already covered above and the
+directive explicitly says to stop re-verifying covered work. `AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-04 - BlackThrush: DIG → int8 SDPA (encoder attention) MEASURED-DEAD (scores 0.14x, out 0.77x) — closes the encoder int8-compute frontier
 
 **Ratio vs OpenAI-Whisper: UNCHANGED.** A measured negative dig on the biggest IMPROVABLE remaining
