@@ -4,6 +4,44 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: NON-TEMPORAL logits load to keep decoder weights L3-resident is DEAD — PREFETCHNTA does NOT protect residency on Zen3 (MEASURED)
+
+**Ratio vs ORIG: UNCHANGED (measured negative, no engine change).** The one un-probed structural decode
+lever: per token the decode reads the ~92 MB int8 decoder-layer weights, then the 66 MB logits weight; the
+logits read has NO reuse within a token yet its 66 MB stream EVICTS the reusable decoder weights from L3
+(decode weight working set ~158 MB > ~128 MB total L3, ledger 2026-07-05 line ~1267). IF the logits could be
+streamed WITHOUT polluting L3 (non-temporal loads / PREFETCHNTA), the decoder weights would stay resident
+across tokens ⇒ less per-token DRAM traffic, byte-exact, default-on. The open question grep never found tried:
+**can Zen3 actually stream-without-evict?** Tested it directly with a cache-residency microbench
+(`examples/nta_residency_probe.rs`): allocate R (24 MB, the resident target, < one CCD's 32 MB L3) + S (96 MB,
+the streaming logits, > L3), then measure R's read bandwidth after streaming S two ways.
+
+**MEASURED (`nta_residency_probe 40`, single-thread, 2 runs, load ~60 — the RELATIVE comparison is the
+load-robust signal, cache-residency not throughput):**
+```
+  R warm (L3-resident)              22.8 / 22.8 GB/s
+  R after normal-S read (baseline)  17.0 / 17.2 GB/s
+  R after PREFETCHNTA-S read        14.9 / 16.6 GB/s   (pollutes => lever dead)
+```
+**Two facts:** (1) the residency effect is REAL — keeping R warm is 22.8 vs 17.0 after S-pollution = **1.34×**
+on R's read, so evicting the decoder weights genuinely costs ~34% on the re-read. (2) But **PREFETCHNTA CANNOT
+capture it: R-after-NTA (14.9–16.6) is consistently ≤ R-after-normal (17.0–17.2)** — the NTA hint does NOT
+reduce L3 pollution on this Zen3, it only adds prefetch-instruction overhead. And **MOVNTDQA
+(`_mm256_stream_load`) is architecturally IGNORED on WB (write-back) memory** — the model weights are normal WB,
+so the NT-load hint is dropped to a plain cached load (it also #GP-faults on the 1-byte-aligned `Vec<i8>`, x86
+requires 32 B). So BOTH x86 non-temporal mechanisms fail: neither can "stream the logits without evicting the
+decoder weights" on Zen3.
+
+**Verdict — DEAD, mechanism does not exist.** Even had NTA worked, the payoff ceiling was modest (working set
+~158 MB is only ~1.23× total L3; the big logits GEMV already streams ~55 GB/s efficiently, and the small
+per-layer GEMVs are DISPATCH/overhead-bound ~18–30 GB/s cold, ledger line ~1267 — residency helps them least).
+But the mechanism itself is absent: x86 NT loads don't bypass WB caching and PREFETCHNTA doesn't shield L3 on
+Zen3. This closes the last structural decode-residency idea; the decode stays at its int8-weight bandwidth
+ceiling. Reinforces [[project_decode_structural_alloc]] and [[project_draft_decoding_amortization]] (the logits
+head is the only real decode lever, and shrinking it is owner-gated, not a cache trick). Harness kept:
+`examples/nta_residency_probe.rs`.
+
+---
 ## 2026-07-04 - BlackThrush: int8-ing the CONV STEM is DEAD (0.3% of encode + below the power-throttle threshold) — completes the encoder int8 coverage audit
 
 **Ratio vs ORIG: UNCHANGED (measured negative).** The power-throttle finding (2e08812: the int8 encoder
