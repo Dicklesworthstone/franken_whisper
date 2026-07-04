@@ -614,7 +614,7 @@ fn forward_time_major(
         }};
     }
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
-    let mut x = et!(0, {
+    let x = et!(0, {
         let mut x = nn::conv1d_wt(
             &x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
         )?;
@@ -1025,6 +1025,12 @@ mod tests {
                 mlp_fc_b: rng.vec(mlp_hidden, s),
                 mlp_proj_w: rng.mat(mlp_hidden, n_state, s),
                 mlp_proj_b: rng.vec(n_state, s),
+                attn_q_i7: None,
+                attn_k_i7: None,
+                attn_v_i7: None,
+                attn_out_i7: None,
+                mlp_fc_i7: None,
+                mlp_proj_i7: None,
             });
         }
 
