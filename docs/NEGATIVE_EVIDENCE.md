@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: REJECT the int8-encoder 48-thread default — the ~3% QUIET-box win INVERTS to a ~16% LOSS under shared-box load; keep the robust 32-thread (physical-core) default.
+
+**Ratio vs ORIG: NO CHANGE — the int8 encoder stays ~1.63× e2e on the 32-thread default; the proposed 48-thread
+int8 default is REVERTED. `default_threads()` is byte-identical to HEAD (no code shipped — this is measured
+negative evidence).** The int8 maddubs GEMM is compute/POWER-bound (unlike the memory-bound f32 sgemm), so on a
+QUIET box (load ~9) it has clock/power headroom the f32 path can't use, and SMT siblings up to ~1.5× physical help:
+interleaved best-of-3 measured t=48 12.69s vs t=32 13.06s median (~3% faster), byte-identical transcript. That
+looked landable, so I flipped `default_threads()` to return `(physical×3/2).min(host).max(32) = 48` when
+`enc_int8_enabled()`. A FRESH-BUILD re-verify under REALISTIC shared-box load (post-build, sibling `rch cargo bench`
+jobs live — this is a shared bench box) INVERTS the result:
+```
+  int8, track01, interleaved 3×, LOADED box (2026-07-04 15:17 fresh build)
+  new default (48 thr)   19.11 / 18.97 / 18.57   median 18.97s
+  forced 32 thr          16.12 / 16.35 / 16.86   median 16.35s   <- 32 WINS by ~16%
+  transcript: BYTE-IDENTICAL (thread count is a pure speed knob — integer maddubs dot, disjoint row partition)
+  f32 default unaffected: 21.94s
+```
+Under load, 48 threads OVER-SUBSCRIBE (cross-CCD + full-SMT contention) and lose ~16% to 32 — an asymmetric bet
+(risk −16% under load to gain +3% at idle) that is WRONG for a default. This is the SAME failure mode that reverted
+DECODE thread-tuning 3× (see `project_decode_overthreaded_rayon_lead`: "don't re-test threads except on a QUIET
+box"), now re-confirmed for the int8 ENCODER path specifically. The quiet-box 48 optimum is REAL but capturable
+only via an explicit `RAYON_NUM_THREADS=48` on an idle box; the shipped default stays 32 (physical cores), which is
+optimal-or-safe in BOTH regimes. NET: no code change (lever rejected); the encoder thread cap 16→32
+(`project_encoder_thread_cap_win`) remains the durable, load-robust setting. LESSON: a thread-count "win" measured on
+a shared bench box MUST be re-verified under load before becoming a default — the quiet↔loaded regime flip is ~19
+percentage points here (from +3% to −16%).
+
+---
+
 ## 2026-07-04 - BlackThrush: PROMOTE error-feedback weight quant to the int8-encoder DEFAULT (validated strictly ≥ plain int8, zero speed cost) + kill-switch `FW_ENC_EF_QUANT=0`; corrected the EF-activations root cause in the entry below.
 
 **Ratio vs ORIG: int8 encoder ~1.5× e2e UNCHANGED (EF is load-time-only, zero e2e cost — CONFIRMED below); the f32
