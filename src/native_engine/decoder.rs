@@ -1167,6 +1167,51 @@ fn cross_scores_keep_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_CROSS_SCORES_KEEP").is_some())
 }
 
+// ── Layer-skip self-draft ACCEPT-RATE probe (BlackThrush, measurement-only) ──
+// `FW_DRAFT_ACCEPT_LAYERS=k` (default UNSET = OFF, zero overhead, byte-identical):
+// on single-token decode steps, compute the k-layer EARLY-EXIT argmax (apply the
+// final LN + tied logits head to the hidden state after k of the 4 decoder layers)
+// and compare it to the FULL-model argmax. The match fraction = the layer-skip
+// self-draft ACCEPT RATE — the last un-measured input to draft-model-FREE
+// speculative decode ([[project_draft_decoding_amortization]]: cost floor 0.47× at
+// k=1, break-even ~47% accept; 2-layer 0.65×/65%; 3-layer 0.82×/82%). Speculative
+// decode is BYTE-EXACT (the target verifies every proposed token), so accept >
+// break-even ⇒ a real byte-exact decode win worth building. Raw-argmax proxy
+// (ignores `process_logits` masking, which almost never changes a text-token argmax).
+static DRAFT_ACCEPT_MATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DRAFT_ACCEPT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn draft_accept_layers() -> Option<usize> {
+    use std::sync::OnceLock;
+    static K: OnceLock<Option<usize>> = OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("FW_DRAFT_ACCEPT_LAYERS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&k| k >= 1)
+    })
+}
+/// Read + reset the `(matches, total)` layer-skip self-draft accept counters
+/// accumulated by [`forward_step`] when `FW_DRAFT_ACCEPT_LAYERS` is set.
+pub fn drain_draft_accept() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        DRAFT_ACCEPT_MATCH.swap(0, Relaxed),
+        DRAFT_ACCEPT_TOTAL.swap(0, Relaxed),
+    )
+}
+/// First-index-of-max over raw logits (matches the greedy sampler's tie-break).
+fn logits_argmax_u32(l: &[f32]) -> u32 {
+    let mut bi = 0u32;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in l.iter().enumerate() {
+        if v > bv {
+            bv = v;
+            bi = i as u32;
+        }
+    }
+    bi
+}
+
 /// Per-layer head slice of the (optionally empty) int8 cross K/V. Empty vec (gate
 /// off) ⇒ `&[]`, which `cross_attention` reads as "use the f16 path".
 fn cross_kv_i8_slice(all: &[nn::I8Mat], h0: usize, n_head: usize) -> &[nn::I8Mat] {
@@ -1466,6 +1511,10 @@ pub fn forward_step(
     let cache_len = st.len;
     let mut x = timed!(Sub::Embed, embed_tokens(w, tokens, cache_len)?);
 
+    // Layer-skip self-draft accept probe (off unless FW_DRAFT_ACCEPT_LAYERS set).
+    let draft_k = draft_accept_layers();
+    let mut draft_arg: Option<u32> = None;
+
     if st.record_cross_attn {
         st.cross_attn_weights.clear();
     }
@@ -1544,6 +1593,16 @@ pub fn forward_step(
             add_into(&mut x, &ff);
         });
 
+        // Early-exit self-draft argmax after k layers (measurement-only; single-
+        // token decode steps only, so prefill is excluded).
+        if tokens.len() == 1 && draft_k == Some(li + 1) {
+            let mut xd = x.clone();
+            w.ln.apply(&mut xd);
+            let last = xd.rows - 1;
+            let xd_last = Mat::from_vec(1, w.n_state, xd.row(last).to_vec());
+            draft_arg = Some(logits_argmax_u32(&logits_last(w, &xd_last)?));
+        }
+
         // Per-layer cancellation point (nn kernels are uncancellable).
         if li + 1 < w.layers.len() {
             checkpoint()?;
@@ -1557,7 +1616,16 @@ pub fn forward_step(
     timed!(Sub::FinalLn, w.ln.apply(&mut x));
     let last = x.rows - 1;
     let x_last = Mat::from_vec(1, w.n_state, x.row(last).to_vec());
-    timed!(Sub::Logits, logits_last(w, &x_last))
+    let logits = timed!(Sub::Logits, logits_last(w, &x_last))?;
+    // Record the self-draft accept comparison (early-exit vs full argmax).
+    if let Some(da) = draft_arg {
+        use std::sync::atomic::Ordering::Relaxed;
+        DRAFT_ACCEPT_TOTAL.fetch_add(1, Relaxed);
+        if da == logits_argmax_u32(&logits) {
+            DRAFT_ACCEPT_MATCH.fetch_add(1, Relaxed);
+        }
+    }
+    Ok(logits)
 }
 
 /// Tied output projection for a single position.

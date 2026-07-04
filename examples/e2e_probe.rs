@@ -116,6 +116,15 @@ fn main() {
         eprintln!("  {:<18} {:>8.1} ms (forward_step total)", "SUM", total as f64 / 1e6);
     }
 
+    // Layer-skip self-draft accept rate (only when FW_DRAFT_ACCEPT_LAYERS is set).
+    if let Ok(k) = std::env::var("FW_DRAFT_ACCEPT_LAYERS") {
+        let (m, tot) = franken_whisper::native_engine::decoder::drain_draft_accept();
+        let pct = if tot > 0 { 100.0 * m as f64 / tot as f64 } else { 0.0 };
+        eprintln!(
+            "DRAFT_ACCEPT k={k} layers: {m}/{tot} decode steps matched full argmax = {pct:.1}% accept"
+        );
+    }
+
     let chars: usize = out.segments.iter().map(|s| s.text.len()).sum();
     if std::env::var("PROBE_DUMP_TEXT").as_deref() == Ok("1") {
         let full: String = out.segments.iter().map(|s| s.text.as_str()).collect();

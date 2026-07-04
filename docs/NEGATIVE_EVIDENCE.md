@@ -4,6 +4,44 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: layer-skip self-draft ACCEPT RATE MEASURED = 0% / 0% / 11.8% (k=1/2/3) → draft-model-FREE speculative decode is DEAD (last open leg of the #1 owner-gated decode lever, closed)
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — a default-OFF gated
+measurement hook, byte-identical (jfk×1 ts golden re-verified with the probe binary).
+
+**Closed the ONE open leg the draft-decoding analysis explicitly left** ([[project_draft_decoding_amortization]]):
+verify-side ceiling R(K)≈3.7× (measured), PLD free-variant dead for ASR (measured), draft-side
+COST floor 0.47× @ k=1 / break-even ~47% accept (measured) — but the layer-skip self-draft ACCEPT
+RATE itself was never measured (prior entries said accept rate is "un-measurable on-box" — true for
+a separate draft MODEL, but a SELF-draft early-exit accept needs only the turbo model, now that the
+cache is GREEN). Speculative decode is BYTE-EXACT (target verifies every token), so accept >
+break-even would have been a real byte-exact decode win.
+
+**Measured it (new gated hook `FW_DRAFT_ACCEPT_LAYERS=k` in decoder.rs `forward_step`, default-off
+byte-identical + `drain_draft_accept()` read by e2e_probe):** on each single-token decode step,
+compute the k-layer EARLY-EXIT argmax (final LN + tied logits head applied to the hidden state
+after k of the 4 decoder layers) and compare to the FULL-model argmax; match fraction = accept rate.
+
+| draft layers k | jfk×1 (28 steps) | track01 124s (306 steps) | break-even (cost floor) | verdict |
+|----------------|------------------|--------------------------|-------------------------|---------|
+| **k=1** | 0/28 = **0.0%** | 0/306 = **0.0%**  | 47% (0.47×) | DEAD |
+| **k=2** | 0/28 = **0.0%** | 0/306 = **0.0%**  | 65% (0.65×) | DEAD |
+| **k=3** | 3/28 = 10.7%    | 36/306 = **11.8%**| 82% (0.82×) | DEAD |
+
+**VERDICT: layer-skip / draft-model-FREE speculative decode is CONCLUSIVELY DEAD on turbo.** The
+accept rate (0–11.8%) is nowhere near break-even (47–82%). Mechanism: turbo is DISTILLED 32→4
+layers, so every one of the 4 layers does critical work AND the final LN + logits head were trained
+for the 4-layer output distribution — applying them to an earlier hidden state yields an argmax that
+almost never matches (k=1/2 literally NEVER over 334 steps). A 1-layer draft that never accepts
+cannot amortize anything.
+
+**Owner decision-surface update (supersedes the "draft decode" row of d250fe7):** draft/speculative
+decode's ONLY path is a REAL trained draft model sharing turbo's multilingual vocab (tiny.en is
+English-only vocab ⇒ incompatible; NONE on-box) + the speculate/verify/rollback loop. The
+draft-model-free shortcut is now measured-dead, not just "weak." No BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: CANONICAL alien-graveyard catalog SWEPT vs the measured profile → NO un-tried byte-exact lever; CPU frontier CLOSED; owner/infra decision surface consolidated
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** Grounded dig, no engine
