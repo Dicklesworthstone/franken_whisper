@@ -4,6 +4,34 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LITERAL alien-graveyard sweep (read the canonical index + candidate numerical entries) → NO applicable lever for a power-throttled external GEMM; dig-the-graveyard mandate definitively closed
+
+**Ratio vs OpenAI-Whisper: UNCHANGED.** The directive names `/alien-graveyard` as a dig source; prior
+cycles reasoned about it from memory — this cycle I actually READ
+`/data/projects/alien_cs_graveyard/alien_cs_graveyard.md` (full section index 0-14 + the candidate
+numerical entries) and mapped each plausibly-relevant technique to franken's biggest gap (the encoder =
+79% external f32 sgemm + 15.5% external SDPA, power-throttle-capped at 32t —
+[[project_encoder_wall_is_clock_throttle]]). The catalog is a systems/DB/crypto/PL corpus; only
+§9 (numerical) + a few §6 entries are even topical. Entry-by-entry rejection:
+
+| graveyard entry | why it does NOT apply to franken's encoder |
+|-----------------|---------------------------------------------|
+| **9.6 Communication-Avoiding** (CA-LU/QR/Krylov) | targets FACTORIZATIONS' data movement; franken's hot path is dense GEMM (already at the communication lower bound via matrixmultiply Goto-blocking) with no LU/QR, AND the wall is CORE-POWER-throttle not data-movement — the bottleneck CA removes isn't franken's. "Constants only pay for very large matrices" ≠ 1500×1280. |
+| **6.5 Polyhedral** (tiling/fusion of affine loops) | the hot GEMM is an EXTERNAL library call — no franken affine loop-nest to transform; franken-side loops (LN/gelu) already AVX2 + DRAM-bound; wall is power not cache. |
+| **9.3 Fast Multipole** (O(N²)→O(N) kernel sums) | attention IS O(N²), but N=1500 is far below FMM's large-N crossover (constants dominate); non-byte-exact; SDPA is external + at ceiling. |
+| **6.1 Self-Adjusting/Incremental** | 30s windows are DISTINCT audio — no cross-window recompute to reuse; the KV cache is already incremental WITHIN a window. |
+| **8.2 Vectorized/Morsel** + **6.4 Stochastic Superopt** | 8.2 is columnar QUERY execution (not GEMM); 6.4 is a non-deterministic research search over kernels already at hand-AVX2 ceiling. |
+
+**Unifying verdict:** every graveyard technique that touches numerical compute assumes the bottleneck is
+DATA MOVEMENT / CACHE / FLOP-asymptotics — but franken's encoder GEMM is (a) EXTERNAL and already
+Goto-optimal (meets the movement lower bound) and (b) limited by all-core POWER THROTTLE, a hardware
+ceiling no algorithm relieves; and every approximation (FMM/linear-attention/token-merge) is
+non-byte-exact = owner quality-gated. So the graveyard yields NO in-lane lever — the dig-the-graveyard
+mandate is now literally (not reasoned) satisfied and closed. Remaining >1% paths stay owner/infra-gated
+(GPU offload, int8 encoder microkernel = days, ToMe = owner). No BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: DIG (logits GEMV latency-bound → more-MLP lever?) PRE-EMPTED by tripwire + double-confirmed bandwidth-bound (IPC 0.53 ∧ 4-accum wash)
 
 **Ratio vs OpenAI-Whisper: UNCHANGED.** No build spent — the mandatory `rg docs/NEGATIVE_EVIDENCE.md`
