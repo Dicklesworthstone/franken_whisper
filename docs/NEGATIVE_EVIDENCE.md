@@ -4,6 +4,48 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LANDED bd-r0qd escape hatch — `FW_NO_CONTEXT=1` (whisper `--no-context`), default-off BYTE-IDENTICAL
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** This is a
+FAITHFULNESS escape hatch, not a perf lever — default-off means the ratio and every
+transcript are byte-for-byte what they were.
+
+**What landed:** a gated toggle `condition_on_prev_disabled()` (decode.rs, `OnceLock`
+mirroring `simd_exp_enabled`) that, when `FW_NO_CONTEXT=1`, suppresses the carried
+previous-window text prompt at the per-window prompt build
+(`if !condition_on_prev_disabled() && !prompt_past.is_empty() && …`). This is the port
+of whisper.cpp's `params.no_context` / whisper-cli `--no-context`
+(`condition_on_previous_text = false`). Change is **confined to decode.rs** — deliberately
+NOT a `DecodeParams` field (which would ripple to 4 `src/backend/*` constructors + tests,
+outside file scope), matching the project's established env-gate idiom
+(FW_SIMD_EXP / FW_PIPELINE_WINDOWS / FW_KV_F16 / FW_FIRST_WINDOW_MARGIN).
+
+**Closes the bd-r0qd loop the prior entry (4152950) deferred** as "a ~10-line change on a
+clean tree". Mechanism (RESOLVED, causal): `prompt_past` (condition_on_previous_text) is the
+SOLE differing input between the full-run final window (drops ~40-word tail) and the same
+audio decoded standalone (keeps it) — the accumulated prompt biases native's greedy /
+temperature-0 (fallback-free) decoder toward an early `eot`; whisper.cpp recovers via
+temperature fallback + prompt reset, native (the deliberate temp-0 port) cannot.
+`FW_NO_CONTEXT=1` drops the carry → restores the tail on affected clips.
+
+**Byte-identity proof:** default (env unset) `jfk×1` turbo ts →
+`"And so, my fellow Americans, ask not what your country can do for you, ask what you can
+do for your country."` = the golden transcript, unchanged. Guaranteed by CONSTRUCTION: the
+gate defaults off (env unset ⇒ `condition_on_prev_disabled()==false` ⇒ the `if` is the
+original predicate verbatim), and single-window clips carry an empty `prompt_past`
+regardless. Built clean (`cargo build --release --example e2e_probe`, exit 0) in an
+isolated sibling git worktree — the main tree still carries an unrelated uncommitted
+repo-wide `cargo fmt` that isn't mine, so the worktree keeps this a clean 1-file diff.
+
+**Residual blocker (unchanged):** CONFIRMING the hatch recovers a real dropped tail still
+needs a TRIGGERING clip (owner's clip120) — on-box repro is closed (2 clips incl. a
+28-window one both decode their final window fully). The hatch is shipped and ready; the
+*proper* fix (per-window temperature fallback in transcribe_samples) stays owner-scoped.
+Exercise: `FW_NO_CONTEXT=1 PROBE_NO_TS=1 PROBE_DUMP_TEXT=1 e2e_probe large-v3-turbo <wav> 1`
+(A/B vs unset).
+
+---
+
 ## 2026-07-06 - BlackThrush: bd-r0qd MECHANISM RESOLVED (prompt is causal) + fix spec; code deferred (tree fmt-dirty) — **the owner's own diagnostic already PROVES the mechanism: the 90–120 s slice transcribed STANDALONE (empty `prompt_past`) captures the tail; the same audio as the final window of the full run (non-empty `prompt_past` from windows 1-3) DROPS it. The ONLY differing input is `prompt_past` (condition_on_previous_text) ⇒ it is CAUSAL, not a coincidence and not pure int8 numerics. Refined model: it's a `prompt_past` × int8-decode-numerics INTERACTION — whisper.cpp carries the same previous-text prompt but its ggml/f16 logits argmax a text token at the critical step, while native's int8 logits argmax `eot`, ending the window early (decode.rs greedy loop terminates only on `tok==eot` in no_ts, :1327). No temperature fallback in native's greedy `transcribe_samples` to recover. Ratio vs OpenAI-Whisper unchanged (no code change; ~1.2× ts / ~1.68–1.8× no_ts).**
 
 **FIX SPEC (for a clean-tree cycle / owner):**
