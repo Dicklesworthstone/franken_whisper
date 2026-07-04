@@ -4,6 +4,44 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: head-to-head ratio INVERTS across 1.0 on box load (0.90x-1.22x) — INTERLEAVED method corrects last cycle's "1.22x floor"; no quotable current-build ratio from this shared box
+
+**Ratio vs whisper.cpp (the original): CONTENTION-DOMINATED, not a fixed number.** Last cycle
+(52fb1cb) quoted "1.22x no_ts floor" from SEQUENTIAL best-of-N at load ~17. This cycle applied the
+DOCUMENTED-CORRECT method — INTERLEAVE the two engines run-by-run so time-varying load hits both
+adjacent (realistic-workload memory line 224) — and it revealed the "floor" framing was wrong: the
+ratio doesn't just get suppressed under load, it **INVERTS**.
+
+**MEASURED (track01_16k.wav 124.5s real speech, matched `-t 32`, interleaved fw/wc adjacent, no_ts):**
+
+| load (1-min) | franken | whisper.cpp | ratio wc/fw | winner |
+|--------------|---------|-------------|-------------|--------|
+| ~17 (52fb1cb, seq) | 20.3 s | 24.8 s | **1.22x** | franken |
+| ~56 (this, interleaved) | 59.5 s | 53.5 s | **0.90x** | whisper.cpp |
+| ~86 (this, interleaved) | 57.5 s | 56.0 s | **0.97x** | ~tie |
+
+**Mechanism:** franken drives up to 32 rayon threads regardless of system load; whisper.cpp uses
+`-t 32` OpenMP. On a SATURATED box (load 56-86, ~22 sibling build procs), franken's rayon
+oversubscribes HARDER than whisper's OpenMP, so franken loses the very int8-decode + pipelining edge
+that wins on a quiet box. Both engines also run ~3x slower under load (RTF ~0.16 quiet -> ~0.45
+saturated). This is the same contention-sensitivity documented in [[project_decode_overthreaded_rayon_lead]]
+(franken decode: rayon-16/32 vs wc OpenMP-4/32) — and the decode thread-count adaptation lever there
+is already CLOSED (d43c499, 3 reverts, load-dependent ~0-gain, un-settleable on a shared box).
+
+**Consequence — this is the definitive close of the head-to-head-measurement question on THIS box:**
+there is NO single quotable current-build ratio; it swings **0.90x-1.22x purely on ambient load**.
+franken's genuine advantage (measured 1.22x quiet, consistent with the documented interleaved
+b8a8069 1.27x and 2c58bf0 realistic ~1.2x) only manifests on a QUIET or core-count-matched box; on a
+saturated shared box franken is ~tied-to-behind. **The blocker is now fully characterized: a true
+quiet-box head-to-head is INFEASIBLE while the box bounces load 8->100 (it has done so every cycle
+this session), and interleaving corrects time-varying load but NOT franken's differential
+oversubscription penalty.** Owner action to get a real number: run the head-to-head on a quiet box
+(or cap concurrent agents). DON'T re-measure the head-to-head on this box — the swing is now mapped;
+every point in between is contention noise. Every >1% CODE lever remains owner/infra-gated; no
+BlackThrush win sits unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: FRESH current-build head-to-head vs whisper.cpp (the original) — franken 1.22x faster no_ts FLOOR on real 124.5s speech, equivalent transcript; contention caps a cleaner number
 
 **Ratio vs OpenAI-Whisper/whisper.cpp: MEASURED THIS CYCLE (not cited from the stale 2c58bf0
