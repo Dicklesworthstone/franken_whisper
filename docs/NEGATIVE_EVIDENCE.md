@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: CLOSE the SDPA gather transpose (loop-order + tiling axes) — the ~18 GB/s apparent rate is a cold/DRAM-latency floor, NOT an optimizable inefficiency. No byte-exact lever.
+
+**Ratio vs ORIG: NO CHANGE — encoder stays at its external-kernel ceiling; the SDPA gather has no in-crate
+byte-exact win. `nn.rs` untouched.** A fresh sub-op profile (`FRANKEN_WHISPER_PERF_SPANS`, turbo, track01) put the
+encoder at ~77% of e2e — of which the four f32 GEMMs (qkv 18.7% + attn_out 6.5% + mlp_fc 22.8% + mlp_proj 23.9% =
+~72%) and `sdpa_kernel` (~18%) are ALL external (`matrixmultiply` / `ft_kernel_cpu::sdpa_forward_f32`). The one
+in-crate encoder op that *looked* optimizable was `sdpa_gather_head_major` (nn.rs): 80 ms/window moving ~15 MB per
+call at only ~18 GB/s — 5–10× below DRAM peak. [[project_sdpa_gather_threadcount_lead]] had settled the CHUNK COUNT
+(default 16) but never tested the transpose ALGORITHM. I dug two new axes (`examples/gather_transpose_probe.rs`,
+byte-identical output asserted for every variant):
+
+1. **Loop order (dest-order vs source-order-contiguous-reads vs tiled).** WARM single-thread, source-order (v1,
+   contiguous src rows) is ~1.3× faster than the current dest-order (v0: 0.16 ms vs 0.21 ms) — but this is a pure
+   L2/prefetch artifact. COLD (cache evicted between reps — the REAL in-engine regime, since `src` is the QKV GEMM
+   output that gets evicted before the gather runs): v1 ≈ v0 (noisy 2.5–17% across runs, ≤ the DRAM-latency floor),
+   and tiled (v2) is WORSE cold. Read order is irrelevant once you're latency-bound on the strided src fetch.
+2. **Chunk count past 16** (in-engine `FW_SDPA_GATHER_CHUNKS` sweep, the authoritative COLD MT measurement):
+   gather 1→428 ms, 2→262, 4→158, 8→98, 16→79.9, 24→79.6, 32→85, 48→83, 64→79.3 — monotone to 16, then FLAT.
+   16 is optimal; the cold gather is parallelism-saturated there.
+
+CONCLUSION: the gather is cold/DRAM-latency-bound at ~80 ms/window and parallelism-saturated at the shipped default
+16 — there is no byte-exact algorithmic lever (loop-order = warm mirage, tiling = worse, more threads = flat). The
+low apparent GB/s is the transpose latency floor, not slack. This closes the loop-order/tiling axes that the prior
+gather entry left open. META (recurring): a warm reuse-loop microbench OVER-states data-movement wins — the standalone
+warm probe showed source-order 1.3× that vanished to noise COLD; always evict to the in-engine regime before trusting
+a transpose/streaming speedup (cf. the draft-decoding "measure COLD >L3" lesson).
+
+---
+
 ## 2026-07-04 - BlackThrush: REJECT the int8-encoder 48-thread default — the ~3% QUIET-box win INVERTS to a ~16% LOSS under shared-box load; keep the robust 32-thread (physical-core) default.
 
 **Ratio vs ORIG: NO CHANGE — the int8 encoder stays ~1.63× e2e on the 32-thread default; the proposed 48-thread
