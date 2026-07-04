@@ -4,6 +4,55 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LAND-OR-DIG pass blocked after clean-main audit — no unstaged work to commit, no unlanded measured worktree win, and the required short per-crate bench target is occupied by a live peer build
+
+**Ratio vs ORIG: UNCHANGED / NOT NEWLY MEASURED.** No runtime files changed in
+this pass, so the shipped ratio envelope remains whatever the currently landed
+mainline entries prove. This entry is a blocker record, not a speed claim.
+
+**Directive step 1.** `AGENT_NAME=BlackThrush git status --short --branch`
+reported `## main...origin/main`; there was no unstaged work to commit.
+Agent Mail registration/reservation was attempted for `docs/NEGATIVE_EVIDENCE.md`
+but the archive SQLite corruption circuit breaker still refused writes
+(`database disk image is malformed`), so no reservation artifact could be
+created.
+
+**Land branch audit.** `git worktree list --porcelain` still shows the same six
+HEADs not reachable from current `main`: `766f5f1` (docs-only OpenAI ratio),
+`db5f059` (f16c unroll8 reject), `4dd616f` (old `perf(mel): fuse simd
+projection` predecessor), `443bc4f`/`c902858` (log-mel stitch rejects), and
+`134f404` (old `perf(nn): fuse f16c gemv dot` predecessor). Current `main`
+already has the later mel path and the later `dot_f16c_2row` f16 GEMV path, so
+there is no measured scratch/worktree win to land.
+
+**Fresh dig attempt.** I did not re-run the covered audio lanes (`resample`,
+`downmix`, fused sanitize/downmix) or the closed model-gated `FW_NO_CONTEXT`
+work. I attempted the required short per-crate bench on a small model-free
+kernel with the requested target dir:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench -- native_engine/f16_gemv/f16_gemv_dequant_384x384 --sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`.
+RCH selected `vmi1227854`, timed out during project sync, fell back local, and
+Cargo rejected the exact spelling again: `error: unexpected argument '--release'
+found`.
+
+The supported release-profile retry:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod rch exec -- cargo bench -p franken_whisper --profile release --bench native_engine_bench -- native_engine/f16_gemv/f16_gemv_dequant_384x384 --sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`
+hit the same worker sync timeout, then fell back local and blocked on the Cargo
+build-directory lock. `ps` showed an already-live peer command using the exact
+same required target dir:
+`rch exec -- cargo bench -p franken_whisper --profile release --bench native_engine_bench -- window_to_time_major --sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`
+with its `cargo`/`rustc` children writing under
+`/data/projects/.rch-targets/whisper-cod/release`. I interrupted only my own
+blocked retry rather than killing peer work.
+
+**Verdict.** No code landed and no measured win was available to land. The
+current blocker is infrastructure contention on the exact required target dir
+plus flaky RCH sync to the selected worker; the honest ratio record for this
+pass is unchanged. Next useful action is to rerun a single uncovered,
+model-free bench after the existing `window_to_time_major` build releases the
+target lock, or force/repair RCH selection away from `vmi1227854` without
+disturbing other agents.
+
+---
 ## 2026-07-04 - BlackThrush: REJECT block-wise EF for the fc2/mlp_2 decoder int8 weight (`FW_DEC_EF_FC2`) — the per-row EF win does NOT transfer to the block-32 path: it helps the diverse sjobs clip but REGRESSES track01 AND destructively interferes with the already-landed per-row EF. EF carry-LENGTH matters, not just operand class. Code reverted (byte-identical to HEAD).
 
 **Ratio vs ORIG: NO CHANGE — decoder int8 default-on; f32/default byte-identical; `nn.rs`+`mod.rs` reverted to HEAD
