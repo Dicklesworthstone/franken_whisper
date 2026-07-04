@@ -4,6 +4,42 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: REJECT block-wise EF for the fc2/mlp_2 decoder int8 weight (`FW_DEC_EF_FC2`) — the per-row EF win does NOT transfer to the block-32 path: it helps the diverse sjobs clip but REGRESSES track01 AND destructively interferes with the already-landed per-row EF. EF carry-LENGTH matters, not just operand class. Code reverted (byte-identical to HEAD).
+
+**Ratio vs ORIG: NO CHANGE — decoder int8 default-on; f32/default byte-identical; `nn.rs`+`mod.rs` reverted to HEAD
+(no code shipped). Speed unchanged (~1.2× ts / ~1.68-1.8× no_ts vs OpenAI-Whisper/whisper.cpp).** Followed the
+operand-class rule from the per-row decoder-EF win ([[project_decoder_ef_win]], 360afea): "when a static-weight EF
+technique works for one int8 GEMM path, try it on the OTHER static-weight int8 paths." fc2/`mlp_2` is the ONE
+static decoder int8 weight `FW_DEC_EF` does NOT cover — it uses `quantize_f16_to_i8_blocked` (Q8_0-style block-32,
+per-block scale; a single per-row scale breaks turbo). Added a gated `FW_DEC_EF_FC2` that carries the rounding
+residual WITHIN each 32-col block (reset at block boundary since each block has its own scale). MEASURED
+(word-diffs vs the f32-DECODER golden; f32 encoder in every row so only decoder precision varies):
+```
+  scheme                              track01 (hard, 5win)    sjobs_16k (13-min diverse)
+  int8 plain (default)                 32                      312
+  per-row EF (FW_DEC_EF, LANDED)       20  (clean win)         301
+  fc2 block-EF only (FW_DEC_EF_FC2)    34  (+2 REGRESS)        280  (-32 improve)
+  per-row + fc2 (both flags on)        34  (= fc2-alone!)      279
+```
+Two disqualifiers: (1) **Not a clean win** — fc2-EF REGRESSES track01 (32→34, deterministic +2), unlike per-row EF
+which improved BOTH clips. (2) **Destructive interference** — the combined row (both flags on) gives track01=34,
+matching fc2-alone (34) NOT per-row-alone (20): fc2-EF DOMINATES and washes out per-row EF's clean track01 win
+(20→34). So fc2-EF cannot stack with the landed per-row lever; enabling it REPLACES the clean both-clips win with a
+track01-regressing, sjobs-only tradeoff. Byte-identity: `FW_DEC_EF_FC2`-OFF (default) BYTE-IDENTICAL to the int8-plain
+baseline on track01+jfk_x3 (inert when off) — the change was correctly gated, it's the ENABLED behavior that's a wash.
+
+**Mechanism / the refined rule: EF CARRY-LENGTH matters, not just operand class.** Per-row EF carries the residual
+across the FULL contraction dim (~1280-5120 elems) → a long, consistent bias-reduction that generalizes across
+clips (clean both-clips win). Block-32 EF RESETS the carry every 32 elems → a short, partial correction whose
+sign/magnitude depends on each block's weight structure → CLIP-DEPENDENT (helps diverse content, hurts the short
+hard clip) and strong enough to dominate the decode trajectory (masks per-row EF). So the operand-class rule
+("static weight ⇒ EF-stable") is necessary but NOT sufficient — the carry must span the full contraction to give a
+clean, clip-invariant win. Block-wise EF's short reset is the failure mode. Consistent with the session's LAND bar
+(only clean both-clips improvements land: per-row met it, fc2 didn't) and the "gate on whichever clip regresses"
+principle (MSE-clip/EF2/Hadamard regressed sjobs → rejected; fc2 regresses track01 + interferes → rejected).
+DON'T re-dig fc2 block-EF or other block-reset EF variants; the per-row (full-dim carry) is the right granularity.
+
+---
 ## 2026-07-04 - BlackThrush: LAND (validated WIN) — error-feedback weight quant for the DEFAULT-ON DECODER int8 (`FW_DEC_EF`), applying the proven encoder EF-weights scheme to the decoder's static per-row weights + cross-KV.
 
 **Ratio vs ORIG: UNCHANGED speed (~1.2× ts / ~1.68-1.8× no_ts vs OpenAI-Whisper/whisper.cpp) — EF is load-time
