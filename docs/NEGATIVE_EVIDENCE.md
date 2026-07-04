@@ -4,6 +4,36 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: REJECT 2nd-order error-feedback weight quant (NTF=(1−z⁻¹)²) for the int8 encoder — helps track01 (41→36) but REGRESSES the diverse 13-min sjobs (125→216). FINDING: **1st-order EF is a LOCAL OPTIMUM in noise-shaping order** — under-shape (plain) and over-shape (2nd-order) both regress sjobs. Code reverted (byte-identical to HEAD).
+
+**Ratio vs ORIG: NO CHANGE — int8 encoder ~1.5-1.63× e2e; f32 default byte-identical; `nn.rs`+`mod.rs` reverted to
+HEAD (no code shipped).** The landed EF-weights (the ONE int8-quality lever that helps: sjobs 179→125) is a 1st-order
+sigma-delta modulator — noise transfer function `NTF = 1 − z⁻¹`, one carried residual, which zeroes the DC component
+of the accumulated dot `Σ q_i·a_i`. I tested the natural extension: 2nd-order shaping `NTF = (1 − z⁻¹)²`, feedback
+`2·e_{i-1} − e_{i-2}` (a strictly steeper high-pass that removes more residual dot error IFF the along-channel
+activation spectrum is smoother-than-white). Gated `FW_ENC_EF2` (default off = 1st-order EF), load-time only, zero
+runtime cost, same i7 format ⇒ maddubs byte-unchanged. MEASURED (word-diffs vs f32 golden):
+```
+  noise-shaping order        track01 (hard, 5win)    sjobs_16k (13-min, diverse)
+  0 (plain round-nearest)    44 diffs                179 diffs
+  1 (EF, LANDED default)     41 diffs                125 diffs   <- OPTIMUM
+  2 (EF2, this test)         36 diffs (BETTER)       216 diffs   (+73% WORSE)
+```
+Byte-identity: EF2-OFF (default) BYTE-IDENTICAL to pre-change binary on track01+jfk_x3 (inert when off). VERDICT:
+**REJECTED.** track01 improved (41→36) but that is the same short-clip mirage that made EF-activations (41→37) and
+MSE-clip look good before sjobs killed them — sjobs is the robustness gate and EF2 regresses it +73%. **The valuable
+finding: 1st-order EF is a LOCAL OPTIMUM along the noise-shaping-ORDER axis** — order-0 (under-shaped, 179) and order-2
+(over-shaped, 216) are BOTH worse on sjobs than order-1 (125). Mechanism: 1st-order carries exactly enough shaping to
+null the DC dot error; 2nd-order's steeper NTF has larger transient error EXCURSIONS (a well-known property of
+higher-order ΔΣ modulators), and over a 1280/5120-element contraction dim × 32 layers those excursions compound into
+MORE accumulated error on long audio than the DC term they remove. This CLOSES the noise-shaping-order axis (0/1/2 all
+measured; 1 is optimal) — do NOT try higher-order or leaky-integrator EF variants; the EF gain is saturated at
+1st-order. Combined with EF-activations (dead) and MSE-clip (dead, entry below), the int8-encoder weight-quant quality
+space is exhausted: EF-weights-1st-order is the only win, and its residual gap is the intrinsic maddubs/u8-activation
+floor ([[project_turbo_encoder_dominates]]). Code reverted; owner-gated int8 quality gap unmoved.
+
+---
+
 ## 2026-07-04 - BlackThrush: REJECT MSE-optimal weight CLIPPING for the int8 encoder — neutral on track01, REGRESSES the diverse 13-min sjobs (125→201 diffs). Same failure mode as EF-activations; the one standard int8 quality technique missing from the ledger is now measured DEAD. Code reverted (byte-identical to HEAD).
 
 **Ratio vs ORIG: NO CHANGE — int8 encoder stays ~1.5-1.63× e2e; f32 default path byte-identical; `nn.rs`+`mod.rs`
