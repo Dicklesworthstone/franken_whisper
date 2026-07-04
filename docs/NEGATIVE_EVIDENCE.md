@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: reduced-head decode lever CHARACTERIZED (measured vocab usage) → modest ~1.5-2% e2e ts, non-byte-exact, owner-scoped (the last un-measured decode direction)
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** Measurement-only
+(existing `PROBE_DUMP_TOKENS` hook, default-off byte-identical; no engine change).
+
+**Dug the ONE surviving decode-lever direction the ledger flagged but never measured** — "a
+smaller-vocab / reduced-head drafter strictly dominates a pure layer-skip" (self-draft entries
+above): the 51866×1280 tied logits GEMV is the single biggest per-token decode op (~19-29% of
+decode), and turbo's vocab is MULTILINGUAL (~100 languages), so an English-only workload never
+needs the non-Latin-script tokens — a reduced/masked logits head would shrink that GEMV.
+
+**MEASURED the observed vocab usage** (PROBE_DUMP_TOKENS over jfk×3 + track01 124s tech-demo,
+ts+no_ts, 462 emitted text tokens): only **142 UNIQUE text token ids of 50257** (0.28%); 95% / 99%
+of emissions covered by just **119 / 138** unique tokens.
+
+**But this is a SEVERE small-sample undercount, NOT the reduced-head ceiling** — 462 narrow-topic
+tokens (a speech + a tech monologue) cannot characterize English coverage (digits in every form,
+punctuation, names, contractions, rare words). A PRODUCTION-safe English reduced-head needs a
+PRINCIPLED subset (Latin-script + digits + punct + specials), and whisper's vocab is English-heavy
+so the Latin portion is large — realistically only ~30-50% of the 50257 is safely skippable
+(the non-Latin CJK/Cyrillic/Arabic/Indic chunks). Ceiling: ~30-50% of the 66 MB logits GEMV ⇒
+~30-50% of the ~19-29% logits-of-decode ⇒ **~1.5-2% e2e ts (~0 no_ts — decode is pipeline-hidden,
+[[project_window_pipelining_lever]]).**
+
+**VERDICT: the reduced-head is a MODEST, NON-BYTE-EXACT, OWNER-SCOPED decode lever** (a masked
+token could in principle win the argmax ⇒ not byte-exact; needs a curated vocab mask + quality
+validation across all English registers). NOT an in-lane landable win. This closes the last
+un-measured decode direction: draft-model-free is measured-dead (1b0be65), layer-skip dead, and
+the reduced-head — the surviving direction — is a modest owner-scoped tradeoff, not a byte-exact
+win. Decode's only >1% path remains a real trained draft model (owner-supplied). No BlackThrush
+win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: CONFORMANCE GREEN certified on the NEW toolchain (nightly roll did NOT perturb byte-exactness) + ToMe-ceiling dig pre-empted by tripwire
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** No engine change.
