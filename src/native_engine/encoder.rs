@@ -914,7 +914,13 @@ fn enc_linear(
 ) -> FwResult<Mat> {
     match w_i7 {
         Some(w) => nn::matmul_bias_i7(x, w, bias),
-        None => nn::matmul_bias(x, w_t, bias),
+        None => match super::enc_act_roundtrip() {
+            // Feasibility harness: roundtrip the ACTIVATION through the int8 path's u8 quant
+            // (per-row or block-wise) before the f32 GEMM, isolating the activation-quant
+            // effect on the transcript. Default (None) = the true f32 path, byte-identical.
+            Some(block) => nn::matmul_bias(&nn::u8_act_roundtrip(x, block), w_t, bias),
+            None => nn::matmul_bias(x, w_t, bias),
+        },
     }
 }
 

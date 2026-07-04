@@ -348,6 +348,23 @@ pub(crate) fn enc_weight_roundtrip() -> Option<Option<usize>> {
     })
 }
 
+/// Feasibility harness (default OFF): `FW_ENC_ACT_ROUNDTRIP` roundtrips every f32 encoder GEMM's
+/// ACTIVATION input through the int8 path's u8 quant (symmetric `amax/127`) before the f32 matmul,
+/// isolating the ACTIVATION-quant effect on the transcript (does block-wise activation granularity
+/// recover the int8 encoder's proper-noun errors, or is it the u8 8-bit precision itself?).
+/// `Some(None)` = `row` (per-row scale = current int8), `Some(Some(n))` = n-channel block, `None` = off.
+pub(crate) fn enc_act_roundtrip() -> Option<Option<usize>> {
+    static V: OnceLock<Option<Option<usize>>> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("FW_ENC_ACT_ROUNDTRIP") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "off" => None,
+            "row" | "col" | "percol" | "perrow" => Some(None),
+            other => other.parse::<usize>().ok().filter(|&n| n > 0).map(Some),
+        },
+        Err(_) => None,
+    })
+}
+
 /// Whether to run the decoder **attention** input projections (fused self `qkv`
 /// and `cross_attn_q`) through the int8/Q8 GEMV on the per-token decode path
 /// (`tq == 1`). The output projections (`self_out`, `cross_out`) stay f16.
