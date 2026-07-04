@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: REJECTED sha256 lowercase-hex table encoder (orchestrator replay hashes) — 0.83-1.01x vs ORIG formatter, dropped
+
+**Ratio vs ORIG formatter path: LOSS/NOISE.** Tried a radical but behavior-preserving micro lever on the
+orchestrator replay/evidence hash renderer: replace `format!("{:x}", Sha256::finalize())` with a fixed
+lowercase hex lookup table. Hypothesis was that bypassing formatting machinery would help small replay
+payload hashes. Alien contract: state = digest byte slice; action = formatter vs table renderer;
+loss = elapsed ns/iter with bit-identical lowercase hex required; fallback = original formatter path.
+
+**MEASURED remote (`ovh-a`, `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod`):**
+
+```bash
+RUSTFLAGS='--cap-lints=allow' rch exec -- cargo bench -p franken_whisper --profile release --bench pipeline_bench -- pipeline/sha256 --sample-size 20 --warm-up-time 0.2 --measurement-time 1.0 --output-format bencher --noplot
+```
+
+(`cargo bench --release` is not valid Cargo syntax in this repo's toolchain; the supported release-profile
+form above is the measured run. This exact syntax issue is already recorded below and was not re-verified.)
+
+| Bench | ORIG formatter | table renderer | speed ratio (ORIG/table) |
+|-------|----------------|----------------|---------------------------|
+| `pipeline/sha256` 1KB | 518 ns | 562 ns | **0.92x** |
+| `pipeline/sha256` 64KB | 28,347 ns | 28,409 ns | **1.00x** |
+| `pipeline/sha256` 1MB | 451,716 ns | 453,193 ns | **1.00x** |
+| `pipeline/sha256_json` 1 segment | 212 ns | 254 ns | **0.83x** |
+| `pipeline/sha256_json` 50 segments | 5,088 ns | 5,048 ns | **1.01x** |
+| `pipeline/sha256_json` 200 segments | 19,077 ns | 19,058 ns | **1.00x** |
+
+**Verdict:** drop. The only visible movement is small-payload regression; larger payloads are hashing or
+serde dominated and sit at noise. This is not a measured win vs ORIG and does not affect the
+OpenAI-Whisper/whisper.cpp ASR ratio. The table variant was removed from `src/orchestrator.rs` and
+`benches/pipeline_bench.rs`; no hash-rendering code from this dig remains. `AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-04 - BlackThrush: LANDED M4-register-blocked maddubs-i7 encoder GEMM = 1.11-1.31x over M1, BIT-IDENTICAL (weight-bandwidth lever)
 
 **Ratio vs OpenAI-Whisper/whisper.cpp: IMPROVED on the int8 encoder path (gated).** A NEW measured WIN
