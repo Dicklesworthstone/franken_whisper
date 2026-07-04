@@ -19,7 +19,10 @@ use franken_whisper::native_engine::mel::{self, FRAMES_PER_CHUNK, N_SAMPLES_30S,
 use std::time::Instant;
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(12);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
     let path = find_model_file("large-v3-turbo")
         .expect("set FRANKEN_WHISPER_MODEL_DIR to the dir holding ggml-large-v3-turbo.bin");
     let model = GgmlModel::load(&path)

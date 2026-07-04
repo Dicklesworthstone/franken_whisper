@@ -41,8 +41,8 @@ fn main() {
         .unwrap_or(100);
 
     let model_name = std::env::var("FW_PROBE_MODEL").unwrap_or_else(|_| "tiny.en".to_string());
-    let path = find_model_file(&model_name)
-        .expect("set FRANKEN_WHISPER_MODEL_DIR to the ggml models dir");
+    let path =
+        find_model_file(&model_name).expect("set FRANKEN_WHISPER_MODEL_DIR to the ggml models dir");
     let model = GgmlModel::load(&path)
         .and_then(LoadedModel::from_ggml)
         .expect("load model");
@@ -87,7 +87,9 @@ fn main() {
             st.reset();
             decoder::forward_step(w, &mut st, &prefill, &noop).expect("prefill");
             std::hint::black_box(
-                decoder::forward_step(w, &mut st, &batch, &noop).expect("step").len(),
+                decoder::forward_step(w, &mut st, &batch, &noop)
+                    .expect("step")
+                    .len(),
             );
         }
         let mut best = f64::INFINITY;

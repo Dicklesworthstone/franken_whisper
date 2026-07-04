@@ -402,16 +402,14 @@ pub(crate) fn int8_attn_enabled() -> bool {
 pub(crate) fn cross_proj_f32_enabled() -> bool {
     const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(
-        || match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
-            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" => true,
-                "0" | "false" | "off" | "no" => false,
-                _ => DEFAULT_ON,
-            },
-            Err(_) => DEFAULT_ON,
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            _ => DEFAULT_ON,
         },
-    )
+        Err(_) => DEFAULT_ON,
+    })
 }
 
 /// Route the prefill / multi-token (`tq > 1`) per-row-int8 projections through
@@ -618,8 +616,18 @@ fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
     // Best-first preference; unknown names sort last but stay eligible, so an
     // operator's custom `ggml-<x>.bin` is still used when it is all that exists.
     const PREF: &[&str] = &[
-        "large-v3-turbo", "large-v3", "large-v2", "large", "medium.en", "medium", "small.en",
-        "small", "base.en", "base", "tiny.en", "tiny",
+        "large-v3-turbo",
+        "large-v3",
+        "large-v2",
+        "large",
+        "medium.en",
+        "medium",
+        "small.en",
+        "small",
+        "base.en",
+        "base",
+        "tiny.en",
+        "tiny",
     ];
     for dir in dirs {
         let Ok(read_dir) = std::fs::read_dir(dir) else {
@@ -818,7 +826,11 @@ fn physical_cores() -> Option<usize> {
         let sibs =
             std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
                 .ok()?;
-        let tpc = sibs.trim().split([',', '-']).filter(|s| !s.is_empty()).count();
+        let tpc = sibs
+            .trim()
+            .split([',', '-'])
+            .filter(|s| !s.is_empty())
+            .count();
         if tpc >= 1 {
             return Some((host_parallelism() / tpc).max(1));
         }

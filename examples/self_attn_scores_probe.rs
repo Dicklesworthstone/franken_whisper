@@ -54,9 +54,18 @@ fn scores_swap(k: &[f32], qh_all: &[f32], scale: f32, tk: usize, out: &mut [f32]
     }
 }
 
-fn run(f: &dyn Fn(&[f32], &[f32], f32, usize, &mut [f32]), k: &[f32], qh: &[f32],
-       scale: f32, tk: usize, out: &mut [f32], iters: usize) -> f64 {
-    for _ in 0..5 { f(k, qh, scale, tk, out); }
+fn run(
+    f: &dyn Fn(&[f32], &[f32], f32, usize, &mut [f32]),
+    k: &[f32],
+    qh: &[f32],
+    scale: f32,
+    tk: usize,
+    out: &mut [f32],
+    iters: usize,
+) -> f64 {
+    for _ in 0..5 {
+        f(k, qh, scale, tk, out);
+    }
     let mut best = f64::INFINITY;
     for _ in 0..iters {
         let t = Instant::now();
@@ -68,25 +77,46 @@ fn run(f: &dyn Fn(&[f32], &[f32], f32, usize, &mut [f32]), k: &[f32], qh: &[f32]
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
     let scale = (D_HEAD as f32).powf(-0.25);
     let mut s = 0x243F_6A88_85A3_08D3u64;
-    let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) };
+    let mut nf = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5)
+    };
     let qh: Vec<f32> = (0..N_STATE).map(|_| nf()).collect();
 
     println!("=== self-attn f32 scores dot: scalar contiguous vs byte-exact loop-swap AXPY ===");
-    println!("    (turbo n_state={N_STATE}, n_head={N_HEAD}, d_head={D_HEAD}; per-token = ALL heads)");
+    println!(
+        "    (turbo n_state={N_STATE}, n_head={N_HEAD}, d_head={D_HEAD}; per-token = ALL heads)"
+    );
     for &tk in &[64usize, 128, 224] {
         let k: Vec<f32> = (0..tk * N_STATE).map(|_| nf()).collect();
         let mut a = vec![0.0f32; N_HEAD * tk];
         let mut b = vec![0.0f32; N_HEAD * tk];
         scores_scalar(&k, &qh, scale, tk, &mut a);
         scores_swap(&k, &qh, scale, tk, &mut b);
-        let ndiff = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let ndiff = a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
         let ts = run(&scores_scalar, &k, &qh, scale, tk, &mut a, iters);
         let tw = run(&scores_swap, &k, &qh, scale, tk, &mut b, iters);
-        println!("  tk={tk:>3}: scalar {:>6.2} µs | swap {:>6.2} µs | {:.2}x [{}] | byte-diff={ndiff}",
-            ts * 1e6, tw * 1e6, ts / tw, if tw < ts { "WIN" } else { "loss" });
+        println!(
+            "  tk={tk:>3}: scalar {:>6.2} µs | swap {:>6.2} µs | {:.2}x [{}] | byte-diff={ndiff}",
+            ts * 1e6,
+            tw * 1e6,
+            ts / tw,
+            if tw < ts { "WIN" } else { "loss" }
+        );
     }
-    println!("  (per-token self-attn scores for ALL 20 heads at the given KV length. byte-diff MUST be 0.)");
+    println!(
+        "  (per-token self-attn scores for ALL 20 heads at the given KV length. byte-diff MUST be 0.)"
+    );
 }

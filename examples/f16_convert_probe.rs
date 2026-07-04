@@ -47,7 +47,9 @@ unsafe fn convert_f16c(x: &[f32], out: &mut [u16]) {
 fn bench(n: usize, iters: usize) {
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
     let mut nf = || {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
         ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0 // encoder-output-ish range
     };
     let x: Vec<f32> = (0..n).map(|_| nf()).collect();
@@ -58,7 +60,9 @@ fn bench(n: usize, iters: usize) {
     let bad = a.iter().zip(&b).filter(|(p, q)| p.to_bits() != **q).count();
 
     let ts = {
-        for _ in 0..3 { black_box(convert_scalar(&x)); }
+        for _ in 0..3 {
+            black_box(convert_scalar(&x));
+        }
         let mut best = f64::INFINITY;
         for _ in 0..iters {
             let t = Instant::now();
@@ -69,7 +73,10 @@ fn bench(n: usize, iters: usize) {
     };
     let ta = {
         let mut buf = vec![0u16; n];
-        for _ in 0..3 { unsafe { convert_f16c(&x, &mut buf) }; black_box(&buf); }
+        for _ in 0..3 {
+            unsafe { convert_f16c(&x, &mut buf) };
+            black_box(&buf);
+        }
         let mut best = f64::INFINITY;
         for _ in 0..iters {
             let t = Instant::now();
@@ -80,16 +87,26 @@ fn bench(n: usize, iters: usize) {
         best
     };
     println!("n={n}  best-of-{iters}");
-    println!("  byte-exact: {bad} differing of {n}  [{}]", if bad == 0 { "IDENTICAL" } else { "DIVERGENT" });
+    println!(
+        "  byte-exact: {bad} differing of {n}  [{}]",
+        if bad == 0 { "IDENTICAL" } else { "DIVERGENT" }
+    );
     println!("  scalar from_f32 (+alloc) : {:>8.3} µs", ts * 1e6);
-    println!("  F16C _mm256_cvtps_ph     : {:>8.3} µs  {:.2}x  [{}]",
-        ta * 1e6, ts / ta, if ta < ts { "WIN" } else { "loss" });
+    println!(
+        "  F16C _mm256_cvtps_ph     : {:>8.3} µs  {:.2}x  [{}]",
+        ta * 1e6,
+        ts / ta,
+        if ta < ts { "WIN" } else { "loss" }
+    );
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
     println!("=== cross-build f32→f16: scalar half::from_f32 vs batched F16C (1 thread) ===");
-    bench(64, iters);   // one k_nat row (d_head)
+    bench(64, iters); // one k_nat row (d_head)
     bench(1500, iters); // one head's k_nat column-run (enc_frames)
     bench(96000, iters / 4); // full (li,h) pair k_nat: enc_frames*d_head
 }

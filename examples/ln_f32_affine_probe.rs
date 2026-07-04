@@ -21,10 +21,15 @@ fn ln_f64(x: &[f32], w: &[f32], b: &[f32], rows: usize, cols: usize, out: &mut [
     for r in 0..rows {
         let row = &x[r * cols..(r + 1) * cols];
         let mut sum = 0.0f64;
-        for &v in row { sum += f64::from(v); }
+        for &v in row {
+            sum += f64::from(v);
+        }
         let mean = sum / n;
         let mut var = 0.0f64;
-        for &v in row { let d = f64::from(v) - mean; var += d * d; }
+        for &v in row {
+            let d = f64::from(v) - mean;
+            var += d * d;
+        }
         var /= n;
         let inv = 1.0 / (var + f64::from(EPS)).sqrt();
         let o = &mut out[r * cols..(r + 1) * cols];
@@ -40,10 +45,15 @@ fn ln_f32affine(x: &[f32], w: &[f32], b: &[f32], rows: usize, cols: usize, out: 
     for r in 0..rows {
         let row = &x[r * cols..(r + 1) * cols];
         let mut sum = 0.0f64;
-        for &v in row { sum += f64::from(v); }
+        for &v in row {
+            sum += f64::from(v);
+        }
         let mean = (sum / n) as f32;
         let mut var = 0.0f64;
-        for &v in row { let d = f64::from(v) - sum / n; var += d * d; }
+        for &v in row {
+            let d = f64::from(v) - sum / n;
+            var += d * d;
+        }
         let variance = (var / n) as f32;
         let inv = 1.0f32 / (variance + EPS).sqrt();
         let o = &mut out[r * cols..(r + 1) * cols];
@@ -54,10 +64,18 @@ fn ln_f32affine(x: &[f32], w: &[f32], b: &[f32], rows: usize, cols: usize, out: 
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(400);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
     let (rows, cols) = (1500usize, 1280usize);
     let mut s = 0x243F_6A88_85A3_08D3u64;
-    let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0 };
+    let mut nf = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0
+    };
     let x: Vec<f32> = (0..rows * cols).map(|_| nf()).collect();
     let w: Vec<f32> = (0..cols).map(|_| nf() * 0.3 + 1.0).collect();
     let b: Vec<f32> = (0..cols).map(|_| nf() * 0.1).collect();
@@ -66,26 +84,48 @@ fn main() {
 
     ln_f64(&x, &w, &b, rows, cols, &mut o64);
     ln_f32affine(&x, &w, &b, rows, cols, &mut o32);
-    let maxd = o64.iter().zip(&o32).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    let ndiff = o64.iter().zip(&o32).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    let maxd = o64
+        .iter()
+        .zip(&o32)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let ndiff = o64
+        .iter()
+        .zip(&o32)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
 
-    let run = |f: &dyn Fn(&[f32], &[f32], &[f32], usize, usize, &mut [f32]), out: &mut [f32]| -> f64 {
-        for _ in 0..3 { f(&x, &w, &b, rows, cols, out); }
-        let mut best = f64::INFINITY;
-        for _ in 0..iters {
-            let t = Instant::now();
-            f(&x, &w, &b, rows, cols, out);
-            best = best.min(t.elapsed().as_secs_f64());
-            black_box(&out[0]);
-        }
-        best
-    };
+    let run =
+        |f: &dyn Fn(&[f32], &[f32], &[f32], usize, usize, &mut [f32]), out: &mut [f32]| -> f64 {
+            for _ in 0..3 {
+                f(&x, &w, &b, rows, cols, out);
+            }
+            let mut best = f64::INFINITY;
+            for _ in 0..iters {
+                let t = Instant::now();
+                f(&x, &w, &b, rows, cols, out);
+                best = best.min(t.elapsed().as_secs_f64());
+                black_box(&out[0]);
+            }
+            best
+        };
     let t64 = run(&ln_f64, &mut o64);
     let t32 = run(&ln_f32affine, &mut o32);
-    println!("=== LayerNorm [1500,1280]: full-f64 (franken) vs f32-normalize/affine (ggml-style), 1 thread ===");
-    println!("  numeric Δ: max|Δ|={maxd:.3e}, {ndiff} of {} differ (non-byte-exact — owner-gated numerics)", rows * cols);
+    println!(
+        "=== LayerNorm [1500,1280]: full-f64 (franken) vs f32-normalize/affine (ggml-style), 1 thread ==="
+    );
+    println!(
+        "  numeric Δ: max|Δ|={maxd:.3e}, {ndiff} of {} differ (non-byte-exact — owner-gated numerics)",
+        rows * cols
+    );
     println!("  full-f64 (franken)        : {:>8.1} µs", t64 * 1e6);
-    println!("  f32-normalize (ggml-style): {:>8.1} µs  {:.2}x  [{}]",
-        t32 * 1e6, t64 / t32, if t32 < t64 { "faster" } else { "not faster" });
-    println!("  (this is the SCALAR shape; SIMD would be f64x4 vs f32x8. If ~1.0x here, LN is memory-bound ⇒ no win.)");
+    println!(
+        "  f32-normalize (ggml-style): {:>8.1} µs  {:.2}x  [{}]",
+        t32 * 1e6,
+        t64 / t32,
+        if t32 < t64 { "faster" } else { "not faster" }
+    );
+    println!(
+        "  (this is the SCALAR shape; SIMD would be f64x4 vs f32x8. If ~1.0x here, LN is memory-bound ⇒ no win.)"
+    );
 }

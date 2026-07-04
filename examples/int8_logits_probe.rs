@@ -12,7 +12,11 @@ use std::hint::black_box;
 use std::time::Instant;
 
 /// f16c fused dot — a copy of `nn::dot_f16c` (4 accumulators, cvtph inline).
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 #[allow(unsafe_code)]
 fn dot_f16c(w: &[Float16], x: &[f32]) -> f32 {
     use core::arch::x86_64::*;
@@ -74,7 +78,10 @@ fn best_of(iters: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let (out, inp) = (51866usize, 1280usize);
     // f16 weights + f32 activation (the current path).
     let wf16: Vec<Float16> = (0..out * inp)
@@ -86,7 +93,11 @@ fn main() {
     let mut wscale: Vec<f32> = vec![0.0; out];
     for o in 0..out {
         let row = &wf16[o * inp..(o + 1) * inp];
-        let amax = row.iter().map(|h| h.to_f32().abs()).fold(0.0f32, f32::max).max(1e-9);
+        let amax = row
+            .iter()
+            .map(|h| h.to_f32().abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-9);
         let s = amax / 127.0;
         wscale[o] = s;
         for i in 0..inp {
@@ -95,7 +106,10 @@ fn main() {
     }
     let xamax = xf.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
     let xs = xamax / 127.0;
-    let xi8: Vec<i8> = xf.iter().map(|v| (v / xs).round().clamp(-127.0, 127.0) as i8).collect();
+    let xi8: Vec<i8> = xf
+        .iter()
+        .map(|v| (v / xs).round().clamp(-127.0, 127.0) as i8)
+        .collect();
 
     let mut buf = vec![0.0f32; out];
 
@@ -117,7 +131,10 @@ fn main() {
     let i8_gb = (out * inp) as f64 / (i8_ms / 1e3) / 1e9;
     println!("logits [{out},{inp}] single-thread best-of-{iters}");
     println!("  f16  {f16_ms:6.2} ms  {f16_gb:5.1} GB/s");
-    println!("  int8 {i8_ms:6.2} ms  {i8_gb:5.1} GB/s   speedup={:.2}x", f16_ms / i8_ms);
+    println!(
+        "  int8 {i8_ms:6.2} ms  {i8_gb:5.1} GB/s   speedup={:.2}x",
+        f16_ms / i8_ms
+    );
     // Accuracy canary: max relative error of int8 logits vs f16 logits.
     let mut maxrel = 0.0f32;
     for o in 0..out.min(2000) {

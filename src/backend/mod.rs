@@ -2716,7 +2716,11 @@ pub fn evaluate_backend_selection(
     // evidence for any state.  This feeds into FallbackPolicy::should_fallback
     // which triggers fallback when e_process > breach_threshold.
     let diff = max_prob - second_prob;
-    let margin = if diff.is_finite() { diff.max(1e-6) } else { 1e-6 };
+    let margin = if diff.is_finite() {
+        diff.max(1e-6)
+    } else {
+        1e-6
+    };
     let e_process = (1.0 / margin).clamp(1.0, 100.0);
 
     let ctx = EvalContext {
@@ -2784,8 +2788,8 @@ pub fn evaluate_backend_selection(
     // Either way we degrade to no evidence entry (the serde-failure default that
     // already existed here) and record the anomaly.
     let posterior_sum: f64 = outcome.audit_entry.posterior_snapshot.iter().sum();
-    let audit_convertible = !outcome.audit_entry.posterior_snapshot.is_empty()
-        && (posterior_sum - 1.0).abs() <= 1e-6;
+    let audit_convertible =
+        !outcome.audit_entry.posterior_snapshot.is_empty() && (posterior_sum - 1.0).abs() <= 1e-6;
     // Sanitize the posterior snapshot that is logged/persisted: a degenerate
     // (empty / unnormalized / subnormal) audit snapshot must not leak into the
     // routing log or evidence ledger. Fall back to the locally-built,
@@ -4435,7 +4439,9 @@ mod tests {
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0].confidence, Some(1.0));
         assert_eq!(segments[1].confidence, Some(0.0));
-        let denormal = segments[2].confidence.expect("denormal confidence retained");
+        let denormal = segments[2]
+            .confidence
+            .expect("denormal confidence retained");
         assert!(
             denormal.is_finite() && (0.0..=1.0).contains(&denormal),
             "denormal confidence should stay finite and in range: {denormal}"
@@ -5631,8 +5637,7 @@ mod tests {
                 BackendKind::InsanelyFast,
                 BackendKind::WhisperDiarization,
             ] {
-                let loss =
-                    BackendSelectionContract::backend_base_loss(backend, &request, duration);
+                let loss = BackendSelectionContract::backend_base_loss(backend, &request, duration);
                 assert!(
                     loss.is_finite() && loss >= 0.0,
                     "loss for {backend:?} at duration {duration} not finite/non-negative: {loss}"

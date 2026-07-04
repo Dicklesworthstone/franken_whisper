@@ -24,8 +24,8 @@ fn main() {
     // Model selectable via FW_PROBE_MODEL (default tiny.en); use large-v3-turbo
     // for the real 32-layer/n_state=1280 decode function mix.
     let model_name = std::env::var("FW_PROBE_MODEL").unwrap_or_else(|_| "tiny.en".to_string());
-    let path = find_model_file(&model_name)
-        .expect("set FRANKEN_WHISPER_MODEL_DIR to the ggml models dir");
+    let path =
+        find_model_file(&model_name).expect("set FRANKEN_WHISPER_MODEL_DIR to the ggml models dir");
     let model = GgmlModel::load(&path)
         .and_then(LoadedModel::from_ggml)
         .expect("load model");
@@ -55,7 +55,11 @@ fn main() {
     for _ in 0..3 {
         st.reset();
         for &tok in &seq {
-            std::hint::black_box(decoder::forward_step(w, &mut st, &[tok], &noop).expect("step").len());
+            std::hint::black_box(
+                decoder::forward_step(w, &mut st, &[tok], &noop)
+                    .expect("step")
+                    .len(),
+            );
         }
     }
     // TIMED region: pure per-token decode (reset retains cross-K/V, regrows cache 0->8).

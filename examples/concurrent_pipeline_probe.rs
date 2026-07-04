@@ -26,10 +26,15 @@ use std::hint::black_box;
 use std::time::Instant;
 
 fn main() {
-    let n_tok: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let n_tok: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let model_name = std::env::var("FW_PROBE_MODEL").unwrap_or_else(|_| "tiny.en".to_string());
     let path = find_model_file(&model_name).expect("set FRANKEN_WHISPER_MODEL_DIR");
-    let model = GgmlModel::load(&path).and_then(LoadedModel::from_ggml).expect("load model");
+    let model = GgmlModel::load(&path)
+        .and_then(LoadedModel::from_ggml)
+        .expect("load model");
 
     let sr = SAMPLE_RATE as f32;
     let audio: Vec<f32> = (0..N_SAMPLES_30S)
@@ -46,17 +51,29 @@ fn main() {
 
     let w = &model.decoder;
     let sot = model.tokenizer.sot;
-    let seq: Vec<i32> = (0..n_tok).map(|i| if i == 0 { sot } else { 1 + (i as i32 % 50000) }).collect();
+    let seq: Vec<i32> = (0..n_tok)
+        .map(|i| if i == 0 { sot } else { 1 + (i as i32 % 50000) })
+        .collect();
     let mut st = DecoderState::new(w, &enc_out).expect("decoder state");
 
     // Run one full decode pass (cache grows 0..n_tok), the real single-window shape.
     let decode_once = |st: &mut DecoderState| {
         st.reset();
         for &tok in &seq {
-            black_box(decoder::forward_step(w, st, &[tok], &noop).expect("step").len());
+            black_box(
+                decoder::forward_step(w, st, &[tok], &noop)
+                    .expect("step")
+                    .len(),
+            );
         }
     };
-    let encode_once = || black_box(encoder::forward(&model.encoder, &window, 0, &noop).expect("enc").rows);
+    let encode_once = || {
+        black_box(
+            encoder::forward(&model.encoder, &window, 0, &noop)
+                .expect("enc")
+                .rows,
+        )
+    };
 
     // Warm.
     for _ in 0..2 {
@@ -96,16 +113,28 @@ fn main() {
     let complementarity = reclaim / t_enc.min(t_dec);
     println!("concurrent_pipeline_probe[{model_name}]  decode_tokens={n_tok}  best-of-5 (min):");
     println!("  encode alone:      {:>7.1} ms", t_enc * 1e3);
-    println!("  decode alone:      {:>7.1} ms  ({:.2} ms/tok)", t_dec * 1e3, t_dec * 1e3 / n_tok as f64);
+    println!(
+        "  decode alone:      {:>7.1} ms  ({:.2} ms/tok)",
+        t_dec * 1e3,
+        t_dec * 1e3 / n_tok as f64
+    );
     println!("  SEQUENTIAL total:  {:>7.1} ms", seq_total * 1e3);
     println!("  CONCURRENT total:  {:>7.1} ms", t_conc * 1e3);
-    println!("  reclaim:           {:>7.1} ms  ({:.0}% of the smaller phase)", reclaim * 1e3, complementarity * 100.0);
+    println!(
+        "  reclaim:           {:>7.1} ms  ({:.0}% of the smaller phase)",
+        reclaim * 1e3,
+        complementarity * 100.0
+    );
     let max_phase = t_enc.max(t_dec);
     println!(
         "  concurrent vs max(enc,dec)={:.1} ms => {}",
         max_phase * 1e3,
-        if t_conc <= max_phase * 1.08 { "~COMPLEMENTARY (pipelining hides the smaller phase — BUILD IT)" }
-        else if reclaim > 0.15 * t_enc.min(t_dec) { "PARTIAL overlap (some reclaim)" }
-        else { "CONTENDED (no meaningful reclaim — pipelining not worth it)" }
+        if t_conc <= max_phase * 1.08 {
+            "~COMPLEMENTARY (pipelining hides the smaller phase — BUILD IT)"
+        } else if reclaim > 0.15 * t_enc.min(t_dec) {
+            "PARTIAL overlap (some reclaim)"
+        } else {
+            "CONTENDED (no meaningful reclaim — pipelining not worth it)"
+        }
     );
 }

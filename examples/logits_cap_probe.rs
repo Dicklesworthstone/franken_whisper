@@ -16,13 +16,18 @@ use std::hint::black_box;
 use std::time::Instant;
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
     let (n_vocab, n_state) = (51866usize, 1280usize); // turbo tied-logits shape
     // Synthetic f16 weight → int8 (the exact layout logits_last consumes).
     let mut s = 0x1234u64;
     let wf16: Vec<f16> = (0..n_vocab * n_state)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             f16::from_f32(((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
         })
         .collect();

@@ -48,7 +48,9 @@ fn make_w(out: usize, inp: usize, seed: u64) -> I8Mat {
 fn make_pool(out: usize, inp: usize, min_bytes: usize, seed0: u64) -> Vec<I8Mat> {
     let per = out * inp; // ~1 byte/elem (i8 weights dominate)
     let copies = (min_bytes / per + 1).max(2);
-    (0..copies).map(|c| make_w(out, inp, seed0.wrapping_add(c as u64 * 0x9E37))).collect()
+    (0..copies)
+        .map(|c| make_w(out, inp, seed0.wrapping_add(c as u64 * 0x9E37)))
+        .collect()
 }
 
 /// WARM: reuse one matrix (L3-resident where it fits). min-of-7 ns/call.
@@ -92,7 +94,10 @@ fn time_cold(pool: &[I8Mat], x: &[f32], out: usize, passes: usize) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     const NS: usize = 1280; // turbo n_state
     const VOCAB: usize = 51866;
     const FFN: usize = 5120;
@@ -104,24 +109,34 @@ fn main() {
 
     eprintln!("building synthetic turbo int8 weights + cold pools (>L3)…");
     let (w_qkv, w_out, w_fc1, w_fc2, w_log) = (
-        make_w(QKV, NS, 0x11), make_w(NS, NS, 0x22), make_w(FFN, NS, 0x33),
-        make_w(NS, FFN, 0x44), make_w(VOCAB, NS, 0x55),
+        make_w(QKV, NS, 0x11),
+        make_w(NS, NS, 0x22),
+        make_w(FFN, NS, 0x33),
+        make_w(NS, FFN, 0x44),
+        make_w(VOCAB, NS, 0x55),
     );
     let (p_qkv, p_out, p_fc1, p_fc2, p_log) = (
-        make_pool(QKV, NS, L3, 0x11), make_pool(NS, NS, L3, 0x22), make_pool(FFN, NS, L3, 0x33),
-        make_pool(NS, FFN, L3, 0x44), make_pool(VOCAB, NS, L3, 0x55),
+        make_pool(QKV, NS, L3, 0x11),
+        make_pool(NS, NS, L3, 0x22),
+        make_pool(FFN, NS, L3, 0x33),
+        make_pool(NS, FFN, L3, 0x44),
+        make_pool(VOCAB, NS, L3, 0x55),
     );
 
     // WARM
     let (t_qkv, t_out, t_fc1, t_fc2, t_log) = (
-        time_warm(&w_qkv, &x_ns, QKV, iters), time_warm(&w_out, &x_ns, NS, iters),
-        time_warm(&w_fc1, &x_ns, FFN, iters), time_warm(&w_fc2, &x_ffn, NS, iters),
+        time_warm(&w_qkv, &x_ns, QKV, iters),
+        time_warm(&w_out, &x_ns, NS, iters),
+        time_warm(&w_fc1, &x_ns, FFN, iters),
+        time_warm(&w_fc2, &x_ffn, NS, iters),
         time_warm(&w_log, &x_ns, VOCAB, iters),
     );
     // COLD
     let (c_qkv, c_out, c_fc1, c_fc2, c_log) = (
-        time_cold(&p_qkv, &x_ns, QKV, 30), time_cold(&p_out, &x_ns, NS, 30),
-        time_cold(&p_fc1, &x_ns, FFN, 30), time_cold(&p_fc2, &x_ffn, NS, 30),
+        time_cold(&p_qkv, &x_ns, QKV, 30),
+        time_cold(&p_out, &x_ns, NS, 30),
+        time_cold(&p_fc1, &x_ns, FFN, 30),
+        time_cold(&p_fc2, &x_ffn, NS, 30),
         time_cold(&p_log, &x_ns, VOCAB, 20),
     );
 
@@ -131,12 +146,32 @@ fn main() {
         let layer = qkv + out + fc1 + fc2;
         let full = 4.0 * layer + log;
         eprintln!("\n=== {tag}: per-token int8 weight-GEMV (µs, and GB/s) ===");
-        eprintln!("  qkv    : {:>7.2}  ({:>5.1} GB/s)", us(qkv), gbs(QKV * NS, qkv));
-        eprintln!("  out    : {:>7.2}  ({:>5.1} GB/s)", us(out), gbs(NS * NS, out));
-        eprintln!("  fc1    : {:>7.2}  ({:>5.1} GB/s)", us(fc1), gbs(FFN * NS, fc1));
-        eprintln!("  fc2    : {:>7.2}  ({:>5.1} GB/s)", us(fc2), gbs(NS * FFN, fc2));
+        eprintln!(
+            "  qkv    : {:>7.2}  ({:>5.1} GB/s)",
+            us(qkv),
+            gbs(QKV * NS, qkv)
+        );
+        eprintln!(
+            "  out    : {:>7.2}  ({:>5.1} GB/s)",
+            us(out),
+            gbs(NS * NS, out)
+        );
+        eprintln!(
+            "  fc1    : {:>7.2}  ({:>5.1} GB/s)",
+            us(fc1),
+            gbs(FFN * NS, fc1)
+        );
+        eprintln!(
+            "  fc2    : {:>7.2}  ({:>5.1} GB/s)",
+            us(fc2),
+            gbs(NS * FFN, fc2)
+        );
         eprintln!("  1 layer: {:>7.2}", us(layer));
-        eprintln!("  logits : {:>7.2}  ({:>5.1} GB/s)  <-- self-draft tax", us(log), gbs(VOCAB * NS, log));
+        eprintln!(
+            "  logits : {:>7.2}  ({:>5.1} GB/s)  <-- self-draft tax",
+            us(log),
+            gbs(VOCAB * NS, log)
+        );
         eprintln!("  token  : {:>7.2}", us(full));
         let frac = log / full;
         eprintln!("  logits fraction of per-token time: {:.1}%", 100.0 * frac);
@@ -146,14 +181,29 @@ fn main() {
             let a_be = (4.0 * floor + c_v - 1.0).clamp(0.0, 4.0);
             eprintln!(
                 "  {k}-layer self-draft: {:.2}x a full token; K=4 break-even accept > {:.0}%",
-                floor, 100.0 * a_be / 4.0
+                floor,
+                100.0 * a_be / 4.0
             );
         }
         frac
     };
 
-    let warm_frac = report("WARM (L3-resident, MIXED regime — earlier probe)", t_qkv, t_out, t_fc1, t_fc2, t_log);
-    let cold_frac = report("COLD (DRAM-bound, regime-controlled — the HONEST number)", c_qkv, c_out, c_fc1, c_fc2, c_log);
+    let warm_frac = report(
+        "WARM (L3-resident, MIXED regime — earlier probe)",
+        t_qkv,
+        t_out,
+        t_fc1,
+        t_fc2,
+        t_log,
+    );
+    let cold_frac = report(
+        "COLD (DRAM-bound, regime-controlled — the HONEST number)",
+        c_qkv,
+        c_out,
+        c_fc1,
+        c_fc2,
+        c_log,
+    );
 
     let cold_floor1 = {
         let layer = c_qkv + c_out + c_fc1 + c_fc2;
@@ -170,7 +220,10 @@ fn main() {
          number implied, though still a high bar for a depth-truncated draft of a 4-layer decoder. \n\
          Regime-invariant point: the biggest single per-token op is still the logits head, and a \n\
          drafter that ALSO shrinks it (smaller vocab / reduced head) dominates a pure layer-skip.",
-        100.0 * warm_frac, 100.0 * cold_frac, 100.0 * (1.0 - cold_frac), cold_floor1,
+        100.0 * warm_frac,
+        100.0 * cold_frac,
+        100.0 * (1.0 - cold_frac),
+        cold_floor1,
         100.0 * (4.0 * cold_floor1 + 1.0 - 1.0) / 4.0
     );
 }

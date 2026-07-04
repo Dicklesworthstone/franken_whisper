@@ -47,7 +47,9 @@ fn fill(rows: usize, cols: usize, seed: u64) -> Mat {
     let mut s = seed;
     let data = (0..rows * cols)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
         })
         .collect();
@@ -55,20 +57,36 @@ fn fill(rows: usize, cols: usize, seed: u64) -> Mat {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(60);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
     let (n_layer, n_head, d_head, enc) = (4usize, 20usize, 64usize, 1500usize);
     let n_state = n_head * d_head;
-    let cross_k: Vec<Mat> = (0..n_layer).map(|l| fill(enc, n_state, 0x10 + l as u64)).collect();
-    let cross_v: Vec<Mat> = (0..n_layer).map(|l| fill(enc, n_state, 0x90 + l as u64)).collect();
+    let cross_k: Vec<Mat> = (0..n_layer)
+        .map(|l| fill(enc, n_state, 0x10 + l as u64))
+        .collect();
+    let cross_v: Vec<Mat> = (0..n_layer)
+        .map(|l| fill(enc, n_state, 0x90 + l as u64))
+        .collect();
     let npairs = n_layer * n_head;
-    println!("turbo cross build: {npairs} (layer,head) pairs, each 4 bufs over {}×{}", enc, d_head);
+    println!(
+        "turbo cross build: {npairs} (layer,head) pairs, each 4 bufs over {}×{}",
+        enc, d_head
+    );
 
     // A) serial nested loop (current decoder.rs).
     let serial = || {
         let mut out: Vec<Built> = Vec::with_capacity(npairs);
         for li in 0..n_layer {
             for h in 0..n_head {
-                out.push(build_head(&cross_k[li], &cross_v[li], h * d_head, d_head, enc));
+                out.push(build_head(
+                    &cross_k[li],
+                    &cross_v[li],
+                    h * d_head,
+                    d_head,
+                    enc,
+                ));
             }
         }
         out
@@ -93,14 +111,31 @@ fn main() {
     }
     println!("byte-exact: parallel == serial  -> {ok}");
 
-    for _ in 0..3 { black_box(serial()); black_box(parallel()); }
+    for _ in 0..3 {
+        black_box(serial());
+        black_box(parallel());
+    }
 
     let mut best_s = f64::INFINITY;
-    for _ in 0..iters { let t = Instant::now(); let r = serial(); best_s = best_s.min(t.elapsed().as_secs_f64()); black_box(r); }
+    for _ in 0..iters {
+        let t = Instant::now();
+        let r = serial();
+        best_s = best_s.min(t.elapsed().as_secs_f64());
+        black_box(r);
+    }
     let mut best_p = f64::INFINITY;
-    for _ in 0..iters { let t = Instant::now(); let r = parallel(); best_p = best_p.min(t.elapsed().as_secs_f64()); black_box(r); }
+    for _ in 0..iters {
+        let t = Instant::now();
+        let r = parallel();
+        best_p = best_p.min(t.elapsed().as_secs_f64());
+        black_box(r);
+    }
 
     println!("best-of-{iters}:");
     println!("  A) serial nested : {:.3} ms", best_s * 1e3);
-    println!("  B) par outer     : {:.3} ms   ({:.2}× vs A)", best_p * 1e3, best_s / best_p);
+    println!(
+        "  B) par outer     : {:.3} ms   ({:.2}× vs A)",
+        best_p * 1e3,
+        best_s / best_p
+    );
 }

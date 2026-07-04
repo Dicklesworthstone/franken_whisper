@@ -185,7 +185,8 @@ unsafe fn dot_i8_avx2_2row(w0: &[i8], w1: &[i8], x: &[i8]) -> (i32, i32) {
 fn gemv_2row(w: &[i8], x: &[i8], n: usize, k: usize, out: &mut [i32]) {
     let mut o = 0;
     while o + 2 <= n {
-        let (s0, s1) = unsafe { dot_i8_avx2_2row(&w[o * k..(o + 1) * k], &w[(o + 1) * k..(o + 2) * k], x) };
+        let (s0, s1) =
+            unsafe { dot_i8_avx2_2row(&w[o * k..(o + 1) * k], &w[(o + 1) * k..(o + 2) * k], x) };
         out[o] = s0;
         out[o + 1] = s1;
         o += 2;
@@ -251,18 +252,53 @@ fn bench(name: &str, n: usize, k: usize, iters: usize) {
     let t4 = run(gemv_4acc, &mut o4);
     let t2r = run(gemv_2row, &mut o2r);
     let bytes = (n * k) as f64; // 1 byte/weight, streamed once
-    println!("{name}  [{n}x{k}] ({:.1} MiB int8)  best-of-{iters} @ 1 thread", bytes / (1 << 20) as f64);
-    println!("  byte-exact vs 2acc: 4acc {diff4} diff, 2row {diff2r} diff (scalar {diff})  [{}]",
-        if diff == 0 && diff4 == 0 && diff2r == 0 { "ALL IDENTICAL" } else { "DIVERGENT" });
-    println!("  scalar-autovec : {:>7.3} ms  {:>6.1} GB/s", ts * 1e3, bytes / ts / 1e9);
-    println!("  hand AVX2 2acc : {:>7.3} ms  {:>6.1} GB/s  {:.2}x (landed)", ta * 1e3, bytes / ta / 1e9, ts / ta);
-    println!("  hand AVX2 4acc : {:>7.3} ms  {:>6.1} GB/s  {:.2}x vs2acc", t4 * 1e3, bytes / t4 / 1e9, ta / t4);
-    println!("  hand AVX2 2row : {:>7.3} ms  {:>6.1} GB/s  {:.2}x vs2acc  [{}]",
-        t2r * 1e3, bytes / t2r / 1e9, ta / t2r, if t2r < ta * 0.98 { "2row WINS" } else { "no gain" });
+    println!(
+        "{name}  [{n}x{k}] ({:.1} MiB int8)  best-of-{iters} @ 1 thread",
+        bytes / (1 << 20) as f64
+    );
+    println!(
+        "  byte-exact vs 2acc: 4acc {diff4} diff, 2row {diff2r} diff (scalar {diff})  [{}]",
+        if diff == 0 && diff4 == 0 && diff2r == 0 {
+            "ALL IDENTICAL"
+        } else {
+            "DIVERGENT"
+        }
+    );
+    println!(
+        "  scalar-autovec : {:>7.3} ms  {:>6.1} GB/s",
+        ts * 1e3,
+        bytes / ts / 1e9
+    );
+    println!(
+        "  hand AVX2 2acc : {:>7.3} ms  {:>6.1} GB/s  {:.2}x (landed)",
+        ta * 1e3,
+        bytes / ta / 1e9,
+        ts / ta
+    );
+    println!(
+        "  hand AVX2 4acc : {:>7.3} ms  {:>6.1} GB/s  {:.2}x vs2acc",
+        t4 * 1e3,
+        bytes / t4 / 1e9,
+        ta / t4
+    );
+    println!(
+        "  hand AVX2 2row : {:>7.3} ms  {:>6.1} GB/s  {:.2}x vs2acc  [{}]",
+        t2r * 1e3,
+        bytes / t2r / 1e9,
+        ta / t2r,
+        if t2r < ta * 0.98 {
+            "2row WINS"
+        } else {
+            "no gain"
+        }
+    );
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
     println!("=== int8 GEMV inner dot: scalar-autovec vs hand AVX2 (Zen3, 1 thread) ===");
     bench("logits", 51866, 1280, iters);
     bench("mlp_0 ", 5120, 1280, iters * 4);

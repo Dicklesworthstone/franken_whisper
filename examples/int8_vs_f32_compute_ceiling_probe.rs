@@ -11,10 +11,10 @@
 //! if int8 ≫ f32, a blocked microkernel is worth building.
 //! Usage: `int8_vs_f32_compute_ceiling_probe [outer_iters]` (default 200000).
 #![allow(unsafe_code)]
-use std::hint::black_box;
-use std::time::Instant;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::hint::black_box;
+use std::time::Instant;
 
 const K: usize = 4096; // per-buffer length; int8 = 4 KB, f32 = 16 KB (L1/L2-resident)
 
@@ -29,13 +29,19 @@ unsafe fn f32_peak(a: &[f32], b: &[f32], iters: usize) -> f32 {
         while k + 64 <= K {
             for (j, ac) in acc.iter_mut().enumerate() {
                 let off = k + j * 8;
-                *ac = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(off)), _mm256_loadu_ps(pb.add(off)), *ac);
+                *ac = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(pa.add(off)),
+                    _mm256_loadu_ps(pb.add(off)),
+                    *ac,
+                );
             }
             k += 64;
         }
     }
     let mut s = _mm256_setzero_ps();
-    for ac in acc { s = _mm256_add_ps(s, ac); }
+    for ac in acc {
+        s = _mm256_add_ps(s, ac);
+    }
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), s);
     tmp.iter().sum()
@@ -65,7 +71,9 @@ unsafe fn i8_peak(a: &[i8], b: &[i8], iters: usize) -> i32 {
         }
     }
     let mut s = _mm256_setzero_si256();
-    for ac in acc { s = _mm256_add_epi32(s, ac); }
+    for ac in acc {
+        s = _mm256_add_epi32(s, ac);
+    }
     let mut tmp = [0i32; 8];
     _mm256_storeu_si256(tmp.as_mut_ptr().cast(), s);
     tmp.iter().sum()
@@ -93,16 +101,26 @@ unsafe fn i8_peak_widening(a: &[i8], b: &[i8], iters: usize) -> i32 {
         }
     }
     let mut s = _mm256_setzero_si256();
-    for ac in acc { s = _mm256_add_epi32(s, ac); }
+    for ac in acc {
+        s = _mm256_add_epi32(s, ac);
+    }
     let mut tmp = [0i32; 8];
     _mm256_storeu_si256(tmp.as_mut_ptr().cast(), s);
     tmp.iter().sum()
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200_000);
     let mut st = 0x243F_6A88_85A3_08D3u64;
-    let mut b8 = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st >> 56) as i8 };
+    let mut b8 = || {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        (st >> 56) as i8
+    };
     let ai: Vec<i8> = (0..K).map(|_| b8()).collect();
     let bi: Vec<i8> = (0..K).map(|_| b8()).collect();
     let af: Vec<f32> = ai.iter().map(|&x| x as f32).collect();
@@ -116,23 +134,53 @@ fn main() {
         black_box(f32_peak(&af, &bf, 2000));
         black_box(i8_peak(&ai, &bi, 2000));
         let mut tf = f64::INFINITY;
-        for _ in 0..7 { let t = Instant::now(); black_box(f32_peak(&af, &bf, iters)); tf = tf.min(t.elapsed().as_secs_f64()); }
+        for _ in 0..7 {
+            let t = Instant::now();
+            black_box(f32_peak(&af, &bf, iters));
+            tf = tf.min(t.elapsed().as_secs_f64());
+        }
         let mut ti = f64::INFINITY;
-        for _ in 0..7 { let t = Instant::now(); black_box(i8_peak(&ai, &bi, iters)); ti = ti.min(t.elapsed().as_secs_f64()); }
+        for _ in 0..7 {
+            let t = Instant::now();
+            black_box(i8_peak(&ai, &bi, iters));
+            ti = ti.min(t.elapsed().as_secs_f64());
+        }
         black_box(i8_peak_widening(&ai, &bi, 2000));
         let mut tw = f64::INFINITY;
-        for _ in 0..7 { let t = Instant::now(); black_box(i8_peak_widening(&ai, &bi, iters)); tw = tw.min(t.elapsed().as_secs_f64()); }
+        for _ in 0..7 {
+            let t = Instant::now();
+            black_box(i8_peak_widening(&ai, &bi, iters));
+            tw = tw.min(t.elapsed().as_secs_f64());
+        }
         let gf = macs_f / tf / 1e9;
         let gi = macs_i / ti / 1e9;
         let gw = macs_i / tw / 1e9;
-        println!("=== int8 COMPUTE ceiling: maddubs vs widening vs f32 — AVX2, no VNNI, L1-resident, 1 core ===");
+        println!(
+            "=== int8 COMPUTE ceiling: maddubs vs widening vs f32 — AVX2, no VNNI, L1-resident, 1 core ==="
+        );
         println!("  f32 VFMADD                        : {gf:>7.1} GMAC/s   (1.00x baseline)");
-        println!("  int8 VPMOVSXBW+VPMADDWD (widening) : {gw:>7.1} GMAC/s   {:.2}x  ← nn::dot_i8 / prior TILED int8 GEMM", gw / gf);
-        println!("  int8 VPMADDUBSW+VPMADDWD (maddubs) : {gi:>7.1} GMAC/s   {:.2}x  ← untried for the encoder", gi / gf);
-        println!("  maddubs / widening                : {:.2}x  [{}]", gi / gw,
-            if gi / gw >= 1.4 { "maddubs is the missing ingredient — prior tiled int8 (0.89x) used the SLOW widening op" }
-            else { "maddubs ~= widening — the int8 gap is NOT the inner op" });
-        println!("  (upper bound: peak instruction throughput, no GEMM load/store/blocking overhead;");
-        println!("   real blocked int8 GEMM would be <= this; multi-thread clock-throttle applies to all.)");
+        println!(
+            "  int8 VPMOVSXBW+VPMADDWD (widening) : {gw:>7.1} GMAC/s   {:.2}x  ← nn::dot_i8 / prior TILED int8 GEMM",
+            gw / gf
+        );
+        println!(
+            "  int8 VPMADDUBSW+VPMADDWD (maddubs) : {gi:>7.1} GMAC/s   {:.2}x  ← untried for the encoder",
+            gi / gf
+        );
+        println!(
+            "  maddubs / widening                : {:.2}x  [{}]",
+            gi / gw,
+            if gi / gw >= 1.4 {
+                "maddubs is the missing ingredient — prior tiled int8 (0.89x) used the SLOW widening op"
+            } else {
+                "maddubs ~= widening — the int8 gap is NOT the inner op"
+            }
+        );
+        println!(
+            "  (upper bound: peak instruction throughput, no GEMM load/store/blocking overhead;"
+        );
+        println!(
+            "   real blocked int8 GEMM would be <= this; multi-thread clock-throttle applies to all.)"
+        );
     }
 }

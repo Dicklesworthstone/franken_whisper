@@ -32,7 +32,10 @@ fn gemv_i4(wdata: &[u8], scales: &[f32], out: usize, inp: usize, x: &[f32], y: &
     let xamax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
     let xs = xamax / 127.0;
     let xinv = 1.0 / xs;
-    let xi8: Vec<i8> = x.iter().map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8).collect();
+    let xi8: Vec<i8> = x
+        .iter()
+        .map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8)
+        .collect();
     let row_bytes = inp / 2;
     let dot = |wrow: &[u8]| -> i32 {
         let mut acc: i32 = 0;
@@ -52,14 +55,19 @@ fn gemv_i4(wdata: &[u8], scales: &[f32], out: usize, inp: usize, x: &[f32], y: &
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let (out, inp) = (51866usize, 1280usize); // turbo tied-logits shape
 
     // Synthetic f16 embedding.
     let mut s = 0x1234u64;
     let wf16: Vec<f16> = (0..out * inp)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             f16::from_f32(((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
         })
         .collect();
@@ -68,17 +76,24 @@ fn main() {
     // int4 path: per-row symmetric quant, scale = amax/7, packed 2 nibbles/byte.
     let mut w_i4 = vec![0u8; out * (inp / 2)];
     let mut sc4 = vec![0.0f32; out];
-    w_i4.par_chunks_mut(inp / 2).zip(sc4.par_iter_mut()).enumerate().for_each(|(o, (row, sco))| {
-        let src = &wf16[o * inp..(o + 1) * inp];
-        let amax = src.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max).max(1e-9);
-        let scale = amax / 7.0;
-        *sco = scale;
-        let inv = 1.0 / scale;
-        for (k, byte) in row.iter_mut().enumerate() {
-            let q = |v: f16| (v.to_f32() * inv).round().clamp(-7.0, 7.0) as i8 as u8 & 0x0F;
-            *byte = q(src[2 * k]) | (q(src[2 * k + 1]) << 4);
-        }
-    });
+    w_i4.par_chunks_mut(inp / 2)
+        .zip(sc4.par_iter_mut())
+        .enumerate()
+        .for_each(|(o, (row, sco))| {
+            let src = &wf16[o * inp..(o + 1) * inp];
+            let amax = src
+                .iter()
+                .map(|v| v.to_f32().abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-9);
+            let scale = amax / 7.0;
+            *sco = scale;
+            let inv = 1.0 / scale;
+            for (k, byte) in row.iter_mut().enumerate() {
+                let q = |v: f16| (v.to_f32() * inv).round().clamp(-7.0, 7.0) as i8 as u8 & 0x0F;
+                *byte = q(src[2 * k]) | (q(src[2 * k + 1]) << 4);
+            }
+        });
 
     let x: Vec<f32> = (0..inp).map(|i| (i as f32 * 0.001).sin()).collect();
     let mut y8 = nn::gemv_out_buf(out);
@@ -101,7 +116,15 @@ fn main() {
         b4 = b4.min(t.elapsed().as_secs_f64());
         black_box((&y8, &y4));
     }
-    println!("logits [{out},{inp}] best-of-{iters} @ {} threads:", rayon::current_num_threads());
+    println!(
+        "logits [{out},{inp}] best-of-{iters} @ {} threads:",
+        rayon::current_num_threads()
+    );
     println!("  int8: {:.3} ms  {:.1} GB/s", b8 * 1e3, bytes8 / b8 / 1e9);
-    println!("  int4: {:.3} ms  {:.1} GB/s  (speedup {:.2}x)", b4 * 1e3, bytes4 / b4 / 1e9, b8 / b4);
+    println!(
+        "  int4: {:.3} ms  {:.1} GB/s  (speedup {:.2}x)",
+        b4 * 1e3,
+        bytes4 / b4 / 1e9,
+        b8 / b4
+    );
 }

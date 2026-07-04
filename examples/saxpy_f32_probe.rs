@@ -66,11 +66,17 @@ fn bench(tk: usize, d: usize, iters: usize) {
 
     let a = out_scalar(&scores, &v, tk, d);
     let b = unsafe { out_avx2(&scores, &v, tk, d) };
-    let bad = a.iter().zip(&b).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+    let bad = a
+        .iter()
+        .zip(&b)
+        .filter(|(p, q)| p.to_bits() != q.to_bits())
+        .count();
 
     macro_rules! time {
         ($f:expr) => {{
-            for _ in 0..3 { black_box($f); }
+            for _ in 0..3 {
+                black_box($f);
+            }
             let mut best = f64::INFINITY;
             for _ in 0..iters {
                 let t = Instant::now();
@@ -83,15 +89,27 @@ fn bench(tk: usize, d: usize, iters: usize) {
     let ts = time!(out_scalar(&scores, &v, tk, d));
     let ta = time!(unsafe { out_avx2(&scores, &v, tk, d) });
     println!("tk={tk} d={d}  best-of-{iters}");
-    println!("  byte-exact: {bad} differing bit-patterns of {d}  [{}]", if bad == 0 { "IDENTICAL" } else { "DIVERGENT" });
+    println!(
+        "  byte-exact: {bad} differing bit-patterns of {d}  [{}]",
+        if bad == 0 { "IDENTICAL" } else { "DIVERGENT" }
+    );
     println!("  scalar *o += a*x : {:>8.3} µs", ts * 1e6);
-    println!("  AVX2 mul+add     : {:>8.3} µs  {:.2}x  [{}]",
-        ta * 1e6, ts / ta, if ta < ts { "WIN" } else { "loss" });
+    println!(
+        "  AVX2 mul+add     : {:>8.3} µs  {:.2}x  [{}]",
+        ta * 1e6,
+        ts / ta,
+        if ta < ts { "WIN" } else { "loss" }
+    );
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8000);
-    println!("=== decode score·V output SAXPY: scalar vs AVX2 mul+add (turbo d_head=64, 1 thread) ===");
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8000);
+    println!(
+        "=== decode score·V output SAXPY: scalar vs AVX2 mul+add (turbo d_head=64, 1 thread) ==="
+    );
     bench(64, 64, iters);
     bench(256, 64, iters);
     bench(448, 64, iters);

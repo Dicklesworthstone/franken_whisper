@@ -512,7 +512,13 @@ fn load_linear(
         Some(name) => Some(load_vec(model, name, out_dim)?),
         None => None,
     };
-    Ok(Linear { w, bias, w_i8: None, w_i8_block: None, w_i4_pack: None })
+    Ok(Linear {
+        w,
+        bias,
+        w_i8: None,
+        w_i8_block: None,
+        w_i4_pack: None,
+    })
 }
 
 /// Load the token embedding `[n_vocab, n_state]` in its NATURAL orientation
@@ -959,7 +965,11 @@ impl DecoderState {
                 let cv = &cross_v[li];
                 let base = h * d_head;
                 // kh_t [d_head, enc_frames]: kh_t[d][j] = ck.row(j)[base + d] (f32 path only).
-                let mut kh_t = if need_f32 { vec![0.0f32; d_head * enc_frames] } else { Vec::new() };
+                let mut kh_t = if need_f32 {
+                    vec![0.0f32; d_head * enc_frames]
+                } else {
+                    Vec::new()
+                };
                 // k_nat [enc_frames, d_head] f16: row j = ck.row(j)[base..base+d_head].
                 let mut k_nat = Vec::<Float16>::with_capacity(enc_frames * d_head);
                 if need_f32 {
@@ -979,7 +989,11 @@ impl DecoderState {
                     }
                 }
                 // vh [enc_frames, d_head] (f32 path only); v_t [d_head, enc_frames] f16.
-                let mut vh = if need_f32 { vec![0.0f32; enc_frames * d_head] } else { Vec::new() };
+                let mut vh = if need_f32 {
+                    vec![0.0f32; enc_frames * d_head]
+                } else {
+                    Vec::new()
+                };
                 let mut v_t = vec![Float16::from_bits(0); d_head * enc_frames];
                 for j in 0..enc_frames {
                     let src = &cv.row(j)[base..base + d_head];
@@ -1238,14 +1252,16 @@ fn int8_cross_kv_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     // Default ON: measured 1.31× on the cross_attn span and transcript byte-exact
     // vs f16 on tiny.en + large-v3-turbo (e2e golden 6/6). `=0` restores f16.
-    *ON.get_or_init(|| !matches!(
-        std::env::var("FRANKEN_WHISPER_INT8_CROSS_KV")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "0" | "false" | "off" | "no"
-    ))
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FRANKEN_WHISPER_INT8_CROSS_KV")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1308,7 +1324,11 @@ fn cross_attention(
             // token 32 layers × 20 heads = 640 discarded ~6 KB vecs. Skip it when
             // not recording; the numeric path (scale → gemv → softmax → gemv) is
             // untouched, so `out_h` and the transcript are BIT-IDENTICAL.
-            let mut scores_all = if build_scores { Vec::with_capacity(tq * tk) } else { Vec::new() };
+            let mut scores_all = if build_scores {
+                Vec::with_capacity(tq * tk)
+            } else {
+                Vec::new()
+            };
             let mut out_all = Vec::with_capacity(tq * d_head);
             let mut qh = vec![0.0f32; d_head];
             for i in 0..tq {

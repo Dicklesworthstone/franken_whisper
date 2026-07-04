@@ -19,34 +19,55 @@ use std::time::Instant;
 /// Live gather: par over heads (chunk = one head), per-head strided read of q.
 fn gather_headmajor(q: &[f32], qa: &mut [f32], hh: usize, tq: usize, d_head: usize) {
     let n_state = hh * d_head;
-    qa.par_chunks_mut(tq * d_head).enumerate().for_each(|(h, blk)| {
-        let base = h * d_head;
-        for i in 0..tq {
-            blk[i * d_head..(i + 1) * d_head]
-                .copy_from_slice(&q[i * n_state + base..i * n_state + base + d_head]);
-        }
-    });
+    qa.par_chunks_mut(tq * d_head)
+        .enumerate()
+        .for_each(|(h, blk)| {
+            let base = h * d_head;
+            for i in 0..tq {
+                blk[i * d_head..(i + 1) * d_head]
+                    .copy_from_slice(&q[i * n_state + base..i * n_state + base + d_head]);
+            }
+        });
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(400);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
     let (hh, tq, d_head) = (20usize, 1500usize, 64usize);
     let n_state = hh * d_head;
     let one = tq * n_state; // 1.92M f32 = 7.68 MB
     // Pool > L3 (128 MB): 30 * 7.68 MB = 230 MB of q, plus 230 MB of qa.
     let pool_n = 30usize;
-    println!("=== SDPA gather thread-count on COLD data (pool {}×{:.1}MB q + same qa = {:.0}MB > 128MB L3) ===",
-        pool_n, one as f64 * 4.0 / 1e6, pool_n as f64 * one as f64 * 8.0 / 1e6);
+    println!(
+        "=== SDPA gather thread-count on COLD data (pool {}×{:.1}MB q + same qa = {:.0}MB > 128MB L3) ===",
+        pool_n,
+        one as f64 * 4.0 / 1e6,
+        pool_n as f64 * one as f64 * 8.0 / 1e6
+    );
 
     let mut s = 0x243F_6A88_85A3_08D3u64;
-    let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 };
-    let qs: Vec<Vec<f32>> = (0..pool_n).map(|_| (0..one).map(|_| nf()).collect()).collect();
-    let mut qas: Vec<Vec<f32>> = (0..pool_n).map(|_| vec![0.0f32; hh * tq * d_head]).collect();
+    let mut nf = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let qs: Vec<Vec<f32>> = (0..pool_n)
+        .map(|_| (0..one).map(|_| nf()).collect())
+        .collect();
+    let mut qas: Vec<Vec<f32>> = (0..pool_n)
+        .map(|_| vec![0.0f32; hh * tq * d_head])
+        .collect();
 
     // Correctness: byte-identical across pool sizes (reference = serial-equivalent).
     let mut refbuf = vec![0.0f32; hh * tq * d_head];
     {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
         pool.install(|| gather_headmajor(&qs[0], &mut refbuf, hh, tq, d_head));
     }
 
@@ -54,7 +75,10 @@ fn main() {
     let mut means = Vec::new();
     let mut bads = Vec::new();
     for &nt in &threads {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(nt).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(nt)
+            .build()
+            .unwrap();
         pool.install(|| gather_headmajor(&qs[0], &mut qas[0], hh, tq, d_head)); // warm
         let mut total = 0.0f64;
         pool.install(|| {
@@ -67,16 +91,30 @@ fn main() {
             }
         });
         gather_headmajor(&qs[0], &mut qas[0], hh, tq, d_head);
-        bads.push(qas[0].iter().zip(&refbuf).filter(|(a, b)| a.to_bits() != b.to_bits()).count());
+        bads.push(
+            qas[0]
+                .iter()
+                .zip(&refbuf)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count(),
+        );
         means.push(total / iters as f64);
     }
     let live_mean = means[threads.iter().position(|&t| t == 20).unwrap()];
     let bytes = (one as f64 * 4.0) * 2.0; // read q + write qa
     println!("  threads |   mean µs | vs live(20) | GB/s(r+w) | byte-exact");
     for (i, &nt) in threads.iter().enumerate() {
-        println!("  {nt:>7} | {:>9.2} | {:>10.2}x | {:>8.1} | {}",
-            means[i] * 1e6, live_mean / means[i], bytes / means[i] / 1e9,
-            if bads[i] == 0 { "IDENTICAL" } else { "DIVERGENT" });
+        println!(
+            "  {nt:>7} | {:>9.2} | {:>10.2}x | {:>8.1} | {}",
+            means[i] * 1e6,
+            live_mean / means[i],
+            bytes / means[i] / 1e9,
+            if bads[i] == 0 {
+                "IDENTICAL"
+            } else {
+                "DIVERGENT"
+            }
+        );
     }
     println!("  (vs live: >1.00x means that thread count BEATS the live per-head 20-way gather)");
 }

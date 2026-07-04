@@ -23,15 +23,15 @@ const N_MLP: usize = 5120; // turbo (4× n_state)
 fn layer_buf_sizes() -> Vec<usize> {
     let s = N_CTX * N_STATE;
     vec![
-        s, // h = x.clone() (attn)
-        s, // q
-        s, // k
-        s, // v
-        s, // attn
-        s, // attn_out
-        s, // h = x.clone() (mlp)
+        s,             // h = x.clone() (attn)
+        s,             // q
+        s,             // k
+        s,             // v
+        s,             // attn
+        s,             // attn_out
+        s,             // h = x.clone() (mlp)
         N_CTX * N_MLP, // mlp fc h
-        s, // mlp proj h
+        s,             // mlp proj h
     ]
 }
 

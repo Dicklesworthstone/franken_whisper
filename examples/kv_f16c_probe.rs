@@ -162,14 +162,24 @@ fn bench(tk: usize, d: usize, iters: usize) {
     let s1 = scores_f32_scalar(&q, &k, tk, d);
     let s4 = unsafe { scores_f16_f16c(&q, &kh, tk, d) };
     let s3 = unsafe { scores_f16_scalar(&q, &kh, tk, d) };
-    let maxd_f16 = s1.iter().zip(&s4).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let maxd_f16 = s1
+        .iter()
+        .zip(&s4)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     // (4) vs (3): both consume the SAME f16 values; difference is only FMA-vs-scalar
     // summation order over d=64 — report it so the reorder cost is on record.
-    let maxd_ord = s3.iter().zip(&s4).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let maxd_ord = s3
+        .iter()
+        .zip(&s4)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
 
     macro_rules! time {
         ($f:expr) => {{
-            for _ in 0..3 { black_box($f); }
+            for _ in 0..3 {
+                black_box($f);
+            }
             let mut best = f64::INFINITY;
             for _ in 0..iters {
                 let t = Instant::now();
@@ -185,17 +195,39 @@ fn bench(tk: usize, d: usize, iters: usize) {
     let t4 = time!(unsafe { scores_f16_f16c(&q, &kh, tk, d) });
 
     println!("tk={tk} d={d}  best-of-{iters}");
-    println!("  precision: max|Δ| (4)f16c vs (1)f32 = {maxd_f16:.3e}   (4)vs(3) reorder = {maxd_ord:.3e}");
-    println!("  (1) f32 scalar      : {:>8.3} µs  1.00x  [baseline = live decode dot]", t1 * 1e6);
-    println!("  (2) f32 AVX2 FMA    : {:>8.3} µs  {:.2}x", t2 * 1e6, t1 / t2);
-    println!("  (3) f16 scalar dq   : {:>8.3} µs  {:.2}x  [live _f16, the 2x-slower naive]", t3 * 1e6, t1 / t3);
-    println!("  (4) f16 F16C AVX2   : {:>8.3} µs  {:.2}x  [THE LEVER]  {}",
-        t4 * 1e6, t1 / t4, if t4 < t1 { "WIN vs f32" } else { "loss vs f32" });
+    println!(
+        "  precision: max|Δ| (4)f16c vs (1)f32 = {maxd_f16:.3e}   (4)vs(3) reorder = {maxd_ord:.3e}"
+    );
+    println!(
+        "  (1) f32 scalar      : {:>8.3} µs  1.00x  [baseline = live decode dot]",
+        t1 * 1e6
+    );
+    println!(
+        "  (2) f32 AVX2 FMA    : {:>8.3} µs  {:.2}x",
+        t2 * 1e6,
+        t1 / t2
+    );
+    println!(
+        "  (3) f16 scalar dq   : {:>8.3} µs  {:.2}x  [live _f16, the 2x-slower naive]",
+        t3 * 1e6,
+        t1 / t3
+    );
+    println!(
+        "  (4) f16 F16C AVX2   : {:>8.3} µs  {:.2}x  [THE LEVER]  {}",
+        t4 * 1e6,
+        t1 / t4,
+        if t4 < t1 { "WIN vs f32" } else { "loss vs f32" }
+    );
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(4000);
-    println!("=== decode self-attn KV dot: f32 vs f16-scalar vs f16-F16C (turbo d_head=64, 1 thread) ===");
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4000);
+    println!(
+        "=== decode self-attn KV dot: f32 vs f16-scalar vs f16-F16C (turbo d_head=64, 1 thread) ==="
+    );
     // turbo: n_state=1280, n_head=20 -> d_head=64. cache_len grows over decode.
     bench(64, 64, iters);
     bench(256, 64, iters);

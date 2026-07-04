@@ -3819,8 +3819,9 @@ pub(crate) fn diarize_segments(
     token: &CancellationToken,
 ) -> FwResult<DiarizeReport> {
     let total = segments.len();
-    let mut notes: Vec<String> =
-        vec!["heuristic: temporal/lexical-feature clustering without neural speaker encoder".to_owned()];
+    let mut notes: Vec<String> = vec![
+        "heuristic: temporal/lexical-feature clustering without neural speaker encoder".to_owned(),
+    ];
 
     if segments.is_empty() {
         return Ok(DiarizeReport {

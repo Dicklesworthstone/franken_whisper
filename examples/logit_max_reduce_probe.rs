@@ -13,10 +13,10 @@
 //! on sanitized input and (b) times scalar fold vs AVX2 maxps over the 51866 vocab.
 //! Usage: `logit_max_reduce_probe [iters]`.
 #![allow(unsafe_code)]
-use std::hint::black_box;
-use std::time::Instant;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::hint::black_box;
+use std::time::Instant;
 
 const N: usize = 51866; // large-v3-turbo vocab
 
@@ -59,33 +59,76 @@ unsafe fn max_avx2(logits: &[f32]) -> f32 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(20000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20000);
     let mut st = 0x243F_6A88_85A3_08D3u64;
-    let mut nf = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; ((st >> 40) as f32 / (1u64 << 24) as f32) * 40.0 - 20.0 };
+    let mut nf = || {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        ((st >> 40) as f32 / (1u64 << 24) as f32) * 40.0 - 20.0
+    };
     // realistic logit magnitudes; sanitized (finite) as compute_logprobs guarantees.
     let mut logits: Vec<f32> = (0..N).map(|_| nf()).collect();
     // simulate the masked lanes compute_logprobs produces (timestamp/suppressed → NEG_INF).
-    for k in (0..N).step_by(97) { logits[k] = f32::NEG_INFINITY; }
+    for k in (0..N).step_by(97) {
+        logits[k] = f32::NEG_INFINITY;
+    }
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let s = max_scalar(&logits);
         let v = max_avx2(&logits);
-        println!("=== logit_max reduce: scalar fold(f32::max) vs AVX2 maxps tree (N={N}, sanitized) ===");
-        println!("  scalar max = {s:.9}   avx2 max = {v:.9}   bits {}",
-            if s.to_bits() == v.to_bits() { "IDENTICAL" } else { "DIFFER" });
+        println!(
+            "=== logit_max reduce: scalar fold(f32::max) vs AVX2 maxps tree (N={N}, sanitized) ==="
+        );
+        println!(
+            "  scalar max = {s:.9}   avx2 max = {v:.9}   bits {}",
+            if s.to_bits() == v.to_bits() {
+                "IDENTICAL"
+            } else {
+                "DIFFER"
+            }
+        );
         // warm
-        for _ in 0..2000 { black_box(max_scalar(black_box(&logits))); }
-        for _ in 0..2000 { black_box(max_avx2(black_box(&logits))); }
+        for _ in 0..2000 {
+            black_box(max_scalar(black_box(&logits)));
+        }
+        for _ in 0..2000 {
+            black_box(max_avx2(black_box(&logits)));
+        }
         let mut ts = f64::INFINITY;
-        for _ in 0..7 { let t = Instant::now(); for _ in 0..iters { black_box(max_scalar(black_box(&logits))); } ts = ts.min(t.elapsed().as_secs_f64()); }
+        for _ in 0..7 {
+            let t = Instant::now();
+            for _ in 0..iters {
+                black_box(max_scalar(black_box(&logits)));
+            }
+            ts = ts.min(t.elapsed().as_secs_f64());
+        }
         let mut tv = f64::INFINITY;
-        for _ in 0..7 { let t = Instant::now(); for _ in 0..iters { black_box(max_avx2(black_box(&logits))); } tv = tv.min(t.elapsed().as_secs_f64()); }
+        for _ in 0..7 {
+            let t = Instant::now();
+            for _ in 0..iters {
+                black_box(max_avx2(black_box(&logits)));
+            }
+            tv = tv.min(t.elapsed().as_secs_f64());
+        }
         let us_s = ts / iters as f64 * 1e6;
         let us_v = tv / iters as f64 * 1e6;
         println!("  scalar : {us_s:>7.2} µs/call");
-        println!("  avx2   : {us_v:>7.2} µs/call   {:.2}× [{}]", us_s / us_v,
-            if us_v < us_s * 0.85 { "WIN — LLVM left the fold scalar" } else { "no win — LLVM already vectorizes the fold" });
-        println!("  (per-token serial sampler op; ~0.05-0.15% e2e like argmax if it's a real win.)");
+        println!(
+            "  avx2   : {us_v:>7.2} µs/call   {:.2}× [{}]",
+            us_s / us_v,
+            if us_v < us_s * 0.85 {
+                "WIN — LLVM left the fold scalar"
+            } else {
+                "no win — LLVM already vectorizes the fold"
+            }
+        );
+        println!(
+            "  (per-token serial sampler op; ~0.05-0.15% e2e like argmax if it's a real win.)"
+        );
     }
 }

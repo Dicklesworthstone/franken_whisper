@@ -15,7 +15,9 @@ use std::time::Instant;
 
 /// Exact replica of gemv_i8's scalar quantize (allocates, like the real code).
 fn quant_scalar(x: &[f32], xinv: f32) -> Vec<i8> {
-    x.iter().map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8).collect()
+    x.iter()
+        .map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8)
+        .collect()
 }
 
 /// AVX2 quantize into a reused buffer. trunc(v + copysign(0.5,v)) = round-half-away
@@ -75,7 +77,9 @@ fn bench(name: &str, n: usize, iters: usize) {
     let diff = a.iter().zip(b.iter()).filter(|(p, q)| p != q).count();
 
     let ts = {
-        for _ in 0..3 { black_box(quant_scalar(&x, xinv)); }
+        for _ in 0..3 {
+            black_box(quant_scalar(&x, xinv));
+        }
         let mut best = f64::INFINITY;
         for _ in 0..iters {
             let t = Instant::now();
@@ -87,7 +91,10 @@ fn bench(name: &str, n: usize, iters: usize) {
     };
     let ta = {
         let mut buf = vec![0i8; n];
-        for _ in 0..3 { unsafe { quant_simd(&x, xinv, &mut buf) }; black_box(&buf); }
+        for _ in 0..3 {
+            unsafe { quant_simd(&x, xinv, &mut buf) };
+            black_box(&buf);
+        }
         let mut best = f64::INFINITY;
         for _ in 0..iters {
             let t = Instant::now();
@@ -98,14 +105,24 @@ fn bench(name: &str, n: usize, iters: usize) {
         best
     };
     println!("{name}  n={n}  best-of-{iters}");
-    println!("  byte-exact: {diff} differing of {n}  [{}]", if diff == 0 { "IDENTICAL" } else { "DIVERGENT" });
+    println!(
+        "  byte-exact: {diff} differing of {n}  [{}]",
+        if diff == 0 { "IDENTICAL" } else { "DIVERGENT" }
+    );
     println!("  scalar .round()+alloc : {:>8.3} µs", ts * 1e6);
-    println!("  AVX2 copysign+trunc   : {:>8.3} µs  {:.2}x  [{}]",
-        ta * 1e6, ts / ta, if ta < ts { "WIN" } else { "loss" });
+    println!(
+        "  AVX2 copysign+trunc   : {:>8.3} µs  {:.2}x  [{}]",
+        ta * 1e6,
+        ts / ta,
+        if ta < ts { "WIN" } else { "loss" }
+    );
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
     println!("=== gemv_i8 activation quantize: scalar .round() vs AVX2 (1 thread) ===");
     bench("qkv/mlp_0 act [1280]", 1280, iters);
     bench("fc2 act    [5120]", 5120, iters / 2);

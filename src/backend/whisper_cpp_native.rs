@@ -736,9 +736,13 @@ fn finalize_segments(
             end_sec: if no_timestamps { None } else { seg.end_sec },
             text: seg.text.trim().to_owned(),
             speaker: None,
-            confidence: seg
-                .confidence
-                .map(|c| if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 }),
+            confidence: seg.confidence.map(|c| {
+                if c.is_finite() {
+                    c.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }),
         });
     }
     Ok(out)
@@ -1139,7 +1143,10 @@ mod tests {
         let grouped = group_word_segments_by_len(&words, 100, None).expect("group");
         assert_eq!(grouped.len(), 1);
         let conf = grouped[0].confidence.expect("finite confidence");
-        assert!(conf.is_finite(), "grouped confidence must be finite: {conf}");
+        assert!(
+            conf.is_finite(),
+            "grouped confidence must be finite: {conf}"
+        );
         // Mean of the two finite confidences (0.8, 0.6), NaN excluded.
         assert!((conf - 0.7).abs() < 1e-9, "unexpected mean: {conf}");
     }

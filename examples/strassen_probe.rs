@@ -38,9 +38,12 @@ fn sub(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b).map(|(x, y)| x - y).collect()
 }
 fn mm(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {
-    nn::matmul(&Mat::from_vec(m, k, a.to_vec()), &Mat::from_vec(k, n, b.to_vec()))
-        .unwrap()
-        .data
+    nn::matmul(
+        &Mat::from_vec(m, k, a.to_vec()),
+        &Mat::from_vec(k, n, b.to_vec()),
+    )
+    .unwrap()
+    .data
 }
 
 /// One-level Strassen: C[M,N] = A[M,K] @ B[K,N]. M,K,N must be even.
@@ -83,7 +86,9 @@ fn strassen1(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {
 fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
     let mut s = 0x51A5_1234u64;
     let mut nf = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     };
     let a: Vec<f32> = (0..m * k).map(|_| nf()).collect();
@@ -118,13 +123,22 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
         .zip(reference.data.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0f32, f32::max);
-    let relmax = reference.data.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+    let relmax = reference
+        .data
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-9);
     let gflop = 2.0 * m as f64 * k as f64 * n as f64 / 1e9;
     println!(
         "{name}  [{m}x{k}]@[{k}x{n}]  ({gflop:.1} GF)  best-of-{iters} @ {}t:",
         rayon::current_num_threads()
     );
-    println!("  baseline nn::matmul : {:>7.2} ms  {:>6.0} GF/s", bbase * 1e3, gflop / bbase);
+    println!(
+        "  baseline nn::matmul : {:>7.2} ms  {:>6.0} GF/s",
+        bbase * 1e3,
+        gflop / bbase
+    );
     println!(
         "  1-level Strassen    : {:>7.2} ms  {:>6.0} GF/s  {:.2}x  |  max|d|={:.2e} (rel {:.1e})  {}",
         bstr * 1e3,
@@ -137,7 +151,10 @@ fn bench(name: &str, m: usize, k: usize, n: usize, iters: usize) {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     println!("=== one-level Strassen vs blocked nn::matmul, encoder MLP shapes ===");
     bench("MLP fc1", 1500, 1280, 5120, iters);
     bench("MLP fc2", 1500, 5120, 1280, iters);

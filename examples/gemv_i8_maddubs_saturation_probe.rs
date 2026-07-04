@@ -10,9 +10,9 @@
 //! This probe proves the saturation: maddubs+sign-offset vs the exact (widening) dot over K.
 //! Usage: `gemv_i8_maddubs_saturation_probe`.
 #![allow(unsafe_code)]
-use std::hint::black_box;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::hint::black_box;
 
 const K: usize = 1280; // decode/encoder inner dim (n_state)
 
@@ -56,7 +56,12 @@ unsafe fn dot_maddubs(w: &[i8], xu: &[u8], wsum: i32) -> i32 {
 
 fn main() {
     let mut st = 0x243F_6A88_85A3_08D3u64;
-    let mut b8 = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st >> 56) as i8 };
+    let mut b8 = || {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        (st >> 56) as i8
+    };
     const ROWS: usize = 4096;
     let w: Vec<i8> = (0..ROWS * K).map(|_| b8()).collect();
     let x: Vec<i8> = (0..K).map(|_| b8()).collect();
@@ -71,16 +76,35 @@ fn main() {
             let wsum: i32 = wr.iter().map(|&v| v as i32).sum();
             let exact = dot_widening(wr, &x);
             let mad = dot_maddubs(wr, &xu, wsum);
-            if exact != mad { differ += 1; maxerr = maxerr.max((exact - mad).abs()); }
+            if exact != mad {
+                differ += 1;
+                maxerr = maxerr.max((exact - mad).abs());
+            }
             black_box(mad);
         }
-        println!("=== VPMADDUBSW saturation check: maddubs+sign-offset vs exact int8·int8 dot (K={K}) ===");
-        println!("  rows where maddubs ≠ exact : {differ} / {ROWS}  ({:.0}%)", 100.0 * differ as f64 / ROWS as f64);
-        println!("  max |error|                : {maxerr}  (int16 saturation of the u8·i8 pair-sums)");
-        println!("  VERDICT: [{}]", if differ == 0 {
-            "no saturation at this scale — maddubs viable" } else {
-            "maddubs SATURATES ⇒ NOT usable for accurate int8×int8 GEMM without VNNI; widening (int32) is the correct op" });
-        println!("  ⇒ last cycle's 'maddubs is the fix' is RETRACTED: the prior kernel used widening because it's correct.");
-        println!("  ⇒ int8 encoder GEMM on AVX2 (no VNNI) is stuck with widening (~1.27× blocked-f32 compute), eaten to 0.89×.");
+        println!(
+            "=== VPMADDUBSW saturation check: maddubs+sign-offset vs exact int8·int8 dot (K={K}) ==="
+        );
+        println!(
+            "  rows where maddubs ≠ exact : {differ} / {ROWS}  ({:.0}%)",
+            100.0 * differ as f64 / ROWS as f64
+        );
+        println!(
+            "  max |error|                : {maxerr}  (int16 saturation of the u8·i8 pair-sums)"
+        );
+        println!(
+            "  VERDICT: [{}]",
+            if differ == 0 {
+                "no saturation at this scale — maddubs viable"
+            } else {
+                "maddubs SATURATES ⇒ NOT usable for accurate int8×int8 GEMM without VNNI; widening (int32) is the correct op"
+            }
+        );
+        println!(
+            "  ⇒ last cycle's 'maddubs is the fix' is RETRACTED: the prior kernel used widening because it's correct."
+        );
+        println!(
+            "  ⇒ int8 encoder GEMM on AVX2 (no VNNI) is stuck with widening (~1.27× blocked-f32 compute), eaten to 0.89×."
+        );
     }
 }
