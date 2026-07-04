@@ -4,6 +4,41 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: FOLLOW-UP LAND-OR-DIG blocker — fail-closed RCH still selects `vmi1227854` and times out syncing this repo; required target dir remains occupied by peer bench
+
+**Ratio vs ORIG: UNCHANGED / NO NEW MEASUREMENT.** This pass made no runtime
+change and produced no usable bench sample, so it does not alter the current
+mainline ratio envelope vs the original lineage.
+
+`AGENT_NAME=BlackThrush git status --short --branch` was clean
+(`## main...origin/main`), so the requested "commit unstaged now" step had
+nothing to commit. Agent Mail registration/reservation was retried and is still
+blocked by the archive SQLite corruption circuit breaker (`database disk image
+is malformed`). Repo-local `.scratch/.worktrees` plus `/data/projects/.scratch`
+and `/data/projects/.worktrees` contained no franken_whisper bench worktree to
+land. The only sibling HEADs still not reachable from `main` remain the already
+classified stale set: `766f5f1`, `db5f059`, `4dd616f`, `443bc4f`, `134f404`,
+and `c902858`.
+
+Fresh short-bench attempt used the required per-crate target dir but fail-closed
+to avoid parking behind the local Cargo lock:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod RCH_REQUIRE_REMOTE=1 RCH_FORCE_REMOTE=1 rch exec -- cargo bench -p franken_whisper --profile release --bench native_engine_bench -- native_engine/f16_gemv/f16_gemv_dequant_384x384 --sample-size 10 --warm-up-time 0.1 --measurement-time 1 --output-format bencher --noplot`.
+RCH again selected `vmi1227854`, completed the dependency-root syncs, then hit
+the same 30 s timeout syncing `/data/projects/franken_whisper`:
+`sync_to_remote: timed out after 30000ms`. Because `RCH_REQUIRE_REMOTE=1` was
+set, it refused local fallback instead of blocking behind the existing local
+bench. The local target dir was still held by a live peer command:
+`cargo bench -p franken_whisper --profile release --bench native_engine_bench -- window_to_time_major ...`
+with its `cargo`/`rustc` children writing under
+`/data/projects/.rch-targets/whisper-cod/release`.
+
+**Verdict.** No measured win is available to land, and the fresh dig is
+currently infrastructure-blocked, not code-blocked: the selected RCH worker
+cannot finish syncing this repo within the 30 s transfer timeout, while the
+required local target dir is occupied by a live peer bench. Do not infer a
+performance loss from this entry; it is a failed measurement attempt.
+
+---
 ## 2026-07-04 - BlackThrush: LAND-OR-DIG pass blocked after clean-main audit — no unstaged work to commit, no unlanded measured worktree win, and the required short per-crate bench target is occupied by a live peer build
 
 **Ratio vs ORIG: UNCHANGED / NOT NEWLY MEASURED.** No runtime files changed in
