@@ -160,13 +160,17 @@ fn main() {
         (layer + c_log) / (4.0 * layer + c_log)
     };
     eprintln!(
-        "\nVERDICT: warm logits fraction = {:.0}% was a MIXED-regime artifact (small ops warm, \n\
-         66 MB logits cold). COLD/regime-controlled = {:.0}% (≈ the byte ratio 66/158 = 42%, since \n\
-         all ops are DRAM-bound). Real decode leans cold for the oversized logits weight. Even at \n\
-         the cold {:.0}%, a 1-layer self-draft still costs {:.2}x a full token → needs high accept; \n\
-         layer-skip self-speculation stays structurally weak BUT less dead than the warm 72% implied. \n\
-         The real lever must cut the LOGITS cost (smaller-vocab / reduced-head drafter), which layer- \n\
-         skip does NOT — that conclusion holds in BOTH regimes.",
-        100.0 * warm_frac, 100.0 * cold_frac, 100.0 * cold_frac, cold_floor1
+        "\nVERDICT: warm logits fraction = {:.0}% is a MIXED-regime, contention-variable artifact \n\
+         (small ops L3-warm, 66 MB logits cold). COLD/regime-controlled = {:.0}% — and NOTE this is \n\
+         BELOW the byte ratio (66/158 = 42%): cold, the large logits GEMV streams efficiently \n\
+         (~55 GB/s) while the small layer GEMVs are dispatch/overhead-limited (~18-30 GB/s), so \n\
+         logits' TIME share < its BYTE share. Real decode is between (158 MB working set ≈ 128 MB \n\
+         L3). Net for self-draft: cold, the 4 layers are the BULK ({:.0}%), so a 1-layer skip draft \n\
+         costs only {:.2}x a full token (break-even ~{:.0}% accept) — MORE viable than the warm \n\
+         number implied, though still a high bar for a depth-truncated draft of a 4-layer decoder. \n\
+         Regime-invariant point: the biggest single per-token op is still the logits head, and a \n\
+         drafter that ALSO shrinks it (smaller vocab / reduced head) dominates a pure layer-skip.",
+        100.0 * warm_frac, 100.0 * cold_frac, 100.0 * (1.0 - cold_frac), cold_floor1,
+        100.0 * (4.0 * cold_floor1 + 1.0 - 1.0) / 4.0
     );
 }
