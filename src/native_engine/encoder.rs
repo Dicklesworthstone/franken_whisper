@@ -702,10 +702,39 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
         return false;
     }
 
-    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<ft_kernel_metal::fused::EncoderGpu>>>> =
+    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<ft_kernel_metal::fused::EncoderGpu>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = std::ptr::from_ref(w) as usize;
+    // Identify the model by a cheap content fingerprint (shape + a few weight
+    // samples), NOT by `w`'s address: this static cache outlives the borrowed
+    // `EncoderWeights`, so a dropped model replaced by a DIFFERENT model reusing the
+    // same address would otherwise alias a stale resident encoder. The fingerprint
+    // also lets the same model loaded twice share one upload.
+    let key: u64 = {
+        fn mix(h: u64, v: u64) -> u64 {
+            (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        h = mix(h, w.n_state as u64);
+        h = mix(h, w.n_head as u64);
+        h = mix(h, w.layers.len() as u64);
+        for l in [w.layers.first(), w.layers.last()].into_iter().flatten() {
+            for s in [
+                l.attn_q_w.data.first(),
+                l.attn_q_w.data.last(),
+                l.mlp_fc_w.data.first(),
+                l.mlp_proj_w.data.last(),
+                l.attn_ln_w.first(),
+                l.attn_ln_w.last(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                h = mix(h, u64::from(s.to_bits()));
+            }
+        }
+        h
+    };
 
     let enc = {
         let mut guard = match cache.lock() {
