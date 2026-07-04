@@ -86,7 +86,28 @@ Exercise: `FW_NO_CONTEXT=1 PROBE_NO_TS=1 PROBE_DUMP_TEXT=1 e2e_probe large-v3-tu
 (A/B vs unset).
 
 ---
+## 2026-07-04 - BlackThrush: MEASURED KEEP — built-in decoder ingestion fused sanitize+downmix is 1.15x faster than the original allocation path
 
+**Land-or-dig result.** AGENT_NAME=BlackThrush. No unlanded measured worktree win was found to land; the useful fresh lever was the built-in audio-normalization ingestion path. Original path after each Symphonia decode packet: allocate a sanitized interleaved `Vec<f32>`, then for multi-channel audio allocate a second mono downmix buffer before appending. New path appends the exact same sanitized/downmixed mono samples directly into the destination buffer, with a finite fast path for normal decoded PCM and the existing SIMD stereo average for finite stereo frames.
+
+**Behavior gate.** Exactness test passed remotely via `rch` on `ovh-a` with the project target dir set to `CARGO_TARGET_DIR=/data/projects/franken_whisper/.rch-targets/blackthrush`:
+`AGENT_NAME=BlackThrush RUSTFLAGS='--cap-lints=allow' rch exec -- cargo test -p franken_whisper --lib append_sanitized_downmix_to_mono_matches_legacy_ingestion -- --nocapture`
+Result: `1 passed; 0 failed; 3266 filtered out`. The `RUSTFLAGS='--cap-lints=allow'` workaround was needed because the live sibling `/data/projects/frankentorch` checkout currently fails normal builds in `ft-kernel-cpu` on its own `#![deny(unsafe_code)]` against an uncommitted unsafe AVX2 transpose block; no peer files were changed.
+
+**Per-crate bench.** Exact requested spelling was attempted and rejected by this Cargo:
+`rch exec -- cargo bench --release -p franken_whisper --bench native_engine_bench -- native_engine/sanitize_downmix --sample-size 10` → `error: unexpected argument '--release' found`.
+Supported equivalent was then run with the same dedicated target dir:
+`AGENT_NAME=BlackThrush RUSTFLAGS='--cap-lints=allow' CARGO_TARGET_DIR=/data/projects/franken_whisper/.rch-targets/blackthrush rch exec -- cargo bench -p franken_whisper --bench native_engine_bench -- native_engine/sanitize_downmix --sample-size 10`.
+RCH selected `hz2` but timed out syncing and failed open locally; Criterion completed in the same target dir.
+
+**Ratio vs the original ingestion path.** Same-run Criterion, 30 s stereo 44.1 kHz synthetic decoded PCM:
+- original `legacy_clean_then_downmix_stereo_30s`: **4.3057 ms** middle estimate
+- fused `fused_append_stereo_30s`: **3.7372 ms** middle estimate
+- ratio: **3.7372 / 4.3057 = 0.868x time**, i.e. **1.15x faster** (about **13.2% less time**) than the original allocation path.
+
+This is a local normalization-path win, not a full ASR end-to-end claim; ratios vs OpenAI/whisper.cpp full transcription remain governed by the existing A/B entries until a full codec corpus run is performed.
+
+---
 ## 2026-07-06 - BlackThrush: bd-r0qd MECHANISM RESOLVED (prompt is causal) + fix spec; code deferred (tree fmt-dirty) — **the owner's own diagnostic already PROVES the mechanism: the 90–120 s slice transcribed STANDALONE (empty `prompt_past`) captures the tail; the same audio as the final window of the full run (non-empty `prompt_past` from windows 1-3) DROPS it. The ONLY differing input is `prompt_past` (condition_on_previous_text) ⇒ it is CAUSAL, not a coincidence and not pure int8 numerics. Refined model: it's a `prompt_past` × int8-decode-numerics INTERACTION — whisper.cpp carries the same previous-text prompt but its ggml/f16 logits argmax a text token at the critical step, while native's int8 logits argmax `eot`, ending the window early (decode.rs greedy loop terminates only on `tok==eot` in no_ts, :1327). No temperature fallback in native's greedy `transcribe_samples` to recover. Ratio vs OpenAI-Whisper unchanged (no code change; ~1.2× ts / ~1.68–1.8× no_ts).**
 
 **FIX SPEC (for a clean-tree cycle / owner):**
