@@ -767,6 +767,61 @@ fn bench_f16_gemv_dequant(c: &mut Criterion) {
     group.finish();
 }
 
+fn synthetic_mat(rows: usize, cols: usize, seed: u64) -> Mat {
+    let mut lcg = Lcg::new(seed);
+    Mat::from_vec(
+        rows,
+        cols,
+        (0..rows * cols).map(|_| lcg.next_f32()).collect(),
+    )
+}
+
+fn synthetic_vec(n: usize, seed: u64) -> Vec<f32> {
+    let mut lcg = Lcg::new(seed);
+    (0..n).map(|_| lcg.next_f32()).collect()
+}
+
+fn bench_i7_qkv_activation_reuse(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn;
+
+    let h = synthetic_mat(1500, 1280, 0x51);
+    let wq = nn::quantize_mat_to_i7(&synthetic_mat(1280, 1280, 0x52));
+    let wk = nn::quantize_mat_to_i7(&synthetic_mat(1280, 1280, 0x53));
+    let wv = nn::quantize_mat_to_i7(&synthetic_mat(1280, 1280, 0x54));
+    let bq = synthetic_vec(1280, 0x55);
+    let bv = synthetic_vec(1280, 0x56);
+
+    let mut group = c.benchmark_group("native_engine/i7_qkv");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(2));
+
+    group.bench_function("three_inline_quantize_1500x1280", |b| {
+        b.iter(|| {
+            let q =
+                nn::matmul_bias_i7(black_box(&h), black_box(&wq), Some(black_box(&bq))).expect("q");
+            let k = nn::matmul_bias_i7(black_box(&h), black_box(&wk), None).expect("k");
+            let v =
+                nn::matmul_bias_i7(black_box(&h), black_box(&wv), Some(black_box(&bv))).expect("v");
+            black_box(q.data[0] + k.data[1] + v.data[2])
+        });
+    });
+
+    group.bench_function("shared_activation_1500x1280", |b| {
+        b.iter(|| {
+            let hq = nn::quantize_act_i7(black_box(&h));
+            let q =
+                nn::matmul_bias_i7_quantized(&hq, black_box(&wq), Some(black_box(&bq))).expect("q");
+            let k = nn::matmul_bias_i7_quantized(&hq, black_box(&wk), None).expect("k");
+            let v =
+                nn::matmul_bias_i7_quantized(&hq, black_box(&wv), Some(black_box(&bv))).expect("v");
+            black_box(q.data[0] + k.data[1] + v.data[2])
+        });
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // 7. layer_norm — vertical-SIMD per-row normalization (hermetic).
 //     Direct instrument for the L5 lever: one encoder-window-shaped
@@ -936,6 +991,7 @@ criterion_group!(
     bench_decoder_token_step_large,
     bench_logits_gemv_large,
     bench_f16_gemv_dequant,
+    bench_i7_qkv_activation_reuse,
     bench_layer_norm,
     bench_gelu,
     bench_resample,

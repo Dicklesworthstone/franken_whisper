@@ -946,10 +946,20 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     let h = et!(2, ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b));
 
     let (q, k, v) = et!(3, {
-        let q = enc_linear(&h, &layer.attn_q_w, &layer.attn_q_i7, Some(&layer.attn_q_b))?;
-        let k = enc_linear(&h, &layer.attn_k_w, &layer.attn_k_i7, None)?; // no key bias
-        let v = enc_linear(&h, &layer.attn_v_w, &layer.attn_v_i7, Some(&layer.attn_v_b))?;
-        (q, k, v)
+        if let (Some(qw), Some(kw), Some(vw)) =
+            (&layer.attn_q_i7, &layer.attn_k_i7, &layer.attn_v_i7)
+        {
+            let hq = nn::quantize_act_i7(&h);
+            let q = nn::matmul_bias_i7_quantized(&hq, qw, Some(&layer.attn_q_b))?;
+            let k = nn::matmul_bias_i7_quantized(&hq, kw, None)?; // no key bias
+            let v = nn::matmul_bias_i7_quantized(&hq, vw, Some(&layer.attn_v_b))?;
+            (q, k, v)
+        } else {
+            let q = enc_linear(&h, &layer.attn_q_w, &layer.attn_q_i7, Some(&layer.attn_q_b))?;
+            let k = enc_linear(&h, &layer.attn_k_w, &layer.attn_k_i7, None)?; // no key bias
+            let v = enc_linear(&h, &layer.attn_v_w, &layer.attn_v_i7, Some(&layer.attn_v_b))?;
+            (q, k, v)
+        }
     });
 
     // Bidirectional self-attention: causal_offset = None.
