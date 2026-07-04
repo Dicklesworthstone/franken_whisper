@@ -728,21 +728,88 @@ fn append_decoded_audio_to_mono(
 ) {
     let mut sample_buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
     sample_buffer.copy_interleaved_ref(decoded);
-    let interleaved = sample_buffer.samples();
-    // NaN/Inf/denormal entry point: IEEE-754 float PCM can legitimately carry
-    // non-finite samples. Sanitize once at ingestion so the downstream downmix,
-    // resampler, and WAV writer only ever see finite values (no hot-loop guards).
-    let clean: Vec<f32> = interleaved
-        .iter()
-        .map(|&x| if x.is_finite() { x } else { 0.0 })
-        .collect();
+    append_sanitized_downmix_to_mono(destination, sample_buffer.samples(), channel_count);
+}
 
+/// Append sanitized mono PCM into `destination`, preserving the legacy ingestion
+/// semantics of "replace each non-finite channel sample with silence, then
+/// average complete interleaved frames". Exposed for the benchmark harness; not
+/// part of the stable API.
+pub fn append_sanitized_downmix_to_mono(
+    destination: &mut Vec<f32>,
+    interleaved: &[f32],
+    channel_count: usize,
+) {
     if channel_count <= 1 {
-        destination.extend_from_slice(&clean);
+        if interleaved.iter().all(|sample| sample.is_finite()) {
+            destination.extend_from_slice(interleaved);
+        } else {
+            destination.extend(
+                interleaved
+                    .iter()
+                    .map(|&sample| if sample.is_finite() { sample } else { 0.0 }),
+            );
+        }
         return;
     }
 
-    destination.extend_from_slice(&downmix_to_mono(&clean, channel_count));
+    let frames = interleaved.len() / channel_count;
+    if frames == 0 {
+        return;
+    }
+    destination.reserve(frames);
+
+    if interleaved[..frames * channel_count]
+        .iter()
+        .all(|sample| sample.is_finite())
+    {
+        append_finite_downmix_to_mono(destination, interleaved, channel_count, frames);
+        return;
+    }
+
+    for i in 0..frames {
+        let frame = &interleaved[i * channel_count..(i + 1) * channel_count];
+        let mut sum = 0.0f32;
+        for &sample in frame {
+            sum += if sample.is_finite() { sample } else { 0.0 };
+        }
+        destination.push(sum / channel_count as f32);
+    }
+}
+
+fn append_finite_downmix_to_mono(
+    destination: &mut Vec<f32>,
+    interleaved: &[f32],
+    channel_count: usize,
+    frames: usize,
+) {
+    if channel_count == 2 {
+        use std::simd::Simd;
+        const L: usize = 8;
+        let start = destination.len();
+        destination.resize(start + frames, 0.0);
+        let out = &mut destination[start..];
+        let simd_frames = (frames / L) * L;
+        let half = Simd::<f32, L>::splat(0.5);
+        let mut f = 0;
+        while f < simd_frames {
+            let a = Simd::<f32, L>::from_slice(&interleaved[2 * f..2 * f + L]);
+            let b = Simd::<f32, L>::from_slice(&interleaved[2 * f + L..2 * f + 2 * L]);
+            let (lefts, rights) = a.deinterleave(b);
+            ((lefts + rights) * half).copy_to_slice(&mut out[f..f + L]);
+            f += L;
+        }
+        for (i, slot) in out.iter_mut().enumerate().skip(simd_frames) {
+            *slot = (interleaved[2 * i] + interleaved[2 * i + 1]) * 0.5;
+        }
+        return;
+    }
+
+    for i in 0..frames {
+        let frame = &interleaved[i * channel_count..(i + 1) * channel_count];
+        let sum: f32 = frame.iter().copied().sum();
+        destination.push(sum / channel_count as f32);
+    }
 }
 
 /// Average `channels` interleaved samples per frame down to mono. Bit-exact with
@@ -1182,6 +1249,52 @@ mod tests {
                     .collect();
                 let got = downmix_to_mono(&interleaved, channels);
                 let want = reference(&interleaved, channels);
+                assert_eq!(got.len(), want.len(), "len ch={channels} frames={frames}");
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "bit mismatch ch={channels} frames={frames} idx={i}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn append_sanitized_downmix_to_mono_matches_legacy_ingestion() {
+        use super::{append_sanitized_downmix_to_mono, downmix_to_mono};
+
+        fn legacy_reference(interleaved: &[f32], channels: usize) -> Vec<f32> {
+            let clean: Vec<f32> = interleaved
+                .iter()
+                .map(|&sample| if sample.is_finite() { sample } else { 0.0 })
+                .collect();
+            if channels <= 1 {
+                clean
+            } else {
+                downmix_to_mono(&clean, channels)
+            }
+        }
+
+        for &channels in &[1usize, 2, 3] {
+            for &frames in &[0usize, 1, 7, 8, 9, 16, 1000] {
+                let mut interleaved: Vec<f32> = (0..frames * channels + channels.saturating_sub(1))
+                    .map(|i| {
+                        let x = i as f32 * 0.017;
+                        (x.sin() * 0.5 + (x * 0.7).cos() * 0.25).fract()
+                    })
+                    .collect();
+                if !interleaved.is_empty() {
+                    interleaved[0] = f32::NAN;
+                    let middle = interleaved.len() / 2;
+                    interleaved[middle] = f32::INFINITY;
+                    *interleaved.last_mut().expect("non-empty") = f32::NEG_INFINITY;
+                }
+
+                let mut got = Vec::new();
+                append_sanitized_downmix_to_mono(&mut got, &interleaved, channels);
+                let want = legacy_reference(&interleaved, channels);
                 assert_eq!(got.len(), want.len(), "len ch={channels} frames={frames}");
                 for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                     assert_eq!(

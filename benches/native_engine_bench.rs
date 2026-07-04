@@ -9,6 +9,8 @@
 //! - `decoder_token_step_*` — ONE decoder `forward_step` at a fixed cache depth.
 //! - `logits_gemv_large`  — the `[n_vocab, n_state]` tied output projection,
 //!   the direct instrument for the f16-GEMV lever.
+//! - `sanitize_downmix`    — built-in decoder ingestion: sanitize + channel
+//!   average over decoded interleaved PCM.
 //! - `e2e_tiny_jfk`       — full `transcribe_samples` over the jfk fixture.
 //!
 //! # Model gating
@@ -865,6 +867,58 @@ fn bench_downmix(c: &mut Criterion) {
     group.finish();
 }
 
+fn legacy_clean_then_downmix_append(
+    destination: &mut Vec<f32>,
+    interleaved: &[f32],
+    channels: usize,
+) {
+    use franken_whisper::audio::downmix_to_mono;
+
+    let clean: Vec<f32> = interleaved
+        .iter()
+        .map(|&sample| if sample.is_finite() { sample } else { 0.0 })
+        .collect();
+    if channels <= 1 {
+        destination.extend_from_slice(&clean);
+    } else {
+        destination.extend_from_slice(&downmix_to_mono(&clean, channels));
+    }
+}
+
+/// Decoded-packet ingestion path: sanitize IEEE-float PCM and downmix 30 s of
+/// stereo 44.1 kHz audio before resampling. No model needed — runs everywhere.
+fn bench_sanitize_downmix(c: &mut Criterion) {
+    use franken_whisper::audio::append_sanitized_downmix_to_mono;
+
+    let frames = 44_100usize * 30;
+    let interleaved = synthetic_audio(frames * 2, 0x35aa_51d7);
+
+    let mut group = c.benchmark_group("native_engine/sanitize_downmix");
+    group.throughput(criterion::Throughput::Elements(interleaved.len() as u64));
+    group.bench_function("legacy_clean_then_downmix_stereo_30s", |bch| {
+        bch.iter_batched_ref(
+            || Vec::with_capacity(frames),
+            |out| {
+                legacy_clean_then_downmix_append(out, black_box(&interleaved), black_box(2));
+                black_box(out.len())
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("fused_append_stereo_30s", |bch| {
+        bch.iter_batched_ref(
+            || Vec::with_capacity(frames),
+            |out| {
+                append_sanitized_downmix_to_mono(out, black_box(&interleaved), black_box(2));
+                black_box(out.len())
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -886,6 +940,7 @@ criterion_group!(
     bench_gelu,
     bench_resample,
     bench_downmix,
+    bench_sanitize_downmix,
     bench_e2e_tiny_jfk,
     bench_e2e_tiny_jfk_no_timestamps,
     bench_e2e_large_jfk,
