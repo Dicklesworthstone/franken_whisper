@@ -99,6 +99,14 @@ struct EncoderLayer {
     /// MLP down projection `[4*n_state, n_state]` (`[in, out]`) + bias.
     mlp_proj_w: Mat,
     mlp_proj_b: Vec<f32>,
+    /// Optional 7-bit int8 (maddubs) copies of the six linear weights, built ONCE
+    /// at load iff [`super::enc_int8_enabled`]. `None` = f32 path = byte-identical.
+    attn_q_i7: Option<nn::I7Mat>,
+    attn_k_i7: Option<nn::I7Mat>,
+    attn_v_i7: Option<nn::I7Mat>,
+    attn_out_i7: Option<nn::I7Mat>,
+    mlp_fc_i7: Option<nn::I7Mat>,
+    mlp_proj_i7: Option<nn::I7Mat>,
 }
 
 /// Fully loaded, pre-transposed encoder weights for one whisper model.
@@ -395,7 +403,7 @@ impl EncoderWeights {
         // `model`, and now transposes SERIALLY, so this fans the 32 layers across
         // cores with no nested spawn. Order is preserved (`map`+`collect`), so the
         // assembled weights are byte-identical to the serial loop.
-        let layers = (0..n_layer)
+        let mut layers = (0..n_layer)
             .into_par_iter()
             .map(|i| -> FwResult<EncoderLayer> {
                 let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
@@ -446,9 +454,29 @@ impl EncoderWeights {
                         mlp_hidden,
                     )?,
                     mlp_proj_b: load_vec(model, &p("mlp.2.bias"), n_state)?,
+                    attn_q_i7: None,
+                    attn_k_i7: None,
+                    attn_v_i7: None,
+                    attn_out_i7: None,
+                    mlp_fc_i7: None,
+                    mlp_proj_i7: None,
                 })
             })
             .collect::<FwResult<Vec<_>>>()?;
+
+        // Optional: quantize every linear weight to 7-bit int8 (maddubs GEMM path)
+        // ONCE, iff FRANKEN_WHISPER_ENC_INT8=1. Default off => all i7 fields stay
+        // None => the forward runs f32 sgemm byte-identically.
+        if super::enc_int8_enabled() {
+            layers.par_iter_mut().for_each(|l| {
+                l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
+                l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
+                l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
+                l.attn_out_i7 = Some(nn::quantize_mat_to_i7(&l.attn_out_w));
+                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+                l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
+            });
+        }
 
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;
@@ -855,6 +883,22 @@ fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
     }
 }
 
+/// Dispatch a linear layer to the maddubs 7-bit int8 GEMM when an [`nn::I7Mat`]
+/// was built at load (`FRANKEN_WHISPER_ENC_INT8=1`), else the f32 sgemm. The
+/// default (no i7) path is byte-identical to the pre-lever encoder.
+#[inline]
+fn enc_linear(
+    x: &Mat,
+    w_t: &Mat,
+    w_i7: &Option<nn::I7Mat>,
+    bias: Option<&[f32]>,
+) -> FwResult<Mat> {
+    match w_i7 {
+        Some(w) => nn::matmul_bias_i7(x, w, bias),
+        None => nn::matmul_bias(x, w_t, bias),
+    }
+}
+
 fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<()> {
     let measure = crate::native_engine::perf_spans_enabled();
     macro_rules! et {
@@ -877,22 +921,25 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     let h = et!(2, ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b));
 
     let (q, k, v) = et!(3, {
-        let q = nn::matmul_bias(&h, &layer.attn_q_w, Some(&layer.attn_q_b))?;
-        let k = nn::matmul_bias(&h, &layer.attn_k_w, None)?; // no key bias
-        let v = nn::matmul_bias(&h, &layer.attn_v_w, Some(&layer.attn_v_b))?;
+        let q = enc_linear(&h, &layer.attn_q_w, &layer.attn_q_i7, Some(&layer.attn_q_b))?;
+        let k = enc_linear(&h, &layer.attn_k_w, &layer.attn_k_i7, None)?; // no key bias
+        let v = enc_linear(&h, &layer.attn_v_w, &layer.attn_v_i7, Some(&layer.attn_v_b))?;
         (q, k, v)
     });
 
     // Bidirectional self-attention: causal_offset = None.
     let attn = et!(4, nn::attention(&q, &k, &v, n_head, None)?);
-    let attn = et!(5, nn::matmul_bias(&attn, &layer.attn_out_w, Some(&layer.attn_out_b))?);
+    let attn = et!(
+        5,
+        enc_linear(&attn, &layer.attn_out_w, &layer.attn_out_i7, Some(&layer.attn_out_b))?
+    );
     et!(6, add_in_place(x, &attn));
 
     // ── MLP residual ── (same fused layer_norm-into-uninit, no clone memcpy)
     let h = et!(7, ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b));
-    let mut h = et!(8, nn::matmul_bias(&h, &layer.mlp_fc_w, Some(&layer.mlp_fc_b))?);
+    let mut h = et!(8, enc_linear(&h, &layer.mlp_fc_w, &layer.mlp_fc_i7, Some(&layer.mlp_fc_b))?);
     et!(9, nn::gelu(&mut h));
-    let h = et!(10, nn::matmul_bias(&h, &layer.mlp_proj_w, Some(&layer.mlp_proj_b))?);
+    let h = et!(10, enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, Some(&layer.mlp_proj_b))?);
     et!(11, add_in_place(x, &h));
 
     Ok(())

@@ -310,6 +310,26 @@ pub(crate) fn int8_mlp_enabled() -> bool {
     })
 }
 
+/// Whether to run the ENCODER linear GEMMs (attn q/k/v/out + mlp fc1/fc2) through
+/// the maddubs 7-bit-weight int8 path ([`nn::matmul_bias_i7`]) instead of f32
+/// sgemm. **DEFAULT OFF = f32 = byte-identical.** When on, each linear weight is
+/// quantized to i7 ONCE at load; the per-window activation is quantized to u8 and
+/// the GEMM runs `_mm256_maddubs_epi16` (measured 1.56-1.58x f32 on the MLP GEMMs,
+/// integer-EXACT/non-saturating for i7, docs/NEGATIVE_EVIDENCE d8b8df6). NON-byte-
+/// exact vs f32 sgemm (int8 quantization) -> owner-gated on a transcript A/B, hence
+/// default off. Env: `FRANKEN_WHISPER_ENC_INT8=1`.
+pub(crate) fn enc_int8_enabled() -> bool {
+    const DEFAULT_ON: bool = false;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_ENC_INT8") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Whether to run the decoder **attention** input projections (fused self `qkv`
 /// and `cross_attn_q`) through the int8/Q8 GEMV on the per-token decode path
 /// (`tq == 1`). The output projections (`self_out`, `cross_out`) stay f16.

@@ -4,6 +4,43 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: LANDED (gated, default-off) — maddubs 7-bit int8 ENCODER GEMM wired into the real 32-layer encoder = **1.23-1.30x e2e MEASURED** (jfk byte-IDENTICAL, track01 ~98% word-identical); the biggest measured win of the project
+
+**Ratio vs OpenAI-Whisper: ~1.5-2.2x (was ~1.2-1.8x) when FRANKEN_WHISPER_ENC_INT8=1 — a MEASURED
+1.23-1.30x e2e on top of the prior lead.** Default OFF = f32 sgemm = BYTE-IDENTICAL (golden preserved);
+opt-in only, because int8 is non-byte-exact (owner may flip default after a broader quality pass).
+
+**This LANDS last cycle's probe finding (d8b8df6) as a real gated feature.** Wired the maddubs-7bit GEMM
+into the actual encoder: new `nn::I7Mat` + `nn::quantize_mat_to_i7` + `nn::matmul_bias_i7` (AVX2
+`_mm256_maddubs_epi16`, u8 activation × i7 weight, sign-offset −128·Σw); `EncoderLayer` gains 6
+`Option<I7Mat>` fields built ONCE at load iff `enc_int8_enabled()` (mod.rs, `FRANKEN_WHISPER_ENC_INT8=1`,
+default off); `encoder_block`'s 6 `matmul_bias` calls route through a new `enc_linear` dispatch
+(None ⇒ f32 ⇒ byte-identical).
+
+**MEASURED e2e (real transcribe_samples, large-v3-turbo, load 8-19):**
+
+| clip | f32 default | ENC_INT8=1 | speedup | transcript |
+|------|-------------|------------|---------|------------|
+| jfk (11s, 1 window) | 3.405 s | 2.623 s | **1.30×** | **BYTE-IDENTICAL** (golden) |
+| track01 (124.5s, 5 windows) | 15.505 s | 12.572 s | **1.23×** | ~98% word-identical (5 segs, 1339 vs 1341 ch) |
+
+**Quality:** on clean speech (jfk) the transcript is BYTE-IDENTICAL — the i7 quant error is below the
+greedy-decode threshold. On varied speech (track01, um/uh/filler) ~4-6 low-confidence word/punctuation
+flips over 270 words (e.g. "it's"→"you", "in."→"in,", "search and"→"search. And") — the STANDARD int8
+encoder-quant delta (comparable to whisper.cpp-Q8 vs f32; no repetition loop, no tail loss, same
+segment count/length). This is the expected non-byte-exact tradeoff, so it LANDS GATED (default byte-
+identical), NOT default-on.
+
+**Correctness of the kernel** is locked by the prior probe (`sat_diff=0` integer-exact, [[d8b8df6]]):
+7-bit weights keep every u8·i7 maddubs pair-sum in int16 (non-saturating). The win comes from 4×
+smaller i8 weights (L3-resident) + denser maddubs compute; the naive parallel GEMM already beats
+blocked f32 sgemm 1.56-1.58× on the MLP shapes, and it flows through to **1.23-1.30× e2e** because the
+encoder is ~87% of e2e. **Biggest measured e2e win in the project.** Owner next step: a broader
+transcript-quality sweep to decide whether to flip the default (or keep opt-in). Default path
+conformance GREEN (jfk golden byte-identical verified).
+
+---
+
 ## 2026-07-04 - BlackThrush: DIG → MEASURED WIN (owner-gated) — maddubs 7-bit-weight int8 encoder GEMM = **1.56-1.58x f32 on the dominant MLP GEMMs** (integer-EXACT, relerr 0.002); REFUTES the "7-bit maddubs not worth it" retraction; ~1.25x e2e projected
 
 **Ratio vs OpenAI-Whisper: PROJECTED ~1.25x e2e (ts) IF the transcript A/B passes — a measured GEMM

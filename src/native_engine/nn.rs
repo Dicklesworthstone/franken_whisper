@@ -402,6 +402,171 @@ pub fn matmul_bias(x: &Mat, w_t: &Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
     Ok(out)
 }
 
+/// A linear weight quantized to 7-bit for the maddubs int8 encoder GEMM path
+/// ([`matmul_bias_i7`]). Stored in NATURAL `[out, in]` row-major layout (each
+/// output's `in` weights contiguous) so the maddubs dot is a contiguous stream.
+///
+/// 7-bit (not 8) is deliberate: `_mm256_maddubs_epi16` sums two `u8·i8` products
+/// into an int16, which SATURATES for full int8 (docs/NEGATIVE_EVIDENCE 4cfcd56).
+/// With the weight clamped to `[-63, 63]` the pair-sum stays in `[-32130, 32130]`
+/// ⊂ int16 → NON-saturating / integer-EXACT (probe `sat_diff=0`, d8b8df6).
+/// `scale[o]` (= amax/63) dequantizes; `colsum[o]` (= Σ row-o i7 weights) applies
+/// the u8 activation sign-offset (`Σ(a+128)·w = maddubs − 128·Σw`).
+#[derive(Debug, Clone)]
+pub struct I7Mat {
+    /// `[out, in]` row-major i7 weights (values in `[-63, 63]`).
+    data: Vec<i8>,
+    /// Per output row: `amax / 63`.
+    scale: Vec<f32>,
+    /// Per output row: sum of the i7 weights (for the +128 u8 sign offset).
+    colsum: Vec<i32>,
+    /// Output dimension (rows of the natural weight).
+    out: usize,
+    /// Input / contraction dimension (columns).
+    inp: usize,
+}
+
+/// Quantize a pre-transposed `[in, out]` f32 weight (the [`matmul_bias`] layout)
+/// to a 7-bit `[out, in]` [`I7Mat`] for [`matmul_bias_i7`]. One-time, at load;
+/// parallel over output rows. The strided gather of column `o` is a load-time
+/// cost (amortized over every window's GEMM).
+#[must_use]
+pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
+    let inp = w_t.rows;
+    let out = w_t.cols;
+    let mut data = vec![0i8; out * inp];
+    let mut scale = vec![0.0f32; out];
+    let mut colsum = vec![0i32; out];
+    data.par_chunks_mut(inp)
+        .zip(scale.par_iter_mut())
+        .zip(colsum.par_iter_mut())
+        .enumerate()
+        .for_each(|(o, ((drow, s), cs))| {
+            let mut amax = 1e-9f32;
+            for i in 0..inp {
+                amax = amax.max(w_t.data[i * out + o].abs());
+            }
+            let sc = amax / 63.0;
+            *s = sc;
+            let inv = 1.0 / sc;
+            let mut acc = 0i32;
+            for (i, d) in drow.iter_mut().enumerate() {
+                let q = (w_t.data[i * out + o] * inv).round().clamp(-63.0, 63.0) as i32;
+                *d = q as i8;
+                acc += q;
+            }
+            *cs = acc;
+        });
+    I7Mat {
+        data,
+        scale,
+        colsum,
+        out,
+        inp,
+    }
+}
+
+/// maddubs `u8·i7` dot `Σ a[x]·w[x]`. Non-saturating for i7 weights (see [`I7Mat`]).
+/// Base target-features include AVX2 (`target-cpu=x86-64-v3`), so this inlines
+/// without a `#[target_feature]` attribute (same pattern as [`dot_f16c`]).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+#[inline]
+fn dot_maddubs_i7(a: &[u8], w: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let k = a.len();
+    // SAFETY: AVX2 is in the base target features; pointers stay in-bounds (32-lane
+    // steps while `x + 32 <= k`, scalar tail after).
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = _mm256_setzero_si256();
+        let mut x = 0;
+        while x + 32 <= k {
+            let av = _mm256_loadu_si256(a.as_ptr().add(x) as *const __m256i);
+            let wv = _mm256_loadu_si256(w.as_ptr().add(x) as *const __m256i);
+            let p = _mm256_madd_epi16(_mm256_maddubs_epi16(av, wv), ones);
+            acc = _mm256_add_epi32(acc, p);
+            x += 32;
+        }
+        let mut t = [0i32; 8];
+        _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, acc);
+        let mut s: i32 = t.iter().sum();
+        while x < k {
+            s += (a[x] as i32) * (w[x] as i32);
+            x += 1;
+        }
+        s
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_maddubs_i7(a: &[u8], w: &[i8]) -> i32 {
+    a.iter().zip(w).map(|(&x, &y)| (x as i32) * (y as i32)).sum()
+}
+
+/// Affine projection `x @ w^T (+ bias)` via the maddubs 7-bit int8 GEMM.
+///
+/// `x` is `[m, in]` f32; `w` is an [`I7Mat`] (`[out, in]`). The activation is
+/// symmetric-quantized to u8 per row (`amax/127`, then `+128` offset), and each
+/// output is `dot_maddubs − 128·Σw`, dequantized by `sa_row · scale[o]` (+bias).
+/// **NON-byte-exact** vs [`matmul_bias`] (int8 quantization). Parallel over rows.
+///
+/// # Errors
+/// [`FwError::InvalidRequest`] on `x.cols != w.inp` or `bias.len() != w.out`.
+pub fn matmul_bias_i7(x: &Mat, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
+    let m = x.rows;
+    let inp = x.cols;
+    if inp != w.inp {
+        return Err(FwError::InvalidRequest(format!(
+            "matmul_bias_i7: x.cols {inp} != w.inp {}",
+            w.inp
+        )));
+    }
+    if let Some(b) = bias {
+        if b.len() != w.out {
+            return Err(FwError::InvalidRequest(format!(
+                "matmul_bias_i7: bias len {} != out {}",
+                b.len(),
+                w.out
+            )));
+        }
+    }
+    let out = w.out;
+    // Quantize x [m,in] -> u8 + per-row scale, ONCE (negligible vs the GEMM).
+    let mut xu = vec![0u8; m * inp];
+    let mut sa = vec![0.0f32; m];
+    xu.par_chunks_mut(inp)
+        .zip(sa.par_iter_mut())
+        .enumerate()
+        .for_each(|(r, (xr_u8, s))| {
+            let xr = &x.data[r * inp..(r + 1) * inp];
+            let amax = xr.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let scale = amax / 127.0;
+            *s = scale;
+            let inv = 1.0 / scale;
+            for (d, &v) in xr_u8.iter_mut().zip(xr) {
+                let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                *d = (i8v + 128) as u8;
+            }
+        });
+    let mut c = vec![0.0f32; m * out];
+    c.par_chunks_mut(out).enumerate().for_each(|(r, crow)| {
+        let xr = &xu[r * inp..(r + 1) * inp];
+        let sar = sa[r];
+        for (o, cv) in crow.iter_mut().enumerate() {
+            let wrow = &w.data[o * inp..(o + 1) * inp];
+            let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
+            let mut val = dot as f32 * sar * w.scale[o];
+            if let Some(b) = bias {
+                val += b[o];
+            }
+            *cv = val;
+        }
+    });
+    Ok(Mat::from_vec(m, out, c))
+}
+
 /// A linear-layer weight matrix in EITHER representation.
 ///
 /// The f32 path stores a pre-transposed `[in, out]` [`Mat`] (so the forward is
