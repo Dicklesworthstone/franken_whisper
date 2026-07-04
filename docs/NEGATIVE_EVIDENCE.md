@@ -4,6 +4,47 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: bd-r0qd hatch VERIFIED WIRED — `FW_NO_CONTEXT=1` changes a real multi-window transcript (A/B); benign-clip no-op; encoder frontier re-confirmed exhausted
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts)** — the hatch (landed
+0b7d6db) is default-off / byte-identical; this entry is A/B VERIFICATION of it plus this
+cycle's dig verdict, no new code.
+
+**Hatch A/B (on-box, native `e2e_probe`, `large-v3-turbo`, `PROBE_NO_TS`):**
+- **Real varied-content multi-window clip** — `track01_16k.wav` (124.5 s tech-demo, ~5
+  windows, real conversational speech where each window's carried prompt is DIFFERENT text):
+  - DEFAULT (context ON): **1356 chars**, cleaner / punctuated style — e.g.
+    `"…ranking and stuff. Like if you do rank, then it's Daniel Franco… That's all my Franken
+    projects."`
+  - `FW_NO_CONTEXT=1` (context OFF): **1368 chars**, rawer / more verbatim, keeps `um`/`uh`
+    fillers, fewer commas — e.g. `"…ranking this stuff uh like if you do rank then it's Daniel
+    Franco but then you do rank in that's all my Franken projects um…"`
+  - → **DIFFERS.** The knob is proven WIRED and meaningfully alters window-2+ decode: the
+    carried previous-window prompt biases the greedy decoder toward fluent/punctuated output,
+    while `--no-context` decodes each window more independently. This is exactly whisper.cpp's
+    documented `condition_on_previous_text` behaviour, faithfully reproduced.
+- **Benign control** — `jfk×3` no_ts (2 windows, IDENTICAL tiled 11 s audio): context ON vs
+  OFF are **byte-identical (342 chars)**. So the hatch does NOT gratuitously perturb benign
+  multi-window output — it only bites when the carried prompt actually differs / degenerates.
+  Good safety property for a default-off escape hatch.
+
+**Still NOT a bug-recovery confirmation:** neither track01 run drops the tail (both end
+`"…um so yeah that's it basically"`), re-confirming track01 is a NEGATIVE CONTROL for the
+bd-r0qd tail-drop specifically (finance/interview clip120 remains the only known trigger, not
+on-box). So the hatch is VERIFIED WIRED and whisper-faithful; CONFIRMING it recovers a *dropped
+tail* still needs the owner's trigger clip. On-box bug repro stays closed.
+
+**Dig verdict this cycle (encoder = biggest gap, ~76-80% e2e):** re-confirmed exhausted, no
+new in-lane byte-exact lever. Checked one un-settled question — the encoder self-attention
+softmax (encoder.rs `nn::attention` → nn.rs:2961 `softmax_rows`) already routes through the
+**FW_SIMD_EXP-gated** `softmax_row_poly_numer` path, so there is NO ungated encoder-`exp`
+lever to add (the exp is small vs the QKᵀ/PV sgemms anyway). Encoder sgemm remains
+clock-throttle-bound (matrixmultiply, pack overhead <0.1% of compute); GPU/draft-model/int8-
+microkernel levers stay owner/infra-gated. No BlackThrush win sits unlanded — the only
+worktrees ahead of origin/main are OTHER agents' (cod-a/cod-b/codex mel/FFT), not mine to land.
+
+---
+
 ## 2026-07-04 - BlackThrush: LANDED bd-r0qd escape hatch — `FW_NO_CONTEXT=1` (whisper `--no-context`), default-off BYTE-IDENTICAL
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** This is a
