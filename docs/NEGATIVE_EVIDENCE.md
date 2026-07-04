@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: REJECT HADAMARD (QuaRot/SpinQuant) incoherence rotation for the int8 encoder — helps track01 (41→38) but REGRESSES the diverse 13-min sjobs (125→247, +98%). The SOTA outlier-spreading technique FAILS; the int8-encoder quality space is now EXHAUSTED across all 5 axes. Code reverted (byte-identical to HEAD).
+
+**Ratio vs ORIG: NO CHANGE — int8 encoder ~1.5-1.63× e2e; f32 default byte-identical (encoder-int8-only, gated);
+`nn.rs`+`mod.rs` reverted to HEAD (no code shipped). Activation FHT overhead was only ~0.75% (13.93→14.03s), so
+speed was NOT the blocker — quality was.** Every prior int8-quality lever (EF-act, MSE-clip, EF2) hit the SAME wall:
+the intrinsic PRECISION of quantizing operands whose heavy-tailed OUTLIER channels stretch the per-row amax and
+starve the u8/i7 levels. Hadamard rotation is the SOTA fix (QuaRot/SpinQuant) — it attacks the SOURCE: for orthonormal
+`H`, `Y = XW = (XH)(HᵀW)` is f32-EXACT, but `XH` and `HᵀW` are far more UNIFORM (a Hadamard mixes every channel into
+all others → outliers spread), so their int8 quant is per-element more accurate. Implemented a symmetric orthonormal
+block-128 Walsh–Hadamard (`H=H₁₂₈/√128`, `H²=I`), applied identically to activation rows (`quantize_act_i7`) and
+weight input-columns (`quantize_mat_to_i7`), paired so `(XH)(HW)=XW` exactly (all turbo GEMM inp∈{1280,5120} are
+128-multiples). Gated `FW_ENC_HADAMARD` default-off. MEASURED (word-diffs vs f32 golden):
+```
+  scheme                   track01 (hard, 5win)    sjobs_16k (13-min, diverse)
+  int8+EF (no rotation)     41 diffs                125 diffs
+  int8+EF+Hadamard          38 diffs (BETTER)       247 diffs   (+98% WORSE)
+```
+Byte-identity: HAD-OFF (default) BYTE-IDENTICAL to pre-change binary on track01+jfk_x3 (inert when off; the math is
+correct — track01 improved and 'Franken' retained, NOT garbage). VERDICT: **REJECTED — same signature as EF-act,
+MSE-clip, EF2** (helps short track01, severely regresses diverse sjobs; track01 is NON-predictive, gate on sjobs).
+**NON-OBVIOUS FINDING — the int8 gap is NOT an outlier/precision-DISTRIBUTION problem that rotation can fix.** QuaRot
+reduces per-element MSE by SPREADING the quant error uniformly across all channels — but for TRANSCRIPTION that is
+WORSE: the natural error is CONCENTRATED in a few outlier channels (which the softmax/attention is relatively robust
+to), whereas the rotated error is DISTRIBUTED across every output channel and compounds through 32 layers into more
+transcript divergence on long audio. So the int8 encoder error is genuinely the intrinsic per-value discretization AND
+the transcript is sensitive to WHERE that error lands, not just its magnitude — rotation moves it to the worse place.
+**This EXHAUSTS the int8-encoder-quality space across all 5 axes: scale/clip (dead), block granularity (dead),
+noise-shaping order (1st-order optimal, 0/2 dead), error-feedback on activations (dead), and now incoherence rotation
+(dead). EF-weights-1st-order is the sole win; the residual gap is irreducible.** Do NOT try full-Hadamard, learned
+rotations, or SmoothQuant scaling — the mechanism (error-location sensitivity) predicts they regress the same way.
+Code reverted; owner-gated int8 quality/speed tradeoff unmoved (1.5-1.63× at the ~41/125-diff gap).
+
+---
+
 ## 2026-07-04 - BlackThrush: REJECT 2nd-order error-feedback weight quant (NTF=(1−z⁻¹)²) for the int8 encoder — helps track01 (41→36) but REGRESSES the diverse 13-min sjobs (125→216). FINDING: **1st-order EF is a LOCAL OPTIMUM in noise-shaping order** — under-shape (plain) and over-shape (2nd-order) both regress sjobs. Code reverted (byte-identical to HEAD).
 
 **Ratio vs ORIG: NO CHANGE — int8 encoder ~1.5-1.63× e2e; f32 default byte-identical; `nn.rs`+`mod.rs` reverted to
