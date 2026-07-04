@@ -4,6 +4,48 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: DIG the logits-GEMV "30-vs-50 GB/s gap" with perf HW counters → REFUTED (memory-stalled IPC 0.53); complete IPC map proves decode has NO compute headroom + explains the contention inversion
+
+**Ratio vs OpenAI-Whisper: UNCHANGED.** A DIG (hypothesis → contention-invariant measurement →
+dropped variant), not a ratio re-measure. Hypothesis: last cycle's logits GEMV clocked 2.21 ms for a
+66.4 MB int8 weight ≈ 30 GB/s, yet dot_i8 is documented ~50 GB/s — is the ~1.6× gap closable
+dispatch/compute headroom? Settled with **perf hardware counters** (IPC / cache-miss rate are
+load-robust ratios, unlike wall-clock — the right tool on this bouncing box).
+
+**MEASURED (perf stat, criterion `--profile-time 15` isolation, large-v3-turbo):**
+
+| hot path | IPC | cache-miss % | reading |
+|----------|-----|--------------|---------|
+| `logits_gemv_large` | **0.53** | 8.36% | severely memory-stalled |
+| `decoder_token_step_large` | **0.67** | 8.49% | memory-stalled |
+| `encoder_window_large` (8t) | **1.12** | 8.37% | compute-leaning (2× decode) but still stalled |
+
+**VERDICT — hypothesis REFUTED, variant DROPPED:** IPC 0.53 (vs ~5 achievable) = the logits GEMV
+core is stalled on memory ~90% of the time, so the "30-vs-50 gap" is NOT dispatch headroom — it's the
+bandwidth wall. Each of the 66.4 MB weight's bytes is used exactly ONCE per token (a tied-embedding
+GEMV, larger than any cache) ⇒ inherently streaming, no reuse to block/tile for. dot_i8's ~50 GB/s ≈
+the Zen3 SINGLE-CORE DRAM ceiling, and the 32-way-parallel logits GEMV has all cores sharing the
+~80 GB/s aggregate ⇒ bandwidth-bound at both levels. More accumulators / prefetch can't beat a
+bandwidth ceiling (confirms [[project_dot_i8_avx2_landed]] "don't re-dig"). The only byte-reducers are
+int4 weights (DEAD — re-confirmed) or on-GPU weights (owner). **No CPU lever on the biggest decode op.**
+
+**BONUS (net-new, decision-relevant):** the complete IPC map is a HARD-NUMBER closure of the decode
+(IPC ≤0.67 = memory-bound, not the reasoned claim but the MEASURED one) and shows the encoder is only
+~2× more compute-leaning (IPC 1.12) — under this contended run its f32 GEMM is memory-stall-sensitive
+too, so the "64-81% of AVX2 peak" is a QUIET-box property (IPC is somewhat contention-depressed at
+load 14-29; the decode's ≤0.67 is low enough to be memory-bound regardless). The **uniform ~8.4%
+cache-miss rate + low IPC across ALL THREE** mechanistically explains last cycle's head-to-head
+INVERSION ([[project_realistic_workload_dominated]] 4ca20a9): every hot path is memory-stall-bound, so
+franken's 32-thread pool means MORE cores contending for the same DRAM bandwidth under load → franken
+degrades faster than whisper.cpp's fewer-thread OpenMP on a saturated box. The inversion is a
+memory-contention artifact, not a compute regression.
+
+**Net:** the biggest decode op is measured (not reasoned) at the bandwidth wall; no in-crate compute
+lever exists on decode OR encoder (both memory-stall-dominated); every >1% path stays owner/infra-gated
+(GPU / fewer bytes). No BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: head-to-head ratio INVERTS across 1.0 on box load (0.90x-1.22x) — INTERLEAVED method corrects last cycle's "1.22x floor"; no quotable current-build ratio from this shared box
 
 **Ratio vs whisper.cpp (the original): CONTENTION-DOMINATED, not a fixed number.** Last cycle
