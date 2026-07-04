@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: int8 ENCODER default-flip QUALITY A/B on DIVERSE audio DONE — NOT byte-neutral (mild mixed tradeoff), correctly stays gated
+
+**Ratio vs ORIG: the int8 encoder gives ~1.3-1.5x encode WHEN ON, but this A/B confirms it is an
+owner-gated QUALITY tradeoff, not a free byte-exact win — so the byte-exact DEFAULT stays f32 (encode
+~tied with whisper.cpp).** The maddubs->M4->M4xN2 int8 encoder (landed gated this session) was only ever
+verified byte-identical on jfk; memory flagged the blocker to a default-flip as "needs a diverse real
+audio A/B." Now have several on-box (jfk 11s speech, sj_last40 40s keynote, track01 124s tech-demo). Ran
+`FRANKEN_WHISPER_ENC_INT8=0 vs 1` transcript diffs (e2e_probe PROBE_DUMP_TEXT, large-v3-turbo, ts mode).
+
+**MEASURED:**
+
+| audio | dur | int8 vs f32 | character of divergence |
+|-------|-----|-------------|-------------------------|
+| jfk | 11s | BYTE-IDENTICAL (125 ch) | none |
+| sj_last40 | 40s | ~65 char-ops (808 ch) | ALL spacing/punctuation ("touchscreen" vs "touch screen", comma vs period) — SAME WORDS, content-equivalent |
+| track01 | 124s | ~1528 char-ops, -44 ch (1401) | coherent + ~95% identical; a few PROPER-NOUN mis-hearings (int8: "Franken"->"Frank at"/"rank in") = real regressions; BUT int8 avoids the f32 end-repetition hallucination ("...that's it basically." x2 in f32, x1 int8) = an improvement |
+
+**Verdict — int8 encoder is a MILD MIXED quality tradeoff, NOT byte-neutral on diverse/long-form audio.**
+jfk byte-identity was MISLEADING (short clean speech); real content shows (a) cosmetic spacing/punct
+shifts (equivalent), (b) occasional proper-noun errors from quant noise on hard words (regression), (c)
+occasionally CLEANER output (less repetition, improvement). Net: coherent, meaning-preserving, with a few
+proper-noun flips. **This CONFIRMS the default MUST stay OFF — flipping default-on is a genuine quality
+tradeoff (proper-noun accuracy vs ~1.3-1.5x encode), an OWNER judgment, not a free win. The "diverse
+audio A/B" blocker is now RESOLVED WITH DATA (was: unknown; now: mild mixed tradeoff).** Evidence enables
+the owner to decide the flip. FOLLOW-ON LEVER (not this cycle): mixed-precision (keep the most
+error-sensitive early encoder layers f32, int8 the rest) could cut the proper-noun regressions for most
+of the speedup — a quality-recovery experiment that might make the flip safe; still owner-gated. No code
+changed (used existing e2e_probe + gated ENC_INT8); no BlackThrush win unlanded.
+
+---
+
 ## 2026-07-04 - BlackThrush: DIG → logits-GEMV latency-hiding (prefetch + 2-row streaming) MEASURED-DEAD — no byte-exact lever, HW prefetcher already saturates the contiguous streams
 
 **Ratio vs ORIG: UNCHANGED (measured negative).** Pivoted off the (closed) encoder to the biggest
