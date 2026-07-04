@@ -4,6 +4,27 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: MEASURED WIN vs legacy whisper.cpp on text-only multi-window — **franken native no-timestamps is 1.25 +/- 0.20x faster than in-repo `whisper-cli` on `jfk x3` at matched 32 threads (8.09 s vs 10.12 s mean total wall). This is a real current-HEAD win, but narrower than the older quiet-box 1.68-1.8x headline because the host was heavily contended (load avg ~52/40/32) and RCH fell back local. One-window timestamp mode is NOT a win on mean under this load (whisper.cpp 1.04 +/- 0.26x faster), so cite the text-only multi-window row only for the accepted win.**
+
+**Land-or-dig result — fresh original-vs-franken ratio pass for `bd-0hnz`.** AGENT_NAME=BlackThrush. Comparator is the in-repo legacy original, `legacy_whispercpp/whisper.cpp/build/bin/whisper-cli`, using `legacy_whispercpp/whisper.cpp/models/ggml-large-v3-turbo.bin`; franken path is `examples/e2e_probe` built under `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a`. Commands:
+- Per-crate RCH bench anchor: `RCH_FORCE_REMOTE=1 CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod-a rch exec -- cargo bench --profile release-perf --bench native_engine_bench -- native_engine/mel/mel_30s_realistic --sample-size 10`.
+- RCH outcome: accepted as `cargo_bench` but fell open to local (`no admissible workers: insufficient_slots=11, active_project_exclusion=1`); cold build 8m30s; Criterion stdout for `native_engine/mel/mel_30s_realistic` = **2.7653-2.8221 ms** (median 2.7913 ms). Model-gated benches skipped in this exact RCH run because ignored legacy model paths were not exported into the bench environment.
+- Ratio command: `hyperfine --warmup 1 --runs 3` comparing `PROBE_NO_TS=1 FRANKEN_WHISPER_MODEL_DIR=legacy_whispercpp/whisper.cpp/models .../e2e_probe large-v3-turbo tests/fixtures/native/jfk.wav 3` vs `whisper-cli ... -f /tmp/franken_whisper_jfk_x3_20260704.wav -bs 1 -bo 1 -t 32 -nt -np`.
+
+**Measured ratio (total wall, includes model load, matched 32 threads):**
+
+| workload | franken native | legacy whisper.cpp | speed_ratio | verdict |
+|--|--:|--:|--:|--|
+| `large-v3-turbo`, JFK tiled 3x, no timestamps/text-only | 8.0855 s mean, 7.6941 s median, 7.6858 s min | 10.1212 s mean, 10.0807 s median, 8.7503 s min | **1.25 +/- 0.20x mean** (1.31x median) | **WIN, current HEAD** |
+| `large-v3-turbo`, JFK 1x, timestamps | 5.6212 s mean, 5.0578 s median, 4.4954 s min | 5.4127 s mean, 5.3968 s median, 5.3584 s min | whisper.cpp **1.04 +/- 0.26x mean faster** | **NO WIN / noisy control** |
+
+**Conformance note.** The `jfk x3` text-only outputs have identical word sequences: 66 words, word-sequence SHA256 `bdfc8596eb94c3acc485760be54411b7fbaaaa6a90055e41533ffc0260baa84f`. The only observed difference is the probe's segment-join spacing (`country.Ask` vs legacy print's separating space), so this is transcript-equivalent after whitespace/word normalization, not byte-identical raw text.
+
+**Artifacts.** Hyperfine JSON: `/tmp/franken_whisper-bd0hnz-jfk3-notimestamps-20260704.json`; noisy one-window control: `/tmp/franken_whisper-bd0hnz-jfk1-20260704.json`; transcript captures: `/tmp/franken_whisper-bd0hnz-franken-jfk3-notimestamps-20260704.txt` and `/tmp/franken_whisper-bd0hnz-whispercpp-jfk3-notimestamps-20260704.txt`; Criterion artifact: `/data/projects/.rch-targets/franken_whisper-cod-a/criterion/native_engine_mel/mel_30s_realistic/new/estimates.json`.
+
+**Conclusion:** ship the measured claim as a current-HEAD, text-only, multi-window win vs the legacy original. Do not generalize it to one-window timestamp mode, and do not quote the older 1.8x number from this noisy host; use **1.25x mean / 1.31x median** for this pass.
+
+---
 ## 2026-07-04 - BlackThrush: NEW CONFIG faithful (mid-clip silence gap) + encoder CEILING re-confirmed with a serial gather/scatter check — **speech-silence-speech (jfk + 3 s silence + jfk), a config NOT in the prior pure/leading/trailing-silence set, is BYTE-IDENTICAL franken vs whisper.cpp: both `[0.000→10.380]` + `[10.380→24.380]`, same text, silence spanned (not split) identically. Independently re-confirms the 28466af segment-ts fix (seg 1 t0 = 10.380 contiguous, no spurious gap). AND a fresh encoder sub-op profile re-confirms the ceiling with ZERO drift after v0.4.0: 95% external (GEMM 73.6% + SDPA 21.4%), ~5% franken-owned (all <1.2%, already optimized). The largest franken-owned chunk — the SDPA gather+scatter (5.7% of encoder) — was checked for a SERIAL lever (memory only rejected the PARALLELIZATION angle): it is pure `copy_from_slice` memcpy at the bandwidth floor, and its only elimination path is the de-interleave layout trap (a known wash, 0.884×) or an external-kernel ABI change (owner-gated). No new byte-exact CPU lever.**
 
 **Dig result — hunted a per-window encoder recompute (the vein that found the conv-transpose, 108d3cd), profiled, then extended the faithfulness audit to a new audio config.** AGENT_NAME=BlackThrush.
