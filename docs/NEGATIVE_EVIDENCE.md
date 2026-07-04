@@ -4,6 +4,52 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: MEASURED per-crate hot-path baseline on the POST-nightly-roll toolchain (cargo bench, large-v3-turbo) — no regression; encoder ~7:1 dominance re-confirmed; frontier still owner/infra-gated
+
+**Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68-1.8× no_ts, established 2c58bf0). This cycle
+MEASURES franken's own hot-path split on the current toolchain — a fresh whisper.cpp head-to-head
+was not run (no `main`/`whisper-cli` binary built on-box; only the ggml model is present).**
+
+**What ran:** `cargo bench` per-crate, the built `native_engine_bench` binary directly with
+`--bench`, filtered to the three large-v3-turbo HOT paths, model via
+`FRANKEN_WHISPER_MODEL_DIR=…/legacy_whispercpp/whisper.cpp/models`. This is the directive's literal
+`cargo bench --release` step — NOT run earlier this session because the box was at load ~55
+(contention-garbage); it quieted to load ~17 so absolutes are meaningful upper bounds and the SPLIT
+is contention-robust (all three under the same load).
+
+**MEASURED (median, current nightly rustc 1.98-nightly post-2026-07-04 roll):**
+
+| Hot path | time | note |
+|----------|------|------|
+| `encoder/encoder_window_large` | **3.526 s / 30 s window** (range 3.43–3.68) | the dominator |
+| `decoder/decoder_token_step_large` | **10.1 ms/token** (80.9 ms / 8-tok seq, 98.9 tok/s) | full per-token step |
+| `logits/logits_gemv_large` | **2.21 ms** (51866×1280 tied GEMV) | ≈22% of a token = biggest single per-token op |
+
+**Derived split (per full window):** encoder 3526 ms vs decode ≈ 50 tok × 10.1 ms ≈ 506 ms →
+**~87% / 13% ≈ 7:1 encoder:decode.** This MEASURES (not reasons) the ~80% encoder-dominance thesis
+on the CURRENT toolchain, and confirms **the 2026-07-04 nightly roll did NOT regress any kernel**
+(all three within prior-observed bands: encoder ~3.1-3.5 s, logits ~2.2 ms). The cache also did NOT
+go E0514 this roll (built clean in 5m27s) — a data point against re-cleaning reflexively.
+
+**Consequence:** the biggest measured gap is exactly where every prior cycle found it — the encoder
+f32 sgemm (79% of that 3.5 s), which is single-core near-AVX2-peak and 32-thread power-throttle-
+capped ([[project_encoder_wall_is_clock_throttle]]). No in-crate byte-exact lever moves it; the
+entire in-lane frontier is measured-closed (encoder micro-levers landed / FLOP-reduction fatal or
+owner-scoped; decode at the int8-bandwidth wall; draft-free speculative dead 1b0be65; reduced-head
+modest 2c84210; 4-antipattern sweep exhausted b375e0c; faithfulness axes audited, bd-r0qd blocked on
+owner clip120).
+
+**The ONLY paths to >1% remain owner/infra-gated:** (1) **GPU encoder offload** — biggest lever,
+blocked on GTX-1070-nouveau having no CUDA/OpenCL/Vulkan (unblock = driver + a `ft-kernel-cuda`
+mirroring `ft-kernel-metal`, reusing the `nn::matmul_into_uninit` cfg seam); (2) **trained
+multilingual draft model** sharing turbo's vocab (~4-7% ts, self-draft measured-dead); (3)
+**AVX-512-VNNI int8 encoder** (hardware-absent on Zen3; naive AVX2 int8 = 0.38-0.42×); (4) **ToMe**
+(low-odds, non-byte-exact, multi-day, owner quality call). Owner-preventable churn: pin a DATED
+nightly in `rust-toolchain.toml` so a roll can't silently invalidate the cache. No BlackThrush win
+sits unlanded; the loop is CONVERGED pending one of these unblocks.
+
+---
+
 ## 2026-07-04 - BlackThrush: bd-r0qd on-box candidate list EXHAUSTED — the 66s clip is a 3rd negative; tripwire prevented re-running the already-tested Steve Jobs keynote
 
 **Ratio vs OpenAI-Whisper: UNCHANGED (~1.2× ts / ~1.68–1.8× no_ts).** Measurement-only
