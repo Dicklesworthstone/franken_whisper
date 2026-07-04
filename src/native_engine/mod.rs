@@ -365,6 +365,22 @@ pub(crate) fn enc_act_roundtrip() -> Option<Option<usize>> {
     })
 }
 
+/// NEW lever (default OFF): `FW_ENC_EF_QUANT=1` switches the int8 encoder WEIGHT quantization
+/// (`nn::quantize_mat_to_i7`) from independent round-to-nearest to ERROR-FEEDBACK (error-diffusion /
+/// sigma-delta) rounding along the contraction dim — each weight's rounding residual is carried into
+/// the next element, so the per-output-column DOT `Σ q_i·a_i` has less accumulated quantization bias.
+/// Only affects the load-time i7 weight table; the maddubs kernel (i7 format, per-col scale, colsum)
+/// is unchanged, so this is a drop-in quality experiment for the gated int8 encoder. Still
+/// NON-byte-exact (owner-gated); the question it answers is whether error-diffusion recovers the
+/// proper-noun errors ("Frank at"→"Franken") that scale-granularity and dequant-order could NOT.
+pub(crate) fn enc_ef_quant() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FW_ENC_EF_QUANT") {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+        Err(_) => false,
+    })
+}
+
 /// Whether to run the decoder **attention** input projections (fused self `qkv`
 /// and `cross_attn_q`) through the int8/Q8 GEMV on the per-token decode path
 /// (`tq == 1`). The output projections (`self_out`, `cross_out`) stay f16.
