@@ -760,51 +760,78 @@ fn dot_maddubs_i7_m4n2(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w0: &[i8], w1
     ]
 }
 
-/// Affine projection `x @ w^T (+ bias)` via the maddubs 7-bit int8 GEMM.
+/// Quantized activation buffer for [`matmul_bias_i7_quantized`].
 ///
-/// `x` is `[m, in]` f32; `w` is an [`I7Mat`] (`[out, in]`). The activation is
-/// symmetric-quantized to u8 per row (`amax/127`, then `+128` offset), and each
-/// output is `dot_maddubs − 128·Σw`, dequantized by `sa_row · scale[o]` (+bias).
-/// **NON-byte-exact** vs [`matmul_bias`] (int8 quantization). Parallel over rows.
-///
-/// # Errors
-/// [`FwError::InvalidRequest`] on `x.cols != w.inp` or `bias.len() != w.out`.
-pub fn matmul_bias_i7(x: &Mat, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
-    let m = x.rows;
-    let inp = x.cols;
-    if inp != w.inp {
-        return Err(FwError::InvalidRequest(format!(
-            "matmul_bias_i7: x.cols {inp} != w.inp {}",
-            w.inp
-        )));
-    }
-    if let Some(b) = bias {
-        if b.len() != w.out {
-            return Err(FwError::InvalidRequest(format!(
-                "matmul_bias_i7: bias len {} != out {}",
-                b.len(),
-                w.out
-            )));
-        }
-    }
-    let out = w.out;
-    // Quantize x [m,in] -> u8 + per-row scale, ONCE (negligible vs the GEMM).
-    let mut xu = vec![0u8; m * inp];
-    let mut sa = vec![0.0f32; m];
-    xu.par_chunks_mut(inp)
-        .zip(sa.par_iter_mut())
+/// Rows are symmetric-quantized to u8 (`amax/127`, then `+128` offset) with a
+/// separate f32 scale per row. Q/K/V encoder projections share the same input,
+/// so reusing this buffer avoids two duplicate quantize passes without changing
+/// the maddubs dot inputs.
+#[derive(Debug, Clone)]
+pub struct I7Activation {
+    rows: usize,
+    inp: usize,
+    data: Vec<u8>,
+    scale: Vec<f32>,
+}
+
+/// Quantize `x` for the maddubs 7-bit int8 GEMM.
+#[must_use]
+pub fn quantize_act_i7(x: &Mat) -> I7Activation {
+    let mut data = vec![0u8; x.rows * x.cols];
+    let mut scale = vec![0.0f32; x.rows];
+    data.par_chunks_mut(x.cols)
+        .zip(scale.par_iter_mut())
         .enumerate()
         .for_each(|(r, (xr_u8, s))| {
-            let xr = &x.data[r * inp..(r + 1) * inp];
+            let xr = &x.data[r * x.cols..(r + 1) * x.cols];
             let amax = xr.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
-            let scale = amax / 127.0;
-            *s = scale;
-            let inv = 1.0 / scale;
+            let row_scale = amax / 127.0;
+            *s = row_scale;
+            let inv = 1.0 / row_scale;
             for (d, &v) in xr_u8.iter_mut().zip(xr) {
                 let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
                 *d = (i8v + 128) as u8;
             }
         });
+    I7Activation {
+        rows: x.rows,
+        inp: x.cols,
+        data,
+        scale,
+    }
+}
+
+/// Affine projection from a pre-quantized activation via the maddubs 7-bit int8 GEMM.
+///
+/// `x` is a [`I7Activation`] built from `[m, in]` f32; `w` is an [`I7Mat`]
+/// (`[out, in]`). Each output is `dot_maddubs - 128*sum(w)`, dequantized by
+/// `x.scale[row] * w.scale[o]` (+bias). **NON-byte-exact** vs [`matmul_bias`]
+/// because the activation and weight are quantized, but byte-identical to
+/// [`matmul_bias_i7`] for the same source activation.
+///
+/// # Errors
+/// [`FwError::InvalidRequest`] on `x.inp != w.inp` or `bias.len() != w.out`.
+pub fn matmul_bias_i7_quantized(x: &I7Activation, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
+    let m = x.rows;
+    let inp = x.inp;
+    if inp != w.inp {
+        return Err(FwError::InvalidRequest(format!(
+            "matmul_bias_i7_quantized: x.cols {inp} != w.inp {}",
+            w.inp
+        )));
+    }
+    if let Some(b) = bias
+        && b.len() != w.out
+    {
+        return Err(FwError::InvalidRequest(format!(
+            "matmul_bias_i7_quantized: bias len {} != out {}",
+            b.len(),
+            w.out
+        )));
+    }
+    let out = w.out;
+    let xu = &x.data;
+    let sa = &x.scale;
     // M4-register-blocked: process activation rows in blocks of 4, streaming each
     // weight row ONCE per block (4× less weight L3 traffic than the m-outer naive
     // loop). Bit-identical to the per-row form (same i32 dot + same f32 dequant
@@ -926,6 +953,20 @@ pub fn matmul_bias_i7(x: &Mat, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat>
         }
     });
     Ok(Mat::from_vec(m, out, c))
+}
+
+/// Affine projection `x @ w^T (+ bias)` via the maddubs 7-bit int8 GEMM.
+///
+/// `x` is `[m, in]` f32; `w` is an [`I7Mat`] (`[out, in]`). The activation is
+/// symmetric-quantized to u8 per row (`amax/127`, then `+128` offset), and each
+/// output is `dot_maddubs - 128*sum(w)`, dequantized by `sa_row * scale[o]`
+/// (+bias). **NON-byte-exact** vs [`matmul_bias`] (int8 quantization).
+///
+/// # Errors
+/// [`FwError::InvalidRequest`] on `x.cols != w.inp` or `bias.len() != w.out`.
+pub fn matmul_bias_i7(x: &Mat, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
+    let xq = quantize_act_i7(x);
+    matmul_bias_i7_quantized(&xq, w, bias)
 }
 
 /// A linear-layer weight matrix in EITHER representation.
@@ -3819,6 +3860,23 @@ mod tests {
                 "shape {m}x{k}x{n} rel err too high"
             );
         }
+    }
+
+    #[test]
+    fn i7_prequantized_activation_matches_inline_quantize() {
+        let mut rng = Lcg::new(0x17);
+        let x = rng.mat(5, 37);
+        let w_t = rng.mat(37, 9);
+        let bias: Vec<f32> = (0..9).map(|_| rng.next_f32()).collect();
+        let w = quantize_mat_to_i7(&w_t);
+
+        let inline = matmul_bias_i7(&x, &w, Some(&bias)).expect("inline i7");
+        let xq = quantize_act_i7(&x);
+        let reused = matmul_bias_i7_quantized(&xq, &w, Some(&bias)).expect("reused i7");
+
+        assert_eq!(inline.rows, reused.rows);
+        assert_eq!(inline.cols, reused.cols);
+        assert_eq!(inline.data, reused.data);
     }
 
     /// Build a natural `[out, in]` f16 weight (typed [`Float16`]) plus the exact

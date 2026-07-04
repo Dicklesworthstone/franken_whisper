@@ -70,6 +70,34 @@ activation+compound falsified here). Harnesses kept default-off (FW_ENC_WEIGHT_R
 reproducible diagnostics (cf. FW_ENCODER_LAYERS). Supersedes the block-wise recommendations in
 [[project_turbo_encoder_dominates]].
 
+---
+## 2026-07-04 - BlackThrush: LANDED gated int8-encoder Q/K/V activation-quant reuse — 1.36x on the QKV projection block, byte-identical to the prior int8 path
+
+**Ratio vs ORIG (current main's int8 QKV path): 1.360x on the hermetic QKV block; default f32 path unchanged.**
+The prior int8 encoder path called `matmul_bias_i7` three times for self-attention Q/K/V, and each call re-quantized
+the same layer-normalized activation `h` to u8 plus per-row scales. The GEMM inputs are identical across the three
+projections; only the weights/bias differ. New path factors the activation quantize into `nn::quantize_act_i7` and
+uses `nn::matmul_bias_i7_quantized` for Q, K, and V when all three i7 weights exist (`FRANKEN_WHISPER_ENC_INT8=1`).
+The owner-facing default remains f32 and byte-identical because encoder int8 is still default-off.
+
+**MEASURED (per-crate short bench, local fallback after RCH compile exceeded 10 min; same command filter/target dir):**
+```
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  cargo bench -p franken_whisper --profile release --bench native_engine_bench -- \
+  native_engine/i7_qkv --sample-size 10 --warm-up-time 0.1 --measurement-time 2 --output-format bencher --noplot
+
+native_engine/i7_qkv/three_inline_quantize_1500x1280  16,154,757 ns/iter (+/- 2,205,357)
+native_engine/i7_qkv/shared_activation_1500x1280       11,879,841 ns/iter (+/- 715,611)
+ratio = 16.155 / 11.880 = 1.360x
+```
+
+**Correctness gate:** `matmul_bias_i7` and `matmul_bias_i7_quantized(quantize_act_i7(x), ...)` are bit-for-bit equal
+in the new unit test (`i7_prequantized_activation_matches_inline_quantize`). The encoder changes only the Q/K/V int8
+dispatch; the f32 fallback and all non-QKV projections keep their previous path. This is intentionally a small
+gated win, not a quality answer to the activation-quant frontier: it removes duplicate quantization work but does
+not change the quantized values, so it cannot recover the track01 proper-noun errors. The next quality lever remains
+activation quantization granularity/calibration, not another weight-scale variant.
+
 ## 2026-07-04 - BlackThrush: DIG → MEASURED CORRECTION of the block-wise-weight lever — the int8 encoder's proper-noun error is from ACTIVATION quantization (u8), NOT weight-quant granularity. Block-wise WEIGHT scales do NOT recover track01. Kernel NOT worth building.
 
 **Ratio vs ORIG: UNCHANGED (measured; corrects the prior cycle's block-wise-weight hypothesis, 66418f9).** Last
