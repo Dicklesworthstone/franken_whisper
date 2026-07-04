@@ -40,6 +40,32 @@ audio (only track01 exercises the failure mode on-box) — clean audio can't dis
 Kept as `FW_ENC_EF_QUANT` next to `FRANKEN_WHISPER_ENC_INT8`; enable both together.
 
 ---
+## 2026-07-04 - BlackThrush: LAND-OR-DIG BLOCKER — no measured worktree win missing from main; fresh fused-wide int8 QKV probe could not reach timings before the bench cap, variant dropped
+
+**Ratio vs ORIG: unavailable (blocked before Criterion timing; no code kept).** AGENT_NAME=BlackThrush. First
+checkpointed and shipped the dirty shared-tree probe batch (`7cc053b`) to `origin/main` and `origin/master`, then
+audited the bench worktree pool. There is no repo-local `.scratch/.worktrees` franken_whisper bench worktree, and
+the sibling worktrees not contained in `main` are the same already-covered set: stale ratio/reject branches, the
+mel projection source-equivalent branch (`4dd616f`), and stale f16c predecessor branches already superseded on main.
+No measured .scratch bench win was available to land.
+
+Fresh dig attempted the next structural int8-QKV question after the landed activation-reuse win: concatenate Q/K/V
+into one wide `[1280,3840]` pre-transposed weight, quantize once as a single `I7Mat`, and benchmark one
+`matmul_bias_i7_quantized` against the current three shared-activation projections. This is the only plausible
+in-crate QKV compute lever left after duplicate activation quantization was removed.
+
+**Bench blocker:** `rch exec` selected workers but failed open twice during remote sync (`sync_to_remote: timed out
+after 30000ms`), then local fallback in `CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod` spent the bench
+cap compiling path dependencies (`asupersync`, `frankensqlite`, then `franken_whisper`) and never reached Criterion
+timings. Per the stop rule, the background/long bench was interrupted instead of waiting indefinitely. The temporary
+fused-wide QKV bench harness was removed; there is no shippable win or retained ~0-gain variant from this dig.
+
+**Next unblock:** rerun only after the release bench target is already warm or after RCH sync recovers; the exact
+filter is `native_engine/i7_qkv`. Keep criterion: fused-wide must beat the current `shared_activation_1500x1280`
+despite losing the `out <= inp` M4xN2 gate and paying output-splitting pressure. If it does not, record the loss and
+do not wire the engine path.
+
+---
 ## 2026-07-04 - BlackThrush: DIG → MEASURED CORRECTION of the "intrinsic to the maddubs COMPUTATION" claim — the maddubs dequant is 19× MORE accurate than the f32-roundtrip, so "Frank at" IS the truer int8 value and the roundtrip's correct "FrankenSearch" was f32-accumulation NOISE. No dequant-precision lever exists.
 
 **Ratio vs ORIG: UNCHANGED (measured; closes the "fixable maddubs dequant bug → flippable 1.5×" question).** Chased
