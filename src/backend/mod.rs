@@ -2076,12 +2076,14 @@ fn probe_system_health_uncached() -> SystemHealthReport {
             None
         };
 
-        // Check diarization-specific requirements.
-        if (kind == BackendKind::InsanelyFast || kind == BackendKind::WhisperDiarization)
-            && !is_hf_token_set()
-        {
+        // Diarization's HF requirement is engine-specific: InsanelyFast runs an HF
+        // (pyannote) diarizer and needs a token; WhisperDiarization uses the local
+        // heuristic diarizer (`orchestrator::diarize_segments`) and needs no HF, so
+        // flagging it here was a false requirement (bd-0522 honesty).
+        if kind == BackendKind::InsanelyFast && !is_hf_token_set() {
             issues.push(
-                "FRANKEN_WHISPER_HF_TOKEN / HF_TOKEN not set (required for diarization)".to_owned(),
+                "FRANKEN_WHISPER_HF_TOKEN / HF_TOKEN not set (required for InsanelyFast diarization)"
+                    .to_owned(),
             );
         }
 
@@ -2098,10 +2100,14 @@ fn probe_system_health_uncached() -> SystemHealthReport {
     }
 
     let hf_token_set = is_hf_token_set();
-    let diarization_ready = backends
-        .iter()
-        .any(|b| b.available && b.capabilities.supports_diarization)
-        && hf_token_set;
+    // A diarization-capable backend is ready if it is available and its own
+    // requirement is met: InsanelyFast needs an HF token; WhisperDiarization's
+    // local heuristic diarizer needs nothing extra.
+    let diarization_ready = backends.iter().any(|b| {
+        b.available
+            && b.capabilities.supports_diarization
+            && (b.backend != BackendKind::InsanelyFast || hf_token_set)
+    });
     let recommended_backend = backends.iter().find(|b| b.available).map(|b| b.backend);
 
     SystemHealthReport {
