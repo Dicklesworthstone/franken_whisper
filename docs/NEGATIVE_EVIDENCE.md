@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: int8-ing the CONV STEM is DEAD (0.3% of encode + below the power-throttle threshold) — completes the encoder int8 coverage audit
+
+**Ratio vs ORIG: UNCHANGED (measured negative).** The power-throttle finding (2e08812: the int8 encoder
+win is a POWER effect, all-or-nothing) naturally raises: the ENC_INT8 post-pass int8s the 6 per-layer
+GEMMs but NOT conv1/conv2 (the conv stem runs f32 `nn::conv1d`->`matmul_bias` even under ENC_INT8). Do
+those f32 convs cap the int8 win (like the 2 f32 layers in the mixed-precision test did), and would
+int8-ing them help? Checked with a FRESH perf-span breakdown (ratios load-robust):
+
+**MEASURED (`FRANKEN_WHISPER_PERF_SPANS=1`, jfk, encoder sub-op shares):**
+`conv_stem 0.3%` | qkv_proj 22.2% + mlp_proj 27.8% + mlp_fc 19.7% + attn_out 5.5% = 75.2% GEMM (int8'd,
+ceiling) | attn_sdpa 17.8% (external; internal split sdpa_gather 29.5% / sdpa_kernel 55% / sdpa_scatter
+15.5%) | LN+gelu+resid ~6.7%.
+
+**Verdict — int8-conv DEAD, two independent reasons:** (1) SIZE: the conv stem is **0.3% of the encode**
+(conv2 ~7.4G MACs but the encode is ~950G MACs) — int8-ing it saves <0.3%, sub-noise. (2) POWER THRESHOLD:
+`int8_all` already achieves 1.5× DESPITE the f32 conv stem (2e08812), so the f32 convs are NOT sustaining
+the all-core throttle (unlike 2 f32 LAYERS, which are ~7× more f32 work and DID cap it) — the conv's brief
+f32 burst is below the throttle-sustaining threshold, so int8-ing it gives no clock benefit either. Plus
+conv2 is the EARLIEST op = most quantization-sensitive (the mixed-precision A/B showed early layers carry
+the proper-noun errors). So int8-conv is all downside. **This completes the encoder int8 coverage audit:
+the 6 layer GEMMs are the ONLY worthwhile int8 targets; conv/SDPA/LN/gelu are correctly left f32.**
+
+**Also re-checked (tripwire): the SDPA gather ACCESS-ORDER lever (row-major/contiguous-read vs the current
+head-major/strided-read gather) — ALREADY FLOORED** (prior `sdpa_gather_traversal_probe`, ledger 2026-07-03:
+1.08× single-thread, doesn't fit the parallel head-band partitioning, ~0.04% e2e; gather at its bandwidth
+floor). The encoder franken-side is fully mined (conv/gelu/LN/gather/scatter/resid floored; GEMM at int8
+ceiling; SDPA kernel external). No code changed; no BlackThrush win unlanded. BLOCKER (unchanged, now with
+conv explicitly closed): remaining >1% levers are all owner/infra — flip the all-layers int8 encoder (its
+quality cost quantified), VNNI hardware, GPU stack, or a draft model.
+
+---
+
 ## 2026-07-04 - BlackThrush: mixed-precision int8 encoder DEAD — the int8 win is a POWER/CLOCK effect (ALL-OR-NOTHING); 2/32 f32 layers destroy the ENTIRE 1.5x speedup
 
 **Ratio vs ORIG: UNCHANGED (measured negative).** Last cycle's follow-on lever: recover the int8
