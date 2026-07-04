@@ -4,6 +4,36 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-04 - BlackThrush: CORRECTION to 157011d (SAME CYCLE) — the self-attn score-dot SIMD lever was ALREADY done at 2eee24f: TRANSCRIPT-UNSAFE, DEAD (I re-derived it)
+
+**Correcting my own commit 157011d from minutes earlier.** It measured the self-attn score-dot
+AVX2 headroom (6-10× isolated) and framed it as a promising owner-gated candidate "very likely
+transcript-safe, needs a jfk A/B to confirm." **That is a RE-DERIVATION — the A/B was already
+done and it FAILED.** Reading the BODY of [[project_self_attn_kv_cache_lever]] (which I skipped;
+the MEMORY.md index line was stale, still saying "remaining SIMD softmax/dots owner-gated")
+surfaced the prior finding, **commit 2eee24f** (my own):
+
+- score-dot SIMD 4-accum = **5-6× on the isolated dot** (157011d's 6-10× re-confirms this; it was
+  never the open question) but only **1.29× on the self_attn SPAN** (the f32-KV read + softmax
+  dilute it) ⇒ **~0.2-0.3% e2e** (NOT the 0.5-0.9% I estimated in 157011d — I over-extrapolated
+  the isolated ratio, exactly the "divide isolated work by in-engine dilution" trap).
+- It WAS implemented behind a default-off flag (`FW_SIMD_SELFATTN`), **A/B'd vs the on-box turbo
+  model**: jfk ×1/×8 no_ts + ts ×3 BYTE-IDENTICAL, **BUT it HALLUCINATES on tiled jfk×3** ⇒
+  **TRANSCRIPT-UNSAFE**, and was **REVERTED**. The ~1e-6 score perturbation, amplified through
+  softmax→hidden→logits→argmax over a long tiled decode, flips tokens. So it is NOT a safe gated
+  flag (a default-off footgun for 0.2-0.3% e2e), which is why 2eee24f reverted the flag entirely.
+
+**VERDICT: the self-attn score-dot SIMD lever is DEAD (transcript-unsafe + ~0.2-0.3% e2e),
+not an open candidate. Supersedes 157011d's "candidate/needs A/B" framing.** The probe committed
+in 157011d (`examples/self_attn_score_dot_probe.rs`) duplicates the earlier
+`self_attn_f16c_dequant_probe`; it stays as a standalone isolated-kernel reproducer but adds no
+new verdict. **LESSON (3rd time — [[feedback_read_memory_before_digging]]): read the memory FILE
+BODY, not just the MEMORY.md index line, before digging self_attn — the index was stale.** The
+`.rch-targets` toolchain-broken blocker in 157011d is real and still stands, but is moot for this
+lever (dead regardless of build).
+
+---
+
 ## 2026-07-04 - BlackThrush: self-attn SCORE-DOT is 6–10× AVX2 headroom (MEASURED) but NON-byte-exact (~1e-6) → owner-gated candidate; engine A/B blocked by toolchain-broken shared cache
 
 **Ratio vs OpenAI-Whisper: UNCHANGED this cycle (~1.2× ts / ~1.68–1.8× no_ts)** — a MEASURED
