@@ -4,6 +4,28 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-05 - AshHeron: DIG → **VIABLE (measured green light — the FIRST positive structural finding this session)** — **the encoder self-attention SCORE MATRIX is substantially LOW-RANK on real audio: rank ~32–64 captures ≥99% of the [1500,1500] softmax matrix in early/mid layers (some heads near rank-8), i.e. real 23–47× structure. This is the NECESSARY precondition for Nyström / Linformer / linear (Performer) attention — MET, unlike the depth/spectral/sequence axes (all absent). It DE-RISKS the owner's attention-approximation / GPU direction (opposite of the ToMe kill), but is NOT solo-landable byte-exact: non-byte-exact + external SDPA kernel + no-slack quality → owner/GPU-gated, needs a prototype.**
+
+**Land-or-dig result: DIG a DIFFERENT approximation than frame-merging (ToMe, killed 54ed482) and weight-reduction (all 4 GEMM classes) — the ATTENTION MATRIX itself.** AGENT_NAME=AshHeron. Nyström/Linformer/linear attention reduce softmax(QKᵀ)V from O(n²·d) to O(n·r·d) IFF the [n,n] score matrix has effective rank r≪n. Measured on real audio (`examples/attn_lowrank_probe.rs`, jfk×3 = 1500 real speech frames, real turbo weights: run encoder to depth L, apply layer L's real attn_ln+query/key, form per-head softmax scores, measure captured energy at rank r via randomized range finding). Probe only, engine byte-identical, conformance GREEN.
+
+**MEASURED (`attn_lowrank_probe`, captured energy of the [1500,1500] per-head score matrix):**
+```
+depth  head   r8      r16     r32     r64     r128
+ 4      0      92.5%   96.9%   99.2%   99.9%   100%
+ 4     10     100%    100%    100%    100%    100%    ← near rank-8 (broad/uniform head)
+ 4     19      75.8%   89.0%   96.1%   99.0%   99.8%
+16      0      94.4%   97.2%   99.2%   99.8%   100%
+16     10     100%    100%    100%    100%    100%
+16     19      94.2%   97.1%   98.7%   99.6%   99.9%
+32      0      66.9%   75.7%   86.0%   92.8%   96.7%   ← final layer HIGHER-rank
+32     10      35.7%   49.3%   64.5%   78.6%   90.5%
+32     19      82.4%   90.9%   97.0%   99.1%   99.8%
+```
+**Attention IS low-rank — a real, first-of-session structural opportunity.** Early/mid-layer attention matrices are captured to ≥99% by rank 32–64 (of 1500), and some heads are near rank-8; the FINAL layer specializes to higher rank (needs r≈128+). This matches the Nyströmformer/Linformer literature (attention is empirically low-rank) and, crucially, CONTRASTS with this session's other encoder findings (weights near-full-rank; frames not mergeable; depth not prunable) — the redundancy lives in the *attention pattern*, not the frames or weights.
+
+**Why it's a GREEN LIGHT, not a landed win (honest caveats):** (1) NON-byte-exact — a fixed low-rank/landmark approximation; can't land default-on. (2) The SDPA is EXTERNAL (`ft_kernel_cpu` sdpa_forward) — a franken Nyström must BEAT the tuned kernel, and FlashAttention-style tiling already lost here on dispatch overhead (2026-06-28), so Nyström's landmark-select + m×m pseudo-inverse overhead at n=1500 is a real risk. (3) Score-matrix rank is NECESSARY, not SUFFICIENT — Nyström's landmark error exceeds the SVD-optimal captured-energy bound measured here. (4) No-slack quality: even ~1% attention error over 32 layers may break the transcript (encoder tolerates ≪1%, layer-prune fatal at 4/32), and the final layer needs larger r. **So this is a MEASURED de-risking of the owner's Nyström/linear-attention/GPU lever — where O(n²)→O(n·r) matters far more (memory + compute) than on this power-bound CPU — NOT a CPU byte-exact win.** Recommended next step (owner/prototype): a gated Nyström SDPA measuring actual speed AND transcript byte-diff at r∈{64,128}. Ratio vs ORIG UNCHANGED (probe-only, default binary byte-identical; ~1.2× ts / ~1.68–1.8× no_ts vs OpenAI-Whisper/whisper.cpp).
+
+---
 ## 2026-07-05 - AshHeron: DIG → REJECTED (measured) — **encoder SEQUENCE redundancy is LOW → ToMe / token-merging is DEAD, measured (not reasoned). On REAL audio the 1500 encoder frames have adjacent cos-sim mean 0.68–0.84 (0% of pairs > 0.95, only ≤16% > 0.9), span ~400+ effective dims (rank-256 = 97% energy), and a 2× adjacent-merge injects 28–39% reconstruction relerr — ~30× over the ≪1% the transcript tolerates. This closes the THIRD and final encoder-redundancy axis: turbo's encoder has NO exploitable redundancy on ANY axis (depth / spectral / sequence).**
 
 **Land-or-dig result: DIG the LAST unmeasured encoder-redundancy axis — SEQUENCE redundancy, the precondition for ToMe / token-merging (the biggest owner-gated encoder lever, previously only "reasoned a poor bet").** AGENT_NAME=AshHeron. ToMe merges mutually-redundant frames after early layers to shrink the O(n) sequence the 70%-e2e encoder GEMMs run over. Its precondition is that adjacent/similar frames actually ARE redundant. Measured directly on real audio (jfk×3 = a full 30 s window of speech, `examples/frame_redundancy_probe.rs`, real turbo weights, sampled at depths 4/8/16/32 via `FW_ENCODER_LAYERS`): probe only, engine byte-identical, conformance GREEN.
