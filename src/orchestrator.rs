@@ -86,6 +86,21 @@ impl PipelineStage {
             Self::Persist => 1 << 9,
         }
     }
+
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::Ingest => 0,
+            Self::Normalize => 1,
+            Self::Vad => 2,
+            Self::Separate => 3,
+            Self::Backend => 4,
+            Self::Accelerate => 5,
+            Self::Align => 6,
+            Self::Punctuate => 7,
+            Self::Diarize => 8,
+            Self::Persist => 9,
+        }
+    }
 }
 
 impl fmt::Display for PipelineStage {
@@ -147,10 +162,14 @@ impl PipelineConfig {
     /// - `Backend` requires `Normalize` before it (which itself requires `Ingest`).
     /// - No duplicate stages.
     pub fn validate(&self) -> FwResult<()> {
-        // Check for duplicates.
-        let mut seen = std::collections::HashSet::new();
-        for stage in &self.stages {
-            if !seen.insert(stage) {
+        let mut positions = [None; DEFAULT_STAGES.len()];
+        for (idx, &stage) in self.stages.iter().enumerate() {
+            let Some(slot) = positions.get_mut(stage.ordinal()) else {
+                return Err(FwError::InvalidRequest(format!(
+                    "unknown pipeline stage: {stage}"
+                )));
+            };
+            if slot.replace(idx).is_some() {
                 return Err(FwError::InvalidRequest(format!(
                     "duplicate pipeline stage: {stage}"
                 )));
@@ -158,7 +177,7 @@ impl PipelineConfig {
         }
 
         // Check ordering constraints.
-        let pos = |s: PipelineStage| self.stages.iter().position(|x| *x == s);
+        let pos = |s: PipelineStage| positions.get(s.ordinal()).copied().flatten();
 
         if let Some(norm_pos) = pos(PipelineStage::Normalize) {
             match pos(PipelineStage::Ingest) {

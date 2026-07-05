@@ -4,6 +4,91 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-05 - BlackThrush: LAND (measured micro-path WIN) - enum-indexed `PipelineConfig::validate`
+
+**Ratio vs ORIG (this per-crate validation microbench's original `HashSet` +
+repeated-position baseline): default validation **11.8x faster** by rounded
+bencher lines (`295 ns` -> `25 ns`, time ratio `0.085x`); minimal builder
+**2.8x faster** (`86 ns` -> `31 ns`, time ratio `0.360x`); builder without
+accelerate **10.9x faster** (`305 ns` -> `28 ns`, time ratio `0.092x`). Overall
+ASR-vs-OpenAI/whisper.cpp ratio envelope is UNCHANGED; this is an orchestrator
+configuration-validation micro-path, not a decoder/encoder macro-path.**
+
+No unstaged work was present at session start (`## main...origin/main`). Agent
+Mail registration/reservation was retried under `AGENT_NAME=BlackThrush` and is
+still blocked by the archive SQLite corruption circuit breaker (`database disk
+image is malformed`). No repo-local `.scratch/.worktrees`,
+`/data/projects/.scratch`, or `/data/projects/.worktrees` franken_whisper bench
+win was found missing from current `main`; the only non-contained code-looking
+sibling commits (`4dd616f` mel projection and `134f404` f16c dot) are already
+source-superseded on main by the later real-FFT/SIMD projection path and the
+later `dot_f16c_2row` path.
+
+Dig rationale from `docs/NEGATIVE_EVIDENCE.md` plus the alien-graveyard /
+extreme-optimization pass: the obvious native-engine and decoder quantization
+families are already covered, and the remaining ASR macro frontier is external
+GEMM / owner-quality policy. For a short model-free per-crate loop I used the
+small-universe membership primitive (succinct bit-vector / fixed enum table)
+on a fresh adjacent surface, not the already-landed `has_stage` lookup. The
+old validator allocated a `HashSet` for duplicates and then rescanned the stage
+`Vec` for each ordering predicate. The landed change builds a fixed
+`[Option<usize>; DEFAULT_STAGES.len()]` position table in one pass, rejects
+duplicates at the same first repeated stage with the same error message, and
+uses that table for all ordering checks. Stage execution order and public
+`stages()` output remain the original `Vec<PipelineStage>`.
+
+Baseline command first attempted through RCH:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench pipeline_bench -- pipeline/config_validation \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 1 \
+    --output-format bencher --noplot
+```
+
+RCH selected `hz1`, synced the repo and dependencies, then spent >10 minutes
+without emitting a Criterion sample or local artifact; I interrupted only that
+run (`SIGINT`, exit 130) and switched to a direct local short bench under the
+same required target dir.
+
+Measured evidence, direct local fallback with
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod`:
+
+```text
+baseline, original HashSet + repeated position scans:
+  test pipeline/config_validation/default_pipeline ... bench: 295 ns/iter (+/- 22)
+  test pipeline/config_validation/minimal_pipeline ... bench: 86 ns/iter (+/- 6)
+  test pipeline/config_validation/builder_without_accelerate ... bench: 305 ns/iter (+/- 27)
+
+after, fixed enum-indexed position table:
+  test pipeline/config_validation/default_pipeline ... bench: 25 ns/iter (+/- 1)
+  test pipeline/config_validation/minimal_pipeline ... bench: 31 ns/iter (+/- 1)
+  test pipeline/config_validation/builder_without_accelerate ... bench: 28 ns/iter (+/- 1)
+```
+
+Final Criterion medians for the committed code:
+`default_pipeline` **25.716 ns** (mean 25.827 ns, median CI
+24.637..27.420 ns); `minimal_pipeline` **31.322 ns** (mean 31.740 ns, median
+CI 30.741..33.013 ns); `builder_without_accelerate` **28.254 ns** (mean
+28.487 ns, median CI 27.262..29.743 ns).
+
+Conformance/gates run: `rustfmt --edition 2024 --check src/orchestrator.rs`
+PASS; `git diff --check` PASS; `cargo test -p franken_whisper
+pipeline_config_validate --lib` PASS (13 tests); `cargo check -p
+franken_whisper --lib` PASS. `cargo fmt --check` for the whole repo still
+fails on pre-existing unrelated formatting drift in examples and
+`src/native_engine/nn.rs`; I did not format unrelated files. `cargo clippy -p
+franken_whisper --lib -- -D warnings` still fails on pre-existing unrelated
+lint debt in `audio.rs`, `backend/whisper_cpp_native.rs`,
+`native_engine/decode.rs`, `native_engine/decoder.rs`, and
+`native_engine/nn.rs`. `ubs src/orchestrator.rs` still exits 1 on broad
+pre-existing/heuristic findings in that file, while its internal fmt/clippy,
+check, tests-build, audit, and deny substeps are clean.
+
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-05 - BlackThrush: LAND (measured micro-path WIN) - cached `PipelineConfig` stage bitmask for `has_stage`
 
 **Ratio vs ORIG (this per-crate lookup microbench's original linear-scan baseline): 0.365x time / 2.74x speedup by exact medians
