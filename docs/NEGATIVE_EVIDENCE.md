@@ -23,6 +23,75 @@ FMA baselines: attn 3.83 ms (1284 GF/s), fc1 15.9 ms (1234 GF/s), fc2 17.8 ms (1
 **UNIFYING META-CONCLUSION — reduced-cost encoder GEMM is CLOSED on all four classes; do not re-dig any of them.** Every technique fails for one of exactly two structural reasons: **(A) the tuned `ft_kernel_cpu` FMA microkernel (1100–1284 GF/s) is unbeatable by any non-FMA arithmetic** — CountSketch's scatter-add and PQ's table-lookup are both 2–10× slower even at fewer nominal ops; and **(B) the distilled-turbo encoder weights have no exploitable structure** — full-rank spectrum (low-rank dead), non-clustering subvectors (VQ dead), small-cosine activations (sketch-variance dead), and no depth/sequence redundancy (layer-prune fatal / ToMe poor-bet, [[project_encoder_flop_reduction_mapped]]). The ONLY remaining encoder levers are the external FMA kernel itself (GPU / AVX-512-VNNI-int8, both hardware-absent here) or an owner-quality ToMe. Future rounds should pivot OFF encoder-GEMM reduction entirely. Ratio vs ORIG UNCHANGED (probe-only, default binary byte-identical; ~1.2× ts / ~1.68–1.8× no_ts vs OpenAI-Whisper/whisper.cpp).
 
 ---
+## 2026-07-05 - BlackThrush: LAND (measured TTY decode WIN) - direct NDJSON tag dispatch, no `serde_json::Value` DOM round-trip
+
+**Ratio vs ORIG (same-worker `ovh-a`, short per-crate `tty/decode_synthetic`
+bench): 32-frame synthetic stream **1.17x faster** / `0.853x` time by exact
+medians (`143,564.730 ns` -> `122,435.486 ns`); 128-frame stream **1.16x
+faster** / `0.860x` time (`577,642.268 ns` -> `496,912.548 ns`). Rounded
+bencher rows agree (`143,564 ns` -> `122,435 ns`; `577,642 ns` ->
+`496,912 ns`). Overall ASR-vs-OpenAI/whisper.cpp ratio envelope is UNCHANGED;
+this is a low-bandwidth TTY framing decode micro-path, not an encoder/decoder
+macro-path.**
+
+Dig rationale: the native encoder/decoder reduced-FLOP, int8-quality, SDPA,
+and pipeline small-set levers above are already covered or closed. This round
+used a fresh parse-fusion / succinct-tag primitive on the TTY NDJSON transport:
+the old `parse_frame_line` materialized every line as a generic
+`serde_json::Value`, inspected `value.get("frame_type")`, then re-materialized
+the same DOM into either `TtyControlFrame` or `TtyAudioFrame`. Audio data frames
+dominate real TTY streams, so every frame paid a full generic object allocation
+pass before the typed parse. The landed path treats `"frame_type"` as the
+wire-format discriminant and deserializes directly into the concrete type,
+preserving the existing control/audio classification and error behavior for the
+project's emitted NDJSON.
+
+The existing `tty/decode` bench requires `ffmpeg` and was skipped on the RCH
+worker, so I added an in-harness synthetic decode bench that builds valid
+handshake + audio-frame NDJSON without external tools. It still exercises the
+public `decode_frames_to_raw_with_policy` path, including parse, sort,
+base64 decode, zlib decode, CRC32, and SHA-256 checks.
+
+Measured commands, both through the required project target dir:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench tty_bench -- tty/decode_synthetic \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 1 \
+    --output-format bencher --noplot
+```
+
+Baseline (ORIG parser + new synthetic harness only), RCH remote `ovh-a`:
+
+```text
+test tty/decode_synthetic/frames/32 ... bench: 143564 ns/iter (+/- 707)
+test tty/decode_synthetic/frames/128 ... bench: 577642 ns/iter (+/- 2530)
+```
+
+After (direct concrete deserialization), same RCH worker `ovh-a`:
+
+```text
+test tty/decode_synthetic/frames/32 ... bench: 122435 ns/iter (+/- 607)
+test tty/decode_synthetic/frames/128 ... bench: 496912 ns/iter (+/- 3610)
+```
+
+Conformance/gates run: `rustfmt --edition 2024 --check src/tty_audio.rs
+benches/tty_bench.rs` PASS; `git diff --check -- src/tty_audio.rs
+benches/tty_bench.rs` PASS; `cargo test -p franken_whisper tty_audio --lib`
+PASS (208 tests, via RCH fail-open local after remote sync timeout);
+`cargo check -p franken_whisper --bench tty_bench` PASS (via RCH fail-open
+local after remote sync timeout). `cargo clippy -p franken_whisper --bench
+tty_bench -- -D warnings` still fails on pre-existing unrelated lib lint debt
+in `audio.rs`, `backend/whisper_cpp_native.rs`, `native_engine/decode.rs`,
+`native_engine/decoder.rs`, and `native_engine/nn.rs`. `ubs
+src/tty_audio.rs benches/tty_bench.rs` exits 1 on broad pre-existing/heuristic
+findings, while its internal fmt/clippy/check/test-build/audit/deny substeps
+are clean for the touched set.
+
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-05 - AshHeron: DIG → REJECTED (measured) — **low-rank WEIGHT factorization of the encoder GEMMs (`W_t ≈ U·V` once at load → two dense GEMMs `(x@U)@V`) is QUALITY-DEAD: the distilled-turbo encoder weights are NEAR-FULL-RANK (more so with depth), so the ranks that WIN on speed (r≤K/4, 3.5–4× measured) give 5–72% output relerr, and the ranks accurate enough (r→K) give ~1× speed. DISTINCT from the ledger's already-dismissed low-rank ATTENTION.**
 
 **Land-or-dig result: DIG a genuinely-new primitive not in the ledger.** AGENT_NAME=AshHeron. The 4 prior `low-rank` hits are all **low-rank ATTENTION** (a data-dependent softmax(QKᵀ) approximation that breaks the faithful port). This is different: factor the **STATIC** linear weight `W_t[in,out] ≈ U[in,r]·V[r,out]` ONCE at load (like the existing pretranspose / i7 quant), turning the per-window `x@W_t` into TWO clean DENSE GEMMs `(x@U)@V`. This deliberately sidesteps the wall that killed the prior CountSketch dig (935a883): that lost on a memory-bound O(M·K) scatter-add, NOT the GEMM. Low-rank has **no scatter** (both factors are dense matmuls the tuned `ft_kernel_cpu` runs fast) and its error is **deterministic** (Eckart-Young optimal truncation), not sketch variance. The whole bet rides on whether the REAL distilled-turbo weights are low-rank, so the probe loads ACTUAL model tensors (random weights are full-rank and would fail trivially) and estimates rank-r captured energy via randomized range finding (Halko-Martinsson-Tropp, 1 power iteration). Harness landed: `examples/lowrank_gemm_probe.rs` (probe only, engine byte-identical, conformance GREEN).
