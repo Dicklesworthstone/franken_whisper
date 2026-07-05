@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-05 - BlackThrush: LAND (measured micro-path WIN) - cached `PipelineConfig` stage bitmask for `has_stage`
+
+**Ratio vs ORIG (this per-crate lookup microbench's original linear-scan baseline): 0.365x time / 2.74x speedup by exact medians
+(`11.389 ns` -> `4.157 ns` for six lookups); rounded `bencher` output is `11 ns/iter` -> `4 ns/iter`, so the conservative
+reported ratio is **2.75x faster**. Overall ASR-vs-OpenAI/whisper.cpp ratio envelope is UNCHANGED; this is an orchestrator
+membership micro-path, not a decoder/encoder macro-path.**
+
+No measured `.scratch` / `.worktrees` franken_whisper bench win was found missing from `main`; the known sibling heads remain
+the already-ledgered stale/reject/source-equivalent set. Agent Mail registration/reservation was retried under
+`AGENT_NAME=BlackThrush` and is still blocked by the archive SQLite corruption circuit breaker (`database disk image is
+malformed`), so no advisory reservation was recorded.
+
+Dig rationale: `docs/NEGATIVE_EVIDENCE.md` already closes the obvious native-engine and decoder quantization families for this
+short loop, so I used the alien-graveyard/extreme-optimization small-set lever: replace repeated small ordered-set membership
+scans with a succinct bit-vector/cache while preserving the ordered `Vec<PipelineStage>` as the execution/validation source of
+truth. The shipped change adds a cached `u16` stage mask in `PipelineConfig`, maps each `PipelineStage` to one bit, keeps all
+ordering and duplicate validation on `stages`, and changes only `has_stage` membership from `Vec::contains` to one bit test.
+The benchmark harness now black-boxes the config reference and stage inputs so the lookup body is not optimized away.
+
+Short per-crate commands, using the required project target dir:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench -p franken_whisper --profile release \
+    --bench pipeline_bench -- pipeline/has_stage_lookup \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 1 \
+    --output-format bencher --noplot
+```
+
+Measured evidence:
+
+```text
+baseline, original linear scan, stronger black_box harness:
+  RCH selected hz2, timed out syncing franken_whisper, fail-open local
+  test pipeline/has_stage_lookup ... bench: 11 ns/iter (+/- 0)
+  Criterion median 11.388891918806674 ns, 95% CI 11.363981091174253..11.87176115024947
+
+after, cached u16 stage mask:
+  RCH selected hz1 and completed remotely
+  test pipeline/has_stage_lookup ... bench: 4 ns/iter (+/- 1)
+  Criterion median 4.1571930007349565 ns, 95% CI 3.9772830470006166..5.2612645829754765
+```
+
+Caveat: RCH does not expose a documented worker pin/local-only flag on `exec`; `RCH_FORCE_LOCAL=1 rch admit ...` still reported
+offload-eligible, so the cleanest completed A/B is same harness / same target-dir, but local fallback for baseline and remote
+for after. The ratio is therefore recorded conservatively from rounded bencher lines as `11/4 = 2.75x`, not from the earlier
+sub-ns folded run. The first naive harness measured `0 ns/iter`; that sample was discarded as optimized-away evidence and is
+not used for the keep decision.
+
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-05 - AshHeron: DIG → REJECTED (measured, doubly-dead) — **randomized / CountSketch "compressed matrix multiplication" on the encoder GEMMs (the one sub-cubic FLOP-reduction class NOT previously in this ledger — Strassen was tried, randomized-NLA sketches were not). MEASURED at the real turbo encoder shapes it is DEAD on BOTH axes: (a) SLOWER on the K-reducing shapes (QKV 0.31×, fc1 0.42×) despite doing half the GEMM FLOPs, and (b) CATASTROPHIC accuracy everywhere (Frobenius relerr 57–142%, i.e. error ≥ signal). Closes the whole variance-based-sketch class (JL / CountSketch / sparse random projection) at the right target.**
 
 **Land-or-dig result: LAND empty (fresh e2e profile re-confirmed the encoder is GEMM-dominated with NO new byte-exact franken hotspot — qkv_proj 29% + mlp_fc 14.6% + mlp_proj 31.5% + attn_out 10.4% ≈ 85% of the encoder, all external `nn::matmul`); DIG = a genuinely NEW radical primitive not in the 1.1 MB ledger.** AGENT_NAME=AshHeron. The ledger's key established fact is that the encoder f32 GEMM is COMPUTE-bound per core (single-core 64–81% of FMA peak) and only frequency/power-throttled at 32t, so a *genuine* FLOP cut with *small* overhead should help proportionally — Strassen was the one sub-cubic lever tried and it lost (0.27–0.34×) purely because its O(n²) extraction/assembly overhead swamped the 12.5% multiply saving. The untried, structurally-different class is **randomized dimensionality reduction of the contraction dim** (Pagh 2013 compressed matrix multiplication / CountSketch): reduce K→K′ with a sparse ±1 sketch S[K,K′] (one nonzero/row), then `h@W ≈ (h@S)@(SᵀW) = hs[M,K′]@Ws[K′,N]`; the weight sketch `Ws` is STATIC (built once at load, like the existing pretranspose/i7 quant), so the per-window cost is just a cheap O(M·K) scatter-add + the SMALLER O(M·K′·N) GEMM. Overhead is O(M·K) ≪ Strassen's O(n²) relative to the GEMM, so if it wins on speed the only question is accuracy. Harness landed: `examples/sketched_gemm_probe.rs` (byte-identical default — NO engine code touched, probe only; conformance trivially GREEN).

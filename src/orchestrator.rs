@@ -71,6 +71,21 @@ impl PipelineStage {
             Self::Persist => "persist",
         }
     }
+
+    const fn mask_bit(self) -> u16 {
+        match self {
+            Self::Ingest => 1 << 0,
+            Self::Normalize => 1 << 1,
+            Self::Vad => 1 << 2,
+            Self::Separate => 1 << 3,
+            Self::Backend => 1 << 4,
+            Self::Accelerate => 1 << 5,
+            Self::Align => 1 << 6,
+            Self::Punctuate => 1 << 7,
+            Self::Diarize => 1 << 8,
+            Self::Persist => 1 << 9,
+        }
+    }
 }
 
 impl fmt::Display for PipelineStage {
@@ -103,12 +118,16 @@ const DEFAULT_STAGES: [PipelineStage; 10] = [
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     stages: Vec<PipelineStage>,
+    stage_mask: u16,
 }
 
 impl PipelineConfig {
     /// Create a config with the given stages executed in order.
     pub fn new(stages: Vec<PipelineStage>) -> Self {
-        Self { stages }
+        let stage_mask = stages
+            .iter()
+            .fold(0u16, |mask, stage| mask | stage.mask_bit());
+        Self { stages, stage_mask }
     }
 
     /// The ordered list of stages that will be executed.
@@ -118,7 +137,7 @@ impl PipelineConfig {
 
     /// Returns `true` if the given stage is present in this config.
     pub fn has_stage(&self, stage: PipelineStage) -> bool {
-        self.stages.contains(&stage)
+        self.stage_mask & stage.mask_bit() != 0
     }
 
     /// Validate the configuration for structural soundness.
@@ -239,9 +258,7 @@ impl PipelineConfig {
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self {
-            stages: DEFAULT_STAGES.to_vec(),
-        }
+        Self::new(DEFAULT_STAGES.to_vec())
     }
 }
 

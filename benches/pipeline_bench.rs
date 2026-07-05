@@ -4,6 +4,8 @@
 //! primitives used by the orchestrator's replay envelope), and stage budget
 //! calculation via `PipelineConfig` construction and validation.
 
+use std::hint::black_box;
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -219,12 +221,15 @@ fn bench_pipeline_has_stage(c: &mut Criterion) {
 
     c.bench_function("pipeline/has_stage_lookup", |b| {
         b.iter(|| {
-            let _ = config.has_stage(PipelineStage::Ingest);
-            let _ = config.has_stage(PipelineStage::Normalize);
-            let _ = config.has_stage(PipelineStage::Backend);
-            let _ = config.has_stage(PipelineStage::Accelerate);
-            let _ = config.has_stage(PipelineStage::Align);
-            let _ = config.has_stage(PipelineStage::Persist);
+            let config = black_box(&config);
+            black_box([
+                config.has_stage(black_box(PipelineStage::Ingest)),
+                config.has_stage(black_box(PipelineStage::Normalize)),
+                config.has_stage(black_box(PipelineStage::Backend)),
+                config.has_stage(black_box(PipelineStage::Accelerate)),
+                config.has_stage(black_box(PipelineStage::Align)),
+                config.has_stage(black_box(PipelineStage::Persist)),
+            ]);
         });
     });
 }
