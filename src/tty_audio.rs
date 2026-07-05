@@ -9,7 +9,6 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::audio;
@@ -781,12 +780,11 @@ fn parse_frame_lines<R: Read>(reader: &mut R) -> FwResult<Vec<FrameLine>> {
 }
 
 fn parse_frame_line(line: &str) -> FwResult<FrameLine> {
-    let value: Value = serde_json::from_str(line)?;
-    if value.get("frame_type").is_some() {
-        let control: TtyControlFrame = serde_json::from_value(value)?;
+    if line.contains("\"frame_type\"") {
+        let control: TtyControlFrame = serde_json::from_str(line)?;
         Ok(FrameLine::Control(control))
     } else {
-        let frame: TtyAudioFrame = serde_json::from_value(value)?;
+        let frame: TtyAudioFrame = serde_json::from_str(line)?;
         Ok(FrameLine::Audio(frame))
     }
 }
