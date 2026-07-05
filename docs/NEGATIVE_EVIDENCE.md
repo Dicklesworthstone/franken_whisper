@@ -4,6 +4,27 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-05 - AshHeron: DIG → REJECTED (measured) — **low-rank WEIGHT factorization of the encoder GEMMs (`W_t ≈ U·V` once at load → two dense GEMMs `(x@U)@V`) is QUALITY-DEAD: the distilled-turbo encoder weights are NEAR-FULL-RANK (more so with depth), so the ranks that WIN on speed (r≤K/4, 3.5–4× measured) give 5–72% output relerr, and the ranks accurate enough (r→K) give ~1× speed. DISTINCT from the ledger's already-dismissed low-rank ATTENTION.**
+
+**Land-or-dig result: DIG a genuinely-new primitive not in the ledger.** AGENT_NAME=AshHeron. The 4 prior `low-rank` hits are all **low-rank ATTENTION** (a data-dependent softmax(QKᵀ) approximation that breaks the faithful port). This is different: factor the **STATIC** linear weight `W_t[in,out] ≈ U[in,r]·V[r,out]` ONCE at load (like the existing pretranspose / i7 quant), turning the per-window `x@W_t` into TWO clean DENSE GEMMs `(x@U)@V`. This deliberately sidesteps the wall that killed the prior CountSketch dig (935a883): that lost on a memory-bound O(M·K) scatter-add, NOT the GEMM. Low-rank has **no scatter** (both factors are dense matmuls the tuned `ft_kernel_cpu` runs fast) and its error is **deterministic** (Eckart-Young optimal truncation), not sketch variance. The whole bet rides on whether the REAL distilled-turbo weights are low-rank, so the probe loads ACTUAL model tensors (random weights are full-rank and would fail trivially) and estimates rank-r captured energy via randomized range finding (Halko-Martinsson-Tropp, 1 power iteration). Harness landed: `examples/lowrank_gemm_probe.rs` (probe only, engine byte-identical, conformance GREEN).
+
+**MEASURED (`lowrank_gemm_probe`, REAL turbo weights, best-of-30 @32t, seq=1500):**
+```
+layer 15    r     speed   FLOPcut   captured   OUT_relerr
+attn.query  128   4.05×   5.00×     97.1%      23.7%
+attn.query  256   2.13×   2.50×     99.4%      11.0%
+mlp.0 fc1   256   3.69×   4.00×     93.3%      35.9%
+mlp.0 fc1   512   1.83×   2.00×     97.6%      21.4%
+mlp.2 fc2   256   3.53×   4.00×     81.3%      58.2%
+attn.out    256   2.05×   2.50×     69.1%      72.2%
+best-in-model: layer 0 attn.query r=128 → 3.64× / captured 99.9% / OUT_relerr 5.1%
+worst: layer 31 attn.query r=128 → 4.01× / captured 75.2% / OUT_relerr 66.0%
+```
+**The technique WORKS — the model doesn't.** Unlike the CountSketch dig (which was even SLOWER), low-rank hits a real **3.5–4× speed** at r≤K/4 — proof the scatter-add, not the factorization, killed the sketch. The kill here is purely **accuracy**: the distilled-turbo encoder weights are **near-full-rank**, so at the speed-winning ranks the OUTPUT relerr is 5–72% (the single most-favorable weight in the entire model — layer-0 attn.query — is 5.1%, still 5× above any usable bound), and the ranks accurate enough (r→K) erase the speedup (attn r=512 already 0.98×). This is a **THIRD** confirmation of the "distillation removed all slack" thesis: turbo's encoder has no **depth**-redundancy (layer-pruning fatal at 4/32, [[project_encoder_flop_reduction_mapped]]), no **sequence**-redundancy (ToMe poor-bet), and now no **spectral**-redundancy (weights near-full-rank, worsening with depth). The transcript tolerates ≪1% per-GEMM error, not 5–72%. Probe caveat: the randomized range finder's MGS loses orthogonality at r≥512 (captured>100% artifacts) — irrelevant, the conclusion rests on the numerically-stable low-r rows.
+
+**Takeaway.** Sub-cubic / reduced-FLOP encoder GEMM is now closed on THREE fronts: exact-restructure (Strassen, O(n²) overhead), randomized-approximate (CountSketch, variance + slower), and low-rank factorization (near-full-rank weights + no-slack quality). All three leave the external `ft_kernel_cpu` GEMM as the floor; the encoder frontier stays GPU / VNNI-int8 / owner-quality-ToMe. Ratio vs ORIG UNCHANGED (probe-only, default binary byte-identical; ~1.2× ts / ~1.68–1.8× no_ts vs OpenAI-Whisper/whisper.cpp).
+
+---
 ## 2026-07-05 - BlackThrush: LAND (measured micro-path WIN) - enum-indexed `PipelineConfig::validate`
 
 **Ratio vs ORIG (this per-crate validation microbench's original `HashSet` +
