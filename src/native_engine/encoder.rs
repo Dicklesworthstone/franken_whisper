@@ -476,6 +476,19 @@ impl EncoderWeights {
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
                 l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
             });
+        } else if super::enc_int8_attn_in() {
+            // fc1 + attention INPUT projections (q/k/v) int8, keeping attn_out + fc2 f32.
+            // Q/K/V feed the attention SCORES → softmax (error-robust, the decode side
+            // runs qkv int8 default-on); attn_out + fc2 feed the RESIDUAL (not absorbed,
+            // the culprit class). Tests whether the prior whole-attention int8 proper-noun
+            // failure ([[project_turbo_encoder_dominates]]) came from the in-projections
+            // or from the residual-feeding out/fc2. `FW_ENC_INT8_ATTN_IN`, default off.
+            layers.par_iter_mut().for_each(|l| {
+                l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
+                l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
+                l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
+                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+            });
         } else if super::enc_int8_fc1_only() {
             // fc1-ONLY int8 (maddubs): apply the PROVEN decode `mlp_0`/fc1-only recipe
             // ([[project_int8_mlp_fc1_default_on]]) to the ENCODER MLP. Only `mlp.0`/fc1

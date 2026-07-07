@@ -354,6 +354,25 @@ pub(crate) fn enc_int8_fc1_only() -> bool {
     })
 }
 
+/// Whether to int8 the encoder attention INPUT projections (q/k/v) IN ADDITION to
+/// `mlp.0`/fc1, keeping `attn.out` + `mlp.2`/fc2 on f32. `FW_ENC_INT8_ATTN_IN`,
+/// **default OFF = byte-identical**. Q/K/V feed the attention SCORES → softmax
+/// (error-robust; the DECODE runs qkv int8 default-on), while out/fc2 feed the
+/// RESIDUAL (not GELU/softmax-absorbed — the [`enc_int8_fc1_only`] culprit class).
+/// A faithfulness probe: does the prior whole-attention int8 proper-noun failure
+/// ([[project_turbo_encoder_dominates]]) come from the in-projections or from the
+/// residual-feeding out/fc2? NON-byte-exact when ON ⇒ owner-gated. Takes precedence
+/// over [`enc_int8_fc1_only`]; subordinate to full [`enc_int8_enabled`].
+pub(crate) fn enc_int8_attn_in() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_ENC_INT8_ATTN_IN").ok().as_deref().map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
 /// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
 /// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
 /// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from
