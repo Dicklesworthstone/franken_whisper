@@ -476,6 +476,18 @@ impl EncoderWeights {
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
                 l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
             });
+        } else if super::enc_int8_fc1_only() {
+            // fc1-ONLY int8 (maddubs): apply the PROVEN decode `mlp_0`/fc1-only recipe
+            // ([[project_int8_mlp_fc1_default_on]]) to the ENCODER MLP. Only `mlp.0`/fc1
+            // feeds GELU, whose saturation absorbs the weight-quant error before it
+            // reaches the residual — the exact reason decode fc1-only int8 is transcript
+            // byte-exact. Attention (proper-noun alignment, [[project_turbo_encoder_dominates]])
+            // and fc2 (residual-feeding) stay f32. `FW_ENC_INT8_FC1`, default off =
+            // byte-identical. Tests whether GELU-absorption survives the encoder's 32
+            // stacked layers (vs decode's 4).
+            layers.par_iter_mut().for_each(|l| {
+                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+            });
         }
 
         // FEASIBILITY HARNESS (off by default): `FW_ENC_WEIGHT_ROUNDTRIP=row|<N>` replaces
