@@ -330,6 +330,30 @@ pub(crate) fn enc_int8_enabled() -> bool {
     })
 }
 
+/// Whether to run ONLY the ENCODER MLP up-projection (`mlp.0`/fc1, feeding GELU) through the
+/// maddubs i7 int8 GEMM, leaving attention (q/k/v/out) and fc2/`mlp.2` on f32 sgemm.
+/// `FW_ENC_INT8_FC1`, **default OFF = f32 = byte-identical**.
+///
+/// This applies the PROVEN decode `mlp_0`/fc1-only recipe ([`int8_mlp_enabled`],
+/// [[project_int8_mlp_fc1_default_on]]) to the encoder: only fc1 feeds GELU, whose saturation
+/// absorbs the weight-quant error before it reaches the residual, so decode fc1-only int8 is
+/// transcript byte-exact while both-quant / attention-quant is not. The prior encoder-int8 digs
+/// quantized the WHOLE encoder (incl. attention) and hit intrinsic proper-noun errors from the
+/// cross-attention alignment ([[project_turbo_encoder_dominates]]); fc1-only keeps attention f32
+/// so that alignment is preserved. Open question this tests: whether GELU-absorption survives the
+/// encoder's 32 stacked layers (vs the decoder's 4). Load-time i7 quantize only; the maddubs GEMV
+/// kernel is unchanged. NON-byte-exact when ON (int8 quantization) ⇒ owner-gated on a transcript
+/// A/B; hence default off. Mutually exclusive with the full [`enc_int8_enabled`] (that wins).
+pub(crate) fn enc_int8_fc1_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_ENC_INT8_FC1").ok().as_deref().map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
 /// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
 /// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
 /// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from
