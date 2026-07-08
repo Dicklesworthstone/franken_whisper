@@ -4,6 +4,66 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-08 - BlackThrush: DIG -> REJECTED (measured) - fused-wide encoder int8 QKV is 2.3-2.7x SLOWER than the landed shared-activation path; do not retry Q/K/V concatenation
+
+**Land-or-dig result:** no measured `.scratch`/worktree win was missing from
+`main` (repo-local `.scratch` absent; the `franken_whisper-cod-b-fft-scratch-*`
+worktree is already contained in `main`; only stale reject branches remain), so
+I dug the exact open lead from the 2026-07-04 entry: concatenate encoder int8
+Q/K/V into one wide `[1280,3840]` pre-transposed weight, quantize it as one
+`I7Mat`, run one `matmul_bias_i7_quantized`, then split the wide output back into
+Q/K/V and add Q/V biases. This is structurally different from the already-landed
+activation-reuse win, and it was the only plausible remaining in-crate QKV compute
+lever after duplicate activation quantization was removed.
+
+**MEASURED (temporary bench arm only, removed after measurement):**
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/i7_qkv \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 2 \
+    --output-format bencher --noplot
+```
+
+Note: the prompt's `cargo bench --release` spelling is invalid on this Cargo
+(`unexpected argument '--release'`), so the supported equivalent
+`cargo bench --profile release` was used. RCH first ran the full native-engine
+bench remotely on `hz1` to establish the surface; the focused QKV confirmations
+failed open locally because the fleet was under pressure / `hz2` sync timed out.
+Both focused runs were same-binary, same-host comparisons:
+
+```text
+run 1 local fallback:
+  three_inline_quantize_1500x1280   19.706 ms
+  shared_activation_1500x1280       11.547 ms
+  fused_wide_split_1500x1280        26.321 ms
+  fused/shared ratio: 0.439x speed (2.28x slower)
+
+run 2 local fallback, warm target:
+  three_inline_quantize_1500x1280   15.111 ms
+  shared_activation_1500x1280        9.312 ms
+  fused_wide_split_1500x1280        25.323 ms
+  fused/shared ratio: 0.368x speed (2.72x slower)
+```
+
+**Why it loses:** the current landed shape is three `out=1280, inp=1280`
+projections over one shared activation, so each call hits the `out <= inp`
+M4xN2 maddubs tile. The fused-wide shape has `out=3840 > inp=1280`, so
+`matmul_bias_i7_quantized` correctly falls back to M4xN1 to avoid register
+pressure, then pays an extra wide-output split/copy and Q/V bias pass. The only
+duplicate work left to save was call overhead; the duplicate activation quantize
+was already removed by `shared_activation_1500x1280`, and the lost N2 tile plus
+split cost swamps any call-fusion benefit.
+
+**Verdict:** REJECT + remove temporary bench arm. Do not retry encoder int8 QKV
+wide concatenation/fused-output splitting unless the maddubs kernel gains a new
+`out > inp` tile that preserves the N2 throughput and returns Q/K/V views without
+copying. Ratio vs ORIG is unchanged: default f32 path is byte-identical; gated
+int8 path remains the already-landed shared-activation implementation. No engine
+code kept, so conformance is unchanged by construction. AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-07 - AshHeron: DIG → REJECTED (measured, ruled out before building) — **replacing rayon's work-stealing sync with a static SPIN-POOL for the decode's per-token GEMV dispatch (the last-standing "inherent 26% crossbeam" claim, [[project_decode_overthreaded_rayon_lead]]) is NOT worth it: the decode GEMV parallelism is already two-sided-optimal, so the reducible dispatch headroom is <1%.** The prior decode-threading digs only tuned the worker COUNT (cap-8 small / cap-32 logits, both landed & re-confirmed optimal) and the par THRESHOLD; nobody had questioned rayon's *sync model itself*. A persistent spin-barrier pool (workers spin on an epoch atomic + static chunk partition) can cut per-fork-join overhead vs rayon's crossbeam-epoch/work-steal for a fixed-shape regular workload — the genuinely-different primitive. Before building it (risky: unsafe lifetime-erased task pointers + busy-wait that is shared-box-load-fragile, exactly the axis that closed the thread-count avenue), I MEASURED the actual dispatch cost with a two-sided bracket via the existing `FW_GEMV_I8_PAR` threshold (jfk×3 decode, min-of-3): **default (thr 1<<21, parallelize qkv/fc1/fc2/logits) = 13.06 ms/tok; ALL-SERIAL (`FW_GEMV_I8_PAR=huge`, zero dispatch) = 17.32 ms/tok (+33%); ALL-PARALLEL (`=0`, incl the 1.64M small projections) = 15.81 ms/tok (+21%).** The default beating ALL-SERIAL by 33% proves the parallelism benefit is REAL WORK speedup (not dominated by sync — if dispatch dominated, serial would win); the default beating ALL-PARALLEL by 21% proves the threshold correctly excludes the small projections. So a spin-pool could only shave the residual per-fork-join sync on the ALREADY-parallel GEMVs — ~13 dispatches/tok × ~5-10µs ≈ 0.1-0.7% of the 13 ms. Not worth the risk/complexity. **Also confirmed DEAD in the same pass: encoder GEMM weight PRE-PACKING** (hoist matrixmultiply's per-call B-panel pack for the static encoder weights, the conv-pretranspose principle) — `ft_kernel_cpu::sgemm` delegates to the `matrixmultiply` crate which packs A/B INTERNALLY per call with NO prepack API, AND `ft_kernel_cpu` lives in the separate `/data/projects/frankentorch` repo (out of scope: "git add ONLY your files"). The decode is dispatch-optimal and the encoder GEMM is external+cross-crate. AGENT_NAME=AshHeron. No code changed (existing-flag bracket A/B + API inspection) ⇒ engine byte-identical to HEAD, conformance GREEN.
 
 ---
