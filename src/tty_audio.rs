@@ -790,7 +790,63 @@ fn parse_frame_line(line: &str) -> FwResult<FrameLine> {
 }
 
 fn write_control_frame<W: Write>(writer: &mut W, frame: &TtyControlFrame) -> FwResult<()> {
-    writeln!(writer, "{}", serde_json::to_string(frame)?)?;
+    match frame {
+        TtyControlFrame::Handshake {
+            min_version,
+            max_version,
+            supported_codecs,
+        } => {
+            write!(
+                writer,
+                "{{\"frame_type\":\"handshake\",\"min_version\":{min_version},\"max_version\":{max_version},\"supported_codecs\":"
+            )?;
+            write_json_string_array(writer, supported_codecs)?;
+            writer.write_all(b"}\n")?;
+        }
+        TtyControlFrame::HandshakeAck {
+            negotiated_version,
+            negotiated_codec,
+        } => {
+            write!(
+                writer,
+                "{{\"frame_type\":\"handshake_ack\",\"negotiated_version\":{negotiated_version},\"negotiated_codec\":"
+            )?;
+            serde_json::to_writer(&mut *writer, negotiated_codec)?;
+            writer.write_all(b"}\n")?;
+        }
+        TtyControlFrame::Ack { up_to_seq } => {
+            writeln!(
+                writer,
+                "{{\"frame_type\":\"ack\",\"up_to_seq\":{up_to_seq}}}"
+            )?;
+        }
+        TtyControlFrame::Backpressure { remaining_capacity } => {
+            writeln!(
+                writer,
+                "{{\"frame_type\":\"backpressure\",\"remaining_capacity\":{remaining_capacity}}}"
+            )?;
+        }
+        TtyControlFrame::RetransmitRequest { .. }
+        | TtyControlFrame::RetransmitResponse { .. }
+        | TtyControlFrame::SessionClose { .. }
+        | TtyControlFrame::TranscriptPartial { .. }
+        | TtyControlFrame::TranscriptRetract { .. }
+        | TtyControlFrame::TranscriptCorrect { .. } => {
+            writeln!(writer, "{}", serde_json::to_string(frame)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_json_string_array<W: Write>(writer: &mut W, values: &[String]) -> FwResult<()> {
+    writer.write_all(b"[")?;
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            writer.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut *writer, value)?;
+    }
+    writer.write_all(b"]")?;
     Ok(())
 }
 
@@ -2451,6 +2507,48 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
         assert_eq!(parsed["frame_type"], "ack");
         assert_eq!(parsed["up_to_seq"], 9);
+    }
+
+    #[test]
+    fn emit_control_frame_to_writer_matches_serde_json_line() {
+        let frames = [
+            TtyControlFrame::Handshake {
+                min_version: MIN_PROTOCOL_VERSION,
+                max_version: SUPPORTED_PROTOCOL_VERSION,
+                supported_codecs: vec![CODEC_MULAW_ZLIB_B64.to_owned(), "pcm16".to_owned()],
+            },
+            TtyControlFrame::Ack { up_to_seq: 9 },
+            TtyControlFrame::Backpressure {
+                remaining_capacity: 50,
+            },
+            TtyControlFrame::HandshakeAck {
+                negotiated_version: 1,
+                negotiated_codec: CODEC_MULAW_ZLIB_B64.to_owned(),
+            },
+            TtyControlFrame::RetransmitRequest {
+                sequences: vec![2, 5, 8],
+            },
+            TtyControlFrame::RetransmitResponse {
+                sequences: vec![13, 21],
+            },
+            TtyControlFrame::SessionClose {
+                reason: SessionCloseReason::PeerRequested,
+                last_data_seq: None,
+            },
+            TtyControlFrame::SessionClose {
+                reason: SessionCloseReason::Normal,
+                last_data_seq: Some(34),
+            },
+        ];
+
+        for frame in frames {
+            let mut out = Vec::new();
+            emit_control_frame_to_writer(&mut out, &frame).expect("emit");
+
+            let mut expected = serde_json::to_string(&frame).expect("serialize");
+            expected.push('\n');
+            assert_eq!(out, expected.into_bytes());
+        }
     }
 
     #[test]
