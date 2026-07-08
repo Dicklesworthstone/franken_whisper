@@ -4,6 +4,59 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-08 - BlackThrush: LAND (measured) - TTY control-frame scalar/manual finite emit is 1.6-2.0x faster on the hot robot control rows; vector retransmit manual emit is rejected
+
+**Land-or-dig result:** no repo-local `.scratch` bench artifact existed to land
+(`find .scratch` returned absent), so I consulted this ledger first and dug a
+new primitive on the TTY robot control-output path: a finite-shape JSON emitter
+for scalar/handshake control frames that bypasses the `serde_json::to_string`
+allocation while preserving exact NDJSON bytes. This is distinct from the prior
+2026-07-05 TTY decode direct-tag dispatch win, which attacked input parsing.
+The kept production change specializes only `handshake`, `handshake_ack`, `ack`,
+and `backpressure`; retransmit/session/transcript frames intentionally stay on
+the original Serde string path.
+
+**MEASURED (`tty/control_emit`, local fallback, same target dir, ORIG =
+`writeln!(writer, "{}", serde_json::to_string(frame)?)`):**
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  cargo bench -p franken_whisper --profile release --bench tty_bench -- tty/control_emit \
+    --sample-size 20 --warm-up-time 0.2 --measurement-time 1 \
+    --output-format bencher --noplot
+
+row                  ORIG ns   kept ns   ratio vs ORIG
+handshake                183       114    1.61x
+handshake_ack            155        77    2.01x
+ack                      115        62    1.85x
+backpressure             110        65    1.69x
+retransmit_request       116       115    1.01x  (original path kept)
+retransmit_response      137       119    1.15x  (original path kept; noise-positive)
+```
+
+The prompt's literal `cargo bench --release` spelling was tried first and is
+invalid on this Cargo (`unexpected argument '--release'`), so the supported
+release-profile spelling was used. RCH selected workers but the broad bench
+fell open / was too expensive locally; the focused proof above is the
+same-target comparator used for keep/reject.
+
+**Rejected sub-lever:** manually emitting the retransmit `Vec<u64>` arrays lost
+locally (`retransmit_request` 150 ns, `retransmit_response` 148 ns vs ORIG
+116/137 ns). Do not retry hand-rolled u64-array emission for retransmit control
+frames unless the benchmark changes shape; Serde's vector path is already
+competitive at this size.
+
+**Conformance:** strict byte-equivalence test
+`emit_control_frame_to_writer_matches_serde_json_line` compares emitted bytes to
+`serde_json::to_string(frame) + "\n"` across every specialized variant plus the
+restored fallback variants and passes. Robot output schema/order/newline remain
+unchanged.
+
+**Verdict:** KEEP the scalar finite emitter. Ratio vs ORIG improves the hot
+scalar control rows by 1.61-2.01x with no observed retransmit regression and no
+wire-format change. AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-08 - BlackThrush: DIG -> REJECTED (measured) - fused-wide encoder int8 QKV is 2.3-2.7x SLOWER than the landed shared-activation path; do not retry Q/K/V concatenation
 
 **Land-or-dig result:** no measured `.scratch`/worktree win was missing from
