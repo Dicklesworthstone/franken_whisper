@@ -4,6 +4,66 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 - BlackThrush: DIG -> REJECTED (measured, reverted) - generic per-call tiled f32 sgemm route for large `gemv_f16_batch` loses to the row-morsel f16 path; do not retry this fallback-vs-default route
+
+**Profile-first target:** after consulting the closed lanes (row-morsel direct
+write already landed, compact per-band buffers rejected, `dot_f16c_2col` /
+weight-conversion amortization rejected, rayon migration rejected, and cross-K/V
+load-time f32 routing already handled separately), the short native-engine
+profile again selected the hottest unskipped model-free row:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/ \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+
+profile row:
+  native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280  20.887 ms
+```
+
+**Rejected primitive:** a generic, default-on large-work `gemv_f16_batch` route
+that tiled/dequantized natural `[out,in]` f16 weights into a temporary `[in,out]`
+f32 matrix, then delegated the full `[tq,in] x [in,out]` multiply to the existing
+ft/matrixmultiply sgemm. This is distinct from the landed cross-K/V load-time
+`cross_proj_f32` route: it pays the f16->f32 transpose and output copy on every
+`gemv_f16_batch` call. It is also numerically non-exact vs the current f16
+`dot_f16c` reduction tree, so conformance would have had to validate transcript
+neutrality before any default-on landing.
+
+**MEASURED vs LEGACY ORIGINAL / same-binary control:**
+
+```text
+focused ORIG, local fallback before hunk:
+  f16_gemv_batch_1500x1280x1280     10.983668 ms (+/- 0.660376)
+
+candidate default, local fallback:
+  run 1                              10.755318 ms (+/- 0.713980)
+  run 2                              10.445545 ms (+/- 0.169470)
+
+same-binary forced-off control, local fallback:
+  FW_BATCH_GEMV_TILED_F32=0          10.361245 ms (+/- 0.279765)
+
+non-comparable routing evidence:
+  ovh-a forced-off control           14.186462 ms (+/- 0.825980)
+```
+
+The apparent pre-hunk gain disappeared under the same-binary forced-off control:
+the existing row-morsel f16 path was faster than the default tiled-f32 candidate.
+Likely cause: the per-call f16->f32 transpose plus temporary output copy costs
+more than the sgemm kernel saves for this direct helper; the load-time f32 route
+remains the correct place for this primitive when a specific model weight can be
+converted once and transcript-checked.
+
+**Verdict:** REJECT and revert source. No engine code retained; the checkout is
+byte-identical to HEAD after the manual reverse patch. Explicit conformance gate:
+`cargo test --profile release -p franken_whisper --test conformance_comparator_tests`
+passed 26/26 via `rch exec` local fallback. This also corrects the
+immediately-following AshHeron note's "concurrent tiled-f32 route" assumption:
+that route was measured and rejected, not landed. AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-09 - AshHeron: DIG → measured byte-exact WIN (1.21×), code-landing DEFERRED (live shared-file collision + concurrent tiled-f32 route supersedes the default target) — **the batched f16 GEMV row-morsel kernel (`gemv_f16_batch_rows`) re-runs the f16→f32 weight conversion (`vcvtph2ps`) for EVERY one of the tq activation rows; a byte-exact M2 activation-column tile (`dot_f16c_2col`) that shares each weight-chunk conversion across 2 rows is MEASURED 1.21× cold on the cross-K/V projection shape — but it is NOT landed this round because BlackThrush is concurrently landing a `FW_BATCH_GEMV_TILED_F32` route on the SAME `gemv_f16_batch` that intercepts that shape by default, and their 100-line change is uncommitted in the shared working tree.**
 
 **The lever (genuinely new — grepped `gemv_i8_batch`/`i8-batch`/`register-til`/`m2col`/`2col` first; distinct from my own line 542 tq=1 `gemv_i8` row-block rejection, which was the LATENCY-bound per-token path, and from BlackThrush's tq=1 `dot_f16c_2row` which shares the ACTIVATION across 2 WEIGHT rows).** Profiling the ~2% e2e `cross_kv` span: `cross_attn_k/v.forward(encoder_out)` at tq=1500 loads NO `w_i8` (they only get `.dequant_to_f32_if(cross_proj_f32_enabled())`, default off) ⇒ they route to the f16 batch (`gemv_f16_batch` → the compute-bound `gemv_f16_batch_rows` row-morsel kernel), NOT `gemv_i8_batch`. That kernel's inner loop is M1×N1: `for t in act_rows { for o in weight_rows { dot_f16c(w[o], x[t]) } }` — so each weight row's f16→f32 conversion is redone tq=1500 times, and `dot_f16c` is ~cvtph-throughput-bound at [1280,1280] (4 `vcvtph2ps` vs 4 `vfmadd` per 32-lane chunk). **`dot_f16c_2col(w, x0, x1)`** (the activation-column transpose of `dot_f16c_2row`) converts each weight chunk ONCE and reuses it across 2 activation rows, each row keeping its OWN 4 accumulators in `dot_f16c`'s exact reduction order ⇒ `== (dot_f16c(w,x0), dot_f16c(w,x1))` **bit-for-bit** (integer-free but the f32 accumulation ORDER is identical, so byte-exact, not just conformance-close). Register budget: 4 converted-w + 4+4 accumulators + transient x = 16 ymm (fits Zen3). **MEASURED (`examples/f16batch_m2col_probe`, exact `gemv_f16_batch_rows` M1 replica vs M2col, real `[1500,1280]×[1280,1280]`, 16t cold, min-of-40, heavily-loaded box so the interleaved RATIO is the robust signal): M1 8.347 ms vs M2col 6.887 ms = 1.212× FASTER, `M1==M2col` BYTE-IDENTICAL (full-array equal).** The ~1.2× (not 2×) means the kernel is partly x-load/fmadd-bound, not purely cvtph-bound, but the halved conversion is a real strictly-fewer-work win.
