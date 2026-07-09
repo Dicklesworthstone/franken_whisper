@@ -4,6 +4,67 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-08 - BlackThrush: DIG -> REJECTED (measured) - compact per-band buffers for batched f16 GEMV are 1.29-1.44x SLOWER than the legacy full-stride worker buffers; do not retry the allocation-shrink variant
+
+**Profile-first target:** current short per-crate profiling kept the hottest
+model-free native-engine row at `native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280`
+(`~20-30 ms`, depending on host pressure), ahead of the already-landed TTY
+decode/control rows (`tty/decode_synthetic/128` ~0.60 ms; scalar control emit
+~66-138 ns). The obvious arithmetic/quantization axes on encoder/decode GEMV,
+QKV fusion, row-blocking, huge pages, low-rank, SDPA exp, and attention
+approximation are already rejected or gated in this ledger, so the one new
+primitive tested was a data-layout/dataflow change from the graveyard
+"data-plane parser/kernel" / vectorized-morsel playbook: keep the exact same
+dot order, but replace each worker's full private `[tq,out]` buffer with a
+compact `[tq,band_width]` buffer before the disjoint merge.
+
+**Hypothesis:** the legacy batch path allocates and zero-fills a full output
+matrix per worker even though each worker writes only its output-column band
+(for the profiled row, ~7.3 MiB per worker at 16 workers). A compact private
+band should remove most zero-fill and merge-copy bytes while preserving every
+`dequant_row_dot` operation and output order.
+
+**MEASURED (temporary `src/native_engine/nn.rs` hunk only, reverted):**
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280 \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 2 \
+    --output-format bencher --noplot
+
+ORIG legacy full-stride worker buffers, local fallback:
+  f16_gemv_batch_1500x1280x1280  20.687 ms
+
+candidate compact per-band buffers, same checkout/target/host class:
+  run 1  26.643 ms  => 0.776x speed vs ORIG (1.29x slower)
+  run 2  29.851 ms  => 0.693x speed vs ORIG (1.44x slower)
+```
+
+RCH had no admissible worker slots / timed out and failed open locally, so this
+is a same-target local A/B. The broad profile immediately before the focused A/B
+also identified this row as the hottest available model-free row:
+
+```text
+native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280  29.804 ms
+native_engine/i7_qkv/shared_activation_1500x1280      18.079 ms
+tty/decode_synthetic/frames/128                        0.598 ms
+```
+
+**Why it loses:** the hot path is not dominated by the zero-fill/copy overhead
+that looked suspicious in source. It is dominated by the 2.46B f16-dequant dot
+operations and their memory/compute schedule. The compact variant saves private
+buffer bytes but adds variable-stride/private-band indexing to the innermost
+write path and loses the legacy full-output row-stride shape that the merge path
+copies directly. Those costs outweigh the removed zero-fill on the measured
+cross-KV stand-in row.
+
+**Verdict:** REJECT + revert the temporary `nn.rs` hunk. Do not retry compact
+per-band private buffers for `gemv_f16_batch` unless a future profile first
+proves allocation/zero-fill, not the dots, dominates. Ratio vs ORIG is unchanged:
+engine code is byte-identical to pre-dig HEAD after revert. AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-08 - BlackThrush: LAND (measured) - TTY control-frame scalar/manual finite emit is 1.6-2.0x faster on the hot robot control rows; vector retransmit manual emit is rejected
 
 **Land-or-dig result:** no repo-local `.scratch` bench artifact existed to land
