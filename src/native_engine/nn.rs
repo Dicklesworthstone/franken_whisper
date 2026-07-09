@@ -1033,6 +1033,61 @@ pub fn matmul_bias_i7(x: &Mat, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat>
     matmul_bias_i7_quantized(&xq, w, bias)
 }
 
+/// GELU-fused activation quantize: quantizes `gelu(x)` to i7 WITHOUT ever
+/// materializing the `[rows, in]` GELU'd activation.
+///
+/// The encoder MLP runs `fc1 → gelu → fc2`; when fc2 is the int8 maddubs path,
+/// the classic form writes a full `[1500, 5120]` GELU'd buffer (`nn::gelu`) and
+/// then re-reads it here to quantize — a ~30 MiB in-place pass plus a ~30 MiB
+/// re-read, both on the (partly DRAM-resident) fc1 output. This folds the GELU
+/// into the quant's own read: each row is GELU'd into a per-worker scratch (via
+/// the SAME [`gelu_slice`] — pure elementwise, so byte-identical to the flat
+/// `nn::gelu`), then amax'd + quantized exactly as [`quantize_act_i7`]. The big
+/// GELU pass disappears; only the tiny per-row L1 scratch remains. **Byte-identical**
+/// to `gelu` + [`quantize_act_i7`] on the same fc1 output (same table+clamp GELU,
+/// same per-row scale + round + affine). Gated behind `super::enc_gelu_fused`.
+pub fn quantize_act_i7_gelu(x: &Mat) -> I7Activation {
+    let cols = x.cols;
+    let mut data = vec![0u8; x.rows * cols];
+    let mut scale = vec![0.0f32; x.rows];
+    // Per-row parallel (disjoint rows ⇒ order-invariant). `for_each_init` gives
+    // each worker ONE reusable `cols`-wide GELU scratch (allocated once per
+    // thread, not once per row) so the fusion adds no per-row heap churn.
+    data.par_chunks_mut(cols)
+        .zip(scale.par_iter_mut())
+        .enumerate()
+        .for_each_init(
+            || vec![0.0f32; cols],
+            |g, (r, (xr_u8, s))| {
+                let xr = &x.data[r * cols..(r + 1) * cols];
+                g.copy_from_slice(xr);
+                gelu_slice(g); // same GGML_GELU_FP16 table+clamp as nn::gelu
+                let amax = g.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+                let row_scale = amax / 127.0;
+                *s = row_scale;
+                let inv = 1.0 / row_scale;
+                for (d, &v) in xr_u8.iter_mut().zip(g.iter()) {
+                    let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                    *d = (i8v + 128) as u8;
+                }
+            },
+        );
+    I7Activation {
+        rows: x.rows,
+        inp: cols,
+        data,
+        scale,
+    }
+}
+
+/// [`matmul_bias_i7`] with the GELU folded into the activation quantize (see
+/// [`quantize_act_i7_gelu`]). `x` is the RAW fc1 output (pre-GELU); the result is
+/// `gelu(x) @ w`, byte-identical to `matmul_bias_i7(&{let mut h=x.clone(); gelu(&mut h); h}, w, bias)`.
+pub fn matmul_bias_i7_gelu(x: &Mat, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
+    let xq = quantize_act_i7_gelu(x);
+    matmul_bias_i7_quantized(&xq, w, bias)
+}
+
 /// A linear-layer weight matrix in EITHER representation.
 ///
 /// The f32 path stores a pre-transposed `[in, out]` [`Mat`] (so the forward is
