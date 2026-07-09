@@ -819,6 +819,24 @@ fn bench_i7_qkv_activation_reuse(c: &mut Criterion) {
         });
     });
 
+    let hq = nn::quantize_act_i7(&h);
+    group.bench_function("headmajor_attention_1500x1280", |b| {
+        b.iter(|| {
+            let attn = nn::attention_from_i7_qkv(
+                black_box(&hq),
+                black_box(&wq),
+                Some(black_box(&bq)),
+                black_box(&wk),
+                None,
+                black_box(&wv),
+                Some(black_box(&bv)),
+                black_box(20),
+            )
+            .expect("headmajor qkv attention");
+            black_box(attn.data[0])
+        });
+    });
+
     group.finish();
 }
 
