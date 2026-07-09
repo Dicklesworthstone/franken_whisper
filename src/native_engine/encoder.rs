@@ -1065,6 +1065,80 @@ fn dot_i8_enc(w: &[i8], x: &[i8]) -> i32 {
     w.iter().zip(x).map(|(&a, &b)| a as i32 * b as i32).sum()
 }
 
+/// M4×N2 register-blocked i8×i8 → i32: 4 activation rows × 2 weight rows = 8 dots,
+/// each 16-i8 chunk sign-extended ONCE and reused across all 8 dots (8 accumulators
+/// + 4 act + 2 weight = 14 ymm, fits Zen3's 16). This amortizes the vpmovsxbw
+/// sign-extend + the loads that make the per-call [`dot_i8_enc`] effectively M1
+/// (it re-loads+re-extends the weight row for every activation row). Mirrors the
+/// maddubs `dot_maddubs_i7_m4n2`; integer-EXACT (associative i32 add ⇒ bit-identical
+/// to per-element order). Returns `[x0·w0,x1·w0,x2·w0,x3·w0, x0·w1,x1·w1,x2·w1,x3·w1]`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code, clippy::too_many_arguments)]
+fn dot_i8_m4n2(x0: &[i8], x1: &[i8], x2: &[i8], x3: &[i8], w0: &[i8], w1: &[i8]) -> [i32; 8] {
+    use core::arch::x86_64::*;
+    let k = w0.len();
+    let (p0, p1, p2, p3) = (x0.as_ptr(), x1.as_ptr(), x2.as_ptr(), x3.as_ptr());
+    let (q0, q1) = (w0.as_ptr(), w1.as_ptr());
+    // SAFETY: avx2 base feature; all six slices have length k; 16-lane steps guarded
+    // by `i+16<=k`, scalar tail after. vpmaddwd accumulates i16→i32 (no saturation).
+    unsafe {
+        let mut acc = [_mm256_setzero_si256(); 8];
+        let mut i = 0;
+        while i + 16 <= k {
+            let a0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p0.add(i) as *const __m128i));
+            let a1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p1.add(i) as *const __m128i));
+            let a2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p2.add(i) as *const __m128i));
+            let a3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p3.add(i) as *const __m128i));
+            let b0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(q0.add(i) as *const __m128i));
+            let b1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(q1.add(i) as *const __m128i));
+            acc[0] = _mm256_add_epi32(acc[0], _mm256_madd_epi16(a0, b0));
+            acc[1] = _mm256_add_epi32(acc[1], _mm256_madd_epi16(a1, b0));
+            acc[2] = _mm256_add_epi32(acc[2], _mm256_madd_epi16(a2, b0));
+            acc[3] = _mm256_add_epi32(acc[3], _mm256_madd_epi16(a3, b0));
+            acc[4] = _mm256_add_epi32(acc[4], _mm256_madd_epi16(a0, b1));
+            acc[5] = _mm256_add_epi32(acc[5], _mm256_madd_epi16(a1, b1));
+            acc[6] = _mm256_add_epi32(acc[6], _mm256_madd_epi16(a2, b1));
+            acc[7] = _mm256_add_epi32(acc[7], _mm256_madd_epi16(a3, b1));
+            i += 16;
+        }
+        let hsum = |v: __m256i| -> i32 {
+            let lo = _mm256_castsi256_si128(v);
+            let hi = _mm256_extracti128_si256::<1>(v);
+            let q = _mm_add_epi32(lo, hi);
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+            _mm_cvtsi128_si32(q)
+        };
+        let mut r = [0i32; 8];
+        for (j, a) in acc.iter().enumerate() {
+            r[j] = hsum(*a);
+        }
+        while i < k {
+            let (wx0, wx1) = (w0[i] as i32, w1[i] as i32);
+            r[0] += x0[i] as i32 * wx0;
+            r[1] += x1[i] as i32 * wx0;
+            r[2] += x2[i] as i32 * wx0;
+            r[3] += x3[i] as i32 * wx0;
+            r[4] += x0[i] as i32 * wx1;
+            r[5] += x1[i] as i32 * wx1;
+            r[6] += x2[i] as i32 * wx1;
+            r[7] += x3[i] as i32 * wx1;
+            i += 1;
+        }
+        r
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_i8_m4n2(x0: &[i8], x1: &[i8], x2: &[i8], x3: &[i8], w0: &[i8], w1: &[i8]) -> [i32; 8] {
+    [
+        dot_i8_enc(w0, x0), dot_i8_enc(w0, x1), dot_i8_enc(w0, x2), dot_i8_enc(w0, x3),
+        dot_i8_enc(w1, x0), dot_i8_enc(w1, x1), dot_i8_enc(w1, x2), dot_i8_enc(w1, x3),
+    ]
+}
+
 /// Affine projection `x @ w^T (+ bias)` via an i8×i8 i32-accumulate GEMM (the fast
 /// path for the quality-safe `attn.out` int8 — see [`EncI8Mat`]). Activation is
 /// per-row i8-symmetric-quantized (amax/127) inline; the GEMM is M4-register-
@@ -1097,20 +1171,56 @@ fn matmul_bias_i8(x: &Mat, w: &EncI8Mat, bias: Option<&[f32]>) -> FwResult<Mat> 
                 *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
             }
         });
-    // M4-blocked GEMM: weight row loaded once per block of 4 activation rows.
+    // M4×N2 register-blocked GEMM: a full 4-row block streams each weight-row PAIR
+    // once, computing 8 dots (4 act × 2 weight) with the sign-extend amortized
+    // (dot_i8_m4n2). Partial row-blocks / the odd final weight row fall back to the
+    // per-element dot_i8_enc. Bit-identical to the per-element order (assoc. i32 add).
     let mut c = vec![0.0f32; m * out];
     c.par_chunks_mut(4 * out).enumerate().for_each(|(blk, cblk)| {
         let r0 = blk * 4;
         let rows = (m - r0).min(4);
-        for o in 0..out {
-            let wr = &w.data[o * inp..(o + 1) * inp];
-            let sc = w.scale[o];
-            let bo = bias.map_or(0.0, |b| b[o]);
-            for j in 0..rows {
-                let r = r0 + j;
-                let xr = &xq[r * inp..(r + 1) * inp];
-                let dot = dot_i8_enc(wr, xr);
-                cblk[j * out + o] = dot as f32 * sa[r] * sc + bo;
+        if rows == 4 {
+            let x0 = &xq[r0 * inp..(r0 + 1) * inp];
+            let x1 = &xq[(r0 + 1) * inp..(r0 + 2) * inp];
+            let x2 = &xq[(r0 + 2) * inp..(r0 + 3) * inp];
+            let x3 = &xq[(r0 + 3) * inp..(r0 + 4) * inp];
+            let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
+            let mut o = 0;
+            while o + 2 <= out {
+                let w0 = &w.data[o * inp..(o + 1) * inp];
+                let w1 = &w.data[(o + 1) * inp..(o + 2) * inp];
+                let raw = dot_i8_m4n2(x0, x1, x2, x3, w0, w1);
+                let (sc0, sc1) = (w.scale[o], w.scale[o + 1]);
+                let (bo0, bo1) = bias.map_or((0.0, 0.0), |b| (b[o], b[o + 1]));
+                cblk[o] = raw[0] as f32 * s0 * sc0 + bo0;
+                cblk[out + o] = raw[1] as f32 * s1 * sc0 + bo0;
+                cblk[2 * out + o] = raw[2] as f32 * s2 * sc0 + bo0;
+                cblk[3 * out + o] = raw[3] as f32 * s3 * sc0 + bo0;
+                cblk[o + 1] = raw[4] as f32 * s0 * sc1 + bo1;
+                cblk[out + o + 1] = raw[5] as f32 * s1 * sc1 + bo1;
+                cblk[2 * out + o + 1] = raw[6] as f32 * s2 * sc1 + bo1;
+                cblk[3 * out + o + 1] = raw[7] as f32 * s3 * sc1 + bo1;
+                o += 2;
+            }
+            while o < out {
+                let wr = &w.data[o * inp..(o + 1) * inp];
+                let (sc, bo) = (w.scale[o], bias.map_or(0.0, |b| b[o]));
+                cblk[o] = dot_i8_enc(wr, x0) as f32 * s0 * sc + bo;
+                cblk[out + o] = dot_i8_enc(wr, x1) as f32 * s1 * sc + bo;
+                cblk[2 * out + o] = dot_i8_enc(wr, x2) as f32 * s2 * sc + bo;
+                cblk[3 * out + o] = dot_i8_enc(wr, x3) as f32 * s3 * sc + bo;
+                o += 1;
+            }
+        } else {
+            for o in 0..out {
+                let wr = &w.data[o * inp..(o + 1) * inp];
+                let sc = w.scale[o];
+                let bo = bias.map_or(0.0, |b| b[o]);
+                for j in 0..rows {
+                    let r = r0 + j;
+                    let xr = &xq[r * inp..(r + 1) * inp];
+                    cblk[j * out + o] = dot_i8_enc(wr, xr) as f32 * sa[r] * sc + bo;
+                }
             }
         }
     });
