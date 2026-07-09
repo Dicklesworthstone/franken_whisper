@@ -445,6 +445,26 @@ pub(crate) fn enc_gelu_fused() -> bool {
     })
 }
 
+/// AVX2 round-half-away for the encoder i7 activation-quantize inner loop
+/// (`nn::quantize_act_i7` / `quantize_act_i7_gelu`). `FW_ENC_QUANT_AVX2`, **default
+/// ON** (kill-switch `=0`). BYTE-IDENTICAL: `f32::round()` (round-half-away) has no
+/// single AVX2 instruction so LLVM scalarizes the per-element round (`vroundss`,
+/// 1 elem/cyc); the vector form `trunc(v + copysign(0.5,v))` (`vroundps`, 8/cyc)
+/// plus vectorized amax/clamp/pack is bit-identical (verified max|Δu8|=0 in
+/// `examples/quant_round_probe`, 2.18× single-thread). Same antipattern already
+/// fixed for the DECODER `gemv_i8` (7939ee6); this covers the never-converted
+/// ENCODER maddubs quant. Only reached when a weight is i7 (an encoder int8 gate
+/// is on) ⇒ zero effect on the default f32 engine.
+pub(crate) fn enc_quant_avx2() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FW_ENC_QUANT_AVX2").ok().as_deref().map(str::trim),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
 /// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
 /// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
 /// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from
