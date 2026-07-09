@@ -1248,25 +1248,45 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     // Kill switch FW_ENCODER_FUSED_LN=0 restores the clone path (A/B + escape).
     let h = et!(2, ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b));
 
-    let (q, k, v) = et!(3, {
-        if let (Some(qw), Some(kw), Some(vw)) =
-            (&layer.attn_q_i7, &layer.attn_k_i7, &layer.attn_v_i7)
-        {
-            let hq = nn::quantize_act_i7(&h);
-            let q = nn::matmul_bias_i7_quantized(&hq, qw, Some(&layer.attn_q_b))?;
-            let k = nn::matmul_bias_i7_quantized(&hq, kw, None)?; // no key bias
-            let v = nn::matmul_bias_i7_quantized(&hq, vw, Some(&layer.attn_v_b))?;
-            (q, k, v)
+    // Bidirectional self-attention: causal_offset = None.
+    let attn = if let (Some(qw), Some(kw), Some(vw)) =
+        (&layer.attn_q_i7, &layer.attn_k_i7, &layer.attn_v_i7)
+    {
+        let hq = nn::quantize_act_i7(&h);
+        if super::enc_qkv_fused() {
+            // Fused: q/k/v written head-major inside the maddubs GEMM → external
+            // SDPA → scatter, skipping the standalone gather. Byte-identical.
+            et!(
+                4,
+                nn::attention_from_i7_qkv(
+                    &hq,
+                    qw,
+                    Some(&layer.attn_q_b),
+                    kw,
+                    None,
+                    vw,
+                    Some(&layer.attn_v_b),
+                    n_head,
+                )?
+            )
         } else {
+            let (q, k, v) = et!(3, {
+                let q = nn::matmul_bias_i7_quantized(&hq, qw, Some(&layer.attn_q_b))?;
+                let k = nn::matmul_bias_i7_quantized(&hq, kw, None)?; // no key bias
+                let v = nn::matmul_bias_i7_quantized(&hq, vw, Some(&layer.attn_v_b))?;
+                (q, k, v)
+            });
+            et!(4, nn::attention(&q, &k, &v, n_head, None)?)
+        }
+    } else {
+        let (q, k, v) = et!(3, {
             let q = enc_linear(&h, &layer.attn_q_w, &layer.attn_q_i7, Some(&layer.attn_q_b))?;
             let k = enc_linear(&h, &layer.attn_k_w, &layer.attn_k_i7, None)?; // no key bias
             let v = enc_linear(&h, &layer.attn_v_w, &layer.attn_v_i7, Some(&layer.attn_v_b))?;
             (q, k, v)
-        }
-    });
-
-    // Bidirectional self-attention: causal_offset = None.
-    let attn = et!(4, nn::attention(&q, &k, &v, n_head, None)?);
+        });
+        et!(4, nn::attention(&q, &k, &v, n_head, None)?)
+    };
     let attn = et!(
         5,
         if let Some(w8) = &layer.attn_out_i8 {

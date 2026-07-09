@@ -3222,6 +3222,165 @@ impl KvCache {
 /// at line ~2069). The identity is
 /// `(q·d^-0.25)·(k·d^-0.25) = q·k·d^-0.5 = q·k / sqrt(d)`.
 ///
+/// Maddubs i7 GEMM (`x @ w^T + bias`) that writes its `[m, out]` result DIRECTLY in
+/// head-major `[hh, m, d_head]` layout (`dst[(o/d_head)*m*d_head + r*d_head + o%d_head]`)
+/// — the FUSED form of `matmul_bias_i7_quantized` + `sdpa_gather_head_major`, so the
+/// external SDPA can consume it with NO separate transpose pass. Byte-IDENTICAL values
+/// to the two-step path (same i32 maddubs dot + same f32 dequant order; only the write
+/// target is permuted). Same M4×N2 register blocking; parallel over 4-row blocks with a
+/// disjoint scatter (each block owns row-range `r0..r0+4`, whose `r*d_head` offset inside
+/// every head is unique across blocks).
+#[allow(unsafe_code)]
+fn maddubs_i7_headmajor(
+    x: &I7Activation,
+    w: &I7Mat,
+    bias: Option<&[f32]>,
+    dst: &mut [f32],
+    hh: usize,
+    d_head: usize,
+) -> FwResult<()> {
+    let m = x.rows;
+    let inp = x.inp;
+    let out = w.out;
+    if inp != w.inp {
+        return Err(FwError::InvalidRequest(format!(
+            "maddubs_i7_headmajor: x.inp {inp} != w.inp {}",
+            w.inp
+        )));
+    }
+    if out != hh * d_head {
+        return Err(FwError::InvalidRequest(format!(
+            "maddubs_i7_headmajor: out {out} != hh*d_head {}",
+            hh * d_head
+        )));
+    }
+    if dst.len() != hh * m * d_head {
+        return Err(FwError::InvalidRequest(format!(
+            "maddubs_i7_headmajor: dst len {} != hh*m*d_head {}",
+            dst.len(),
+            hh * m * d_head
+        )));
+    }
+    let xu = &x.data;
+    let sa = &x.scale;
+    let tq = m;
+    // Pass the base pointer as usize (Send+Sync, captured by copy) so the rayon
+    // closure can scatter into disjoint head-major slots without a wrapper type.
+    let base_addr = dst.as_mut_ptr() as usize;
+    let n_blocks = m.div_ceil(4);
+    (0..n_blocks).into_par_iter().for_each(|blk| {
+        let base = base_addr as *mut f32;
+        // Scatter (row r, col o) to head-major. SAFETY: h*tq*d_head + r*d_head + d is in
+        // 0..hh*m*d_head; blocks own disjoint r ⇒ disjoint writes (no data race).
+        let put = |r: usize, o: usize, val: f32| {
+            let h = o / d_head;
+            let d = o % d_head;
+            unsafe { *base.add(h * tq * d_head + r * d_head + d) = val };
+        };
+        let r0 = blk * 4;
+        let rows = (m - r0).min(4);
+        if rows == 4 {
+            let x0 = &xu[r0 * inp..(r0 + 1) * inp];
+            let x1 = &xu[(r0 + 1) * inp..(r0 + 2) * inp];
+            let x2 = &xu[(r0 + 2) * inp..(r0 + 3) * inp];
+            let x3 = &xu[(r0 + 3) * inp..(r0 + 4) * inp];
+            let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
+            let mut o = 0;
+            while o + 2 <= out {
+                let w0r = &w.data[o * inp..(o + 1) * inp];
+                let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
+                let raw = dot_maddubs_i7_m4n2(x0, x1, x2, x3, w0r, w1r);
+                let off0 = 128 * w.colsum[o];
+                let off1 = 128 * w.colsum[o + 1];
+                let (sc0, sc1) = (w.scale[o], w.scale[o + 1]);
+                let (bo0, bo1) = bias.map_or((0.0, 0.0), |b| (b[o], b[o + 1]));
+                put(r0, o, (raw[0] - off0) as f32 * s0 * sc0 + bo0);
+                put(r0 + 1, o, (raw[1] - off0) as f32 * s1 * sc0 + bo0);
+                put(r0 + 2, o, (raw[2] - off0) as f32 * s2 * sc0 + bo0);
+                put(r0 + 3, o, (raw[3] - off0) as f32 * s3 * sc0 + bo0);
+                put(r0, o + 1, (raw[4] - off1) as f32 * s0 * sc1 + bo1);
+                put(r0 + 1, o + 1, (raw[5] - off1) as f32 * s1 * sc1 + bo1);
+                put(r0 + 2, o + 1, (raw[6] - off1) as f32 * s2 * sc1 + bo1);
+                put(r0 + 3, o + 1, (raw[7] - off1) as f32 * s3 * sc1 + bo1);
+                o += 2;
+            }
+            while o < out {
+                let wrow = &w.data[o * inp..(o + 1) * inp];
+                let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
+                let off = 128 * w.colsum[o];
+                let sc = w.scale[o];
+                let bo = bias.map_or(0.0, |b| b[o]);
+                put(r0, o, (raw[0] - off) as f32 * s0 * sc + bo);
+                put(r0 + 1, o, (raw[1] - off) as f32 * s1 * sc + bo);
+                put(r0 + 2, o, (raw[2] - off) as f32 * s2 * sc + bo);
+                put(r0 + 3, o, (raw[3] - off) as f32 * s3 * sc + bo);
+                o += 1;
+            }
+        } else {
+            for j in 0..rows {
+                let r = r0 + j;
+                let xr = &xu[r * inp..(r + 1) * inp];
+                let sar = sa[r];
+                for o in 0..out {
+                    let wrow = &w.data[o * inp..(o + 1) * inp];
+                    let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
+                    let mut val = dot as f32 * sar * w.scale[o];
+                    if let Some(b) = bias {
+                        val += b[o];
+                    }
+                    put(r, o, val);
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// FUSED int8-QKV + fused SDPA: run the three maddubs i7 GEMMs writing q/k/v DIRECTLY in
+/// head-major `[hh, tq, d_head]` (eliminating `sdpa_gather_head_major`), feed the external
+/// `ft_kernel_cpu::sdpa_forward_f32`, then scatter back to `[tq, n_state]`. Byte-IDENTICAL
+/// to `matmul_bias_i7_quantized ×3` + [`attention`] on the SDPA branch (same dots, same
+/// head-major permutation ⇒ identical SDPA inputs ⇒ identical output). Encoder-only
+/// (bidirectional self-attention). The head-major GEMM write (stride `d_head`) sidesteps
+/// the gather's strided READ (stride `n_state`) that the ledger measured as a DRAM-latency
+/// floor. `hq` is the shared quantized activation; `*_bias` mirror q/k/v (k has none).
+///
+/// # Errors
+/// [`FwError::InvalidRequest`] on shape mismatch.
+pub fn attention_from_i7_qkv(
+    hq: &I7Activation,
+    qw: &I7Mat,
+    q_bias: Option<&[f32]>,
+    kw: &I7Mat,
+    k_bias: Option<&[f32]>,
+    vw: &I7Mat,
+    v_bias: Option<&[f32]>,
+    n_head: usize,
+) -> FwResult<Mat> {
+    let tq = hq.rows;
+    let n_state = qw.out;
+    if n_head == 0 || !n_state.is_multiple_of(n_head) {
+        return Err(FwError::InvalidRequest(format!(
+            "attention_from_i7_qkv: n_head {n_head} must divide n_state {n_state}"
+        )));
+    }
+    let d_head = n_state / n_head;
+    let hh = n_head;
+    let mut qa = gemv_out_buf(hh * tq * d_head);
+    let mut ka = gemv_out_buf(hh * tq * d_head);
+    let mut va = gemv_out_buf(hh * tq * d_head);
+    maddubs_i7_headmajor(hq, qw, q_bias, &mut qa, hh, d_head)?;
+    maddubs_i7_headmajor(hq, kw, k_bias, &mut ka, hh, d_head)?;
+    maddubs_i7_headmajor(hq, vw, v_bias, &mut va, hh, d_head)?;
+    let sdpa_scale = (d_head as f32).powf(-0.5);
+    let o = ft_kernel_cpu::sdpa_forward_f32(
+        &qa, &ka, &va, hh, tq, tq, d_head, d_head, sdpa_scale, false,
+    );
+    let mut out = gemv_out_buf(tq * n_state);
+    sdpa_scatter_interleaved(&mut out, &o, hh, tq, d_head, n_state, sdpa_gather_chunks());
+    Ok(Mat::from_vec(tq, n_state, out))
+}
+
 /// # Errors
 /// [`FwError::InvalidRequest`] if `n_head == 0`, `n_state % n_head != 0`,
 /// the q/k/v widths disagree, or `k.rows != v.rows`.

@@ -402,6 +402,28 @@ pub(crate) fn enc_attn_out_i8i32() -> bool {
     })
 }
 
+/// When the int8 encoder attention-input path is active (q/k/v are i7), fuse the
+/// SDPA gather into the maddubs GEMM: q/k/v are written DIRECTLY in head-major
+/// layout ([`nn::attention_from_i7_qkv`]), skipping the separate
+/// `sdpa_gather_head_major` transpose (a DRAM-latency floor, ledger 2026-07-04).
+/// `FW_ENC_QKV_FUSED`, **default ON** (kill-switch `=0`). BYTE-IDENTICAL to the
+/// two-step path (same maddubs dots + same head-major permutation ⇒ identical SDPA
+/// inputs ⇒ identical transcript, verified on track01 + jfk×3) — a pure
+/// speed/scheduling change WITHIN the already-gated int8 path, so default-on adds
+/// zero risk to the default (int8-off) engine: the fused path only fires when
+/// q/k/v are i7 (i.e. an encoder int8 gate is also on). MEASURED 1.082× on the int8
+/// encoder_window (133 ms/window saved by dropping `sdpa_gather_head_major`),
+/// lifting the full quality-safe int8 config to ~1.67× vs f32.
+pub(crate) fn enc_qkv_fused() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FW_ENC_QKV_FUSED").ok().as_deref().map(str::trim),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
 /// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
 /// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
 /// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from
