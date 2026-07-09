@@ -3168,6 +3168,49 @@ pub fn gelu_add_bias(x: &mut Mat, bias: &[f32]) {
     x.data.par_chunks_mut(rows_per * cols).for_each(add_gelu);
 }
 
+/// Fused bias-add + residual: `x[i][j] += proj[i][j] + bias[j]` in ONE parallel pass.
+///
+/// BYTE-IDENTICAL to `matmul_bias`'s serial bias pass (`proj[i][j] += bias[j]`)
+/// followed by the serial residual [`add_in_place`](super::encoder)-style
+/// `x[i][j] += proj[i][j]`: both compute `x[i][j] + (proj[i][j] + bias[j])` as
+/// `t = proj+bias` (one rounding) then `x + t` (second rounding), identical
+/// operand order. Merges the two SERIAL passes into one and reads `proj` ONCE,
+/// eliminating the separate bias pass's write-back of the `[n_ctx, n_state]`
+/// output. Pays ONLY when that output is partly-DRAM — its producing sgemm's
+/// working set > L3 (e.g. `mlp.proj`/fc2: `[1500,5120]` input + `[5120,1280]`
+/// weight = ~56 MiB stream evicts the 7.68 MiB output before the bias pass reads
+/// row 0) — so the serial bias RMW is bandwidth-starved single-core. The residual
+/// add alone stays cache-warm (why `encoder::add_in_place` is deliberately
+/// serial); the win here is removing the DRAM-bound bias pass, not the add.
+/// Parallel over whole-row bands (bias alignment trivial, rows independent).
+pub fn add_bias_residual(x: &mut Mat, proj: &Mat, bias: &[f32]) {
+    debug_assert_eq!(
+        (x.rows, x.cols),
+        (proj.rows, proj.cols),
+        "add_bias_residual shape mismatch"
+    );
+    debug_assert_eq!(bias.len(), x.cols, "add_bias_residual: bias len != cols");
+    let cols = x.cols;
+    let apply = move |xband: &mut [f32], pband: &[f32]| {
+        for (xrow, prow) in xband.chunks_mut(cols).zip(pband.chunks(cols)) {
+            for ((xv, &pv), &bv) in xrow.iter_mut().zip(prow).zip(bias) {
+                *xv += pv + bv;
+            }
+        }
+    };
+    const PAR_THRESHOLD: usize = 1 << 15;
+    let n = x.data.len();
+    if n < PAR_THRESHOLD || worker_count() < 2 {
+        apply(&mut x.data, &proj.data);
+        return;
+    }
+    let band = x.rows.div_ceil(worker_count()).max(1) * cols;
+    x.data
+        .par_chunks_mut(band)
+        .zip(proj.data.par_chunks(band))
+        .for_each(|(xb, pb)| apply(xb, pb));
+}
+
 /// Poly-exp softmax gate — shares the sampler's `FW_SIMD_EXP` env var (default OFF,
 /// an owner opt-in). When set, [`softmax_rows`] replaces the per-element scalar libm
 /// `.exp()` with an AVX2 poly (same Taylor/`ln2`-range-reduced poly family as

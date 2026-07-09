@@ -934,6 +934,21 @@ fn fc_bias_gelu_fused_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FW_ENC_FC_BIAS_GELU_FUSED").as_deref() != Ok("0"))
 }
 
+/// Default-ON gate (`FW_ENC_PROJ_BIAS_RESID_FUSED=0` kill-switch) for folding the
+/// **f32-path** `mlp.proj` (fc2) bias-add into the residual add
+/// ([`nn::add_bias_residual`]). `matmul_bias` applies the fc2 bias as a SEPARATE
+/// single-threaded RMW over the `[n_ctx, n_state]` output; unlike qkv/attn_out
+/// (whose sgemm working sets fit L3 ⇒ output cache-warm), fc2's sgemm streams a
+/// ~56 MiB working set (`[1500,5120]`+`[5120,1280]`) that evicts its own 7.68 MiB
+/// output, so that serial bias pass reads partly-DRAM. Folding it into the
+/// residual removes the pass (and the h write-back) and parallelizes it.
+/// BYTE-IDENTICAL. Fires only on the f32 fc2 path (`mlp_proj_i7 == None`).
+fn proj_bias_resid_fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENC_PROJ_BIAS_RESID_FUSED").as_deref() != Ok("0"))
+}
+
 /// Optional encoder-depth cap `FW_ENCODER_LAYERS=N` (viability probe for encoder
 /// layer-pruning). `None` (unset / unparsable / `0`) ⇒ run all layers
 /// (byte-identical default). Resolved once.
@@ -1329,6 +1344,11 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     // never materialized (byte-identical; see `super::enc_gelu_fused`). Otherwise
     // the classic separate GELU (label 9) + fc2 (label 10), with the f32 fc1 bias
     // folded into GELU when `fuse_fc_bias`.
+    // f32-path fc2 bias→residual fusion (see `proj_bias_resid_fused_enabled`):
+    // fold the separate serial bias RMW into the residual add. Only on the f32
+    // fc2 path (`mlp_proj_i7 == None`); the int8 `matmul_bias_i7_gelu` path keeps
+    // its own bias. Byte-identical.
+    let fuse_proj_bias = layer.mlp_proj_i7.is_none() && proj_bias_resid_fused_enabled();
     let h = if super::enc_gelu_fused()
         && let Some(w) = layer.mlp_proj_i7.as_ref()
     {
@@ -1339,9 +1359,15 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
         } else {
             et!(9, nn::gelu(&mut h));
         }
-        et!(10, enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, Some(&layer.mlp_proj_b))?)
+        let proj_bias: Option<&[f32]> =
+            if fuse_proj_bias { None } else { Some(&layer.mlp_proj_b) };
+        et!(10, enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, proj_bias)?)
     };
-    et!(11, add_in_place(x, &h));
+    if fuse_proj_bias {
+        et!(11, nn::add_bias_residual(x, &h, &layer.mlp_proj_b));
+    } else {
+        et!(11, add_in_place(x, &h));
+    }
 
     Ok(())
 }
