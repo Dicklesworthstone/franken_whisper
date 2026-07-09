@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 - BlackThrush: DIG -> REJECTED (measured, reverted) - const-specializing `matmul_bias_i7_quantized` on bias/no-bias is 0-gain on the shared-activation i7 QKV row
+
+**Profile-first target:** consulted this ledger first and avoided the closed lanes: allocator/buffer reuse and jemalloc are dead on a quiet box, decoder fused-LN is size-gated dead, f32 bias-folds are exhausted, M2col/M3col/weight-stationary f16 tiles are closed, int8-batch 2col is already landed, uninitialized i7 output buffers are already landed, and quantize/round/QKV-fusion/maddubs tile variants are mined. The usable hot model-free row remained the current i7 shared-activation QKV path:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/ \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+
+ovh-a profile row:
+  native_engine/i7_qkv/shared_activation_1500x1280   12.765932 ms
+```
+
+**Primitive tried:** partial evaluation / branch specialization for `matmul_bias_i7_quantized`. The public wrapper validated once, then dispatched to `matmul_bias_i7_quantized_impl::<true>` for Q/V and `::<false>` for K so LLVM could erase the inner-loop `Option<&[f32]>` bias branches. This was deliberately different from prior maddubs tiles, quantize-round work, allocator work, output-init elision, and QKV fusion: same dot kernels and same allocation, only specializing a per-call invariant.
+
+**MEASURED vs LEGACY ORIGINAL:** focused parity passed before timing (`native_engine::nn::tests::i7_prequantized_activation_matches_inline_quantize`). The decisive same-worker short row was flat/slightly slower:
+
+```text
+legacy original (same loop, pre-change profile, ovh-a):
+  shared_activation_1500x1280   12.765932 ms
+
+const-specialized candidate (ovh-a):
+  shared_activation_1500x1280   12.774024 ms (+/- 1.220864 ms)
+
+ratio vs LEGACY ORIGINAL: 0.999x (0-gain; inside noise, slightly slower)
+```
+
+One additional candidate row on `vmi1152480` was discarded as routing/noise evidence only (`108.744646 ms`, +/- 21.722843 ms while the worker was sharing another long job). **Verdict:** reject and do not re-dig this branch-specialization primitive for `matmul_bias_i7_quantized`; the compiler/hot branch predictor already make the bias `Option` cost invisible next to the maddubs dot work and memory traffic. Source reverted cleanly; docs-only rejection. AGENT_NAME=BlackThrush. Conformance GREEN.
+
+---
 ## 2026-07-09 - AshHeron: DIG → REJECTED (measured, 0-gain, reverted) — **extending the encoder's landed `fused_ln` (clone-free layer-norm into an uninit buffer) to the DECODER is 0-gain: the decode LN at tq=1 is `[1,1280]` = 5 KiB L1-hot, so eliminating the `x.clone()` (a ~100 ns copy) is IMMEASURABLE — decode_loop 7/12 + total transcribe 8/12 fused-faster = statistical NOISE. The `fused_ln` win is SIZE-GATED: it pays for the encoder's `[1500,1280]` = 7.68 MiB LN clone, NOT the decoder's 5 KiB one. Byte-identical; reverted per "revert cleanly on 0-gain."**
 
 **Profile-first + systematic re-sweep.** Fresh confirmation the byte-exact franken frontier is closed — this round re-verified via the profiling + extreme-optimization + alien-graveyard skills, each landing on a prior rejection: (1) **rayon idle-spin during decode** (the perf breakdown's "8% epoch-GC + work-steal") is NOT a wall-clock lever — BlackThrush's timed cap-sweep disproof (line ~4422: cap 8 vs 32 within noise) + my spin-pool rejection (line ~690: <1% reducible dispatch) already closed it; the "idle-spin steals decode-core boost" angle is disproven by that same cap-sweep (fewer spinners ≠ faster). (2) **Speculative ts-mode pipelining** = already built + measured DEAD (f278e78: hits=0, misses steal decode cores → 1.3× slower; [[project_window_pipelining_lever]]). (3) **Encoder GEMM weight pre-packing** = dead (matrixmultiply packs A/B internally, no prepack API, and `ft_kernel_cpu` is the separate `../frankentorch` repo — out of "own files" scope). (4) alien-graveyard is systems-oriented (concurrency/distributed); the GEMM-numerical primitives (posit/nyström/countsketch/butterfly/winograd/pq) are all already in this ledger.
