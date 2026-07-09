@@ -4,6 +4,90 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-08 - BlackThrush: LAND (measured) - row-morsel direct-write scheduler for compute-bound batched f16 GEMV is 1.75-2.13x faster than the legacy output-band/private-buffer scheduler
+
+**Profile-first target:** after consulting the closed ledger axes (compact
+per-band buffers, f16 dot restructuring, QKV wide fusion, huge pages/prefetch,
+spin-pool dispatch, low-rank/logits, SDPA exp/approximation, and replay
+JSON-hash streaming), the short native-engine profile again made the hottest
+model-free row `native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280`:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/ \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+
+ovh-a profile rows:
+  f16_gemv_batch_1500x1280x1280     46.301 ms
+  i7_qkv/three_inline_quantize      14.002 ms
+  i7_qkv/shared_activation          12.845 ms
+  sanitize_downmix/legacy_clean      6.531 ms
+```
+
+**Alien primitive kept:** vectorized morsel/data-plane scheduling over token
+rows instead of output-column bands. The legacy compute-bound batch path splits
+by output columns, gives every worker a private full `[tq,out]` buffer, and then
+copies each disjoint band back. The kept path splits by token-row morsels:
+each worker owns contiguous `[t0..t1, all out]` rows and writes directly into
+`out_slice`. This is not the rejected compact per-band variant: the ownership
+axis changes from columns to rows, removing the merge and keeping the token row
+hot while preserving every element's `dequant_row_dot(w[o], x[t]) + bias[o]`
+summation order.
+
+State/action/loss/fallback:
+- State: compute-bound `gemv_f16_batch` where `tq*out*inp >= 1<<26`.
+- Action: default row-morsel direct writes vs legacy output-band buffers.
+- Loss: ns/iter on the focused Criterion row, with byte-exact per-element
+  parity.
+- Fallback: `FW_BATCH_GEMV_ROW_MORSEL=0` restores the legacy scheduler.
+
+**MEASURED vs LEGACY ORIGINAL:**
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280 \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 2 \
+    --output-format bencher --noplot
+
+ORIG legacy output-band/private-buffer scheduler, local fallback before hunk:
+  18.806 ms
+
+same-binary A/B after adding the kill switch, local fallback:
+  FW_BATCH_GEMV_ROW_MORSEL=0 legacy scheduler   22.940 ms
+  default row-morsel scheduler                  10.751 ms
+
+ratios:
+  row-morsel vs pre-hunk ORIG        1.75x faster
+  row-morsel vs same-binary legacy   2.13x faster
+
+remote routing confirmation on ovh-a:
+  broad-profile ORIG                 46.301 ms
+  row-morsel candidate               34.269 ms  (1.35x faster; routing evidence)
+```
+
+**Why it wins:** the prior compact-buffer rejection proved the old path was not
+limited by zero-fill alone. The row-morsel scheduler changes the reuse pattern:
+each worker streams full output rows for a small token band, writes contiguous
+destination rows directly, and avoids the old per-worker full-output scratch
+plus merge copy. Each output element still uses the same f16 dequant-dot order,
+so the change is a scheduler/data-ownership win, not a numeric approximation.
+
+**Conformance/proof:** new unit test
+`native_engine::nn::tests::gemv_f16_batch_row_morsel_equals_per_token_gemv`
+passes and compares the row-morsel helper byte-for-byte against per-token
+`gemv_f16`. Compact comparator conformance passes:
+`cargo test -p franken_whisper --test conformance_comparator_tests` -> 26/26
+passed. `cargo check -p franken_whisper --lib --tests` passes.
+
+**Verdict:** KEEP the default-on row-morsel scheduler for compute-bound
+`gemv_f16_batch`. Ratio vs LEGACY ORIGINAL improves by 1.75x on the focused
+local ORIG row and 2.13x against the same-binary forced legacy scheduler.
+AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-08 - AshHeron: DIG → REJECTED on SPEED + **LEDGER CORRECTION** (measured) — **encoder `fc2`/mlp_proj int8 is QUALITY-SAFE (NOT a residual culprit — corrects my 2026-07-07 `no_fc2` entry below that lumped `{attn_out, fc2}` together), but the maddubs path is SPEED-NEGATIVE, so `attn_in` `{q,k,v,fc1}` stays the maximal speed-positive faithful set.** Added `FW_ENC_INT8_FC2_FROM=N` (int8 fc2 for layers `[N,32)` on top of `attn_in`) to test late-layer / all-layer fc2 int8. **QUALITY (track01 vs f32, proper nouns):** fc2 int8 preserves `FrankenSearch`/`Franco`/`Franken` at EVERY threshold incl `FROM=0` (ALL layers) — 45 word-diffs, same ambiguous-filler class as `attn_in`'s 29, NO "Frank at". So the maximal FAITHFUL int8 set is actually `{q,k,v,fc1,fc2}` = everything EXCEPT `attn_out` (~66% of encoder GEMM); **`attn_out` is the SOLE residual-feeding proper-noun culprit** (the `no_fc2` test that broke was the one carrying `attn_out`, not fc2). **SPEED (jfk×3 window-1 encoder_window, interleaved min-of-5):** f32=2614.5ms; attn_in=2173.2ms (1.203×); attn_in+fc2(FROM=0)=**2645.4ms = 0.988×, SLOWER THAN f32**. fc2 int8 is a SPEED LOSER because fc2's input is the `[1500,5120]` GELU output (4× the q/k/v/fc1 activation) and the maddubs path must u8-quantize that large DYNAMIC activation EVERY layer — the per-layer quant overhead exceeds the GEMM saving. **This EXPLAINS the long-standing SKIP_FIRST "more int8 = slower than f32" anomaly (ledger ~line 1690 / [[project_turbo_encoder_dominates]]): it was NOT a throttle mystery, it is fc2's big activation-quant cost** (SKIP_FIRST configs left fc2 int8 for most layers). Code REVERTED (gate strictly dominated — slower than attn_in). **FOLLOW-UP (owner/future, could be a real +23.7%-of-encoder gated win):** a block-int8-WEIGHT × f32-ACTIVATION fc2 GEMM (the decode's `gemv_i8w_f32a_blocked` recipe, which has NO activation quant) would sidestep the overhead and — since fc2 is now proven quality-safe — could flip fc2 to speed-positive, pushing the faithful int8 encoder from 42%→66% GEMM coverage. Needs a new encoder block-maddubs kernel (multi-hour); NOT the quality-focused "block-wise maddubs dead" reject (be062ef), which was about fixing proper nouns fc2 doesn't break. AGENT_NAME=AshHeron. src reverted to HEAD, conformance GREEN.
 
 ---
