@@ -80,6 +80,22 @@ shared-activation row by 1.27x vs the legacy zero-filled allocation.
 AGENT_NAME=BlackThrush.
 
 ---
+## 2026-07-09 - AshHeron: DIG → REJECTED (measured, probe-only) — **a token-block WEIGHT-STATIONARY tile for the f16 batch GEMV (convert each weight row f16→f32 ONCE per B-token block into an L1 scratch, then B byte-exact f32 dots) is DEAD: byte-exact but 0.78–0.81× SLOWER than the current row-morsel M1 across B=4/8/16, DESPITE cutting cvtph AND weight L3 re-reads by B×. And M3col (3-token in-register share) merely TIES M2col. This CLOSES the f16-batch cross-proj kernel design space: the landed M2col (2-token in-register) is the byte-exact optimum.**
+
+**The bold primitive (genuinely different from M2col — grepped `token-block`/`weight-stationary`/`mblock`/`m4col` first; distinct from the int8-rowblock reject at [[project_2row_gemv_landed]]/ledger which was R *concurrent weight-streams* degrading DRAM locality — this is the OPPOSITE, ONE weight-stream SHARED across B activation rows).** Last round's landing exposed that the row-morsel kernel is TOKEN-OUTER (`for t { for o }`), re-streaming+re-converting the 3.3 MB weight per token. M2col shared cvtph+weight-read across 2 tokens (in-register, 1.26×). The natural escalation: a WEIGHT-STATIONARY token-block — `for t_block(B) { for o { convert w[o]→scratch once; for t in block { dot_f16corder_f32(scratch, x[t]) } } }` — cuts cvtph AND weight-L3-read by B× (B=8 → 8× fewer). `dot_f16corder_f32` reads the pre-converted f32 scratch with `dot_f16c`'s exact 4-accumulator reduction ⇒ byte-identical (f16→f32 lossless). 
+
+**MEASURED (`examples/f16batch_m2col_probe`, real `[1500,1280]×[1280,1280]`, 16t cold, min-of-40; all byte-identical to M1):**
+```text
+  M1 (row-morsel)                    9.157 ms   1.000×
+  M2col (2-tok in-register) LANDED   7.214 ms   1.269×  <-- byte-exact OPTIMUM
+  M3col (3-tok in-register)          7.254 ms   1.262×  = 0.994× vs M2col (TIE, no gain)
+  mblock B=4  (weight-stationary)   11.698 ms   0.783×  REJECTED
+  mblock B=8                        11.506 ms   0.796×  REJECTED
+  mblock B=16                       11.326 ms   0.808×  REJECTED
+```
+**Why the weight-stationary block LOSES despite cutting the very costs M2col exploited:** it is WEIGHT-OUTER within the block (`for o { for t }`), so its output writes are STRIDED (`dst[t*out+o]` per o, stride `out`) instead of the row-morsel's CONTIGUOUS per-token rows. The strided-write penalty (+ the extra convert-to-scratch pass + loss of the interleaved-accumulator ILP) EXCEEDS the cvtph/weight-read savings — and it gets *worse* the smaller B is (more block boundaries). This is the SAME reason BlackThrush's row-morsel (token-outer, contiguous writes) beat the legacy weight-outer private-buffer scheduler: **contiguous output locality dominates weight-stationarity for this shape.** M3col ties M2col because 3-way in-register sharing only trims cvtph from tq/2→tq/3 (marginal) while adding register pressure — 2-way is the sweet spot. **f16-batch cross-proj kernel space is now CLOSED: M2col optimal; do NOT re-dig larger tiles or weight-stationary blocks.** Probe kept as the artifact (documents all six variants). AGENT_NAME=AshHeron. No engine code touched (probe + ledger only) ⇒ byte-identical to HEAD, conformance GREEN.
+
+---
 ## 2026-07-09 - AshHeron: LAND (byte-exact, default-on) — **M2 activation-column tile `dot_f16c_2col` for the row-morsel f16 batch GEMV: shares each weight-row f16→f32 conversion across 2 activation rows, MEASURED 1.26× isolated on the cross-K/V projection shape and, decisively, FASTER than the (now-reverted, non-exact) dequant→f32 sgemm route it competes with — while staying BYTE-IDENTICAL. `FW_F16_BATCH_M2COL` default-on.**
 
 **Context / not-a-re-dig:** this is the LAND of the `dot_f16c_2col` WIN I measured+deferred last round (entry below), now that `nn.rs` is quiescent (BlackThrush measured+REVERTED their competing `FW_BATCH_GEMV_TILED_F32` route — see the entry immediately below; my 3-way probe independently reproduced that same loss). Their "closed lanes" summary listed "`dot_f16c_2col` … rejected", but their MEASUREMENT was the tiled-f32 sgemm route, NOT `dot_f16c_2col`; `dot_f16c_2col` was never measured-rejected — it is the byte-exact win, distinct from (and complementary to) the rejected f32 route. Grepped `dot_f16c_2col`/`m2col`/`FW_F16_BATCH_M2COL` first.
