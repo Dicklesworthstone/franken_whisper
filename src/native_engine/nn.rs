@@ -204,6 +204,15 @@ fn i7_m2n4_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("FW_I7_M2N4").ok().as_deref() != Some("0"))
 }
 
+/// Default-ON row-block co-scheduler for fused head-major encoder Q/K/V i7 GEMMs.
+/// `FW_I7_QKV_HEADMAJOR_ROWCO=0` restores the legacy three independent
+/// `maddubs_i7_headmajor` passes for A/B and rollback.
+fn i7_qkv_headmajor_rowco_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FW_I7_QKV_HEADMAJOR_ROWCO").ok().as_deref() != Some("0"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemv_f16_batch_rows(
     w_f16: &[Float16],
@@ -3875,6 +3884,182 @@ fn maddubs_i7_headmajor(
     Ok(())
 }
 
+#[allow(unsafe_code)]
+fn maddubs_i7_headmajor_block(
+    x: &I7Activation,
+    w: &I7Mat,
+    bias: Option<&[f32]>,
+    base_addr: usize,
+    hh: usize,
+    d_head: usize,
+    r0: usize,
+) {
+    let m = x.rows;
+    let inp = x.inp;
+    let out = w.out;
+    let xu = &x.data;
+    let sa = &x.scale;
+    let base = base_addr as *mut f32;
+    let put = |r: usize, o: usize, val: f32| {
+        let h = o / d_head;
+        let d = o % d_head;
+        unsafe { *base.add(h * m * d_head + r * d_head + d) = val };
+    };
+    let rows = (m - r0).min(4);
+    if rows == 4 {
+        let x0 = &xu[r0 * inp..(r0 + 1) * inp];
+        let x1 = &xu[(r0 + 1) * inp..(r0 + 2) * inp];
+        let x2 = &xu[(r0 + 2) * inp..(r0 + 3) * inp];
+        let x3 = &xu[(r0 + 3) * inp..(r0 + 4) * inp];
+        let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
+        let mut o = 0;
+        if i7_m2n4_enabled() {
+            while o + 4 <= out {
+                let w0r = &w.data[o * inp..(o + 1) * inp];
+                let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
+                let w2r = &w.data[(o + 2) * inp..(o + 3) * inp];
+                let w3r = &w.data[(o + 3) * inp..(o + 4) * inp];
+                let raw01 = dot_maddubs_i7_m2n4(x0, x1, w0r, w1r, w2r, w3r);
+                let raw23 = dot_maddubs_i7_m2n4(x2, x3, w0r, w1r, w2r, w3r);
+                let off0 = 128 * w.colsum[o];
+                let off1 = 128 * w.colsum[o + 1];
+                let off2 = 128 * w.colsum[o + 2];
+                let off3 = 128 * w.colsum[o + 3];
+                let (sc0, sc1, sc2, sc3) =
+                    (w.scale[o], w.scale[o + 1], w.scale[o + 2], w.scale[o + 3]);
+                let (bo0, bo1, bo2, bo3) = bias.map_or((0.0, 0.0, 0.0, 0.0), |b| {
+                    (b[o], b[o + 1], b[o + 2], b[o + 3])
+                });
+                put(r0, o, (raw01[0] - off0) as f32 * s0 * sc0 + bo0);
+                put(r0 + 1, o, (raw01[1] - off0) as f32 * s1 * sc0 + bo0);
+                put(r0 + 2, o, (raw23[0] - off0) as f32 * s2 * sc0 + bo0);
+                put(r0 + 3, o, (raw23[1] - off0) as f32 * s3 * sc0 + bo0);
+                put(r0, o + 1, (raw01[2] - off1) as f32 * s0 * sc1 + bo1);
+                put(r0 + 1, o + 1, (raw01[3] - off1) as f32 * s1 * sc1 + bo1);
+                put(r0 + 2, o + 1, (raw23[2] - off1) as f32 * s2 * sc1 + bo1);
+                put(r0 + 3, o + 1, (raw23[3] - off1) as f32 * s3 * sc1 + bo1);
+                put(r0, o + 2, (raw01[4] - off2) as f32 * s0 * sc2 + bo2);
+                put(r0 + 1, o + 2, (raw01[5] - off2) as f32 * s1 * sc2 + bo2);
+                put(r0 + 2, o + 2, (raw23[4] - off2) as f32 * s2 * sc2 + bo2);
+                put(r0 + 3, o + 2, (raw23[5] - off2) as f32 * s3 * sc2 + bo2);
+                put(r0, o + 3, (raw01[6] - off3) as f32 * s0 * sc3 + bo3);
+                put(r0 + 1, o + 3, (raw01[7] - off3) as f32 * s1 * sc3 + bo3);
+                put(r0 + 2, o + 3, (raw23[6] - off3) as f32 * s2 * sc3 + bo3);
+                put(r0 + 3, o + 3, (raw23[7] - off3) as f32 * s3 * sc3 + bo3);
+                o += 4;
+            }
+        }
+        while o + 2 <= out {
+            let w0r = &w.data[o * inp..(o + 1) * inp];
+            let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
+            let raw = dot_maddubs_i7_m4n2(x0, x1, x2, x3, w0r, w1r);
+            let off0 = 128 * w.colsum[o];
+            let off1 = 128 * w.colsum[o + 1];
+            let (sc0, sc1) = (w.scale[o], w.scale[o + 1]);
+            let (bo0, bo1) = bias.map_or((0.0, 0.0), |b| (b[o], b[o + 1]));
+            put(r0, o, (raw[0] - off0) as f32 * s0 * sc0 + bo0);
+            put(r0 + 1, o, (raw[1] - off0) as f32 * s1 * sc0 + bo0);
+            put(r0 + 2, o, (raw[2] - off0) as f32 * s2 * sc0 + bo0);
+            put(r0 + 3, o, (raw[3] - off0) as f32 * s3 * sc0 + bo0);
+            put(r0, o + 1, (raw[4] - off1) as f32 * s0 * sc1 + bo1);
+            put(r0 + 1, o + 1, (raw[5] - off1) as f32 * s1 * sc1 + bo1);
+            put(r0 + 2, o + 1, (raw[6] - off1) as f32 * s2 * sc1 + bo1);
+            put(r0 + 3, o + 1, (raw[7] - off1) as f32 * s3 * sc1 + bo1);
+            o += 2;
+        }
+        while o < out {
+            let wrow = &w.data[o * inp..(o + 1) * inp];
+            let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
+            let off = 128 * w.colsum[o];
+            let sc = w.scale[o];
+            let bo = bias.map_or(0.0, |b| b[o]);
+            put(r0, o, (raw[0] - off) as f32 * s0 * sc + bo);
+            put(r0 + 1, o, (raw[1] - off) as f32 * s1 * sc + bo);
+            put(r0 + 2, o, (raw[2] - off) as f32 * s2 * sc + bo);
+            put(r0 + 3, o, (raw[3] - off) as f32 * s3 * sc + bo);
+            o += 1;
+        }
+    } else {
+        for j in 0..rows {
+            let r = r0 + j;
+            let xr = &xu[r * inp..(r + 1) * inp];
+            let sar = sa[r];
+            for o in 0..out {
+                let wrow = &w.data[o * inp..(o + 1) * inp];
+                let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
+                let mut val = dot as f32 * sar * w.scale[o];
+                if let Some(b) = bias {
+                    val += b[o];
+                }
+                put(r, o, val);
+            }
+        }
+    }
+    debug_assert_eq!(out, hh * d_head);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maddubs_i7_qkv_headmajor(
+    hq: &I7Activation,
+    qw: &I7Mat,
+    q_bias: Option<&[f32]>,
+    kw: &I7Mat,
+    k_bias: Option<&[f32]>,
+    vw: &I7Mat,
+    v_bias: Option<&[f32]>,
+    qa: &mut [f32],
+    ka: &mut [f32],
+    va: &mut [f32],
+    hh: usize,
+    d_head: usize,
+) -> FwResult<()> {
+    let m = hq.rows;
+    let inp = hq.inp;
+    let out = hh * d_head;
+    for (name, w, bias) in [("q", qw, q_bias), ("k", kw, k_bias), ("v", vw, v_bias)] {
+        if w.inp != inp {
+            return Err(FwError::InvalidRequest(format!(
+                "maddubs_i7_qkv_headmajor: {name}.inp {} != x.inp {inp}",
+                w.inp
+            )));
+        }
+        if w.out != out {
+            return Err(FwError::InvalidRequest(format!(
+                "maddubs_i7_qkv_headmajor: {name}.out {} != hh*d_head {out}",
+                w.out
+            )));
+        }
+        if let Some(b) = bias
+            && b.len() != out
+        {
+            return Err(FwError::InvalidRequest(format!(
+                "maddubs_i7_qkv_headmajor: {name} bias len {} != out {out}",
+                b.len()
+            )));
+        }
+    }
+    let want = hh * m * d_head;
+    for (name, dst) in [("q", qa.len()), ("k", ka.len()), ("v", va.len())] {
+        if dst != want {
+            return Err(FwError::InvalidRequest(format!(
+                "maddubs_i7_qkv_headmajor: {name} dst len {dst} != hh*m*d_head {want}"
+            )));
+        }
+    }
+
+    let q_addr = qa.as_mut_ptr() as usize;
+    let k_addr = ka.as_mut_ptr() as usize;
+    let v_addr = va.as_mut_ptr() as usize;
+    let n_blocks = m.div_ceil(4);
+    (0..n_blocks).into_par_iter().for_each(|blk| {
+        let r0 = blk * 4;
+        maddubs_i7_headmajor_block(hq, qw, q_bias, q_addr, hh, d_head, r0);
+        maddubs_i7_headmajor_block(hq, kw, k_bias, k_addr, hh, d_head, r0);
+        maddubs_i7_headmajor_block(hq, vw, v_bias, v_addr, hh, d_head, r0);
+    });
+    Ok(())
+}
+
 /// FUSED int8-QKV + fused SDPA: run the three maddubs i7 GEMMs writing q/k/v DIRECTLY in
 /// head-major `[hh, tq, d_head]` (eliminating `sdpa_gather_head_major`), feed the external
 /// `ft_kernel_cpu::sdpa_forward_f32`, then scatter back to `[tq, n_state]`. Byte-IDENTICAL
@@ -3908,9 +4093,15 @@ pub fn attention_from_i7_qkv(
     let mut qa = gemv_out_buf(hh * tq * d_head);
     let mut ka = gemv_out_buf(hh * tq * d_head);
     let mut va = gemv_out_buf(hh * tq * d_head);
-    maddubs_i7_headmajor(hq, qw, q_bias, &mut qa, hh, d_head)?;
-    maddubs_i7_headmajor(hq, kw, k_bias, &mut ka, hh, d_head)?;
-    maddubs_i7_headmajor(hq, vw, v_bias, &mut va, hh, d_head)?;
+    if i7_qkv_headmajor_rowco_enabled() {
+        maddubs_i7_qkv_headmajor(
+            hq, qw, q_bias, kw, k_bias, vw, v_bias, &mut qa, &mut ka, &mut va, hh, d_head,
+        )?;
+    } else {
+        maddubs_i7_headmajor(hq, qw, q_bias, &mut qa, hh, d_head)?;
+        maddubs_i7_headmajor(hq, kw, k_bias, &mut ka, hh, d_head)?;
+        maddubs_i7_headmajor(hq, vw, v_bias, &mut va, hh, d_head)?;
+    }
     let sdpa_scale = (d_head as f32).powf(-0.5);
     let o = ft_kernel_cpu::sdpa_forward_f32(
         &qa, &ka, &va, hh, tq, tq, d_head, d_head, sdpa_scale, false,
@@ -4664,6 +4855,50 @@ mod tests {
         assert_eq!(inline.rows, reused.rows);
         assert_eq!(inline.cols, reused.cols);
         assert_eq!(inline.data, reused.data);
+    }
+
+    #[test]
+    fn qkv_headmajor_rowco_matches_three_passes() {
+        let mut rng = Lcg::new(0x71);
+        let (rows, inp, out, heads) = (5, 37, 8, 2);
+        let d_head = out / heads;
+        let x = rng.mat(rows, inp);
+        let xq = quantize_act_i7(&x);
+        let qw = quantize_mat_to_i7(&rng.mat(inp, out));
+        let kw = quantize_mat_to_i7(&rng.mat(inp, out));
+        let vw = quantize_mat_to_i7(&rng.mat(inp, out));
+        let qb: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
+        let vb: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
+
+        let mut q0 = vec![0.0f32; heads * rows * d_head];
+        let mut k0 = vec![0.0f32; heads * rows * d_head];
+        let mut v0 = vec![0.0f32; heads * rows * d_head];
+        let mut q1 = vec![0.0f32; heads * rows * d_head];
+        let mut k1 = vec![0.0f32; heads * rows * d_head];
+        let mut v1 = vec![0.0f32; heads * rows * d_head];
+
+        maddubs_i7_headmajor(&xq, &qw, Some(&qb), &mut q0, heads, d_head).expect("q");
+        maddubs_i7_headmajor(&xq, &kw, None, &mut k0, heads, d_head).expect("k");
+        maddubs_i7_headmajor(&xq, &vw, Some(&vb), &mut v0, heads, d_head).expect("v");
+        maddubs_i7_qkv_headmajor(
+            &xq,
+            &qw,
+            Some(&qb),
+            &kw,
+            None,
+            &vw,
+            Some(&vb),
+            &mut q1,
+            &mut k1,
+            &mut v1,
+            heads,
+            d_head,
+        )
+        .expect("qkv rowco");
+
+        assert_eq!(q0, q1);
+        assert_eq!(k0, k1);
+        assert_eq!(v0, v1);
     }
 
     #[test]
