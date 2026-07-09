@@ -840,109 +840,26 @@ pub struct I7Activation {
 
 /// Quantize `x` for the maddubs 7-bit int8 GEMM.
 #[must_use]
-/// Quantize ONE activation row to u8 (per-row symmetric amax/127, +128 zero-point),
-/// returning the row scale. Shared by [`quantize_act_i7`] and [`quantize_act_i7_gelu`].
-/// Scalar reference form: `(v*inv).round().clamp(-127,127) as i32 + 128`.
-#[inline]
-fn quantize_row_i7_scalar(src: &[f32], dst: &mut [u8]) -> f32 {
-    let amax = src.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
-    let row_scale = amax / 127.0;
-    let inv = 1.0 / row_scale;
-    for (d, &v) in dst.iter_mut().zip(src) {
-        let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
-        *d = (i8v + 128) as u8;
-    }
-    row_scale
-}
-
-/// AVX2 form of [`quantize_row_i7_scalar`] — BIT-IDENTICAL. `f32::round()`
-/// (round-half-away) has no single AVX2 op ⇒ LLVM scalarizes it (`vroundss`);
-/// this does the amax reduction, the round via `trunc(v + copysign(0.5,v))`
-/// (`vroundps` trunc), the clamp and the i32→u8 pack all 8-wide. Gated by
-/// [`super::enc_quant_avx2`]; verified max|Δu8|=0 in `examples/quant_round_probe`.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[allow(unsafe_code)]
-fn quantize_row_i7_avx2(src: &[f32], dst: &mut [u8]) -> f32 {
-    use core::arch::x86_64::*;
-    let cols = src.len();
-    // SAFETY: avx2 guaranteed by cfg; all loads/stores bounded by `i+8<=cols`
-    // guards with scalar remainders; the i32→u8 store goes through a bounded
-    // 8-wide stack buffer. Bit-identical to the scalar reference.
-    unsafe {
-        let sign = _mm256_set1_ps(-0.0);
-        let half = _mm256_set1_ps(0.5);
-        let clamp_hi = _mm256_set1_ps(127.0);
-        let clamp_lo = _mm256_set1_ps(-127.0);
-        let bias = _mm256_set1_epi32(128);
-        // amax = max|v|
-        let mut amx = _mm256_setzero_ps();
-        let mut i = 0;
-        while i + 8 <= cols {
-            let v = _mm256_loadu_ps(src.as_ptr().add(i));
-            amx = _mm256_max_ps(amx, _mm256_andnot_ps(sign, v));
-            i += 8;
-        }
-        let hi = _mm256_extractf128_ps(amx, 1);
-        let lo = _mm256_castps256_ps128(amx);
-        let m = _mm_max_ps(lo, hi);
-        let m = _mm_max_ps(m, _mm_movehl_ps(m, m));
-        let m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
-        let mut amax = _mm_cvtss_f32(m);
-        for &v in &src[i..] {
-            amax = amax.max(v.abs());
-        }
-        amax = amax.max(1e-9);
-        let row_scale = amax / 127.0;
-        let inv = 1.0 / row_scale;
-        let inv_v = _mm256_set1_ps(inv);
-        let mut j = 0;
-        while j + 8 <= cols {
-            let s = _mm256_mul_ps(_mm256_loadu_ps(src.as_ptr().add(j)), inv_v);
-            // round-half-away: trunc(s + copysign(0.5, s))
-            let cs = _mm256_or_ps(_mm256_and_ps(s, sign), half);
-            let rounded =
-                _mm256_round_ps(_mm256_add_ps(s, cs), _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
-            let cl = _mm256_min_ps(_mm256_max_ps(rounded, clamp_lo), clamp_hi);
-            let ii = _mm256_add_epi32(_mm256_cvttps_epi32(cl), bias); // +128
-            let mut tmp = [0i32; 8];
-            _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, ii);
-            for k in 0..8 {
-                *dst.get_unchecked_mut(j + k) = tmp[k] as u8;
-            }
-            j += 8;
-        }
-        for k in j..cols {
-            let i8v = (src[k] * inv).round().clamp(-127.0, 127.0) as i32;
-            dst[k] = (i8v + 128) as u8;
-        }
-        row_scale
-    }
-}
-
-/// Quantize one row, dispatching to the AVX2 or scalar form (bit-identical).
-#[inline]
-fn quantize_row_i7(src: &[f32], dst: &mut [u8]) -> f32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if super::enc_quant_avx2() {
-        return quantize_row_i7_avx2(src, dst);
-    }
-    quantize_row_i7_scalar(src, dst)
-}
-
 pub fn quantize_act_i7(x: &Mat) -> I7Activation {
-    let cols = x.cols;
-    let mut data = vec![0u8; x.rows * cols];
+    let mut data = vec![0u8; x.rows * x.cols];
     let mut scale = vec![0.0f32; x.rows];
-    data.par_chunks_mut(cols)
+    data.par_chunks_mut(x.cols)
         .zip(scale.par_iter_mut())
         .enumerate()
         .for_each(|(r, (xr_u8, s))| {
-            let xr = &x.data[r * cols..(r + 1) * cols];
-            *s = quantize_row_i7(xr, xr_u8);
+            let xr = &x.data[r * x.cols..(r + 1) * x.cols];
+            let amax = xr.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let row_scale = amax / 127.0;
+            *s = row_scale;
+            let inv = 1.0 / row_scale;
+            for (d, &v) in xr_u8.iter_mut().zip(xr) {
+                let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                *d = (i8v + 128) as u8;
+            }
         });
     I7Activation {
         rows: x.rows,
-        inp: cols,
+        inp: x.cols,
         data,
         scale,
     }
@@ -1145,7 +1062,14 @@ pub fn quantize_act_i7_gelu(x: &Mat) -> I7Activation {
                 let xr = &x.data[r * cols..(r + 1) * cols];
                 g.copy_from_slice(xr);
                 gelu_slice(g); // same GGML_GELU_FP16 table+clamp as nn::gelu
-                *s = quantize_row_i7(g, xr_u8);
+                let amax = g.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+                let row_scale = amax / 127.0;
+                *s = row_scale;
+                let inv = 1.0 / row_scale;
+                for (d, &v) in xr_u8.iter_mut().zip(g.iter()) {
+                    let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                    *d = (i8v + 128) as u8;
+                }
             },
         );
     I7Activation {
