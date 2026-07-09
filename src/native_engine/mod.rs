@@ -424,6 +424,27 @@ pub(crate) fn enc_qkv_fused() -> bool {
     })
 }
 
+/// Fold the encoder MLP GELU into fc2's int8 activation-quantize
+/// (`nn::matmul_bias_i7_gelu`). `FW_ENC_GELU_FUSED`, **default ON** (kill-switch
+/// `=0`). BYTE-IDENTICAL to the separate `nn::gelu` + `matmul_bias_i7` (same
+/// GGML_GELU_FP16 table+clamp per element, same per-row quant), a pure
+/// memory-traffic change WITHIN the already-gated int8 MLP: the classic form
+/// writes a full `[1500, 5120]` GELU'd buffer and re-reads it to quantize; the
+/// fused form GELUs each row into a per-worker L1 scratch during the quant,
+/// eliminating that ~30 MiB (partly DRAM-resident) fc1-output round-trip. Only
+/// fires when `mlp_proj` is i7 (an encoder int8 gate is on), so default-on adds
+/// zero risk to the default (int8-off) engine. Kill-switch restores the separate
+/// `gelu` + `enc_linear` path.
+pub(crate) fn enc_gelu_fused() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FW_ENC_GELU_FUSED").ok().as_deref().map(str::trim),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
 /// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
 /// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
 /// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from

@@ -1300,8 +1300,18 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     // ── MLP residual ── (same fused layer_norm-into-uninit, no clone memcpy)
     let h = et!(7, ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b));
     let mut h = et!(8, enc_linear(&h, &layer.mlp_fc_w, &layer.mlp_fc_i7, Some(&layer.mlp_fc_b))?);
-    et!(9, nn::gelu(&mut h));
-    let h = et!(10, enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, Some(&layer.mlp_proj_b))?);
+    // GELU-into-fc2-quant fusion: when fc2 is the int8 maddubs path, fold the
+    // GELU into the activation quant so the big `[1500, 5120]` GELU'd buffer is
+    // never materialized (byte-identical; see `super::enc_gelu_fused`). Otherwise
+    // the classic separate GELU (label 9) + fc2 (label 10).
+    let h = if super::enc_gelu_fused()
+        && let Some(w) = layer.mlp_proj_i7.as_ref()
+    {
+        et!(10, nn::matmul_bias_i7_gelu(&h, w, Some(&layer.mlp_proj_b))?)
+    } else {
+        et!(9, nn::gelu(&mut h));
+        et!(10, enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, Some(&layer.mlp_proj_b))?)
+    };
     et!(11, add_in_place(x, &h));
 
     Ok(())
