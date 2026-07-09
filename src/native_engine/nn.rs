@@ -174,6 +174,17 @@ fn batch_gemv_row_morsel_enabled() -> bool {
         .get_or_init(|| std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() != Some("0"))
 }
 
+/// Default-ON M2 activation-column tile for the row-morsel f16 batch GEMV: pairs of
+/// activation rows share each weight-row f16→f32 conversion (`dot_f16c_2col`), which
+/// is BYTE-IDENTICAL to the M1 path and MEASURED 1.26× on the cross-K/V projection
+/// shape (`examples/f16batch_m2col_probe`). `FW_F16_BATCH_M2COL=0` restores the M1
+/// per-row `dequant_row_dot` loop for A/B and rollback.
+fn f16_batch_m2col_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FW_F16_BATCH_M2COL").ok().as_deref() != Some("0"))
+}
+
 /// Default-ON alternate register tile for square/non-expanding encoder i7 GEMMs.
 /// `FW_I7_M2N4=0` restores the legacy M4xN2 tile for A/B and rollback.
 fn i7_m2n4_enabled() -> bool {
@@ -204,14 +215,39 @@ fn gemv_f16_batch_rows(
             remaining = tail;
             s.spawn(move || {
                 let mut scratch = vec![0.0f32; inp];
-                for local_t in 0..rows {
-                    let t = t0 + local_t;
-                    let xr = &x[t * inp..(t + 1) * inp];
-                    let dst_row = &mut dst_rows[local_t * out..(local_t + 1) * out];
-                    for o in 0..out {
-                        let w_row = &w_f16[o * inp..(o + 1) * inp];
-                        let b = bias.map_or(0.0, |bb| bb[o]);
-                        dst_row[o] = dequant_row_dot(w_row, xr, &mut scratch, use_fused) + b;
+                // M2 activation-column tile: pairs of adjacent activation rows share
+                // each weight-row f16→f32 conversion (`dequant_row_dot_2col`), the
+                // cvtph-halving win. BYTE-IDENTICAL to the per-row M1 loop below (each
+                // row keeps `dot_f16c`'s exact reduction). The odd tail row and the
+                // `FW_F16_BATCH_M2COL=0` A/B path fall back to the M1 `dequant_row_dot`.
+                let m2 = f16_batch_m2col_enabled();
+                let mut local_t = 0;
+                while local_t < rows {
+                    if m2 && local_t + 2 <= rows {
+                        let t = t0 + local_t;
+                        let x0 = &x[t * inp..(t + 1) * inp];
+                        let x1 = &x[(t + 1) * inp..(t + 2) * inp];
+                        let (d0, d1) =
+                            dst_rows[local_t * out..(local_t + 2) * out].split_at_mut(out);
+                        for o in 0..out {
+                            let w_row = &w_f16[o * inp..(o + 1) * inp];
+                            let b = bias.map_or(0.0, |bb| bb[o]);
+                            let (s0, s1) =
+                                dequant_row_dot_2col(w_row, x0, x1, &mut scratch, use_fused);
+                            d0[o] = s0 + b;
+                            d1[o] = s1 + b;
+                        }
+                        local_t += 2;
+                    } else {
+                        let t = t0 + local_t;
+                        let xr = &x[t * inp..(t + 1) * inp];
+                        let dst_row = &mut dst_rows[local_t * out..(local_t + 1) * out];
+                        for o in 0..out {
+                            let w_row = &w_f16[o * inp..(o + 1) * inp];
+                            let b = bias.map_or(0.0, |bb| bb[o]);
+                            dst_row[o] = dequant_row_dot(w_row, xr, &mut scratch, use_fused) + b;
+                        }
+                        local_t += 1;
                     }
                 }
             });
@@ -1463,6 +1499,90 @@ fn dot_f16c_2row(w0: &[Float16], w1: &[Float16], x: &[f32]) -> (f32, f32) {
     }
 }
 
+/// Two GEMV row dots over **one** f16 weight row against **two** activation rows
+/// `x0`/`x1` — the ACTIVATION-column transpose of [`dot_f16c_2row`]. The four
+/// f16→f32 weight-chunk conversions (`vcvtph2ps`) are done ONCE per 32-lane chunk
+/// and REUSED across both activation rows; each row keeps its OWN four accumulators
+/// reduced in the byte-identical order of [`dot_f16c`], so
+/// `dot_f16c_2col(w, x0, x1) == (dot_f16c(w, x0), dot_f16c(w, x1))` **bit-for-bit**.
+///
+/// The win is on the batched (tq>1) row-morsel GEMV, where the weight is streamed
+/// once per activation row: pairing rows halves the weight conversion (the
+/// cvtph-throughput bottleneck at [1280,1280]) — MEASURED 1.26× cold on the
+/// per-window cross-K/V projection shape, itself FASTER than a dequant-to-f32 ft
+/// sgemm (which reads 2× the weight bytes and is non-byte-exact); see
+/// `examples/f16batch_m2col_probe`. Register budget: 4 converted-weight + 4+4
+/// accumulators + transient x = 16 ymm (fits Zen3).
+///
+/// Compiled only under `f16c`+`fma` (same cfg/inlining contract as [`dot_f16c`]).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_f16c_2col(w: &[Float16], x0: &[f32], x1: &[f32]) -> (f32, f32) {
+    use core::arch::x86_64::*;
+    let n = w.len().min(x0.len()).min(x1.len());
+    let (p0, p1) = (x0.as_ptr(), x1.as_ptr());
+    // SAFETY: every load is in-bounds by the i+32 / i+8 / i<n guards over
+    // n = min(w.len, x0.len, x1.len); Float16 is repr(transparent) u16 so a 128-bit
+    // load reads 8 contiguous lanes; f16c/fma are guaranteed by this fn's cfg.
+    unsafe {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut b0 = _mm256_setzero_ps();
+        let mut b1 = _mm256_setzero_ps();
+        let mut b2 = _mm256_setzero_ps();
+        let mut b3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            // Convert the four weight chunks ONCE, reuse across both activation rows.
+            let wc0 = _mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(i).cast()));
+            let wc1 = _mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(i + 8).cast()));
+            let wc2 = _mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(i + 16).cast()));
+            let wc3 = _mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(i + 24).cast()));
+            a0 = _mm256_fmadd_ps(wc0, _mm256_loadu_ps(p0.add(i)), a0);
+            a1 = _mm256_fmadd_ps(wc1, _mm256_loadu_ps(p0.add(i + 8)), a1);
+            a2 = _mm256_fmadd_ps(wc2, _mm256_loadu_ps(p0.add(i + 16)), a2);
+            a3 = _mm256_fmadd_ps(wc3, _mm256_loadu_ps(p0.add(i + 24)), a3);
+            b0 = _mm256_fmadd_ps(wc0, _mm256_loadu_ps(p1.add(i)), b0);
+            b1 = _mm256_fmadd_ps(wc1, _mm256_loadu_ps(p1.add(i + 8)), b1);
+            b2 = _mm256_fmadd_ps(wc2, _mm256_loadu_ps(p1.add(i + 16)), b2);
+            b3 = _mm256_fmadd_ps(wc3, _mm256_loadu_ps(p1.add(i + 24)), b3);
+            i += 32;
+        }
+        let acca = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let accb = _mm256_add_ps(_mm256_add_ps(b0, b1), _mm256_add_ps(b2, b3));
+        let mut ta = [0.0f32; 8];
+        let mut tb = [0.0f32; 8];
+        _mm256_storeu_ps(ta.as_mut_ptr(), acca);
+        _mm256_storeu_ps(tb.as_mut_ptr(), accb);
+        let mut s0 = ((ta[0] + ta[1]) + (ta[2] + ta[3])) + ((ta[4] + ta[5]) + (ta[6] + ta[7]));
+        let mut s1 = ((tb[0] + tb[1]) + (tb[2] + tb[3])) + ((tb[4] + tb[5]) + (tb[6] + tb[7]));
+        while i + 8 <= n {
+            let wc = _mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(i).cast()));
+            let pa = _mm256_mul_ps(wc, _mm256_loadu_ps(p0.add(i)));
+            let pb = _mm256_mul_ps(wc, _mm256_loadu_ps(p1.add(i)));
+            _mm256_storeu_ps(ta.as_mut_ptr(), pa);
+            _mm256_storeu_ps(tb.as_mut_ptr(), pb);
+            s0 += ((ta[0] + ta[1]) + (ta[2] + ta[3])) + ((ta[4] + ta[5]) + (ta[6] + ta[7]));
+            s1 += ((tb[0] + tb[1]) + (tb[2] + tb[3])) + ((tb[4] + tb[5]) + (tb[6] + tb[7]));
+            i += 8;
+        }
+        while i < n {
+            let wv = w[i].to_f32();
+            s0 += wv * x0[i];
+            s1 += wv * x1[i];
+            i += 1;
+        }
+        (s0, s1)
+    }
+}
+
 /// One GEMV row dot over an f16 weight row and f32 activation: the fused f16c
 /// path when available ([`dot_f16c`], a safe call — its `unsafe` is internal),
 /// else the portable two-pass (`convert_to_f32_slice` into `scratch`, then
@@ -1480,6 +1600,33 @@ fn dequant_row_dot(w_row: &[Float16], x: &[f32], scratch: &mut [f32], use_fused:
     let _ = use_fused;
     w_row.convert_to_f32_slice(scratch);
     dot8(scratch, x)
+}
+
+/// Two GEMV row dots of ONE f16 weight row against TWO activation rows, sharing the
+/// weight's f16→f32 conversion — the batched twin of [`dequant_row_dot`]. Fused f16c
+/// path ([`dot_f16c_2col`]) when available; else the portable two-pass converts the
+/// weight ONCE into `scratch` then [`dot8`]s each activation. BYTE-IDENTICAL to two
+/// separate [`dequant_row_dot`] calls in BOTH paths (same per-row reduction; the
+/// convert is row-independent so doing it once changes nothing).
+#[inline]
+fn dequant_row_dot_2col(
+    w_row: &[Float16],
+    x0: &[f32],
+    x1: &[f32],
+    scratch: &mut [f32],
+    use_fused: bool,
+) -> (f32, f32) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    ))]
+    if use_fused {
+        return dot_f16c_2col(w_row, x0, x1);
+    }
+    let _ = use_fused;
+    w_row.convert_to_f32_slice(scratch);
+    (dot8(scratch, x0), dot8(scratch, x1))
 }
 
 /// Whether the register-blocked two-row fused dot ([`dot_f16c_2row`]) is both

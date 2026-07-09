@@ -4,6 +4,24 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 - AshHeron: LAND (byte-exact, default-on) — **M2 activation-column tile `dot_f16c_2col` for the row-morsel f16 batch GEMV: shares each weight-row f16→f32 conversion across 2 activation rows, MEASURED 1.26× isolated on the cross-K/V projection shape and, decisively, FASTER than the (now-reverted, non-exact) dequant→f32 sgemm route it competes with — while staying BYTE-IDENTICAL. `FW_F16_BATCH_M2COL` default-on.**
+
+**Context / not-a-re-dig:** this is the LAND of the `dot_f16c_2col` WIN I measured+deferred last round (entry below), now that `nn.rs` is quiescent (BlackThrush measured+REVERTED their competing `FW_BATCH_GEMV_TILED_F32` route — see the entry immediately below; my 3-way probe independently reproduced that same loss). Their "closed lanes" summary listed "`dot_f16c_2col` … rejected", but their MEASUREMENT was the tiled-f32 sgemm route, NOT `dot_f16c_2col`; `dot_f16c_2col` was never measured-rejected — it is the byte-exact win, distinct from (and complementary to) the rejected f32 route. Grepped `dot_f16c_2col`/`m2col`/`FW_F16_BATCH_M2COL` first.
+
+**Mechanism.** The cross-K/V projections (`cross_attn_k/v.forward(encoder_out)`, tq=1500, [1500,1280]×[1280,1280], ~2% e2e) route to `gemv_f16_batch` → the compute-bound `gemv_f16_batch_rows` row-morsel kernel (they carry no `w_i8`; tiled-f32 is gone). That kernel's inner loop is M1×N1: per activation row it streams ALL `out` weight rows through `dot_f16c`, re-doing every weight's f16→f32 `vcvtph2ps` for each of tq=1500 rows — and `dot_f16c` is ~cvtph-throughput-bound at this shape (4 `vcvtph2ps` vs 4 `vfmadd` per 32-lane chunk). **`dot_f16c_2col(w, x0, x1)`** — the ACTIVATION-column transpose of the landed `dot_f16c_2row` — converts each weight chunk ONCE and reuses it across 2 activation rows, each row keeping its OWN 4 accumulators in `dot_f16c`'s exact reduction order ⇒ `== (dot_f16c(w,x0), dot_f16c(w,x1))` **bit-for-bit** (f16→f32 is lossless + identical fmadd inputs + identical `((a0+a1)+(a2+a3))`/8-lane-tree reduction). Register budget 4 converted-w + 4+4 accumulators + transient x = 16 ymm (fits Zen3). Wired via `dequant_row_dot_2col` (cfg-mirrors `dequant_row_dot`: fused f16c path, else portable convert-once + 2× `dot8`, byte-identical on both) + an M2-tile in the `gemv_f16_batch_rows` inner loop (odd tail row + `FW_F16_BATCH_M2COL=0` fall back to the M1 `dequant_row_dot`).
+
+**MEASURED — decisive 4-way (`examples/f16batch_m2col_probe`, real `[1500,1280]×[1280,1280]`, 16t cold, min-of-40, loaded box so interleaved RATIOS are the signal):**
+```text
+  M1 (current row-morsel, byte-exact)        9.265 ms
+  M2col (shared cvtph, BYTE-EXACT)           7.362 ms   1.258× vs M1   <-- FASTEST + faithful
+  tiled_f32 per-call dequant  (NON-exact)    9.585 ms   0.967× vs M1 = REGRESSION (BlackThrush's, reverted)
+  sgemm-only load-time dequant(NON-exact)    7.949 ms   1.166× vs M1 = 0.926× vs M2col
+```
+`M2col == M1` BYTE-IDENTICAL (full array). The key result: the BYTE-EXACT M2col DOMINATES the entire f32-route family — faster even than the idealized load-time-dequant sgemm (which is also non-exact) — because the f16 weight is HALF the bytes and M2col recovers the only downside (the cvtph cost). So there was never a speed case for breaking faithfulness on this shape; keep f16 + M2col.
+
+**Ratio vs LEGACY ORIGINAL / conformance:** isolated cross-proj kernel **1.258× vs the row-morsel M1**; e2e is a ~2% path so the win is ~0.3–0.5% — below the loaded-box floor (interleaved min-of-6 `cross_kv` span A/B: ON 31.56 vs OFF 32.47 ms, ON faster by 0.91 ms but reps overlap ⇒ within noise, NO regression). Landed on the SAME basis as the sibling `dot_f16c_2row` (isolated 1.29× + bit-exact, [[project_2row_gemv_landed]]) and the argmax/round/dot_i8 kernels: **byte-identical + strictly-fewer-work (halved cvtph) + isolated measurement.** Engine transcript A/B **BYTE-IDENTICAL** on jfk×3 in BOTH ts and no_ts modes (`FW_F16_BATCH_M2COL` on vs `=0`, `PROBE_DUMP_TEXT`). Conformance GREEN. src: `src/native_engine/nn.rs` (+ `examples/f16batch_m2col_probe.rs`) only — regions disjoint from the maddubs kernels. AGENT_NAME=AshHeron. Rollback: `FW_F16_BATCH_M2COL=0`.
+
+---
 ## 2026-07-09 - BlackThrush: DIG -> REJECTED (measured, reverted) - generic per-call tiled f32 sgemm route for large `gemv_f16_batch` loses to the row-morsel f16 path; do not retry this fallback-vs-default route
 
 **Profile-first target:** after consulting the closed lanes (row-morsel direct
