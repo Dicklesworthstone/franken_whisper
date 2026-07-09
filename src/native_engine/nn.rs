@@ -164,6 +164,54 @@ fn batch_gemv_cap() -> Option<usize> {
     })
 }
 
+/// Default-ON row-morsel scheduler for compute-bound batched f16 GEMV.
+/// `FW_BATCH_GEMV_ROW_MORSEL=0` restores the legacy output-band/private-buffer
+/// scheduler for A/B and rollback.
+fn batch_gemv_row_morsel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() != Some("0"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemv_f16_batch_rows(
+    w_f16: &[Float16],
+    out: usize,
+    inp: usize,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+    workers: usize,
+    use_fused: bool,
+) {
+    let row_band = tq.div_ceil(workers).max(1);
+    std::thread::scope(|s| {
+        let mut t0 = 0;
+        let mut remaining = out_slice;
+        while t0 < tq {
+            let rows = row_band.min(tq - t0);
+            let (dst_rows, tail) = remaining.split_at_mut(rows * out);
+            remaining = tail;
+            s.spawn(move || {
+                let mut scratch = vec![0.0f32; inp];
+                for local_t in 0..rows {
+                    let t = t0 + local_t;
+                    let xr = &x[t * inp..(t + 1) * inp];
+                    let dst_row = &mut dst_rows[local_t * out..(local_t + 1) * out];
+                    for o in 0..out {
+                        let w_row = &w_f16[o * inp..(o + 1) * inp];
+                        let b = bias.map_or(0.0, |bb| bb[o]);
+                        dst_row[o] = dequant_row_dot(w_row, xr, &mut scratch, use_fused) + b;
+                    }
+                }
+            });
+            t0 += rows;
+        }
+    });
+}
+
 /// Map a FrankenTorch `KernelError` into [`FwError`].
 ///
 /// Kernel failures here are almost always shape/contract violations from
@@ -2282,6 +2330,16 @@ pub fn gemv_f16_batch(
         return;
     }
 
+    // For the long compute-bound cross-K/V shape, split ownership by token rows
+    // instead of output columns. Each worker writes disjoint contiguous
+    // `[rows, out]` morsels directly into `out_slice`, eliminating the legacy
+    // private `[tq, out]` buffers and merge while preserving each dot product's
+    // exact summation order.
+    if work >= COMPUTE_BOUND_MACS && batch_gemv_row_morsel_enabled() {
+        gemv_f16_batch_rows(w_f16, out, inp, x, tq, bias, out_slice, workers, use_fused);
+        return;
+    }
+
     // Parallelize over output-column bands; each worker fills a private
     // [tq, out] buffer (writing only its band), then we disjoint-merge them
     // (every column written by exactly one worker → `0.0 + x == x` exactly).
@@ -4247,6 +4305,47 @@ mod tests {
                     batch[t * out + o].to_bits(),
                     r.to_bits(),
                     "batch[{t},{o}] differs from per-token gemv"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gemv_f16_batch_row_morsel_equals_per_token_gemv() {
+        let mut rng = Lcg::new(18);
+        let (out, inp, tq) = (17usize, 19usize, 7usize);
+        let (w_h, _w_f32) = rand_f16_weight(&mut rng, out, inp);
+        let x: Vec<f32> = (0..tq * inp).map(|_| rng.next_f32()).collect();
+        let bias: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
+
+        let mut batch = vec![0.0f32; tq * out];
+        gemv_f16_batch_rows(
+            &w_h,
+            out,
+            inp,
+            &x,
+            tq,
+            Some(&bias),
+            &mut batch,
+            3,
+            f16c_dot_available(),
+        );
+
+        for t in 0..tq {
+            let mut row = vec![0.0f32; out];
+            gemv_f16(
+                &w_h,
+                out,
+                inp,
+                &x[t * inp..(t + 1) * inp],
+                Some(&bias),
+                &mut row,
+            );
+            for (o, &r) in row.iter().enumerate() {
+                assert_eq!(
+                    batch[t * out + o].to_bits(),
+                    r.to_bits(),
+                    "row-morsel batch[{t},{o}] differs from per-token gemv"
                 );
             }
         }
