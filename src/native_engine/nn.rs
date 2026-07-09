@@ -400,8 +400,9 @@ const METAL_MIN_MKN: usize = 2_000_000_000;
 /// Allocate an `[n]` f32 buffer that the caller **fully overwrites** before any
 /// read, skipping the dead serial zero-init — the same dead-work elision as
 /// [`matmul_into_uninit`] (d44f1fa). Used for the decode's per-token GEMV/logits
-/// outputs ([`gemv_f16`]/[`gemv_f16_batch`] assign every slot) and the encoder
-/// SDPA gather buffers (qa/ka/va, each `copy_from_slice`-filled in full). NOT for
+/// outputs ([`gemv_f16`]/[`gemv_f16_batch`] assign every slot), the encoder
+/// SDPA gather buffers (qa/ka/va, each `copy_from_slice`-filled in full), and
+/// exact int8/i7 GEMM outputs that assign every matrix element. NOT for
 /// accumulator buffers (the parallel per-head `out`, `+=`-merged — keep those
 /// zeroed). Gated by `FW_DECODE_ZEROINIT` (set => zero-init: an A/B and safety
 /// fallback covering all uninit-output sites).
@@ -1021,7 +1022,7 @@ pub fn matmul_bias_i7_quantized(x: &I7Activation, w: &I7Mat, bias: Option<&[f32]
     // weight row ONCE per block (4× less weight L3 traffic than the m-outer naive
     // loop). Bit-identical to the per-row form (same i32 dot + same f32 dequant
     // order), so the int8 transcript is unchanged. Parallel over row-blocks.
-    let mut c = vec![0.0f32; m * out];
+    let mut c = gemv_out_buf(m * out);
     c.par_chunks_mut(4 * out).enumerate().for_each(|(blk, cblk)| {
         let r0 = blk * 4;
         let rows = (m - r0).min(4);

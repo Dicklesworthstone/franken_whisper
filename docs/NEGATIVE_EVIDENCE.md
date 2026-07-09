@@ -4,6 +4,82 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 - BlackThrush: LAND (measured) - uninitialized i7 maddubs output buffers are 1.27x faster than legacy zero-filled output on the shared-activation QKV row
+
+**Profile-first target:** after consulting this ledger first, I did not re-dig
+the `dot_f16c_2col`/M2col artifact: the pre-rebase ledger still carried the
+2026-06-29 rejection for that mechanism/shape, and the rebased ledger now
+records AshHeron's scheduler-reopened byte-exact M2col landing immediately
+below. I also skipped the closed encoder i7 quantize/round, fused-wide QKV
+concatenation, residual/LN/scatter fusions, prefetch, and M2xN4 tile axes. The
+short native-engine profile then left the usable orthogonal hot path on the
+current i7 QKV surface:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/ \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+
+ovh-a profile rows:
+  native_engine/i7_qkv/three_inline_quantize_1500x1280    93.965 ms
+  native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280    45.764 ms
+  native_engine/i7_qkv/shared_activation_1500x1280        20.962 ms
+```
+
+**Alien primitive kept:** dead-output initialization elision for the exact i7
+maddubs GEMM. `matmul_bias_i7_quantized` allocates the full `[m,out]` result
+and then assigns every element in disjoint row-blocks before returning the
+`Mat`; the old `vec![0.0; m*out]` memset was pure dead work. The kept path uses
+the existing `gemv_out_buf` uninitialized-buffer primitive already used for
+fully overwritten GEMV/SDPA outputs. This is a data-plane allocation primitive,
+not a quantize-round rewrite, not QKV fusion, and not another maddubs tile.
+
+State/action/loss/fallback:
+- State: exact i7 maddubs GEMM output buffer in `matmul_bias_i7_quantized`.
+- Action: allocate the result with `gemv_out_buf(m*out)` instead of zero-fill.
+- Loss: ns/iter on `native_engine/i7_qkv/shared_activation_1500x1280`, with
+  byte-identical output because every element is assigned before read.
+- Fallback: `FW_DECODE_ZEROINIT=1` restores the legacy zero-filled allocation.
+
+**MEASURED vs LEGACY ORIGINAL:**
+
+```text
+Required RCH bench attempts:
+
+FW_DECODE_ZEROINIT=1 legacy, vmi1149989:
+  three_inline_quantize_1500x1280   34.254 ms
+  shared_activation_1500x1280       37.283 ms
+
+default uninit candidate, hz2:
+  three_inline_quantize_1500x1280   41.496 ms
+  shared_activation_1500x1280       36.282 ms
+
+Those RCH rows routed to different workers and are treated only as routing
+evidence, not keep proof.
+
+Same-host paired A/B in one bench binary, local fallback after RCH shell
+command declined remote routing:
+  FW_DECODE_ZEROINIT=1 legacy shared_activation   9.561 ms
+  default uninit shared_activation                7.538 ms
+
+ratio vs LEGACY ORIGINAL: 1.27x faster
+```
+
+**Conformance/proof:** the existing `i7_prequantized_activation_matches_inline_quantize`
+tail-shape test covers the i7 quantized-output writer against the public inline
+path. Compact conformance passes: `cargo test -p franken_whisper --test
+conformance_comparator_tests` -> GREEN. Full-tree quality gates remain subject
+to the existing repo debt called out in prior entries.
+
+**Verdict:** KEEP the default uninitialized output buffer for
+`matmul_bias_i7_quantized`. It is byte-identical, uses the existing
+`FW_DECODE_ZEROINIT` fallback, and improves the focused current i7 QKV
+shared-activation row by 1.27x vs the legacy zero-filled allocation.
+AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-09 - AshHeron: LAND (byte-exact, default-on) — **M2 activation-column tile `dot_f16c_2col` for the row-morsel f16 batch GEMV: shares each weight-row f16→f32 conversion across 2 activation rows, MEASURED 1.26× isolated on the cross-K/V projection shape and, decisively, FASTER than the (now-reverted, non-exact) dequant→f32 sgemm route it competes with — while staying BYTE-IDENTICAL. `FW_F16_BATCH_M2COL` default-on.**
 
 **Context / not-a-re-dig:** this is the LAND of the `dot_f16c_2col` WIN I measured+deferred last round (entry below), now that `nn.rs` is quiescent (BlackThrush measured+REVERTED their competing `FW_BATCH_GEMV_TILED_F32` route — see the entry immediately below; my 3-way probe independently reproduced that same loss). Their "closed lanes" summary listed "`dot_f16c_2col` … rejected", but their MEASUREMENT was the tiled-f32 sgemm route, NOT `dot_f16c_2col`; `dot_f16c_2col` was never measured-rejected — it is the byte-exact win, distinct from (and complementary to) the rejected f32 route. Grepped `dot_f16c_2col`/`m2col`/`FW_F16_BATCH_M2COL` first.
