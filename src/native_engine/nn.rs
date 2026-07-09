@@ -185,6 +185,17 @@ fn f16_batch_m2col_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("FW_F16_BATCH_M2COL").ok().as_deref() != Some("0"))
 }
 
+/// Default-ON 2-token activation-column tile for the int8 batched GEMV
+/// (`gemv_i8_batch`, prefill tq>1 + draft): pairs of tokens share each weight row's
+/// `vpmovsxbw` (`dot_i8_2col`), BYTE-IDENTICAL to the M1 `dot_i8` loop (integer-exact)
+/// and MEASURED 1.15-1.19× at tq=64 (`examples/i8batch_2col_probe`). `FW_I8_BATCH_2COL=0`
+/// restores the per-token `dot_i8` loop for A/B and rollback.
+fn i8_batch_2col_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FW_I8_BATCH_2COL").ok().as_deref() != Some("0"))
+}
+
 /// Default-ON alternate register tile for square/non-expanding encoder i7 GEMMs.
 /// `FW_I7_M2N4=0` restores the legacy M4xN2 tile for A/B and rollback.
 fn i7_m2n4_enabled() -> bool {
@@ -1934,6 +1945,69 @@ fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     }
 }
 
+/// Two i8 dots of ONE weight row against TWO activation rows (`xa`/`xb`), sign-extending
+/// the weight (`vpmovsxbw`) ONCE per 16-chunk and reusing it for both — the int8
+/// analogue of [`dot_f16c_2col`], for the WEIGHT-OUTER batched GEMV where `w[o]` is
+/// re-sign-extended per token. Each token keeps [`dot_i8`]'s exact 2-accumulator layout;
+/// i32 sums are integer-exact (order-independent), so `dot_i8_2col(w,xa,xb) ==
+/// (dot_i8(w,xa), dot_i8(w,xb))` bit-for-bit. Halves the weight sign-extend (MEASURED
+/// 1.15-1.19× at tq=64, `examples/i8batch_2col_probe`, byte-identical).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8_2col(w: &[i8], xa: &[i8], xb: &[i8]) -> (i32, i32) {
+    use core::arch::x86_64::*;
+    let n = w.len().min(xa.len()).min(xb.len());
+    let (wp, ap, bp) = (w.as_ptr(), xa.as_ptr(), xb.as_ptr());
+    // SAFETY: avx2 by cfg; every 128-bit load bounded by the i+32<=n / i+16<=n guards
+    // over n = min(lens); tail runs scalar. No i32 overflow (see dot_i8 doc).
+    unsafe {
+        let mut aa0 = _mm256_setzero_si256();
+        let mut aa1 = _mm256_setzero_si256();
+        let mut ab0 = _mm256_setzero_si256();
+        let mut ab1 = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 32 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+            let xa0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i));
+            let xa1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i + 16) as *const __m128i));
+            let xb0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i));
+            let xb1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i + 16) as *const __m128i));
+            aa0 = _mm256_add_epi32(aa0, _mm256_madd_epi16(w0, xa0));
+            aa1 = _mm256_add_epi32(aa1, _mm256_madd_epi16(w1, xa1));
+            ab0 = _mm256_add_epi32(ab0, _mm256_madd_epi16(w0, xb0));
+            ab1 = _mm256_add_epi32(ab1, _mm256_madd_epi16(w1, xb1));
+            i += 32;
+        }
+        while i + 16 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let xa0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i));
+            let xb0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i));
+            aa0 = _mm256_add_epi32(aa0, _mm256_madd_epi16(w0, xa0));
+            ab0 = _mm256_add_epi32(ab0, _mm256_madd_epi16(w0, xb0));
+            i += 16;
+        }
+        let hsum = |s: __m256i| -> i32 {
+            let lo = _mm256_castsi256_si128(s);
+            let hi = _mm256_extracti128_si256::<1>(s);
+            let q = _mm_add_epi32(lo, hi);
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+            _mm_cvtsi128_si32(q)
+        };
+        let mut acc_a = hsum(_mm256_add_epi32(aa0, aa1));
+        let mut acc_b = hsum(_mm256_add_epi32(ab0, ab1));
+        while i < n {
+            let wv = *w.get_unchecked(i) as i32;
+            acc_a += wv * (*xa.get_unchecked(i) as i32);
+            acc_b += wv * (*xb.get_unchecked(i) as i32);
+            i += 1;
+        }
+        (acc_a, acc_b)
+    }
+}
+
 /// Scalar fallback (non-x86 / no avx2): the reference the AVX2 path reproduces exactly.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
@@ -1943,6 +2017,13 @@ fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
         acc += (*a as i32) * (*b as i32);
     }
     acc
+}
+
+/// Scalar fallback for [`dot_i8_2col`].
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_i8_2col(w: &[i8], xa: &[i8], xb: &[i8]) -> (i32, i32) {
+    (dot_i8(w, xa), dot_i8(w, xb))
 }
 
 /// Symmetric int8 quantize of an activation into `out` (`len == x.len()`):
@@ -2142,14 +2223,36 @@ pub fn gemv_i8_batch(
     // Disjoint-column-band structure identical to gemv_f16_batch; the only change
     // is the per-(o,t) value = `dot_i8(w[o], xi8[t]) * scale_w[o] * scale_x[t] + b`,
     // in the SAME product order as gemv_i8 (bit-identical).
+    // 2-token activation-column tile (`dot_i8_2col`): share each weight row's
+    // `vpmovsxbw` across a pair of tokens (byte-identical i32, then the SAME
+    // per-(o,t) `* so * xs[t] + b`). Odd tail token + `FW_I8_BATCH_2COL=0` use `dot_i8`.
+    let use_2col = i8_batch_2col_enabled();
     let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
         for o in o0..o1 {
             let wrow = &w.data[o * inp..(o + 1) * inp];
             let so = w.scales[o];
             let b = bias.map_or(0.0, |bb| bb[o]);
-            for t in 0..tq {
-                dst[t * out + o] =
-                    dot_i8(wrow, &xi8[t * inp..(t + 1) * inp]) as f32 * so * xs[t] + b;
+            if use_2col {
+                let mut t = 0;
+                while t + 2 <= tq {
+                    let (da, db) = dot_i8_2col(
+                        wrow,
+                        &xi8[t * inp..(t + 1) * inp],
+                        &xi8[(t + 1) * inp..(t + 2) * inp],
+                    );
+                    dst[t * out + o] = da as f32 * so * xs[t] + b;
+                    dst[(t + 1) * out + o] = db as f32 * so * xs[t + 1] + b;
+                    t += 2;
+                }
+                if t < tq {
+                    dst[t * out + o] =
+                        dot_i8(wrow, &xi8[t * inp..(t + 1) * inp]) as f32 * so * xs[t] + b;
+                }
+            } else {
+                for t in 0..tq {
+                    dst[t * out + o] =
+                        dot_i8(wrow, &xi8[t * inp..(t + 1) * inp]) as f32 * so * xs[t] + b;
+                }
             }
         }
     };
