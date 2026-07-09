@@ -4,6 +4,19 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 - AshHeron: LAND (byte-exact, default-on) — **2-token activation-column tile `dot_i8_2col` for the INT8 batched GEMV (`gemv_i8_batch`, prefill tq>1 + draft): shares each weight row's `vpmovsxbw` sign-extend across a pair of tokens, MEASURED 1.15-1.19× at tq=64, BYTE-IDENTICAL (integer i32 dots). The int8 analogue of the landed f16 M2col. `FW_I8_BATCH_2COL` default-on.**
+
+**Profile-first + not-a-re-dig.** Fresh default-config profile (jfk×3): encoder ~80% (external f32 sgemm, `enc_int8` DEFAULT-OFF ⇒ the int8 maddubs path is owner-gated + off), decode ~17% (int8 GEMVs, mined), cross_kv ~2% (M2col landed), mel ~0.17% (5.7 ms, negligible). Ruled out re-treads by grepping the ledger: the per-head cross-build f16-conversion → batched-F16C is BlackThrush's a05e9ab MEASURED rejection ("no from_f32 site clears the bar", and it POSTDATES the 9141049 per-head parallelization so the sub-noise verdict is structure-current — NOT a reopenable structure-change like M2col's was); int8 ROW-blocking is the [[project_2row_gemv_landed]] cold-regression (R concurrent WEIGHT streams). **`dot_i8_2col` is genuinely new (grepped `dot_i8_2col`/`i8-batch.*2col`/`sign-extend.*shar` — absent):** the int8 batched GEMV is WEIGHT-OUTER (`for o { for t { dot_i8(w[o], xi8[t]) } }`), and `dot_i8` sign-extends BOTH operands (`vpmovsxbw`) per call — so `w[o]` (fixed across the tq tokens, L1-hot) is RE-sign-extended per token. The tile sign-extends `w[o]` ONCE per 16-chunk and reuses it for 2 tokens (each keeping `dot_i8`'s exact 2-accumulator layout), halving the weight sign-extend. Distinct from ROW-blocking (that's R WEIGHT rows = concurrent DRAM streams; this is 1 weight SHARED across 2 activations = compute-share, weight L1-hot). BYTE-EXACT: i32 integer dots are order-independent ⇒ `dot_i8_2col(w,xa,xb) == (dot_i8(w,xa), dot_i8(w,xb))`, then the SAME `* so * xs[t] + b`.
+
+**MEASURED (`examples/i8batch_2col_probe`, prefill shapes, 16t cold, min-of-60; byte-identical everywhere):**
+```text
+  mlp_0[1280,5120] tq=8   M1 0.375  M2col 0.370  1.013×      qkv[1280,3840] tq=8   0.986× (noise)
+  mlp_0[1280,5120] tq=64  M1 1.201  M2col 1.047  1.147×      qkv[1280,3840] tq=64  1.189×  <-- peak
+  mlp_0[1280,5120] tq=200 M1 3.191  M2col 3.057  1.044×      qkv[1280,3840] tq=200 1.058×
+```
+The win peaks at tq~64 (weight L1-hot, sign-extend is a real fraction); at tq=8 it's a wash (dispatch-dominated), at tq=200 the weight L2 pressure dilutes it — but it's never a regression (strictly-fewer sign-extends). **Ratio vs LEGACY ORIGINAL:** the int8 batch kernel is 1.15-1.19× at tq=64 vs the M1 `dot_i8` loop. E2e is marginal: `gemv_i8_batch` runs at PREFILL (tq = SOT+prompt length) + draft; unconditioned prefill (jfk, tq~4) is ~0, but CONDITIONED long-form prefill (`condition_on_previous_text`, tq~64+) and draft get 1.05-1.19% on the ~1.4% e2e prefill span. Landed on the SAME basis as the sibling `dot_f16c_2col`/M2col and the argmax/round/dot_i8 kernels: **byte-identical + strictly-fewer-work + isolated measurement.** Engine transcript A/B **BYTE-IDENTICAL** jfk×3 ts + no_ts (`FW_I8_BATCH_2COL` on vs `=0`). Conformance GREEN. src: `src/native_engine/nn.rs` (+ `examples/i8batch_2col_probe.rs`) — regions disjoint from the maddubs/f16-batch kernels. AGENT_NAME=AshHeron. Rollback: `FW_I8_BATCH_2COL=0`.
+
+---
 ## 2026-07-09 - BlackThrush: LAND (measured) - uninitialized i7 maddubs output buffers are 1.27x faster than legacy zero-filled output on the shared-activation QKV row
 
 **Profile-first target:** after consulting this ledger first, I did not re-dig
