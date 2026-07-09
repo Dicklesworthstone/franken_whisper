@@ -1401,6 +1401,7 @@ mod tests {
                 attn_k_i7: None,
                 attn_v_i7: None,
                 attn_out_i7: None,
+                attn_out_i8: None,
                 mlp_fc_i7: None,
                 mlp_proj_i7: None,
             });

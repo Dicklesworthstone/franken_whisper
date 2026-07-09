@@ -174,6 +174,14 @@ fn batch_gemv_row_morsel_enabled() -> bool {
         .get_or_init(|| std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() != Some("0"))
 }
 
+/// Default-ON alternate register tile for square/non-expanding encoder i7 GEMMs.
+/// `FW_I7_M2N4=0` restores the legacy M4xN2 tile for A/B and rollback.
+fn i7_m2n4_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FW_I7_M2N4").ok().as_deref() != Some("0"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemv_f16_batch_rows(
     w_f16: &[Float16],
@@ -824,6 +832,83 @@ fn dot_maddubs_i7_m4n2(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w0: &[i8], w1
     ]
 }
 
+/// M2xN4 register tile: 2 activation rows x 4 weight rows = 8 dots per pass.
+/// This is the dual of M4xN2: same dot count and exact integer arithmetic, but
+/// it spends registers on four neighboring outputs so each activation vector is
+/// reused across four weight rows. Returns `[w0:r0,r1, w1:r0,r1, ... w3:r0,r1]`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+#[inline]
+fn dot_maddubs_i7_m2n4(a0: &[u8], a1: &[u8], w0: &[i8], w1: &[i8], w2: &[i8], w3: &[i8]) -> [i32; 8] {
+    use std::arch::x86_64::*;
+    let k = w0.len();
+    let (p0, p1) = (a0.as_ptr(), a1.as_ptr());
+    let (pw0, pw1, pw2, pw3) = (w0.as_ptr(), w1.as_ptr(), w2.as_ptr(), w3.as_ptr());
+    // SAFETY: AVX2 is in the base target features; all activation and weight slices
+    // have length k (caller invariant); 32-lane steps are guarded by `x + 32 <= k`.
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_si256(); 8];
+        let mut x = 0;
+        while x + 32 <= k {
+            let av0 = _mm256_loadu_si256(p0.add(x) as *const __m256i);
+            let av1 = _mm256_loadu_si256(p1.add(x) as *const __m256i);
+            let wv0 = _mm256_loadu_si256(pw0.add(x) as *const __m256i);
+            let wv1 = _mm256_loadu_si256(pw1.add(x) as *const __m256i);
+            let wv2 = _mm256_loadu_si256(pw2.add(x) as *const __m256i);
+            let wv3 = _mm256_loadu_si256(pw3.add(x) as *const __m256i);
+            acc[0] = _mm256_add_epi32(acc[0], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv0), ones));
+            acc[1] = _mm256_add_epi32(acc[1], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv0), ones));
+            acc[2] = _mm256_add_epi32(acc[2], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv1), ones));
+            acc[3] = _mm256_add_epi32(acc[3], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv1), ones));
+            acc[4] = _mm256_add_epi32(acc[4], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv2), ones));
+            acc[5] = _mm256_add_epi32(acc[5], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv2), ones));
+            acc[6] = _mm256_add_epi32(acc[6], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv3), ones));
+            acc[7] = _mm256_add_epi32(acc[7], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv3), ones));
+            x += 32;
+        }
+        let hsum = |v: __m256i| -> i32 {
+            let mut tmp = [0i32; 8];
+            _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, v);
+            tmp.iter().sum()
+        };
+        let mut r = acc.map(hsum);
+        while x < k {
+            let a0x = a0[x] as i32;
+            let a1x = a1[x] as i32;
+            let w0x = w0[x] as i32;
+            let w1x = w1[x] as i32;
+            let w2x = w2[x] as i32;
+            let w3x = w3[x] as i32;
+            r[0] += a0x * w0x;
+            r[1] += a1x * w0x;
+            r[2] += a0x * w1x;
+            r[3] += a1x * w1x;
+            r[4] += a0x * w2x;
+            r[5] += a1x * w2x;
+            r[6] += a0x * w3x;
+            r[7] += a1x * w3x;
+            x += 1;
+        }
+        r
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_maddubs_i7_m2n4(a0: &[u8], a1: &[u8], w0: &[i8], w1: &[i8], w2: &[i8], w3: &[i8]) -> [i32; 8] {
+    [
+        dot_maddubs_i7(a0, w0),
+        dot_maddubs_i7(a1, w0),
+        dot_maddubs_i7(a0, w1),
+        dot_maddubs_i7(a1, w1),
+        dot_maddubs_i7(a0, w2),
+        dot_maddubs_i7(a1, w2),
+        dot_maddubs_i7(a0, w3),
+        dot_maddubs_i7(a1, w3),
+    ]
+}
+
 /// Quantized activation buffer for [`matmul_bias_i7_quantized`].
 ///
 /// Rows are symmetric-quantized to u8 (`amax/127`, then `+128` offset) with a
@@ -917,6 +1002,43 @@ pub fn matmul_bias_i7_quantized(x: &I7Activation, w: &I7Mat, bias: Option<&[f32]
                 // (`out ≫ in`) makes N2 a wash/slight-loss (register pressure), so
                 // this is strictly ≥ M4 on every shape. Bit-identical.
                 let mut o = 0;
+                if i7_m2n4_enabled() {
+                    while o + 4 <= out {
+                        let w0r = &w.data[o * inp..(o + 1) * inp];
+                        let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
+                        let w2r = &w.data[(o + 2) * inp..(o + 3) * inp];
+                        let w3r = &w.data[(o + 3) * inp..(o + 4) * inp];
+                        let raw01 = dot_maddubs_i7_m2n4(x0, x1, w0r, w1r, w2r, w3r);
+                        let raw23 = dot_maddubs_i7_m2n4(x2, x3, w0r, w1r, w2r, w3r);
+                        let off0 = 128 * w.colsum[o];
+                        let off1 = 128 * w.colsum[o + 1];
+                        let off2 = 128 * w.colsum[o + 2];
+                        let off3 = 128 * w.colsum[o + 3];
+                        let sc0 = w.scale[o];
+                        let sc1 = w.scale[o + 1];
+                        let sc2 = w.scale[o + 2];
+                        let sc3 = w.scale[o + 3];
+                        let (bo0, bo1, bo2, bo3) =
+                            bias.map_or((0.0, 0.0, 0.0, 0.0), |b| (b[o], b[o + 1], b[o + 2], b[o + 3]));
+                        cblk[o] = (raw01[0] - off0) as f32 * s0 * sc0 + bo0;
+                        cblk[out + o] = (raw01[1] - off0) as f32 * s1 * sc0 + bo0;
+                        cblk[2 * out + o] = (raw23[0] - off0) as f32 * s2 * sc0 + bo0;
+                        cblk[3 * out + o] = (raw23[1] - off0) as f32 * s3 * sc0 + bo0;
+                        cblk[o + 1] = (raw01[2] - off1) as f32 * s0 * sc1 + bo1;
+                        cblk[out + o + 1] = (raw01[3] - off1) as f32 * s1 * sc1 + bo1;
+                        cblk[2 * out + o + 1] = (raw23[2] - off1) as f32 * s2 * sc1 + bo1;
+                        cblk[3 * out + o + 1] = (raw23[3] - off1) as f32 * s3 * sc1 + bo1;
+                        cblk[o + 2] = (raw01[4] - off2) as f32 * s0 * sc2 + bo2;
+                        cblk[out + o + 2] = (raw01[5] - off2) as f32 * s1 * sc2 + bo2;
+                        cblk[2 * out + o + 2] = (raw23[4] - off2) as f32 * s2 * sc2 + bo2;
+                        cblk[3 * out + o + 2] = (raw23[5] - off2) as f32 * s3 * sc2 + bo2;
+                        cblk[o + 3] = (raw01[6] - off3) as f32 * s0 * sc3 + bo3;
+                        cblk[out + o + 3] = (raw01[7] - off3) as f32 * s1 * sc3 + bo3;
+                        cblk[2 * out + o + 3] = (raw23[6] - off3) as f32 * s2 * sc3 + bo3;
+                        cblk[3 * out + o + 3] = (raw23[7] - off3) as f32 * s3 * sc3 + bo3;
+                        o += 4;
+                    }
+                }
                 while o + 2 <= out {
                     let w0r = &w.data[o * inp..(o + 1) * inp];
                     let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
@@ -3341,6 +3463,41 @@ fn maddubs_i7_headmajor(
             let x3 = &xu[(r0 + 3) * inp..(r0 + 4) * inp];
             let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
             let mut o = 0;
+            if i7_m2n4_enabled() {
+                while o + 4 <= out {
+                    let w0r = &w.data[o * inp..(o + 1) * inp];
+                    let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
+                    let w2r = &w.data[(o + 2) * inp..(o + 3) * inp];
+                    let w3r = &w.data[(o + 3) * inp..(o + 4) * inp];
+                    let raw01 = dot_maddubs_i7_m2n4(x0, x1, w0r, w1r, w2r, w3r);
+                    let raw23 = dot_maddubs_i7_m2n4(x2, x3, w0r, w1r, w2r, w3r);
+                    let off0 = 128 * w.colsum[o];
+                    let off1 = 128 * w.colsum[o + 1];
+                    let off2 = 128 * w.colsum[o + 2];
+                    let off3 = 128 * w.colsum[o + 3];
+                    let (sc0, sc1, sc2, sc3) =
+                        (w.scale[o], w.scale[o + 1], w.scale[o + 2], w.scale[o + 3]);
+                    let (bo0, bo1, bo2, bo3) =
+                        bias.map_or((0.0, 0.0, 0.0, 0.0), |b| (b[o], b[o + 1], b[o + 2], b[o + 3]));
+                    put(r0, o, (raw01[0] - off0) as f32 * s0 * sc0 + bo0);
+                    put(r0 + 1, o, (raw01[1] - off0) as f32 * s1 * sc0 + bo0);
+                    put(r0 + 2, o, (raw23[0] - off0) as f32 * s2 * sc0 + bo0);
+                    put(r0 + 3, o, (raw23[1] - off0) as f32 * s3 * sc0 + bo0);
+                    put(r0, o + 1, (raw01[2] - off1) as f32 * s0 * sc1 + bo1);
+                    put(r0 + 1, o + 1, (raw01[3] - off1) as f32 * s1 * sc1 + bo1);
+                    put(r0 + 2, o + 1, (raw23[2] - off1) as f32 * s2 * sc1 + bo1);
+                    put(r0 + 3, o + 1, (raw23[3] - off1) as f32 * s3 * sc1 + bo1);
+                    put(r0, o + 2, (raw01[4] - off2) as f32 * s0 * sc2 + bo2);
+                    put(r0 + 1, o + 2, (raw01[5] - off2) as f32 * s1 * sc2 + bo2);
+                    put(r0 + 2, o + 2, (raw23[4] - off2) as f32 * s2 * sc2 + bo2);
+                    put(r0 + 3, o + 2, (raw23[5] - off2) as f32 * s3 * sc2 + bo2);
+                    put(r0, o + 3, (raw01[6] - off3) as f32 * s0 * sc3 + bo3);
+                    put(r0 + 1, o + 3, (raw01[7] - off3) as f32 * s1 * sc3 + bo3);
+                    put(r0 + 2, o + 3, (raw23[6] - off3) as f32 * s2 * sc3 + bo3);
+                    put(r0 + 3, o + 3, (raw23[7] - off3) as f32 * s3 * sc3 + bo3);
+                    o += 4;
+                }
+            }
             while o + 2 <= out {
                 let w0r = &w.data[o * inp..(o + 1) * inp];
                 let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
@@ -4180,6 +4337,31 @@ mod tests {
         assert_eq!(inline.rows, reused.rows);
         assert_eq!(inline.cols, reused.cols);
         assert_eq!(inline.data, reused.data);
+    }
+
+    #[test]
+    fn maddubs_i7_m2n4_matches_scalar_dots() {
+        let mut rng = Lcg::new(0x2a4);
+        let k = 73;
+        let a0: Vec<u8> = (0..k).map(|_| (rng.next_u32() % 256) as u8).collect();
+        let a1: Vec<u8> = (0..k).map(|_| (rng.next_u32() % 256) as u8).collect();
+        let w0: Vec<i8> = (0..k).map(|_| (rng.next_u32() % 127) as i8 - 63).collect();
+        let w1: Vec<i8> = (0..k).map(|_| (rng.next_u32() % 127) as i8 - 63).collect();
+        let w2: Vec<i8> = (0..k).map(|_| (rng.next_u32() % 127) as i8 - 63).collect();
+        let w3: Vec<i8> = (0..k).map(|_| (rng.next_u32() % 127) as i8 - 63).collect();
+
+        let got = dot_maddubs_i7_m2n4(&a0, &a1, &w0, &w1, &w2, &w3);
+        let want = [
+            dot_maddubs_i7(&a0, &w0),
+            dot_maddubs_i7(&a1, &w0),
+            dot_maddubs_i7(&a0, &w1),
+            dot_maddubs_i7(&a1, &w1),
+            dot_maddubs_i7(&a0, &w2),
+            dot_maddubs_i7(&a1, &w2),
+            dot_maddubs_i7(&a0, &w3),
+            dot_maddubs_i7(&a1, &w3),
+        ];
+        assert_eq!(got, want);
     }
 
     /// Build a natural `[out, in]` f16 weight (typed [`Float16`]) plus the exact
