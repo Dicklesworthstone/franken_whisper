@@ -3135,6 +3135,39 @@ pub fn gelu(x: &mut Mat) {
     x.data.par_chunks_mut(chunk).for_each(gelu_slice);
 }
 
+/// Fused bias-add + GELU: `x[i][j] = gelu(x[i][j] + bias[j])` in ONE pass.
+///
+/// BYTE-IDENTICAL to a separate `matmul_bias` bias pass (`x[i][j] += bias[j]`)
+/// followed by [`gelu`]: the intermediate `x[i][j] + bias[j]` is the same f32
+/// value (identical operands, identical add) and [`gelu_slice`] is elementwise +
+/// chunk-invariant (the landed f16-table GELU is `max|Δ|=0` regardless of slice
+/// boundaries). The win is ELIMINATING the separate bias pass — `matmul_bias`
+/// runs its bias RMW SINGLE-THREADED over the whole `[n_ctx, mlp_hidden]` fc1
+/// output (`[1500,5120]` = ~30 MiB, L3-borderline ⇒ partly DRAM), leaving 31
+/// cores idle, right before the (already-parallel) GELU pass over the SAME
+/// buffer. Folding the bias into the GELU's read makes it a single parallel pass.
+/// Parallel over whole-row bands so `bias[j]` alignment stays trivial.
+pub fn gelu_add_bias(x: &mut Mat, bias: &[f32]) {
+    debug_assert_eq!(bias.len(), x.cols, "gelu_add_bias: bias len != cols");
+    let cols = x.cols;
+    let add_gelu = move |band: &mut [f32]| {
+        for row in band.chunks_mut(cols) {
+            for (v, &b) in row.iter_mut().zip(bias) {
+                *v += b;
+            }
+            gelu_slice(row);
+        }
+    };
+    const PAR_THRESHOLD: usize = 1 << 15;
+    let n = x.data.len();
+    if n < PAR_THRESHOLD || worker_count() < 2 {
+        add_gelu(&mut x.data);
+        return;
+    }
+    let rows_per = x.rows.div_ceil(worker_count()).max(1);
+    x.data.par_chunks_mut(rows_per * cols).for_each(add_gelu);
+}
+
 /// Poly-exp softmax gate — shares the sampler's `FW_SIMD_EXP` env var (default OFF,
 /// an owner opt-in). When set, [`softmax_rows`] replaces the per-element scalar libm
 /// `.exp()` with an AVX2 poly (same Taylor/`ln2`-range-reduced poly family as

@@ -919,6 +919,21 @@ fn fused_ln_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FW_ENCODER_FUSED_LN").as_deref() != Ok("0"))
 }
 
+/// Default-ON gate (`FW_ENC_FC_BIAS_GELU_FUSED=0` kill-switch) for folding the
+/// **f32-path** `mlp_fc` bias-add into the subsequent GELU pass
+/// ([`nn::gelu_add_bias`]). `matmul_bias` applies the fc1 bias as a SEPARATE
+/// single-threaded RMW over the whole `[n_ctx, mlp_hidden]` output (`[1500,5120]`
+/// = ~30 MiB, L3-borderline/DRAM), immediately before the parallel GELU pass over
+/// the same buffer; the fold removes that serial pass. BYTE-IDENTICAL. Fires only
+/// on the f32 fc1 path (`mlp_fc_i7 == None`) with the separate-GELU branch — the
+/// int8 `matmul_bias_i7_gelu` path already folds GELU into fc2's quant and needs
+/// the bias resident in `h`, so it is excluded.
+fn fc_bias_gelu_fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENC_FC_BIAS_GELU_FUSED").as_deref() != Ok("0"))
+}
+
 /// Optional encoder-depth cap `FW_ENCODER_LAYERS=N` (viability probe for encoder
 /// layer-pruning). `None` (unset / unparsable / `0`) ⇒ run all layers
 /// (byte-identical default). Resolved once.
@@ -1299,17 +1314,31 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
 
     // ── MLP residual ── (same fused layer_norm-into-uninit, no clone memcpy)
     let h = et!(7, ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b));
-    let mut h = et!(8, enc_linear(&h, &layer.mlp_fc_w, &layer.mlp_fc_i7, Some(&layer.mlp_fc_b))?);
+    // f32-path fc1 bias→GELU fusion (see `fc_bias_gelu_fused_enabled`): fold the
+    // separate serial 30 MiB bias RMW into the GELU pass. Only when fc1 is f32
+    // (`mlp_fc_i7 == None`) AND the separate-GELU branch runs — the int8
+    // `matmul_bias_i7_gelu` path folds GELU into fc2's quant and needs the bias
+    // already in `h`, so it is excluded. Byte-identical.
+    let int8_gelu_path = super::enc_gelu_fused() && layer.mlp_proj_i7.is_some();
+    let fuse_fc_bias =
+        !int8_gelu_path && layer.mlp_fc_i7.is_none() && fc_bias_gelu_fused_enabled();
+    let fc_bias: Option<&[f32]> = if fuse_fc_bias { None } else { Some(&layer.mlp_fc_b) };
+    let mut h = et!(8, enc_linear(&h, &layer.mlp_fc_w, &layer.mlp_fc_i7, fc_bias)?);
     // GELU-into-fc2-quant fusion: when fc2 is the int8 maddubs path, fold the
     // GELU into the activation quant so the big `[1500, 5120]` GELU'd buffer is
     // never materialized (byte-identical; see `super::enc_gelu_fused`). Otherwise
-    // the classic separate GELU (label 9) + fc2 (label 10).
+    // the classic separate GELU (label 9) + fc2 (label 10), with the f32 fc1 bias
+    // folded into GELU when `fuse_fc_bias`.
     let h = if super::enc_gelu_fused()
         && let Some(w) = layer.mlp_proj_i7.as_ref()
     {
         et!(10, nn::matmul_bias_i7_gelu(&h, w, Some(&layer.mlp_proj_b))?)
     } else {
-        et!(9, nn::gelu(&mut h));
+        if fuse_fc_bias {
+            et!(9, nn::gelu_add_bias(&mut h, &layer.mlp_fc_b));
+        } else {
+            et!(9, nn::gelu(&mut h));
+        }
         et!(10, enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, Some(&layer.mlp_proj_b))?)
     };
     et!(11, add_in_place(x, &h));
