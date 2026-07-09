@@ -4,6 +4,70 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-08 - BlackThrush: DIG -> REJECTED (measured) - streaming JSON-to-SHA256 digest sink regresses the hottest replay-hash payload; do not retry `serde_json::to_writer` hashing for replay envelopes
+
+**Profile-first target:** after avoiding the closed audio lanes (`resample`,
+`downmix`, fused sanitize/downmix), closed pipeline `has_stage`/validation
+rows, and the already-rejected SHA-256 lowercase hex-table renderer, I profiled
+the model-free pipeline bench surface with the requested target dir. The broad
+short run identified the largest pipeline rows as raw 1 MiB SHA-256
+(`543,856 ns`), batch event logging (`82,607 ns` for 100 events), and the
+production-shaped replay JSON hash row:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release --bench pipeline_bench -- pipeline \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+
+pipeline/sha256_json/segments/1    290 ns
+pipeline/sha256_json/segments/50   6,123 ns
+pipeline/sha256_json/segments/200  23,288 ns
+```
+
+RCH selected `hz2`, timed out during remote sync, and failed open locally; this
+profile is routing/target evidence, not the final keep/reject proof. The
+production replay helper still used `serde_json::to_vec(value)` followed by
+`sha256_bytes_hex(&encoded)`, and speculative segment hashing used the same
+allocate-then-hash shape.
+
+**Alien primitive tested:** datatype-generic deterministic serialization /
+canonical hashing as a streaming transducer: serialize directly into a
+`Write` sink backed by `Sha256`, avoiding the intermediate JSON `Vec<u8>`.
+This intentionally did **not** retry the rejected lowercase hex-table renderer;
+the digest-to-hex path stayed `format!("{:x}", finalize())`. State =
+`serde_json::Value` / segment slice; action = allocating Serde buffer vs
+streaming Serde writer into the digest; loss = ns/iter with byte-identical hash
+required; fallback = original `to_vec` path.
+
+**Same-binary A/B proof (`hz1`, temporary bench rows only, reverted):**
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release --bench pipeline_bench -- pipeline/sha256_json \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+```
+
+| Bench row | legacy allocating `to_vec` | streaming digest sink | speed ratio (legacy/streaming) |
+|-----------|----------------------------|-----------------------|---------------------------------|
+| `pipeline/sha256_json/1` | 353 ns | 350 ns | **1.01x** |
+| `pipeline/sha256_json/50` | 7,611 ns | 7,220 ns | **1.05x** |
+| `pipeline/sha256_json/200` | 30,156 ns | 33,275 ns | **0.91x** |
+
+**Verdict:** REJECT + revert. The 50-segment row shows a small win, but the
+hottest profiled replay-payload row (200 segments) regresses by ~10%, and an
+earlier same-worker `ovh-a` candidate-only run was also no better than the
+2026-07-04 allocating baseline (`19,837 ns` streaming candidate vs `19,077 ns`
+historical ORIG). Do not retry `serde_json::to_writer` directly into SHA-256 for
+`sha256_json_value`, `sha256_segments`, or replay-envelope output hashes unless
+a new profile first proves a different, smaller fixed-shape payload dominates.
+
+Ratio vs LEGACY ORIGINAL: **UNCHANGED**. The temporary edits to
+`src/orchestrator.rs` and `benches/pipeline_bench.rs` were reverted; this
+docs-only entry is the retained artifact. `AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-08 - BlackThrush: DIG -> REJECTED (measured) - compact per-band buffers for batched f16 GEMV are 1.29-1.44x SLOWER than the legacy full-stride worker buffers; do not retry the allocation-shrink variant
 
 **Profile-first target:** current short per-crate profiling kept the hottest
