@@ -4,6 +4,80 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 - BlackThrush: LAND (measured) - M2xN4 i7 maddubs register tile is 1.35x faster than the legacy M4xN2 tile on the hottest shared-activation QKV row
+
+**Profile-first target:** after consulting the closed ledger axes (encoder i7
+activation quantize/round is double-rejected, attn.out residual fusion is
+cache-warm noise, GELU and SDPA gather fusions already landed, fused-wide QKV
+was rejected, reduced-cost encoder GEMMs are closed, and prefetch/huge-page
+memory levers are closed), the short native-engine profile selected the current
+model-free hot path:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/ \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+
+local fallback profile rows:
+  native_engine/i7_qkv/three_inline_quantize_1500x1280    60.180 ms
+  native_engine/i7_qkv/shared_activation_1500x1280        43.388 ms
+  native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280    38.731 ms
+```
+
+**Alien primitive kept:** register-tile axis flip from M4xN2 to M2xN4 for exact
+u8xi7 maddubs GEMM. The legacy tile spends registers on four activation rows
+and two weight rows; the kept tile spends them on two activation rows and four
+neighboring output rows, reusing each activation vector across more output
+weights. It computes the same eight integer dots, applies the same
+`dot_maddubs - 128*colsum` correction, and preserves the same per-element
+dequant/bias order. This is a cache/SIMD tile-layout primitive, not another
+quantize-round, QKV fusion, residual/GELU fusion, or numeric approximation.
+
+State/action/loss/fallback:
+- State: non-expanding i7 maddubs GEMM (`out <= inp`) in
+  `matmul_bias_i7_quantized` and the fused head-major QKV writer.
+- Action: default M2xN4 tile before the legacy M4xN2 tail.
+- Loss: ns/iter on `native_engine/i7_qkv/shared_activation_1500x1280`, with
+  exact integer dot parity.
+- Fallback: `FW_I7_M2N4=0` restores the legacy M4xN2 tile for rollback/A-B.
+
+**MEASURED vs LEGACY ORIGINAL:**
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/i7_qkv/shared_activation_1500x1280 \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 2 \
+    --output-format bencher --noplot
+
+ORIG pre-hunk legacy M4xN2, local fallback: 13.896 ms
+M2xN4 candidate, local fallback:              10.331 ms
+
+ratio vs LEGACY ORIGINAL: 1.35x faster
+
+same-binary forced legacy routing evidence:
+  FW_I7_M2N4=0 on ovh-a: 12.198 ms
+
+later local candidate under shared-box pressure:
+  M2xN4: 13.151 ms (+/- 2.984 ms), treated as noise/routing evidence only.
+```
+
+**Conformance/proof:** `maddubs_i7_m2n4_matches_scalar_dots` passes and compares
+the M2xN4 helper to scalar dots. `cargo test -p franken_whisper --test
+conformance_comparator_tests` passes 26/26. `cargo check -p franken_whisper
+--lib --tests` passes. `git diff --check -- src/native_engine/nn.rs
+src/native_engine/encoder.rs` passes. Full `cargo fmt --check`, full
+`cargo check --all-targets`, scoped clippy, and full lib tests are currently
+blocked by pre-existing unrelated repo debt/probes (format drift; unsafe probe
+example; clippy debt; `backend::tests::fallback_action_is_last_action`).
+
+**Verdict:** KEEP the default-on M2xN4 i7 maddubs tile. Ratio vs LEGACY ORIGINAL
+improves by 1.35x on the focused current hot row, with `FW_I7_M2N4=0` available
+as the deterministic fallback. AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-09 - AshHeron: DIG → REJECTED (measured, byte-EXACT but sub-noise) — **head-major read-order for the SDPA scatter (`sdpa_scatter_interleaved`) is byte-exact + ~1.05× faster COLD but sub-noise e2e — confirms BlackThrush's "scatter at bandwidth floor" (ledger 3223/3536) with the one A/B he didn't run (the SCATTER's read-order; he tested the GATHER's).** The scatter's current loop is POSITION-major (i outer, h inner): per output row it copies 20 head-blocks from `o` at a 384 KB inter-head stride = a strided READ of `o`. Reframe (the mirror of my landed gather-fusion): iterate HEAD-major (h outer, i inner) WITHIN each worker's output band ⇒ contiguous read of `o` per head (prefetcher-friendly), moving the stride to the WRITE (into the L2-resident output band, write-combined). Same partitioning + same copies ⇒ BYTE-IDENTICAL (verified both chunk counts). **MEASURED (`examples/scatter_reorder_probe`, real `[hh20,t1500,dh64,ns1280]`, 32t cold, min-of-50): chunks=16 (real default) pos-major 0.414 ms vs head-major 0.393 ms = 1.05×; chunks=0 0.750 vs 0.725 = 1.03×.** The reorder DOES help (the strided read has a real penalty), BUT: (1) the whole scatter is only ~0.414 ms/call × 32 layers ≈ 13 ms/window = ~0.8% of the 1636 ms encoder, so 1.05× on it = **~0.04% e2e** — far below the ~15 ms box-noise floor; (2) the microbench evicts `o` COLD, but in the real engine `o` is cache-WARM (the SDPA just wrote it), so the strided-read penalty (and thus the reorder benefit) is even smaller = ~wash. Not worth an nn.rs edit (esp. with a concurrent agent active in that file) for a sub-noise data-move tweak. **This RE-CONFIRMS the scatter (and gather) are at their memory floor — a necessary head↔position transpose, ~0.4 ms, mostly bandwidth — with a DIRECT read-order A/B rather than the prior by-analysis claim. CONTRAST with the gather-FUSION win (1.08×): that eliminated the gather ENTIRELY by writing head-major from the producer GEMM; the scatter has no producer to fuse into (its producer is the external SDPA), so only the ~1.05× read-order tweak remains, and it's sub-noise.** Probe kept as artifact. AGENT_NAME=AshHeron. No engine code touched (probe-only) ⇒ byte-identical to HEAD, conformance GREEN.
 
 ---
