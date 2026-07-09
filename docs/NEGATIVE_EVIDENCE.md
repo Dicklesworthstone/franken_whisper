@@ -4,7 +4,24 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
-## 2026-07-08 - AshHeron: DIG → **MECHANISM RESOLVED for the fc2 anomaly (definitive 4-way interleaved) — encoder int8 speed is NON-MONOTONIC in coverage; the killer is the int8/f32 GEMM-MIX, and exactly ONE f32 GEMM/layer is the PESSIMUM.** Verified the fc2-slower result is NOT a transient (my worry) — it REPRODUCES at exactly 1.000× in a clean single-loop 4-way interleaved A/B (jfk×3 win-1, 8 reps, min, all configs share box state):**
+## 2026-07-09 - AshHeron: LAND (gated WIN, measured) — **FULL quality-safe encoder int8 = 1.47× (`FW_ENC_ATTN_OUT_I8I32`, default OFF). REVERSES the "binary choice 1.23× safe / 1.44× unsafe" conclusion of the entry directly below: the residual-feeding `attn.out` int8 IS quality-safe if you give it 1 more weight bit (full i8 vs i7) + an i32-accumulate GEMM. The prior "error is intrinsic to the maddubs arithmetic" attribution ([[project_turbo_encoder_dominates]], line ~354 below) was WRONG.**
+
+**Root-cause correction.** Franken's encoder maddubs (`dot_maddubs_i7`, nn.rs:603) uses **i7** weight (amax/63, clamp ±63) DELIBERATELY (comment nn.rs:457) so `_mm256_maddubs_epi16` cannot i16-saturate — and it already accumulates in **i32** via `_mm256_madd_epi16`. So the long-blamed "maddubs arithmetic" is NOT saturating and NOT low-precision-accumulate. The real un-tested variable was the **1 bit of weight precision**: i7 (±63) vs i8 (±127). On the residual-feeding `attn.out` (the SOLE proper-noun culprit, 32 stacked layers compounding the error) that bit matters. Swapping `attn.out` to a full-**i8** weight (per-output-channel amax/127) + i8 symmetric activation + `vpmovsxbw`+`vpmaddwd` **i32-accumulate** GEMM (`encoder::matmul_bias_i8`, self-contained AVX2, M4-blocked) PRESERVES the proper nouns.
+
+**MEASURED (`e2e_probe large-v3-turbo`, no_ts):**
+```
+QUALITY (track01_16k.wav, f32-vs-int8 word diff, proper nouns FrankenSearch/Franco/Franken):
+  attn.out i8 ALONE (rest f32)          48 diffs   Franco/Franken/FrankenSearch ALL intact, NO "Frank at"
+  FULL {q,k,v,fc1,fc2 i7 + attn.out i8} 45 diffs   ALL intact, NO "Frank at"        ← the landed gate
+  (prior i7-maddubs attn.out)           60 diffs   → "Frank at search library"       ← the corruption
+SPEED (jfk×3 window-1 encoder_window, interleaved f32-vs-i8, min-of-5, 32t, current 64-core regime):
+  f32 baseline          2578.8 ms   1.000×
+  FULL quality-safe i8  1753.1 ms   1.471×   ← NEW quality-safe MAX (+20% over attn_in 1.23×)
+```
+All 6 GEMMs are now int8 ⇒ **0 f32 GEMMs/layer** ⇒ the fast end of the non-monotonic mix (the f32-mix pessimum only bites at exactly 1 f32 GEMM), so the quality-safe config lands at ~1.44-1.47× — the SAME fast-mix state the prior full-maddubs config reached, but WITHOUT the proper-noun drift. The slightly-slower `attn.out` vpmaddwd kernel (~2.6× the maddubs MAC rate, but `attn.out` is only ~6.5% of the encoder) is fully absorbed by the mix win. **Gate is default-OFF ⇒ byte-identical (attn_out_i8=None ⇒ f32 path untouched); non-byte-exact when ON (int8 quant) ⇒ owner-gated on a transcript A/B, exactly like the landed `attn_in` gate.** Supersedes the `attn_in` gate as the quality-safe int8 max (both remain selectable). src: `src/native_engine/{encoder.rs,mod.rs}`. AGENT_NAME=AshHeron. Conformance GREEN (OFF path unchanged). **LESSON: when a technique is "intrinsically dead," re-audit the ACTUAL kernel — the blamed mechanism (i16 saturation) was already engineered around; the real lever (i7→i8, 1 bit) was hiding under an untested assumption. Cross-crate `ft_kernel_cpu` had the i8×i8 i32-accum GEMM that made the quality test cheap.**
+
+---
+## 2026-07-08 - AshHeron: DIG → **MECHANISM RESOLVED for the fc2 anomaly (definitive 4-way interleaved) — encoder int8 speed is NON-MONOTONIC in coverage; the killer is the int8/f32 GEMM-MIX, and exactly ONE f32 GEMM/layer is the PESSIMUM.** Verified the fc2-slower result is NOT a transient (my worry) — it REPRODUCES at exactly 1.000× in a clean single-loop 4-way interleaved A/B (jfk×3 win-1, 8 reps, min, all configs share box state):** _(SUPERSEDED by the 2026-07-09 entry above: "attn_out MUST stay f32 for proper nouns" was FALSE — full i8 attn.out is quality-safe, so the quality-safe max is now the 0-f32-GEMM full config at 1.47×, not attn_in at 1.23×.)_
 ```
 f32                         2572.9ms  1.000×   (6 f32 GEMMs/layer)
 attn_in {q,k,v,fc1}         2089.1ms  1.232×   (2 f32/layer: attn_out+fc2)   ← QUALITY-SAFE MAX

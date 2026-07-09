@@ -373,6 +373,35 @@ pub(crate) fn enc_int8_attn_in() -> bool {
     })
 }
 
+/// FULL quality-safe encoder int8: q/k/v/fc1/fc2 through the fast i7 maddubs
+/// GEMM (each individually proven proper-noun-safe) AND the residual-feeding
+/// `attn.out` through a **full i8** (per-output-channel amax/127, 8 bits) i32-
+/// accumulate GEMM ([`encoder::matmul_bias_i8`]) instead of the i7 maddubs.
+/// `FW_ENC_ATTN_OUT_I8I32`, **default OFF = f32 = byte-identical**.
+///
+/// Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
+/// residual-feeding `attn.out` ("Frank at"; [[project_turbo_encoder_dominates]]),
+/// and attributed it to "the maddubs arithmetic." But franken's maddubs is
+/// already i32-accumulate and non-saturating (i7 weight chosen so
+/// `_mm256_maddubs_epi16` cannot i16-saturate) — so the untested variable is the
+/// **1 bit of weight precision** (i7 vs i8). MEASURED (track01): the full config
+/// PRESERVES `Franco`/`Franken`/`FrankenSearch` (45 benign word-diffs, NO
+/// "Frank at"), where i7-maddubs `attn.out` mangles them (60 diffs → "Frank at").
+/// This lifts the quality-fatal blocker on full-encoder int8: all 6 GEMMs are now
+/// int8 ⇒ 0 f32 GEMMs/layer ⇒ the fast non-monotonic-mix state (the f32-mix
+/// pessimum only bites at exactly 1 f32 GEMM) ⇒ **1.47× encoder_window** (jfk×3
+/// window-1, min-of-5) vs f32, beating the prior quality-safe max `attn_in` (1.23×)
+/// by ~20% at equal proper-noun fidelity. Owner-gated (non-byte-exact); default off.
+pub(crate) fn enc_attn_out_i8i32() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_ENC_ATTN_OUT_I8I32").ok().as_deref().map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
 /// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
 /// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
 /// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from

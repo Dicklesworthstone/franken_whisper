@@ -107,6 +107,12 @@ struct EncoderLayer {
     attn_out_i7: Option<nn::I7Mat>,
     mlp_fc_i7: Option<nn::I7Mat>,
     mlp_proj_i7: Option<nn::I7Mat>,
+    /// Optional cached **i8** (full 8-bit) `attn.out` weight, built ONCE at load
+    /// iff [`super::enc_attn_out_i8i32`]. Routes `attn.out` through the i8×i8
+    /// i32-accumulate GEMM ([`matmul_bias_i8`]) instead of the i7 maddubs — the
+    /// extra weight bit preserves proper nouns on this residual-feeding path.
+    /// `None` = f32/i7 path.
+    attn_out_i8: Option<EncI8Mat>,
 }
 
 /// Fully loaded, pre-transposed encoder weights for one whisper model.
@@ -460,6 +466,7 @@ impl EncoderWeights {
                     attn_out_i7: None,
                     mlp_fc_i7: None,
                     mlp_proj_i7: None,
+                    attn_out_i8: None,
                 })
             })
             .collect::<FwResult<Vec<_>>>()?;
@@ -488,6 +495,21 @@ impl EncoderWeights {
                 l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
                 l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+            });
+        } else if super::enc_attn_out_i8i32() {
+            // FULL quality-safe int8: q/k/v/fc1/fc2 through the fast i7 maddubs
+            // (each individually proven proper-noun-safe), and the residual-feeding
+            // attn.out through the FULL-i8 i32-accumulate GEMM (the 1 extra weight
+            // bit vs i7 preserves proper nouns where i7 maddubs mangles them). This
+            // yields 0 f32 GEMMs/layer — the fast non-monotonic-mix state — at
+            // proven-safe quality. `FW_ENC_ATTN_OUT_I8I32`, default OFF.
+            layers.par_iter_mut().for_each(|l| {
+                l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
+                l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
+                l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
+                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+                l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
+                l.attn_out_i8 = Some(quantize_enc_i8(&l.attn_out_w));
             });
         } else if super::enc_int8_fc1_only() {
             // fc1-ONLY int8 (maddubs): apply the PROVEN decode `mlp_0`/fc1-only recipe
@@ -949,6 +971,152 @@ fn enc_linear(
     }
 }
 
+/// Cached per-output-channel **i8** weight for the encoder `attn.out` GEMM
+/// (gated by [`super::enc_attn_out_i8i32`]). `data` is `[out, inp]` row-major i8
+/// (per-output-channel amax/127, FULL 8 bits — the extra bit vs franken's i7
+/// maddubs is what preserves proper nouns on the residual-feeding `attn.out`;
+/// see the flag doc), transposed once at load from franken's `[inp, out]` `w_t`.
+#[derive(Debug, Clone)]
+struct EncI8Mat {
+    data: Vec<i8>,
+    scale: Vec<f32>,
+    inp: usize,
+    out: usize,
+}
+
+/// Quantize franken's `[inp, out]` weight (element `[i*out + o]`) to a cached
+/// `[out, inp]` i8 matrix, per-output-channel symmetric (amax/127). One-time load
+/// cost, parallel over output channels (disjoint rows ⇒ order-invariant).
+fn quantize_enc_i8(w_t: &Mat) -> EncI8Mat {
+    let inp = w_t.rows;
+    let out = w_t.cols;
+    let mut data = vec![0i8; out * inp];
+    let mut scale = vec![0.0f32; out];
+    data.par_chunks_mut(inp)
+        .zip(scale.par_iter_mut())
+        .enumerate()
+        .for_each(|(o, (drow, s))| {
+            let mut amax = 1e-9f32;
+            for i in 0..inp {
+                amax = amax.max(w_t.data[i * out + o].abs());
+            }
+            let sc = amax / 127.0;
+            *s = sc;
+            let inv = 1.0 / sc;
+            for (i, d) in drow.iter_mut().enumerate() {
+                *d = (w_t.data[i * out + o] * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        });
+    EncI8Mat { data, scale, inp, out }
+}
+
+/// AVX2 i8×i8 → i32 dot (vpmovsxbw + vpmaddwd, 2 accumulators; sign-extend both
+/// operands so there is NO `_mm256_maddubs_epi16` i16-saturation constraint —
+/// this is why the weight can be full i8, unlike franken's i7 maddubs). A private
+/// copy of `nn::dot_i8` (which is not `pub`), kept self-contained in encoder.rs to
+/// avoid touching the shared-tree `nn.rs`. Integer-exact.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8_enc(w: &[i8], x: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    let n = w.len();
+    let (wp, xp) = (w.as_ptr(), x.as_ptr());
+    // SAFETY: avx2 is a base target feature; every 128-bit load is bounded by the
+    // `i+32<=n` / `i+16<=n` guards; the `<16` tail runs scalar. Bit-identical to
+    // the scalar reduction (integer add is order-independent).
+    unsafe {
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 32 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+            let x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i + 16) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(w1, x1));
+            i += 32;
+        }
+        while i + 16 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            i += 16;
+        }
+        let s = _mm256_add_epi32(a0, a1);
+        let lo = _mm256_castsi256_si128(s);
+        let hi = _mm256_extracti128_si256::<1>(s);
+        let q = _mm_add_epi32(lo, hi);
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+        let mut acc = _mm_cvtsi128_si32(q);
+        while i < n {
+            acc += (*w.get_unchecked(i) as i32) * (*x.get_unchecked(i) as i32);
+            i += 1;
+        }
+        acc
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_i8_enc(w: &[i8], x: &[i8]) -> i32 {
+    w.iter().zip(x).map(|(&a, &b)| a as i32 * b as i32).sum()
+}
+
+/// Affine projection `x @ w^T (+ bias)` via an i8×i8 i32-accumulate GEMM (the fast
+/// path for the quality-safe `attn.out` int8 — see [`EncI8Mat`]). Activation is
+/// per-row i8-symmetric-quantized (amax/127) inline; the GEMM is M4-register-
+/// blocked (each weight row streamed once per 4 activation rows) and parallel over
+/// row-blocks. NON-byte-exact vs f32 (int8 quantization) but quality-safe on
+/// proper nouns (validated on track01).
+fn matmul_bias_i8(x: &Mat, w: &EncI8Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
+    let m = x.rows;
+    let inp = x.cols;
+    let out = w.out;
+    if inp != w.inp {
+        return Err(FwError::InvalidRequest(format!(
+            "matmul_bias_i8: x.cols {inp} != w.inp {}",
+            w.inp
+        )));
+    }
+    // Per-row i8 symmetric activation quant.
+    let mut xq = vec![0i8; m * inp];
+    let mut sa = vec![0.0f32; m];
+    xq.par_chunks_mut(inp)
+        .zip(sa.par_iter_mut())
+        .enumerate()
+        .for_each(|(r, (xr_i8, s))| {
+            let xr = &x.data[r * inp..(r + 1) * inp];
+            let amax = xr.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let rs = amax / 127.0;
+            *s = rs;
+            let inv = 1.0 / rs;
+            for (d, &v) in xr_i8.iter_mut().zip(xr) {
+                *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        });
+    // M4-blocked GEMM: weight row loaded once per block of 4 activation rows.
+    let mut c = vec![0.0f32; m * out];
+    c.par_chunks_mut(4 * out).enumerate().for_each(|(blk, cblk)| {
+        let r0 = blk * 4;
+        let rows = (m - r0).min(4);
+        for o in 0..out {
+            let wr = &w.data[o * inp..(o + 1) * inp];
+            let sc = w.scale[o];
+            let bo = bias.map_or(0.0, |b| b[o]);
+            for j in 0..rows {
+                let r = r0 + j;
+                let xr = &xq[r * inp..(r + 1) * inp];
+                let dot = dot_i8_enc(wr, xr);
+                cblk[j * out + o] = dot as f32 * sa[r] * sc + bo;
+            }
+        }
+    });
+    Ok(Mat::from_vec(m, out, c))
+}
+
 fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<()> {
     let measure = crate::native_engine::perf_spans_enabled();
     macro_rules! et {
@@ -991,7 +1159,11 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     let attn = et!(4, nn::attention(&q, &k, &v, n_head, None)?);
     let attn = et!(
         5,
-        enc_linear(&attn, &layer.attn_out_w, &layer.attn_out_i7, Some(&layer.attn_out_b))?
+        if let Some(w8) = &layer.attn_out_i8 {
+            matmul_bias_i8(&attn, w8, Some(&layer.attn_out_b))?
+        } else {
+            enc_linear(&attn, &layer.attn_out_w, &layer.attn_out_i7, Some(&layer.attn_out_b))?
+        }
     );
     et!(6, add_in_place(x, &attn));
 
