@@ -4,6 +4,42 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 - BlackThrush: DIG -> REJECTED (measured, reverted) - coarse Rayon splitting for `matmul_bias_i7_quantized` row blocks regresses the hottest i7 QKV row
+
+**Profile-first target:** consulted this ledger first and avoided the closed lanes: allocator/buffer reuse and jemalloc, decoder fused-LN, remaining f32 bias-folds, f16 M2col/M3col/weight-stationary routes, int8-batch 2col, i7 uninit output, branch specialization, quantize/round, QKV fusion, maddubs tile variants, and L2/prefetch data-movement variants. The fresh short native-engine profile routed the live model-free target to the current i7 QKV surface:
+
+```text
+AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/whisper-cod \
+  rch exec -- cargo bench --profile release -p franken_whisper \
+    --bench native_engine_bench -- native_engine/ \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+    --output-format bencher --noplot
+
+vmi1293453 profile rows (path-selection only):
+  native_engine/i7_qkv/three_inline_quantize_1500x1280   23.022606 ms
+  native_engine/i7_qkv/shared_activation_1500x1280       25.174067 ms
+  native_engine/f16_gemv/f16_gemv_batch_1500x1280x1280   21.236689 ms
+```
+
+**Primitive tried:** a scheduler-only alien primitive for the exact current M4/M2xN4 maddubs kernel: add a cached `FW_I7_ROWBLOCK_MIN_LEN` knob and set the default to `8`, applying `with_min_len(8)` to the existing `c.par_chunks_mut(4 * out)` iterator. This was deliberately **not** another dot tile, quantizer, output allocation, or bias branch specialization. The logical 4-row work item, all dot functions, f32 dequant expression order, and output writes stayed unchanged; only Rayon split/coarsening changed. `FW_I7_ROWBLOCK_MIN_LEN=1` restored the legacy per-block split for A/B.
+
+**MEASURED vs LEGACY ORIGINAL:** the decisive focused A/B ran on the same `hz2` RCH worker with the same release profile and bench filter:
+
+```text
+candidate coarse split (FW_I7_ROWBLOCK_MIN_LEN default 8, hz2):
+  three_inline_quantize_1500x1280   15.736250 ms (+/- 0.510924 ms)
+  shared_activation_1500x1280       14.254501 ms (+/- 0.288863 ms)
+
+legacy original split (FW_I7_ROWBLOCK_MIN_LEN=1, hz2):
+  three_inline_quantize_1500x1280   12.792196 ms (+/- 1.303891 ms)
+  shared_activation_1500x1280       11.520114 ms (+/- 0.532579 ms)
+
+ratio vs LEGACY ORIGINAL on hottest current row: 0.808x
+```
+
+**Verdict:** reject and do not re-dig coarse Rayon split hints (`with_min_len`, larger row-block batches, or `FW_I7_ROWBLOCK_MIN_LEN`-style knobs) for `matmul_bias_i7_quantized`. The existing fine-grained 4-row iterator is not scheduler-bound; coarsening reduces useful load balance and regresses both i7 QKV rows. Source reverted cleanly to HEAD; docs-only rejection. Conformance GREEN (`cargo test --profile release -p franken_whisper --test conformance_comparator_tests`, RCH `hz2`: 26 passed, 0 failed). AGENT_NAME=BlackThrush.
+
+---
 ## 2026-07-09 - BlackThrush: DIG -> REJECTED (measured, reverted) - const-specializing `matmul_bias_i7_quantized` on bias/no-bias is 0-gain on the shared-activation i7 QKV row
 
 **Profile-first target:** consulted this ledger first and avoided the closed lanes: allocator/buffer reuse and jemalloc are dead on a quiet box, decoder fused-LN is size-gated dead, f32 bias-folds are exhausted, M2col/M3col/weight-stationary f16 tiles are closed, int8-batch 2col is already landed, uninitialized i7 output buffers are already landed, and quantize/round/QKV-fusion/maddubs tile variants are mined. The usable hot model-free row remained the current i7 shared-activation QKV path:
