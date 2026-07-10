@@ -4,6 +4,75 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **ROOFLINE of the int8 encoder GEMM — COMPUTE-bound at ~60% of ISA-capped peak.** So cod's M4×N4 tile IS the right lever (not a memory wall), but in-crate headroom is ~1.4–1.6×; beyond that needs GPU/VNNI (owner/hardware). Plus a **companion owner-gated SDPA lever** and a coordination hand-off to cod.
+
+**PROVENANCE.** `e2e_probe` sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
+turbo, `FRANKEN_WHISPER_PERF_SPANS` (per-layer from the 32-layer window). **Worker LOCAL** (5975WX,
+32c) — roofline/profile, not an A/B, so no null-control applies. No build; disk 74 G.
+
+### Roofline — is the ~28% i7 GEMM improvable in-crate, or at the wall?
+| GEMM (per layer) | time | MACs | achieved | arithmetic intensity |
+|---|---|---|---|---|
+| `mlp_fc` (fc1) `[1500,1280]×[1280,5120]` | 7.86 ms | 9.83 G | **1.25 TMAC/s** | **1500 MAC/weight-byte** |
+| `mlp_proj` (fc2) `[1500,5120]×[5120,1280]` | 7.83 ms | 9.83 G | **1.25 TMAC/s** | 1500 MAC/weight-byte |
+
+int8 maddubs peak (1 `vpmaddubsw`/cyc/core × 32 MAC/instr × 32c @ 2.02 GHz all-core-throttled) ≈
+**2.07 TMAC/s** ⇒ **achieved ≈ 60% of peak.** AI ≈ 1500 ≫ the ~0.08 MAC/byte ridge ⇒ **firmly
+compute-bound, not memory-bound.**
+
+**Consequence (the actionable part for cod):** the i7 GEMM is *not* at a bandwidth wall, so a better
+register tile CAN help — cod's **M4×N4 lane-packed maddubs** targets exactly the non-MAC overhead
+(the kernel is **12% MAC-dense**, `perf annotate`-confirmed: 9 `vpmaddubsw` of ~75 vector ops).
+Nominal headroom to peak ~**1.65×**, but two hard caps sit below it: (1) the
+`vpmaddubsw→vpmaddwd→vpaddd` **widening chain** (3 ports/32-MAC group; **no AVX512-VNNI** on Zen3, so
+`vpdpbusd` — which would make it 1 op — is unreachable, [[project_isa_baseline]]); (2) the **all-core
+frequency throttle** (~2.0 GHz @ 32c, [[project_encoder_wall_is_clock_throttle]]). **Realistic
+in-crate ceiling ≈ 1.4–1.6×** on this ~28% frame ⇒ ~1.1–1.15× e2e if fully captured.
+
+### STRATEGIC SURFACE (for the owner)
+The turbo encoder is ~90% GEMM (**i7 int8 ~28% + external `matrixmultiply` f32 sgemm 14% + SDPA
+sgemm inside the 37.8%**), and **every piece is compute-bound at ~60% of a throttled, VNNI-less
+peak.** So the CPU encoder is near its **practical ISA ceiling**: in-crate kernel work (cod's tile,
+the reopened dispatch-coarsening, a better f32 microkernel) is worth ~1.1–1.3× e2e in aggregate, but
+**the large remaining multiplier is a hardware move** — GPU offload (the Metal path exists for
+macOS; CUDA is nouveau-blocked here, [[project_gpu_present_no_compute_stack]]) or AVX512-VNNI
+silicon. That is the owner's decision; the CPU kernels cannot be tweaked past ~1.5×.
+
+### COMPANION owner-gated SDPA lever (my lane) — surfaced alongside poly-exp
+Post-poly, `sdpa_forward_f32` (the 37.8% "true SDPA", ft_kernel_cpu — **mine**) is ~64% external
+`matrixmultiply` sgemm. The `gemm 0.19` crate measured **1.115× on the full SDPA kernel / ~1.19× on
+its sgemm** (`sdpa_gemm_ab`, early-session, 7 ABBA reps — **pre-null-control-discipline**, so re-run
+under the median-null gate before quoting as final). That is ~24% of the encoder × 1.19× ⇒ **~3–4%
+e2e**, and 11.5% on a ~470 ms kernel is very likely **above** the (tight, large-op) null floor.
+**Not landed:** it needs `gemm` + its tree (gemm-f16/c32/c64, bytemuck, dyn-stack, num-complex,
+half, zerocopy) added to **shared `ft_kernel_cpu`**, and it is **non-byte-exact** (rel 3.8e-7,
+transcript-safe but not bit-identical). Same class of decision as poly-exp ⇒ **owner call**, behind
+a default-off gate. I did **not** add the dep unilaterally to a shared crate. Recommend pairing this
+decision with the poly-exp one (`docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`).
+
+### COORDINATION — cod_fw (active on i7 per `a24e8d4`)
+`nn.rs` is clean but reserved for your M4×N4 work; I profiled read-only and touched nothing. The
+roofline says your tile has a real, compute-bound target (60%→peak). Two adjacent, **byte-exact**,
+null-control-ready levers, both in the GEMM *wrapper* not the dot (so lower collision with your tile
+work — but still your call since they share `matmul_bias_i7_quantized`):
+1. **`FW_I7_ROWBLOCK_MIN_LEN` coarsening** (`bd-i7-rows-gated-and-substrate-invalid-o0bu`, reopened):
+   targets the **9.91% rayon dispatch** frame. Prior 0.808× REJECT was two-invocation/substrate-
+   invalid — re-measure on the ABBA + per-shape null harness (`sdpa_br.rs`, frankentorch `2ba080ba`,
+   is the template; needs a runtime setter since `FW_I7_ROWBLOCK_MIN_LEN` is a `OnceLock` env read).
+2. **Hoist the per-GEMM `gemv_out_buf` `malloc`/`free` + the `OnceLock` reads** out of the per-call
+   setup (confirmed in the annotate: the setup does zero arithmetic).
+
+### My lane status: no un-surfaced in-crate lever remains
+poly-exp (decidable, ~7–25× floor) → owner. SDPA-sgemm swap (this entry) → owner. BR → withdrawn
+(inside floor). sc/out alloc → rejected 0.5%. int8 SDPA → dead. gemm-swap on linears → closed.
+Non-GEMM residual lane → closed (mel/tokenizer/beam/KV all <0.25%). **This is a `surface`: the
+decidable wins are with the owner and the int8 GEMM belongs to cod; refusing to chase the sub-floor
+int8 frames I don't own is the correct outcome under the median-null discipline.**
+
+AGENT_NAME=cc_fw. No source changed (roofline/profile + surface). No build; disk 74 G; nothing
+stashed or deleted; `nn.rs`/`benches` untouched.
+
+---
 ## 2026-07-10 - cc_fw: **ISA-BASELINE CHECK (fleet-wide). franken_whisper SHIPS AVX2 — question CLOSED, no compile-target gap in the product.** But **frankentorch's own bench/test builds default to SSE2 on AVX2 workers**, and **`rch` strips `RUSTFLAGS`** so the fix must be a committed `.cargo/config`. My session's GEMM-lever conclusions are **baseline-robust** (verified). Diagnostic landed: frankentorch `37ee5949` (`examples/isacheck`).
 
 **MEASURED** (`RCH_REQUIRE_REMOTE=1`, no local build; `cfg!(target_feature)` = compile baseline,
