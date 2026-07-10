@@ -4,6 +4,51 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **CC-LANE FRONTIER SUMMARY (SDPA / int8-SDPA / encoder-non-GEMM / mel / VAD) — one consolidated record. HOLDING.**
+
+The cc byte-exact lane is at its frontier. Encoder, decode, mel, VAD, and KV paths are closed or
+cross-lane. This entry consolidates what shipped, what was rejected (with commit IDs), and what
+remains gated, so no future agent re-surveys the vein.
+
+### SHIPPED (measured, verified remote, WER/output proven neutral)
+| lever | repo / commit | result |
+|---|---|---|
+| **FT_SDPA_POLY_EXP default-on for large-v3-turbo** | franken `94714c1` (setter frankentorch `1fb80836`; gate/budget `b13eeb36`/`d336dc58`) | **1.0722× e2e** (cv 0.8%, 5/5), transcript byte-identical jfk×1/3/8, WER Δ 0.000; tiny.en OFF |
+| 2-D tile the large-K reused-output sgemm (F32_2D_TALL_MAX_K 1536→8192) | frankentorch `8e3e7c9d` | bit-exact, 1.057× fc2 (benefits f32-sgemm consumers; franken turbo is int8) |
+| decouple SDPA row-block split guard from BR (latent scheduler bug) + runtime BR knob | frankentorch `0fef5755` | bit-exact, default-identical |
+| runtime tile-grid policy + `set_sdpa_flat_par`-class knobs | frankentorch `86a54f1a` | bit-exact, gated |
+| **A/B methodology**: ABBA harness + median-vs-null gate + admissibility guard + ISA probes | frankentorch `c870a4d4` `2ba080ba` `e959c67e` `37ee5949` `3b8cdebc` | fleet-adopted null-control discipline |
+| bd-0522 HF-token honesty fix (native diarize not gated on a token it never uses) | franken `84afe64` | benchmark-honesty prerequisite; 643 backend tests green |
+
+### REJECTED / FALSIFIED (measured against a paired null control; do not retry unless the retry-condition holds)
+| reject | commit | why |
+|---|---|---|
+| bd-4hc0 `matrixmultiply→gemm` swap (was "P0, 3.75×") | franken `2bbff39` `fe97df1` | **FALSIFIED** — 1.00–1.07× on the REAL ft path, 0.934× at 16t; the "3.75×" measured code the engine never runs |
+| SDPA **BR tile** sweep | franken `a410602` `efacdf8` `bbe6ed0` | median 1.0305×, inside null [0.9384,1.0455]; bit-exact but undecidable |
+| SDPA **flat-vs-nested rayon** | franken `59b77db` | median 1.0128×, inside null [0.9465,1.0276]; the 35% tiny.en rayon cost is aggregate small-op dispatch, not SDPA nesting |
+| **f16-GEMV** fc2-prefill scheduler | franken `d6168ce` `ca2edb2` | fc2 medians inside floor; at tq=100 row-morsel is *faster* — the gate I proposed would have regressed it |
+| softmax pass-elimination / scale-fold / reciprocal | franken `91b44b1` (+ledger) | +3.9 ms/window, sc L2-resident so fusion buys nothing |
+| int8-SDPA (scores/out) | ledger 2026-07-04 | 0.14×/0.77× — d_head=64 thin dim, quant overhead > tiny f32 time |
+| SDPA sc/out alloc, LN, residual, conv, mel, VAD, constant-recompute hunt | `55df007` (fraction math) | below-floor / faithfulness / DRAM-floored / cached / bridge-only |
+
+Self-corrections logged (integrity): the "SDPA not exp-bound" closure (falsified — exp is 23.7% of
+the kernel), the i7 "0% self-time" mis-audit (`44833c2` — it's ~28%, default-on), the "9.91% dequant
+epilogue" mislabel (`3910c9c` — it's rayon dispatch), the cv<5 gate (`bbe6ed0` — unreachable; median
+gate adopted), and the BR overclaim withdrawal.
+
+### GATED — the only remaining cc-relevant levers (NOT one-cycle byte-exact; require owner/cod/hardware)
+1. **SDPA-sgemm `gemm`-crate swap** — ~1.12× on the SDPA frame (~3% e2e), WER-neutral (rel 3.8e-7)
+   but not byte-identical; needs the `gemm` dep tree in shared `ft_kernel_cpu`. **Owner ship/skip.**
+2. **cod's M4×N4 i7 tile** — the ~28% encoder frame, compute-bound at ~60% of the measured maddubs
+   peak (`3b8cdebc`), ~1.4–1.6× headroom. **cod's lane.**
+3. **Draft/speculative decoding** — R(8)≈3.7×, output-identical, needs an owner-supplied draft model.
+4. **Hardware** — GPU offload / AVX512-VNNI (`vpdpbusd` collapses the i7 widening chain; Zen3 has none).
+5. **frankentorch bench-harness AVX2 config** (`3db5a82`) — owner-gated on FMA vs 3 golden-f32 asserts.
+
+**HOLDING.** The cc byte-exact lane is exhausted; this is the terminal record. AGENT_NAME=cc_fw.
+No source changed. No build (analysis-only); rch not needed, no local fallback. disk 76 G.
+
+---
 ## 2026-07-10 - cc_fw: **TERMINAL CLOSURE — encoder/mel/VAD (cc byte-exact lane) cannot yield a median-floor-clearing lever. The math, not just assertion.** The one remaining decidable encoder-attention lever (SDPA-sgemm gemm-swap) is owner-gated; everything else is below-floor, closed, or cod's.
 
 Every frame in this lane, with its ceiling (turbo spans, `e2e_probe` sha256 272102fd..., int8 default):
