@@ -4,6 +4,25 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **SHIPPED — FT_SDPA_POLY_EXP default-on for large-v3-turbo (franken `94714c1`, bd-bcm7 CLOSED).** The convergence loop's one qualifying lever, owner-authorized and landed.
+
+The byte-exact CPU survey converged to REJECT (BR/flat-par inside the null floor). The single lever
+meeting "measured median win + WER unchanged" was poly-exp for turbo — proven last cycle (transcript
+byte-identical jfk ×1/×3/×8, WER Δ 0.000, e2e **1.0722×** cv 0.8% 5/5, ~7× the null floor). Owner
+authorized the default flip.
+
+**Landed** (native_engine, not nn.rs): `Encoder::from_ggml` → `configure_sdpa_poly_exp(hparams)` →
+`ft_kernel_cpu::set_sdpa_poly_exp(is_large_v3_turbo && !FW_SDPA_POLY_EXP=0 || FT_SDPA_POLY_EXP=1)`,
+set explicitly per load (no turbo→tiny.en leak). **tiny.en stays OFF** (uncertified). `is_large_v3_turbo`
+extracted + unit-tested (turbo→on, tiny.en→off, unknown→off); `native_engine::encoder` 13/0; verified
+remotely, no local build. Default turbo transcripts change only to a transcript already proven
+byte-identical ⇒ transcript- and WER-neutral. Kill-switch `FW_SDPA_POLY_EXP=0`.
+
+**This is the campaign's first shipped e2e win of the convergence loop** (~1.07× turbo). The rest of
+the map (`b4629f3`) is unchanged: cod's M4×N4 tile + packed-K, draft decoding, the SDPA-sgemm swap,
+GPU/VNNI — all cross-lane/owner/hardware.
+
+---
 ## 2026-07-10 - cod_fw: **SURFACE — strict remote RCH blocked the decoder/KV-cache median gate before Cargo ran; packed self-K remains unmeasured, neither shipped nor rejected.**
 
 Profile-first routing found the hottest still-open decoder/KV-cache production symbol at
