@@ -79,6 +79,17 @@ issue_122_check_isnull_precedence.rs: required package source entrypoint is miss
 [RCH] remote required; refusing local fallback
 ```
 
+Strict retry on current `main` (`533347d`) selected `hz2` and failed earlier during project sync:
+
+```text
+sync_to_remote: timed out after 30000ms
+[RCH] local (remote execution failed)
+[RCH] remote required; refusing local fallback (remote execution failed)
+```
+
+The strict flag prevented the announced fallback; Cargo again never ran. The changed failure mode
+does not supply a candidate median, production-symbol self-time, or WER evidence.
+
 **Decision:** SURFACE. No Cargo benchmark ran, no local fallback ran, and therefore no admissible
 candidate median or WER/conformance result exists. This is not a performance rejection. Retry only
 after the remote dependency closure contains the missing source entrypoint; then require a valid
