@@ -4,6 +4,99 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **PROFILE INSIDE THE int8 ENCODER PATH.** Top span is **`attn_sdpa` 44.6%** — and it is *not* what it looks like: `enc_qkv_fused` folds the i7 **QKV GEMM** into it, which is why `qkv_proj` has vanished from the span table. Top flat frame is `dot_maddubs_i7_m2n4` (**14.63% self**), whose inner loop is only **12% MAC ops**. **The non-GEMM lane is CLOSED — ledgered here so nobody re-mines it.**
+
+**PROVENANCE / LEDGER METADATA (per the new rules).**
+binary `examples/e2e_probe`, **sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`**,
+mtime 2026-07-10 00:47:02, profile `release-perf`; `git log -1 -- src/` = **`a997f37`** (binary ==
+current source). **Worker: LOCAL** (AMD Threadripper PRO 5975WX, 32 physical cores, x86-64-v3) —
+this is a profile, not an rch A/B, so no worker id applies and no ratio is claimed. **No cargo
+build.** Disk 77 G before and after. `perf record -F 299` flat + `-F 199 --call-graph=dwarf` (the
+dwarf unwind was **useless** on this kernel — heavy inlining makes it report `dot_maddubs_i7_m2n4`
+calling itself; do not trust dwarf callers through an inlined AVX kernel). **cv:** n/a for a
+profile; the one ratio quoted below (e2e poly ON/OFF) carries **cv 0.8%**.
+
+### 1. Encoder sub-op spans, turbo, `FRANKEN_WHISPER_PERF_SPANS=1` (window 1, sum over 32 layers)
+| sub-op | ms | % of encoder |
+|---|---|---|
+| **`attn_sdpa`** | **626.7** | **44.6%** |
+| `mlp_fc` | 251.4 | 17.9% |
+| `mlp_proj` | 250.7 | 17.8% |
+| `attn_out` | 141.2 | 10.0% |
+| `conv_stem` | 30.5 | 2.2% |
+| `mlp_resid` / `attn_resid` / `mlp_ln` / `attn_ln` / `pos_emb` | 104.2 | 7.5% |
+| **SUM** | **1405.6** | |
+
+**`qkv_proj` is ABSENT, and that is the finding.** `enc_qkv_fused` (default-ON *within* the int8
+path) fuses the three i7 QKV GEMMs into `nn::attention_from_i7_qkv`, writing q/k/v head-major and
+feeding `sdpa_forward_f32` directly. So the QKV GEMM's time is **billed to `attn_sdpa`**.
+**`attn_sdpa` at 44.6% is therefore i7-QKV-GEMM + gather + external SDPA + scatter — not "SDPA".**
+Anyone reading the span table as "SDPA is 45% of the encoder" is reading it wrong.
+
+### 2. Flat self-time inside the int8 path (turbo, jfk×8, load amortized)
+| % self | frame | what it is |
+|---|---|---|
+| **14.63** | `nn::dot_maddubs_i7_m2n4` | the i7 maddubs dot kernel (M2×N4 tile) |
+| 9.91 | `nn::matmul_bias_i7_quantized::{closure#0}` | the GEMM's rayon body *outside* the dot (epilogue: dequant/scale/bias/store + loop) |
+| 5.86 | `__expf_fma` | SDPA softmax exp — **removed by the recommended `FT_SDPA_POLY_EXP`** |
+| 5.60 | `sdpa_forward_f32::{closure#0}` | external SDPA |
+| 2.74 | `encoder::matmul_bias_i8::{closure#1}` | `attn.out` full-i8 i32-accumulate GEMM |
+| 0.88 | `nn::quantize_act_i7::{closure#0}` | per-window activation quantization |
+⇒ **i7 int8 encoder GEMM ≈ 28.2%** of e2e self-time; external `matrixmultiply` sgemm 14.31%.
+
+### 3. Mechanism inside the top frame — `dot_maddubs_i7_m2n4` is ~12% MAC-dense
+`perf annotate` instruction census of the kernel body:
+| op | count | role |
+|---|---|---|
+| `vpaddd` | 24 | i32 accumulate |
+| `vmovdqu` | 18 | loads |
+| `vpxor` | 15 | zero / sign handling |
+| **`vpmaddubsw`** | **9** | **the actual i8 MAC** |
+| `vpmaddwd` | 9 | widen i16 → i32 |
+| `vzeroupper` / `cmp` / `add` / `jne` | 19 | overhead |
+
+**Only 9 of ~75 vector ops do arithmetic on the data.** Zen3 has **no AVX512-VNNI**, so the
+`vpmaddubsw → vpmaddwd → vpaddd` widening chain (3 vector ops per 32 MACs) is **structural, not a
+coding defect**: a single `vpdpbusd` would replace all three. This is a **hardware-gated ceiling**,
+not an in-crate one. The ~2.7 `vpaddd` per `vpmaddubsw` reflects the M2×N4 tile's 8 accumulators.
+
+### 4. Verifying the closures that gate this 14.63% frame (per the ledger-integrity rule)
+* **`M2xN4` is NOT a closed lever — it is a LANDED WIN** (2026-07-09, 1.35× vs the legacy M4xN2)
+  and is the tile currently executing (`FW_I7_M2N4`, default-on). Reading it as a do-not-retry row
+  would be a category error.
+* **`i5 delayed-widening` (2026-07-04, MEASURED-DEAD 0.56–0.83×)** was measured **against the older
+  M4xN2 tile**, five days before M2xN4 landed — a **stale baseline**. But the closure survives
+  *a fortiori*: delayed widening lost to the **slower** tile, so it loses harder to the faster one.
+  **Retry-condition:** only if the tile's accumulator pressure changes (delayed widening's whole
+  premise is spare i16 accumulators). Not reopened.
+
+### 5. What this means, and who owns what
+* **`attn_sdpa` (44.6%) is the largest span and is in the SDPA lane (mine).** Its `__expf_fma`
+  (5.86% e2e) is exactly what the recommended `FT_SDPA_POLY_EXP` removes — turbo transcript
+  **byte-identical 3/3**, WER Δ **0.000**, e2e **1.0722× at cv 0.8%, 5/5 paired wins**. See
+  `docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`. **The owner decides; I have not flipped it.**
+* **`mlp_fc` + `mlp_proj` + `attn_out` = 45.7% of the encoder** and are **non-SDPA int8 execution
+  ⇒ cod_fw's lane.** Handing over with numbers rather than touching their kernel:
+  bd-non-gemm-lane-empty-turbo-x67v. The honest headline for them: the i7 dot kernel is ~12%
+  MAC-dense and the widening chain is a Zen3 ISA limit; the *reducible* part is the **9.91%**
+  epilogue in `matmul_bias_i7_quantized::{closure#0}` — 68% of the dot kernel's own cost, spent
+  outside the dot.
+* **Hardware lever, surfaced not attacked:** `vpdpbusd` (AVX512-VNNI) collapses 3 vector ops into
+  1 for every 32 MACs, on a Zen4/Sapphire-Rapids host. This box is Zen3. Owner/infra-gated.
+
+### 6. THE NON-GEMM RESIDUAL LANE IS CLOSED — do not re-mine it
+Same binary + sha, turbo, jfk×8, in-situ self-time: **`mel` 0.00% · `tokenizer` 0.00% ·
+beam-search 0.00% · KV-cache 0.00%.** The only franken frames outside GEMM/SDPA/rayon are
+`DecoderState::new::{closure#4}` **0.23%** and `Linear::dequant_to_f32_if` **0.01%**;
+`nn::softmax_rows` is **0.02%**. Two trap notes for whoever checks this: **`grep beam` matches
+CROSSbeam** (that is rayon, not beam search), and `mel` shows 4.65 ms cumulative in the span
+summary — 0.3% of a 1.65 s encoder window. **There is no lever in `mel.rs`, the tokenizer, beam
+search, or the KV cache on large-v3-turbo. This row exists so nobody spends another cycle there.**
+
+AGENT_NAME=cc_fw. No source changed; profile + recommendation doc only. No cargo build, no maturin,
+nothing deleted, nothing stashed.
+
+---
 ## 2026-07-10 - cc_fw: **FT_SDPA_POLY_EXP GATE RUN — turbo transcript BYTE-IDENTICAL 3/3, WER ON ≤ OFF on BOTH models, e2e turbo 1.0722× (cv 0.8%, 5/5 paired wins). PROPOSE DEFAULT-ON FOR large-v3-turbo.** Plus: **the non-GEMM residual lane is EMPTY (numbers below) — stop mining it.** Plus: **the README's "~90% of the encoder is external f32 sgemm, irreducible in-crate" is now MEASURED FALSE for turbo.**
 
 **PROVENANCE** (frankenredis rule — 67/70 of their REJECTs carried no binary hash):
