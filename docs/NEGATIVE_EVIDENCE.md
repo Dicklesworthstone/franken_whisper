@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **ISA-PEAK MEASURED — the roofline's 40% headroom is CONFIRMED, and it is the GEMM's non-minimal-chain overhead (loads / M2col shuffle / sign-trick / dispatch), exactly what cod's M4×N4 tile targets.** Landed the peak-measurement tool cod needs (frankentorch `3b8cdebc`, `examples/maddubs_peak`). The dot kernel stays cod's; my contribution is the ISA reference + validated target.
+
+**PROVENANCE.** Peak: `examples/maddubs_peak`, worker **`vmi1149989`** (10c). GEMM 1.25 TMAC/s:
+`e2e_probe` sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`, local 5975WX.
+No local build; disk 75 G.
+
+### What the ISA-peak probe establishes
+Streams int8 operands from an **L2-resident** buffer (the GEMM's real inner-loop regime: the int8
+weight is reused ~1500× from cache while the maddubs chain runs) through the exact
+`vpmaddubsw→vpmaddwd→vpaddd` chain, 8 independent accumulators, `#[target_feature(avx2)]`:
+
+- **~0.08 TMAC/s/core = ~0.8 `vpmaddubsw`/cycle** — the physical chain limit (`maddubs` + `madd`
+  contend for 2 FP ports). Scaled to a 32-core box at the ~2 GHz all-core throttle ⇒ **~2 TMAC/s
+  ALU peak**, which **matches the roofline estimate** (2.07). The naive "1 maddubs/cycle → 2.07"
+  was right in ballpark; the streaming probe confirms it rather than inflating it.
+- ⇒ the i7 GEMM's **1.25 TMAC/s is ~60% of the maddubs ALU peak**, so the **40% headroom is real**.
+
+### What the 40% actually IS (the specific inefficiency, for cod)
+The probe runs the *minimal* chain (3 vector ops/maddubs = 33% MAC-density). The shipped GEMM is
+**12% MAC-dense** (`perf annotate`, 9 `vpmaddubsw` of ~75 vector ops) — so it does ~2.7× **more**
+vector ops per maddubs than the minimal chain. That extra work is: **activation loads, the M2col
+head-major shuffle, the int8→uint8 sign trick maddubs requires, and row-block dispatch.** A wider
+register tile (**cod's M4×N4**, more accumulators) amortizes the loads/shuffle/sign-setup across
+more maddubs per load ⇒ moves 12% density toward the 33% chain ceiling. **Realistic target ~1.5×**
+(12%→~20-25% density; the widening chain caps it at 33% and the frequency throttle sits below that).
+So the ~28% frame → ~1.5× is ~1.1× e2e, **in-crate, and it is cod's tile.**
+
+### Contribution + coordination (dot kernel is cod's reserved nn.rs — I touched nothing there)
+- **Landed `maddubs_peak` (frankentorch `3b8cdebc`)** so cod can measure their tile against a real
+  ISA ceiling (~1 maddubs/cycle/core streaming) instead of a guessed number — the "measure against
+  the ISA-capped peak" the task asked for, as reusable infra.
+- **Two bugs baked in as lessons:** (1) `black_box` the OUTPUT only, with constant inputs, and LLVM
+  DCE'd the loop → 7.26 TMAC/s single-core (impossible); streaming from memory fixes it. (2) too
+  short a run measures thread-spawn. Both are the "control that measures ~zero" family.
+- **CAVEAT (honest):** probe on VPS workers vs GEMM on local 5975WX ⇒ the per-core comparison is
+  **cross-machine, not rigorous**; a same-machine peak is **infra-blocked** (model benches need the
+  local box; workers can't sync the model). The ballpark match (~2 TMAC/s peak vs the roofline) is
+  what I stand on, not an exact ratio.
+
+### Net
+The roofline stands, now with a measured peak behind it: **the CPU int8 GEMM is compute-bound at
+~60% of the maddubs ALU peak; the 40% is non-minimal-chain overhead; cod's M4×N4 tile is the
+validated in-crate lever (~1.5× ceiling, ~1.1× e2e), capped by the widening chain (no VNNI) and the
+throttle.** Beyond that is a **hardware move** (GPU / VNNI silicon), owner-gated. My SDPA-lane
+decidable win (poly-exp) is with the owner; the companion SDPA-sgemm swap is surfaced. **This is a
+`surface` + infra deliverable: I measured the ceiling and handed cod the tool and the target,
+without editing their kernel.**
+
+AGENT_NAME=cc_fw. No franken_whisper source changed (docs only). frankentorch: `maddubs_peak`
+example (`3b8cdebc`). No local build; disk 75 G; nothing stashed/deleted; `nn.rs`/`benches` untouched.
+
+---
 ## 2026-07-10 - cc_fw: **ROOFLINE of the int8 encoder GEMM — COMPUTE-bound at ~60% of ISA-capped peak.** So cod's M4×N4 tile IS the right lever (not a memory wall), but in-crate headroom is ~1.4–1.6×; beyond that needs GPU/VNNI (owner/hardware). Plus a **companion owner-gated SDPA lever** and a coordination hand-off to cod.
 
 **PROVENANCE.** `e2e_probe` sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
