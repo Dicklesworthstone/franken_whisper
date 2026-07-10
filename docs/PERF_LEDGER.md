@@ -51,6 +51,84 @@
 
 ## Levers
 
+### 2026-07-10 UTC — cod_fw — SURFACE: cod-lane at frontier — one-pass i7/maddubs logits GEMV failed the median proof gate
+
+**Profile-first target.** The latest full `large-v3-turbo` decode attribution
+routes to the tied output projection: `logits_gemv` consumed **162.5 ms / 58
+tokens = 2.802 ms/token**, or **21.4% of decode**. The shipped path is already
+row-quantized i8 and streams about 66 MiB/token. Tokenizer, sampler, argmax, and
+detokenization do not reach 0.03% self-time, so they cannot clear this fleet's
+per-function median floor.
+
+**One lever.** The candidate coupled exactly one new weight/kernel format:
+natural `[51_866, 1_280]` f16 output weights quantized to i7 (`[-63,63]`) and a
+one-pass AVX2 `vpmaddubsw -> vpmaddwd` dot. Activation quantization, output-row
+worker bands, parallel threshold, shape, and result materialization matched the
+current i8 GEMV. The narrower range makes each maddubs pair non-saturating, but
+it is numerics-changing and retains the same one-byte-per-weight traffic. No
+encoder or VAD file was touched.
+
+**Strict-remote screen.** Both runs used only:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -p franken_whisper --bench native_engine_bench -- native_engine/logits_i7_ab --noplot
+```
+
+The first same-binary ABBA screen ran on RCH worker `vmi1264463`
+(`38.242.209.154`), job `j-29914252970039323`, exit 0. It was a routing screen,
+not ship proof: it reused cache-hot matrices and its BASE/BASE control shared one
+physical i8 allocation. Its 31 BASE/BASE ratios were:
+
+```text
+1.060228 1.024087 1.019717 1.127256 0.945750 0.938100 1.175068
+0.854657 0.942118 1.021765 1.200061 0.951862 0.877495 0.698881
+0.957614 0.977946 1.010288 0.875190 1.202485 0.949110 1.298386
+0.948810 0.983725 0.861340 0.980618 1.079131 1.207674 1.030361
+0.881000 2.013591 1.108262
+```
+
+Null p10/median/p90 were **0.875190 / 0.983725 / 1.202485** (CV
+**20.900%**). The BASE/i7 ratios were:
+
+```text
+0.902765 1.230757 1.172071 1.095160 1.018939 1.097167 0.813799
+0.987037 1.262902 0.885573 1.183382 1.077852 1.175507 1.193337
+1.300625 1.087920 0.884324 0.847036 0.998400 1.048336 0.947688
+0.820807 1.316556 1.076197 1.190292 0.907257 1.125974 1.064319
+1.000395 1.132858 1.110063
+```
+
+Direct-call medians were **3.227577 ms i8** versus **3.039853 ms i7**;
+paired median **1.077852x**, CV **12.927%**, wins **21/31**. That apparent gain
+did **not** clear the same-binary null p90 of **1.202485x**, so the screen
+rejected it.
+
+**Cold decision run.** The tightened harness used independently quantized i8
+null matrices, touched a 256 MiB eviction pool outside every timed arm, and
+predeclared a symmetric floor `max(1, p90(r), 1/p10(r))`. RCH worker `hz1`
+(`87.99.133.171`), job `j-29914252970039362`, compiled the exact snapshot
+successfully. BASE/BASE median was **1.026128**, outside the predeclared
+`[0.98,1.02]` validity interval, so the harness stopped before candidate timing
+and Cargo exited 101. This was a benchmark validity assertion on a healthy
+remote worker, not RCH degradation and not a local fallback.
+
+**Parity / quality boundary.** The numerics-changing candidate never passed a
+valid performance screen, so production wiring and the WER/transcript/timestamp
+gate were not entered. Both remote workers also lacked the model/JFK assets, and
+the model-backed rows visibly skipped. Candidate code, test, and bench were
+manually removed; production source is back at the starting commit. Therefore
+the landed docs/tracker-only result leaves production output and WER unchanged
+by construction, but makes no unsupported WER claim for i7.
+
+**Verdict: SURFACE, do not ship.** Decode/KV is separately blocked, tokenizer is
+profile-cold, and the remaining output/logits families (f16 layout/FMA,
+low-rank, int4, row skipping, prefetch/NTA, accumulator/row blocking, and
+logsumexp processing) are already closed. This final distinct i7/maddubs idea
+either sat below its null floor or was gated by an invalid cold null. The
+**cod-lane is at frontier; hold**. Reopen only for a genuinely different
+primitive that reduces output-weight bytes, new ISA hardware such as VNNI, or a
+remote model-backed substrate capable of the full median plus WER proof bundle.
+
 ### 2026-07-10 UTC — cod_fw — SURFACE: wide-i7 K=64 candidate stopped by its per-function BASE/BASE floor; candidate never executed
 
 This pass re-read the negative-evidence ledger before editing. The full

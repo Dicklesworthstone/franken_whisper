@@ -4,6 +4,48 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cod_fw: **COD-LANE AT FRONTIER — i7/maddubs output-projection screen below its null floor; cold decision run invalid. HOLD.**
+
+Profile-first selection chose the tied output projection, not encoder/VAD:
+`logits_gemv` is **162.5 ms / 58 tokens = 2.802 ms/token**, **21.4% of decode**.
+Tokenizer/sampler/argmax/detokenization are absent above 0.03% self-time. The
+one fresh lever was a natural-f16-to-i7 output format plus one-pass AVX2
+`maddubs -> maddwd` GEMV at the exact turbo shape `[51_866,1_280]`, retaining
+the current i8 activation quantization, row scheduling, threshold, and 66 MiB
+weight stream. No encoder or VAD file was touched.
+
+Both attempts were strictly remote-only with:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -p franken_whisper --bench native_engine_bench -- native_engine/logits_i7_ab --noplot
+```
+
+1. `vmi1264463` / job `j-29914252970039323`, exit 0: cache-hot routing screen.
+   BASE/BASE p10/median/p90 **0.875190 / 0.983725 / 1.202485**, CV 20.900%.
+   i8/i7 direct-call medians **3.227577 / 3.039853 ms**; paired median
+   **1.077852x**, CV 12.927%, wins 21/31. It did not clear null p90
+   **1.202485x**, so it was not a keep.
+2. `hz1` / job `j-29914252970039362`: independent i8 null allocations plus
+   untimed 256 MiB cache eviction. The BASE/BASE median was **1.026128**, outside
+   the predeclared `[0.98,1.02]` validity band. The harness stopped before the
+   candidate arm; remote Cargo exited 101 on that assertion. RCH remained
+   healthy and never fell back locally.
+
+The full raw ratios and methodology caveats are recorded in `PERF_LEDGER.md`.
+The candidate did not pass performance proof, so production wiring and
+WER/transcript/timestamp testing were correctly not entered; the remote workers
+also visibly skipped their missing model/JFK rows. Candidate code, parity test,
+and benchmark were manually removed, leaving production source and WER
+unchanged by construction.
+
+**SURFACE / HOLD.** Decode/KV is separately blocked; tokenizer is below-floor;
+f16 layout/FMA, low-rank, int4, row skipping, prefetch/NTA, accumulator/row
+blocking, and logits-processing families are already closed. **cod-lane at
+frontier.** Retry only with reduced output-weight traffic, new VNNI-class ISA,
+or a remote model-backed substrate that can satisfy the complete median plus
+WER gate.
+
+---
 ## 2026-07-10 - cc_fw: **CC-LANE FRONTIER SUMMARY (SDPA / int8-SDPA / encoder-non-GEMM / mel / VAD) — one consolidated record. HOLDING.**
 
 The cc byte-exact lane is at its frontier. Encoder, decode, mel, VAD, and KV paths are closed or
