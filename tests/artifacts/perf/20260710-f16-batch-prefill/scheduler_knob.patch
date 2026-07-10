@@ -1,0 +1,67 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c2ba70b..140ec79 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -98,6 +98,10 @@ ft-core = { path = "../frankentorch/crates/ft-core" }
+ # Already a transitive dependency; dev-only, does not affect the shipped binary.
+ libc = "0.2"
+ 
++[[bench]]
++name = "f16_batch_prefill"
++harness = false
++
+ [[bench]]
+ name = "storage_bench"
+ harness = false
+diff --git a/src/native_engine/nn.rs b/src/native_engine/nn.rs
+index 6a1c905..4618141 100644
+--- a/src/native_engine/nn.rs
++++ b/src/native_engine/nn.rs
+@@ -171,10 +171,44 @@ fn batch_gemv_cap() -> Option<usize> {
+ /// Default-ON row-morsel scheduler for compute-bound batched f16 GEMV.
+ /// `FW_BATCH_GEMV_ROW_MORSEL=0` restores the legacy output-band/private-buffer
+ /// scheduler for A/B and rollback.
+-fn batch_gemv_row_morsel_enabled() -> bool {
++static BATCH_GEMV_ROW_MORSEL: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(true);
++
++fn batch_gemv_row_morsel_init() {
+     use std::sync::OnceLock;
+-    static ENABLED: OnceLock<bool> = OnceLock::new();
+-    *ENABLED.get_or_init(|| std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() != Some("0"))
++    static INIT: OnceLock<()> = OnceLock::new();
++    INIT.get_or_init(|| {
++        if std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() == Some("0") {
++            BATCH_GEMV_ROW_MORSEL.store(false, std::sync::atomic::Ordering::Relaxed);
++        }
++    });
++}
++
++fn batch_gemv_row_morsel_enabled() -> bool {
++    batch_gemv_row_morsel_init();
++    BATCH_GEMV_ROW_MORSEL.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++/// Select the batched-f16-GEMV scheduler. **Default on** = the shipped row-morsel path.
++///
++/// `gemv_f16_batch` has two schedulers, both proven bit-identical to per-token `gemv_f16`
++/// (`gemv_f16_batch_equals_per_token_gemv`, `gemv_f16_batch_row_morsel_equals_per_token_gemv`),
++/// so this knob **cannot change results** — only scheduling:
++/// * **column-band** (`compute_band`, o-outer): each weight row is fetched once and dotted
++///   against all `tq` tokens ⇒ the weight is streamed **once**. Arithmetic intensity `tq`
++///   flop per weight byte.
++/// * **row-morsel** (`gemv_f16_batch_rows`, t-outer per band): every band re-streams the
++///   **whole** weight ⇒ one pass per band. Intensity `tq / workers`. It wins only when the
++///   shape is compute-bound enough that the extra weight traffic is free (cross-K/V:
++///   weight 3.3 MB, 2.4 GFLOP), and it carries the M2col cvtph-halving tile — which itself
++///   requires `row_band >= 2`, i.e. `tq >= 2 * workers`.
++///
++/// This setter exists so a bench can flip the scheduler **inside one binary** and time the
++/// real `gemv_f16_batch` both ways. An env var is read once per process and cannot do that,
++/// and an A/B split across two process invocations is not admissible.
++pub fn set_batch_gemv_row_morsel(on: bool) {
++    batch_gemv_row_morsel_init();
++    BATCH_GEMV_ROW_MORSEL.store(on, std::sync::atomic::Ordering::Relaxed);
+ }
+ 
+ /// Default-ON M2 activation-column tile for the row-morsel f16 batch GEMV: pairs of
