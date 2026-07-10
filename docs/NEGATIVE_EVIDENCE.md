@@ -4,6 +4,72 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **ISA-BASELINE CHECK (fleet-wide). franken_whisper SHIPS AVX2 — question CLOSED, no compile-target gap in the product.** But **frankentorch's own bench/test builds default to SSE2 on AVX2 workers**, and **`rch` strips `RUSTFLAGS`** so the fix must be a committed `.cargo/config`. My session's GEMM-lever conclusions are **baseline-robust** (verified). Diagnostic landed: frankentorch `37ee5949` (`examples/isacheck`).
+
+**MEASURED** (`RCH_REQUIRE_REMOTE=1`, no local build; `cfg!(target_feature)` = compile baseline,
+`is_x86_feature_detected!` = worker capability):
+
+| | sse2 | avx2 | fma | bmi2 | avx512vnni |
+|---|---|---|---|---|---|
+| **franken_whisper `e2e_probe` (shipped)** | ✓ | **✓** | **✓** | ✓ | ✗ |
+| **frankentorch DEFAULT build** | ✓ | **✗** | **✗** | ✗ | ✗ |
+| worker `vmi1167313` supports | ✓ | ✓ | ✓ | ✓ | ✗ |
+| worker `hetzner2` supports | ✓ | ✓ | ✓ | ✓ | **✓** |
+
+### 1. The product is NOT SSE2 — question closed
+`franken_whisper/.cargo/config.toml` sets `target-cpu=x86-64-v3` build-wide, and it reaches
+`ft_kernel_cpu` (a dependency). Confirmed in the shipped binary sha256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`: **4649 `%ymm0`**,
+`matrixmultiply::sgemm_kernel::KernelFmaAvx2`, `vpmaddubsw`. **There is no compile-target gap in the
+shipped engine.** frankenscipy/frankenredis's "SSE2 on AVX2" defect does **not** apply to this
+product's binary. This closes the question the check was meant to answer.
+
+### 2. But the frankentorch MEASUREMENT HARNESS is SSE2 — and rch hides it
+frankentorch has **no `.cargo/config.toml`**, so `rch exec -- cargo bench -p ft-kernel-cpu` (this
+session's BR / tile_shape / sdpa tests) compiled `ft_kernel_cpu`'s **own** code at the SSE2 default.
+`RUSTFLAGS=-C target-cpu=x86-64-v3` **does NOT fix it**: rch strips RUSTFLAGS (measured — still
+`avx2=false`). So a fix must be a **committed `.cargo/config.toml`** (rch syncs it with the repo).
+
+### 3. Did this distort my session's conclusions? NO — verified, not assumed
+- **BR sweep / tile_shape / gemm-swap** exercise **`matrixmultiply`/`gemm`**, which **runtime-dispatch**
+  to `KernelFmaAvx2` (confirmed in the binary) regardless of the compile baseline ⇒ the GEMM math
+  was AVX2. And the BR bench ran **poly OFF ⇒ scalar libm `expf`** (baseline-independent), not the
+  `wide::f32x8` path. So "**BR inside the null floor**" and the tile_shape/gemm-swap results **hold**.
+- **poly-exp** was measured on the **AVX2** `e2e_probe`, not a frankentorch bench ⇒ its
+  `wide::f32x8` softmax was AVX2 ⇒ the 1.2465× op-level / 1.0722× e2e / byte-identical transcript
+  numbers are on the correct baseline.
+- **What WOULD be distorted** (and I did NOT measure this session): frankentorch's own `wide`-based
+  SIMD benched standalone — layernorm, elementwise, the poly softmax in isolation — is 2× SSE on
+  SSE2. Any FUTURE frankentorch perf work on ft's own kernels must fix the baseline first.
+
+### 4. VNNI is a HARDWARE gap, not a build gap — closes the i7-dot ceiling question
+The i7 dot's `vpmaddubsw→vpmaddwd→vpaddd` widening chain (the ISA ceiling I flagged, 14.63% frame)
+would collapse to one `vpdpbusd` **only with AVX512-VNNI**. Production is Zen3 (no VNNI); worker
+`vmi1167313` has none; `hetzner2` has it but franken is `#![forbid(unsafe_code)]` so it cannot
+runtime-dispatch to it, and a fixed `target-feature=+avx512vnni` would SIGILL on the Zen3 product
+box. **So VNNI is genuinely unreachable for the shipped engine — the i7 ceiling is real hardware,
+not a missing flag.** No action; question closed.
+
+### 5. RECOMMENDATION (owner-gated, cross-repo — I did NOT flip it)
+Add `frankentorch/.cargo/config.toml` with `target-cpu=x86-64-v3` scoped to `cfg(target_arch =
+"x86_64")`, mirroring `franken_whisper`'s, so frankentorch's **own** bench/test builds match how the
+product consumes it. **BLOCKER for doing it unilaterally:** `x86-64-v3` enables **FMA**, which
+changes f32 rounding. frankentorch's bit-exact tests are mostly **path-vs-path** (FMA-robust — both
+sides get FMA), but there are **3 hardcoded golden-f32 asserts** that could shift. The safe path:
+owner confirms those 3 survive FMA (or widens them to a tolerance), *then* commits the config. This
+is a **shared crate with `*_bit_exact` tests and other consumers**, so it is not mine to flip on a
+whim — surfaced, not shipped. Diagnostic to re-check any host: `cargo run -p ft-kernel-cpu --example
+isacheck` (frankentorch `37ee5949`).
+
+**Net:** the highest-leverage version of this check (product ships SSE2 on AVX2 hardware) is
+**FALSE here** — franken_whisper is already AVX2. The real, smaller finding is a frankentorch
+measurement-environment gap that did not affect this session's conclusions and is fixed by a
+committed config once the FMA/bit-exact risk is cleared.
+
+AGENT_NAME=cc_fw. No franken_whisper source changed (docs only). No build; disk 75 G; nothing
+deleted or stashed. `nn.rs`/`benches` remain cod_fw's.
+
+---
 ## 2026-07-10 - cc_fw: **PROFILE INSIDE int8 GEMM (read-only) + SURFACE.** Top frame `dot_maddubs_i7_m2n4` **14.63%** (cod's, ISA-bound). **CORRECTION to my own hand-off:** the "9.91% reducible epilogue" I told cod about is **rayon DISPATCH**, not dequant — the closure it runs does **zero arithmetic**. Every int8 GEMM frame is in cod's `nn.rs`; my SDPA lane has **no wall-clock-decidable lever left** — surfacing rather than shipping floor-level noise.
 
 **PROVENANCE.** franken `e2e_probe` sha256
