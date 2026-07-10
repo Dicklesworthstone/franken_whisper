@@ -4,6 +4,87 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **HARNESS FIXED (ABBA): null control 1.1163×/cv 29.0% → 1.0018×/cv 5.3%, 21/41, sign-p 1.000.** With a trustworthy harness the `BR` effect is **real, monotone and significant** (BR=160 → **+3.44%**, 38/41, p<0.001) — **but a global bump REGRESSES 0.9414× at `num_bh=4`.** ⇒ adaptive policy, landed **opt-in** (default unchanged); frankentorch `c870a4d4`.
+
+### The harness was the defect, not the kernel
+`sdpa_forward_f32` **allocates and returns a fresh 7.7 MB output per call**, so the FIRST call of a
+rep page-faults new pages while the SECOND reuses the ones the first just freed. Plain A/B
+alternation over an **odd** rep count leaves one arm in first position more often — precisely the
++11.6% first-arm bias the null control caught. `paired` now runs **ABBA within every rep**
+(A,B,B,A) and forms `(tA1+tA2)/(tB1+tB2)`: A occupies positions 1 and 4, B positions 2 and 3, so the
+position effect and any linear drift cancel *inside* each rep.
+
+| null control (BR=64 vs BR=64 — identical code) | ratio | cv | wins | sign-p |
+|---|---|---|---|---|
+| before — simple alternation, n=9, worker `vmi1149989` | **1.1163×** | **29.0%** | 6/9 | — |
+| after — **ABBA**, n=41, worker `hz2` | **1.0018×** | **5.3%** | **21/41** | **1.000** |
+
+Bias **+11.6% → +0.18%**; cv **29.0% → 5.3%**. An honest coin flip.
+
+### The BR question, answered on the admissible run
+Worker **`hz2`**, `available_parallelism=16`, n=41 ABBA reps (3 warm discarded), turbo shape
+`nbh=20 seq=1500 d=64`. Ratios null-corrected against the 1.0018× floor:
+
+| BR | raw | null-corrected | wins | sign-p | cv | SEM |
+|---|---|---|---|---|---|---|
+| 96 | 1.0145× | 1.0127× | 31/41 | 0.001 | 4.6% | 0.72% |
+| 128 | 1.0247× | **1.0229×** | 34/41 | <0.001 | 4.1% | 0.64% |
+| 160 | 1.0363× | **1.0344×** | 38/41 | <0.001 | 5.1% | 0.80% |
+
+**Monotone in BR**, exactly as the pack-amortization mechanism predicts: `matrixmultiply` has no
+prepack API, so `kh`/`vh` are repacked on every one of a head's `ceil(seq_q/BR)` blocks. Self-time
+of that pack loop, in-situ: **`matrixmultiply::gemm::gemm_loop` = 4.05% of e2e** (binary sha256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`).
+
+### But a global bump is WRONG — generality sweep, same admissible run
+| shape | BR=128 vs 64 | wins | cv |
+|---|---|---|---|
+| `nbh=64, seq=1500` | 1.0335× | 7/7 | 1.1% |
+| `nbh=20, seq=96` | 1.0503× | 5/7 | — |
+| `nbh=20, seq=128` | 1.0035× | 4/7 | — |
+| **`nbh=4, seq=1500`** | **0.9414×** | **1/7** | 5.0% |
+
+Coarsening `BR` **halves the number of parallel row-blocks**. When `num_bh < threads` the kernel
+splits a head's blocks across the pool, so with few heads the coarse tile **starves** it. *The same
+lever that wins at 20 heads loses at 4.*
+
+### Landed: adaptive policy, OPT-IN (default unchanged) — `c870a4d4`
+`sdpa_br_pick(seq_q, num_bh, threads)`: coarsen to 128 when `num_bh >= threads` (heads already fill
+the pool, blocks run serially) **or** when `num_bh * ceil(seq_q/128) >= 4*threads`; else keep 64.
+Each branch picks the tile that *measured* better above. Verified by a **deterministic,
+host-independent unit test** (`sdpa_br_policy_picks_the_measured_tile`, no timing):
+`1500×64@16t→128`, `1500×20@32t→128` (franken's encoder at its 32-thread cap), `1500×4@16t→64`
+(the regressing case), `96×4@16t→64`.
+
+**The default remains the historical fixed `BR=64`**, so the commit is behavior-identical.
+**Why I did not flip it:** the AUTO arm itself was never measured on an admissible run. Of three
+post-fix attempts, **two were discarded** under a **pre-declared** acceptance rule (`|bias| < 2%`
+and `cv < 6%`; accept the first passing run; report all discards):
+`vmi1149989` null **0.9434× cv 25.3%** and `vmi1152480` null **0.9843× cv 40.3%**. `RCH_WORKER=hz2`
+**does not pin** — placement stayed non-deterministic. Declaring the rule *before* looking at the
+arms is what stops "retry until the null passes" from becoming worker-shopping.
+**Retry-condition:** one admissible run including the AUTO arm, with no regression in the
+generality sweep. Then flip the default.
+
+`BR` is **bit-exact** (host-independent): matrixmultiply's k-accumulation order is fixed by the
+micro-kernel and independent of the row count; the softmax is per-row. Asserted across
+`BR ∈ {32,96,128,160}` (block counts 47/16/12/10 vs 24 — the arms are provably not the same code)
+and `(nbh,seq) ∈ {(20,96),(20,128),(4,1500),(64,1500)}`.
+
+Tests (remote `vmi1264463`): `cargo test -p ft-kernel-cpu --release sdpa` **4/4**. No local build.
+
+### Coordination — the i7 GEMM stays with cod_fw
+The ~28% i7 int8 GEMM and the 12.3% fused i7 QKV both live in `src/native_engine/nn.rs`, which
+**cod_fw reserved** for the M4×N4 lane-packed maddubs. I did not touch it, per
+[[feedback_shared_tree_reserve_files]]. Their two numbers, unchanged: the dot kernel is **~12%
+MAC-dense** (Zen3 has no AVX512-VNNI; `vpmaddubsw→vpmaddwd→vpaddd` is an ISA ceiling that one
+`vpdpbusd` would collapse), and the **reducible** cost is the **9.91%** epilogue *outside* the dot —
+68% of the dot kernel's own self-time. **cod_fw: your bench must carry a null control; ours read
+1.1163× at cv 29.0% on an A/A comparison and would have "confirmed" any lever you liked.**
+
+AGENT_NAME=cc_fw. franken_whisper source unchanged (docs only).
+
+---
 ## 2026-07-10 - cc_fw: **SDPA `BR` tile sweep — REJECTED on measurement grounds (the NULL CONTROL, identical code both arms, reads 1.1163× at cv 29.0%).** But the exercise proof landed two host-independent results: **BR is BIT-EXACT** at 4 tile sizes × 5 shapes, and the kernel had a **latent scheduler bug** (`seq_q > BR` tied the parallel split to the tile size) — **fixed, default-identical** (frankentorch `0fef5755`).
 
 **COORDINATION FIRST.** The ~28% i7 int8 GEMM and the 12.3% fused i7 QKV both live in
