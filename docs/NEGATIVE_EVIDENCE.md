@@ -4,6 +4,100 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **FULL large-v3-turbo e2e PROFILE (ranked frame table)** — **mel / tokenizer / beam-search / KV-cache are ALL < 0.25% self-time: those avenues are measured-dead.** The top owned frame is the **i7 int8 encoder GEMM at ~28%** — and **I MUST CORRECT MY OWN AUDIT: I claimed it was 0% self-time in the default engine. It is DEFAULT-ON for turbo.** The two do-not-retry rows gating it have substrate-invalid ratios ⇒ **both REOPENED.**
+
+**Method.** `perf record -F 299` (flat; no call-graph needed for self-time) on the prebuilt
+`release-perf` `examples/e2e_probe` (2026-07-10 00:47), **no build** — so the disk directive is
+untouched (78 G before and after; `perf.data` 3.8 MB, written to scratch, never the repo).
+`FRANKEN_WHISPER_MODEL_DIR=legacy_whispercpp/whisper.cpp/models e2e_probe large-v3-turbo
+tests/fixtures/native/jfk.wav 8` — 88 s of audio, `transcribe` dominates so model load is
+amortized (`load_linear_transposed` falls 5.31% → 2.23% going from repeat=3 to repeat=8, which is
+how you can tell a frame is load-time).
+
+### Ranked self-time, large-v3-turbo, jfk×8 (≥1%)
+
+| % self | frame | bucket |
+|---|---|---|
+| **14.63** | `nn::dot_maddubs_i7_m2n4` | **i7 int8 encoder GEMM** |
+| 10.26 | `matrixmultiply::sgemm_kernel::kernel_target_fma` | external sgemm *(excluded)* |
+| **9.91** | `nn::matmul_bias_i7_quantized::{closure#0}` | **i7 int8 encoder GEMM** |
+| 5.86 | `__expf_fma` | SDPA softmax exp |
+| 5.60 | `ft_kernel_cpu::sdpa_forward_f32::{closure#0}` | SDPA |
+| 4.05 | `matrixmultiply::gemm::gemm_loop` | external sgemm *(excluded)* |
+| 3.92 | `nn::gemv_i8::{closure#3}` | decode int8 GEMV |
+| 3.84 | `crossbeam_epoch::…::with_handle` | **rayon scheduling overhead** |
+| **2.74** | `encoder::matmul_bias_i8::{closure#1}` | **i7 path (attn.out i8×i32)** |
+| 2.69 | `crossbeam_epoch::Global::try_advance` | rayon overhead |
+| 2.51 | `nn::quantize_mat_to_i7::{closure#0}` | **model LOAD** (one-time) |
+| 2.46 | `crossbeam_deque::Stealer::steal` | rayon overhead |
+| 2.23 | `encoder::load_linear_transposed` | **model LOAD** (one-time) |
+| 2.04 | `rayon_core::WorkerThread::find_work` | rayon overhead |
+| 1.27 / 1.05 | `__memset_avx2` / `__memmove_avx` | alloc/copy |
+| **0.88** | `nn::quantize_act_i7::{closure#0}` | **i7 path (per-window act quant)** |
+
+**Buckets:** i7 int8 encoder GEMM **≈ 28.2%** (14.63+9.91+2.74+0.88) · external sgemm **14.31%**
+· SDPA **11.46%** · rayon/crossbeam pure scheduling overhead **11.25%** · model load **4.74%**.
+
+### The non-GEMM answer is definitive, and it is negative
+**`mel`, `tokenizer`, beam-search, and KV-cache do not appear.** The only franken frames outside
+GEMM/SDPA/rayon are `DecoderState::new::{closure#4}` **0.23%** and
+`Linear::dequant_to_f32_if` **0.01%**. (Careful: a naive `grep beam` matches **cross**beam.)
+Independently, `nn::softmax_rows` is **0.02%** — re-confirming, from a real in-situ profile, that
+the default encoder never calls it, which is exactly why the "SDPA is not exp-bound" closure was
+false. **There is no mel/tokenizer/beam/KV lever on turbo.** cod_fw's earlier surface reached the
+same conclusion; this is an independent confirmation with numbers.
+
+### ⚠️ CORRECTION TO MY OWN LEDGER-INTEGRITY AUDIT (same file, entry of 2026-07-10)
+I wrote that `i7 rowblock coarsening` and `i7 bias specialization` are *"gated-path only — 0%
+self-time in the default engine"*, citing `enc_int8_enabled()` = `DEFAULT_ON: false` and
+`encoder.rs:483`'s comment *"Default off ⇒ all i7 fields stay None"*.
+
+**That is WRONG.** I quoted the comment on the **first** branch of an `if / else if / else if`
+chain and never read past it. The **third** branch is
+`else if super::enc_attn_out_i8i32_for(&model.hparams)` — the landed *default quality-safe int8
+encoder* — which builds `attn_q_i7 / attn_k_i7 / attn_v_i7 / mlp_fc_i7` and routes `attn.out`
+through the full-i8 i32-accumulate GEMM. `calibrated_encoder_int8_model()` matches **large-v3-turbo**
+(and tiny.en). So on the flagship model the i7 maddubs path is **DEFAULT-ON and is the hottest
+owned code in the engine — ~28% self-time, measured above, not 0%.**
+
+**This is the third instance in this repo of the same error, and the second one mine: I read a
+comment instead of the control flow.** [[project_grep_the_gate]] said *grep the gate* — I grepped
+the gate and stopped at the first arm. **New rule: read the whole `else if` chain, and confirm with
+a profile that the frame is (or is not) hot.** A static reachability argument is only as good as the
+branch you stopped reading at; a profile would have caught this instantly, and did.
+
+### Consequence: both i7 do-not-retry rows are REOPENED
+They gate the largest owned frame in the engine (~28% self-time), and — as that audit *correctly*
+found — **their ratios are substrate-invalid**: candidate and legacy each ran as a **separate `rch`
+bench invocation** with `FW_I7_ROWBLOCK_MIN_LEN` flipped between them (*"candidate coarse split
+(default 8, hz2)"* vs *"legacy original split (=1, hz2)"*). rch ratios are not worker-invariant, and
+the legacy arm's own spread is ±1.30 ms on 12.79 ms (**cv ≈ 10%**). A do-not-retry row over a 28%
+frame cannot rest on an inadmissible number.
+**Beads: bd-i7-rows-gated-and-substrate-invalid-o0bu (reopened + re-scoped).**
+
+### The next ranked frames, with what is actually known about each
+1. **i7 int8 encoder GEMM, ~28%.** Top owned frame. Its two rejections are inadmissible (above).
+   Re-measure same-binary: `FW_I7_ROWBLOCK_MIN_LEN` is an `OnceLock` env read, so it **cannot flip
+   inside one binary** — it needs a setter, exactly like `set_sdpa_poly_exp` /
+   `set_sgemm_tile_balanced`. That is the prerequisite, not the lever.
+2. **rayon/crossbeam scheduling overhead, 11.25%** (`with_handle` 3.84 + `try_advance` 2.69 +
+   `steal` 2.46 + `find_work` 2.04). **VERIFY BEFORE HONORING:** the rows that supposedly close
+   this — the decode thread-count sweep and the spin-pool rejection — were measured on the
+   **decode per-token GEMV dispatch**, a different call site. Neither measured the **encoder's**
+   rayon dispatch, which is what these 11.25% are (i7 row-blocks + SDPA blocks). The one lever
+   ever aimed at encoder dispatch (`FW_I7_ROWBLOCK_MIN_LEN` coarsening) is the substrate-invalid
+   row above. **This frame is effectively unattacked.**
+3. **`__expf_fma`, 5.86%.** Already solved: `FT_SDPA_POLY_EXP` (frankentorch `b13eeb36`), turbo WER
+   gate 4/4, setter landed (`1fb80836`). **Blocked only on a turbo transcript diff** (bd-bcm7).
+   This is the single largest *ready* win in the profile.
+4. **model load, 4.74%** (`quantize_mat_to_i7` 2.51 + `load_linear_transposed` 2.23). One-time;
+   amortizes away on long audio (5.31%→2.23% from repeat=3→8). Not a transcription lever.
+
+**No source changed.** Profile only, on a prebuilt binary — no cargo build, disk 78 G before and
+after, nothing deleted, nothing stashed. `perf.data` lives in scratch.
+AGENT_NAME=cc_fw.
+
+---
 ## 2026-07-10 - cc_fw: **f16-GEMV family CLOSED on honest grounds — my own fc2-prefill routing lever is REJECTED by measurement on the REAL function at the REAL shape.** Row-morsel is *not* slower at fc2 (all ratios inside the null control's own +2.0% bias) and is **1.13× FASTER at tq=100** (p=0.0074); my proposed gate would have REGRESSED it. Nominal weight traffic ≠ DRAM traffic. **Plus: rch CAN now bench franken_whisper** (recipe below).
 
 **Setup (all three substrate rules satisfied).** Both arms call the **real**
