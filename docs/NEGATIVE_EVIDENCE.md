@@ -4,6 +4,53 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 EDT / 2026-07-10 UTC - cc_fw: ★ WIN, CAPTURED + GATED (`FT_SDPA_POLY_EXP=1`) - **1.28-1.32x on the `attn_sdpa` span, ~1.069x e2e**, transcript byte-identical on jfk x1/x3/x8
+
+**Lands the lever the entry below quantified.** frankentorch commit `b13eeb36`
+(`ft-kernel-cpu`): `sdpa_forward_f32`'s per-block row softmax gains an 8-lane
+`wide::f32x8` path (scale+max, exp+sum, normalize) behind a **default-OFF** env
+gate. Gate unset => identical scalar code => bit-for-bit unchanged for every
+existing frankentorch consumer. `wide`'s poly `exp` is ~1-2 ULP but flushes to
+0.0 outside `|x| < 88`, so the reduced argument is clamped to `>= -87.0` first;
+a non-finite row max (fully-masked row, unreachable for bidirectional attention)
+falls back to the scalar loop, reproducing its `NaN` exactly. New crate test
+`softmax_row_f32_poly_matches_scalar_softmax` covers body/tail split, causal
+`limit` masking, normalization, and the degenerate row.
+
+**A/B (jfk x3, `e2e_probe`, ORDER-ALTERNATED to cancel cache/boost order effects,
+box load ~40, first rep discarded as a cold-start outlier):**
+
+```
+                       OFF        ON       ratio
+attn_sdpa span (min)   627.1 ms   488.3 ms  1.28x
+attn_sdpa span (med)   655.6 ms   497.4 ms  1.32x
+transcribe (mean)       3.330 s    3.116 s  1.069x   cv 2.8% / 1.8%
+perf stat instructions  541.2 G    468.2 G  -13.5%
+perf stat cycles        130.5 G    125.4 G   -3.9%   (IPC 1.12 -> 1.01)
+```
+ON won in 5/5 paired reps in BOTH orders. Transcript **byte-identical** OFF-vs-ON
+on jfk x1 (1 window) / x3 (2 windows) / x8 (multi-window), `PROBE_DUMP_TEXT=1`.
+
+**METHOD NOTE (my own error, corrected mid-flight):** the first A/B ran OFF
+before ON in every pair and reported 1.108x; that ordering systematically favors
+the second run. Alternating the order dropped the honest e2e figure to ~1.069x.
+**Always alternate A/B order on this box** — the paired-order bias here was worth
+~4 points of apparent speedup, larger than most levers in this ledger.
+
+**Honest caveat on the two clocks:** wall-clock says 1.069x but aggregate `perf`
+cycles say only -3.9%. Instructions fall much further (-13.5%) than cycles because
+the poly `exp` is an FMA dependency chain (IPC drops 1.12 -> 1.01). Rayon idle-spin
+also inflates both counters. The *direct* `attn_sdpa` span (1.28-1.32x, order-
+alternated) is the cleanest evidence; treat e2e as ~1.05-1.07x, not 1.11x.
+
+**Status: NOT default-on.** Non-byte-exact by construction (different
+transcendental; lane-wise sum reorders). jfk is one clip and the int8 digs showed
+clip-dependent error cancellation ([[project_cross_v_block_win]]), so promotion
+needs an owner A/B on diverse audio (track01 / a long multi-speaker clip). Enable
+with `FT_SDPA_POLY_EXP=1`. franken's default binary is unchanged and conformance
+is unaffected. Probe: `examples/sdpa_softmax_attrib_probe.rs`. AGENT_NAME=cc_fw.
+
+---
 ## 2026-07-09 EDT / 2026-07-10 UTC - cc_fw: FALSIFICATION of a recorded corollary + QUANTIFIED LEAD - the external fused SDPA **IS** exp-bound: `exp` is **23.7%** of `sdpa_forward_f32`, not "a negligible fraction"
 
 **What the ledger said (2026-07-07, AshHeron, this file ~line 830):** "the encoder
