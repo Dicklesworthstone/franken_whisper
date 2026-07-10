@@ -4,6 +4,90 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **SELF-CORRECTION to the bd-4hc0 entry below (commit `2bbff39`)** — I under-claimed. The crate swap alone is still rejected, but `gemm` + a 2-D tile grid IS **1.231× on turbo's linear GEMMs (≈1.14× e2e)**. And a **BIT-EXACT, dep-free 2-D-tiling fix lands 1.057× on fc2** (frankentorch `F32_2D_TALL_MAX_K`). Two factual errors in that entry, corrected here.
+
+**ERROR 1 (mine).** I wrote: *"Every turbo linear shape has `k > 1024`, so ft's
+`sgemm`/`sgemm_reused_output` provably takes the plain row-split branch."* **Wrong.**
+`sgemm_reused_output` — the path franken actually takes (`out.len()==numel`) — calls
+`should_use_f32_reused_output_2d_tiling`, which fires for `1024 < k <= 1536 && m,n >= 1024`.
+So turbo **qkv/out and fc1 (k=1280) are ALREADY 2-D tiled by ft**; only **fc2 (k=5120)**
+falls back to the 1-D row split. My "hybrid" arm C therefore row-split fc1 against ft's
+*already-2-D-tiled* fc1 — an unfair replication, and the source of C's 0.840× on fc1.
+I made the very mistake I accused bd-4hc0 of: **I did not check which branch the real
+code takes.** Ironic, and worth the entry.
+
+**ERROR 2 (mine).** I concluded the GEMM avenue survives only as a 1.6% SDPA slice.
+It does not. Given a 2-D grid, `gemm`'s microkernel advantage *does* reach turbo.
+
+**MEASURED (interleaved, arms rotated every rep, min-of-9, 32t, load ~23, cv ≤5% except
+where noted).** A = ft real; B = `matrixmultiply` in an explicit (rb×cb) grid; C = `gemm`
+serial in the same grid:
+
+| shape (grid) | A ft ms | B mm | C gemm | notes |
+|---|---|---|---|---|
+| turbo qkv/out `4x8` | 4.10 | 1.022× | **1.200×** | B bit-exact |
+| turbo fc1 `8x4` | 16.12 | 0.940× | **1.238×** | B bit-exact |
+| turbo fc2 `4x8` | 17.00 | **1.241×** | **1.255×** | B bit-exact |
+| **turbo linear layer total** | 49.51 | 1.056× | **1.231×** | |
+
+⇒ projected: C = encoder **1.158×** → **e2e ≈ 1.139×** (linear GEMMs = 72.8% of
+`encoder_window`, encoder = 89.5% of e2e). So bd-4hc0's *headline number* (~1.2× e2e) was
+approximately RIGHT, while its *prescription* (swap the crate) was WRONG: the plain swap
+buys 1.00–1.07× and REGRESSES 0.934× at 16t. **You need the microkernel AND a 2-D grid;
+neither alone suffices.** `+gemm 32x1` (= the hybrid I rejected) reproduces at 0.82–0.97×,
+confirming the mechanism: the row split's per-thread B re-streaming, not the microkernel.
+
+**THE STALE CONSTANT (`F32_2D_TALL_MAX_K = 1536`).** Its comment justifies the cap with
+*"large-K square sgemm regresses (measured: m2048 k2048 n2048 sgemm 0.81x)"*. **That does
+not reproduce on this box: 2-D tiled, that shape is 1.27× FASTER, bit-exact.** Gating on
+K alone is the wrong invariant — what decides whether the 1-D row split hurts is the size
+of **B (k·n·4 bytes) that every thread re-streams** (fc2's B = 26.2 MB × 32 threads =
+839 MB). K is only a proxy, and a bad one for wide-N shapes.
+
+**LANDED (bit-exact, dep-free, frankentorch):** raise the bound to 8192 behind kill-switch
+`FT_SGEMM_2D_LARGE_K=0`. Honest A/B — **same binary**, env-flipped, order alternated across
+3 paired reps, and normalized by the fixed control arm B (identical code in both arms, so
+box drift cancels):
+
+| | fc2 A/B (control-normalized) | square 2048³ |
+|---|---|---|
+| OLD (1536) | 1.211 / 1.135 / 1.227 → med **1.211** | med 1.159 |
+| NEW (8192) | 1.146 / 1.148 / 1.139 → med **1.146** | med 1.140 |
+| win | **1.057×** on fc2, NEW wins 3/3 paired, both orders | 1.017× (neutral, NOT a regression) |
+
+Raw fc2 (ft): OLD 18.89/18.43/17.99 → NEW 17.01/17.22/16.89. **BIT-EXACT** — the probe
+asserts ft == the mm 4×8 grid bitwise in BOTH arms, so transitively ft-old ≡ ft-new
+bit-for-bit; and the invariant holds structurally (each output element's full
+k-accumulation stays inside ONE serial micro-kernel call; neither row nor column count
+changes that order — the same argument as `gemm_row_split_matches_single_bit_exact`).
+e2e: fc2 ≈ 34% of the linear-GEMM layer ⇒ layer 1.020× ⇒ **e2e ≈ 1.013×**. Small, but
+byte-exact, dependency-free, and it needs no WER gate.
+
+**NEXT RANKED LEVER (bigger than the one I just landed, still bit-exact and dep-free):
+`tile_shape` is load-imbalanced.** It picks `p = floor(sqrt(threads))`, `q = ceil(threads/p)`
+⇒ at 32 threads **p=5, q=7 = 35 tiles on 32 threads**, so a 3-tile straggler wave. Even
+after the bound raise, ft's fc2 is still **1.146×** slower than the same `matrixmultiply`
+kernel on a balanced 4×8 = 32-tile grid. Fix: choose `p` as the largest divisor of
+`threads` with `p <= sqrt(threads)` (32 → 4×8). Expected: fc2 → ~1.24× total vs the
+original row split ⇒ ~1.05× e2e byte-exact. **Do this before reaching for `gemm`.**
+
+**REMAINING (needs owner sign-off):** `gemm` + 2-D grid = **1.231×** on the turbo linear
+layer (≈1.14× e2e), and 1.115× on `sdpa_forward_f32`. Cost: a `gemm` dependency tree
+(gemm-f16/c32/c64, bytemuck, dyn-stack, num-complex, half, zerocopy) inside `ft-kernel-cpu`,
+a SHARED crate with `*_bit_exact` tests and training/gradient consumers; non-byte-exact
+(rel_l2 4.0e-7, i.e. 3.6× tighter than the already-accepted `FT_SDPA_POLY_EXP` at 1.43e-6).
+Needs the full WER gate. **This is now the largest measured unclaimed e2e lever in the repo.**
+
+**METHOD NOTE.** Both errors above, and bd-4hc0's original error, are the SAME failure:
+a ratio measured on code the engine does not execute. The fix is mechanical — before
+trusting (or writing) any GEMM ratio, print which branch of `should_parallelize*` /
+`should_use_f32_reused_output_2d_tiling` the real shape takes. I did not do that in the
+first entry; I did here, and it inverted the conclusion.
+
+AGENT_NAME=cc_fw. Code: frankentorch `crates/ft-kernel-cpu/src/lib.rs` (bound + kill-switch).
+franken_whisper engine unchanged. Probes: `tile2d_ab` (scratchpad).
+
+---
 ## 2026-07-10 - cc_fw: DIG → **bd-4hc0 REJECTED / FALSIFIED (measured against the REAL `ft_kernel_cpu` path)** — the `matrixmultiply→gemm` backend swap is **1.00–1.07× on large-v3-turbo**, not "~2× encoder → ~1.2× e2e". PERF_LEDGER's "3.75× headroom" was measured against a baseline the engine never executes. The only survivor is a **1.115×** swap inside `sdpa_forward_f32` (~1.6% e2e).
 
 **Profile-first (method rule 2).** Took the next ranked frame from my SDPA profile after
