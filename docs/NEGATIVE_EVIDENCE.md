@@ -4,6 +4,80 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 UTC - cod_fw: PROFILE -> SURFACE (measured) - large-v3-turbo non-GEMM residual has no eligible owned top frame after excluding `sgemm`, cc-owned int8/SDPA, and closed families
+
+**Lane.** User redirected cod_fw away from SDPA and encoder-int8 after cc_fw
+landed `perf(native): default quality-safe encoder int8` plus the
+`FT_SDPA_POLY_EXP` lane. Ledger grep came first: f32 QKV sgemm fusion,
+weight-stationary f16 GEMV tiles, allocator/buffer-reuse, decoder fused-LN,
+LN-to-quant fusion, head-major SDPA scatter read-order, i7 rowblock coarsening,
+and i7 bias specialization are closed. The remaining requested candidates were
+mel, tokenizer, beam/decoder logic, and decoder KV-cache management.
+
+**Profile method.** `e2e_probe large-v3-turbo tests/fixtures/native/jfk.wav 1`
+with `PROBE_NO_TS=1`, `RAYON_NUM_THREADS=8`, release-perf binary from
+`/data/tmp/cargo-target/release-perf/examples/e2e_probe`, current `HEAD`
+`91b44b1d`. `rch exec` was attempted for a fresh frame-pointer build but worker
+sync timed out and the local rebuild was aborted after the existing shared
+release-perf probe was confirmed usable. Local host was contended by multiple
+agent compiles, so this is routing evidence, not a timing ratchet.
+
+**Coarse span sanity check (with `FRANKEN_WHISPER_PERF_SPANS=1`; instrumentation
+adds overhead):**
+
+```text
+mel                 4.47 ms
+encoder_window   5811.90 ms
+cross_kv          102.56 ms
+decoder_prefill    30.61 ms
+decode_loop       414.77 ms, 27 tokens
+transcribe          6.365 s, 108 chars
+```
+
+**Transcribe-only perf stat** (`perf stat -D 2000 -d`, delay skips model load):
+
+```text
+task-clock 29.286 s, elapsed 4.900 s, 5.98 CPUs
+instructions 309.710 B, cycles 112.311 B, IPC 2.76
+L1-dcache-load-misses 8.561 B / 73.867 B = 11.59%
+```
+
+**Ranked transcribe-only frame table** (`perf record -D 2000 -F 99 -g
+--call-graph dwarf`, 4092 samples), with `sgemm` shown for context and then
+excluded from candidate selection:
+
+| rank | self | frame | decision |
+|---:|---:|---|---|
+| 1 | 19.83% | `franken_whisper::native_engine::nn::dot_maddubs_i7_m2n4` | int8 encoder lane; cc-owned, do not touch |
+| 2 | 19.03% | `matrixmultiply::sgemm_kernel::kernel_target_fma` | excluded `sgemm` |
+| 3 | 13.88% | `nn::matmul_bias_i7_quantized::{closure#0}` | int8 encoder lane; cc-owned |
+| 4 | 13.17% | `ft_kernel_cpu::sdpa_forward_f32::{closure#0}` | SDPA lane; cc-owned |
+| 5 | 9.43% | `__expf_fma` | SDPA softmax / poly-exp lane; cc-owned |
+| 6 | 4.04% | `encoder::matmul_bias_i8::{closure#1}` | int8 encoder lane; cc-owned |
+| 7 | 3.76% | `matrixmultiply::gemm_loop<KernelFmaAvx2>` | excluded `sgemm` |
+| 8 | 2.90% | `nn::gemv_i8::{closure#3}` | int8 decoder/encoder quant lane; avoid during peer int8 ownership |
+| 9 | 1.02% | `nn::gemv_i8` | int8 lane |
+| 10 | 0.98% | `nn::quantize_act_i7_gelu` | int8 quant lane |
+| 11 | 0.90% | `nn::maddubs_i7_headmajor_block` | int8 head-major lane |
+| 12 | 0.70% | `__memset_avx2_unaligned_erms` | allocator/buffer-reuse family closed |
+| 13 | 0.69% | `nn::gemv_i8w_f32a_blocked::{closure#0}` | int8 lane |
+| 14 | 0.61% | `nn::norm_rows_into` | LN/LN-to-quant family closed |
+| 15 | 0.33% | `DecoderState::new::{closure#4}` | KV-cache/cross-KV setup, below useful lever threshold |
+
+**Requested candidate visibility.** `mel` is already ~4.5 ms in the span table
+and absent from the flat sample table above 0.05%; tokenizer/beam logic is not
+sample-visible; decoder KV setup is only 0.33%; decode loop as a whole is ~0.415 s
+on an encoder-dominated 4-6 s transcript. The highest open candidate has too
+little leverage for an honest e2e keep, and the higher-ranked frames are either
+explicitly cc-owned or ledger-closed.
+
+**Decision.** No source lever attempted. Do **not** touch SDPA/int8 files and do
+not re-dig the closed families above. Retry condition: reprofile after cc lands
+or rejects the active int8/SDPA rows, or on a workload where mel, tokenizer,
+beam/decoder policy, or KV management is at least a top-5 owned frame with
+>=2% self time. AGENT_NAME=cod_fw. Source byte-identical to HEAD.
+
+---
 ## 2026-07-10 UTC - cc_fw: DIG -> REJECTED (measured) - **SDPA softmax PASS-ELIMINATION is worth 3.9 ms/window (0.8% of the kernel); divide->reciprocal is a REGRESSION.** Quiet-box re-take CONFIRMS the exp attribution and CORRECTS my own e2e number down.
 
 **The frame.** After the poly-exp win the fused kernel is `~304 ms sgemm + ~169 ms

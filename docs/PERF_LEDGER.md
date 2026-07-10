@@ -43,6 +43,44 @@
 
 ## Levers
 
+### 2026-07-10 UTC — cod_fw — SURFACE: large-v3-turbo non-GEMM residual profile has no eligible owned top frame
+
+**Lane.** After cc_fw took SDPA and encoder-int8 ownership, cod_fw profiled a
+full `large-v3-turbo` no-timestamp JFK transcription and excluded `sgemm` before
+candidate selection. Prior ledger grep closed f32 QKV sgemm fusion,
+weight-stationary f16 GEMV tiles, allocator/buffer-reuse, decoder fused-LN,
+LN-to-quant fusion, head-major SDPA scatter read-order, i7 rowblock coarsening,
+and i7 bias specialization.
+
+**Profile.** `perf stat -D 2000 -d` and `perf record -D 2000 -F 99 -g
+--call-graph dwarf` against the release-perf `e2e_probe` at HEAD `91b44b1d`,
+`PROBE_NO_TS=1`, `RAYON_NUM_THREADS=8`,
+`FRANKEN_WHISPER_MODEL_DIR=legacy_whispercpp/whisper.cpp/models`. The delay
+skips model load. Stat row: 309.710B instructions, 112.311B cycles, 4.900 s
+elapsed, IPC 2.76, L1D miss rate 11.59%.
+
+**Ranked transcribe-only frames.**
+
+| self | frame | disposition |
+|---:|---|---|
+| 19.83% | `nn::dot_maddubs_i7_m2n4` | int8 lane; peer-owned |
+| 19.03% | `matrixmultiply::sgemm_kernel::kernel_target_fma` | excluded `sgemm` |
+| 13.88% | `nn::matmul_bias_i7_quantized` | int8 lane; peer-owned |
+| 13.17% | `ft_kernel_cpu::sdpa_forward_f32` | SDPA lane; peer-owned |
+| 9.43% | `__expf_fma` | SDPA/poly-exp lane; peer-owned |
+| 4.04% | `encoder::matmul_bias_i8` | int8 lane; peer-owned |
+| 3.76% | `matrixmultiply::gemm_loop` | excluded `sgemm` |
+| 2.90% | `nn::gemv_i8` closure | int8 lane |
+| 0.70% | `__memset_avx2_unaligned_erms` | allocator/buffer-reuse closed |
+| 0.61% | `nn::norm_rows_into` | LN/LN-to-quant closed |
+| 0.33% | `DecoderState::new` cross-KV setup | below useful threshold |
+
+**Decision.** No keep/reject source lever: the top non-`sgemm` frames are
+int8/SDPA peer lanes or closed families, while mel/tokenizer are below the
+sampling floor and KV setup is 0.33%. Retry only after the active int8/SDPA work
+settles or a fresh workload makes mel/tokenizer/decoder/KV a top-5 owned frame
+with >=2% self time. Source remains byte-identical.
+
 ### 2026-07-09 EDT / 2026-07-10 UTC — cod_fw — WIN: default-on quality-safe encoder int8 behind calibrated fallback gate
 
 **Lane.** Complete the owner-gated evidence pack for the quality-safe encoder
