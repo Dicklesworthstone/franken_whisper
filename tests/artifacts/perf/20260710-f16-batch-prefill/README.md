@@ -1,4 +1,21 @@
-# PARKED — f16 batch GEMV scheduler: row-morsel is the wrong scheduler for fc2 prefill
+# CLOSED (REJECTED, measured) — f16 batch GEMV scheduler for fc2 prefill
+
+> **RESULT 2026-07-10 (hz2, real fn, one binary, interleaved, bit-exact):** the routing lever
+> below is **REJECTED**. Row-morsel is NOT slower at fc2 — every ratio (1.020–1.037×) lies inside
+> the NULL CONTROL's own **+2.0% bias** (identical code both arms, cv 36.8%), sign-test p = 1.00 /
+> 1.00 / 0.30. At **tq=100 row-morsel is 1.13× FASTER** (13/15 wins, p = 0.0074), so the proposed
+> gate `4·tq >= inp` would have **regressed** it. Control: cross-KV tq=1500, row-morsel 1.66×
+> faster (p = 0.0001) — both paths provably execute.
+>
+> **Why the analysis below was wrong:** the 12–24× "weight re-stream" is *nominal* traffic. The
+> bands run concurrently and stream the **same** 13.1 MB weight, which shared cache serves.
+> **Nominal bytes-read ≠ distinct DRAM bytes.** Count distinct DRAM bytes, not bytes summed over
+> threads.
+>
+> Ceiling, so nobody reopens: fc2 prefill is 2–5 ms × 4 layers × once/window ⇒ **<0.7% e2e even
+> at a 100% delta.** Family retired. Raw run: `measured_run_hz2.txt`.
+
+# (original analysis, retained) — row-morsel is the wrong scheduler for fc2 prefill
 
 **Status: PARKED. Patch + bench saved, NOT applied.** This is the re-attack of the family
 reopened by the 2026-07-10 ledger-integrity audit (`bd-f16-gemv-weight-stationary-reopen-ugyh`).

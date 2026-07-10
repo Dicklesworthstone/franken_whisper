@@ -4,6 +4,93 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **f16-GEMV family CLOSED on honest grounds — my own fc2-prefill routing lever is REJECTED by measurement on the REAL function at the REAL shape.** Row-morsel is *not* slower at fc2 (all ratios inside the null control's own +2.0% bias) and is **1.13× FASTER at tq=100** (p=0.0074); my proposed gate would have REGRESSED it. Nominal weight traffic ≠ DRAM traffic. **Plus: rch CAN now bench franken_whisper** (recipe below).
+
+**Setup (all three substrate rules satisfied).** Both arms call the **real**
+`nn::gemv_f16_batch` (public), differing only by a tri-state
+`nn::set_batch_gemv_row_morsel(Option<bool>)` — an env var is read once per process and cannot
+flip inside one binary. **ONE binary, ONE rch invocation.** Arms **interleaved inside a single
+measured routine** (`paired()`, order alternated per rep, per-rep paired ratios) — *not* merely
+co-registered in a criterion group, which runs members sequentially and cancels nothing. Every
+input fed through `black_box`; the **full** output consumed through `black_box`. 15 paired reps,
+3 warm discarded. `hz2`/hetzner2, `available_parallelism=16`. Artifact non-empty (2424 B).
+
+**BIT-EXACT:** the assert (`the two schedulers must be bit-identical`) passed at every shape —
+consistent with `gemv_f16_batch_equals_per_token_gemv` and
+`gemv_f16_batch_row_morsel_equals_per_token_gemv`. So the routing choice cannot change results,
+and no transcript/WER gate is needed.
+
+**SELF-TIME per arm (per the ledger-integrity rule).** The timed region is exactly one call to
+`nn::gemv_f16_batch` and nothing else, so the code under test is **100% of each arm's self-time**
+by construction. Absolute medians below *are* the self-times.
+
+| shape | row-morsel (ORIG) | column-band (CAND) | ratio | colband wins | sign-test p |
+|---|---|---|---|---|---|
+| fc2 prefill `tq=12` | **2.33 ms** | **1.96 ms** | 1.037× | 8/15 | **1.00** |
+| fc2 prefill `tq=24` | **3.00 ms** | **3.20 ms** | 1.026× | 8/15 | **1.00** |
+| fc2 prefill `tq=50` | **3.88 ms** | **3.73 ms** | 1.020× | 10/15 | 0.30 |
+| fc2 prefill `tq=100` | **4.95 ms** | **5.63 ms** | **0.884×** | 2/15 | **0.0074** |
+| cross-KV `tq=1500` *(control; not a live consumer)* | **12.24 ms** | **19.33 ms** | **0.601×** | 0/15 | 0.0001 |
+| **NULL CONTROL** (row-morsel vs itself) | 2.69 ms | 2.72 ms | **1.020×** | 8/15 | 1.00 |
+
+**VERDICT: REJECT.** The null control — *identical code on both arms* — reads **1.020× with
+cv 36.8%**. Every fc2 ratio (1.020–1.037×) lies **inside that bias**, and their sign tests are
+p = 1.00 / 1.00 / 0.30: **indistinguishable from noise.** Meanwhile at `tq=100` row-morsel is
+**genuinely 1.13× faster** (13/15 wins, p = 0.0074), so the gate I proposed
+(`row-morsel iff 4·tq >= inp`, which routes every fc2 prefill to column-band) would have
+**caused a measured regression**. The cross-KV control (row-morsel 1.66× faster, p = 0.0001)
+confirms both paths really execute and that row-morsel's design intent is sound.
+
+**WHY MY ANALYTIC MODEL WAS WRONG — the reusable lesson.** I predicted ~0.4% e2e from
+"row-morsel re-streams the 13.1 MB weight once per band ⇒ 157 MB at `tq=12` vs 13.1 MB". That
+arithmetic is right and **irrelevant**: the bands run *concurrently* and all stream the **same**
+weight, so it is served from shared cache — **nominal bytes-read ≠ distinct bytes from DRAM.**
+Cost models must count *distinct* DRAM bytes, not bytes-read-summed-over-threads. Same family of
+error as the SDPA dead-calloc (5.9 GB nominal memset worth only 2.8 ms because glibc recycles the
+size class). **A traffic-multiplier argument is a hypothesis, not a result.**
+
+**What survives from the audit** (both source-provable, neither worth acting on):
+1. `gemv_f16_batch`'s real consumer is **fc2 at prefill**, not `cross_attn_k/v` — those were
+   routed to f32 sgemm by `a674b49` (2026-07-02). The 2026-07-09 REJECT of the weight-stationary
+   tile was benched at the cross shape and is INVALID **as written**; re-run here at the true
+   shape, the family is now **closed with a real number** instead of a wrong one.
+2. **M2col (`dot_f16c_2col`) is inert whenever `tq < 2·workers`** (`row_band = 1`, so
+   `local_t + 2 <= rows` never fires) — i.e. at `tq = 12` and `24`. Its landed 1.212× therefore
+   does nothing at those shapes, and its recorded "~2% e2e cross_kv" attribution remains wrong.
+   But since row-morsel is *not* slower there, this costs nothing measurable. No revert.
+
+**Magnitude ceiling, so nobody re-opens this.** fc2 prefill is 2–5 ms/call × 4 turbo decoder
+layers × **once per window** ≈ 8–20 ms against ~2.9 s/window ⇒ **< 0.7% e2e even if the delta
+were 100%.** The measured delta is ~0. **The family is retired.**
+
+---
+
+### INFRA WIN — `rch` CAN bench `franken_whisper` (bd-rch-sync-timeout-franken-whisper-z1w4)
+The 30 s `sync_to_remote` timeout is fixable **without touching the shared global config**:
+
+```
+mkdir -p $SCRATCH/rchcfg && cp ~/.config/rch/*.toml $SCRATCH/rchcfg/
+#   [transfer.retry] total_timeout_ms : 30000 -> 600000
+#   [transfer] exclude_patterns += "legacy_whispercpp/", "perf.data", ".rch-targets/",
+#                                  "*.wav", "*.mp3", "sample_audio_files/"
+RCH_CONFIG_DIR=$SCRATCH/rchcfg RCH_DISABLE_CONFIG_CACHE=1 RCH_REQUIRE_REMOTE=1 \
+  env -u CARGO_TARGET_DIR rch exec -- cargo bench -p franken_whisper --bench <name>
+```
+Result: *"Executing command remotely"* on `hz2`, artifacts retrieved (2424 B, **non-empty** —
+`env -u CARGO_TARGET_DIR` is what makes retrieval work), **disk flat at 78 G, no local build.**
+`RCH_REQUIRE_REMOTE=1` remains mandatory: without it rch logs *"Remote execution failed …,
+running locally"* and silently builds locally (`rch diagnose` → `Strict remote: off`).
+
+**Also surfaced: `.rch-targets/` inside `franken_whisper` is 47 GB** — rch's own pooled target
+dirs, and the dominant disk consumer in this tree (`target` 2.2 G, `legacy_whispercpp` 1.7 G,
+`perf.data` 736 MB). Owner call; I delete nothing.
+
+AGENT_NAME=cc_fw. **No source committed** — the tri-state knob + routing gate were applied only to
+take the measurement, then reverse-applied hunk-by-hunk (no stash, no reset, `git checkout --`
+refused by dcg and not used). `nn.rs` and `Cargo.toml` are back at HEAD and left to cod_fw.
+Patch, bench, and the raw run are archived at `tests/artifacts/perf/20260710-f16-batch-prefill/`.
+
+---
 ## 2026-07-10 - cc_fw: **cashed in the reopened f16-GEMV family — the lever is NOT weight-stationary token-blocking; it is that `gemv_f16_batch` routes fc2 prefill to the WRONG SCHEDULER (12–24× weight re-stream), and the landed M2col tile is INERT there.** Bit-exact, ~0.4% e2e. PARKED: `rch` cannot sync this 52 GB tree.
 
 **Where the code actually runs** (the audit's payoff). `gemv_f16_batch` has ONE production
@@ -82,6 +169,114 @@ element), so no arm can be DCE'd; a null control (arm-vs-itself) calibrates the 
 AGENT_NAME=cc_fw. **No source code committed** — `nn.rs` and `Cargo.toml` were restored to HEAD by
 reverse-applying my own hunks (no stash, no reset), and `nn.rs` released to cod_fw, who is working
 the KV-cache region. No local cargo build, nothing deleted.
+
+---
+## 2026-07-10 - cod_fw: **NON-GEMM LEDGER-INTEGRITY CORRECTION + PACKED SELF-K CANDIDATE PARKED** — fresh full-turbo profile finds `attention_with_cache` at **0.17% self**, but the historical byte-exact rejection timed a replica; strict RCH then failed closed before a valid A/B/profile could run
+
+**Correction to my own `d3499aa` row.** Its long-form profile remains valid
+priority evidence, but its **REJECT** label does not satisfy the newly adopted
+integrity rule: no candidate benchmark was profiled and no function-under-test
+self-time was recorded. Treat `d3499aa` as a SURFACE/routing row, not do-not-retry
+authority. Likewise, static reachability can prove that a branch is dead, but
+under the current owner rule it does not substitute for benchmark self-time in
+a new REJECT row.
+
+### Fresh full-transcription profile
+
+Timestamped `large-v3-turbo`, dense track01, 124.5 seconds of audio,
+`RAYON_NUM_THREADS=8`, existing symbolized release-perf `e2e_probe` Build ID
+`acd75e8eb9b593d129a8563461349529921d46ef`. Transcription: **23.329 s**, RTF
+0.1874, 12 segments, 1,337 characters. Flat `cycles:u -F199` capture: 38,308
+process samples; exact transcribe slice `2428346.252,2428369.586`: **32K samples,
+zero lost**. External sgemm (`kernel_target_fma` 17.88%, `gemm_loop` 4.25%) is
+excluded below.
+
+The executable was built at source `91b44b1`; committed `mel.rs`, tokenizer,
+decoder, and `nn.rs` are unchanged through this profile's HEAD. The sibling
+`frankentorch` revision advanced, so cc-owned sibling-frame magnitudes are
+routing context, not fresh comparator claims.
+
+| rank | self | non-sgemm frame | integrity routing |
+|---:|---:|---|---|
+| 1 | 21.67% | `nn::dot_maddubs_i7_m2n4` | cc-owned int8 |
+| 2 | 14.34% | `nn::matmul_bias_i7_quantized` closure | cc-owned int8 |
+| 3 | 13.08% | `ft_kernel_cpu::sdpa_forward_f32` | cc-owned SDPA |
+| 4 | 7.53% | `__expf_fma` | cc-owned SDPA |
+| 5 | 6.03% | `nn::gemv_i8` closure | cc-owned int8 |
+| 6 | 4.63% | `encoder::matmul_bias_i8` closure | cc-owned int8 |
+| 7 | 1.68% | `nn::gemv_i8w_f32a_blocked` | cc-owned int8 |
+| 8 | 1.39% | `nn::quantize_act_i7_gelu` closure | cc-owned int8 |
+| 9 | 1.07% | `nn::gemv_i8` | cc-owned int8 |
+| 10 | 0.78% | `nn::norm_rows_into` | decoder fused-LN row is in-situ but lacks benchmark self-time |
+| 11 | 0.74% | `nn::maddubs_i7_headmajor_block` | cc-owned int8 |
+| 12 | 0.69% | `__memset_avx2_unaligned_erms` | mixed callers; not attributable to KV allocation |
+| 13 | 0.65% | `nn::quantize_act_i7` closure | cc-owned int8 |
+| 14 | 0.39% | `__memmove_avx_unaligned_erms` | mixed callers |
+| 15 | 0.29% | encoder quantization closure | cc-owned int8 |
+| 16 | 0.20% | unresolved kernel address | outside crate |
+| 17 | 0.19% | unresolved kernel address | outside crate |
+| 18 | 0.17% | `encoder::forward_time_major` | outside decoder lane |
+| **19** | **0.17%** | **`nn::attention_with_cache`** | **top open requested family** |
+| 20 | 0.14% | `DecoderState::new` closure 4 | cross-K/V f16 conversion; prior F16C row is replica-only |
+| 21 | 0.11% | `nn::softmax_rows` | decoder attention |
+
+Tokenizer, `process_logits`, and argmax have no >=0.1% symbol; native beam does
+not exist. `compute_logprobs` is positively reached at 0.03%. Mel is positively
+reached (`log_mel` worker and `cfft_simd8` samples exist) but remains below 0.01%
+of full transcription.
+
+### Relevant rejection audit
+
+| family | historical substrate | integrity result |
+|---|---|---|
+| byte-exact self-K loop swap | `examples/self_attn_scores_probe` private `scores_scalar`/`scores_swap` replicas | **INVALID REJECT**: production `attention_with_cache` self-time in that bench was 0%; no production benchmark profile |
+| f16/F16C self-K cache | standalone `kv_f16c_probe` replica | **INVALID family closure**: real f16-storage e2e path was span-timed, but no benchmark self-time; non-exact 4-accumulator path remains closed independently because it changed transcript |
+| cross-K/V transpose/F16 conversion | row claimed `decoder_token_step` rebuilt `DecoderState` inside `b.iter` | **FALSE ROUTING**: `DecoderState::new` has always been outside the timed loop; current production closure 4 is 0.14% self |
+| KV allocation/zero-init | source inspection only | preallocation/no-realloc fact stands, but the zero-init dismissal is **unmeasured**; aggregate memset cannot be assigned to KV |
+| mel/FFT sweeping closures | real `log_mel` benches mixed with standalone/private replicas; none records production target self-time | **NOT do-not-retry authority**; several were later falsified by landed RFFT, radix-5, per-worker scratch, CFFT arena, and SIMD projection wins |
+| tokenizer overlap | production load path but separate invocations, no self-time | invalid as a REJECT under the current rule; also absent from transcription profile |
+| prompt/ngram drafting | offline token-stream simulator | dead relative to production; no speculative branch executed |
+| greedy/no-ts logprob elisions | real e2e branches | executed, but old separate-build A/B and no benchmark self-time; current opportunity is 0.03% |
+
+### Top live mechanism and alien primitive
+
+`perf annotate` gives 67 production samples in `attention_with_cache`. The scalar
+self-K score chain's `vmulss` and `vaddss` carry **40.71% + 12.16% = 52.87%** of
+that symbol's local sampled period, approximately **0.09% of full transcription**.
+The rejected replica's d-outer loop lost because it read row-major K at a 5,120
+byte token stride.
+
+The new candidate changes the layout: mirror K as
+`[state, capacity_tokens]`, append into both layouts, then run d-outer/j-inner
+over contiguous key columns. Each `scores[j]` still receives the identical
+d-ascending sequence `score += qd * (key * scale)`, so vectorization across
+independent scores is bit-exact. The real `attention_with_cache` arms, extra
+append scatter, and duplicate K storage are all included in the parked A/B.
+The harness alternates 25 pairs, asserts output bits before timing, and reports
+paired-ratio CV.
+
+Patch and full evidence:
+`tests/artifacts/perf/20260710-self-k-column-major/`.
+
+### BLOCKED, not rejected
+
+Required fail-closed command was executed exactly as directed:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench \
+  --profile release-perf --bench native_engine_bench -- \
+  native_engine/self_attn_k_layout --noplot
+```
+
+RCH selected healthy `vmi1264463`, then `sync_to_remote` timed out after 30 s.
+`RCH_REQUIRE_REMOTE=1` refused local fallback; **no local Cargo/rustc ran**. This
+reproduces the concurrent f16-prefill lane's repository-sync blocker.
+
+**Verdict: PARK / concrete blocker. No WIN or REJECT is admissible.** The live
+source is unchanged and therefore bit-exact. Retry only when strict RCH can
+complete sync; then run the single-invocation paired A/B and profile the
+retrieved benchmark binary. A future REJECT must record non-zero self-time for
+`attention_decode_step_column_keys`; absent that figure, the row stays open.
 
 ---
 ## 2026-07-10 - cc_fw: **LEDGER-INTEGRITY AUDIT of all 10 do-not-retry families** — **1 row INVALID (benched a consumer the engine abandoned 7 days earlier), 1 LANDED win's e2e attribution WRONG, 1 "REJECT" is really a SIZING argument, 2 i7 rows are gated-path-only AND substrate-invalid.** Method: static reachability, which is *stronger* than sampled self-time for "does it execute".
