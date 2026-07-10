@@ -1,7 +1,11 @@
 # RECOMMENDATION: enable `FT_SDPA_POLY_EXP` for `large-v3-turbo` only
 
-**Status: RECOMMENDATION. The default is NOT changed by this document. The owner decides.**
-Author: `cc_fw` (SDPA/int8 lane) · 2026-07-10 · Tracking: `bd-bcm7`
+> **✅ SHIPPED 2026-07-10 (owner-authorized) — franken_whisper `94714c1`, bd-bcm7 CLOSED.**
+> `large-v3-turbo` now enables poly softmax by default at encoder load; `tiny.en` stays OFF;
+> kill-switch `FW_SDPA_POLY_EXP=0`. Merge/review packet: `docs/PR_ft_sdpa_poly_exp_turbo.md`.
+> This document is retained as the full evidence record.
+
+**Status: SHIPPED (was RECOMMENDATION).** Author: `cc_fw` (SDPA/int8 lane) · 2026-07-10 · Tracking: `bd-bcm7`
 
 ---
 
