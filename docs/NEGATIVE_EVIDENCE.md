@@ -4,6 +4,68 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **PROFILE INSIDE int8 GEMM (read-only) + SURFACE.** Top frame `dot_maddubs_i7_m2n4` **14.63%** (cod's, ISA-bound). **CORRECTION to my own hand-off:** the "9.91% reducible epilogue" I told cod about is **rayon DISPATCH**, not dequant — the closure it runs does **zero arithmetic**. Every int8 GEMM frame is in cod's `nn.rs`; my SDPA lane has **no wall-clock-decidable lever left** — surfacing rather than shipping floor-level noise.
+
+**PROVENANCE.** franken `e2e_probe` sha256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`, turbo, jfk×8, in-situ,
+`perf -F 299` + `perf annotate`. **Worker: LOCAL** (5975WX, profile not an A/B). No build; disk 75G.
+
+### 1. int8 GEMM top frames, finally attributed correctly
+| % self | frame | what it actually is |
+|---|---|---|
+| **14.63** | `nn::dot_maddubs_i7_m2n4` | the i7 MAC kernel. `perf annotate`: 9 `vpmaddubsw` of ~75 vector ops ⇒ **~12% MAC-dense**; Zen3 has no AVX512-VNNI so `vpmaddubsw→vpmaddwd→vpaddd` (3 ops / 32 MACs) is an **ISA ceiling** (`vpdpbusd` would collapse it). **cod_fw's M4×N4 lane-packed tile is the right lever.** |
+| **9.91** | `rayon::…bridge_producer_consumer::helper<…matmul_bias_i7_quantized::{closure#0}>` | **rayon DISPATCH**, executing the i7 row-block closure. `perf annotate` of the setup fn: **81 mov, 12 call, ZERO** `vpmaddubsw`/`vcvtdq2ps`/`vmulps` — no arithmetic. Callees: rayon bridge, `malloc`/`free` (per-GEMM `gemv_out_buf`), 2× `OnceLock<bool>` reads. |
+
+**CORRECTION.** frankentorch commits `b361d04`/`31fbd0c` and my hand-off to cod described the 9.91%
+as *"the reducible epilogue in `matmul_bias_i7_quantized::{closure#0}` — 68% of the dot kernel's own
+self-time, spent outside the dot."* **The framing "dequant epilogue" is wrong.** The closure does no
+dequant and no arithmetic; the 9.91% is **rayon row-block dispatch** (plus a per-GEMM `malloc`/`free`
+and two `OnceLock` reads). It belongs to the **rayon overhead bucket (11.25%)**, not to a
+dequant/store pass. The *reducible* handle is therefore **row-block granularity**, not vectorizing a
+store loop.
+
+### 2. The 12.3% "fused QKV" is the SAME arithmetic, not a new target
+`attention_from_i7_qkv`'s own frames are ≤ **0.61%** (`maddubs_i7_headmajor_block`). The span's cost
+is the three QKV maddubs GEMMs, i.e. `dot_maddubs_i7_m2n4` **billed through it** — already the 14.63%
+frame above. So "attack the 12.3% fused QKV" and "attack the 14.63% i7 dot" are **the same kernel**.
+
+### 3. This connects the reopened i7-coarsening lever to the 9.91% frame — a hand-off for cod
+`bd-i7-rows-gated-and-substrate-invalid-o0bu` reopened `FW_I7_ROWBLOCK_MIN_LEN` coarsening (prior
+REJECT 0.808× was **two-invocation, substrate-invalid**). That lever changes exactly the **row-block
+rayon dispatch granularity** — i.e. the **9.91% frame just attributed here**. So it is aimed at a
+real, correctly-identified target. **cod_fw: re-measure it on the ABBA + per-shape null-control
+harness (frankentorch `2ba080ba` is the template), one binary, one invocation — the old 0.808× is
+not admissible.** Also cheap and byte-exact: hoist the per-GEMM `gemv_out_buf` `malloc`/`free` and
+the `OnceLock` reads out of the per-call path.
+
+### 4. SURFACE — my SDPA lane has no wall-clock-decidable lever left on this hardware
+Honest inventory, each judged against the **median null floor** (~[0.94, 1.05] per-worker; the
+fleet cannot resolve a few-percent kernel effect via wall-clock):
+| SDPA-lane lever | status |
+|---|---|
+| poly-exp (`FT_SDPA_POLY_EXP`) | **DECIDABLE** — op-level 1.2465× (~25× floor), e2e 1.0722× cv 0.8%, byte-identical transcript, WER Δ 0.000. Recommended, **with the owner**. |
+| `BR` tile | **inside the null floor** (this session; withdrawn). |
+| `sc` per-block calloc + `out` zero-init | **rejected 0.5%** (below floor) — do not re-dig. |
+| `matrixmultiply→gemm` swap | closed. `F32_2D_TALL_MAX_K` landed (bit-exact; perf flagged unvalidated). |
+| int8 SDPA (scores/out) | measured-dead (0.14×/0.77×). |
+
+Every remaining int8 GEMM frame (14.63% dot, 9.91% dispatch, 12.3% QKV) is in **cod_fw's reserved
+`nn.rs`**; I profiled read-only and did not edit ([[feedback_shared_tree_reserve_files]]). So the
+in-crate frontier **in my lane** is at the hardware/measurement floor: the decidable win is captured
+and with the owner; the rest is either cod's or below the floor. **This is a `surface`, not a `ship`
+— and after a session where shipping floor-level noise was the recurring failure mode
+([[project_abba_null_control]]), refusing to invent a marginal lever is the correct outcome.**
+
+**Where real e2e gains remain (all cross-lane / owner / hardware), ranked:**
+(a) cod's **M4×N4 i7 tile** — the 14.63% dot is ISA-bound but the tile controls widening-op count;
+(b) **row-block dispatch** (9.91%) via the reopened coarsening lever, re-measured admissibly;
+(c) **AVX512-VNNI** (`vpdpbusd`) on a Zen4/SPR host — collapses the 3-op widening chain, hardware-gated;
+(d) the **upstream `ft_kernel_cpu` GEMM** tile-shape lever, gated on a ≥32-core rch worker.
+
+AGENT_NAME=cc_fw. No source changed (profile + correction only). No build; disk 75 G; nothing
+stashed or deleted. `nn.rs`/`benches` untouched — cod_fw's.
+
+---
 ## 2026-07-10 - cc_fw: **GATE CORRECTED (median vs null spread, not cv<5) — and it FALSIFIES MY OWN CLAIMS.** BR is **not decidable** on any worker I have had; the "`BR=128` regresses 0.9414× at `nbh=4`" number is **WITHDRAWN** — it was decided **inside that shape's own null floor**. Self-audit of every ratio I have published this session, against the null floor and the provenance rules.
 
 **Rule adopted** (frankenmermaid harness calibration + frankenlibc per-function floor): `cv < 5` is
