@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **DUG the new subsystems (VAD, feature-cache, encoder non-GEMM) — VAD is BRIDGE-ONLY (no native surface), feature-cache DOES NOT EXIST, encoder non-GEMM ops all CLOSED. No hot frame; nothing to ship. The franken CPU inference surface is exhausted for shippable in-lane byte-exact levers.**
+
+Acting on the convergence REJECT by digging genuinely-new subsystems (not a re-survey of the hot GEMM/SDPA frames).
+
+- **VAD:** `grep -n vad src/native_engine/*.rs` = **empty**. VAD is a **bridge-only** CLI param handed
+  to the external tool; there is **no native VAD implementation** ⇒ zero franken perf surface. The
+  silence pre-gate is a cheap per-window noise-floor check in `mel.rs` (cold, <0.02% in-profile).
+- **feature-cache:** no such subsystem exists (`grep feature.*cache` = empty). The cross-window
+  feature reuse that DOES exist is the cross-KV precompute (granularity-flip LANDED,
+  [[project_cross_quant_parallel_landed]]) and window pipelining (LANDED default-on,
+  [[project_window_pipelining_lever]]).
+- **encoder non-GEMM ops** (the one named subsystem with any residual): **all closed** —
+  LayerNorm is compute-bound f64 SoA *and a faithfulness feature* (more precise than ggml/PyTorch,
+  [[project_layernorm_dram_bound_dead]]); GELU antipattern exhausted ([[project_gelu_gather_antipattern_fixed]]);
+  residual `add_in_place` parallelization a wash (kept serial); conv stem delegates to external sgemm
+  (weight-pretranspose landed).
+
+**Profile evidence (both models):** no VAD/silence/mel/fft/feature frame appears above **0.02%**;
+the biggest generic frames are `__memset_avx2` 1.12% / `__memmove` 0.71% (aggregate alloc/copy,
+below the null floor, sdpa out/sc zero-init flagged don't-re-dig).
+
+**STATE OF THE CAMPAIGN (my lane).** Every franken CPU inference subsystem is now frame-profiled on
+both models: encoder GEMM (~90%, cod's int8 tile + external sgemm, owner/hardware), SDPA (mine —
+poly-exp with owner + byte-exact levers rejected/closed), decode int8 GEMVs (cod's), mel / tokenizer
+/ sampler / VAD / feature-cache (cold or non-existent). **There is no un-profiled subsystem with a
+hot frame and no shippable one-cycle byte-exact lever in the SDPA/int8-SDPA lane.** The convergence
+verdict (`0bc2817`) stands: REJECT, no ship. Productive next steps are the cross-lane/owner/hardware
+items in the closure map (`b4629f3`) — draft decoding (owner model), cod's M4×N4 tile + packed-K,
+the two owner quant decisions, GPU/VNNI. Further single-agent CPU-lever digs will keep returning
+"cold or cod's or owner."
+
+AGENT_NAME=cc_fw. No source changed (profile + grep audit). No build; disk 76 G; nothing stashed/deleted.
+
+---
 ## 2026-07-10 - cc_fw: **CONVERGENCE VERDICT — hottest in-lane frame `sdpa_forward_f32`: REJECT. No byte-exact lever beats the null floor.** (Not a survey — the binary ship-or-reject decision, backed by this session's paired-null measurements.)
 
 **Single hottest frame, global:** `nn::dot_maddubs_i7_m2n4` **14.63%** — cod_fw's reserved i7 kernel,
