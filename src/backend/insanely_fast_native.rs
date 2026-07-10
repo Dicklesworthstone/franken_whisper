@@ -160,12 +160,6 @@ pub fn is_available() -> bool {
     super::whisper_cpp_native::is_available()
 }
 
-/// Whether a HuggingFace token is present for the given request (diarization
-/// gate, unchanged from the bridge contract).
-pub(crate) fn hf_token_present_for_request(request: &TranscribeRequest) -> bool {
-    super::insanely_fast::hf_token_present_for_request(request)
-}
-
 /// Resolve the effective model spec for a request, or a [`FwError`] explaining
 /// how to provision one. Identical precedence to the whisper.cpp native engine:
 /// `request.model` then `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`, else an
@@ -323,8 +317,9 @@ struct RangeResult {
 ///
 /// # Errors
 ///
-/// - [`FwError::BackendUnavailable`] when no model can be resolved (or when
-///   diarization is requested without a HuggingFace token).
+/// - [`FwError::BackendUnavailable`] when no model can be resolved. (Diarization is
+///   NOT gated here: the native path uses the orchestrator's local heuristic and needs
+///   no HuggingFace token; the bridge-only token gate lives in `readiness_for`.)
 /// - [`FwError::Io`] / [`FwError::InvalidRequest`] when the WAV cannot be read.
 /// - [`FwError::Cancelled`] when the cancellation token's deadline expires
 ///   (propagated into every worker; the first error wins).
@@ -336,12 +331,10 @@ pub fn run(
     _timeout: Duration,
     token: Option<&crate::orchestrator::CancellationToken>,
 ) -> FwResult<TranscriptionResult> {
-    if request.diarize && !hf_token_present_for_request(request) {
-        return Err(FwError::BackendUnavailable(
-            "diarization requires HF token (`--hf-token` or env `FRANKEN_WHISPER_HF_TOKEN` / `HF_TOKEN`)"
-                .to_owned(),
-        ));
-    }
+    // NOTE (bd-0522): the native path never contacts HuggingFace. Diarization is added
+    // downstream by the orchestrator's local heuristic `Diarize` stage, so this function
+    // must NOT gate on an HF token — doing so was a false requirement. The token gate now
+    // lives in `backend::readiness_for`, fired only when the bridge will diarize.
     if let Some(tok) = token {
         tok.checkpoint()?;
     }
@@ -1018,7 +1011,12 @@ mod tests {
     // ── Diarization gate ──────────────────────────────────────────────────
 
     #[test]
-    fn run_diarize_without_token_fails() {
+    fn run_diarize_without_token_is_not_gated_on_token() {
+        // bd-0522: the native insanely-fast path never contacts HuggingFace — diarization
+        // is added downstream by the orchestrator's local heuristic `Diarize` stage. So a
+        // diarize request without a token must NOT be rejected here for lack of a token.
+        // It may still fail for an unrelated reason (e.g. no model in the test env); we
+        // only assert the failure is NOT the (now-removed) spurious HF-token gate.
         let dir = tempfile::tempdir().expect("tempdir");
         let wav = dir.path().join("tone.wav");
         let mut samples = vec![0i16; 1_600];
@@ -1027,8 +1025,13 @@ mod tests {
 
         let mut req = request();
         req.diarize = true;
-        let result = run(&req, &wav, dir.path(), Duration::from_secs(1), None);
-        assert!(result.is_err(), "diarize without HF token should fail");
+        if let Err(e) = run(&req, &wav, dir.path(), Duration::from_secs(1), None) {
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                !msg.contains("hf token") && !msg.contains("huggingface"),
+                "native diarize must not be gated on an HF token, got: {e}"
+            );
+        }
     }
 
     // ── Silence pre-gate ──────────────────────────────────────────────────
