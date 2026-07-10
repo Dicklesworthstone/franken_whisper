@@ -7,13 +7,17 @@
 ## Measurement protocol
 
 - **Harness:** `benches/native_engine_bench.rs` (criterion).
-- **Build/run:** per-crate via `rch exec` with
-  `CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cc` (never
-  workspace-wide).
-- **Baseline vs candidate:** criterion `--save-baseline` / `--baseline`. rch
-  repo-convergence keeps a repo on one worker, so save/compare runs land on the
-  same hardware; large effects (≫ worker variance) are the bar for keeping a
-  lever.
+- **Build/run:** fail-closed remote only:
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo ...`.
+  An RCH failure is a blocker, never permission to build locally.
+- **Baseline vs candidate:** both arms must execute in one binary and one RCH
+  invocation, interleaved inside one measured routine with black-boxed inputs
+  and complete results. Separate Criterion baseline invocations are invalid
+  because RCH worker selection is non-deterministic.
+- **REJECT provenance:** record benchmark-binary SHA256, worker identity,
+  no-filter `cv_pct < 5`, and profile-verified non-zero self-time for the real
+  function under test. Without all four, the row is a blocker or routing probe,
+  not do-not-retry authority.
 - **Conformance gate:** every numeric kernel change ships with a **bit-exact
   parity test** against the pre-change reference, so a "win" cannot silently
   alter output. The mel output is conformance-checked against whisper.cpp's exact
@@ -42,6 +46,136 @@
 ---
 
 ## Levers
+
+### 2026-07-10 UTC — cod_fw — SURFACE: static balanced i7 stripes are bit-exact and live-profiled; CV 13.235% blocks a verdict
+
+Ledger audit reopened the old i7 rowblock row: its two arms were separate RCH
+invocations, its spread implies roughly 10% CV, and it records neither a binary
+hash nor candidate-path self-time. A fresh full `large-v3-turbo` transcription
+profile instead attributes **43.717%** of full self-time to the encoder i7/int8
+family: `dot_maddubs_i7_m2n4` 21.68%,
+`matmul_bias_i7_quantized` Rayon compute 14.34%, full-i8 `attn.out` 4.63%,
+quantizers 2.33%, and head-major helper 0.74%. Profile binary SHA256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
+Build ID `acd75e8eb9b593d129a8563461349529921d46ef`, 32K samples, zero lost.
+External sgemm is excluded.
+
+The top dot frame is arithmetic/issue-pressure dominated (`vpmaddubsw` 41.297%,
+`vpaddd` 17.714%, loads 17.485%, `vpmaddwd` 6.361%). A packed M4N4 tile repeats
+the observed register-pressure/data-movement mechanism, so the measured lever
+took the next frame: replace the shipped 375-item four-row Rayon traversal with
+one balanced contiguous quotient/remainder stripe per Rayon worker. The dot,
+epilogue, allocation, store order, and Q/K/V sequence were shared unchanged.
+
+One binary alternated ORIG/candidate inside each timed routine, black-boxed all
+inputs and full Q/K/V results, and proved every output bit identical. The only
+confirmation evaluated for a verdict ran via strict RCH on `vmi1152480`, 10
+Rayon threads, binary SHA256
+`c85d05bbf7837c493da9e9bf801d16aa1693caeab71346abb9d9be945341aea2`.
+Its 10 Criterion measurement-batch ratios (ORIG/CANDIDATE, 25 pairs each,
+`INNER=3`, none filtered) were:
+
+```text
+0.947109 0.857250 1.055037 1.098787 0.925783
+0.883159 1.192566 0.998777 0.965458 1.272703
+```
+
+Mean `1.019663`, sample SD `0.134949`, **cv_pct `13.235`**, candidate wins
+`97/250`. The same binary's profile proves the benchmark was live:
+`matmul_bias_i7_quantized::{closure#0}` **7.44% self / 12,417 samples** and the
+candidate-only `DrainProducer` dispatcher **0.02% / 38 samples**;
+`dot_maddubs_i7_m2n4` was 89.08% / 148,635 samples, with zero lost.
+
+**No verdict.** CV exceeds the mandatory 5% gate, so this is neither WIN nor
+REJECT. A `vmi1264463` preflight with within-batch CV 9.672–27.103% and an
+`hz2` attempt that stopped before execution because `perf` was absent are both
+excluded. Candidate source and bench switch were manually removed, restoring
+both files exactly to HEAD. The retained strict-RCH runner records worker,
+binary hash, and self-time and now fails before execution on workers without
+`perf`. Retry the exact static-stripe primitive only in one perf-capable remote
+invocation with no-filter CV `<5%`; otherwise rotate to a different ownership
+primitive. This does not establish a parity or performance ceiling.
+
+### 2026-07-10 UTC — cod_fw — SURFACE/PARK: integrity audit reopens self-K; packed-column candidate blocked before A/B
+
+**This entry supersedes the `d3499aa` REJECT immediately below.** That profile
+is still useful routing evidence, but the source-attempt verdict is not valid
+under the active ledger-integrity rule: its byte-exact self-K benchmark timed
+private replica functions and recorded no production function-under-test
+self-time. The mel/FFT, tokenizer, decoder, and KV families were audited under
+the same rule; no historical REJECT in those families currently supplies both
+a production-path A/B and non-zero benchmark self-time for the function under
+test. Several mel closures were also contradicted by later landed RFFT,
+radix-5, scratch-arena, and SIMD-projection wins.
+
+**Fresh full-transcription profile.** Timestamped `large-v3-turbo`, dense
+track01 (124.5 s), `RAYON_NUM_THREADS=8`, existing symbolized release-perf
+`e2e_probe` Build ID `acd75e8eb9b593d129a8563461349529921d46ef`.
+Transcription took **23.329 s** (RTF 0.1874, 12 segments, 1,337 characters).
+The exact transcribe slice contained **32K cycles:u samples with zero lost**.
+External sgemm (`kernel_target_fma` 17.88%, `gemm_loop` 4.25%) is excluded:
+
+The executable was built at source `91b44b1`; the requested in-crate mel,
+tokenizer, decoder, and `nn.rs` paths are unchanged through this profile's
+HEAD. The sibling `frankentorch` revision advanced, so cc-owned sibling-frame
+magnitudes are routing context rather than fresh comparator claims.
+
+| rank | self | non-sgemm frame | disposition |
+|---:|---:|---|---|
+| 1 | 21.67% | `nn::dot_maddubs_i7_m2n4` | cc-owned int8 |
+| 2 | 14.34% | `nn::matmul_bias_i7_quantized` closure | cc-owned int8 |
+| 3 | 13.08% | `ft_kernel_cpu::sdpa_forward_f32` | cc-owned SDPA |
+| 4 | 7.53% | `__expf_fma` | cc-owned SDPA |
+| 5 | 6.03% | `nn::gemv_i8` closure | cc-owned int8 |
+| 6 | 4.63% | `encoder::matmul_bias_i8` closure | cc-owned int8 |
+| 7 | 1.68% | `nn::gemv_i8w_f32a_blocked` | cc-owned int8 |
+| 8 | 1.39% | `nn::quantize_act_i7_gelu` closure | cc-owned int8 |
+| 9 | 1.07% | `nn::gemv_i8` | cc-owned int8 |
+| 10 | 0.78% | `nn::norm_rows_into` | old fused-LN row lacks benchmark self-time |
+| 11 | 0.74% | `nn::maddubs_i7_headmajor_block` | cc-owned int8 |
+| 12 | 0.69% | `__memset_avx2_unaligned_erms` | mixed callers; not KV-attributable |
+| 13 | 0.65% | `nn::quantize_act_i7` closure | cc-owned int8 |
+| 14 | 0.39% | `__memmove_avx_unaligned_erms` | mixed callers |
+| 15 | 0.29% | encoder quantization closure | cc-owned int8 |
+| 16 | 0.20% | unresolved kernel address | outside crate |
+| 17 | 0.19% | unresolved kernel address | outside crate |
+| 18 | 0.17% | `encoder::forward_time_major` | outside decoder lane |
+| **19** | **0.17%** | **`nn::attention_with_cache`** | **top open requested family** |
+| 20 | 0.14% | `DecoderState::new` closure 4 | prior F16C row used a replica |
+| 21 | 0.11% | `nn::softmax_rows` | decoder attention |
+
+Tokenizer, `process_logits`, and argmax have no >=0.1% symbol; native beam
+search does not exist. `compute_logprobs` is reached at 0.03%. Mel is reached
+but remains below 0.01% of full transcription.
+
+**Mechanism.** Production `perf annotate` gives 67 samples in
+`attention_with_cache`. The scalar self-K score chain's `vmulss` and `vaddss`
+carry **40.71% + 12.16% = 52.87%** of the symbol's sampled period, approximately
+**0.09% of full-transcription self-time**. The old loop-swap replica made K
+access strided. The parked alien primitive instead mirrors self-K as
+`[state, capacity_tokens]`, appends to both layouts, and computes d-outer/
+j-inner over contiguous columns while preserving each score's d-ascending
+floating-point operation sequence. Its same-binary harness calls the real
+`attention_with_cache` in both arms, alternates 25 paired repetitions, asserts
+bit equality before timing, and reports paired-ratio CV.
+
+**BLOCKED before measurement; this is neither WIN nor REJECT.** The required
+fail-closed invocation was:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench \
+  --profile release-perf --bench native_engine_bench -- \
+  native_engine/self_attn_k_layout --noplot
+```
+
+RCH selected healthy `vmi1264463`, prepared 26 roots, then failed at
+`sync_to_remote: timed out after 30000ms`; `RCH_REQUIRE_REMOTE=1` refused local
+fallback, and no local Cargo/rustc ran. Therefore no parity test, A/B ratio,
+CV, or benchmark function self-time exists. The source patch is not applied;
+it is parked with the full proof plan at
+`tests/artifacts/perf/20260710-self-k-column-major/`. Retry only when strict RCH
+can sync, then profile the retrieved benchmark binary and require non-zero
+candidate-kernel self-time before admitting either a WIN or REJECT.
 
 ### 2026-07-10 UTC — cod_fw — REJECT: long-form turbo does not promote an owned non-GEMM residual
 
