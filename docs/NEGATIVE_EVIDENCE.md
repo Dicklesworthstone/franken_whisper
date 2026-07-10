@@ -4,6 +4,81 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 EDT / 2026-07-10 UTC - cc_fw: FALSIFICATION of a recorded corollary + QUANTIFIED LEAD - the external fused SDPA **IS** exp-bound: `exp` is **23.7%** of `sdpa_forward_f32`, not "a negligible fraction"
+
+**What the ledger said (2026-07-07, AshHeron, this file ~line 830):** "the encoder
+attention is matmul + score-MATERIALIZATION + per-head transpose/alloc
+overhead-bound, NOT exp-bound. **Corollary (1): NO softmax-exp optimization
+(poly, faster transcendental, etc.) can speed the encoder attention; the exp is a
+negligible fraction.**"
+
+**Why that corollary does not follow from its experiment.** The A/B swapped the
+WHOLE fused kernel for a franken *per-head* rewrite (`FW_ATTN_NO_SDPA=1`) that
+materializes the `[1500,1500]` scores: fused 2573.8 ms vs franken-libm 3451.1 ms
+(0.746x) vs franken-poly 3535.6 ms. Poly moved nothing **inside the slow rewrite**,
+whose materialization + transpose + alloc overhead dominates and masks the exp
+term. Nobody ever held the fused kernel's structure FIXED and swapped only its
+exp. Separately, `examples/softmax_probe.rs` ("is SIMD-exp worth it for the
+ENCODER?", rejected as "kernel 1.80x isolated, encoder e2e FLAT") A/B'd franken's
+`nn::softmax_rows` — which the **default encoder path never calls**, because the
+external kernel carries its own softmax. Both prior probes missed the target.
+
+**The clean experiment (`examples/sdpa_softmax_attrib_probe.rs`, min-of-7, real
+turbo shape n_head=20 seq=1500 d_head=64 n_layer=32 BR=64, 32 rayon threads,
+15,360 blocks/window, box load ~23):** hold `sdpa_forward_f32`'s exact 3-pass
+per-block softmax and vary ONLY the transcendental.
+
+```
+REAL sdpa_forward_f32 x32 layers (one encoder window)   525.0 ms   cv 0.8%
+  T_fill   (memcpy control)                               0.1 ms
+  T_libm   (control + kernel's exact softmax)           188.6 ms   cv 0.8%
+  T_noexp  (same 3 passes, exp -> subtraction)           64.1 ms   cv 0.9%
+  T_poly   (same 3 passes, 8-lane minimax poly exp)      77.3 ms   cv 1.8%
+  T_alloc  (the dead per-block `vec![0.0; br*seq_k]`)     2.8 ms   cv 11.6%
+derived:  softmax = 188.5 ms = 35.9% of kernel
+          exp     = 124.5 ms = 23.7% of kernel  (66.1% of the softmax)
+          poly saving                111.2 ms  = 21.2% of kernel
+```
+
+**Model validated by an independent identity:** 525.0 - 188.5 = 336.5 ms of sgemm
+for the shape's 368.6 GFLOP = **1.10 TF/s**, which matches the encoder's other
+sgemms (1888 GFLOP / 1763 ms = 1.07 TF/s) to 3%. The kernel is therefore
+`336 ms sgemm + 188 ms softmax`, and the softmax is two-thirds transcendental.
+
+**Accuracy:** poly vs libm over a full `[64,1500]` block, `max|delta| = 3.2e-9`,
+poly row-sum = 0.9999998. That is ~2^-28 on probabilities <= 1, an order of
+magnitude TIGHTER than the already-A/B'd `FW_SIMD_EXP` poly (max|delta| = 2.98e-8,
+byte-identical transcripts on jfk x1/x3/x8). Non-byte-exact, so still owner-gated
+on a transcript A/B, but the numerical risk is very small.
+
+**Projected e2e (fresh profile this session, jfk, turbo, load ~19):**
+`encoder_window` 2642 ms = 89.5% of `transcribe` 2952 ms; `attn_sdpa` 543 ms =
+22.0% of the encoder, of which `sdpa_kernel` = 431.2 ms. A 21.2% kernel cut is
+~91 ms/window -> encoder 2642 -> 2551 ms, e2e 2952 -> 2861 ms = **~1.032x e2e
+(3.1%)**. That is larger than most landed byte-exact wins (conv pre-transpose
+0.4%, AVX2 argmax 0.15%, SDPA gather-chunks 0.5%).
+
+**REJECTED in the same pass (my own hypothesis, honestly killed):** the kernel's
+dead per-block `let mut sc = vec![0.0f32; br*seq_k];` (384 KiB, zeroed then fully
+overwritten by `sgemm_bt`, 15,360x/window = 5.9 GB of nominal memset) is worth
+only **2.8 ms = 0.5% of the kernel** — glibc recycles the same size class and the
+zero pages never fault. Do NOT re-dig the SDPA dead-calloc; the earlier ~8%
+gather-uninit win (2026-06-28) does NOT generalize to this buffer. `out`'s
+zero-init is likewise ~0 (fresh mmap zero pages).
+
+**Capture path (NOT yet landed; this entry is measurement only, engine
+byte-identical to HEAD).** The kernel lives in the sibling repo
+`/data/projects/frankentorch` (`ft-kernel-cpu`), which earlier rounds declared
+"out of scope". Two options: (a) a poly-exp softmax inside `sdpa_forward_f32`
+behind a default-OFF env gate in ft-kernel-cpu (~30 lines, byte-identical when
+off, captures the full 111 ms); (b) a franken-side faithful row-tiled copy using
+the public `matmul_rhs_transposed_contiguous_f32` + `matmul_tensor_contiguous_f32_into`
+— but that routes 30,720 wrapper calls/window and is exactly the dispatch overhead
+that sank the 2026-06-28 FlashAttention-style tiling attempt. **(a) is the
+recommended path.** AGENT_NAME=cc_fw. No engine source changed (probe only) =>
+conformance unaffected.
+
+---
 ## 2026-07-09 EDT / 2026-07-10 UTC - cod_fw: SURFACE -> DO NOT FLIP DEFAULT YET - quality-safe full encoder-int8 now has a JFK WER gate, but the default-on evidence pack is still incomplete
 
 **Decision guard:** do not promote encoder int8 default-on from the JFK-only
