@@ -4,6 +4,124 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **LEDGER-INTEGRITY AUDIT of all 10 do-not-retry families** — **1 row INVALID (benched a consumer the engine abandoned 7 days earlier), 1 LANDED win's e2e attribution WRONG, 1 "REJECT" is really a SIZING argument, 2 i7 rows are gated-path-only AND substrate-invalid.** Method: static reachability, which is *stronger* than sampled self-time for "does it execute".
+
+**Rule applied** (frankenmermaid `5feb977`): no REJECT is valid unless the bench provably
+executes the function under test with non-zero self-time. **Note on method:** a *profile* is
+blocked this turn (model benches need gitignored models/wavs; local builds disk-suspended —
+bd-transcript-gate-unrunnable-xu9g). But for the "does it execute" question, **static
+reachability is strictly stronger than a sampled profile**: if the engine never *constructs*
+the operand, self-time is exactly 0%, no sampling required. Where a *magnitude* is needed I
+say so and mark it blocked.
+
+| # | family | did the bench execute the code the ENGINE runs? | self-time | verdict |
+|---|---|---|---|---|
+| 1 | f32 QKV sgemm fusion | **YES, in-situ.** Built as a real gated impl (`FW_ENC_QKV_F32_FUSED`), measured on the real `encoder_window`, transcript byte-identical | qkv ⊂ **63%** external `matrixmultiply` sgemm (profiled) | **VALID** |
+| 2 | **weight-stationary f16 GEMV tiles** | **NO — premise false** (see below) | **0%** via the consumer it names | **INVALID → REOPENED** |
+| 3 | allocator/buffer-reuse | **YES, in-situ.** jemalloc `LD_PRELOAD` on the real binary + real encoder span | effect ~**0.6%** (near-noise) | **VALID** |
+| 4 | decoder fused-LN | **YES, in-situ.** Implemented `LayerNorm::apply_into` at all 3 real decoder LN sites | decode LN at tq=1 is `[1,1280]` = 5 KiB, L1-hot | **VALID** (0-gain by magnitude) |
+| 5 | **LN-to-quant fusion** | **NO — the fused variant was never built or run.** `ln_membound_probe` timed a *replica* of `norm_rows_into` alone | **0%** in the default engine (gated, below) | **RELABEL: SIZING, not a measured REJECT** |
+| 6 | head-major SDPA scatter | **REPLICA**, of `sdpa_scatter_interleaved` (which *is* on the default path). Entry itself admits the probe runs `o` **COLD** while the engine has it **WARM** | scatter ≈ **0.8%** of encoder ⇒ ~0.04% e2e | **VALID-but-REPLICA** (+ regime mismatch); conclusion stands on magnitude alone |
+| 7 | softmax pass-elimination (mine) | **REPLICA** of `sdpa_forward_f32`; replica timing validated to within 3% of the real kernel (510.9–528.0 vs 525.0 ms) | softmax non-exp passes **16.29%** self | **VALID-but-REPLICA** |
+| 8 | matrixmultiply→gemm swap (mine) | **YES.** Arm A is the real `matmul_tensor_contiguous_f32_into` | `kernel_target_fma` **19.22%** + `gemm::gemm_loop` **5.87%** self | **VALID** |
+| 9 | i7 rowblock coarsening | bench *does* run `matmul_bias_i7_quantized`, but the **default engine never builds i7 encoder weights** | **0%** by default | **RELABEL: gated-path only; ratio also SUBSTRATE-INVALID** |
+| 10 | i7 bias specialization | same as #9 | **0%** by default | **RELABEL: gated-path only; ratio also SUBSTRATE-INVALID** |
+
+---
+
+### #2 — `weight-stationary f16 GEMV tiles` is **INVALID**. It benched a consumer the engine abandoned seven days earlier.
+
+The row (2026-07-09) builds its whole case on this claim:
+
+> *"`cross_attn_k/v.forward(encoder_out)` at tq=1500 loads NO `w_i8` (they only get
+> `.dequant_to_f32_if(cross_proj_f32_enabled())`, **default off**) ⇒ they route to the f16
+> batch (`gemv_f16_batch` → `gemv_f16_batch_rows`), NOT `gemv_i8_batch`."*
+
+**`cross_proj_f32_enabled()` is `const DEFAULT_ON: bool = true`** (`mod.rs:701`). It was flipped
+default-ON by **`a674b49`, 2026-07-02** — *"flip cross-proj f32 sgemm DEFAULT-ON — 2.25× now
+active"* — and its own doc comment reads: *"Route the per-window cross-K/V PROJECTIONS
+(encoder_out @ Wk/Wv, tq=1500) through dequant-once f32 tiled sgemm **instead of** the f16
+batched GEMV."* So `decoder.rs:671,679` hand cross-K/V to `WeightMat::F32` ⇒ `nn::matmul_bias`.
+**Cross-K/V contributes exactly 0% of `gemv_f16_batch`'s self-time, and had done so for seven
+days when the row was written.** The rejection was measured at the **cross shape**
+`[1500,1280]×[1280,1280]` — a shape that kernel no longer sees.
+
+**The kernel is not dead, but its consumer is different.** `gemv_f16_batch` has exactly one
+production call site (`decoder.rs:345`; the other, `nn.rs:5558`, is a unit test). It is reached
+only by `WeightMat::F16` linears at `tq>1` with no `w_i8`. Per `decoder.rs:312`, **`mlp_2`
+(fc2) is deliberately excluded from the int8 batch path because it carries a `w_i8_block`
+copy** — *"those stay on the f16 batch path."* So the real consumer is **fc2 at prefill**:
+`tq` = prompt length (small, single digits), `k=5120`, `n=1280` — nothing like `[1500,1280]`.
+
+**REOPENED**, scoped to the true consumer. Expect a small prize: prefill runs once per window,
+not per token. Bead: **bd-f16-gemv-weight-stationary-reopen** (below). Do NOT re-run it at the
+cross shape.
+
+### #2b — the *landed* `dot_f16c_2col` win rests on the same false premise
+`M2col` (2026-07-09, **LAND, byte-exact, default-on**, 1.212×) profiles *"the ~2% e2e
+`cross_kv` span"* and attributes its win to `cross_attn_k/v` → `gemv_f16_batch_rows`. Same
+error. **The kernel result (1.212×, bit-for-bit identical) is not in doubt; its e2e attribution
+is.** cross_kv does not flow through it. The real beneficiary is fc2 prefill, which is a much
+smaller slice. **No revert** — the change is byte-exact and harmless — but the **claim is
+corrected**: do not carry "~2% e2e cross_kv" forward as this lever's payoff.
+
+The ledger is also **self-contradictory** here: `2026-06-29` (line ~6835) **REJECTED**
+`dot_f16c_2col` (−0.84%, p=0.14) on the same kernel that `2026-07-09` **LANDED** at 1.212×.
+Two rows, opposite verdicts, same primitive. Neither cites the other.
+
+### #5 — `LN-to-quant fusion` is a SIZING argument, not a measured REJECT
+`ln_membound_probe` timed an *"exact `norm_rows_into` SoA `Simd<f64,8>` replica"* and a memcpy
+floor. **The fused LN→activation-quant variant was never built or executed.** The conclusion
+(fusion can save at most the memcpy floor, 0.571 ms of a 1.432 ms compute-bound LN ⇒ sub-noise)
+is a sound *upper bound*, and its LEDGER CORRECTION (LN is compute-bound, not DRAM-bound) is
+independently valuable. But it is not an A/B of the code under test, and it must not be cited as
+one. Additionally the fusion only exists **on the encoder int8 path**, which is off by default
+(next section) ⇒ engine self-time **0%**.
+
+### #9/#10 — the i7 rows are gated-path-only, and their ratios are substrate-invalid
+`encoder.rs:483-492`: i7 encoder weights are quantized **"ONCE, iff `FRANKEN_WHISPER_ENC_INT8=1`.
+Default off ⇒ all i7 fields stay `None`."** And `mod.rs:322`: `enc_int8_enabled()` has
+`const DEFAULT_ON: bool = false`. (The *landed* "default quality-safe encoder int8" is a
+**separate**, attn.out-only i8×i32 policy — `enc_attn_out_i8i32_for` — not the i7 QKV path.)
+So `matmul_bias_i7_quantized` has **0% self-time in the default engine**. The benches do execute
+it, so these are not the frankenmermaid defect; but they are **gated-path rows** and must not sit
+in a blanket do-not-retry list as if they governed the default engine.
+
+Separately, both i7 ratios violate the A/B substrate rule: the candidate and the legacy arm ran
+as **two separate `rch` bench invocations** with `FW_I7_ROWBLOCK_MIN_LEN` flipped between them
+(*"candidate coarse split (default 8, hz2)"* vs *"legacy original split (`=1`, hz2)"*). rch ratios
+are not worker-invariant, and the legacy arm's own spread is ±1.30 ms on 12.79 ms (**cv ≈ 10%**).
+The 0.808× is directionally large enough to survive, but it is **not an admissible ratio** and
+must be re-measured same-binary (flip via a setter, not an env var) before anyone quotes it.
+
+---
+
+### Score
+Of ten sweeping do-not-retry families: **2 in-situ VALID**, **3 VALID-but-REPLICA** (all with the
+replica's fidelity established), **1 SIZING mislabelled as a REJECT**, **2 gated-path-only with
+substrate-invalid ratios**, **1 INVALID and reopened**, and **1 landed win whose e2e attribution
+is wrong**. Adding my earlier finding, this repo has now produced **three** rows measured against
+code the engine does not execute: the "SDPA is not exp-bound" closure (self-time **0%**;
+falsified — exp is really **23.7%** of the fused kernel), my own hybrid arm (`fe97df1`), and the
+f16-GEMV pair above.
+
+**The common shape:** every one of them stated a *routing* premise — "the default path calls X" —
+that was false, and nobody re-checked the gate. Grepping the ledger is not enough; **grep the
+gate.** Cheap, mechanical defence, now mandatory in this lane:
+1. Before trusting or writing a row, print the gate: `const DEFAULT_ON` / `OnceLock` env default
+   for every flag on the path, **and `git log -S` the flag** to see when it last flipped.
+2. Make both arms call the real function, differing only by a runtime setter
+   (`set_sdpa_poly_exp`, `set_sgemm_tile_balanced`) — an env var cannot flip inside one binary.
+3. Record the self-time (or, better, the static reachability) in the entry.
+
+**BLOCKED:** assigning *magnitudes* to rows 6/7 (replica self-times) needs a profile of the real
+engine — model benches are unrunnable (bd-transcript-gate-unrunnable-xu9g). Reachability, which
+is what invalidates rows, needed no profile.
+
+AGENT_NAME=cc_fw. No code changed (audit + ledger only). No local cargo build, no new target
+trees, nothing deleted, nothing stashed.
+
+---
 ## 2026-07-10 - cc_fw: **`tile_shape` A/B REBUILT same-binary on the REAL function — keep gate NOT MET (cv 16.8–24.2% ≫ 5, and the NULL CONTROL itself fails at 6.8–17.7%)** ⇒ default not flipped. Mechanism confirmed large (fc1 **1.689×**, fc2 **1.686×**, 23–24/25 paired wins) at T=14. Knob landed (`frankentorch 86a54f1a`). Plus a **LEDGER-INTEGRITY AUDIT** of this lane's REJECT rows.
 
 ### The bench now provably executes the code under test
