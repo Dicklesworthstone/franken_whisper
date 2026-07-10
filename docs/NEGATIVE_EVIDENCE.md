@@ -4,6 +4,52 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **DIG → REJECTED (measured, BIT-EXACT, inside the null floor) — flattening `sdpa_forward_f32`'s nested rayon parallelism does NOT move the scheduling overhead.** Mechanism: tiny.en's ~35% rayon cost is aggregate small-op dispatch, not SDPA's per-head join nesting. Profile-first, one lever, median-gated.
+
+**PROFILE-FIRST (the lever's motivation).** Fresh `perf -F 299` on the prebuilt `e2e_probe`
+(sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`, tiny.en jfk×8, LOCAL
+5975WX) shows tiny.en is **~35% rayon/crossbeam scheduling**: `crossbeam_epoch::with_handle` 12.10%,
+`try_advance` 7.06%, `crossbeam_deque::steal` 6.75%, `WorkerThread::find_work` 5.13%, bridge 3.15%,
+`Mutex::lock_contended` 0.98% (turbo: ~11%). Candidate byte-exact lever in my lane:
+`sdpa_forward_f32` uses **nested** `par_chunks_mut` (per head, then per block) when
+`num_bh < threads` — one rayon join scope PER HEAD. Flattening to ONE `par_iter` over all
+`(head, block)` tasks is strictly fewer joins and bit-exact (same `block()` on the same disjoint
+slices).
+
+**MEASURED** (`sdpa_par` bench: both arms the REAL `sdpa_forward_f32` via `set_sdpa_flat_par`, ABBA
+per rep, black_box in+out, per-shape A/A null control, median-vs-null gate; worker **`ovh-a`
+(fixmydocuments, 16c)**, 21 ABBA reps). **BIT-EXACT verified** (flat == nested, full array):
+
+| shape | null (flat/flat) med [p10,p90] | nested/flat med [p10,p90] | verdict |
+|---|---|---|---|
+| tiny.en nbh=6 seq=1500 | 0.9900 [0.9465, 1.0276] | **1.0128** [0.9557, 1.0941] | **INSIDE NULL FLOOR** |
+| turbo nbh=20 seq=1500 | 1.0027 [0.9386, 1.0523] | 0.9835 [0.9380, 1.0775] | INSIDE NULL FLOOR* |
+
+*On the 16-core worker `num_bh=20 ≥ threads`, so **turbo does not even take the nested path** — both
+arms hit the per-head-serial `else` branch, i.e. that row is effectively a second null control (and
+reads like one). The nested path applies to turbo only on a ≥20-thread box, which no sampled rch
+worker provides; the flat lever there is unmeasurable ([[project_rch_ab_admissibility]]).
+
+**VERDICT: REJECT.** On the one shape that actually exercises the nested path here (tiny.en), the
+flat variant's median (1.0128×) sits **inside the null control's [p10, p90]** — indistinguishable
+from noise. **Mechanism (why flattening SDPA's join doesn't help):** the 35% is the AGGREGATE of
+many tiny parallel ops (every LN, GEMV, elementwise op spawns rayon tasks too small to amortize on
+a small model), not SDPA's per-head nesting specifically — so removing 5 of SDPA's join scopes is
+noise against the whole-engine dispatch cost. Reducing that aggregate is the global threading-
+threshold avenue, which is **CLOSED** (3 reverts, fully audited — [[project_decode_overthreaded_rayon_lead]]);
+do not re-open it. And tiny.en is ~107× realtime (0.827 s / 88 s audio) — a non-bottleneck in
+absolute terms; the realistic workload is turbo ([[project_realistic_workload_dominated]]).
+
+Source reverted to nested-only (bit-identical to HEAD); knob/path/bench removed (bench parked at
+`scratchpad/sdpa_par_rejected.rs`). No default changed.
+
+**RETRY-CONDITION:** only if a ≥32-core rch worker becomes available AND turbo's nested-path flat
+variant clears its own null floor there — unlikely given the tiny.en mechanism above.
+
+AGENT_NAME=cc_fw. frankentorch source unchanged from HEAD after revert; franken_whisper untouched.
+No local build; disk 76 G; nothing stashed/deleted; `nn.rs`/`benches` are cod_fw's, untouched.
+
+---
 ## 2026-07-10 - cc_fw: **DECODE FLOOR PROFILED (turbo) — bandwidth-bound; every frame is either cod's default-on int8 GEMV or a closed SDPA lever. No decidable in-my-lane decode lever remains.** (bd-0522's honesty sweep is the measurement prerequisite; done + committed `84afe64`.)
 
 **PROVENANCE.** `e2e_probe` sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
