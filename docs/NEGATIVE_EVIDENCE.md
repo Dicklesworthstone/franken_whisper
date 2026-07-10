@@ -4,6 +4,76 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **GATE CORRECTED (median vs null spread, not cv<5) — and it FALSIFIES MY OWN CLAIMS.** BR is **not decidable** on any worker I have had; the "`BR=128` regresses 0.9414× at `nbh=4`" number is **WITHDRAWN** — it was decided **inside that shape's own null floor**. Self-audit of every ratio I have published this session, against the null floor and the provenance rules.
+
+**Rule adopted** (frankenmermaid harness calibration + frankenlibc per-function floor): `cv < 5` is
+**unreachable on this hardware** and is no longer a gate. Run `paired(base, base)` as an **A/A null
+control**, take the **median** of the null ratio and its **observed spread**, and call a candidate
+**decidable only when its median lies outside the null's [p10, p90]**. Report null median, null
+spread, and candidate median together. **The floor is PER-FUNCTION and PER-SHAPE** — calibrate it
+for the thing you are actually measuring. cv stays as information, never as a gate.
+Harness updated: frankentorch `2ba080ba`.
+
+### The accepted run (pre-declared rule: accept first run with null median ∈ [0.98, 1.02]; report discards)
+worker **`vmi1264463`**, `available_parallelism=8`, n=31 ABBA reps, turbo shape `nbh=20 seq=1500 d=64`.
+Binary provenance for the self-time figures: franken `e2e_probe` sha256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`.
+
+| arm | median | null's [p10,p90] | range | cv | wins | verdict |
+|---|---|---|---|---|---|---|
+| **NULL CONTROL (64 vs 64)** | **0.9888×** | [0.9384, 1.0455] | [0.8136, 1.1244] | 5.8% | 13/31 | *the floor* |
+| AUTO (adaptive) | 1.0137× | — | — | 11.7% | 18/31 | **INSIDE NULL FLOOR** |
+| BR=96 | 1.0114× | — | — | 6.8% | 18/31 | **INSIDE NULL FLOOR** |
+| BR=128 | 1.0305× | — | — | 6.2% | 20/31 | **INSIDE NULL FLOOR** |
+| BR=160 | 1.0435× | — | — | 9.6% | 24/31 | **INSIDE NULL FLOOR** |
+
+**Nothing about `BR` is decidable here.** And on the earlier `hz2` run (n=41) the null had cv 5.3%
+⇒ an implied p90 ≈ 1.07, while BR=160's median was 1.0363 — **also inside the floor**. The win-rate
+evidence there was strong (**38/41 vs the null's 21/41**, sign-p < 0.001) and remains *suggestive
+and mechanism-consistent*, but under the adopted gate **I am not claiming BR.**
+
+### WITHDRAWN: "BR=128 regresses 0.9414× at nbh=4"
+That number was taken **without a per-shape null control**. With one, that shape's null median is
+**0.9680× with p10 0.8034** — the 0.9414× sits **inside its own floor**. I used it to justify the
+adaptive `sdpa_br_pick` policy. **The policy's empirical premise is therefore unproven.** It stays
+**opt-in**; the default remains the historical fixed `BR=64`. Its branch logic is still verified by
+a deterministic host-independent unit test, but the tile choice it encodes is now supported by
+**mechanism only, not by an admissible measurement.**
+
+### SELF-AUDIT — every ratio I published this session, re-judged against the null floor
+frankenlibc found **92 REJECT rows, 0% with a sha256, 51% decided inside the null floor.** Same test,
+applied to me:
+
+| my row | had a null control? | verdict under the corrected gate |
+|---|---|---|
+| `BR` sweep, old harness (null 1.1163×, cv 29.0%) | yes | **Correct as written** — I refused to decide. |
+| `BR` sweep, ABBA harness (hz2, n=41) | yes | **OVERCLAIMED.** Medians 1.0127–1.0344 sit inside the null's implied spread. Sign test (38/41) is suggestive, not decisive. **Corrected here.** |
+| `nbh=4` regression 0.9414× | **no per-shape null** | **WITHDRAWN** (inside that shape's floor). |
+| f16 batch prefill REJECT (fc2 arms 1.020–1.037×) | yes (null 1.020×, cv 36.8%) | **Correct as written** — I called them "indistinguishable from noise". |
+| f16 prefill, `tq=100` row-morsel 0.884× | yes | **Median inside the floor.** The 13/15 sign test (p=0.0074) is the only support. Downgrade "1.13× faster" → *suggestive*. |
+| `tile_shape` T=14 (fc1 1.689×, fc2 1.686×, 23–24/25) | yes (null 1.010–1.036×) | **DECIDABLE — medians far outside any plausible null p90.** My "keep gate NOT MET (cv)" framing was **wrong**: cv never decided it. The real blocker was that no host could field T=32. **Corrected.** |
+| `matrixmultiply→gemm` REJECT (turbo 1.00–1.07×) | **NO null control** | **Uncalibrated.** The 1.00–1.07× spread is plausibly the floor itself. The *1t* datum (1.325×) and the *16t regression* (0.934×) are what carry that rejection — both far larger than any floor I have since measured. Rejection stands; the 32t numbers should not be quoted. |
+| `F32_2D_TALL_MAX_K` 1536→8192 **LANDED** (1.057× on fc2) | **NO A/A null control** (used a fixed control arm to normalize drift, which is not the same thing) | **Perf claim UNVALIDATED.** Bit-exact, so zero correctness risk, but 1.057× may lie inside an uncalibrated floor. **Flagged for re-validation** with the ABBA + null-control harness. Does not warrant a revert. |
+
+**Two lessons.** (1) A fixed control arm normalizes drift; **only an A/A null control measures the
+floor.** I conflated them. (2) *Every* ratio in the 1.00–1.10× band that this session produced on an
+rch worker is at or under the floor — the fleet's hardware simply cannot resolve a few-percent
+kernel effect. Levers of that size must be argued by **mechanism + instructions-retired**, or
+measured on a quiet, dedicated host.
+
+**What survives, untouched, because it never depended on timing:**
+`BR` is **bit-exact** (asserted across `BR ∈ {32,96,128,160}` × 5 shapes, block counts provably
+differing). The **latent scheduler bug** is real and fixed (`seq_q > BR` tied the parallel split to
+the tile size; now `SDPA_PAR_MIN_ROWS`), and it is default-identical at `BR=64`. The **poly-exp
+recommendation** rests on a *byte-identical transcript* and a *WER delta of 0.000* — determinism, not
+a ratio — with the e2e 1.0722× (5/5 paired, cv 0.8%) as corroboration; that effect is ~7×, and its
+op-level span win 1.2465× is ~25×, the null floors observed here.
+
+AGENT_NAME=cc_fw. No local build; disk 75 G. franken_whisper source unchanged (docs only).
+`nn.rs`/`benches/` remain cod_fw's — **cod_fw: your bench needs an A/A null control per shape; ours
+would have "confirmed" a 3% lever that is pure floor.**
+
+---
 ## 2026-07-10 - cc_fw: **HARNESS FIXED (ABBA): null control 1.1163×/cv 29.0% → 1.0018×/cv 5.3%, 21/41, sign-p 1.000.** With a trustworthy harness the `BR` effect is **real, monotone and significant** (BR=160 → **+3.44%**, 38/41, p<0.001) — **but a global bump REGRESSES 0.9414× at `num_bh=4`.** ⇒ adaptive policy, landed **opt-in** (default unchanged); frankentorch `c870a4d4`.
 
 ### The harness was the defect, not the kernel
