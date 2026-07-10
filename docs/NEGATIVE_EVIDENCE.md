@@ -4,6 +4,86 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **cashed in the reopened f16-GEMV family — the lever is NOT weight-stationary token-blocking; it is that `gemv_f16_batch` routes fc2 prefill to the WRONG SCHEDULER (12–24× weight re-stream), and the landed M2col tile is INERT there.** Bit-exact, ~0.4% e2e. PARKED: `rch` cannot sync this 52 GB tree.
+
+**Where the code actually runs** (the audit's payoff). `gemv_f16_batch` has ONE production
+caller (`decoder.rs:345`; `nn.rs:5558` is a unit test), reached only by `WeightMat::F16` linears
+at `tq>1` without `w_i8`. Per `decoder.rs:312`, **`mlp_2` (fc2)** is excluded from the int8 batch
+path by its `w_i8_block` copy — *"those stay on the f16 batch path."* So the real consumer is
+**fc2 at prefill**: `out=1280`, `inp=5120`, `tq` = prompt length. **Not** `cross_attn_k/v`, which
+`a674b49` (2026-07-02) routed to f32 sgemm.
+
+**The structural defect (provable from source; no bench needed).** Two schedulers, both proven
+bit-identical to per-token `gemv_f16`:
+
+| scheduler | loop | weight traffic | intensity (flop/weight-byte) |
+|---|---|---|---|
+| column-band (`compute_band`) | `o` outer, `t` inner | streamed **once** | `tq` |
+| row-morsel (`gemv_f16_batch_rows`) | `t` outer per band | **once per band** | `tq / workers` |
+
+Row-morsel fires when `work = tq·out·inp ≥ COMPUTE_BOUND_MACS (1<<26)`. **That gate conflates
+"compute-bound" with "big weight."** It was tuned for cross-K/V (weight 3.3 MB, 2.4 GFLOP —
+genuinely compute-bound). fc2's weight is **13.1 MB**, 4× larger, at far smaller `tq`.
+
+| prefill `tq` | path | `row_band` | weight traffic | M2col fires (`row_band ≥ 2`)? |
+|---|---|---|---|---|
+| 10 | column-band | — | **13.1 MB** | n/a |
+| **12** | row-morsel | **1** | **157 MB (12×)** | **NO** |
+| **24** | row-morsel | 1 | **315 MB (24×)** | **NO** |
+| 50 | row-morsel | 4 | 170 MB (13×) | yes |
+| 1500 (cross-K/V — *no longer a live consumer*) | row-morsel | 94 | 53 MB | yes |
+
+Two provable consequences:
+1. For `tq ∈ [11, 2·workers)` the row-morsel path is **worst-of-both**: `row_band = 1` ⇒ the
+   weight is re-streamed **once per token**, *and* M2col's `local_t + 2 <= rows` never fires, so
+   the cvtph tile is **inert**. At `tq=12`: **157 MB instead of 13.1 MB** for 0.157 GFLOP.
+2. **The landed `dot_f16c_2col` M2col win (1.212×, default-on) is INERT on its own real consumer**
+   whenever `tq < 2·workers` (= 32 at `avail ≥ 16`). Together with the audit's finding that its
+   claimed beneficiary (cross-K/V) no longer uses this kernel at all, its recorded payoff
+   ("~2% e2e cross_kv") is doubly wrong.
+
+**So the rejected lever was rejected for the right reason at the wrong shape.** Token-blocking a
+weight-stationary tile at `tq=1500` really does lose (0.783×). The actual lever is: **don't route
+fc2-class shapes to row-morsel at all** — `compute_band` is *already* weight-stationary. Gate on
+re-streamed weight bytes (`bands · out · inp · 2`) or on `row_band ≥ C`, not on `tq·out·inp`.
+**Exactly the same bug class as `F32_2D_TALL_MAX_K`** in ft-kernel-cpu (gate keyed on `k` alone
+when the invariant was B-bytes re-streamed per thread). Bit-exact ⇒ **no transcript/WER gate**.
+
+**Magnitude, stated honestly (analytic; profile blocked).** turbo decoder = 4 layers, fc2 prefill
+once/window. At `tq=12`: row-morsel moves `4×157 MB ≈ 628 MB` vs column-band `4×13.1 MB ≈ 52 MB`;
+at ~50 GB/s that is ~12.6 ms vs ~1.0 ms ⇒ **~11.6 ms/window ≈ 0.4% e2e**. Real, modest.
+
+**SELF-TIME (per the ledger-integrity rule).** The bench's arms are the **real**
+`nn::gemv_f16_batch` (public), flipped by a new `set_batch_gemv_row_morsel` setter — so the code
+under test is 100% of the measured region by construction. Its **engine** self-time is the
+quantity that needs a profile, and that is blocked; the analytic bound above (≈0.4% e2e) stands
+in its place and is labelled as a bound, not a measurement.
+
+**PARKED — `rch` cannot sync this repo.** `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+-- cargo bench -p franken_whisper --bench f16_batch_prefill` fails closed **twice**:
+`sync_to_remote: timed out after 30000ms` → *"remote required; refusing local fallback."* Root
+cause: **this working tree is 52 GB** (`target` 2.2 G, `legacy_whispercpp` 1.7 G, `perf.data`
+736 MB, …); rsync cannot finish in rch's 30 s window. `frankentorch` (11 GB, deps in-tree) syncs
+and benches fine — every remote run this session was there. **`RCH_REQUIRE_REMOTE=1` worked as
+designed: disk delta across both attempts ≈ 1 MB, no local build.** Without it rch logs
+*"Remote execution failed …, running locally"* — the fall-open that drains disk. Use it always.
+
+Patch + bench + full analysis: `tests/artifacts/perf/20260710-f16-batch-prefill/`.
+Beads: **bd-f16-gemv-weight-stationary-reopen-ugyh**, **bd-transcript-gate-unrunnable-xu9g**.
+
+**Substrate note (frankenredis correction, applied to my own work).** Criterion group members run
+**sequentially** and do NOT cancel drift. Every ratio I have ledgered came from a hand-written
+`paired()`/`alternating()` routine that alternates the arms *inside one measured routine* and
+forms per-rep paired ratios — not from criterion's grouping. I have stopped registering criterion
+groups that imply a cancellation they do not provide. `black_box` discipline in the parked bench:
+every input fed through `black_box`, and the **full** output consumed through `black_box` (not one
+element), so no arm can be DCE'd; a null control (arm-vs-itself) calibrates the floor.
+
+AGENT_NAME=cc_fw. **No source code committed** — `nn.rs` and `Cargo.toml` were restored to HEAD by
+reverse-applying my own hunks (no stash, no reset), and `nn.rs` released to cod_fw, who is working
+the KV-cache region. No local cargo build, nothing deleted.
+
+---
 ## 2026-07-10 - cc_fw: **LEDGER-INTEGRITY AUDIT of all 10 do-not-retry families** — **1 row INVALID (benched a consumer the engine abandoned 7 days earlier), 1 LANDED win's e2e attribution WRONG, 1 "REJECT" is really a SIZING argument, 2 i7 rows are gated-path-only AND substrate-invalid.** Method: static reachability, which is *stronger* than sampled self-time for "does it execute".
 
 **Rule applied** (frankenmermaid `5feb977`): no REJECT is valid unless the bench provably
