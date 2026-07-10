@@ -43,6 +43,91 @@
 
 ## Levers
 
+### 2026-07-09 EDT / 2026-07-10 UTC — cod_fw — WIN: executable quality gate for the quality-safe full encoder-int8 policy
+
+**Lane.** Encoder int8 default-on evidence pack. Ledger grep came first:
+do not retry full all-i7 encoder int8 (`FRANKEN_WHISPER_ENC_INT8=1`) as a
+quality proof, fused-wide QKV concatenation, row-block coarsening, bias
+specialization, or quantize/round rewrites. The safe candidate is the current
+`FW_ENC_ATTN_OUT_I8I32=1` policy: q/k/v/fc1/fc2 on i7 maddubs, `attn.out` on
+full-i8 i32 accumulate, with `FW_ENC_QKV_FUSED=1` and `FW_ENC_EF_QUANT=1`.
+
+**Profile-first routing.** Focused release-perf criterion row on RCH worker
+`ovh-a`:
+
+```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod_fw \
+  RUSTFLAGS='-C force-frame-pointers=yes' \
+  rch exec -- cargo bench --profile release-perf --bench native_engine_bench -- \
+  native_engine/i7_qkv/headmajor_attention_1500x1280 \
+  --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5 \
+  --output-format bencher --noplot
+
+native_engine/i7_qkv/headmajor_attention_1500x1280:
+  83.074 ms/iter (+/- 1.817 ms), CV ~= 2.2%
+```
+
+Local `perf stat` on the same filtered bench binary, because counters require
+the process on this host:
+
+```text
+0.6205 s elapsed (+/- 3.16%), 12.55 CPUs utilized
+27.806B cycles, 25.530B instructions, IPC 0.92
+191.896M cache misses / 1.335B cache refs = 14.37%
+102.553M branch misses / 3.270B branches = 3.14%
+```
+
+Flamegraph: `/tmp/fw-int8-qkv-20260710.svg`. `perf report` was qualitative
+only because recording lost 24.29% of samples under local IO/CPU load, but the
+ranked surface still matched the prior ledgers: external SDPA (`12.46%`),
+external `matrixmultiply` sgemm kernel (`10.01%`), benchmark synthetic-audio
+setup noise (`7.05%`), `__expf_fma` (`5.64%`), matrixmultiply packing
+(`4.63%`), Rayon/crossbeam scheduling (`~10%` combined), and the owned
+`dot_maddubs_i7_m2n4` at only `2.07%`. This routes the next useful work away
+from another dot-tile dig and into the owner-gated quality evidence.
+
+**Change.** Added
+`gated_quality_safe_encoder_int8_jfk_reference_wer_gate` to
+`tests/native_engine_e2e.rs`. It spawns the real CLI in a child process, forces
+bridge binaries to `/nonexistent`, sets `FRANKEN_WHISPER_NATIVE_EXECUTION=1` and
+`FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole`, explicitly disables the older
+all-i7 full gate with `FRANKEN_WHISPER_ENC_INT8=0`, and enables the quality-safe
+full policy with `FW_ENC_ATTN_OUT_I8I32=1`, `FW_ENC_QKV_FUSED=1`, and
+`FW_ENC_EF_QUANT=1`.
+
+**Quality gate.** The test computes word-level Levenshtein WER against
+`tests/fixtures/native/jfk_tiny_reference.json` and requires `WER <= 0.0`.
+It also rejects the known all-i7 adversarial phrase `"Frank at"` and proves the
+native implementation ran (`backend.ok.payload.implementation == "native"`).
+
+```text
+CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test --test native_engine_e2e \
+  gated_quality_safe_encoder_int8_jfk_reference_wer_gate -- --nocapture
+
+test gated_quality_safe_encoder_int8_jfk_reference_wer_gate ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 9.93s
+```
+
+**Expected-loss default-on policy contract (not flipped here).**
+State space: model id/hparams, CPU feature class, calibration corpus id/hash,
+per-layer quantization-error vector, per-corpus WER deltas, proper-noun sentinel
+results, and live drift/error observations. Actions: `F32Encoder`,
+`QualitySafeInt8Encoder`, and deterministic `FallbackF32`. Loss matrix:
+false-accepting int8 with WER/proper-noun drift is high loss; false-fallback to
+f32 costs only speed; missing calibration is treated as high loss. Posterior:
+Beta-binomial exceedance model over fixture WER gates plus per-layer error
+credible intervals; default-on requires posterior confidence that corpus WER
+delta and every layer's quantization-error budget are inside thresholds. Fallback
+trigger: use f32 deterministically when model/corpus hash is unknown, AVX2/i8
+kernel support is absent, any adversarial sentinel fails, any per-layer error
+budget is exceeded, or the operator sets the kill switch.
+
+**Verdict: KEEP the executable gate; do not flip the default from this row
+alone.** This lands the first hard quality-gate artifact for the safe full-int8
+policy and documents the exact adaptive fallback contract. The broader default
+promotion still needs the fixture-corpus WER table, per-layer quantization error
+budget, and track01/proper-noun adversarial probe rows filled in.
+
 ### L1 — log-mel FFT twiddle precompute (bit-exact)  — `src/native_engine/mel.rs`
 
 **Hypothesis.** whisper.cpp's recursive `fft` recomputes `cos`/`sin` twiddles

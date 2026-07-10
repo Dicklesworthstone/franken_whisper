@@ -55,6 +55,37 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn transcript_words(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()).to_owned())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Word-level Levenshtein WER, normalized by reference word count.
+fn word_error_rate(reference: &str, candidate: &str) -> f64 {
+    let reference = transcript_words(reference);
+    let candidate = transcript_words(candidate);
+    if reference.is_empty() {
+        return if candidate.is_empty() { 0.0 } else { 1.0 };
+    }
+
+    let mut prev: Vec<usize> = (0..=candidate.len()).collect();
+    let mut curr = vec![0usize; candidate.len() + 1];
+    for (i, reference_word) in reference.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, candidate_word) in candidate.iter().enumerate() {
+            let substitute = prev[j] + usize::from(reference_word != candidate_word);
+            let delete = prev[j + 1] + 1;
+            let insert = curr[j] + 1;
+            curr[j + 1] = substitute.min(delete).min(insert);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[candidate.len()] as f64 / reference.len() as f64
+}
+
 /// Absolute path to the in-repo audio fixture.
 fn jfk_wav() -> PathBuf {
     PathBuf::from(concat!(
@@ -150,6 +181,16 @@ fn assert_transcript_matches_reference(report: &Value) {
     );
 }
 
+fn assert_reference_wer_at_or_below(report: &Value, max_wer: f64, scenario: &str) {
+    let produced = normalize_ws(report["result"]["transcript"].as_str().unwrap_or_default());
+    let reference = reference_transcript();
+    let wer = word_error_rate(&reference, &produced);
+    assert!(
+        wer <= max_wer,
+        "{scenario} WER {wer:.4} exceeds gate {max_wer:.4}\nREFERENCE: {reference}\nPRODUCED:  {produced}"
+    );
+}
+
 // ===========================================================================
 // (a) sole-stage native: native is the ONLY thing that can have run.
 // ===========================================================================
@@ -215,6 +256,73 @@ fn gated_sole_stage_native_is_only_path() {
         report["result"]["raw_output"]["implementation"],
         "real-inference"
     );
+}
+
+// ===========================================================================
+// (a2) quality-safe full encoder int8: default-on candidate must preserve JFK.
+// ===========================================================================
+
+#[test]
+fn gated_quality_safe_encoder_int8_jfk_reference_wer_gate() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_quality_safe_encoder_int8_jfk_reference_wer_gate: tiny.en model missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        // Point at the quality-safe full encoder-int8 policy, not the older
+        // all-i7 full gate that is still owner-gated for proper-noun drift.
+        ("FRANKEN_WHISPER_ENC_INT8", "0"),
+        ("FW_ENC_ATTN_OUT_I8I32", "1"),
+        // Make the intended default-on int8 subpolicy explicit in the evidence
+        // gate; both are currently default-on only inside the int8 encoder path.
+        ("FW_ENC_QKV_FUSED", "1"),
+        ("FW_ENC_EF_QUANT", "1"),
+    ];
+    env.extend(bridge_bins_missing());
+
+    let run = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            "tiny.en",
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+
+    assert!(
+        run.status.success(),
+        "quality-safe encoder-int8 native run failed\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    let report = run.report();
+
+    assert_reference_wer_at_or_below(&report, 0.0, "quality-safe encoder-int8 JFK");
+    let produced = normalize_ws(report["result"]["transcript"].as_str().unwrap_or_default());
+    assert!(
+        !produced.to_lowercase().contains("frank at"),
+        "known all-i7 encoder adversarial phrase must not appear in quality-safe int8 output: {produced}"
+    );
+
+    let payload = backend_ok_payload(&report);
+    assert_eq!(
+        payload["implementation"], "native",
+        "quality-safe encoder-int8 gate must run the native implementation"
+    );
+    assert_eq!(payload["execution_mode"], "native_only");
 }
 
 // ===========================================================================
