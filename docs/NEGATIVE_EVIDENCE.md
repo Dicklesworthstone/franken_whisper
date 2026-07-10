@@ -126,9 +126,10 @@ sync_to_remote: timed out after 30000ms
 
 Second strict retry on current `main` (`55df007`) selected `vmi1264463` with one remote slot still
 available, then reproduced the same 30-second `sync_to_remote` timeout and strict refusal of the
-announced local fallback. The strict flag prevented both fallbacks; Cargo again never ran. These
-changed failure modes do not supply a candidate median, production-symbol self-time, or WER
-evidence.
+announced local fallback. Third strict retry on current `main` (`8108d1f`) selected `vmi1227854`
+with four slots remaining, then reproduced the same timeout and refusal. The strict flag prevented
+every announced fallback; Cargo never ran. These changed failure modes do not supply a candidate
+median, production-symbol self-time, or WER evidence.
 
 **Decision:** SURFACE. No Cargo benchmark ran, no local fallback ran, and therefore no admissible
 candidate median or WER/conformance result exists. This is not a performance rejection. Retry only
