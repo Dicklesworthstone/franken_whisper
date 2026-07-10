@@ -4,6 +4,102 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **`tile_shape` load imbalance — BIT-EXACTNESS CERTIFIED, PERF PARKED (patch saved)** + **two measurement rules that invalidate a whole class of rch A/Bs** + blocker beads filed
+
+### The lever (defect is certain; no measurement needed to see it)
+`ft_kernel_cpu::gemm::tile_shape` picks the 2-D grid as `p = floor(sqrt(T))`,
+`q = ceil(T/p)`. **`p*q != T` for many T. At T=32 it is 5×7 = 35 tiles on 32 threads** —
+a straggler wave of 3 tiles runs while 29 threads idle. T=32 is exactly franken's encoder
+thread cap ([[project_encoder_thread_cap_win]]), so it is the case that matters (T=64→8×8,
+T=16→4×4 are already balanced). Fix: pick `p` = largest **divisor** of T that is ≤ √T.
+
+**BIT-EXACT — certified, and this half is host-independent.** New harness
+`frankentorch crates/ft-kernel-cpu/examples/sgemm_tile_shape_ab.rs` (`e959c67e`) runs three
+arms in ONE binary: A = real `matmul_tensor_contiguous_f32_into`, B = replication of the
+*current* grid (fidelity guard), C = replication of the *balanced* grid. On **three
+independent rch workers**: `A==B` and `A==C` full-array bit-identical on all three turbo
+linear shapes; guard holds (B/A = 0.954–1.028×). **⇒ this lever needs no transcript/WER
+gate.** Arm B exists because a prior dig replicated ft's scheduler wrong and drew a false
+conclusion; it must never be deleted.
+
+### PERF: PARKED, patch prepared and validated, NOT applied
+`tests/artifacts/perf/20260710-sgemm-tile-shape/` holds the patch (`git apply --check` OK
+at frankentorch `1fb80836`), the baseline, and the blocker note.
+
+**Baseline (captured BEFORE the local-build directive; 32-core Zen3 5975WX, 32 rayon
+threads, interleaved, order-rotated, min-of-9, cv ≤5%):**
+
+| shape | ft (5×7) | balanced 4×8 |
+|---|---|---|
+| turbo qkv/out | 4.10 ms | **1.022×** |
+| turbo fc1 | 16.12 ms | **0.958× ← REGRESSES** |
+| turbo fc2 | 17.00 ms | **1.241×** |
+
+layer 49.52 → 46.57 ms = **1.063×** ⇒ encoder 1.045× ⇒ **e2e ≈ 1.04×**.
+
+**THE CATCH — do not land the patch and claim 1.24×.** A uniform balanced grid is *not* a
+clean win: **fc1 regresses 4%.** Tile-count balance is not the only force — more column
+blocks shrink the per-thread `B` re-stream (`k·nb·4` B), which fc1 wants (B = 26.2 MB,
+n = 5120) and fc2 does not (n = 1280; at q=16, `nb` clamps to `MIN_BLOCK_COLS=128`,
+collapsing to 20 tiles and under-filling the pool). Bit-exact grid sweep:
+
+| shape | 32×1 | 16×2 | 8×4 | 4×8 | 2×16 |
+|---|---|---|---|---|---|
+| qkv/out | 0.881 | 0.943 | **1.016** | 1.001 | 0.972 |
+| fc1 | 0.778 | 0.970 | 0.805 | 0.958 | **1.085** |
+| fc2 | 0.947 | 1.066 | 1.086 | **1.111** | 1.063 |
+
+**The real lever is a `B`-bytes-aware choice among the divisor pairs of T** (minimize
+`k·nb` subject to `nb ≥ MIN_BLOCK_COLS` and `p·q` tiles filling the pool), not naive
+balance. Unmeasured. Bead: **bd-sgemm-tile-shape-imbalance-kf1j**.
+
+### TWO MEASUREMENT RULES — both cost real work; they invalidate a class of rch A/Bs
+
+**(a) Ratios are NOT worker-invariant ⇒ an A/B split across TWO `rch exec` invocations is
+INVALID.** Discard any such ratio (franken_networkx `br-r37-c1-839yx`). Correct substrate:
+**both arms in ONE binary and ONE invocation**, alternating/rotated per rep, so worker
+identity and drift cancel *within* the run. The old `stash ORIG / bench / pop / bench NEW`
+recipe is doubly forbidden — it assumes one machine AND uses `git stash`.
+**I violated the spirit of this and am correcting myself:** frankentorch `a7f2e4fb`'s
+message cited "two runs disagreed (hz2 1.060× vs vmi1264463 0.981×)" as evidence of
+inadmissibility. Under worker non-invariance **that spread is expected and carries no
+information.** The conclusion (no admissible number) stands, but for the reason in (b).
+
+**(b) Single-binary is necessary but NOT sufficient — the host must also have
+`available_parallelism ≥ the thread count under test.`** Otherwise rayon work-steals across
+the oversubscription and **smears the very scheduling effect being measured**. Sampled rch
+workers, all forcing T=32:
+
+| worker | `available_parallelism` | verdict |
+|---|---|---|
+| `vmi1264463` | 8 | NOT ADMISSIBLE (4× oversubscribed) |
+| `ovh-a` (`fixmydocuments`) | 16 | NOT ADMISSIBLE (2× oversubscribed) |
+| `hz2` | not captured | cannot be certified |
+
+`rch exec` has no `--worker` / `--min-cores` flag and picks non-deterministically, so
+retrying cannot help. The harness now prints an explicit `PERF *** NOT ADMISSIBLE ***`
+verdict and suppresses its e2e projection in that case — **never quote a run that emitted
+it.** This generalizes PERF_LEDGER's "only same-worker single-`rch exec` A/B is admissible".
+
+### Consequence for this repo, stated plainly
+**No new perf number can be produced right now.** Local `cargo build/bench/test` is
+suspended (`/data` 96%, 90 G free); `rch` cannot host model gates (models/`*.wav` gitignored,
+never synced) *or* 32-thread scheduling gates (workers too small); and
+`rch exec -- maturin build` **fails open to a local build** (no strict-remote flag; 18 MB
+offload then a 179 MB local `release/` tree) so it must not be run at all.
+**What still works: pure-cargo CORRECTNESS via `rch exec -- cargo test`** — verified this
+session (12/12 gemm `hz2`, 3/3 sdpa `vmi1149989`, 1/1 setter `vmi1227854`). Bit-exactness is
+host-independent, so bit-exact levers can still be *certified*; they just cannot be *sized*.
+
+Blocker beads: **bd-transcript-gate-unrunnable-xu9g** (umbrella; now covers both model gates
+and 32-thread perf gates) blocks **bd-bcm7** (poly-exp turbo default-on; setter LANDED,
+only the transcript diff remains) and **bd-sgemm-tile-shape-imbalance-kf1j**.
+
+AGENT_NAME=cc_fw. franken_whisper engine unchanged (docs + parked artifact only). No local
+cargo build, no new target trees, nothing deleted, nothing stashed. frankentorch: `a7f2e4fb`
+(harness) + `e959c67e` (admissibility guard).
+
+---
 ## 2026-07-10 - cc_fw: **FT_SDPA_POLY_EXP promotion RESOLVED (setter landed, `frankentorch 1fb80836`)** + **SDPA `BR` row-block sweep MEASURED (bit-exact, 1.028-1.039× on the kernel) → PARKED, not landed** + **turbo default-on BLOCKED on the transcript gate (disk emergency: no local builds; rch workers have no models/wavs)**
 
 ### 1. The poly-exp quantification was already complete — re-surfacing it, not re-running it
