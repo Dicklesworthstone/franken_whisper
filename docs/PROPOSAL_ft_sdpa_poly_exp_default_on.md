@@ -118,7 +118,24 @@ share of its runtime.
 ### Frame this removes
 In-situ profile of the same binary (`perf -F 299`, turbo, jfk ×8, load amortized):
 **`__expf_fma` = 5.86% of e2e self-time.** A 1.0722× e2e speedup is consistent with removing most
-of it. Op-level, the `attn_sdpa` span moves **1.26–1.28×** on both models.
+of it.
+
+**Op-level, measured today** (`FRANKEN_WHISPER_PERF_SPANS=1`, turbo, jfk ×3, window 1, 5 paired
+reps with arm order alternated):
+
+| span | poly OFF (median) | poly ON (median) | ratio | cv | ON wins |
+|---|---|---|---|---|---|
+| `attn_sdpa` | 585.6 ms | **464.9 ms** | **1.2465×** | **3.5%** | **5/5** |
+
+**120.7 ms saved per encoder window**, and the op-level measurement also clears the cv < 5% gate.
+
+> **Read `attn_sdpa` correctly.** It is *not* pure SDPA: `enc_qkv_fused` (default-on inside the
+> int8 path) folds the three i7 QKV GEMMs into `nn::attention_from_i7_qkv`, so their cost is billed
+> to this span — which is why `qkv_proj` is absent from the span table. Flipping the kill-switch
+> `FW_ENC_QKV_FUSED=0` splits them apart: `qkv_proj` **174.2 ms (12.3%)** + `attn_sdpa`
+> **533.1 ms (37.8%)** = 707.3 ms, versus **603.8 ms** fused. So (a) the true SDPA share of the
+> encoder is ~**37.8%**, not 44.6%, and (b) the QKV fusion is independently worth **1.171×** on the
+> combined span. The poly-exp win lands inside the genuine SDPA part.
 
 ### vs whisper.cpp
 Same wav, `whisper-cli -t 32`. Both totals **include model load** (franken load ≈ 1.19 s), so this

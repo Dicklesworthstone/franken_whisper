@@ -4,6 +4,57 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **`attn_sdpa` = 44.6% is NOT SDPA — the kill-switch decomposes it.** True SDPA share is **37.8%**; the fused i7 QKV GEMM is the other **12.3%**, and that fusion is independently worth **1.171×**. Op-level poly-exp win measured today: **`attn_sdpa` 1.2465×, cv 3.5%, 5/5 paired wins, 120.7 ms/window.** No build.
+
+**PROVENANCE.** binary `examples/e2e_probe` **sha256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`**, mtime 2026-07-10 00:47:02,
+`release-perf`; `git log -1 -- src/` = `a997f37` (binary == current source). **Worker: LOCAL**
+(5975WX, 32 cores, x86-64-v3). **No cargo build**; disk 76 G unchanged. Method:
+`FRANKEN_WHISPER_PERF_SPANS=1`, turbo, jfk×3, window 1, spans read from the probe's own timers.
+
+### 1. Decomposing the 44.6% span (env kill-switch, no code change)
+| config | `qkv_proj` | `attn_sdpa` | combined |
+|---|---|---|---|
+| `FW_ENC_QKV_FUSED=1` (**default**) | *(absent — billed into `attn_sdpa`)* | **603.8 ms (44.0%)** | 603.8 ms |
+| `FW_ENC_QKV_FUSED=0` (kill-switch) | **174.2 ms (12.3%)** | **533.1 ms (37.8%)** | 707.3 ms |
+
+Two facts fall out, neither previously stated with numbers:
+1. **The true SDPA share of the encoder is ~37.8%, not 44.6%.** `enc_qkv_fused` folds the three i7
+   QKV GEMMs into `nn::attention_from_i7_qkv`, so the QKV GEMM's ~12.3% is billed to `attn_sdpa`
+   and `qkv_proj` disappears from the span table. **Anyone quoting "attn_sdpa is 45% of the
+   encoder" as an SDPA figure is over-attributing my lane by ~12 points.**
+2. **The QKV fusion is worth `707.3 / 603.8` = 1.171× on the combined span**, measured today — an
+   independent confirmation of AshHeron's landed `FW_ENC_QKV_FUSED` win (recorded as 1.082× on the
+   whole `encoder_window`, which is the same effect diluted by the rest of the encoder).
+
+### 2. Op-level poly-exp win, in the genuine SDPA part (5 paired reps, arm order alternated)
+| span | poly OFF | poly ON | ratio | cv | ON wins |
+|---|---|---|---|---|---|
+| `attn_sdpa` | 585.6 ms | **464.9 ms** | **1.2465×** | **3.5%** | **5/5** |
+
+**120.7 ms saved per encoder window.** cv 3.5% clears the keep gate. This is the op-level figure the
+earlier ledger recorded as "1.26–1.28×" — now re-measured on the shipped binary, at cv 3.5%, rather
+than quoted. It is consistent with the e2e **1.0722×** (cv 0.8%, 5/5) and with `__expf_fma` = 5.86%
+of e2e self-time. All three numbers agree, which is the point of measuring them three ways.
+
+### 3. Consequence for the recommendation (`docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`)
+The poly-exp win lands squarely inside the **37.8%** that is really SDPA — it does not touch the i7
+QKV GEMM. So the recommendation and cod_fw's i7 work are **orthogonal and additive**: poly attacks
+`__expf_fma` (5.86% e2e), cod attacks `dot_maddubs_i7_m2n4` (14.63%) +
+`matmul_bias_i7_quantized::{closure#0}` (9.91%). Neither blocks the other.
+
+### 4. Coordination
+**cod_fw owns `nn.rs`, `native_engine_bench`, and the scripts perf runner** (M4×N4 lane-packed
+maddubs). I have touched none of them and will not; every measurement in this entry is an env-gated
+run of the prebuilt binary. Handing cod the two numbers that matter for their lane: the i7 dot
+kernel is **~12% MAC-dense** (`vpmaddubsw` 9 of ~75 vector ops; Zen3 has no AVX512-VNNI so the
+`vpmaddubsw → vpmaddwd → vpaddd` widening chain is an **ISA ceiling**, one `vpdpbusd` would replace
+all three), and the **reducible** cost is the **9.91%** epilogue *outside* the dot — 68% of the dot
+kernel's own self-time.
+
+AGENT_NAME=cc_fw. No source changed. No cargo build, no maturin, nothing deleted, nothing stashed.
+
+---
 ## 2026-07-10 - cc_fw: **PROFILE INSIDE THE int8 ENCODER PATH.** Top span is **`attn_sdpa` 44.6%** — and it is *not* what it looks like: `enc_qkv_fused` folds the i7 **QKV GEMM** into it, which is why `qkv_proj` has vanished from the span table. Top flat frame is `dot_maddubs_i7_m2n4` (**14.63% self**), whose inner loop is only **12% MAC ops**. **The non-GEMM lane is CLOSED — ledgered here so nobody re-mines it.**
 
 **PROVENANCE / LEDGER METADATA (per the new rules).**
