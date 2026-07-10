@@ -4,6 +4,34 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **CONVERGENCE VERDICT — hottest in-lane frame `sdpa_forward_f32`: REJECT. No byte-exact lever beats the null floor.** (Not a survey — the binary ship-or-reject decision, backed by this session's paired-null measurements.)
+
+**Single hottest frame, global:** `nn::dot_maddubs_i7_m2n4` **14.63%** — cod_fw's reserved i7 kernel,
+compute-bound at ~60% of the measured maddubs peak (`maddubs_peak`); not mine to ship.
+
+**Single hottest frame, my (SDPA) lane:** `ft_kernel_cpu::sdpa_forward_f32` (5.6% self + its internal
+sgemm). Both its byte-exact structural levers were measured this session, both arms in one binary,
+ABBA-interleaved, `black_box` in+out, gated on the candidate MEDIAN vs a paired A/A null control:
+
+| lever | candidate median | null control [p10, p90] | verdict | commit |
+|---|---|---|---|---|
+| BR tile (pack amortization) | 1.0305× | [0.9384, 1.0455] | **INSIDE FLOOR** | `efacdf8`/`bbe6ed0` |
+| flat vs nested rayon | 1.0128× | [0.9465, 1.0276] | **INSIDE FLOOR** | `59b77db` |
+
+Both bit-exact, both undecidable against the floor ⇒ **REJECT**. The frame's other byte-exact levers
+are ledger-closed (softmax pass-elimination, scale-fold, `sc`/`out` alloc). Its one decidable win —
+the exp (`__expf_fma` 5.86%) via poly-softmax — is **not byte-exact** (WER-neutral, byte-identical
+turbo transcript) and is **with the owner** (bd-bcm7); the sgemm `gemm`-crate swap (~3% e2e) is also
+non-byte-exact + needs a shared-crate dep. **No byte-exact `sdpa_forward_f32` lever remains to ship.**
+
+**VERDICT: REJECT (no ship).** The convergent, measured answer for the hottest attackable frame in my
+lane. Remaining gains are all cross-lane/owner/hardware (closure map `b4629f3`). Do not re-attempt BR
+or flat-par unless a ≥32-core rch worker appears (would let the production T=32 SDPA nested path be
+measured) — retry-condition, not an open lever.
+
+AGENT_NAME=cc_fw. No source changed. No build; disk 76 G; nothing stashed/deleted.
+
+---
 ## 2026-07-10 - cc_fw: **FRESH FRAME-LEVEL PROFILE of mel / tokenizer / sampler (both models) — all COLD (<0.1%). No fresh hot frame; no un-explored quality-preserving quantization lever. SURFACE.**
 
 Profile-first on the subsystems named as candidates (encoder / mel / tokenizer), this time drilling
