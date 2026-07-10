@@ -904,13 +904,18 @@ impl Engine for WhisperCppNativeEngine {
     fn kind(&self) -> BackendKind {
         BackendKind::WhisperCpp
     }
+    /// Probed, not declared (bd-0522). Translation needs a multilingual vocab;
+    /// word timestamps need resolvable DTW alignment heads; GPU needs the Metal
+    /// encoder compiled in and enabled. This engine never diarizes, and its
+    /// `run_streaming` is batch-then-replay rather than incremental delivery.
     fn capabilities(&self) -> EngineCapabilities {
+        let probe = whisper_cpp_native::capability_probe();
         EngineCapabilities {
             supports_diarization: false,
-            supports_translation: true,
-            supports_word_timestamps: true,
-            supports_gpu: true,
-            supports_streaming: true,
+            supports_translation: probe.multilingual,
+            supports_word_timestamps: probe.word_timestamps,
+            supports_gpu: probe.gpu,
+            supports_streaming: false,
         }
     }
     fn is_available(&self) -> bool {
@@ -1002,12 +1007,19 @@ impl Engine for InsanelyFastNativeEngine {
     fn kind(&self) -> BackendKind {
         BackendKind::InsanelyFast
     }
+    /// Probed, not declared (bd-0522). Unlike the bridge engine — which shells
+    /// out to a pyannote diarizer — this engine performs **no** diarization of
+    /// its own: it emits segments with no speaker labels, and speakers are
+    /// assigned downstream by the pipeline's `Diarize` stage. Reporting
+    /// `supports_diarization: true` here claimed a capability the engine does
+    /// not have.
     fn capabilities(&self) -> EngineCapabilities {
+        let probe = whisper_cpp_native::capability_probe();
         EngineCapabilities {
-            supports_diarization: true,
-            supports_translation: true,
-            supports_word_timestamps: true,
-            supports_gpu: true,
+            supports_diarization: false,
+            supports_translation: probe.multilingual,
+            supports_word_timestamps: probe.word_timestamps,
+            supports_gpu: probe.gpu,
             supports_streaming: false,
         }
     }
@@ -1084,12 +1096,18 @@ impl Engine for WhisperDiarizationNativeEngine {
     fn kind(&self) -> BackendKind {
         BackendKind::WhisperDiarization
     }
+    /// Probed, not declared (bd-0522). This engine does own its diarization —
+    /// it calls the orchestrator's local heuristic diarizer in-process, which is
+    /// always present and needs no HuggingFace token — so the flag is a true
+    /// constant rather than a probe. It does not expose the translate task, and
+    /// emits segment- rather than word-level timings.
     fn capabilities(&self) -> EngineCapabilities {
+        let probe = whisper_cpp_native::capability_probe();
         EngineCapabilities {
             supports_diarization: true,
             supports_translation: false,
             supports_word_timestamps: false,
-            supports_gpu: true,
+            supports_gpu: probe.gpu,
             supports_streaming: false,
         }
     }
@@ -4994,11 +5012,16 @@ mod tests {
         assert_eq!(engine.name(), "whisper.cpp-native");
         assert_eq!(engine.kind(), BackendKind::WhisperCpp);
         let caps = engine.capabilities();
+        // Constants: this engine never diarizes, and `run_streaming` replays a
+        // completed batch rather than delivering segments incrementally.
         assert!(!caps.supports_diarization);
-        assert!(caps.supports_translation);
-        assert!(caps.supports_word_timestamps);
-        assert!(caps.supports_gpu);
-        assert!(caps.supports_streaming);
+        assert!(!caps.supports_streaming);
+        // Probed: agree with the probe rather than pinning a machine-dependent
+        // constant (a model may or may not be installed on the test host).
+        let probe = super::whisper_cpp_native::capability_probe();
+        assert_eq!(caps.supports_translation, probe.multilingual);
+        assert_eq!(caps.supports_word_timestamps, probe.word_timestamps);
+        assert_eq!(caps.supports_gpu, probe.gpu);
     }
 
     #[test]
@@ -5007,11 +5030,15 @@ mod tests {
         assert_eq!(engine.name(), "insanely-fast-native");
         assert_eq!(engine.kind(), BackendKind::InsanelyFast);
         let caps = engine.capabilities();
-        assert!(caps.supports_diarization);
-        assert!(caps.supports_translation);
-        assert!(caps.supports_word_timestamps);
-        assert!(caps.supports_gpu);
+        // The native engine emits no speaker labels of its own (the bridge's
+        // pyannote diarizer has no native counterpart); speakers come from the
+        // pipeline's Diarize stage.
+        assert!(!caps.supports_diarization);
         assert!(!caps.supports_streaming);
+        let probe = super::whisper_cpp_native::capability_probe();
+        assert_eq!(caps.supports_translation, probe.multilingual);
+        assert_eq!(caps.supports_word_timestamps, probe.word_timestamps);
+        assert_eq!(caps.supports_gpu, probe.gpu);
     }
 
     #[test]
@@ -5020,11 +5047,35 @@ mod tests {
         assert_eq!(engine.name(), "whisper-diarization-native");
         assert_eq!(engine.kind(), BackendKind::WhisperDiarization);
         let caps = engine.capabilities();
+        // This engine does own its diarization: the local heuristic diarizer is
+        // compiled in and needs no HuggingFace token.
         assert!(caps.supports_diarization);
         assert!(!caps.supports_translation);
         assert!(!caps.supports_word_timestamps);
-        assert!(caps.supports_gpu);
         assert!(!caps.supports_streaming);
+        assert_eq!(
+            caps.supports_gpu,
+            super::whisper_cpp_native::capability_probe().gpu
+        );
+    }
+
+    /// Honesty regression guard (bd-0522): the native engine reaches a GPU only
+    /// through the Apple-Silicon Metal encoder. On every other platform there is
+    /// no CUDA/Vulkan path, so a native engine must never advertise GPU support.
+    /// A future GPU backend must flip `gpu_encoder_available()`, not this test.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn native_engines_never_claim_gpu_off_apple_silicon() {
+        for engine in super::all_engines() {
+            if !engine.name().contains("native") {
+                continue;
+            }
+            assert!(
+                !engine.capabilities().supports_gpu,
+                "native engine `{}` claims GPU support with no GPU path compiled in",
+                engine.name()
+            );
+        }
     }
 
     #[test]
@@ -5874,13 +5925,23 @@ mod tests {
         );
     }
 
+    /// The untrusted-router fallback degrades to the TOP static-priority backend
+    /// (index 0), never to `fallback_error` (the last action), which emits no
+    /// transcription. Asserting "fallback is the last action" encoded the old
+    /// behavior that returned 0 utterances whenever the posterior was merely
+    /// uncertain; see `fallback_action`'s note.
     #[test]
-    fn fallback_action_is_last_action() {
+    fn fallback_action_is_top_priority_backend_not_error() {
         let contract = BackendSelectionContract::new(&test_request(false), 30.0);
         assert_eq!(
             contract.fallback_action(),
+            0,
+            "fallback should be try_whisper_cpp"
+        );
+        assert_ne!(
+            contract.fallback_action(),
             contract.action_set().len() - 1,
-            "fallback should be last action"
+            "fallback must not be the transcription-free fallback_error action"
         );
     }
 

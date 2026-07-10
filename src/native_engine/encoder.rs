@@ -906,6 +906,29 @@ fn gpu_encoder_enabled() -> bool {
     })
 }
 
+/// Whether a real GPU encoder path exists in this build, on this machine, right
+/// now: the Metal kernels are compiled in, the device reports a usable queue,
+/// and `FRANKEN_WHISPER_GPU=0` has not disabled it.
+///
+/// Model-independent: the per-model [`GPU_ENCODER_MIN_N_STATE`] width gate is a
+/// performance policy applied inside [`gpu_encode_stack`], not a statement about
+/// whether the engine *can* reach a GPU. Off Apple Silicon this is always
+/// `false` — the native engine is CPU-only there, with no CUDA/Vulkan path.
+///
+/// This is the ground truth behind the native engines' reported
+/// `supports_gpu` capability flag.
+#[must_use]
+pub fn gpu_encoder_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        gpu_encoder_enabled()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// One residual encoder block, mutating `x` (`[n_ctx, n_state]`) in place.
 ///
 /// `x = x + attn_out(attn(ln_attn(x)))` then `x = x + mlp(ln_mlp(x))`. The
