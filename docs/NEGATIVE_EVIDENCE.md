@@ -56,6 +56,63 @@ AGENT_NAME=cc_fw. No franken_whisper source changed (docs only). frankentorch: `
 example (`3b8cdebc`). No local build; disk 75 G; nothing stashed/deleted; `nn.rs`/`benches` untouched.
 
 ---
+## 2026-07-10 - cod_fw: **SURFACE / NULL-CONTROL BLOCKER — production wide-i7 BASE/BASE is too biased and broad to test K=64 unrolling; candidate never executed, so this is NOT a REJECT.**
+
+**Ledger-first routing.** Full `large-v3-turbo` capture binary SHA256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
+Build ID `acd75e8eb9b593d129a8563461349529921d46ef`, flat perf-data SHA256
+`15a513d12bef45766eca5d13c9ef61bf15d7b7089524e0f46fa17bb408db8341`,
+32K `cycles:u` samples, zero lost. Excluding external f32 sgemm, the ranked
+encoder-i7/int8 table is: `dot_maddubs_i7_m2n4` **21.68%**;
+monomorphized `matmul_bias_i7_quantized` Rayon worker **14.34%**;
+`encoder::matmul_bias_i8` **4.63%**; `quantize_act_i7_gelu` **1.39%**;
+`maddubs_i7_headmajor_block` **0.74%**; `quantize_act_i7` **0.65%**; encoder
+activation quantization **0.29%**. Total: **43.717%** full self-time.
+
+The top dot's M8, M4N2, and exact L2-panel families are already closed, while
+VNNI is unavailable on the product CPU, so this pass followed the next frame.
+It also corrects an attribution error in the immediately preceding audit: the
+14.34% worker is not pure dispatch. Disassembly of the exact worker at
+`0x7e770` contains the inlined wide-FC1 `dot_maddubs_i7_m4` loop at
+`0x7ebe0–0x7ec40` and its reduction at `0x7ec42–0x7ed24`; the old claim
+annotated a setup wrapper. The proposed alien primitive was a bit-exact K=64
+two-bank M4 loop plus packed four-row reduction, not another fused epilogue,
+rowblock, allocator, M8, or M4N2 attempt.
+
+**Parity proof before timing.** A strict-remote focused test on `ovh-a` proved
+candidate = shipped K=32 = scalar for K lengths
+`0,1,31,32,33,63,64,65,73,127,1280,5120` (1 passed, 0 failed). No local Cargo
+ran. This proof does not justify keeping an unmeasured candidate.
+
+**Profiled per-function null.** One release-perf binary, one strict-RCH
+invocation, worker `ovh-a` / hostname `fixmydocuments`, binary SHA256
+`ce041e4421ab60faa2650813088bd5a6c5e30fc4fa43544c9e4c08a32837b79f`.
+Shape `[1500,1280] x [1280,5120]`; 31 physical ABBA BASE/BASE repetitions;
+black-boxed inputs and all 7,680,000 output elements. Null median
+**1.028623**, p10 **0.904293**, p90 **1.302412**, range
+`[0.686858,1.452323]`, CV **15.838%**, wins 18/31. The predeclared admissibility
+gate required null median in `[0.98,1.02]`, so the harness stopped before the
+candidate arm. Perf nevertheless proves live production execution: the real
+`matmul_bias_i7_quantized` Rayon worker has **98.00% self / 10,265 of 11,308
+samples**, zero lost. The benchmark runner used `sudo -n perf` on the remote
+worker because `perf_event_paranoid=4`; failure to obtain that privilege would
+have stopped before execution.
+
+**NO REJECT.** Candidate median, candidate CV, and candidate self-time do not
+exist. The source/test/bench candidate was manually removed, restoring
+`nn.rs` and `native_engine_bench.rs` exactly to HEAD. The K=64 mechanism only
+removes loop-control and reduction work while retaining all MACs and loads, so
+it cannot responsibly be chased against this null's 1.302412 p90. Retry only
+with the same function and shape in a same-binary interleaved harness whose
+BASE/BASE median passes its predeclared gate and whose p10-p90 floor is narrow
+enough for that mechanism. The isolated fail-closed worker recipe remains at
+`tests/artifacts/perf/20260710-i7-m4-k64/rchcfg/`. This closes only the noisy
+substrate, never the optimization family or a broader parity ceiling.
+
+AGENT_NAME=cod_fw. No source lever kept; nothing deleted, stashed, reset, or
+built locally.
+
+---
 ## 2026-07-10 - cc_fw: **ROOFLINE of the int8 encoder GEMM — COMPUTE-bound at ~60% of ISA-capped peak.** So cod's M4×N4 tile IS the right lever (not a memory wall), but in-crate headroom is ~1.4–1.6×; beyond that needs GPU/VNNI (owner/hardware). Plus a **companion owner-gated SDPA lever** and a coordination hand-off to cod.
 
 **PROVENANCE.** `e2e_probe` sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,

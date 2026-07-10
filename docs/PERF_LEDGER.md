@@ -14,10 +14,14 @@
   invocation, interleaved inside one measured routine with black-boxed inputs
   and complete results. Separate Criterion baseline invocations are invalid
   because RCH worker selection is non-deterministic.
-- **REJECT provenance:** record benchmark-binary SHA256, worker identity,
-  no-filter `cv_pct < 5`, and profile-verified non-zero self-time for the real
-  function under test. Without all four, the row is a blocker or routing probe,
-  not do-not-retry authority.
+- **Verdict gate and REJECT provenance:** run paired BASE/BASE first for the
+  exact function and shape. CV is informational, not a gate. A candidate is
+  decidable only when its paired-ratio median lies outside that null control's
+  observed `[p10, p90]`; a predeclared null-median acceptance gate must also
+  pass. Record benchmark-binary SHA256, worker identity, raw paired ratios,
+  null median/spread, candidate CV, and profile-verified non-zero self-time for
+  the real function under test. Without that bundle, the row is a blocker or
+  routing probe, not do-not-retry authority.
 - **Conformance gate:** every numeric kernel change ships with a **bit-exact
   parity test** against the pre-change reference, so a "win" cannot silently
   alter output. The mel output is conformance-checked against whisper.cpp's exact
@@ -46,6 +50,81 @@
 ---
 
 ## Levers
+
+### 2026-07-10 UTC — cod_fw — SURFACE: wide-i7 K=64 candidate stopped by its per-function BASE/BASE floor; candidate never executed
+
+This pass re-read the negative-evidence ledger before editing. The full
+`large-v3-turbo` transcription profile remains the routing source: binary
+SHA256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
+Build ID `acd75e8eb9b593d129a8563461349529921d46ef`, flat capture SHA256
+`15a513d12bef45766eca5d13c9ef61bf15d7b7089524e0f46fa17bb408db8341`,
+32K `cycles:u` samples, zero lost. External f32 sgemm is excluded. The ranked
+encoder i7/int8 family is:
+
+| rank | full self | frame | disposition |
+|---:|---:|---|---|
+| 1 | 21.68% | `nn::dot_maddubs_i7_m2n4` | M8/M4N2/L2-panel families already closed; VNNI unavailable |
+| 2 | 14.34% | monomorphized `matmul_bias_i7_quantized` Rayon worker | selected live wide-FC1 M4 seam |
+| 3 | 4.63% | `encoder::matmul_bias_i8` compute | separate full-i8 kernel |
+| 4 | 1.39% | `quantize_act_i7_gelu` | quantizer |
+| 5 | 0.74% | `maddubs_i7_headmajor_block` | fused head-major helper |
+| 6 | 0.65% | `quantize_act_i7` | quantizer |
+| 7 | 0.29% | encoder activation quantization | quantizer |
+
+The family totals **43.717%** of full-transcription self-time. Exact disassembly
+also corrects the earlier claim that rank 2 is dispatch-only: the worker at
+`0x7e770` contains the inlined wide-FC1 M4 arithmetic, with its dominant dot
+loop at `0x7ebe0–0x7ec40` and horizontal reduction at
+`0x7ec42–0x7ed24`. The prior annotation had inspected a setup wrapper, not this
+worker. LLVM already vectorizes the four-row dequant/bias epilogue, so this pass
+did not retry the closed epilogue/fusion families.
+
+The one proposed lever was a K=64 two-bank M4 loop plus a packed four-row
+horizontal reduction. It preserves the exact i32 sum and passed its focused
+bit-parity test on strict-remote `ovh-a` for K lengths
+`0,1,31,32,33,63,64,65,73,127,1280,5120` (candidate = shipped K=32 = scalar,
+one test passed). The production-shaped bench used rows=1500, inp=1280,
+out=5120, black-boxed the inputs and full 7,680,000-element result, and put the
+paired BASE/BASE null before the interleaved BASE/CANDIDATE arm in one binary.
+
+The only profiled measurement invocation ran fail-closed through RCH on
+`ovh-a` (hostname `fixmydocuments`). Benchmark-binary SHA256:
+`ce041e4421ab60faa2650813088bd5a6c5e30fc4fa43544c9e4c08a32837b79f`.
+Its 31 unfiltered BASE/BASE ABBA ratios were:
+
+```text
+1.147281 0.964606 1.071223 0.941393 0.926977 1.302412 1.128820
+0.943957 0.904293 1.157274 0.929797 1.073807 1.041408 0.918513
+1.337974 1.002293 1.162562 0.898850 1.452323 0.940790 0.980430
+0.811961 0.996196 1.023475 1.028623 1.376994 0.686858 1.109428
+1.031808 1.238578 1.135372
+```
+
+Null median **1.028623**, p10 **0.904293**, p90 **1.302412**, range
+`[0.686858, 1.452323]`, CV **15.838%**, wins 18/31. The predeclared
+`[0.98,1.02]` unbiased-null-median gate therefore failed before parity or the
+candidate arm ran. The attached `perf` capture proves this was not dead code:
+11,308 `cycles:u` samples, zero lost, with the real
+`matmul_bias_i7_quantized` Rayon worker at **98.00% self / 10,265 samples**.
+The runner used non-interactive `sudo perf` because the remote worker has
+`perf_event_paranoid=4`; it did not fall back locally.
+
+**Verdict: measurement blocker, neither WIN nor REJECT.** There is no
+candidate median, so this run cannot close K=64 unrolling. The observed
+per-function p90 would require a result above 1.302412x, while this lever only
+removes loop-control and reduction work and leaves every maddubs/maddwd/add and
+load intact; proceeding on this substrate would knowingly chase below its
+floor. Candidate source, test, and bench selector were manually removed and
+production/bench are byte-for-byte back at HEAD. The retained runner change
+fails closed when `perf` needs unavailable privilege, and the isolated
+worker-pinning recipe is preserved at
+`tests/artifacts/perf/20260710-i7-m4-k64/rchcfg/`.
+
+Retry condition: a same-binary, one-invocation harness for this exact function
+and shape whose BASE/BASE median passes the predeclared gate and whose null
+spread is narrow enough for a mechanism-sized effect. Do not rerun the K=64
+candidate on the whole-GEMM `ovh-a` substrate above. This is a measurement
+boundary, not a parity or optimization ceiling.
 
 ### 2026-07-10 UTC — cod_fw — SURFACE: static balanced i7 stripes are bit-exact and live-profiled; CV 13.235% blocks a verdict
 
