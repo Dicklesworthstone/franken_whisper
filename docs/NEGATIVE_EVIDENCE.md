@@ -4,6 +4,57 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **DECODE FLOOR PROFILED (turbo) — bandwidth-bound; every frame is either cod's default-on int8 GEMV or a closed SDPA lever. No decidable in-my-lane decode lever remains.** (bd-0522's honesty sweep is the measurement prerequisite; done + committed `84afe64`.)
+
+**PROVENANCE.** `e2e_probe` sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
+turbo, jfk×3, `FRANKEN_WHISPER_PERF_SPANS` (decode sub-op spans) + `perf -F 299`. Worker LOCAL
+(5975WX). No build; disk 75 G. Decode floor: `decode_loop` 544.8 ms / 58 tok = **9.39 ms/tok**,
+**latency/bandwidth-bound** (~66-158 MB int8 weights streamed per token; [[project_draft_decoding_amortization]]).
+
+### Ranked decode sub-ops (window 1, 58 tokens)
+| op | ms | % of decode | lane / status |
+|---|---|---|---|
+| `mlp_fc_gelu_proj` | 219.6 | 28.9% | **cod** — int8 GEMV, default-on ([[project_int8_mlp_fc1_default_on]]) |
+| `logits_gemv` | 162.5 | 21.4% | **int8 default-on** (see correction) + low-rank REJECTED |
+| `cross_attn` | 77.1 | 10.2% | SDPA (mine) — cross-V-block + parallel-quant LANDED |
+| `self_attn` | 46.9 | 6.2% | SDPA (mine) — **FULLY CLOSED** ([[project_self_attn_kv_cache_lever]]) |
+| LNs / resid | ~55 | ~7% | DRAM-floored |
+
+In `perf` these read low CPU% (`gemv_i8` 0.50%, `gemv_i8w_f32a_blocked` 0.67%, rayon dispatch 3.92%)
+precisely because the cores stall on the weight stream — the decode is memory-bound, so wall-time
+≫ CPU-time on these frames.
+
+### CORRECTION to my own reasoning (grep the gate, not the field comment — again)
+I first read `token_embedding_i8`'s field doc (*"`None` (the default) leaves the f16 path"*) and
+concluded the logits head runs **f16** (133 MB/tok). **Wrong.** `int8_logits_enabled()` is
+`DEFAULT_ON = true`, so the int8 copy IS built and `logits_last` runs **`gemv_i8`** — **66 MB/tok,
+int8, default-on.** The field comment describes the struct field's initial `None`, not the runtime
+gate. This is the exact failure [[project_grep_the_gate]] warns about (a field comment ≠ the gate);
+noting it so the "133 MB f16 logits, enable int8 to halve it" mirage is not chased — that lever
+does not exist, the logits head is already int8.
+
+### Lever assessment — the decode floor is cod's int8 + closed SDPA
+- **MLP + logits int8 GEMVs (50.3% of decode)** are cod's default-on int8 execution, bandwidth-bound.
+  Further shrink is int4 (quality-gated, `INT4_MLP` measured-mixed) or vocab pruning (approximate,
+  needs a WER gate) — both cross-lane/owner, none byte-exact.
+- **logits low-rank** shrink is **REJECTED** (2026-07-06, near-full-rank: rank-32 captures 53%,
+  rank-1024 only 95% ⇒ no cheap factorization). Do not re-dig.
+- **self_attn SDPA** (mine): FULLY CLOSED (re-derived 3×). **cross_attn SDPA** (mine): the byte-exact
+  levers (cross-V block, parallel-quant, M2col) are LANDED; the decode softmax poly-exp was measured
+  within-noise/default-off ([[project_sampler_exp_measured]]).
+- **rayon decode dispatch (3.92%)**: CLOSED (thread-count + spin-pool, 3 reverts,
+  [[project_decode_overthreaded_rayon_lead]]).
+
+**⇒ No decidable in-my-lane (SDPA) decode lever remains, and the bandwidth-bound int8 GEMVs are
+cod's.** The genuine remaining decode multipliers are cross-lane/owner: (a) draft/speculative
+decoding to amortize the weight stream across tokens (landed, ceiling R(8)≈2.9×,
+[[project_draft_decoding_amortization]]); (b) int4/vocab-prune on cod's int8 GEMVs behind a WER
+gate; (c) the encoder poly-exp already with the owner. **This is a `surface`: the decode floor is
+memory-bandwidth on cod's int8 weights, not an SDPA-lane lever.**
+
+AGENT_NAME=cc_fw. No source changed (profile only). No build; disk 75 G; `nn.rs`/`benches` untouched.
+
+---
 ## 2026-07-10 - cc_fw: **ISA-PEAK MEASURED — the roofline's 40% headroom is CONFIRMED, and it is the GEMM's non-minimal-chain overhead (loads / M2col shuffle / sign-trick / dispatch), exactly what cod's M4×N4 tile targets.** Landed the peak-measurement tool cod needs (frankentorch `3b8cdebc`, `examples/maddubs_peak`). The dot kernel stays cod's; my contribution is the ISA reference + validated target.
 
 **PROVENANCE.** Peak: `examples/maddubs_peak`, worker **`vmi1149989`** (10c). GEMM 1.25 TMAC/s:
