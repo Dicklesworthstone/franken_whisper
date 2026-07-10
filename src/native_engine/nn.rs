@@ -129,7 +129,11 @@ fn gemv_worker_count(out: usize) -> usize {
     // Only the vocab-class GEMV (tens of thousands of rows) is bandwidth-bound
     // enough to want >8 threads; below that the 8-cap wins (see fn docs).
     const WIDE_OUT_THRESHOLD: usize = 1 << 14; // 16384 rows
-    let cap = if out >= WIDE_OUT_THRESHOLD { wide_gemv_cap() } else { 8 };
+    let cap = if out >= WIDE_OUT_THRESHOLD {
+        wide_gemv_cap()
+    } else {
+        8
+    };
     avail.min(cap)
 }
 
@@ -170,8 +174,7 @@ fn batch_gemv_cap() -> Option<usize> {
 fn batch_gemv_row_morsel_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() != Some("0"))
+    *ENABLED.get_or_init(|| std::env::var("FW_BATCH_GEMV_ROW_MORSEL").ok().as_deref() != Some("0"))
 }
 
 /// Default-ON M2 activation-column tile for the row-morsel f16 batch GEMV: pairs of
@@ -595,6 +598,18 @@ pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn dequant_i7_for_test(w: &I7Mat) -> Mat {
+    let mut data = vec![0.0f32; w.inp * w.out];
+    for o in 0..w.out {
+        let row = &w.data[o * w.inp..(o + 1) * w.inp];
+        for (i, &q) in row.iter().enumerate() {
+            data[i * w.out + o] = f32::from(q) * w.scale[o];
+        }
+    }
+    Mat::from_vec(w.inp, w.out, data)
+}
+
 /// Quantize `w_t` (`[inp, out]`, element `w_t.data[i*out + o]`) to i7 then DEQUANTIZE
 /// back to f32, returning the perturbed weight. `block == None` ⇒ one scale per output
 /// column `o` over the whole `inp` dim (== [`quantize_mat_to_i7`] granularity = the current
@@ -646,7 +661,11 @@ pub fn u8_act_roundtrip(x: &Mat, block: Option<usize>) -> Mat {
         let mut c0 = 0;
         while c0 < inp {
             let c1 = (c0 + b).min(inp);
-            let amax = xr[c0..c1].iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let amax = xr[c0..c1]
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-9);
             let scale = amax / 127.0;
             let inv = 1.0 / scale;
             for c in c0..c1 {
@@ -720,7 +739,10 @@ fn dot_maddubs_i7(a: &[u8], w: &[i8]) -> i32 {
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
 fn dot_maddubs_i7(a: &[u8], w: &[i8]) -> i32 {
-    a.iter().zip(w).map(|(&x, &y)| (x as i32) * (y as i32)).sum()
+    a.iter()
+        .zip(w)
+        .map(|(&x, &y)| (x as i32) * (y as i32))
+        .sum()
 }
 
 /// M4-register-blocked `u8·i7` dot: FOUR activation rows against ONE weight row,
@@ -737,7 +759,13 @@ fn dot_maddubs_i7(a: &[u8], w: &[i8]) -> i32 {
 fn dot_maddubs_i7_m4(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w: &[i8]) -> [i32; 4] {
     use std::arch::x86_64::*;
     let k = w.len();
-    let (p0, p1, p2, p3, pw) = (a0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), w.as_ptr());
+    let (p0, p1, p2, p3, pw) = (
+        a0.as_ptr(),
+        a1.as_ptr(),
+        a2.as_ptr(),
+        a3.as_ptr(),
+        w.as_ptr(),
+    );
     // SAFETY: AVX2 in the base target features; all four activation slices and the
     // weight slice have length k (caller invariant); 32-lane steps guarded by
     // `x + 32 <= k`, scalar tail after.
@@ -820,7 +848,14 @@ fn dot_maddubs_i7_m4(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w: &[i8]) -> [i
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(unsafe_code)]
 #[inline]
-fn dot_maddubs_i7_m4n2(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w0: &[i8], w1: &[i8]) -> [i32; 8] {
+fn dot_maddubs_i7_m4n2(
+    a0: &[u8],
+    a1: &[u8],
+    a2: &[u8],
+    a3: &[u8],
+    w0: &[i8],
+    w1: &[i8],
+) -> [i32; 8] {
     use std::arch::x86_64::*;
     let k = w0.len();
     let (p0, p1, p2, p3) = (a0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr());
@@ -839,14 +874,38 @@ fn dot_maddubs_i7_m4n2(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w0: &[i8], w1
             let av1 = _mm256_loadu_si256(p1.add(x) as *const __m256i);
             let av2 = _mm256_loadu_si256(p2.add(x) as *const __m256i);
             let av3 = _mm256_loadu_si256(p3.add(x) as *const __m256i);
-            acc[0] = _mm256_add_epi32(acc[0], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv0), ones));
-            acc[1] = _mm256_add_epi32(acc[1], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv0), ones));
-            acc[2] = _mm256_add_epi32(acc[2], _mm256_madd_epi16(_mm256_maddubs_epi16(av2, wv0), ones));
-            acc[3] = _mm256_add_epi32(acc[3], _mm256_madd_epi16(_mm256_maddubs_epi16(av3, wv0), ones));
-            acc[4] = _mm256_add_epi32(acc[4], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv1), ones));
-            acc[5] = _mm256_add_epi32(acc[5], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv1), ones));
-            acc[6] = _mm256_add_epi32(acc[6], _mm256_madd_epi16(_mm256_maddubs_epi16(av2, wv1), ones));
-            acc[7] = _mm256_add_epi32(acc[7], _mm256_madd_epi16(_mm256_maddubs_epi16(av3, wv1), ones));
+            acc[0] = _mm256_add_epi32(
+                acc[0],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv0), ones),
+            );
+            acc[1] = _mm256_add_epi32(
+                acc[1],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv0), ones),
+            );
+            acc[2] = _mm256_add_epi32(
+                acc[2],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av2, wv0), ones),
+            );
+            acc[3] = _mm256_add_epi32(
+                acc[3],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av3, wv0), ones),
+            );
+            acc[4] = _mm256_add_epi32(
+                acc[4],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv1), ones),
+            );
+            acc[5] = _mm256_add_epi32(
+                acc[5],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv1), ones),
+            );
+            acc[6] = _mm256_add_epi32(
+                acc[6],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av2, wv1), ones),
+            );
+            acc[7] = _mm256_add_epi32(
+                acc[7],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av3, wv1), ones),
+            );
             x += 32;
         }
         let hsum = |v: __m256i| -> i32 {
@@ -876,7 +935,14 @@ fn dot_maddubs_i7_m4n2(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w0: &[i8], w1
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
-fn dot_maddubs_i7_m4n2(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w0: &[i8], w1: &[i8]) -> [i32; 8] {
+fn dot_maddubs_i7_m4n2(
+    a0: &[u8],
+    a1: &[u8],
+    a2: &[u8],
+    a3: &[u8],
+    w0: &[i8],
+    w1: &[i8],
+) -> [i32; 8] {
     [
         dot_maddubs_i7(a0, w0),
         dot_maddubs_i7(a1, w0),
@@ -896,7 +962,14 @@ fn dot_maddubs_i7_m4n2(a0: &[u8], a1: &[u8], a2: &[u8], a3: &[u8], w0: &[i8], w1
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(unsafe_code)]
 #[inline]
-fn dot_maddubs_i7_m2n4(a0: &[u8], a1: &[u8], w0: &[i8], w1: &[i8], w2: &[i8], w3: &[i8]) -> [i32; 8] {
+fn dot_maddubs_i7_m2n4(
+    a0: &[u8],
+    a1: &[u8],
+    w0: &[i8],
+    w1: &[i8],
+    w2: &[i8],
+    w3: &[i8],
+) -> [i32; 8] {
     use std::arch::x86_64::*;
     let k = w0.len();
     let (p0, p1) = (a0.as_ptr(), a1.as_ptr());
@@ -914,14 +987,38 @@ fn dot_maddubs_i7_m2n4(a0: &[u8], a1: &[u8], w0: &[i8], w1: &[i8], w2: &[i8], w3
             let wv1 = _mm256_loadu_si256(pw1.add(x) as *const __m256i);
             let wv2 = _mm256_loadu_si256(pw2.add(x) as *const __m256i);
             let wv3 = _mm256_loadu_si256(pw3.add(x) as *const __m256i);
-            acc[0] = _mm256_add_epi32(acc[0], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv0), ones));
-            acc[1] = _mm256_add_epi32(acc[1], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv0), ones));
-            acc[2] = _mm256_add_epi32(acc[2], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv1), ones));
-            acc[3] = _mm256_add_epi32(acc[3], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv1), ones));
-            acc[4] = _mm256_add_epi32(acc[4], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv2), ones));
-            acc[5] = _mm256_add_epi32(acc[5], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv2), ones));
-            acc[6] = _mm256_add_epi32(acc[6], _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv3), ones));
-            acc[7] = _mm256_add_epi32(acc[7], _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv3), ones));
+            acc[0] = _mm256_add_epi32(
+                acc[0],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv0), ones),
+            );
+            acc[1] = _mm256_add_epi32(
+                acc[1],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv0), ones),
+            );
+            acc[2] = _mm256_add_epi32(
+                acc[2],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv1), ones),
+            );
+            acc[3] = _mm256_add_epi32(
+                acc[3],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv1), ones),
+            );
+            acc[4] = _mm256_add_epi32(
+                acc[4],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv2), ones),
+            );
+            acc[5] = _mm256_add_epi32(
+                acc[5],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv2), ones),
+            );
+            acc[6] = _mm256_add_epi32(
+                acc[6],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av0, wv3), ones),
+            );
+            acc[7] = _mm256_add_epi32(
+                acc[7],
+                _mm256_madd_epi16(_mm256_maddubs_epi16(av1, wv3), ones),
+            );
             x += 32;
         }
         let hsum = |v: __m256i| -> i32 {
@@ -953,7 +1050,14 @@ fn dot_maddubs_i7_m2n4(a0: &[u8], a1: &[u8], w0: &[i8], w1: &[i8], w2: &[i8], w3
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
-fn dot_maddubs_i7_m2n4(a0: &[u8], a1: &[u8], w0: &[i8], w1: &[i8], w2: &[i8], w3: &[i8]) -> [i32; 8] {
+fn dot_maddubs_i7_m2n4(
+    a0: &[u8],
+    a1: &[u8],
+    w0: &[i8],
+    w1: &[i8],
+    w2: &[i8],
+    w3: &[i8],
+) -> [i32; 8] {
     [
         dot_maddubs_i7(a0, w0),
         dot_maddubs_i7(a1, w0),
@@ -1017,7 +1121,11 @@ pub fn quantize_act_i7(x: &Mat) -> I7Activation {
 ///
 /// # Errors
 /// [`FwError::InvalidRequest`] on `x.inp != w.inp` or `bias.len() != w.out`.
-pub fn matmul_bias_i7_quantized(x: &I7Activation, w: &I7Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
+pub fn matmul_bias_i7_quantized(
+    x: &I7Activation,
+    w: &I7Mat,
+    bias: Option<&[f32]>,
+) -> FwResult<Mat> {
     let m = x.rows;
     let inp = x.inp;
     if inp != w.inp {
@@ -1043,158 +1151,161 @@ pub fn matmul_bias_i7_quantized(x: &I7Activation, w: &I7Mat, bias: Option<&[f32]
     // loop). Bit-identical to the per-row form (same i32 dot + same f32 dequant
     // order), so the int8 transcript is unchanged. Parallel over row-blocks.
     let mut c = gemv_out_buf(m * out);
-    c.par_chunks_mut(4 * out).enumerate().for_each(|(blk, cblk)| {
-        let r0 = blk * 4;
-        let rows = (m - r0).min(4);
-        if rows == 4 {
-            let x0 = &xu[r0 * inp..(r0 + 1) * inp];
-            let x1 = &xu[(r0 + 1) * inp..(r0 + 2) * inp];
-            let x2 = &xu[(r0 + 2) * inp..(r0 + 3) * inp];
-            let x3 = &xu[(r0 + 3) * inp..(r0 + 4) * inp];
-            let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
-            if out <= inp {
-                // M4×N2 tile: 2 weight rows per pass. Measured ~1.3–1.5× over plain
-                // M4 on the non-expanding shapes (attn projections `out==in`, mlp
-                // fc2 `out<in`). Gated to `out ≤ in` because the wide fc1
-                // (`out ≫ in`) makes N2 a wash/slight-loss (register pressure), so
-                // this is strictly ≥ M4 on every shape. Bit-identical.
-                let mut o = 0;
-                if i7_m2n4_enabled() {
-                    while o + 4 <= out {
+    c.par_chunks_mut(4 * out)
+        .enumerate()
+        .for_each(|(blk, cblk)| {
+            let r0 = blk * 4;
+            let rows = (m - r0).min(4);
+            if rows == 4 {
+                let x0 = &xu[r0 * inp..(r0 + 1) * inp];
+                let x1 = &xu[(r0 + 1) * inp..(r0 + 2) * inp];
+                let x2 = &xu[(r0 + 2) * inp..(r0 + 3) * inp];
+                let x3 = &xu[(r0 + 3) * inp..(r0 + 4) * inp];
+                let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
+                if out <= inp {
+                    // M4×N2 tile: 2 weight rows per pass. Measured ~1.3–1.5× over plain
+                    // M4 on the non-expanding shapes (attn projections `out==in`, mlp
+                    // fc2 `out<in`). Gated to `out ≤ in` because the wide fc1
+                    // (`out ≫ in`) makes N2 a wash/slight-loss (register pressure), so
+                    // this is strictly ≥ M4 on every shape. Bit-identical.
+                    let mut o = 0;
+                    if i7_m2n4_enabled() {
+                        while o + 4 <= out {
+                            let w0r = &w.data[o * inp..(o + 1) * inp];
+                            let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
+                            let w2r = &w.data[(o + 2) * inp..(o + 3) * inp];
+                            let w3r = &w.data[(o + 3) * inp..(o + 4) * inp];
+                            let raw01 = dot_maddubs_i7_m2n4(x0, x1, w0r, w1r, w2r, w3r);
+                            let raw23 = dot_maddubs_i7_m2n4(x2, x3, w0r, w1r, w2r, w3r);
+                            let off0 = 128 * w.colsum[o];
+                            let off1 = 128 * w.colsum[o + 1];
+                            let off2 = 128 * w.colsum[o + 2];
+                            let off3 = 128 * w.colsum[o + 3];
+                            let sc0 = w.scale[o];
+                            let sc1 = w.scale[o + 1];
+                            let sc2 = w.scale[o + 2];
+                            let sc3 = w.scale[o + 3];
+                            let (bo0, bo1, bo2, bo3) = bias.map_or((0.0, 0.0, 0.0, 0.0), |b| {
+                                (b[o], b[o + 1], b[o + 2], b[o + 3])
+                            });
+                            cblk[o] = (raw01[0] - off0) as f32 * s0 * sc0 + bo0;
+                            cblk[out + o] = (raw01[1] - off0) as f32 * s1 * sc0 + bo0;
+                            cblk[2 * out + o] = (raw23[0] - off0) as f32 * s2 * sc0 + bo0;
+                            cblk[3 * out + o] = (raw23[1] - off0) as f32 * s3 * sc0 + bo0;
+                            cblk[o + 1] = (raw01[2] - off1) as f32 * s0 * sc1 + bo1;
+                            cblk[out + o + 1] = (raw01[3] - off1) as f32 * s1 * sc1 + bo1;
+                            cblk[2 * out + o + 1] = (raw23[2] - off1) as f32 * s2 * sc1 + bo1;
+                            cblk[3 * out + o + 1] = (raw23[3] - off1) as f32 * s3 * sc1 + bo1;
+                            cblk[o + 2] = (raw01[4] - off2) as f32 * s0 * sc2 + bo2;
+                            cblk[out + o + 2] = (raw01[5] - off2) as f32 * s1 * sc2 + bo2;
+                            cblk[2 * out + o + 2] = (raw23[4] - off2) as f32 * s2 * sc2 + bo2;
+                            cblk[3 * out + o + 2] = (raw23[5] - off2) as f32 * s3 * sc2 + bo2;
+                            cblk[o + 3] = (raw01[6] - off3) as f32 * s0 * sc3 + bo3;
+                            cblk[out + o + 3] = (raw01[7] - off3) as f32 * s1 * sc3 + bo3;
+                            cblk[2 * out + o + 3] = (raw23[6] - off3) as f32 * s2 * sc3 + bo3;
+                            cblk[3 * out + o + 3] = (raw23[7] - off3) as f32 * s3 * sc3 + bo3;
+                            o += 4;
+                        }
+                    }
+                    while o + 2 <= out {
                         let w0r = &w.data[o * inp..(o + 1) * inp];
                         let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
-                        let w2r = &w.data[(o + 2) * inp..(o + 3) * inp];
-                        let w3r = &w.data[(o + 3) * inp..(o + 4) * inp];
-                        let raw01 = dot_maddubs_i7_m2n4(x0, x1, w0r, w1r, w2r, w3r);
-                        let raw23 = dot_maddubs_i7_m2n4(x2, x3, w0r, w1r, w2r, w3r);
+                        let raw = dot_maddubs_i7_m4n2(x0, x1, x2, x3, w0r, w1r);
                         let off0 = 128 * w.colsum[o];
                         let off1 = 128 * w.colsum[o + 1];
-                        let off2 = 128 * w.colsum[o + 2];
-                        let off3 = 128 * w.colsum[o + 3];
                         let sc0 = w.scale[o];
                         let sc1 = w.scale[o + 1];
-                        let sc2 = w.scale[o + 2];
-                        let sc3 = w.scale[o + 3];
-                        let (bo0, bo1, bo2, bo3) =
-                            bias.map_or((0.0, 0.0, 0.0, 0.0), |b| (b[o], b[o + 1], b[o + 2], b[o + 3]));
-                        cblk[o] = (raw01[0] - off0) as f32 * s0 * sc0 + bo0;
-                        cblk[out + o] = (raw01[1] - off0) as f32 * s1 * sc0 + bo0;
-                        cblk[2 * out + o] = (raw23[0] - off0) as f32 * s2 * sc0 + bo0;
-                        cblk[3 * out + o] = (raw23[1] - off0) as f32 * s3 * sc0 + bo0;
-                        cblk[o + 1] = (raw01[2] - off1) as f32 * s0 * sc1 + bo1;
-                        cblk[out + o + 1] = (raw01[3] - off1) as f32 * s1 * sc1 + bo1;
-                        cblk[2 * out + o + 1] = (raw23[2] - off1) as f32 * s2 * sc1 + bo1;
-                        cblk[3 * out + o + 1] = (raw23[3] - off1) as f32 * s3 * sc1 + bo1;
-                        cblk[o + 2] = (raw01[4] - off2) as f32 * s0 * sc2 + bo2;
-                        cblk[out + o + 2] = (raw01[5] - off2) as f32 * s1 * sc2 + bo2;
-                        cblk[2 * out + o + 2] = (raw23[4] - off2) as f32 * s2 * sc2 + bo2;
-                        cblk[3 * out + o + 2] = (raw23[5] - off2) as f32 * s3 * sc2 + bo2;
-                        cblk[o + 3] = (raw01[6] - off3) as f32 * s0 * sc3 + bo3;
-                        cblk[out + o + 3] = (raw01[7] - off3) as f32 * s1 * sc3 + bo3;
-                        cblk[2 * out + o + 3] = (raw23[6] - off3) as f32 * s2 * sc3 + bo3;
-                        cblk[3 * out + o + 3] = (raw23[7] - off3) as f32 * s3 * sc3 + bo3;
-                        o += 4;
+                        let mut a0v = (raw[0] - off0) as f32 * s0 * sc0;
+                        let mut a1v = (raw[1] - off0) as f32 * s1 * sc0;
+                        let mut a2v = (raw[2] - off0) as f32 * s2 * sc0;
+                        let mut a3v = (raw[3] - off0) as f32 * s3 * sc0;
+                        let mut b0v = (raw[4] - off1) as f32 * s0 * sc1;
+                        let mut b1v = (raw[5] - off1) as f32 * s1 * sc1;
+                        let mut b2v = (raw[6] - off1) as f32 * s2 * sc1;
+                        let mut b3v = (raw[7] - off1) as f32 * s3 * sc1;
+                        if let Some(b) = bias {
+                            let (bo0, bo1) = (b[o], b[o + 1]);
+                            a0v += bo0;
+                            a1v += bo0;
+                            a2v += bo0;
+                            a3v += bo0;
+                            b0v += bo1;
+                            b1v += bo1;
+                            b2v += bo1;
+                            b3v += bo1;
+                        }
+                        cblk[o] = a0v;
+                        cblk[out + o] = a1v;
+                        cblk[2 * out + o] = a2v;
+                        cblk[3 * out + o] = a3v;
+                        cblk[o + 1] = b0v;
+                        cblk[out + o + 1] = b1v;
+                        cblk[2 * out + o + 1] = b2v;
+                        cblk[3 * out + o + 1] = b3v;
+                        o += 2;
                     }
-                }
-                while o + 2 <= out {
-                    let w0r = &w.data[o * inp..(o + 1) * inp];
-                    let w1r = &w.data[(o + 1) * inp..(o + 2) * inp];
-                    let raw = dot_maddubs_i7_m4n2(x0, x1, x2, x3, w0r, w1r);
-                    let off0 = 128 * w.colsum[o];
-                    let off1 = 128 * w.colsum[o + 1];
-                    let sc0 = w.scale[o];
-                    let sc1 = w.scale[o + 1];
-                    let mut a0v = (raw[0] - off0) as f32 * s0 * sc0;
-                    let mut a1v = (raw[1] - off0) as f32 * s1 * sc0;
-                    let mut a2v = (raw[2] - off0) as f32 * s2 * sc0;
-                    let mut a3v = (raw[3] - off0) as f32 * s3 * sc0;
-                    let mut b0v = (raw[4] - off1) as f32 * s0 * sc1;
-                    let mut b1v = (raw[5] - off1) as f32 * s1 * sc1;
-                    let mut b2v = (raw[6] - off1) as f32 * s2 * sc1;
-                    let mut b3v = (raw[7] - off1) as f32 * s3 * sc1;
-                    if let Some(b) = bias {
-                        let (bo0, bo1) = (b[o], b[o + 1]);
-                        a0v += bo0;
-                        a1v += bo0;
-                        a2v += bo0;
-                        a3v += bo0;
-                        b0v += bo1;
-                        b1v += bo1;
-                        b2v += bo1;
-                        b3v += bo1;
+                    while o < out {
+                        let wrow = &w.data[o * inp..(o + 1) * inp];
+                        let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
+                        let off = 128 * w.colsum[o];
+                        let sc = w.scale[o];
+                        let mut v0 = (raw[0] - off) as f32 * s0 * sc;
+                        let mut v1 = (raw[1] - off) as f32 * s1 * sc;
+                        let mut v2 = (raw[2] - off) as f32 * s2 * sc;
+                        let mut v3 = (raw[3] - off) as f32 * s3 * sc;
+                        if let Some(b) = bias {
+                            let bo = b[o];
+                            v0 += bo;
+                            v1 += bo;
+                            v2 += bo;
+                            v3 += bo;
+                        }
+                        cblk[o] = v0;
+                        cblk[out + o] = v1;
+                        cblk[2 * out + o] = v2;
+                        cblk[3 * out + o] = v3;
+                        o += 1;
                     }
-                    cblk[o] = a0v;
-                    cblk[out + o] = a1v;
-                    cblk[2 * out + o] = a2v;
-                    cblk[3 * out + o] = a3v;
-                    cblk[o + 1] = b0v;
-                    cblk[out + o + 1] = b1v;
-                    cblk[2 * out + o + 1] = b2v;
-                    cblk[3 * out + o + 1] = b3v;
-                    o += 2;
-                }
-                while o < out {
-                    let wrow = &w.data[o * inp..(o + 1) * inp];
-                    let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
-                    let off = 128 * w.colsum[o];
-                    let sc = w.scale[o];
-                    let mut v0 = (raw[0] - off) as f32 * s0 * sc;
-                    let mut v1 = (raw[1] - off) as f32 * s1 * sc;
-                    let mut v2 = (raw[2] - off) as f32 * s2 * sc;
-                    let mut v3 = (raw[3] - off) as f32 * s3 * sc;
-                    if let Some(b) = bias {
-                        let bo = b[o];
-                        v0 += bo;
-                        v1 += bo;
-                        v2 += bo;
-                        v3 += bo;
+                } else {
+                    for o in 0..out {
+                        let wrow = &w.data[o * inp..(o + 1) * inp];
+                        let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
+                        let off = 128 * w.colsum[o];
+                        let sc = w.scale[o];
+                        let mut v0 = (raw[0] - off) as f32 * s0 * sc;
+                        let mut v1 = (raw[1] - off) as f32 * s1 * sc;
+                        let mut v2 = (raw[2] - off) as f32 * s2 * sc;
+                        let mut v3 = (raw[3] - off) as f32 * s3 * sc;
+                        if let Some(b) = bias {
+                            let bo = b[o];
+                            v0 += bo;
+                            v1 += bo;
+                            v2 += bo;
+                            v3 += bo;
+                        }
+                        cblk[o] = v0;
+                        cblk[out + o] = v1;
+                        cblk[2 * out + o] = v2;
+                        cblk[3 * out + o] = v3;
                     }
-                    cblk[o] = v0;
-                    cblk[out + o] = v1;
-                    cblk[2 * out + o] = v2;
-                    cblk[3 * out + o] = v3;
-                    o += 1;
                 }
             } else {
-                for o in 0..out {
-                    let wrow = &w.data[o * inp..(o + 1) * inp];
-                    let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
-                    let off = 128 * w.colsum[o];
-                    let sc = w.scale[o];
-                    let mut v0 = (raw[0] - off) as f32 * s0 * sc;
-                    let mut v1 = (raw[1] - off) as f32 * s1 * sc;
-                    let mut v2 = (raw[2] - off) as f32 * s2 * sc;
-                    let mut v3 = (raw[3] - off) as f32 * s3 * sc;
-                    if let Some(b) = bias {
-                        let bo = b[o];
-                        v0 += bo;
-                        v1 += bo;
-                        v2 += bo;
-                        v3 += bo;
+                for j in 0..rows {
+                    let r = r0 + j;
+                    let xr = &xu[r * inp..(r + 1) * inp];
+                    let sar = sa[r];
+                    for o in 0..out {
+                        let wrow = &w.data[o * inp..(o + 1) * inp];
+                        let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
+                        let mut val = dot as f32 * sar * w.scale[o];
+                        if let Some(b) = bias {
+                            val += b[o];
+                        }
+                        cblk[j * out + o] = val;
                     }
-                    cblk[o] = v0;
-                    cblk[out + o] = v1;
-                    cblk[2 * out + o] = v2;
-                    cblk[3 * out + o] = v3;
                 }
             }
-        } else {
-            for j in 0..rows {
-                let r = r0 + j;
-                let xr = &xu[r * inp..(r + 1) * inp];
-                let sar = sa[r];
-                for o in 0..out {
-                    let wrow = &w.data[o * inp..(o + 1) * inp];
-                    let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
-                    let mut val = dot as f32 * sar * w.scale[o];
-                    if let Some(b) = bias {
-                        val += b[o];
-                    }
-                    cblk[j * out + o] = val;
-                }
-            }
-        }
-    });
+        });
     Ok(Mat::from_vec(m, out, c))
 }
 
@@ -1481,24 +1592,46 @@ fn dot_f16c_2row(w0: &[Float16], w1: &[Float16], x: &[f32]) -> (f32, f32) {
             let xc = _mm256_loadu_ps(xp.add(i + 16));
             let xd = _mm256_loadu_ps(xp.add(i + 24));
             a0 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i).cast())), xa, a0);
-            a1 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 8).cast())), xb, a1);
-            a2 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 16).cast())), xc, a2);
-            a3 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 24).cast())), xd, a3);
+            a1 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 8).cast())),
+                xb,
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 16).cast())),
+                xc,
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128(p0.add(i + 24).cast())),
+                xd,
+                a3,
+            );
             b0 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i).cast())), xa, b0);
-            b1 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 8).cast())), xb, b1);
-            b2 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 16).cast())), xc, b2);
-            b3 = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 24).cast())), xd, b3);
+            b1 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 8).cast())),
+                xb,
+                b1,
+            );
+            b2 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 16).cast())),
+                xc,
+                b2,
+            );
+            b3 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(_mm_loadu_si128(p1.add(i + 24).cast())),
+                xd,
+                b3,
+            );
             i += 32;
         }
         let acc0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
         let acc1 = _mm256_add_ps(_mm256_add_ps(b0, b1), _mm256_add_ps(b2, b3));
         let mut t = [0.0f32; 8];
         _mm256_storeu_ps(t.as_mut_ptr(), acc0);
-        let mut s0 =
-            ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+        let mut s0 = ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
         _mm256_storeu_ps(t.as_mut_ptr(), acc1);
-        let mut s1 =
-            ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+        let mut s1 = ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
         while i + 8 <= n {
             let xv = _mm256_loadu_ps(xp.add(i));
             let p = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(p0.add(i).cast())), xv);
@@ -1894,7 +2027,12 @@ pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
                 }
             }
         });
-    I8Mat { data, scales, out, inp }
+    I8Mat {
+        data,
+        scales,
+        out,
+        inp,
+    }
 }
 
 /// Signed int8 dot → i32. Explicit AVX2 (`vpmovsxbw`+`vpmaddwd`+`vpaddd`, 2
@@ -2140,7 +2278,10 @@ pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]
     debug_assert_eq!(w.data.len(), out * inp, "gemv_i8 weight shape mismatch");
     debug_assert_eq!(x.len(), inp, "gemv_i8 x length mismatch");
     debug_assert_eq!(out_slice.len(), out, "gemv_i8 out length mismatch");
-    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8 bias length mismatch");
+    debug_assert!(
+        bias.is_none_or(|b| b.len() == out),
+        "gemv_i8 bias length mismatch"
+    );
     // Quantize the activation once (per-vector symmetric), shared by all rows.
     let xamax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
     let xs = xamax / 127.0;
@@ -2197,18 +2338,23 @@ pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]
 /// the batch as `tq` separate [`gemv_i8`] calls. `out_slice` is `[tq, out]`
 /// row-major (same layout as [`gemv_f16_batch`]). Quantifies + captures the
 /// draft-decoding amortization (`examples/draft_amortization_probe.rs`).
-pub fn gemv_i8_batch(
-    w: &I8Mat,
-    x: &[f32],
-    tq: usize,
-    bias: Option<&[f32]>,
-    out_slice: &mut [f32],
-) {
+pub fn gemv_i8_batch(w: &I8Mat, x: &[f32], tq: usize, bias: Option<&[f32]>, out_slice: &mut [f32]) {
     let (out, inp) = (w.out, w.inp);
-    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8_batch weight shape mismatch");
+    debug_assert_eq!(
+        w.data.len(),
+        out * inp,
+        "gemv_i8_batch weight shape mismatch"
+    );
     debug_assert_eq!(x.len(), tq * inp, "gemv_i8_batch x length mismatch");
-    debug_assert_eq!(out_slice.len(), tq * out, "gemv_i8_batch out length mismatch");
-    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8_batch bias length mismatch");
+    debug_assert_eq!(
+        out_slice.len(),
+        tq * out,
+        "gemv_i8_batch out length mismatch"
+    );
+    debug_assert!(
+        bias.is_none_or(|b| b.len() == out),
+        "gemv_i8_batch bias length mismatch"
+    );
     if tq == 1 {
         gemv_i8(w, x, bias, out_slice);
         return;
@@ -2270,15 +2416,13 @@ pub fn gemv_i8_batch(
     const COMPUTE_BOUND_MACS: usize = 1 << 26;
     let avail = avail_parallelism();
     let work = tq.saturating_mul(out).saturating_mul(inp);
-    let workers = batch_gemv_cap()
-        .map(|c| avail.min(c))
-        .unwrap_or_else(|| {
-            if work >= COMPUTE_BOUND_MACS {
-                avail.min(16)
-            } else {
-                gemv_worker_count(out)
-            }
-        });
+    let workers = batch_gemv_cap().map(|c| avail.min(c)).unwrap_or_else(|| {
+        if work >= COMPUTE_BOUND_MACS {
+            avail.min(16)
+        } else {
+            gemv_worker_count(out)
+        }
+    });
     if work < PAR_THRESHOLD || workers < 2 {
         compute_band(0, out, out_slice);
         return;
@@ -2312,7 +2456,11 @@ pub fn gemv_i8_batch(
 
 /// Dot of an int8 weight row against an **f32** activation (no activation
 /// quantization): `Σ_i (w[i] as f32) · x[i]`. Scalar fallback.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+)))]
 fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
     let n = w.len().min(x.len());
     let mut acc = 0.0f32;
@@ -2328,7 +2476,11 @@ fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
 /// [`dot_f16c`], so it is the f16-dot with the weight source swapped from f16 to
 /// int8 — the win is bandwidth (int8 weight = half the f16 bytes), the activation
 /// stays full precision (unlike `gemv_i8`, which also quantizes `x`).
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[inline]
 #[allow(unsafe_code)]
 fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
@@ -2378,7 +2530,9 @@ fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
             ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
         while i + 8 <= n {
             let p = _mm256_mul_ps(
-                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(w.as_ptr().add(i).cast()))),
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    w.as_ptr().add(i).cast(),
+                ))),
                 _mm256_loadu_ps(xp.add(i)),
             );
             let mut t = [0.0f32; 8];
@@ -2411,7 +2565,12 @@ pub struct I8BlockMat {
 /// Quantize a natural `[out, inp]` f16 weight to block-wise int8 (`block`
 /// columns share a symmetric `amax/127` scale). Mirrors [`quantize_f16_to_i8`]
 /// but per block, so the whisper.cpp-Q8_0-class accuracy on wide rows.
-pub fn quantize_f16_to_i8_blocked(w: &[Float16], out: usize, inp: usize, block: usize) -> I8BlockMat {
+pub fn quantize_f16_to_i8_blocked(
+    w: &[Float16],
+    out: usize,
+    inp: usize,
+    block: usize,
+) -> I8BlockMat {
     quantize_f16_to_int_blocked(w, out, inp, block, 127.0)
 }
 
@@ -2419,7 +2578,12 @@ pub fn quantize_f16_to_i8_blocked(w: &[Float16], out: usize, inp: usize, block: 
 /// values still ride the [`gemv_i8w_f32a_blocked`] dot, so this measures 4-bit
 /// PRECISION without the packed-nibble kernel). For probing whether a GELU-absorbed
 /// weight (`mlp_0`) tolerates int4 byte-exactly before writing the packed kernel.
-pub fn quantize_f16_to_i4_blocked(w: &[Float16], out: usize, inp: usize, block: usize) -> I8BlockMat {
+pub fn quantize_f16_to_i4_blocked(
+    w: &[Float16],
+    out: usize,
+    inp: usize,
+    block: usize,
+) -> I8BlockMat {
     quantize_f16_to_int_blocked(w, out, inp, block, 7.0)
 }
 
@@ -2452,11 +2616,19 @@ fn quantize_f16_to_int_blocked(
                 srow[b] = sc;
                 let inv = 1.0 / sc;
                 for i in s..e {
-                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-max_level, max_level) as i8;
+                    drow[i] = (wrow[i].to_f32() * inv)
+                        .round()
+                        .clamp(-max_level, max_level) as i8;
                 }
             }
         });
-    I8BlockMat { data, scales, out, inp, block }
+    I8BlockMat {
+        data,
+        scales,
+        out,
+        inp,
+        block,
+    }
 }
 
 /// Mixed block-wise GEMV: block-int8 weight × **f32** activation.
@@ -2465,14 +2637,34 @@ fn quantize_f16_to_int_blocked(
 /// a full-precision activation, so it is accurate enough for the residual-feeding
 /// `mlp_2`/fc2 (the per-row [`I8Mat`] variant broke turbo). Parallelization mirrors
 /// [`gemv_i8`]; the per-block dot reuses [`dot_i8w_f32`].
-pub fn gemv_i8w_f32a_blocked(w: &I8BlockMat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
+pub fn gemv_i8w_f32a_blocked(
+    w: &I8BlockMat,
+    x: &[f32],
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+) {
     let (out, inp, block) = (w.out, w.inp, w.block);
     let n_blocks = inp.div_ceil(block);
-    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8w_f32a_blocked weight shape mismatch");
+    debug_assert_eq!(
+        w.data.len(),
+        out * inp,
+        "gemv_i8w_f32a_blocked weight shape mismatch"
+    );
     debug_assert_eq!(x.len(), inp, "gemv_i8w_f32a_blocked x length mismatch");
-    debug_assert_eq!(out_slice.len(), out, "gemv_i8w_f32a_blocked out length mismatch");
-    debug_assert_eq!(w.scales.len(), out * n_blocks, "gemv_i8w_f32a_blocked scales shape mismatch");
-    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8w_f32a_blocked bias length mismatch");
+    debug_assert_eq!(
+        out_slice.len(),
+        out,
+        "gemv_i8w_f32a_blocked out length mismatch"
+    );
+    debug_assert_eq!(
+        w.scales.len(),
+        out * n_blocks,
+        "gemv_i8w_f32a_blocked scales shape mismatch"
+    );
+    debug_assert!(
+        bias.is_none_or(|b| b.len() == out),
+        "gemv_i8w_f32a_blocked bias length mismatch"
+    );
     let fill = |o_base: usize, slice: &mut [f32]| {
         for (i, slot) in slice.iter_mut().enumerate() {
             let o = o_base + i;
@@ -2534,7 +2726,11 @@ pub struct I4BlockMat {
 pub fn quantize_f16_to_i4_packed(w: &[Float16], out: usize, inp: usize) -> I4BlockMat {
     const BLOCK: usize = 32;
     debug_assert_eq!(w.len(), out * inp);
-    assert_eq!(inp % BLOCK, 0, "i4-packed requires inp % 32 == 0, got inp={inp}");
+    assert_eq!(
+        inp % BLOCK,
+        0,
+        "i4-packed requires inp % 32 == 0, got inp={inp}"
+    );
     let n_blocks = inp / BLOCK;
     let row_bytes = inp / 2;
     let mut data = vec![0u8; out * row_bytes];
@@ -2563,14 +2759,23 @@ pub fn quantize_f16_to_i4_packed(w: &[Float16], out: usize, inp: usize) -> I4Blo
                 }
             }
         });
-    I4BlockMat { data, scales, out, inp }
+    I4BlockMat {
+        data,
+        scales,
+        out,
+        inp,
+    }
 }
 
 /// Dot of ONE packed 32-block (16 bytes → 32 signed nibbles) against 32 f32
 /// activations, in the EXACT accumulator/reduction order of [`dot_i8w_f32`] on a
 /// 32-element slice, so the packed path is bit-identical to the int4 probe.
 /// Scalar fallback: unpack into an `[i8; 32]` and defer to [`dot_i8w_f32`].
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+)))]
 #[inline]
 fn dot_i4_block_packed(packed: &[u8], x: &[f32]) -> f32 {
     let mut tmp = [0i8; 32];
@@ -2587,7 +2792,11 @@ fn dot_i4_block_packed(packed: &[u8], x: &[f32]) -> f32 {
 /// (4-bit sign-extend), then runs the same four-accumulator fmadd + tree reduce as
 /// [`dot_i8w_f32`]. The unpack is fully vectorized (no per-nibble scalar work) so
 /// the halved weight read is not eaten by decode-time compute.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[inline]
 #[allow(unsafe_code)]
 fn dot_i4_block_packed(packed: &[u8], x: &[f32]) -> f32 {
@@ -2635,11 +2844,22 @@ pub fn gemv_i4_packed_f32a(w: &I4BlockMat, x: &[f32], bias: Option<&[f32]>, out_
     let (out, inp) = (w.out, w.inp);
     let n_blocks = inp / BLOCK;
     let row_bytes = inp / 2;
-    debug_assert_eq!(w.data.len(), out * row_bytes, "gemv_i4_packed weight shape mismatch");
+    debug_assert_eq!(
+        w.data.len(),
+        out * row_bytes,
+        "gemv_i4_packed weight shape mismatch"
+    );
     debug_assert_eq!(x.len(), inp, "gemv_i4_packed x length mismatch");
     debug_assert_eq!(out_slice.len(), out, "gemv_i4_packed out length mismatch");
-    debug_assert_eq!(w.scales.len(), out * n_blocks, "gemv_i4_packed scales shape mismatch");
-    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i4_packed bias length mismatch");
+    debug_assert_eq!(
+        w.scales.len(),
+        out * n_blocks,
+        "gemv_i4_packed scales shape mismatch"
+    );
+    debug_assert!(
+        bias.is_none_or(|b| b.len() == out),
+        "gemv_i4_packed bias length mismatch"
+    );
     let fill = |o_base: usize, slice: &mut [f32]| {
         for (i, slot) in slice.iter_mut().enumerate() {
             let o = o_base + i;
@@ -2647,7 +2867,10 @@ pub fn gemv_i4_packed_f32a(w: &I4BlockMat, x: &[f32], bias: Option<&[f32]>, out_
             let srow = &w.scales[o * n_blocks..(o + 1) * n_blocks];
             let mut acc = 0.0f32;
             for (b, &sc) in srow.iter().enumerate() {
-                acc += dot_i4_block_packed(&wrow[b * 16..b * 16 + 16], &x[b * BLOCK..b * BLOCK + BLOCK]) * sc;
+                acc += dot_i4_block_packed(
+                    &wrow[b * 16..b * 16 + 16],
+                    &x[b * BLOCK..b * BLOCK + BLOCK],
+                ) * sc;
             }
             *slot = acc + bias.map_or(0.0, |bb| bb[o]);
         }
@@ -2656,7 +2879,10 @@ pub fn gemv_i4_packed_f32a(w: &I4BlockMat, x: &[f32], bias: Option<&[f32]>, out_
         use std::sync::OnceLock;
         static T: OnceLock<usize> = OnceLock::new();
         *T.get_or_init(|| {
-            std::env::var("FW_GEMV_I8_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 21)
+            std::env::var("FW_GEMV_I8_PAR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 21)
         })
     };
     let workers = gemv_worker_count(out);
@@ -2753,15 +2979,13 @@ pub fn gemv_f16_batch(
     const COMPUTE_BOUND_MACS: usize = 1 << 26; // ~67M: cross-KV (2.4G) + long prompts
     let avail = avail_parallelism();
     let work = tq.saturating_mul(out).saturating_mul(inp);
-    let workers = batch_gemv_cap()
-        .map(|c| avail.min(c))
-        .unwrap_or_else(|| {
-            if work >= COMPUTE_BOUND_MACS {
-                avail.min(16)
-            } else {
-                gemv_worker_count(out)
-            }
-        });
+    let workers = batch_gemv_cap().map(|c| avail.min(c)).unwrap_or_else(|| {
+        if work >= COMPUTE_BOUND_MACS {
+            avail.min(16)
+        } else {
+            gemv_worker_count(out)
+        }
+    });
     if work < PAR_THRESHOLD || workers < 2 {
         compute_band(0, out, out_slice);
         return;
@@ -2923,7 +3147,11 @@ fn norm_rows(block: &mut [f32], cols: usize, w: &[f32], b: &[f32], eps: f64) {
 /// removed on turbo). `dst` may be uninitialized (every element is written).
 pub fn layer_norm_into(src: &Mat, dst: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
     let cols = src.cols;
-    debug_assert_eq!(dst.len(), src.rows * cols, "layer_norm_into: dst len mismatch");
+    debug_assert_eq!(
+        dst.len(),
+        src.rows * cols,
+        "layer_norm_into: dst len mismatch"
+    );
     if cols == 0 || w.len() != cols || b.len() != cols {
         // Degenerate no-op mirrors in-place `layer_norm` (which leaves x
         // untouched) ⇒ dst must equal src, since the clone would have copied it.
@@ -3030,7 +3258,8 @@ fn gelu_table() -> &'static [f32; 1 << 16] {
         let mut t = vec![0.0f32; 1 << 16].into_boxed_slice();
         for (i, slot) in t.iter_mut().enumerate() {
             let f = Float16::from_bits(i as u16).to_f32();
-            let g = 0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
+            let g =
+                0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
             *slot = Float16::from_f32(g).to_f32();
         }
         // Vec<f32> of exactly 1<<16 elements → Box<[f32; 1<<16]> (infallible).
@@ -3058,7 +3287,11 @@ fn gelu_table() -> &'static [f32; 1 << 16] {
 /// cache-resident / 1.13× streaming** speedup over the gather (`examples/gelu_gather_probe`,
 /// max|Δ|=0 over 7.68M elems spanning both clamp regions). Bit-identical to the
 /// scalar fallback (max|Δ|=0 in `examples/gelu_probe`), ~4.4× faster than the old tanh.
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "avx2"
+))]
 #[allow(unsafe_code)]
 fn gelu_slice(data: &mut [f32]) {
     use core::arch::x86_64::*;
@@ -3113,7 +3346,11 @@ fn gelu_slice(data: &mut [f32]) {
 }
 
 /// Scalar fallback (non-x86 / no f16c+avx2): exact ggml `GGML_GELU_FP16` branch + clamp.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "avx2"
+)))]
 fn gelu_slice(data: &mut [f32]) {
     let table = gelu_table();
     for v in data.iter_mut() {
@@ -3238,7 +3475,11 @@ fn simd_exp_softmax_enabled() -> bool {
 /// sum. `-inf`/NaN lanes map to 0 (via the `l > -inf` keep-mask, matching the scalar
 /// finite-guard: `NaN > -inf` and `-inf > -inf` are both false). Only reached under
 /// [`simd_exp_softmax_enabled`]; NON-byte-exact vs libm (poly + reordered sum).
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[allow(unsafe_code)]
 fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
     use core::arch::x86_64::*;
@@ -3301,7 +3542,11 @@ fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
 }
 
 /// Scalar fallback (non-avx2 build): identical to the default libm loop.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+)))]
 fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
     let mut s = 0.0f32;
     for v in row.iter_mut() {
@@ -3429,7 +3674,15 @@ pub fn conv1d(
             w_t[j * cout + co] = w[co * patch + j];
         }
     }
-    conv1d_wt(x, &Mat::from_vec(patch, cout, w_t), cin, k, bias, stride, pad)
+    conv1d_wt(
+        x,
+        &Mat::from_vec(patch, cout, w_t),
+        cin,
+        k,
+        bias,
+        stride,
+        pad,
+    )
 }
 
 /// 1-D convolution taking the weight ALREADY transposed to `[Cin*K, Cout]` (the layout
@@ -3574,8 +3827,16 @@ impl KvCache {
         Self {
             k: if f16 { Vec::new() } else { vec![0.0; n] },
             v: if f16 { Vec::new() } else { vec![0.0; n] },
-            k16: if f16 { vec![Float16::from_f32(0.0); n] } else { Vec::new() },
-            v16: if f16 { vec![Float16::from_f32(0.0); n] } else { Vec::new() },
+            k16: if f16 {
+                vec![Float16::from_f32(0.0); n]
+            } else {
+                Vec::new()
+            },
+            v16: if f16 {
+                vec![Float16::from_f32(0.0); n]
+            } else {
+                Vec::new()
+            },
             f16,
             len: 0,
             capacity_tokens,
@@ -3813,8 +4074,9 @@ fn maddubs_i7_headmajor(
                     let off3 = 128 * w.colsum[o + 3];
                     let (sc0, sc1, sc2, sc3) =
                         (w.scale[o], w.scale[o + 1], w.scale[o + 2], w.scale[o + 3]);
-                    let (bo0, bo1, bo2, bo3) =
-                        bias.map_or((0.0, 0.0, 0.0, 0.0), |b| (b[o], b[o + 1], b[o + 2], b[o + 3]));
+                    let (bo0, bo1, bo2, bo3) = bias.map_or((0.0, 0.0, 0.0, 0.0), |b| {
+                        (b[o], b[o + 1], b[o + 2], b[o + 3])
+                    });
                     put(r0, o, (raw01[0] - off0) as f32 * s0 * sc0 + bo0);
                     put(r0 + 1, o, (raw01[1] - off0) as f32 * s1 * sc0 + bo0);
                     put(r0 + 2, o, (raw23[0] - off0) as f32 * s2 * sc0 + bo0);
@@ -4196,7 +4458,10 @@ fn sdpa_gather_chunks() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("FW_SDPA_GATHER_CHUNKS").ok().and_then(|s| s.parse().ok()).unwrap_or(16)
+        std::env::var("FW_SDPA_GATHER_CHUNKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16)
     })
 }
 
@@ -4206,20 +4471,34 @@ fn sdpa_gather_chunks() -> usize {
 /// (each output row copied whole). `chunks == 0` ⇒ one band per head (== the historical
 /// `par_chunks_mut(t*d_head)`, bit-identical). Pure data movement — output is independent
 /// of `chunks`. See [`sdpa_gather_chunks`] / `sdpa_gather_head_major_chunk_invariant`.
-fn sdpa_gather_head_major(dst: &mut [f32], src: &[f32], hh: usize, t: usize, d_head: usize, n_state: usize, chunks: usize) {
+fn sdpa_gather_head_major(
+    dst: &mut [f32],
+    src: &[f32],
+    hh: usize,
+    t: usize,
+    d_head: usize,
+    n_state: usize,
+    chunks: usize,
+) {
     let total_rows = hh * t;
-    let n = if chunks == 0 { hh } else { chunks.min(total_rows).max(1) };
+    let n = if chunks == 0 {
+        hh
+    } else {
+        chunks.min(total_rows).max(1)
+    };
     let chunk_rows = total_rows.div_ceil(n).max(1);
-    dst.par_chunks_mut(chunk_rows * d_head).enumerate().for_each(|(c, blk)| {
-        let row0 = c * chunk_rows;
-        for (local, out_row) in blk.chunks_mut(d_head).enumerate() {
-            let r = row0 + local;
-            let h = r / t;
-            let i = r % t;
-            let base = i * n_state + h * d_head;
-            out_row.copy_from_slice(&src[base..base + d_head]);
-        }
-    });
+    dst.par_chunks_mut(chunk_rows * d_head)
+        .enumerate()
+        .for_each(|(c, blk)| {
+            let row0 = c * chunk_rows;
+            for (local, out_row) in blk.chunks_mut(d_head).enumerate() {
+                let r = row0 + local;
+                let h = r / t;
+                let i = r % t;
+                let base = i * n_state + h * d_head;
+                out_row.copy_from_slice(&src[base..base + d_head]);
+            }
+        });
 }
 
 /// Inverse of [`sdpa_gather_head_major`]: scatter head-major `o` (`[hh, t, d_head]`) into
@@ -4227,19 +4506,30 @@ fn sdpa_gather_head_major(dst: &mut [f32], src: &[f32], hh: usize, t: usize, d_h
 /// Parallelized over `chunks` balanced output-row bands (`chunks == 0` ⇒ one band per output
 /// row, == the historical `par_chunks_mut(n_state)` scatter, bit-identical). Pure data
 /// movement — output independent of `chunks`. See `sdpa_scatter_interleaved_chunk_invariant`.
-fn sdpa_scatter_interleaved(out: &mut [f32], o: &[f32], hh: usize, t: usize, d_head: usize, n_state: usize, chunks: usize) {
+fn sdpa_scatter_interleaved(
+    out: &mut [f32],
+    o: &[f32],
+    hh: usize,
+    t: usize,
+    d_head: usize,
+    n_state: usize,
+    chunks: usize,
+) {
     let n = if chunks == 0 { t } else { chunks.min(t).max(1) };
     let rows_per = t.div_ceil(n).max(1);
-    out.par_chunks_mut(rows_per * n_state).enumerate().for_each(|(c, blk)| {
-        let i0 = c * rows_per;
-        for (local, orow) in blk.chunks_mut(n_state).enumerate() {
-            let i = i0 + local;
-            for h in 0..hh {
-                orow[h * d_head..(h + 1) * d_head]
-                    .copy_from_slice(&o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head]);
+    out.par_chunks_mut(rows_per * n_state)
+        .enumerate()
+        .for_each(|(c, blk)| {
+            let i0 = c * rows_per;
+            for (local, orow) in blk.chunks_mut(n_state).enumerate() {
+                let i = i0 + local;
+                for h in 0..hh {
+                    orow[h * d_head..(h + 1) * d_head].copy_from_slice(
+                        &o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head],
+                    );
+                }
             }
-        }
-    });
+        });
 }
 
 fn attention_raw(
@@ -4398,14 +4688,20 @@ fn attention_raw(
             sdpa_gather_head_major(&mut va, v, hh, tk, d_head, n_state, gchunks);
         });
         let sdpa_scale = (d_head as f32).powf(-0.5);
-        let o = st!(1, ft_kernel_cpu::sdpa_forward_f32(
-            &qa, &ka, &va, hh, tq, tk, d_head, d_head, sdpa_scale, false,
-        ));
+        let o = st!(
+            1,
+            ft_kernel_cpu::sdpa_forward_f32(
+                &qa, &ka, &va, hh, tq, tk, d_head, d_head, sdpa_scale, false,
+            )
+        );
         // Scatter head-major `o` back to interleaved `out` — same FW_SDPA_GATHER_CHUNKS
         // knob (default 16). This is where the win is: the legacy per-row scatter used
         // tq=1500 fine rayon bands (oversubscribed) → 16 bands is ~1.6× faster on the real
         // quiet encoder (42.4→25.9 ms/window, byte-identical). See NEGATIVE_EVIDENCE 2026-07-04.
-        st!(2, sdpa_scatter_interleaved(&mut out, &o, hh, tq, d_head, n_state, gchunks));
+        st!(
+            2,
+            sdpa_scatter_interleaved(&mut out, &o, hh, tq, d_head, n_state, gchunks)
+        );
         return Ok(Mat::from_vec(tq, n_state, out));
     }
 
@@ -4530,13 +4826,7 @@ pub fn attention_with_cache(
 
 /// Allocation-light single-token (`tq == 1`) causal self-attention over a cache
 /// prefix. Bit-identical to [`attention_raw`] with `causal_offset == Some(tk-1)`.
-fn attention_decode_step(
-    q: &Mat,
-    k: &[f32],
-    v: &[f32],
-    tk: usize,
-    n_head: usize,
-) -> FwResult<Mat> {
+fn attention_decode_step(q: &Mat, k: &[f32], v: &[f32], tk: usize, n_head: usize) -> FwResult<Mat> {
     let n_state = q.cols;
     if n_head == 0 || !n_state.is_multiple_of(n_head) {
         return Err(FwError::InvalidRequest(format!(
@@ -5058,7 +5348,9 @@ mod tests {
         // activations, across all code paths (SIMD body, <8 tail) and the ±127 clamp
         // edges, and must round HALF-AWAY (f32::round), NOT round-to-even.
         fn scalar(x: &[f32], xinv: f32) -> Vec<i8> {
-            x.iter().map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8).collect()
+            x.iter()
+                .map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8)
+                .collect()
         }
         let mut s = 0x243F_6A88_85A3_08D3u64;
         let mut nf = || {
@@ -5128,7 +5420,12 @@ mod tests {
         let n_state = hh * d_head;
         let mut s = 0x243F_6A88_85A3_08D3u64;
         let src: Vec<f32> = (0..t * n_state)
-            .map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 })
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 24) as f32
+            })
             .collect();
         // Reference: the historical per-head gather.
         let mut want = vec![0.0f32; hh * t * d_head];
@@ -5158,7 +5455,12 @@ mod tests {
         let (t_in, stride, pad) = (17usize, 2usize, 1usize);
         let patch = cin * k;
         let mut s = 0x243F_6A88_85A3_08D3u64;
-        let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 };
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+        };
         let x = Mat::from_vec(t_in, cin, (0..t_in * cin).map(|_| nf()).collect());
         let w: Vec<f32> = (0..cout * patch).map(|_| nf()).collect();
         let bias: Vec<f32> = (0..cout).map(|_| nf()).collect();
@@ -5182,14 +5484,20 @@ mod tests {
         let n_state = hh * d_head;
         let mut s = 0xD1B5_4A32_D192_ED03u64;
         let o: Vec<f32> = (0..hh * t * d_head)
-            .map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 })
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 24) as f32
+            })
             .collect();
         // Reference: the historical per-row scatter.
         let mut want = vec![0.0f32; t * n_state];
         for i in 0..t {
             for h in 0..hh {
-                want[i * n_state + h * d_head..i * n_state + (h + 1) * d_head]
-                    .copy_from_slice(&o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head]);
+                want[i * n_state + h * d_head..i * n_state + (h + 1) * d_head].copy_from_slice(
+                    &o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head],
+                );
             }
         }
         for &chunks in &[0usize, 1, 3, 12, 16, 37, 50, 1000] {
@@ -5224,7 +5532,9 @@ mod tests {
             s ^= s << 17;
             ((s >> 24) as i32 % 255 - 127) as i8
         };
-        for &n in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 384, 1280, 5120] {
+        for &n in &[
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 384, 1280, 5120,
+        ] {
             let w: Vec<i8> = (0..n).map(|_| ni8()).collect();
             let x: Vec<i8> = (0..n).map(|_| ni8()).collect();
             assert_eq!(dot_i8(&w, &x), scalar(&w, &x), "dot_i8 mismatch at n={n}");
@@ -5443,7 +5753,8 @@ mod tests {
         // tanh form re-rounded through f16 at both the input index and the value.
         let f = |v: f32| {
             let f = Float16::from_f32(v).to_f32();
-            let g = 0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
+            let g =
+                0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
             Float16::from_f32(g).to_f32()
         };
         assert_eq!(x.data[0], f(0.0), "gelu(0) table-exact");
@@ -5516,11 +5827,7 @@ mod tests {
                 .iter()
                 .map(|&x| {
                     let e = (x - max).exp();
-                    if e.is_finite() {
-                        e
-                    } else {
-                        0.0
-                    }
+                    if e.is_finite() { e } else { 0.0 }
                 })
                 .collect();
             let sum: f32 = row.iter().sum();
@@ -5553,12 +5860,25 @@ mod tests {
             assert!(maxd < 1e-5, "len {len}: poly vs scalar max|Δ|={maxd:e}");
         }
         // Masked/NaN lanes -> 0 in the poly numerator (matches scalar finite-guard).
-        let mut row = vec![1.0f32, f32::NEG_INFINITY, 2.0, f32::NAN, 0.5, 3.0, -1.0, 4.0, 0.0];
+        let mut row = vec![
+            1.0f32,
+            f32::NEG_INFINITY,
+            2.0,
+            f32::NAN,
+            0.5,
+            3.0,
+            -1.0,
+            4.0,
+            0.0,
+        ];
         let max = 4.0f32;
         super::softmax_row_poly_numer(&mut row, max);
         assert_eq!(row[1], 0.0, "-inf lane -> 0");
         assert_eq!(row[3], 0.0, "NaN lane -> 0");
-        assert!(row.iter().all(|v| v.is_finite()), "no NaN/inf in poly output");
+        assert!(
+            row.iter().all(|v| v.is_finite()),
+            "no NaN/inf in poly output"
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5881,8 +6201,9 @@ mod tests {
         let mut rng = Lcg::new(0xF16C_4B17);
         for &inp in &[384usize, 768, 1280] {
             let out = 96; // small out; must exceed the narrow worker cap? no — serial ok
-            let w: Vec<Float16> =
-                (0..out * inp).map(|_| Float16::from_f32(rng.next_f32() * 0.4)).collect();
+            let w: Vec<Float16> = (0..out * inp)
+                .map(|_| Float16::from_f32(rng.next_f32() * 0.4))
+                .collect();
             let x: Vec<f32> = (0..inp).map(|_| rng.next_f32()).collect();
             let bias: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
 

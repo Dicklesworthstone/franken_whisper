@@ -43,6 +43,97 @@
 
 ## Levers
 
+### 2026-07-09 EDT / 2026-07-10 UTC — cod_fw — WIN: default-on quality-safe encoder int8 behind calibrated fallback gate
+
+**Lane.** Complete the owner-gated evidence pack for the quality-safe encoder
+int8 path and flip the default only where the evidence applies. Ledger grep came
+first: the prior cod_fw row explicitly said **do not flip** from the JFK-only
+gate; retry condition required full fixture-corpus WER, per-layer quantization
+budget, large-v3-turbo/proper-noun adversarial probes, and deterministic f32
+fallback. Existing rejections still stand for `FRANKEN_WHISPER_ENC_INT8=1`
+all-i7-as-quality-proof, fused-wide QKV concatenation, row-block coarsening,
+bias specialization, and quantize/round rewrites.
+
+**Change.** Added `encoder_int8_policy_decision` /
+`encoder_int8_effective_policy_decision` with calibration id
+`encoder-int8-calibration-2026-07-10`. Default action is now
+`QualitySafeInt8Encoder` only for calibrated hparams (`tiny.en` and
+`large-v3-turbo`) on AVX2 builds; unknown model shapes and non-AVX2 builds
+deterministically return `F32Encoder`. `FW_ENC_ATTN_OUT_I8I32=0` is the explicit
+f32 kill switch; `=1` remains an operator force/probe override. Native JSON
+`raw_output.encoder_int8_policy` now records action, reason, calibration id,
+corpus WER delta budget, and quant RMSE budget.
+
+**Expected-loss policy contract.** State: model hparams/family, CPU feature
+class, calibration id, corpus WER/adversarial sentinels, per-layer quantization
+error vector, and operator override. Actions: f32 encoder or quality-safe int8
+encoder. Loss matrix: false-accepting int8 with transcript/proper-noun drift is
+high loss; false-fallback to f32 costs only speed. Confidence terms: fixture WER
+delta must remain inside `0.0`, adversarial sentinels must pass, and every layer
+must stay below the recorded quant-error budget. Fallback trigger: unknown
+hparams, missing AVX2 kernel support, explicit kill switch, failed WER/sentinel,
+or exceeded quant budget.
+
+**Quality evidence.**
+
+```text
+FRANKEN_WHISPER_MODEL_DIR=legacy_whispercpp/whisper.cpp/models \
+  CARGO_TARGET_DIR=/data/tmp/cargo-target \
+  cargo test --lib 'quality_safe_int8_per_layer_error_budget' -- --nocapture
+
+tiny.en: worst rel_rmse 0.053139 (layer01 attn_k_i7);
+         worst attn_out_i8 rel_rmse 0.010997; all max_abs/amax <= 0.015778
+large-v3-turbo: worst rel_rmse 0.082685 (layer03 mlp_proj_i7);
+                worst attn_out_i8 rel_rmse 0.014560; all max_abs/amax <= 0.015868
+budget: rel_rmse <= 0.09, i7 max_abs/amax <= 0.035, i8 max_abs/amax <= 0.012
+test result: ok. 2 passed; finished in 30.25s
+```
+
+```text
+FRANKEN_WHISPER_MODEL_DIR=legacy_whispercpp/whisper.cpp/models \
+  CARGO_TARGET_DIR=/data/tmp/cargo-target \
+  cargo test --test native_engine_e2e -- --nocapture
+
+paired whisper.cpp fixture corpus (9/9): WER delta 0.0000
+  code_switching, long_form, multilingual, noisy_environment, jfk,
+  overlap, short_utterance, silence_heavy, variable_volume_overlap
+explicit quality-safe JFK:          WER 0.0000 / gate 0.0000
+default quality-safe tiny.en JFK:   WER 0.0000 / gate 0.0000
+default quality-safe large-v3 JFK:  WER 0.0000 / gate 0.0500
+adversarial sentinels: rejects known all-i7 "Frank at" phrase; requires
+  "fellow americans", "ask not", and "country" for large-v3-turbo
+test result: ok. 10 passed; finished in 126.13s
+```
+
+**Release-perf timing arms (same host, greedy decode, 8 threads, no timestamps).**
+Native default was confirmed in JSON as `action=quality_safe_int8` and
+`reason=calibrated_model_budget_pass`.
+
+```text
+hyperfine --warmup 1 --runs 5
+
+franken_whisper default-int8 large-v3-turbo:
+  6.141 s +/- 0.087 s, CV 1.41%, min 6.033, max 6.237
+whisper.cpp greedy CPU large-v3-turbo:
+  11.952 s +/- 0.805 s, CV 6.74%, min 10.904, max 12.840
+observed ratio: native 1.95x faster, but comparator CV misses the <5% ratchet
+```
+
+Loaded-host follow-up A/B against the deterministic f32 kill switch was also
+noisy on the default arm under load average ~41:
+
+```text
+default-int8: 7.238 s +/- 1.515 s, CV 20.93%
+f32 kill switch: 7.822 s +/- 0.192 s, CV 2.46%
+```
+
+**Verdict.** KEEP the default-on quality-safe policy for calibrated tiny.en and
+large-v3-turbo shapes because the quality evidence pack is green and fallback is
+deterministic. Do **not** use the loaded-host whisper.cpp timing row as a perf
+ratchet; it is evidence that the fast arm works and is likely ahead, but the
+comparator CV exceeded the protocol. A quiet-window timing rerun should ratchet
+the e2e row separately.
+
 ### 2026-07-09 EDT / 2026-07-10 UTC — cod_fw — WIN: executable quality gate for the quality-safe full encoder-int8 policy
 
 **Lane.** Encoder int8 default-on evidence pack. Ledger grep came first:

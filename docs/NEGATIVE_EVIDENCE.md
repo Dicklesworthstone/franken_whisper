@@ -4,6 +4,49 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 EDT / 2026-07-10 UTC - cod_fw: RESOLVED prior encoder-int8 default-on blocker for calibrated shapes; noisy timing arm NOT a ratchet
+
+**What changed.** The previous cod_fw "do not flip" condition for the
+quality-safe encoder-int8 path is now satisfied for the calibrated `tiny.en` and
+`large-v3-turbo` hparams only. The default path is guarded by
+`encoder-int8-calibration-2026-07-10`, AVX2 support, a deterministic f32 fallback
+for unknown shapes/non-AVX2 builds, and the explicit kill switch
+`FW_ENC_ATTN_OUT_I8I32=0`. This does **not** resurrect the rejected
+`FRANKEN_WHISPER_ENC_INT8=1` all-i7 path.
+
+**Quality gates that retired the blocker.**
+
+```
+per-layer quant budget:
+  tiny.en worst rel_rmse 0.053139 (layer01 attn_k_i7)
+  large-v3-turbo worst rel_rmse 0.082685 (layer03 mlp_proj_i7)
+  budget rel_rmse <= 0.09; all max_abs/amax <= 0.015868
+
+full paired fixture corpus:
+  9/9 whisper.cpp-vs-native golden pairs WER delta 0.0000
+
+adversarial/default probes:
+  explicit quality-safe JFK WER 0.0000
+  default tiny.en JFK WER 0.0000
+  default large-v3-turbo JFK WER 0.0000 (gate 0.0500)
+  rejects known all-i7 "Frank at" phrase; large probe requires
+  "fellow americans", "ask not", "country"
+```
+
+**Timing caveat.** A release-perf same-host `hyperfine` run observed native
+default-int8 large-v3-turbo at `6.141 s +/- 0.087 s` (CV 1.41%) vs whisper.cpp
+greedy CPU at `11.952 s +/- 0.805 s` (CV 6.74%), ratio 1.95x. Because the
+comparator CV exceeded the <5% protocol on a box with load average ~41, this is
+**not** a keep-gate ratchet. Do not cite that row as clean perf proof; rerun in a
+quiet window. The default flip is justified by the green quality/fallback
+evidence, not by this noisy timing row.
+
+**Retry boundary.** Future retries may extend default-on to additional model
+families only after adding their hparams to the policy with the same full
+evidence pack: fixture-corpus WER deltas, per-layer quant budget, adversarial
+sentinels, release-perf timing with CV <5%, and deterministic f32 fallback.
+
+---
 ## 2026-07-09 EDT / 2026-07-10 UTC - cc_fw: ★ WIN, CAPTURED + GATED (`FT_SDPA_POLY_EXP=1`) - **1.28-1.32x on the `attn_sdpa` span, ~1.069x e2e**, transcript byte-identical on jfk x1/x3/x8
 
 **Lands the lever the entry below quantified.** frankentorch commit `b13eeb36`
