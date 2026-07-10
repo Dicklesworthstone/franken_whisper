@@ -43,6 +43,64 @@
 
 ## Levers
 
+### 2026-07-10 UTC — cod_fw — REJECT: long-form turbo does not promote an owned non-GEMM residual
+
+**Retry condition tested.** The short timestamped profile allowed a retry when
+a different workload made mel/tokenizer/decoder/KV a top-five owned frame at
+>=2% self. This pass profiled two genuinely long-form workloads with timestamps:
+JFK x8 (88.0 s) and dense track01 (124.5 s). Closed families remained closed,
+including the plain `matrixmultiply` -> `gemm` swap; cc still owns SDPA/int8.
+
+**Profile protocol.** Release-perf `e2e_probe` Build ID
+`acd75e8eb9b593d129a8563461349529921d46ef`, `large-v3-turbo`,
+`RAYON_NUM_THREADS=8`, undelayed `perf record -m 1 -e cycles:u -F 199`, then a
+time filter from the first `mel::log_mel` sample through completion. Runtime
+source is unchanged since profiled HEAD `91b44b1d`.
+
+| workload | transcribe wall | samples | lost | first open requested frame |
+|---|---:|---:|---:|---|
+| JFK x8 / 88.0 s | 15.891 s | 25K | 0 | `attention_with_cache` 0.16% |
+| track01 / 124.5 s | 22.612 s | 35K | 0 | `attention_with_cache` 0.17% |
+
+Dense-track01 ranked non-sgemm user frames at or above 0.1% self time (external
+`kernel_target_fma` 17.89% and `gemm_loop` 4.00% excluded):
+
+| self | frame | disposition |
+|---:|---|---|
+| 21.55% | `nn::dot_maddubs_i7_m2n4` | cc-owned int8 |
+| 14.39% | `nn::matmul_bias_i7_quantized` | cc-owned int8 |
+| 13.01% | `ft_kernel_cpu::sdpa_forward_f32` | cc-owned SDPA |
+| 7.30% | `__expf_fma` | cc-owned/closed SDPA softmax |
+| 7.19% | `nn::gemv_i8` closure | cc-owned int8 |
+| 4.57% | `encoder::matmul_bias_i8` | cc-owned int8 |
+| 1.85% | `nn::gemv_i8w_f32a_blocked` | cc-owned int8 |
+| 1.45% | `nn::quantize_act_i7_gelu` | cc-owned int8 |
+| 1.13% | `nn::gemv_i8` | cc-owned int8 |
+| 0.72% | `nn::norm_rows_into` | fused-LN/LN-to-quant closed |
+| 0.65% | `nn::maddubs_i7_headmajor_block` | cc-owned int8 |
+| 0.55% | `nn::quantize_act_i7` | cc-owned int8 |
+| 0.54% | `__memset_avx2_unaligned_erms` | allocator/buffer reuse closed |
+| 0.28% | `encoder::matmul_bias_i8` quant closure | cc-owned int8 |
+| 0.23% | `__memmove_avx_unaligned_erms` | callgraph: cc-owned SDPA scatter/int8 quantization |
+| 0.17% | `nn::attention_with_cache` | first open requested family; below gate |
+| 0.13% | `DecoderState::new` closure 4 | scalar f16 cross-KV conversion already rejected |
+| 0.12% | `encoder::forward_time_major` | below gate; outside decoder lane |
+
+Mel, tokenizer, decoder policy, and remaining self-KV frames were below 0.1%;
+native beam search is absent. A separate `F=49` DWARF capture (6,969 samples,
+zero lost) attributed transcribe-time `memmove` to cc-owned SDPA scatter and int8
+quantization. It also confirmed the cross-KV sample is the already-rejected
+scalar f16 conversion. A higher-frequency callgraph attempt lost 99.56% and was
+discarded.
+
+**Verdict: REJECT a source attempt.** `attention_with_cache` scores
+`(impact 1 x confidence 5) / effort 4 = 1.25`, below the 2.0 implementation
+threshold and 3% keep ratchet. The only distinct decoder primitive left is
+trained token-level drafting (`bd-wzgh`), but the local models are turbo
+`n_vocab=51866` and `tiny.en n_vocab=51864`; no compatible multilingual draft
+artifact exists. No runtime code changed, so output remains bit-exact by
+construction.
+
 ### 2026-07-10 UTC — cod_fw — REJECT: timestamped turbo retry still exposes no eligible owned non-GEMM frame
 
 **Retry condition tested.** The prior no-timestamp profile required a different
