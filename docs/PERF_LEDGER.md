@@ -43,6 +43,60 @@
 
 ## Levers
 
+### 2026-07-10 UTC — cod_fw — REJECT: timestamped turbo retry still exposes no eligible owned non-GEMM frame
+
+**Retry condition tested.** The prior no-timestamp profile required a different
+workload to promote mel/tokenizer/decoder/KV into the top-five owned frames at
+>=2% self time. This run enabled the default timestamped decoder after cc closed
+the SDPA pass-elimination lane. All previously rejected families remained
+closed; cc still owns int8 and SDPA.
+
+**Full-transcribe profile.** `large-v3-turbo`, JFK x1, timestamps enabled,
+`RAYON_NUM_THREADS=8`, release-perf `e2e_probe` Build ID
+`acd75e8eb9b593d129a8563461349529921d46ef`. An offloaded cold rebuild succeeded
+on `ovh-a` (4m40s) but did not restore its local executable, so the surviving
+probe at source HEAD `91b44b1d` was used; later commits are docs/tracker only.
+The decisive undelayed flat capture was time-filtered from the first
+`mel::log_mel` sample through completion: 6,963 transcription samples, zero
+lost, 4.342 s probe wall. A delayed counter row measured 305.234B instructions,
+98.092B cycles, IPC 3.11, and 11.12% L1D miss rate, but is context-only because
+the delay can omit early transcription.
+
+External sgemm (`kernel_target_fma` 18.38%, `gemm_loop` 4.20%) was excluded.
+Ranked non-sgemm user frames at or above 0.1% self:
+
+| self | frame | disposition |
+|---:|---|---|
+| 21.65% | `nn::dot_maddubs_i7_m2n4` | cc-owned int8 |
+| 13.82% | `nn::matmul_bias_i7_quantized` | cc-owned int8 |
+| 11.64% | `ft_kernel_cpu::sdpa_forward_f32` | cc-owned SDPA |
+| 9.82% | `__expf_fma` | cc-owned/closed SDPA softmax |
+| 3.78% | `encoder::matmul_bias_i8` | cc-owned int8 |
+| 1.88% | `nn::gemv_i8` closure | cc-owned int8 |
+| 1.64% | `nn::quantize_act_i7_gelu` | cc-owned int8 |
+| 0.93% | `nn::norm_rows_into` | LN/LN-to-quant closed |
+| 0.88% | `nn::maddubs_i7_headmajor_block` | cc-owned int8 |
+| 0.74% | `__memmove_avx_unaligned_erms` | below gate; mechanism not isolated |
+| 0.74% | `nn::quantize_act_i7` | cc-owned int8 |
+| 0.71% | `__memset_avx2_unaligned_erms` | allocator/buffer reuse closed |
+| 0.54% | `nn::gemv_i8w_f32a_blocked` | cc-owned int8 |
+| 0.31% | `encoder::matmul_bias_i8` quant closure | cc-owned int8 |
+| 0.25% | `nn::gemv_i8` | cc-owned int8 |
+| 0.16% | `DecoderState::new` cross-KV setup | first permitted family; below retry gate |
+
+Ten restricted kernel addresses contributed 1.69% in aggregate. Mel,
+tokenizer, decoder policy, and self-KV were below 0.1% self. Native beam search
+does not exist.
+
+**Verdict: REJECT a source attempt.** Cross-KV scores
+`(impact 1 x confidence 5) / effort 3 = 1.67`, below the implementation gate and
+far below the 3% e2e keep ratchet. No source change was made. This is not a
+parity ceiling: the next different decoder primitive is the existing trained
+token-draft bead `bd-wzgh`, which requires a real vocabulary-compatible draft
+model because layer-skip and prompt/ngram drafts are already rejected. Retry
+only with that prerequisite or a profile where a permitted frame is top-five
+owned and >=2% self.
+
 ### 2026-07-10 UTC — cod_fw — SURFACE: large-v3-turbo non-GEMM residual profile has no eligible owned top frame
 
 **Lane.** After cc_fw took SDPA and encoder-int8 ownership, cod_fw profiled a
@@ -796,6 +850,8 @@ transcription-green wins followed — all whisper.cpp/GGML techniques franken la
 parity); ts (realistic, with word timestamps) 614→504 ms (−18%)** — all
 conformance-green. Remaining to *win outright*: bd-4hc0 (encoder
 `matrixmultiply→gemm`, out-of-scope) would cut the encoder ~2×.
+**[2026-07-10 cc_fw: FALSIFIED — measured 1.00–1.07× on turbo against ft's real
+path, and 0.934× at 16t. See the SUPERSEDED banner on the bd-4hc0 section below.]**
 
 ## Conformance-level finding — bit-exact was stricter than required (BlackThrush)
 
@@ -887,6 +943,32 @@ work (`matrixmultiply` → `gemm`/faer, ~1.5–3×) or lifting `#![forbid(unsafe
 for VNNI int8 — **both out of `franken_whisper`'s crate**.
 
 ## ⇒ Biggest remaining e2e lever, MEASURED: the GEMM has 3.75× headroom (bd-4hc0)
+
+> **⚠️ SUPERSEDED / FALSIFIED — 2026-07-10, cc_fw.** The table below is measured
+> against **raw `matrixmultiply`**, NOT against `ft_kernel_cpu::matmul_tensor_
+> contiguous_f32`, which wraps it in ft's own tuned rayon layer (`PAR_MIN_FLOPS`,
+> `TALL_MIN_ROWS`, `F32_2D_MAX_K`, row-split + 2-D tiling). On the exact
+> `[1500,384]×[384,1536]` shape below, this entry's baseline is **187 GF/s**;
+> ft's real path measures **1191 GF/s** — 6.4× faster. The "3.75× headroom" is
+> headroom over **code the engine never executes**.
+>
+> Measured against the real path (interleaved, min-of-9, 32t):
+> **large-v3-turbo linear-GEMM layer total = 1.00–1.07×** (fc2 = 1.001×), and the
+> swap is a **regression (0.934×) at 16 threads**. tiny.en = 1.311×. `gemm`'s
+> microkernel IS ~1.325× better **serially**, but its internal rayon is worse than
+> ft's row-split, which throws the gain away above 8 threads. A hybrid
+> (ft scheduler + `gemm` serial block) is **0.942×** on turbo, because ft's
+> row-split makes every thread re-stream the full B (fc1's B = 26.2 MB × 32
+> threads) and `sgemm_2d_parallel` — which exists for exactly that regime — is
+> gated `k ≤ 1024` while turbo's k is 1280/5120.
+>
+> **bd-4hc0 as specified (swap the crate) is REJECTED.** The real lever is to
+> raise/replace `F32_2D_MAX_K` so turbo reaches the 2-D tiled path, *then* swap the
+> serial microkernel. Full numbers, thread sweep, and retry conditions:
+> `docs/NEGATIVE_EVIDENCE.md` (2026-07-10, cc_fw, "bd-4hc0 REJECTED / FALSIFIED").
+> The one surviving slice is `sdpa_forward_f32`'s inner serial GEMM: **1.115×** on
+> the kernel, ~1.6% e2e, non-byte-exact (rel_l2 3.8e-7), unlanded (dependency cost).
+
 
 The e2e wall is the encoder GEMM, delegated to `ft_kernel_cpu::matmul_tensor_
 contiguous_f32`, which uses **`matrixmultiply 0.3`**. Standalone A/B (x86-64-v3,

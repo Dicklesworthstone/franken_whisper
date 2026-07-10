@@ -4,6 +4,235 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: DIG → **bd-4hc0 REJECTED / FALSIFIED (measured against the REAL `ft_kernel_cpu` path)** — the `matrixmultiply→gemm` backend swap is **1.00–1.07× on large-v3-turbo**, not "~2× encoder → ~1.2× e2e". PERF_LEDGER's "3.75× headroom" was measured against a baseline the engine never executes. The only survivor is a **1.115×** swap inside `sdpa_forward_f32` (~1.6% e2e).
+
+**Profile-first (method rule 2).** Took the next ranked frame from my SDPA profile after
+landing `FT_SDPA_POLY_EXP`. Fresh `perf record -F 999 --call-graph=dwarf` on an exact
+replica of `sdpa_forward_f32` (turbo shape `num_bh=20 seq=1500 d=64`, `BR=64`, 32 layers,
+32t, default poly-OFF/libm path). Ranked self-time ≥0.1%:
+
+| % self | frame |
+|---|---|
+| 29.47 | `__expf_fma` (scalar libm exp — the frame my landed `FT_SDPA_POLY_EXP` removes) |
+| 19.22 | `matrixmultiply::sgemm_kernel::kernel_target_fma` |
+| 16.29 | `rayon…bridge_producer_consumer::helper<…sdpa::closure>` (inlined `block()`: softmax scale/max/div passes) |
+| 16.17 | `gemm_f32::microkernel::fma::f32::x2x6` |
+| 5.87 | `matrixmultiply::gemm::gemm_loop` (mm's pack loop = 23% of its sgemm cost) |
+| 4.19 | `gemm_common::pack_operands::pack_lhs::<f32,8,16,V3>` |
+| 1.23 | `__memset_avx2_unaligned_erms` (the dead per-block calloc; matches my prior 0.5% finding) |
+| 1.04 / 0.71 / 0.15 | `gemm_f32 x2x4` / `gemm_basic_generic::closure#4` / `x1x6` |
+
+Post-poly the top open frame is the **sgemm** — exactly what PERF_LEDGER's bd-4hc0 targets.
+So I sized bd-4hc0 before building it.
+
+**Replica validated:** the `matrixmultiply` arm reproduces my prior attribution probe's
+kernel time (min 510.9 / med 528.0 ms vs the recorded 525.0 ms/window). The probe executes
+the real structure.
+
+**MEASURED A — the SDPA kernel** (`sdpa_gemm_ab`, swaps ONLY the two inner GEMM calls,
+7 reps ABBA-alternated per [[feedback_ab_order_alternate]], 4 rotating operand copies to
+defeat artificial L3 warmth, 32t):
+`matrixmultiply` min **510.9** ms (med 528.0, cv 2.0%) → `gemm 0.19` min **458.1** ms
+(med 470.8, cv 2.1%) = **1.115× min / 1.122× med** on the full kernel ⇒ ~1.19× on the
+sgemm portion alone. Divergence vs mm: bitdiff 91.5%, max|Δ| 2.28e-8, **rel_l2(vector)
+3.82e-7** (per-component rel 2.0e-1 is cancellation in the reference — same trap as the
+poly-exp accuracy budget; do not quote it). Non-byte-exact, but **3.7× tighter than the
+already-accepted `FT_SDPA_POLY_EXP` perturbation (1.43e-6)**.
+
+**MEASURED B — the linear GEMMs, against the REAL public entry point.** `linear_gemm_ab`
+calls `ft_kernel_cpu::matmul_tensor_contiguous_f32_into` with `out.len()==numel` — franken's
+exact call shape (`nn.rs:392` `set_len` + `_into`), which selects ft's `reused_output` path.
+Arm B = `gemm 0.19` with `Parallelism::Rayon(32)`. 9 reps, ABBA, min-of-9, 32t:
+
+| shape | ft ms | gemm ms | speedup | ft GF/s | gemm GF/s |
+|---|---|---|---|---|---|
+| turbo qkv/out `[1500,1280]×[1280,1280]` | 4.09 | 3.50 | 1.169× | 1203 | 1406 |
+| turbo fc1 `[1500,1280]×[1280,5120]` | 16.41 | 15.72 | **1.044×** | 1198 | 1251 |
+| turbo fc2 `[1500,5120]×[5120,1280]` | 17.58 | 17.57 | **1.001×** | 1118 | 1119 |
+| **turbo layer total** (4×qkv/out + fc1 + fc2) | 50.3 | 47.3 | **1.065×** | | |
+| tiny qkv/out `[1500,384]×[384,384]` | 0.60 | 0.41 | 1.486× | 735 | 1092 |
+| tiny fc1 `[1500,384]×[384,1536]` | 1.49 | 1.19 | 1.249× | 1191 | 1488 |
+| tiny fc2 `[1500,1536]×[1536,384]` | 1.73 | 1.48 | 1.169× | 1021 | 1193 |
+| **tiny layer total** | 5.6 | 4.3 | **1.311×** | | |
+
+**WHY THE LEDGER WAS WRONG (the load-bearing point).** PERF_LEDGER claims `[1500,384]×[384,1536]`
+goes "187→701 GFLOP/s = 3.75×". **My measurement of ft's real path on that exact shape is
+1191 GF/s** — 6.4× faster than the ledger's "matrixmultiply" baseline. The bd-4hc0 A/B
+benchmarked **raw `matrixmultiply`**, but `matmul_tensor_contiguous_f32` wraps it in ft's own
+tuned rayon layer (`PAR_MIN_FLOPS`, `TALL_MIN_ROWS`, `F32_2D_MAX_K`, row-split + 2-D tiling).
+The "3.75× headroom" is headroom over **code the engine never executes**. This is the same
+error class as the "SDPA is not exp-bound" closure I falsified on 2026-07-09: *a measurement
+of a proxy, written up as a fact about the real kernel.* **Before trusting a ledger ratio,
+check which code the experiment actually ran.**
+
+**THREAD SWEEP — the microkernel gap is real; `gemm`'s SCHEDULER is what throws it away.**
+turbo layer total, `gemm` vs `ft`, min-of-5, interleaved:
+
+| threads | 1 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|
+| gemm/ft | **1.325×** | 1.235× | 1.055× | **0.934×** | 1.046× |
+
+At 1t (contention-robust: one thread on a 64-way box) `gemm` is uniformly 1.31–1.33× on every
+turbo shape (ft 86–87 GF/s ≈ 76% of single-core peak; gemm 114–116 GF/s ≈ 100%). By 16t the
+crate swap is a **REGRESSION**. ft's hand-tuned row-split beats `gemm`'s internal rayon.
+**Shipping bd-4hc0 as specified would have bought ~1.05× on turbo and a −7% regression at 16t.**
+
+**HYBRID (the obvious rescue) ALSO REJECTED.** `hybrid_ab`, 3-arm rotation, 9 reps, 32t.
+A = ft real; B = gemm crate; C = ft's row-split scheduler + `gemm`'s **serial** block
+(`Parallelism::None`) — i.e. take the best half of each. Every turbo linear shape has
+`k > 1024`, so ft's `sgemm`/`sgemm_reused_output` provably takes the plain row-split branch
+(`br = ceil(m/threads).max(8)`), which C replicates exactly:
+
+| shape | A ms | B ms | C ms | C/A |
+|---|---|---|---|---|
+| turbo qkv/out | 3.91 | 3.67 | 4.01 | 0.975× |
+| turbo fc1 | 16.11 | 15.64 | 19.17 | **0.840×** |
+| turbo fc2 | 16.69 | 18.12 | 16.19 | 1.031× |
+| **TURBO layer** | 48.4 | 48.5 | 51.4 | **0.942×** (B/A = 0.999×) |
+| **TINY layer** | 6.2 | 4.8 | 4.7 | 1.324× (B/A = 1.308×) |
+
+**Mechanism of the hybrid's turbo loss.** ft's row-split hands each of 32 threads
+`sgemm_block(m≈47, k, n)`, and **every thread streams and packs the FULL B (k×n)**. turbo
+fc1's B is `1280×5120×4 = 26.2 MB` ⇒ 32×26.2 MB of B traffic. ft already has
+`sgemm_2d_parallel` for precisely this bandwidth-bound regime — but it is gated
+`k <= F32_2D_MAX_K (1024)`, and turbo's k is 1280/5120, so **it never fires**.
+`matrixmultiply`'s packing tolerates the re-streaming; `gemm`'s serial path (LHS packed into
+8×16 panels, `pack_lhs`) does not. The gate constant was tuned *for matrixmultiply*.
+
+**WHAT SURVIVES (my lane).** The SDPA-only serial swap holds at **1.115×** because SDPA's
+inner GEMMs are already serial-per-block and their B is small (`kh`/`vh` = 384 KiB per head,
+not 26 MB), so the re-streaming blowup never applies. e2e: `sdpa_forward_f32` = 16.8% of
+`encoder_window`, encoder = 89.5% of e2e (turbo) ⇒ encoder 1.0176× ⇒ **e2e ≈ 1.016×**.
+Not landed: it costs a `gemm` dependency tree (gemm-f16/c32/c64, bytemuck, dyn-stack,
+num-complex, half, zerocopy) inside `ft-kernel-cpu`, a SHARED crate with `*_bit_exact` tests
+and training/gradient consumers, and it is non-byte-exact — a poor trade for 1.6% without
+owner sign-off. Recorded here as **measured-and-available**, not as a closed door.
+
+**NO-CEILING — the corrected headroom map (where the GEMM lever actually is).**
+The 1.325× serial-microkernel gap is REAL and unclaimed. It is capturable only by a scheduler
+that does **not** re-stream B per thread. Concrete follow-ons, in EV order:
+1. **Raise/replace `F32_2D_MAX_K`** (currently 1024, tuned for matrixmultiply) so turbo's
+   `k=1280/5120` shapes reach `sgemm_2d_parallel`, *then* retry the hybrid. The 2-D tile is
+   the prerequisite for any better microkernel to pay on turbo. This is the real bd-4hc0.
+2. **tiny.en only**: the crate swap is a genuine 1.31× on its linear layer (≈1.15× e2e).
+   Needs its own WER gate, and note tiny.en's baseline is already broken by the long-form
+   tail-drop ([[project_final_window_early_eot_bug]]).
+3. A hand-written AVX2 16×6 microkernel for SDPA's two fixed shapes (`m=64,k=64,n=1500` and
+   `m=64,k=1500,n=64`), avoiding the dependency entirely.
+
+**RETRY CONDITIONS (do not re-run the plain crate swap unless one holds):**
+(a) `ft-kernel-cpu` gains a 2-D/panel-parallel path for `k > 1024`; (b) the target is tiny.en;
+(c) a quiet-clock box shows the 32t turbo ratio ≥1.2× — measured here at load 15–26, and
+although arms were interleaved (contention hits both), contention does compress ratios toward
+1.0, so the 32t points are the weakest numbers in this entry. The **1t (1.325×) and 16t
+(0.934×) points are not contention artifacts** and are what carry the rejection.
+
+**Also confirmed in this pass (cheap ledger-first kills, no code):** (i) `should_parallelize_cols`
+does NOT fire inside SDPA (blocks are 6.1M flops < `PAR_MIN_FLOPS_COLS` 16.8M), so there is no
+nested-rayon bug in `sdpa_forward_f32` — hypothesis raised and killed in 30 seconds by reading
+the constants. (ii) **int8 SDPA remains DEAD** (scores 0.14×, out 0.77×, 2026-07-04): its
+mechanism (`d_head=64` is a thin K/N dim ⇒ quant/dequant overhead exceeds the tiny f32 time)
+holds inside the fused kernel too. Not retried.
+
+AGENT_NAME=cc_fw. **No engine code changed** (three standalone scratch probes against the real
+`ft-kernel-cpu` path) ⇒ franken_whisper and frankentorch byte-identical to HEAD; conformance
+GREEN by construction. Probes: `sdpa_gemm_ab`, `linear_gemm_ab`, `hybrid_ab` (scratchpad).
+**INFRA BLOCKER surfaced:** MCP agent-mail is down — `database disk image is malformed`
+(`table_seek called on index page ... page 1513, root 41`); coordination this session was
+ledger-only. Did not run `am doctor repair` (destructive, not my lane).
+
+---
+## 2026-07-10 UTC - cod_fw: PROFILE RETRY -> REJECT (measured) - timestamped large-v3-turbo still has no eligible owned non-GEMM frame
+
+**Ledger-first route.** The immediately preceding cod_fw profile closed a
+source attempt until either cc's int8/SDPA work settled or a fresh workload made
+mel, tokenizer, decoder policy, or KV management a top-five owned frame with at
+least 2% self time. The cc softmax pass-elimination lane is now closed, so this
+retry changed the workload from `PROBE_NO_TS=1` to the default timestamped
+decoder path. The ledger grep still forbids f32 QKV sgemm fusion,
+weight-stationary f16 GEMV tiles, allocator/buffer reuse, decoder fused-LN,
+LN-to-quant fusion, head-major SDPA scatter, i7 rowblock coarsening, i7 bias
+specialization, and softmax pass elimination.
+
+**Build and workload.** A fresh frame-pointer build was offloaded with
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/franken_whisper-cod_fw` and
+`rch exec -- cargo build --profile release-perf -p franken_whisper --example
+e2e_probe`; worker `ovh-a` completed the cold build in 4m40s, but RCH artifact
+retrieval did not materialize the example locally. The measurement therefore
+used the surviving release-perf probe at source HEAD `91b44b1d` (Build ID
+`acd75e8eb9b593d129a8563461349529921d46ef`); commits through current HEAD are
+documentation/tracker-only, and the shared `decode.rs` worktree delta is
+rustfmt-only. Workload:
+
+```text
+FRANKEN_WHISPER_MODEL_DIR=legacy_whispercpp/whisper.cpp/models
+RAYON_NUM_THREADS=8
+PROBE_NO_TS unset (timestamps enabled)
+e2e_probe large-v3-turbo tests/fixtures/native/jfk.wav 1
+```
+
+**Counter run.** `perf stat -D 2000 -d` reported 305.234B instructions,
+98.092B cycles, IPC 3.11, 8.064B / 72.508B L1D misses (11.12%), and 4.121 s
+elapsed; the probe reported 4.084 s transcribe wall. This delayed counter row is
+context only because the 2 s delay can omit the first few hundred milliseconds
+after a 1.5-1.7 s model load.
+
+**Corrected full-transcribe capture.** To include mel and the first encoder
+work, the decisive flat profile removed the delay and then time-filtered from
+the first `mel::log_mel` sample (`2408117.920`) through transcription completion
+(`2408122.300`). Command shape: `perf record -m 1 -F 199`; 12,857 samples were
+captured overall, 6,963 fell in the transcription window, and zero samples were
+lost. The probe reported 4.342 s transcribe wall. Dwarf retries that hit the
+host mlock limit, lost 96.49% of samples, or captured only 106 main-thread
+samples were discarded and are not used below.
+
+External sgemm was excluded before ranking (`kernel_target_fma` 18.38%,
+`gemm_loop` 4.20%). All remaining user-space frames at or above 0.1% self time:
+
+| rank | self | non-sgemm frame | disposition |
+|---:|---:|---|---|
+| 1 | 21.65% | `nn::dot_maddubs_i7_m2n4` | cc-owned int8 lane |
+| 2 | 13.82% | `nn::matmul_bias_i7_quantized::{closure#0}` | cc-owned int8 lane |
+| 3 | 11.64% | `ft_kernel_cpu::sdpa_forward_f32::{closure#0}` | cc-owned SDPA lane |
+| 4 | 9.82% | `__expf_fma` | cc-owned/closed SDPA softmax lane |
+| 5 | 3.78% | `encoder::matmul_bias_i8::{closure#1}` | cc-owned int8 lane |
+| 6 | 1.88% | `nn::gemv_i8::{closure#3}` | cc-owned int8 lane |
+| 7 | 1.64% | `nn::quantize_act_i7_gelu` | cc-owned int8 quantization lane |
+| 8 | 0.93% | `nn::norm_rows_into` | fused-LN/LN-to-quant family closed |
+| 9 | 0.88% | `nn::maddubs_i7_headmajor_block` | cc-owned int8 lane |
+| 10 | 0.74% | `__memmove_avx_unaligned_erms` | below retry/keep gate; no owned mechanism isolated |
+| 11 | 0.74% | `nn::quantize_act_i7` | cc-owned int8 quantization lane |
+| 12 | 0.71% | `__memset_avx2_unaligned_erms` | allocator/buffer-reuse family closed |
+| 13 | 0.54% | `nn::gemv_i8w_f32a_blocked::{closure#0}` | cc-owned int8 lane |
+| 14 | 0.31% | `encoder::matmul_bias_i8::{closure#0}` | cc-owned int8 lane |
+| 15 | 0.25% | `nn::gemv_i8` | cc-owned int8 lane |
+| 16 | 0.16% | `DecoderState::new::{closure#4}` | first requested-family frame; below 2% retry gate |
+
+Restricted kernel addresses contributed 1.69% across ten individually sampled
+addresses at or above 0.1%; they are not actionable source frames. Mel,
+tokenizer, `process_logits`/argmax/segment policy, and self-KV management remain
+below 0.1% flat self time. Native beam search is not implemented (bridge beam
+parameters do not execute in this engine).
+
+**Opportunity gate and verdict: REJECT a source attempt.** The first eligible
+requested-family frame is cross-KV construction at 0.16% self. Its opportunity
+score is `(impact 1 x confidence 5) / effort 3 = 1.67`, below the 2.0
+implementation threshold, with only 0.16% observed self share against the 3%
+keep ratchet. The timestamped retry therefore does not satisfy the ledger's
+top-five / >=2% condition. No source lever was attempted; bit-exact parity is
+vacuous because native-engine source and output behavior were not changed.
+
+This is an ownership/profile blocker, not a parity ceiling. The next admissible
+decoder primitive is the already-filed trained, vocabulary-compatible
+token-draft loop (`bd-wzgh`); layer-skip and prompt/ngram self-drafts are already
+rejected, so that vein requires a real draft model artifact before retry. Reopen
+this residual lane only when a permitted frame is top-five owned and >=2% self,
+or when that trained draft prerequisite exists. Raw artifacts:
+`/tmp/fw-cod-fw-ts-perf-stat-20260710.txt`,
+`/tmp/fw-cod-fw-ts-perf-20260710.data`, and
+`/tmp/fw-cod-fw-ts-full-flat-perf-20260710.data`. `AGENT_NAME=cod_fw`.
+
+---
 ## 2026-07-10 UTC - cod_fw: PROFILE -> SURFACE (measured) - large-v3-turbo non-GEMM residual has no eligible owned top frame after excluding `sgemm`, cc-owned int8/SDPA, and closed families
 
 **Lane.** User redirected cod_fw away from SDPA and encoder-int8 after cc_fw
