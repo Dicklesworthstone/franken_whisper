@@ -195,6 +195,109 @@ fn softmax_poly(sc: &mut [f32], br: usize, scale: f32) {
     }
 }
 
+/// Pass 3 with a reciprocal multiply instead of a divide. Isolates the cost of
+/// the kernel's 1.44 G scalar `*s /= sum` per window.
+fn softmax_poly_recip(sc: &mut [f32], br: usize, scale: f32) {
+    for r in 0..br {
+        let row = &mut sc[r * SEQ..(r + 1) * SEQ];
+        let sum = softmax_poly_row_unnorm(row, scale);
+        let vinv = F32s::splat(1.0 / sum);
+        let mut i = 0;
+        while i + LANES <= SEQ {
+            (F32s::from_slice(&row[i..]) * vinv).copy_to_slice(&mut row[i..]);
+            i += LANES;
+        }
+        for s in row[i..].iter_mut() {
+            *s *= 1.0 / sum;
+        }
+    }
+}
+
+/// The 2-pass form: `scale` is folded into `q` before the scores GEMM (so pass 1
+/// is a read-only max) and the normalize pass is DELETED — the caller instead
+/// scales each `d_v`-wide output row of `O = P_unnorm @ V` by `1/sum`. That is
+/// 64 multiplies per row instead of 1500, and one fewer full pass over `sc`.
+/// This is the FlashAttention accumulation identity, exact up to rounding.
+fn softmax_poly_2pass(sc: &mut [f32], br: usize, _scale: f32) {
+    for r in 0..br {
+        let row = &mut sc[r * SEQ..(r + 1) * SEQ];
+        // pass 1: max only, read-only (no scale multiply, no store)
+        let mut vmax = F32s::splat(f32::NEG_INFINITY);
+        let mut i = 0;
+        while i + LANES <= SEQ {
+            vmax = vmax.simd_max(F32s::from_slice(&row[i..]));
+            i += LANES;
+        }
+        let mut m = vmax.reduce_max();
+        for s in row[i..].iter() {
+            if *s > m {
+                m = *s;
+            }
+        }
+        // pass 2: exp + sum, leave UNNORMALIZED
+        let vm = F32s::splat(m);
+        let mut vsum = F32s::splat(0.0);
+        let mut i = 0;
+        while i + LANES <= SEQ {
+            let e = exp_poly(F32s::from_slice(&row[i..]) - vm);
+            e.copy_to_slice(&mut row[i..]);
+            vsum += e;
+            i += LANES;
+        }
+        let mut sum = vsum.reduce_sum();
+        for s in row[i..].iter_mut() {
+            let e = (*s - m).exp();
+            *s = e;
+            sum += e;
+        }
+        // The caller would now do `o_row *= 1/sum` over d_v=64 elements; emulate
+        // that cost so the comparison is honest rather than flattering.
+        let inv = 1.0 / sum;
+        let mut o = [1.0f32; 64];
+        for x in &mut o {
+            *x *= inv;
+        }
+        black_box(&o);
+    }
+}
+
+/// Scale + max + exp + sum, leaving the row unnormalized; returns the row sum.
+#[inline]
+fn softmax_poly_row_unnorm(row: &mut [f32], scale: f32) -> f32 {
+    let vscale = F32s::splat(scale);
+    let mut vmax = F32s::splat(f32::NEG_INFINITY);
+    let mut i = 0;
+    while i + LANES <= SEQ {
+        let v = F32s::from_slice(&row[i..]) * vscale;
+        v.copy_to_slice(&mut row[i..]);
+        vmax = vmax.simd_max(v);
+        i += LANES;
+    }
+    let mut m = vmax.reduce_max();
+    for s in row[i..].iter_mut() {
+        *s *= scale;
+        if *s > m {
+            m = *s;
+        }
+    }
+    let vm = F32s::splat(m);
+    let mut vsum = F32s::splat(0.0);
+    let mut i = 0;
+    while i + LANES <= SEQ {
+        let e = exp_poly(F32s::from_slice(&row[i..]) - vm);
+        e.copy_to_slice(&mut row[i..]);
+        vsum += e;
+        i += LANES;
+    }
+    let mut sum = vsum.reduce_sum();
+    for s in row[i..].iter_mut() {
+        let e = (*s - m).exp();
+        *s = e;
+        sum += e;
+    }
+    sum
+}
+
 /// min / mean / cv% over `reps` timings of `f`, in ms.
 fn bench(reps: usize, mut f: impl FnMut()) -> (f64, f64, f64) {
     let mut ms: Vec<f64> = Vec::with_capacity(reps);
@@ -270,7 +373,14 @@ fn main() {
     });
 
     // ---- controls + softmax variants ---------------------------------------
-    let (fill_min, _, fill_cv) = bench(reps, || over_blocks(&bs, &src, |_, _| {}));
+    // NOTE: the control must OBSERVE the scratch, or LLVM dead-store-eliminates the
+    // whole `copy_from_slice` and the "control" reads ~0 ms — which would silently
+    // fold the probe's own 5.9 GB of fill traffic into every softmax variant.
+    let (fill_min, _, fill_cv) = bench(reps, || {
+        over_blocks(&bs, &src, |sc, _| {
+            black_box(&*sc);
+        })
+    });
     let (libm_min, _, libm_cv) = bench(reps, || {
         over_blocks(&bs, &src, |sc, br| softmax_libm(sc, br, scale));
     });
@@ -280,13 +390,30 @@ fn main() {
     let (poly_min, _, poly_cv) = bench(reps, || {
         over_blocks(&bs, &src, |sc, br| softmax_poly(sc, br, scale));
     });
+    let (recip_min, _, recip_cv) = bench(reps, || {
+        over_blocks(&bs, &src, |sc, br| softmax_poly_recip(sc, br, scale));
+    });
+    let (p2_min, _, p2_cv) = bench(reps, || {
+        over_blocks(&bs, &src, |sc, br| softmax_poly_2pass(sc, br, scale));
+    });
 
     println!("per-window totals (min-of-{reps}, ms):");
     println!("  T_alloc  (dead calloc)   {alloc_min:8.1}   cv {alloc_cv:.1}%");
     println!("  T_fill   (control)       {fill_min:8.1}   cv {fill_cv:.1}%");
     println!("  T_libm   (fill+softmax)  {libm_min:8.1}   cv {libm_cv:.1}%");
     println!("  T_noexp  (fill+no exp)   {noexp_min:8.1}   cv {noexp_cv:.1}%");
-    println!("  T_poly   (fill+poly exp) {poly_min:8.1}   cv {poly_cv:.1}%\n");
+    println!("  T_poly   (fill+poly exp) {poly_min:8.1}   cv {poly_cv:.1}%");
+    println!("  T_recip  (poly, *1/sum)  {recip_min:8.1}   cv {recip_cv:.1}%");
+    println!("  T_2pass  (poly, no norm) {p2_min:8.1}   cv {p2_cv:.1}%\n");
+    println!("NEXT-FRAME candidates (both inside the already-gated poly path):");
+    println!(
+        "  divide -> reciprocal      saves {:8.1} ms/window",
+        poly_min - recip_min
+    );
+    println!(
+        "  + fold scale, drop norm   saves {:8.1} ms/window (total vs T_poly)",
+        poly_min - p2_min
+    );
 
     let softmax = libm_min - fill_min;
     let exp = libm_min - noexp_min;
