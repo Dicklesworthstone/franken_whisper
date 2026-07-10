@@ -124,14 +124,17 @@ sync_to_remote: timed out after 30000ms
 [RCH] remote required; refusing local fallback (remote execution failed)
 ```
 
-The strict flag prevented the announced fallback; Cargo again never ran. The changed failure mode
-does not supply a candidate median, production-symbol self-time, or WER evidence.
+Second strict retry on current `main` (`55df007`) selected `vmi1264463` with one remote slot still
+available, then reproduced the same 30-second `sync_to_remote` timeout and strict refusal of the
+announced local fallback. The strict flag prevented both fallbacks; Cargo again never ran. These
+changed failure modes do not supply a candidate median, production-symbol self-time, or WER
+evidence.
 
 **Decision:** SURFACE. No Cargo benchmark ran, no local fallback ran, and therefore no admissible
 candidate median or WER/conformance result exists. This is not a performance rejection. Retry only
-after the remote dependency closure contains the missing source entrypoint; then require a valid
-BASE/BASE null median, candidate median above the null p90, and unchanged transcript/WER before
-promoting the production layout.
+after strict RCH can sync the project and validate the remote dependency closure; then require a
+valid BASE/BASE null median, candidate median above the null p90, and unchanged transcript/WER
+before promoting the production layout.
 
 ---
 ## 2026-07-10 - cc_fw: **DUG the new subsystems (VAD, feature-cache, encoder non-GEMM) — VAD is BRIDGE-ONLY (no native surface), feature-cache DOES NOT EXIST, encoder non-GEMM ops all CLOSED. No hot frame; nothing to ship. The franken CPU inference surface is exhausted for shippable in-lane byte-exact levers.**
