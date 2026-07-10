@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cod_fw: **SURFACE — strict remote RCH blocked the decoder/KV-cache median gate before Cargo ran; packed self-K remains unmeasured, neither shipped nor rejected.**
+
+Profile-first routing found the hottest still-open decoder/KV-cache production symbol at
+`nn::attention_with_cache` (**0.17% full-transcription self-time**) on timestamped
+`large-v3-turbo`; `perf annotate` attributed about **0.09% process self-time** to its scalar
+self-K score chain. The one-lever candidate mirrors f32 self-attention keys as
+`[state, capacity_tokens]` so independent token scores are contiguous while every score keeps the
+same ascending-dimension f32 reduction order. The same-binary harness reaches production
+`attention_with_cache`, checks bit-exact output, runs an ABBA BASE/BASE null, and gates only on the
+BASE/candidate **median** against that null distribution.
+
+Required remote-only command:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf \
+  -p franken_whisper --bench native_engine_bench -- \
+  native_engine/self_attn_k_layout --noplot
+```
+
+RCH selected `ovh-a`, synced the project/dependency roots, then failed closed with `RCH-E410`:
+
+```text
+missing source_entrypoint /data/projects/frankensqlite/crates/fsqlite-core/tests/
+issue_122_check_isnull_precedence.rs: required package source entrypoint is missing on remote worker
+[RCH] remote required; refusing local fallback
+```
+
+**Decision:** SURFACE. No Cargo benchmark ran, no local fallback ran, and therefore no admissible
+candidate median or WER/conformance result exists. This is not a performance rejection. Retry only
+after the remote dependency closure contains the missing source entrypoint; then require a valid
+BASE/BASE null median, candidate median above the null p90, and unchanged transcript/WER before
+promoting the production layout.
+
+---
 ## 2026-07-10 - cc_fw: **DUG the new subsystems (VAD, feature-cache, encoder non-GEMM) — VAD is BRIDGE-ONLY (no native surface), feature-cache DOES NOT EXIST, encoder non-GEMM ops all CLOSED. No hot frame; nothing to ship. The franken CPU inference surface is exhausted for shippable in-lane byte-exact levers.**
 
 Acting on the convergence REJECT by digging genuinely-new subsystems (not a re-survey of the hot GEMM/SDPA frames).
