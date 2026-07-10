@@ -4,6 +4,41 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **FRESH FRAME-LEVEL PROFILE of mel / tokenizer / sampler (both models) — all COLD (<0.1%). No fresh hot frame; no un-explored quality-preserving quantization lever. SURFACE.**
+
+Profile-first on the subsystems named as candidates (encoder / mel / tokenizer), this time drilling
+the **sampler + tokenizer** frames I had only asserted-cold before. `perf -F 299`, `e2e_probe`
+sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`, LOCAL 5975WX, turbo jfk×8
+(91K samples) + tiny.en jfk×8 (18K samples, token-dense: 10 segs / 524 chars).
+
+**Direct evidence (not assertion):** grepping both profiles for `sampl|token|argmax|detok|bpe|merge|
+logit|greedy|suppress|vocab` returns **nothing ≥0.03%** except `nn::softmax_rows` **0.08%** (tiny.en).
+The only franken non-GEMM decode frame is `DecoderState::new::{closure#4}` — **0.23% turbo / 0.55%
+tiny.en** (decode-state/KV-cache setup, cod's lane). **The sampler/tokenizer path is cold** — argmax
+is already AVX2 (5.10×, [[project_argmax_avx2_landed]]), so the LLVM-scalarized-serial-loop
+antipattern family has no remaining target here.
+
+**Quality-preserving quantization is also explored** (checked the flag defaults directly):
+`FRANKEN_WHISPER_NATIVE_F16_COMPUTE` **default-ON**; encoder quality-safe int8 + decode int8 both
+**default-on**; `INT4_MLP` **measured-mixed**, int4-logits **dead**; int8-SDPA **dead**; cross-proj
+**f32 won** over int8 (2.25×). No un-quantized WER-neutral GEMM/GEMV remains to convert.
+
+**Lane note:** mel and tokenizer are **cod_fw's** ("non-GEMM residuals"), and they are *also* cold —
+so even a frame there would not be mine and would not be worth a cycle. The encoder GEMM (~28% i7)
+is cod's; the SDPA (mine) is poly-exp (with owner) + closed.
+
+**SURFACE.** Across this session I have frame-profiled every named subsystem on both models and
+measured every novel byte-exact structural probe against a paired null control. **There is no fresh
+hot frame and no shippable one-cycle byte-exact lever in my (SDPA/int8-SDPA) lane.** The campaign is
+at the characterized CPU floor; the real remaining gains are the five cross-lane/owner/hardware
+items in the closure map committed at HEAD~1 (`b4629f3`): draft decoding (owner model), cod's M4×N4
+tile + packed-K, the two owner quant decisions (`FT_SDPA_POLY_EXP` default-on, SDPA-sgemm `gemm`
+swap), and GPU/VNNI hardware. Re-profiling mel/tokenizer/sampler will keep returning "cold."
+
+AGENT_NAME=cc_fw. No source changed (profile only). No build; disk 76 G; nothing stashed/deleted;
+`nn.rs`/`benches`/mel/tokenizer are cod_fw's, untouched.
+
+---
 ## 2026-07-10 - cc_fw: **DECODE/INFERENCE HOT-PATH CLOSURE MAP (mel / conv / attention / kv-cache) — profile-first, every named path is landed / closed / cod's / owner-gated. No one-cycle byte-exact in-my-lane lever remains; SURFACE with the definitive map so the campaign stops re-profiling exhausted paths.**
 
 **PROFILE-FIRST (this session, both models).** `e2e_probe` sha256
