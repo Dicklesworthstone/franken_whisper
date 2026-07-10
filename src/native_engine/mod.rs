@@ -466,6 +466,22 @@ pub(crate) fn encoder_int8_policy_decision(hparams: &WhisperHParams) -> EncoderI
     }
 }
 
+/// Whether `hparams` is the `large-v3-turbo` checkpoint (as opposed to `tiny.en` or an
+/// unknown model). Used both for the encoder int8 calibration set and for the poly-softmax
+/// enablement, which is proven WER-neutral on this model but NOT on `tiny.en`.
+#[must_use]
+pub(crate) fn is_large_v3_turbo(hparams: &WhisperHParams) -> bool {
+    hparams.n_vocab == 51_866
+        && hparams.n_audio_ctx == 1_500
+        && hparams.n_audio_state == 1_280
+        && hparams.n_audio_head == 20
+        && hparams.n_audio_layer == 32
+        && hparams.n_text_state == 1_280
+        && hparams.n_text_layer == 4
+        && hparams.n_mels == 128
+        && hparams.ftype == 1
+}
+
 #[must_use]
 fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
     let tiny_en = hparams.n_vocab == 51_864
@@ -477,16 +493,24 @@ fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
         && hparams.n_text_layer == 4
         && hparams.n_mels == 80
         && hparams.ftype == 1;
-    let large_v3_turbo = hparams.n_vocab == 51_866
-        && hparams.n_audio_ctx == 1_500
-        && hparams.n_audio_state == 1_280
-        && hparams.n_audio_head == 20
-        && hparams.n_audio_layer == 32
-        && hparams.n_text_state == 1_280
-        && hparams.n_text_layer == 4
-        && hparams.n_mels == 128
-        && hparams.ftype == 1;
-    tiny_en || large_v3_turbo
+    tiny_en || is_large_v3_turbo(hparams)
+}
+
+/// Enable `ft_kernel_cpu`'s 8-lane poly softmax in `sdpa_forward_f32` for the models where it
+/// is proven WER-neutral, at model load.
+///
+/// **`large-v3-turbo` only.** Evidence (bd-bcm7, `docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`):
+/// transcript **byte-identical** on jfk ×1/×3/×8, WER vs whisper.cpp **Δ 0.000**, e2e **1.0722×**
+/// (cv 0.8%, 5/5 paired). `tiny.en` is **uncertified** (regressed on track01) and stays OFF.
+/// Set explicitly per load so a turbo→tiny.en sequence in one process does not leak the ON state.
+///
+/// Controls: `FW_SDPA_POLY_EXP=0` kills it even on turbo; `FT_SDPA_POLY_EXP=1` forces it on for any
+/// model (operator override, e.g. for a certified fine-tune).
+pub(crate) fn configure_sdpa_poly_exp(hparams: &WhisperHParams) {
+    let killed = std::env::var("FW_SDPA_POLY_EXP").as_deref() == Ok("0");
+    let forced = std::env::var("FT_SDPA_POLY_EXP").as_deref() == Ok("1");
+    let want = forced || (is_large_v3_turbo(hparams) && !killed);
+    ft_kernel_cpu::set_sdpa_poly_exp(want);
 }
 
 #[must_use]
@@ -1505,6 +1529,38 @@ mod tests {
             assert_eq!(decision.corpus_wer_delta_budget, 0.0);
             assert_eq!(decision.quant_rel_rmse_budget, 0.09);
         }
+    }
+
+    #[test]
+    fn is_large_v3_turbo_discriminates_models_for_poly_exp() {
+        // bd-bcm7: poly softmax is enabled at load for turbo only. Verify the discriminator
+        // that gates it: turbo -> true, tiny.en -> false (uncertified), unknown -> false.
+        let turbo = WhisperHParams {
+            n_vocab: 51_866,
+            n_audio_ctx: 1_500,
+            n_audio_state: 1_280,
+            n_audio_head: 20,
+            n_audio_layer: 32,
+            n_text_ctx: 448,
+            n_text_state: 1_280,
+            n_text_head: 20,
+            n_text_layer: 4,
+            n_mels: 128,
+            ftype: 1,
+        };
+        assert!(is_large_v3_turbo(&turbo));
+        let mut tiny = turbo;
+        tiny.n_vocab = 51_864;
+        tiny.n_audio_state = 384;
+        tiny.n_audio_head = 6;
+        tiny.n_audio_layer = 4;
+        tiny.n_text_state = 384;
+        tiny.n_text_head = 6;
+        tiny.n_mels = 80;
+        assert!(!is_large_v3_turbo(&tiny), "tiny.en must NOT enable poly (uncertified)");
+        let mut unknown = turbo;
+        unknown.n_audio_state = 1_024;
+        assert!(!is_large_v3_turbo(&unknown), "unknown model must NOT enable poly");
     }
 
     #[test]

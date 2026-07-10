@@ -535,6 +535,11 @@ impl EncoderWeights {
             });
         }
 
+        // bd-bcm7: enable ft_kernel_cpu's poly softmax for large-v3-turbo (proven WER-neutral:
+        // byte-identical transcript, WER Δ 0.000, 1.0722× e2e). tiny.en stays off (uncertified).
+        // Kill-switch FW_SDPA_POLY_EXP=0; operator force FT_SDPA_POLY_EXP=1.
+        super::configure_sdpa_poly_exp(&model.hparams);
+
         // FEASIBILITY HARNESS (off by default): `FW_ENC_WEIGHT_ROUNDTRIP=row|<N>` replaces
         // every f32 GEMM weight with its i7 quantize→dequantize roundtrip, so the EXISTING
         // f32 encoder measures the WEIGHT-quant-granularity effect on the transcript.
