@@ -4,6 +4,87 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 UTC - cc_fw: PROMOTION EVIDENCE for `FT_SDPA_POLY_EXP` - WER gate **PASSES on large-v3-turbo (4/4)**, **does NOT cleanly pass on tiny.en (1 clip +0.8 WER)**; accuracy budget published. **Recommendation: franken-scoped opt-in, NOT a global kernel default.**
+
+**Accuracy budget (deterministic, load-independent; asserted by
+`ft-kernel-cpu::tests::sdpa_poly_exp_accuracy_budget`):**
+
+```
+exp over the clamped domain [-87,0]:  max 1 ULP,  max rel 1.192e-7
+softmax P (seq_k=1500, 64 rows):      max|delta| 1.630e-9,  max rel 1.552e-6
+output O = P@V (vector ||do||/||o||): 1.425e-6
+```
+**The dominant error is NOT the poly `exp` (1 ULP) — it is the lane-wise row-sum
+reduction**, which rescales a whole row nearly uniformly. That is why `P`'s
+*absolute* error is ~1e-9 while its *relative* error is ~1e-6, and why `O` tracks
+the sum error, not the exp error. Budgets asserted with 2-6x headroom (`exp` <= 2
+ULP, `P` abs <= 1e-8, `P` rel <= 4e-6, `O` rel <= 4e-6) so a future `wide` bump
+cannot silently widen them. (Measuring `O` **per-component** was rejected as an
+artifact: `O` is a probability-weighted mean of zero-mean `V` rows, so its
+components sit near zero and per-component relative error — 3.9e-4 — is dominated
+by cancellation in the *reference*, not by the poly. The vector norm is honest.)
+
+**WER parity gate.** Corpus: `jfk.wav` tiled x1/x3/x8 + `example_audio_track_01`
+(124.5 s), both models; reference = `whisper-cli -t 32 -nt` on the SAME wav;
+word-level WER after casefold + punctuation strip.
+
+```
+model           clip     WER(wc,OFF)   WER(wc,ON)    OFF-vs-ON
+tiny.en         jfk_x1      9.091        9.091        identical
+tiny.en         jfk_x3     45.333       45.333        identical
+tiny.en         jfk_x8     43.713       43.114  (-)   DIFFERS 5.83%
+tiny.en         track01    52.800       53.600  (+)   DIFFERS 8.00%
+large-v3-turbo  jfk_x1      0.000        0.000        identical
+large-v3-turbo  jfk_x3      0.000        0.000        identical
+large-v3-turbo  jfk_x8      4.545        4.545        identical
+large-v3-turbo  track01     8.519        7.778  (-)   DIFFERS 1.95%
+```
+**turbo: gate PASSES 4/4** — `WER_ON <= WER_OFF` everywhere, byte-identical on 3/4,
+and on the one diverging clip ON is strictly CLOSER to whisper.cpp (8.519 ->
+7.778). **tiny.en: gate does NOT cleanly pass** — `jfk_x8` improves but `track01`
+regresses +0.8 pts. tiny.en's baseline is *already broken* (43-53% WER, `del=126`
+on track01) by the pre-existing long-form tail-drop
+([[project_final_window_early_eot_bug]], bd-r0qd/bd-b4hp); at that error level a
+1.4e-6 perturbation flips greedy argmax on already-marginal tokens. **That is
+chaos around a broken baseline, not a systematic accuracy loss** — but it is real
+and I will not explain it away, so tiny.en is NOT certified.
+
+**Speed, both models.** Load-independent counters (box load ~40; e2e wall-clock is
+unusable at tiny.en scale):
+
+```
+perf instructions      OFF        ON       delta      attn_sdpa span (min-of-5, alternated)
+tiny.en  jfk_x3       24.9 G    22.1 G   -11.13%      29.6 -> 23.5 ms   1.260x
+tiny.en  track01      87.2 G    74.8 G   -14.21%
+turbo    jfk_x3      552.2 G   474.4 G   -14.08%     622.6 -> 485.4 ms  1.283x
+turbo    track01    1973.5 G  1618.1 G   -18.01%
+```
+vs whisper.cpp (`-t 32`, franken `transcribe` vs wc `total - load`, min-of-3):
+turbo/jfk_x3 **2.24x -> 2.38x**; turbo/track01 **1.64x -> 1.70x**. tiny.en e2e
+wall-clock reads ON-*slower* (2.76x -> 2.31x) but that is **noise**: its
+instruction count FALLS 11-14% and its span is 1.26x faster; the ~6 ms/window
+saving is far below this box's noise floor. **Do not quote tiny.en e2e wall-clock
+at load 40.** (Also: the "parity, 9.73s vs 9.59s" premise does not reproduce here
+— franken is already 1.64-2.38x ahead of whisper.cpp at matched `-t 32`.)
+
+**DECISION / PROPOSAL.**
+1. **Do NOT flip frankentorch's global default.** `ft_kernel_cpu` is a shared crate
+   with explicit `*_bit_exact` tests and non-ASR consumers (training / gradient
+   checks) that rely on exact scalar semantics. A 1.4e-6 output perturbation is
+   fine for a 32-layer encoder feeding a greedy decoder; it is not obviously fine
+   for a backward pass.
+2. **Propose default-ON scoped to franken_whisper's encoder**, via an explicit
+   `ft-kernel-cpu` setter rather than the process-global env var (an env read is a
+   poor library API, and franken cannot set it itself under `#![deny(unsafe_code)]`
+   since `std::env::set_var` is `unsafe` in edition 2024).
+3. **Blockers before that flip:** (a) the corpus is 2 distinct audios (jfk +
+   track01) — extend to >=5 (multi-speaker, noisy, accented) and re-run the gate;
+   (b) tiny.en cannot be certified until its long-form tail-drop is fixed.
+   Tracked in bd-bcm7.
+
+AGENT_NAME=cc_fw. Default binary unchanged (gate OFF); conformance unaffected.
+
+---
 ## 2026-07-09 EDT / 2026-07-10 UTC - cod_fw: RESOLVED prior encoder-int8 default-on blocker for calibrated shapes; noisy timing arm NOT a ratchet
 
 **What changed.** The previous cod_fw "do not flip" condition for the
