@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **ENCODER / mel / VAD lane — constant-recompute hunt EXHAUSTED (all cached/hoisted); no fresh byte-exact lever. SURFACE.** (This session's SDPA ship — poly-exp default-on for turbo, `94714c1` — is the lane's recent landed win.)
+
+Profile-first on the cc lane (encoder / mel / VAD, NOT decode/kv-cache) for the one open pattern my
+memory flagged: *"hunt other constant-tensor recompute in hot paths"* (the conv-weight-pretranspose
+win, [[project_conv_wt_pretranspose_landed]]). **All constant recompute is already eliminated:**
+
+- **Encoder weight transposes** — hoisted to LOAD: `load_linear_transposed` + `nn::transpose_serial`
+  for conv1/conv2 run once in `Encoder::from_ggml`, not per window.
+- **mel FFT twiddles** — `cached_fft_twiddles()` (`OnceLock<FftTwiddles>`, built once, shared
+  read-only across mel workers); `DftTable::build(n)` runs once, not per frame.
+- **mel hann window** — `cached_hann_window()` (`OnceLock`, built once).
+- The mel FFT is already SIMD (`dft_simd8`, `radix5_dft_simd8`, `fft_twoforone`) and the cfft arena
+  landed (−10.6% mel instr, [[project_tiny_component_attribution]]); mel is <0.3% e2e and a franken WIN.
+
+**Rest of the lane (unchanged, all closed):** encoder non-GEMM — LayerNorm is compute-bound f64 SoA
+*and a faithfulness feature* (more precise than ggml, byte-exact speedup blocked by f64 sum order);
+residual `add_in_place` parallelization a wash (serial); conv delegates to external sgemm (im2col
+reshape audited). **VAD is bridge-only** — no native implementation, zero franken perf surface. The
+big encoder frames (i7 int8 GEMM ~28%) are cod's; the SDPA (mine) just had its exp shipped.
+
+**SURFACE.** No fresh byte-exact lever in encoder/mel/VAD that clears the median null floor. The
+lane is not idle — poly-exp for turbo shipped this session (`94714c1`, 1.0722× e2e). The remaining
+encoder gains are cross-lane/owner/hardware (closure map `b4629f3`): cod's M4×N4 i7 tile (~1.4-1.6×,
+the ~28% frame), the external-sgemm `gemm`-swap (~3% e2e, owner dep + WER gate), GPU/VNNI.
+
+AGENT_NAME=cc_fw. No source changed (profile + code-read audit). No build; disk 76 G; nothing
+stashed/deleted; `nn.rs`/decode/kv-cache are cod_fw's, untouched.
+
+---
 ## 2026-07-10 - cc_fw: **SHIPPED — FT_SDPA_POLY_EXP default-on for large-v3-turbo (franken `94714c1`, bd-bcm7 CLOSED).** The convergence loop's one qualifying lever, owner-authorized and landed.
 
 The byte-exact CPU survey converged to REJECT (BR/flat-par inside the null floor). The single lever
