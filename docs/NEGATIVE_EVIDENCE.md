@@ -4,6 +4,112 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **FT_SDPA_POLY_EXP GATE RUN — turbo transcript BYTE-IDENTICAL 3/3, WER ON ≤ OFF on BOTH models, e2e turbo 1.0722× (cv 0.8%, 5/5 paired wins). PROPOSE DEFAULT-ON FOR large-v3-turbo.** Plus: **the non-GEMM residual lane is EMPTY (numbers below) — stop mining it.** Plus: **the README's "~90% of the encoder is external f32 sgemm, irreducible in-crate" is now MEASURED FALSE for turbo.**
+
+**PROVENANCE** (frankenredis rule — 67/70 of their REJECTs carried no binary hash):
+binary `examples/e2e_probe`, **sha256 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`**,
+mtime 2026-07-10 00:47:02, profile `release-perf`. `git log -1 -- src/` = **`a997f37`**, i.e. the
+binary is built from the *current* source; nothing in `src/` has changed since. **No cargo build
+was run** — `FT_SDPA_POLY_EXP` is a runtime env read, so the whole gate runs on the prebuilt
+binary. Disk 77 G before and after. Comparator `whisper-cli` (built 2026-06-25).
+
+### 1. The blocker was never real — the gate is runnable on a prebuilt binary
+bd-bcm7 sat blocked all session on "needs a turbo transcript diff, which needs a build." It does
+not: `PROBE_DUMP_TEXT=1` + `FT_SDPA_POLY_EXP=0|1` on the existing binary is the whole gate.
+(Two traps cost me a first pass: `PROBE_DUMP_TEXT` writes to **stderr** via `eprintln!`, so
+`2>/dev/null` silently produced two empty transcripts that compared "BYTE-IDENTICAL" at
+`chars=0`. **A control that measures nothing is a bug, not a pass.** And `grep beam` matches
+**cross**beam.)
+
+### 2. TRANSCRIPT GATE (deterministic; no timing, no substrate concerns)
+| model | jfk×1 | jfk×3 | jfk×8 |
+|---|---|---|---|
+| **large-v3-turbo** | **BYTE-IDENTICAL** (124 ch) | **BYTE-IDENTICAL** (340 ch) | **BYTE-IDENTICAL** (917 ch) |
+| tiny.en | BYTE-IDENTICAL (120 ch) | BYTE-IDENTICAL (255 ch) | **DIFFERS** (540 ch) |
+
+### 3. WER PARITY GATE vs whisper.cpp (`whisper-cli -m … -f jfk_x8.wav -nt -t 32`, identical wav)
+| model | poly OFF | poly ON | Δ | verdict |
+|---|---|---|---|---|
+| large-v3-turbo | 28.977% | 28.977% | **0.000** | **PASS** (byte-identical) |
+| tiny.en | 50.299% | **49.701%** | **−0.599** | **PASS** (ON strictly closer to wc) |
+
+**Read the absolute numbers with care:** the reference is whisper.cpp on *8× repeated* audio,
+where wc emits 176 words while franken emits 227 (turbo) / 145 (tiny.en). The high absolute WER is
+an artifact of repeated-audio + wc's repeat suppression, **not** a franken faithfulness claim.
+**Only the ON-vs-OFF delta is meaningful here**, and it is ≤ 0 on both models.
+
+**Corpus limitation, stated:** `track01` could not be run — it is an `.mp3` and **there is no mp3
+decoder on this box** (no ffmpeg/sox/mpg123/librosa); the `track01_16k.wav` the earlier gate used
+is gone from `/data/tmp/blackthrush-targets/`. The prior ledgered track01 results stand unchanged:
+turbo diverged but ON was *closer* to wc (8.519 → 7.778); **tiny.en regressed (52.800 → 53.600)**.
+So tiny.en remains **uncertified**.
+
+### 4. ACCURACY / ULP BUDGET (asserted in frankentorch `d336dc58`, `sdpa_poly_exp_accuracy_budget`)
+`exp` over `[-87,0]` ≤ **1 ULP** (rel 1.192e-7) · softmax `P` max|Δ| **1.630e-9** (rel 1.552e-6) ·
+output `O = P@V` **vector** rel **1.425e-6**. The dominant error is the **lane-wise row-sum
+reduction, not the poly exp**. Do not quote `O`'s per-component rel (3.9e-4) — that is
+cancellation *in the reference*.
+
+### 5. E2E, paired and order-alternated (jfk_x8.wav = 88 s audio, 5 paired reps)
+| model | OFF (med) | ON (med) | paired-median ratio | cv | ON wins |
+|---|---|---|---|---|---|
+| **large-v3-turbo** | 8.378 s | **7.865 s** | **1.0722×** | **0.8%** | **5/5** |
+| tiny.en | 0.776 s | 0.769 s | 0.9883× | 2.7% | 2/5 (noise) |
+
+**Turbo clears the keep gate (cv 0.8% ≪ 5) and wins 5/5.** This supersedes the earlier
+"ratcheted-down ~1.04×", which was measured at box load ~40; the honest quiet-box number is
+**1.072×**. tiny.en shows nothing — its encoder is small, so `exp` is a much smaller share.
+
+**vs whisper.cpp** (`-t 32`, same wav, both totals **including model load**; franken load ≈ 1.19 s):
+turbo **9.57 s OFF / 9.06 s ON** vs wc **13.622 s** ⇒ **1.42× → 1.50×**. tiny.en ≈ 0.86 s vs
+wc 1.71 s ⇒ ~2.0×.
+
+**Self-time of the frame this removes:** `__expf_fma` = **5.86%** of e2e self-time on turbo
+(in-situ, same binary, `perf -F 299`, jfk×8). 1.0722× e2e is consistent with removing most of it.
+
+### 6. PROPOSAL — default-on for large-v3-turbo only
+Do **not** flip frankentorch's global default (shared crate, `*_bit_exact` tests, training
+consumers). Instead franken calls the **already-landed** `ft_kernel_cpu::set_sdpa_poly_exp(true)`
+(frankentorch `1fb80836`) when `calibrated_encoder_int8_model(hparams)` selects large-v3-turbo,
+kill-switch `FW_SDPA_POLY_EXP=0`; **tiny.en stays OFF** until its long-form tail-drop is fixed and
+track01 can be re-run. Evidence: transcript byte-identical 3/3, WER Δ = 0.000, e2e 1.072× at
+cv 0.8%, 5/5. The one-line change needs a build to verify ⇒ **bd-bcm7 now blocks only on that**,
+not on the gate. (franken_whisper does build+bench remotely — see the rch recipe in
+bd-rch-sync-timeout-franken-whisper-z1w4.)
+
+### 7. THE NON-GEMM RESIDUAL LANE IS EMPTY — say it once, plainly, with numbers
+In-situ turbo profile (same binary+sha, jfk×8, load amortized), self-time:
+**`mel` 0.00% · `tokenizer` 0.00% · beam-search 0.00% · KV-cache 0.00%.** The *only* franken
+frames outside GEMM/SDPA/rayon are `DecoderState::new::{closure#4}` **0.23%** and
+`Linear::dequant_to_f32_if` **0.01%**. `nn::softmax_rows` is **0.02%**.
+**There is nothing to mine in mel.rs, the tokenizer, beam search, or the KV cache on turbo. Do not
+send another agent at them.** (**cod_fw** — you own these residuals and are usage-walled until
+14:16; this is for you. Your `d3499aa` / self-K direction is consistent with this: the residual is
+not in those files.)
+
+### 8. README CORRECTION — "~90% of the encoder is external f32 sgemm" is FALSE on turbo
+Measured buckets (same profile): **franken's own i7 int8 encoder GEMM ≈ 28.2%** of e2e self-time
+(`dot_maddubs_i7_m2n4` 14.63 + `matmul_bias_i7_quantized::{closure#0}` 9.91 +
+`encoder::matmul_bias_i8::{closure#1}` 2.74 + `quantize_act_i7` 0.88) versus **external
+`matrixmultiply` sgemm 14.31%** (`sgemm_kernel` 10.26 + `gemm_loop` 4.05). Since the *default
+quality-safe int8 encoder* (`enc_attn_out_i8i32_for`, default-on for calibrated hparams) puts
+**0 f32 GEMMs per encoder layer**, the encoder's linear algebra is now **franken-owned and
+in-crate**, not external. The residual external sgemm is **SDPA's internal `sgemm_bt`/`sgemm`,
+the cross-K/V f32 projections, and the conv stem** — not the encoder MLP/attention projections.
+**The "irreducible, out-of-crate" framing is obsolete for turbo and should be corrected in the
+README/PERF_LEDGER.**
+
+### 9. CROSS-REPO LEVER (the honest form of "sgemm is out-of-crate")
+What external sgemm remains lives in **frankentorch `ft_kernel_cpu`**, and that is where I have
+already been landing GEMM work this session: `8e3e7c9d` (`F32_2D_TALL_MAX_K` 1536→8192, bit-exact,
+1.057× on turbo fc2) and `86a54f1a` (runtime tile-grid policy + a same-binary A/B harness that
+refuses to report an inadmissible ratio). **The upstream lever is real and open**, gated only on a
+host with `available_parallelism ≥ 32` (no sampled rch worker exceeds 16). That is a
+**cross-repo blocker**, not an in-crate ceiling: bd-sgemm-tile-shape-imbalance-kf1j.
+
+AGENT_NAME=cc_fw. No source changed. No cargo build, no maturin, nothing deleted, nothing stashed.
+
+---
 ## 2026-07-10 - cc_fw: **FULL large-v3-turbo e2e PROFILE (ranked frame table)** — **mel / tokenizer / beam-search / KV-cache are ALL < 0.25% self-time: those avenues are measured-dead.** The top owned frame is the **i7 int8 encoder GEMM at ~28%** — and **I MUST CORRECT MY OWN AUDIT: I claimed it was 0% self-time in the default engine. It is DEFAULT-ON for turbo.** The two do-not-retry rows gating it have substrate-invalid ratios ⇒ **both REOPENED.**
 
 **Method.** `perf record -F 299` (flat; no call-graph needed for self-time) on the prebuilt
