@@ -391,11 +391,19 @@ impl EncoderWeights {
         // `transpose_serial([Cout, Cin*K])` is bit-identical to conv1d's inline transpose.
         let conv1_patch = n_mels * CONV_K;
         let conv1_raw = load_shaped(model, "encoder.conv1.weight", &[n_state, n_mels, CONV_K])?;
-        let conv1_wt = Mat::from_vec(conv1_patch, n_state, nn::transpose_serial(&conv1_raw, n_state, conv1_patch));
+        let conv1_wt = Mat::from_vec(
+            conv1_patch,
+            n_state,
+            nn::transpose_serial(&conv1_raw, n_state, conv1_patch),
+        );
         let conv1_b = load_vec(model, "encoder.conv1.bias", n_state)?;
         let conv2_patch = n_state * CONV_K;
         let conv2_raw = load_shaped(model, "encoder.conv2.weight", &[n_state, n_state, CONV_K])?;
-        let conv2_wt = Mat::from_vec(conv2_patch, n_state, nn::transpose_serial(&conv2_raw, n_state, conv2_patch));
+        let conv2_wt = Mat::from_vec(
+            conv2_patch,
+            n_state,
+            nn::transpose_serial(&conv2_raw, n_state, conv2_patch),
+        );
         let conv2_b = load_vec(model, "encoder.conv2.bias", n_state)?;
 
         // Positional embedding: file tensor [n_ctx, n_state], used verbatim.
@@ -496,13 +504,15 @@ impl EncoderWeights {
                 l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
             });
-        } else if super::enc_attn_out_i8i32() {
+        } else if super::enc_attn_out_i8i32_for(&model.hparams) {
             // FULL quality-safe int8: q/k/v/fc1/fc2 through the fast i7 maddubs
             // (each individually proven proper-noun-safe), and the residual-feeding
             // attn.out through the FULL-i8 i32-accumulate GEMM (the 1 extra weight
             // bit vs i7 preserves proper nouns where i7 maddubs mangles them). This
             // yields 0 f32 GEMMs/layer — the fast non-monotonic-mix state — at
-            // proven-safe quality. `FW_ENC_ATTN_OUT_I8I32`, default OFF.
+            // proven-safe quality. Default-on only for calibrated model hparams;
+            // unknown models and non-AVX2 builds deterministically keep f32.
+            // `FW_ENC_ATTN_OUT_I8I32=0` is the kill switch, `=1` forces probes.
             layers.par_iter_mut().for_each(|l| {
                 l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
                 l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
@@ -654,8 +664,18 @@ thread_local! {
     static ENC_PROF: std::cell::RefCell<[u128; 12]> = const { std::cell::RefCell::new([0; 12]) };
 }
 const ENC_PROF_LABELS: [&str; 12] = [
-    "conv_stem", "pos_emb", "attn_ln", "qkv_proj", "attn_sdpa", "attn_out",
-    "attn_resid", "mlp_ln", "mlp_fc", "gelu", "mlp_proj", "mlp_resid",
+    "conv_stem",
+    "pos_emb",
+    "attn_ln",
+    "qkv_proj",
+    "attn_sdpa",
+    "attn_out",
+    "attn_resid",
+    "mlp_ln",
+    "mlp_fc",
+    "gelu",
+    "mlp_proj",
+    "mlp_resid",
 ];
 fn enc_prof_add(i: usize, ns: u128) {
     ENC_PROF.with(|p| p.borrow_mut()[i] += ns);
@@ -681,18 +701,14 @@ fn forward_time_major(
     }
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
     let x = et!(0, {
-        let mut x = nn::conv1d_wt(
-            &x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
-        )?;
+        let mut x = nn::conv1d_wt(&x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD)?;
         nn::gelu(&mut x);
         x
     });
 
     // conv2 (stride 2): [3000, n_state] -> [1500, n_state], +gelu.
     let mut x = et!(0, {
-        let mut x = nn::conv1d_wt(
-            &x, &w.conv2_wt, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
-        )?;
+        let mut x = nn::conv1d_wt(&x, &w.conv2_wt, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD)?;
         nn::gelu(&mut x);
         x
     });
@@ -719,7 +735,9 @@ fn forward_time_major(
         // layer-pruning, default = all layers (byte-identical). If a truncated
         // depth keeps the transcript within conformance it is a direct encoder
         // FLOP win (≈ pruned_layers / n_layers of the block stack).
-        let n_run = encoder_layer_limit().unwrap_or(w.layers.len()).min(w.layers.len());
+        let n_run = encoder_layer_limit()
+            .unwrap_or(w.layers.len())
+            .min(w.layers.len());
         for layer in w.layers.iter().take(n_run) {
             encoder_block(&mut x, layer, w.n_head)?;
             checkpoint()?;
@@ -737,11 +755,19 @@ fn forward_time_major(
             for (i, lbl) in ENC_PROF_LABELS.iter().enumerate() {
                 if a[i] > 0 {
                     let ms = a[i] as f64 / 1e6;
-                    let pct = if total > 0 { a[i] as f64 / total as f64 * 100.0 } else { 0.0 };
+                    let pct = if total > 0 {
+                        a[i] as f64 / total as f64 * 100.0
+                    } else {
+                        0.0
+                    };
                     eprintln!("  {lbl:<12} {ms:>8.1} ms  {pct:>5.1}%");
                 }
             }
-            eprintln!("  {:<12} {:>8.1} ms (encoder sub-op total)", "SUM", total as f64 / 1e6);
+            eprintln!(
+                "  {:<12} {:>8.1} ms (encoder sub-op total)",
+                "SUM",
+                total as f64 / 1e6
+            );
         });
         ENC_PROF.with(|p| *p.borrow_mut() = [0; 12]);
         // Split attn_sdpa into gather / kernel / scatter (sum over layers).
@@ -857,12 +883,8 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
                     b2: &l.mlp_proj_b,
                 })
                 .collect();
-            match ft_kernel_metal::fused::EncoderGpu::new(
-                w.n_state,
-                w.n_head,
-                w.n_state * 4,
-                &refs,
-            ) {
+            match ft_kernel_metal::fused::EncoderGpu::new(w.n_state, w.n_head, w.n_state * 4, &refs)
+            {
                 Ok(enc) => {
                     guard.insert(key, Arc::new(enc));
                 }
@@ -1006,12 +1028,7 @@ fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
 /// was built at load (`FRANKEN_WHISPER_ENC_INT8=1`), else the f32 sgemm. The
 /// default (no i7) path is byte-identical to the pre-lever encoder.
 #[inline]
-fn enc_linear(
-    x: &Mat,
-    w_t: &Mat,
-    w_i7: &Option<nn::I7Mat>,
-    bias: Option<&[f32]>,
-) -> FwResult<Mat> {
+fn enc_linear(x: &Mat, w_t: &Mat, w_i7: &Option<nn::I7Mat>, bias: Option<&[f32]>) -> FwResult<Mat> {
     match w_i7 {
         Some(w) => nn::matmul_bias_i7(x, w, bias),
         None => match super::enc_act_roundtrip() {
@@ -1060,7 +1077,12 @@ fn quantize_enc_i8(w_t: &Mat) -> EncI8Mat {
                 *d = (w_t.data[i * out + o] * inv).round().clamp(-127.0, 127.0) as i8;
             }
         });
-    EncI8Mat { data, scale, inp, out }
+    EncI8Mat {
+        data,
+        scale,
+        inp,
+        out,
+    }
 }
 
 /// AVX2 i8×i8 → i32 dot (vpmovsxbw + vpmaddwd, 2 accumulators; sign-extend both
@@ -1187,8 +1209,14 @@ fn dot_i8_m4n2(x0: &[i8], x1: &[i8], x2: &[i8], x3: &[i8], w0: &[i8], w1: &[i8])
 #[inline]
 fn dot_i8_m4n2(x0: &[i8], x1: &[i8], x2: &[i8], x3: &[i8], w0: &[i8], w1: &[i8]) -> [i32; 8] {
     [
-        dot_i8_enc(w0, x0), dot_i8_enc(w0, x1), dot_i8_enc(w0, x2), dot_i8_enc(w0, x3),
-        dot_i8_enc(w1, x0), dot_i8_enc(w1, x1), dot_i8_enc(w1, x2), dot_i8_enc(w1, x3),
+        dot_i8_enc(w0, x0),
+        dot_i8_enc(w0, x1),
+        dot_i8_enc(w0, x2),
+        dot_i8_enc(w0, x3),
+        dot_i8_enc(w1, x0),
+        dot_i8_enc(w1, x1),
+        dot_i8_enc(w1, x2),
+        dot_i8_enc(w1, x3),
     ]
 }
 
@@ -1229,54 +1257,56 @@ fn matmul_bias_i8(x: &Mat, w: &EncI8Mat, bias: Option<&[f32]>) -> FwResult<Mat> 
     // (dot_i8_m4n2). Partial row-blocks / the odd final weight row fall back to the
     // per-element dot_i8_enc. Bit-identical to the per-element order (assoc. i32 add).
     let mut c = vec![0.0f32; m * out];
-    c.par_chunks_mut(4 * out).enumerate().for_each(|(blk, cblk)| {
-        let r0 = blk * 4;
-        let rows = (m - r0).min(4);
-        if rows == 4 {
-            let x0 = &xq[r0 * inp..(r0 + 1) * inp];
-            let x1 = &xq[(r0 + 1) * inp..(r0 + 2) * inp];
-            let x2 = &xq[(r0 + 2) * inp..(r0 + 3) * inp];
-            let x3 = &xq[(r0 + 3) * inp..(r0 + 4) * inp];
-            let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
-            let mut o = 0;
-            while o + 2 <= out {
-                let w0 = &w.data[o * inp..(o + 1) * inp];
-                let w1 = &w.data[(o + 1) * inp..(o + 2) * inp];
-                let raw = dot_i8_m4n2(x0, x1, x2, x3, w0, w1);
-                let (sc0, sc1) = (w.scale[o], w.scale[o + 1]);
-                let (bo0, bo1) = bias.map_or((0.0, 0.0), |b| (b[o], b[o + 1]));
-                cblk[o] = raw[0] as f32 * s0 * sc0 + bo0;
-                cblk[out + o] = raw[1] as f32 * s1 * sc0 + bo0;
-                cblk[2 * out + o] = raw[2] as f32 * s2 * sc0 + bo0;
-                cblk[3 * out + o] = raw[3] as f32 * s3 * sc0 + bo0;
-                cblk[o + 1] = raw[4] as f32 * s0 * sc1 + bo1;
-                cblk[out + o + 1] = raw[5] as f32 * s1 * sc1 + bo1;
-                cblk[2 * out + o + 1] = raw[6] as f32 * s2 * sc1 + bo1;
-                cblk[3 * out + o + 1] = raw[7] as f32 * s3 * sc1 + bo1;
-                o += 2;
-            }
-            while o < out {
-                let wr = &w.data[o * inp..(o + 1) * inp];
-                let (sc, bo) = (w.scale[o], bias.map_or(0.0, |b| b[o]));
-                cblk[o] = dot_i8_enc(wr, x0) as f32 * s0 * sc + bo;
-                cblk[out + o] = dot_i8_enc(wr, x1) as f32 * s1 * sc + bo;
-                cblk[2 * out + o] = dot_i8_enc(wr, x2) as f32 * s2 * sc + bo;
-                cblk[3 * out + o] = dot_i8_enc(wr, x3) as f32 * s3 * sc + bo;
-                o += 1;
-            }
-        } else {
-            for o in 0..out {
-                let wr = &w.data[o * inp..(o + 1) * inp];
-                let sc = w.scale[o];
-                let bo = bias.map_or(0.0, |b| b[o]);
-                for j in 0..rows {
-                    let r = r0 + j;
-                    let xr = &xq[r * inp..(r + 1) * inp];
-                    cblk[j * out + o] = dot_i8_enc(wr, xr) as f32 * sa[r] * sc + bo;
+    c.par_chunks_mut(4 * out)
+        .enumerate()
+        .for_each(|(blk, cblk)| {
+            let r0 = blk * 4;
+            let rows = (m - r0).min(4);
+            if rows == 4 {
+                let x0 = &xq[r0 * inp..(r0 + 1) * inp];
+                let x1 = &xq[(r0 + 1) * inp..(r0 + 2) * inp];
+                let x2 = &xq[(r0 + 2) * inp..(r0 + 3) * inp];
+                let x3 = &xq[(r0 + 3) * inp..(r0 + 4) * inp];
+                let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
+                let mut o = 0;
+                while o + 2 <= out {
+                    let w0 = &w.data[o * inp..(o + 1) * inp];
+                    let w1 = &w.data[(o + 1) * inp..(o + 2) * inp];
+                    let raw = dot_i8_m4n2(x0, x1, x2, x3, w0, w1);
+                    let (sc0, sc1) = (w.scale[o], w.scale[o + 1]);
+                    let (bo0, bo1) = bias.map_or((0.0, 0.0), |b| (b[o], b[o + 1]));
+                    cblk[o] = raw[0] as f32 * s0 * sc0 + bo0;
+                    cblk[out + o] = raw[1] as f32 * s1 * sc0 + bo0;
+                    cblk[2 * out + o] = raw[2] as f32 * s2 * sc0 + bo0;
+                    cblk[3 * out + o] = raw[3] as f32 * s3 * sc0 + bo0;
+                    cblk[o + 1] = raw[4] as f32 * s0 * sc1 + bo1;
+                    cblk[out + o + 1] = raw[5] as f32 * s1 * sc1 + bo1;
+                    cblk[2 * out + o + 1] = raw[6] as f32 * s2 * sc1 + bo1;
+                    cblk[3 * out + o + 1] = raw[7] as f32 * s3 * sc1 + bo1;
+                    o += 2;
+                }
+                while o < out {
+                    let wr = &w.data[o * inp..(o + 1) * inp];
+                    let (sc, bo) = (w.scale[o], bias.map_or(0.0, |b| b[o]));
+                    cblk[o] = dot_i8_enc(wr, x0) as f32 * s0 * sc + bo;
+                    cblk[out + o] = dot_i8_enc(wr, x1) as f32 * s1 * sc + bo;
+                    cblk[2 * out + o] = dot_i8_enc(wr, x2) as f32 * s2 * sc + bo;
+                    cblk[3 * out + o] = dot_i8_enc(wr, x3) as f32 * s3 * sc + bo;
+                    o += 1;
+                }
+            } else {
+                for o in 0..out {
+                    let wr = &w.data[o * inp..(o + 1) * inp];
+                    let sc = w.scale[o];
+                    let bo = bias.map_or(0.0, |b| b[o]);
+                    for j in 0..rows {
+                        let r = r0 + j;
+                        let xr = &xq[r * inp..(r + 1) * inp];
+                        cblk[j * out + o] = dot_i8_enc(wr, xr) as f32 * sa[r] * sc + bo;
+                    }
                 }
             }
-        }
-    });
+        });
     Ok(Mat::from_vec(m, out, c))
 }
 
@@ -1345,7 +1375,12 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
         if let Some(w8) = &layer.attn_out_i8 {
             matmul_bias_i8(&attn, w8, Some(&layer.attn_out_b))?
         } else {
-            enc_linear(&attn, &layer.attn_out_w, &layer.attn_out_i7, Some(&layer.attn_out_b))?
+            enc_linear(
+                &attn,
+                &layer.attn_out_w,
+                &layer.attn_out_i7,
+                Some(&layer.attn_out_b),
+            )?
         }
     );
     et!(6, add_in_place(x, &attn));
@@ -1358,10 +1393,16 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     // `matmul_bias_i7_gelu` path folds GELU into fc2's quant and needs the bias
     // already in `h`, so it is excluded. Byte-identical.
     let int8_gelu_path = super::enc_gelu_fused() && layer.mlp_proj_i7.is_some();
-    let fuse_fc_bias =
-        !int8_gelu_path && layer.mlp_fc_i7.is_none() && fc_bias_gelu_fused_enabled();
-    let fc_bias: Option<&[f32]> = if fuse_fc_bias { None } else { Some(&layer.mlp_fc_b) };
-    let mut h = et!(8, enc_linear(&h, &layer.mlp_fc_w, &layer.mlp_fc_i7, fc_bias)?);
+    let fuse_fc_bias = !int8_gelu_path && layer.mlp_fc_i7.is_none() && fc_bias_gelu_fused_enabled();
+    let fc_bias: Option<&[f32]> = if fuse_fc_bias {
+        None
+    } else {
+        Some(&layer.mlp_fc_b)
+    };
+    let mut h = et!(
+        8,
+        enc_linear(&h, &layer.mlp_fc_w, &layer.mlp_fc_i7, fc_bias)?
+    );
     // GELU-into-fc2-quant fusion: when fc2 is the int8 maddubs path, fold the
     // GELU into the activation quant so the big `[1500, 5120]` GELU'd buffer is
     // never materialized (byte-identical; see `super::enc_gelu_fused`). Otherwise
@@ -1382,9 +1423,15 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
         } else {
             et!(9, nn::gelu(&mut h));
         }
-        let proj_bias: Option<&[f32]> =
-            if fuse_proj_bias { None } else { Some(&layer.mlp_proj_b) };
-        et!(10, enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, proj_bias)?)
+        let proj_bias: Option<&[f32]> = if fuse_proj_bias {
+            None
+        } else {
+            Some(&layer.mlp_proj_b)
+        };
+        et!(
+            10,
+            enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, proj_bias)?
+        )
     };
     if fuse_proj_bias {
         et!(11, nn::add_bias_residual(x, &h, &layer.mlp_proj_b));
@@ -1716,6 +1763,174 @@ mod tests {
             .map(|s| s as f32 / max)
             .collect();
         Some(samples)
+    }
+
+    fn dequant_i8_for_test(w: &EncI8Mat) -> Mat {
+        let mut data = vec![0.0f32; w.inp * w.out];
+        for o in 0..w.out {
+            let row = &w.data[o * w.inp..(o + 1) * w.inp];
+            for (i, &q) in row.iter().enumerate() {
+                data[i * w.out + o] = f32::from(q) * w.scale[o];
+            }
+        }
+        Mat::from_vec(w.inp, w.out, data)
+    }
+
+    fn quant_error(original: &Mat, dequant: &Mat) -> (f64, f64) {
+        assert_eq!(original.rows, dequant.rows);
+        assert_eq!(original.cols, dequant.cols);
+        let mut sum_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        let mut max_abs = 0.0f64;
+        let mut ref_amax = 0.0f64;
+        for (&a, &b) in original.data.iter().zip(&dequant.data) {
+            let a = f64::from(a);
+            let b = f64::from(b);
+            let d = (a - b).abs();
+            sum_sq += d * d;
+            ref_sq += a * a;
+            max_abs = max_abs.max(d);
+            ref_amax = ref_amax.max(a.abs());
+        }
+        let rel_rmse = (sum_sq / ref_sq.max(1e-24)).sqrt();
+        let max_abs_over_amax = max_abs / ref_amax.max(1e-12);
+        (rel_rmse, max_abs_over_amax)
+    }
+
+    fn assert_quant_budget(
+        model: &str,
+        layer: usize,
+        matrix: &str,
+        original: &Mat,
+        dequant: &Mat,
+        max_rel_rmse: f64,
+        max_abs_over_amax: f64,
+    ) {
+        let (rel_rmse, max_abs) = quant_error(original, dequant);
+        eprintln!(
+            "{model} layer={layer:02} {matrix:<12} rel_rmse={rel_rmse:.6} max_abs/amax={max_abs:.6}"
+        );
+        assert!(
+            rel_rmse <= max_rel_rmse,
+            "{model} layer {layer} {matrix} rel_rmse {rel_rmse:.6} exceeds {max_rel_rmse:.6}"
+        );
+        assert!(
+            max_abs <= max_abs_over_amax,
+            "{model} layer {layer} {matrix} max_abs/amax {max_abs:.6} exceeds {max_abs_over_amax:.6}"
+        );
+    }
+
+    fn assert_quality_safe_int8_error_budget(model_name: &str) {
+        let Some(path) = find_model_file(model_name) else {
+            eprintln!("SKIP {model_name} encoder-int8 budget: model missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load model");
+        let decision = crate::native_engine::encoder_int8_policy_decision(&model.hparams);
+        if !decision.enabled() {
+            eprintln!(
+                "SKIP {model_name} encoder-int8 budget: policy reason={}",
+                decision.reason
+            );
+            return;
+        }
+
+        let weights = EncoderWeights::from_ggml(&model).expect("encoder weights");
+        assert_eq!(
+            weights.layers.len(),
+            model.hparams.n_audio_layer as usize,
+            "loaded all encoder layers"
+        );
+
+        for (idx, layer) in weights.layers.iter().enumerate() {
+            let attn_q =
+                nn::dequant_i7_for_test(layer.attn_q_i7.as_ref().expect("quality-safe q i7"));
+            let attn_k =
+                nn::dequant_i7_for_test(layer.attn_k_i7.as_ref().expect("quality-safe k i7"));
+            let attn_v =
+                nn::dequant_i7_for_test(layer.attn_v_i7.as_ref().expect("quality-safe v i7"));
+            let mlp_fc =
+                nn::dequant_i7_for_test(layer.mlp_fc_i7.as_ref().expect("quality-safe fc1 i7"));
+            let mlp_proj =
+                nn::dequant_i7_for_test(layer.mlp_proj_i7.as_ref().expect("quality-safe fc2 i7"));
+            let attn_out = dequant_i8_for_test(
+                layer
+                    .attn_out_i8
+                    .as_ref()
+                    .expect("quality-safe attn.out i8"),
+            );
+            assert!(
+                layer.attn_out_i7.is_none(),
+                "quality-safe policy must not use the rejected all-i7 attn.out path"
+            );
+
+            let max_i7_abs = 0.035;
+            let max_i8_abs = 0.012;
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_q_i7",
+                &layer.attn_q_w,
+                &attn_q,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_k_i7",
+                &layer.attn_k_w,
+                &attn_k,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_v_i7",
+                &layer.attn_v_w,
+                &attn_v,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "mlp_fc_i7",
+                &layer.mlp_fc_w,
+                &mlp_fc,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "mlp_proj_i7",
+                &layer.mlp_proj_w,
+                &mlp_proj,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_out_i8",
+                &layer.attn_out_w,
+                &attn_out,
+                decision.quant_rel_rmse_budget * 0.55,
+                max_i8_abs,
+            );
+        }
+    }
+
+    #[test]
+    fn real_tiny_en_quality_safe_int8_per_layer_error_budget() {
+        assert_quality_safe_int8_error_budget("tiny.en");
+    }
+
+    #[test]
+    fn real_large_v3_turbo_quality_safe_int8_per_layer_error_budget() {
+        assert_quality_safe_int8_error_budget("large-v3-turbo");
     }
 
     // ── gated real-model test (skips when tiny.en is absent) ──

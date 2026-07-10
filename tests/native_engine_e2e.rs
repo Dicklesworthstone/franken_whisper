@@ -100,6 +100,10 @@ fn tiny_en_available() -> bool {
     franken_whisper::native_engine::find_model_file("tiny.en").is_some()
 }
 
+fn large_v3_turbo_available() -> bool {
+    franken_whisper::native_engine::find_model_file("large-v3-turbo").is_some()
+}
+
 /// Outcome of a CLI transcribe subprocess: the parsed JSON report plus the raw
 /// streams and exit status (so error-path tests can inspect all three).
 struct CliRun {
@@ -135,6 +139,15 @@ fn run_transcribe(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) 
     cmd.arg("transcribe");
     cmd.args(args);
     cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
+    for key in [
+        "FRANKEN_WHISPER_ENC_INT8",
+        "FW_ENC_ATTN_OUT_I8I32",
+        "FW_ENC_INT8_ATTN_IN",
+        "FW_ENC_INT8_FC1",
+        "FW_ENC_WEIGHT_ROUNDTRIP",
+    ] {
+        cmd.env_remove(key);
+    }
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -185,10 +198,79 @@ fn assert_reference_wer_at_or_below(report: &Value, max_wer: f64, scenario: &str
     let produced = normalize_ws(report["result"]["transcript"].as_str().unwrap_or_default());
     let reference = reference_transcript();
     let wer = word_error_rate(&reference, &produced);
+    eprintln!("{scenario} wer={wer:.4} gate={max_wer:.4}");
     assert!(
         wer <= max_wer,
         "{scenario} WER {wer:.4} exceeds gate {max_wer:.4}\nREFERENCE: {reference}\nPRODUCED:  {produced}"
     );
+}
+
+fn fixture_json_text(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let json: Value =
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    if let Some(text) = json["text"].as_str() {
+        return normalize_ws(text);
+    }
+    let segments = json["segments"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{} missing text and segments", path.display()));
+    normalize_ws(
+        &segments
+            .iter()
+            .map(|seg| seg["text"].as_str().unwrap_or_default().trim())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+#[test]
+fn whisper_cpp_full_paired_fixture_corpus_wer_delta_budget() {
+    let golden = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/golden"
+    ));
+    let mut pairs = Vec::new();
+    for entry in std::fs::read_dir(&golden).expect("read golden fixture dir") {
+        let path = entry.expect("dir entry").path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("whisper_cpp_")
+            || !name.ends_with("_output.json")
+            || name.ends_with("_native_output.json")
+        {
+            continue;
+        }
+        let native_name = name.replace("_output.json", "_native_output.json");
+        let native = golden.join(native_name);
+        if native.is_file() {
+            pairs.push((path, native));
+        }
+    }
+    pairs.sort();
+    assert!(
+        pairs.len() >= 8,
+        "expected the full paired whisper.cpp fixture corpus, got {} pairs",
+        pairs.len()
+    );
+
+    for (reference_path, native_path) in pairs {
+        let reference = fixture_json_text(&reference_path);
+        let native = fixture_json_text(&native_path);
+        let wer = word_error_rate(&reference, &native);
+        eprintln!(
+            "fixture_corpus pair={} native={} wer_delta={wer:.4}",
+            reference_path.file_name().unwrap().to_string_lossy(),
+            native_path.file_name().unwrap().to_string_lossy()
+        );
+        assert!(
+            wer <= 0.0,
+            "fixture corpus WER drift {wer:.4}: {} vs {}",
+            reference_path.display(),
+            native_path.display()
+        );
+    }
 }
 
 // ===========================================================================
@@ -323,6 +405,130 @@ fn gated_quality_safe_encoder_int8_jfk_reference_wer_gate() {
         "quality-safe encoder-int8 gate must run the native implementation"
     );
     assert_eq!(payload["execution_mode"], "native_only");
+}
+
+#[test]
+fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_default_encoder_int8_policy_jfk_reference_wer_gate: tiny.en model missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        // Keep the rejected all-i7 owner gate off; the quality-safe arm is now
+        // selected by the default policy, not by FW_ENC_ATTN_OUT_I8I32.
+        ("FRANKEN_WHISPER_ENC_INT8", "0"),
+    ];
+    env.extend(bridge_bins_missing());
+
+    let run = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            "tiny.en",
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+
+    assert!(
+        run.status.success(),
+        "default encoder-int8 native run failed\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    let report = run.report();
+
+    assert_reference_wer_at_or_below(&report, 0.0, "default encoder-int8 JFK");
+    let produced = normalize_ws(report["result"]["transcript"].as_str().unwrap_or_default());
+    assert!(
+        !produced.to_lowercase().contains("frank at"),
+        "default quality-safe int8 must not emit the known all-i7 adversarial phrase: {produced}"
+    );
+    assert_eq!(
+        report["result"]["raw_output"]["encoder_int8_policy"]["action"],
+        "quality_safe_int8"
+    );
+    assert_eq!(
+        report["result"]["raw_output"]["encoder_int8_policy"]["reason"],
+        "calibrated_model_budget_pass"
+    );
+
+    let payload = backend_ok_payload(&report);
+    assert_eq!(
+        payload["implementation"], "native",
+        "default encoder-int8 policy gate must run the native implementation"
+    );
+    assert_eq!(payload["execution_mode"], "native_only");
+}
+
+#[test]
+fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
+    if !large_v3_turbo_available() {
+        eprintln!(
+            "SKIP gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe: large-v3-turbo model missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        ("FRANKEN_WHISPER_ENC_INT8", "0"),
+    ];
+    env.extend(bridge_bins_missing());
+
+    let run = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            "large-v3-turbo",
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+
+    assert!(
+        run.status.success(),
+        "large-v3-turbo default encoder-int8 native run failed\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    let report = run.report();
+    assert_reference_wer_at_or_below(&report, 0.05, "large-v3-turbo default encoder-int8 JFK");
+    let produced = normalize_ws(report["result"]["transcript"].as_str().unwrap_or_default());
+    for sentinel in ["fellow americans", "ask not", "country"] {
+        assert!(
+            produced.to_lowercase().contains(sentinel),
+            "large-v3-turbo adversarial sentinel `{sentinel}` missing from: {produced}"
+        );
+    }
+    assert!(
+        !produced.to_lowercase().contains("frank at"),
+        "large-v3-turbo default quality-safe int8 must not emit known all-i7 phrase: {produced}"
+    );
+    assert_eq!(
+        report["result"]["raw_output"]["encoder_int8_policy"]["action"],
+        "quality_safe_int8"
+    );
 }
 
 // ===========================================================================

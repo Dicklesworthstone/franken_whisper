@@ -548,6 +548,7 @@ pub fn run(
         &spec,
         &model_path,
         version_tag,
+        native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
         &output.windows,
         word_mode,
         request.backend_params.split_on_word,
@@ -875,6 +876,7 @@ fn raw_output_json(
     spec: &str,
     model_path: &Path,
     version_tag: String,
+    encoder_policy: native_engine::EncoderInt8PolicyDecision,
     windows: &[decode::WindowStats],
     word_mode: WordTimestampMode,
     split_on_word: bool,
@@ -909,6 +911,16 @@ fn raw_output_json(
         "model": spec,
         "model_path": model_path.display().to_string(),
         "model_version_tag": version_tag,
+        "encoder_int8_policy": {
+            "action": match encoder_policy.action {
+                native_engine::EncoderInt8PolicyAction::F32Encoder => "f32",
+                native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
+            },
+            "reason": encoder_policy.reason,
+            "calibration_id": encoder_policy.calibration_id,
+            "corpus_wer_delta_budget": encoder_policy.corpus_wer_delta_budget,
+            "quant_rel_rmse_budget": encoder_policy.quant_rel_rmse_budget,
+        },
         "windows": windows_json,
         "word_timestamps": word_timestamps,
     })
@@ -1358,12 +1370,23 @@ mod tests {
         );
     }
 
+    fn f32_encoder_policy_fixture() -> native_engine::EncoderInt8PolicyDecision {
+        native_engine::EncoderInt8PolicyDecision {
+            action: native_engine::EncoderInt8PolicyAction::F32Encoder,
+            reason: "unit_test_fixture",
+            calibration_id: native_engine::ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: 0.0,
+            quant_rel_rmse_budget: 0.09,
+        }
+    }
+
     #[test]
     fn raw_output_word_flag_is_interpolated_when_requested() {
         let json = raw_output_json(
             "tiny.en",
             Path::new("/models/ggml-tiny.en.bin"),
             "fw-native-v1+sha256:abc".to_owned(),
+            f32_encoder_policy_fixture(),
             &[],
             WordTimestampMode::Word,
             false,
@@ -1382,6 +1405,7 @@ mod tests {
             "tiny.en",
             Path::new("/models/ggml-tiny.en.bin"),
             "fw-native-v1+sha256:abc".to_owned(),
+            f32_encoder_policy_fixture(),
             &[],
             WordTimestampMode::Word,
             false,

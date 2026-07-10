@@ -348,7 +348,10 @@ pub(crate) fn enc_int8_fc1_only() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            std::env::var("FW_ENC_INT8_FC1").ok().as_deref().map(str::trim),
+            std::env::var("FW_ENC_INT8_FC1")
+                .ok()
+                .as_deref()
+                .map(str::trim),
             Some("1" | "on" | "true" | "yes")
         )
     })
@@ -367,7 +370,10 @@ pub(crate) fn enc_int8_attn_in() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            std::env::var("FW_ENC_INT8_ATTN_IN").ok().as_deref().map(str::trim),
+            std::env::var("FW_ENC_INT8_ATTN_IN")
+                .ok()
+                .as_deref()
+                .map(str::trim),
             Some("1" | "on" | "true" | "yes")
         )
     })
@@ -392,14 +398,141 @@ pub(crate) fn enc_int8_attn_in() -> bool {
 /// pessimum only bites at exactly 1 f32 GEMM) ⇒ **1.47× encoder_window** (jfk×3
 /// window-1, min-of-5) vs f32, beating the prior quality-safe max `attn_in` (1.23×)
 /// by ~20% at equal proper-noun fidelity. Owner-gated (non-byte-exact); default off.
-pub(crate) fn enc_attn_out_i8i32() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("FW_ENC_ATTN_OUT_I8I32").ok().as_deref().map(str::trim),
-            Some("1" | "on" | "true" | "yes")
-        )
+pub(crate) const ENCODER_INT8_CALIBRATION_ID: &str = "encoder-int8-calibration-2026-07-10";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncoderInt8PolicyAction {
+    F32Encoder,
+    QualitySafeInt8Encoder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EncoderInt8PolicyDecision {
+    pub action: EncoderInt8PolicyAction,
+    pub reason: &'static str,
+    pub calibration_id: &'static str,
+    pub corpus_wer_delta_budget: f64,
+    pub quant_rel_rmse_budget: f64,
+}
+
+impl EncoderInt8PolicyDecision {
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        self.action == EncoderInt8PolicyAction::QualitySafeInt8Encoder
+    }
+}
+
+/// Expected-loss default policy for the quality-safe encoder int8 arm.
+///
+/// State: model hparams/family, compiled CPU feature class, calibration corpus
+/// id, per-layer quantization-error budget, fixture WER/adversarial sentinels,
+/// and the operator override. Actions: f32 encoder or quality-safe int8. Loss:
+/// false-accepting int8 with WER/proper-noun drift is high loss; falling back to
+/// f32 only pays speed. Posterior/calibration artifact:
+/// [`ENCODER_INT8_CALIBRATION_ID`] in the performance ledger. Deterministic
+/// fallback: f32 for unknown hparams or non-AVX2 builds, and f32 when the
+/// kill-switch is set.
+#[must_use]
+pub(crate) fn encoder_int8_policy_decision(hparams: &WhisperHParams) -> EncoderInt8PolicyDecision {
+    const WER_DELTA_BUDGET: f64 = 0.0;
+    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+
+    if !encoder_i8_kernel_supported() {
+        return EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::F32Encoder,
+            reason: "cpu_feature_fallback",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        };
+    }
+
+    if !calibrated_encoder_int8_model(hparams) {
+        return EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::F32Encoder,
+            reason: "uncalibrated_model_fallback",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        };
+    }
+
+    EncoderInt8PolicyDecision {
+        action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+        reason: "calibrated_model_budget_pass",
+        calibration_id: ENCODER_INT8_CALIBRATION_ID,
+        corpus_wer_delta_budget: WER_DELTA_BUDGET,
+        quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+    }
+}
+
+#[must_use]
+fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
+    let tiny_en = hparams.n_vocab == 51_864
+        && hparams.n_audio_ctx == 1_500
+        && hparams.n_audio_state == 384
+        && hparams.n_audio_head == 6
+        && hparams.n_audio_layer == 4
+        && hparams.n_text_state == 384
+        && hparams.n_text_layer == 4
+        && hparams.n_mels == 80
+        && hparams.ftype == 1;
+    let large_v3_turbo = hparams.n_vocab == 51_866
+        && hparams.n_audio_ctx == 1_500
+        && hparams.n_audio_state == 1_280
+        && hparams.n_audio_head == 20
+        && hparams.n_audio_layer == 32
+        && hparams.n_text_state == 1_280
+        && hparams.n_text_layer == 4
+        && hparams.n_mels == 128
+        && hparams.ftype == 1;
+    tiny_en || large_v3_turbo
+}
+
+#[must_use]
+fn encoder_i8_kernel_supported() -> bool {
+    cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+}
+
+fn enc_attn_out_i8i32_override() -> Option<bool> {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("FW_ENC_ATTN_OUT_I8I32") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => Some(true),
+            "0" | "off" | "false" | "no" => Some(false),
+            _ => None,
+        },
+        Err(_) => None,
     })
+}
+
+pub(crate) fn enc_attn_out_i8i32_for(hparams: &WhisperHParams) -> bool {
+    encoder_int8_effective_policy_decision(hparams).enabled()
+}
+
+#[must_use]
+pub(crate) fn encoder_int8_effective_policy_decision(
+    hparams: &WhisperHParams,
+) -> EncoderInt8PolicyDecision {
+    const WER_DELTA_BUDGET: f64 = 0.0;
+    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+    match enc_attn_out_i8i32_override() {
+        Some(true) => EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+            reason: "operator_forced_quality_safe_int8",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        },
+        Some(false) => EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::F32Encoder,
+            reason: "operator_f32_kill_switch",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        },
+        None => encoder_int8_policy_decision(hparams),
+    }
 }
 
 /// When the int8 encoder attention-input path is active (q/k/v are i7), fuse the
@@ -418,7 +551,10 @@ pub(crate) fn enc_qkv_fused() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            std::env::var("FW_ENC_QKV_FUSED").ok().as_deref().map(str::trim),
+            std::env::var("FW_ENC_QKV_FUSED")
+                .ok()
+                .as_deref()
+                .map(str::trim),
             Some("0" | "off" | "false" | "no")
         )
     })
@@ -439,7 +575,10 @@ pub(crate) fn enc_gelu_fused() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            std::env::var("FW_ENC_GELU_FUSED").ok().as_deref().map(str::trim),
+            std::env::var("FW_ENC_GELU_FUSED")
+                .ok()
+                .as_deref()
+                .map(str::trim),
             Some("0" | "off" | "false" | "no")
         )
     })
@@ -516,7 +655,10 @@ pub(crate) fn enc_ef_quant() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("FW_ENC_EF_QUANT") {
         // Kill-switch: explicit 0/off/false/no restores plain round-to-nearest int8.
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
         Err(_) => true, // default: EF on (validated strictly ≥ plain int8, zero speed cost)
     })
 }
@@ -1316,6 +1458,77 @@ mod tests {
         assert!(hp.is_multilingual());
         hp.n_vocab = 51866;
         assert!(hp.is_multilingual(), "large-v3 family (51866)");
+    }
+
+    #[test]
+    fn encoder_int8_policy_allows_calibrated_model_shapes() {
+        let tiny = WhisperHParams {
+            n_vocab: 51_864,
+            n_audio_ctx: 1_500,
+            n_audio_state: 384,
+            n_audio_head: 6,
+            n_audio_layer: 4,
+            n_text_ctx: 448,
+            n_text_state: 384,
+            n_text_head: 6,
+            n_text_layer: 4,
+            n_mels: 80,
+            ftype: 1,
+        };
+        let large_turbo = WhisperHParams {
+            n_vocab: 51_866,
+            n_audio_ctx: 1_500,
+            n_audio_state: 1_280,
+            n_audio_head: 20,
+            n_audio_layer: 32,
+            n_text_ctx: 448,
+            n_text_state: 1_280,
+            n_text_head: 20,
+            n_text_layer: 4,
+            n_mels: 128,
+            ftype: 1,
+        };
+
+        for hp in [tiny, large_turbo] {
+            let decision = encoder_int8_policy_decision(&hp);
+            if encoder_i8_kernel_supported() {
+                assert_eq!(
+                    decision.action,
+                    EncoderInt8PolicyAction::QualitySafeInt8Encoder
+                );
+                assert_eq!(decision.reason, "calibrated_model_budget_pass");
+            } else {
+                assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+                assert_eq!(decision.reason, "cpu_feature_fallback");
+            }
+            assert_eq!(decision.calibration_id, ENCODER_INT8_CALIBRATION_ID);
+            assert_eq!(decision.corpus_wer_delta_budget, 0.0);
+            assert_eq!(decision.quant_rel_rmse_budget, 0.09);
+        }
+    }
+
+    #[test]
+    fn encoder_int8_policy_falls_back_for_uncalibrated_shape() {
+        let unknown = WhisperHParams {
+            n_vocab: 51_866,
+            n_audio_ctx: 1_500,
+            n_audio_state: 768,
+            n_audio_head: 12,
+            n_audio_layer: 12,
+            n_text_ctx: 448,
+            n_text_state: 768,
+            n_text_head: 12,
+            n_text_layer: 12,
+            n_mels: 80,
+            ftype: 1,
+        };
+        let decision = encoder_int8_policy_decision(&unknown);
+        assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+        if encoder_i8_kernel_supported() {
+            assert_eq!(decision.reason, "uncalibrated_model_fallback");
+        } else {
+            assert_eq!(decision.reason, "cpu_feature_fallback");
+        }
     }
 
     #[test]
