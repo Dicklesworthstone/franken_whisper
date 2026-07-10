@@ -4,6 +4,43 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **TERMINAL CLOSURE — encoder/mel/VAD (cc byte-exact lane) cannot yield a median-floor-clearing lever. The math, not just assertion.** The one remaining decidable encoder-attention lever (SDPA-sgemm gemm-swap) is owner-gated; everything else is below-floor, closed, or cod's.
+
+Every frame in this lane, with its ceiling (turbo spans, `e2e_probe` sha256 272102fd..., int8 default):
+
+| frame | % e2e | max possible byte-exact lever | status |
+|---|---|---|---|
+| **mel** (FFT/filterbank/log) | **0.27%** (5.62 ms / ~2100 ms window) | ≤0.27% even if mel→0 | **BELOW ANY MEDIAN FLOOR** — twiddles/hann cached, FFT SIMD, arena landed |
+| **VAD** | **0.00%** | 0 | bridge-only; **no native surface** |
+| encoder LN | 3.6% | ~0 byte-exact | compute-bound f64 SoA + **faithfulness feature** (f64 sum order blocks it) |
+| encoder residual add | 3.8% | ~0 | DRAM-floored; parallelization a measured wash (serial) |
+| encoder conv stem | 2.2% | ~0 | delegates to external sgemm; im2col + weight-transpose audited/hoisted |
+| encoder i7 int8 GEMM | ~28% | — | **cod's** (M4×N4 tile, compute-bound at ~60% of the measured maddubs peak) |
+| encoder external sgemm | ~14% | — | SDPA sgemm (mine) + conv; the SDPA slice's only lever is the gemm-swap (below) |
+| encoder SDPA exp | (was 5.86%) | **SHIPPED** | poly-exp default-on for turbo, `94714c1`, 1.0722× e2e |
+
+**The arithmetic is decisive:** mel and VAD sum to **0.27% of e2e**, so no lever there — byte-exact
+or not — can clear a median self-time floor that is itself ~5% on this fleet's workers. The encoder
+non-GEMM ops (LN/resid/conv ~10%) are each individually closed for byte-exact speedup (faithfulness /
+DRAM-floor / audited). The hot encoder frames (~42% GEMM) are cod's int8 or the SDPA whose exp I just
+shipped.
+
+**The one decidable encoder lever left in my lane** is the SDPA-sgemm `gemm`-crate swap: **~1.12× on
+the SDPA kernel frame** (clears that frame's floor), ~3% e2e, WER-neutral (rel 3.8e-7, transcript-safe)
+but **NOT byte-identical**, and it needs the `gemm` dependency tree (gemm-f16/c32/c64, bytemuck,
+dyn-stack, num-complex, half, zerocopy) added to **shared `ft_kernel_cpu`**. Same owner-decision class
+as poly-exp was — surfaced for a ship/skip call, not landed unilaterally on a shared crate.
+
+**SURFACE (terminal for this lane).** Re-profiling encoder/mel/VAD will keep returning below-floor /
+closed / cod's — this entry is the math showing why. Productive next moves, all requiring an
+owner/cod decision (closure map `b4629f3`): (a) authorize the SDPA-sgemm gemm-swap dep (~3% e2e);
+(b) cod's M4×N4 i7 tile (the ~28% frame, ~1.4-1.6× measured headroom); (c) draft decoding (owner
+model); (d) GPU/VNNI hardware.
+
+AGENT_NAME=cc_fw. Analysis-only (profile + code-read); rch not needed, no build, no local fallback.
+disk 76 G; nothing stashed/deleted; `nn.rs`/decode/kv-cache are cod_fw's, untouched.
+
+---
 ## 2026-07-10 - cc_fw: **ENCODER / mel / VAD lane — constant-recompute hunt EXHAUSTED (all cached/hoisted); no fresh byte-exact lever. SURFACE.** (This session's SDPA ship — poly-exp default-on for turbo, `94714c1` — is the lane's recent landed win.)
 
 Profile-first on the cc lane (encoder / mel / VAD, NOT decode/kv-cache) for the one open pattern my
