@@ -85,6 +85,86 @@ MAC-dense** (Zen3 has no AVX512-VNNI; `vpmaddubsw→vpmaddwd→vpaddd` is an ISA
 AGENT_NAME=cc_fw. franken_whisper source unchanged (docs only).
 
 ---
+## 2026-07-10 - cod_fw: **SURFACE, NOT REJECT — balanced static stripes for production i7 Q/K/V are bit-exact and profiled live, but the confirmation CV is 13.235%. No verdict is admissible.**
+
+**Ledger first.** The old `FW_I7_ROWBLOCK_MIN_LEN` rejection does not close this
+surface: its arms ran in separate RCH invocations, it has no benchmark-binary
+SHA256 or candidate-path profile, and its recorded spread implies roughly 10%
+CV. The current integrity audit found that no older encoder-i7 REJECT carries
+all of binary SHA256, worker identity, CV, and non-zero candidate self-time.
+
+**Fresh full-transcription routing profile.** The transcribe-only
+`large-v3-turbo` slice (`2428346.262–2428369.586`) contains 32K `cycles:u`
+samples, zero lost, and `535,710,198,717` total period. Binary SHA256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`,
+Build ID `acd75e8eb9b593d129a8563461349529921d46ef`, capture host
+`thinkstation1` (Threadripper PRO 5975WX). External sgemm is excluded:
+
+| rank | full self | encoder i7/int8 frame | family share |
+|---:|---:|---|---:|
+| 1 | 21.68% | `nn::dot_maddubs_i7_m2n4` | 49.581% |
+| 2 | 14.34% | `matmul_bias_i7_quantized` Rayon compute | 32.794% |
+| 3 | 4.63% | `encoder::matmul_bias_i8` compute | 10.601% |
+| 4 | 1.39% | `quantize_act_i7_gelu` | 3.172% |
+| 5 | 0.74% | `maddubs_i7_headmajor_block` | 1.696% |
+| 6 | 0.65% | `quantize_act_i7` | 1.487% |
+| 7 | 0.29% | encoder activation quantization | 0.669% |
+
+The encoder i7/int8 family is **43.717%** of full self-time. Annotating the top
+frame attributes 41.297% of its own period to `vpmaddubsw`, 17.714% to
+`vpaddd`, 17.485% to six loads, and 6.361% to `vpmaddwd`: arithmetic issue and
+register pressure dominate. A four-activation/four-weight lane-packed tile
+would require more than the 16 available YMM registers or add cross-lane
+shuffles, repeating the already-observed M8/L2 pressure mechanism. Per the
+profile-first rule, this attempt therefore took the next frame rather than
+guessing at another dot tile.
+
+**One lever.** ORIG used the shipped fine-grained
+`par_chunks_mut(4 * out)` iterator over 375 four-row blocks. Candidate divided
+those same blocks into exactly `min(rayon_threads, 375)` contiguous balanced
+quotient/remainder stripes and processed each stripe serially in one Rayon
+item. The M2N4/M4N2 dots, integer and floating operation order, bias handling,
+stores, allocation, and Q/K/V call sequence were shared unchanged.
+
+**Parity and A/B substrate.** One `release-perf` binary selected both arms with
+a bench-only atomic, alternated arm order inside each timed routine, black-boxed
+the inputs and every full Q/K/V output, and compared all Q/K/V `f32::to_bits()`
+before timing. Parity passed. Each Criterion measurement batch contained 25
+pairs with `INNER=3`; no ratio was filtered.
+
+**Confirmation bundle (the only run evaluated for a verdict):**
+
+- strict-remote worker `vmi1152480`, 10 Rayon threads;
+- benchmark binary SHA256
+  `c85d05bbf7837c493da9e9bf801d16aa1693caeab71346abb9d9be945341aea2`;
+- 10 post-`Collecting 10 samples` batch means (ORIG/CANDIDATE):
+  `0.947109, 0.857250, 1.055037, 1.098787, 0.925783, 0.883159,
+  1.192566, 0.998777, 0.965458, 1.272703`;
+- mean `1.019663`, sample SD `0.134949`, **cv_pct `13.235`**, candidate wins
+  `97/250`;
+- profile: `matmul_bias_i7_quantized::{closure#0}` **7.44% self / 12,417
+  samples**; candidate-only `DrainProducer` stripe dispatcher
+  **0.02% self / 38 samples**; `dot_maddubs_i7_m2n4` 89.08% / 148,635
+  samples; zero samples lost.
+
+Two pre-collection batches (`0.997506`, `0.960444`) are reported for audit but
+excluded by Criterion's explicit measurement boundary. A prior `vmi1264463`
+preflight was also excluded because its within-batch paired CV was 9.672–27.103%.
+The `hz2` retry failed closed before executing the benchmark because that worker
+has no `perf`; it contributes no ratio or self-time.
+
+**Verdict: NO VERDICT / MEASUREMENT BLOCKER.** The confirmation fails the
+mandatory CV `<5%` gate, so these numbers are neither a WIN nor a REJECT and do
+not close static stripes or the wider scheduling family. The candidate source
+and benchmark switch were manually removed; production and bench files are
+byte-for-byte back at HEAD. The retained strict-RCH runner now emits worker and
+binary identity plus the live self-time table, and fails before benchmark
+execution when `perf` is absent. Retry this exact primitive only with a single
+perf-capable remote invocation whose no-filter batch CV is `<5%`; otherwise
+rotate to a different ownership primitive. This is a substrate boundary, not a
+parity or performance ceiling.
+
+---
 ## 2026-07-10 - cc_fw: **SDPA `BR` tile sweep — REJECTED on measurement grounds (the NULL CONTROL, identical code both arms, reads 1.1163× at cv 29.0%).** But the exercise proof landed two host-independent results: **BR is BIT-EXACT** at 4 tile sizes × 5 shapes, and the kernel had a **latent scheduler bug** (`seq_q > BR` tied the parallel split to the tile size) — **fixed, default-identical** (frankentorch `0fef5755`).
 
 **COORDINATION FIRST.** The ~28% i7 int8 GEMM and the 12.3% fused i7 QKV both live in
