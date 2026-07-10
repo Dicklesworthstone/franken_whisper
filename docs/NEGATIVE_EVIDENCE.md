@@ -4,6 +4,59 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **DECODE/INFERENCE HOT-PATH CLOSURE MAP (mel / conv / attention / kv-cache) — profile-first, every named path is landed / closed / cod's / owner-gated. No one-cycle byte-exact in-my-lane lever remains; SURFACE with the definitive map so the campaign stops re-profiling exhausted paths.**
+
+**PROFILE-FIRST (this session, both models).** `e2e_probe` sha256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`, LOCAL 5975WX, `perf -F 299` +
+`FRANKEN_WHISPER_PERF_SPANS`. Turbo: encoder ~90% GEMM (compute-bound), decode 9.39 ms/tok
+(bandwidth-bound int8). tiny.en: ~35% rayon scheduling (aggregate small-op dispatch).
+
+### The map — each named hot path, with status + evidence
+| path | turbo self-time | status | evidence |
+|---|---|---|---|
+| **mel** (log-mel FFT/DCT) | <0.3% | **negligible** (turbo); franken WIN vs ORIG (tiny.en). cfft arena landed (−10.6% mel instr) | [[project_tiny_component_attribution]] |
+| **conv** (conv stem) | 2.2% enc | delegates to external `matrixmultiply` sgemm; weight-pretranspose LANDED; im2col reshape audited | [[project_conv_wt_pretranspose_landed]] |
+| **attention — encoder SDPA** | 37.8% enc | poly-exp gate PASSES (turbo byte-identical, WER Δ 0.000, 1.0722× e2e) — **WITH OWNER** (bd-bcm7); BR inside floor; gemm-swap owner-gated; int8-SDPA dead | this session |
+| **attention — decode self** | 6.2% dec | `fast_self_attn` LANDED (overhead-bound, default-on); f16-KV REJECTED; score-dot SIMD transcript-UNSAFE | [[project_self_attn_kv_cache_lever]] |
+| **attention — decode cross** | 10.2% dec | score-scratch-skip LANDED (byte-exact); cross-V-block LANDED; cross-quant-parallel LANDED; M2col LANDED | [[project_cross_v_block_win]] |
+| **attention softmax (decode)** | — | poly-exp measured **within-noise, default-off** | [[project_sampler_exp_measured]] |
+| **kv-cache** | — | f16-KV STORAGE rewrite REJECTED (2× compute regression); cross-V int8 block LANDED; **column-major packed-K = cod_fw's ACTIVE work** | ledger 2026-07-02; cod `self-k-column-major` |
+| **rayon dispatch** | 11% (turbo) / 35% (tiny) | flat-vs-nested SDPA REJECTED this session (bit-exact, inside null floor); global thread-threshold CLOSED (3 reverts) | this session; [[project_decode_overthreaded_rayon_lead]] |
+
+**Corroborated by the prior full audit:** the 20-flag `FW_*` audit found every engine flag is a
+landed default-on win or characterized, and the consolidated lever map concluded **"all remaining
+are owner/infra, none one-cycle"** (BlackThrush, 2026-07-03).
+
+### Why there is no one-cycle byte-exact lever left for me to land
+The fleet's null floor is ~[0.94, 1.05] on the (noisy, 8–16-core) rch workers, so any few-percent
+wall-clock lever is undecidable ([[project_abba_null_control]]). The frames large enough to clear it
+are: encoder/decode **GEMM/GEMV** (cod's int8 tile + external sgemm — compute-bound at ~60% of an
+ISA-capped, VNNI-less peak) and **draft decoding** — none of which is a one-cycle byte-exact edit in
+the SDPA lane. My session's novel structural probe (flat-par) confirmed this: bit-exact, inside the
+floor.
+
+### The genuine remaining decode/inference multipliers (all cross-lane / owner / hardware)
+1. **Draft/speculative decoding** — the #1 decode lever, de-risked, **R(8) ≈ 3.7× stable across
+   depth**, and **output-IDENTICAL** under greedy verification. Blocked on an **owner-supplied cheap
+   multilingual draft model sharing the tokenizer** ([[project_draft_decoding_amortization]]).
+2. **cod's M4×N4 i7 tile** (~28% encoder, ~50% decode is int8 GEMV) — compute-bound at ~60% of the
+   maddubs peak, ~1.4–1.6× in-crate headroom (measured, `maddubs_peak`).
+3. **cod's column-major packed-K** KV-cache (active).
+4. **Owner decisions I've surfaced with evidence:** `FT_SDPA_POLY_EXP` default-on for turbo
+   (`docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`); the SDPA-sgemm `gemm`-crate swap (~3% e2e,
+   needs the dep in shared `ft_kernel_cpu` + a WER gate).
+5. **Hardware:** GPU offload (Metal path exists for macOS; CUDA nouveau-blocked here) or AVX512-VNNI
+   silicon (`vpdpbusd` collapses the i7 widening chain; production Zen3 has none).
+
+**SHIP-OR-SURFACE = SURFACE.** After a session of profile-first digs each measured against a paired
+null control, the CPU inference hot paths are at their characterized floor. Landing another
+sub-floor byte-exact micro-restructuring would ship noise — the exact failure this session's
+null-control discipline exists to prevent. The campaign's next real gains are items 1–5 above.
+
+AGENT_NAME=cc_fw. No source changed (profile + closure map). No build; disk 76 G; nothing
+stashed/deleted; `nn.rs`/`benches` are cod_fw's, untouched.
+
+---
 ## 2026-07-10 - cc_fw: **DIG → REJECTED (measured, BIT-EXACT, inside the null floor) — flattening `sdpa_forward_f32`'s nested rayon parallelism does NOT move the scheduling overhead.** Mechanism: tiny.en's ~35% rayon cost is aggregate small-op dispatch, not SDPA's per-head join nesting. Profile-first, one lever, median-gated.
 
 **PROFILE-FIRST (the lever's motivation).** Fresh `perf -F 299` on the prebuilt `e2e_probe`
