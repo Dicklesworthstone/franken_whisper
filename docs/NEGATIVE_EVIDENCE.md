@@ -4,6 +4,88 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 UTC - cod_fw: LONG-FORM PROFILE RETRY -> REJECT (measured) - dense 124.5 s audio still leaves the first owned decoder/KV frame at 0.17% self
+
+**Why this retry was admissible.** The prior short-JFK profile allowed another
+attempt only if a different workload promoted mel, tokenizer, decoder policy, or
+KV management into the top five owned frames at least 2% self time. This
+attempt changed the workload twice: timestamped JFK tiled to 88.0 s, then a
+dense 124.5 s MP3 normalized through the in-tree Symphonia path. The ledger was
+grepped first. f32 QKV sgemm fusion, weight-stationary f16 GEMV tiles,
+allocator/buffer reuse, decoder fused-LN, LN-to-quant fusion, head-major SDPA
+scatter, i7 rowblock coarsening, i7 bias specialization, softmax pass
+elimination, and the plain `matrixmultiply` -> `gemm` swap remained closed; cc
+still owns SDPA and int8.
+
+**Measurement.** Both runs used the release-perf `e2e_probe` Build ID
+`acd75e8eb9b593d129a8563461349529921d46ef`, `large-v3-turbo`, timestamps
+enabled, and `RAYON_NUM_THREADS=8`. Runtime source is unchanged from profiled
+HEAD `91b44b1d`; later tracked changes through `fe97df1` are documentation and
+Beads only. Undelayed flat `perf record -m 1 -e cycles:u -F 199` captures were
+time-filtered from the first `mel::log_mel` sample through transcription
+completion:
+
+| workload | audio | transcribe wall | profile samples | lost |
+|---|---:|---:|---:|---:|
+| JFK x8 | 88.0 s | 15.891 s | 25K | 0 |
+| track01 | 124.5 s | 22.612 s | 35K | 0 |
+
+The decisive dense-track01 table below excludes external sgemm
+(`kernel_target_fma` 17.89%, `gemm_loop` 4.00%) and restricted kernel addresses.
+All remaining user-space frames at or above 0.1% self time:
+
+| rank | self | non-sgemm frame | disposition |
+|---:|---:|---|---|
+| 1 | 21.55% | `nn::dot_maddubs_i7_m2n4` | cc-owned int8 |
+| 2 | 14.39% | `nn::matmul_bias_i7_quantized` | cc-owned int8 |
+| 3 | 13.01% | `ft_kernel_cpu::sdpa_forward_f32` | cc-owned SDPA |
+| 4 | 7.30% | `__expf_fma` | cc-owned/closed SDPA softmax |
+| 5 | 7.19% | `nn::gemv_i8` closure | cc-owned int8 |
+| 6 | 4.57% | `encoder::matmul_bias_i8` | cc-owned int8 |
+| 7 | 1.85% | `nn::gemv_i8w_f32a_blocked` | cc-owned int8 |
+| 8 | 1.45% | `nn::quantize_act_i7_gelu` | cc-owned int8 |
+| 9 | 1.13% | `nn::gemv_i8` | cc-owned int8 |
+| 10 | 0.72% | `nn::norm_rows_into` | fused-LN/LN-to-quant closed |
+| 11 | 0.65% | `nn::maddubs_i7_headmajor_block` | cc-owned int8 |
+| 12 | 0.55% | `nn::quantize_act_i7` | cc-owned int8 |
+| 13 | 0.54% | `__memset_avx2_unaligned_erms` | allocator/buffer reuse closed |
+| 14 | 0.28% | `encoder::matmul_bias_i8` quant closure | cc-owned int8 |
+| 15 | 0.23% | `__memmove_avx_unaligned_erms` | callgraph: cc-owned SDPA scatter/int8 quantization |
+| 16 | 0.17% | `nn::attention_with_cache` | first open requested family; below gate |
+| 17 | 0.13% | `DecoderState::new` closure 4 | exact f16 cross-KV build mechanism already rejected |
+| 18 | 0.12% | `encoder::forward_time_major` | below gate; not requested decoder lane |
+
+JFK x8 independently reproduced the routing: `attention_with_cache` was 0.16%
+and `DecoderState::new` was 0.11%. Mel, tokenizer, `process_logits`/argmax,
+segment policy, and every other self-KV frame stayed below 0.1%; native beam
+search still does not exist.
+
+**Callgraph resolution.** A low-frequency DWARF capture (`F=49`, 6,969 samples,
+zero lost) resolved the formerly ambiguous transcribe-time `memmove`: its callers
+were `nn::sdpa_scatter_interleaved` and int8 activation quantization, both cc
+owned/closed. The only owned sampled cross-KV frame maps to the scalar
+`Float16::from_f32` K/V cache build. That exact batched-F16C conversion was
+already measured at 3.1-3.7x kernel speed with zero bit differences and rejected
+because it is about 0.1% of decode and hidden by cross-attention pipelining. The
+first attempted `F=199` DWARF capture lost 99.56% and is explicitly discarded.
+
+**Verdict: REJECT a source attempt.** Long-form did not satisfy the ledger's
+top-five / at-least-2% retry condition. The first open requested frame,
+`attention_with_cache`, scores `(impact 1 x confidence 5) / effort 4 = 1.25`,
+below the 2.0 implementation gate and the 3% keep ratchet. No kernel change was
+made; bit-exact parity is therefore unchanged by construction.
+
+This is not a parity ceiling. The distinct next primitive remains trained
+token-level drafting (`bd-wzgh`). The local model inventory has only
+`large-v3-turbo` (`n_vocab=51866`) and `tiny.en` (`n_vocab=51864`); no trained
+multilingual vocabulary-compatible draft artifact exists, so a bit-exact dual-KV
+acceptance loop is concretely blocked on that model prerequisite. Prompt/ngram
+drafting and layer-skip drafting are already rejected. Raw artifacts:
+`/tmp/fw-cod-fw-ts-long8-flat-20260710.data`,
+`/tmp/fw-cod-fw-ts-track01-flat-20260710.data`, and
+`/tmp/fw-cod-fw-ts-callgraph-f49-20260710.data`. `AGENT_NAME=cod_fw`.
+
+---
 ## 2026-07-10 - cc_fw: **SELF-CORRECTION to the bd-4hc0 entry below (commit `2bbff39`)** — I under-claimed. The crate swap alone is still rejected, but `gemm` + a 2-D tile grid IS **1.231× on turbo's linear GEMMs (≈1.14× e2e)**. And a **BIT-EXACT, dep-free 2-D-tiling fix lands 1.057× on fc2** (frankentorch `F32_2D_TALL_MAX_K`). Two factual errors in that entry, corrected here.
 
 **ERROR 1 (mine).** I wrote: *"Every turbo linear shape has `k > 1024`, so ft's
