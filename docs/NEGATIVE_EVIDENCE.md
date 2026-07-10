@@ -4,6 +4,71 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **`tile_shape` A/B REBUILT same-binary on the REAL function — keep gate NOT MET (cv 16.8–24.2% ≫ 5, and the NULL CONTROL itself fails at 6.8–17.7%)** ⇒ default not flipped. Mechanism confirmed large (fc1 **1.689×**, fc2 **1.686×**, 23–24/25 paired wins) at T=14. Knob landed (`frankentorch 86a54f1a`). Plus a **LEDGER-INTEGRITY AUDIT** of this lane's REJECT rows.
+
+### The bench now provably executes the code under test
+Prompted by frankenmermaid `5feb977` (four crossing-min REJECT rows were A/B'd on a bench
+where the code under test had **0.000% self-time** — the auto-selector never routed to it).
+**My previous `tile_shape` A/B had the same defect**: both arms timed `tiled()`, a *bench-side
+replica* of `gemm::sgemm_2d_parallel`, not `tile_shape` itself.
+
+Fixed by landing a runtime policy knob (`set_sgemm_tile_balanced`, default OFF = historical
+grid, bit-exact either way). An env var could not do this — read once per process, it cannot
+flip between arms inside one binary, and a two-invocation A/B is invalid because rch ratios
+are not worker-invariant. **Now both arms call the real
+`matmul_tensor_contiguous_f32_into` and differ only by the flag.** The bench asserts, before
+any timing, that flipping the flag changes the tile grid (`exercise_proof`), and panics if it
+does not — a bench that cannot change the grid is measuring noise, not the scheduler.
+
+### MEASURED (hz2/`hetzner2`, `available_parallelism=16`, ONE binary, ONE rch invocation, 25 paired reps, 3 warm discarded, arm order alternated). Keep-gate statistic = cv of the **paired** ratio.
+
+`exercise_proof` @ T=14: tiles **15 → 14** on all three shapes, bit-exact ⇒ **PASSED**.
+
+| | qkv/out | fc1 | fc2 |
+|---|---|---|---|
+| **NULL CONTROL** T=16 (grids identical 4×4→4×4) | 1.023× cv 6.8% (wins 23/25) | 1.010× cv 14.1% | 1.036× cv 17.7% |
+| **LEVER** T=14 (orig 3×5 = 15 tiles on 14 threads) | 0.946× cv 23.7% (wins 11/25) | **1.689×** cv 24.2% (wins 23/25) | **1.686×** cv 16.8% (wins 24/25) |
+
+**VERDICT: keep gate (cv_pct < 5) FAILS on every arm — including the NULL CONTROL, which
+also shows a systematic +2–3% bias.** `hetzner2` cannot satisfy the gate at any effect size,
+so this is a property of the host, not of the lever. **Default NOT flipped.**
+
+**What the data does establish**, and it is not nothing: the straggler mechanism is real and
+large on the two big shapes — 23–24 of 25 paired wins (sign test p ≈ 1e-4, robust to the cv),
+median 1.686–1.689×, matching the wave model `ceil(15/14)·14/15 = 1.87×`. It does **not** help
+the small shape (qkv 0.946×, 11/25 — a coin flip), the same non-uniformity seen at T=32 where
+**fc1 regressed (0.958×)**. A uniform balanced grid is *not* a clean win. The real lever
+remains a **`B`-bytes-aware choice among the divisor pairs of T**, unmeasured.
+
+**T=32 (the shipped config) remains unmeasurable.** No sampled rch worker exceeds 16 hw
+threads (`vmi1264463`=8, `ovh-a`=16, `hetzner2`=16); local builds are disk-suspended. Parked
+with baseline: `tests/artifacts/perf/20260710-sgemm-tile-shape/`. Beads
+**bd-sgemm-tile-shape-imbalance-kf1j** ← **bd-transcript-gate-unrunnable-xu9g**.
+
+---
+
+### LEDGER-INTEGRITY AUDIT of this lane's REJECT rows (per frankenmermaid `5feb977`)
+*Rule adopted: no REJECT is valid unless a profile shows non-zero self-time attributable to
+the function under test. Every new REJECT in this lane now carries that figure.*
+
+| row | did the A/B execute the code under test? | self-time of code under test | status |
+|---|---|---|---|
+| **"SDPA is not exp-bound"** (2026-07-07) | **NO.** Arms were `FW_ATTN_NO_SDPA=1` (a franken *per-head rewrite*) and `examples/softmax_probe` (`nn::softmax_rows`). The default encoder calls `ft_kernel_cpu::sdpa_forward_f32` (`nn.rs:4368`), which carries its **own** softmax — `nn::softmax_rows` is **never reached**. | **0%** in both benches | **INVALID — already reopened & falsified** by me 2026-07-09. In-situ the exp is **23.7%** of the fused kernel (124.5 / 525.0 ms) and the lever is real (`FT_SDPA_POLY_EXP`, 1.26–1.28× span). |
+| **my own hybrid arm C** (`2bbff39`) | **NO.** Row-split fc1 while ft *already 2-D tiles* it (`should_use_f32_reused_output_2d_tiling`, `1024 < k ≤ 1536`). | n/a — wrong branch | **SELF-CORRECTED** in `fe97df1`. |
+| **`matrixmultiply→gemm` swap** (`2bbff39`) | **YES.** Arm A is the real `matmul_tensor_contiguous_f32_into`. | `matrixmultiply::sgemm_kernel::kernel_target_fma` **19.22%** + `matrixmultiply::gemm::gemm_loop` **5.87%** self | **VALID.** REJECT stands. |
+| **softmax pass-elimination** (`91b44b1`) | **REPLICA.** Measured in `sdpa_softmax_attrib_probe`, a replica of `sdpa_forward_f32`, not the shipped kernel. | replica reproduces the real kernel to within 3% (510.9–528.0 ms vs 525.0); softmax non-exp passes = **16.29%** self | **VALID-but-REPLICA.** Not invalid: the replica *is* the code being modified, and its timing is validated against the real kernel. Flagged so nobody mistakes it for in-situ. |
+| **SDPA `BR` row-block sweep** (parked) | **REPLICA**, same probe, same validation. | packing frame `gemm::gemm_loop` = **5.87%** self (23% of SDPA's sgemm) | **VALID-but-REPLICA.** |
+| **int8 SDPA dead** (2026-07-04, scores 0.14× / out 0.77×) | **N/A** — sizing a kernel that does not exist; the probe ran the actual per-head shapes. | — | **STANDS**, but note its "scores is output-bandwidth-bound" sub-claim does **not** transfer to the *fused* kernel, which never materializes `[1500,1500]` scores. The `d_head=64` thin-dim mechanism does transfer. |
+
+**Two of six rows in this lane were measured on code the engine does not execute, and one of
+those was mine.** Both were caught and reopened. The reusable defence is now mechanical:
+`exercise_proof()` in the bench + a self-time figure in the entry. Copy both.
+
+**INFRA unchanged.** No local cargo build, no new target trees, nothing deleted, nothing
+stashed. All builds/benches via `rch exec -- cargo …`; tests 12/12 gemm green after the knob.
+AGENT_NAME=cc_fw. franken_whisper engine unchanged (docs only). frankentorch: `86a54f1a`.
+
+---
 ## 2026-07-10 - cc_fw: **`tile_shape` load imbalance — BIT-EXACTNESS CERTIFIED, PERF PARKED (patch saved)** + **two measurement rules that invalidate a whole class of rch A/Bs** + blocker beads filed
 
 ### The lever (defect is certain; no measurement needed to see it)

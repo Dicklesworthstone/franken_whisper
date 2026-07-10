@@ -1,5 +1,21 @@
 # PARKED LEVER — `ft_kernel_cpu::gemm::tile_shape` load imbalance (bit-exact)
 
+> **UPDATE 2026-07-10 — the patch below is SUPERSEDED by a landed runtime knob.**
+> `frankentorch 86a54f1a` adds `set_sgemm_tile_balanced(bool)` (default **off** = historical
+> grid, bit-exact either way), so the policy no longer needs a source patch to evaluate — a
+> bench can flip it inside one binary and time the **real** `matmul_tensor_contiguous_f32`
+> both ways. Keep the patch only as a record of the minimal source change.
+>
+> The A/B was rebuilt on the real function (`benches/sgemm_tile_shape.rs`, with an
+> `exercise_proof` that panics unless flipping the flag changes the grid). **Keep gate NOT
+> MET:** on `hetzner2` (16 hw threads) cv(paired ratio) is 16.8–24.2%, and the NULL CONTROL
+> — where both policies yield the *same* grid — itself fails at 6.8–17.7% with a systematic
+> +2–3% bias. The host cannot satisfy cv<5 at any effect size. Default stays OFF.
+>
+> Mechanism confirmed anyway at T=14 (15 tiles on 14 threads): fc1 **1.689×**, fc2 **1.686×**,
+> 23–24/25 paired wins (sign test p≈1e-4), matching `ceil(15/14)·14/15 = 1.87×`. qkv 0.946× —
+> the balanced grid is **not** uniformly good, mirroring fc1's regression at T=32.
+
 **Status: PARKED, patch prepared and validated, NOT applied.** Blocked on the absence of
 any box where an admissible 32-thread perf A/B can run. Filed by `cc_fw` 2026-07-10.
 
@@ -27,7 +43,13 @@ franken_whisper's encoder thread cap (`project_encoder_thread_cap_win`), so this
 case that matters. `T = 64 → 8×8` and `T = 16 → 4×4` are already balanced and do not move.
 
 The patch picks `p` = the largest **divisor** of `T` that is `≤ sqrt(T)`, so `p*q == T`
-exactly (32 → 4×8). Kill-switch `FT_SGEMM_TILE_BALANCED=0` restores the old grid.
+exactly (32 → 4×8).
+
+> **Polarity differs from what shipped.** This *patch* defaults the balanced grid **ON**
+> (`FT_SGEMM_TILE_BALANCED=0` disables). The *landed knob* (`86a54f1a`) defaults **OFF**
+> (`FT_SGEMM_TILE_BALANCED=1` enables, or `set_sgemm_tile_balanced(true)`), because the
+> keep gate has not been met. Prefer the knob; use this patch only as a record of the
+> minimal source change.
 
 **Bit-exact.** Each output element's full k-accumulation happens inside one serial
 micro-kernel call; neither the row nor the column count changes that order (same invariant
