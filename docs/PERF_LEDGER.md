@@ -968,6 +968,26 @@ for VNNI int8 — **both out of `franken_whisper`'s crate**.
 > `docs/NEGATIVE_EVIDENCE.md` (2026-07-10, cc_fw, "bd-4hc0 REJECTED / FALSIFIED").
 > The one surviving slice is `sdpa_forward_f32`'s inner serial GEMM: **1.115×** on
 > the kernel, ~1.6% e2e, non-byte-exact (rel_l2 3.8e-7), unlanded (dependency cost).
+>
+> **UPDATE (same day, cc_fw — I under-claimed above; see the SELF-CORRECTION entry
+> at the top of NEGATIVE_EVIDENCE.md).** Confirmed the predicted fix: with a 2-D tile
+> grid, `gemm` DOES reach turbo — **1.231× on the turbo linear-GEMM layer ⇒ ≈1.14× e2e**
+> (qkv/out 1.200×, fc1 1.238×, fc2 1.255×; interleaved, arms rotated, min-of-9).
+> So bd-4hc0's *number* (~1.2× e2e) was about right; its *prescription* was wrong.
+> You need the microkernel AND the 2-D grid — the crate swap alone is 1.00–1.07×.
+> Also: `sgemm_reused_output` already 2-D tiles `1024 < k ≤ 1536`, so turbo qkv/out and
+> fc1 were never on the row split; only fc2 (k=5120) was.
+>
+> **LANDED (bit-exact, dep-free):** frankentorch `8e3e7c9d` raises `F32_2D_TALL_MAX_K`
+> 1536→8192 (kill-switch `FT_SGEMM_2D_LARGE_K=0`) ⇒ **1.057× on fc2**, ~1.3% e2e.
+> The stale comment claiming 2-D regresses 0.81× on `m2048 k2048 n2048` does NOT
+> reproduce: it is **1.27× faster** 2-D tiled.
+>
+> **NEXT RANKED LEVER (bit-exact, dep-free, bigger):** `tile_shape` is load-imbalanced —
+> `p=floor(√32)=5, q=7` ⇒ **35 tiles on 32 threads**. Even post-fix ft's fc2 is 1.146×
+> slower than the same `matrixmultiply` kernel on a balanced 4×8 grid. Fix `p` to the
+> largest divisor of `threads` ≤ √threads. Expect fc2 → ~1.24× ⇒ ~1.05× e2e byte-exact.
+> **Do this before reaching for `gemm`.**
 
 
 The e2e wall is the encoder GEMM, delegated to `ft_kernel_cpu::matmul_tensor_
