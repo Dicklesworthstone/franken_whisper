@@ -4,6 +4,70 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **SDPA `BR` tile sweep — REJECTED on measurement grounds (the NULL CONTROL, identical code both arms, reads 1.1163× at cv 29.0%).** But the exercise proof landed two host-independent results: **BR is BIT-EXACT** at 4 tile sizes × 5 shapes, and the kernel had a **latent scheduler bug** (`seq_q > BR` tied the parallel split to the tile size) — **fixed, default-identical** (frankentorch `0fef5755`).
+
+**COORDINATION FIRST.** The ~28% i7 int8 GEMM and the 12.3% fused i7 QKV both live in
+`src/native_engine/nn.rs`, which **cod_fw reserved** ("avoid nn.rs/bench; your lane is SDPA/poly
+only") to take the M4×N4 lane-packed maddubs. Per [[feedback_shared_tree_reserve_files]] I did not
+touch it. I attacked the largest frame I actually own: the **true-SDPA 37.8%**, i.e.
+`ft_kernel_cpu::sdpa_forward_f32` in frankentorch. cod_fw and I are orthogonal and additive.
+
+**LEDGER METADATA (per the rules).**
+· Self-time figures from `franken_whisper` `e2e_probe`, **sha256
+`272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`** (turbo, jfk×8, in-situ).
+· Bench: `frankentorch crates/ft-kernel-cpu/benches/sdpa_br.rs`, **worker `vmi1149989`**,
+`available_parallelism=10`, rayon threads 10, 9 paired reps + 3 warm discarded.
+· **cv_pct: see table.** No local build; disk 75 G; `RCH_REQUIRE_REMOTE=1` throughout.
+
+### What the lever was
+`sdpa_forward_f32` tiles query rows at `BR=64` and, per block, calls `sgemm_bt(m=BR,k=64,n=1500)`
+(B = `kh`) and `sgemm(m=BR,k=1500,n=64)` (B = `vh`). **`kh`/`vh` are invariant across a head's 24
+blocks, yet `matrixmultiply` repacks them on every call** (no prepack API). Raising `BR` amortizes
+both B-packs. In-situ self-time of that pack loop: **`matrixmultiply::gemm::gemm_loop` = 4.05% of
+e2e** — so the ceiling was small before any measurement.
+
+### REJECT — the null control refuses to let me claim it
+| arm (vs BR=64) | ratio | cv | wins | gate |
+|---|---|---|---|---|
+| **NULL CONTROL (BR=64 vs BR=64 — identical code)** | **1.1163×** | **29.0%** | 6/9 | **FAIL** |
+| BR=96 | 1.1278× | 35.4% | 5/9 | FAIL |
+| BR=128 | 0.8598× | 24.0% | 3/9 | FAIL |
+| BR=160 | 1.1408× | 19.9% | 7/9 | FAIL |
+
+**Every arm lies inside the null control's own 11.6% systematic bias.** The keep gate (cv < 5) is
+unreachable on this worker. Without the null control I would have reported "BR=160 is 1.14×" —
+a pure artifact. *This is the second time in this repo a null control has killed a plausible win.*
+
+**ROOT CAUSE of the floor, and the prerequisite for ever measuring this:** the timed region is
+dominated by **allocation**, not by the packing it targets. `sdpa_forward_f32` allocates and
+returns `vec![0.0f32; num_bh*seq_q*d_v]` = **7.7 MB zeroed per call** at the turbo shape, plus
+`24 × 20 × 375 KiB` = **184 MB** of per-block `sc` scratch. (`__memset_avx2` = **1.27%** of e2e
+self-time.) Measuring a 3–4% packing effect through that needs an **`_into` (out-param) variant and
+a scratch arena**. Recorded, not attempted. **Retry-condition:** only after `sdpa_forward_f32_into`
+exists AND the null control passes cv < 5 on the target host.
+
+### What DID land (bit-exact, default-identical) — frankentorch `0fef5755`
+1. **A latent scheduler bug.** The parallel-split guard read `seq_q > BR`, tying the **scheduler**
+   to the **tile size**: any consumer raising `BR` would silently lose the row-block split for
+   `64 < seq_q ≤ BR`, and any `BR` sweep would compare two schedulers while believing it compared
+   two tile sizes. Now a constant `SDPA_PAR_MIN_ROWS = 64`. At the shipped `BR=64` the predicate is
+   literally unchanged (`seq_q > 64`) ⇒ **cannot alter behavior today.** This is the same
+   mislabeled-frame family as `attn_sdpa`: a knob that silently meant two things at once.
+2. **`set_sdpa_br` / `sdpa_br_current`** — so a bench can sweep `BR` inside ONE binary.
+3. **BR is BIT-EXACT — proven, host-independent.** `matrixmultiply`'s k-accumulation order is fixed
+   by the micro-kernel and independent of the row count; the softmax is per-row. Asserted across
+   `BR ∈ {32,96,128,160}` (block counts 47/16/12/10 vs 24 — so the arms are provably *not* the same
+   code) and across `(nbh,seq) ∈ {(20,96),(20,128),(4,1500),(64,1500)}`. Every output bit-identical.
+4. Bench `sdpa_br`: both arms call the **real** `sdpa_forward_f32`; arms **interleaved inside one
+   measured routine**; `black_box` on inputs and the **full** output; `exercise_proof` panics unless
+   flipping `BR` changes the block count and preserves bits; NULL CONTROL always runs first.
+
+Tests (remote `hz2`): `cargo test -p ft-kernel-cpu --release sdpa` **3/3**, `… gemm` **12/12**.
+
+AGENT_NAME=cc_fw. franken_whisper source unchanged (docs only); `nn.rs`, `benches/`, and the
+scripts perf runner are cod_fw's and were not touched.
+
+---
 ## 2026-07-10 - cc_fw: **`attn_sdpa` = 44.6% is NOT SDPA — the kill-switch decomposes it.** True SDPA share is **37.8%**; the fused i7 QKV GEMM is the other **12.3%**, and that fusion is independently worth **1.171×**. Op-level poly-exp win measured today: **`attn_sdpa` 1.2465×, cv 3.5%, 5/5 paired wins, 120.7 ms/window.** No build.
 
 **PROVENANCE.** binary `examples/e2e_probe` **sha256
