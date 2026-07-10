@@ -64,7 +64,7 @@ fn consume(v: &[f32]) -> f32 {
 }
 
 fn run_once(morsel: bool, w: &[Float16], out: usize, inp: usize, x: &[f32], tq: usize, y: &mut [f32]) -> f64 {
-    nn::set_batch_gemv_row_morsel(morsel);
+    nn::set_batch_gemv_row_morsel(Some(morsel));
     let t0 = Instant::now();
     nn::gemv_f16_batch(
         black_box(w),
