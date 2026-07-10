@@ -1395,7 +1395,7 @@ pub fn diagnostics() -> Vec<serde_json::Value> {
             "env_override": "FRANKEN_WHISPER_INSANELY_FAST_BIN",
             "hf_token_set": insanely_fast::hf_token_present(),
             "hf_token_env_overrides": ["FRANKEN_WHISPER_HF_TOKEN", "HF_TOKEN"],
-            "requires_hf_token_for_diarization": true,
+            "requires_hf_token_for_diarization": insanely_fast_bridge_diarizes(native_execution_mode(native_rollout_stage())),
             "unsupported_options": [
                 "--output-txt/--output-vtt/--output-srt/--output-csv/--output-json-full/--output-lrc",
                 "--no-timestamps",
@@ -1594,6 +1594,21 @@ fn available_for_mode(kind: BackendKind, mode: NativeExecutionMode) -> bool {
         }
         NativeExecutionMode::NativePreferred => native_available(kind) || bridge_available(kind),
         NativeExecutionMode::NativeOnly => native_available(kind),
+    }
+}
+
+/// Whether an InsanelyFast diarization request in `mode` will be served by the
+/// external **bridge** (`insanely-fast-whisper`, which runs pyannote via
+/// HuggingFace) rather than the **native** path. The native engine transcribes and
+/// leaves speaker labelling to the orchestrator's local heuristic `Diarize` stage,
+/// which never contacts HuggingFace — so the HF-token requirement is real only when
+/// the bridge is what actually runs. `NativePreferred` uses the bridge only when the
+/// native engine is unavailable; `NativeOnly` never touches the bridge.
+fn insanely_fast_bridge_diarizes(mode: NativeExecutionMode) -> bool {
+    match mode {
+        NativeExecutionMode::BridgeOnly => true,
+        NativeExecutionMode::NativePreferred => !native_available(BackendKind::InsanelyFast),
+        NativeExecutionMode::NativeOnly => false,
     }
 }
 
@@ -1877,14 +1892,19 @@ fn readiness_for(kind: BackendKind, request: &TranscribeRequest) -> BackendReadi
         };
     }
 
+    // The HF-token requirement applies ONLY when the insanely-fast *bridge* will run
+    // the diarization (pyannote via HuggingFace). The native path diarizes through the
+    // orchestrator's local heuristic and needs no token, so gating the native path on a
+    // token was a false requirement (bd-0522). Fire only when the bridge will diarize.
     if kind == BackendKind::InsanelyFast
         && request.diarize
+        && insanely_fast_bridge_diarizes(mode)
         && !insanely_fast::hf_token_present_for_request(request)
     {
         return BackendReadiness {
             available: false,
             reason: Some(
-                "diarization requires HF token (`--hf-token` or env `FRANKEN_WHISPER_HF_TOKEN` / `HF_TOKEN`)"
+                "diarization via the insanely-fast bridge requires an HF token (`--hf-token` or env `FRANKEN_WHISPER_HF_TOKEN` / `HF_TOKEN`)"
                     .to_owned(),
             ),
         };
@@ -5624,10 +5644,30 @@ mod tests {
             fast["hf_token_env_overrides"].is_array(),
             "hf_token_env_overrides should be array"
         );
+        // bd-0522: this is now DYNAMIC — true only when the insanely-fast BRIDGE will run
+        // the diarization. The native path uses the orchestrator's local heuristic and needs
+        // no token. Assert the descriptor reflects that honest condition, not a stale `true`.
+        let mode = super::native_execution_mode(super::native_rollout_stage());
         assert_eq!(
             fast["requires_hf_token_for_diarization"].as_bool(),
-            Some(true)
+            Some(super::insanely_fast_bridge_diarizes(mode)),
+            "descriptor must track whether the bridge will diarize in the current mode"
         );
+    }
+
+    #[test]
+    fn insanely_fast_bridge_diarizes_reflects_execution_mode() {
+        // bd-0522: HF token is required for diarization ONLY when the external bridge runs it.
+        assert!(
+            super::insanely_fast_bridge_diarizes(super::NativeExecutionMode::BridgeOnly),
+            "bridge-only mode diarizes via the external tool -> HF token required"
+        );
+        assert!(
+            !super::insanely_fast_bridge_diarizes(super::NativeExecutionMode::NativeOnly),
+            "native-only mode never touches the bridge -> no HF token"
+        );
+        // NativePreferred is availability-dependent; just exercise it (must not panic).
+        let _ = super::insanely_fast_bridge_diarizes(super::NativeExecutionMode::NativePreferred);
     }
 
     #[test]
