@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-09 EDT / 2026-07-10 UTC - cod_fw: SURFACE -> DO NOT FLIP DEFAULT YET - quality-safe full encoder-int8 now has a JFK WER gate, but the default-on evidence pack is still incomplete
+
+**Decision guard:** do not promote encoder int8 default-on from the JFK-only
+gate. The safe candidate is `FW_ENC_ATTN_OUT_I8I32=1` (q/k/v/fc1/fc2 i7
+maddubs, `attn.out` full-i8 i32 accumulate) with `FW_ENC_QKV_FUSED=1` and
+`FW_ENC_EF_QUANT=1`; the older all-i7 `FRANKEN_WHISPER_ENC_INT8=1` path remains
+owner-gated and is not a quality proof.
+
+**What landed this session:** an executable child-process e2e gate,
+`gated_quality_safe_encoder_int8_jfk_reference_wer_gate`, that runs the real CLI
+with bridge binaries forced to `/nonexistent`, proves native execution, and
+requires JFK tiny.en WER `<= 0.0` against
+`tests/fixtures/native/jfk_tiny_reference.json`. Local run passed in 9.93s:
+`1 passed; 0 failed; 6 filtered out`. The same session profiled the focused
+current int8 QKV row before editing: RCH `ovh-a` criterion
+`headmajor_attention_1500x1280 = 83.074 ms/iter (+/- 1.817 ms)`, local
+`perf stat` elapsed CV `3.16%`, and qualitative flamegraph top rows remained
+external SDPA/matrixmultiply plus Rayon/crossbeam overhead, with owned
+`dot_maddubs_i7_m2n4` only `2.07%`. See the 2026-07-09 cod_fw row in
+`docs/PERF_LEDGER.md` for the full command log.
+
+**Why default-on is still blocked:** this row covers only the in-repo JFK/tiny
+fixture. The broad fixture corpus WER table is not populated, `large-v3-turbo`
+is absent from this host/RCH worker cache for model-backed benches, the
+per-layer quantization-error vector/budget has not been measured, and the
+track01-style adversarial proper-noun probe set is not present in the repo. The
+expected-loss policy is specified in the perf ledger, but it is not yet backed by
+the required calibration artifacts. Retry condition: populate those three
+evidence tables, then flip only through the deterministic f32-fallback policy
+and keep a kill switch.
+
+---
 ## 2026-07-09 - BlackThrush: DIG → REJECTED (measured on the REAL encoder, reverted) — **fusing the DEFAULT f32-path encoder Q/K/V into ONE `[1280,3840]` sgemm is 1.27× faster IN ISOLATION but 7% SLOWER on the real encoder_window — the isolated A-packing win does NOT survive the split + L3 contention. This is the f32 analogue of the already-rejected int8 fused-wide QKV (line ~688); BOTH concatenation routes are now closed. Kept the probe `examples/qkv_f32_fusion_probe.rs`; no engine code committed ⇒ byte-identical to HEAD.**
 
 **Profile-first (fresh, `perf record` on the symboled release binary):** the DEFAULT f32 engine is **63% external matrixmultiply sgemm** (encoder qkv/attn_out/fc1/fc2 — `ft_kernel_cpu`, out of "own files" scope) + ~10% rayon idle-spin (documented-closed) + ~6% external SDPA + 3.4% `__expf_fma` (poly-exp owner-gated, non-byte-exact). Every FRANKEN-owned symbol is ≤1% or mined (`gemv_i8` decode 2.7%, `gelu_add_bias` 0.27%, `norm_rows_into` 0.16%). No franken lever >1% on the default path. The one genuinely-OPEN lead: the 3 QKV f32 sgemms all project the SAME layer-norm'd activation `h=[1500,1280]`, and matrixmultiply packs A into a cache buffer on EVERY call ⇒ 3× redundant A-packing. The prior fused-wide rejection (2026-07-08, line ~688) was INT8-only (concatenating loses the maddubs M2×N4 tile); the f32 external sgemm has no such tile, so the f32 case was untested.
