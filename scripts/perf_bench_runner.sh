@@ -15,6 +15,17 @@ if ! command -v perf >/dev/null 2>&1; then
     exit 69
 fi
 
+perf_cmd=(perf)
+if [[ -r /proc/sys/kernel/perf_event_paranoid ]] &&
+   (( $(< /proc/sys/kernel/perf_event_paranoid) > 2 )); then
+    if command -v sudo >/dev/null 2>&1 && sudo -n perf --version >/dev/null 2>&1; then
+        perf_cmd=(sudo -n perf)
+    else
+        echo "perf_bench_runner: perf_event_paranoid blocks profiling and sudo -n perf is unavailable; benchmark not executed" >&2
+        exit 77
+    fi
+fi
+
 binary=$1
 shift
 perf_data="/tmp/fw-cod-fw-$(basename "$binary")-$$.data"
@@ -24,11 +35,11 @@ hostname
 sha256sum -- "$binary"
 echo "PERF_BENCH_WORKER_END"
 
-perf record -m 1 -F 499 -e cycles:u -o "$perf_data" -- "$binary" "$@"
+"${perf_cmd[@]}" record -m 1 -F 499 -e cycles:u -o "$perf_data" -- "$binary" "$@"
 status=$?
 
 echo "PERF_BENCH_SELF_TIME_BEGIN"
-perf report \
+"${perf_cmd[@]}" report \
     -i "$perf_data" \
     --stdio \
     --no-children \
