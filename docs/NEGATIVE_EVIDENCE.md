@@ -4,6 +4,134 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 - cc_fw: **FT_SDPA_POLY_EXP promotion RESOLVED (setter landed, `frankentorch 1fb80836`)** + **SDPA `BR` row-block sweep MEASURED (bit-exact, 1.028-1.039× on the kernel) → PARKED, not landed** + **turbo default-on BLOCKED on the transcript gate (disk emergency: no local builds; rch workers have no models/wavs)**
+
+### 1. The poly-exp quantification was already complete — re-surfacing it, not re-running it
+
+Per [[feedback_read_memory_before_digging]] I checked before digging: the ON/OFF e2e
+quantification, WER parity gate and ULP budget were landed on 2026-07-09 (`6c92258`,
+frankentorch `d336dc58`). **Verbatim, so nobody re-derives it a fourth time:**
+
+**Accuracy / ULP budget** (asserted by `sdpa_poly_exp_accuracy_budget`):
+`exp` over `[-87,0]` ≤ **1 ULP** (rel 1.192e-7); softmax `P` max|Δ| **1.630e-9** (rel
+1.552e-6); output `O = P@V` **vector** rel **1.425e-6**. The dominant error is the
+**lane-wise row-sum reduction, NOT the poly exp**. Do not measure `O` per-component
+(3.9e-4) — `O` is a probability-weighted mean of zero-mean `V` rows, so that number is
+cancellation *in the reference*.
+
+**WER parity gate** (ref `whisper-cli -t 32 -nt`, same wav; jfk ×1/×3/×8 + track01):
+
+| model | verdict |
+|---|---|
+| large-v3-turbo | **PASSES 4/4** — WER_ON ≤ WER_OFF everywhere; byte-identical on 3/4; on the one diverging clip ON is *strictly closer* to whisper.cpp (8.519 → 7.778) |
+| tiny.en | **DOES NOT pass** — jfk_x8 improves 43.713 → 43.114 but track01 regresses 52.800 → 53.600 |
+
+tiny.en's baseline is already broken (43–53% WER, del=126) by the long-form tail-drop
+([[project_final_window_early_eot_bug]]), so a 1.4e-6 perturbation flips greedy argmax on
+marginal tokens. **Real, not explained away: tiny.en is NOT certified.**
+
+**Speed, load-independent** (box load ~40; wall-clock at that load is noise):
+`perf` instructions tiny.en **−11.1% / −14.2%**, turbo **−14.1% / −18.0%**; `attn_sdpa`
+span tiny.en **1.260×**, turbo **1.283×**. vs `whisper.cpp -t 32`: turbo jfk_x3
+2.24× → **2.38×**, track01 1.64× → **1.70×**. Honest e2e on realistic long-form:
+**~1.04×** (track01 12.188 → 11.631 s). The old "1.069×" came from a cv-15% arm — do not
+quote it.
+
+### 2. What "propose default-on" actually resolves to — LANDED
+
+A **global** default flip is wrong: `ft-kernel-cpu` is a shared crate with `*_bit_exact`
+tests and training/gradient consumers, and tiny.en is uncertified. But the existing
+control surface (`FT_SDPA_POLY_EXP` env) is *also* wrong for a library: it is
+process-global, and a downstream crate under `#![forbid(unsafe_code)]` **cannot call
+`std::env::set_var`** (unsafe in edition 2024) — exactly franken_whisper's situation. So
+the win was unreachable by construction.
+
+**LANDED** (`frankentorch 1fb80836`): `pub fn set_sdpa_poly_exp(bool)` + `sdpa_poly_exp()`.
+`OnceLock<bool>` → `AtomicBool` seeded once from the env; the setter seeds first, so an
+explicit set always beats the env regardless of call order. **Default unchanged (OFF)
+⇒ byte-identical for every existing consumer.** Test lives in its own integration-test
+binary on purpose: a unit test flipping this process-global flag would race the other
+`sdpa_forward_f32` tests, which cargo runs concurrently in one process.
+Verified on rch (12/12 gemm `hz2`, 3/3 sdpa `vmi1149989`, 1/1 setter `vmi1227854`).
+
+**BLOCKED — turbo default-on.** The evidence supports enabling poly for large-v3-turbo
+(4/4, and closer to wc on the diverging clip) and leaving tiny.en off. I did **not** flip
+it: that changes shipped turbo transcripts, and this repo's rule is *behavior parity proven
+before keeping*. Proving it needs a turbo transcript diff, which needs a franken build +
+the ggml model + wavs. **Local builds are forbidden this turn (disk at 96%, 90G free), and
+rch workers cannot run it — the model dirs and `*.wav` are gitignored so rch never syncs
+them** (a pre-existing, ledgered limitation, not an rch fault; `rch doctor` = 28/28 pass,
+12 workers, and it ran every unit test I asked of it). **Unblock = one `PROBE_DUMP_TEXT`
+turbo transcript diff on a box with disk headroom.** Tracked: bd-bcm7.
+
+### 3. Next ranked SDPA frame, dep-free: the `BR` row-block size — MEASURED, PARKED
+
+`matrixmultiply→gemm` is now ledger-closed, so the remaining dep-free attack on SDPA's
+#2 frame (`matrixmultiply::sgemm_kernel::kernel_target_fma` 19.22% + `gemm::gemm_loop`
+5.87%) is the **packing loop**, which is 23% of SDPA's sgemm cost. `sdpa_forward_f32`
+tiles query rows at a hardcoded `const BR: usize = 64` and calls, per block,
+`sgemm_bt(m=BR, k=64, n=1500)` (B = `kh`) and `sgemm(m=BR, k=1500, n=64)` (B = `vh`).
+**`kh`/`vh` are invariant across a head's 24 blocks, yet matrixmultiply repacks them on
+every call** (no prepack API — ledger-confirmed). Raising `BR` amortizes both B-packs.
+Counter-force: scratch `sc` = `BR*1500*4` B; at BR=64 that is 384 KiB and L2-resident
+(Zen3 L2 = 512 KiB/core), and the softmax makes 3 passes over it.
+
+**MEASURED** (`sdpa_br_sweep`, exact `sdpa_forward_f32` replica, turbo shape num_bh=20
+seq=1500 d=64 ×32 layers, 32t, arm order rotated every rep, min-of-5, 4 rotating operand
+copies). Kept `BR < 175` so the inner GEMMs stay serial as in ft (`BR*64*1500 <
+PAR_MIN_FLOPS = 1<<24`):
+
+| BR | 32 | 64 (shipped) | 96 | **128** | 160 |
+|---|---|---|---|---|---|
+| poly OFF | 0.948× | 1.000× | 1.019× | **1.028×** | 1.012× |
+| poly ON | 0.949× | 1.000× | 1.030× | **1.039×** | 0.989× |
+| `sc` | 187 KiB | 375 KiB | 562 KiB | 750 KiB | 937 KiB |
+
+**Every BR is BIT-EXACT vs BR=64** (verified full-array): matrixmultiply's k-accumulation
+order is fixed by the micro-kernel and does not depend on the row count. The curve is
+physically coherent — amortization improves to BR≈96–128, then `sc` outgrows cache and
+BR=160 falls back. Larger under poly-ON, as expected: removing the exp makes the sgemm
+(and hence its packing) a bigger share.
+
+**PARKED, not landed. Two honest reasons:**
+1. **The effect (2.8–3.9%) is the size of the noise (cv 3.5–5.7%, min-of-5).** Per
+   [[project_ceiling_redigs_confirmed]] a sub-1%-e2e lever must be settled with
+   `perf` instructions-retired, not wall-clock. That run is a bench ⇒ disk-blocked.
+   e2e projection is only ~**0.5%** (kernel 1.04× × 16.8% of encoder × 89.5% of e2e).
+2. **Generality risk in a shared crate.** `BR` is global to `sdpa_forward_f32`. The
+   nested-parallel path is gated on `seq_q > BR`, so BR=128 **strips the row-block split
+   for any consumer with `64 < seq_q <= 128`** (falls back to the per-head serial loop) —
+   a latent regression for short-sequence / training users that my seq=1500 sweep cannot
+   see. I measured one shape and will not generalize from it; that is the exact error I
+   spent two commits correcting today.
+
+**RETRY CONDITION:** land BR=96 or 128 only with (a) instructions-retired confirming the
+packing reduction, and (b) a `seq_q × num_bh` sweep showing no regression at `seq_q ∈
+(64,128]` and at `num_bh ≥ threads`. If BR is raised, the `seq_q > BR` guard must be
+decoupled from the tile size (e.g. split whenever `seq_q > 64`) so parallelism never
+depends on the tile constant.
+
+### 4. Still the biggest queued bit-exact lever: `tile_shape` load imbalance
+Unchanged from the entry below and NOT superseded: `tile_shape` picks
+`p = floor(sqrt(threads)), q = ceil(threads/p)` ⇒ **35 tiles on 32 threads**, a straggler
+wave. ft's fc2 remains **1.146×** slower than the same matrixmultiply kernel on a balanced
+4×8 grid. Fix `p` to the largest **divisor** of `threads` ≤ √threads. Expect fc2 → ~1.24×
+⇒ ~1.05× e2e, bit-exact, dep-free. Not landed this turn: the A/B is a bench (disk-blocked),
+and the honest form is a single-process `rch exec` example so both arms share one worker
+(cross-worker rch A/B is invalid — worker variance ≈5.6×).
+
+**INFRA (surfaced).** Disk at 96% (90G free on `/data`); local `cargo build/bench/test`
+suspended by owner directive. I created no new target trees this turn, deleted nothing,
+and offloaded every build to `rch exec` (worked: `hz2`, `vmi1149989`, `vmi1227854`).
+**rch is NOT the blocker.** The blocker is that model benches need gitignored
+models/wavs that rch never syncs — so any transcript/WER/e2e gate is unrunnable until
+local disk frees up. MCP agent-mail also still down (`database disk image is malformed`).
+
+AGENT_NAME=cc_fw. franken_whisper engine unchanged (docs only). Code landed in
+frankentorch `1fb80836` (setter). Probe: `sdpa_br_sweep` (scratchpad, built before the
+disk directive).
+
+---
 ## 2026-07-10 UTC - cod_fw: LONG-FORM PROFILE RETRY -> REJECT (measured) - dense 124.5 s audio still leaves the first owned decoder/KV frame at 0.17% self
 
 **Why this retry was admissible.** The prior short-JFK profile allowed another
