@@ -4,6 +4,73 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-10 UTC - cc_fw: DIG -> REJECTED (measured) - **SDPA softmax PASS-ELIMINATION is worth 3.9 ms/window (0.8% of the kernel); divide->reciprocal is a REGRESSION.** Quiet-box re-take CONFIRMS the exp attribution and CORRECTS my own e2e number down.
+
+**The frame.** After the poly-exp win the fused kernel is `~304 ms sgemm + ~169 ms
+softmax` per window. Inside that softmax the poly `exp` is only ~12 ms; the other
+~57 ms is the three elementwise passes over `sc`. Per window those passes run
+**1.44 G scale-multiplies (pass 1)** and **1.44 G scalar divides (pass 3)**. Two
+candidates, both inside the already-gated non-byte-exact poly path, both
+ledger-clear (NE:12628 is franken's *decode* softmax, which already uses `v*=inv`;
+NE:9263 is folding scale into *weights* in franken's own attention — different
+sites, neither rejects this):
+
+1. fold `scale` into `q_block` before `sgemm_bt` (pass 1 becomes a read-only max)
+   **and delete pass 3** — leave `P` unnormalized, run the PV gemm, then scale each
+   `d_v=64`-wide output row by `1/sum`. 64 multiplies per row instead of 1500, and
+   one fewer full pass over `sc`. (The FlashAttention accumulation identity.)
+2. replace pass 3's divide with a reciprocal multiply.
+
+**MEASURED (`examples/sdpa_softmax_attrib_probe.rs`, quiet box load ~10, min-of-7,
+real shape; REAL kernel 472.7 ms at cv 0.2%):**
+
+```
+T_fill  (observable control)   7.0 ms
+T_libm  (fill + softmax)     175.7 ms   -> softmax = 168.8 ms = 35.7% of kernel
+T_noexp (fill, exp->subtract) 57.8 ms   -> exp     = 117.9 ms = 24.9% of kernel
+T_poly  (fill + poly exp)     69.5 ms   -> poly saving 106.2 ms = 22.5% of kernel
+T_recip (poly, *1/sum)        70.1 ms   -> divide->reciprocal:  -0.5 ms  (REGRESSION)
+T_2pass (poly, no normalize)  65.6 ms   -> fold scale + drop norm: +3.9 ms (0.8%)
+```
+
+**REJECT both.** 3.9 ms/window is ~0.15% e2e — noise. **Why:** removing 1.5 of 3
+passes should have saved ~25 ms if the passes were traffic-bound. They are not.
+`sc` is `64 x 1500 x 4 B = 384 KiB`, firmly **L2-resident**, so the extra passes'
+loads are nearly free and the cost sits in pass 2's `exp` and the per-row reduce
+chains. **The ledger's own fusion-ranking rule predicted this and I should have
+applied it before building:** "fusion only pays when the folded pass is
+bandwidth-bound AND DRAM-resident, not merely present in the profile." `sc` is
+exactly the cache-warm class that already killed encoder residual-add fusion
+(NE:428, 1.0027x) and LN->quant fusion (NE:416). Pass-count reduction on an
+L2-resident buffer buys nothing.
+
+**A trap I fell into and fixed in my own probe.** The `T_fill` control originally
+read **0.1 ms** for 5.9 GB of `copy_from_slice` — impossible. LLVM had
+dead-store-eliminated the whole fill because the empty control closure never read
+the scratch. `black_box(&*sc)` restores it (7.0 ms; it is an L2->L2 copy, hence
+genuinely cheap). The exp attribution was never affected — it is a *difference* of
+two variants that both carry the fill — but a control that measures zero should
+always be treated as DCE until proven otherwise.
+
+**CORRECTIONS to my own prior entries, from the quiet-box re-take (load ~9-17):**
+- The exp attribution **holds**: 24.9% of the kernel here vs 23.7% measured at load
+  ~40. Real-kernel cv improved from 0.8% to **0.2%**.
+- **e2e is smaller than I claimed.** Order-alternated min-of-5, turbo:
+  `track01` (124.5 s, 5 windows, the realistic long-form case) OFF 12.188 s -> ON
+  11.631 s = **1.048x min / 1.041x median at cv 3.2% / 1.4%** — the only arm that
+  clears a 5% cv gate. vs whisper.cpp `-t 32`: **1.85x -> 1.94x**.
+  `jfk_x3` reads 1.075x min but at **cv 15%** and must not be quoted. My earlier
+  "~1.069x e2e" came from the short, encoder-heavier jfk_x3 arm; **the honest
+  headline is ~1.04x e2e on realistic long-form**, with the op-level `attn_sdpa`
+  span win (1.26-1.28x) unchanged. Ratcheting the claim DOWN.
+
+**Consequence for the lane.** With softmax pass-elimination rejected and the exp
+captured, the fused SDPA is now `~304 ms sgemm (64%) + ~62 ms irreducible softmax`.
+What remains is external `matrixmultiply` sgemm at 1.10 TF/s — the GEMM lane, not
+the non-GEMM residual lane. **The SDPA softmax axis is CLOSED.** AGENT_NAME=cc_fw.
+Probe-only + doc; engine byte-identical to HEAD.
+
+---
 ## 2026-07-10 UTC - cc_fw: PROMOTION EVIDENCE for `FT_SDPA_POLY_EXP` - WER gate **PASSES on large-v3-turbo (4/4)**, **does NOT cleanly pass on tiny.en (1 clip +0.8 WER)**; accuracy budget published. **Recommendation: franken-scoped opt-in, NOT a global kernel default.**
 
 **Accuracy budget (deterministic, load-independent; asserted by
