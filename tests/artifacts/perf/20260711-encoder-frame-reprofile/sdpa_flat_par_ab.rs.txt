@@ -1,0 +1,146 @@
+//! Does flattening `sdpa_forward_f32`'s nested per-head × per-block `par_chunks_mut` into a
+//! single `par_iter` cut the rayon scheduling overhead on the turbo encoder shape?
+//!
+//! On large-v3-turbo the encoder SDPA is `num_bh=20` heads (< 32 threads) at `seq_q=seq_k=1500`,
+//! so it takes the few-heads-many-cores branch that nests an inner `par_chunks_mut` inside an
+//! outer one. An in-situ perf profile of the default turbo engine showed ~1/3 of self-time in
+//! `rayon::...::bridge_producer_consumer` + `crossbeam_deque::Stealer::steal`, and SDPA is the
+//! single biggest encoder sub-op (~37% of encoder). The flat split (gated by
+//! `set_sdpa_flat_par`) is BIT-EXACT (same blocks, same k-accumulation order) — only the rayon
+//! task tree changes.
+//!
+//! Arms (ONE process, order rotated per rep, so no cross-worker variance):
+//!   A  nested split  (ships today; `set_sdpa_flat_par(false)`)
+//!   B  flat split     (the lever;   `set_sdpa_flat_par(true)`)
+//! Both call the REAL `ft_kernel_cpu::sdpa_forward_f32`; the only difference is the flag. The
+//! outputs must be bit-identical (asserted before timing).
+//!
+//! Admissible only on a host with `available_parallelism >= threads` (default 32) — the whole
+//! point is a 32-thread scheduling effect; on a smaller host rayon work-steals across the
+//! oversubscription and smears it. Build REMOTELY, run LOCALLY on a >=32-core box:
+//!   RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+//!     cargo build --release -p ft-kernel-cpu --example sdpa_flat_par_ab
+//!   SDPA_AB_THREADS=32 SDPA_AB_REPS=25 target/release/examples/sdpa_flat_par_ab
+
+use std::hint::black_box;
+use std::time::Instant;
+
+fn fill(seed: u64, n: usize) -> Vec<f32> {
+    let mut s = seed | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / 16_777_216.0) - 0.5
+        })
+        .collect()
+}
+
+fn stat(v: &mut [f64]) -> (f64, f64) {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min = v[0];
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+    (min, 100.0 * sd / mean)
+}
+
+fn main() {
+    let threads: usize = std::env::var("SDPA_AB_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let reps: usize = std::env::var("SDPA_AB_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let avail = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .unwrap();
+
+    // large-v3-turbo encoder self-attention: 20 heads, seq 1500, d_head 64, non-causal.
+    let (num_bh, seq_q, seq_k, d_k, d_v) = (20usize, 1500usize, 1500usize, 64usize, 64usize);
+    let scale = 1.0 / (d_k as f32).sqrt();
+    let causal = false;
+    // Match the default turbo runtime: poly softmax on. (Flat-vs-nested is independent of it,
+    // but poly sets the realistic compute:overhead ratio.)
+    ft_kernel_cpu::set_sdpa_poly_exp(true);
+
+    let q = fill(1, num_bh * seq_q * d_k);
+    let k = fill(7, num_bh * seq_k * d_k);
+    let v = fill(13, num_bh * seq_k * d_v);
+
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".into());
+    let admissible = avail >= threads;
+    println!("host={host}  threads={threads}  available_parallelism={avail}  reps={reps}");
+    println!(
+        "shape: num_bh={num_bh} (< {threads} threads => nested branch) seq_q={seq_q} d={d_k} poly=on causal={causal}"
+    );
+
+    let run = |flat: bool| -> Vec<f32> {
+        ft_kernel_cpu::set_sdpa_flat_par(flat);
+        ft_kernel_cpu::sdpa_forward_f32(&q, &k, &v, num_bh, seq_q, seq_k, d_k, d_v, scale, causal)
+    };
+
+    // bit-exactness: flat output must equal nested output bit-for-bit
+    let out_nested = run(false);
+    let out_flat = run(true);
+    let bit_exact = out_nested
+        .iter()
+        .zip(out_flat.iter())
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    println!("bit-exact (flat == nested): {bit_exact}   (len {})", out_nested.len());
+    assert!(bit_exact, "flat split MUST be bit-identical to nested");
+
+    let time_one = |flat: bool| -> f64 {
+        let t = Instant::now();
+        let o = run(flat);
+        black_box(&o[0]);
+        black_box(&o[o.len() - 1]);
+        t.elapsed().as_secs_f64() * 1e3
+    };
+
+    // warm
+    black_box(time_one(false));
+    black_box(time_one(true));
+
+    let (mut va, mut vb) = (Vec::new(), Vec::new());
+    for r in 0..reps {
+        // rotate arm order per rep so drift cancels within the run
+        if r % 2 == 0 {
+            va.push(time_one(false));
+            vb.push(time_one(true));
+        } else {
+            vb.push(time_one(true));
+            va.push(time_one(false));
+        }
+    }
+    let (fa, cva) = stat(&mut va);
+    let (fb, cvb) = stat(&mut vb);
+
+    println!();
+    println!("A nested  min {fa:7.3} ms  cv {cva:.1}%");
+    println!("B flat    min {fb:7.3} ms  cv {cvb:.1}%");
+    println!("A/B (speedup of flat over nested) = {:.3}x", fa / fb);
+
+    println!("\n=== VERDICT ===");
+    if admissible {
+        // SDPA attn_sdpa is ~37% of encoder_window, encoder ~72% of e2e per-window.
+        let enc = 1.0 / (1.0 - 0.37 + 0.37 / (fa / fb));
+        let e2e = 1.0 / (1.0 - 0.72 + 0.72 / enc);
+        println!(
+            "PERF ADMISSIBLE (host={host}, {avail} hw threads >= {threads} under test, single binary)."
+        );
+        println!(
+            "projected: encoder {enc:.3}x -> e2e {e2e:.3}x  (SDPA 37% of encoder, encoder 72% of window)"
+        );
+    } else {
+        println!(
+            "PERF *** NOT ADMISSIBLE *** on host={host}: {avail} hw threads < {threads}. DO NOT QUOTE."
+        );
+    }
+}
