@@ -1,5 +1,36 @@
-# tile_shape load imbalance (bit-exact) — UNPARKED & MEASURED 2026-07-11
+# tile_shape load imbalance (bit-exact) — MEASURED, then GATE-CORRECTED 2026-07-11
 
+> **CORRECTION 2026-07-11 (same day, cc_fw) — the e2e projection below is a GREP-THE-GATE
+> error; the 1.089× LAYER number is real but OFF the default hot path. Read this first.**
+>
+> The admissible sweep measured `ft_kernel_cpu::matmul_tensor_contiguous_f32` (the f32 2-D
+> tiler) at the turbo linear shapes, and the harness projected e2e via a baked-in "linear GEMMs
+> = 72.8% of encoder_window". **That 72.8% predates the default int8 encoder and is now false.**
+> The DEFAULT large-v3-turbo / tiny.en engine takes the `enc_attn_out_i8i32_for` branch
+> (`src/native_engine/encoder.rs:507-523`, default-ON for calibrated models), which quantizes
+> **every** encoder linear — q/k/v/fc1/fc2 to i7 maddubs and attn.out to i8×i32 — and its own
+> comment states it **"yields 0 f32 GEMMs/layer"**. `enc_linear` (encoder.rs:1036) dispatches
+> `Some(w_i7) => nn::matmul_bias_i7` (int8); only the `None` fallback reaches
+> `nn::matmul_bias → matmul → matmul_tensor_contiguous_f32` → `sgemm_2d_parallel` → `tile_shape`.
+>
+> **So in the default turbo engine the 32 encoder linears NEVER call the function this lever
+> optimizes.** The only default-path f32 GEMM that still hits the 2-D tiler is **conv2**
+> (`[~3000, 3840]×[3840, 1280]`, k=3840 ∈ (1024, 8192], one op PER WINDOW — not per-layer),
+> whose share of the encoder is ~1-3%. tile_shape's true default-turbo e2e impact is therefore
+> **~0.1-0.3% (conv2 only), NOT the ~5.6% projected below.**
+>
+> **CONSEQUENCE:** the "flip `set_sgemm_tile_balanced` default ON" recommendation is
+> **DOWNGRADED** — it would not move default turbo/tiny.en e2e. The 1.089× is only realizable
+> on configs that run f32 encoder linears: `FRANKEN_WHISPER_ENC_INT8`-off + a non-calibrated
+> (unknown) model, or `FW_ENC_ATTN_OUT_I8I32=0`. Not the shipped deployment. The bit-exactness
+> and the function-level 1.089× stand; only the e2e attribution was wrong.
+>
+> **LESSON (project_grep_the_gate, again):** I trusted the harness's baked-in linear-fraction
+> instead of grepping which branch the default engine takes. The int8 encoder made the f32
+> linear layer dead. Always confirm the DEFAULT dispatch reaches the function under test.
+>
+> ---
+>
 > **UPDATE 2026-07-11 — ADMISSIBLE PERF CAPTURED; lever is no longer blocked.**
 > The sole missing piece (a 32-thread perf A/B on a host with `available_parallelism >= 32`)
 > is now measured on **thinkstation1 (64 cores)**: built remotely via `rch` (vmi1227854), run
