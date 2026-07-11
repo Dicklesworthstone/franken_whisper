@@ -1,3 +1,19 @@
+# Fresh default-turbo re-profile (2026-07-11) — SDPA flat-par REJECT (now ADMISSIBLE) + infra recipe
+
+> **HONESTY CORRECTION (same day) — this was NOT a novel re-ranking. Read `project_turbo_e2e_frame_table`
+> first.** That memory ALREADY documents (a) SDPA's ~37.8% encoder share, (b) the rayon/crossbeam
+> decomposition, and (c) **"SDPA flat-vs-nested" as an existing REJECT (`59b77db`/`a410602`) that was
+> "measurement-blocked"** pending "a QUIET ≥32-physical-core box." My net-new contribution is narrower
+> and real: I **admissibly CONFIRMED that measurement-blocked reject** (0.997×, byte-exact, thinkstation1
+> 64c satisfies the retry-condition via build-remote/run-local), and **verified the profiling-infra
+> recipe** (§0). The "~37% rayon aggregate" in §2 is NOT a real increase over the frame table's 11.25% —
+> it is a symbol-attribution artifact of my thin-LTO `release` build leaving `bridge_producer_consumer`
+> un-inlined (the frame table's `release-perf` build inlines it into the loop bodies). Same engine, same
+> reality; do not cite "37%" as evidence the engine changed. The FLAT #1 frame is still `dot_maddubs_i7`
+> (i7 GEMM); "SDPA #1" holds only by PHASE/region, which was already known.
+
+## (original writeup below — the SDPA-37% / rayon framing is superseded by the correction above)
+
 # Fresh default-turbo re-profile (2026-07-11) — frame re-ranking + SDPA flat-par REJECT
 
 Profile-before-optimizing pass. Built a debuginfo'd `e2e_probe` remotely, ran the DEFAULT
