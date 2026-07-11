@@ -55,6 +55,15 @@ median/parity proof, then pass remote `cargo check --all-targets`, remote
 `cargo clippy --all-targets -- -D warnings`, and remote `cargo test` before
 shipping.
 
+**Fresh-auth retry audit (2026-07-11T19:15:18Z):** `rch doctor` reported all
+28 diagnostic checks passing, but the authoritative `rch status --json` still
+reported `posture: degraded` with only 9/12 workers healthy (35 remote slots
+available; `ovh-a` unreachable and two workers drained). Per the explicit
+`rch degraded = SURFACE` rule, no Cargo command was launched, no local fallback
+was attempted, and the candidate remains unshipped. The retry condition above
+is unchanged: require fleet posture `healthy` before re-running the remote
+median/parity and all-targets gates.
+
 ---
 ## 2026-07-11 - whisper-cc: **EXHAUSTED — after the `matmul_bias_i8` quant ship, the cod-free hot-path antipattern vein is empty. Every remaining `round`/transcendental site is sub-floor or closed; the next hot lever needs cod's `nn.rs` to commit (wire-ins) or the 32-thread infra.**
 
