@@ -4,6 +4,20 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-11 - whisper-cc: **REJECTED by register arithmetic — the Ncol weight-conversion-sharing tile does NOT extend to the f16 GEMV. `dot_f16c_4col` needs 16 YMM accumulators = the whole AVX2 register file, leaving none for the shared `cvtph`. f16 caps at the shipped M2col. No build (deductive, not measured).**
+
+**Negative-ledger-first follow-on to the int8 `dot_i8_4col` park (below).** The int8 4col win raised the natural question: does the same weight-conversion-sharing tile extend to the f16 row-morsel GEMV (`gemv_f16_batch_rows` / `dot_f16c_2col`, the M2col that landed **1.26×**, `ce43019`)? f16 has *more* headroom in principle — `cvtph` (f16→f32) is costlier than int8's `vpmovsxbw`.
+
+**REJECTED — register-infeasible for a byte-exact version (code-grounded, certain):** `dot_f16c_2col` (nn.rs:1679) uses **8 f32 YMM accumulators — 4 per column** (`a0..a3`, `b0..b3`, matching `dot_f16c`'s 4-way-unrolled FMA reduction). Byte-exactness vs the shipped M1/M2col path *requires* that exact 4-accumulator-per-column structure (f32 add is **not** order-independent — unlike int8's i32 madd). A 4-column tile therefore needs **4×4 = 16 f32 accumulators = all 16 AVX2 YMM registers**, with the 4 shared weight-`cvtph` chunks (`wc0..wc3`) having **nowhere to live** → guaranteed spill of the very thing the tile amortizes. M3col is 12+4 = 16 *exactly full* (no spare for FMA/load temps) → also spills, and its incremental cvtph-sharing (0.5→0.33/token) is marginal.
+
+**WHY int8 4col fit but f16 4col cannot:** `dot_i8` uses only **2 accumulators/column** (i16 `madd_epi16` → i32, 2-way unroll), so int8 4col = 8 accumulators + 2 weight = 10 YMM (fits). f16 `dot_f16c` uses **4 accumulators/column** (FMA-latency hiding), so f16 4col = 16 + 4 = 20 YMM (spills). The tile's max N is set by the base kernel's accumulators-per-column: `floor(16 / accum_per_col) ≥ N + weight_regs`.
+
+**Ncol tile family now MAPPED (do not re-attempt f16 N>2):**
+- **int8** (`dot_i8`, 2 accum/col): 2col shipped (`85776f4`), **4col parked win** (below), 6col fits (14 YMM) but marginal, 8col spills.
+- **f16** (`dot_f16c`, 4 accum/col): **2col shipped is the ceiling** (`ce43019`); N≥3 register-infeasible byte-exact.
+
+**Retry-condition:** none for byte-exact f16 (the register wall is structural). A *non*-byte-exact f16 4col (fewer accumulators, different reduction order) is a WER-gated owner call, not a byte/ULP-exact lever.
+
 ## 2026-07-11 - whisper-cc: **PARKED byte-exact win — `dot_i8_4col` (4-token activation-column tile) beats the shipped `dot_i8_2col` on the int8 batched GEMV. Pure-kernel 1.03–1.11× admissibly measured on rch; production wire-in + default-flip BLOCKED.**
 
 **Negative-ledger-first lever** (bv `--robot-triage` top pick `bd-transcript-gate-unrunnable-xu9g` established "pure-cargo franken benches now RUN remotely"; the reopened kernel family is the landed `dot_i8_2col`, `85776f4`). The int8 batched GEMV `gemv_i8_batch` (feeds the ~28% encoder int8 GEMM frame) is WEIGHT-OUTER; 2col shares the L1-hot weight-row `vpmovsxbw` across 2 tokens. **4col shares it across 4** (0.5 weight-cvt/token → 0.25), at 8 i32 accumulators (4 cols × 2 halves) — register-pressure-risky on AVX2's 16 YMM.
