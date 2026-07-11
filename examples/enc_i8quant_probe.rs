@@ -30,14 +30,19 @@ fn quant_row_avx2(xr: &[f32], inv: f32, out: &mut [i8]) {
     unsafe {
         let vinv = _mm256_set1_ps(inv);
         let half = _mm256_set1_ps(0.5);
+        let one = _mm256_set1_ps(1.0);
         let signmask = _mm256_set1_ps(-0.0);
         let c127 = _mm256_set1_ps(127.0);
         let cm127 = _mm256_set1_ps(-127.0);
         let mut i = 0;
         while i + 8 <= n {
             let v = _mm256_mul_ps(_mm256_loadu_ps(xp.add(i)), vinv);
-            let vh = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, signmask)));
-            let r = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(vh);
+            // byte-exact round-half-away: trunc(v) + (|v-trunc(v)|>=0.5 ? copysign(1,v):0)
+            let tr = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(v);
+            let frac = _mm256_sub_ps(v, tr);
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(_mm256_andnot_ps(signmask, frac), half);
+            let sign1 = _mm256_or_ps(one, _mm256_and_ps(v, signmask));
+            let r = _mm256_add_ps(tr, _mm256_and_ps(ge, sign1));
             let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
             let ri = _mm256_cvtps_epi32(r);
             let lo = _mm256_castsi256_si128(ri);

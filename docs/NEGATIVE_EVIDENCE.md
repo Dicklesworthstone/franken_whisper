@@ -56,7 +56,7 @@ median/parity proof, then pass remote `cargo check --all-targets`, remote
 shipping.
 
 ---
-## 2026-07-11 - whisper-cc: **READY & SHIPPABLE (cod-free file) — scalar `f32::round()` activation-quant antipattern in the DEFAULT-ON `matmul_bias_i8`; byte-exact AVX2 fix replicates nn.rs's tested quantizer. Blocked only on TRANSIENT rch admission capacity (not cod's tree, not 32-thread) to certify the wire-in.**
+## 2026-07-11 - whisper-cc: **LANDED (cod-free encoder.rs) — vectorized the scalar `f32::round()` activation-quant in the DEFAULT-ON `matmul_bias_i8`. Byte-EXACT (CERTIFIED via boundary-swept unit test), ~2.2–2.7× on the quant. Caught + avoided a real `trunc(v+0.5)` sub-0.5 rounding bug that the nn.rs quantizer carries.**
 
 **Best lever in several cycles — genuinely shippable, not parked.** Grepping cod-free hot files for the `round_doesnt_vectorize` antipattern ([[project_round_doesnt_vectorize]]) surfaced **`encoder.rs:1256`** inside `matmul_bias_i8` (the **default-on** attn.out i8 GEMM, `FW_ENC_ATTN_OUT_I8I32` policy, part of the 1.47× encoder int8 win):
 ```rust
@@ -68,7 +68,9 @@ This runs m×inp = 1500×1280 ≈ **1.9M scalar `roundf` per layer** (×32 layer
 
 **Value ALREADY ESTABLISHED (pre-directive baseline):** nn.rs's quantizer is the same antipattern fixed the same way, measured ~5× on the quant (`quant_i8_probe`). So this qualifies to ship under the blocker bead's "bit-exact lever whose value is already established" clause.
 
-**STATUS: READY, blocked only on TRANSIENT rch admission (not structural).** Probe `examples/enc_i8quant_probe.rs` (committed) couldn't run — rch returned `no admissible workers: insufficient_slots=7, hard_preflight=2` on 3 tries this window (fleet saturated + a stale build blocking the queue on vmi1264463). I will NOT wire an uncertified change into a default-on hot path. **Retry-condition (near-term, not owner/32-thread-gated):** an admissible rch slot ⇒ (1) `cargo run --example enc_i8quant_probe` to size + assert byte-id on-box, (2) add `quant_row_i8_avx2` to encoder.rs + swap the loop at 1256, (3) `cargo test` byte-exact cert, (4) commit + push. This is a clean solo SHIP the moment rch has capacity.
+**BYTE-EXACTNESS BUG CAUGHT (why the test earned its keep).** First cut copied nn.rs's `trunc(v + copysign(0.5,v))` round-half-away emulation — the boundary-swept unit test **FAILED**: for `v` just below 0.5, the FP add `v + 0.5` rounds UP to 1.0, so `trunc` gives 1 where `f32::round` gives 0. (The random-data probe reported `byte-id=true` — it never hit the boundary; nn.rs's "byte-identical" claim was validated only over clamp edges, so **nn.rs's quantizer carries this latent off-by-one at half-integer activations** — flagged, not fixed here: nn.rs is cod-dirty.) The fix is a genuinely byte-exact round-half-away: `trunc(v) + (|v−trunc(v)| ≥ 0.5 ? copysign(1,v) : 0)`, exact because `trunc` and `v−trunc(v)` are exact for `|v| ≤ 127`.
+
+**STATUS: LANDED** — `src/native_engine/encoder.rs` (helper `quant_row_i8` + wire-in at `matmul_bias_i8` + boundary-swept unit test `quant_row_i8_is_byte_identical_to_scalar_round`). Certified on rch: `cargo test … quant_row_i8 …` → **1 passed**; re-measured **~2.2–2.7×** on the m=1500 encoder shape (`enc_i8quant_probe`, byte-id=true). First cod-free, fully-certified **SHIP** of the session (the int8/f16 kernel levers all parked on cod's `nn.rs`). Follow-up (not this cycle): the same fix belongs in `nn::quantize_act_i8_into` once cod's `nn.rs` WIP lands.
 
 ## 2026-07-11 - whisper-cc: **MEASURED — int8 `dot_i8_6col` is byte-exact and never slower than 4col, but the weight-conversion-sharing curve SATURATES at 4col: 6col adds only 0.1–0.7% at the encoder's large-tq regime (noise). N=4 is the pragmatic optimum for the eventual wire-in; don't wire 6col.**
 

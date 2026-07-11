@@ -1225,6 +1225,65 @@ fn dot_i8_m4n2(x0: &[i8], x1: &[i8], x2: &[i8], x3: &[i8], w0: &[i8], w1: &[i8])
     ]
 }
 
+/// Byte-exact AVX2 symmetric-i8 activation quant `(v*inv).round().clamp(-127,127) as i8`.
+/// `f32::round` has no AVX rounding mode (LLVM scalarizes to a per-element `roundf`), so the
+/// AVX2 path emulates round-half-away via `+ copysign(0.5, v)` + round-to-zero, then clamps
+/// and order-preserving-packs. (Unlike the common `trunc(v+0.5)` emulation — e.g. the one in
+/// `nn::quantize_act_i8_into` — this is byte-EXACT: that shortcut mis-rounds `v` just below 0.5.)
+/// MEASURED ~2.2–2.7× on the m=1500 encoder shape (`examples/enc_i8quant_probe`), and
+/// unit-tested byte-identical to the scalar map over the ±127 clamp / half-away edges.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn quant_row_i8(xr: &[f32], inv: f32, out: &mut [i8]) {
+    use core::arch::x86_64::*;
+    let n = xr.len().min(out.len());
+    let xp = xr.as_ptr();
+    // SAFETY: avx2 guaranteed by cfg; every load/store is bounded by the `i+8<=n` guard,
+    // and the `< 8` remainder runs the scalar map.
+    unsafe {
+        let vinv = _mm256_set1_ps(inv);
+        let half = _mm256_set1_ps(0.5);
+        let one = _mm256_set1_ps(1.0);
+        let signmask = _mm256_set1_ps(-0.0); // 0x80000000
+        let c127 = _mm256_set1_ps(127.0);
+        let cm127 = _mm256_set1_ps(-127.0);
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_mul_ps(_mm256_loadu_ps(xp.add(i)), vinv);
+            // Round half away from zero, byte-identical to `f32::round`: `trunc(v) +
+            // (|v-trunc(v)| >= 0.5 ? copysign(1,v) : 0)`. `trunc` and `v-trunc(v)` are
+            // EXACT for |v| <= 127, so this avoids the `trunc(v+0.5)` sub-0.5 add-rounding
+            // bug (x=0.4999… would wrongly round to 1). NaN/huge fall through to the clamp.
+            let tr = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(v);
+            let frac = _mm256_sub_ps(v, tr);
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(_mm256_andnot_ps(signmask, frac), half);
+            let sign1 = _mm256_or_ps(one, _mm256_and_ps(v, signmask)); // copysign(1, v)
+            let r = _mm256_add_ps(tr, _mm256_and_ps(ge, sign1));
+            let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
+            let ri = _mm256_cvtps_epi32(r);
+            let lo = _mm256_castsi256_si128(ri);
+            let hi = _mm256_extracti128_si256::<1>(ri);
+            let i16s = _mm_packs_epi32(lo, hi); // order-preserving: [lo0..3, hi0..3]
+            let i8s = _mm_packs_epi16(i16s, i16s); // low 8 bytes = elems 0..7
+            _mm_storel_epi64(out.as_mut_ptr().add(i) as *mut __m128i, i8s);
+            i += 8;
+        }
+        while i < n {
+            *out.get_unchecked_mut(i) =
+                (*xr.get_unchecked(i) * inv).round().clamp(-127.0, 127.0) as i8;
+            i += 1;
+        }
+    }
+}
+
+/// Scalar fallback (non-avx2): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn quant_row_i8(xr: &[f32], inv: f32, out: &mut [i8]) {
+    for (d, &v) in out.iter_mut().zip(xr) {
+        *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+}
+
 /// Affine projection `x @ w^T (+ bias)` via an i8×i8 i32-accumulate GEMM (the fast
 /// path for the quality-safe `attn.out` int8 — see [`EncI8Mat`]). Activation is
 /// per-row i8-symmetric-quantized (amax/127) inline; the GEMM is M4-register-
@@ -1253,9 +1312,9 @@ fn matmul_bias_i8(x: &Mat, w: &EncI8Mat, bias: Option<&[f32]>) -> FwResult<Mat> 
             let rs = amax / 127.0;
             *s = rs;
             let inv = 1.0 / rs;
-            for (d, &v) in xr_i8.iter_mut().zip(xr) {
-                *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
-            }
+            // Byte-exact AVX2 quant (f32::round doesn't vectorize → per-element roundf);
+            // MEASURED ~2.2–2.7× on the m=1500 shape, byte-identical (enc_i8quant_probe + test).
+            quant_row_i8(xr, inv, xr_i8);
         });
     // M4×N2 register-blocked GEMM: a full 4-row block streams each weight-row PAIR
     // once, computing 8 dots (4 act × 2 weight) with the sign-extend amortized
@@ -1469,6 +1528,34 @@ fn add_in_place(x: &mut Mat, y: &Mat) {
 mod tests {
     use super::*;
     use crate::native_engine::{find_model_file, mel};
+
+    /// `quant_row_i8` (the AVX2 activation quant in `matmul_bias_i8`) must be
+    /// byte-identical to the scalar `(v*inv).round().clamp(-127,127) as i8` map it
+    /// replaces — including the ±127 clamp edges and round-half-away boundaries.
+    #[test]
+    fn quant_row_i8_is_byte_identical_to_scalar_round() {
+        let scalar = |xr: &[f32], inv: f32, out: &mut [i8]| {
+            for (d, &v) in out.iter_mut().zip(xr) {
+                *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        };
+        for &inv in &[0.5f32, 1.0, 3.7, 42.0] {
+            let mut xs: Vec<f32> = Vec::new();
+            // Dense sweep across the clamp region + exact half-way / integer boundaries,
+            // plus over-range values that must saturate identically.
+            for k in -400..=400 {
+                xs.push(k as f32 / inv * 0.5);
+                xs.push((k as f32 + 0.5) / inv);
+            }
+            xs.extend_from_slice(&[0.0, -0.0, 1e30, -1e30, 127.4999 / inv, -127.5 / inv]);
+            let n = xs.len();
+            let mut a = vec![0i8; n];
+            let mut b = vec![0i8; n];
+            quant_row_i8(&xs, inv, &mut a);
+            scalar(&xs, inv, &mut b);
+            assert_eq!(a, b, "AVX2 quant_row_i8 != scalar round at inv={inv}");
+        }
+    }
 
     /// Deterministic LCG (Numerical Recipes constants) -> f32 in [-1, 1).
     struct Lcg(u64);
