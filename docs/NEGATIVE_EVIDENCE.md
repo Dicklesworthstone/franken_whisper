@@ -56,6 +56,17 @@ median/parity proof, then pass remote `cargo check --all-targets`, remote
 shipping.
 
 ---
+## 2026-07-11 - whisper-cc: **EXHAUSTED — after the `matmul_bias_i8` quant ship, the cod-free hot-path antipattern vein is empty. Every remaining `round`/transcendental site is sub-floor or closed; the next hot lever needs cod's `nn.rs` to commit (wire-ins) or the 32-thread infra.**
+
+**Next-lever search (profile-first grep of cod-free files for `round_doesnt_vectorize` + transcendental scalarization), post-quant-ship:**
+- `quantize_enc_i8` weight quant (`encoder.rs:1082`, scalar `.round()`) — **SUB-FLOOR + strided.** One-time LOAD cost; default path quantizes only the `[1280,1280]` attn.out weight ≈ 52 M elems ⇒ ~4–8 ms parallelized ≈ **~1% of the ~340 ms load** (below the load-arc floor). And the read is column-strided (`w_t[i*out+o]`) ⇒ vectorizing needs `vgather` (microcoded on Zen3) or a restructure+transpose. Not worth it.
+- `audio.rs` resample `floor`/`round` (898/912/942/1181) — SUB-FLOOR (one-time normalize, [[project_realistic_workload_dominated]] / bd-3nw3: not on the critical path).
+- `gelu_slice` (`nn.rs:3296`) — already a byte-exact 65 536-entry table, ~4.4× (done); and cod-dirty.
+- `ln_into` LayerNorm — f64 SoA, a **faithfulness feature**, never byte-exact (f64 sum order) — closed, don't trade faithfulness.
+- `DecoderState::new` cross-K/V `Float16::from_f32` reshape (`decoder.rs:981+`) — SUB-FLOOR (`cross_kv` <0.25% e2e) and f16-conversion is [[project_half_from_f32_software_no_site]] (assessed, no site clears the bar).
+
+**Verdict:** the shipped `quant_row_i8` (the one hot, contiguous, byte-exact cod-free site) closed this vein. Remaining hot levers live in cod-dirty `nn.rs`/`decode.rs` (park on the wire-in) or are owner/32-thread-gated. **Retry-condition:** cod's `nn.rs` KV WIP lands ⇒ wire in the parked `dot_i8_4col` + propagate the byte-exact quant fix into `nn::quantize_act_i8_into` (which still carries the `trunc(v+0.5)` off-by-one).
+
 ## 2026-07-11 - whisper-cc: **LANDED (cod-free encoder.rs) — vectorized the scalar `f32::round()` activation-quant in the DEFAULT-ON `matmul_bias_i8`. Byte-EXACT (CERTIFIED via boundary-swept unit test), ~2.2–2.7× on the quant. Caught + avoided a real `trunc(v+0.5)` sub-0.5 rounding bug that the nn.rs quantizer carries.**
 
 **Best lever in several cycles — genuinely shippable, not parked.** Grepping cod-free hot files for the `round_doesnt_vectorize` antipattern ([[project_round_doesnt_vectorize]]) surfaced **`encoder.rs:1256`** inside `matmul_bias_i8` (the **default-on** attn.out i8 GEMM, `FW_ENC_ATTN_OUT_I8I32` policy, part of the 1.47× encoder int8 win):
