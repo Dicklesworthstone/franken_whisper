@@ -8,6 +8,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## [0.5.0] - 2026-07-11
+
+### CPU int8 encoder + SDPA poly-exp — a measured, quality-gated CPU speedup on x86-64
+
+This is a performance release for the **CPU** native engine (x86-64 AVX2/FMA — AMD Zen/Threadripper, Intel Haswell and newer). Where v0.4.0 moved the encoder onto the GPU for Apple Silicon, v0.5.0 makes the *CPU* encoder substantially faster while holding output quality to a measured zero-WER-Δ budget. Every lever below was kept only on a measured win — verified **byte-identical** where it is byte-exact, and **WER-neutral** where it changes numerics — and gated on the candidate **median** against a **paired null (A/A) control**, not a single before/after pair. Rejected levers are recorded with their null-control and a retry-condition in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
+
+#### Quality-safe int8 encoder (calibrated, policy-gated)
+
+- **The encoder attention-output GEMM now runs int8×int32 under a calibrated per-model quality policy** ([`035e83b`](https://github.com/Dicklesworthstone/franken_whisper/commit/035e83b), [`a997f37`](https://github.com/Dicklesworthstone/franken_whisper/commit/a997f37)) — engaged when the model's calibration certifies it within a **WER-Δ budget of 0.0** and a quantization rel-RMSE budget of 0.09; `FW_ENC_ATTN_OUT_I8I32=0` is the kill switch, `=1` forces it. Measured **1.47× encoder** vs the f32 path, WER-neutral.
+- **Fusing the SDPA gather into the int8 QKV GEMM** ([`3293b47`](https://github.com/Dicklesworthstone/franken_whisper/commit/3293b47)) writes q/k/v head-major straight out of the maddubs GEMM, skipping the standalone gather → **1.47→1.67× vs f32, byte-exact**.
+- **Register-blocked int8 microkernels**: M4×N2 attn.out i8 GEMM ([`b6c3028`](https://github.com/Dicklesworthstone/franken_whisper/commit/b6c3028), 165→129 ms), the M2×N4 maddubs tile ([`40fc09d`](https://github.com/Dicklesworthstone/franken_whisper/commit/40fc09d)), a 2-token column tile `dot_i8_2col` ([`85776f4`](https://github.com/Dicklesworthstone/franken_whisper/commit/85776f4), 1.15–1.19× @tq=64), AVX2 round-half-away activation-quantize ([`0ce9f64`](https://github.com/Dicklesworthstone/franken_whisper/commit/0ce9f64)), and eliding the i7 output zero-fill ([`db3272f`](https://github.com/Dicklesworthstone/franken_whisper/commit/db3272f)).
+- **More aggressive full-int8 paths stay opt-in**: q/k/v+fc1 int8 (`FW_ENC_INT8_ATTN_IN`, ~1.23× encoder, proper-noun-safe, [`e36fec2`](https://github.com/Dicklesworthstone/franken_whisper/commit/e36fec2)) and fc1-only int8 (`FW_ENC_INT8_FC1`, ~1.10×, byte-identical, [`5481d46`](https://github.com/Dicklesworthstone/franken_whisper/commit/5481d46)).
+- The quality-safe policy is WER-gated by a conformance test ([`9fcedac`](https://github.com/Dicklesworthstone/franken_whisper/commit/9fcedac)).
+
+#### SDPA softmax poly-exp (large-v3-turbo)
+
+- **A degree-5 AVX2/FMA polynomial `exp` replaces libm in the fused SDPA softmax for `large-v3-turbo`** ([`94714c1`](https://github.com/Dicklesworthstone/franken_whisper/commit/94714c1), [`5935d68`](https://github.com/Dicklesworthstone/franken_whisper/commit/5935d68)) — **default-on for turbo only** (`tiny.en` is uncertified and stays off; `FW_SDPA_POLY_EXP=0` kills it, `FT_SDPA_POLY_EXP=1` forces it for a certified fine-tune). Measured **1.0722× e2e** (cv 0.8%, 5/5 paired), transcript **byte-identical** on jfk ×1/×3/×8, **WER Δ 0.000** vs whisper.cpp. Evidence: [`docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`](docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md).
+
+#### Byte-exact encoder fusions
+
+- Fuse the f32 `mlp_fc` bias into the GELU pass ([`f06543d`](https://github.com/Dicklesworthstone/franken_whisper/commit/f06543d), 1.04–1.06× encoder), fold the f32 `mlp_proj` bias into the residual add ([`5cb3cac`](https://github.com/Dicklesworthstone/franken_whisper/commit/5cb3cac), ~1.01×), fuse MLP GELU into the fc2 int8 activation-quantize ([`ede9f15`](https://github.com/Dicklesworthstone/franken_whisper/commit/ede9f15)), an M2 activation-column tile for the row-morsel f16 batch GEMV ([`ce43019`](https://github.com/Dicklesworthstone/franken_whisper/commit/ce43019), **byte-exact 1.26×**), and head-major i7 QKV row scheduling ([`50cbd65`](https://github.com/Dicklesworthstone/franken_whisper/commit/50cbd65)). All byte-identical to the prior output.
+
+#### Honesty & correctness
+
+- **Native engines now report *probed* capabilities, not *declared* ones** ([`e782733`](https://github.com/Dicklesworthstone/franken_whisper/commit/e782733)) — reported feature availability reflects what the running binary actually supports.
+- **The HuggingFace-token requirement now fires only when the insanely-fast bridge actually diarizes** ([`84afe64`](https://github.com/Dicklesworthstone/franken_whisper/commit/84afe64), bd-0522) — the native path no longer demands a token it never uses.
+
+#### Measurement methodology (why these numbers are trustworthy)
+
+- **Median-vs-paired-null gate** — every ratio is the candidate median compared against a same-binary A/A null control (ABBA-interleaved), so host contention and order bias cannot masquerade as a win.
+- **Byte/ULP-exact verification** — byte-exact levers are asserted bit-identical against the reference path; the one numerics-affecting lever (poly-exp) is held to a measured WER-Δ of 0.000 vs whisper.cpp.
+- **Negative-evidence ledger** — rejected levers are logged in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md) with a reject-id, the null-control, and a retry-condition, so a dead end stays dead.
+
+**Evidence sources:** [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md), [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md), [`docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`](docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md), [`docs/cc_lane_finalization.md`](docs/cc_lane_finalization.md), and the per-lever commit messages linked above. CPU measurements on an AMD Threadripper PRO 5975WX (32 physical cores, `release-perf`, `target-cpu=x86-64-v3`) unless noted; Apple-Silicon GPU figures are in the v0.4.0 entry.
+
+Compare: [`v0.4.0...v0.5.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.4.0...v0.5.0)
+
 ## [0.4.0] - 2026-07-03
 
 ### Fused GPU encoder — the whole transformer stack on the GPU (Apple Silicon)
