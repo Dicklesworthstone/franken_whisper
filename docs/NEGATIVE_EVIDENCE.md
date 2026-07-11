@@ -4,6 +4,20 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-11 - whisper-cc: **READY & SHIPPABLE (cod-free file) — scalar `f32::round()` activation-quant antipattern in the DEFAULT-ON `matmul_bias_i8`; byte-exact AVX2 fix replicates nn.rs's tested quantizer. Blocked only on TRANSIENT rch admission capacity (not cod's tree, not 32-thread) to certify the wire-in.**
+
+**Best lever in several cycles — genuinely shippable, not parked.** Grepping cod-free hot files for the `round_doesnt_vectorize` antipattern ([[project_round_doesnt_vectorize]]) surfaced **`encoder.rs:1256`** inside `matmul_bias_i8` (the **default-on** attn.out i8 GEMM, `FW_ENC_ATTN_OUT_I8I32` policy, part of the 1.47× encoder int8 win):
+```rust
+for (d, &v) in xr_i8.iter_mut().zip(xr) {
+    *d = (v * inv).round().clamp(-127.0, 127.0) as i8;   // per-element roundf — no AVX round mode
+}
+```
+This runs m×inp = 1500×1280 ≈ **1.9M scalar `roundf` per layer** (×32 layers × windows). nn.rs already has a **byte-identical AVX2 quantizer** (`quantize_act_i8_into`, nn.rs:2186) documented "**byte-identical to the scalar map, ~5× faster, 0-diff over ±127 edges** (`quant_i8_probe`)" — but it's module-private, and `pub(crate)`-ing it edits cod-dirty nn.rs (park). So the fix **replicates the proven AVX2 algorithm LOCALLY in encoder.rs** (cod-free ⇒ shippable): `v*inv`; `+ copysign(0.5,v)`; `round-to-zero` (= round-half-away = `f32::round`); clamp[-127,127]; order-preserving `packs_epi32`/`packs_epi16`. **Byte-exact BY CONSTRUCTION** — identical ops to the tested nn.rs quantizer.
+
+**Value ALREADY ESTABLISHED (pre-directive baseline):** nn.rs's quantizer is the same antipattern fixed the same way, measured ~5× on the quant (`quant_i8_probe`). So this qualifies to ship under the blocker bead's "bit-exact lever whose value is already established" clause.
+
+**STATUS: READY, blocked only on TRANSIENT rch admission (not structural).** Probe `examples/enc_i8quant_probe.rs` (committed) couldn't run — rch returned `no admissible workers: insufficient_slots=7, hard_preflight=2` on 3 tries this window (fleet saturated + a stale build blocking the queue on vmi1264463). I will NOT wire an uncertified change into a default-on hot path. **Retry-condition (near-term, not owner/32-thread-gated):** an admissible rch slot ⇒ (1) `cargo run --example enc_i8quant_probe` to size + assert byte-id on-box, (2) add `quant_row_i8_avx2` to encoder.rs + swap the loop at 1256, (3) `cargo test` byte-exact cert, (4) commit + push. This is a clean solo SHIP the moment rch has capacity.
+
 ## 2026-07-11 - whisper-cc: **MEASURED — int8 `dot_i8_6col` is byte-exact and never slower than 4col, but the weight-conversion-sharing curve SATURATES at 4col: 6col adds only 0.1–0.7% at the encoder's large-tq regime (noise). N=4 is the pragmatic optimum for the eventual wire-in; don't wire 6col.**
 
 **"Measure, don't argue" completion of the int8 Ncol family.** `dot_i8` uses 2 accum/col, so 6col = 12 accumulators + 2 weight = **14 YMM (fits, no spill)** — measurable, unlike f16 4col. Probe `examples/i8batch_6col_probe.rs`, single-binary, order-alternated, min-of-80, `RCH_REQUIRE_REMOTE=1 … cargo run`, worker (available_parallelism=10). Thread-invariant per-core ratio ⇒ workers=1 arm admissible.
