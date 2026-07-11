@@ -1,5 +1,35 @@
-# PARKED LEVER — `ft_kernel_cpu::gemm::tile_shape` load imbalance (bit-exact)
+# tile_shape load imbalance (bit-exact) — UNPARKED & MEASURED 2026-07-11
 
+> **UPDATE 2026-07-11 — ADMISSIBLE PERF CAPTURED; lever is no longer blocked.**
+> The sole missing piece (a 32-thread perf A/B on a host with `available_parallelism >= 32`)
+> is now measured on **thinkstation1 (64 cores)**: built remotely via `rch` (vmi1227854), run
+> LOCALLY at T=32. Raw table: `20260711-thinkstation1-admissible-sweep.txt`. Replica-faithful —
+> the real f32 path (`sgemm_2d_parallel`, lib.rs:951) reads B **unpacked with stride n**, exactly
+> like the harness `tiled()` arm, and real-A (5x7)=3.68ms sits naturally between the swept 4x8 and
+> 8x4 grids (no systematic offset).
+>
+> **RESULT.** The naive uniform **4x8** grid (already gated behind `set_sgemm_tile_balanced`,
+> frankentorch `86a54f1a`, default OFF) is a clean bit-exact win on ALL THREE turbo shapes here:
+> qkv 1.008x (~neutral), **fc1 1.143x**, **fc2 1.126x** => **layer 1.089x => projected e2e ~1.056x**.
+>
+> **THE PARKED WORRY IS FALSIFIED ON THE TARGET BOX.** The 5975WX baseline had 4x8 *regress* fc1
+> (0.958x); on thinkstation1 fc1 4x8 = 1.143x, a WIN. The fc1 regression was host-specific to the
+> 5975WX. There is no fc1 catch here.
+>
+> **THE B-BYTES-AWARE SELECTOR IS MARGINAL HERE.** The refined selector rule (largest divisor
+> `q <= T/2` with `ceil(n/q) >= MIN_BLOCK_COLS`; the `p>=2` clause avoids the p=1 A-locality cliff
+> that made a pure minimize-B rule overshoot fc1 to 1x32) DOES pick the measured per-shape optimum
+> (qkv/fc2 4x8, fc1 2x16), but that optimum is only **1.098x** vs naive's **1.089x** — a ~0.8%
+> layer delta, entirely from fc1 (2x16 1.176x vs 4x8 1.143x), and that 2.9% fc1 gap is within ~1 cv
+> (4%) of the noise. NOT worth a shape-dependent policy on a shared, shipped crate.
+>
+> **RECOMMENDATION (owner-gated, cross-repo shared crate — surface, do not flip unilaterally):**
+> flip `set_sgemm_tile_balanced` default to ON. Bit-exact, fc1-regression concern does not
+> reproduce on the target box, clean +1.089x layer (~1.056x e2e). Residual risk is only the
+> unrelated FMA/golden-f32 shared-crate concern in `project_isa_baseline`.
+>
+> ---
+>
 > **UPDATE 2026-07-10 — the patch below is SUPERSEDED by a landed runtime knob.**
 > `frankentorch 86a54f1a` adds `set_sgemm_tile_balanced(bool)` (default **off** = historical
 > grid, bit-exact either way), so the policy no longer needs a source patch to evaluate — a
