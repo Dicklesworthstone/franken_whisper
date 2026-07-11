@@ -1,3 +1,9 @@
+*** GATE CORRECTION (see README.md CORRECTION 2026-07-11): the LAYER 1.089x below is real for
+    matmul_tensor_contiguous_f32, but the DEFAULT turbo/tiny.en engine int8-quantizes ALL encoder
+    linears (encoder.rs:507-523, "0 f32 GEMMs/layer"), so this function is OFF the default hot
+    path. True default-turbo e2e impact ~0.1-0.3% (conv2 only), NOT the ~5.6% projected here.
+    Do NOT quote the e2e number as a shippable turbo win. ***
+
 ADMISSIBLE tile_shape grid sweep — the perf number that was missing when this lever parked.
 Host thinkstation1, available_parallelism=64 >= 32 under test => ADMISSIBLE (single binary,
 single invocation, order rotated per rep). Built REMOTELY via rch (vmi1227854), run LOCALLY.
