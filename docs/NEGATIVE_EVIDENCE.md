@@ -64,6 +64,15 @@ was attempted, and the candidate remains unshipped. The retry condition above
 is unchanged: require fleet posture `healthy` before re-running the remote
 median/parity and all-targets gates.
 
+**Strict-remote retry surface (2026-07-11T19:56:36Z):** the exact baseline
+command above selected `vmi1167313`, synchronized all dependency roots, and
+started Cargo remotely. The cold build then failed before the benchmark binary
+existed: remote `rustc` compiling `asupersync 0.3.5` was killed by signal 9
+(`SIGKILL`). Consequently no baseline samples, candidate samples, or new median
+ratio exist. `RCH_REQUIRE_REMOTE=1` prevented any local fallback; the candidate
+remains unshipped and this is infrastructure evidence, not a performance
+rejection.
+
 ---
 ## 2026-07-11 - whisper-cc: **EXHAUSTED — after the `matmul_bias_i8` quant ship, the cod-free hot-path antipattern vein is empty. Every remaining `round`/transcendental site is sub-floor or closed; the next hot lever needs cod's `nn.rs` to commit (wire-ins) or the 32-thread infra.**
 
