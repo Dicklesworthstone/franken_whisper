@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-11 - cod_fw: **SURFACED (measured win, production NOT shipped) — direct `BufRead` zlib decode removes the per-frame 32 KiB read-ahead allocation and clears the same-worker MEDIAN floor, but the mandatory strict-remote all-targets gate hit an RCH worker allocator abort while fleet posture was `degraded`. No local Cargo fallback.**
+
+**Negative-ledger/profile-first selection.** A scaled 300,000-frame run of the
+production 24-byte TTY frame shape attributed self-time to `__memmove` 23.91%,
+`__memset` 14.61%, malloc 1.46%, and calloc 0.76% (524 samples, zero lost).
+`flate2::read::ZlibDecoder` wraps the already in-memory `&[u8]` in a 32 KiB
+read-ahead buffer for every frame. The one production lever was only to use
+`flate2::bufread::ZlibDecoder`; `&[u8]` already implements `BufRead`.
+Opportunity score `(impact 3 * confidence 5) / effort 2 = 7.5`.
+
+**Strict-remote MEDIAN gate, same worker `vmi1149989`, 31 Criterion samples per
+row:**
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench \
+  --profile release -p franken_whisper --bench tty_bench -- \
+  tty/decode_synthetic --sample-size 31 --warm-up-time 1 \
+  --measurement-time 5 --noplot
+
+frames   baseline median   candidate 1   candidate 2   conservative speedup   repeat floor
+32       136,200.881 ns    125,893.175   120,319.831   1.0819x PASS           1.0463x
+128      530,016.087 ns    468,278.149   475,963.417   1.1136x PASS           1.0164x
+```
+
+The conservative speedup uses the slower candidate repetition. The repeat
+floor is the symmetric ratio between the two unchanged-candidate medians, so
+both rows clear observed same-worker run-to-run movement rather than relying on
+Criterion's mean estimate.
+
+**Output proof:** this path performs no floating-point operation, so the ULP
+requirement reduces to exact bytes. A legacy-read versus direct-BufRead oracle
+compared complete output bytes or the exact error string for raw lengths 0, 1,
+24, 160, 4,096, 40,000, 80,000, and the 80,001-byte bomb case, plus corrupt,
+truncated, empty, and one-byte zlib inputs. Strict-remote
+`cargo test -p franken_whisper tty_audio --lib` passed **210/210**, including
+that oracle and existing CRC/SHA, ordering, recovery, bomb-cap, and full-frame
+byte-identity tests. WER is unchanged by construction because the decoder emits
+the identical compressed-frame payload bytes and never enters ASR numerics.
+
+**Why this is surfaced instead of shipped:** the mandatory command
+`RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo check
+--all-targets` ran remotely on `ovh-b` but exited 101 when `num-traits`' build
+script received SIGABRT after requesting `648518346341351440` bytes. Immediate
+`rch status --json` reported `posture: degraded` with 9/12 workers healthy.
+Per the fail-closed directive, no local Cargo command and no remote retry was
+used; the production source change was not committed. **Retry condition:** once
+RCH posture is healthy, reapply the one-line import change, rerun the same
+median/parity proof, then pass remote `cargo check --all-targets`, remote
+`cargo clippy --all-targets -- -D warnings`, and remote `cargo test` before
+shipping.
+
+---
 ## 2026-07-11 - whisper-cc: **READY & SHIPPABLE (cod-free file) — scalar `f32::round()` activation-quant antipattern in the DEFAULT-ON `matmul_bias_i8`; byte-exact AVX2 fix replicates nn.rs's tested quantizer. Blocked only on TRANSIENT rch admission capacity (not cod's tree, not 32-thread) to certify the wire-in.**
 
 **Best lever in several cycles — genuinely shippable, not parked.** Grepping cod-free hot files for the `round_doesnt_vectorize` antipattern ([[project_round_doesnt_vectorize]]) surfaced **`encoder.rs:1256`** inside `matmul_bias_i8` (the **default-on** attn.out i8 GEMM, `FW_ENC_ATTN_OUT_I8I32` policy, part of the 1.47× encoder int8 win):
