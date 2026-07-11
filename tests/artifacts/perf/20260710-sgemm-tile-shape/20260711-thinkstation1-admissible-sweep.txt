@@ -1,0 +1,73 @@
+ADMISSIBLE tile_shape grid sweep — the perf number that was missing when this lever parked.
+Host thinkstation1, available_parallelism=64 >= 32 under test => ADMISSIBLE (single binary,
+single invocation, order rotated per rep). Built REMOTELY via rch (vmi1227854), run LOCALLY.
+Harness: frankentorch crates/ft-kernel-cpu/examples/sgemm_tile_shape_ab.rs (extended to sweep
+every divisor-pair grid + a candidate B-bytes-aware selector).
+
+REPLICA FIDELITY: the real f32 path (ft_kernel_cpu::sgemm_2d_parallel, lib.rs:951) reads B
+UNPACKED with stride n — structurally identical to the harness `tiled()` replica (no b_panel
+copy, unlike the f64 dgemm path). Arm A (real ft, 5x7) = 3.68 ms for qkv sits naturally between
+the swept 4x8 (3.65) and 8x4 (3.84) grids => no systematic replica offset. Every grid bit-exact
+vs A (host-independent, certified). The gold-standard real-path A/B (benches/sgemm_tile_shape.rs)
+corroborates (see 20260711-thinkstation1-realpath-bench.txt if present).
+
+TILE_AB_THREADS=32 TILE_AB_REPS=25
+
+host=thinkstation1  threads=32  available_parallelism=64  reps=25
+  current  grid p x q = 5 x 7  (p*q = 35)   [FIDELITY GUARD arm]
+  naive-balanced grid p x q = 4 x 8  (p*q = 32)
+  divisor grids swept: 1x32 2x16 4x8 8x4 16x2 32x1
+
+turbo qkv/out [1500,1280]x[1280,1280]   A(ft)=3.68 ms  cv 3.9%   tiles/pool=32
+     1x32  nb=128  tiles=10      6.06 ms  A/grid= 0.608x  cv 14.2%  bitexact true
+     2x16  nb=128  tiles=20      3.84 ms  A/grid= 0.958x  cv 11.2%  bitexact true
+     4x8   nb=160  tiles=32      3.65 ms  A/grid= 1.008x  cv 8.1%  bitexact true <balanced <SELECTOR
+     8x4   nb=320  tiles=32      3.84 ms  A/grid= 0.959x  cv 6.1%  bitexact true
+    16x2   nb=640  tiles=32      4.12 ms  A/grid= 0.894x  cv 7.2%  bitexact true
+    32x1   nb=1280 tiles=32      4.41 ms  A/grid= 0.834x  cv 7.7%  bitexact true
+
+turbo fc1     [1500,1280]x[1280,5120]   A(ft)=14.38 ms  cv 2.2%   tiles/pool=32
+     1x32  nb=160  tiles=32     12.50 ms  A/grid= 1.151x  cv 4.0%  bitexact true <SELECTOR
+     2x16  nb=320  tiles=32     12.23 ms  A/grid= 1.176x  cv 4.0%  bitexact true   *** best ***
+     4x8   nb=640  tiles=32     12.58 ms  A/grid= 1.143x  cv 4.4%  bitexact true <balanced
+     8x4   nb=1280 tiles=32     14.00 ms  A/grid= 1.027x  cv 4.7%  bitexact true
+    16x2   nb=2560 tiles=32     15.40 ms  A/grid= 0.934x  cv 3.7%  bitexact true
+    32x1   nb=5120 tiles=32     16.91 ms  A/grid= 0.850x  cv 5.1%  bitexact true
+
+turbo fc2     [1500,5120]x[5120,1280]   A(ft)=14.87 ms  cv 3.4%   tiles/pool=32
+     1x32  nb=128  tiles=10     23.95 ms  A/grid= 0.621x  cv 6.7%  bitexact true
+     2x16  nb=128  tiles=20     14.78 ms  A/grid= 1.006x  cv 9.9%  bitexact true
+     4x8   nb=160  tiles=32     13.21 ms  A/grid= 1.126x  cv 5.2%  bitexact true <balanced <SELECTOR
+     8x4   nb=320  tiles=32     13.87 ms  A/grid= 1.072x  cv 4.3%  bitexact true
+    16x2   nb=640  tiles=32     13.61 ms  A/grid= 1.093x  cv 5.9%  bitexact true
+    32x1   nb=1280 tiles=32     14.72 ms  A/grid= 1.010x  cv 4.4%  bitexact true
+
+TURBO LINEAR-GEMM LAYER (4x qkv/out + fc1 + fc2):
+  A (ship, current grid)        43.98 ms
+  naive-balanced (uniform 4x8)  40.39 ms = 1.089x   enc 1.063x  e2e 1.056x
+  B-BYTES-AWARE SELECTOR        40.31 ms = 1.091x   enc 1.065x  e2e 1.058x
+  (per-shape optimum: qkv 4x8, fc1 2x16, fc2 4x8 = 40.04 ms = 1.098x   enc 1.072x  e2e 1.064x)
+
+all grids bit-exact vs A: true   (this half IS host-independent / certified)
+
+=== CONCLUSIONS (admissible on thinkstation1, T=32) ===
+
+1. THE PARKED WORRY IS FALSIFIED ON THIS BOX. The 5975WX baseline had naive-4x8 REGRESS fc1
+   (0.958x); on thinkstation1 naive-4x8 gives fc1 1.143x — a clean WIN. fc1 4x8 was host-
+   specific. Here the naive uniform 4x8 grid is a clean bit-exact win on ALL THREE shapes
+   (qkv 1.008x ~neutral, fc1 1.143x, fc2 1.126x) => LAYER 1.089x => projected e2e ~1.056x.
+   This is the win the lever was parked waiting to size. It is ALREADY IMPLEMENTED and gated
+   behind set_sgemm_tile_balanced() (frankentorch 86a54f1a), default OFF.
+
+2. THE B-BYTES-AWARE SELECTOR ADDS ~NOTHING HERE. The refined rule (largest divisor q<=T/2 with
+   ceil(n/q)>=MIN_BLOCK_COLS; p>=2 avoids the p=1 A-locality cliff) DOES pick the per-shape
+   optimum (qkv/fc2 4x8, fc1 2x16), but the per-shape optimum is only 1.098x vs naive's 1.089x
+   — a ~0.8% layer delta driven entirely by fc1 (2x16 1.176x vs 4x8 1.143x), and that 2.9% fc1
+   gap is within ~1 cv (4%) of the noise. NOT worth the API/complexity of a shape-dependent
+   policy on a shared, shipped crate. The naive uniform grid captures the win.
+
+3. RECOMMENDATION (owner-gated, cross-repo shared crate — surface, do not flip unilaterally):
+   flip set_sgemm_tile_balanced default to ON. It is bit-exact (certified host-independent),
+   the fc1-regression concern that blocked it does not reproduce on the target box, and it is a
+   clean +1.089x on the turbo linear-GEMM layer (~1.056x e2e). Residual risk is only the FMA/
+   golden-f32 shared-crate concern noted in project_isa_baseline, unrelated to this grid choice.
