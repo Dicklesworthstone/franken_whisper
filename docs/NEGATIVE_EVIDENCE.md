@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-11 - cod_fw: **SURFACED / INVALID PROFILE — `storage/load_run_details` is a fresh schema-probe lane with an exact fallback-preserving lever, but the strict-remote baseline produced no MEDIAN: `asupersync 0.3.5` compilation was SIGKILLed on `vmi1167313` while RCH remained `degraded`. No local Cargo fallback.**
+
+**Negative-ledger-first selection.** Neither performance ledger contains a
+`load_run_details`, `table_has_column`, `PRAGMA table_info`, `replay_json`, or
+`acceleration_json` closeout. `bv --robot-triage` (`data_hash
+9e84cc23ad8d84bd`) returned no storage/schema recommendation, and the existing
+storage Criterion row has been unchanged since its initial commit. The
+production load path performs two complete `PRAGMA table_info(runs)` scans
+before its keyed run query. With the current 12-column schema, those scans
+decode 144 SQLite metadata values per load before the useful run and event
+rows. The planned profile would split those probes from the keyed run query,
+JSON decoding, and event query; no production optimization was applied before
+that measurement.
+
+**Parity boundary found before editing.** A fixed modern-schema `SELECT` is
+not behavior-preserving. Migration code trusts `_meta.schema_version == 3`
+without validating the physical columns, and rollback/failpoint coverage
+intentionally opens that shape. The current probes keep such databases
+readable by substituting `'{}'` for either missing JSON column. The eligible
+one-lever candidates are therefore (a) derive both flags from one
+`table_columns("runs")` snapshot per load, or (b) cache both capability flags
+after `RunStore::open` initializes the schema and preserve the existing
+four-way fallback projection. The byte oracle will serialize modern,
+neither-column, replay-only, and acceleration-only `StoredRunDetails` results
+and require exact equality; this path adds no floating-point arithmetic, so
+ULP tolerance reduces to byte identity.
+
+**Strict-remote profile failure:**
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench \
+  --profile release -p franken_whisper --bench storage_bench -- \
+  storage/load_run_details --sample-size 31 --warm-up-time 1 \
+  --measurement-time 5 --noplot
+
+worker: vmi1167313
+build:  29914252970041741
+result: rustc compiling asupersync 0.3.5 received signal 9 (SIGKILL)
+```
+
+The remote cold build failed before the benchmark executable existed, so
+there are **zero Criterion samples and no admissible MEDIAN**. Cargo then hung
+waiting for its remaining remote jobs after the decisive compiler failure; the
+local wrapper was interrupted only to finish unwinding. `RCH_REQUIRE_REMOTE=1`
+prevented fallback. The authoritative post-failure `rch status --json`
+reported `posture: degraded` (`Some workers unhealthy, partial remote
+capability`; 9/12 workers healthy). This is infrastructure evidence, not a
+performance rejection. **Retry condition:** RCH returns to healthy posture and
+can compile this repo remotely; then run the stage profile, select exactly one
+fallback-preserving lever, and require same-worker Criterion medians plus exact
+serialized output before shipping.
+
 ## 2026-07-11 - cod_fw: **SURFACED (measured win, production NOT shipped) — direct `BufRead` zlib decode removes the per-frame 32 KiB read-ahead allocation and clears the same-worker MEDIAN floor, but the mandatory strict-remote all-targets gate hit an RCH worker allocator abort while fleet posture was `degraded`. No local Cargo fallback.**
 
 **Negative-ledger/profile-first selection.** A scaled 300,000-frame run of the
