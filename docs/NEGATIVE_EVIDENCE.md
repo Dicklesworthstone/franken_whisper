@@ -4,6 +4,29 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-11 - whisper-cc: **MEASURED — int8 `dot_i8_6col` is byte-exact and never slower than 4col, but the weight-conversion-sharing curve SATURATES at 4col: 6col adds only 0.1–0.7% at the encoder's large-tq regime (noise). N=4 is the pragmatic optimum for the eventual wire-in; don't wire 6col.**
+
+**"Measure, don't argue" completion of the int8 Ncol family.** `dot_i8` uses 2 accum/col, so 6col = 12 accumulators + 2 weight = **14 YMM (fits, no spill)** — measurable, unlike f16 4col. Probe `examples/i8batch_6col_probe.rs`, single-binary, order-alternated, min-of-80, `RCH_REQUIRE_REMOTE=1 … cargo run`, worker (available_parallelism=10). Thread-invariant per-core ratio ⇒ workers=1 arm admissible.
+
+**MEASURED 6col-vs-4col, byte-id=true 12/12, never slower:**
+```
+             tq= 12   tq= 64   tq=204     (workers=1, pure kernel)
+mlp_0        1.037×   1.026×   1.001×
+qkv          1.036×   1.013×   1.007×
+```
+The gain **decays with tq to the noise floor**: at tq=204 (→ the encoder's tq=1500 regime) it's 1.001–1.007× = tied. 6col only helps at small tq (decode prefill, ~1–4%). This matches the amortization arithmetic — 6col recovers only ~1/3 of the 2col→4col cvt step (0.25→0.167 weight-cvt/token).
+
+**CONCLUSION — int8 Ncol tile family fully characterized (do not re-explore):**
+| N | weight-cvt/token | vs prior | verdict |
+|---|---|---|---|
+| 1col | 1.0 | — | baseline |
+| 2col | 0.5 | 1.15–1.19× | **shipped** (`85776f4`) |
+| 4col | 0.25 | 1.03–1.11× | **parked win** — the pragmatic optimum |
+| 6col | 0.167 | 1.001–1.04× (noise at encoder tq) | measured, **not worth wiring** |
+| 8col | 0.125 | — | register-infeasible (18 YMM spills) |
+
+**Retry-condition:** when the wire-in unblocks (cod's `nn.rs` KV WIP lands + 32-thread e2e sizing), wire **4col** (`dot_i8_4col`), not 6col. The kernel micro-lever vein is exhausted at N=4.
+
 ## 2026-07-11 - whisper-cc: **REJECTED by register arithmetic — the Ncol weight-conversion-sharing tile does NOT extend to the f16 GEMV. `dot_f16c_4col` needs 16 YMM accumulators = the whole AVX2 register file, leaving none for the shared `cvtph`. f16 caps at the shipped M2col. No build (deductive, not measured).**
 
 **Negative-ledger-first follow-on to the int8 `dot_i8_4col` park (below).** The int8 4col win raised the natural question: does the same weight-conversion-sharing tile extend to the f16 row-morsel GEMV (`gemv_f16_batch_rows` / `dot_f16c_2col`, the M2col that landed **1.26×**, `ce43019`)? f16 has *more* headroom in principle — `cvtph` (f16→f32) is costlier than int8's `vpmovsxbw`.
