@@ -4,6 +4,25 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-11 - whisper-cc: **PARKED byte-exact win — `dot_i8_4col` (4-token activation-column tile) beats the shipped `dot_i8_2col` on the int8 batched GEMV. Pure-kernel 1.03–1.11× admissibly measured on rch; production wire-in + default-flip BLOCKED.**
+
+**Negative-ledger-first lever** (bv `--robot-triage` top pick `bd-transcript-gate-unrunnable-xu9g` established "pure-cargo franken benches now RUN remotely"; the reopened kernel family is the landed `dot_i8_2col`, `85776f4`). The int8 batched GEMV `gemv_i8_batch` (feeds the ~28% encoder int8 GEMM frame) is WEIGHT-OUTER; 2col shares the L1-hot weight-row `vpmovsxbw` across 2 tokens. **4col shares it across 4** (0.5 weight-cvt/token → 0.25), at 8 i32 accumulators (4 cols × 2 halves) — register-pressure-risky on AVX2's 16 YMM.
+
+**BYTE-EXACT (certified, 12/12):** each column keeps `dot_i8`'s exact madd pairing + 2-accum reduction, so `dot_i8_4col(w,a,b,c,d) == (dot_i8(w,a),…,dot_i8(w,d))` bit-for-bit. The probe asserts `byte-id=true` on every config — **integer i32 dots are order-independent**, so this is a *ULP-free* lever (not merely WER-neutral).
+
+**MEASURED** — `examples/i8batch_4col_probe.rs`, single-binary, order-alternated, min-of-80, `RCH_REQUIRE_REMOTE=1 … cargo run --release`, worker `vmi1149989` (available_parallelism=10). This is a **PER-CORE compute lever ⇒ the 2col↔4col ratio is thread-count-invariant**, so the **workers=1 arm is fully admissible** (1 ≤ 10; not a 32-thread scheduling lever). Pure-kernel (workers=1):
+```
+mlp_0[1280,5120] tq=  8  1.110×   tq= 64  1.034×   tq=200  1.046×   (all 4col FASTER, byte-id)
+qkv  [1280,3840] tq=  8  1.104×   tq= 64  1.055×   tq=200  1.055×   (all 4col FASTER, byte-id)
+```
+6/6 workers=1 configs faster, **never slower**. Multi-thread (10t) is noisy: 1.07–1.30× at realistic tq, but `mlp_0 tq=8 10t = 0.663×` — a sub-ms dispatch artifact (the *same* tq=8 is 1.11× faster at workers=1, so the kernel is not slower; small-tq work is dominated by rayon dispatch, not the dot).
+
+**STATUS: PARKED — two blockers, not shippable this cycle:**
+1. **Production wire-in blocked by an uncommitted-tree conflict.** `dot_i8_4col` must go into `src/native_engine/nn.rs` beside `dot_i8_2col` and wire into `compute_band`, but a coworker's column-major-KV WIP is uncommitted in that same file; staging `nn.rs` would sweep it up (`git add -p` unavailable). Do NOT edit `nn.rs` until that WIP commits.
+2. **Default-flip needs 32-thread e2e sizing** (`bd-transcript-gate-unrunnable-xu9g`, Class 2): the encoder runs `gemv_i8_batch` on the 32-thread pool; the kernel win's *e2e* magnitude and any small-tq multi-thread regression can only be settled on a ≥32-core host (fleet max = 16 vCPU; local cargo disk/directive-forbidden). The kernel win is established; the default-flip is not.
+
+**PATCH / captured baseline:** `examples/i8batch_4col_probe.rs` (committed) — the byte-exact reference impl + harness. **Retry-condition:** (a) cod's `nn.rs` KV WIP lands ⇒ clean wire-in behind a `FW_I8_BATCH_4COL` gate; AND (b) a ≥32-core host sizes the e2e delta ⇒ default-flip decision. Until both hold, 2col stays the default.
+
 ## 2026-07-10 - cod_fw: **COD-LANE AT FRONTIER — i7/maddubs output-projection screen below its null floor; cold decision run invalid. HOLD.**
 
 Profile-first selection chose the tied output projection, not encoder/VAD:
