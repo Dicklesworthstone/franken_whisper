@@ -51,6 +51,38 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_SYNC_BATCH_QUERY`): incremental export batches the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` — **~1.32× incremental export**
+
+**What.** `export_table_segments_for_runs` / `export_table_events_for_runs` ran one
+`SELECT … WHERE run_id = ?1` **per run_id in a loop** (N+1). Replaced with one
+`WHERE run_id IN (?1,…,?K)` query per chunk (chunk = `sync_query_batch_size()`, default
+512), grouping rows into a `HashMap<run_id, Vec<json_line>>` and emitting in `run_ids`
+order (idx/seq-ascending within each run) ⇒ **byte-identical JSONL**. `FW_SYNC_BATCH_QUERY=0`
+sets chunk 1 = one query per run = the legacy N+1 (kill-switch + A/B arm).
+
+**Why it wins (vs the rejected persist multi-row INSERT).** For a `SELECT` returning a
+few rows per run, the query *setup* (parse/plan/cursor-open) dominates, so cutting K
+setups → 1 is a real saving. Contrast the persist multi-row INSERT reject
+(NEGATIVE_EVIDENCE 2026-07-12): there the residual cost was per-row B-tree *work*,
+which batching couldn't reduce. Batching helps when you cut execution COUNT, not when
+you only reshape the same per-row work.
+
+**Correctness CERTIFIED.** `sync::tests` **347/0**, incl. a new
+`incremental_export_multi_run_batched_round_trips` (3 runs in one export → exercises the
+multi-param `IN` clause → full export→import round-trip preserves every segment/event).
+
+**Measurement (`sync/export_incremental/runs/50` = 50 runs, first export = all;
+forced-local; external-env A/B interleaved 0/1/0/1):**
+
+| rep | flag=0 (per-run N+1) | flag=1 (batched `IN`) |
+|---|---|---|
+| 1 | 141.98 ms | 107.59 ms |
+| 2 | 142.29 ms | 106.83 ms |
+
+**~1.32× faster** (~35 ms saved on 50 runs), CIs non-overlapping ([141–143] vs
+[105–111]), both reps consistent. NOTE: `export_table_runs_incremental` was already a
+single query; only the two child-table writers had the N+1.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): sync **incremental** export writers wrap `File` in `BufWriter` (same antipattern as `export.rs`)
 
 **What.** The full-export writers in `src/sync.rs` (`export_table_runs/segments/events`)

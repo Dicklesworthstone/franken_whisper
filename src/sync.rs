@@ -27,6 +27,20 @@ fn sync_skip_stmt_sp_enabled() -> bool {
     std::env::var("FW_SYNC_SKIP_STMT_SP").ok().as_deref() != Some("0")
 }
 
+/// How many `run_id`s the incremental `_for_runs` export writers pack into each
+/// `WHERE run_id IN (…)` query, collapsing the legacy per-run N+1 `SELECT` into one
+/// query per chunk (query *setup* dominates for the few-row-per-run results).
+/// Default 512 (well under fsqlite's 32766-variable limit); `FW_SYNC_BATCH_QUERY=0`
+/// forces 1 (= one query per run = the legacy N+1). Rows are grouped by run_id and
+/// emitted in `run_ids` order regardless, so the JSONL is byte-identical either way.
+fn sync_query_batch_size() -> usize {
+    if std::env::var("FW_SYNC_BATCH_QUERY").ok().as_deref() == Some("0") {
+        1
+    } else {
+        512
+    }
+}
+
 /// Extension over `fsqlite::Connection` for the import write loops: dispatches to
 /// the statement-savepoint-skipping executor when enabled (see
 /// [`sync_skip_stmt_sp_enabled`]). Behaviourally identical to `execute_with_params`
@@ -796,18 +810,30 @@ fn export_table_segments_for_runs(
     // of one syscall per JSONL line (the full-export writers above are already
     // buffered; these incremental ones were not). Byte-identical output.
     let mut file = BufWriter::new(fs::File::create(path)?);
-    let mut count = 0u64;
-
-    for run_id in run_ids {
+    // Batch the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` query per chunk,
+    // grouping rows by run_id and emitting in `run_ids` order (idx-ascending within
+    // each run) ⇒ byte-identical JSONL to the legacy per-run path. Chunk size 1
+    // (`FW_SYNC_BATCH_QUERY=0`) reproduces the legacy one-query-per-run behavior.
+    let mut by_run: HashMap<String, Vec<String>> = HashMap::new();
+    for chunk in run_ids.chunks(sync_query_batch_size()) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
+             FROM segments WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, idx ASC"
+        );
+        let params: Vec<SqliteValue> = chunk
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
         let rows = connection
-            .query_with_params(
-                "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
-                 FROM segments WHERE run_id = ?1 ORDER BY idx ASC",
-                &[SqliteValue::Text(run_id.clone().into())],
-            )
+            .query_with_params(&sql, &params)
             .map_err(|error| FwError::Storage(error.to_string()))?;
 
         for row in rows {
+            let run_id = value_to_string_sqlite(row.get(0));
             let obj = serde_json::json!({
                 "run_id": value_to_json(row.get(0)),
                 "idx": value_to_json(row.get(1)),
@@ -817,8 +843,20 @@ fn export_table_segments_for_runs(
                 "text": value_to_json(row.get(5)),
                 "confidence": value_to_json(row.get(6)),
             });
-            writeln!(file, "{}", serde_json::to_string(&obj)?)?;
-            count += 1;
+            by_run
+                .entry(run_id)
+                .or_default()
+                .push(serde_json::to_string(&obj)?);
+        }
+    }
+
+    let mut count = 0u64;
+    for run_id in run_ids {
+        if let Some(lines) = by_run.get(run_id) {
+            for line in lines {
+                writeln!(file, "{line}")?;
+                count += 1;
+            }
         }
     }
     file.flush()?;
@@ -837,18 +875,29 @@ fn export_table_events_for_runs(
     // of one syscall per JSONL line (the full-export writers above are already
     // buffered; these incremental ones were not). Byte-identical output.
     let mut file = BufWriter::new(fs::File::create(path)?);
-    let mut count = 0u64;
-
-    for run_id in run_ids {
+    // Batch the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` query per chunk;
+    // group by run_id and emit in `run_ids` order (seq-ascending within each run) ⇒
+    // byte-identical JSONL. `FW_SYNC_BATCH_QUERY=0` (chunk 1) = legacy per-run path.
+    let mut by_run: HashMap<String, Vec<String>> = HashMap::new();
+    for chunk in run_ids.chunks(sync_query_batch_size()) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+             FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
+        );
+        let params: Vec<SqliteValue> = chunk
+            .iter()
+            .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+            .collect();
         let rows = connection
-            .query_with_params(
-                "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
-                 FROM events WHERE run_id = ?1 ORDER BY seq ASC",
-                &[SqliteValue::Text(run_id.clone().into())],
-            )
+            .query_with_params(&sql, &params)
             .map_err(|error| FwError::Storage(error.to_string()))?;
 
         for row in rows {
+            let run_id = value_to_string_sqlite(row.get(0));
             let obj = serde_json::json!({
                 "run_id": value_to_json(row.get(0)),
                 "seq": value_to_json(row.get(1)),
@@ -858,8 +907,20 @@ fn export_table_events_for_runs(
                 "message": value_to_json(row.get(5)),
                 "payload_json": value_to_json(row.get(6)),
             });
-            writeln!(file, "{}", serde_json::to_string(&obj)?)?;
-            count += 1;
+            by_run
+                .entry(run_id)
+                .or_default()
+                .push(serde_json::to_string(&obj)?);
+        }
+    }
+
+    let mut count = 0u64;
+    for run_id in run_ids {
+        if let Some(lines) = by_run.get(run_id) {
+            for line in lines {
+                writeln!(file, "{line}")?;
+                count += 1;
+            }
         }
     }
     file.flush()?;
@@ -7647,6 +7708,46 @@ mod tests {
         );
         assert!(!manifest.cursor_after.last_export_rfc3339.is_empty());
         assert_eq!(manifest.cursor_after.last_run_count, 1);
+    }
+
+    #[test]
+    fn incremental_export_multi_run_batched_round_trips() {
+        // Exercises the batched `WHERE run_id IN (…)` path in
+        // export_table_{segments,events}_for_runs with MULTIPLE run_ids in one export
+        // (the single-run incremental tests never hit the multi-param IN clause), and
+        // verifies a full export→import round-trip so the cross-run grouping preserves
+        // every segment/event.
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("multi.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("store open");
+        for i in 0..3 {
+            let report = fixture_report(&format!("multi-{i}"), &db_path);
+            store.persist_report(&report).expect("persist");
+        }
+
+        let manifest =
+            export_incremental(&db_path, &export_dir, &state_root).expect("incremental export");
+        assert_eq!(manifest.row_counts.runs, 3);
+        assert_eq!(manifest.row_counts.segments, 6); // 3 runs × 2 segments
+        assert_eq!(manifest.row_counts.events, 6); // 3 runs × 2 events
+
+        let import_db = dir.path().join("import.sqlite3");
+        let result =
+            import_inner(&import_db, &export_dir, ConflictPolicy::Reject).expect("import");
+        assert_eq!(result.runs_imported, 3);
+
+        let imported = RunStore::open(&import_db).expect("open imported");
+        for i in 0..3 {
+            let details = imported
+                .load_run_details(&format!("multi-{i}"))
+                .expect("load")
+                .expect("run should exist");
+            assert_eq!(details.segments.len(), 2);
+            assert_eq!(details.events.len(), 2);
+        }
     }
 
     #[test]
