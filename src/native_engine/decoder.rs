@@ -356,10 +356,36 @@ struct LayerNorm {
     b: Vec<f32>,
 }
 
+/// Default-ON gate for the fused decoder `layer_norm`-into-uninit path (kill switch
+/// `FW_DECODER_FUSED_LN=0` restores `x.clone()` + in-place `layer_norm`). Mirrors the
+/// encoder's `FW_ENCODER_FUSED_LN` — the per-token self/cross/mlp pre-norms each cloned
+/// `x` only to overwrite every element, a redundant memcpy on the hot decode path.
+fn decoder_fused_ln_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_DECODER_FUSED_LN").as_deref() != Ok("0"))
+}
+
 impl LayerNorm {
     /// In-place normalize each row of `x` then apply the affine transform.
     fn apply(&self, x: &mut Mat) {
         nn::layer_norm(x, &self.w, &self.b, LN_EPS);
+    }
+
+    /// Normalize `src` into a FRESH `Mat` (affine applied), **byte-identical** to
+    /// `{ let mut h = src.clone(); self.apply(&mut h); h }` but without the clone's
+    /// redundant memcpy — `layer_norm_into` writes every output element from `src`
+    /// into an uninit buffer (same proven kernel the encoder's `ln_into` uses).
+    fn apply_into(&self, src: &Mat) -> Mat {
+        if decoder_fused_ln_enabled() {
+            let mut data = nn::gemv_out_buf(src.rows * src.cols);
+            nn::layer_norm_into(src, &mut data, &self.w, &self.b, LN_EPS);
+            Mat::from_vec(src.rows, src.cols, data)
+        } else {
+            let mut h = src.clone();
+            nn::layer_norm(&mut h, &self.w, &self.b, LN_EPS);
+            h
+        }
     }
 }
 
@@ -1605,11 +1631,7 @@ pub fn forward_step(
 
     for (li, layer) in w.layers.iter().enumerate() {
         // ── self-attention (causal, over the KV cache) ──
-        let h = timed!(Sub::SelfLn, {
-            let mut h = x.clone();
-            layer.attn_ln.apply(&mut h);
-            h
-        });
+        let h = timed!(Sub::SelfLn, layer.attn_ln.apply_into(&x));
         // Q/K/V are three independent projections of the same `h`. On wide
         // models each is a serial GEMV (`[1,n_state] x [n_state,n_state]`, below
         // the kernel's parallel threshold), so running them on separate threads
@@ -1636,11 +1658,7 @@ pub fn forward_step(
         });
 
         // ── cross-attention (encoder K/V, no mask, optional recording) ──
-        let hc = timed!(Sub::CrossLn, {
-            let mut hc = x.clone();
-            layer.cross_attn_ln.apply(&mut hc);
-            hc
-        });
+        let hc = timed!(Sub::CrossLn, layer.cross_attn_ln.apply_into(&x));
         let qc = timed!(Sub::CrossQ, layer.cross_attn_q.forward(&hc)?);
         let h0 = li * w.n_head;
         let cross = timed!(
@@ -1666,11 +1684,7 @@ pub fn forward_step(
         });
 
         // ── MLP ──
-        let hm = timed!(Sub::MlpLn, {
-            let mut hm = x.clone();
-            layer.mlp_ln.apply(&mut hm);
-            hm
-        });
+        let hm = timed!(Sub::MlpLn, layer.mlp_ln.apply_into(&x));
         timed!(Sub::Mlp, {
             let mut ff = layer.mlp_0.forward(&hm)?;
             nn::gelu(&mut ff);
@@ -2013,6 +2027,31 @@ mod tests {
 
     fn noop_checkpoint() -> FwResult<()> {
         Ok(())
+    }
+
+    #[test]
+    fn layernorm_apply_into_matches_clone_apply() {
+        // apply_into (the fused decode pre-norm) must be BYTE-identical to the
+        // reference `{ let mut h = x.clone(); ln.apply(&mut h); h }`.
+        let ln = LayerNorm {
+            w: vec![0.9f32, 1.1, 1.0, 1.2, 0.8, 1.05, 0.95, 1.3],
+            b: vec![0.01f32, -0.02, 0.0, 0.03, -0.01, 0.02, -0.03, 0.04],
+        };
+        // Decode uses [1, n_state]; also exercise multi-row for generality.
+        for rows in [1usize, 3] {
+            let data: Vec<f32> = (0..rows * 8)
+                .map(|i| ((i as f32) * 0.37).sin() * 3.0 - 1.0)
+                .collect();
+            let x = Mat::from_vec(rows, 8, data);
+            let mut reference = x.clone();
+            ln.apply(&mut reference);
+            let got = ln.apply_into(&x);
+            assert_eq!((got.rows, got.cols), (reference.rows, reference.cols));
+            assert_eq!(
+                got.data, reference.data,
+                "apply_into must be byte-identical to clone+apply (rows={rows})"
+            );
+        }
     }
 
     #[test]
