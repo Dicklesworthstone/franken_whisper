@@ -267,11 +267,94 @@ fn bench_sha256_buffer(c: &mut Criterion) {
     group.finish();
 }
 
+/// Isolated A/B for the streaming-checksum change: writing a JSONL file then
+/// re-reading it to SHA-256 (`sha256_file`) vs streaming the SHA while writing
+/// (`HashingWriter`) — the latter drops the whole re-read pass. Both arms write the
+/// same file and produce the identical digest (asserted); only the re-read differs.
+fn bench_export_streaming_hash(c: &mut Criterion) {
+    use sha2::{Digest, Sha256};
+    use std::fs::File;
+    use std::io::{BufWriter, Read, Write};
+
+    struct Hw<W: Write> {
+        inner: W,
+        hasher: Sha256,
+    }
+    impl<W: Write> Write for Hw<W> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(b)?;
+            self.hasher.update(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    let dir = tempdir().expect("tempdir");
+    let lines: Vec<String> = (0..120_000)
+        .map(|i| format!("{{\"id\":\"run-{i}\",\"text\":\"the quick brown fox jumps {i}\"}}"))
+        .collect();
+
+    fn write_then_reread(path: &std::path::Path, lines: &[String]) -> String {
+        {
+            let mut w = BufWriter::new(File::create(path).expect("create"));
+            for l in lines {
+                writeln!(w, "{l}").expect("write");
+            }
+            w.flush().expect("flush");
+        }
+        let mut f = File::open(path).expect("open");
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = f.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+    fn write_streaming(path: &std::path::Path, lines: &[String]) -> String {
+        let mut w = Hw {
+            inner: BufWriter::new(File::create(path).expect("create")),
+            hasher: Sha256::new(),
+        };
+        for l in lines {
+            writeln!(w, "{l}").expect("write");
+        }
+        w.flush().expect("flush");
+        format!("{:x}", w.hasher.finalize())
+    }
+
+    let pa = dir.path().join("a.jsonl");
+    let pb = dir.path().join("b.jsonl");
+    assert_eq!(write_then_reread(&pa, &lines), write_streaming(&pb, &lines));
+
+    let mut group = c.benchmark_group("sync/export_hash");
+    for arm in ["reread_r1", "stream_r1", "reread_r2", "stream_r2"] {
+        let stream = arm.starts_with("stream");
+        let path = dir.path().join(format!("{arm}.jsonl"));
+        group.bench_function(arm, |b| {
+            b.iter(|| {
+                if stream {
+                    write_streaming(&path, &lines)
+                } else {
+                    write_then_reread(&path, &lines)
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sync_export,
     bench_sync_import,
     bench_sync_export_incremental,
     bench_sha256_buffer,
+    bench_export_streaming_hash,
 );
 criterion_main!(benches);

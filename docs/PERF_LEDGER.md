@@ -51,6 +51,33 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): full export streams SHA-256 while writing (`HashingWriter`) — drops the checksum re-read pass (~5–7%)
+
+**What.** `export_inner` wrote each JSONL (`runs`/`segments`/`events`), then re-read it
+with `sha256_file` to checksum for the manifest — a whole extra pass over the data.
+Added a `HashingWriter<W>` `Write` adapter that streams every byte through SHA-256 as it
+forwards to the `BufWriter`; the three full-export writers now return `(count, sha256)`
+and `export_inner` uses those, **eliminating the re-read**. Completes last turn's
+checksum-buffer bump (which made the re-read cheaper; this removes it).
+
+**Correctness CERTIFIED.** The three writer tests now assert the streamed digest equals
+`sha256_file(path)` of the written bytes; `sync::tests` **347/0** (incl. export→import
+round-trips that validate the manifest checksums against the files).
+
+**Measurement (isolated in-binary A/B, `sync/export_hash`, write 120k JSONL lines then
+checksum; forced-local; interleaved reread/stream/reread/stream):**
+
+| rep | reread (`sha256_file`) | stream (`HashingWriter`) |
+|---|---|---|
+| 1 | ~19.4 ms* | 18.551 ms |
+| 2 | 19.401 ms | 18.171 ms |
+
+**~5–7% faster** (rep2 clean: 6.8%, CIs non-overlapping [18.87–19.98] vs [17.89–18.48]).
+The bench is write-dominated (writing 120k lines ~18 ms), so the eliminated re-read is
+~7% of the export write+checksum flow — a realistic export speedup. *rep1's reread `time:`
+was interleaved with the first-arm bench compile. Byte-exact, zero-downside (strictly
+removes a pass), no gate. Incremental export still uses `sha256_file` (a follow-up).
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): `sha256_file` read buffer 8 KiB → 64 KiB — **~1.16× large-file checksum**
 
 **What.** `sync::sha256_file` (checksums each export/import JSONL for the manifest)
