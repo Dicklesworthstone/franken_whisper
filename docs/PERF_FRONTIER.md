@@ -40,10 +40,25 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   — never fires; `conformance_harness.rs` validates replay/backend metadata, not live native decode).
   No test uses a multi-window native clip, so nothing exercises the retry outside the 238/0 lib suite.
 
-## ⚡ Current-code headline vs whisper.cpp is ~2.2× on the encoder — the "~1.2×" boilerplate is STALE
+## ⚡ Current-code headline vs whisper.cpp is ~2.2–2.3× — the "~1.2×" boilerplate is STALE
 
-Measured 2026-07-12 on an **idle box** (load ~7), **turbo**, `jfk.wav`, **matched 32 threads**
-(whisper.cpp's *best* — `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
+**Realistic multi-window no_ts (the target workload), measured 2026-07-12:** turbo, `track01.wav`
+(**124.5 s / 5 windows** — the *same clip* [[project_realistic_workload_dominated]] benched pre-int8),
+`--no-timestamps`, matched `-t 32`, total wall:
+- **fw ~9.2 s** (load ~4, output verified correct) vs **whisper.cpp ~21.5 s** (6 clean reps 21.1–22.8 s)
+  = **fw ~2.3× FASTER**.
+- **Rock-solid anchor (fw-vs-fw, no wc-build confound):** the memory documents fw's *pre-int8* time on
+  this EXACT clip/threads/box (52fb1cb, 2026-07-04) as **20.34 s** ⇒ fw is now **2.22× faster than its
+  own pre-int8 self**. wc is ~unchanged (24.78 s→21.5 s), so the realistic ratio jumped **1.22×
+  (pre-int8) → ~2.3× (now)**. The gain compounds the full-int8 encoder (`a997f37`) + int8 decode
+  (`FW_I8_BATCH_4COL`) + cross-window pipelining, all landed after 2026-07-04.
+- **Caveat:** only 1 clean fw sample — the shared box turned hostile mid-run (the `fw` binary was
+  evicted 3× by disk-pressure cleanup at 86% full, load spiked 4→34). wc reps were clean/consistent,
+  and the fw-vs-fw self-improvement is confound-free, so the ~2.3× is directionally solid. This
+  supersedes the "~1.68–1.8× no_ts" boilerplate (pre-int8).
+
+**Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
+whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
 all-core freq-throttle wall [[project_encoder_wall_is_clock_throttle]]):
 
 | stage | fw (ms) | whisper.cpp `-t 32` (ms) | fw speedup |
