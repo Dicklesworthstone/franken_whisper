@@ -7,17 +7,29 @@
 
 ## ⚠ TOP PRIORITY IS NOW A CORRECTNESS BUG, NOT A PERF LEVER (2026-07-12)
 
-The byte-exact **perf** envelope is exhausted (below), but this session surfaced a bigger issue: the
-**shipping default drops ~48% of long-form content on tiny.en** (bd-r0qd, reproduced on the in-repo
-`example_audio_track_01.mp3` — two 30 s windows dropped in TS mode; `NEGATIVE_EVIDENCE` 2026-07-12).
-A "faster" long-form tiny.en is partly from decoding LESS. **This outranks every perf lever below.**
-Status: root-caused (no temperature fallback → prompt×int8 early-EOT windows dropped), fix landed
-behind `FW_RETRY_FAILED_WINDOW` (default-OFF, recovers real audio exactly = whisper.cpp, but a
-repetitive/tiled-audio duplication caveat keeps it OFF). **Owner action:** either (a) implement the
-proper whisper.cpp temperature fallback (tracks `prompt_reset_since`, avoids the dup) in
-`transcribe_samples`, or (b) flip `FW_RETRY_FAILED_WINDOW` default-on accepting the jfk×N golden change.
-A drop-warning (surface the silent loss, byte-exact) was written but is **blocked** on a broken sibling
-dep (frankensqlite `fsqlite-vdbe/codegen.rs` mid-refactor, another agent's uncommitted WIP).
+The byte-exact **perf** envelope is exhausted (below), but this session surfaced a bigger issue and
+worked it end-to-end. **This outranks every perf lever below.** Full write-up: `NEGATIVE_EVIDENCE`
+2026-07-12 / `project_final_window_early_eot_bug`.
+
+- **Bug:** shipping default **drops ~48% of long-form content on tiny.en** (bd-r0qd), reproduced on the
+  in-repo `example_audio_track_01.mp3` — **two 30 s windows dropped** in TS mode
+  (`fw transcribe --json`: gaps `[24.88-54.88]`, `[80.08-110.08]`). A "faster" long-form tiny.en is
+  partly from decoding LESS (non-comparable).
+- **Root cause:** greedy decode with **no temperature fallback** — a window that closes no timestamp
+  (`result_len==0`) while carrying the prior-window prompt (prompt × int8 numerics → early `eot`) is
+  dropped (empty, full `CHUNK_CS` advance).
+- **Severity bound:** **tiny.en ONLY** — `large-v3-turbo` covers the full clip (no drops); its stronger
+  decoder doesn't early-EOT. Quality-seeking (turbo) users unaffected.
+- **Landed this session (all byte-exact / default-OFF):** `FW_RETRY_FAILED_WINDOW=1` (`1caba18`) retries
+  a failed window once with the prompt cleared → **recovers real audio EXACTLY = whisper.cpp** (track01
+  643→1301 chars); a `tracing::warn!` (`1d777f0`) surfaces the otherwise-silent drop (track01 warns 2×
+  at seek 24.88/80.08); a `decode_to_wav` example (`e221630`) makes mp3s whisper-cli-readable.
+- **CAVEAT keeping the retry OFF:** it drops the prompt entirely for the failed window, so on
+  repetitive/tiled audio it re-transcribes covered content (jfk×3 239→379ch). Real speech is fine.
+- **Owner action (pick one):** (a) implement the proper whisper.cpp **temperature fallback** (tracks
+  `prompt_reset_since`, avoids the dup, covers non-prompt failure modes) in `transcribe_samples` — the
+  correct superset; or (b) flip `FW_RETRY_FAILED_WINDOW` default-on for tiny.en, accepting the jfk×N
+  golden-test change (a repetitive-audio artifact, not a real-speech regression).
 
 ## State: the byte-exact, autonomously-verifiable envelope is CLOSED
 
