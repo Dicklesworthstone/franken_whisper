@@ -25,10 +25,16 @@ steps, NO build):**
 **Verdict.** Every k is below its break-even, so layer-skip self-speculative decode would be
 a **net slowdown** for tiny.en — not worth building. k=1/2 are catastrophic (1.7%, the early
 hidden state barely resembles the final argmax after only 1–2 of 4 layers); k=3 is close-ish
-(62.9%) but still short of 82%. **Do-not-build** for tiny.en. (Turbo has 32 layers — a
-k≈24-of-32 early-exit *might* clear break-even; that's a separate turbo-model probe, and any
-build would use the same `FW_DRAFT_ACCEPT_LAYERS` probe first.) This closes the
-draft-decoding lever for tiny.en with the actual accept-rate measurement.
+(62.9%) but still short of 82%. **Do-not-build** for tiny.en.
+
+**Turbo measured too — SAME verdict, worse (my "32-layer" hunch was wrong).** large-v3-turbo's
+*decoder* is also **4 layers** (the 32 is the ENCODER); `e2e_probe large-v3-turbo jfk 2`
+(56 steps): k=1 **0.0%**, k=2 **0.0%**, k=3 **10.7%**, k=4 100% (trivial = full model), k=8
+0/0 (no such layer). All far below break-even (47/65/82%) — turbo's distilled decoder changes
+its hidden state MORE between layers than tiny.en, so layer-skip is even less viable. **Both
+models CLOSED: byte-exact layer-skip self-speculative decode is dead for the 4-layer
+Whisper decoder.** (The other decode-draft idea — shrink the LOGITS head — was the int4-logits
+attempt, already REVERTED 54033ad.) So the decode-draft lever family is exhausted.
 
 ---
 ## 2026-07-12 - BlackThrush: **SURFACED / OWNER-GATED — the byte-exact autonomous perf envelope is exhausted; the remaining high-EV lever (encoder fc1/full int8 for uncalibrated models) is byte-identical on jfk but needs the model-bench + corpus-WER loop, not a quick byte-exact flip.**
