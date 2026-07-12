@@ -4,6 +4,78 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - Codex: **SURFACE — reusable TTY NDJSON line buffer showed 1.0459x, but did not clear its same-binary BASE/BASE floor; source reverted.**
+
+**Negative-ledger-first target.** `parse_frame_lines` still used
+`BufRead::lines()`, allocating a fresh `String` for each TTY NDJSON record. This
+was distinct from the rejected byte-whitespace `count_jsonl_lines` idea: the
+candidate reused one `String` with `read_line` + `clear` while preserving the
+existing Unicode `str::trim`, blank-line handling, CRLF handling, physical line
+numbers, JSON parser, and retained `Vec<FrameLine>`.
+
+**Proof seam.** A temporary same-binary ABBA harness compared the historical
+allocating loop with the real candidate parser on 128 synthetic audio frames
+plus one handshake (24 raw bytes/frame). Both arms produced the exact digest
+`(entries=129, sequence_checksum=8128, controls=1)`. A focused test also proved
+that CRLF/whitespace-only lines remained skipped and malformed physical line 4
+still reported line 4. The harness used 16 parses per timed arm, three warmups,
+31 paired repetitions, alternating `BASE/CAND/CAND/BASE` order, and distinct
+but byte-identical payload allocations.
+
+**Strict-remote measurement.** No local Cargo fallback occurred. The first
+attempt (`j-29914252970043693`, `vmi1227854`) lost control-plane visibility
+during its final link and was interrupted without producing a measurement. The
+deciding invocation completed on RCH worker `vmi1149989` as job
+`j-29928833041825808`:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench --profile release-perf -p franken_whisper --bench tty_bench -- \
+  tty/parse_line_buffer_ab --sample-size 20 --warm-up-time 0.5 \
+  --measurement-time 1 --noplot
+
+benchmark binary sha256:
+  b413f309778285c4c3b0210f148131c1ded1cd5ea3d17ad071815965a7d6ad9a
+```
+
+BASE/BASE ratios:
+
+```text
+0.986666 1.027554 0.922466 0.920122 0.956458 0.943207 0.990309
+1.150359 1.005132 1.009807 1.043467 1.236815 0.914458 1.113768
+1.011209 0.991713 0.846544 0.908953 0.885586 0.903501 0.894010
+0.998146 0.956942 1.014197 0.958808 1.023329 0.894667 1.039782
+1.063658 0.999754 0.955548
+```
+
+Null median/p10/p90 were **0.990309 / 0.894667 / 1.063658**, CV
+**8.325%**, range `[0.846544, 1.236815]`, wins 12/31. The predeclared unbiased
+null-median gate `[0.98, 1.02]` passed.
+
+BASE/reusable-buffer ratios:
+
+```text
+1.035018 0.998017 1.128590 1.126313 1.100771 0.952555 0.998635
+1.027688 1.082135 0.964596 0.868008 1.099846 1.036947 0.971935
+1.010551 1.068007 0.886085 1.051474 1.047403 0.827631 1.097769
+1.069634 0.902773 1.051261 1.045882 1.078107 1.063648 1.037719
+1.101031 1.066685 1.030060
+```
+
+Candidate median was **1.045882x**, p10/p90 **0.902773 / 1.100771**,
+CV **7.342%**, wins 22/31. That apparent 4.6% gain remained inside the paired
+null p90 of **1.063658x**, so `decision_eligible=false`. The candidate-only
+Criterion diagnostic was `[48.867 us, 50.899 us, 53.976 us]`; it is not a
+comparative result.
+
+**Verdict: below-floor SURFACE, not a keep or authoritative rejection.** The
+production parser, focused test, and temporary A/B harness were manually
+restored byte-for-byte to `HEAD`; no runtime code remains. Reopen only with a
+quieter same-binary substrate whose null envelope is narrow enough to resolve a
+~5% allocation lever, or with a larger representative record count that proves
+the line-allocation share grows without changing protocol behavior.
+
+---
 ## 2026-07-12 - BlackThrush: **SWEPT — decode standard-path redundant-work is exhausted (compute_logprobs, cross-KV, LN, clones all checked). No byte-exact lever remains.**
 
 Final decode-path redundant-work sweep (the encode-reuse `f3d8550` was the one real find; everything
