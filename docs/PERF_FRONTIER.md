@@ -126,6 +126,14 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
     minor (int8-vs-f16 numerics + segmentation). Caveat: this is fw↔wc *agreement* (no ground-truth WER on
     box), and on HARD cases franken is *more* faithful than wc (the sjobs-turbo loop), so 98 % is a floor,
     not a divergence. Net: the project's "faster **faithful** whisper" claim is now quantitative on both axes.
+  - **The 2 % gap is BENIGN — no systematic franken bug (characterized 2026-07-12, `difflib` opcodes, 54
+    hunks):** the diffs are (1) **punctuation attachment** ("while"↔"while,") — a *normalization artifact*,
+    not a real word difference ⇒ true content agreement is even HIGHER than 98 %; (2) **segmentation/spacing**
+    ("smartphones"↔"smart phones"); (3) **filler** ("so"↔"so,", "actually"); (4) a few genuine **tiny.en
+    mishearings** ("pom"↔"palm" for *Palm*) — expected of the 39 M model, not a port defect. Both engines
+    capture the same content incl. the iconic "an iPod, a phone, an internet communicator" line, and wc's
+    `[applause]` markers. So franken's faithfulness is clean — the ~2 % is model-grade + formatting noise,
+    NOT a divergence to fix.
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
