@@ -1474,6 +1474,21 @@ pub fn transcribe_samples(
             }
             force_empty_prompt = false;
 
+            // Surface the otherwise-SILENT content drop (bd-r0qd): a non-first window
+            // that closed no timestamp and isn't silence emits nothing yet advances a
+            // full chunk, so ~30 s of speech vanishes with no signal to the caller.
+            // Transcript-unchanged (a log only) ⇒ byte-exact. Points at the recovery flag.
+            if result_len == 0 && !is_no_speech && seek_cs > 0 {
+                tracing::warn!(
+                    target: "franken_whisper::native_engine::decode",
+                    seek_sec = seek_cs as f64 / 100.0,
+                    no_speech_prob,
+                    avg_logprob,
+                    "long-form window closed no timestamp — ~30 s of audio dropped \
+                     (set FW_RETRY_FAILED_WINDOW=1 to attempt prompt-reset recovery; see bd-r0qd)"
+                );
+            }
+
             // single-timestamp-ending: skip the rest of the chunk (whisper.cpp
             // 7753-7760). Ordering fix #5: upstream emits segments (7624-7730) and
             // records DTW word timings with the ORIGINAL `seek_delta`, then applies
