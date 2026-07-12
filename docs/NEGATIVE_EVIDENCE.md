@@ -4,6 +4,39 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **REJECTED (measured) — the SDPA poly-exp lever (`FT_SDPA_POLY_EXP`, ~1.069× e2e) is NOT WER-neutral for tiny.en; it materially changes the transcript on real speech. Stays default-off for tiny.en (shipped only for turbo).**
+
+**What.** `FT_SDPA_POLY_EXP=1` forces the polynomial-exp approximation in the fused SDPA
+softmax (`nn::softmax`, ~2.5e-5 abs error). It is a genuine, non-sub-floor lever — **1.28×
+span / ~1.069× e2e** on the encoder ([[project_sdpa_exp_lever]]) — and is **shipped default-on
+for large-v3-turbo** (certified byte-identical transcript 3/3, WER Δ 0.000). For tiny.en it was
+left **default-off / uncertified**. The open question: does the poly-exp error change tiny.en
+tokens, or is it (like turbo) below the token-decision threshold? If WER-neutral it would be a
+real ~1.069× encoder lever for tiny.en. Gate at `mod.rs:510-511` (`FW_SDPA_POLY_EXP=0` kills,
+`FT_SDPA_POLY_EXP=1` forces).
+
+**Measured (prebuilt `fw` native tiny.en engine, transcript-diff off vs on, NO build —
+[[project_native_transcript_diff_no_build]]):**
+
+| clip | off vs on |
+|---|---|
+| `jfk.wav` (short, clean, no proper nouns) | **IDENTICAL** |
+| `example_audio_track_01.mp3` (~1 min real speech) | **DIFFERS — multiple word-level changes** |
+
+The real-speech clip diverges materially: `objects`→`projects`, an inserted `you know`,
+`three tier system, where it's sort of like`→`three-tier system, on Windows sort of except if`.
+These are real token changes, not whitespace — the ~2.5e-5 exp error propagates through
+tiny.en's *smaller* attention and flips argmax on harder audio.
+
+**Verdict.** tiny.en is **more sensitive** to the SDPA exp approximation than turbo (fewer/narrower
+layers → less numerical headroom before a token flips), so `FT_SDPA_POLY_EXP` is **not** a safe
+byte-exact / WER-neutral lever for tiny.en — jfk byte-identity was a false positive (too easy a
+clip, exactly the [[project_native_transcript_diff_no_build]] caveat). **Stays default-off for
+tiny.en; do-not-flip without a full corpus WER that the owner accepts as a lossy trade.** This is
+the same model-specific split as encoder int8 (calibrated turbo yes, tiny.en no) — the small
+model has no numerical slack for lossy kernels.
+
+---
 ## 2026-07-12 - BlackThrush: **REJECTED (measured) — byte-exact layer-skip self-speculative decode is a NET LOSS for tiny.en; all k-layer early-exit accept rates are below break-even.**
 
 **What.** `FW_DRAFT_ACCEPT_LAYERS=k` is a probe (default-off, byte-identical) that measures
