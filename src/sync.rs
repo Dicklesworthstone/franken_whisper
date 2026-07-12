@@ -2903,21 +2903,43 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     missing_from_db.sort();
 
     // --- Compare record content for shared run IDs ---
-    let shared_ids: HashSet<&String> = db_run_ids.intersection(&jsonl_run_ids).collect();
+    let shared_ids: Vec<&String> = db_run_ids.intersection(&jsonl_run_ids).collect();
     let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
     let mut mismatched_records: Vec<String> = Vec::new();
 
-    for id in &shared_ids {
-        let db_rows = connection
-            .query_with_params(
-                "SELECT id, started_at, finished_at, backend, input_path, \
-                 normalized_wav_path, request_json, result_json, warnings_json, \
-                 transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
-                &[SqliteValue::Text((*id).clone().into())],
-            )
+    // Prefetch the DB rows for all shared ids with one `WHERE id IN (…)` per chunk
+    // instead of one `SELECT … WHERE id = ?1` per shared run (query *setup* dominates
+    // the single-row lookups) — the read-only mirror of the import N+1 batch. Byte-
+    // identical: the compare is unchanged and `mismatched_records` is sorted below, so
+    // fetch order is irrelevant. `FW_SYNC_BATCH_QUERY=0` (chunk 1) restores the legacy
+    // per-id N+1. `shared_ids` ⊆ `db_run_ids`, so every id resolves in the map.
+    let mut db_run_map: HashMap<String, Vec<SqliteValue>> =
+        HashMap::with_capacity(shared_ids.len());
+    for chunk in shared_ids.chunks(sync_query_batch_size().max(1)) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, started_at, finished_at, backend, input_path, \
+             normalized_wav_path, request_json, result_json, warnings_json, \
+             transcript, replay_json, acceleration_json FROM runs WHERE id IN ({placeholders})"
+        );
+        let params: Vec<SqliteValue> = chunk
+            .iter()
+            .map(|id| SqliteValue::Text((**id).clone().into()))
+            .collect();
+        let rows = connection
+            .query_with_params(&sql, &params)
             .map_err(|error| FwError::Storage(error.to_string()))?;
+        for row in &rows {
+            let cols = run_row_to_cols(row);
+            db_run_map.insert(value_to_string_sqlite(cols.first()), cols);
+        }
+    }
 
-        if let Some(db_row) = db_rows.first()
+    for id in &shared_ids {
+        if let Some(db_row) = db_run_map.get(*id)
             && let Some(jsonl_value) = jsonl_run_map.get(*id)
         {
             let matches = value_to_string_sqlite(db_row.get(1))
