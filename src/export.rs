@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::FwResult;
@@ -42,10 +42,15 @@ pub fn write_artifacts(
 }
 
 fn write_txt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let mut file = File::create(path)?;
+    // BufWriter batches the per-segment writeln! into ~8 KiB write() syscalls
+    // instead of one syscall per line — byte-identical output, far fewer syscalls
+    // on long transcripts. Explicit flush surfaces write errors (raw-File drop
+    // would swallow them).
+    let mut file = BufWriter::new(File::create(path)?);
     for seg in &result.segments {
         writeln!(file, "{}", seg.text)?;
     }
+    file.flush()?;
     Ok(())
 }
 
@@ -68,7 +73,7 @@ fn format_timestamp_srt(seconds: f64) -> String {
 }
 
 fn write_vtt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let mut file = File::create(path)?;
+    let mut file = BufWriter::new(File::create(path)?);
     writeln!(file, "WEBVTT\n")?;
     for seg in &result.segments {
         if let (Some(start), Some(end)) = (seg.start_sec, seg.end_sec) {
@@ -81,11 +86,12 @@ fn write_vtt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
             writeln!(file, "{}\n", seg.text)?;
         }
     }
+    file.flush()?;
     Ok(())
 }
 
 fn write_srt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let mut file = File::create(path)?;
+    let mut file = BufWriter::new(File::create(path)?);
     for (i, seg) in result.segments.iter().enumerate() {
         if let (Some(start), Some(end)) = (seg.start_sec, seg.end_sec) {
             writeln!(file, "{}", i + 1)?;
@@ -98,11 +104,12 @@ fn write_srt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
             writeln!(file, "{}\n", seg.text)?;
         }
     }
+    file.flush()?;
     Ok(())
 }
 
 fn write_csv(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let mut file = File::create(path)?;
+    let mut file = BufWriter::new(File::create(path)?);
     writeln!(file, "start,end,speaker,text")?;
     for seg in &result.segments {
         let start = seg.start_sec.unwrap_or(0.0);
@@ -117,26 +124,29 @@ fn write_csv(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
             start, end, escaped_speaker, escaped_text
         )?;
     }
+    file.flush()?;
     Ok(())
 }
 
 fn write_json(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let file = File::create(path)?;
+    let mut file = BufWriter::new(File::create(path)?);
     serde_json::to_writer_pretty(
-        file,
+        &mut file,
         &serde_json::json!({ "transcription": result.segments }),
     )?;
+    file.flush()?;
     Ok(())
 }
 
 fn write_json_full(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let file = File::create(path)?;
-    serde_json::to_writer_pretty(file, result)?;
+    let mut file = BufWriter::new(File::create(path)?);
+    serde_json::to_writer_pretty(&mut file, result)?;
+    file.flush()?;
     Ok(())
 }
 
 fn write_lrc(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let mut file = File::create(path)?;
+    let mut file = BufWriter::new(File::create(path)?);
     for seg in &result.segments {
         if let Some(start) = seg.start_sec {
             let total_ms = (start * 1000.0).round() as u64;
@@ -146,6 +156,7 @@ fn write_lrc(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
             writeln!(file, "[{:02}:{:02}.{:02}] {}", m, s, cs, seg.text)?;
         }
     }
+    file.flush()?;
     Ok(())
 }
 
@@ -195,5 +206,56 @@ mod tests {
             content,
             "start,end,speaker,text\n1,2,\"Speaker 1, \"\"Boss\"\"\",\"Hello, \"\"world\"\"\"\n"
         );
+    }
+
+    /// Byte-exact output guard for the `BufWriter`-wrapped writers (srt/vtt/txt
+    /// previously had no content test). Confirms the buffered+flushed writers emit
+    /// the exact bytes across a multi-segment result — the buffering change must be
+    /// transparent.
+    #[test]
+    fn writers_emit_byte_exact_content() {
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: "hello world".to_string(),
+            language: Some("en".to_string()),
+            segments: vec![
+                TranscriptionSegment {
+                    start_sec: Some(0.0),
+                    end_sec: Some(1.5),
+                    text: "hello".to_string(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(1.5),
+                    end_sec: Some(3.0),
+                    text: "world".to_string(),
+                    speaker: None,
+                    confidence: None,
+                },
+            ],
+            acceleration: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: vec![],
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let srt = dir.path().join("o.srt");
+        write_srt(&srt, &result).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&srt).unwrap(),
+            "1\n00:00:00,000 --> 00:00:01,500\nhello\n\n2\n00:00:01,500 --> 00:00:03,000\nworld\n\n"
+        );
+
+        let vtt = dir.path().join("o.vtt");
+        write_vtt(&vtt, &result).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&vtt).unwrap(),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nhello\n\n00:00:01.500 --> 00:00:03.000\nworld\n\n"
+        );
+
+        let txt = dir.path().join("o.txt");
+        write_txt(&txt, &result).unwrap();
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), "hello\nworld\n");
     }
 }
