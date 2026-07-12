@@ -49,6 +49,26 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
 
 ## ⚡ Current-code headline vs whisper.cpp is ~1.4–2.3× across all model×modes (a WIN in every one) — "~1.2×" is STALE
 
+**Quick reference (all 2026-07-12, matched threads — wc's best: turbo `-t 32`, tiny.en `-t 16`; total wall unless noted).** franken wins every cell; evidence + caveats in the bullets below.
+
+| clip | model | mode | fw | whisper.cpp | ratio | coverage |
+|---|---|---|---|---|---|---|
+| jfk 11 s (encoder only) | turbo | — | ~1.40 s | ~3.21 s | **2.29×** | — |
+| track01 124.5 s | turbo | no_ts | ~9.2 s | ~21.5 s | **~2.3×** | full (259 w) |
+| track01 | turbo | seg-TS | ~12.2 s | ~21.6 s | **~1.77×** | full |
+| track01 | turbo | word-TS (DTW) | ~12.2 s | ~20.9 s | **~1.71×** | full |
+| track01 | tiny.en | no_ts | ~1.26 s | ~2.43 s | **~1.93×** | full (254 w) |
+| track01 | tiny.en | seg-TS (retry¹) | ~1.95 s | ~2.72 s | **~1.39×** | full |
+| **sjobs 840 s / 28 win** | turbo | no_ts | ~52 s | ~134 s | **~2.58×²** | fw clean / **wc loops** |
+| sjobs 840 s | tiny.en | no_ts | ~8.4 s | ~17.3 s | **~2.06×** | both clean (valid) |
+
+¹ tiny.en TS default drops ~50% (content-drop bug) → non-comparable; `FW_RETRY_FAILED_WINDOW=1` restores full
+coverage (slower but correct). ² sjobs turbo ratio is muddied *in franken's favour* — wc degrades into greedy
+repetition loops + drops ~40%; fw stays clean. Whole-pipeline rows are load-sensitive on this shared box
+(the ratio can compress under contention); the isolated-encoder 2.29× and the fw-vs-fw self-improvement are
+the confound-free anchors. **Net: franken is ~1.4–2.3× across every model×mode/clip, and at least as
+faithful — cleaner than wc on the one clip where either engine degraded.**
+
 **Realistic multi-window no_ts (the target workload), measured 2026-07-12:** turbo, `track01.wav`
 (**124.5 s / 5 windows** — the *same clip* [[project_realistic_workload_dominated]] benched pre-int8),
 `--no-timestamps`, matched `-t 32`, total wall:
