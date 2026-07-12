@@ -598,7 +598,9 @@ impl DecoderWeights {
         let token_embedding =
             load_embedding(model, "decoder.token_embedding.weight", n_vocab, n_state)?;
         // Optional int8 copy of the tied logits projection (the model's largest,
-        // DRAM-bandwidth-bound tensor). Built once at load, gated OFF by default.
+        // DRAM-bandwidth-bound tensor). Built once at load; int8_logits_enabled is
+        // DEFAULT-ON (measured ~6% e2e faster than f16, transcript-identical on
+        // large-v3-turbo). `FRANKEN_WHISPER_INT8_LOGITS=0` forces the exact f16 path.
         let token_embedding_i8 = match (&token_embedding, super::int8_logits_enabled()) {
             (WeightMat::F16 { data, out, inp }, true) => {
                 Some(nn::quantize_f16_to_i8(data, *out, *inp))
