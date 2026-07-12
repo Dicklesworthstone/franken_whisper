@@ -82,27 +82,30 @@ rayon oversubscribes harder than wc's OpenMP under contention) — a true whole-
 but the compute (~2.1×) / total-wall (~1.7×) rows are load-~7 point estimates, not guaranteed floors. Also the
 decode row is fw-TS vs wc-`-nt` (not matched). **Quote the encoder; treat the rest as directional.**
 
-### The ONE known LOSING case — tiny.en long-form — and a specific byte-exact candidate (2026-07-12)
+### The ONE known LOSING case — tiny.en long-form — over-threading hypothesis MEASURED & REJECTED (2026-07-12)
 
 franken WINS turbo everywhere (above), but [[project_realistic_workload_dominated]] documents the inverse
-for **tiny.en long-form: ~1.73–1.84× SLOWER than whisper.cpp** (bd-b4hp) — the tiny 4-layer/384-wide encoder
-doesn't amortize the fixed per-window overhead the way turbo's 32-layer encoder does. **Pinpointed a specific,
-testable, byte-exact mechanism this turn (code inspection):** `default_threads()` (mod.rs:1131) returns **32
-regardless of model** on this 64-core box, and it's baked once into the global rayon pool
-(`ensure_default_rayon_pool`, mod.rs:1187). So tiny.en's small GEMMs are split 32 ways ⇒ **dispatch-bound
-over-threading per window**, while whisper.cpp uses its tiny.en optimum (~8–16 threads,
-[[project_encoder_wall_is_clock_throttle]] shows >optimum REGRESSES). A **model-size-adaptive** encoder pool
-(fewer threads for small `n_audio_layer`) is byte-exact (thread count never changes GEMM output) and would
-attack the loss directly.
+for **tiny.en long-form: ~1.73–1.84× SLOWER than whisper.cpp** (bd-b4hp, but that figure is **2026-06-29,
+pre-int8 — likely stale**). Last turn I hypothesised the cause was 32-way OVER-threading of the small
+encoder (`default_threads()`=32 regardless of model, mod.rs:1131) — tiny.en's 384-wide GEMMs split 32 ways
+looked dispatch-bound. **TESTED this turn (no code change — the bench honours `RAYON_NUM_THREADS`):**
 
-**DEFERRED (not measured this turn) — hazards:** (1) the box is hostile to timing right now (fw binary
-evicted 3× by disk-pressure cleanup at 86% disk, load bouncing 7→34); (2) threading levers have a **3-revert
-history** ([[project_decode_overthreaded_rayon_lead]]) — measure before landing; (3) the global pool is
-`Once`-init, and the GEMM task granularity may partly live in `ft_kernel_cpu` (out-of-crate), so the fix
-might need a scoped sub-pool or an ft change, not just a smaller `default_threads()`. **Test recipe (quiet
-box):** sweep `RAYON_NUM_THREADS=8/16/32` on `cargo bench -- encoder_window_tiny` (it honors the env, so no
-code change needed to A/B the hypothesis), then `fw` tiny.en on `track01.wav` (124.5 s) vs `whisper-cli -t 8`.
-If fewer threads speeds the tiny encoder, it's a real byte-exact win on franken's only losing workload.
+```
+encoder/encoder_window_tiny :  8t = 113.8 ms   16t = 78.7 ms   32t = 63.7 ms   (median, load ~8)
+```
+
+**REJECTED.** The tiny.en encoder scales *monotonically* with threads — 32t is the FASTEST, so fewer
+threads would make it SLOWER. `default_threads()=32` is correct for tiny.en too; there is **no encoder
+over-threading lever** (scaling is sub-linear — 4× threads → 1.78× — so dispatch overhead exists, but not
+enough to reverse the win). **Measuring before landing avoided a 4th entry in the threading
+3-revert history** ([[project_decode_overthreaded_rayon_lead]]).
+
+⇒ The bd-b4hp loss is **not** encoder threading. `project_per_window_overhead_subfloor` already ruled out
+the orchestration layer (mel amortised, DecoderState sub-floor), so what's left is the **decode** (tiny.en's
+per-token GEMVs vs wc) — but the "1.84×" is pre-int8 and the int8 decode flips (`FW_I8_BATCH_4COL`) +
+pipelining have landed since, so it needs a **fresh full-transcribe re-measure** on a quiet box (deferred —
+box currently disk-hostile: `fw` binary evicted repeatedly). Recipe: `fw` tiny.en on `track01.wav` vs
+`whisper-cli -m tiny.en -t 8`, interleaved.
 
 ## Live full-pipeline span breakdown (measured 2026-07-12, real `fw transcribe`, not isolated benches)
 
