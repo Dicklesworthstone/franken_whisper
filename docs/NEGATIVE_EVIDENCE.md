@@ -282,6 +282,13 @@ rejection.
 
 **Verdict:** the shipped `quant_row_i8` (the one hot, contiguous, byte-exact cod-free site) closed this vein. Remaining hot levers live in cod-dirty `nn.rs`/`decode.rs` (park on the wire-in) or are owner/32-thread-gated. **Retry-condition:** cod's `nn.rs` KV WIP lands ⇒ wire in the parked `dot_i8_4col` + propagate the byte-exact quant fix into `nn::quantize_act_i8_into` (which still carries the `trunc(v+0.5)` off-by-one).
 
+> **RESOLVED / STALE 2026-07-12 (BlackThrush).** Both halves of this retry-condition are
+> done: `dot_i8_4col` was wired in + flipped default-ON (`FW_I8_BATCH_4COL`, commit e4f1492,
+> bd-8wq6). And `nn::quantize_act_i8_into` (nn.rs:2341) is now **AVX2-vectorized with correct
+> round-HALF-AWAY** (`_mm256_round_ps` of `v + copysign(0.5, v)` = `f32::round`; scalar
+> fallback uses `.round()`) — the `trunc(v+0.5)` off-by-one is GONE. Nothing to propagate;
+> do not re-attempt.
+
 ## 2026-07-11 - whisper-cc: **LANDED (cod-free encoder.rs) — vectorized the scalar `f32::round()` activation-quant in the DEFAULT-ON `matmul_bias_i8`. Byte-EXACT (CERTIFIED via boundary-swept unit test), ~2.2–2.7× on the quant. Caught + avoided a real `trunc(v+0.5)` sub-0.5 rounding bug that the nn.rs quantizer carries.**
 
 **Best lever in several cycles — genuinely shippable, not parked.** Grepping cod-free hot files for the `round_doesnt_vectorize` antipattern ([[project_round_doesnt_vectorize]]) surfaced **`encoder.rs:1256`** inside `matmul_bias_i8` (the **default-on** attn.out i8 GEMM, `FW_ENC_ATTN_OUT_I8I32` policy, part of the 1.47× encoder int8 win):
