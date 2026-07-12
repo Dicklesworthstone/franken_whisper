@@ -27,7 +27,7 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
 
 | lever | est. e2e | evidence in hand | why gated | validate before flip |
 |---|---|---|---|---|
-| **`FW_ENC_INT8_FC1` for tiny.en** (fc1-only encoder int8) | ~1.9% encoder ≈ **sub-1% e2e** | `encoder_window_tiny` 83.1→81.5 ms (CIs disjoint); transcript **byte-identical on all 5 clips** incl. real speech | global flag (unknown >4-layer models untested); sub-floor e2e | corpus WER on tiny.en + scope the default to tiny.en if desired |
+| **`FW_ENC_INT8_FC1` for tiny.en** (fc1-only encoder int8) | ~1.9% **encoder**; **e2e UNMEASURED** (see note) | `encoder_window_tiny` 83.1→81.5 ms (CIs disjoint, warm isolated); transcript **byte-identical on all 5 clips** incl. real speech | global flag (unknown >4-layer models untested); e2e sign-flipped under load — plus a real quantize-at-load cost concern | idle-box or instructions-retired e2e A/B + corpus WER; scope default to tiny.en if it survives |
 | **tiny.en encoder int8 *calibration*** (enable the full `enc_attn_out_i8i32`, not a flag) | up to ~1.47× encoder (turbo-sized) | full-int8 flag is **calibration-inert** for tiny.en — needs a calibration entry, not a flip | quality (proper nouns) unproven for tiny.en; needs `ENCODER_INT8_CALIBRATION_ID` work | proper-noun corpus WER vs whisper-cli |
 | **ToMe / layer-pruning** (encoder FLOP reduction) | large (turbo) | space mapped; tail-truncation already landed | changes output structurally | full WER + segment-timing corpus |
 | **poly-exp variants / GPU** | — | poly-exp turbo shipped; GTX1070 = nouveau (no CUDA) | owner / infra | — |
