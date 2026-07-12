@@ -43,6 +43,13 @@ dropped (5segs/1315ch off==on). ⇒ default-OFF is correct (preserves jfk×N gol
 real-long-form benefit). The PROPER fix (whisper.cpp temp fallback) tracks `prompt_reset_since` to
 avoid the repetitive-audio duplication — that's the owner-scoped superset.
 
+**SEVERITY BOUND — TINY.EN ONLY, turbo is CLEAN (verified 2026-07-12).** `large-v3-turbo` on the SAME
+track01 (TS mode, `fw transcribe --json`): **13 segments spanning the full [0.00-124.48s]**, largest
+inter-segment gap 4.0s (a normal pause), **NO 30s window drops, 0 drop-warnings**. The flagship's
+stronger decoder doesn't early-EOT on the carried prompt, so the ~48% drop is confined to **tiny.en**
+(the small/fast model). Quality-seeking users on turbo are unaffected; the fix urgency is scoped to
+tiny.en long-form.
+
 **Implications:** (1) the landed `FW_NO_CONTEXT` hatch (0b7d6db) is **CONFIRMED to recover** dropped
 content on a real trigger (previously unverified). (2) Any long-form **tiny.en** native-vs-whisper.cpp
 speed comparison is **non-comparable** — native decodes ~half the content on this clip. (3) Proper fix
