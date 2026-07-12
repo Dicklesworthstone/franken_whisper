@@ -47,7 +47,7 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   `FW_RETRY_FAILED_WINDOW=1` (which restores the full decode ⇒ slower but correct). The headline's tiny.en
   figure (~1.93×) is safe because it was measured in **no_ts** mode (full 254-word coverage, verified).
 
-## ⚡ Current-code headline vs whisper.cpp is ~1.8–2.3× across all modes — the "~1.2×" boilerplate is STALE
+## ⚡ Current-code headline vs whisper.cpp is ~1.4–2.3× across all model×modes (a WIN in every one) — "~1.2×" is STALE
 
 **Realistic multi-window no_ts (the target workload), measured 2026-07-12:** turbo, `track01.wav`
 (**124.5 s / 5 windows** — the *same clip* [[project_realistic_workload_dominated]] benched pre-int8),
@@ -67,9 +67,14 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   stable even as load spiked 8→35):** **fw ~12.2 s vs whisper.cpp `-t 32` ~21.6 s = ~1.77× FASTER**
   (coverage-verified: fw 259 words, turbo doesn't drop). Lower than the ~2.3× no_ts because TS mode has
   **no cross-window pipelining** ([[project_window_pipelining_lever]]) — encode/decode serialize — so this
-  is fw's honest *worst-case* headline. Still supersedes the stale "~1.2× ts" boilerplate. **Full
-  current-code headline (turbo, track01, matched 32t): encoder 2.29× · realistic no_ts ~2.3× · default TS
-  ~1.77× · tiny.en long-form no_ts ~1.93× — every mode ~1.8–2.3×, roughly double the pre-int8 boilerplate.**
+  is fw's honest *worst-case* headline. Still supersedes the stale "~1.2× ts" boilerplate.
+- **tiny.en TS, done CORRECTLY (`FW_RETRY_FAILED_WINDOW=1`, so both engines cover the full clip):** fw
+  ~1.95 s (254 words) vs whisper.cpp `-t 16` ~2.72 s = **~1.39× FASTER** (6 interleaved reps, load ~6–10).
+  This is the LOWEST cell — TS has no pipelining AND the retry re-decodes the 2 recovered windows — but
+  it's the only *valid* tiny.en-TS number (the default drops ~50%, non-comparable — see the content-drop
+  entry above). **Full current-code headline (track01, matched threads): turbo encoder 2.29× · turbo no_ts
+  ~2.3× · turbo TS ~1.77× · tiny.en no_ts ~1.93× · tiny.en TS (retry) ~1.39× — every mode ~1.4–2.3×,
+  roughly double the pre-int8 "~1.2×" boilerplate, and franken now WINS every model×mode measured.**
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
