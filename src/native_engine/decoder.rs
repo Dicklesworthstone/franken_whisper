@@ -412,12 +412,6 @@ pub struct DecoderWeights {
     /// instead of the f16 GEMV. `None` (the default) leaves the f16 path exactly
     /// as-is (bit-identical, conformance unchanged).
     token_embedding_i8: Option<nn::I8Mat>,
-    /// Optional int4-packed copy of the tied logits projection, built at load only
-    /// when [`super::i4_logits_enabled`] is set (`FW_I4_LOGITS=1`) and the embedding
-    /// is f16. Halves the int8 weight traffic again (33 MB/tok) for the
-    /// bandwidth-bound head; a coarser argmax approximation, so default-OFF and
-    /// quality-gated. When present it takes precedence over `token_embedding_i8`.
-    token_embedding_i4: Option<nn::I4BlockMat>,
     /// Learned positional embedding `[n_text_ctx, n_state]`.
     positional_embedding: Mat,
     layers: Vec<DecoderLayer>,
@@ -605,21 +599,12 @@ impl DecoderWeights {
             load_embedding(model, "decoder.token_embedding.weight", n_vocab, n_state)?;
         // Optional int8 copy of the tied logits projection (the model's largest,
         // DRAM-bandwidth-bound tensor). Built once at load, gated OFF by default.
-        // Int4-packed copy (opt-in `FW_I4_LOGITS`): built first so it can suppress the
-        // int8 copy — the two are mutually exclusive logits-quant paths.
-        let token_embedding_i4 = match (&token_embedding, super::i4_logits_enabled()) {
+        let token_embedding_i8 = match (&token_embedding, super::int8_logits_enabled()) {
             (WeightMat::F16 { data, out, inp }, true) => {
-                Some(nn::quantize_f16_to_i4_packed(data, *out, *inp))
+                Some(nn::quantize_f16_to_i8(data, *out, *inp))
             }
             _ => None,
         };
-        let token_embedding_i8 =
-            match (&token_embedding, super::int8_logits_enabled() && token_embedding_i4.is_none()) {
-                (WeightMat::F16 { data, out, inp }, true) => {
-                    Some(nn::quantize_f16_to_i8(data, *out, *inp))
-                }
-                _ => None,
-            };
         let positional_embedding =
             load_mat(model, "decoder.positional_embedding", n_text_ctx, n_state)?;
         let ln = load_layer_norm(model, "decoder.ln", n_state)?;
@@ -756,7 +741,6 @@ impl DecoderWeights {
         Ok(Self {
             token_embedding,
             token_embedding_i8,
-            token_embedding_i4,
             positional_embedding,
             layers,
             ln,
@@ -1742,16 +1726,6 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
     let n_vocab = w.n_vocab;
     let n_state = w.n_state;
 
-    // int4-packed tied-output path (opt-in, `i4_logits_enabled`): halves the int8
-    // weight traffic again over the bandwidth-bound head. Coarser argmax
-    // approximation; present only when `FW_I4_LOGITS` was on at load.
-    if let Some(i4) = &w.token_embedding_i4 {
-        debug_assert_eq!((i4.out, i4.inp), (n_vocab, n_state));
-        let mut logits = nn::gemv_out_buf(i4.out);
-        nn::gemv_i4_packed_f32a(i4, &x_last.data, None, &mut logits);
-        return Ok(logits);
-    }
-
     // int8 tied-output path (opt-in, `int8_logits_enabled`): the memory-halved
     // GEMV over the per-row-quantized embedding. Numerics-affecting approximation
     // of the f16 arm; present only when the gate was on at load.
@@ -2025,7 +1999,6 @@ mod tests {
         DecoderWeights {
             token_embedding: WeightMat::F32(rng.mat(N_VOCAB, N_STATE)),
             token_embedding_i8: None,
-            token_embedding_i4: None,
             positional_embedding: rng.mat(N_CTX, N_STATE),
             layers,
             ln: ln(&mut rng),
