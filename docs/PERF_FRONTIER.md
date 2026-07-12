@@ -40,6 +40,37 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   — never fires; `conformance_harness.rs` validates replay/backend metadata, not live native decode).
   No test uses a multi-window native clip, so nothing exercises the retry outside the 238/0 lib suite.
 
+## Live full-pipeline span breakdown (measured 2026-07-12, real `fw transcribe`, not isolated benches)
+
+`FRANKEN_WHISPER_PERF_SPANS=1 fw transcribe --input jfk.wav --no-persist` (single 11 s window):
+
+| span | tiny.en (ms) | turbo (ms) | note |
+|---|---|---|---|
+| encoder_window | 80 | 1441 | per-window compute — dominates (ledger ceiling) |
+| **model_weights** | **59** | **745** | **one-time load** (`from_ggml`: format-dequant→f32→i7/i8 requant→layout) |
+| decode_loop | 48 | 231 | per-window token decode |
+| model_parse | 14 | 182 | one-time ggml file parse |
+| cross_kv | 9 | 36 | per-window cross-attn KV precompute |
+| mel | 2.5 | 4 | per-window |
+| backend_run (total) | 216 | 2666 | |
+
+**This confirms the per-window compute ceiling** (encoder+decode dominate, both audited-at-ceiling)
+**but reframes "load is sub-floor":** load (`model_parse`+`model_weights`) is **~35 % of single-shot
+turbo wall time** (927 / 2666 ms) — sub-floor only for BATCH/long-file/server-resident workloads
+(`load_resident` amortizes it to ~0), NOT for single-clip CLI / serverless / first-request latency.
+
+- **CANDIDATE (byte-exact, cold-start-only, UNSIZED, DEFERRED):** `quantize_mat_to_i7` (nn.rs:573,
+  called for every weight at load) reads each output column **strided** (`w_t.data[i*out+o]`, stride
+  `out`) — columns `o` and `o+1` share a cache line, so the column loop re-reads each line ~16× (f32
+  line = 16 elems) ⇒ ~0.7 GB/s effective — plus a scalar `.round()` ([[project_round_doesnt_vectorize]]).
+  Byte-exact fix = a **cache-blocked transpose-quant** (read/write each line once + AVX2 round). BUT:
+  (1) it's a COMPONENT of the 745 ms `model_weights` pipeline, share UNMEASURED (needs an internal
+  split before sizing — don't quote 745 ms as the quant cost); (2) LOAD-time ⇒ below the
+  realistic-workload bar the project optimizes for; (3) HIGH blast radius (all weight quant → every
+  int8 GEMM) ⇒ owner/dedicated-session-worthy, do NOT rush in an autonomous tick. It only wins
+  cold-start latency (single-shot/serverless), which memory calls "at parity with wc" — this would
+  make franken *faster* than wc there, if the owner wants that lane.
+
 ## State: the byte-exact, autonomously-verifiable envelope is CLOSED
 
 Everything that could be landed with a *quick, local, byte-exact* verify has been:
