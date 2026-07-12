@@ -5,6 +5,20 @@
 > the short answer to "what's left and exactly how to do it." Owned by swarm agent
 > **BlackThrush**. Last updated 2026-07-12.
 
+## ⚠ TOP PRIORITY IS NOW A CORRECTNESS BUG, NOT A PERF LEVER (2026-07-12)
+
+The byte-exact **perf** envelope is exhausted (below), but this session surfaced a bigger issue: the
+**shipping default drops ~48% of long-form content on tiny.en** (bd-r0qd, reproduced on the in-repo
+`example_audio_track_01.mp3` — two 30 s windows dropped in TS mode; `NEGATIVE_EVIDENCE` 2026-07-12).
+A "faster" long-form tiny.en is partly from decoding LESS. **This outranks every perf lever below.**
+Status: root-caused (no temperature fallback → prompt×int8 early-EOT windows dropped), fix landed
+behind `FW_RETRY_FAILED_WINDOW` (default-OFF, recovers real audio exactly = whisper.cpp, but a
+repetitive/tiled-audio duplication caveat keeps it OFF). **Owner action:** either (a) implement the
+proper whisper.cpp temperature fallback (tracks `prompt_reset_since`, avoids the dup) in
+`transcribe_samples`, or (b) flip `FW_RETRY_FAILED_WINDOW` default-on accepting the jfk×N golden change.
+A drop-warning (surface the silent loss, byte-exact) was written but is **blocked** on a broken sibling
+dep (frankensqlite `fsqlite-vdbe/codegen.rs` mid-refactor, another agent's uncommitted WIP).
+
 ## State: the byte-exact, autonomously-verifiable envelope is CLOSED
 
 Everything that could be landed with a *quick, local, byte-exact* verify has been:
