@@ -70,6 +70,16 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   per-video model-reload N+1); `Regex::new` in hot loops (none); raw-`File` write/read
   loops (all buffered or one-time SHA); `Vec::contains`/O(n²) in hot paths (none); stdout
   per-item emit (streaming-unsafe to buffer, sub-floor for batch dumps).
+- **LLVM-leaves-perf antipattern sweep — CLOSED** (re-verified against current code
+  2026-07-12, post the recent default-on flips): the four exploited scalar-hot-loop classes
+  are all covered. **argmax** (index-tracking reduction, loop-carried `best_i` ⇒ won't
+  autovec) is the ONLY one that needed hand-AVX2 — landed `argmax_idx` 5.10× byte-exact
+  (`decode.rs:614`, `[[project_argmax_avx2_landed]]`); its *siblings* are NOT levers:
+  **max/min folds** (`decode.rs:387` timestamp-rule `max_text_logprob`, `decode.rs:1941`
+  lang-detect, softmax) already lower to `llvm.vector.reduce.fmax` (byte-identical, ~1.2–1.36×,
+  sub-noise — ledger `7469`/`7478`/`7779`); **`.round()`** quant maps are AVX2'd
+  (`encoder.rs:1228`, `nn.rs:2332`); **gather** (gelu) exhausted. No uncovered index-tracking
+  hot serial loop exists (grep). Don't re-grep this vein.
 
 ## ⚠ CORRECTION 2026-07-12: tiny.en FULL int8 is ALREADY SHIPPED (rows 1 & 2 below were STALE)
 
