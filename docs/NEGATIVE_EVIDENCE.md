@@ -72,8 +72,12 @@ retry-on (8) is 3× CLOSER to whisper.cpp (7) than the buggy default (4).** The 
 was DROPPING content, not being cleaner; the retry's residual +1 vs wc is a minor tiled-boundary artifact
 both engines share. So the flip IMPROVES faithfulness on tiled audio too — the jfk×N golden-test change
 is toward whisper.cpp, not away. On **real (non-repetitive) audio it recovers exactly right**. The drop
-is **TS-mode-specific**: track01 **no_ts** is NOT dropped (5segs/1315ch off==on). ⇒ default-OFF is the safe
-ship default (preserves the current jfk×N goldens); the case to flip is now materially stronger (owner:
+is **TS-mode-specific**: track01 **no_ts** is NOT dropped (5segs/1315ch off==on).
+**FLIP IS TEST-SAFE (measured): `FW_RETRY_FAILED_WINDOW=1 cargo test --lib native_engine` = 238/0** —
+flipping default-on breaks ZERO lib tests (the tiled-jfk multi-window test decode.rs:2969 uses a loose
+`≥2 "country"` assertion, robust to the retry's higher count; conformance harness has no exact tiled
+assertions). ⇒ default-OFF is the safe ship default (preserves the current jfk×N goldens); the case to
+flip is now materially stronger AND test-safe (owner:
 real-long-form benefit). The PROPER fix (whisper.cpp temp fallback) tracks `prompt_reset_since` to
 avoid the repetitive-audio duplication — that's the owner-scoped superset.
 
