@@ -47,9 +47,9 @@ path, is the last un-optimized IO site — byte-exact (no quality gate), just ca
 (existing row passed as `&[SqliteValue]`, so the 11-field identical-compare is bit-for-bit the
 same), and `flush_run_chunk` does the `WHERE id IN (…)` prefetch + a seen-map for intra-chunk
 duplicate ids. Gate: `sync::tests` 348/0 incl. `flush_run_chunk_matches_per_line_reference`.
-**Still open: `import_segments` / `import_events`** — the higher-row-count tables, harder because
-they key on `(run_id, idx)` / `(run_id, seq)` (composite). Same recipe below applies; batch by
-`run_id` if fsqlite lacks row-value `IN`. Both hazards below still apply. Not a quick tick —
+**SEGMENTS also LANDED** (`8199711`, composite `(run_id,idx)`: prefetch `WHERE run_id IN (…)` +
+map by `(run_id,idx)` + shared `apply_segment_row`/`record_segment_pre` + seen-map; 349/0 tests +
+E2E byte-identical). **Only `import_events` `(run_id, seq)` remains** — same recipe. Both hazards below still apply. Not a quick tick —
 rushing a conflict-semantics change on the sync path is how the `quantize_act_i7` re-dig burned a
 turn; do the composite-key tables in a dedicated pass.
 
