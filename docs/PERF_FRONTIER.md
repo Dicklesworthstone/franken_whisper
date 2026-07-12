@@ -27,9 +27,16 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
 - **CAVEAT keeping the retry OFF:** it drops the prompt entirely for the failed window, so on
   repetitive/tiled audio it re-transcribes covered content (jfk×3 239→379ch). Real speech is fine.
 - **Owner action (pick one):** (a) implement the proper whisper.cpp **temperature fallback** (tracks
-  `prompt_reset_since`, avoids the dup, covers non-prompt failure modes) in `transcribe_samples` — the
-  correct superset; or (b) flip `FW_RETRY_FAILED_WINDOW` default-on for tiny.en, accepting the jfk×N
-  golden-test change (a repetitive-audio artifact, not a real-speech regression).
+  `prompt_reset_since`, avoids even the minor tiled +1, covers non-prompt failure modes) in
+  `transcribe_samples` — the correct superset; or (b) **flip `FW_RETRY_FAILED_WINDOW` default-on** —
+  the case is now fully evidenced (measured, not asserted): fixes the ~48% drop; **more faithful to
+  whisper.cpp** on both real audio (recovers exactly) and tiled audio (jfk×3 "country": wc 7, default 4
+  DROPS, retry 8 — retry 3× closer to wc); **test-safe** (`FW_RETRY_FAILED_WINDOW=1 cargo test --lib
+  native_engine` = 238/0); **cheap** (encode-reused, `f3d8550`); **safety-audited** (retry TS-only,
+  pipeline no_ts-only ⇒ no desync). It is left OFF only because it reverses the deliberate greedy/temp-0
+  design (an owner call), not for any measured risk. NB: only the LIB native_engine suite was run with
+  the flag; the integration/conformance suites route to whisper.cpp so are likely flag-agnostic, but
+  confirm before flipping.
 
 ## State: the byte-exact, autonomously-verifiable envelope is CLOSED
 
