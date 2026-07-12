@@ -1270,6 +1270,11 @@ pub fn transcribe_samples(
             // FW_RETRY_FAILED_WINDOW retry — same audio/window ⇒ byte-identical enc, so
             // the retry skips a full re-encode. Only hit when the flag is on and a retry
             // is in flight; otherwise falls through to prefetch/inline exactly as before.
+            // SAFE vs the pipeline prefetch below: the retry only fires on `result_len == 0`,
+            // which is a TS-mode-only failure (no_ts sets result_len = i+1 at its break), while
+            // `pipeline` is `… && cfg.no_timestamps` (no_ts only). Retry and pipeline are thus
+            // mutually exclusive, so the `if pipeline` dispatch is a no-op on any retry re-entry —
+            // no double-send / res_rx desync. (Verified: retry-on track01 transcript is coherent.)
             let enc = if retry_enc_cache
                 .as_ref()
                 .is_some_and(|(off, _): &(usize, _)| *off == frame_offset)
