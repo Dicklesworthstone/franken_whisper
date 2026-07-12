@@ -59,17 +59,21 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
 turbo wall time** (927 / 2666 ms) — sub-floor only for BATCH/long-file/server-resident workloads
 (`load_resident` amortizes it to ~0), NOT for single-clip CLI / serverless / first-request latency.
 
-- **CANDIDATE (byte-exact, cold-start-only, UNSIZED, DEFERRED):** `quantize_mat_to_i7` (nn.rs:573,
-  called for every weight at load) reads each output column **strided** (`w_t.data[i*out+o]`, stride
-  `out`) — columns `o` and `o+1` share a cache line, so the column loop re-reads each line ~16× (f32
-  line = 16 elems) ⇒ ~0.7 GB/s effective — plus a scalar `.round()` ([[project_round_doesnt_vectorize]]).
-  Byte-exact fix = a **cache-blocked transpose-quant** (read/write each line once + AVX2 round). BUT:
-  (1) it's a COMPONENT of the 745 ms `model_weights` pipeline, share UNMEASURED (needs an internal
-  split before sizing — don't quote 745 ms as the quant cost); (2) LOAD-time ⇒ below the
-  realistic-workload bar the project optimizes for; (3) HIGH blast radius (all weight quant → every
-  int8 GEMM) ⇒ owner/dedicated-session-worthy, do NOT rush in an autonomous tick. It only wins
-  cold-start latency (single-shot/serverless), which memory calls "at parity with wc" — this would
-  make franken *faster* than wc there, if the owner wants that lane.
+- **CANDIDATE (byte-exact) — BUILT + MEASURED = WASH, reverted 2026-07-12.** Hypothesis: `quantize_mat_to_i7`
+  (nn.rs:573) reads each output column **strided** (`w_t.data[i*out+o]`, stride `out`) — columns `o`/`o+1`
+  share a cache line so the column loop re-reads it ~16× ⇒ memory-read-bound, so a **cache-blocked
+  transpose-quant** (own a contiguous `BC=64`-column block, sweep rows, read each line ~once) would win.
+  Implemented behind `FW_QUANT_BLOCKED`, **byte-identical** (unit-test-passed across partial blocks + live
+  shapes; the tricky part was preserving the default **error-feedback** rounding — EF diffuses the residual
+  along the contraction dim WITHIN each column, so a per-column `err[BC]` in the i-outer loop keeps it
+  bit-exact). **But the `model_weights` span did NOT move: default ≈ blocked ≈ ~640 ms turbo (ABBA, both
+  EF and non-EF).** So the 16× read amplification is REAL but NOT the bottleneck: the default path is EF,
+  whose per-column serial `err`-chain is **latency-bound not bandwidth-bound**, and `model_weights` is
+  anyway dominated by the ggml-Q-format **dequant + f32 convert + layout**, not the i7 re-quant. Reverted
+  (byte-exact impl in git history; do not re-attempt cache-blocking this kernel — it's not memory-bound).
+  **Lesson: "strided ⇒ memory-bound" is a HYPOTHESIS ([[project_nominal_vs_dram_bytes]]); a serial
+  dependency (EF) or a dominating sibling stage can make the amplified reads free.** Load stays "at parity
+  with wc"; cold-start latency is not an autonomously-movable lever here.
 
 ## State: the byte-exact, autonomously-verifiable envelope is CLOSED
 
