@@ -4,6 +4,30 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **PROFILE-VERIFIED (no new lever) — a fresh flat `perf` profile on the CURRENT shipping binary (tiny.en int8) confirms the frame table; every hot frame is ceiling / owner-gated / sub-floor. Symbol resolution is blocked at `paranoid=1`.**
+
+Motivated by finding the encoder-int8 state stale (a18fed2 correction), I re-verified the hot path with
+a profile instead of trusting memory: `perf record -F 299` on `fw transcribe` (tiny.en, the ~1min
+`example_audio_track_01.mp3`), flat self-time. Findings:
+
+- **`__expf_fma` (libm) 4.00%** — the SDPA-softmax exp. This is the `FT_SDPA_POLY_EXP` lever, but it is
+  **lossy for tiny.en** (transcript changes, rejected earlier) → owner-gated, not byte-exact. On turbo
+  poly-exp is already default-ON so this frame is already captured there.
+- **int8 GEMM cluster (~15%+ self-time in one `fw` code region)** — the `dot_maddubs` hot loop, at its
+  ceiling ([[project_grep_the_gate]] i7 ~28%; [[project_dot_i8_avx2_landed]]).
+- **`__memset_avx2` 0.92% + `__memmove_avx` 0.43%** — sub-floor; `gemv_out_buf` is already uninit.
+- **kernel frames ~8%** (`[k] 0xffffffff…`, two clusters) — **UNRESOLVABLE**: `perf_event_paranoid=1`
+  hides `/proc/kallsyms`, so can't split page-faults (would imply a buffer-pool lever) from rayon
+  futex/schedule (the known ~11% rayon overhead, [[project_turbo_e2e_frame_table]]). Consistent with
+  rayon; no evidence of an alloc/page-fault lever.
+
+**Constraint for future profiling (record so nobody re-fights it):** the release binary has no debuginfo
+(its own frames show as raw addresses) and `paranoid=1` blocks kernel-symbol + kallsyms resolution
+without root. A *symbolized* profile needs a debug/`debug=1` build; kernel attribution needs
+`paranoid<=0` (not settable here). **Net: the profile CONFIRMS the frame table on current code and
+surfaces NO new byte-exact lever** — GEMM ceiling, expf lossy/owner-gated, copies sub-floor.
+
+---
 ## 2026-07-12 - BlackThrush: **SWEPT — the redundant clone-then-overwrite / large per-window copy vein is exhausted (encoder forward clean; decoder default path clean after the fused-LN land). Don't re-hunt.**
 
 The [[project_conv_wt_pretranspose_landed]] hunt ("find other constant-tensor recompute / redundant
