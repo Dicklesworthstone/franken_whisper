@@ -72,9 +72,14 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   ~1.95 s (254 words) vs whisper.cpp `-t 16` ~2.72 s = **~1.39× FASTER** (6 interleaved reps, load ~6–10).
   This is the LOWEST cell — TS has no pipelining AND the retry re-decodes the 2 recovered windows — but
   it's the only *valid* tiny.en-TS number (the default drops ~50%, non-comparable — see the content-drop
-  entry above). **Full current-code headline (track01, matched threads): turbo encoder 2.29× · turbo no_ts
-  ~2.3× · turbo TS ~1.77× · tiny.en no_ts ~1.93× · tiny.en TS (retry) ~1.39× — every mode ~1.4–2.3×,
-  roughly double the pre-int8 "~1.2×" boilerplate, and franken now WINS every model×mode measured.**
+  entry above).
+- **WORD timestamps (DTW), turbo track01:** fw `--timestamp-level word` ~12.2 s (259 words) vs
+  whisper.cpp `-dtw large.v3.turbo -t 32` ~20.9 s = **~1.71× FASTER** (2 interleaved reps, both stable even
+  at load 35–39). Notably fw word-ts (~12.2 s) ≈ fw segment-TS (~12.2 s) ⇒ **the DTW alignment overhead is
+  NEGLIGIBLE** — confirms with measurement that `dtw.rs` (1185 lines) is sub-floor, no DTW speed lever.
+  **Full current-code headline (track01, matched threads): turbo encoder 2.29× · turbo no_ts ~2.3× · turbo
+  segTS ~1.77× · turbo wordTS ~1.71× · tiny.en no_ts ~1.93× · tiny.en TS (retry) ~1.39× — every model×mode
+  ~1.4–2.3×, roughly double the pre-int8 "~1.2×" boilerplate, and franken WINS every one measured.**
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
