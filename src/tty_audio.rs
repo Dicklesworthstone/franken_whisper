@@ -405,8 +405,8 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                 continue;
             }
         };
-        let decoded = match decompress_chunk(&compressed) {
-            Ok(value) => value,
+        let decoded_start = match decompress_chunk_into(&compressed, &mut raw) {
+            Ok(start) => start,
             Err(error) => {
                 integrity_failures.push(frame.seq);
                 dropped_frames.push(frame.seq);
@@ -422,7 +422,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
 
         // CRC32 integrity check.
         if let Some(expected_crc) = frame.crc32 {
-            let actual_crc = crc32_of(&decoded);
+            let actual_crc = crc32_of(&raw[decoded_start..]);
             if actual_crc != expected_crc {
                 integrity_failures.push(frame.seq);
                 dropped_frames.push(frame.seq);
@@ -432,6 +432,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                         frame.seq, expected_crc, actual_crc
                     )));
                 }
+                raw.truncate(decoded_start);
                 contiguous_prefix_intact = false;
                 expected_seq = frame.seq + 1;
                 seen.insert(frame.seq);
@@ -439,7 +440,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
             }
         }
         if let Some(expected_sha) = frame.payload_sha256.as_deref() {
-            let actual_sha = sha256_hex(&decoded);
+            let actual_sha = sha256_hex(&raw[decoded_start..]);
             if !actual_sha.eq_ignore_ascii_case(expected_sha) {
                 integrity_failures.push(frame.seq);
                 dropped_frames.push(frame.seq);
@@ -449,6 +450,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                         frame.seq, expected_sha, actual_sha
                     )));
                 }
+                raw.truncate(decoded_start);
                 contiguous_prefix_intact = false;
                 expected_seq = frame.seq + 1;
                 seen.insert(frame.seq);
@@ -456,7 +458,6 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
             }
         }
 
-        raw.extend_from_slice(&decoded);
         seen.insert(frame.seq);
         frames_decoded += 1;
         if contiguous_prefix_intact {
@@ -925,28 +926,45 @@ fn compress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
 const MAX_DECOMPRESSED_FRAME_BYTES: usize = 80_000;
 
 fn decompress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_chunk_into(input, &mut out)?;
+    Ok(out)
+}
+
+/// Append one decompressed frame directly to `out`, returning its start offset.
+///
+/// On failure, `out` is restored to its original length so recovery-mode callers
+/// never retain bytes from a corrupt or oversized frame.
+fn decompress_chunk_into(input: &[u8], out: &mut Vec<u8>) -> FwResult<usize> {
     // `input` is already a fully-buffered `&[u8]` (which implements `BufRead`), so
     // feed it straight to the `bufread` decoder. `flate2::read::ZlibDecoder` would
     // wrap it in an *additional* 32 KiB read-ahead `BufReader`, allocating + memmoving
     // a scratch buffer for every frame; `flate2::bufread::ZlibDecoder` reads directly
     // from the slice. Output is byte-identical — same inflate, no extra copy.
     let mut decoder = ZlibDecoder::new(input);
-    let mut out = Vec::new();
+    let start = out.len();
     let mut buf = [0u8; 8192];
     loop {
-        let n = decoder.read(&mut buf)?;
+        let n = match decoder.read(&mut buf) {
+            Ok(n) => n,
+            Err(error) => {
+                out.truncate(start);
+                return Err(error.into());
+            }
+        };
         if n == 0 {
             break;
         }
         out.extend_from_slice(&buf[..n]);
-        if out.len() > MAX_DECOMPRESSED_FRAME_BYTES {
+        if out.len() - start > MAX_DECOMPRESSED_FRAME_BYTES {
+            out.truncate(start);
             return Err(FwError::InvalidRequest(format!(
                 "decompressed frame exceeds {MAX_DECOMPRESSED_FRAME_BYTES} byte limit \
                  (possible decompression bomb)"
             )));
         }
     }
-    Ok(out)
+    Ok(start)
 }
 
 fn crc32_of(data: &[u8]) -> u32 {
@@ -1875,6 +1893,32 @@ mod tests {
         let compressed = compress_chunk(data).expect("compression should work");
         let decompressed = decompress_chunk(&compressed).expect("decompression should work");
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn decompress_chunk_into_appends_and_rolls_back_on_error() {
+        let prefix = b"already-decoded";
+        let frame = b"next frame bytes";
+        let compressed = compress_chunk(frame).expect("compression should work");
+        let mut output = prefix.to_vec();
+
+        let start =
+            super::decompress_chunk_into(&compressed, &mut output).expect("append inflate");
+        assert_eq!(start, prefix.len());
+        assert_eq!(&output[..start], prefix);
+        assert_eq!(&output[start..], frame);
+
+        let before_error = output.clone();
+        assert!(super::decompress_chunk_into(b"not zlib", &mut output).is_err());
+        assert_eq!(output, before_error, "failed frame must not alter output");
+
+        let oversized = vec![0u8; super::MAX_DECOMPRESSED_FRAME_BYTES + 1];
+        let compressed = compress_chunk(&oversized).expect("compress oversized fixture");
+        assert!(super::decompress_chunk_into(&compressed, &mut output).is_err());
+        assert_eq!(
+            output, before_error,
+            "oversized frame must roll back bytes appended before the cap"
+        );
     }
 
     /// Byte-exactness certification for the `read::ZlibDecoder` ->
