@@ -4,6 +4,47 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **SURFACED / OWNER-GATED — the byte-exact autonomous perf envelope is exhausted; the remaining high-EV lever (encoder fc1/full int8 for uncalibrated models) is byte-identical on jfk but needs the model-bench + corpus-WER loop, not a quick byte-exact flip.**
+
+**Context.** After 10 landed byte-exact wins + 2 measured rejections this session
+(peripheral IO/DB/export lane: BufWriter read+write, streaming checksums, statement
+savepoints, DB- and app-level N+1s — all exhausted), the only remaining high-EV area is
+the transcription hot path. Grepped the encoder int8 gate (per
+[[project_grep_the_gate]]): the FULL quality-safe int8 (`enc_attn_out_i8i32`, q/k/v/fc1/
+fc2 + i32-accumulate attn_out) is **already default-ON for calibrated models**
+(large-v3-turbo) — the captured 1.47× win. For **uncalibrated** models (tiny.en,
+unknown) the encoder runs f32; `FW_ENC_INT8_FC1=1` (fc1-only, "GELU-absorbed byte-
+identical") and `FW_ENC_ATTN_OUT_I8I32=1` (full) are default-OFF.
+
+**In-hand verification (prebuilt `fw`, NO rebuild).** Ran the native tiny.en engine on
+jfk.wav (`FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole`,
+`FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL=…/ggml-tiny.en.bin`):
+
+```text
+f32 default          : "And so my fellow Americans ask not what your country can do for you ask what you can do for your country."
+FW_ENC_INT8_FC1=1     : (byte-identical)
+FW_ENC_ATTN_OUT_I8I32=1: (byte-identical)
+wall (min of 3): 0.30971 / 0.30957 / 0.30987 s — identical to 4 decimals
+```
+
+**Why this is SURFACED not landed.** (1) **Effectiveness/sizing is unmeasurable via the
+CLI here** — tiny.en's 4-layer encoder makes any int8 delta invisible under the load-
+dominated ~0.31 s wall; a real size needs the `encoder_window_tiny` bench (a ~6 min local
+model build, [[project_bench_model_local_only]]). (2) **jfk byte-identical ≠ corpus WER-
+neutral** — jfk is short/clean/proper-noun-free; the encoder int8 proper-noun risk
+([[project_turbo_encoder_dominates]]) is exactly why these stay default-OFF, so a default
+flip is an **owner corpus-WER decision**, not a byte-exact flip I can make autonomously.
+(3) The "does GELU-absorption survive **32 stacked layers**" question is turbo-specific,
+and on turbo fc1-only is superseded by the already-on full int8 — so the fc1-only lever's
+only scope is small-encoder uncalibrated models (low EV).
+
+**Retry condition / next step for an owner-gated pass:** build `native_engine_bench`
+locally, A/B `encoder_window_tiny` with `FW_ENC_INT8_FC1` off/on to size the encoder
+speedup, then run a corpus WER comparison (whisper.cpp reference at
+`legacy_whispercpp/whisper.cpp/build/bin/whisper-cli`) before any default flip. This is
+outside the quick byte-exact envelope — it needs the model+WER loop + owner authorization.
+
+---
 ## 2026-07-12 - BlackThrush: **REJECTED (measured REGRESSION ~5%) — multi-row batched INSERT for `persist_report` segments/events is SLOWER than the savepoint-skipped per-row path.**
 
 **Hypothesis (disproven).** After the savepoint-skip win (`FW_PERSIST_SKIP_STMT_SP`,
