@@ -152,6 +152,15 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   sub-noise — ledger `7469`/`7478`/`7779`); **`.round()`** quant maps are AVX2'd
   (`encoder.rs:1228`, `nn.rs:2332`); **gather** (gelu) exhausted. No uncovered index-tracking
   hot serial loop exists (grep). Don't re-grep this vein.
+- **Cross-attention K/V — verified fully optimized** (2026-07-12, the last per-window area not yet
+  re-checked this session): the per-window K/V PROJECTION (`encoder_out @ Wk/Wv`, tq=1500) runs the
+  dequant-once f32 sgemm (`cross_proj_f32_enabled` **DEFAULT-ON**, mod.rs:724; **2.25×** on turbo,
+  golden-checked, `examples/cross_f16path_probe`); the per-TOKEN K/V read is **f16 by default**
+  (byte-identical) with int8/block-wise variants gated for quality (`FW_CROSS_V_BLOCK`,
+  [[project_cross_v_block_win]]). `cross_attn` is only ~4.4% of decode. No byte-exact cross lever.
+  **With this, every per-window area (encoder int8/FLOP/SDPA/conv/LN, decode mlp/logits/qkv/self-attn/
+  cross, mel) is personally re-verified closed this session, and the load path is floored (above) —
+  the autonomous byte-exact frontier is empirically exhausted; remaining levers are owner/infra only.**
 
 ## ⚠ CORRECTION 2026-07-12: tiny.en FULL int8 is ALREADY SHIPPED (rows 1 & 2 below were STALE)
 
