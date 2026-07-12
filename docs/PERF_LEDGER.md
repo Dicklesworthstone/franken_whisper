@@ -51,6 +51,26 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): **incremental** export also streams SHA-256 while writing (`HashingWriter`) — completes the re-read-free checksum path
+
+**What.** Mirror of the full-export streaming-hash onto the incremental path:
+`export_table_runs_incremental` / `export_table_segments_for_runs` /
+`export_table_events_for_runs` now wrap their `BufWriter` in `HashingWriter` and return
+`(count, sha256)`; `export_incremental_inner` uses those instead of re-reading each JSONL
+with `sha256_file`. **Both** export paths now checksum in one pass — no re-read.
+`sha256_file` remains for import-side validation (a fail-closed pass that must precede
+import, so it stays a separate read).
+
+**Correctness CERTIFIED.** `sync::tests` **347/0** — incl. incremental export→import
+round-trips (validate manifest checksums against the files) + a new assert that the
+incremental streamed digest equals `sha256_file` of the written bytes.
+
+**Sizing.** Identical `HashingWriter` mechanism as the full-export win measured this
+session (`sync/export_hash` in-binary A/B: reread ~19.4 ms vs stream ~18.2 ms ≈ **~7%**,
+dropping the whole re-read pass). No separate bench — same std pattern, same in-tree
+measurement. Byte-exact, zero-downside, no gate. The sync export checksum path is now
+re-read-free end to end.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): full export streams SHA-256 while writing (`HashingWriter`) — drops the checksum re-read pass (~5–7%)
 
 **What.** `export_inner` wrote each JSONL (`runs`/`segments`/`events`), then re-read it
