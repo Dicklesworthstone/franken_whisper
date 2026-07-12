@@ -281,26 +281,6 @@ pub(crate) fn int8_logits_enabled() -> bool {
     })
 }
 
-/// Whether to run the tied logits projection through the **int4-packed** GEMV
-/// ([`nn::gemv_i4_packed_f32a`]) instead of int8. The logits head is the model's
-/// largest, DRAM-bandwidth-bound tensor: a same-binary A/B measured int8 (66 MB/tok)
-/// at ~6% e2e faster than f16 (132 MB/tok) with a byte-identical turbo transcript,
-/// i.e. the head is bandwidth-bound and precision reduction pays roughly linearly, so
-/// int4 (33 MB/tok) is worth a *quality-gated* try. Default-OFF (`FW_I4_LOGITS=1`
-/// opts in) because int4 is a coarser argmax approximation than the transcript-safe
-/// int8 default — it must clear a transcript/WER gate before any default flip. When
-/// on, it takes precedence over (and suppresses the build of) the int8 copy.
-pub(crate) fn i4_logits_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("FW_I4_LOGITS") {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        ),
-        Err(_) => false,
-    })
-}
-
 /// Whether to run the decoder MLP up-projection (fc1 `[4·n_state, n_state]`,
 /// `mlp_0`, feeding GELU) through the int8/Q8 GEMV ([`nn::gemv_i8`]) on the
 /// per-token decode path (`tq == 1`). The down-projection (`mlp_2`) stays f16.
