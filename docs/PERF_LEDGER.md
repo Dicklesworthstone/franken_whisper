@@ -51,6 +51,49 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_PERSIST_SKIP_STMT_SP`): `persist_report_inner` skips redundant per-statement savepoints inside its enclosing SAVEPOINT — **~1.48× persist**
+
+**What.** `persist_report_inner` writes the `runs` row + one INSERT per segment +
+one INSERT per event, each via `execute_with_params`, which wraps **every** statement
+in an fsqlite internal statement savepoint. But those inserts already run inside
+`persist_report_once`'s explicit `SAVEPOINT`, which is the rollback boundary (it
+rolls back on any `Err`), so the per-statement savepoints are pure redundant
+bookkeeping — N create/release pairs for N segments + N events. Switched all three
+insert sites to fsqlite's purpose-built escape hatch
+`execute_with_params_skip_statement_savepoint_in_explicit_txn`. Persisted rows are
+**byte-identical** on success; on failure the enclosing savepoint rollback discards
+partial effects exactly as the legacy path did (equivalent final state either way).
+`FW_PERSIST_SKIP_STMT_SP=0` restores the per-statement-savepoint path (kill-switch);
+default is skip.
+
+**Not a negative-ledger pickup** — found by profiling the storage write path after
+the `load_run_details` scan lever measured sub-floor (that closeout is in
+NEGATIVE_EVIDENCE 2026-07-12). The load path is fsqlite-query-dominated; the *write*
+path's savepoint bookkeeping, by contrast, is a large, measurable fraction.
+
+**Correctness CERTIFIED.** Full `storage::tests` module (persist→load round-trips,
+schema migrations, cancellation/rollback, corrupt-input handling): **201 passed /
+0 failed** under the default skip path.
+
+**Measurement (`persist_report/segments/100` = 100 segments + 10 events = 111
+inserts; forced-local; external-env A/B interleaved 0/1/0/1 — in-binary env A/B
+impossible under edition 2024 + `#![deny(unsafe_code)]`, see
+[[project_asupersync_oom_roulette]]):**
+
+| rep | flag=0 (statement savepoint) | flag=1 (skip) |
+|---|---|---|
+| 1 | 2.5050 ms | 1.6684 ms |
+| 2 | 2.4365 ms | 1.6764 ms |
+
+**~1.45–1.50× faster** (rep1 1.50×, rep2 1.45×). The two arms' 95% CIs are fully
+non-overlapping ([2.39–2.56 ms] vs [1.64–1.71 ms]) and each arm's CV is <2% — a
+clean, stable separation (contrast the same-file `load_run_details` scan lever,
+whose delta sat inside ±5% run-to-run noise). ~0.8 ms saved across 111 inserts ≈
+7 µs/insert of savepoint overhead removed. persist_report runs once per
+transcription (when `persist=true`), so the e2e effect scales with segment/event
+count; modest but real on the transcription-completion path, and a clean structural
+win backed by the API author's intended contract.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): `decompress_chunk` `read::ZlibDecoder` → `bufread::ZlibDecoder` — removes the per-frame 32 KiB read-ahead alloc (negative-ledger pickup)
 
 **What.** `tty_audio::decompress_chunk(input: &[u8])` fed an already-in-memory
