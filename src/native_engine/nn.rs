@@ -237,6 +237,67 @@ fn i7_qkv_headmajor_rowco_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("FW_I7_QKV_HEADMAJOR_ROWCO").ok().as_deref() != Some("0"))
 }
 
+/// Default-OFF AVX2 vectorization of the i7 GEMM dequant *epilogue* for the
+/// expanding (`out > in`) shape — i.e. the encoder MLP `fc1`, the single largest
+/// producer of dequant-scatter outputs in [`matmul_bias_i7_quantized`]. The dot
+/// itself is unchanged (still `dot_maddubs_i7_m4`); only the scalar
+/// `(raw - off) as f32 * s_row * sc_col (+bias)` per-output chain is replaced by a
+/// per-lane AVX2 `vpsubd → vcvtdq2ps → vmulps → vmulps → vaddps` (NON-FMA, so each
+/// lane is bit-identical to the scalar op order — a ULP-free lever). `FW_I7_EPILOGUE_SIMD=1`
+/// opts in. Distinct from (and composable with) cod's dot-tile lane, which
+/// amortizes the epilogue by doing more MACs per invocation rather than making
+/// each dequant cheaper.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn i7_epilogue_simd_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FW_I7_EPILOGUE_SIMD").ok().as_deref() == Some("1"))
+}
+
+/// AVX2 dequant of two i7 GEMM columns (`out > in` else-branch) over the same
+/// four activation rows: returns `[colA_r0..r3, colB_r0..r3]` where each lane is
+/// `(raw - 128*colsum) as f32 * s_row * scale (+bias)`. Non-FMA `vmulps/vaddps`,
+/// so every lane is **bit-identical** to the scalar per-output chain in
+/// [`matmul_bias_i7_quantized`]'s tail (pass `bias_a=bias_b=0.0` for the
+/// no-bias case — `x + 0.0` is an identity here since all scales are ≥ 0, so no
+/// `-0.0` can arise). `sv` is `[s0,s1,s2,s3, s0,s1,s2,s3]`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+#[inline]
+fn dequant_2col_i7(
+    ra: [i32; 4],
+    rb: [i32; 4],
+    offa: i32,
+    offb: i32,
+    sca: f32,
+    scb: f32,
+    sv: [f32; 8],
+    bias_a: f32,
+    bias_b: f32,
+) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    // SAFETY: AVX2 is in the base target features (.cargo/config.toml
+    // `target-cpu=x86-64-v3`); all lanes operate on register values only.
+    unsafe {
+        let raw = _mm256_setr_epi32(ra[0], ra[1], ra[2], ra[3], rb[0], rb[1], rb[2], rb[3]);
+        let off = _mm256_setr_epi32(offa, offa, offa, offa, offb, offb, offb, offb);
+        let svv = _mm256_loadu_ps(sv.as_ptr());
+        let scv = _mm256_setr_ps(sca, sca, sca, sca, scb, scb, scb, scb);
+        let bv = _mm256_setr_ps(
+            bias_a, bias_a, bias_a, bias_a, bias_b, bias_b, bias_b, bias_b,
+        );
+        // (raw - off) as f32 * s * sc + bias, per lane, NON-FMA (mul, mul, add).
+        let d = _mm256_sub_epi32(raw, off);
+        let f = _mm256_cvtepi32_ps(d);
+        let m1 = _mm256_mul_ps(f, svv);
+        let m2 = _mm256_mul_ps(m1, scv);
+        let res = _mm256_add_ps(m2, bv);
+        let mut out = [0.0f32; 8];
+        _mm256_storeu_ps(out.as_mut_ptr(), res);
+        out
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemv_f16_batch_rows(
     w_f16: &[Float16],
@@ -1288,7 +1349,44 @@ pub fn matmul_bias_i7_quantized(
                         o += 1;
                     }
                 } else {
-                    for o in 0..out {
+                    let mut o = 0usize;
+                    // AVX2 dequant epilogue: two columns per 256-bit lane group. The
+                    // dot is unchanged; only the per-output f32 dequant chain is
+                    // vectorized (non-FMA ⇒ byte-identical to the scalar tail below).
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                    if i7_epilogue_simd_enabled() {
+                        // s-vector is constant across the whole out-loop for this
+                        // 4-row block: [s0,s1,s2,s3, s0,s1,s2,s3].
+                        let sv = [s0, s1, s2, s3, s0, s1, s2, s3];
+                        while o + 2 <= out {
+                            let wa = &w.data[o * inp..(o + 1) * inp];
+                            let wb = &w.data[(o + 1) * inp..(o + 2) * inp];
+                            let ra = dot_maddubs_i7_m4(x0, x1, x2, x3, wa);
+                            let rb = dot_maddubs_i7_m4(x0, x1, x2, x3, wb);
+                            let (ba, bb) = bias.map_or((0.0, 0.0), |b| (b[o], b[o + 1]));
+                            let t = dequant_2col_i7(
+                                ra,
+                                rb,
+                                128 * w.colsum[o],
+                                128 * w.colsum[o + 1],
+                                w.scale[o],
+                                w.scale[o + 1],
+                                sv,
+                                ba,
+                                bb,
+                            );
+                            cblk[o] = t[0];
+                            cblk[out + o] = t[1];
+                            cblk[2 * out + o] = t[2];
+                            cblk[3 * out + o] = t[3];
+                            cblk[o + 1] = t[4];
+                            cblk[out + o + 1] = t[5];
+                            cblk[2 * out + o + 1] = t[6];
+                            cblk[3 * out + o + 1] = t[7];
+                            o += 2;
+                        }
+                    }
+                    while o < out {
                         let wrow = &w.data[o * inp..(o + 1) * inp];
                         let raw = dot_maddubs_i7_m4(x0, x1, x2, x3, wrow);
                         let off = 128 * w.colsum[o];
@@ -1308,6 +1406,7 @@ pub fn matmul_bias_i7_quantized(
                         cblk[out + o] = v1;
                         cblk[2 * out + o] = v2;
                         cblk[3 * out + o] = v3;
+                        o += 1;
                     }
                 }
             } else {
@@ -6619,6 +6718,93 @@ mod tests {
                     "i4-packed != probe at o={o}, inp={inp}: {} vs {}",
                     y_packed[o],
                     y_probe[o]
+                );
+            }
+        }
+    }
+
+    /// The AVX2 dequant epilogue helper must be BIT-IDENTICAL to the scalar
+    /// `(raw - 128*colsum) as f32 * s_row * scale (+bias)` chain it replaces in
+    /// the `out > in` (fc1) branch of `matmul_bias_i7_quantized`. Covers the
+    /// with-bias and no-bias (`0.0`) paths, positive scales (as produced by the
+    /// real amax/63 and amax/127 quantizers), and the `raw == off` zero case that
+    /// would be the only source of a `-0.0` discrepancy.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn dequant_2col_i7_bit_identical_to_scalar() {
+        let mut rng = Lcg::new(0x0E71_10D0);
+        // Reference scalar chain, mirroring the tail exactly.
+        let scalar = |raw: i32, off: i32, s: f32, sc: f32, b: f32, add: bool| -> f32 {
+            let v = (raw - off) as f32 * s * sc;
+            if add { v + b } else { v }
+        };
+        for trial in 0..2000usize {
+            // Plausible magnitudes: raw is a u8·u8 dot over inp≤5120 (0..~3.3e8),
+            // off = 128·colsum with colsum a sum of i7 weights.
+            let mk_raw = |rng: &mut Lcg| (rng.next_u32() % 300_000_000) as i32;
+            let ra = [mk_raw(&mut rng), mk_raw(&mut rng), mk_raw(&mut rng), mk_raw(&mut rng)];
+            let mut rb = [mk_raw(&mut rng), mk_raw(&mut rng), mk_raw(&mut rng), mk_raw(&mut rng)];
+            let offa = 128 * ((rng.next_u32() % 2_000_000) as i32 - 1_000_000);
+            let offb = 128 * ((rng.next_u32() % 2_000_000) as i32 - 1_000_000);
+            // Scales are amax/{63,127} ⇒ strictly ≥ 0 (this is exactly what rules
+            // out a `-0.0` when raw==off, so the test MUST honor it).
+            let s = [
+                rng.next_f32().abs() * 0.02,
+                rng.next_f32().abs() * 0.02,
+                rng.next_f32().abs() * 0.02,
+                rng.next_f32().abs() * 0.02,
+            ];
+            let sca = rng.next_f32().abs() * 0.05;
+            let scb = rng.next_f32().abs() * 0.05;
+            let ba = rng.next_f32() * 4.0 - 2.0;
+            let bb = rng.next_f32() * 4.0 - 2.0;
+            // Every ~11th trial force raw==off on colA lane0 to hit the 0.0/-0.0 edge.
+            if trial % 11 == 0 {
+                rb[0] = offb;
+            }
+            let sv = [s[0], s[1], s[2], s[3], s[0], s[1], s[2], s[3]];
+
+            // With bias.
+            let got = dequant_2col_i7(ra, rb, offa, offb, sca, scb, sv, ba, bb);
+            let exp = [
+                scalar(ra[0], offa, s[0], sca, ba, true),
+                scalar(ra[1], offa, s[1], sca, ba, true),
+                scalar(ra[2], offa, s[2], sca, ba, true),
+                scalar(ra[3], offa, s[3], sca, ba, true),
+                scalar(rb[0], offb, s[0], scb, bb, true),
+                scalar(rb[1], offb, s[1], scb, bb, true),
+                scalar(rb[2], offb, s[2], scb, bb, true),
+                scalar(rb[3], offb, s[3], scb, bb, true),
+            ];
+            for k in 0..8 {
+                assert_eq!(
+                    got[k].to_bits(),
+                    exp[k].to_bits(),
+                    "bias lane {k} trial {trial}: {} vs {}",
+                    got[k],
+                    exp[k]
+                );
+            }
+
+            // No bias (pass 0.0): must equal the scalar chain WITHOUT the add.
+            let got0 = dequant_2col_i7(ra, rb, offa, offb, sca, scb, sv, 0.0, 0.0);
+            let exp0 = [
+                scalar(ra[0], offa, s[0], sca, 0.0, false),
+                scalar(ra[1], offa, s[1], sca, 0.0, false),
+                scalar(ra[2], offa, s[2], sca, 0.0, false),
+                scalar(ra[3], offa, s[3], sca, 0.0, false),
+                scalar(rb[0], offb, s[0], scb, 0.0, false),
+                scalar(rb[1], offb, s[1], scb, 0.0, false),
+                scalar(rb[2], offb, s[2], scb, 0.0, false),
+                scalar(rb[3], offb, s[3], scb, 0.0, false),
+            ];
+            for k in 0..8 {
+                assert_eq!(
+                    got0[k].to_bits(),
+                    exp0[k].to_bits(),
+                    "nobias lane {k} trial {trial}: {} vs {}",
+                    got0[k],
+                    exp0[k]
                 );
             }
         }
