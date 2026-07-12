@@ -1458,6 +1458,222 @@ fn flush_run_chunk(
     Ok(count)
 }
 
+/// The 7 `segments` columns in `SELECT`/`INSERT` order — the shared "existing row"
+/// representation for [`apply_segment_row`] (see [`run_row_to_cols`]).
+fn segment_row_to_cols(row: &fsqlite::Row) -> Vec<SqliteValue> {
+    (0..7)
+        .map(|i| row.get(i).cloned().unwrap_or(SqliteValue::Null))
+        .collect()
+}
+
+/// Per-line bookkeeping for `import_segments` that is independent of where the
+/// "existing row" comes from — shared verbatim by the legacy and batched paths.
+#[derive(Default)]
+struct SegmentImportState {
+    imported_idx_by_run: HashMap<String, HashSet<i64>>,
+    imported_idx_by_overwritten_run: HashMap<String, HashSet<i64>>,
+    known_run_ids: HashSet<String>,
+}
+
+/// The per-line FK check + overwrite/imported idx tracking (runs before the
+/// existing-row lookup in both paths, so batching cannot change it).
+fn record_segment_pre(
+    connection: &Connection,
+    run_id: &str,
+    idx: i64,
+    key: &str,
+    conflict_policy: ConflictPolicy,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+    state: &mut SegmentImportState,
+) -> FwResult<()> {
+    ensure_run_reference_exists(connection, run_id, "segments", key, &mut state.known_run_ids)?;
+    if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(run_id) {
+        state
+            .imported_idx_by_overwritten_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(idx);
+    }
+    if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(run_id) {
+        state
+            .imported_idx_by_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(idx);
+    }
+    Ok(())
+}
+
+/// Apply one `segments` JSONL row against `existing` (current DB/seen row, or
+/// `None`). **Shared by the per-line and batched paths** ⇒ byte-identical imported
+/// rows. Returns `Some(inserted_cols)` when a row was INSERTed (so the batched
+/// caller can update its seen-map), else `None`.
+fn apply_segment_row(
+    connection: &Connection,
+    run_id: &str,
+    idx: i64,
+    key: &str,
+    row: &serde_json::Value,
+    existing: Option<&[SqliteValue]>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+) -> FwResult<Option<Vec<SqliteValue>>> {
+    if let Some(existing) = existing {
+        let identical = optional_floats_equal(
+            sqlite_to_optional_f64(existing.get(2)),
+            json_to_optional_f64(row, "start_sec"),
+        ) && optional_floats_equal(
+            sqlite_to_optional_f64(existing.get(3)),
+            json_to_optional_f64(row, "end_sec"),
+        ) && sqlite_to_optional_text(existing.get(4)) == json_to_optional_text(row, "speaker")
+            && value_to_string_sqlite(existing.get(5)) == json_str(row, "text")?
+            && optional_floats_equal(
+                sqlite_to_optional_f64(existing.get(6)),
+                json_to_optional_f64(row, "confidence"),
+            );
+
+        if identical {
+            return Ok(None);
+        }
+
+        match conflict_policy {
+            ConflictPolicy::Reject => {
+                conflicts.push(SyncConflict {
+                    table: "segments".to_owned(),
+                    key: key.to_owned(),
+                    reason: "duplicate composite key".to_owned(),
+                });
+                return Ok(None);
+            }
+            ConflictPolicy::Skip => {
+                return Ok(None);
+            }
+            ConflictPolicy::Overwrite => {
+                return Err(FwError::Storage(format!(
+                    "overwrite would require updating conflicting segment row `{run_id}/{idx}`, \
+                     but child-row UPDATE is unsupported in this runtime; \
+                     re-import into an empty target DB for strict replacement"
+                )));
+            }
+            ConflictPolicy::OverwriteStrict => {
+                connection
+                    .import_exec(
+                        "DELETE FROM segments WHERE run_id = ?1 AND idx = ?2",
+                        &[SqliteValue::Text(run_id.to_owned().into()), SqliteValue::Integer(idx)],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!(
+                            "strict overwrite delete conflicting segment `{run_id}/{idx}` failed: {error}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    let cols = vec![
+        SqliteValue::Text(run_id.to_owned().into()),
+        SqliteValue::Integer(idx),
+        json_optional_float(row, "start_sec"),
+        json_optional_float(row, "end_sec"),
+        json_optional_text(row, "speaker"),
+        SqliteValue::Text(json_str(row, "text")?.into()),
+        json_optional_float(row, "confidence"),
+    ];
+    connection
+        .import_exec(
+            "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &cols,
+        )
+        .map_err(|error| {
+            FwError::Storage(format!("insert segments `{run_id}/{idx}` failed: {error}"))
+        })?;
+
+    Ok(Some(cols))
+}
+
+/// Batched-import worker for `segments`: one `WHERE run_id IN (…)` prefetch for the
+/// whole chunk (composite `(run_id, idx)` keyed map — fsqlite has no row-value `IN`),
+/// then [`apply_segment_row`] per line in order. The prefetched map doubles as the
+/// intra-chunk seen-map (updated on every INSERT), reproducing the per-line invariant
+/// that a duplicate `(run_id, idx)` later in the file sees the earlier line's insert.
+/// Drains `chunk`. Returns the number of lines processed.
+fn flush_segment_chunk(
+    connection: &Connection,
+    chunk: &mut Vec<(String, i64, serde_json::Value)>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    state: &mut SegmentImportState,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+) -> FwResult<u64> {
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    let mut seen = HashSet::new();
+    let unique_run_ids: Vec<String> = chunk
+        .iter()
+        .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| seen.insert(run_id.clone()))
+        .collect();
+    let placeholders = (1..=unique_run_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id IN ({placeholders})"
+    );
+    let params: Vec<SqliteValue> = unique_run_ids
+        .iter()
+        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+        .collect();
+    let rows = connection
+        .query_with_params(&sql, &params)
+        .map_err(|error| FwError::Storage(format!("batch query segments existing failed: {error}")))?;
+
+    let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
+    for r in &rows {
+        let cols = segment_row_to_cols(r);
+        let run_id = value_to_string_sqlite(cols.first());
+        if let Some(SqliteValue::Integer(idx)) = cols.get(1) {
+            existing_map.insert((run_id, *idx), cols);
+        }
+    }
+
+    let mut count = 0u64;
+    for (run_id, idx, row) in chunk.drain(..) {
+        let key = format!("{run_id}/{idx}");
+        record_segment_pre(
+            connection,
+            &run_id,
+            idx,
+            &key,
+            conflict_policy,
+            imported_run_ids,
+            overwritten_run_ids,
+            state,
+        )?;
+        let existing = existing_map.get(&(run_id.clone(), idx)).cloned();
+        if let Some(cols) = apply_segment_row(
+            connection,
+            &run_id,
+            idx,
+            &key,
+            &row,
+            existing.as_deref(),
+            conflict_policy,
+            conflicts,
+        )? {
+            existing_map.insert((run_id, idx), cols); // seen-map for intra-chunk dup
+        }
+        count += 1;
+    }
+
+    Ok(count)
+}
+
 fn import_segments(
     connection: &Connection,
     path: &Path,
@@ -1470,141 +1686,109 @@ fn import_segments(
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut count = 0u64;
-    let mut imported_idx_by_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut imported_idx_by_overwritten_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut known_run_ids = HashSet::new();
+    let mut state = SegmentImportState::default();
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    if sync_batch_import_enabled() {
+        let chunk_size = sync_query_batch_size().max(1);
+        let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let idx = row
+                .get("idx")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing idx in segments row".to_owned()))?;
+            chunk.push((run_id, idx, row));
+            if chunk.len() >= chunk_size {
+                count += flush_segment_chunk(
+                    connection,
+                    &mut chunk,
+                    conflict_policy,
+                    conflicts,
+                    &mut state,
+                    imported_run_ids,
+                    overwritten_run_ids,
+                )?;
+            }
         }
-
-        let row: serde_json::Value = serde_json::from_str(line)?;
-        let run_id = json_str(&row, "run_id")?;
-        let idx = row
-            .get("idx")
-            .and_then(|value| value.as_i64())
-            .ok_or_else(|| FwError::Storage("missing idx in segments row".to_owned()))?;
-
-        let key = format!("{run_id}/{idx}");
-        ensure_run_reference_exists(connection, &run_id, "segments", &key, &mut known_run_ids)?;
-        if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(&run_id) {
-            imported_idx_by_overwritten_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(idx);
-        }
-        if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(&run_id) {
-            imported_idx_by_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(idx);
-        }
-
-        // Check existing
-        let existing = connection
-            .query_with_params(
-                "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id = ?1 AND idx = ?2",
-                &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(idx)],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!(
-                    "query segments existing `{run_id}/{idx}` failed: {error}"
-                ))
-            })?;
-
-        if !existing.is_empty() {
-            let existing_row = &existing[0];
-            let identical = optional_floats_equal(
-                sqlite_to_optional_f64(existing_row.get(2)),
-                json_to_optional_f64(&row, "start_sec"),
-            ) && optional_floats_equal(
-                sqlite_to_optional_f64(existing_row.get(3)),
-                json_to_optional_f64(&row, "end_sec"),
-            ) && sqlite_to_optional_text(existing_row.get(4))
-                == json_to_optional_text(&row, "speaker")
-                && value_to_string_sqlite(existing_row.get(5)) == json_str(&row, "text")?
-                && optional_floats_equal(
-                    sqlite_to_optional_f64(existing_row.get(6)),
-                    json_to_optional_f64(&row, "confidence"),
-                );
-
-            if identical {
-                count += 1;
+        count += flush_segment_chunk(
+            connection,
+            &mut chunk,
+            conflict_policy,
+            conflicts,
+            &mut state,
+            imported_run_ids,
+            overwritten_run_ids,
+        )?;
+    } else {
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
                 continue;
             }
 
-            match conflict_policy {
-                ConflictPolicy::Reject => {
-                    conflicts.push(SyncConflict {
-                        table: "segments".to_owned(),
-                        key: key.clone(),
-                        reason: "duplicate composite key".to_owned(),
-                    });
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Skip => {
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Overwrite => {
-                    return Err(FwError::Storage(format!(
-                        "overwrite would require updating conflicting segment row `{run_id}/{idx}`, \
-                         but child-row UPDATE is unsupported in this runtime; \
-                         re-import into an empty target DB for strict replacement"
-                    )));
-                }
-                ConflictPolicy::OverwriteStrict => {
-                    connection
-                        .import_exec(
-                            "DELETE FROM segments WHERE run_id = ?1 AND idx = ?2",
-                            &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(idx)],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "strict overwrite delete conflicting segment `{run_id}/{idx}` failed: {error}"
-                            ))
-                        })?;
-                }
-            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let idx = row
+                .get("idx")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing idx in segments row".to_owned()))?;
+
+            let key = format!("{run_id}/{idx}");
+            record_segment_pre(
+                connection,
+                &run_id,
+                idx,
+                &key,
+                conflict_policy,
+                imported_run_ids,
+                overwritten_run_ids,
+                &mut state,
+            )?;
+
+            let existing_rows = connection
+                .query_with_params(
+                    "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id = ?1 AND idx = ?2",
+                    &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(idx)],
+                )
+                .map_err(|error| {
+                    FwError::Storage(format!(
+                        "query segments existing `{run_id}/{idx}` failed: {error}"
+                    ))
+                })?;
+            let existing = existing_rows.first().map(segment_row_to_cols);
+            apply_segment_row(
+                connection,
+                &run_id,
+                idx,
+                &key,
+                &row,
+                existing.as_deref(),
+                conflict_policy,
+                conflicts,
+            )?;
+            count += 1;
         }
-
-        connection
-            .import_exec(
-                "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    SqliteValue::Text(run_id.clone().into()),
-                    SqliteValue::Integer(idx),
-                    json_optional_float(&row, "start_sec"),
-                    json_optional_float(&row, "end_sec"),
-                    json_optional_text(&row, "speaker"),
-                    SqliteValue::Text(json_str(&row, "text")?.into()),
-                    json_optional_float(&row, "confidence"),
-                ],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!("insert segments `{run_id}/{idx}` failed: {error}"))
-            })?;
-
-        count += 1;
     }
 
     if conflict_policy == ConflictPolicy::Overwrite && !overwritten_run_ids.is_empty() {
         assert_no_stale_segments_for_overwritten_runs(
             overwritten_run_ids,
             overwritten_segment_idxs_before,
-            &imported_idx_by_overwritten_run,
+            &state.imported_idx_by_overwritten_run,
         )?;
     }
     if conflict_policy == ConflictPolicy::OverwriteStrict && !imported_run_ids.is_empty() {
         delete_stale_segments_for_strict_overwrite(
             connection,
             imported_run_ids,
-            &imported_idx_by_run,
+            &state.imported_idx_by_run,
         )?;
     }
 
@@ -12281,6 +12465,128 @@ mod tests {
         assert_eq!(d, dump(&cref), "batched import diverged from per-line");
         assert_eq!(d.len(), 3, "x,y,z — the intra-chunk dup must not double-insert y");
         assert_eq!(d[0][3], "gpu", "x overwritten to gpu");
+    }
+
+    #[test]
+    fn flush_segment_chunk_matches_per_line_reference() {
+        // Batched segment import (composite (run_id, idx) key) must produce a
+        // byte-identical `segments` table to the per-line path: an existing-row
+        // conflict (→ OverwriteStrict delete+insert), a fresh insert, and an
+        // intra-chunk DUPLICATE (run_id, idx) that must see the earlier insert.
+        let dir = tempdir().expect("tempdir");
+        let mk = |name: &str| {
+            let c = Connection::open(dir.path().join(name).display().to_string())
+                .expect("open");
+            ensure_schema(&c).expect("schema");
+            c
+        };
+        let run_row = |id: &str| {
+            serde_json::json!({
+                "id": id, "started_at": "t0", "finished_at": "t1", "backend": "cpu",
+                "input_path": "/a.wav", "normalized_wav_path": "/a16.wav",
+                "request_json": "{}", "result_json": "{}", "warnings_json": "[]",
+                "transcript": "hi", "replay_json": "{}", "acceleration_json": "{}"
+            })
+        };
+        let seg = |run_id: &str, idx: i64, text: &str| {
+            serde_json::json!({
+                "run_id": run_id, "idx": idx, "start_sec": (idx as f64),
+                "end_sec": (idx as f64) + 1.0, "speaker": serde_json::Value::Null,
+                "text": text, "confidence": 0.9
+            })
+        };
+        let sel = "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments ORDER BY run_id, idx";
+        let dump = |c: &Connection| -> Vec<Vec<String>> {
+            c.query_with_params(sel, &[])
+                .expect("dump")
+                .iter()
+                .map(|r| {
+                    segment_row_to_cols(r)
+                        .iter()
+                        .map(|v| value_to_string_sqlite(Some(v)))
+                        .collect()
+                })
+                .collect()
+        };
+
+        let cref = mk("segref.sqlite3");
+        let cbat = mk("segbat.sqlite3");
+        // Both DBs need run "r1" (FK check) and a seed segment (r1,0)="old".
+        for c in [&cref, &cbat] {
+            apply_run_row(
+                c,
+                "r1",
+                &run_row("r1"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("seed run");
+            apply_segment_row(
+                c,
+                "r1",
+                0,
+                "r1/0",
+                &seg("r1", 0, "old"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+            )
+            .expect("seed seg");
+        }
+
+        let import_rows = vec![
+            ("r1".to_string(), 0i64, seg("r1", 0, "new")), // conflicts seed → overwrite-strict
+            ("r1".to_string(), 1i64, seg("r1", 1, "b")),   // new
+            ("r1".to_string(), 1i64, seg("r1", 1, "b")),   // intra-chunk dup, identical → noop
+        ];
+
+        // Reference: per-line.
+        {
+            let mut st = SegmentImportState::default();
+            let mut cf = Vec::new();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            for (run_id, idx, row) in &import_rows {
+                let key = format!("{run_id}/{idx}");
+                record_segment_pre(
+                    &cref, run_id, *idx, &key,
+                    ConflictPolicy::OverwriteStrict, &imp, &ovr, &mut st,
+                )
+                .expect("pre");
+                let existing_rows = cref
+                    .query_with_params(
+                        "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id = ?1 AND idx = ?2",
+                        &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(*idx)],
+                    )
+                    .expect("select");
+                let existing = existing_rows.first().map(segment_row_to_cols);
+                apply_segment_row(
+                    &cref, run_id, *idx, &key, row, existing.as_deref(),
+                    ConflictPolicy::OverwriteStrict, &mut cf,
+                )
+                .expect("apply");
+            }
+        }
+
+        // Batched.
+        {
+            let mut st = SegmentImportState::default();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let mut chunk = import_rows.clone();
+            let n = flush_segment_chunk(
+                &cbat, &mut chunk, ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(), &mut st, &imp, &ovr,
+            )
+            .expect("flush");
+            assert_eq!(n, 3);
+            assert!(chunk.is_empty());
+        }
+
+        let d = dump(&cbat);
+        assert_eq!(d, dump(&cref), "batched segment import diverged from per-line");
+        assert_eq!(d.len(), 2, "(r1,0)+(r1,1); intra-chunk dup must not double-insert");
+        assert_eq!(d[0][5], "new", "(r1,0) overwritten to 'new'");
     }
 
     #[test]
