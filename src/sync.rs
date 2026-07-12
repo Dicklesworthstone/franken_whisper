@@ -3026,6 +3026,12 @@ fn count_table(connection: &Connection, table: &str) -> FwResult<u64> {
 }
 
 /// Collect all values of a given string `key` from a JSONL file into a set.
+///
+/// Test-only since `7632a2b` removed the production caller (`validate_sync` now
+/// uses `load_jsonl_run_map().keys()` for the same set — a single read instead of
+/// two); kept as the equivalence reference exercised by the `collect_jsonl_ids_*`
+/// unit tests. `#[cfg(test)]` so a non-test build doesn't warn dead_code.
+#[cfg(test)]
 fn collect_jsonl_ids(path: &Path, key: &str) -> FwResult<HashSet<String>> {
     if !path.exists() {
         return Ok(HashSet::new());
