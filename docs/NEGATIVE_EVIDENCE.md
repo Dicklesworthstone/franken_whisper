@@ -27,6 +27,17 @@ without root. A *symbolized* profile needs a debug/`debug=1` build; kernel attri
 `paranoid<=0` (not settable here). **Net: the profile CONFIRMS the frame table on current code and
 surfaces NO new byte-exact lever** — GEMM ceiling, expf lossy/owner-gated, copies sub-floor.
 
+**RESOLVED the ambiguous kernel ~8% via counters (no symbols needed):** `perf stat` on the same run —
+**context-switches 343,005 ≫ page-faults 194,294 (ALL minor, 0 major)**, + 19,616 cpu-migrations, over
+1.4 s. So the kernel time is **rayon scheduling** (32 workers parking/waking between many small parallel
+tasks + core migration), **NOT** allocation/demand-paging churn. The page-faults are moderate, all-minor
+(unavoidable working-set demand-paging, ~0.5 µs each across 32 threads ⇒ sub-1% CPU) and 0 major (no
+swap). **⇒ there is NO buffer-pool / alloc lever** — the only "reducible" kernel cost is the rayon
+scheduling overhead, which is already audited/optimal ([[project_encoder_thread_cap_win]] 32t,
+[[project_decode_overthreaded_rayon_lead]] closed after 3 reverts, [[project_encoder_wall_is_clock_throttle]]
+32t optimal). The profile is now fully explained: GEMM-ceiling + expf-lossy + rayon-scheduling +
+sub-floor-copies. Nothing left.
+
 ---
 ## 2026-07-12 - BlackThrush: **SWEPT — the redundant clone-then-overwrite / large per-window copy vein is exhausted (encoder forward clean; decoder default path clean after the fused-LN land). Don't re-hunt.**
 
