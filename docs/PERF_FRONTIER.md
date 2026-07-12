@@ -119,6 +119,17 @@ flag decision). The recipe + hazards below are retained as the historical record
 - **Corpus WER vs the original**: `legacy_whispercpp/whisper.cpp/build/bin/whisper-cli`
   is the reference (not on `$PATH`); tiny.en + turbo models + jfk/other clips live in
   `legacy_whispercpp/whisper.cpp/models/` and `sample_audio_files/`, `tests/fixtures/audio/`.
+  **BASELINE ESTABLISHED + BLOCKER SHARPENED (2026-07-12):** the SHIPPING int8 `fw` is
+  **byte-identical (normalized) to whisper.cpp on jfk** (`whisper-cli -m tiny.en -nt -t 8` vs
+  `fw transcribe --no-persist`) — so the default int8 engine is faithful on real speech; the
+  gated-lever WER baseline on jfk is **≈0**. **But the actual gate is the CORPUS, not just owner
+  sign-off:** the only clean-speech-with-reference clip on this box is **jfk** — `whisper-cli`
+  **cannot read `.mp3`** (so `example_audio_track_01.mp3`, the discriminating real-speech clip,
+  has no whisper.cpp reference), and `tests/fixtures/audio/test_10s_speech.wav` is **non-speech**
+  (whisper.cpp → "bell dings", `fw` → empty; unusable for WER). ⇒ Evaluating ANY gated lever
+  (encoder int8 variants, poly-exp) at corpus-WER first needs the **owner to provide a diverse
+  speech corpus with references** (or decoded `.wav`s of the mp3s). The method is proven; the
+  data is missing.
 
 ## Recommendation
 
