@@ -40,6 +40,33 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   — never fires; `conformance_harness.rs` validates replay/backend metadata, not live native decode).
   No test uses a multi-window native clip, so nothing exercises the retry outside the 238/0 lib suite.
 
+## ⚡ Current-code headline vs whisper.cpp is ~2.2× on the encoder — the "~1.2×" boilerplate is STALE
+
+Measured 2026-07-12 on an **idle box** (load ~7), **turbo**, `jfk.wav`, **matched 32 threads**
+(whisper.cpp's *best* — `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
+all-core freq-throttle wall [[project_encoder_wall_is_clock_throttle]]):
+
+| stage | fw (ms) | whisper.cpp `-t 32` (ms) | fw speedup |
+|---|---|---|---|
+| **encoder** (82% of compute, ts-independent) | **~1404** (`encoder_window` span, 3 reps 1420/1379/1414) | **~3210** (`encode`, 3 reps 3227/3231/3184) | **2.29×** |
+| decode | ~223 | ~285 `batchd` + 36 `sample` | ~1.4× |
+| compute (enc+dec+xkv+mel) | ~1666 | ~3538 | **2.12×** |
+| total wall incl. load (single-shot) | ~2593 (compute + 927 load) | ~4398 (compute + 860 load) | **1.70×** |
+
+**The encoder 2.29× is the solid number** (isolated per-engine spans, matched threads, ts-independent, the
+dominant stage; fw ships full-int8 encoder, wc runs f16; both reps low-variance). **Why it's a real
+regime change and not noise:** [[project_realistic_workload_dominated]] measured the *pre-int8* encoder as
+**~tied** (franken 3.53 s/win vs wc 3.19 s/win); the `a997f37` full-int8 ship (2026-07-09) is what moved
+franken's encoder ~3.5 s → ~1.4 s. So the ubiquitous `NEGATIVE_EVIDENCE` boilerplate "~1.2× ts / ~1.68–1.8×
+no_ts vs whisper.cpp" is **STALE (pre-int8)** — treat those trailing ratios in older entries as such.
+
+**CAVEAT (do not over-quote the total/compute rows):** [[project_realistic_workload_dominated]] proved the
+*whole-pipeline* ratio on THIS shared box **swings 0.90–1.22× with ambient load 8→100** (franken's 32-thread
+rayon oversubscribes harder than wc's OpenMP under contention) — a true whole-pipeline number needs a
+*dedicated quiet* box. This run was load ~7 with stable reps, so the **isolated encoder span** is trustworthy,
+but the compute (~2.1×) / total-wall (~1.7×) rows are load-~7 point estimates, not guaranteed floors. Also the
+decode row is fw-TS vs wc-`-nt` (not matched). **Quote the encoder; treat the rest as directional.**
+
 ## Live full-pipeline span breakdown (measured 2026-07-12, real `fw transcribe`, not isolated benches)
 
 `FRANKEN_WHISPER_PERF_SPANS=1 fw transcribe --input jfk.wav --no-persist` (single 11 s window):
