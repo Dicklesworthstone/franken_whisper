@@ -119,6 +119,13 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
     **full-coverage on 28 windows** (the content-drop bug stays TS-mode-only); (c) the turbo wc repetition
     loop above is a **large-model greedy failure mode on this clip**, NOT "wc always loops" — don't
     over-generalize it. franken is clean on this clip at both model sizes.
+  - **FAITHFULNESS quantified (2026-07-12) — the "faithful" half of the claim:** on that clean tiny.en
+    sjobs case (both full-coverage), fw vs whisper.cpp share a **1921-word longest-common-subsequence =
+    98.0 %** of the transcript (normalized, `difflib`), fw 1959 / wc 1961 normalized words. So franken is
+    **~2× faster AND ~98 % word-faithful to the reference** on a clean 840 s clip; the 2 % differences are
+    minor (int8-vs-f16 numerics + segmentation). Caveat: this is fw↔wc *agreement* (no ground-truth WER on
+    box), and on HARD cases franken is *more* faithful than wc (the sjobs-turbo loop), so 98 % is a floor,
+    not a divergence. Net: the project's "faster **faithful** whisper" claim is now quantitative on both axes.
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
