@@ -51,6 +51,38 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_STORAGE_BATCH_HISTORY`): routing-history app-level N+1 → two batched `WHERE id/run_id IN (…)` queries — **~14×**
+
+**What.** `load_routing_history_details` (the routing-history CLI) listed N runs then
+called `load_run_details` **per run** — each = 2 queries + 2 `PRAGMA table_info` scans,
+so ~4N queries + 2N scans for N runs (app-level N+1). Added
+`RunStore::load_run_details_batch(run_ids)`: two batched `WHERE id IN (…)` /
+`WHERE run_id IN (…)` queries (optional-column exprs computed once), grouping events by
+run_id and assembling in input order via `assemble_run_details_batched` — a helper that
+mirrors `load_run_details`'s parsing exactly (batched events carry `run_id` at col 0 ⇒
++1 index shift). `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path.
+
+**Correctness CERTIFIED.** New `load_run_details_batch_matches_per_run` asserts the
+batched result **serializes byte-identically** to per-run `load_run_details` for every
+run (multi-event, grouped, run_id-shifted event layout). `storage::tests` **202/0**;
+`cargo check --bins` confirms the `main.rs` wiring (the run-vanished error message +
+input order preserved).
+
+**Measurement (`storage/load_history_batch/runs/50` = 50 runs × 5 seg × 5 evt;
+forced-local; external-env A/B interleaved 0/1/0/1):**
+
+| rep | flag=0 (per-run N+1) | flag=1 (batched `IN`) |
+|---|---|---|
+| 1 | ~29–30 ms* | 2.2347 ms |
+| 2 | 29.682 ms | 2.1403 ms |
+
+**~14× faster** (29.68 ms → 2.14 ms), CIs orders of magnitude apart. *rep1's per-run
+`time:` line was interleaved with the first-run bench compile output; the clean rep2
+per-run + both stable batched arms make the ~14× unambiguous. Biggest DB-lane win of the
+session — collapsing ~200 per-run operations (4 queries + 2 scans × 50) into 2 queries;
+few-row-per-run loads are query-setup-bound ([[project_fsqlite_statement_savepoint_skip]]:
+batch cuts execution COUNT). On the routing-history CLI path.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_SYNC_BATCH_QUERY`): incremental export batches the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` — **~1.32× incremental export**
 
 **What.** `export_table_segments_for_runs` / `export_table_events_for_runs` ran one

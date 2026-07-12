@@ -149,6 +149,36 @@ fn bench_load_run_details(c: &mut Criterion) {
     group.finish();
 }
 
+/// A/B for the routing-history app-level N+1: loading full details for many runs via
+/// the batched two-query `load_run_details_batch` vs the per-run path. Toggle with
+/// external env: `FW_STORAGE_BATCH_HISTORY=0 cargo bench …` (per-run N+1) vs unset/`1`
+/// (batched). Same cached binary; output is byte-identical (asserted in unit tests).
+fn bench_load_run_details_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage/load_history_batch");
+
+    for run_count in [50usize] {
+        let (_dir, store) = open_temp_store();
+        let mut run_ids: Vec<String> = Vec::with_capacity(run_count);
+        for i in 0..run_count {
+            let id = format!("hist-{i:04}");
+            let report = make_report(&id, 5, 5);
+            store.persist_report(&report).expect("seed persist should succeed");
+            run_ids.push(id);
+        }
+
+        group.bench_with_input(BenchmarkId::new("runs", run_count), &run_ids, |b, ids| {
+            b.iter(|| {
+                let details = store
+                    .load_run_details_batch(ids)
+                    .expect("batch load should succeed");
+                assert_eq!(details.len(), ids.len());
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_list_recent_runs(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage/list_recent_runs");
 
@@ -194,6 +224,7 @@ criterion_group!(
     benches,
     bench_persist_report,
     bench_load_run_details,
+    bench_load_run_details_batch,
     bench_list_recent_runs,
     bench_schema_migration,
 );
