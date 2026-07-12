@@ -6,6 +6,23 @@ evidence. It exists to prevent stale optimism from being reused as proof.
 ---
 ## 2026-07-12 - BlackThrush: **SURFACED / OWNER-GATED — the byte-exact autonomous perf envelope is exhausted; the remaining high-EV lever (encoder fc1/full int8 for uncalibrated models) is byte-identical on jfk but needs the model-bench + corpus-WER loop, not a quick byte-exact flip.**
 
+> **UPDATE 2026-07-12 (MEASURED via `encoder_window_tiny` local bench, 10 samples).** Sized
+> both flags on the tiny.en encoder (one 3000-frame window, warm):
+>
+> | config | encoder_window_tiny | vs f32 |
+> |---|---|---|
+> | f32 (default) | 83.098 ms `[82.635, 83.417]` | — |
+> | `FW_ENC_ATTN_OUT_I8I32=1` (full) | 83.567 ms `[80.981, 85.856]` | **identical** — the flag is CALIBRATION-gated; for uncalibrated tiny.en `enc_attn_out_i8i32_for` returns false even with `=1`, so it falls through to f32 (last turn's CLI-timing hypothesis CONFIRMED). |
+> | `FW_ENC_INT8_FC1=1` (fc1-only) | 81.535 ms `[80.891, 82.117]` | **~1.9% faster**, CIs non-overlapping — the fc1-only branch reads the env var directly (not calibration-gated) so it DOES apply to tiny.en, and it's byte-identical on jfk. |
+>
+> **Refined conclusion:** (a) there is NO "extend full int8 to tiny.en via a flag" — that
+> needs calibration code, not a flip. (b) `FW_ENC_INT8_FC1` is a real, jfk-byte-exact
+> **~1.9% encoder** lever for tiny.en, BUT it stays default-OFF/owner-gated because the flag
+> is global (all uncalibrated models incl. unknown large ones) and the "does GELU-absorption
+> survive many stacked layers" WER question is unresolved for models with more than tiny.en's
+> 4 layers — a corpus-WER call, not a byte-exact flip. ~1.9% encoder ≈ sub-1% e2e for
+> tiny.en; below the bar for a unilateral default change even setting quality aside.
+
 **Context.** After 10 landed byte-exact wins + 2 measured rejections this session
 (peripheral IO/DB/export lane: BufWriter read+write, streaming checksums, statement
 savepoints, DB- and app-level N+1s — all exhausted), the only remaining high-EV area is
