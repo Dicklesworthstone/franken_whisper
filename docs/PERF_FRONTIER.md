@@ -16,9 +16,17 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   + sync import; DB-level N+1 → `IN (…)` on incremental export (1.32×); app-level N+1
   batch on routing history (**~14×**).
 - **Transcription hot path — at its byte-exact ceiling**: encoder full int8 already
-  default-ON for calibrated models (turbo, 1.47×); int8 logits head default-ON;
-  `nn::quantize_act_i8_into` already AVX2-vectorized w/ correct round-half-away; SDPA
-  poly-exp shipped for turbo; decode alloc-light rewrite landed. Measured/closed.
+  default-ON for **both calibrated models — turbo AND tiny.en** (`calibrated_encoder_int8_model`
+  = `tiny_en || is_large_v3_turbo`, shipped `a997f37`, ~1.47× encoder; `FW_ENC_ATTN_OUT_I8I32=0`
+  kills); int8 logits head default-ON; `nn::quantize_act_i8_into` already AVX2-vectorized w/ correct
+  round-half-away; SDPA poly-exp shipped for turbo; decode alloc-light rewrite landed. Measured/closed.
+- **Flag audit (2026-07-12): every byte-exact `FW_*` win is already default-ON** — nothing dormant
+  to flip. Verified default-ON: `FW_I8_BATCH_4COL`, `FW_I8_BATCH_2COL`, `FW_I7_M2N4`,
+  `FW_I7_QKV_HEADMAJOR_ROWCO`, `FW_F16_BATCH_M2COL`, `FW_BATCH_GEMV_ROW_MORSEL`,
+  `FW_SDPA_GATHER_CHUNKS` (=16), `FW_PERSIST_SKIP_STMT_SP`, `FW_STORAGE_BATCH_HISTORY`,
+  `FW_SYNC_BATCH_{QUERY,IMPORT,SKIP_STMT_SP}`. The remaining **default-OFF** flags are all
+  **lossy/quality** (NOT byte-exact → owner/WER-gated, cannot be autonomously flipped):
+  `FW_CROSS_V_BLOCK`, `FW_DEC_EF`, `FW_ENC_INT8_ATTN_IN`, `FW_SIMD_EXP`, `FT_SDPA_POLY_EXP` (tiny.en).
 - **Two rejections** kept the discipline honest: `load_run_details` scan (sub-floor),
   persist multi-row INSERT (regression). Unifying rule: **batching helps only when it
   cuts execution COUNT, not per-row work.**
