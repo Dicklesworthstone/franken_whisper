@@ -199,7 +199,7 @@ fn i8_batch_2col_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("FW_I8_BATCH_2COL").ok().as_deref() != Some("0"))
 }
 
-/// Default-OFF 4-token activation-column tile for the int8 batched GEMV, layered on
+/// Default-ON 4-token activation-column tile for the int8 batched GEMV, layered on
 /// top of [`i8_batch_2col_enabled`] (the 4-tile handles groups of 4 tokens, then the
 /// 2col tile the ≤3-token remainder, then a 1col tail). Shares each weight-row
 /// `vpmovsxbw` across FOUR tokens (0.25 cvt/token vs 2col's 0.5); BYTE-IDENTICAL to
@@ -209,15 +209,17 @@ fn i8_batch_2col_enabled() -> bool {
 /// same-binary order-alternated min-of-80, 3 reps, byte-id=true 12/12): **1.11-1.14×
 /// pure-kernel (workers=1, 6/6 always faster)** and **1.03-1.18× at the shipped
 /// 16-worker cap for tq≥64**; the tq=8/16t corner oscillates 0.96-1.08× (dispatch
-/// noise on a sub-ms op, not a stable regression). Held default-OFF anyway: this
-/// feeds only decode prefill/draft (a sub-1% e2e slice), so a default flip is not
-/// worth the risk without a long-form turbo transcript diff confirming the
-/// `compute_band` wire-in indexing (the kernel unit test covers the dot, not the
-/// wire-in). Opt in for large-prefill workloads via `FW_I8_BATCH_4COL=1`.
+/// noise on a sub-ms op, not a stable regression).
+///
+/// FLIPPED default-ON (bd-8wq6): the kernel is a strict, integer-exact win on the
+/// decode prefill/draft batched GEMV, and the long-form turbo transcript diff of the
+/// `compute_band` wire-in indexing (4-tile → 2col remainder → 1col tail) is
+/// byte-identical (unset == `FW_I8_BATCH_4COL=0`, jfk ×1/×3/×8), so the previously
+/// held-back risk is retired. Kill-switch: `FW_I8_BATCH_4COL=0` restores the 2col path.
 fn i8_batch_4col_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("FW_I8_BATCH_4COL").ok().as_deref() == Some("1"))
+    *ENABLED.get_or_init(|| std::env::var("FW_I8_BATCH_4COL").ok().as_deref() != Some("0"))
 }
 
 /// Default-ON alternate register tile for square/non-expanding encoder i7 GEMMs.
