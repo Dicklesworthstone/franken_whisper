@@ -47,11 +47,14 @@ path, is the last un-optimized IO site — byte-exact (no quality gate), just ca
 (existing row passed as `&[SqliteValue]`, so the 11-field identical-compare is bit-for-bit the
 same), and `flush_run_chunk` does the `WHERE id IN (…)` prefetch + a seen-map for intra-chunk
 duplicate ids. Gate: `sync::tests` 348/0 incl. `flush_run_chunk_matches_per_line_reference`.
-**SEGMENTS also LANDED** (`8199711`, composite `(run_id,idx)`: prefetch `WHERE run_id IN (…)` +
-map by `(run_id,idx)` + shared `apply_segment_row`/`record_segment_pre` + seen-map; 349/0 tests +
-E2E byte-identical). **Only `import_events` `(run_id, seq)` remains** — same recipe. Both hazards below still apply. Not a quick tick —
-rushing a conflict-semantics change on the sync path is how the `quantize_act_i7` re-dig burned a
-turn; do the composite-key tables in a dedicated pass.
+**SEGMENTS (`8199711`) and EVENTS (`40fbcdf`) also LANDED** — the import N+1 batch is now
+**COMPLETE for all 3 tables** (runs/segments/events) under the single `FW_SYNC_BATCH_IMPORT` flag.
+Composite tables prefetch `WHERE run_id IN (…)` + map by `(run_id,idx)`/`(run_id,seq)` + seen-map;
+shared `apply_*_row`/`record_*_pre` keep legacy==batched byte-identical. Gate: `sync::tests` 350/0
+(+ `flush_{run,segment,event}_chunk_matches_per_line_reference`) + E2E A/B byte-identical off-vs-on
+for all 3 tables incl. the conflict/noop re-import path. **The peripheral IO/DB lane is now fully
+optimized; nothing left in this vein.** Remaining work is a soak then the default-on flip (a single
+flag decision). The recipe + hazards below are retained as the historical record.
 
 - **Sites** (`src/sync.rs`): `import_table_runs` loop `SELECT … WHERE id=?1` **per line**
   (~:1202); `import_table_segments` `WHERE run_id=?1 AND idx=?2` (~:1384); `import_table_events`
