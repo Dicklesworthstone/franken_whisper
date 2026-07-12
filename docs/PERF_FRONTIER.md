@@ -134,6 +134,14 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
     capture the same content incl. the iconic "an iPod, a phone, an internet communicator" line, and wc's
     `[applause]` markers. So franken's faithfulness is clean — the ~2 % is model-grade + formatting noise,
     NOT a divergence to fix.
+  - **HONEST refinement — faithfulness is CLIP-DEPENDENT (88–98 %), gap dominated by FILLER not errors
+    (2026-07-12):** the flagship **turbo on track01** (casual, disfluency-heavy tech-demo) agrees only
+    **88.5 %** (LCS 239/270) — lower than the sjobs keynote's 98 %. But the diffs are **wc transcribing
+    disfluencies fw suppresses** ("um, and, um,", "showcase, uh,", "it's, you know,") + a proper-noun
+    ("cast"↔"cas" for *CAS*) + segmentation — i.e. the known **DISC-003 greedy-vs-beam filler** behavior
+    (fw is *cleaner*, drops um/uh/you-know), NOT transcription errors. So don't quote a single faithfulness
+    number: it's **88–98 % depending on how disfluent the audio is**, and the divergence is largely
+    stylistic (verbatim-wc vs clean-fw), with core content captured by both.
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
