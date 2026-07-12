@@ -22,6 +22,11 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
 - **Two rejections** kept the discipline honest: `load_run_details` scan (sub-floor),
   persist multi-row INSERT (regression). Unifying rule: **batching helps only when it
   cuts execution COUNT, not per-row work.**
+- **Sweeps that found nothing** (so nobody re-runs them): the youtube batch pipeline
+  already shares one engine across all videos (`transcribe_and_render(&engine, …)` — no
+  per-video model-reload N+1); `Regex::new` in hot loops (none); raw-`File` write/read
+  loops (all buffered or one-time SHA); `Vec::contains`/O(n²) in hot paths (none); stdout
+  per-item emit (streaming-unsafe to buffer, sub-floor for batch dumps).
 
 ## Remaining levers — all need the model-bench + corpus-WER loop + owner sign-off
 
