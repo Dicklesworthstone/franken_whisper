@@ -185,5 +185,43 @@ fn bench_sync_import(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sync_export, bench_sync_import);
+/// First-time incremental export of a seeded store (exports all runs, so the
+/// `export_table_{segments,events}_for_runs` writers run over every run_id). A/B the
+/// per-run N+1 query vs the batched `WHERE run_id IN (…)` query via external env:
+/// `FW_SYNC_BATCH_QUERY=0 cargo bench ...` (legacy per-run) vs unset/`1` (batched).
+fn bench_sync_export_incremental(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sync/export_incremental");
+
+    for run_count in [50usize] {
+        let fixture = tempdir().expect("tempdir");
+        let src_db = fixture.path().join(format!("src-{run_count}.sqlite3"));
+        seed_db(&src_db, run_count);
+
+        group.bench_with_input(BenchmarkId::new("runs", run_count), &run_count, |b, &n| {
+            b.iter_batched(
+                || {
+                    let iter_dir = tempdir().expect("tempdir");
+                    let out_dir = iter_dir.path().join("out");
+                    let state_root = iter_dir.path().join("state");
+                    (iter_dir, out_dir, state_root)
+                },
+                |(_iter_dir, out_dir, state_root)| {
+                    let manifest = sync::export_incremental(&src_db, &out_dir, &state_root)
+                        .expect("incremental export should succeed");
+                    assert_eq!(manifest.row_counts.runs, n as u64);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_sync_export,
+    bench_sync_import,
+    bench_sync_export_incremental,
+);
 criterion_main!(benches);
