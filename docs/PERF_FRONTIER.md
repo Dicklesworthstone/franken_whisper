@@ -82,30 +82,27 @@ rayon oversubscribes harder than wc's OpenMP under contention) — a true whole-
 but the compute (~2.1×) / total-wall (~1.7×) rows are load-~7 point estimates, not guaranteed floors. Also the
 decode row is fw-TS vs wc-`-nt` (not matched). **Quote the encoder; treat the rest as directional.**
 
-### The ONE known LOSING case — tiny.en long-form — over-threading hypothesis MEASURED & REJECTED (2026-07-12)
+### bd-b4hp RESOLVED — franken's one documented LOSING case (tiny.en long-form) is now a ~1.9× WIN (2026-07-12)
 
-franken WINS turbo everywhere (above), but [[project_realistic_workload_dominated]] documents the inverse
-for **tiny.en long-form: ~1.73–1.84× SLOWER than whisper.cpp** (bd-b4hp, but that figure is **2026-06-29,
-pre-int8 — likely stale**). Last turn I hypothesised the cause was 32-way OVER-threading of the small
-encoder (`default_threads()`=32 regardless of model, mod.rs:1131) — tiny.en's 384-wide GEMMs split 32 ways
-looked dispatch-bound. **TESTED this turn (no code change — the bench honours `RAYON_NUM_THREADS`):**
+[[project_realistic_workload_dominated]] documented **tiny.en long-form as ~1.73–1.84× SLOWER than
+whisper.cpp** (bd-b4hp, 2026-06-29, **pre-int8**). Over two turns I (a) hypothesised 32-way encoder
+over-threading and **MEASURED-REJECTED it** (no code change — the bench honours `RAYON_NUM_THREADS`:
+`encoder_window_tiny` 8t=113.8 / 16t=78.7 / **32t=63.7 ms** — scales monotonically, 32t fastest, so fewer
+threads would LOSE; this avoided a 4th entry in the threading 3-revert history
+[[project_decode_overthreaded_rayon_lead]]); then (b) **re-measured the full transcribe current-code** now
+that the box let `fw` survive:
 
 ```
-encoder/encoder_window_tiny :  8t = 113.8 ms   16t = 78.7 ms   32t = 63.7 ms   (median, load ~8)
+tiny.en, track01.wav (124.5 s / 5 windows), --no-timestamps, total wall, 6 interleaved reps, load ~8:
+  fw ~1.26 s   vs   whisper-cli -t 16 ~2.43 s   =   fw ~1.93× FASTER
 ```
 
-**REJECTED.** The tiny.en encoder scales *monotonically* with threads — 32t is the FASTEST, so fewer
-threads would make it SLOWER. `default_threads()=32` is correct for tiny.en too; there is **no encoder
-over-threading lever** (scaling is sub-linear — 4× threads → 1.78× — so dispatch overhead exists, but not
-enough to reverse the win). **Measuring before landing avoided a 4th entry in the threading
-3-revert history** ([[project_decode_overthreaded_rayon_lead]]).
-
-⇒ The bd-b4hp loss is **not** encoder threading. `project_per_window_overhead_subfloor` already ruled out
-the orchestration layer (mel amortised, DecoderState sub-floor), so what's left is the **decode** (tiny.en's
-per-token GEMVs vs wc) — but the "1.84×" is pre-int8 and the int8 decode flips (`FW_I8_BATCH_4COL`) +
-pipelining have landed since, so it needs a **fresh full-transcribe re-measure** on a quiet box (deferred —
-box currently disk-hostile: `fw` binary evicted repeatedly). Recipe: `fw` tiny.en on `track01.wav` vs
-`whisper-cli -m tiny.en -t 8`, interleaved.
+**COVERAGE-VERIFIED (not the content-drop bug):** fw 254 words vs wc 250, both end "…that's it basically."
+— fw transcribes the FULL clip, so the speed is real, not [[project_final_window_early_eot_bug]] decoding
+less. So **the ONLY documented losing case is now a decisive WIN** — the pre-int8 1.84× *loss* → ~1.93×
+*win* is a ~3.6× relative swing, from the cumulative int8 decode (`FW_I8_BATCH_4COL`) + int8 encoder
+(`a997f37`) + pipelining wins landed since 2026-06-29. **franken now dominates BOTH turbo AND tiny.en
+long-form.** bd-b4hp is closeable.
 
 ## Live full-pipeline span breakdown (measured 2026-07-12, real `fw transcribe`, not isolated benches)
 
