@@ -4,6 +4,33 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **REJECTED (measured) — byte-exact layer-skip self-speculative decode is a NET LOSS for tiny.en; all k-layer early-exit accept rates are below break-even.**
+
+**What.** `FW_DRAFT_ACCEPT_LAYERS=k` is a probe (default-off, byte-identical) that measures
+the layer-skip self-draft ACCEPT RATE — the fraction of single-token decode steps where the
+k-of-4-layer early-exit argmax matches the full-model argmax. Its own comment calls this
+"the last un-measured input to draft-model-FREE speculative decode"
+([[project_draft_decoding_amortization]]). Speculative decode is byte-exact (the target
+verifies every proposed token), so it's worth building **only if accept > break-even**.
+
+**Measured (prebuilt `target/release/examples/e2e_probe tiny.en jfk.wav 5`, 116 decode
+steps, NO build):**
+
+| k (early-exit layers of 4) | accept | break-even | verdict |
+|---|---|---|---|
+| 1 | 1.7% (2/116) | 47% | net loss |
+| 2 | 1.7% (2/116) | 65% | net loss |
+| 3 | 62.9% (73/116) | 82% | net loss |
+
+**Verdict.** Every k is below its break-even, so layer-skip self-speculative decode would be
+a **net slowdown** for tiny.en — not worth building. k=1/2 are catastrophic (1.7%, the early
+hidden state barely resembles the final argmax after only 1–2 of 4 layers); k=3 is close-ish
+(62.9%) but still short of 82%. **Do-not-build** for tiny.en. (Turbo has 32 layers — a
+k≈24-of-32 early-exit *might* clear break-even; that's a separate turbo-model probe, and any
+build would use the same `FW_DRAFT_ACCEPT_LAYERS` probe first.) This closes the
+draft-decoding lever for tiny.en with the actual accept-rate measurement.
+
+---
 ## 2026-07-12 - BlackThrush: **SURFACED / OWNER-GATED — the byte-exact autonomous perf envelope is exhausted; the remaining high-EV lever (encoder fc1/full int8 for uncalibrated models) is byte-identical on jfk but needs the model-bench + corpus-WER loop, not a quick byte-exact flip.**
 
 > **UPDATE 2026-07-12 (MEASURED via `encoder_window_tiny` local bench, 10 samples).** Sized
