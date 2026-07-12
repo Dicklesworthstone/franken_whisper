@@ -51,6 +51,41 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_SYNC_SKIP_STMT_SP`): JSONL import loops skip redundant per-statement savepoints — modest (~2–5% import, IO/parse-bound)
+
+**What.** Follow-through of the `persist_report` savepoint-skip win onto the sync
+**import** write path. `import_runs` / `import_segments` / `import_events` (and the
+strict-overwrite delete helpers) write every `runs`/`segments`/`events` row via
+`execute_with_params`, each wrapped by fsqlite in an internal statement savepoint —
+but all 10 sites run inside `import_inner`'s single `BEGIN;` (the rollback boundary:
+COMMIT on success, ROLLBACK on any Err or Reject). Routed them through a small
+`ImportExec::import_exec` extension that dispatches to
+`execute_with_params_skip_statement_savepoint_in_explicit_txn`. Imported rows are
+**byte-identical**; on failure the enclosing `BEGIN;` rollback discards partial rows
+exactly as before. `FW_SYNC_SKIP_STMT_SP=0` restores the legacy path (kill-switch).
+
+**Correctness CERTIFIED.** Full `sync::tests` module (export→import round-trips,
+checksum/schema/version validation, all conflict policies incl. overwrite/strict,
+referential-integrity rejection): **346 passed / 0 failed** under the default skip.
+
+**Measurement (`sync/import/runs/50` = 50 runs × 5 rows = 250 inserts; forced-local;
+external-env A/B interleaved 0/1/0/1):**
+
+| rep | flag=0 (statement savepoint) | flag=1 (skip) |
+|---|---|---|
+| 1 | 55.365 ms | 54.395 ms |
+| 2 | 57.170 ms | 54.321 ms |
+
+**~1.8–5.0% faster** (rep2 p<0.05; rep1 borderline p≈0.05). Skip is faster in **both**
+reps and notably more stable (54.39 / 54.32 ms, ~0.1% spread) while the savepoint arm
+is noisier and always slower (55.4–57.2 ms) — a consistent direction, not sign-flipping
+noise (contrast the `load_run_details` scan closeout in NEGATIVE_EVIDENCE). The
+per-insert saving is the same ~7 µs as persist, but sync import is JSONL-parse/file-IO
+dominated (~55 ms for 250 inserts), so the ~1.75 ms savepoint saving is a small slice —
+hence ~2–5% here vs persist's 1.48× on its insert-dominated workload. Byte-exact,
+zero-downside, and the second half of making both SQLite write paths skip redundant
+savepoints ([[project_fsqlite_statement_savepoint_skip]]).
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_PERSIST_SKIP_STMT_SP`): `persist_report_inner` skips redundant per-statement savepoints inside its enclosing SAVEPOINT — **~1.48× persist**
 
 **What.** `persist_report_inner` writes the `runs` row + one INSERT per segment +

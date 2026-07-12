@@ -15,6 +15,44 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{FwError, FwResult};
 
+/// Whether the JSONL import loops write their rows with the fsqlite "skip
+/// statement savepoint in explicit txn" escape hatch (default). Every import
+/// INSERT/DELETE runs inside `import_inner`'s single `BEGIN;` transaction, which
+/// is the rollback boundary (COMMIT on success, ROLLBACK on any Err or Reject),
+/// so the per-statement savepoint fsqlite wraps around each `execute_with_params`
+/// is redundant bookkeeping. `FW_SYNC_SKIP_STMT_SP=0` restores the per-statement
+/// savepoint path. Imported rows are byte-identical either way. Mirrors the
+/// `persist_report` win (`FW_PERSIST_SKIP_STMT_SP`).
+fn sync_skip_stmt_sp_enabled() -> bool {
+    std::env::var("FW_SYNC_SKIP_STMT_SP").ok().as_deref() != Some("0")
+}
+
+/// Extension over `fsqlite::Connection` for the import write loops: dispatches to
+/// the statement-savepoint-skipping executor when enabled (see
+/// [`sync_skip_stmt_sp_enabled`]). Behaviourally identical to `execute_with_params`
+/// on success; on failure the enclosing `BEGIN;` rollback discards partial rows.
+trait ImportExec {
+    fn import_exec(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, fsqlite::FrankenError>;
+}
+
+impl ImportExec for Connection {
+    fn import_exec(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, fsqlite::FrankenError> {
+        if sync_skip_stmt_sp_enabled() {
+            self.execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params)
+        } else {
+            self.execute_with_params(sql, params)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -1157,7 +1195,7 @@ fn import_runs(
                         .extend(existing_event_seqs);
 
                     connection
-                        .execute_with_params(
+                        .import_exec(
                             "DELETE FROM segments WHERE run_id = ?1",
                             &[SqliteValue::Text(id.clone().into())],
                         )
@@ -1167,7 +1205,7 @@ fn import_runs(
                             ))
                         })?;
                     connection
-                        .execute_with_params(
+                        .import_exec(
                             "DELETE FROM events WHERE run_id = ?1",
                             &[SqliteValue::Text(id.clone().into())],
                         )
@@ -1177,7 +1215,7 @@ fn import_runs(
                             ))
                         })?;
                     connection
-                        .execute_with_params(
+                        .import_exec(
                             "DELETE FROM runs WHERE id = ?1",
                             &[SqliteValue::Text(id.clone().into())],
                         )
@@ -1193,7 +1231,7 @@ fn import_runs(
         }
 
         connection
-            .execute_with_params(
+            .import_exec(
                 "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
                  normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -1321,7 +1359,7 @@ fn import_segments(
                 }
                 ConflictPolicy::OverwriteStrict => {
                     connection
-                        .execute_with_params(
+                        .import_exec(
                             "DELETE FROM segments WHERE run_id = ?1 AND idx = ?2",
                             &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(idx)],
                         )
@@ -1335,7 +1373,7 @@ fn import_segments(
         }
 
         connection
-            .execute_with_params(
+            .import_exec(
                 "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
@@ -1463,7 +1501,7 @@ fn import_events(
                 }
                 ConflictPolicy::OverwriteStrict => {
                     connection
-                        .execute_with_params(
+                        .import_exec(
                             "DELETE FROM events WHERE run_id = ?1 AND seq = ?2",
                             &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(seq)],
                         )
@@ -1477,7 +1515,7 @@ fn import_events(
         }
 
         connection
-            .execute_with_params(
+            .import_exec(
                 "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
@@ -1582,7 +1620,7 @@ fn delete_stale_segments_for_strict_overwrite(
                 continue;
             }
             connection
-                .execute_with_params(
+                .import_exec(
                     "DELETE FROM segments WHERE run_id = ?1 AND idx = ?2",
                     &[
                         SqliteValue::Text(run_id.clone().into()),
@@ -1614,7 +1652,7 @@ fn delete_stale_events_for_strict_overwrite(
                 continue;
             }
             connection
-                .execute_with_params(
+                .import_exec(
                     "DELETE FROM events WHERE run_id = ?1 AND seq = ?2",
                     &[
                         SqliteValue::Text(run_id.clone().into()),
