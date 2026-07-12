@@ -37,6 +37,32 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
 | **ToMe / layer-pruning** (encoder FLOP reduction) | large (turbo) | space mapped; tail-truncation already landed | changes output structurally | full WER + segment-timing corpus |
 | **poly-exp variants / GPU** | — | poly-exp turbo shipped; GTX1070 = nouveau (no CUDA) | owner / infra | — |
 
+## The one remaining BYTE-EXACT lever (no WER gate) — import N+1, intricate
+
+The sync **export** N+1 is landed (`FW_SYNC_BATCH_QUERY`, ~1.32×). Its mirror, the **import**
+path, is the last un-optimized IO site — and it is byte-exact (no quality gate), just careful.
+It is **not a quick autonomous tick**: rushing a conflict-semantics change on the sync path is
+how the `quantize_act_i7` re-dig burned a turn. Do it in a dedicated pass.
+
+- **Sites** (`src/sync.rs`): `import_table_runs` loop `SELECT … WHERE id=?1` **per line**
+  (~:1202); `import_table_segments` `WHERE run_id=?1 AND idx=?2` (~:1384); `import_table_events`
+  `WHERE run_id=?1 AND seq=?2` (~:1536). One query per JSONL line = N+1.
+- **Recipe**: chunk the lines; per chunk collect keys → one `WHERE … IN (…)` → pre-fetch a
+  `HashMap<key, full_row>`; process lines in original order against the map, applying the exact
+  same identical-compare + `ConflictPolicy` (Reject/Skip/Overwrite) logic.
+- **Hazard 1 — full row, not existence**: the per-line SELECT returns all columns for an 11-field
+  identical-vs-conflict compare, so the map must hold full rows (not a `HashSet` of ids).
+- **Hazard 2 — intra-chunk duplicate ids**: the per-line version's later duplicate SEES the
+  earlier line's INSERT. A pre-fetch queried before any insert does not. Maintain a `seen` map
+  updated on every insert/delete within the chunk so duplicate-id files stay byte-exact.
+- **Composite keys**: segments/events key on `(run_id, idx)` / `(run_id, seq)`; if fsqlite lacks
+  row-value `IN`, batch by `run_id` and index the map by the composite key.
+- **Expected magnitude**: import is INSERT-dominated (the persist multi-row-INSERT reject proved
+  per-row B-tree work isn't batchable), so batching only the SELECT setup nets **< the export's
+  1.32×**. Real but modest.
+- **Gate**: `sync::tests` round-trips + a NEW intra-chunk-duplicate-id test must stay byte-exact;
+  put it behind a `FW_SYNC_BATCH_IMPORT` kill-switch/A/B arm mirroring `FW_SYNC_BATCH_QUERY`.
+
 ## Recipes (so the next session doesn't rediscover them)
 
 - **Fast byte-exactness check, NO build** (~0.3 s/clip): prebuilt
