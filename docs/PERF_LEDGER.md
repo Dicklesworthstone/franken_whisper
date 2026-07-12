@@ -51,6 +51,27 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): `sha256_file` read buffer 8 KiB → 64 KiB — **~1.16× large-file checksum**
+
+**What.** `sync::sha256_file` (checksums each export/import JSONL for the manifest)
+read the file in **8 KiB** chunks; the native-engine hasher already used **64 KiB**.
+Bumped it to 64 KiB — 8× fewer `read()` syscalls per checksum. Same digest regardless
+of chunk size (byte-exact; asserted in the bench).
+
+**Measurement (isolated in-binary A/B, `sync/sha256_file`, ~17 MiB file, forced-local,
+interleaved 8k/64k/8k/64k):**
+
+| rep | 8 KiB buffer | 64 KiB buffer |
+|---|---|---|
+| 1 | 13.290 ms | 11.875 ms |
+| 2 | 13.457 ms | 11.253 ms |
+
+**~1.16× faster** (1.12–1.20×), CIs non-overlapping ([13.06–13.70] vs [11.04–12.04]),
+both reps consistent — the `read()` syscall overhead of the 8 KiB loop was a larger slice
+of the hash than expected. Scales with checksum size (large exports hash MB-scale JSONL;
+import verifies each). Byte-exact, zero-downside, no gate. Last of the sync/storage/IO
+peripheral-lane wins.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_STORAGE_BATCH_HISTORY`): routing-history app-level N+1 → two batched `WHERE id/run_id IN (…)` queries — **~14×**
 
 **What.** `load_routing_history_details` (the routing-history CLI) listed N runs then

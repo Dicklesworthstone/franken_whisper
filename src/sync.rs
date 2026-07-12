@@ -1981,7 +1981,10 @@ fn sync_parent_dir(path: &Path) -> FwResult<()> {
 fn sha256_file(path: &Path) -> FwResult<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
+    // 64 KiB read buffer (matches the native-engine hasher): 8× fewer `read()`
+    // syscalls than the previous 8 KiB when checksumming large export/import JSONL.
+    // Same SHA regardless of chunk size.
+    let mut buf = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
