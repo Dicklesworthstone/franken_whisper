@@ -51,6 +51,54 @@
 
 ## Levers
 
+### 2026-07-11 UTC — BlackThrush — LANDED (byte-exact, default-OFF gate): `dot_i8_4col` wired into `gemv_i8_batch` (`FW_I8_BATCH_4COL`); cod_fw's parked lever, both retry-conditions now MET and SIZED
+
+**What.** Wired cod_fw's parked, byte-exact `dot_i8_4col` (4-token activation-column
+tile, committed reference `examples/i8batch_4col_probe`, `fb43d93`) into the
+production int8 batched GEMV `nn::gemv_i8_batch` (decode prefill tq>1 + draft),
+behind a new default-OFF gate `FW_I8_BATCH_4COL=1`. The 4-tile handles groups of 4
+tokens, then the existing 2col tile the ≤3-token remainder, then a 1col tail — so
+the output is BYTE-IDENTICAL to both the default 2col path and the plain `dot_i8`
+loop. Integer i32 madd is order-independent ⇒ **ULP-free** (not merely WER-neutral).
+
+**Why it was unblocked.** cod_fw parked this (NEGATIVE_EVIDENCE 2026-07-11) with two
+retry-conditions: **(a)** the uncommitted column-major-KV WIP in `nn.rs` must land
+(else `git add nn.rs` sweeps it) — now MET (tree clean, last `nn.rs` commit
+`a997f37`); **(b)** a ≥32-core host must size the e2e/multi-thread delta before any
+default flip — now MET via build-remote (rch)/run-local on the 64-core box
+([[project_rch_ab_admissibility]]).
+
+**Byte-exactness CERTIFIED in-tree.** New unit test
+`native_engine::nn::tests::dot_i8_4col_matches_four_dot_i8` asserts each of the four
+columns equals a scalar `dot_i8` reference across every tail path (n ∈ {0,1,7,15,16,
+17,31,32,33,47,63,64,65,384,1280,5120}) + the ±127 worst-case magnitude. Ran on rch
+(remote compile vmi1149989, local run): **1 passed**.
+
+**SIZED (same-binary A/B, order-alternated min-of-80, 3 reps, 64c box load ~1.5,
+byte-id=true 12/12 every rep):**
+
+| arm | mlp_0[1280,5120] | qkv[1280,3840] |
+|---|---|---|
+| workers=1, tq=8/64/200 | 1.139/1.136/1.106× | 1.133/1.129/1.115× |
+| 16-worker cap, tq=64/200 | 1.05-1.12× / 1.03-1.12× | 1.06-1.18× / 1.04-1.08× |
+| 16-worker cap, tq=8 | **0.96-1.06× (noise)** | **0.96-1.08× (noise)** |
+
+Pure-kernel win is stable **1.11-1.14×** (6/6 always faster). The tq=8/16t corner
+oscillates around 1.0 across the 3 reps ⇒ dispatch noise on a sub-ms op, NOT a
+stable regression (confirms cod_fw's read).
+
+**Default held OFF (deliberate, not blocked).** `gemv_i8_batch` feeds only decode
+prefill/draft — a **sub-1% e2e slice** — so the incremental win over the already-
+default-ON 2col does not justify a default flip without a long-form turbo transcript
+diff confirming the `compute_band` wire-in *indexing* (the kernel unit test covers
+the dot, not the wire-in). The sizing SUPPORTS a future flip; it is de-risked to
+that single routine step. Opt in today via `FW_I8_BATCH_4COL=1` for large-prefill
+workloads. Kill-switch semantics mirror `FW_I8_BATCH_2COL`.
+
+**Files:** `src/native_engine/nn.rs` (kernel `dot_i8_4col` avx2+scalar, gate
+`i8_batch_4col_enabled`, `compute_band` `use_4col` branch, unit test). No production
+default changed ⇒ current transcripts unchanged by construction.
+
 ### 2026-07-10 UTC — cod_fw — SURFACE: cod-lane at frontier — one-pass i7/maddubs logits GEMV failed the median proof gate
 
 **Profile-first target.** The latest full `large-v3-turbo` decode attribution

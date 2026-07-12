@@ -199,6 +199,27 @@ fn i8_batch_2col_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("FW_I8_BATCH_2COL").ok().as_deref() != Some("0"))
 }
 
+/// Default-OFF 4-token activation-column tile for the int8 batched GEMV, layered on
+/// top of [`i8_batch_2col_enabled`] (the 4-tile handles groups of 4 tokens, then the
+/// 2col tile the ≤3-token remainder, then a 1col tail). Shares each weight-row
+/// `vpmovsxbw` across FOUR tokens (0.25 cvt/token vs 2col's 0.5); BYTE-IDENTICAL to
+/// the `dot_i8` loop (integer-exact — a ULP-free lever).
+///
+/// SIZED on the 64-core box (build-remote/run-local, `examples/i8batch_4col_probe`,
+/// same-binary order-alternated min-of-80, 3 reps, byte-id=true 12/12): **1.11-1.14×
+/// pure-kernel (workers=1, 6/6 always faster)** and **1.03-1.18× at the shipped
+/// 16-worker cap for tq≥64**; the tq=8/16t corner oscillates 0.96-1.08× (dispatch
+/// noise on a sub-ms op, not a stable regression). Held default-OFF anyway: this
+/// feeds only decode prefill/draft (a sub-1% e2e slice), so a default flip is not
+/// worth the risk without a long-form turbo transcript diff confirming the
+/// `compute_band` wire-in indexing (the kernel unit test covers the dot, not the
+/// wire-in). Opt in for large-prefill workloads via `FW_I8_BATCH_4COL=1`.
+fn i8_batch_4col_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FW_I8_BATCH_4COL").ok().as_deref() == Some("1"))
+}
+
 /// Default-ON alternate register tile for square/non-expanding encoder i7 GEMMs.
 /// `FW_I7_M2N4=0` restores the legacy M4xN2 tile for A/B and rollback.
 fn i7_m2n4_enabled() -> bool {
@@ -2155,6 +2176,126 @@ fn dot_i8_2col(w: &[i8], xa: &[i8], xb: &[i8]) -> (i32, i32) {
     }
 }
 
+/// 4-token activation-column tile: one weight row, FOUR activation columns, sharing
+/// each weight-row `vpmovsxbw` (`_mm256_cvtepi8_epi16`) across all four tokens
+/// (0.25 weight-cvt/token vs `dot_i8_2col`'s 0.5). 8 i32 accumulators (4 cols × 2
+/// halves) + 2 weight regs = 10 YMM (fits Zen3's 16, no spill). Each column keeps
+/// [`dot_i8`]'s EXACT `madd_epi16` pairing + 2-accumulator reduction, so
+/// `dot_i8_4col(w,xa,xb,xc,xd) == (dot_i8(w,xa), dot_i8(w,xb), dot_i8(w,xc),
+/// dot_i8(w,xd))` bit-for-bit (i32 sums are integer-exact ⇒ order-independent — a
+/// ULP-FREE lever, not merely WER-neutral). Reference impl + measurement:
+/// `examples/i8batch_4col_probe` (1.03-1.11× pure-kernel over 2col, byte-id 12/12).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i32, i32, i32) {
+    use core::arch::x86_64::*;
+    let n = w
+        .len()
+        .min(xa.len())
+        .min(xb.len())
+        .min(xc.len())
+        .min(xd.len());
+    let (wp, ap, bp, cp, dp) = (
+        w.as_ptr(),
+        xa.as_ptr(),
+        xb.as_ptr(),
+        xc.as_ptr(),
+        xd.as_ptr(),
+    );
+    // SAFETY: avx2 by cfg; every 128-bit load bounded by the i+32<=n / i+16<=n guards
+    // over n = min(lens); tail runs scalar. No i32 overflow (see dot_i8 doc).
+    unsafe {
+        let mut aa0 = _mm256_setzero_si256();
+        let mut aa1 = _mm256_setzero_si256();
+        let mut ab0 = _mm256_setzero_si256();
+        let mut ab1 = _mm256_setzero_si256();
+        let mut ac0 = _mm256_setzero_si256();
+        let mut ac1 = _mm256_setzero_si256();
+        let mut ad0 = _mm256_setzero_si256();
+        let mut ad1 = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 32 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+            aa0 = _mm256_add_epi32(
+                aa0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i))),
+            );
+            aa1 = _mm256_add_epi32(
+                aa1,
+                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i + 16) as *const __m128i))),
+            );
+            ab0 = _mm256_add_epi32(
+                ab0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i))),
+            );
+            ab1 = _mm256_add_epi32(
+                ab1,
+                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i + 16) as *const __m128i))),
+            );
+            ac0 = _mm256_add_epi32(
+                ac0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i) as *const __m128i))),
+            );
+            ac1 = _mm256_add_epi32(
+                ac1,
+                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i + 16) as *const __m128i))),
+            );
+            ad0 = _mm256_add_epi32(
+                ad0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i) as *const __m128i))),
+            );
+            ad1 = _mm256_add_epi32(
+                ad1,
+                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i + 16) as *const __m128i))),
+            );
+            i += 32;
+        }
+        while i + 16 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            aa0 = _mm256_add_epi32(
+                aa0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i))),
+            );
+            ab0 = _mm256_add_epi32(
+                ab0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i))),
+            );
+            ac0 = _mm256_add_epi32(
+                ac0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i) as *const __m128i))),
+            );
+            ad0 = _mm256_add_epi32(
+                ad0,
+                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i) as *const __m128i))),
+            );
+            i += 16;
+        }
+        let hsum = |s: __m256i| -> i32 {
+            let lo = _mm256_castsi256_si128(s);
+            let hi = _mm256_extracti128_si256::<1>(s);
+            let q = _mm_add_epi32(lo, hi);
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+            _mm_cvtsi128_si32(q)
+        };
+        let mut acc_a = hsum(_mm256_add_epi32(aa0, aa1));
+        let mut acc_b = hsum(_mm256_add_epi32(ab0, ab1));
+        let mut acc_c = hsum(_mm256_add_epi32(ac0, ac1));
+        let mut acc_d = hsum(_mm256_add_epi32(ad0, ad1));
+        while i < n {
+            let wv = *w.get_unchecked(i) as i32;
+            acc_a += wv * (*xa.get_unchecked(i) as i32);
+            acc_b += wv * (*xb.get_unchecked(i) as i32);
+            acc_c += wv * (*xc.get_unchecked(i) as i32);
+            acc_d += wv * (*xd.get_unchecked(i) as i32);
+            i += 1;
+        }
+        (acc_a, acc_b, acc_c, acc_d)
+    }
+}
+
 /// Scalar fallback (non-x86 / no avx2): the reference the AVX2 path reproduces exactly.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
@@ -2171,6 +2312,18 @@ fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
 #[inline]
 fn dot_i8_2col(w: &[i8], xa: &[i8], xb: &[i8]) -> (i32, i32) {
     (dot_i8(w, xa), dot_i8(w, xb))
+}
+
+/// Scalar fallback for [`dot_i8_4col`].
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i32, i32, i32) {
+    (
+        dot_i8(w, xa),
+        dot_i8(w, xb),
+        dot_i8(w, xc),
+        dot_i8(w, xd),
+    )
 }
 
 /// Symmetric int8 quantize of an activation into `out` (`len == x.len()`):
@@ -2382,12 +2535,46 @@ pub fn gemv_i8_batch(w: &I8Mat, x: &[f32], tq: usize, bias: Option<&[f32]>, out_
     // `vpmovsxbw` across a pair of tokens (byte-identical i32, then the SAME
     // per-(o,t) `* so * xs[t] + b`). Odd tail token + `FW_I8_BATCH_2COL=0` use `dot_i8`.
     let use_2col = i8_batch_2col_enabled();
+    let use_4col = i8_batch_4col_enabled();
     let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
         for o in o0..o1 {
             let wrow = &w.data[o * inp..(o + 1) * inp];
             let so = w.scales[o];
             let b = bias.map_or(0.0, |bb| bb[o]);
-            if use_2col {
+            if use_4col {
+                // 4-token tile, then 2col for the ≤3-token remainder, then 1col tail.
+                // dot_i8_4col == (dot_i8,dot_i8,dot_i8,dot_i8) bit-for-bit, so this is
+                // byte-identical to both the 2col and the plain dot_i8 branches.
+                let mut t = 0;
+                while t + 4 <= tq {
+                    let (da, db, dc, dd) = dot_i8_4col(
+                        wrow,
+                        &xi8[t * inp..(t + 1) * inp],
+                        &xi8[(t + 1) * inp..(t + 2) * inp],
+                        &xi8[(t + 2) * inp..(t + 3) * inp],
+                        &xi8[(t + 3) * inp..(t + 4) * inp],
+                    );
+                    dst[t * out + o] = da as f32 * so * xs[t] + b;
+                    dst[(t + 1) * out + o] = db as f32 * so * xs[t + 1] + b;
+                    dst[(t + 2) * out + o] = dc as f32 * so * xs[t + 2] + b;
+                    dst[(t + 3) * out + o] = dd as f32 * so * xs[t + 3] + b;
+                    t += 4;
+                }
+                while t + 2 <= tq {
+                    let (da, db) = dot_i8_2col(
+                        wrow,
+                        &xi8[t * inp..(t + 1) * inp],
+                        &xi8[(t + 1) * inp..(t + 2) * inp],
+                    );
+                    dst[t * out + o] = da as f32 * so * xs[t] + b;
+                    dst[(t + 1) * out + o] = db as f32 * so * xs[t + 1] + b;
+                    t += 2;
+                }
+                if t < tq {
+                    dst[t * out + o] =
+                        dot_i8(wrow, &xi8[t * inp..(t + 1) * inp]) as f32 * so * xs[t] + b;
+                }
+            } else if use_2col {
                 let mut t = 0;
                 while t + 2 <= tq {
                     let (da, db) = dot_i8_2col(
@@ -3809,6 +3996,10 @@ fn kv_f16_enabled() -> bool {
 pub struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
+    // Optional key mirror `[state, capacity_tokens]`. The token-major copy is
+    // retained for prefill and fallback; the mirror makes the single-token
+    // score loop contiguous across independent cached tokens.
+    k_columns: Vec<f32>,
     k16: Vec<Float16>,
     v16: Vec<Float16>,
     f16: bool,
@@ -3823,10 +4014,38 @@ impl KvCache {
     #[must_use]
     pub fn new(capacity_tokens: usize, n_state: usize) -> Self {
         let f16 = kv_f16_enabled();
+        Self::new_with_layout(capacity_tokens, n_state, f16, false)
+    }
+
+    /// Construct the historical f32 token-major cache for same-binary A/B.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_row_major_keys_for_bench(capacity_tokens: usize, n_state: usize) -> Self {
+        Self::new_with_layout(capacity_tokens, n_state, false, false)
+    }
+
+    /// Construct the packed-key f32 candidate for same-binary A/B.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_column_major_keys_for_bench(capacity_tokens: usize, n_state: usize) -> Self {
+        Self::new_with_layout(capacity_tokens, n_state, false, true)
+    }
+
+    fn new_with_layout(
+        capacity_tokens: usize,
+        n_state: usize,
+        f16: bool,
+        column_keys: bool,
+    ) -> Self {
         let n = capacity_tokens * n_state;
         Self {
             k: if f16 { Vec::new() } else { vec![0.0; n] },
             v: if f16 { Vec::new() } else { vec![0.0; n] },
+            k_columns: if column_keys && !f16 {
+                vec![0.0; n]
+            } else {
+                Vec::new()
+            },
             k16: if f16 {
                 vec![Float16::from_f32(0.0); n]
             } else {
@@ -3924,6 +4143,15 @@ impl KvCache {
         } else {
             self.k[off..off + span].copy_from_slice(&k.data);
             self.v[off..off + span].copy_from_slice(&v.data);
+            if !self.k_columns.is_empty() {
+                for r in 0..t {
+                    let token = self.len + r;
+                    let src = &k.data[r * self.n_state..(r + 1) * self.n_state];
+                    for (d, &value) in src.iter().enumerate() {
+                        self.k_columns[d * self.capacity_tokens + token] = value;
+                    }
+                }
+            }
         }
         self.len += t;
         Ok(())
@@ -3967,6 +4195,18 @@ impl KvCache {
     #[must_use]
     pub fn value_slice(&self) -> &[f32] {
         &self.v[..self.len * self.n_state]
+    }
+
+    fn key_columns(&self) -> Option<&[f32]> {
+        (!self.k_columns.is_empty()).then_some(self.k_columns.as_slice())
+    }
+
+    /// Restore a populated prefix without modifying its bytes. Benchmark-only:
+    /// repeated arms exclude cache construction while exercising real append.
+    #[doc(hidden)]
+    pub fn truncate_for_bench(&mut self, len: usize) {
+        assert!(len <= self.len, "KvCache benchmark truncate grows cache");
+        self.len = len;
     }
 }
 
@@ -4812,6 +5052,16 @@ pub fn attention_with_cache(
         return attention_raw(q, &k_f32, &v_f32, tk, n_head, Some(past_len));
     }
     if q.rows == 1 && fast_self_attn_enabled() {
+        if let Some(k_columns) = cache.key_columns() {
+            return attention_decode_step_column_keys(
+                q,
+                k_columns,
+                cache.value_slice(),
+                tk,
+                n_head,
+                cache.capacity_tokens,
+            );
+        }
         return attention_decode_step(q, cache.key_slice(), cache.value_slice(), tk, n_head);
     }
     attention_raw(
@@ -4874,6 +5124,69 @@ fn attention_decode_step(q: &Mat, k: &[f32], v: &[f32], tk: usize, n_head: usize
         // AVX2 `axpy_f32_into` vectorizes across the INDEPENDENT output slots `d`
         // (separate mul+add, NOT fmadd) so the per-slot j-ascending sum is
         // bit-identical to the scalar `*o += sj*vd` loop it replaces.
+        for (j, &sj) in scores.iter().enumerate() {
+            let vrow = &v[j * n_state + base..j * n_state + base + d_head];
+            let orow = &mut out[base..base + d_head];
+            axpy_f32_into(orow, sj, vrow);
+        }
+    }
+    Ok(Mat::from_vec(1, n_state, out))
+}
+
+/// Packed-key variant of [`attention_decode_step`]. Keys are mirrored as
+/// `[n_state, capacity_tokens]`, so the d-outer score loop reads contiguous
+/// tokens. Each independent `scores[j]` still receives the same products in
+/// ascending `d` order, preserving the exact f32 reduction while exposing
+/// vector parallelism across tokens.
+#[inline(never)]
+fn attention_decode_step_column_keys(
+    q: &Mat,
+    k_columns: &[f32],
+    v: &[f32],
+    tk: usize,
+    n_head: usize,
+    capacity_tokens: usize,
+) -> FwResult<Mat> {
+    let n_state = q.cols;
+    if n_head == 0 || !n_state.is_multiple_of(n_head) {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: n_head {n_head} must divide n_state {n_state}"
+        )));
+    }
+    if k_columns.len() != capacity_tokens * n_state || v.len() != tk * n_state {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: column-k/v slice len {}/{} != capacity*n_state/tk*n_state {}/{}",
+            k_columns.len(),
+            v.len(),
+            capacity_tokens * n_state,
+            tk * n_state
+        )));
+    }
+    let d_head = n_state / n_head;
+    if d_head == 0 {
+        return Err(FwError::InvalidRequest("attention: d_head == 0".into()));
+    }
+    let scale = (d_head as f32).powf(-0.25);
+    let q0 = q.row(0);
+    let mut out = vec![0.0f32; n_state];
+    let mut qh = vec![0.0f32; d_head];
+    let mut scores = vec![0.0f32; tk];
+    for h in 0..n_head {
+        let base = h * d_head;
+        for (d, slot) in qh.iter_mut().enumerate() {
+            *slot = q0[base + d] * scale;
+        }
+        scores.fill(0.0);
+        for (d, &qd) in qh.iter().enumerate() {
+            let column =
+                &k_columns[(base + d) * capacity_tokens..(base + d) * capacity_tokens + tk];
+            for (score, &key) in scores.iter_mut().zip(column) {
+                *score += qd * (key * scale);
+            }
+        }
+        let mut sm = Mat::from_vec(1, tk, std::mem::take(&mut scores));
+        softmax_rows(&mut sm);
+        scores = sm.data;
         for (j, &sj) in scores.iter().enumerate() {
             let vrow = &v[j * n_state + base..j * n_state + base + d_head];
             let orow = &mut out[base..base + d_head];
@@ -5547,6 +5860,43 @@ mod tests {
     }
 
     #[test]
+    fn dot_i8_4col_matches_four_dot_i8() {
+        // The 4-token column tile must be BIT-IDENTICAL to four independent `dot_i8`
+        // calls, for every contraction length across all three code paths (32-wide,
+        // 16-wide tail, <16 scalar tail). This is the byte-exactness guarantee the
+        // `FW_I8_BATCH_4COL` wire-in relies on: `gemv_i8_batch`'s 4col branch reuses
+        // the exact per-(o,t) dequant of the 2col/dot_i8 branches, so once each column
+        // of `dot_i8_4col` equals `dot_i8`, the whole path is byte-identical.
+        let mut s = 0x1234_5678_9ABC_DEF0u64;
+        let mut ni8 = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 24) as i32 % 255 - 127) as i8
+        };
+        for &n in &[
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 384, 1280, 5120,
+        ] {
+            let w: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let xa: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let xb: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let xc: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let xd: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let (a, b, c, d) = dot_i8_4col(&w, &xa, &xb, &xc, &xd);
+            assert_eq!(a, dot_i8(&w, &xa), "col a mismatch at n={n}");
+            assert_eq!(b, dot_i8(&w, &xb), "col b mismatch at n={n}");
+            assert_eq!(c, dot_i8(&w, &xc), "col c mismatch at n={n}");
+            assert_eq!(d, dot_i8(&w, &xd), "col d mismatch at n={n}");
+        }
+        // Worst-case magnitude: all four columns at the ±127 clamp edge, max length.
+        let w = vec![127i8; 5120];
+        let xn = vec![-127i8; 5120];
+        let xp = vec![127i8; 5120];
+        let (a, b, c, d) = dot_i8_4col(&w, &xn, &xp, &xn, &xp);
+        assert_eq!((a, b, c, d), (-82_580_480, 82_580_480, -82_580_480, 82_580_480));
+    }
+
+    #[test]
     fn gemv_f16_batch_equals_per_token_gemv() {
         let mut rng = Lcg::new(17);
         let (out, inp, tq) = (300usize, 128usize, 5usize);
@@ -6166,6 +6516,49 @@ mod tests {
                 "attention_raw differs bitwise (offset {off:?})"
             );
         }
+    }
+
+    #[test]
+    fn column_major_key_cache_matches_row_major_turbo_bit_exact() {
+        // large-v3-turbo decoder geometry at the maximum text-cache depth.
+        // This drives both layouts through production `attention_with_cache`,
+        // including append, the score kernel, softmax, and score-times-V.
+        const N_STATE: usize = 1280;
+        const N_HEAD: usize = 20;
+        const CAPACITY: usize = 448;
+        const PREFILL: usize = CAPACITY - 1;
+
+        let mut rng = Lcg::new(0xc011_0a7e);
+        let prefill_k = rng.mat(PREFILL, N_STATE);
+        let prefill_v = rng.mat(PREFILL, N_STATE);
+        let q = rng.mat(1, N_STATE);
+        let k_new = rng.mat(1, N_STATE);
+        let v_new = rng.mat(1, N_STATE);
+
+        let mut row_major = KvCache::new_row_major_keys_for_bench(CAPACITY, N_STATE);
+        let mut column_major = KvCache::new_column_major_keys_for_bench(CAPACITY, N_STATE);
+        row_major.append(&prefill_k, &prefill_v).unwrap();
+        column_major.append(&prefill_k, &prefill_v).unwrap();
+
+        let expected =
+            attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut row_major).unwrap();
+        let actual =
+            attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut column_major).unwrap();
+        assert_eq!(row_major.len(), CAPACITY);
+        assert_eq!(column_major.len(), CAPACITY);
+        assert_eq!(
+            expected
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            actual
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "packed K changed a large-v3-turbo attention output bit"
+        );
     }
 
     #[test]
