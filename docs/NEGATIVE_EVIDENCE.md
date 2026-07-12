@@ -4,6 +4,42 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **LONG-FORM CONTENT-DROP bug REPRODUCED on an in-repo clip (tiny.en) + hatch CONFIRMED — so tiny.en long-form "speed" is partly from decoding LESS, not a clean win. Triggering clip found (was "blocked on owner's clip").**
+
+The `project_final_window_early_eot_bug` (bd-r0qd) investigation was BLOCKED — the on-box repro was
+"definitively closed", needing the owner's `clip120`, and `example_audio_track_01.mp3` was logged a
+**negative control** (tested only on **turbo / no_ts** via `e2e_probe`). **It reproduces on tiny.en.**
+
+**Repro (all no-build except the two throwaway examples, verified DIRECT-native via `e2e_probe`
+= `transcribe_samples`, not the CLI):** decode the in-repo mp3 to wav (`cargo run --example
+decode_to_wav -- sample_audio_files/example_audio_track_01.mp3 track01_16k.wav`, 124.5 s). Then:
+
+| engine (tiny.en, TS mode) | output | vs whisper.cpp |
+|---|---|---|
+| **whisper.cpp** (`whisper-cli -m tiny.en -nt`) | ~261 words / ~1400 chars | reference (full) |
+| **native fw / `e2e_probe` (default, context ON)** | **13 segs, 643 chars** | **drops ~48%** |
+| **native `e2e_probe` `FW_NO_CONTEXT=1`** | **21 segs, 1301 chars** | **recovers the drop** |
+
+`fw transcribe --json` shows the drop as **two exactly-30 s gaps** — `[24.88→54.88]` and
+`[80.08→110.08]` — i.e. two full 30 s windows produce NO segments and advance a full `CHUNK_CS`.
+
+**Root cause (confirmed):** `decode.rs` greedy loop, a window that hits EOT with **`result_len==0`
+and `params.timestamps`** → *"Decoder failed with no timestamps closed"* → **break, empty result,
+`seek_delta_cs = CHUNK_CS`** (≈:1394). Native has **NO temperature fallback** (grep: zero
+`temperature`/`fallback`/`retry` in decode.rs code) — whisper.cpp retries the failed window at
+temp 0.2…1.0 with a prompt reset and recovers it. The failure is the carried previous-window
+prompt × int8-decode-numerics interaction (the memory-hypothesized mechanism): **confirmed** because
+`FW_NO_CONTEXT=1` (drops the carried prompt) recovers the windows (643→1301 chars).
+
+**Implications:** (1) the landed `FW_NO_CONTEXT` hatch (0b7d6db) is **CONFIRMED to recover** dropped
+content on a real trigger (previously unverified). (2) Any long-form **tiny.en** native-vs-whisper.cpp
+speed comparison is **non-comparable** — native decodes ~half the content on this clip. (3) Proper fix
+= whisper.cpp temperature fallback in `transcribe_samples` — a real decoder feature, **owner-scoped**
+(native is the deliberate greedy/temp-0 port); OR reconsider the shipped `condition_on_previous_text`
+default for tiny.en. NOT an autonomous byte-exact tick. Reproduction is now in-repo & no-build (the
+`decode_to_wav` example is committed).
+
+---
 ## 2026-07-12 - BlackThrush: **PROFILE-VERIFIED (no new lever) — a fresh flat `perf` profile on the CURRENT shipping binary (tiny.en int8) confirms the frame table; every hot frame is ceiling / owner-gated / sub-floor. Symbol resolution is blocked at `paranoid=1`.**
 
 Motivated by finding the encoder-int8 state stale (a18fed2 correction), I re-verified the hot path with
