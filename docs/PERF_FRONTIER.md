@@ -74,6 +74,16 @@ turbo wall time** (927 / 2666 ms) — sub-floor only for BATCH/long-file/server-
   **Lesson: "strided ⇒ memory-bound" is a HYPOTHESIS ([[project_nominal_vs_dram_bytes]]); a serial
   dependency (EF) or a dominating sibling stage can make the amplified reads free.** Load stays "at parity
   with wc"; cold-start latency is not an autonomously-movable lever here.
+- **The OTHER load component — f16→f32 weight dequant — is BANDWIDTH-BOUND (probe, 2026-07-12).** The
+  turbo weights are f16; `ggml::dequant_f16_parallel` (ggml.rs:623) converts them f16→f32 with a scalar
+  per-element `half::f16::to_f32`. Hypothesis: SIMD `HalfFloatSliceExt::convert_to_f32_slice` (F16C
+  `vcvtph2ps`, already used in the GEMV path) would beat it. `examples/f16_dequant_probe` (100M f16, 8
+  workers, best-of-7): **SIMD 22.5 ms vs scalar 21.7 ms = 0.96× (WASH), 0/100M differing bits.** Both hit
+  ~27 GB/s (read f16 + write 2× f32) ⇒ **bandwidth-bound, not compute-bound** — `half::to_f32` already
+  autovectorises. So neither piece of `model_weights` is movable: the quant is EF-latency-bound, the
+  dequant is bandwidth-bound. **The single-shot load path is fully characterized and at its floor.** (The
+  memory's f16-conversion audit [[project_half_from_f32_software_no_site]] covered `from_f32` sites; this
+  measures the previously-uncovered `to_f32` LOAD dequant. Don't re-dig either.)
 
 ## State: the byte-exact, autonomously-verifiable envelope is CLOSED
 
