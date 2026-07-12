@@ -34,9 +34,11 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   DROPS, retry 8 — retry 3× closer to wc); **test-safe** (`FW_RETRY_FAILED_WINDOW=1 cargo test --lib
   native_engine` = 238/0); **cheap** (encode-reused, `f3d8550`); **safety-audited** (retry TS-only,
   pipeline no_ts-only ⇒ no desync). It is left OFF only because it reverses the deliberate greedy/temp-0
-  design (an owner call), not for any measured risk. NB: only the LIB native_engine suite was run with
-  the flag; the integration/conformance suites route to whisper.cpp so are likely flag-agnostic, but
-  confirm before flipping.
+  design (an owner call), not for any measured risk. **Test-safety is now COMPLETE** (238/0 lib + the
+  integration/conformance suites confirmed flag-agnostic by construction: `native_engine_e2e.rs`
+  transcribes only `jfk.wav` = single-window, so the retry — which needs a carried prompt / multi-window
+  — never fires; `conformance_harness.rs` validates replay/backend metadata, not live native decode).
+  No test uses a multi-window native clip, so nothing exercises the retry outside the 238/0 lib suite.
 
 ## State: the byte-exact, autonomously-verifiable envelope is CLOSED
 
