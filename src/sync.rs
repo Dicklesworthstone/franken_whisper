@@ -41,6 +41,30 @@ fn sync_query_batch_size() -> usize {
     }
 }
 
+/// Import-side mirror of the export N+1 batching: when enabled, `import_runs`
+/// pre-fetches the existing rows for a chunk of ids with one `WHERE id IN (…)`
+/// query instead of one `SELECT … WHERE id = ?1` per JSONL line (query *setup*
+/// dominates the few-row lookups). **Default OFF** — the conflict path is
+/// correctness-sensitive (identical-compare + policy + intra-chunk duplicate ids),
+/// so this lands the tested-and-measurable machinery without changing the shipped
+/// default until it has soaked; `FW_SYNC_BATCH_IMPORT=1` opts in. The per-line and
+/// batched paths call the SAME `apply_run_row` conflict logic (differing only in
+/// where `existing` comes from) ⇒ byte-identical imported rows either way.
+fn sync_batch_import_enabled() -> bool {
+    std::env::var("FW_SYNC_BATCH_IMPORT").ok().as_deref() == Some("1")
+}
+
+/// The 12 `runs` columns in `SELECT`/`INSERT` order, as an owned slice — the
+/// shared representation of "the existing row" for [`apply_run_row`]. Both the
+/// per-line `SELECT` result (a `Row`) and a prefetched/just-inserted row reduce to
+/// this, and `<[SqliteValue]>::get(i)` returns `Option<&SqliteValue>` exactly like
+/// `Row::get(i)`, so the 11-field identical-compare is bit-for-bit the same.
+fn run_row_to_cols(row: &fsqlite::Row) -> Vec<SqliteValue> {
+    (0..12)
+        .map(|i| row.get(i).cloned().unwrap_or(SqliteValue::Null))
+        .collect()
+}
+
 /// Extension over `fsqlite::Connection` for the import write loops: dispatches to
 /// the statement-savepoint-skipping executor when enabled (see
 /// [`sync_skip_stmt_sp_enabled`]). Behaviourally identical to `execute_with_params`
@@ -1187,146 +1211,247 @@ fn import_runs(
     let reader = BufReader::new(file);
     let mut count = 0u64;
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let row: serde_json::Value = serde_json::from_str(line)?;
-        let id = json_str(&row, "id")?;
-        tracking.imported_run_ids.insert(id.clone());
-
-        // Check for existing row
-        let existing = connection
-            .query_with_params(
-                "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
-                &[SqliteValue::Text(id.clone().into())],
-            )
-            .map_err(|error| FwError::Storage(format!("query runs existing `{id}` failed: {error}")))?;
-
-        if !existing.is_empty() {
-            // Compare payload: if identical, noop; if different, apply conflict policy
-            let existing_row = &existing[0];
-            let identical = value_to_string_sqlite(existing_row.get(1))
-                == json_str(&row, "started_at")?
-                && value_to_string_sqlite(existing_row.get(2)) == json_str(&row, "finished_at")?
-                && value_to_string_sqlite(existing_row.get(3)) == json_str(&row, "backend")?
-                && value_to_string_sqlite(existing_row.get(4)) == json_str(&row, "input_path")?
-                && value_to_string_sqlite(existing_row.get(5))
-                    == json_str(&row, "normalized_wav_path")?
-                && value_to_string_sqlite(existing_row.get(6)) == json_str(&row, "request_json")?
-                && value_to_string_sqlite(existing_row.get(7)) == json_str(&row, "result_json")?
-                && value_to_string_sqlite(existing_row.get(8)) == json_str(&row, "warnings_json")?
-                && value_to_string_sqlite(existing_row.get(9)) == json_str(&row, "transcript")?
-                && value_to_string_sqlite(existing_row.get(10))
-                    == json_string_or_default(&row, "replay_json", "{}")
-                && value_to_string_sqlite(existing_row.get(11))
-                    == json_string_or_default(&row, "acceleration_json", "{}");
-
-            if identical {
-                count += 1;
-                continue; // identical — noop
+    if sync_batch_import_enabled() {
+        // Batched: pre-fetch the existing rows for a chunk of ids with one
+        // `WHERE id IN (…)` query, then run the SAME `apply_run_row` conflict logic
+        // per line ⇒ byte-identical to the per-line path. Chunked to bound memory.
+        let chunk_size = sync_query_batch_size().max(1);
+        let mut chunk: Vec<(String, serde_json::Value)> = Vec::with_capacity(chunk_size);
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-
-            match conflict_policy {
-                ConflictPolicy::Reject => {
-                    conflicts.push(SyncConflict {
-                        table: "runs".to_owned(),
-                        key: id.clone(),
-                        reason: "different payload for same id".to_owned(),
-                    });
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Skip => {
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Overwrite | ConflictPolicy::OverwriteStrict => {
-                    let existing_segment_idxs = query_segment_idxs_for_run(connection, &id)
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite capture segments `{id}` failed: {error}"
-                            ))
-                        })?;
-                    tracking
-                        .overwritten_segment_idxs_before
-                        .entry(id.clone())
-                        .or_default()
-                        .extend(existing_segment_idxs);
-
-                    let existing_event_seqs =
-                        query_event_seqs_for_run(connection, &id).map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite capture events `{id}` failed: {error}"
-                            ))
-                        })?;
-                    tracking
-                        .overwritten_event_seqs_before
-                        .entry(id.clone())
-                        .or_default()
-                        .extend(existing_event_seqs);
-
-                    connection
-                        .import_exec(
-                            "DELETE FROM segments WHERE run_id = ?1",
-                            &[SqliteValue::Text(id.clone().into())],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite delete segments `{id}` failed: {error}"
-                            ))
-                        })?;
-                    connection
-                        .import_exec(
-                            "DELETE FROM events WHERE run_id = ?1",
-                            &[SqliteValue::Text(id.clone().into())],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite delete events `{id}` failed: {error}"
-                            ))
-                        })?;
-                    connection
-                        .import_exec(
-                            "DELETE FROM runs WHERE id = ?1",
-                            &[SqliteValue::Text(id.clone().into())],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "overwrite delete runs `{id}` failed: {error}"
-                            ))
-                        })?;
-                    tracking.overwritten_run_ids.insert(id.clone());
-                    // Fall through to INSERT
-                }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let id = json_str(&row, "id")?;
+            chunk.push((id, row));
+            if chunk.len() >= chunk_size {
+                count +=
+                    flush_run_chunk(connection, &mut chunk, conflict_policy, conflicts, tracking)?;
             }
         }
+        count += flush_run_chunk(connection, &mut chunk, conflict_policy, conflicts, tracking)?;
+    } else {
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let id = json_str(&row, "id")?;
 
-        connection
-            .import_exec(
-                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
-                 normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                &[
-                    SqliteValue::Text(id.clone().into()),
-                    SqliteValue::Text(json_str(&row, "started_at")?.into()),
-                    SqliteValue::Text(json_str(&row, "finished_at")?.into()),
-                    SqliteValue::Text(json_str(&row, "backend")?.into()),
-                    SqliteValue::Text(json_str(&row, "input_path")?.into()),
-                    SqliteValue::Text(json_str(&row, "normalized_wav_path")?.into()),
-                    SqliteValue::Text(json_str(&row, "request_json")?.into()),
-                    SqliteValue::Text(json_str(&row, "result_json")?.into()),
-                    SqliteValue::Text(json_str(&row, "warnings_json")?.into()),
-                    SqliteValue::Text(json_str(&row, "transcript")?.into()),
-                    SqliteValue::Text(json_string_or_default(&row, "replay_json", "{}").into()),
-                    SqliteValue::Text(json_string_or_default(&row, "acceleration_json", "{}").into()),
-                ],
-            )
-            .map_err(|error| FwError::Storage(format!("insert runs `{id}` failed: {error}")))?;
+            // Per-line existing lookup (the N+1 the batched path collapses).
+            let existing_rows = connection
+                .query_with_params(
+                    "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
+                    &[SqliteValue::Text(id.clone().into())],
+                )
+                .map_err(|error| {
+                    FwError::Storage(format!("query runs existing `{id}` failed: {error}"))
+                })?;
+            let existing = existing_rows.first().map(run_row_to_cols);
+            apply_run_row(
+                connection,
+                &id,
+                &row,
+                existing.as_deref(),
+                conflict_policy,
+                conflicts,
+                tracking,
+            )?;
+            count += 1;
+        }
+    }
 
+    Ok(count)
+}
+
+/// Process one `runs` JSONL row against `existing` (the current DB/seen row, or
+/// `None`), applying the identical-compare + [`ConflictPolicy`]. **Shared by the
+/// per-line and batched import paths** so their imported rows are byte-identical —
+/// the only difference is where `existing` comes from (a per-line `SELECT` vs a
+/// prefetched `WHERE id IN (…)` map). Returns `Some(inserted_cols)` when a row was
+/// INSERTed (so the batched caller can update its intra-chunk seen-map), else `None`.
+fn apply_run_row(
+    connection: &Connection,
+    id: &str,
+    row: &serde_json::Value,
+    existing: Option<&[SqliteValue]>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    tracking: &mut RunImportTracking,
+) -> FwResult<Option<Vec<SqliteValue>>> {
+    tracking.imported_run_ids.insert(id.to_owned());
+
+    if let Some(existing) = existing {
+        // Compare payload: if identical, noop; if different, apply conflict policy.
+        let identical = value_to_string_sqlite(existing.get(1)) == json_str(row, "started_at")?
+            && value_to_string_sqlite(existing.get(2)) == json_str(row, "finished_at")?
+            && value_to_string_sqlite(existing.get(3)) == json_str(row, "backend")?
+            && value_to_string_sqlite(existing.get(4)) == json_str(row, "input_path")?
+            && value_to_string_sqlite(existing.get(5)) == json_str(row, "normalized_wav_path")?
+            && value_to_string_sqlite(existing.get(6)) == json_str(row, "request_json")?
+            && value_to_string_sqlite(existing.get(7)) == json_str(row, "result_json")?
+            && value_to_string_sqlite(existing.get(8)) == json_str(row, "warnings_json")?
+            && value_to_string_sqlite(existing.get(9)) == json_str(row, "transcript")?
+            && value_to_string_sqlite(existing.get(10))
+                == json_string_or_default(row, "replay_json", "{}")
+            && value_to_string_sqlite(existing.get(11))
+                == json_string_or_default(row, "acceleration_json", "{}");
+
+        if identical {
+            return Ok(None); // identical — noop
+        }
+
+        match conflict_policy {
+            ConflictPolicy::Reject => {
+                conflicts.push(SyncConflict {
+                    table: "runs".to_owned(),
+                    key: id.to_owned(),
+                    reason: "different payload for same id".to_owned(),
+                });
+                return Ok(None);
+            }
+            ConflictPolicy::Skip => {
+                return Ok(None);
+            }
+            ConflictPolicy::Overwrite | ConflictPolicy::OverwriteStrict => {
+                let existing_segment_idxs =
+                    query_segment_idxs_for_run(connection, id).map_err(|error| {
+                        FwError::Storage(format!("overwrite capture segments `{id}` failed: {error}"))
+                    })?;
+                tracking
+                    .overwritten_segment_idxs_before
+                    .entry(id.to_owned())
+                    .or_default()
+                    .extend(existing_segment_idxs);
+
+                let existing_event_seqs =
+                    query_event_seqs_for_run(connection, id).map_err(|error| {
+                        FwError::Storage(format!("overwrite capture events `{id}` failed: {error}"))
+                    })?;
+                tracking
+                    .overwritten_event_seqs_before
+                    .entry(id.to_owned())
+                    .or_default()
+                    .extend(existing_event_seqs);
+
+                connection
+                    .import_exec(
+                        "DELETE FROM segments WHERE run_id = ?1",
+                        &[SqliteValue::Text(id.to_owned().into())],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!("overwrite delete segments `{id}` failed: {error}"))
+                    })?;
+                connection
+                    .import_exec(
+                        "DELETE FROM events WHERE run_id = ?1",
+                        &[SqliteValue::Text(id.to_owned().into())],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!("overwrite delete events `{id}` failed: {error}"))
+                    })?;
+                connection
+                    .import_exec(
+                        "DELETE FROM runs WHERE id = ?1",
+                        &[SqliteValue::Text(id.to_owned().into())],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!("overwrite delete runs `{id}` failed: {error}"))
+                    })?;
+                tracking.overwritten_run_ids.insert(id.to_owned());
+                // Fall through to INSERT.
+            }
+        }
+    }
+
+    let cols = vec![
+        SqliteValue::Text(id.to_owned().into()),
+        SqliteValue::Text(json_str(row, "started_at")?.into()),
+        SqliteValue::Text(json_str(row, "finished_at")?.into()),
+        SqliteValue::Text(json_str(row, "backend")?.into()),
+        SqliteValue::Text(json_str(row, "input_path")?.into()),
+        SqliteValue::Text(json_str(row, "normalized_wav_path")?.into()),
+        SqliteValue::Text(json_str(row, "request_json")?.into()),
+        SqliteValue::Text(json_str(row, "result_json")?.into()),
+        SqliteValue::Text(json_str(row, "warnings_json")?.into()),
+        SqliteValue::Text(json_str(row, "transcript")?.into()),
+        SqliteValue::Text(json_string_or_default(row, "replay_json", "{}").into()),
+        SqliteValue::Text(json_string_or_default(row, "acceleration_json", "{}").into()),
+    ];
+    connection
+        .import_exec(
+            "INSERT INTO runs (id, started_at, finished_at, backend, input_path, \
+             normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            &cols,
+        )
+        .map_err(|error| FwError::Storage(format!("insert runs `{id}` failed: {error}")))?;
+
+    Ok(Some(cols))
+}
+
+/// Batched-import worker: one `WHERE id IN (…)` prefetch for the whole `chunk`,
+/// then [`apply_run_row`] per line in original order. An intra-chunk **seen-map**
+/// (the prefetched map, updated on every INSERT) reproduces the per-line invariant
+/// that a duplicate id later in the file sees the earlier line's insert. Drains
+/// `chunk`. Returns the number of lines processed (== `chunk` len on entry).
+fn flush_run_chunk(
+    connection: &Connection,
+    chunk: &mut Vec<(String, serde_json::Value)>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    tracking: &mut RunImportTracking,
+) -> FwResult<u64> {
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    // Distinct ids for the IN clause (a duplicate id in the file → one bind).
+    let mut seen = HashSet::new();
+    let unique_ids: Vec<String> = chunk
+        .iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    let placeholders = (1..=unique_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id IN ({placeholders})"
+    );
+    let params: Vec<SqliteValue> = unique_ids
+        .iter()
+        .map(|id| SqliteValue::Text(id.clone().into()))
+        .collect();
+    let rows = connection
+        .query_with_params(&sql, &params)
+        .map_err(|error| FwError::Storage(format!("batch query runs existing failed: {error}")))?;
+
+    let mut existing_map: HashMap<String, Vec<SqliteValue>> = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        let cols = run_row_to_cols(r);
+        existing_map.insert(value_to_string_sqlite(cols.first()), cols);
+    }
+
+    let mut count = 0u64;
+    for (id, row) in chunk.drain(..) {
+        let existing = existing_map.get(&id).cloned();
+        if let Some(inserted) = apply_run_row(
+            connection,
+            &id,
+            &row,
+            existing.as_deref(),
+            conflict_policy,
+            conflicts,
+            tracking,
+        )? {
+            existing_map.insert(id, inserted); // seen-map: later dup in chunk sees this insert
+        }
         count += 1;
     }
 
@@ -12051,6 +12176,111 @@ mod tests {
         assert!(report.mismatched_records.is_empty());
         assert_eq!(report.db_segment_count, report.jsonl_segment_count);
         assert_eq!(report.db_event_count, report.jsonl_event_count);
+    }
+
+    #[test]
+    fn flush_run_chunk_matches_per_line_reference() {
+        // The batched import (`flush_run_chunk`) must produce a byte-identical `runs`
+        // table to the per-line path, including: an existing-row conflict (→ Overwrite),
+        // a fresh insert, and an intra-chunk DUPLICATE id (the 2nd occurrence must see
+        // the 1st's insert via the seen-map, exactly as the per-line SELECT would).
+        let dir = tempdir().expect("tempdir");
+        let mk = |name: &str| {
+            let c = Connection::open(dir.path().join(name).display().to_string())
+                .expect("open");
+            ensure_schema(&c).expect("schema");
+            c
+        };
+        let row = |id: &str, backend: &str| {
+            serde_json::json!({
+                "id": id, "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:01:00Z", "backend": backend,
+                "input_path": "/a.wav", "normalized_wav_path": "/a16.wav",
+                "request_json": "{}", "result_json": "{}", "warnings_json": "[]",
+                "transcript": "hello", "replay_json": "{}", "acceleration_json": "{}"
+            })
+        };
+        let sel_all = "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs ORDER BY id";
+        let dump = |c: &Connection| -> Vec<Vec<String>> {
+            c.query_with_params(sel_all, &[])
+                .expect("dump")
+                .iter()
+                .map(|r| {
+                    run_row_to_cols(r)
+                        .iter()
+                        .map(|v| value_to_string_sqlite(Some(v)))
+                        .collect()
+                })
+                .collect()
+        };
+
+        let cref = mk("ref.sqlite3");
+        let cbat = mk("bat.sqlite3");
+        // Seed both DBs identically with x=cpu (via the shared insert path).
+        for c in [&cref, &cbat] {
+            apply_run_row(
+                c,
+                "x",
+                &row("x", "cpu"),
+                None,
+                ConflictPolicy::Overwrite,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("seed");
+        }
+
+        let import_rows = vec![
+            ("x".to_string(), row("x", "gpu")), // conflicts with seed → overwrite
+            ("y".to_string(), row("y", "cpu")), // new
+            ("y".to_string(), row("y", "cpu")), // intra-chunk dup, identical → noop
+            ("z".to_string(), row("z", "cpu")), // new
+        ];
+
+        // Reference: per-line apply_run_row with a per-line SELECT.
+        {
+            let mut tracking = RunImportTracking::default();
+            let mut conflicts = Vec::new();
+            for (id, r) in &import_rows {
+                let existing_rows = cref
+                    .query_with_params(
+                        "SELECT id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id = ?1",
+                        &[SqliteValue::Text(id.clone().into())],
+                    )
+                    .expect("per-line select");
+                let existing = existing_rows.first().map(run_row_to_cols);
+                apply_run_row(
+                    &cref,
+                    id,
+                    r,
+                    existing.as_deref(),
+                    ConflictPolicy::Overwrite,
+                    &mut conflicts,
+                    &mut tracking,
+                )
+                .expect("per-line apply");
+            }
+        }
+
+        // Batched: one prefetch + seen-map.
+        {
+            let mut chunk = import_rows.clone();
+            let n = flush_run_chunk(
+                &cbat,
+                &mut chunk,
+                ConflictPolicy::Overwrite,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("flush");
+            assert_eq!(n, 4, "every line counts once");
+            assert!(chunk.is_empty(), "chunk drained");
+        }
+
+        let d = dump(&cbat);
+        assert_eq!(d, dump(&cref), "batched import diverged from per-line");
+        assert_eq!(d.len(), 3, "x,y,z — the intra-chunk dup must not double-insert y");
+        assert_eq!(d[0][3], "gpu", "x overwritten to gpu");
     }
 
     #[test]
