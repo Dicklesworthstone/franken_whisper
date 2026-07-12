@@ -4,6 +4,34 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **SWEPT CLEAN — the peripheral byte-exact envelope (DB / IO / audio) is comprehensively exhausted; every candidate this turn was already optimal. Don't re-hunt these.**
+
+After landing the full N+1→IN family (export `FW_SYNC_BATCH_QUERY` 1.32×; import
+`FW_SYNC_BATCH_IMPORT` all-3-tables 1.29×, default-ON; `validate_sync` per-run compare;
+`validate_sync` double-read of `runs.jsonl` eliminated), I swept the remaining non-hot-path
+candidates and found **all already optimized** — verified, not assumed:
+
+- **All DB access lives in `sync.rs` + `storage.rs`** (grep-confirmed: no `query`/`execute`
+  anywhere else in `src/`). Both are fully N+1-swept.
+- **`storage.rs` multi-run load has NO hidden segments N+1.** `load_run_details_batch` runs
+  two batched queries (runs `WHERE id IN`, events `WHERE run_id IN`) and
+  `assemble_run_details_batched` takes **`segments: result.segments` from the run row's
+  `result_json`** (storage.rs:1499/1554) — segments ride along free with the run query. There is
+  no per-run segments SELECT to batch.
+- **`audio.rs` `downmix_to_mono` / `resample_mono_linear` are already `std::simd`-vectorized
+  AND short-circuit** (`channels<=1` → `to_vec`; `src_rate==dst_rate` → `to_vec`), bit-exact-tested
+  (perf ledger L16). No lever.
+- **Rejected as sub-floor / byte-unsafe (do not attempt):** byte-level `count_jsonl_lines`
+  (avoids the per-line `String` alloc but a byte-level whitespace check ≠ `str::trim`'s Unicode
+  whitespace → not byte-exact on adversarial input; and it's I/O-dominated + occasional anyway).
+
+**Net:** the autonomously-landable, quick-verify **byte-exact** envelope is exhausted — DB N+1,
+BufWriter, savepoint-skip, streaming SHA, redundant-read, audio SIMD all done and shipping. The
+remaining frontier is entirely the **owner/WER-gated hot path** (`docs/PERF_FRONTIER.md`: tiny.en
+encoder int8 / calibration, ToMe/pruning, GPU) — none of which a byte-exact autonomous tick can
+land. Further peripheral ticks will only re-measure settled ground.
+
+---
 ## 2026-07-12 - BlackThrush: **REJECTED (measured) — the SDPA poly-exp lever (`FT_SDPA_POLY_EXP`, ~1.069× e2e) is NOT WER-neutral for tiny.en; it materially changes the transcript on real speech. Stays default-off for tiny.en (shipped only for turbo).**
 
 **What.** `FT_SDPA_POLY_EXP=1` forces the polynomial-exp approximation in the fused SDPA
