@@ -31,6 +31,18 @@ temp 0.2…1.0 with a prompt reset and recovers it. The failure is the carried p
 prompt × int8-decode-numerics interaction (the memory-hypothesized mechanism): **confirmed** because
 `FW_NO_CONTEXT=1` (drops the carried prompt) recovers the windows (643→1301 chars).
 
+**Fix LANDED + VALIDATED (1caba18): `FW_RETRY_FAILED_WINDOW=1`** retries a failed window once with the
+prompt cleared. **Validated (e2e_probe direct native):** default byte-identical (jfk×1 2/104,
+track01 13/643 unchanged); ON recovers track01 to **1301 chars = whisper.cpp** (exact). **CAVEAT for
+the default-on flip (owner):** the retry drops the prompt *entirely* for the failed window (like
+`FW_NO_CONTEXT`), so on **repetitive/tiled audio** it can re-transcribe already-covered content —
+`jfk×3` off=239ch→on=379ch (4→8 "country" for 3 sentence-reps = over-recovery/duplication), `jfk×8`
+524→830. On **real (non-repetitive) audio it recovers exactly right** (the prompt only mattered as the
+EOT-trigger, not as a dedup guard). Also the drop is **TS-mode-specific**: track01 **no_ts** is NOT
+dropped (5segs/1315ch off==on). ⇒ default-OFF is correct (preserves jfk×N goldens; owner flips for the
+real-long-form benefit). The PROPER fix (whisper.cpp temp fallback) tracks `prompt_reset_since` to
+avoid the repetitive-audio duplication — that's the owner-scoped superset.
+
 **Implications:** (1) the landed `FW_NO_CONTEXT` hatch (0b7d6db) is **CONFIRMED to recover** dropped
 content on a real trigger (previously unverified). (2) Any long-form **tiny.en** native-vs-whisper.cpp
 speed comparison is **non-comparable** — native decodes ~half the content on this clip. (3) Proper fix
