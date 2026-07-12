@@ -40,7 +40,7 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   — never fires; `conformance_harness.rs` validates replay/backend metadata, not live native decode).
   No test uses a multi-window native clip, so nothing exercises the retry outside the 238/0 lib suite.
 
-## ⚡ Current-code headline vs whisper.cpp is ~2.2–2.3× — the "~1.2×" boilerplate is STALE
+## ⚡ Current-code headline vs whisper.cpp is ~1.8–2.3× across all modes — the "~1.2×" boilerplate is STALE
 
 **Realistic multi-window no_ts (the target workload), measured 2026-07-12:** turbo, `track01.wav`
 (**124.5 s / 5 windows** — the *same clip* [[project_realistic_workload_dominated]] benched pre-int8),
@@ -56,6 +56,13 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   evicted 3× by disk-pressure cleanup at 86% full, load spiked 4→34). wc reps were clean/consistent,
   and the fw-vs-fw self-improvement is confound-free, so the ~2.3× is directionally solid. This
   supersedes the "~1.68–1.8× no_ts" boilerplate (pre-int8).
+- **DEFAULT TS mode (segment timestamps) — same clip, measured 2026-07-12 (6 interleaved reps, both engines
+  stable even as load spiked 8→35):** **fw ~12.2 s vs whisper.cpp `-t 32` ~21.6 s = ~1.77× FASTER**
+  (coverage-verified: fw 259 words, turbo doesn't drop). Lower than the ~2.3× no_ts because TS mode has
+  **no cross-window pipelining** ([[project_window_pipelining_lever]]) — encode/decode serialize — so this
+  is fw's honest *worst-case* headline. Still supersedes the stale "~1.2× ts" boilerplate. **Full
+  current-code headline (turbo, track01, matched 32t): encoder 2.29× · realistic no_ts ~2.3× · default TS
+  ~1.77× · tiny.en long-form no_ts ~1.93× — every mode ~1.8–2.3×, roughly double the pre-int8 boilerplate.**
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
