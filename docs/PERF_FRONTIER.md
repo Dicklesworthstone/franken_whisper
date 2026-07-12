@@ -28,12 +28,25 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   loops (all buffered or one-time SHA); `Vec::contains`/O(n²) in hot paths (none); stdout
   per-item emit (streaming-unsafe to buffer, sub-floor for batch dumps).
 
+## ⚠ CORRECTION 2026-07-12: tiny.en FULL int8 is ALREADY SHIPPED (rows 1 & 2 below were STALE)
+
+Verified against current code (`a997f37 "perf(native): default quality-safe encoder int8"`):
+`calibrated_encoder_int8_model()` returns `tiny_en || is_large_v3_turbo`, so **tiny.en gets the
+full quality-safe int8 encoder (q/k/v/fc1/fc2 i7 + attn.out i8, the ~1.47× lever) DEFAULT-ON** —
+it was calibrated `2026-07-10`, not "uncalibrated/pending" as the old rows (and memory) claimed.
+Empirically confirmed (prebuilt `fw`, tiny.en): unset **≠** `FW_ENC_ATTN_OUT_I8I32=0` (the f32
+kill-switch) and unset **==** `=1` — i.e. the shipped default IS int8. `FW_ENC_INT8_FC1` is
+therefore **inert in the default config** (branch precedence: the full-int8 branch runs first;
+fc1-only is only reachable with `FW_ENC_ATTN_OUT_I8I32=0`). **This invalidates the a18fed2 "fc1-int8
+WER-neutral proxy" evidence** — that transcript-diff compared default-int8 vs default-int8 (a no-op
+flag), NOT f32 vs fc1-int8. See NEGATIVE_EVIDENCE 2026-07-12 for the full correction.
+
 ## Remaining levers — all need the model-bench + corpus-WER loop + owner sign-off
 
 | lever | est. e2e | evidence in hand | why gated | validate before flip |
 |---|---|---|---|---|
-| **`FW_ENC_INT8_FC1` for tiny.en** (fc1-only encoder int8) | ~1.9% **encoder** (isolated); **e2e sub-floor + UNMEASURED reliably** | `encoder_window_tiny` fc1 ~1.9% faster (warm); byte-identical on 5 clips **+ NEW (2026-07-12): byte-identical on the harder `example_audio_track_01.mp3` real-speech clip that BROKE poly-exp, and on `test_10s_speech.wav` — fc1-int8 survives where a sibling lossy lever fails (GELU-absorption validated on hard speech)**. Strong tiny.en WER-neutral proxy (transcript-diff, prebuilt `fw`, no build). e2e A/B looked like a regression but was **confounded** (see note) | quality: tiny.en WER-neutral case is now STRONG (byte-identical on the clip that broke poly-exp); residual gate is the **global flag** (other uncalibrated / >4-layer models WER-unproven) + owner accepting a lossy trade; e2e sub-floor for tiny.en's small encoder | broaden the transcript-diff corpus (proper-noun clips) + owner sign-off on the global-flag scope; e2e (if wanted) via a run-order-safe idle-box ABBA |
-| **tiny.en encoder int8 *calibration*** (enable the full `enc_attn_out_i8i32`, not a flag) | up to ~1.47× encoder (turbo-sized) | full-int8 flag is **calibration-inert** for tiny.en — needs a calibration entry, not a flip | quality (proper nouns) unproven for tiny.en; needs `ENCODER_INT8_CALIBRATION_ID` work | proper-noun corpus WER vs whisper-cli |
+| ~~`FW_ENC_INT8_FC1` for tiny.en~~ **MOOT** | — | tiny.en already ships the strictly-more-aggressive FULL int8 (above); fc1-only is superseded/inert in the default config | n/a — not a lever | n/a |
+| ~~tiny.en encoder int8 *calibration*~~ **DONE (shipped `a997f37`)** | ~1.47× encoder, LIVE | `calibrated_encoder_int8_model` includes tiny.en; policy `calibrated_model_budget_pass` (asserted by a unit test). Default-on, `FW_ENC_ATTN_OUT_I8I32=0` kills | not gated — shipped | — |
 | **ToMe / layer-pruning** (encoder FLOP reduction) | large (turbo) | space mapped; tail-truncation already landed | changes output structurally | full WER + segment-timing corpus |
 | **poly-exp variants / GPU** | — | poly-exp turbo shipped; GTX1070 = nouveau (no CUDA) | owner / infra | — |
 
