@@ -602,7 +602,8 @@ fn export_incremental_inner(
     // --- runs ---
     let runs_tmp = output_dir.join("runs.jsonl.tmp");
     let runs_final = output_dir.join("runs.jsonl");
-    let runs_count = export_table_runs_incremental(&connection, &runs_tmp, cursor_used.as_ref())?;
+    let (runs_count, runs_sha256) =
+        export_table_runs_incremental(&connection, &runs_tmp, cursor_used.as_ref())?;
     atomic_rename(&runs_tmp, &runs_final)?;
 
     // Collect the run_ids that were exported so segments/events can be scoped.
@@ -611,20 +612,23 @@ fn export_incremental_inner(
     // --- segments ---
     let segments_tmp = output_dir.join("segments.jsonl.tmp");
     let segments_final = output_dir.join("segments.jsonl");
-    let segments_count = export_table_segments_for_runs(&connection, &segments_tmp, &run_ids)?;
+    let (segments_count, segments_sha256) =
+        export_table_segments_for_runs(&connection, &segments_tmp, &run_ids)?;
     atomic_rename(&segments_tmp, &segments_final)?;
 
     // --- events ---
     let events_tmp = output_dir.join("events.jsonl.tmp");
     let events_final = output_dir.join("events.jsonl");
-    let events_count = export_table_events_for_runs(&connection, &events_tmp, &run_ids)?;
+    let (events_count, events_sha256) =
+        export_table_events_for_runs(&connection, &events_tmp, &run_ids)?;
     atomic_rename(&events_tmp, &events_final)?;
 
-    // Compute checksums
+    // Checksums streamed while writing (HashingWriter) — no re-read pass. Same digest
+    // as `sha256_file` of the written bytes.
     let checksums = FileChecksums {
-        runs_jsonl_sha256: sha256_file(&runs_final)?,
-        segments_jsonl_sha256: sha256_file(&segments_final)?,
-        events_jsonl_sha256: sha256_file(&events_final)?,
+        runs_jsonl_sha256: runs_sha256,
+        segments_jsonl_sha256: segments_sha256,
+        events_jsonl_sha256: events_sha256,
     };
 
     // Determine the new cursor: the maximum `(finished_at, id)` tuple among
@@ -699,7 +703,7 @@ fn export_table_runs_incremental(
     connection: &Connection,
     path: &Path,
     cursor: Option<&SyncCursor>,
-) -> FwResult<u64> {
+) -> FwResult<(u64, String)> {
     let (sql, params) = match cursor {
         Some(c) => (
             "SELECT id, started_at, finished_at, backend, input_path, \
@@ -735,7 +739,7 @@ fn export_table_runs_incremental(
     // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
     // of one syscall per JSONL line (the full-export writers above are already
     // buffered; these incremental ones were not). Byte-identical output.
-    let mut file = BufWriter::new(fs::File::create(path)?);
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
     let mut count = 0u64;
 
     for row in rows {
@@ -757,9 +761,9 @@ fn export_table_runs_incremental(
         count += 1;
     }
     file.flush()?;
-    file.get_ref().sync_all()?;
+    file.get_ref().get_ref().sync_all()?;
 
-    Ok(count)
+    Ok((count, file.finalize_hex()))
 }
 
 /// Collect all run IDs that match the incremental filter, so we can scope
@@ -806,11 +810,11 @@ fn export_table_segments_for_runs(
     connection: &Connection,
     path: &Path,
     run_ids: &[String],
-) -> FwResult<u64> {
+) -> FwResult<(u64, String)> {
     // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
     // of one syscall per JSONL line (the full-export writers above are already
     // buffered; these incremental ones were not). Byte-identical output.
-    let mut file = BufWriter::new(fs::File::create(path)?);
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
     // Batch the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` query per chunk,
     // grouping rows by run_id and emitting in `run_ids` order (idx-ascending within
     // each run) ⇒ byte-identical JSONL to the legacy per-run path. Chunk size 1
@@ -861,9 +865,9 @@ fn export_table_segments_for_runs(
         }
     }
     file.flush()?;
-    file.get_ref().sync_all()?;
+    file.get_ref().get_ref().sync_all()?;
 
-    Ok(count)
+    Ok((count, file.finalize_hex()))
 }
 
 /// Export events belonging to a specific set of run_ids.
@@ -871,11 +875,11 @@ fn export_table_events_for_runs(
     connection: &Connection,
     path: &Path,
     run_ids: &[String],
-) -> FwResult<u64> {
+) -> FwResult<(u64, String)> {
     // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
     // of one syscall per JSONL line (the full-export writers above are already
     // buffered; these incremental ones were not). Byte-identical output.
-    let mut file = BufWriter::new(fs::File::create(path)?);
+    let mut file = HashingWriter::new(BufWriter::new(fs::File::create(path)?));
     // Batch the per-run N+1 `SELECT` into one `WHERE run_id IN (…)` query per chunk;
     // group by run_id and emit in `run_ids` order (seq-ascending within each run) ⇒
     // byte-identical JSONL. `FW_SYNC_BATCH_QUERY=0` (chunk 1) = legacy per-run path.
@@ -925,9 +929,9 @@ fn export_table_events_for_runs(
         }
     }
     file.flush()?;
-    file.get_ref().sync_all()?;
+    file.get_ref().get_ref().sync_all()?;
 
-    Ok(count)
+    Ok((count, file.finalize_hex()))
 }
 
 /// Find the maximum `(finished_at, id)` tuple among runs matching the
@@ -1998,6 +2002,10 @@ impl<W: Write> HashingWriter<W> {
 
     fn finalize_hex(self) -> String {
         format!("{:x}", self.hasher.finalize())
+    }
+
+    fn get_ref(&self) -> &W {
+        &self.inner
     }
 }
 
@@ -8321,7 +8329,7 @@ mod tests {
         let conn =
             fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
         let output_path = dir.path().join("segments.jsonl");
-        let count =
+        let (count, _sha256) =
             export_table_segments_for_runs(&conn, &output_path, &[]).expect("should succeed");
         assert_eq!(count, 0, "empty run_ids should produce 0 rows");
 
@@ -8981,7 +8989,7 @@ mod tests {
             fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
 
         let out_path = dir.path().join("events_empty.jsonl");
-        let count = export_table_events_for_runs(&conn, &out_path, &[]).expect("export");
+        let (count, _sha256) = export_table_events_for_runs(&conn, &out_path, &[]).expect("export");
         assert_eq!(count, 0, "empty run_ids should produce zero rows");
         let content = fs::read_to_string(&out_path).expect("read");
         assert!(content.is_empty(), "file should be empty");
@@ -9073,13 +9081,19 @@ mod tests {
 
         // No filter → both runs exported.
         let all_path = dir.path().join("all_runs.jsonl");
-        let all_count = export_table_runs_incremental(&conn, &all_path, None).expect("all");
+        let (all_count, all_sha256) =
+            export_table_runs_incremental(&conn, &all_path, None).expect("all");
         assert_eq!(all_count, 2, "no filter should export both runs");
+        assert_eq!(
+            all_sha256,
+            super::sha256_file(&all_path).expect("re-read hash"),
+            "incremental streamed hash must match sha256_file of the written bytes"
+        );
 
         // Cursor at inc-a -> only inc-b.
         let filtered_path = dir.path().join("filtered_runs.jsonl");
         let cursor = test_cursor("2026-01-15T00:00:05Z", Some("inc-a"));
-        let filtered_count =
+        let (filtered_count, _sha256) =
             export_table_runs_incremental(&conn, &filtered_path, Some(&cursor)).expect("filtered");
         assert_eq!(filtered_count, 1, "filter should export only inc-b");
 
@@ -10830,7 +10844,7 @@ mod tests {
 
         // Cursor with a future timestamp — no runs should match.
         let cursor = test_cursor("2099-01-01T00:00:00Z", Some("zzz"));
-        let count =
+        let (count, _sha256) =
             export_table_runs_incremental(&conn, &output_path, Some(&cursor)).expect("export");
         assert_eq!(count, 0, "no runs should match a far-future cursor");
 
