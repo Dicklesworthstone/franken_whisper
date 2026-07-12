@@ -40,9 +40,18 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
 ## The one remaining BYTE-EXACT lever (no WER gate) — import N+1, intricate
 
 The sync **export** N+1 is landed (`FW_SYNC_BATCH_QUERY`, ~1.32×). Its mirror, the **import**
-path, is the last un-optimized IO site — and it is byte-exact (no quality gate), just careful.
-It is **not a quick autonomous tick**: rushing a conflict-semantics change on the sync path is
-how the `quantize_act_i7` re-dig burned a turn. Do it in a dedicated pass.
+path, is the last un-optimized IO site — byte-exact (no quality gate), just careful.
+
+**UPDATE 2026-07-12 (`d2b5b14`): the RUNS table is now LANDED** behind `FW_SYNC_BATCH_IMPORT`
+(**default-OFF**). `import_runs` dispatches legacy vs batched; both call a shared `apply_run_row`
+(existing row passed as `&[SqliteValue]`, so the 11-field identical-compare is bit-for-bit the
+same), and `flush_run_chunk` does the `WHERE id IN (…)` prefetch + a seen-map for intra-chunk
+duplicate ids. Gate: `sync::tests` 348/0 incl. `flush_run_chunk_matches_per_line_reference`.
+**Still open: `import_segments` / `import_events`** — the higher-row-count tables, harder because
+they key on `(run_id, idx)` / `(run_id, seq)` (composite). Same recipe below applies; batch by
+`run_id` if fsqlite lacks row-value `IN`. Both hazards below still apply. Not a quick tick —
+rushing a conflict-semantics change on the sync path is how the `quantize_act_i7` re-dig burned a
+turn; do the composite-key tables in a dedicated pass.
 
 - **Sites** (`src/sync.rs`): `import_table_runs` loop `SELECT … WHERE id=?1` **per line**
   (~:1202); `import_table_segments` `WHERE run_id=?1 AND idx=?2` (~:1384); `import_table_events`
