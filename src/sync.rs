@@ -2883,9 +2883,16 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     let db_segment_count = count_table(&connection, "segments")?;
     let db_event_count = count_table(&connection, "events")?;
 
-    // --- Read JSONL run IDs ---
+    // --- Read JSONL runs ONCE (the map + the id set) ---
+    // `runs.jsonl` was previously read twice — `collect_jsonl_ids` here and
+    // `load_jsonl_run_map` later. Load the map once and derive the id set from its
+    // keys: both include exactly the lines with a string `id` (skipping empty lines,
+    // parsing every line), so `map.keys()` == `collect_jsonl_ids(runs, "id")` and the
+    // parse-error behavior is identical (runs.jsonl is the only JSON-parsed file;
+    // segments/events use `count_jsonl_lines`, which does not parse).
     let runs_path = resolve_jsonl_path(jsonl_dir, "runs");
-    let jsonl_run_ids = collect_jsonl_ids(&runs_path, "id")?;
+    let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
+    let jsonl_run_ids: HashSet<String> = jsonl_run_map.keys().cloned().collect();
 
     // --- Count JSONL segments and events ---
     let segments_path = resolve_jsonl_path(jsonl_dir, "segments");
@@ -2903,8 +2910,8 @@ pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidatio
     missing_from_db.sort();
 
     // --- Compare record content for shared run IDs ---
+    // (`jsonl_run_map` already loaded above — no second read of runs.jsonl.)
     let shared_ids: Vec<&String> = db_run_ids.intersection(&jsonl_run_ids).collect();
-    let jsonl_run_map = load_jsonl_run_map(&runs_path)?;
     let mut mismatched_records: Vec<String> = Vec::new();
 
     // Prefetch the DB rows for all shared ids with one `WHERE id IN (…)` per chunk
