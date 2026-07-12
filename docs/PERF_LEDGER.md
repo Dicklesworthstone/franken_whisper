@@ -51,6 +51,37 @@
 
 ## Levers
 
+### 2026-07-12 UTC — cod_fw — LANDED (byte-exact): TTY decode inflates each frame directly into the final raw buffer — **32-frame decode −10.35%; 128-frame decode neutral**
+
+**What.** `decode_frames_to_raw_with_policy` previously inflated every zlib frame
+into a fresh temporary `Vec<u8>`, checked CRC/SHA over that allocation, and then copied
+it into the aggregate `raw` buffer. `decompress_chunk_into` now appends the same inflate
+stream directly to `raw` and returns the frame's start offset. Decode errors, oversized
+frames, and recovery-mode CRC/SHA failures truncate back to that offset, so rejected
+frames cannot leak partial bytes. The existing `decompress_chunk` helper remains a thin
+wrapper for callers that need an owned frame.
+
+**Quick strict-remote A/B (owner-requested, same worker `vmi1264463`, 31 Criterion
+samples, `--profile release`; baseline and candidate were successive source builds on
+the same worker/target pool):**
+
+| row | baseline | candidate | Criterion change | verdict |
+|---|---:|---:|---:|---|
+| `tty/decode_synthetic/frames/32` | 265.29 µs | 258.57 µs | **−10.353%**, 95% CI [−18.182%, −3.106%], p=0.01 | keep |
+| `tty/decode_synthetic/frames/128` | 1.1179 ms | 1.2316 ms | +1.963%, 95% CI [−4.083%, +10.230%], p=0.59 | no detectable change |
+
+The 32-frame row clears zero with a conservative 3.1% lower bound; the 128-frame row is
+statistically neutral rather than a proved regression. The lever removes one allocation
+and one copy per successfully decoded frame and adds no work to the steady-state path.
+
+**Behavior proof.** Ordering and integrity checks are unchanged; there is no floating-
+point or ASR-numeric operation. The inflate implementation is identical, only its
+destination changes. `decompress_chunk_into_appends_and_rolls_back_on_error` proves an
+existing prefix is preserved, successful bytes append exactly, invalid zlib rolls back,
+and an oversized frame rolls back bytes appended before the bomb cap. The focused remote
+`tty_audio` suite passed **211/211** for gap, duplicate, corrupt-frame, integrity,
+bomb-limit, and round-trip behavior.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED default-ON (byte-exact, no gate, `FW_SYNC_BATCH_IMPORT=0` kills): import N+1 → one `WHERE … IN (…)` per chunk for ALL 3 tables — **~1.29× `sync/import/runs/50`**
 
 **What.** The import mirror of the landed export N+1. `import_{runs,segments,events}` ran one
