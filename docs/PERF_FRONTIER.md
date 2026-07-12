@@ -91,6 +91,14 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   franken's greedy int8 decoder stays faithful; **franken is faster AND cleaner** on this clip. (Note: this
   is the reverse of the tiny.en content-drop above — the greedy repetition/drop failure mode is
   clip-and-decoder-specific and afflicts BOTH engines on different audio.)
+  - **REFINED (2026-07-12): the wc sjobs loop is TURBO-specific, not general.** Same clip on **tiny.en
+    no_ts** (`-t 16`, 2 reps): **both engines clean and full-coverage** — fw 1849 words vs wc 1852, both
+    max-5gram-rep = 3, fw ends "…portrait to landscape." So this is a *valid same-content* comparison:
+    **fw ~8.4 s vs wc ~17.3 s = ~2.06× FASTER** (consistent with track01's tiny.en 1.93×). So (a) the ~2×
+    headline generalizes to a 2nd, much longer, different clip on BOTH models; (b) tiny.en no_ts is
+    **full-coverage on 28 windows** (the content-drop bug stays TS-mode-only); (c) the turbo wc repetition
+    loop above is a **large-model greedy failure mode on this clip**, NOT "wc always loops" — don't
+    over-generalize it. franken is clean on this clip at both model sizes.
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
