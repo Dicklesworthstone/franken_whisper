@@ -93,24 +93,23 @@ flag), NOT f32 vs fc1-int8. See NEGATIVE_EVIDENCE 2026-07-12 for the full correc
 | **ToMe / layer-pruning** (encoder FLOP reduction) | large (turbo) | space mapped; tail-truncation already landed | changes output structurally | full WER + segment-timing corpus |
 | **poly-exp variants / GPU** | — | poly-exp turbo shipped; GTX1070 = nouveau (no CUDA) | owner / infra | — |
 
-## The one remaining BYTE-EXACT lever (no WER gate) — import N+1, intricate
+## Import N+1 — DONE + flipped default-ON (no byte-exact lever remains)
 
 The sync **export** N+1 is landed (`FW_SYNC_BATCH_QUERY`, ~1.32×). Its mirror, the **import**
-path, is the last un-optimized IO site — byte-exact (no quality gate), just careful.
+path, was the last un-optimized IO site — byte-exact (no quality gate). **It is now COMPLETE.**
 
-**UPDATE 2026-07-12 (`d2b5b14`): the RUNS table is now LANDED** behind `FW_SYNC_BATCH_IMPORT`
-(**default-OFF**). `import_runs` dispatches legacy vs batched; both call a shared `apply_run_row`
-(existing row passed as `&[SqliteValue]`, so the 11-field identical-compare is bit-for-bit the
-same), and `flush_run_chunk` does the `WHERE id IN (…)` prefetch + a seen-map for intra-chunk
-duplicate ids. Gate: `sync::tests` 348/0 incl. `flush_run_chunk_matches_per_line_reference`.
-**SEGMENTS (`8199711`) and EVENTS (`40fbcdf`) also LANDED** — the import N+1 batch is now
-**COMPLETE for all 3 tables** (runs/segments/events) under the single `FW_SYNC_BATCH_IMPORT` flag.
-Composite tables prefetch `WHERE run_id IN (…)` + map by `(run_id,idx)`/`(run_id,seq)` + seen-map;
-shared `apply_*_row`/`record_*_pre` keep legacy==batched byte-identical. Gate: `sync::tests` 350/0
-(+ `flush_{run,segment,event}_chunk_matches_per_line_reference`) + E2E A/B byte-identical off-vs-on
-for all 3 tables incl. the conflict/noop re-import path. **The peripheral IO/DB lane is now fully
-optimized; nothing left in this vein.** Remaining work is a soak then the default-on flip (a single
-flag decision). The recipe + hazards below are retained as the historical record.
+**CORRECTION 2026-07-12 (was stale): `FW_SYNC_BATCH_IMPORT` is DEFAULT-ON, not "default-OFF
+pending a flip."** The runs/segments/events batch landed (`d2b5b14`/`8199711`/`40fbcdf`) and the
+flip to default-on shipped in **`f38d83c` "flip FW_SYNC_BATCH_IMPORT default-ON — measured ~1.29×
+import, byte-exact"** (verified against `sync.rs:56` = `… != Some("0")`, comment "**Default ON**",
+`FW_SYNC_BATCH_IMPORT=0` kills). All three tables dispatch legacy vs batched through the SAME
+`apply_{run,segment,event}_row` conflict logic (differing only in where `existing` comes from):
+runs prefetch `WHERE id IN (…)`, composite tables prefetch `WHERE run_id IN (…)` + map by
+`(run_id,idx)`/`(run_id,seq)`, each with an intra-chunk seen-map ⇒ byte-identical. Gate:
+`sync::tests` 350/0 (now exercised through the batched path by default) +
+`flush_{run,segment,event}_chunk_matches_per_line_reference` + full-CLI export→import A/B
+byte-identical off-vs-on incl. the conflict/noop re-import path. **There is no pending byte-exact
+lever — the soak+flip is already done.** The recipe + hazards below are retained as historical record.
 
 - **Sites** (`src/sync.rs`): `import_table_runs` loop `SELECT … WHERE id=?1` **per line**
   (~:1202); `import_table_segments` `WHERE run_id=?1 AND idx=?2` (~:1384); `import_table_events`
@@ -173,6 +172,19 @@ flag decision). The recipe + hazards below are retained as the historical record
 ## Recommendation
 
 Pause the autonomous *byte-exact* loop — further ticks only re-measure settled ground or
-land sub-floor micro-levers the ledger reverts. Schedule a deliberate **owner-authorized
-model-bench + WER session** and start from row 1 (`FW_ENC_INT8_FC1`, already 5-clip
-byte-exact) or row 2 (tiny.en calibration, the bigger prize).
+land sub-floor micro-levers the ledger reverts. **Rows 1 & 2 of the table above are no longer
+the start point** (both MOOT/DONE per the §CORRECTION: `FW_ENC_INT8_FC1` is inert under the
+shipped full int8; tiny.en calibration shipped `a997f37`). And the encoder FLOP-reduction row
+is **measured dead on CPU** — `NEGATIVE_EVIDENCE` closes all three redundancy axes with data:
+DEPTH (layer-pruning breaks the transcript at 4/32, `7092`), SEQUENCE (ToMe frames not mergeable,
+`4518`), SPECTRAL (weights near-full-rank, `4640`); Nyström/CountSketch/PQ/low-rank/Strassen all
+rejected (`4552`). So the genuinely-remaining levers are **owner/infra only**: (1) a **Linux GPU
+compute stack** (GTX 1070 is on nouveau → no CUDA/OpenCL/Vulkan — the encoder GEMM/SDPA is the
+sole out-of-crate lever); (2) a **cheap multilingual DRAFT model** to unlock speculative decode
+(verify amortization R(K)≈3.7× de-risked, but a layer-skip self-draft can't clear break-even —
+the drafter must also shrink the logits head); (3) **AVX-512-VNNI hardware** (int8 encoder GEMM
+is 0.89× on this AVX2-no-VNNI box). No autonomously-landable byte-exact perf lever remains
+(re-verified against current code 2026-07-12: encoder int8 maximal, import N+1 default-on, IO
+swept, fresh shipped-tiny.en encoder profile = exp `__expf_fma` ~9% [poly-exp owns it: turbo-on,
+tiny.en regressed-off] + rayon `__sched_yield` [contention-inflated] + int8-GEMM bulk — no new
+hot spot).
