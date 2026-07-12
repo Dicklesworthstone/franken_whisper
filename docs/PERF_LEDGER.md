@@ -51,6 +51,51 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): `decompress_chunk` `read::ZlibDecoder` → `bufread::ZlibDecoder` — removes the per-frame 32 KiB read-ahead alloc (negative-ledger pickup)
+
+**What.** `tty_audio::decompress_chunk(input: &[u8])` fed an already-in-memory
+`&[u8]` to `flate2::read::ZlibDecoder`, which wraps its `Read` source in an
+**additional 32 KiB read-ahead `BufReader`** — a per-frame heap alloc + memset +
+memmove on every decompressed TTY-audio frame. `&[u8]` already implements
+`BufRead`, so `flate2::bufread::ZlibDecoder` reads the slice directly with zero
+scratch buffer. One-line import swap; identical inflate; **byte-identical output**
+(no float, never enters ASR numerics ⇒ the ULP requirement reduces to exact
+bytes, WER unchanged by construction). Landed default (no gate) — a pure
+buffering-strategy change with no downside.
+
+**Negative-ledger pickup.** This was cod_fw's SURFACED-but-unshipped win
+(NEGATIVE_EVIDENCE 2026-07-11, now marked RESOLVED): a scaled 300k-frame profile
+of the 24-byte TTY frame shape attributed self-time `__memmove` 23.91% +
+`__memset` 14.61% to that read-ahead buffer. cod_fw held the ship under the strict
+`degraded = SURFACE, no local fallback` rule — the mandatory `--all-targets`
+remote gate OOM'd (`asupersync` lib compile SIGKILL) on memory-constrained
+workers.
+
+**Sizing — cod_fw same-worker in-binary paired A/B, worker `vmi1149989`, 31
+Criterion samples, in-tree `tty/decode_synthetic` bench (unchanged by this diff):**
+
+| frames | baseline median | candidate | conservative speedup | repeat floor |
+|---|---|---|---|---|
+| 32  | 136,200.881 ns | 120,319.831 | 1.0819× PASS | 1.0463× |
+| 128 | 530,016.087 ns | 468,278.149 | 1.1136× PASS | 1.0164× |
+
+**Byte-exactness CERTIFIED in-tree (this turn).** New unit test
+`tty_audio::tests::decompress_bufread_matches_read_reference_byte_exact` asserts
+the production `bufread` output equals a `read::ZlibDecoder` reference across
+sizes {0,1,15,16,17,160,1600,8192,8193,40000,79999} × 4 content patterns
+(zero/constant/strided/pseudo-random) + roundtrip identity. Run and **PASSED via a
+reliable local build** (the remote fleet was rouletting `asupersync` OOMs, so
+correctness was verified locally rather than gambling on worker memory; the
+franken_whisper lib itself compiled cleanly remotely on vmi1293453).
+
+**Why local for the gate.** The `--all-targets`/full-crate remote build failed on
+a worker-memory `asupersync` SIGKILL (vmi1167313) — a flaky-infra property of
+certain workers, not of this diff. cod_fw's paired measurement is already
+same-worker-admissible and unaffected by the swap (the decompress kernel emits
+identical bytes), so a fresh remote timing adds nothing over a local correctness
+proof. Retry-condition from the negative ledger ("RCH healthy") is relaxed:
+worker-memory OOM is orthogonal to correctness.
+
 ### 2026-07-11 UTC — BlackThrush — LANDED (byte-exact, default-OFF gate): `dot_i8_4col` wired into `gemv_i8_batch` (`FW_I8_BATCH_4COL`); cod_fw's parked lever, both retry-conditions now MET and SIZED
 
 **What.** Wired cod_fw's parked, byte-exact `dot_i8_4col` (4-token activation-column

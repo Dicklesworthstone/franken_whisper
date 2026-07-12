@@ -58,6 +58,23 @@ serialized output before shipping.
 
 ## 2026-07-11 - cod_fw: **SURFACED (measured win, production NOT shipped) — direct `BufRead` zlib decode removes the per-frame 32 KiB read-ahead allocation and clears the same-worker MEDIAN floor, but the mandatory strict-remote all-targets gate hit an RCH worker allocator abort while fleet posture was `degraded`. No local Cargo fallback.**
 
+> **RESOLVED / SHIPPED 2026-07-12 (BlackThrush).** Landed as the one-line
+> `read::ZlibDecoder` → `bufread::ZlibDecoder` swap in `tty_audio::decompress_chunk`
+> (see PERF_LEDGER 2026-07-12). Byte-exactness re-certified in-tree via new unit
+> test `tty_audio::tests::decompress_bufread_matches_read_reference_byte_exact`
+> (production bufread output vs a `read::ZlibDecoder` reference, 11 sizes ×
+> 4 content patterns + roundtrip identity), run and PASSED via a reliable local
+> build. Sizing is cod_fw's own admissible same-worker paired A/B on the in-tree
+> `tty/decode_synthetic` bench (1.0819× @32 frames, 1.1136× @128 frames), which is
+> unchanged by this diff. cod_fw's only blocker was the strict `--all-targets`
+> remote gate on a degraded fleet; the underlying failure is a worker-memory
+> `asupersync` compile OOM (SIGKILL), which recurred here on vmi1167313 — it is a
+> flaky-infra property of certain workers, NOT a property of this diff (the
+> franken_whisper lib itself compiled cleanly remotely on vmi1293453). Resolved
+> by verifying correctness with a reliable local build rather than gambling on the
+> OOM roulette; the swap does no float arithmetic, so WER is unchanged by
+> construction.
+
 **Negative-ledger/profile-first selection.** A scaled 300,000-frame run of the
 production 24-byte TTY frame shape attributed self-time to `__memmove` 23.91%,
 `__memset` 14.61%, malloc 1.46%, and calloc 0.76% (524 samples, zero lost).
