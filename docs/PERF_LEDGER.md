@@ -51,6 +51,43 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED default-ON (byte-exact, no gate, `FW_SYNC_BATCH_IMPORT=0` kills): import N+1 → one `WHERE … IN (…)` per chunk for ALL 3 tables — **~1.29× `sync/import/runs/50`**
+
+**What.** The import mirror of the landed export N+1. `import_{runs,segments,events}` ran one
+`SELECT … WHERE key = ?` **per JSONL line** for conflict detection (N+1). Added a batched path
+(runs `d2b5b14`, segments `8199711`, events `40fbcdf`) that prefetches a chunk with one
+`WHERE id IN (…)` (runs) / `WHERE run_id IN (…)` (segments/events — composite `(run_id,idx)` /
+`(run_id,seq)`, mapped client-side since fsqlite has no row-value `IN`). The prefetched map
+doubles as the intra-chunk **seen-map** (updated on every INSERT) so duplicate keys later in the
+file see the earlier insert, exactly as the per-line SELECT would. Flipped default-ON (`f38d83c`).
+
+**Byte-exact by construction.** Per-line and batched paths call the SAME
+`apply_{run,segment,event}_row` conflict logic (Reject/Skip/Overwrite/OverwriteStrict + the
+11-/5-field identical-compare); `existing` is passed as `&[SqliteValue]` (`.get(i)` matches
+`Row::get(i)`), and the per-line FK-check + idx/seq tracking is shared via `record_*_pre` +
+`*ImportState`, so the post-loop `assert_no_stale` / `delete_stale` is untouched.
+
+**Why it wins (setup-bound, like the export).** For a few-row `SELECT`, parse/plan/cursor-open
+dominates, so K setups → 1 is a real saving; import stays INSERT-dominated so the net is a touch
+under the export's 1.32× (the SELECT is only part of the per-line cost).
+
+**Measurement (`bench sync/import`, external-env ABBA on one binary, forced-local):**
+
+| N | OFF (legacy N+1) | ON (batched `IN`) | speedup |
+|---|---|---|---|
+| runs/50 | 50.9 / 51.7 ms | 39.6 / 39.9 ms | **~1.29×** |
+| runs/10 | 33.5 / 34.1 ms | 30.9 / 31.2 ms | ~1.09× |
+
+ON/OFF absolutes rock-steady across reps; larger N → larger win (more SELECT setups collapsed).
+
+**Correctness CERTIFIED.** `sync::tests` **350/0**, now exercised **through the batched path by
+default** (every round-trip / conflict-policy / edge-case test) + 3 new
+`flush_{run,segment,event}_chunk_matches_per_line_reference` (batched == per-line for
+OverwriteStrict conflict + fresh insert + intra-chunk dup) + a full-CLI `export-jsonl`→`import-jsonl`
+A/B: runs/segments/events byte-identical OFF vs ON incl. the conflict/noop re-import path. **This
+completes the peripheral IO/DB lane — export N+1, import N+1, BufWriter, savepoint-skip, streaming
+SHA are all optimized.**
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): **incremental** export also streams SHA-256 while writing (`HashingWriter`) — completes the re-read-free checksum path
 
 **What.** Mirror of the full-export streaming-hash onto the incremental path:
