@@ -1232,6 +1232,10 @@ pub fn transcribe_samples(
         // Set for one iteration when retrying a failed window with the carried prompt
         // cleared (FW_RETRY_FAILED_WINDOW). Reset once the window completes.
         let mut force_empty_prompt = false;
+        // Holds `(frame_offset, enc)` from a window's first attempt so a
+        // FW_RETRY_FAILED_WINDOW retry (same seek) reuses the identical encode instead
+        // of paying a full re-encode. Only ever populated when the flag is on.
+        let mut retry_enc_cache = None;
         while seek_cs + DELTA_MIN < seek_end_cs {
             checkpoint()?;
 
@@ -1262,9 +1266,16 @@ pub fn transcribe_samples(
                 );
             }
             let t_enc = std::time::Instant::now();
-            // Take the prefetched encode if the pipeline already computed THIS window
-            // (overlapped with the previous window's decode); otherwise encode inline.
-            let enc = if pipeline && prefetched == Some(frame_offset) {
+            // Reuse the encode from THIS seek's failed first attempt on a
+            // FW_RETRY_FAILED_WINDOW retry — same audio/window ⇒ byte-identical enc, so
+            // the retry skips a full re-encode. Only hit when the flag is on and a retry
+            // is in flight; otherwise falls through to prefetch/inline exactly as before.
+            let enc = if retry_enc_cache
+                .as_ref()
+                .is_some_and(|(off, _): &(usize, _)| *off == frame_offset)
+            {
+                retry_enc_cache.take().expect("checked is_some_and above").1
+            } else if pipeline && prefetched == Some(frame_offset) {
                 match res_rx.recv() {
                     Ok(r) => r?,
                     Err(_) => encoder::forward_from_full_mel_window(
@@ -1470,7 +1481,11 @@ pub fn transcribe_samples(
                 && prompt_carried
             {
                 force_empty_prompt = true;
-                continue; // re-decode this window with no carried prompt
+                // Stash this window's encode so the retry (same seek) reuses it instead
+                // of re-encoding. `st` owns its cross-KV copy (no borrow of `enc`), so
+                // this move is sound; `enc` is otherwise unused past DecoderState::new.
+                retry_enc_cache = Some((frame_offset, enc));
+                continue; // re-decode this window with no carried prompt (reusing this encode)
             }
             force_empty_prompt = false;
 
