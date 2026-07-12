@@ -1121,7 +1121,10 @@ pub fn quantize_act_i7(x: &Mat) -> I7Activation {
             let row_scale = amax / 127.0;
             *s = row_scale;
             let inv = 1.0 / row_scale;
-            quantize_i7_row_into_u8(xr, inv, xr_u8);
+            for (d, &v) in xr_u8.iter_mut().zip(xr) {
+                let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                *d = (i8v + 128) as u8;
+            }
         });
     I7Activation {
         rows: x.rows,
@@ -1376,7 +1379,10 @@ pub fn quantize_act_i7_gelu(x: &Mat) -> I7Activation {
                 let row_scale = amax / 127.0;
                 *s = row_scale;
                 let inv = 1.0 / row_scale;
-                quantize_i7_row_into_u8(g, inv, xr_u8);
+                for (d, &v) in xr_u8.iter_mut().zip(g.iter()) {
+                    let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
+                    *d = (i8v + 128) as u8;
+                }
             },
         );
     I7Activation {
@@ -2372,66 +2378,6 @@ fn quantize_act_i8_into(x: &[f32], xinv: f32, out: &mut [i8]) {
 fn quantize_act_i8_into(x: &[f32], xinv: f32, out: &mut [i8]) {
     for (o, &v) in out.iter_mut().zip(x) {
         *o = (v * xinv).round().clamp(-127.0, 127.0) as i8;
-    }
-}
-
-/// Quantize one activation row for the **maddubs 7-bit int8 GEMM**: the u8-biased
-/// form `(v*inv).round().clamp(-127,127) as i32 + 128` (range `[1,255]`), the exact
-/// scalar recipe both [`quantize_act_i7`] and [`quantize_act_i7_gelu`] ran per-element.
-/// BYTE-IDENTICAL to that scalar loop: same round-HALF-AWAY (`f32::round`) via
-/// `trunc(v + copysign(0.5, v))` and same `±127` clamp as [`quantize_act_i8_into`]
-/// (its proven kernel), then `+128` (exact i32 add) and an **unsigned** pack
-/// (`packus`, exact for the in-range `[1,255]`). LLVM cannot vectorize the scalar
-/// form — `f32::round` lowers to a per-element `roundf` libcall (see
-/// `project_round_doesnt_vectorize`) — so the hand-AVX2 body removes that scalar tax
-/// from the encoder's per-window activation quantize (q/k/v + fc1 + fc2, default-on
-/// for calibrated turbo). Verified by `quantize_i7_row_u8_matches_scalar_reference`.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[allow(unsafe_code)]
-fn quantize_i7_row_into_u8(src: &[f32], inv: f32, dst: &mut [u8]) {
-    use core::arch::x86_64::*;
-    debug_assert_eq!(src.len(), dst.len(), "quantize_i7_row_into_u8 len mismatch");
-    let n = src.len();
-    let sp = src.as_ptr();
-    let dp = dst.as_mut_ptr();
-    // SAFETY: avx2 guaranteed by cfg; every load/store is bounded by the `i+8<=n`
-    // guard and the `< 8` remainder runs scalar.
-    unsafe {
-        let vinv = _mm256_set1_ps(inv);
-        let half = _mm256_set1_ps(0.5);
-        let signmask = _mm256_set1_ps(-0.0); // 0x80000000
-        let c127 = _mm256_set1_ps(127.0);
-        let cm127 = _mm256_set1_ps(-127.0);
-        let c128 = _mm256_set1_epi32(128);
-        let mut i = 0;
-        while i + 8 <= n {
-            let v = _mm256_mul_ps(_mm256_loadu_ps(sp.add(i)), vinv);
-            // round-half-away-from-zero: trunc(v + copysign(0.5, v)) == f32::round.
-            let vh = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, signmask)));
-            let r = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(vh);
-            let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
-            let ri = _mm256_add_epi32(_mm256_cvtps_epi32(r), c128); // [-127,127] + 128 = [1,255]
-            let lo = _mm256_castsi256_si128(ri);
-            let hi = _mm256_extracti128_si256::<1>(ri);
-            let i16s = _mm_packs_epi32(lo, hi); // order-preserving [lo0..3, hi0..3], in [1,255]
-            let u8s = _mm_packus_epi16(i16s, i16s); // unsigned-saturate → u8; low 8 bytes = elems 0..7
-            _mm_storel_epi64(dp.add(i) as *mut __m128i, u8s);
-            i += 8;
-        }
-        while i < n {
-            let i8v = (*src.get_unchecked(i) * inv).round().clamp(-127.0, 127.0) as i32;
-            *dst.get_unchecked_mut(i) = (i8v + 128) as u8;
-            i += 1;
-        }
-    }
-}
-
-/// Scalar fallback (non-avx2): the exact reference the AVX2 path reproduces.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-fn quantize_i7_row_into_u8(src: &[f32], inv: f32, dst: &mut [u8]) {
-    for (d, &v) in dst.iter_mut().zip(src) {
-        let i8v = (v * inv).round().clamp(-127.0, 127.0) as i32;
-        *d = (i8v + 128) as u8;
     }
 }
 
@@ -5741,38 +5687,6 @@ mod tests {
         let mut got = vec![0i8; x.len()];
         quantize_act_i8_into(&x, 1.0, &mut got);
         assert_eq!(got, vec![1i8, 2, 3, -1, -2, -3, 127, -127]);
-    }
-
-    #[test]
-    fn quantize_i7_row_u8_matches_scalar_reference() {
-        // The AVX2 i7 activation quantize (u8-biased, for maddubs) must be BIT-identical
-        // to the scalar `(v*inv).round().clamp(-127,127) as i32 + 128` map — across the
-        // SIMD body, the <8 tail, the ±127 clamp (→ 1/255 after bias), and round-HALF-AWAY.
-        fn scalar(x: &[f32], inv: f32) -> Vec<u8> {
-            x.iter()
-                .map(|&v| ((v * inv).round().clamp(-127.0, 127.0) as i32 + 128) as u8)
-                .collect()
-        }
-        let mut s = 0x853C_49E6_748F_EA9Bu64;
-        let mut nf = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0
-        };
-        for &n in &[0usize, 1, 5, 7, 8, 9, 15, 16, 17, 1280, 5120] {
-            let x: Vec<f32> = (0..n).map(|_| nf()).collect();
-            let amax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
-            let inv = 127.0 / amax; // maps amax -> ±127 (exercise the clamp/bias edge)
-            let mut got = vec![0u8; n];
-            quantize_i7_row_into_u8(&x, inv, &mut got);
-            assert_eq!(got, scalar(&x, inv), "quantize_i7 mismatch at n={n}");
-        }
-        // Exact-.5 inputs (half-AWAY) + clamp saturation → 1/255 after the +128 bias.
-        let x = vec![0.5f32, 1.5, 2.5, -0.5, -2.5, 126.5, -126.5, 999.0, -999.0];
-        let mut got = vec![0u8; x.len()];
-        quantize_i7_row_into_u8(&x, 1.0, &mut got);
-        assert_eq!(got, vec![129u8, 130, 131, 127, 125, 255, 1, 255, 1]);
     }
 
     #[test]
