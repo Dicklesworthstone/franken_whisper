@@ -82,6 +82,28 @@ rayon oversubscribes harder than wc's OpenMP under contention) — a true whole-
 but the compute (~2.1×) / total-wall (~1.7×) rows are load-~7 point estimates, not guaranteed floors. Also the
 decode row is fw-TS vs wc-`-nt` (not matched). **Quote the encoder; treat the rest as directional.**
 
+### The ONE known LOSING case — tiny.en long-form — and a specific byte-exact candidate (2026-07-12)
+
+franken WINS turbo everywhere (above), but [[project_realistic_workload_dominated]] documents the inverse
+for **tiny.en long-form: ~1.73–1.84× SLOWER than whisper.cpp** (bd-b4hp) — the tiny 4-layer/384-wide encoder
+doesn't amortize the fixed per-window overhead the way turbo's 32-layer encoder does. **Pinpointed a specific,
+testable, byte-exact mechanism this turn (code inspection):** `default_threads()` (mod.rs:1131) returns **32
+regardless of model** on this 64-core box, and it's baked once into the global rayon pool
+(`ensure_default_rayon_pool`, mod.rs:1187). So tiny.en's small GEMMs are split 32 ways ⇒ **dispatch-bound
+over-threading per window**, while whisper.cpp uses its tiny.en optimum (~8–16 threads,
+[[project_encoder_wall_is_clock_throttle]] shows >optimum REGRESSES). A **model-size-adaptive** encoder pool
+(fewer threads for small `n_audio_layer`) is byte-exact (thread count never changes GEMM output) and would
+attack the loss directly.
+
+**DEFERRED (not measured this turn) — hazards:** (1) the box is hostile to timing right now (fw binary
+evicted 3× by disk-pressure cleanup at 86% disk, load bouncing 7→34); (2) threading levers have a **3-revert
+history** ([[project_decode_overthreaded_rayon_lead]]) — measure before landing; (3) the global pool is
+`Once`-init, and the GEMM task granularity may partly live in `ft_kernel_cpu` (out-of-crate), so the fix
+might need a scoped sub-pool or an ft change, not just a smaller `default_threads()`. **Test recipe (quiet
+box):** sweep `RAYON_NUM_THREADS=8/16/32` on `cargo bench -- encoder_window_tiny` (it honors the env, so no
+code change needed to A/B the hypothesis), then `fw` tiny.en on `track01.wav` (124.5 s) vs `whisper-cli -t 8`.
+If fewer threads speeds the tiny encoder, it's a real byte-exact win on franken's only losing workload.
+
 ## Live full-pipeline span breakdown (measured 2026-07-12, real `fw transcribe`, not isolated benches)
 
 `FRANKEN_WHISPER_PERF_SPANS=1 fw transcribe --input jfk.wav --no-persist` (single 11 s window):
