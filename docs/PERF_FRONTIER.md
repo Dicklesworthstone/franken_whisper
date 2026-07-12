@@ -316,8 +316,11 @@ DEPTH (layer-pruning fatal at skip-1: `=31` mangles proper nouns + repetition-lo
 rejected (`4552`). So the genuinely-remaining levers are **owner/infra only**: (1) a **Linux GPU
 compute stack** (GTX 1070 is on nouveau → no CUDA/OpenCL/Vulkan — the encoder GEMM/SDPA is the
 sole out-of-crate lever); (2) a **cheap multilingual DRAFT model** to unlock speculative decode
-(verify amortization R(K)≈3.7× de-risked, but a layer-skip self-draft can't clear break-even —
-the drafter must also shrink the logits head); (3) **AVX-512-VNNI hardware** (int8 encoder GEMM
+(verify amortization R(K)≈3.7× de-risked, but the draft-model-FREE **layer-skip self-draft is
+MEASURED-DEAD** — `FW_DRAFT_ACCEPT_LAYERS` probe, NEGATIVE_EVIDENCE `6675`/`252`: k-of-4-layer early-exit
+argmax matches the full-model argmax only **0% / 0% / 11.8%** (k=1/2/3) vs the 47% / 65% / 82% break-even,
+because the distilled 4-layer decoder's layers are all load-bearing — so the drafter MUST be a real
+separate model with a smaller logits head, not a self-skip); (3) **AVX-512-VNNI hardware** (int8 encoder GEMM
 is 0.89× on this AVX2-no-VNNI box). No autonomously-landable byte-exact perf lever remains
 (re-verified against current code 2026-07-12: encoder int8 maximal, import N+1 default-on, IO
 swept, fresh shipped-tiny.en encoder profile = exp `__expf_fma` ~9% [poly-exp owns it: turbo-on,
