@@ -39,6 +39,13 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   transcribes only `jfk.wav` = single-window, so the retry — which needs a carried prompt / multi-window
   — never fires; `conformance_harness.rs` validates replay/backend metadata, not live native decode).
   No test uses a multi-window native clip, so nothing exercises the retry outside the 238/0 lib suite.
+- **RE-CONFIRMED current-code 2026-07-12** (fresh `fw`, tiny.en, `track01.wav`): default TS mode transcribes
+  only **126 words**, `FW_RETRY_FAILED_WINDOW=1` restores **254 words** (== the no_ts full coverage measured
+  the same day) — the retry recovers the dropped ~50% **exactly** to full coverage. The bug + fix both
+  reproduce on current main. **PERF-MEASUREMENT-INTEGRITY consequence:** any tiny.en **TS** speed number is
+  **non-comparable by default** (it decodes ~50% less), so a valid tiny.en-TS head-to-head MUST set
+  `FW_RETRY_FAILED_WINDOW=1` (which restores the full decode ⇒ slower but correct). The headline's tiny.en
+  figure (~1.93×) is safe because it was measured in **no_ts** mode (full 254-word coverage, verified).
 
 ## ⚡ Current-code headline vs whisper.cpp is ~1.8–2.3× across all modes — the "~1.2×" boilerplate is STALE
 
