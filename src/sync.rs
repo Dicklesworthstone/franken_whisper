@@ -41,17 +41,19 @@ fn sync_query_batch_size() -> usize {
     }
 }
 
-/// Import-side mirror of the export N+1 batching: when enabled, `import_runs`
-/// pre-fetches the existing rows for a chunk of ids with one `WHERE id IN (…)`
-/// query instead of one `SELECT … WHERE id = ?1` per JSONL line (query *setup*
-/// dominates the few-row lookups). **Default OFF** — the conflict path is
-/// correctness-sensitive (identical-compare + policy + intra-chunk duplicate ids),
-/// so this lands the tested-and-measurable machinery without changing the shipped
-/// default until it has soaked; `FW_SYNC_BATCH_IMPORT=1` opts in. The per-line and
-/// batched paths call the SAME `apply_run_row` conflict logic (differing only in
-/// where `existing` comes from) ⇒ byte-identical imported rows either way.
+/// Import-side mirror of the export N+1 batching (all three tables): pre-fetch the
+/// existing rows for a chunk with one `WHERE … IN (…)` query instead of one
+/// `SELECT … WHERE key = ?` per JSONL line (query *setup* dominates the few-row
+/// lookups). **Default ON** (`FW_SYNC_BATCH_IMPORT=0` restores the legacy per-line
+/// N+1, matching the `FW_SYNC_BATCH_QUERY` kill-switch convention). Proven safe to
+/// flip: the per-line and batched paths call the SAME `apply_{run,segment,event}_row`
+/// conflict logic (differing only in where `existing` comes from) ⇒ byte-identical
+/// imported rows; verified by `sync::tests` (350/0, now exercised through the batched
+/// path by default) + a full-CLI export→import A/B (all 3 tables byte-identical incl.
+/// the conflict/noop re-import path). Measured **~1.29× on `sync/import/runs/50`**
+/// (50.9→39.6 ms, external-env ABBA), matching the export N+1's 1.32×.
 fn sync_batch_import_enabled() -> bool {
-    std::env::var("FW_SYNC_BATCH_IMPORT").ok().as_deref() == Some("1")
+    std::env::var("FW_SYNC_BATCH_IMPORT").ok().as_deref() != Some("0")
 }
 
 /// The 12 `runs` columns in `SELECT`/`INSERT` order, as an owned slice — the
