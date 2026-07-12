@@ -22,6 +22,18 @@ evidence. It exists to prevent stale optimism from being reused as proof.
 > survive many stacked layers" WER question is unresolved for models with more than tiny.en's
 > 4 layers — a corpus-WER call, not a byte-exact flip. ~1.9% encoder ≈ sub-1% e2e for
 > tiny.en; below the bar for a unilateral default change even setting quality aside.
+>
+> **UPDATE 2 (byte-exact evidence, prebuilt binary, no build).** Ran `FW_ENC_INT8_FC1`
+> off/on through the native tiny.en engine across ALL 5 available clips: `jfk.wav`,
+> `test_10s_speech.wav`, `example_audio_track_01.mp3` (a real ~demo track — "Alright, this
+> is a quick demo of the search tool…"), `test_1s_tone.wav`, `test_silence.wav`. **Transcript
+> byte-IDENTICAL on all 5**, incl. the real longer clip + tone/silence edge cases. This
+> strongly supports the design claim that fc1-only int8 is byte-exact for tiny.en (GELU
+> saturation absorbs the weight-quant error before the residual — distinct from the
+> attention int8's proper-noun risk). **Still not flipped:** the win is sub-1% e2e and the
+> flag is global (unknown-model / >4-layer safety untested), so a default flip remains an
+> owner decision — but the tiny.en byte-exactness is now well-evidenced (5 clips) should the
+> owner want a tiny.en-scoped default. This closes the encoder-int8-for-tiny.en investigation.
 
 **Context.** After 10 landed byte-exact wins + 2 measured rejections this session
 (peripheral IO/DB/export lane: BufWriter read+write, streaming checksums, statement
