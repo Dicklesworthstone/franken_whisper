@@ -32,7 +32,7 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
 
 | lever | est. e2e | evidence in hand | why gated | validate before flip |
 |---|---|---|---|---|
-| **`FW_ENC_INT8_FC1` for tiny.en** (fc1-only encoder int8) | ~1.9% **encoder** but e2e **NEUTRAL-to-REGRESSION** (likely reject) | `encoder_window_tiny` 83.1→81.5 ms (warm isolated, faster); BUT `e2e_tiny_jfk` in both calm reps fc1 **SLOWER** +6–15% (f32 115.8/116.5 → fc1 133.5/123.7 ms); byte-identical on 5 clips | e2e regresses despite encoder speedup — a real **encoder-int8-vs-e2e divergence** to explain; also global-flag / quality | explain the divergence first (isolated encoder faster, full transcribe slower — likely an int8 overhead in the real encode path); it's not a landable win |
+| **`FW_ENC_INT8_FC1` for tiny.en** (fc1-only encoder int8) | ~1.9% **encoder** (isolated); **e2e sub-floor + UNMEASURED reliably** | `encoder_window_tiny` fc1 ~1.9% faster (warm); byte-identical on 5 clips. e2e A/B looked like a regression but was **confounded** (see note) | quality (global flag, >4-layer WER unproven); e2e sub-floor for tiny.en's ~20%-of-e2e small encoder | a **run-order-safe** e2e A/B on an idle box (ABBA, not f32-then-fc1 each rep) + corpus WER |
 | **tiny.en encoder int8 *calibration*** (enable the full `enc_attn_out_i8i32`, not a flag) | up to ~1.47× encoder (turbo-sized) | full-int8 flag is **calibration-inert** for tiny.en — needs a calibration entry, not a flip | quality (proper nouns) unproven for tiny.en; needs `ENCODER_INT8_CALIBRATION_ID` work | proper-noun corpus WER vs whisper-cli |
 | **ToMe / layer-pruning** (encoder FLOP reduction) | large (turbo) | space mapped; tail-truncation already landed | changes output structurally | full WER + segment-timing corpus |
 | **poly-exp variants / GPU** | — | poly-exp turbo shipped; GTX1070 = nouveau (no CUDA) | owner / infra | — |
@@ -48,7 +48,15 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
 - **Warm perf sizing** (needs ~6 min local build): `RCH_MIN_LOCAL_TIME_MS=999999999`
   `FRANKEN_WHISPER_MODEL_DIR=…` `cargo bench --bench native_engine_bench --
   encoder_window_tiny` (+ `e2e_tiny_jfk`, `decoder_token_step_tiny`), A/B the flag via
-  external env on the same cached binary.
+  external env on the same cached binary. **TWO GOTCHAS learned 2026-07-12:** (1) the
+  `e2e_tiny_jfk` A/B needs an **idle box** — on a loaded host wall-clock swings ~22% (load
+  2→26 mid-run) and buries any sub-15% lever. (2) Do NOT run `f32 then flag` each rep — the
+  flag arm always runs second, so a warming/contending machine makes it *look* slower
+  (this exact confound made `FW_ENC_INT8_FC1` look like an e2e regression when it likely
+  isn't). Use ABBA / randomized order, and note both `encoder::forward` and the production
+  `encoder::forward_from_full_mel_window` **ignore the thread-hint** (same ft rayon pool),
+  so `encoder_window` IS representative of the encode *work* — the divergence was
+  measurement, not a real code-path difference.
 - **Corpus WER vs the original**: `legacy_whispercpp/whisper.cpp/build/bin/whisper-cli`
   is the reference (not on `$PATH`); tiny.en + turbo models + jfk/other clips live in
   `legacy_whispercpp/whisper.cpp/models/` and `sample_audio_files/`, `tests/fixtures/audio/`.
