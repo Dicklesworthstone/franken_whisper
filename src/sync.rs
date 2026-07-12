@@ -383,26 +383,27 @@ fn export_inner(db_path: &Path, output_dir: &Path) -> FwResult<SyncManifest> {
     // Export runs
     let runs_tmp = output_dir.join("runs.jsonl.tmp");
     let runs_final = output_dir.join("runs.jsonl");
-    let runs_count = export_table_runs(&connection, &runs_tmp)?;
+    let (runs_count, runs_sha256) = export_table_runs(&connection, &runs_tmp)?;
     atomic_rename(&runs_tmp, &runs_final)?;
 
     // Export segments
     let segments_tmp = output_dir.join("segments.jsonl.tmp");
     let segments_final = output_dir.join("segments.jsonl");
-    let segments_count = export_table_segments(&connection, &segments_tmp)?;
+    let (segments_count, segments_sha256) = export_table_segments(&connection, &segments_tmp)?;
     atomic_rename(&segments_tmp, &segments_final)?;
 
     // Export events
     let events_tmp = output_dir.join("events.jsonl.tmp");
     let events_final = output_dir.join("events.jsonl");
-    let events_count = export_table_events(&connection, &events_tmp)?;
+    let (events_count, events_sha256) = export_table_events(&connection, &events_tmp)?;
     atomic_rename(&events_tmp, &events_final)?;
 
-    // Compute checksums
+    // Checksums streamed while writing (HashingWriter) — no second pass to re-read
+    // the JSONL files. Identical digest to `sha256_file` of the written bytes.
     let checksums = FileChecksums {
-        runs_jsonl_sha256: sha256_file(&runs_final)?,
-        segments_jsonl_sha256: sha256_file(&segments_final)?,
-        events_jsonl_sha256: sha256_file(&events_final)?,
+        runs_jsonl_sha256: runs_sha256,
+        segments_jsonl_sha256: segments_sha256,
+        events_jsonl_sha256: events_sha256,
     };
 
     let manifest = SyncManifest {
@@ -425,7 +426,7 @@ fn export_inner(db_path: &Path, output_dir: &Path) -> FwResult<SyncManifest> {
     Ok(manifest)
 }
 
-fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<u64> {
+fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<(u64, String)> {
     let rows = connection
         .query(
             "SELECT id, started_at, finished_at, backend, input_path, \
@@ -435,7 +436,7 @@ fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<u64> {
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
     let file = fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = HashingWriter::new(BufWriter::new(file));
     let mut count = 0u64;
 
     for row in rows {
@@ -458,10 +459,10 @@ fn export_table_runs(connection: &Connection, path: &Path) -> FwResult<u64> {
     }
     writer.flush()?;
 
-    Ok(count)
+    Ok((count, writer.finalize_hex()))
 }
 
-fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<u64> {
+fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<(u64, String)> {
     let rows = connection
         .query(
             "SELECT run_id, idx, start_sec, end_sec, speaker, text, confidence \
@@ -470,7 +471,7 @@ fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<u64> 
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
     let file = fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = HashingWriter::new(BufWriter::new(file));
     let mut count = 0u64;
 
     for row in rows {
@@ -488,10 +489,10 @@ fn export_table_segments(connection: &Connection, path: &Path) -> FwResult<u64> 
     }
     writer.flush()?;
 
-    Ok(count)
+    Ok((count, writer.finalize_hex()))
 }
 
-fn export_table_events(connection: &Connection, path: &Path) -> FwResult<u64> {
+fn export_table_events(connection: &Connection, path: &Path) -> FwResult<(u64, String)> {
     let rows = connection
         .query(
             "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
@@ -500,7 +501,7 @@ fn export_table_events(connection: &Connection, path: &Path) -> FwResult<u64> {
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
     let file = fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = HashingWriter::new(BufWriter::new(file));
     let mut count = 0u64;
 
     for row in rows {
@@ -518,7 +519,7 @@ fn export_table_events(connection: &Connection, path: &Path) -> FwResult<u64> {
     }
     writer.flush()?;
 
-    Ok(count)
+    Ok((count, writer.finalize_hex()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1976,6 +1977,40 @@ fn sync_parent_dir(path: &Path) -> FwResult<()> {
         }
     }
     Ok(())
+}
+
+/// A `Write` adapter that streams every byte through SHA-256 as it forwards them to
+/// the inner writer. Lets the full-export writers compute each JSONL's checksum while
+/// writing it — avoiding a second full pass to re-read the file (`sha256_file`). The
+/// digest equals `sha256_file` of the written bytes exactly (same bytes, same hash).
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn sha256_file(path: &Path) -> FwResult<String> {
@@ -11252,8 +11287,13 @@ mod tests {
             .expect("persist");
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
         let out = dir.path().join("runs.jsonl");
-        let count = export_table_runs(&conn, &out).expect("export");
+        let (count, sha256) = export_table_runs(&conn, &out).expect("export");
         assert_eq!(count, 1, "should export 1 run");
+        assert_eq!(
+            sha256,
+            super::sha256_file(&out).expect("re-read hash"),
+            "streamed hash must match sha256_file of the written bytes"
+        );
         let content = fs::read_to_string(&out).expect("read");
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).expect("parse");
         assert_eq!(parsed["id"], "run-exp-1");
@@ -11273,8 +11313,13 @@ mod tests {
             .expect("persist");
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
         let out = dir.path().join("segments.jsonl");
-        let count = export_table_segments(&conn, &out).expect("export");
+        let (count, sha256) = export_table_segments(&conn, &out).expect("export");
         assert_eq!(count, 2, "fixture has 2 segments");
+        assert_eq!(
+            sha256,
+            super::sha256_file(&out).expect("re-read hash"),
+            "streamed hash must match sha256_file of the written bytes"
+        );
         let content = fs::read_to_string(&out).expect("read");
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -11293,8 +11338,13 @@ mod tests {
             .expect("persist");
         let conn = Connection::open(db_path.display().to_string()).expect("conn");
         let out = dir.path().join("events.jsonl");
-        let count = export_table_events(&conn, &out).expect("export");
+        let (count, sha256) = export_table_events(&conn, &out).expect("export");
         assert_eq!(count, 2, "fixture has 2 events");
+        assert_eq!(
+            sha256,
+            super::sha256_file(&out).expect("re-read hash"),
+            "streamed hash must match sha256_file of the written bytes"
+        );
         let content = fs::read_to_string(&out).expect("read");
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
