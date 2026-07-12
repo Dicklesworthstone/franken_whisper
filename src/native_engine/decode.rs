@@ -451,11 +451,29 @@ fn condition_on_prev_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FW_NO_CONTEXT").is_some())
 }
 
+/// Default-OFF: on a window that fails to close any timestamp (`result_len == 0`,
+/// the "decoder failed with no timestamps closed" break) while carrying a
+/// previous-window prompt, RETRY that same seek ONCE with the prompt cleared before
+/// accepting the drop. The carried-prompt × int8 interaction is the confirmed cause
+/// of the long-form content-drop (bd-r0qd): `FW_NO_CONTEXT=1` recovers it globally;
+/// this recovers it targeted (only the failed window resets its prompt, so good
+/// windows keep whisper.cpp-faithful conditioning). Default (unset) never retries ⇒
+/// BYTE-IDENTICAL. See NEGATIVE_EVIDENCE 2026-07-12 / project_final_window_early_eot_bug.
+fn retry_failed_window_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_RETRY_FAILED_WINDOW").is_some())
+}
+
 /// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
 /// (matching the scalar `l > -inf` guard). AVX2 degree-5 poly exp: range-reduce
 /// `x = k·ln2 + r`, `exp(r)` via Horner, `2^k` by float-bit construction. Numerics-
 /// affecting (~2.5e-5 vs libm) — only reached under [`simd_exp_enabled`].
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[allow(unsafe_code)]
 fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
     use core::arch::x86_64::*;
@@ -501,7 +519,8 @@ fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
         }
         let mut tmp = [0.0f32; 8];
         _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
-        let mut s = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
         while i < n {
             let l = logits[i];
             if l > f32::NEG_INFINITY {
@@ -514,7 +533,11 @@ fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
 }
 
 /// Scalar fallback (non-avx2): identical to the default libm loop.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+)))]
 fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
     let mut s = 0.0f32;
     for &l in logits {
@@ -801,7 +824,11 @@ fn confidence(plogs: &[f32]) -> Option<f64> {
     let mean = plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / plogs.len() as f64;
     // `clamp` panics on NaN under the current nightly; guard the exp result.
     let c = mean.exp();
-    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
+    Some(if c.is_finite() {
+        c.clamp(0.0, 1.0)
+    } else {
+        0.0
+    })
 }
 
 /// Per-segment **text** confidence (fix #8): `exp(mean text-token logprob)`
@@ -832,7 +859,11 @@ fn text_confidence(tk: &Tokenizer, tokens: &[i32], plogs: &[f32]) -> Option<f64>
     let mean = sum / count as f64;
     // `clamp` panics on NaN under the current nightly; guard the exp result.
     let c = mean.exp();
-    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
+    Some(if c.is_finite() {
+        c.clamp(0.0, 1.0)
+    } else {
+        0.0
+    })
 }
 
 /// Construct a [`TranscriptionSegment`] from centisecond bounds + text.
@@ -933,8 +964,9 @@ fn pipeline_windows_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("FW_PIPELINE_WINDOWS")
-            .map_or(true, |v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+        std::env::var("FW_PIPELINE_WINDOWS").map_or(true, |v| {
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        })
     })
 }
 
@@ -1177,7 +1209,12 @@ pub fn transcribe_samples(
                 let noop = || Ok(());
                 while let Ok((off, mf)) = req_rx.recv() {
                     let r = encoder::forward_from_full_mel_window(
-                        enc_w, mel_ref, off, mf, enc_n_threads, &noop,
+                        enc_w,
+                        mel_ref,
+                        off,
+                        mf,
+                        enc_n_threads,
+                        &noop,
                     );
                     if res_tx.send(r).is_err() {
                         break;
@@ -1191,334 +1228,371 @@ pub fn transcribe_samples(
         // in flight / waiting on `res_rx`), or None when nothing is prefetched.
         let mut prefetched: Option<usize> = None;
 
-    let mut seek_cs: i64 = 0;
-    while seek_cs + DELTA_MIN < seek_end_cs {
-        checkpoint()?;
-
-        // Encode this window's mel chunk. A full window is 3000 mel frames
-        // (1500 encoder ctx); a tail window with under 30 s of real audio left
-        // is truncated to `2*enc_ctx` mel frames (`enc_ctx` encoder rows),
-        // mirroring whisper.cpp's audio_ctx (-ac) feature — a near-empty final
-        // window otherwise pays a full encode for a fraction of a second of
-        // audio (perf hotspot #1). Timestamp/precision semantics are unaffected
-        // (`max_initial_tid` is tied to the full model `n_audio_ctx`, not this
-        // window's ctx — whisper.cpp 6322).
-        let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
-        // Real (unpadded) audio remaining in this window, in mel frames
-        // (1 mel frame = 1 cs); capped at the full window, as whisper.cpp does.
-        let real_frames = usize::try_from((seek_end_cs - seek_cs).max(0))
-            .unwrap_or(0)
-            .min(FRAMES_PER_CHUNK);
-        let enc_ctx = tail_enc_ctx(real_frames, seek_cs == 0, tail_truncate);
-        let mel_frames = enc_ctx * 2;
-        if mel_frames < FRAMES_PER_CHUNK {
-            tracing::debug!(
-                target: "franken_whisper::native_engine::decode",
-                seek_cs,
-                real_frames,
-                enc_ctx,
-                mel_frames,
-                "tail-window encoder-context truncation engaged"
-            );
-        }
-        let t_enc = std::time::Instant::now();
-        // Take the prefetched encode if the pipeline already computed THIS window
-        // (overlapped with the previous window's decode); otherwise encode inline.
-        let enc = if pipeline && prefetched == Some(frame_offset) {
-            match res_rx.recv() {
-                Ok(r) => r?,
-                Err(_) => encoder::forward_from_full_mel_window(
-                    &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
-                )?,
-            }
-        } else {
-            encoder::forward_from_full_mel_window(
-                &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
-            )?
-        };
-        // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
-        // no_timestamps advance is always CHUNK_CS, so the next offset is known and
-        // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
-        prefetched = None;
-        if pipeline {
-            let next_seek = seek_cs + CHUNK_CS;
-            if next_seek + DELTA_MIN < seek_end_cs {
-                let next_off = frame_offset + CHUNK_CS as usize;
-                let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
-                    .unwrap_or(0)
-                    .min(FRAMES_PER_CHUNK);
-                let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
-                if req_tx.send((next_off, next_ctx * 2)).is_ok() {
-                    prefetched = Some(next_off);
-                }
-            }
-        }
-        super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
-        let t_xkv = std::time::Instant::now();
-        let mut st = DecoderState::new(&m.decoder, &enc)?;
-        super::perf_span("cross_kv", t_xkv.elapsed().as_secs_f64() * 1e3, "");
-
-        // First-window language auto-detect (multilingual, no explicit
-        // language): reuses this window's encode + this state's cross K/V.
-        if used_language.is_none() {
-            used_language = detect_language_from_enc(m, &mut st, checkpoint)?;
-        }
-
-        // Short-tail prompt clearing (fix #2 — whisper.cpp 7046-7051): a
-        // non-first window with under 5 s of audio left drops the carried prompt
-        // to avoid repetition/hallucination on the tail.
-        if should_clear_short_tail_prompt(seek_cs, seek_end_cs) {
-            prompt_past.clear();
-        }
-
-        // Build the prompt: [sot_prev, ...past...] + sot_sequence (whisper.cpp
-        // 7106-7133). prompt_init is the sot sequence for this language/task.
-        let sot_seq = tk.sot_sequence(
-            used_language.as_deref(),
-            params.translate,
-            params.timestamps,
-        );
-        let mut prompt: Vec<i32> = Vec::new();
-        // Carry the prior-window text prompt unless conditioning is disabled
-        // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
-        // `FW_NO_CONTEXT=1`). Default (unset) keeps the carry ⇒ byte-identical.
-        if !condition_on_prev_disabled() && !prompt_past.is_empty() && max_prompt_ctx > 1 {
-            prompt.push(tk.sot_prev);
-            let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
-            prompt.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
-        }
-        prompt.extend_from_slice(&sot_seq);
-
-        // Prefill the prompt; the first forward's softmax gives no_speech_prob
-        // (whisper.cpp 7165-7182). Compute it BEFORE filtering.
-        let t_prefill = std::time::Instant::now();
-        let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
-        super::perf_span(
-            "decoder_prefill",
-            t_prefill.elapsed().as_secs_f64() * 1e3,
-            &format!("\"prompt_tokens\":{}", prompt.len()),
-        );
-        let no_speech_prob = {
-            let lp = compute_logprobs(&prefill_logits);
-            usize::try_from(tk.no_speech)
-                .ok()
-                .and_then(|i| lp.get(i).copied())
-                .map_or(0.0, |x| {
-                    // Defense-in-depth: a non-finite logprob must not export a
-                    // NaN no_speech_prob into the silence gate / routing snapshot.
-                    let p = f64::from(x.exp());
-                    if p.is_finite() { p } else { 0.0 }
-                })
-        };
-
-        // Greedy decode loop.
-        let t_loop = std::time::Instant::now();
-        let mut decoded: Vec<i32> = Vec::new();
-        let mut plogs: Vec<f32> = Vec::new();
-        let mut has_ts = false;
-        let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
-        let mut result_len = 0usize;
-        let mut step_logits = prefill_logits;
-
-        for i in 0..n_max_tokens {
-            let (filtered, logprobs) = process_logits(
-                tk,
-                &cfg,
-                step_logits,
-                &decoded,
-                has_ts,
-                seek_delta_cs,
-                decoded.len(),
-            );
-            let (tok, plog) = argmax(&filtered, &logprobs);
-            decoded.push(tok);
-            plogs.push(plog);
-
-            // Update sliding window from a timestamp token (whisper.cpp 7362-7375).
-            if tok > tk.timestamp_begin {
-                let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
-                if has_ts && seek_delta_cs > new_delta && result_len < i {
-                    // Going back in time: bail out of this window (whisper.cpp 7366-7369).
-                    break;
-                }
-                seek_delta_cs = new_delta;
-                result_len = i + 1;
-                has_ts = true;
-            }
-
-            // End of segment (whisper.cpp 7387-7410). `budget_reached` is the
-            // `params.max_tokens > 0 && i >= params.max_tokens` clause: the
-            // EOT-forcing filter masked text from sampled-token index `mt`
-            // onward, so the token at index `i == mt` is the forced closer and
-            // the window completes here with `decoded.len() == mt + 1`.
-            let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-            let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
-            if tok == tk.eot || budget_reached || reached_end {
-                if result_len == 0 && params.timestamps {
-                    if reached_end {
-                        result_len = i + 1;
-                    } else {
-                        // Decoder failed with no timestamps closed.
-                        break;
-                    }
-                }
-                if !params.timestamps {
-                    result_len = i + 1;
-                    seek_delta_cs = CHUNK_CS;
-                }
-                break;
-            }
-
-            // Cancellation between every decoder step (the project contract).
+        let mut seek_cs: i64 = 0;
+        // Set for one iteration when retrying a failed window with the carried prompt
+        // cleared (FW_RETRY_FAILED_WINDOW). Reset once the window completes.
+        let mut force_empty_prompt = false;
+        while seek_cs + DELTA_MIN < seek_end_cs {
             checkpoint()?;
 
-            // Forward the just-chosen token to get the next logits.
-            step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
-        }
-
-        // avg_logprob over result tokens (whisper.cpp 6602-6617).
-        let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
-            &plogs[..result_len]
-        } else {
-            &plogs[..]
-        };
-        let avg_logprob = if result_plogs.is_empty() {
-            EMPTY_WINDOW_AVG_LOGPROB
-        } else {
-            result_plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / result_plogs.len() as f64
-        };
-        // A non-finite mean (a NaN/inf plog escaping the decoder) degrades to the
-        // finite empty-window sentinel so the silence gate and routing snapshot
-        // never see NaN (a NaN would silently read as "not silence").
-        let avg_logprob = if avg_logprob.is_finite() {
-            avg_logprob
-        } else {
-            EMPTY_WINDOW_AVG_LOGPROB
-        };
-
-        // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
-        // silence, emit nothing, advance the full window.
-        let is_no_speech = no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
-
-        // single-timestamp-ending: skip the rest of the chunk (whisper.cpp
-        // 7753-7760). Ordering fix #5: upstream emits segments (7624-7730) and
-        // records DTW word timings with the ORIGINAL `seek_delta`, then applies
-        // this whole-chunk skip ONLY to the seek advance (7753-7760). So we keep
-        // `seek_delta_cs` untouched for build_segments/window_word_timings below
-        super::perf_span(
-            "decode_loop",
-            t_loop.elapsed().as_secs_f64() * 1e3,
-            &format!("\"tokens\":{}", decoded.len()),
-        );
-        // and compute a separate `seek_advance_cs` for the window step.
-        //
-        // whisper.cpp resizes the sequence to `result_len` (dropping the
-        // loop-terminating EOT and anything past the last closed timestamp)
-        // BEFORE this test (whisper.cpp 7534, `sequence.tokens.resize(result_len)`).
-        // Testing the full `decoded` — which still holds the EOT the loop pushed
-        // at line ~1270 before breaking — makes an EOT-closed window that ends
-        // "…text <|ts|> <eot>" read as "(ts, eot)" instead of "(text, ts)", so the
-        // skip-rest-of-chunk NEVER fires on EOT-terminated windows. That spawns a
-        // spurious extra window over the post-speech zero-padding (jfk: a
-        // hallucinated "a." second window that whisper.cpp does not emit). Match
-        // upstream exactly: run the test on the `result_len`-truncated slice.
-        let result_decoded: &[i32] = &decoded[..result_len.min(decoded.len())];
-        let single_ts_ending = single_timestamp_ending(
-            result_decoded,
-            tk.timestamp_begin,
-            params.timestamps,
-            user_max_tokens,
-        );
-        let seek_advance_cs = if single_ts_ending {
-            (seek_end_cs - seek_cs).min(CHUNK_CS)
-        } else {
-            seek_delta_cs
-        };
-
-        windows.push(WindowStats {
-            avg_logprob,
-            no_speech_prob,
-            tokens: result_len,
-            window_offset_sec: seek_cs as f64 / 100.0,
-        });
-
-        if !is_no_speech && !decoded.is_empty() {
-            // Use only the result_len tokens for emission (drop a trailing eot).
-            let take = result_len.min(decoded.len());
-            let result_tokens = &decoded[..take];
-            // Debug hook (`PROBE_DUMP_TOKENS=1`): emit this window's raw token ids
-            // to stderr for offline analysis (e.g. prompt-lookup/n-gram speculation
-            // accept-rate simulation). Off by default, zero cost when unset.
-            if std::env::var_os("PROBE_DUMP_TOKENS").is_some() {
-                use std::fmt::Write as _;
-                let mut line = String::from("TOKENS>>>");
-                for (i, &t) in result_tokens.iter().enumerate() {
-                    if i > 0 {
-                        line.push(',');
-                    }
-                    let _ = write!(line, "{t}");
-                }
-                line.push_str("<<<");
-                eprintln!("{line}");
+            // Encode this window's mel chunk. A full window is 3000 mel frames
+            // (1500 encoder ctx); a tail window with under 30 s of real audio left
+            // is truncated to `2*enc_ctx` mel frames (`enc_ctx` encoder rows),
+            // mirroring whisper.cpp's audio_ctx (-ac) feature — a near-empty final
+            // window otherwise pays a full encode for a fraction of a second of
+            // audio (perf hotspot #1). Timestamp/precision semantics are unaffected
+            // (`max_initial_tid` is tied to the full model `n_audio_ctx`, not this
+            // window's ctx — whisper.cpp 6322).
+            let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
+            // Real (unpadded) audio remaining in this window, in mel frames
+            // (1 mel frame = 1 cs); capped at the full window, as whisper.cpp does.
+            let real_frames = usize::try_from((seek_end_cs - seek_cs).max(0))
+                .unwrap_or(0)
+                .min(FRAMES_PER_CHUNK);
+            let enc_ctx = tail_enc_ctx(real_frames, seek_cs == 0, tail_truncate);
+            let mel_frames = enc_ctx * 2;
+            if mel_frames < FRAMES_PER_CHUNK {
+                tracing::debug!(
+                    target: "franken_whisper::native_engine::decode",
+                    seek_cs,
+                    real_frames,
+                    enc_ctx,
+                    mel_frames,
+                    "tail-window encoder-context truncation engaged"
+                );
             }
-            let result_token_plogs = &plogs[..take];
-            let win_segments = build_segments(
-                tk,
-                result_tokens,
-                result_token_plogs,
-                seek_cs,
-                seek_delta_cs,
-                seek_end_cs,
+            let t_enc = std::time::Instant::now();
+            // Take the prefetched encode if the pipeline already computed THIS window
+            // (overlapped with the previous window's decode); otherwise encode inline.
+            let enc = if pipeline && prefetched == Some(frame_offset) {
+                match res_rx.recv() {
+                    Ok(r) => r?,
+                    Err(_) => encoder::forward_from_full_mel_window(
+                        &m.encoder,
+                        &full_mel,
+                        frame_offset,
+                        mel_frames,
+                        params.n_threads,
+                        checkpoint,
+                    )?,
+                }
+            } else {
+                encoder::forward_from_full_mel_window(
+                    &m.encoder,
+                    &full_mel,
+                    frame_offset,
+                    mel_frames,
+                    params.n_threads,
+                    checkpoint,
+                )?
+            };
+            // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
+            // no_timestamps advance is always CHUNK_CS, so the next offset is known and
+            // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
+            prefetched = None;
+            if pipeline {
+                let next_seek = seek_cs + CHUNK_CS;
+                if next_seek + DELTA_MIN < seek_end_cs {
+                    let next_off = frame_offset + CHUNK_CS as usize;
+                    let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
+                        .unwrap_or(0)
+                        .min(FRAMES_PER_CHUNK);
+                    let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
+                    if req_tx.send((next_off, next_ctx * 2)).is_ok() {
+                        prefetched = Some(next_off);
+                    }
+                }
+            }
+            super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
+            let t_xkv = std::time::Instant::now();
+            let mut st = DecoderState::new(&m.decoder, &enc)?;
+            super::perf_span("cross_kv", t_xkv.elapsed().as_secs_f64() * 1e3, "");
+
+            // First-window language auto-detect (multilingual, no explicit
+            // language): reuses this window's encode + this state's cross K/V.
+            if used_language.is_none() {
+                used_language = detect_language_from_enc(m, &mut st, checkpoint)?;
+            }
+
+            // Short-tail prompt clearing (fix #2 — whisper.cpp 7046-7051): a
+            // non-first window with under 5 s of audio left drops the carried prompt
+            // to avoid repetition/hallucination on the tail.
+            if should_clear_short_tail_prompt(seek_cs, seek_end_cs) {
+                prompt_past.clear();
+            }
+
+            // Build the prompt: [sot_prev, ...past...] + sot_sequence (whisper.cpp
+            // 7106-7133). prompt_init is the sot sequence for this language/task.
+            let sot_seq = tk.sot_sequence(
+                used_language.as_deref(),
+                params.translate,
                 params.timestamps,
             );
-
-            // DTW word timestamps (bd-rjsx): record cross-attention over this
-            // window's result tokens and align them to audio frames. Computed
-            // before `win_segments` is moved so we stay 1:1 with it. When
-            // requested we always push one (possibly empty) word vec per emitted
-            // segment so `word_timings` stays aligned with `segments`.
-            if params.word_timestamps {
-                let win_words = if align_heads.is_empty() {
-                    vec![Vec::new(); win_segments.len()]
-                } else {
-                    window_word_timings(
-                        m,
-                        &mut st,
-                        used_language.as_deref(),
-                        params,
-                        &align_heads,
-                        result_tokens,
-                        &win_segments,
-                        seek_cs,
-                        seek_delta_cs,
-                        checkpoint,
-                    )?
-                };
-                word_timings.extend(win_words);
+            let mut prompt: Vec<i32> = Vec::new();
+            // Carry the prior-window text prompt unless conditioning is disabled
+            // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
+            // `FW_NO_CONTEXT=1`) or this is a failed-window retry (`force_empty_prompt`,
+            // FW_RETRY_FAILED_WINDOW). Default (unset) keeps the carry ⇒ byte-identical.
+            let prompt_carried = !condition_on_prev_disabled()
+                && !force_empty_prompt
+                && !prompt_past.is_empty()
+                && max_prompt_ctx > 1;
+            if prompt_carried {
+                prompt.push(tk.sot_prev);
+                let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
+                prompt.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
             }
+            prompt.extend_from_slice(&sot_seq);
 
-            segments.extend(win_segments);
+            // Prefill the prompt; the first forward's softmax gives no_speech_prob
+            // (whisper.cpp 7165-7182). Compute it BEFORE filtering.
+            let t_prefill = std::time::Instant::now();
+            let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
+            super::perf_span(
+                "decoder_prefill",
+                t_prefill.elapsed().as_secs_f64() * 1e3,
+                &format!("\"prompt_tokens\":{}", prompt.len()),
+            );
+            let no_speech_prob = {
+                let lp = compute_logprobs(&prefill_logits);
+                usize::try_from(tk.no_speech)
+                    .ok()
+                    .and_then(|i| lp.get(i).copied())
+                    .map_or(0.0, |x| {
+                        // Defense-in-depth: a non-finite logprob must not export a
+                        // NaN no_speech_prob into the silence gate / routing snapshot.
+                        let p = f64::from(x.exp());
+                        if p.is_finite() { p } else { 0.0 }
+                    })
+            };
 
-            // Update rolling context: the decoded text tokens (whisper.cpp
-            // 7617-7622), capped to the prompt budget.
-            prompt_past.clear();
-            for &t in result_tokens {
-                if !tk.is_special(t) {
-                    prompt_past.push(t);
+            // Greedy decode loop.
+            let t_loop = std::time::Instant::now();
+            let mut decoded: Vec<i32> = Vec::new();
+            let mut plogs: Vec<f32> = Vec::new();
+            let mut has_ts = false;
+            let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
+            let mut result_len = 0usize;
+            let mut step_logits = prefill_logits;
+
+            for i in 0..n_max_tokens {
+                let (filtered, logprobs) = process_logits(
+                    tk,
+                    &cfg,
+                    step_logits,
+                    &decoded,
+                    has_ts,
+                    seek_delta_cs,
+                    decoded.len(),
+                );
+                let (tok, plog) = argmax(&filtered, &logprobs);
+                decoded.push(tok);
+                plogs.push(plog);
+
+                // Update sliding window from a timestamp token (whisper.cpp 7362-7375).
+                if tok > tk.timestamp_begin {
+                    let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
+                    if has_ts && seek_delta_cs > new_delta && result_len < i {
+                        // Going back in time: bail out of this window (whisper.cpp 7366-7369).
+                        break;
+                    }
+                    seek_delta_cs = new_delta;
+                    result_len = i + 1;
+                    has_ts = true;
                 }
-            }
-            if prompt_past.len() > max_prompt_ctx {
-                let drop = prompt_past.len() - max_prompt_ctx;
-                prompt_past.drain(0..drop);
-            }
-        } else if is_no_speech {
-            prompt_past.clear();
-        }
 
-        // Advance the window (whisper.cpp 7763) with the (possibly chunk-skip
-        // adjusted) advance, NOT the emission delta (fix #5).
-        seek_cs += seek_advance_cs.max(DELTA_MIN);
-    }
+                // End of segment (whisper.cpp 7387-7410). `budget_reached` is the
+                // `params.max_tokens > 0 && i >= params.max_tokens` clause: the
+                // EOT-forcing filter masked text from sampled-token index `mt`
+                // onward, so the token at index `i == mt` is the forced closer and
+                // the window completes here with `decoded.len() == mt + 1`.
+                let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
+                let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+                if tok == tk.eot || budget_reached || reached_end {
+                    if result_len == 0 && params.timestamps {
+                        if reached_end {
+                            result_len = i + 1;
+                        } else {
+                            // Decoder failed with no timestamps closed.
+                            break;
+                        }
+                    }
+                    if !params.timestamps {
+                        result_len = i + 1;
+                        seek_delta_cs = CHUNK_CS;
+                    }
+                    break;
+                }
+
+                // Cancellation between every decoder step (the project contract).
+                checkpoint()?;
+
+                // Forward the just-chosen token to get the next logits.
+                step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
+            }
+
+            // avg_logprob over result tokens (whisper.cpp 6602-6617).
+            let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
+                &plogs[..result_len]
+            } else {
+                &plogs[..]
+            };
+            let avg_logprob = if result_plogs.is_empty() {
+                EMPTY_WINDOW_AVG_LOGPROB
+            } else {
+                result_plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / result_plogs.len() as f64
+            };
+            // A non-finite mean (a NaN/inf plog escaping the decoder) degrades to the
+            // finite empty-window sentinel so the silence gate and routing snapshot
+            // never see NaN (a NaN would silently read as "not silence").
+            let avg_logprob = if avg_logprob.is_finite() {
+                avg_logprob
+            } else {
+                EMPTY_WINDOW_AVG_LOGPROB
+            };
+
+            // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
+            // silence, emit nothing, advance the full window.
+            let is_no_speech =
+                no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
+
+            // FW_RETRY_FAILED_WINDOW (default-off): a window that closed NO timestamp
+            // (`result_len == 0`, not silence) while carrying a prior-window prompt is
+            // the bd-r0qd long-form drop — the carried prompt × int8 numerics made the
+            // decoder emit `eot` early. Retry this SAME seek ONCE with the prompt
+            // cleared (fresh `st` next iteration; `FW_NO_CONTEXT`-style recovery, but
+            // targeted) before accepting the drop. `force_empty_prompt` makes it fire at
+            // most once per seek, so no infinite loop; unset ⇒ never fires ⇒ byte-exact.
+            if retry_failed_window_enabled()
+                && result_len == 0
+                && !is_no_speech
+                && !force_empty_prompt
+                && prompt_carried
+            {
+                force_empty_prompt = true;
+                continue; // re-decode this window with no carried prompt
+            }
+            force_empty_prompt = false;
+
+            // single-timestamp-ending: skip the rest of the chunk (whisper.cpp
+            // 7753-7760). Ordering fix #5: upstream emits segments (7624-7730) and
+            // records DTW word timings with the ORIGINAL `seek_delta`, then applies
+            // this whole-chunk skip ONLY to the seek advance (7753-7760). So we keep
+            // `seek_delta_cs` untouched for build_segments/window_word_timings below
+            super::perf_span(
+                "decode_loop",
+                t_loop.elapsed().as_secs_f64() * 1e3,
+                &format!("\"tokens\":{}", decoded.len()),
+            );
+            // and compute a separate `seek_advance_cs` for the window step.
+            //
+            // whisper.cpp resizes the sequence to `result_len` (dropping the
+            // loop-terminating EOT and anything past the last closed timestamp)
+            // BEFORE this test (whisper.cpp 7534, `sequence.tokens.resize(result_len)`).
+            // Testing the full `decoded` — which still holds the EOT the loop pushed
+            // at line ~1270 before breaking — makes an EOT-closed window that ends
+            // "…text <|ts|> <eot>" read as "(ts, eot)" instead of "(text, ts)", so the
+            // skip-rest-of-chunk NEVER fires on EOT-terminated windows. That spawns a
+            // spurious extra window over the post-speech zero-padding (jfk: a
+            // hallucinated "a." second window that whisper.cpp does not emit). Match
+            // upstream exactly: run the test on the `result_len`-truncated slice.
+            let result_decoded: &[i32] = &decoded[..result_len.min(decoded.len())];
+            let single_ts_ending = single_timestamp_ending(
+                result_decoded,
+                tk.timestamp_begin,
+                params.timestamps,
+                user_max_tokens,
+            );
+            let seek_advance_cs = if single_ts_ending {
+                (seek_end_cs - seek_cs).min(CHUNK_CS)
+            } else {
+                seek_delta_cs
+            };
+
+            windows.push(WindowStats {
+                avg_logprob,
+                no_speech_prob,
+                tokens: result_len,
+                window_offset_sec: seek_cs as f64 / 100.0,
+            });
+
+            if !is_no_speech && !decoded.is_empty() {
+                // Use only the result_len tokens for emission (drop a trailing eot).
+                let take = result_len.min(decoded.len());
+                let result_tokens = &decoded[..take];
+                // Debug hook (`PROBE_DUMP_TOKENS=1`): emit this window's raw token ids
+                // to stderr for offline analysis (e.g. prompt-lookup/n-gram speculation
+                // accept-rate simulation). Off by default, zero cost when unset.
+                if std::env::var_os("PROBE_DUMP_TOKENS").is_some() {
+                    use std::fmt::Write as _;
+                    let mut line = String::from("TOKENS>>>");
+                    for (i, &t) in result_tokens.iter().enumerate() {
+                        if i > 0 {
+                            line.push(',');
+                        }
+                        let _ = write!(line, "{t}");
+                    }
+                    line.push_str("<<<");
+                    eprintln!("{line}");
+                }
+                let result_token_plogs = &plogs[..take];
+                let win_segments = build_segments(
+                    tk,
+                    result_tokens,
+                    result_token_plogs,
+                    seek_cs,
+                    seek_delta_cs,
+                    seek_end_cs,
+                    params.timestamps,
+                );
+
+                // DTW word timestamps (bd-rjsx): record cross-attention over this
+                // window's result tokens and align them to audio frames. Computed
+                // before `win_segments` is moved so we stay 1:1 with it. When
+                // requested we always push one (possibly empty) word vec per emitted
+                // segment so `word_timings` stays aligned with `segments`.
+                if params.word_timestamps {
+                    let win_words = if align_heads.is_empty() {
+                        vec![Vec::new(); win_segments.len()]
+                    } else {
+                        window_word_timings(
+                            m,
+                            &mut st,
+                            used_language.as_deref(),
+                            params,
+                            &align_heads,
+                            result_tokens,
+                            &win_segments,
+                            seek_cs,
+                            seek_delta_cs,
+                            checkpoint,
+                        )?
+                    };
+                    word_timings.extend(win_words);
+                }
+
+                segments.extend(win_segments);
+
+                // Update rolling context: the decoded text tokens (whisper.cpp
+                // 7617-7622), capped to the prompt budget.
+                prompt_past.clear();
+                for &t in result_tokens {
+                    if !tk.is_special(t) {
+                        prompt_past.push(t);
+                    }
+                }
+                if prompt_past.len() > max_prompt_ctx {
+                    let drop = prompt_past.len() - max_prompt_ctx;
+                    prompt_past.drain(0..drop);
+                }
+            } else if is_no_speech {
+                prompt_past.clear();
+            }
+
+            // Advance the window (whisper.cpp 7763) with the (possibly chunk-skip
+            // adjusted) advance, NOT the emission delta (fix #5).
+            seek_cs += seek_advance_cs.max(DELTA_MIN);
+        }
 
         // Close the encoder-thread channel so the scoped worker exits; `scope`
         // then joins it before returning.
@@ -2013,7 +2087,11 @@ mod tests {
             let mut v: Vec<f32> = (0..n)
                 .map(|_| {
                     let u = nf();
-                    if u < 0.1 { f32::NEG_INFINITY } else { -30.0 * nf() }
+                    if u < 0.1 {
+                        f32::NEG_INFINITY
+                    } else {
+                        -30.0 * nf()
+                    }
                 })
                 .collect();
             if n > 0 {
@@ -2023,10 +2101,16 @@ mod tests {
             let got = logsumexp_sum_simd(&v, max);
             let want = scalar(&v, max);
             let rel = (got - want).abs() / want.abs().max(1e-30);
-            assert!(rel < 1e-3, "n={n}: simd {got} vs scalar {want} rel {rel:.2e}");
+            assert!(
+                rel < 1e-3,
+                "n={n}: simd {got} vs scalar {want} rel {rel:.2e}"
+            );
         }
         // All-masked (-inf, max=-inf) → sum exactly 0 (mask zeroes the NaN lanes).
-        assert_eq!(logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY), 0.0);
+        assert_eq!(
+            logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY),
+            0.0
+        );
     }
 
     #[test]
@@ -2414,8 +2498,14 @@ mod tests {
         let plogs = vec![0.0f32, f32::NAN];
         let conf = text_confidence(&tk, &tokens, &plogs).expect("finite text token present");
         assert!(conf.is_finite(), "confidence must be finite, got {conf}");
-        assert!((0.0..=1.0).contains(&conf), "confidence in [0,1], got {conf}");
-        assert!((conf - 1.0).abs() < 1e-9, "only the finite plog (0.0) counts → exp(0)=1");
+        assert!(
+            (0.0..=1.0).contains(&conf),
+            "confidence in [0,1], got {conf}"
+        );
+        assert!(
+            (conf - 1.0).abs() < 1e-9,
+            "only the finite plog (0.0) counts → exp(0)=1"
+        );
 
         // Every text-token plog non-finite → all skipped → None (no NaN mean, no
         // clamp panic).
@@ -2429,14 +2519,25 @@ mod tests {
         // (`-inf`) lane; the finite lanes must still yield finite logprobs
         // instead of a NaN-poisoned whole vector.
         let lp = compute_logprobs(&[f32::INFINITY, 0.0, -1.0]);
-        assert!(lp[1].is_finite(), "logprob for finite logit 0.0 must be finite, got {}", lp[1]);
-        assert!(lp[2].is_finite(), "logprob for finite logit -1.0 must be finite, got {}", lp[2]);
+        assert!(
+            lp[1].is_finite(),
+            "logprob for finite logit 0.0 must be finite, got {}",
+            lp[1]
+        );
+        assert!(
+            lp[2].is_finite(),
+            "logprob for finite logit -1.0 must be finite, got {}",
+            lp[2]
+        );
         assert!(!lp[1].is_nan() && !lp[2].is_nan(), "no NaN logprobs");
 
         // A NaN logit is likewise neutralized (mapped to a masked lane) rather
         // than poisoning the finite lanes.
         let lp2 = compute_logprobs(&[f32::NAN, 0.0, -1.0]);
-        assert!(lp2[1].is_finite() && lp2[2].is_finite(), "NaN logit must not poison finite lanes");
+        assert!(
+            lp2[1].is_finite() && lp2[2].is_finite(),
+            "NaN logit must not poison finite lanes"
+        );
     }
 
     #[test]
@@ -2652,7 +2753,10 @@ mod tests {
         // A NaN plog makes the mean NaN; the guarded clamp must not panic on the
         // current nightly and must degrade to a finite 0.0.
         let c = confidence(&[f32::NAN, 0.0]).expect("non-empty plogs → Some");
-        assert!(c.is_finite(), "confidence must be finite on NaN input, got {c}");
+        assert!(
+            c.is_finite(),
+            "confidence must be finite on NaN input, got {c}"
+        );
         assert_eq!(c, 0.0);
     }
 
