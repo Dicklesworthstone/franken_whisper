@@ -80,6 +80,17 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
   **Full current-code headline (track01, matched threads): turbo encoder 2.29× · turbo no_ts ~2.3× · turbo
   segTS ~1.77× · turbo wordTS ~1.71× · tiny.en no_ts ~1.93× · tiny.en TS (retry) ~1.39× — every model×mode
   ~1.4–2.3×, roughly double the pre-int8 "~1.2×" boilerplate, and franken WINS every one measured.**
+- **GENERALIZES to a 2nd, much longer, different-content clip + a FAITHFULNESS win (2026-07-12):** the
+  Steve Jobs iPhone keynote (`sjobs.wav`, **840.5 s / 28 windows**, turbo no_ts, `-t 32`, 2 reps, load
+  40–50 both stable) — **fw ~52 s vs whisper.cpp ~134 s = ~2.58× FASTER** (even higher than track01, as the
+  28-window encode weights the 2.29× encoder more). **BUT it's also a QUALITY win that muddies the raw
+  ratio in franken's favour:** fw is **clean** (1855 words, max repeated 5-gram = 3 — a natural phrase),
+  while **whisper.cpp DEGRADES into severe greedy repetition loops** ("you know, you know" ×19, "use a
+  stylus" ×11, tail "We're going to ship it." ×4) and only 1090 words (~1.3 w/s, too low for a keynote ⇒
+  ~40 % dropped). Both start byte-identical. So here whisper.cpp — *with* temp-fallback — loops/drops while
+  franken's greedy int8 decoder stays faithful; **franken is faster AND cleaner** on this clip. (Note: this
+  is the reverse of the tiny.en content-drop above — the greedy repetition/drop failure mode is
+  clip-and-decoder-specific and afflicts BOTH engines on different audio.)
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
