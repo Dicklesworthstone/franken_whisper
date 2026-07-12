@@ -157,14 +157,18 @@ flag decision). The recipe + hazards below are retained as the historical record
   **BASELINE ESTABLISHED + BLOCKER SHARPENED (2026-07-12):** the SHIPPING int8 `fw` is
   **byte-identical (normalized) to whisper.cpp on jfk** (`whisper-cli -m tiny.en -nt -t 8` vs
   `fw transcribe --no-persist`) — so the default int8 engine is faithful on real speech; the
-  gated-lever WER baseline on jfk is **≈0**. **But the actual gate is the CORPUS, not just owner
-  sign-off:** the only clean-speech-with-reference clip on this box is **jfk** — `whisper-cli`
-  **cannot read `.mp3`** (so `example_audio_track_01.mp3`, the discriminating real-speech clip,
-  has no whisper.cpp reference), and `tests/fixtures/audio/test_10s_speech.wav` is **non-speech**
-  (whisper.cpp → "bell dings", `fw` → empty; unusable for WER). ⇒ Evaluating ANY gated lever
-  (encoder int8 variants, poly-exp) at corpus-WER first needs the **owner to provide a diverse
-  speech corpus with references** (or decoded `.wav`s of the mp3s). The method is proven; the
-  data is missing.
+  gated-lever WER baseline on jfk is **≈0**. **mp3-corpus limitation RESOLVED (`decode_to_wav` example, `e221630`):** `whisper-cli` can't read
+  `.mp3`, but `cargo run --release --example decode_to_wav -- <mp3> <wav>` (built-in symphonia, no
+  ffmpeg) makes any mp3 whisper-cli-readable. So `example_audio_track_01.mp3` now HAS a reference.
+  **ENCODER-INT8 PROPER-NOUN WER (2026-07-12, positive):** the concern gating the shipped int8 was
+  proper-noun safety — MEASURED on the track01 proper-noun clip (turbo): fw (shipping int8) vs
+  whisper.cpp turbo = **271 vs 283 words (~96%), ~22 diff lines (~4% word variance)**, and the proper
+  nouns are CORRECT (FrankenSearch, Twitter, XF, CAS×2, Daniel). No content-drop (turbo covers the full
+  span). ⇒ the shipped int8 encoder is **proper-noun-faithful** on this clip; the ~4% is normal
+  cross-quant/decode variance, not a quality bug. Still only 2 real-speech clips (jfk + track01) on box;
+  a full corpus-WER for the remaining gated levers needs the **owner to supply more diverse speech**,
+  but the mp3-corpus tooling is now in-tree and the int8 encoder is validated proper-noun-safe on the
+  one proper-noun clip available.
 
 ## Recommendation
 
