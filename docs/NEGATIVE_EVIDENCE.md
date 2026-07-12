@@ -2326,6 +2326,54 @@ complete sync; then run the single-invocation paired A/B and profile the
 retrieved benchmark binary. A future REJECT must record non-zero self-time for
 `attention_decode_step_column_keys`; absent that figure, the row stays open.
 
+### RESOLVED 2026-07-12 — column-major packed-K: byte-exact but below-bar AND harness-unresolvable → **REJECT/CLOSED**
+
+Ran the parked A/B **locally** (the 2026-07-10 blocker was `RCH_REQUIRE_REMOTE=1`
+refusing local fallback on a sync timeout — criterion bench bins never sync back
+from rch anyway, so a forced-local build is the correct route; `RCH_MIN_LOCAL_TIME_MS=999999999`).
+Same harness (`native_engine/self_attn_k_layout`), real `attention_with_cache`
+production arms, `attention_decode_step_column_keys` reached (candidate cache has
+`k_columns`). Three independent findings, all pointing the same way:
+
+1. **Parity is byte-exact — CONFIRMED (not just "source unchanged").** The harness
+   asserts `original_out.to_bits() == candidate_out.to_bits()` on the full 1280-float
+   output *before* any candidate timing. That `assert_eq!` **passed in every one of
+   6 fresh process runs** (no panic). The d-outer/j-inner AXPY over contiguous key
+   columns reproduces the row-major scalar dot bit-for-bit, exactly as designed. So
+   the layout is safe; the only open question was *speed*.
+
+2. **Timing is structurally unresolvable by this harness — the BASE/BASE null control
+   fails.** The harness (correctly, per `project_abba_null_control`) first times two
+   identically-populated row-major caches through the same ABBA routine and gates the
+   candidate on the null median landing in the pre-declared `[0.98, 1.02]` band. Across
+   **6/6 fresh processes pinned to one core** (single-threaded scalar kernel — pinning
+   is legitimate here, the taskset/rayon-oversubscription warning does not apply), the
+   null median was **1.046, 1.047, 1.035, 1.027, 0.946, 1.048** (cv 2–3.5%, wins mostly
+   26–31/31 one-sided). That is a **~3–5% object-identity heap-placement bias between the
+   two distinct `KvCache` allocations, sign varying by process** — ABBA cancels *time*
+   order but cannot cancel a bias tied to *object identity*. Every run returned
+   `verdict=BLOCKED_NULL_MEDIAN` / `candidate_not_timed=true`. Since the BASE/BASE noise
+   floor (±5%) exceeds both the acceptance band (±2%) and any plausible column-keys
+   effect, **the candidate ratio is not certifiable at the resolution this harness
+   targets** — no amount of re-running changes that (the bias is per-heap-layout, not
+   per-sample noise).
+
+3. **The upstream ceiling makes the exact ratio moot.** This very entry's `perf annotate`
+   (above) puts the entire scalar self-K score chain at **~0.09% of full transcription**,
+   and a fresh `perf record` of the harness's `profile_only_*` benches shows the resolved
+   hot symbols are `__ieee754_exp_fma` / `exp@@GLIBC` — i.e. self_attn's cost is the
+   **scalar softmax `exp`**, which column-keys does **not** touch (it only rearranges the
+   score-dot read). Even a *perfect* elimination of the score dot is <0.1% e2e, and it is
+   **pipelining-hidden in the default no_ts path** ([[project_window_pipelining_lever]]).
+
+**Disposition:** byte-exact (no WER risk, no owner gate needed) but **too small to land
+and unmeasurable at its target resolution.** Column-major packed-K joins the fully-closed
+self-attention family alongside f16-KV, the F16C dequant, and the row-major scores-dot
+loop-swap. Do not re-run this A/B — the null control will keep blocking (object-identity
+bias), and the ceiling is fixed at ~0.09% e2e. The bench harness is committed as the
+reproducible artifact; the `k_columns` path stays gated behind the `_for_bench` cache
+constructors (never wired into production cache construction).
+
 ---
 ## 2026-07-10 - cc_fw: **LEDGER-INTEGRITY AUDIT of all 10 do-not-retry families** — **1 row INVALID (benched a consumer the engine abandoned 7 days earlier), 1 LANDED win's e2e attribution WRONG, 1 "REJECT" is really a SIZING argument, 2 i7 rows are gated-path-only AND substrate-invalid.** Method: static reachability, which is *stronger* than sampled self-time for "does it execute".
 

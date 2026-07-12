@@ -42,7 +42,7 @@
 
 use std::hint::black_box;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -507,6 +507,351 @@ fn bench_decoder_token_step_tiny(c: &mut Criterion) {
 
 fn bench_decoder_token_step_large(c: &mut Criterion) {
     bench_decoder_token_step(c, MODEL_LARGE, "large");
+}
+
+// ---------------------------------------------------------------------------
+// 3b. self-attention packed K — same-binary, interleaved BASE/candidate A/B
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct PairedRatioStats {
+    median: f64,
+    p10: f64,
+    p90: f64,
+    min: f64,
+    max: f64,
+    cv_pct: f64,
+    wins: usize,
+}
+
+fn paired_ratio_stats(ratios: &[f64]) -> PairedRatioStats {
+    assert!(!ratios.is_empty());
+    let mut sorted = ratios.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let nearest_rank = |percent: usize| {
+        let index = (sorted.len() * percent).div_ceil(100).saturating_sub(1);
+        sorted[index.min(sorted.len() - 1)]
+    };
+    let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    let variance = if ratios.len() > 1 {
+        ratios
+            .iter()
+            .map(|ratio| (ratio - mean).powi(2))
+            .sum::<f64>()
+            / (ratios.len() - 1) as f64
+    } else {
+        0.0
+    };
+    PairedRatioStats {
+        median: sorted[sorted.len() / 2],
+        p10: nearest_rank(10),
+        p90: nearest_rank(90),
+        min: sorted[0],
+        max: sorted[sorted.len() - 1],
+        cv_pct: variance.sqrt() / mean * 100.0,
+        wins: ratios.iter().filter(|&&ratio| ratio > 1.0).count(),
+    }
+}
+
+fn format_ratios(ratios: &[f64]) -> String {
+    ratios
+        .iter()
+        .map(|ratio| format!("{ratio:.6}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn measure_self_attn_arm(
+    cache: &mut franken_whisper::native_engine::nn::KvCache,
+    q: &Mat,
+    k_new: &Mat,
+    v_new: &Mat,
+    n_head: usize,
+    prefill: usize,
+    inner_steps: usize,
+) -> Duration {
+    use franken_whisper::native_engine::nn::attention_with_cache;
+
+    let started = Instant::now();
+    for _ in 0..inner_steps {
+        let output = attention_with_cache(
+            black_box(q),
+            black_box(k_new),
+            black_box(v_new),
+            black_box(n_head),
+            black_box(&mut *cache),
+        )
+        .expect("self-attention step");
+        black_box(output.data.as_slice());
+        cache.truncate_for_bench(prefill);
+    }
+    started.elapsed()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paired_self_attn_ratios(
+    first: &mut franken_whisper::native_engine::nn::KvCache,
+    second: &mut franken_whisper::native_engine::nn::KvCache,
+    q: &Mat,
+    k_new: &Mat,
+    v_new: &Mat,
+    n_head: usize,
+    prefill: usize,
+    inner_steps: usize,
+    repetitions: usize,
+) -> Vec<f64> {
+    let measure = |cache: &mut franken_whisper::native_engine::nn::KvCache| {
+        measure_self_attn_arm(cache, q, k_new, v_new, n_head, prefill, inner_steps)
+    };
+    let mut ratios = Vec::with_capacity(repetitions);
+    for repetition in 0..repetitions {
+        let (first_elapsed, second_elapsed) = if repetition % 2 == 0 {
+            let first_before = measure(first);
+            let second_before = measure(second);
+            let second_after = measure(second);
+            let first_after = measure(first);
+            (first_before + first_after, second_before + second_after)
+        } else {
+            let second_before = measure(second);
+            let first_before = measure(first);
+            let first_after = measure(first);
+            let second_after = measure(second);
+            (first_before + first_after, second_before + second_after)
+        };
+        ratios.push(first_elapsed.as_secs_f64() / second_elapsed.as_secs_f64());
+    }
+    ratios
+}
+
+fn bench_self_attn_column_keys(c: &mut Criterion) {
+    use franken_whisper::native_engine::nn::{KvCache, attention_with_cache};
+
+    // large-v3-turbo decoder geometry: d_model=1280, 20 heads, 448-token text
+    // context. The last-token case maximizes the live score loop without using
+    // a private replica of the production function.
+    const N_STATE: usize = 1280;
+    const N_HEAD: usize = 20;
+    const CAPACITY: usize = 448;
+    const PREFILL: usize = CAPACITY - 1;
+    const INNER_STEPS: usize = 16;
+    const WARMUP_REPS: usize = 3;
+    const PAIRED_REPS: usize = 31;
+    const NULL_MEDIAN_MIN: f64 = 0.98;
+    const NULL_MEDIAN_MAX: f64 = 1.02;
+
+    let mut lcg = Lcg::new(0xc011_0a7e);
+    let prefill_k = Mat::from_vec(
+        PREFILL,
+        N_STATE,
+        (0..PREFILL * N_STATE)
+            .map(|_| 0.1 * lcg.next_f32())
+            .collect(),
+    );
+    let prefill_v = Mat::from_vec(
+        PREFILL,
+        N_STATE,
+        (0..PREFILL * N_STATE)
+            .map(|_| 0.1 * lcg.next_f32())
+            .collect(),
+    );
+    let q = Mat::from_vec(
+        1,
+        N_STATE,
+        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
+    );
+    let k_new = Mat::from_vec(
+        1,
+        N_STATE,
+        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
+    );
+    let v_new = Mat::from_vec(
+        1,
+        N_STATE,
+        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
+    );
+
+    let prefill = |cache: &mut KvCache| {
+        cache
+            .append(black_box(&prefill_k), black_box(&prefill_v))
+            .expect("prefill self-attention cache");
+    };
+    let mut null_first = KvCache::new_row_major_keys_for_bench(CAPACITY, N_STATE);
+    let mut null_second = KvCache::new_row_major_keys_for_bench(CAPACITY, N_STATE);
+    let mut original = KvCache::new_row_major_keys_for_bench(CAPACITY, N_STATE);
+    let mut candidate = KvCache::new_column_major_keys_for_bench(CAPACITY, N_STATE);
+    prefill(&mut null_first);
+    prefill(&mut null_second);
+    prefill(&mut original);
+    prefill(&mut candidate);
+
+    // Establish the per-function timing floor first. BASE/BASE uses distinct,
+    // identically populated caches and the same ABBA routine as BASE/candidate.
+    black_box(paired_self_attn_ratios(
+        &mut null_first,
+        &mut null_second,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        WARMUP_REPS,
+    ));
+    let null_ratios = paired_self_attn_ratios(
+        &mut null_first,
+        &mut null_second,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        PAIRED_REPS,
+    );
+    let null_stats = paired_ratio_stats(&null_ratios);
+    eprintln!(
+        "SELF_K_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} min={:.6} \
+         max={:.6} cv_pct={:.3} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+        format_ratios(&null_ratios),
+        null_stats.median,
+        null_stats.p10,
+        null_stats.p90,
+        null_stats.min,
+        null_stats.max,
+        null_stats.cv_pct,
+        null_stats.wins,
+        PAIRED_REPS,
+    );
+    let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null_stats.median);
+
+    // Correctness is checked through the real public path before candidate
+    // timing. Both complete 1280-float outputs must match bit-for-bit.
+    let original_out = attention_with_cache(
+        black_box(&q),
+        black_box(&k_new),
+        black_box(&v_new),
+        black_box(N_HEAD),
+        black_box(&mut original),
+    )
+    .expect("original self-attention step");
+    original.truncate_for_bench(PREFILL);
+    let candidate_out = attention_with_cache(
+        black_box(&q),
+        black_box(&k_new),
+        black_box(&v_new),
+        black_box(N_HEAD),
+        black_box(&mut candidate),
+    )
+    .expect("candidate self-attention step");
+    candidate.truncate_for_bench(PREFILL);
+    assert_eq!(
+        original_out
+            .data
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        candidate_out
+            .data
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        "packed K layout changed turbo-shaped attention output"
+    );
+    black_box(original_out.data.as_slice());
+    black_box(candidate_out.data.as_slice());
+
+    if null_valid {
+        black_box(paired_self_attn_ratios(
+            &mut original,
+            &mut candidate,
+            &q,
+            &k_new,
+            &v_new,
+            N_HEAD,
+            PREFILL,
+            INNER_STEPS,
+            WARMUP_REPS,
+        ));
+        let candidate_ratios = paired_self_attn_ratios(
+            &mut original,
+            &mut candidate,
+            &q,
+            &k_new,
+            &v_new,
+            N_HEAD,
+            PREFILL,
+            INNER_STEPS,
+            PAIRED_REPS,
+        );
+        let candidate_stats = paired_ratio_stats(&candidate_ratios);
+        let verdict = if candidate_stats.median > null_stats.p90 {
+            "WIN_ABOVE_NULL_P90"
+        } else if candidate_stats.median < null_stats.p10 {
+            "REJECT_BELOW_NULL_P10"
+        } else {
+            "SURFACE_INSIDE_NULL"
+        };
+        eprintln!(
+            "SELF_K_CANDIDATE reach=attention_with_cache parity=bit_exact ratios=[{}] \
+             median={:.6} p10={:.6} p90={:.6} min={:.6} max={:.6} cv_pct={:.3} \
+             wins={}/{} null_median={:.6} null_floor=[{:.6},{:.6}] verdict={verdict}",
+            format_ratios(&candidate_ratios),
+            candidate_stats.median,
+            candidate_stats.p10,
+            candidate_stats.p90,
+            candidate_stats.min,
+            candidate_stats.max,
+            candidate_stats.cv_pct,
+            candidate_stats.wins,
+            PAIRED_REPS,
+            null_stats.median,
+            null_stats.p10,
+            null_stats.p90,
+        );
+    } else {
+        eprintln!(
+            "SELF_K_CANDIDATE verdict=BLOCKED_NULL_MEDIAN null_median={:.6} \
+             acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}] candidate_not_timed=true",
+            null_stats.median,
+        );
+    }
+
+    // These are profiler-reachability loops only, not A/B evidence. The valid
+    // comparison above is interleaved in one routine; these two labels merely
+    // give perf enough samples to verify both production symbols are live.
+    let mut group = c.benchmark_group("native_engine/self_attn_k_layout");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.bench_function("profile_only_orig_row_major", |b| {
+        b.iter(|| {
+            let elapsed = measure_self_attn_arm(
+                &mut original,
+                &q,
+                &k_new,
+                &v_new,
+                N_HEAD,
+                PREFILL,
+                1,
+            );
+            black_box(elapsed);
+        });
+    });
+    group.bench_function("profile_only_candidate_column_major", |b| {
+        b.iter(|| {
+            let elapsed = measure_self_attn_arm(
+                &mut candidate,
+                &q,
+                &k_new,
+                &v_new,
+                N_HEAD,
+                PREFILL,
+                1,
+            );
+            black_box(elapsed);
+        });
+    });
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1352,7 @@ criterion_group!(
     bench_encoder_window_large,
     bench_decoder_token_step_tiny,
     bench_decoder_token_step_large,
+    bench_self_attn_column_keys,
     bench_logits_gemv_large,
     bench_f16_gemv_dequant,
     bench_i7_qkv_activation_reuse,
