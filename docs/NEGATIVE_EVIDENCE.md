@@ -4,6 +4,34 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **REJECTED (measured REGRESSION ~5%) — multi-row batched INSERT for `persist_report` segments/events is SLOWER than the savepoint-skipped per-row path.**
+
+**Hypothesis (disproven).** After the savepoint-skip win (`FW_PERSIST_SKIP_STMT_SP`,
+commit b4f6213, ~1.48×), each segment/event was still a separate `execute_with_params`;
+I hypothesised fsqlite's per-statement *dispatch* (background_status + cached_parse +
+prepare/bind) was a big residual, and that packing rows into chunked multi-row INSERTs
+(`INSERT ... VALUES (..),(..),..`, chunk 512, `FW_PERSIST_MULTIROW`) would amortize it.
+Byte-identical persisted data (rows/keys/order unchanged; storage::tests **201/0**).
+
+**Measurement (`persist_report/segments/100` = 111 inserts, forced-local, external-env
+A/B interleaved 0/1/0/1; both arms keep savepoint-skip ON so only batching differs):**
+
+| rep | flag=0 (per-row) | flag=1 (multi-row, chunk 512) |
+|---|---|---|
+| 1 | 1.7442 ms | 1.8316 ms |
+| 2 | 1.7693 ms | 1.8666 ms |
+
+**Multi-row is ~5% SLOWER**, consistently (both reps; rep1 CIs non-overlapping:
+[1.705,1.783] vs [1.792,1.872]). **Verdict:** post-savepoint-skip the residual cost is
+the actual VDBE row insert + B-tree work — which batching does NOT reduce (same rows) —
+while multi-row *adds* dynamic SQL-string construction + a `Vec<Vec<SqliteValue>>` row
+buffer + a flat-params clone, and that marshaling overhead dominates. The per-row loop
+(with savepoints skipped) is already the better path. **Reverted** (the b4f6213
+savepoint-skip persist stays). **Do-not-retry** multi-row INSERT batching for persist
+unless fsqlite's per-statement dispatch is independently profiled as large
+post-savepoint (it is not — the `load_run_details` closeout shows the cost is VDBE
+query execution, not statement setup). [[project_fsqlite_statement_savepoint_skip]]
+
 ## 2026-07-11 - cod_fw: **SURFACED / INVALID PROFILE — `storage/load_run_details` is a fresh schema-probe lane with an exact fallback-preserving lever, but the strict-remote baseline produced no MEDIAN: `asupersync 0.3.5` compilation was SIGKILLed on `vmi1167313` while RCH remained `degraded`. No local Cargo fallback.**
 
 > **RESOLVED / REJECTED (SUB-FLOOR) 2026-07-12 (BlackThrush).** Implemented
