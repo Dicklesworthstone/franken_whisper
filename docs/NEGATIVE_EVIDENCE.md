@@ -4,6 +4,28 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **SWEPT — decode standard-path redundant-work is exhausted (compute_logprobs, cross-KV, LN, clones all checked). No byte-exact lever remains.**
+
+Final decode-path redundant-work sweep (the encode-reuse `f3d8550` was the one real find; everything
+else checked this session is sub-floor or genuinely-needed):
+
+- **`compute_logprobs` for `no_speech_prob` (decode.rs:1373)** reads ONE element (`lp[no_speech]`) of a
+  full log-softmax over the ~51,864 vocab. Looks reducible (compute `logits[i] - logsumexp` for one `i`,
+  skip the 200 KB Vec) — but it runs **once per WINDOW** (~5×/clip), ~5-10 µs each ⇒ **~0.004% of e2e.
+  Deeply sub-floor; not landed.** The OTHER caller (decode.rs:362, `process_logits`) is per-TOKEN and
+  **genuinely needs the full Vec** (sampling) — not reducible.
+- **cross-KV recompute on retry** — `DecoderState::new(&enc)` rebuilds cross-KV each window; on a retry
+  it's recomputed from the reused enc. Per [[project_per_window_overhead_subfloor]] the whole
+  DecoderState::new/cross_kv orchestration is **<0.25%** ⇒ sub-floor; only the ENCODE was worth reusing
+  (`f3d8550`).
+- **LN clones** (fused, `de72683`) and **clone-then-overwrite** (swept, 4cc2281) already done.
+
+**Net:** the decode path is redundant-work-free (encode-reuse landed; the rest sub-floor/needed). With
+the peripheral IO/DB lane, audio SIMD, the flag audit, the fresh profile + counters, and now this, the
+**byte-exact autonomous perf frontier is comprehensively exhausted**; remaining is owner/WER/infra-gated
+(temp fallback for bd-r0qd; encoder int8 corpus-WER; ToMe; GPU).
+
+---
 ## 2026-07-12 - BlackThrush: **LONG-FORM CONTENT-DROP bug REPRODUCED on an in-repo clip (tiny.en) + hatch CONFIRMED — so tiny.en long-form "speed" is partly from decoding LESS, not a clean win. Triggering clip found (was "blocked on owner's clip").**
 
 The `project_final_window_early_eot_bug` (bd-r0qd) investigation was BLOCKED — the on-box repro was
