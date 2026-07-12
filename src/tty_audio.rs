@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use flate2::Compression;
-use flate2::read::ZlibDecoder;
+use flate2::bufread::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -925,6 +925,11 @@ fn compress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
 const MAX_DECOMPRESSED_FRAME_BYTES: usize = 80_000;
 
 fn decompress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
+    // `input` is already a fully-buffered `&[u8]` (which implements `BufRead`), so
+    // feed it straight to the `bufread` decoder. `flate2::read::ZlibDecoder` would
+    // wrap it in an *additional* 32 KiB read-ahead `BufReader`, allocating + memmoving
+    // a scratch buffer for every frame; `flate2::bufread::ZlibDecoder` reads directly
+    // from the slice. Output is byte-identical — same inflate, no extra copy.
     let mut decoder = ZlibDecoder::new(input);
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
@@ -1870,6 +1875,49 @@ mod tests {
         let compressed = compress_chunk(data).expect("compression should work");
         let decompressed = decompress_chunk(&compressed).expect("decompression should work");
         assert_eq!(decompressed, data);
+    }
+
+    /// Byte-exactness certification for the `read::ZlibDecoder` ->
+    /// `bufread::ZlibDecoder` swap in [`decompress_chunk`]. Both decoders run the
+    /// identical inflate algorithm; only the input buffering differs (the `read`
+    /// variant wraps the slice in an extra 32 KiB `BufReader`). This asserts the
+    /// production `bufread` output is byte-identical to the legacy `read` reference
+    /// across empty, small, boundary, and near-limit frame sizes and several
+    /// content patterns, so the allocation-removal lever cannot alter any output.
+    #[test]
+    fn decompress_bufread_matches_read_reference_byte_exact() {
+        use std::io::Read as _;
+
+        fn decompress_read_reference(input: &[u8]) -> Vec<u8> {
+            let mut decoder = flate2::read::ZlibDecoder::new(input);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).expect("reference inflate");
+            out
+        }
+
+        // Sizes span 0, 1, byte/kib boundaries, a mulaw chunk, and just under the
+        // 80 000-byte decompression-bomb limit.
+        let sizes = [0usize, 1, 15, 16, 17, 160, 1600, 8192, 8193, 40_000, 79_999];
+        for &n in &sizes {
+            for pattern in 0u8..4 {
+                let data: Vec<u8> = (0..n)
+                    .map(|i| match pattern {
+                        0 => 0,                                // all-zero (highly compressible)
+                        1 => 0xAB,                             // constant
+                        2 => (i % 251) as u8,                  // strided
+                        _ => (i.wrapping_mul(2654435761)) as u8, // pseudo-random
+                    })
+                    .collect();
+                let compressed = compress_chunk(&data).expect("compress");
+                let production = decompress_chunk(&compressed).expect("bufread decompress");
+                let reference = decompress_read_reference(&compressed);
+                assert_eq!(
+                    production, reference,
+                    "bufread != read reference at size {n}, pattern {pattern}"
+                );
+                assert_eq!(production, data, "roundtrip failed at size {n}, pattern {pattern}");
+            }
+        }
     }
 
     #[test]
