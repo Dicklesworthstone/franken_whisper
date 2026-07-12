@@ -6,6 +6,36 @@ evidence. It exists to prevent stale optimism from being reused as proof.
 ---
 ## 2026-07-11 - cod_fw: **SURFACED / INVALID PROFILE — `storage/load_run_details` is a fresh schema-probe lane with an exact fallback-preserving lever, but the strict-remote baseline produced no MEDIAN: `asupersync 0.3.5` compilation was SIGKILLed on `vmi1167313` while RCH remained `degraded`. No local Cargo fallback.**
 
+> **RESOLVED / REJECTED (SUB-FLOOR) 2026-07-12 (BlackThrush).** Implemented
+> cod_fw's candidate (a) — derive both optional-column flags from ONE
+> `table_columns("runs")` snapshot instead of two `table_has_column` scans — behind
+> a kill-switch `FW_STORAGE_RUNS_1SCAN` (default one-scan), and MEASURED it. The
+> premise (the double `PRAGMA table_info(runs)` scan is worth optimizing) is
+> **disproven: the scan removal is sub-floor / within noise.** In-binary env-toggle
+> A/B is impossible here (edition 2024 + `#![deny(unsafe_code)]` ⇒ `env::set_var`
+> is an unusable unsafe call), so measured via the in-tree `bench_load_run_details`
+> (`segments/10`) with the flag set externally on the SAME cached binary, forced
+> local ([[project_asupersync_oom_roulette]]), interleaved 0/1/0/1:
+>
+> | rep | two_scan (flag=0) | one_scan (flag=1) |
+> |---|---|---|
+> | 1 | 576.88 µs | 581.48 µs |
+> | 2 | 606.70 µs | 576.81 µs |
+>
+> The **run-to-run variance of the *same* two_scan arm (576.88 → 606.70 µs, +5.2%)
+> exceeds any between-arm difference, and the between-arm sign flips across reps** —
+> i.e. pure noise. At ~580 µs/load the fsqlite VDBE query + JSON decode dominates;
+> one extra 12-column `table_info` scan (+ its `Vec<TableColumn>`) is negligible.
+> cod_fw's "144 metadata values per load" is real but sub-floor against the query
+> cost. Byte-exactness of the one-scan path WAS confirmed (unit test
+> `load_run_details_single_scan_flags_match_two_scan_probes` PASSED — the two
+> predicates are identical over the same PRAGMA output). Per ledger discipline
+> (~0-gain levers are reverted, not kept; the flag + legacy branch is net
+> complexity for no measurable gain) the production change was **reverted**; this
+> row is the closeout so the lane is not re-treaded. **Do-not-retry** unless the
+> fsqlite load path itself is first made ≳10× cheaper (then the scan fraction may
+> rise above the floor).
+
 **Negative-ledger-first selection.** Neither performance ledger contains a
 `load_run_details`, `table_has_column`, `PRAGMA table_info`, `replay_json`, or
 `acceleration_json` closeout. `bv --robot-triage` (`data_hash
