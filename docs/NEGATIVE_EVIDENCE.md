@@ -4,6 +4,29 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **SWEPT — the redundant clone-then-overwrite / large per-window copy vein is exhausted (encoder forward clean; decoder default path clean after the fused-LN land). Don't re-hunt.**
+
+The [[project_conv_wt_pretranspose_landed]] hunt ("find other constant-tensor recompute / redundant
+copy in hot paths") drove two landed wins — encoder `ln_into` and, this session, decoder
+`LayerNorm::apply_into` (de72683, the 3 per-token pre-norms). Swept the rest to confirm nothing
+else lands:
+
+- **Encoder forward** (`encoder.rs`): only two `.clone()` sites — `ln_into`'s own **`else`
+  (kill-switch) branch** and a **probe** (`perturbed = base.clone()`). The default path uses
+  `ln_into` (fused, uninit buffer) + in-place residual `add` + fresh attention/MLP buffers.
+  **No redundant large [1500, n_state] copy.**
+- **Decoder default forward** (`decoder.rs`): the 3 pre-norm clones are now `apply_into`. The
+  remaining `.clone()`/`.to_vec()` are all **off the default hot path or trivial**: `xd = x.clone()`
+  is in the default-OFF `FW_DRAFT_ACCEPT_LAYERS` probe; `x_last^T` clone (`x_last.data.clone()`) is
+  the **F32-embedding fallback** (default token_embedding is i8/f16, which read `x_last.data`
+  directly and "skip the x^T bookkeeping"); `x.row(last).to_vec()` is a single necessary
+  `[n_state]` extraction/token (sub-floor, not worth eliminating).
+
+**Net:** the redundant-copy vein is closed alongside the DB-N+1, IO/BufWriter, and audio-SIMD veins.
+No byte-exact hot-path copy remains to eliminate; the residual decode is at the int8/DRAM floor
+([[project_decode_structural_alloc]]) and the frontier is owner/WER/infra-gated.
+
+---
 ## 2026-07-12 - BlackThrush: **CORRECTION — my a18fed2 `FW_ENC_INT8_FC1` "WER-neutral proxy" evidence was WRONG (inert flag). tiny.en FULL int8 is ALREADY DEFAULT-ON, so fc1-only is superseded; the transcript-diff compared default-int8 vs default-int8.**
 
 **What I got wrong (a18fed2).** I transcript-diffed `FW_ENC_INT8_FC1=0` vs `=1` on tiny.en, saw
