@@ -25,6 +25,13 @@ the peripheral IO/DB lane, audio SIMD, the flag audit, the fresh profile + count
 **byte-exact autonomous perf frontier is comprehensively exhausted**; remaining is owner/WER/infra-gated
 (temp fallback for bd-r0qd; encoder int8 corpus-WER; ToMe; GPU).
 
+**Also swept (2026-07-12): the native diarization backend** (`src/backend/whisper_diarization_native.rs`)
+— the last genuinely-unexamined compute path. Production code is a **light "acoustic-feature clustering"
+heuristic** (line ~653), not a heavy neural speaker-embedding; the `.clone()`/`vec!` hits are per-request
+/ per-segment (sub-floor) or test fixtures. No byte-safe compute lever, and the clustering output is
+byte-exactness-risky. All modules (transcription hot path, sync/storage/export, audio, diarization) are
+now swept — no byte-exact perf lever remains anywhere.
+
 ---
 ## 2026-07-12 - BlackThrush: **LONG-FORM CONTENT-DROP bug REPRODUCED on an in-repo clip (tiny.en) + hatch CONFIRMED — so tiny.en long-form "speed" is partly from decoding LESS, not a clean win. Triggering clip found (was "blocked on owner's clip").**
 
