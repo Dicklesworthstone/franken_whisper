@@ -51,6 +51,28 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): sync **incremental** export writers wrap `File` in `BufWriter` (same antipattern as `export.rs`)
+
+**What.** The full-export writers in `src/sync.rs` (`export_table_runs/segments/events`)
+were already `BufWriter`-wrapped, but the three **incremental** export writers —
+`export_table_runs_incremental`, `export_table_segments_for_runs`,
+`export_table_events_for_runs` — created a raw `fs::File` and did `writeln!(file, …)`
+per row (one `write()` syscall per JSONL line). Wrapped each in `BufWriter`
+(`file.flush()?` already present; changed the trailing `file.sync_all()?` to
+`file.get_ref().sync_all()?` since `file` is now a `BufWriter`). **Byte-identical**
+JSONL output.
+
+**Correctness CERTIFIED.** `sync::tests` (export↔import round-trips incl. incremental
+cursor paths, all conflict policies): pass, byte-identical.
+
+**Sizing.** Identical `writeln!`-per-row → `BufWriter` mechanism as the `export.rs`
+win measured this session — `export/srt_write` in-binary A/B: raw `File` ~82 ms vs
+`BufWriter` ~2 ms = **~40×** on the write cost (one `write()` syscall per line was the
+entire bottleneck). No separate bench added (same std pattern, same in-tree
+measurement). NOTE: the two `_for_runs` writers ALSO carry a per-run N+1 `SELECT`
+(one query per run_id) — a separate, order-sensitive lever left for later; this change
+only removes the write-side syscall storm.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): export writers wrap `File` in `BufWriter` — **~40× faster subtitle/transcript export**
 
 **What.** Every export writer (`write_txt/vtt/srt/csv/lrc/json/json_full` in

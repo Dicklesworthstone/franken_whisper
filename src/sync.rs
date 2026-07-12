@@ -717,7 +717,10 @@ fn export_table_runs_incremental(
             .map_err(|error| FwError::Storage(error.to_string()))?
     };
 
-    let mut file = fs::File::create(path)?;
+    // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
+    // of one syscall per JSONL line (the full-export writers above are already
+    // buffered; these incremental ones were not). Byte-identical output.
+    let mut file = BufWriter::new(fs::File::create(path)?);
     let mut count = 0u64;
 
     for row in rows {
@@ -739,7 +742,7 @@ fn export_table_runs_incremental(
         count += 1;
     }
     file.flush()?;
-    file.sync_all()?;
+    file.get_ref().sync_all()?;
 
     Ok(count)
 }
@@ -789,7 +792,10 @@ fn export_table_segments_for_runs(
     path: &Path,
     run_ids: &[String],
 ) -> FwResult<u64> {
-    let mut file = fs::File::create(path)?;
+    // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
+    // of one syscall per JSONL line (the full-export writers above are already
+    // buffered; these incremental ones were not). Byte-identical output.
+    let mut file = BufWriter::new(fs::File::create(path)?);
     let mut count = 0u64;
 
     for run_id in run_ids {
@@ -816,7 +822,7 @@ fn export_table_segments_for_runs(
         }
     }
     file.flush()?;
-    file.sync_all()?;
+    file.get_ref().sync_all()?;
 
     Ok(count)
 }
@@ -827,7 +833,10 @@ fn export_table_events_for_runs(
     path: &Path,
     run_ids: &[String],
 ) -> FwResult<u64> {
-    let mut file = fs::File::create(path)?;
+    // BufWriter batches the per-row `writeln!` into ~8 KiB write() syscalls instead
+    // of one syscall per JSONL line (the full-export writers above are already
+    // buffered; these incremental ones were not). Byte-identical output.
+    let mut file = BufWriter::new(fs::File::create(path)?);
     let mut count = 0u64;
 
     for run_id in run_ids {
@@ -854,7 +863,7 @@ fn export_table_events_for_runs(
         }
     }
     file.flush()?;
-    file.sync_all()?;
+    file.get_ref().sync_all()?;
 
     Ok(count)
 }
