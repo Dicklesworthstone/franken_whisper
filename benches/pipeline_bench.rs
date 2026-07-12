@@ -238,6 +238,59 @@ fn bench_pipeline_has_stage(c: &mut Criterion) {
 // Criterion harness
 // ---------------------------------------------------------------------------
 
+/// Isolated same-binary A/B for the export-writer `BufWriter` change (see
+/// `src/export.rs`): writing an SRT-shaped transcript to a real file per-segment
+/// through a raw `File` (one `write()` syscall per line) vs a `BufWriter`
+/// (batched ~8 KiB writes). Both arms emit byte-identical file content; only the
+/// syscall count differs. Interleaved unbuffered/buffered/unbuffered/buffered.
+fn bench_export_srt_buffering(c: &mut Criterion) {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let n = 5_000usize;
+    let segs: Vec<(f64, f64, String)> = (0..n)
+        .map(|i| {
+            (
+                i as f64,
+                i as f64 + 0.9,
+                format!("segment number {i} with a handful of transcribed words"),
+            )
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("export/srt_write");
+
+    for arm in ["unbuffered_r1", "buffered_r1", "unbuffered_r2", "buffered_r2"] {
+        let buffered = arm.starts_with("buffered");
+        let path = dir.path().join(format!("{arm}.srt"));
+        group.bench_function(arm, |b| {
+            if buffered {
+                b.iter(|| {
+                    let mut file = BufWriter::new(File::create(&path).expect("create"));
+                    for (i, (start, end, text)) in segs.iter().enumerate() {
+                        writeln!(file, "{}", i + 1).unwrap();
+                        writeln!(file, "{start:.3} --> {end:.3}").unwrap();
+                        writeln!(file, "{text}\n").unwrap();
+                    }
+                    file.flush().unwrap();
+                });
+            } else {
+                b.iter(|| {
+                    let mut file = File::create(&path).expect("create");
+                    for (i, (start, end, text)) in segs.iter().enumerate() {
+                        writeln!(file, "{}", i + 1).unwrap();
+                        writeln!(file, "{start:.3} --> {end:.3}").unwrap();
+                        writeln!(file, "{text}\n").unwrap();
+                    }
+                });
+            }
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_event_logging_throughput,
@@ -246,5 +299,6 @@ criterion_group!(
     bench_sha256_json_value,
     bench_pipeline_config_validation,
     bench_pipeline_has_stage,
+    bench_export_srt_buffering,
 );
 criterion_main!(benches);

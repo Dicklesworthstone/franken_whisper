@@ -51,6 +51,35 @@
 
 ## Levers
 
+### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, no gate): export writers wrap `File` in `BufWriter` — **~40× faster subtitle/transcript export**
+
+**What.** Every export writer (`write_txt/vtt/srt/csv/lrc/json/json_full` in
+`src/export.rs`) wrote per-segment straight to a raw `File` via `writeln!` /
+`serde_json::to_writer_pretty` — **one `write()` syscall per line** (SRT emits ~3
+lines/segment ⇒ ~3N syscalls for N segments; JSON serde emits many small chunks).
+Wrapped each in `BufWriter` (batched ~8 KiB writes) + an explicit `flush()?` (which
+also surfaces write errors the raw-`File` drop silently swallowed). **Byte-identical
+output** — `BufWriter` forwards the same bytes, just batched.
+
+**Correctness CERTIFIED.** Existing CSV round-trip test + new
+`export::tests::writers_emit_byte_exact_content` (asserts exact SRT/VTT/TXT bytes for
+a multi-segment result). `export::tests`: pass.
+
+**Measurement (in-binary paired A/B, `export/srt_write`, 5000 segments = 15000 lines,
+forced-local, interleaved unbuffered/buffered/unbuffered/buffered):**
+
+| rep | unbuffered (raw `File`) | buffered (`BufWriter`) |
+|---|---|---|
+| 1 | 80.692 ms | 1.9985 ms |
+| 2 | 84.418 ms | 1.9091 ms |
+
+**~40–44× faster** (rep1 40.4×, rep2 44.2×), CIs orders of magnitude apart — the
+syscall-per-line cost is the entire bottleneck. Scales with transcript length: a
+long transcription (hours of audio ⇒ thousands of segments, multiple output formats)
+was doing tens of thousands of `write()` syscalls per artifact; now a handful. Same
+textbook category as the tty `bufread` win — a well-known std API, byte-exact,
+zero-downside, no gate. Runs on the transcription output path.
+
 ### 2026-07-12 UTC — BlackThrush — LANDED (byte-exact, kill-switch `FW_SYNC_SKIP_STMT_SP`): JSONL import loops skip redundant per-statement savepoints — modest (~2–5% import, IO/parse-bound)
 
 **What.** Follow-through of the `persist_report` savepoint-skip win onto the sync
