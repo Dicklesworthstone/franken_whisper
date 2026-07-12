@@ -218,10 +218,60 @@ fn bench_sync_export_incremental(c: &mut Criterion) {
     group.finish();
 }
 
+/// Isolated A/B for the `sha256_file` read-buffer bump (8 KiB → 64 KiB): checksum a
+/// large JSONL-shaped file, comparing the old 8 KiB read loop to the new 64 KiB one
+/// (8× fewer `read()` syscalls). Both arms produce the identical digest (asserted).
+fn bench_sha256_buffer(c: &mut Criterion) {
+    use sha2::{Digest, Sha256};
+    use std::fs::File;
+    use std::io::{Read, Write};
+
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("large.jsonl");
+    {
+        let mut f = std::io::BufWriter::new(File::create(&path).expect("create"));
+        let line =
+            b"{\"run_id\":\"sha-bench\",\"idx\":0,\"text\":\"the quick brown fox jumps over the lazy dog\"}\n";
+        for _ in 0..200_000 {
+            f.write_all(line).expect("write");
+        }
+        f.flush().expect("flush");
+    }
+
+    fn hash_with_buf(path: &std::path::Path, buf_len: usize) -> String {
+        let mut file = File::open(path).expect("open");
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; buf_len];
+        loop {
+            let n = file.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    // Byte-exactness guard: both buffer sizes must yield the same digest.
+    assert_eq!(hash_with_buf(&path, 8192), hash_with_buf(&path, 64 * 1024));
+
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut group = c.benchmark_group("sync/sha256_file");
+    group.throughput(Throughput::Bytes(size));
+    for arm in ["buf8k_r1", "buf64k_r1", "buf8k_r2", "buf64k_r2"] {
+        let buf_len = if arm.starts_with("buf64k") { 64 * 1024 } else { 8192 };
+        group.bench_function(arm, |b| {
+            b.iter(|| hash_with_buf(&path, buf_len));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sync_export,
     bench_sync_import,
     bench_sync_export_incremental,
+    bench_sha256_buffer,
 );
 criterion_main!(benches);
