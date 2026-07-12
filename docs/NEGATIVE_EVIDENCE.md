@@ -4,6 +4,82 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - Codex: **SURFACE — reusing the per-stream TTY Base64 decode buffer measured 1.0081x, inside the same-binary BASE/BASE floor; source reverted.**
+
+**Negative-ledger-first target.** After the line-buffer candidate surfaced below
+floor, the next distinct per-frame allocation was the compressed payload:
+`STANDARD_NO_PAD.decode(...)` returned a new `Vec<u8>` for every audio frame.
+The candidate kept one `Vec<u8>` for the stream, called `clear()` before each
+frame, and used Base64 0.22's `decode_vec`. Ordering, JSON, zlib, CRC32, SHA-256,
+recovery policy, and output bytes were otherwise unchanged. The earlier
+300,000-frame profile bounded all `malloc` + `calloc` at 2.22%, so this was a
+deliberately narrow last check of that allocation family, not a new hot-path
+claim.
+
+**Proof seam.** A temporary const-specialized same-binary harness called the
+complete production decoder with either the historical allocating Base64 arm or
+the scratch-buffer arm. It used 128 frames × 24 raw bytes, 16 complete decodes
+per timed arm, three warmups, 31 ABBA pairs, and distinct byte-identical input
+allocations. Full `DecodeReport` debug output and all 3,072 raw output bytes were
+equal. The raw output SHA-256 was
+`1f3d8f02ac5bec221a1714651f89b2a8d5303afea46e09793a9dcdf913ef4580`.
+A focused oracle also compared SkipMissing reports/raw bytes and FailClosed
+error strings after an invalid Base64 payload that could partially fill the
+scratch buffer.
+
+**Strict-remote measurement.** No local Cargo fallback occurred. RCH was
+degraded only by unrelated worker `ovh-a`; the deciding job completed remotely
+on `vmi1149989` as `j-29928833041825866`:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench --profile release-perf -p franken_whisper --bench tty_bench -- \
+  tty/base64_buffer_ab --sample-size 20 --warm-up-time 0.5 \
+  --measurement-time 1 --noplot
+
+benchmark binary sha256:
+  799d6f1c6078133a91e85405326ad11cd1d95e904ba94f45449f1fa06f0a2d22
+```
+
+BASE/BASE ratios:
+
+```text
+1.085954 1.039124 0.893119 1.082428 0.920375 0.989378 0.808771
+0.881735 0.979215 1.193032 0.999840 1.144776 0.925899 1.082354
+1.092321 0.916845 1.015238 0.904757 0.984383 1.007477 0.941153
+0.997787 1.030827 1.002108 0.972407 1.065938 0.987061 0.986020
+0.990842 1.040089 0.952412
+```
+
+Null median/p10/p90 were **0.990842 / 0.904757 / 1.085954**, CV
+**8.058%**, range `[0.808771, 1.193032]`, wins 13/31. The predeclared
+`[0.98, 1.02]` null-median gate passed.
+
+BASE/reused-buffer ratios:
+
+```text
+1.109327 1.042599 1.033875 0.979144 1.058218 1.059861 1.003717
+0.989069 1.085415 0.948886 0.999627 0.987377 0.953564 1.091522
+0.969909 1.037828 0.950818 1.042257 1.034805 1.095268 1.145518
+1.004758 0.959876 0.993329 1.101150 0.909736 1.048464 0.890341
+1.008118 0.913066 1.046033
+```
+
+Candidate median was **1.008118x**, p10/p90 **0.948886 / 1.095268**,
+CV **6.157%**, wins 18/31. It remained deep inside the paired null envelope,
+so `decision_eligible=false`. The production candidate-only Criterion
+diagnostic was `[418.35 us, 431.58 us, 450.36 us]`; it is not a comparative
+result.
+
+**Verdict: no ship; below-floor SURFACE.** Production source, focused oracle,
+and the temporary harness were manually restored byte-for-byte to `HEAD`; no
+runtime code remains. Together with the immediately preceding reusable-line
+result, this closes small TTY per-frame allocation reuse on the current noisy
+substrate. Reopen only with a null envelope narrow enough to resolve a ~1% arm,
+or a materially larger real frame shape whose allocation share is profiled
+above the gate.
+
+---
 ## 2026-07-12 - Codex: **SURFACE — reusable TTY NDJSON line buffer showed 1.0459x, but did not clear its same-binary BASE/BASE floor; source reverted.**
 
 **Negative-ledger-first target.** `parse_frame_lines` still used
