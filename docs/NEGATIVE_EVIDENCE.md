@@ -64,11 +64,16 @@ prompt × int8-decode-numerics interaction (the memory-hypothesized mechanism): 
 prompt cleared. **Validated (e2e_probe direct native):** default byte-identical (jfk×1 2/104,
 track01 13/643 unchanged); ON recovers track01 to **1301 chars = whisper.cpp** (exact). **CAVEAT for
 the default-on flip (owner):** the retry drops the prompt *entirely* for the failed window (like
-`FW_NO_CONTEXT`), so on **repetitive/tiled audio** it can re-transcribe already-covered content —
-`jfk×3` off=239ch→on=379ch (4→8 "country" for 3 sentence-reps = over-recovery/duplication), `jfk×8`
-524→830. On **real (non-repetitive) audio it recovers exactly right** (the prompt only mattered as the
-EOT-trigger, not as a dedup guard). Also the drop is **TS-mode-specific**: track01 **no_ts** is NOT
-dropped (5segs/1315ch off==on). ⇒ default-OFF is correct (preserves jfk×N goldens; owner flips for the
+`FW_NO_CONTEXT`), which on **repetitive/tiled audio** shifts the boundary count — `jfk×3` off=239ch→on=379ch.
+**BUT the "duplication regression" framing was WRONG (corrected, whisper.cpp measured on a tiled jfk×3
+wav): "country" counts = whisper.cpp 7, fw default 4 (DROPS, −3), fw retry-on 8 (+1). whisper.cpp itself
+does NOT suppress the repetition (it transcribes ~3.5 reps with its own boundary artifacts), so the
+retry-on (8) is 3× CLOSER to whisper.cpp (7) than the buggy default (4).** The default's "cleaner" jfk×N
+was DROPPING content, not being cleaner; the retry's residual +1 vs wc is a minor tiled-boundary artifact
+both engines share. So the flip IMPROVES faithfulness on tiled audio too — the jfk×N golden-test change
+is toward whisper.cpp, not away. On **real (non-repetitive) audio it recovers exactly right**. The drop
+is **TS-mode-specific**: track01 **no_ts** is NOT dropped (5segs/1315ch off==on). ⇒ default-OFF is the safe
+ship default (preserves the current jfk×N goldens); the case to flip is now materially stronger (owner:
 real-long-form benefit). The PROPER fix (whisper.cpp temp fallback) tracks `prompt_reset_since` to
 avoid the repetitive-audio duplication — that's the owner-scoped superset.
 
