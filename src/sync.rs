@@ -1795,6 +1795,206 @@ fn import_segments(
     Ok(count)
 }
 
+/// The 7 `events` columns in `SELECT`/`INSERT` order (see [`segment_row_to_cols`]).
+fn event_row_to_cols(row: &fsqlite::Row) -> Vec<SqliteValue> {
+    (0..7)
+        .map(|i| row.get(i).cloned().unwrap_or(SqliteValue::Null))
+        .collect()
+}
+
+/// Per-line bookkeeping for `import_events` (mirror of [`SegmentImportState`]).
+#[derive(Default)]
+struct EventImportState {
+    imported_seq_by_run: HashMap<String, HashSet<i64>>,
+    imported_seq_by_overwritten_run: HashMap<String, HashSet<i64>>,
+    known_run_ids: HashSet<String>,
+}
+
+/// The per-line FK check + overwrite/imported seq tracking (mirror of
+/// [`record_segment_pre`]).
+fn record_event_pre(
+    connection: &Connection,
+    run_id: &str,
+    seq: i64,
+    key: &str,
+    conflict_policy: ConflictPolicy,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+    state: &mut EventImportState,
+) -> FwResult<()> {
+    ensure_run_reference_exists(connection, run_id, "events", key, &mut state.known_run_ids)?;
+    if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(run_id) {
+        state
+            .imported_seq_by_overwritten_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(seq);
+    }
+    if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(run_id) {
+        state
+            .imported_seq_by_run
+            .entry(run_id.to_owned())
+            .or_default()
+            .insert(seq);
+    }
+    Ok(())
+}
+
+/// Apply one `events` JSONL row against `existing` (mirror of [`apply_segment_row`];
+/// the compare is all-TEXT). Returns `Some(inserted_cols)` when INSERTed, else `None`.
+fn apply_event_row(
+    connection: &Connection,
+    run_id: &str,
+    seq: i64,
+    key: &str,
+    row: &serde_json::Value,
+    existing: Option<&[SqliteValue]>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+) -> FwResult<Option<Vec<SqliteValue>>> {
+    if let Some(existing) = existing {
+        let identical = value_to_string_sqlite(existing.get(2)) == json_str(row, "ts_rfc3339")?
+            && value_to_string_sqlite(existing.get(3)) == json_str(row, "stage")?
+            && value_to_string_sqlite(existing.get(4)) == json_str(row, "code")?
+            && value_to_string_sqlite(existing.get(5)) == json_str(row, "message")?
+            && value_to_string_sqlite(existing.get(6)) == json_str(row, "payload_json")?;
+        if identical {
+            return Ok(None);
+        }
+
+        match conflict_policy {
+            ConflictPolicy::Reject => {
+                conflicts.push(SyncConflict {
+                    table: "events".to_owned(),
+                    key: key.to_owned(),
+                    reason: "duplicate composite key".to_owned(),
+                });
+                return Ok(None);
+            }
+            ConflictPolicy::Skip => {
+                return Ok(None);
+            }
+            ConflictPolicy::Overwrite => {
+                return Err(FwError::Storage(format!(
+                    "overwrite would require updating conflicting event row `{run_id}/{seq}`, \
+                     but child-row UPDATE is unsupported in this runtime; \
+                     re-import into an empty target DB for strict replacement"
+                )));
+            }
+            ConflictPolicy::OverwriteStrict => {
+                connection
+                    .import_exec(
+                        "DELETE FROM events WHERE run_id = ?1 AND seq = ?2",
+                        &[SqliteValue::Text(run_id.to_owned().into()), SqliteValue::Integer(seq)],
+                    )
+                    .map_err(|error| {
+                        FwError::Storage(format!(
+                            "strict overwrite delete conflicting event `{run_id}/{seq}` failed: {error}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    let cols = vec![
+        SqliteValue::Text(run_id.to_owned().into()),
+        SqliteValue::Integer(seq),
+        SqliteValue::Text(json_str(row, "ts_rfc3339")?.into()),
+        SqliteValue::Text(json_str(row, "stage")?.into()),
+        SqliteValue::Text(json_str(row, "code")?.into()),
+        SqliteValue::Text(json_str(row, "message")?.into()),
+        SqliteValue::Text(json_str(row, "payload_json")?.into()),
+    ];
+    connection
+        .import_exec(
+            "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &cols,
+        )
+        .map_err(|error| {
+            FwError::Storage(format!("insert events `{run_id}/{seq}` failed: {error}"))
+        })?;
+
+    Ok(Some(cols))
+}
+
+/// Batched-import worker for `events` (mirror of [`flush_segment_chunk`]; composite
+/// `(run_id, seq)` key, prefetched by `run_id`, seen-map for intra-chunk dups).
+fn flush_event_chunk(
+    connection: &Connection,
+    chunk: &mut Vec<(String, i64, serde_json::Value)>,
+    conflict_policy: ConflictPolicy,
+    conflicts: &mut Vec<SyncConflict>,
+    state: &mut EventImportState,
+    imported_run_ids: &HashSet<String>,
+    overwritten_run_ids: &HashSet<String>,
+) -> FwResult<u64> {
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    let mut seen = HashSet::new();
+    let unique_run_ids: Vec<String> = chunk
+        .iter()
+        .map(|(run_id, _, _)| run_id.clone())
+        .filter(|run_id| seen.insert(run_id.clone()))
+        .collect();
+    let placeholders = (1..=unique_run_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id IN ({placeholders})"
+    );
+    let params: Vec<SqliteValue> = unique_run_ids
+        .iter()
+        .map(|run_id| SqliteValue::Text(run_id.clone().into()))
+        .collect();
+    let rows = connection
+        .query_with_params(&sql, &params)
+        .map_err(|error| FwError::Storage(format!("batch query events existing failed: {error}")))?;
+
+    let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
+    for r in &rows {
+        let cols = event_row_to_cols(r);
+        let run_id = value_to_string_sqlite(cols.first());
+        if let Some(SqliteValue::Integer(seq)) = cols.get(1) {
+            existing_map.insert((run_id, *seq), cols);
+        }
+    }
+
+    let mut count = 0u64;
+    for (run_id, seq, row) in chunk.drain(..) {
+        let key = format!("{run_id}/{seq}");
+        record_event_pre(
+            connection,
+            &run_id,
+            seq,
+            &key,
+            conflict_policy,
+            imported_run_ids,
+            overwritten_run_ids,
+            state,
+        )?;
+        let existing = existing_map.get(&(run_id.clone(), seq)).cloned();
+        if let Some(cols) = apply_event_row(
+            connection,
+            &run_id,
+            seq,
+            &key,
+            &row,
+            existing.as_deref(),
+            conflict_policy,
+            conflicts,
+        )? {
+            existing_map.insert((run_id, seq), cols); // seen-map for intra-chunk dup
+        }
+        count += 1;
+    }
+
+    Ok(count)
+}
+
 fn import_events(
     connection: &Connection,
     path: &Path,
@@ -1807,130 +2007,107 @@ fn import_events(
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut count = 0u64;
-    let mut imported_seq_by_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut imported_seq_by_overwritten_run: HashMap<String, HashSet<i64>> = HashMap::new();
-    let mut known_run_ids = HashSet::new();
+    let mut state = EventImportState::default();
 
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    if sync_batch_import_enabled() {
+        let chunk_size = sync_query_batch_size().max(1);
+        let mut chunk: Vec<(String, i64, serde_json::Value)> = Vec::with_capacity(chunk_size);
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let seq = row
+                .get("seq")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing seq in events row".to_owned()))?;
+            chunk.push((run_id, seq, row));
+            if chunk.len() >= chunk_size {
+                count += flush_event_chunk(
+                    connection,
+                    &mut chunk,
+                    conflict_policy,
+                    conflicts,
+                    &mut state,
+                    imported_run_ids,
+                    overwritten_run_ids,
+                )?;
+            }
         }
-
-        let row: serde_json::Value = serde_json::from_str(line)?;
-        let run_id = json_str(&row, "run_id")?;
-        let seq = row
-            .get("seq")
-            .and_then(|value| value.as_i64())
-            .ok_or_else(|| FwError::Storage("missing seq in events row".to_owned()))?;
-
-        let key = format!("{run_id}/{seq}");
-        ensure_run_reference_exists(connection, &run_id, "events", &key, &mut known_run_ids)?;
-        if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(&run_id) {
-            imported_seq_by_overwritten_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(seq);
-        }
-        if conflict_policy.allows_child_row_mutation() && imported_run_ids.contains(&run_id) {
-            imported_seq_by_run
-                .entry(run_id.clone())
-                .or_default()
-                .insert(seq);
-        }
-
-        let existing = connection
-            .query_with_params(
-                "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id = ?1 AND seq = ?2",
-                &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(seq)],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!("query events existing `{run_id}/{seq}` failed: {error}"))
-            })?;
-
-        if !existing.is_empty() {
-            let existing_row = &existing[0];
-            let identical = value_to_string_sqlite(existing_row.get(2))
-                == json_str(&row, "ts_rfc3339")?
-                && value_to_string_sqlite(existing_row.get(3)) == json_str(&row, "stage")?
-                && value_to_string_sqlite(existing_row.get(4)) == json_str(&row, "code")?
-                && value_to_string_sqlite(existing_row.get(5)) == json_str(&row, "message")?
-                && value_to_string_sqlite(existing_row.get(6)) == json_str(&row, "payload_json")?;
-            if identical {
-                count += 1;
+        count += flush_event_chunk(
+            connection,
+            &mut chunk,
+            conflict_policy,
+            conflicts,
+            &mut state,
+            imported_run_ids,
+            overwritten_run_ids,
+        )?;
+    } else {
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() {
                 continue;
             }
 
-            match conflict_policy {
-                ConflictPolicy::Reject => {
-                    conflicts.push(SyncConflict {
-                        table: "events".to_owned(),
-                        key: key.clone(),
-                        reason: "duplicate composite key".to_owned(),
-                    });
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Skip => {
-                    count += 1;
-                    continue;
-                }
-                ConflictPolicy::Overwrite => {
-                    return Err(FwError::Storage(format!(
-                        "overwrite would require updating conflicting event row `{run_id}/{seq}`, \
-                         but child-row UPDATE is unsupported in this runtime; \
-                         re-import into an empty target DB for strict replacement"
-                    )));
-                }
-                ConflictPolicy::OverwriteStrict => {
-                    connection
-                        .import_exec(
-                            "DELETE FROM events WHERE run_id = ?1 AND seq = ?2",
-                            &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(seq)],
-                        )
-                        .map_err(|error| {
-                            FwError::Storage(format!(
-                                "strict overwrite delete conflicting event `{run_id}/{seq}` failed: {error}"
-                            ))
-                        })?;
-                }
-            }
+            let row: serde_json::Value = serde_json::from_str(line)?;
+            let run_id = json_str(&row, "run_id")?;
+            let seq = row
+                .get("seq")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| FwError::Storage("missing seq in events row".to_owned()))?;
+
+            let key = format!("{run_id}/{seq}");
+            record_event_pre(
+                connection,
+                &run_id,
+                seq,
+                &key,
+                conflict_policy,
+                imported_run_ids,
+                overwritten_run_ids,
+                &mut state,
+            )?;
+
+            let existing_rows = connection
+                .query_with_params(
+                    "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id = ?1 AND seq = ?2",
+                    &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(seq)],
+                )
+                .map_err(|error| {
+                    FwError::Storage(format!("query events existing `{run_id}/{seq}` failed: {error}"))
+                })?;
+            let existing = existing_rows.first().map(event_row_to_cols);
+            apply_event_row(
+                connection,
+                &run_id,
+                seq,
+                &key,
+                &row,
+                existing.as_deref(),
+                conflict_policy,
+                conflicts,
+            )?;
+            count += 1;
         }
-
-        connection
-            .import_exec(
-                "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    SqliteValue::Text(run_id.clone().into()),
-                    SqliteValue::Integer(seq),
-                    SqliteValue::Text(json_str(&row, "ts_rfc3339")?.into()),
-                    SqliteValue::Text(json_str(&row, "stage")?.into()),
-                    SqliteValue::Text(json_str(&row, "code")?.into()),
-                    SqliteValue::Text(json_str(&row, "message")?.into()),
-                    SqliteValue::Text(json_str(&row, "payload_json")?.into()),
-                ],
-            )
-            .map_err(|error| {
-                FwError::Storage(format!("insert events `{run_id}/{seq}` failed: {error}"))
-            })?;
-
-        count += 1;
     }
 
     if conflict_policy == ConflictPolicy::Overwrite && !overwritten_run_ids.is_empty() {
         assert_no_stale_events_for_overwritten_runs(
             overwritten_run_ids,
             overwritten_event_seqs_before,
-            &imported_seq_by_overwritten_run,
+            &state.imported_seq_by_overwritten_run,
         )?;
     }
     if conflict_policy == ConflictPolicy::OverwriteStrict && !imported_run_ids.is_empty() {
         delete_stale_events_for_strict_overwrite(
             connection,
             imported_run_ids,
-            &imported_seq_by_run,
+            &state.imported_seq_by_run,
         )?;
     }
 
@@ -12587,6 +12764,123 @@ mod tests {
         assert_eq!(d, dump(&cref), "batched segment import diverged from per-line");
         assert_eq!(d.len(), 2, "(r1,0)+(r1,1); intra-chunk dup must not double-insert");
         assert_eq!(d[0][5], "new", "(r1,0) overwritten to 'new'");
+    }
+
+    #[test]
+    fn flush_event_chunk_matches_per_line_reference() {
+        // Batched event import (composite (run_id, seq) key) must produce a
+        // byte-identical `events` table to the per-line path (conflict → OverwriteStrict,
+        // fresh insert, intra-chunk duplicate (run_id, seq) → seen-map).
+        let dir = tempdir().expect("tempdir");
+        let mk = |name: &str| {
+            let c = Connection::open(dir.path().join(name).display().to_string())
+                .expect("open");
+            ensure_schema(&c).expect("schema");
+            c
+        };
+        let run_row = |id: &str| {
+            serde_json::json!({
+                "id": id, "started_at": "t0", "finished_at": "t1", "backend": "cpu",
+                "input_path": "/a.wav", "normalized_wav_path": "/a16.wav",
+                "request_json": "{}", "result_json": "{}", "warnings_json": "[]",
+                "transcript": "hi", "replay_json": "{}", "acceleration_json": "{}"
+            })
+        };
+        let ev = |run_id: &str, seq: i64, message: &str| {
+            serde_json::json!({
+                "run_id": run_id, "seq": seq, "ts_rfc3339": "2026-01-01T00:00:00Z",
+                "stage": "decode", "code": "info", "message": message, "payload_json": "{}"
+            })
+        };
+        let sel = "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events ORDER BY run_id, seq";
+        let dump = |c: &Connection| -> Vec<Vec<String>> {
+            c.query_with_params(sel, &[])
+                .expect("dump")
+                .iter()
+                .map(|r| {
+                    event_row_to_cols(r)
+                        .iter()
+                        .map(|v| value_to_string_sqlite(Some(v)))
+                        .collect()
+                })
+                .collect()
+        };
+
+        let cref = mk("evref.sqlite3");
+        let cbat = mk("evbat.sqlite3");
+        for c in [&cref, &cbat] {
+            apply_run_row(
+                c,
+                "r1",
+                &run_row("r1"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut RunImportTracking::default(),
+            )
+            .expect("seed run");
+            apply_event_row(
+                c,
+                "r1",
+                0,
+                "r1/0",
+                &ev("r1", 0, "old"),
+                None,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+            )
+            .expect("seed ev");
+        }
+
+        let import_rows = vec![
+            ("r1".to_string(), 0i64, ev("r1", 0, "new")), // conflicts seed → overwrite-strict
+            ("r1".to_string(), 1i64, ev("r1", 1, "b")),   // new
+            ("r1".to_string(), 1i64, ev("r1", 1, "b")),   // intra-chunk dup, identical → noop
+        ];
+
+        {
+            let mut st = EventImportState::default();
+            let mut cf = Vec::new();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            for (run_id, seq, row) in &import_rows {
+                let key = format!("{run_id}/{seq}");
+                record_event_pre(
+                    &cref, run_id, *seq, &key,
+                    ConflictPolicy::OverwriteStrict, &imp, &ovr, &mut st,
+                )
+                .expect("pre");
+                let existing_rows = cref
+                    .query_with_params(
+                        "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json FROM events WHERE run_id = ?1 AND seq = ?2",
+                        &[SqliteValue::Text(run_id.clone().into()), SqliteValue::Integer(*seq)],
+                    )
+                    .expect("select");
+                let existing = existing_rows.first().map(event_row_to_cols);
+                apply_event_row(
+                    &cref, run_id, *seq, &key, row, existing.as_deref(),
+                    ConflictPolicy::OverwriteStrict, &mut cf,
+                )
+                .expect("apply");
+            }
+        }
+
+        {
+            let mut st = EventImportState::default();
+            let (imp, ovr) = (HashSet::new(), HashSet::new());
+            let mut chunk = import_rows.clone();
+            let n = flush_event_chunk(
+                &cbat, &mut chunk, ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(), &mut st, &imp, &ovr,
+            )
+            .expect("flush");
+            assert_eq!(n, 3);
+            assert!(chunk.is_empty());
+        }
+
+        let d = dump(&cbat);
+        assert_eq!(d, dump(&cref), "batched event import diverged from per-line");
+        assert_eq!(d.len(), 2, "(r1,0)+(r1,1); intra-chunk dup must not double-insert");
+        assert_eq!(d[0][5], "new", "(r1,0) message overwritten to 'new'");
     }
 
     #[test]
