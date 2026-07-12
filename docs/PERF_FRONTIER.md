@@ -186,7 +186,7 @@ land sub-floor micro-levers the ledger reverts. **Rows 1 & 2 of the table above 
 the start point** (both MOOT/DONE per the §CORRECTION: `FW_ENC_INT8_FC1` is inert under the
 shipped full int8; tiny.en calibration shipped `a997f37`). And the encoder FLOP-reduction row
 is **measured dead on CPU** — `NEGATIVE_EVIDENCE` closes all three redundancy axes with data:
-DEPTH (layer-pruning breaks the transcript at 4/32, `7092`), SEQUENCE (ToMe frames not mergeable,
+DEPTH (layer-pruning fatal at skip-1: `=31` mangles proper nouns + repetition-loops track01 (−27% words) though it's jfk-byte-identical; `=30` breaks even jfk — `7092` + 2026-07-12 update), SEQUENCE (ToMe frames not mergeable,
 `4518`), SPECTRAL (weights near-full-rank, `4640`); Nyström/CountSketch/PQ/low-rank/Strassen all
 rejected (`4552`). So the genuinely-remaining levers are **owner/infra only**: (1) a **Linux GPU
 compute stack** (GTX 1070 is on nouveau → no CUDA/OpenCL/Vulkan — the encoder GEMM/SDPA is the
