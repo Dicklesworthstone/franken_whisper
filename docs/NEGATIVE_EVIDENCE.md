@@ -4,6 +4,39 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-12 - BlackThrush: **CORRECTION — my a18fed2 `FW_ENC_INT8_FC1` "WER-neutral proxy" evidence was WRONG (inert flag). tiny.en FULL int8 is ALREADY DEFAULT-ON, so fc1-only is superseded; the transcript-diff compared default-int8 vs default-int8.**
+
+**What I got wrong (a18fed2).** I transcript-diffed `FW_ENC_INT8_FC1=0` vs `=1` on tiny.en, saw
+byte-identical on 3 clips (incl. the hard mp3 that broke poly-exp), and concluded "fc1-int8 is
+WER-neutral for tiny.en (GELU-absorption validated on hard speech)." **The flag was inert** — so
+byte-identical proved nothing.
+
+**Why (verified against current code + prebuilt `fw`).** `calibrated_encoder_int8_model()` =
+`tiny_en || is_large_v3_turbo` (mod.rs:486), and the `tiny_en` predicate matches tiny.en's hparams.
+So tiny.en's **default** encoder policy is `QualitySafeInt8Encoder` — the **full** int8 encoder
+(q/k/v/fc1/fc2 i7 + attn.out i8) is DEFAULT-ON (shipped `a997f37`, calibrated 2026-07-10). In
+`encoder.rs::from_ggml` the branch order is `enc_int8_attn_in` → **`enc_attn_out_i8i32_for` (TRUE
+for tiny.en by default)** → `enc_int8_fc1_only`. The full-int8 branch runs first, so
+`FW_ENC_INT8_FC1` is **unreachable / inert** unless `FW_ENC_ATTN_OUT_I8I32=0` forces the f32 base.
+
+**Empirical proof (tiny.en, mp3, prebuilt `fw`, deterministic across 2 runs each):**
+
+| config | vs default | meaning |
+|---|---|---|
+| unset (default) | — | full int8 (shipped) |
+| `FW_ENC_INT8_FC1=1` (attn unset) | **IDENTICAL** to default | fc1 flag INERT in default config |
+| `FW_ENC_ATTN_OUT_I8I32=0` (f32) | **DIFFERS** from default | default is NOT f32 → default IS int8 |
+| `=0` + `FW_ENC_INT8_FC1=1` | DIFFERS from `=0` | fc1-int8 only matters on an f32 base |
+
+**Corrected conclusions.** (1) tiny.en full int8 (~1.47× encoder) is **already shipped default-on**,
+NOT an owner-gated pending lever (PERF_FRONTIER rows 1 & 2 were stale; corrected). (2) The fc1-only
+tiny.en lever is **moot** (superseded by the shipped full int8). (3) **PROCESS LESSON (again):
+before transcript-diffing a flag as evidence, PROVE the flag changes the computation** — here `=0`
+vs `=1` (not unset vs `=1`) exposes that the default already differs from f32. A byte-identical
+result from a no-op flag is not evidence. (Same class of miss as the `quantize_act_i7`
+grep-then-build re-dig; verify the gate before trusting the measurement.)
+
+---
 ## 2026-07-12 - BlackThrush: **SWEPT CLEAN — the peripheral byte-exact envelope (DB / IO / audio) is comprehensively exhausted; every candidate this turn was already optimal. Don't re-hunt these.**
 
 After landing the full N+1→IN family (export `FW_SYNC_BATCH_QUERY` 1.32×; import
