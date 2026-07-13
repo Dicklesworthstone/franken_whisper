@@ -21072,6 +21072,26 @@ scores, MEASURED 2.35× over the in-tree per-head `attention_raw` fallback); its
 13t+13u: the two hand int8 GEMM kernels (encoder=compute-bound/maddubs-optimal, decode=DRAM/latency-bound) are both
 confirmed at their CPU floor by DIRECT build+measure, not assertion; remaining upside is hardware (VNNI/GPU) or
 WER-gated precision (owner).
+**Tick 2026-07-13v (fresh-context loop) — int4 LOGITS built + benched + DOUBLE-NEGATIVE; the memory's stated
+"next lever" (`FW_I4_LOGITS`) is FALSIFIED (perf WASH/slight-loss + non-byte-exact).** The logits GEMV is the
+model's largest tensor and int8-logits (DEFAULT-ON, `int8_logits_enabled`) is ~6% e2e faster than f16
+([[project_decode_frame_table]]) ⇒ the standing hypothesis was "logits is bandwidth-bound, so int4 (33 MB/tok,
+half the int8 bytes) is the next halving." IMPLEMENTED it cleanly by REUSING the existing packed-int4 machinery
+(`quantize_f16_to_i4_packed` → `I4BlockMat`, `gemv_i4_packed_f32a`): new `token_embedding_i4` built at load
+behind `FW_I4_LOGITS=1` (default OFF), priority over int8 in `logits_last`. Smoke-verified (jfk transcript
+correct). SAME-binary ABBA A/B on the 124 s decode-dominated mp3 (turbo, summing per-window `decode_loop`),
+threads=32, rep0 discarded: **decode_loop median 5298.4 ms (int4) vs 5234.9 ms (int8) = ratio 1.012 (1.2 %
+SLOWER); wall 8121.9 vs 8072.7 ms.** ⇒ despite reading HALF the weight bytes (33 vs 66 MB/tok), the packed-nibble
+UNPACK (`(nib^8)-8` sign-extend per 32-block) + f32-activation fmadd in `gemv_i4_packed_f32a` costs MORE than the
+bandwidth it saves — so int4 flips the logits GEMV from bandwidth-bound (where int8<f16) back to compute-bound.
+Same mechanism as `int4_mlp0` ([[project_int4_mlp0_dead]]: nibble-unpack > bandwidth gain). **This FALSIFIES the
+"int4 logits is the next lever" claim in [[project_decode_frame_table]]** — int8 logits sits at the
+bandwidth/compute balance point; halving bytes again doesn't pay because the unpack is not free. Also non-byte-
+exact (4-bit block ≈ 15 levels): track01 transcript drifts ("it's to"→"you do", "in.That's"→"in,that's"), so even
+a perf win would be WER-gated. Both axes fail ⇒ reverted surgically (mod.rs + decoder.rs == HEAD, no stash). NET:
+the ONE decode frame that yields to precision (logits) yields to int8 but NOT int4; the int4-packed kernel's
+unpack overhead is the wall. Decode precision levers are now exhausted for CPU (int8 logits already default-on;
+int4 logits + int4_mlp0 both falsified; further halving needs a cheaper unpack or hardware).
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
