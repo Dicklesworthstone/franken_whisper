@@ -20260,3 +20260,16 @@ exploits (round-doesn't-autovec, per-element division). Findings, all NON-levers
   `compute_frame_rms` = sequential f64 sum (not byte-exact vectorizable).
 The clean vectorizable production loops (read_wav mono, blob-read bands) are already landed; the stereo
 downmix was already SIMD. **The scalar-antipattern hunt is exhausted.**
+
+### Parallelism-cap + CLI-startup sweep closed (last two candidates)
+- **`mel_threads` (`host∧16`, decode.rs:1090)** — NOT a lever: `full_mel` is computed ONCE and is
+  sub-floor (~4 ms/window; ~0.2 % of the wall even on the 840 s sjobs clip), so raising the cap would
+  drop only the mel span, not the wall. (mel is also compute-bound → the ~32-core freq-throttle wall
+  [[project_encoder_wall_is_clock_throttle]] caps it anyway.) Wall-irrelevant ⇒ excluded by the
+  "land measured WALL wins" discipline. Only the 1.5 GB **blob read** (a serial-critical prerequisite,
+  not sub-floor) justified a cap bump (`5fc0707`).
+- **CLI startup** (main.rs/cli.rs) — arg-parse + model-path resolution are ~ms; the single-shot wall is
+  dominated by model load (~900 ms) + transcribe (seconds). No redundant resolution/config-reparse on
+  the path. Not a lever.
+**Every parallelism cap in the codebase is now accounted for** (blob-read tuned; per-tensor f16 decodes
+hidden; mel sub-floor; encoder/decode thread counts owner-tuned to 32 per the memory).
