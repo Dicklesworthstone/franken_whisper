@@ -565,17 +565,21 @@ pub struct I7Mat {
     inp: usize,
 }
 
-/// Quantize a pre-transposed `[in, out]` f32 weight (the [`matmul_bias`] layout)
-/// to a 7-bit `[out, in]` [`I7Mat`] for [`matmul_bias_i7`]. One-time, at load;
-/// parallel over output rows. The strided gather of column `o` is a load-time
-/// cost (amortized over every window's GEMM).
+/// Shared inner quantizer for [`I7Mat`]: for output row `o`, `weight(o, i)` yields
+/// the f32 weight at contraction index `i` (`0..inp`). Parallel over output rows;
+/// identical amax/scale/EF/colsum arithmetic for every caller — the ONLY thing that
+/// varies is WHERE the f32 comes from (a pre-transposed `[in, out]` `Mat`, or the raw
+/// ggml `[out, in]` f16 bytes read directly). `weight` is monomorphized so it inlines
+/// with no indirection. This is the single source of the quant arithmetic — the two
+/// public entry points below must stay bit-identical by sharing it.
 #[must_use]
-pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
-    let inp = w_t.rows;
-    let out = w_t.cols;
+fn quantize_rows_to_i7(out: usize, inp: usize, weight: impl Fn(usize, usize) -> f32 + Sync) -> I7Mat {
     let mut data = vec![0i8; out * inp];
     let mut scale = vec![0.0f32; out];
     let mut colsum = vec![0i32; out];
+    // Deterministic flag (OnceLock env read) — hoisted out of the row loop; constant
+    // across rows, so the branch taken is identical to reading it per row.
+    let ef = crate::native_engine::enc_ef_quant();
     data.par_chunks_mut(inp)
         .zip(scale.par_iter_mut())
         .zip(colsum.par_iter_mut())
@@ -583,20 +587,20 @@ pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
         .for_each(|(o, ((drow, s), cs))| {
             let mut amax = 1e-9f32;
             for i in 0..inp {
-                amax = amax.max(w_t.data[i * out + o].abs());
+                amax = amax.max(weight(o, i).abs());
             }
             let sc = amax / 63.0;
             *s = sc;
             let inv = 1.0 / sc;
             let mut acc = 0i32;
-            if crate::native_engine::enc_ef_quant() {
+            if ef {
                 // Error-feedback (error-diffusion) rounding: carry each element's
                 // rounding residual (in QUANTIZED units) into the next, so the
                 // per-column dot Σ q_i·a_i has less accumulated quantization bias
                 // than independent round-to-nearest. Same i7 format/scale/colsum.
                 let mut err = 0.0f32;
                 for (i, d) in drow.iter_mut().enumerate() {
-                    let target = w_t.data[i * out + o] * inv + err;
+                    let target = weight(o, i) * inv + err;
                     let q = target.round().clamp(-63.0, 63.0);
                     err = target - q; // residual carried forward
                     let qi = q as i32;
@@ -605,7 +609,7 @@ pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
                 }
             } else {
                 for (i, d) in drow.iter_mut().enumerate() {
-                    let q = (w_t.data[i * out + o] * inv).round().clamp(-63.0, 63.0) as i32;
+                    let q = (weight(o, i) * inv).round().clamp(-63.0, 63.0) as i32;
                     *d = q as i8;
                     acc += q;
                 }
@@ -619,6 +623,36 @@ pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
         out,
         inp,
     }
+}
+
+/// Quantize a pre-transposed `[in, out]` f32 weight (the [`matmul_bias`] layout)
+/// to a 7-bit `[out, in]` [`I7Mat`] for [`matmul_bias_i7`]. One-time, at load;
+/// parallel over output rows. The strided gather of column `o` is a load-time
+/// cost (amortized over every window's GEMM).
+#[must_use]
+pub fn quantize_mat_to_i7(w_t: &Mat) -> I7Mat {
+    let inp = w_t.rows;
+    let out = w_t.cols;
+    quantize_rows_to_i7(out, inp, |o, i| w_t.data[i * out + o])
+}
+
+/// Quantize DIRECTLY from ggml's raw `[out, in]` f16 bytes (little-endian, row-major
+/// — `raw` is borrowed from the resident model blob) to a 7-bit `[out, in]` [`I7Mat`],
+/// WITHOUT ever materializing the intermediate transposed f32 `Mat`. **Bit-identical**
+/// to `quantize_mat_to_i7(&load_linear_transposed(..))`: output row `o` reads ggml row
+/// `o` (`raw[(o*inp + i)*2]`), which is exactly the value sequence the transposed path
+/// gathers for column `o` — the same `Float16::from_bits` of the same LE pair (see
+/// `encoder::dequant_transpose_f16_bytes`). It skips BOTH the transpose and the f32
+/// round-trip (the load-time win) and leaves no per-linear f32 transient (the peak
+/// win) — the i7's natural `[out, in]` layout IS ggml's, so no transpose is needed.
+/// `raw.len()` must equal `out * inp * 2`.
+#[must_use]
+pub fn quantize_f16_bytes_to_i7(raw: &[u8], out: usize, inp: usize) -> I7Mat {
+    debug_assert_eq!(raw.len(), out * inp * 2, "f16 byte length != out*inp*2");
+    quantize_rows_to_i7(out, inp, |o, i| {
+        let off = (o * inp + i) * 2;
+        Float16::from_bits(u16::from_le_bytes([raw[off], raw[off + 1]])).to_f32()
+    })
 }
 
 #[cfg(test)]
