@@ -20830,3 +20830,13 @@ greedy-verify, ~1.5-1.8× e2e). It is OWNER-SCOPED: monolithic (layer-skip draft
 dual-KV-cache + rollback), owner-ticketed bd-wzgh. Full spec = the "OWNER DECISION BRIEF" entry above
 (`4d8fd85`). **Owner: authorize it (I'll build layer-skip behind a default-off flag, byte-exact verified) /
 re-point at the content-drop temp-fallback / pause the byte-exact loop.** No small autonomous lever remains.
+
+### LOOP-STATUS (update-in-place; do NOT append a new entry per tick once converged)
+`571168a` CONVERGED — byte-exact autonomous frontier exhausted, 4 wins shipped+certified (full matrix +
+lib 229/0), sole lever (speculative decode) owner-scoped. **Post-convergence ticks re-confirm this terminal
+state; they should EDIT this line (bump the commit / note any genuinely-new datapoint), not append a new
+dated section — the ledger is the record, not a per-tick log.** Ticks since close: verified off-hot-path
+files sub-floor + ft kernels owner-closed/out-of-scope; declined to autonomously build owner-ticketed
+bd-wzgh spec-decode. Awaiting owner scope decision (authorize spec-decode / content-drop temp-fallback /
+pause). Genuinely no small byte-exact autonomous lever remains — do not re-derive; cite the CONSOLIDATED
+FRONTIER MAP + OWNER DECISION BRIEF above.
