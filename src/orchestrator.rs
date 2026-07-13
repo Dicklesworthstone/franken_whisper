@@ -4232,13 +4232,14 @@ impl EventLog {
             payload,
         };
 
-        self.events.push(event.clone());
-
         if let Some(tx) = &self.event_tx {
+            self.events.push(event.clone());
             let _ = tx.send(StreamedRunEvent {
                 run_id: self.run_id.clone(),
                 event,
             });
+        } else {
+            self.events.push(event);
         }
     }
 }
@@ -4300,6 +4301,12 @@ mod tests {
         assert_eq!(streamed[0].event.code, "ingest.start");
         assert_eq!(streamed[1].event.code, "ingest.ok");
         assert_eq!(streamed[2].event.code, "backend.ok");
+        for (retained, streamed) in log.events.iter().zip(&streamed) {
+            assert_eq!(
+                serde_json::to_vec(retained).expect("retained event should serialize"),
+                serde_json::to_vec(&streamed.event).expect("streamed event should serialize")
+            );
+        }
     }
 
     #[test]
