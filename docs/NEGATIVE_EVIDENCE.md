@@ -20986,3 +20986,18 @@ confirms these bandwidth-bound streaming ops SATURATE ~8 workers ⇒ `worker_cou
 the stale `add_bias_residual` doc comment (still said `add_in_place` is "deliberately serial" — false since 13h).
 NET: the turbo-scale in-tree encoder parallelism vein is mined; encoder residual (13h) was its one win. Remaining
 encoder cost is external (SDPA/sgemm), GPU, or VNNI — owner/infra.
+**Tick 2026-07-13j (this loop) — closed the LAST unmeasured regime: turbo LONG-audio (decode-dominated), no new
+lever.** Measured turbo/track01 (124 s / 5-window real speech, no_ts) — the frontier's two-regime split
+(tiny.en-measured) now CONFIRMED at turbo scale: **decode_loop 5069 ms (64%) ≫ encoder_window 1575 ms (20%)** —
+long audio is DECODE-dominated on turbo too (jfk single-window is the opposite: encoder 65% / decode 10%, NOT
+representative). **Cross-window pipelining WORKS and is a big win at turbo scale: `backend_run` ON 7713 ms vs
+OFF 10347 ms = 1.34× (3-pair A/B, byte-exact, `FW_PIPELINE_WINDOWS`).** It reclaims the smaller phase (here the
+encoder) under the decode — already default-on, NOT a lever (my initial "backend_run≈span-sum ⇒ no overlap"
+read was WRONG: the concurrent-encoder span time double-counts against the wall). The decode itself is
+int8-EXHAUSTED at turbo scale: logits/mlp-fc1/attn-out/qkv int8 + **cross-KV int8 default-on** (`int8_cross_kv`,
+1.31× cross_attn, byte-exact) — no byte-exact CPU decode lever. Decode runs ~20 ms/tok under pipelining (vs
+~8 ms/tok solo on jfk) — the extra is memory-bandwidth CONTENTION with the concurrent prefetch encoder, an
+INHERENT cost of the (net-winning) pipeline trade, not a bug. The decode-dominated regime's only lever is
+AMORTIZATION (spec-decode) — owner-gated AND still blocked (no vocab-compatible on-box draft: tiny.en vocab
+51864 ≠ turbo 51866). **NET: all three turbo regimes (encoder-bound jfk, load, decode-bound long-audio) now
+measured + closed; byte-exact autonomous surface exhausted at turbo scale. Remaining = owner/external/HW.**
