@@ -20897,3 +20897,18 @@ subprocess; it is in-process (thread-scheduling/contention on the shared box). A
 `probe_duration`'s ffprobe result was UNUSED — the routing duration (124.488) comes from the decoded-audio
 analysis pass, not probe_duration (bogus-ffprobe A/B: duration unchanged). No further byte-exact orchestration
 lever found; the remaining non-native overhead (~120–190 ms) is inherent startup + in-process stage wrappers.
+**Tick 2026-07-13d (this loop) — re-audited 4 candidates, all closed (no code landed; recording so they're not
+re-chased).** (1) **replay-envelope sha256** (`execute_normalize` hashes the whole normalized wav every run,
+unconditional): sha2 0.10 runtime-detects **sha-ni** (Zen3 has it) ⇒ already hw-accelerated, ~2 ms/3.8 MB =
+sub-floor; gating it on "report actually consumes replay" is CONFORMANCE-risky (changes report metadata) and
+unverifiable without CI (a transcript diff can't catch a report-snapshot break) — not worth it. (2) **build
+flags already optimal**: `.cargo/config.toml` sets `target-cpu=x86-64-v3` (AVX2/FMA/BMI) — all Zen3 offers for
+GEMM (no AVX-512/VNNI on this µarch anyway); sha-ni is runtime-detected regardless. (3) **decode `gemv_out_buf`**
+allocates per-call (~20–30/token) but each is 1.5–20 KB (free-list-fast, below mmap threshold); decode
+alloc-slim was already tried and REVERTED sub-noise ([[project_decode_sampler_slim_landed]]) — still closed.
+(4) **encoder hot path is EXTERNAL**: `nn.rs` GEMM (`ft_kernel_cpu::matmul_tensor_contiguous_f32`) + SDPA
+(`ft_kernel_cpu::sdpa_forward_f32`) are the ft_kernel_cpu crate (owner-owned); SDPA poly-exp already default-on
+for turbo (`encoder.rs:598`, bd-bcm7 WER-neutral). Net: the byte-exact autonomous surface (compute + orchestration)
+is exhausted here; every remaining lever is owner/external-gated (enc-int8 flip, spec-decode, per-model poly-exp,
+content-drop temp-fallback). The 2 in-repo audio-path wins this loop (`1f53229` passthrough, `3ca0793` wav-dur)
+were the tail of the reachable surface.
