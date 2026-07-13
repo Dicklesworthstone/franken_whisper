@@ -130,9 +130,7 @@ impl LoadedModel {
     /// Propagates [`EncoderWeights::from_ggml`] / [`DecoderWeights::from_ggml`]
     /// shape-validation errors.
     pub fn from_ggml(model: GgmlModel) -> FwResult<Self> {
-        let hparams = model.hparams;
-        let filters = model.filters.clone();
-        let tokenizer = Tokenizer::from_vocab(&hparams, model.vocab_tokens.clone());
+        let hparams = model.hparams; // `Copy`, so `model` stays whole for the borrows below.
         // The encoder (~180 ms) and decoder (~102 ms) weight builds are independent
         // and neither saturates RAM bandwidth (~14 GB/s vs ~100+ aggregate), so run
         // them concurrently — the decoder hides behind the encoder (MEASURED ~1.2×
@@ -145,6 +143,14 @@ impl LoadedModel {
         );
         let encoder = encoder?;
         let decoder = decoder?;
+        // Build the tokenizer and take the filterbank AFTER the borrowing weight
+        // builds, so both are MOVED out of the now-finished-with `model` (dropped at
+        // return) instead of cloned. The vocab move alone drops ~`n_vocab` (~51 865 on
+        // turbo) `Vec<u8>` clones + copies from the load critical path — the tokenizer
+        // build previously ran serial-before-`join` purely to clone what it could move.
+        // Byte-identical (same vocab/filters bytes, only the ownership changes).
+        let filters = model.filters;
+        let tokenizer = Tokenizer::from_vocab(&hparams, model.vocab_tokens);
         Ok(Self {
             hparams,
             filters,
