@@ -20227,6 +20227,19 @@ Note: the 16-bit requant is NOT a quality regression (whisper expects 16 kHz/16-
 compute+IO inefficiency for non-wav inputs only. The READ half of the round-trip is already optimized
 (`read_wav_16k_mono` mono fast path, `87556b4`); the write half + the round-trip itself remain.
 
+**Batch/YouTube pipeline downloads + transcribes STRICTLY SERIALLY per video.** `youtube::pipeline`
+(pipeline.rs ~441) does `download_one(N)` → `transcribe_and_render(&engine, N)` → `download_one(N+1)`
+→ … so the network (download) and compute (transcribe) never overlap: the cores idle during each
+download, the network idles during each transcribe. (Already optimized: the engine is SHARED across
+videos — no per-video model reload — and the manifest write-amplification is fixed to per-terminal-
+transition, `pipeline.rs:430-440`.) Prefetching `download_one(N+1)` on a background thread DURING
+`transcribe_and_render(N)` would overlap the two for a batch-throughput win. Benefit is
+workload-dependent (∝ download-time / transcribe-time — largest for many SHORT videos; small when
+transcribe dominates a long video) and it's an architectural concurrency change (background download +
+cancel/error coordination with the existing `token`/manifest logic), NOT byte-exact — so **owner-level**,
+not a small autonomous increment. The per-video transcribe loop itself is correctly serial (each
+transcription already saturates all cores; concurrent videos would oversubscribe).
+
 ### Systematic scalar-antipattern grep — no fresh lever (so nobody re-greps)
 Grepped `÷` / `.round()` / clone-in-loop across `mel.rs`/`nn.rs`/`audio.rs` for the classes the memory
 exploits (round-doesn't-autovec, per-element division). Findings, all NON-levers by construction:
