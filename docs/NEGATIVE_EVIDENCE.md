@@ -20593,3 +20593,30 @@ already free. Pre-converting just adds a buffer write+read + an extra pass. Net 
 shipped change.** Corollary: `Float16::to_f32` is only a lever when a NON-autovectorizing op (`.round()`) is
 fused into the same loop (the decoder wt-quant case, `3e7f295`/`991df99`); a pure `to_f32→abs→max` fold
 autovecs on its own. Don't re-attempt the encoder-quant f16-preconvert.
+
+## 2026-07-13 (GoldenOwl) — HEAD re-verified byte-correct + flip holds; residual candidates closed by analysis
+
+Rebuilt HEAD (post all session reverts) and re-verified the session's 4 default-on wins are solid:
+transcript **byte-correct** (turbo/jfk md5 `32c8f2…`), and `FW_ENC_FREE_F32` (default-on) still delivers
+**−11% wall (2.69→2.40 s) / −46% RSS (5.29→2.83 GB)** vs `=0`. The heavy build/revert churn this session
+regressed nothing.
+
+This turn's specific closures (so the next tick doesn't re-open them):
+- **Decode has NO sub-op profiling** (no `DEC_PROF` — grep-confirmed), so there's no finer decode hotspot to
+  chase via spans; `perf` already characterized decode as exhausted (logits GEMV bandwidth-bound over the
+  133 MB/token tied-embedding read; mlp/self-attn closed; cross-attn ~4.4%). No instrumentation would reveal
+  a byte-exact lever the frame table hasn't.
+- **Decode `gemv_out_buf` alloc-pooling = WASH** (by the measured glibc mechanism, `e52ffe1`): the per-head
+  score/output buffers are `tk`≈1500 f32 (6 KB) and `d_head`=64 f32 (256 B) — BOTH below the 128 KiB mmap
+  threshold ⇒ heap allocs reused from the arena free-list, NOT `munmap` churn. Pooling them saves nothing
+  the allocator isn't already doing (same reason the decoder-weight-free reclaimed only ~13%). ~1% of decode,
+  not worth a build.
+- **Encoder int8 GEMMs are compute-bound at ceiling**, not bandwidth: each weight (~1.6 MB i7) fits L2 and is
+  reused across the 1500 activation rows, so `dot_i8`/`dot_maddubs` (~50 GB/s cache-resident, hand-AVX2,
+  owner-closed) is the compute ceiling — no bandwidth headroom to reclaim. (Contrast the decode LOGITS GEMV,
+  which is genuinely DRAM-bandwidth-bound and equally closed.)
+
+**Net: still no byte-exact autonomous lever. The frontier is exhausted (extended 4× this session, then every
+fresh candidate — encoder-preconvert, decoder-free, allocator, decode-alloc — measured/reasoned closed).
+Recommend pausing the byte-exact PERF loop; the highest-value remaining work is owner-level (long-form
+content-drop temp-fallback, or the WER-gated SDPA-poly-exp / int8-calibration / ToMe levers).**
