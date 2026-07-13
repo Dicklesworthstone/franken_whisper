@@ -20847,9 +20847,13 @@ hidden (FW_SIMD_EXP within-noise even at 250-tok long audio, tick 13o); tokenize
 sub-floor. Turbo-scale hypotheses LN-workers / prefetch-throttle / distil-i8i32 / exp-scale ALL tested+falsified.
 **Genuinely no small byte-exact autonomous lever remains — do not re-derive (every hot-path file opened, every
 regime measured at turbo scale). Cite the CONSOLIDATED FRONTIER MAP + this line.** The remaining upside is
-OWNER-SCOPED, not autonomously landable as a small byte-exact increment: (1) content-drop temperature-fallback
-(correctness, frontier #1 + perf-measurement-integrity — implementable behind a default-off flag but a
-multi-file decode-strategy change); (2) a stronger+cheaper spec-decode draft (infra); (3) GPU / VNNI hardware
+OWNER-SCOPED, not autonomously landable as a small byte-exact increment: (1) content-drop temperature-fallback —
+**owner-scoped BY DESIGN, NOT autonomously-landable (confirmed by reading `decode.rs`):** the native engine is a
+DELIBERATE greedy/temp-0 port with NO sampling infra, and the temp fallback is explicitly "remains owner-scoped"
+(`decode.rs:449-453`); `FW_RETRY_FAILED_WINDOW` is the sanctioned partial fix (already landed, default-off). Do
+NOT add a sampler/temp-escalation autonomously even gated — it's a reserved decoder-strategy decision, and turbo
+(the perf-relevant model) does not even exhibit the drop (tiny.en-only). (2) a stronger+cheaper spec-decode draft
+(infra); (3) GPU / VNNI hardware
 (int8 barely beats f32 sgemm without VNNI on this Zen3 box); (4) WER-gated default-flip of enc-int8/poly-exp with
 a corpus WER harness. Generic "pick a perf lever" ticks now return only sub-floor or falsified results.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
