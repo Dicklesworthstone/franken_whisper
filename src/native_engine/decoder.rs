@@ -1816,6 +1816,43 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
     Ok(logits)
 }
 
+/// Batched tied-output logits for ALL `tq` positions of `x` (`[tq, n_state]`),
+/// returned row-major as `tq × [n_vocab]` (position `t`'s logits at `[t*n_vocab ..]`).
+///
+/// **Byte-identical to calling [`logits_last`] on each row** — `gemv_f16_batch` /
+/// `gemv_i8_batch` reduce each output exactly as the per-token `gemv_f16` / `gemv_i8`
+/// (they document this bit-for-bit equivalence), and the f32 arm literally calls
+/// `logits_last` per row. The point is that the batched GEMV reads the ~133 MB tied
+/// embedding ONCE for the whole batch instead of `tq` times — this is the
+/// weight-stream amortization at the heart of speculative-decode VERIFY (Phase 1 of
+/// `FW_SPEC_DECODE` / bd-wzgh; see `docs/SPEC_DECODE_PLAN.md`). Not yet wired to any
+/// production path — the verify/draft loop (Phase 2) is the next increment.
+pub fn logits_all(w: &DecoderWeights, x: &Mat) -> FwResult<Vec<f32>> {
+    let tq = x.rows;
+    let n_state = w.n_state;
+    debug_assert_eq!(x.cols, n_state, "logits_all: x.cols != n_state");
+    // int8 tied-output (opt-in): batched memory-halved GEMV.
+    if let Some(i8) = &w.token_embedding_i8 {
+        let mut logits = nn::gemv_out_buf(tq * i8.out);
+        nn::gemv_i8_batch(i8, &x.data, tq, None, &mut logits);
+        return Ok(logits);
+    }
+    // f16-resident (default f16-compute path): batched fused dequant-GEMV, one read.
+    if let WeightMat::F16 { data, out, inp } = &w.token_embedding {
+        let mut logits = nn::gemv_out_buf(tq * *out);
+        nn::gemv_f16_batch(data, *out, *inp, &x.data, tq, None, &mut logits);
+        return Ok(logits);
+    }
+    // f32 (non-default): per-position via `logits_last` — byte-identical by construction.
+    let n_vocab = w.n_vocab;
+    let mut logits = Vec::with_capacity(tq * n_vocab);
+    for t in 0..tq {
+        let row = Mat::from_vec(1, n_state, x.data[t * n_state..(t + 1) * n_state].to_vec());
+        logits.extend_from_slice(&logits_last(w, &row)?);
+    }
+    Ok(logits)
+}
+
 /// Project `h` through three independent linears (`q`, `k`, `v`) concurrently.
 ///
 /// The self-attention Q/K/V projections share the same input `h` and have no
@@ -2037,6 +2074,85 @@ mod tests {
 
     fn noop_checkpoint() -> FwResult<()> {
         Ok(())
+    }
+
+    #[test]
+    fn logits_all_matches_logits_last_per_position() {
+        // Spec-decode Phase 1: batched verify logits MUST be byte-identical to calling
+        // logits_last on each row — for BOTH the default f16 embedding path and the f32
+        // path. (This is the byte-exactness the whole speculative-decode scheme rests on:
+        // the verify's argmax per position must equal greedy's.)
+        let mut w = synthetic_weights(0x106175_A11);
+        let mut rng = Lcg::new(0x5EED_106);
+        let tq = 5;
+        let x = rng.mat(tq, N_STATE);
+        let check = |w: &DecoderWeights, tag: &str| {
+            let all = logits_all(w, &x).unwrap();
+            for t in 0..tq {
+                let row = Mat::from_vec(1, N_STATE, x.data[t * N_STATE..(t + 1) * N_STATE].to_vec());
+                let one = logits_last(w, &row).unwrap();
+                assert_eq!(
+                    all[t * N_VOCAB..(t + 1) * N_VOCAB]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    one.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{tag} position {t}"
+                );
+            }
+        };
+        check(&w, "f32"); // synthetic default
+        // Convert the embedding to f16 (the DEFAULT production form) and re-check.
+        if let WeightMat::F32(emb) = &w.token_embedding {
+            let data: Vec<Float16> = emb.data.iter().map(|&v| Float16::from_f32(v)).collect();
+            w.token_embedding = WeightMat::F16 {
+                data,
+                out: N_VOCAB,
+                inp: N_STATE,
+            };
+        }
+        check(&w, "f16");
+    }
+
+    // Spec-decode Phase 1 amortization microbench: the verify reads the ~133 MB tied
+    // embedding ONCE for K positions (gemv_f16_batch) vs K× (per-position gemv_f16).
+    // cargo test --release --lib logits_all_amortization_perf -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn logits_all_amortization_perf() {
+        use std::time::Instant;
+        let (n_vocab, n_state, k) = (51865usize, 1280usize, 8usize); // turbo vocab, K=8 verify batch
+        let mut rng = Lcg::new(0x106175_BE);
+        let emb: Vec<Float16> = (0..n_vocab * n_state)
+            .map(|_| Float16::from_f32((rng.next_f32() - 0.5) * 0.1))
+            .collect();
+        let x: Vec<f32> = (0..k * n_state).map(|_| rng.next_f32() - 0.5).collect();
+        let mut sep = vec![0.0f32; k * n_vocab];
+        let mut bat = vec![0.0f32; k * n_vocab];
+        let (mut best_sep, mut best_bat) = (f64::MAX, f64::MAX);
+        for _ in 0..20 {
+            let t = Instant::now();
+            for i in 0..k {
+                nn::gemv_f16(
+                    &emb,
+                    n_vocab,
+                    n_state,
+                    &x[i * n_state..(i + 1) * n_state],
+                    None,
+                    &mut sep[i * n_vocab..(i + 1) * n_vocab],
+                );
+            }
+            best_sep = best_sep.min(t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            nn::gemv_f16_batch(&emb, n_vocab, n_state, &x, k, None, &mut bat);
+            best_bat = best_bat.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "logits verify amortization [vocab={n_vocab} K={k}]: {k}x-separate={:.1}ms batched={:.1}ms speedup={:.2}x",
+            best_sep * 1e3,
+            best_bat * 1e3,
+            best_sep / best_bat
+        );
     }
 
     #[test]
