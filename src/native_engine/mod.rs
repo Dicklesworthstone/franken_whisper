@@ -330,6 +330,29 @@ pub(crate) fn enc_int8_enabled() -> bool {
     })
 }
 
+/// Whether to FREE the f32 encoder weight copies (`attn_{q,k,v,out}_w`,
+/// `mlp_{fc,proj}_w`) after they have been quantized to i7/i8 at load. In the
+/// default full-int8 config every encoder linear runs through its i7/i8 quant
+/// ([`encoder::enc_linear`] reads the f32 `w_t` **only** when the i7 field is
+/// `None`), so once a linear is quantized its f32 copy is dead weight — ~2.5 GB
+/// of steady-state RSS on turbo (78 MiB/layer × 32). Freeing it is **byte-exact**
+/// (the forward never reads a freed weight). `FW_ENC_FREE_F32`, **default OFF**
+/// (opt-in) so the shipped behavior is byte-for-byte unchanged; the freed-vs-kept
+/// A/B must be transcript-identical. NOT applied when the weight-roundtrip harness
+/// is active (it rewrites the f32 in place) nor on macOS (the GPU encode stack
+/// reads the f32 weights) — see the `from_ggml` guard.
+pub(crate) fn enc_free_f32() -> bool {
+    const DEFAULT_ON: bool = false;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FW_ENC_FREE_F32") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Whether to run ONLY the ENCODER MLP up-projection (`mlp.0`/fc1, feeding GELU) through the
 /// maddubs i7 int8 GEMM, leaving attention (q/k/v/out) and fc2/`mlp.2` on f32 sgemm.
 /// `FW_ENC_INT8_FC1`, **default OFF = f32 = byte-identical**.

@@ -4,6 +4,54 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-13 - CloudyOsprey: **LANDED gated (`FW_ENC_FREE_F32`, default-OFF) — the f32 encoder weight copies are DEAD post-quant; freeing them is TRANSCRIPT-BYTE-IDENTICAL and reclaims −2.38 GB steady-state RSS (−64% of the compute-phase working set). A memory lever, not speed; peak RSS unchanged (freed after quant). The peak+load-speed win needs the fused dequant→i7 (spec below).**
+
+**Fresh lever the frontier missed.** In the default full-int8 encoder
+(`encoder.rs:507-523` quantizes all 6 linears to i7, `attn.out` to i8),
+`enc_linear` (`encoder.rs:1037`) reads a linear's f32 `w_t` **only when its i7
+field is `None`**; `attn.out` reads its f32 only when neither i8 nor i7 is present.
+So once a linear is quantized its f32 `_w` copy is **dead** — the only other
+readers are `#[cfg(target_os="macos")]` (the GPU encode stack) and `#[cfg(test)]`.
+On Linux the ~2.4 GB of f32 encoder weights (78 MiB/layer × 32 on turbo) are pure
+dead weight after load, kept only for the f32/kill-switch fallback.
+
+**Implemented + measured (quick foreground A/B, real `fw`, turbo/jfk).**
+`FW_ENC_FREE_F32` (default-OFF opt-in) frees each dead f32 `_w` after quant, per
+linear, only when its quant field is present — so partial-int8 configs
+(`FW_ENC_INT8_ATTN_IN`) and non-calibrated models (no i7 ⇒ nothing freed) keep the
+f32 they still read. Guarded off macOS (GPU reads f32) and when the weight-roundtrip
+harness is active (it rewrites f32 in place). RSS sampled from `/proc/<pid>/status`:
+
+```text
+                       FW_ENC_FREE_F32=0    =1        delta
+  transcript           byte-IDENTICAL (109 bytes, off==on) ✓   ← proves f32 is dead
+  peak RSS (VmHWM)         5176 MB        5185 MB     ~0 (freed AFTER quant; peak is load)
+  steady RSS (compute)     3719 MB        1338 MB     −2381 MB (−64%)
+```
+
+**Verdict — byte-exact WIN, but left default-OFF (a gated experiment, not a flip).**
+The transcript identity is **input-independent** (the code proof — `enc_linear` reads
+`w_t` only when i7 is `None` — does not depend on the audio), so this is byte-exact on
+ALL inputs, not just jfk. It is left opt-in because (a) it is a **memory** (RSS) lever,
+not speed — the RTF is unchanged; (b) **peak** RSS does not move (the f32 is freed
+*after* quant, and the peak is reached during load with both resident); and (c) flipping
+default-ON risks the `#[cfg(test)]` asserts that read f32 weights post-load on a
+calibrated model (e.g. `assert_quality_safe_int8_error_budget`, `encoder.rs:1915`), which
+I cannot cheaply run the full suite to clear. The owner can flip it default-ON for
+memory-limited / serverless deploys (~halves the compute-phase footprint) after a
+`cargo test --lib native_engine` pass, or supersede it with:
+
+**Follow-up (the real win, bigger change): fused dequant→i7 at load.** To also cut
+**PEAK** RSS (~2.4 GB) AND **load-fault SPEED** (part of the 18% single-shot cold-start
+tax, [[this ledger, whole-run profile 84666bd]]), quantize directly from the ggml f16
+bytes to i7 **without materializing the f32 `Mat`**, for calibrated models — keeping the
+current dequant→f32→i7 path for non-calibrated / kill-switch / macOS. That removes the
+2.4 GB f32 allocation entirely (fewer first-touch faults = faster cold start) instead of
+freeing it after the fact. Hazards: the f32 path must stay reachable for every
+non-default config; `load_linear_transposed` (`encoder.rs:199`) would grow an i7-direct
+variant; needs the calibrated-model gate + macOS/roundtrip guards this lever already uses.
+
+---
 ## 2026-07-13 - CloudyOsprey: **ANCHOR (fresh whole-run profile on current `main`) — turbo/jfk `perf` flat profile confirms compute closure empirically: 71.3% flat compute (top symbol 0.72%, NO dominant reducible hot spot), 18.0% cold-start kernel page-fault/sched, 1.8% libc buffer mgmt. Third independent confirmation; no new lever.**
 
 **Measure-don't-guess.** Rather than reason further about the (documented-closed)
