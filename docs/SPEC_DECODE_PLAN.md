@@ -17,9 +17,15 @@ Two claims in the ⚠ CORRECTION below are now SUPERSEDED by measurement (`NEGAT
    is now on-box (`fetch_test_models.sh --model distil-large-v3`, sha `2883a11b…`). Header-verified: n_vocab
    **51866 == turbo**, the **SAME 32-layer/n_state-1280 large-v3 encoder** (⇒ encoder computed ONCE, shared by
    draft+verify — no dual encode), and n_text_layer **2 (vs turbo's 4)**. Measured: distil decode **1.64×
-   faster** than turbo (132 vs 217 ms/27 tok); independent-transcript agreement (accept LOWER-bound) jfk
-   near-identical, **track01 89.5%**. So the draft is a SEPARATE cheap MODEL, not layer-skip — the layer-skip
-   deadness below still stands, but it is now MOOT.
+   faster** than turbo (132 vs 217 ms/27 tok). So the draft is a SEPARATE cheap MODEL, not layer-skip.
+   **⚠ BUT the accept rate is TOO LOW to win (MEASURED, `examples/spec_accept_probe.rs`, tick 13m):** teacher-
+   forced K=1 accept = jfk 73.1%, jfk×3 81.2%, **track01 real conversational speech 54.5%**. At 54.5% a K=1 pass
+   yields E[tok]=1.545 for cost ≈ draft(0.61×)+verify(~1.2×)=1.81 turbo-equiv ⇒ **~0.85× = NET SLOWDOWN**
+   (general-K worse — rejected drafts waste K draft-decodes). distil's 2-layer decoder disagrees with turbo's
+   4-layer too often on ambiguous speech (the earlier "89.5%" was WORD-LCS, far laxer than token-accept). **⇒
+   spec-decode with the on-box distil draft does NOT win**; it needs a draft that is BOTH much cheaper AND ≥~85%
+   token-agreeing — none is on-box. The `logits_all`/`gemv_i8_batch` verify primitives + the probe stay for a
+   future better draft.
 
 2. **EV was UNDER-stated: decode is NOT pipeline-hidden in no_ts.** The "~0 exposed in no_ts ⇒ 4-7% TS-only"
    claim was tiny.en-scoped/wrong for turbo. MEASURED (tick 13j, turbo/track01 no_ts): decode_loop is **64% of
