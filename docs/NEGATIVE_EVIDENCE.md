@@ -20313,3 +20313,36 @@ its floor" claim was also stale (f16-direct removed the transpose entirely). **F
 a `frontier says CLOSED` note means "the OBVIOUS levers are gone," not "no lever exists" — pivot to
 genuinely-untouched files/subsystems and read them line-by-line before concluding exhaustion.** Only NOW,
 after every file is personally opened + every win guarded, is it genuinely complete.
+
+## 2026-07-13 (GoldenOwl) — 6th byte-exact win AFTER "complete": AVX2 encoder activation-quant (3.82×)
+
+The "genuinely complete" marker above was again PREMATURE. A fresh live turbo/jfk span table (prebuilt
+binary, `FRANKEN_WHISPER_PERF_SPANS=1`) exposed a lever the file-level sweep had NOT: the encoder sub-op
+SUM is **1309.5 ms but `encoder_window` = 1506.7 ms** — a ~197 ms (13 % of the encoder) gap that NO
+profiled sub-op accounts for. The per-layer activation quantize `quantize_act_i7` (encoder.rs:1518, the
+QKV path) is called 32×/window OUTSIDE any `et!()` span macro → it lives in that gap; the mlp_fc/mlp_proj
+activation quant (via `enc_linear` / `quantize_act_i7_gelu`) lives INSIDE the 246/232 ms spans, unlabeled.
+
+Both `quantize_act_i7` and `quantize_act_i7_gelu` ran a SCALAR `.round()` inner loop
+(`((v*inv).round().clamp(-127,127) as i32 + 128) as u8`) — the exact `f32::round`-doesn't-autovectorize
+antipattern (`project_round_doesnt_vectorize`) — while their i8 sibling `quantize_act_i8_into` was ALREADY
+hand-AVX2 (round = `trunc(v+copysign(0.5,v))` = round-HALF-AWAY, proven byte-exact + tested). The i7
+(maddubs u8) activation path was simply never given the same treatment.
+
+**Fix (landed):** extracted the shared inner loop into `quantize_row_i7_u8_into` — AVX2 + scalar-fallback,
+mirroring `quantize_act_i8_into`'s idiom: mul, round-half-away, clamp in f32, `+128` in i32, then
+unsigned-saturating pack i32→u16→u8 (`_mm_packus_epi32`/`_mm_packus_epi16`). Single `_mm256_mul_ps` (no
+FMA fusion) so byte-exact under the committed `target-cpu=x86-64-v3` too.
+
+**Measured — single-binary kernel A/B** (`quantize_row_i7_u8_perf`, black_box-guarded, real [1500×1280]
+QKV/fc1 shape): **scalar 1652.0 µs → avx2 432.7 µs = 3.82×**, byte-identical. Runs 96×/window on turbo
+(3 quant passes × 32 layers: QKV+fc1 over [1500,1280], fc2 over [1500,5120]) — shrinks the ~197 ms
+QKV-quant gap AND the quant-fraction of the mlp_fc/mlp_proj spans. e2e fraction not isolated this tick
+(box saturated: 23 concurrent cargo builds), but the kernel is squarely on the encoder hot path.
+
+**Gate:** none — byte-exact (`quantize_row_i7_u8_matches_scalar_reference`: SIMD body + <8 tail + ±127
+clamp edges + exact-.5 half-away; full `native_engine::nn::tests` 44/0/1-ignored green), `cfg(avx2)` +
+scalar-reference fallback, matching the sibling-kernel convention. Kernel A/B kept as an `#[ignore]`d
+`quantize_row_i7_u8_perf`. **Method (again):** "complete" meant the file-level sweep was done, not that
+the compute spans had been read from the INSIDE — the win hid in the unprofiled `encoder_window` gap
+(activation quant is not span-wrapped for QKV). Reading the live span table (SUM vs window) surfaced it.
