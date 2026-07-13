@@ -21092,6 +21092,28 @@ a perf win would be WER-gated. Both axes fail ⇒ reverted surgically (mod.rs + 
 the ONE decode frame that yields to precision (logits) yields to int8 but NOT int4; the int4-packed kernel's
 unpack overhead is the wall. Decode precision levers are now exhausted for CPU (int8 logits already default-on;
 int4 logits + int4_mlp0 both falsified; further halving needs a cheaper unpack or hardware).
+**Tick 2026-07-13w (fresh-context loop) — decode int8 GEMV software-PREFETCH built + benched + WASH (byte-exact,
+no win); the latency-bound-⇒-prefetch-helps hypothesis is FALSIFIED.** Re-derived the decode memory profile:
+~213 MB/token at ~17 ms/token ≈ **12.5 GB/s aggregate** ≪ this box's ~40 GB/s DRAM peak ⇒ decode is
+LATENCY-bound, not bandwidth-saturated; and the small projections (`self_out`/`cross_q`/`cross_out`, 1.64 M <
+the 2.1 M par threshold) run SINGLE-THREADED where the HW prefetcher under-fills memory-level parallelism —
+a real, BYTE-EXACT rationale for software prefetch (unlike the precision levers, a win here would be landable).
+Implemented `FW_GEMV_PREFETCH=1` (default off) in `gemv_i8`: `_mm_prefetch(T0)` the whole weight row `PF_DIST=4`
+ahead (cache-warm only ⇒ no arithmetic change). SAME-binary ABBA A/B on the 124 s decode-dominated mp3
+(turbo, per-window `decode_loop`), threads=32, rep0 discarded: transcript **BYTE-IDENTICAL** (1329 B, proof
+held), but perf **WASH** — A(off) decode_loop median 5390.3 ms vs B(on) 5555.9 ms, and B's distribution
+(5337.8 / 5435.3 / 5676.5, plus one 6187.8 contention outlier at wall 9153) OVERLAPS A's (5361.3 / 5390.3 /
+5514.4); B's min (5337.8) is below A's min, so there is no decisive delta — within box noise, if anything
+slightly slower. ⇒ the Zen3 L2 streaming HW prefetcher already saturates the sequential row-major weight
+streams, and the extra prefetch instructions on the PARALLEL logits (51866 rows × 20 lines ≈ 1 M prefetches)
+cancel any latency-hiding on the serial projections. Byte-exact but no win ⇒ not landable; reverted surgically
+(nn.rs == HEAD, no stash). (Could gate prefetch to serial-only projections to isolate, but that is a
+speculative second cycle on a demonstrably ≤noise effect.) **Confirms the decode GEMV is at its access floor
+from a THIRD angle** (13p accumulators, 13q/13u compute-op-count, now 13w memory-prefetch) — no byte-exact CPU
+access/schedule lever; the ledgered "12.5 GB/s ≪ peak" latency-bound-ness does NOT convert to a prefetch win.
+Also surveyed this turn (no build, all already-worked): cross-attention K/V is already int8/f16/block gated
+(`cross_kh_i8`/`cross_vh_i8`/`cross_vh_i8_block`), and SDPA poly-exp (`FW_SDPA_POLY_EXP`) is DEFAULT-ON for turbo
+(proven WER-neutral, `encoder.rs:598`) — neither is a fresh lever.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
