@@ -51,6 +51,50 @@
 
 ## Levers
 
+### 2026-07-13 UTC — cod_fw — LANDED (byte-exact): borrowed, scratch-buffered TTY mic-event serialization — **1.351209× median**
+
+**What.** `stream_mic_to_ndjson` cloned each payload-bearing `TtyAudioFrame` into an
+owned `MicStreamEvent`, serialized that clone into a fresh `String`, and then copied the
+string into the output writer. The stream now serializes a private borrowed wire view into
+one reusable `Vec<u8>` and appends the newline there before one contiguous `write_all`.
+This removes both payload-sized intermediate copies without fragmenting an NDJSON line
+across many writer calls.
+
+**Quick strict-remote same-binary A/B (worker `vmi1152480`, job
+`j-29928833041825933`, `--profile release-perf`, 31 ABBA paired ratios, 128 frames at
+1,600 payload bytes/frame and 32 inner steps):**
+
+| comparison | median | p10 | p90 | wins | verdict |
+|---|---:|---:|---:|---:|---|
+| BASE/BASE null | 0.983197 | 0.855482 | 1.107166 | 14/31 | valid: median inside predeclared `[0.98, 1.02]` |
+| owned baseline / borrowed-buffered candidate | **1.351209×** | 1.175340 | 1.501463 | 30/31 | **keep: median exceeds null p90** |
+
+Raw null ratios: `[0.855482, 1.017333, 0.942091, 0.983197, 1.021870,
+0.949002, 1.140288, 1.074221, 1.146375, 0.860789, 1.023922, 0.526830,
+0.901547, 0.975305, 1.011700, 0.933213, 0.956306, 1.185503, 0.862927,
+1.015745, 0.981897, 1.017197, 0.940411, 0.999936, 0.821159, 0.978932,
+1.107166, 1.073023, 0.821058, 1.004296, 1.053423]`.
+
+Raw candidate ratios: `[1.567366, 1.372642, 1.551403, 1.661746, 1.192477,
+1.420918, 1.332580, 0.846778, 1.033618, 1.361168, 1.443200, 1.420965,
+1.322606, 1.287326, 1.336843, 1.279740, 1.454837, 1.352027, 1.351209,
+1.413428, 1.347642, 1.369392, 1.494505, 1.501463, 1.175340, 1.263651,
+1.198878, 1.249702, 1.166975, 1.253189, 1.457358]`.
+
+Candidate CV was 11.994%; the null CV was 12.654%. The separate candidate-only
+Criterion row measured `[98.952, 108.62, 118.00] µs` for 128 events. Benchmark binary
+SHA-256 was `03777a919df4f460d60b038d37d248e9a4623d5a414def0b33229e4bc51a88e4`;
+the common 87,922-byte output SHA-256 was
+`348e68bcb9bd188559fbf620d9787d68f1c609dced0437fbf8e358c3240b11d7`.
+The first remote attempt was invalidated by a mid-edit path-dependency sync race; the
+recorded job compiled the repaired snapshot remotely and exited 0 with no local fallback.
+
+**Behavior proof.** The borrowed struct preserves the owned event's field order and
+values. The byte-exact oracle compares consecutive lines against the old owned serde path,
+including quotes, backslashes, a newline, non-ASCII text, and absent optional integrity
+fields while reusing the same scratch buffer. Serialization still completes before the
+single writer call, preserving the prior I/O-error boundary.
+
 ### 2026-07-12 UTC — cod_fw — LANDED (byte-exact): TTY decode inflates each frame directly into the final raw buffer — **32-frame decode −10.35%; 128-frame decode neutral**
 
 **What.** `decode_frames_to_raw_with_policy` previously inflated every zlib frame
