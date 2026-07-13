@@ -4,6 +4,69 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-13 - CloudyOsprey: **REJECT (measured-mechanism wash) — the redundant zero-init of `matmul_bias_i8`'s `c`/`xq` buffers is NOT a lever: `alloc_zeroed` on the 7.68 MB / 1.92 MB buffers costs 0.0 µs (lazy mmap zero pages), so a new `unsafe` uninit site would save 0. Plus fresh-sweep confirmations that the last un-characterized preprocessing/load veins are closed.**
+
+**Negative-ledger-first target.** `encoder::matmul_bias_i8` (the quality-safe
+`attn.out` int8 GEMM, default-ON) allocates `xq = vec![0i8; m*inp]` (1.92 MB on
+turbo, m=1500/inp=1280) and `c = vec![0.0f32; m*out]` (7.68 MB), then **fully
+overwrites every element** (`quant_row_i8` writes all `inp` per row; the M4×N2
+GEMM writes all `out` per row — `n_ctx` is always 1500 so every row-block is
+`rows==4`, no partial-coverage rows). The zero-init is therefore provably
+redundant. This looked like a byte-exact micro-lever (skip the memset via an
+uninit buffer, mirroring the sanctioned `matmul_uninit` / fused-LN-into-uninit
+contract) — no prior ledger row had measured this specific site.
+
+**Executed proof seam (quick foreground micro-bench, `rustc -O -C
+target-cpu=native`, N = 1.92M f32 = 7.68 MB, 200 reps, 2 runs).** Isolated the
+three costs:
+
+```text
+(A) vec![0.0;N] alloc-only          :      0.0 us/iter   <- alloc_zeroed returns instantly
+(B) alloc_zeroed + full write       :  1009-1058 us/iter
+(C) with_capacity + full write      :   969- 998 us/iter  <- the "uninit" analogue
+```
+
+**Verdict — measured wash, and the mechanism is airtight.** The zero-init itself
+costs **0.0 µs**: buffers this size (>> the ~128 KiB `MMAP_THRESHOLD`) are served
+by `mmap`, so `alloc_zeroed` hands back pages mapped to the shared zero page with
+**no eager memset** — the "zeroing" is free. The real cost (B) is the
+minor-fault-on-first-write + the writes themselves, and the uninit analogue (C)
+pays that **identically** (B is within noise of C, if anything ~4–6% *slower*).
+So converting to an uninit buffer would save **0 µs** while adding a NEW
+`#[allow(unsafe_code)]` site across the crate's `#![deny(unsafe_code)]` boundary
+(owner-gated per the `dot_f16c`/`even_fft` precedent) — pure downside. In the
+production kernel the first-write faults are additionally hidden under the
+2.46 G-MAC int8 GEMM that writes `c`. Same class as the i7-epilogue-SIMD reject
+([[project_i7_epilogue_simd_reject]]): **self-time / "wasted work" ≠ reducible.**
+Generalizable rule: **`vec![0; big_N]` is free (lazy mmap zero pages) — chasing
+its "redundant" memset with `unsafe` uninit buys nothing above the mmap threshold;
+only sub-`MMAP_THRESHOLD` (<~128 KiB) buffers hit the eager-memset path where it
+could matter, and those are sub-floor by size.** Do not add an uninit site to
+`matmul_bias_i8` (or the sibling int8 GEMMs) chasing this phantom.
+
+**Corroborating fresh sweep — the last un-characterized preprocessing/load veins
+are ALSO closed (independent re-verification against current `main`, no prior
+frontier row covered these explicitly).** Confirmed by reading current code:
+- **Audio input preprocessing** (`src/audio.rs`) is already SIMD: the
+  `resample_mono_linear` interior runs a `std::simd` 8-lane gather
+  (`gather_or_default`, bit-exact vs the scalar reference, guarded by a unit
+  test); the stereo downmix (`:820`) is SIMD with a scalar fallback only for
+  `channels>2` (rare). One-time-per-file and sub-floor vs the encode regardless.
+- **Model load parallelism** (`decode::LoadedModel::from_ggml`) already fans out:
+  encoder∥decoder via `rayon::join` (`decode.rs:142`), and inside each,
+  `EncoderWeights::from_ggml` quantizes all 32 layers with `layers.par_iter_mut`
+  (`encoder.rs:486-552`) + `load_linear_transposed` does a FUSED dequant-transpose
+  (no separate transpose pass). Load is layer-parallel, not serial — the 35%-of-
+  single-shot-latency load path has no outer-loop parallelism lever left.
+- `accelerate.rs` is confidence/segment post-processing on the `TranscriptionResult`
+  (once per transcription), **not** a compute hot path — not a lever.
+
+**Net:** no autonomously-landable byte-exact lever surfaced in these veins;
+consistent with `PERF_FRONTIER.md`'s "byte-exact envelope CLOSED" (now
+independently re-verified by a second agent at the code level + one empirical
+micro-bench). Remaining levers stay owner/infra-gated (WER-corpus, GPU, VNNI).
+
+---
 ## 2026-07-13 - Codex: **SURFACE — resetting one zlib encoder and ping-ponging its output buffers measured 1.0646x, inside the same-binary BASE/BASE floor; source reverted.**
 
 **Negative-ledger-first target.** `stream_mic_to_ndjson` constructed and dropped a
