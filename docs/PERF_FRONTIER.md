@@ -142,6 +142,12 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
     (fw is *cleaner*, drops um/uh/you-know), NOT transcription errors. So don't quote a single faithfulness
     number: it's **88–98 % depending on how disfluent the audio is**, and the divergence is largely
     stylistic (verbatim-wc vs clean-fw), with core content captured by both.
+    - **Reproducible baseline (`scripts/whisper_cpp_faithfulness.sh`, 2026-07-13):** the committed harness
+      (uniform punctuation normalization) gives track01 **turbo 91.9 %** / **tiny.en 92.5 %** agreement,
+      **both clean** (most-repeated 5-gram = 2, no loops) — slightly above the ad-hoc 88.5 % precisely
+      because it strips the punctuation-attachment artifacts, confirming "true content agreement is higher
+      than the raw number." Re-run `whisper_cpp_faithfulness.sh` for these; on jfk it reproduces the 0.0 %
+      WER / 100 % anchor. These are the canonical, re-runnable faithfulness numbers.
   - **PROPER NOUNS (the faithfulness-CRITICAL axis) match (2026-07-12):** on track01 turbo, fw and wc agree
     exactly on **FrankenSearch, XF, Twitter, Franken, Franco, Daniel**; the only proper-noun difference is
     **CAS** (a 3-letter acronym → fw "Coding"/"cast"), a model-grade acronym miss, NOT int8 mangling. This
