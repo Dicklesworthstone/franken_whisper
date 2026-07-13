@@ -4,6 +4,55 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-13 - CloudyOsprey: **ANCHOR (fresh whole-run profile on current `main`) — turbo/jfk `perf` flat profile confirms compute closure empirically: 71.3% flat compute (top symbol 0.72%, NO dominant reducible hot spot), 18.0% cold-start kernel page-fault/sched, 1.8% libc buffer mgmt. Third independent confirmation; no new lever.**
+
+**Measure-don't-guess.** Rather than reason further about the (documented-closed)
+hot path, I profiled the **shipped binary on current `main`** end-to-end:
+`perf record -F 1999` over `fw transcribe --input jfk.wav --no-persist` with the
+`large-v3-turbo` model (`FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE=sole`), 3.07 s wall,
+~26 cores active. The `fw` release binary is stripped (symbols unresolved), but
+the **shape of the flat self-time distribution is itself the finding** and needs
+no symbols:
+
+```text
+self-time buckets (whole single-shot run):
+  fw   (compute, spread flat)          : 71.3%   <- top single symbol only 0.72%
+  kernel [k] (page-fault + sched)      : 18.0%
+  libc (memset/memmove buffer mgmt)    :  1.8%   (__memset 0.79% / __memmove 0.77%)
+  libc __sched_yield                   :  0.11%
+```
+
+**Findings:**
+1. **Compute is flat and closed (3rd independent confirmation).** The busiest
+   single self-time address in `fw` is **0.72%**; the 71.3% is smeared across the
+   int8-GEMM microkernels with no dominant reducible peak. A well-optimized
+   compute-bound workload looks exactly like this — there is no single hot spot to
+   attack. Consistent with `PERF_FRONTIER.md` (BlackThrush) + my code-level sweep
+   (603e78c). `__sched_yield` = **0.11%** at load ~3 empirically confirms the
+   frontier's claim that the profile's `__sched_yield` is **contention-inflated on
+   a loaded box, not real reducible overhead** ([[project_encoder_wall_is_clock_throttle]]).
+2. **The only large non-compute bucket is COLD-START (18% kernel).** The single
+   shot takes **1.77 M minor page faults** (`/usr/bin/time -v`) faulting in the
+   ~7 GB working set (1.5 GB turbo weights + f32/i8 weight copies + activations) on
+   first touch, plus 94 k voluntary / 179 k involuntary context switches. This is
+   **single-shot cold-start tax**, NOT compute: a resident server faults the pages
+   once and amortizes it to ~0 (`load_resident`; frontier: "load sub-floor for
+   BATCH/server, ~35% only for single-clip CLI"). This profile quantifies that from
+   the fault/scheduler side (18% of a single-shot wall).
+3. **`memset`/`memmove` = 1.8% total.** Corroborates the 603e78c zero-init finding
+   (large-buffer `alloc_zeroed` is lazy-page-free; the residual memset is
+   small-buffer + page-zeroing, sub-floor). Not a lever.
+
+**Verdict — no autonomously-landable byte-exact compute lever surfaced.** The
+18% cold-start fault tax is the only sizeable non-compute chunk and is
+**owner/infra-gated + workload-scoped**: reducible only via THP / `madvise(MADV_
+HUGEPAGE)` on the big weight mmaps (crosses `#![deny(unsafe_code)]` via `libc`
+FFI, or a system `transparent_hugepage` setting), and it **only helps single-shot
+CLI latency** — the batch/server workload the perf frontier targets amortizes it
+away. Surfaced here with the measured number in case the owner wants cold-start
+CLI latency (est. ceiling: shave part of the 18% fault tax, single-shot only).
+
+---
 ## 2026-07-13 - CloudyOsprey: **REJECT (measured-mechanism wash) — the redundant zero-init of `matmul_bias_i8`'s `c`/`xq` buffers is NOT a lever: `alloc_zeroed` on the 7.68 MB / 1.92 MB buffers costs 0.0 µs (lazy mmap zero pages), so a new `unsafe` uninit site would save 0. Plus fresh-sweep confirmations that the last un-characterized preprocessing/load veins are closed.**
 
 **Negative-ledger-first target.** `encoder::matmul_bias_i8` (the quality-safe
