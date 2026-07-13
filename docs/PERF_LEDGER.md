@@ -51,6 +51,48 @@
 
 ## Levers
 
+### 2026-07-13 UTC — cod_fw — LANDED (byte-exact): move unstreamed events into the retained log — **1.399743× median**
+
+**What.** `EventLog::push` always deep-cloned each completed `RunEvent` into
+`self.events`, even when `event_tx` was `None` and the original event was then
+dropped. Ordinary `FrankenWhisperEngine::transcribe` uses that no-sender path.
+The no-sender branch now moves the event directly into the retained vector;
+`transcribe_with_stream` keeps the historical clone, push-before-send ordering,
+and ignored channel-error behavior verbatim. This removes copies of four owned
+strings plus the JSON payload for every ordinary pipeline event.
+
+**Profile-first target.** The existing model-free pipeline profile measured
+100-event batch logging at `82,607 ns`. The focused probe used a heavier
+production-shaped payload and timed the complete `EventLog::push` path,
+including payload trace injection, sequence/timestamp construction, vector
+retention, and destruction.
+
+**Quick strict-remote same-binary A/B** (worker `vmi1227854`, job
+`j-29928833041827208`, `--profile release-perf` with LTO disabled, 21 alternating
+paired repetitions, 334 batches per arm and 100 events per batch):
+
+| comparison | p10 | median | p90 | verdict |
+|---|---:|---:|---:|---|
+| historical clone / historical clone null | 0.943677 | 1.015232 | 1.106939 | valid: median inside predeclared `[0.98, 1.02]` |
+| historical clone / ownership-move candidate | **1.339972×** | **1.399743×** | **1.563353×** | **keep: candidate p10 exceeds null p90** |
+
+Historical median was `197,116 ns/100 events`; candidate median was
+`131,105 ns/100 events`. The benchmark binary SHA-256 was
+`55078af84bca0e1de73039ed2d844e9897ad502daa5bb4c8af2b86512e73bad4`.
+The strict remote invocation exited 0 and ran the 21-repetition foreground probe
+in 5.07 seconds. An earlier full-LTO attempt (job `j-29928833041827186`) was
+invalid evidence because the admitted worker terminated the link with exit 143
+before the timed path; no local fallback was used.
+
+**Behavior proof.** The same-binary oracle fed identical object, array, and
+nested segment payloads through the historical and candidate no-sender paths,
+normalized only their independently sampled wall-clock timestamps, and compared
+the complete serialized retained-event vectors byte-for-byte. It passed. The
+streaming branch is structurally unchanged; the permanent event-log tests cover
+monotonic sequence, retained/streamed ordering, sender delivery, trace injection,
+elapsed timing, and the no-sender path. Ratio vs LEGACY ORIGINAL for this
+100-event boundary: **1.399743×**.
+
 ### 2026-07-13 UTC — cod_fw — LANDED (byte-exact): scratch-buffered plain TTY audio-frame serialization — **1.174662× median**
 
 **What.** `encode_to_writer` serialized every `TtyAudioFrame` into a fresh owned
