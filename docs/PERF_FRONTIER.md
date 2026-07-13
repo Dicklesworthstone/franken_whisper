@@ -51,22 +51,25 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
 
 **Quick reference (all 2026-07-12, matched threads — wc's best: turbo `-t 32`, tiny.en `-t 16`; total wall unless noted).** franken wins every cell; evidence + caveats in the bullets below. **⚠ These speed cells are fw-greedy vs whisper.cpp's DEFAULT (beam/best-of-5) — NOT matched-greedy. Matched-greedy (fair) is lower: turbo ~2.07× (small correction, encoder-dominated), tiny.en ~1.10× (the "1.93×" was mostly wc's beam-5 decode tax). Only the isolated encoder 2.29× is framing-independent. See the "CORRECTION 2026-07-13" in the Recommendation.**
 
-| clip | model | mode | fw | whisper.cpp | ratio | coverage |
-|---|---|---|---|---|---|---|
-| jfk 11 s (encoder only) | turbo | — | ~1.40 s | ~3.21 s | **2.29×** | — |
-| track01 124.5 s | turbo | no_ts | ~9.2 s | ~21.5 s | **~2.3×** | full (259 w) |
-| track01 | turbo | seg-TS | ~12.2 s | ~21.6 s | **~1.77×** | full |
-| track01 | turbo | word-TS (DTW) | ~12.2 s | ~20.9 s | **~1.71×** | full |
-| track01 | tiny.en | no_ts | ~1.26 s | ~2.43 s | **~1.93×** | full (254 w) |
-| track01 | tiny.en | seg-TS (retry¹) | ~1.95 s | ~2.72 s | **~1.39×** | full |
-| **sjobs 840 s / 28 win** | turbo | no_ts | ~52 s | ~134 s | **~2.58×²** | fw clean / **wc loops** |
-| sjobs 840 s | tiny.en | no_ts | ~8.4 s | ~17.3 s | **~2.06×** | both clean (valid) |
+| clip | model | mode | **matched-greedy (FAIR)** | vs wc-default (old headline) | coverage |
+|---|---|---|---|---|---|
+| jfk 11 s (encoder only) | turbo | — | **2.29×** (framing-independent) | — | — |
+| track01 124.5 s | turbo | no_ts | **2.07×** | 2.30× | full (259 w) |
+| track01 | turbo | seg-TS | *(not yet measured)* | 1.77×³ | full |
+| track01 | turbo | word-TS (DTW) | *(not yet measured)* | 1.71×³ | full |
+| track01 | tiny.en | no_ts | **1.10×** | 1.87–1.93× | full (254 w) |
+| track01 | tiny.en | seg-TS (retry¹) | *(not yet measured)* | 1.39×³ | full |
+| **sjobs 840 s / 28 win** | turbo | no_ts | **2.29×** | 2.44–2.58×² | fw clean / **wc loops (both modes)** |
+| sjobs 840 s | tiny.en | no_ts | **1.47×** | 2.06× | both clean (valid) |
 
 ¹ tiny.en TS default drops ~50% (content-drop bug) → non-comparable; `FW_RETRY_FAILED_WINDOW=1` restores full
-coverage (slower but correct). ² sjobs turbo ratio is muddied *in franken's favour* — wc degrades into greedy
-repetition loops + drops ~40%; fw stays clean. Whole-pipeline rows are load-sensitive on this shared box
-(the ratio can compress under contention); the isolated-encoder 2.29× and the fw-vs-fw self-improvement are
-the confound-free anchors. **Net: franken is ~1.4–2.3× across every model×mode/clip, and at least as
+coverage (slower but correct). ² sjobs: wc degrades into repetition loops in *both* decode modes (beam-5 worse
+than greedy); fw stays clean either way. ³ the seg-TS/word-TS rows still carry vs-DEFAULT numbers — apply the
+same matched-greedy correction (small for these encoder-dominated turbo cells, large for tiny.en). Whole-pipeline
+rows are load-sensitive on this shared box; the isolated-encoder 2.29× (beam-independent) and the fw-vs-fw
+self-improvement are the confound-free anchors. **Net (matched-greedy, the fair comparison): franken is ~2–2.3×
+on encoder-heavy turbo, ~1.1–1.5× on decode-heavy tiny.en (clip-length-dependent — longer ⇒ more encoder ⇒
+higher), and at least as
 faithful — cleaner than wc on the one clip where either engine degraded.**
 
 **Realistic multi-window no_ts (the target workload), measured 2026-07-12:** turbo, `track01.wav`
