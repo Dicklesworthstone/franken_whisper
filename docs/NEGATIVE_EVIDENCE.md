@@ -20835,8 +20835,13 @@ re-point at the content-drop temp-fallback / pause the byte-exact loop.** No sma
 **NO LONGER just converged — BUILDING the sole lever (speculative decode, per `SPEC_DECODE_PLAN.md`).**
 Phase 1 LANDED: `logits_all` batched verify primitive (decoder.rs) — byte-identical to per-position
 `logits_last` (f32+f16 test), and the amortization microbench measures **8×-separate 26.8 ms → batched
-11.4 ms = 2.36×** (verify reads the 133 MB tied embedding once for K=8 vs 8×). decoder suite 12/0. Next:
-Phase 2 (K=2 read-only draft + verify loop + byte-exact e2e). — Prior state: CONVERGED @ `571168a`; byte-exact autonomous frontier
+11.4 ms = 2.36×** (verify reads the 133 MB tied embedding once for K=8 vs 8×). decoder suite 12/0.
+**⚠ CORRECTION: the DRAFT side is BLOCKED — layer-skip self-draft is MEASURED-DEAD (the Whisper decoder is
+only 4 layers; accept 0-1.7% = net slowdown, `project_draft_decoding_amortization`), prompt-lookup dead too,
+and NO draft model is on-box. So spec-decode is OWNER/INFRA-gated (needs a real draft model); the verify
+primitives (`logits_all`, `gemv_i8_batch`) are landable+byte-exact but INERT without a draft. I hit the
+read-memory-first trap — Phase 1 is a valid primitive, but do NOT build the draft/verify LOOP autonomously.**
+— Prior state: CONVERGED @ `571168a`; byte-exact autonomous frontier
 exhausted, 4 wins shipped+certified (full matrix + lib 229/0), sole lever (speculative decode) owner-scoped.
 **Post-convergence ticks re-confirm this terminal state; they EDIT this line (bump the tick / note any
 genuinely-new datapoint), they do NOT append a new dated section — the ledger is the record, not a per-tick

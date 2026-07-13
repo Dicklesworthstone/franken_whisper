@@ -10,14 +10,27 @@ Realistic long audio is **decode-dominated (62.5% of e2e)** and DRAM-weight-stre
 stream K×. **Greedy-verify is BYTE-EXACT vs greedy** (accept only tokens the full model's argmax
 agrees with), so this ships to the default quality path — no WER gate.
 
-## The draft MUST be layer-skip self-draft (settled by measurement)
-- Prompt-lookup / n-gram: **measured non-viable** on real speech (hit-rate 0.7–6.4%, `9d0d07b`) — speech
-  doesn't repeat n-grams. Do NOT use it.
-- Layer-skip self-draft: content-independent (the k-layer partial computation correlates with the full
-  model regardless of speech content); `FW_DRAFT_ACCEPT_LAYERS` is the existing accept-rate probe;
-  `project_draft_decoding_amortization` R(8)≈2.9× ceiling. USE THIS (or a real draft model if one is added).
-- The draft can be APPROXIMATE (even int8 logits) — correctness is guaranteed by the exact verify, so make
-  the draft as cheap as possible.
+## ⚠ CORRECTION 2026-07-13 — the DRAFT side is BLOCKED (both cheap drafts measured DEAD); this feature is owner/infra-gated
+Reading `[[project_draft_decoding_amortization]]` in full (should have been step 0) closes the draft side:
+- **Layer-skip self-draft: MEASURED-DEAD, do-not-build.** The Whisper DECODER is only **4 layers** (turbo AND
+  tiny.en — the "32" is the ENCODER). `FW_DRAFT_ACCEPT_LAYERS` probe: tiny.en k=1/2/3 = **1.7%/1.7%/62.9%**,
+  turbo **0.0%/0.0%/10.7%** — all BELOW the ~47-82% break-even ⇒ a NET SLOWDOWN. Skipping k of 4 layers saves
+  little and the early hidden state ≠ final argmax. `bd`-rejected (`5118b4a`/`aed4ae1`). Do NOT build a
+  layer-skip drafter (my Phase-2/3 K=2/general-K plans below assumed a deep decoder — INVALID).
+- **Prompt-lookup / n-gram: MEASURED-DEAD** (0.7-6.4% on real speech, `9d0d07b`/`0ddbd3b`) — ASR output is
+  novel token-by-token.
+- **⇒ the ONLY viable draft is a real, cheap, ACCURATE draft model, and NONE is on-box** (only turbo +
+  tiny.en, different vocabs). So speculative decode is **BLOCKED on owner/infra** (supply a draft model).
+- **EV is also modest + mode-gated:** decode is ~15% of e2e in TS mode and **~0 exposed in no_ts**
+  (pipeline-hidden), so realized e2e ≈ **4-7%, timestamp-mode ONLY** (ceiling R(8)≈2.9-3.7× × accept ÷
+  draft-cost). A SECONDARY lever, not the biggest.
+
+## What IS landable now (the verify side — real, byte-exact, but inert without a draft)
+The VERIFY primitives read the weights once for K tokens and are byte-exact — useful IF a draft model is ever
+added: `gemv_i8_batch` (LANDED default-on), and **`logits_all` (Phase 1, LANDED `19a71ca`, 2.36× amortization
+microbench, byte-exact)**. These are correct + tested but NOT on any production path (no viable draft to feed
+them). **Do NOT build the draft/verify LOOP until a real draft model exists** — the loop without a working
+draft is dead code.
 
 ## Phasing (each phase byte-exact, gated `FW_SPEC_DECODE` default-OFF, verified flag-on-transcript == greedy)
 
