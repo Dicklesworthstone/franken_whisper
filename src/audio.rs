@@ -1086,7 +1086,45 @@ pub fn probe_duration_seconds(input: &Path) -> Option<f64> {
     probe_duration_seconds_with_timeout(input, ffprobe_timeout())
 }
 
+/// Exact duration of a PCM WAV from its header (frames-per-channel / sample rate),
+/// or `None` if `input` is not a readable WAV. Header-only (`hound` keeps samples
+/// lazy), so O(1). The value equals ffprobe's `format=duration` for PCM WAV; see
+/// [`probe_duration_seconds_with_timeout`].
+fn wav_duration_seconds(input: &Path) -> Option<f64> {
+    let is_wav = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+    if !is_wav {
+        return None;
+    }
+    let reader = hound::WavReader::open(input).ok()?;
+    let sample_rate = reader.spec().sample_rate;
+    if sample_rate == 0 {
+        return None;
+    }
+    let secs = f64::from(reader.duration()) / f64::from(sample_rate);
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
 pub fn probe_duration_seconds_with_timeout(input: &Path, timeout: Duration) -> Option<f64> {
+    // Fast path: a WAV carries its exact duration in the header, so shelling
+    // `ffprobe` (a per-run subprocess) to recover it is pure overhead. `hound`
+    // reads only the header here — `duration()` is frames-per-channel — and the
+    // result is BIT-IDENTICAL to ffprobe's `format=duration` for PCM WAV: both
+    // reduce to `data_bytes / byte_rate` (`frames/sample_rate` ==
+    // `data_bytes/(block_align·sample_rate)` == `data_bytes/byte_rate`). The
+    // pipeline's normalized audio is always such a WAV, so this removes the
+    // ffprobe spawn from the normalize stage on ffprobe-equipped hosts. Any
+    // parse error / non-WAV falls through to the ffprobe path unchanged.
+    if let Some(secs) = wav_duration_seconds(input) {
+        return Some(secs);
+    }
+
     let ffprobe_program = resolve_ffprobe_program(None).ok()?;
     let args = vec![
         "-v".to_owned(),

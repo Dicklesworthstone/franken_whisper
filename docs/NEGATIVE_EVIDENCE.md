@@ -20881,3 +20881,19 @@ window-scoped, a legitimate Q8-class approximation (whisper.cpp ships Q8_0) but 
 74.3→74.2 ms) + 55-word drift — the 1.47× is a large-model (n_state=1280) benefit; worthless on small models
 (SDPA-dominated + tiny GEMMs). dtw/word-ts confirmed sub-floor; orchestration gap (~120 ms) mostly inherent
 process startup.
+**Tick 2026-07-13c (this loop) — LANDED a byte-exact wav-duration fast-path + CLOSED the "normalize tail =
+subprocess" trap with strace.** Chased the ~20 ms fixed normalize-stage tail (present even with WAV_PASSTHROUGH,
+so independent of the decode). (1) **`probe_duration` wav-header fast-path (`src/audio.rs`, default-on, byte-
+exact):** `probe_duration_seconds_with_timeout` shelled `ffprobe` (a per-run subprocess) to recover a wav's
+duration that is trivially in its header. Added a hound header read (`frames/sample_rate`), BIT-IDENTICAL to
+ffprobe's `format=duration` for PCM WAV (both = `data_bytes/byte_rate`). The normalized output is ALWAYS such a
+wav, so this removes the ffprobe spawn from the normalize stage **on ffprobe-equipped hosts** (production/CI
+norm) — a real per-run subprocess elimination. Built + verified: transcript BYTE-EXACT (md5 f68af24506, 254 w)
++ duration still 124.488 + also makes the existing `probe_duration_seconds` wav tests pass WITHOUT ffprobe
+(robustness). NOT benchable on this box (no ffprobe installed ⇒ nothing to eliminate here), so the speedup is
+structural-certain, not measured-here. (2) **strace CLOSES the tail-is-ffprobe hypothesis:** `strace -f -e
+execve,clone,fork` on the default run = **0 fork/clone, no external-tool execve** — the ~20 ms tail is NOT a
+subprocess; it is in-process (thread-scheduling/contention on the shared box). Also: on this ffprobe-less box
+`probe_duration`'s ffprobe result was UNUSED — the routing duration (124.488) comes from the decoded-audio
+analysis pass, not probe_duration (bogus-ffprobe A/B: duration unchanged). No further byte-exact orchestration
+lever found; the remaining non-native overhead (~120–190 ms) is inherent startup + in-process stage wrappers.
