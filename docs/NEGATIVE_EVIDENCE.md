@@ -20964,6 +20964,30 @@ harness is INFRA-gated** (needs the LibriSpeech download). Working tree this tur
 avenue checked freshly this turn is at byte-exact floor or owner/infra-gated — TERMINAL re-confirmed with new
 datapoints, not re-derivation. Cite the CONSOLIDATED FRONTIER MAP + the OWNER DECISION BRIEF; no small
 autonomous byte-exact lever remains.
+**Tick 2026-07-13t (fresh-context loop, DIRECTED to build a fundamentally-different primitive) — encoder int8
+GEMM two-level (BLIS/Goto) CACHE-BLOCKING built + benched + FALSIFIED (byte-exact, −3.4% encoder REGRESSION,
+compute-bound confirmed EMPIRICALLY not by assertion).** The `matmul_bias_i7_quantized` hot kernel
+(encoder MLP fc1/fc2 + Q/K/V, ~28% enc) is register-blocked M4 only: it streams each weight row once per
+4-activation-row block ⇒ at turbo scale fc1's 6.5 MB weight (≫ 512 KB L2) is re-read ~m/4 times. Hypothesis
+(via [[project_closures_are_scale_scoped]]): the "~50 GB/s compute ceiling" is actually an L2→L3 spill, so a
+weight-panel sized to L2 and reused across a whole M-band (N-panel × M-band outer loops wrapping the SAME
+bit-identical M4×N2/M4 tiles) would cut L3 re-reads ~band/4× and win. BUILT it behind `FW_I7_L2_PANEL=1`
+(default-off, new `matmul_bias_i7_quantized_panel`), local release build, SAME-binary ABBA A/B on turbo/jfk
+(single-window = pure encoder signal), threads=32, rep0 discarded. **Result: BYTE-IDENTICAL (md5 32c8f2208d,
+transcript 109 B — the byte-exactness proof held: identical i32 dots + identical per-element dequant order,
+only (m,n) visitation reordered) but every panel rep was SLOWER — encoder_window median 1493.7 ms (panel) vs
+1441.6 ms (register) = +3.6%; wall 2438.6 vs 2362.0 ms = +3.2%; all 3 B-reps > all 3 A-reps (clean, not noise).**
+⇒ the L3-spill hypothesis is **FALSIFIED**: the kernel is genuinely COMPUTE-bound on the `maddubs`/`madd`/`add`
+throughput (3 vector ops per 32 weight bytes ≈ 48 GB/s/core — matches the measured "~50 GB/s"), so cache-blocking
+relieves no real bottleneck and only adds panel/output-locality overhead. This is the FIRST time two-level
+blocking was actually implemented+measured for the hand int8 GEMM (prior "compute-bound" was analytic; the
+`project_encoder_colpanel_dead` note was about the *f32 matrixmultiply* path). Consistent with `maddubs` already
+being the AVX2-optimal u7×i8 scheme (no VNNI on this Zen3 box) and encoder scaling to the freq-throttle wall
+([[project_encoder_wall_is_clock_throttle]]). Reverted (stashed as `i7-l2-panel experiment` for reference; NOT
+dropped). Encoder int8 GEMM speedup now needs VNNI/GPU (hardware) or fewer MACs (ToMe/prune, owner-WER-gated) —
+no byte-exact CPU layout/schedule lever. **METHOD: remote rch build stalled 11 min on a degraded worker
+(`project_asupersync_oom_roulette`); cancelled → local incremental build 3m08s. Build remote is only faster on a
+HEALTHY fleet; check `rch status` posture first.**
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
