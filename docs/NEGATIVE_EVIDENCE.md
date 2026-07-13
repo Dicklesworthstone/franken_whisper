@@ -20912,3 +20912,19 @@ for turbo (`encoder.rs:598`, bd-bcm7 WER-neutral). Net: the byte-exact autonomou
 is exhausted here; every remaining lever is owner/external-gated (enc-int8 flip, spec-decode, per-model poly-exp,
 content-drop temp-fallback). The 2 in-repo audio-path wins this loop (`1f53229` passthrough, `3ca0793` wav-dur)
 were the tail of the reachable surface.
+**Tick 2026-07-13e (this loop) — load-path re-audit closed + the BINDING BLOCKER named: single-model (tiny.en)
+testability.** (1) **process startup is negligible** — exec→"Starting transcription run" = **3.5 ms**, `fw --help`
+~0 ms; not a lever (ruled out). (2) **load already parallel** — `LoadedModel::from_ggml` runs encoder+decoder
+weight builds via `rayon::join` (granularity-flip already done, `decode.rs:141`). (3) **the two f16-dequant
+thread caps in `ggml.rs` (`dequant_f16_to_halves_parallel` `.min(16)`, `dequant_f16_parallel` `.min(8)`) are
+CORRECTLY bandwidth-tuned, do NOT raise:** consistent with the same DRAM model as the landed blob-read `.min(32)`
+— blob-read is ~2 B/elem (pure read, saturates @32), f16-dequant ~4 B/elem (read+write, saturates @~16),
+f32-dequant ~6 B/elem (saturates @~8). Raising pushes past saturation (no win) and adds thread-spawn overhead.
+**(4) THE BLOCKER: only tiny.en is on-box** (`fetch_test_models.sh` provisions tiny.en ONLY; no turbo/small;
+the other on-box `*.bin` are frankenpandas/sqlite fuzz corpus, not ggml). tiny.en's cost is external SDPA
+(46.7% enc) + tiny GEMMs, so it has NO in-tree measurable lever; the remaining real levers (enc-int8 1.47×,
+poly-exp 1.07×) are **turbo-scale — unmeasurable AND unsafe to tune here** (tiny.en poly-exp already
+regressed, `mod.rs:536`). **OWNER ACTION to unblock autonomous perf: provision a larger ggml model
+(`scripts/fetch_test_models.sh` currently tiny.en-only) so enc-int8 / poly-exp / dequant-cap sweeps are
+measurable.** No code landed this tick (a load-cap change would be unbenchable on tiny.en and risks de-tuning
+turbo); recorded to stop re-chasing startup/load-caps and to surface the model-provisioning blocker.
