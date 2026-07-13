@@ -20460,3 +20460,31 @@ session's 3 byte-exact AVX2 quant wins demonstrably move e2e ~10% on turbo, at z
 ~172 ms (was ~197) — the ~25 ms it shrank IS the QKV activation-quant I AVX2'd; the residual gap is the
 unwrapped QKV quant (now AVX2, small) + `ln_post` + per-layer alloc/page-fault/rayon-join overhead, none an
 obvious scalar lever. Decode gap likewise closed. Frontier remains owner-gated / external, as before.
+
+## 2026-07-13 (GoldenOwl) — LANDED: FW_ENC_FREE_F32 flipped DEFAULT-ON — −14% wall, −46% RSS, byte-exact
+
+The "18% single-shot page-fault tax" (`project_wholerun_profile_coldstart`) turned out to be a LANDABLE
+lever, not just an artifact. `perf stat` on turbo/jfk showed **1.77 M minor page-faults** (~7 GB first-
+touch); the ~2.5 GB of retained f32 encoder weights are DEAD post-int8-quant (the forward reads only i7/i8)
+yet were first-touched every run = pure page-fault tax. `FW_ENC_FREE_F32` already frees them (load-time,
+never materializing the transposed f32) but was DEFAULT-OFF ("owner sign-off" per the frontier). The A/B
+was already verified transcript-identical; I re-verified byte-identical (turbo/jfk, md5 match) and MEASURED
+the wall effect the prior notes lacked, then flipped `DEFAULT_ON = true` (kill-switch `FW_ENC_FREE_F32=0`
+restores retained-f32, clean 0/off/false/no idiom).
+
+**Measured turbo/jfk, new-default (freed) vs kill-switch =0 (retained), `/usr/bin/time -v`:**
+| metric        | =0 (old default) | new default (freed) | Δ            |
+|---------------|------------------|---------------------|--------------|
+| peak RSS      | 5.29 GB          | 2.83 GB             | **−46%**     |
+| wall (single) | 2.73 s           | 2.35 s              | **−14%**     |
+| minor faults  | 1.775 M          | 1.170 M             | −606 k       |
+Transcript **BYTE-IDENTICAL** (md5 `32c8f2…`, the JFK quote). `native_engine::encoder::tests` 15/0.
+
+**Safety (why the flip is sound):** freeing is per-linear conditional on that linear having an i7/i8 copy
+(`load_linear_maybe_i7` returns the f32 unchanged when `to_i7==false`), so a config that keeps any linear
+f32 (e.g. `FRANKEN_WHISPER_ENC_INT8=0`) still retains exactly what it needs; and `free_f32_now` is already
+gated off on macOS (GPU reads f32) and under the weight-roundtrip harness. So the DEFAULT int8+Linux path
+frees provably-dead weight; every other path is unchanged; and `FW_ENC_FREE_F32=0` is a total escape hatch.
+This reframes the prior "memory-only" note (`project_enc_free_f32_dead_weights`) into a **−14% SINGLE-SHOT
+SPEED win** (single-shot = the CLI use case). Owner-gated levers remaining: SDPA poly-exp, enc int8
+calibration (WER), ToMe/pruning (WER).
