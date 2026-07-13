@@ -20787,3 +20787,14 @@ realistic-workload WALL improvement comes from the unconditional AVX2 quant wins
 26feafd/3e7f295/991df99), not the flip. No new lever — a correctness-of-claims refinement so the −10% e2e
 single-shot figure isn't over-generalized to server/long-audio usage (there it's ~memory-only + the quant
 compute wins).
+
+## 2026-07-13 (GoldenOwl) — session FINAL cert: full native_engine lib suite GREEN on HEAD (229/0)
+
+After the session's heavy build/revert churn (3 landed AVX2-quant wins + the flip + 4 probed-and-reverted
+candidates: decoder-free, allocator, encoder-preconvert, decoder-qkv-free), ran the FULL
+`cargo test --release --lib native_engine::` on current HEAD to definitively certify the shipped state is
+regression-clean: **229 passed / 0 failed / 3 ignored** (the 3 ignored = the kept perf microbenches
+`quantize_row_i7_u8_perf` / `quantize_f16_row_to_i8_perf` / `quantize_f16_row_blocked_perf`). Combined with
+the transcript checks (turbo single+multi-window byte-identical, tiny.en byte-identical), the session's four
+default-on wins (`26feafd`/`3e7f295`/`991df99`/`78ba068`) are shipped, green, and byte-exact. Session
+verification surface COMPLETE. No new lever.
