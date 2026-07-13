@@ -1049,6 +1049,13 @@ pub struct MicStreamEvent {
     pub frame: TtyAudioFrame,
 }
 
+#[derive(Serialize)]
+struct BorrowedMicStreamEvent<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    frame: &'a TtyAudioFrame,
+}
+
 /// Required NDJSON fields for `mic_audio_chunk` events.
 pub const MIC_AUDIO_CHUNK_REQUIRED_FIELDS: &[&str] = &["event", "schema_version", "frame"];
 
@@ -1060,6 +1067,28 @@ pub fn mic_stream_event_value(frame: &TtyAudioFrame) -> MicStreamEvent {
         schema_version: crate::robot::ROBOT_SCHEMA_VERSION.to_owned(),
         frame: frame.clone(),
     }
+}
+
+/// Serialize one mic event without cloning its payload-bearing audio frame.
+///
+/// The caller-owned scratch buffer is reused across a stream, while the final
+/// writer still receives one contiguous NDJSON line per frame.
+#[doc(hidden)]
+pub fn write_mic_stream_event_line<W: Write>(
+    writer: &mut W,
+    frame: &TtyAudioFrame,
+    line_buffer: &mut Vec<u8>,
+) -> FwResult<()> {
+    let event = BorrowedMicStreamEvent {
+        event: "mic_audio_chunk",
+        schema_version: crate::robot::ROBOT_SCHEMA_VERSION,
+        frame,
+    };
+    line_buffer.clear();
+    serde_json::to_writer(&mut *line_buffer, &event)?;
+    line_buffer.push(b'\n');
+    writer.write_all(line_buffer)?;
+    Ok(())
 }
 
 /// Trait abstracting the raw audio source for mic streaming.
@@ -1104,6 +1133,7 @@ pub fn stream_mic_to_ndjson<S: MicAudioSource, W: Write>(
     write_control_frame(writer, &handshake)?;
 
     let mut seq: u64 = 0;
+    let mut event_line = Vec::new();
 
     loop {
         let chunk = match source.read_chunk(chunk_size) {
@@ -1131,8 +1161,7 @@ pub fn stream_mic_to_ndjson<S: MicAudioSource, W: Write>(
             payload_sha256: Some(sha),
         };
 
-        let event = mic_stream_event_value(&frame);
-        writeln!(writer, "{}", serde_json::to_string(&event)?)?;
+        write_mic_stream_event_line(writer, &frame, &mut event_line)?;
 
         seq += 1;
     }
@@ -1841,6 +1870,7 @@ pub fn emit_tty_transcript_correct(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::path::Path;
 
     use crate::error::{FwError, FwResult};
@@ -3462,7 +3492,7 @@ mod tests {
     use super::{
         FixedCountMicSource, MIC_AUDIO_CHUNK_REQUIRED_FIELDS, MicAudioSource, MicStreamConfig,
         MicStreamEvent, SliceMicSource, UnavailableMicSource, mic_stream_event_value,
-        stream_mic_to_ndjson,
+        stream_mic_to_ndjson, write_mic_stream_event_line,
     };
 
     // -- MicStreamConfig tests --
@@ -3584,6 +3614,35 @@ mod tests {
             !line.contains('\n'),
             "NDJSON event must not contain newlines"
         );
+    }
+
+    #[test]
+    fn borrowed_mic_event_writer_matches_owned_serde_lines_byte_exact() {
+        let mut first = make_frame(7, b"first payload");
+        first.codec = "mu\"law\\codec\n雪".to_owned();
+        let mut second = make_frame(8, b"second payload");
+        second.crc32 = None;
+        second.payload_sha256 = None;
+
+        let mut expected = Vec::new();
+        for frame in [&first, &second] {
+            let event = mic_stream_event_value(frame);
+            writeln!(
+                expected,
+                "{}",
+                serde_json::to_string(&event).expect("serialize owned event")
+            )
+            .expect("write expected line");
+        }
+
+        let mut actual = Vec::new();
+        let mut line_buffer = Vec::new();
+        write_mic_stream_event_line(&mut actual, &first, &mut line_buffer)
+            .expect("write first borrowed event");
+        write_mic_stream_event_line(&mut actual, &second, &mut line_buffer)
+            .expect("write second borrowed event");
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
