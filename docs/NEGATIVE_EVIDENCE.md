@@ -20214,3 +20214,15 @@ Every subsystem personally opened + verified this session (not just the frontier
 - **Orchestrator/routing** — per-run sub-ms; `routing_log` is part of the outcome contract (not wasted).
 **Net: the byte-exact autonomous perf frontier is codebase-wide EXHAUSTED. The only remaining perf
 value is the owner-gated FW_ENC_FREE_F32 flip (fully prepared/verified) or infra (GPU / blob streaming).**
+
+### Owner-level opportunity surfaced (architectural, NOT an autonomous byte-exact lever)
+**Non-wav inputs do a f32→i16-wav-file→f32 round-trip.** `orchestrator` normalizes EVERY input to an
+on-disk 16 kHz-mono i16 WAV (`audio::normalize_to_wav`, `normalized_wav: PathBuf`), which the backend
+then reads back via `read_wav_16k_mono`. So an mp3/other input is: decode→f32 → write i16 wav file →
+read i16 wav → f32 — two conversions, a disk write+read, and a 16-bit requantization per transcription.
+Transcribing the decoded f32 samples DIRECTLY would skip all of it, but the `normalized_wav` file is a
+first-class pipeline artifact (SHA-256 input checksum, `native_audio::analyze_wav`/VAD, run persistence
+all consume the PATH), so removing it is a wide-blast-radius architectural change — **owner-level**.
+Note: the 16-bit requant is NOT a quality regression (whisper expects 16 kHz/16-bit-grade audio); it's a
+compute+IO inefficiency for non-wav inputs only. The READ half of the round-trip is already optimized
+(`read_wav_16k_mono` mono fast path, `87556b4`); the write half + the round-trip itself remain.
