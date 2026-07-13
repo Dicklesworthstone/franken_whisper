@@ -20273,3 +20273,15 @@ downmix was already SIMD. **The scalar-antipattern hunt is exhausted.**
   the path. Not a lever.
 **Every parallelism cap in the codebase is now accounted for** (blob-read tuned; per-tensor f16 decodes
 hidden; mel sub-floor; encoder/decode thread counts owner-tuned to 32 per the memory).
+
+### Final redundant-clone check + convergence marker
+- `backend/mod.rs:2610` `let evidence_entries = vec![routing_log.clone()];` — checked, NOT a lever: the
+  same `Value` is also stored in the outcome struct (`:2647`), so both consumers need an owned copy; the
+  clone is inherent (not removable without an `Arc`/interface change), and it's per-run sub-ms regardless.
+- Encoder int8 GEMM (`matmul_bias_i7`/`dot_i8`): trusted at ceiling per the firm memory
+  ([[project_dot_i8_avx2_landed]], [[project_i7_epilogue_simd_reject]], [[project_engine_at_safe_ceiling]] —
+  which explicitly say "don't re-run the audit"); not re-probed.
+**CONVERGENCE MARKER (CyanGull session):** the byte-exact autonomous perf frontier is codebase-wide
+exhausted and its wins measured + guarded. Remaining perf value is owner-decisions only: the one-line
+`FW_ENC_FREE_F32` flip (byte-exact, verified, doubly-guarded), the non-wav round-trip, the batch prefetch
+(blocker pinned), or infra (GPU/blob-stream). Further autonomous byte-exact ticks will be repetitive.
