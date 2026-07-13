@@ -58,21 +58,25 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
 | track01 | turbo | seg-TS | **~1.79×** (≈ default) | 1.77× | full |
 | track01 | turbo | word-TS (DTW) | ~1.71×³ (≈ default) | 1.71× | full |
 | track01 | tiny.en | no_ts | **1.10×** | 1.87–1.93× | full (254 w) |
-| track01 | tiny.en | seg-TS (retry¹) | *(not yet measured⁴)* | 1.39× | full |
+| track01 | tiny.en | seg-TS (retry¹) | **0.78× (fw SLOWER)⁴** | 1.15–1.39× | full |
 | **sjobs 840 s / 28 win** | turbo | no_ts | **2.29×** | 2.44–2.58×² | fw clean / **wc loops (both modes)** |
 | sjobs 840 s | tiny.en | no_ts | **1.47×** | 2.06× | both clean (valid) |
 
 ¹ tiny.en TS default drops ~50% (content-drop bug) → non-comparable; `FW_RETRY_FAILED_WINDOW=1` restores full
 coverage (slower but correct). ² sjobs: wc degrades into repetition loops in *both* decode modes (beam-5 worse
-than greedy); fw stays clean either way. ³ **TS-mode has ~NO beam tax** (measured: turbo seg-TS wc-default
-22.4 s ≈ wc-greedy 22.5 s), so the turbo TS/word-TS cells are ALREADY ~matched-greedy — the beam-5 tax is a
-**no_ts phenomenon**, not a blanket correction. ⁴ tiny.en TS (decode-heavy + the retry) not yet measured
-matched-greedy; likely a smaller correction than no_ts since TS has no beam tax. Whole-pipeline
+than greedy); fw stays clean either way. ³ the beam tax in TS mode is **model-dependent**: **turbo** TS has ~none
+(encoder-dominated: wc-default 22.4 s ≈ wc-greedy 22.5 s ⇒ turbo TS/word-TS were already ~matched-greedy),
+but **tiny.en** TS DOES (decode-heavy: wc-default 2.58 s vs wc-greedy 1.76 s = 1.47× tax). ⁴ **tiny.en seg-TS
+is a LOSING cell matched-greedy: 0.78× (fw SLOWER than wc-greedy)** — because fw's tiny.en TS hits the
+content-drop bug, so correct coverage needs `FW_RETRY_FAILED_WINDOW=1`, which **re-decodes ~2 windows** (fw
+2.24 s vs wc-greedy 1.76 s). This is the retry-workaround's speed cost; a proper temp-fallback fix would
+narrow it. Reinforces the TOP-PRIORITY correctness item. Whole-pipeline
 rows are load-sensitive on this shared box; the isolated-encoder 2.29× (beam-independent) and the fw-vs-fw
 self-improvement are the confound-free anchors. **Net (matched-greedy, the fair comparison): franken is ~2–2.3×
-on encoder-heavy turbo, ~1.1–1.5× on decode-heavy tiny.en (clip-length-dependent — longer ⇒ more encoder ⇒
-higher), and at least as
-faithful — cleaner than wc on the one clip where either engine degraded.**
+on encoder-heavy turbo (all modes), ~1.1–1.5× on decode-heavy tiny.en no_ts (clip-length-dependent — longer ⇒
+more encoder ⇒ higher), but LOSES (~0.78×) on tiny.en seg-TS because the content-drop bug forces the retry's
+re-decode — a correctness-workaround cost, not a compute deficit. Faithful either way: 0 % WER vs ground truth
+on jfk, ~92 % word-agreement on real speech, cleaner than wc on loop-prone clips (both wc decode modes).**
 
 **Realistic multi-window no_ts (the target workload), measured 2026-07-12:** turbo, `track01.wav`
 (**124.5 s / 5 windows** — the *same clip* [[project_realistic_workload_dominated]] benched pre-int8),
