@@ -164,6 +164,88 @@ independently re-verified by a second agent at the code level + one empirical
 micro-bench). Remaining levers stay owner/infra-gated (WER-corpus, GPU, VNNI).
 
 ---
+## 2026-07-13 - Codex: **SURFACE / INVALID CV — fused Base64-to-JSON frame serialization measured 0.9957x with 8/21 wins; source reverted.**
+
+**Negative-ledger-first target.** The landed scratch-buffered plain-frame writer
+removed the outer JSON `String`, but `encode_to_writer` still allocated a fresh
+payload-sized Base64 `String` and then copied it into that JSON scratch buffer. No
+ledger row covered encode-to-JSON fusion: the existing Base64 surface is decode-side
+buffer reuse, while the compressor-reset surface is zlib state reuse. The candidate
+used Base64 0.22's heap-free `Base64Display` through Serde's `collect_str`, writing
+the exact unpadded payload directly into a borrowed wire frame in the reusable line
+buffer. Opportunity score was `(impact 4 * confidence 4) / effort 1.5 = 10.7`.
+
+**Strict-remote same-binary probe.** No local Cargo fallback occurred. RCH worker
+`vmi1227854`, job `j-29928833041826258`, compiled and ran both arms in one
+`--profile release-perf` binary:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench --profile release-perf -p franken_whisper --bench tty_bench -- \
+  tty/base64_json_fused_ab --sample-size 20 --warm-up-time 0.5 \
+  --measurement-time 1 --noplot
+
+benchmark binary sha256:
+  1f44c627097025f2b7ae90a4a79d99589b08ebcb38a0653a6ebc99326824101b
+```
+
+The conservative baseline allocated only the historical Base64 payload `String`;
+codec and SHA metadata were borrowed in both arms, so the measurement did not credit
+the candidate for unrelated metadata allocations. Both arms serialized 128 distinct
+1,600-byte high-entropy pre-compressed payloads into the same pre-sized outer and line
+buffers. Before timing, their complete 300,276 output bytes compared equal; common
+SHA-256 was
+`8e6fa3e6845ee1bdc71007c7b6a791da49be58e2d917276c3931bff87be8c234`.
+
+**Noise-resistant timing design.** One baseline pass calibrated at 402.231 us, so
+each microblock used five passes (approximately 2 ms). Every reported macro ratio is
+the median of 15 alternating `A/B/B/A` or `B/A/A/B` microquartets. Three macro
+warmups preceded 21 recorded macro ratios. The predeclared null gate required both a
+median in `[0.98, 1.02]` and macro CV at most 3.0%.
+
+BASE/BASE macro ratios:
+
+```text
+1.010060 0.983861 1.032997 0.963533 1.002140 0.999679 1.010080
+1.002358 0.995432 0.998133 1.017632 1.060020 0.909432 0.959178
+1.000421 1.004283 0.964128 0.978757 1.008236 1.027922 1.054700
+```
+
+Null median/p10/p90 were **1.002140 / 0.963533 / 1.032997**, range
+`[0.909432, 1.060020]`, wins 12/21. Centering passed, but CV was **3.340%**,
+above the predeclared 3.0% cap, so `null_valid=false`.
+
+BASE/fused macro ratios:
+
+```text
+1.070600 1.034642 1.015779 0.993284 1.035419 0.998964 1.000316
+0.993331 0.988840 0.991985 1.006746 0.986049 1.007298 0.972288
+0.985314 0.995736 0.986832 0.980317 0.999357 0.956859 1.002959
+```
+
+Candidate median/p10/p90 were **0.995736 / 0.980317 / 1.034642**, CV
+**2.418%**, range `[0.956859, 1.070600]`, wins **8/21**. It missed every keep
+condition: median below the predeclared 1.05 floor, p10 below 1.0, and fewer than
+18 wins. The candidate-only Criterion diagnostic was
+`[285.77 us, 314.95 us, 351.79 us]` for 128 frames; it is not comparative
+evidence.
+
+**Proof boundary.** The executed benchmark certified exact bytes for the timed
+128-frame corpus. A stronger focused oracle was also authored for empty and
+non-multiple-of-three Base64 tails, 1,599/1,600/1,601-byte payloads, maximum
+sequence, absent integrity fields, large-to-small scratch reuse, parse/decode
+round trips, and three-byte short writes. It is deliberately not claimed as
+executed because the measurement already forced restoration.
+
+**Verdict: invalid-CV SURFACE, not a keep or authoritative regression.** The
+production wire view, fused helper, boundary test, and temporary nested A/B harness
+were manually restored byte-for-byte to `HEAD`; no runtime or benchmark code
+remains. On this shape, Base64Display's chunked formatting overhead offsets the
+allocation/copy it removes. Reopen only on a quieter worker or after a materially
+different Base64/Serde implementation; do not infer a win from allocation removal
+alone.
+
+---
 ## 2026-07-13 - Codex: **SURFACE / INVALID NULL — sorting borrowed pipeline-adapter frame references measured 1.0280x, inside a broad BASE/BASE envelope; source reverted.**
 
 **Negative-ledger-first target.** `TtyAudioPipelineAdapter::ingest_frames` cloned
