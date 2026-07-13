@@ -20401,3 +20401,38 @@ every default hot path** — encoder activation quant (`26feafd`), decoder per-r
 `quantize_rows_to_i7` (encoder wt, `enc_ef` DEFAULT-ON = serial EF `err`-chain, not vectorizable) and the
 packed-nibble int4 kernel (fc1; check its gate/default separately if pursued — nibble packing complicates
 the store). Every quant-INPUT pass that feeds the AVX2 GEMV kernels (dot_i8, dot_f16c) is now AVX2.
+
+## 2026-07-13 (GoldenOwl) — scalar-quant/round/exp vein CLOSED: exhaustive site probe (no lever)
+
+After the 3 quant wins (26feafd/3e7f295/991df99) I probed EVERY remaining scalar `.round()`/`.exp()`/dot
+site on a default hot path. **No clean autonomous byte-exact lever remains.** Full classification (so the
+next session does NOT re-derive):
+
+- **Encoder WEIGHT quant is EF-SERIAL by default → NOT vectorizable (the crisp reason).** `quantize_rows_to_i7`
+  (i7) reads `enc_ef_quant()` (FW_ENC_EF_QUANT) which is **DEFAULT-ON** (kill-switch: only 0/off/false/no
+  disables). The default branch is the error-feedback loop `target = w·inv + err; q = round(target); err =
+  target − q` — a SEQUENTIAL dependency through `err`, so it is latency-bound and cannot be SIMD'd. The
+  amax pass could be vectorized but the EF quant pass dominates. This is exactly WHY the decoder quant was
+  fixable (`dec_ef` DEFAULT-**OFF** → independent round) and the encoder weight quant is not.
+- **Encoder attn_out i8 quant** (`quantize_enc_i8_rows`, non-EF) — default caller `quantize_enc_i8` reads
+  the pre-transposed `[in,out]` f32 via `w_t.data[i*out+o]` = **STRIDED** (stride `out`) ⇒ gather, and
+  AVX2 gather is microcoded on Zen ([[project_gelu_gather_antipattern_fixed]]). The CONTIGUOUS f16-bytes
+  twin (`quantize_enc_i8_f16_bytes`) is only reached on the owner-gated FW_ENC_FREE_F32 path (non-default —
+  don't optimize non-default code, [[project_grep_the_gate]]). Note the clean f16-direct layout is coupled
+  to FW_ENC_FREE_F32's f32-free; decoupling (contiguous-AVX2-quant while retaining f32) is the only real
+  default-path idea left but is an invasive load-path refactor AND still hits the EF-serial wall above ⇒
+  owner/dedicated-session, not an autonomous increment.
+- **Softmax** (`softmax_rows`) — default is scalar libm `.exp()` (byte-exact); the AVX2 poly is
+  `FW_SIMD_EXP`/`softmax_row_poly_numer` (owner-gated, non-byte-exact). The max-reduce + normalize already
+  autovectorize. exp is the ONLY cost and it's the gated non-byte-exact lever. No byte-exact structural win.
+- **Decode dots ALL already AVX2:** `dot_i8` (i8·i8 madd), `dot_f16c` (f16c fused), `dot_i8w_f32` (fc2
+  block GEMV, i8·f32 fmadd). `argmax` AVX2 ([[project_argmax_avx2_landed]]). Nothing scalar feeds them.
+- **Remaining `.round()` hits are all non-levers:** `i7_roundtrip`/`u8_act_roundtrip` (feasibility
+  HARNESSES, "examples/*_probe", not production), the AVX2 helpers' own scalar tails/fallbacks, and the
+  EF/kill-switch branches. Verified by grep this tick.
+
+**Net:** the scalar-quant/round vein is fully closed across every default hot path. The 3 landed wins swept
+the vectorizable quant-INPUT passes (encoder activation, decoder per-row + block-wise weight). What's left
+is EF-serial (impossible), strided-gather (microcoded), owner-gated (FW_ENC_FREE_F32 / FW_SIMD_EXP / SDPA
+poly-exp), external (SDPA kernel), or bandwidth-bound (LN, residual adds, logits GEMV). Next session: do
+NOT re-hunt scalar quant — pivot to owner-gated levers or a fresh subsystem/antipattern class.
