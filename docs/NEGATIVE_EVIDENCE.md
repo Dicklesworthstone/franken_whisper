@@ -20678,3 +20678,33 @@ session's biggest shipped default-on change is safe on the harder path. (The qua
 991df99 are unconditional AVX2 so can't be runtime-A/B'd, but are byte-exact by their matches-scalar unit
 tests + this shows the composed default binary decodes multi-window audio correctly.) No new lever; a
 robustness datapoint for the shipped work.
+
+## 2026-07-13 (GoldenOwl) — TWO-REGIME correction: long-audio is DECODE-dominated (62.5%), not encode; both closed
+
+**The single-window jfk frame table (encoder 58.7%, decode 9%) that the CONSOLIDATED FRONTIER MAP's e2e%
+column is built on is NOT representative of the realistic long-audio workload.** Fresh MULTI-WINDOW span
+(track01.wav, 124 s = 5 windows, turbo, `PERF_SPANS=1`, HEAD binary, no build):
+
+| window | encoder_window | cross_kv | prefill | decode_loop (tokens) |
+|---|---|---|---|---|
+| 1 | 1389 ms | 42 | 34 | 1147 (78) |
+| 2 | 124 | 33 | 134 | 1104 (71) |
+| 3 | 173 | 41 | 123 | 1238 (72) |
+| 4 | **0.00** | 42 | 124 | 1226 (76) |
+| 5 | **0.00** | 30 | 12 | 50 (8) |
+
+`backend_run` 7625 ms. **Totals: decode 4765 ms = 62.5%, encoder 1686 ms = 22% (window-1 heavy; windows
+4-5 = 0.00 ms → the encoder is PIPELINED behind the prior window's decode, `project_window_pipelining_lever`),
+load 499 ms = 6.5%, prefill 427 ms = 5.6%.** So for long audio the encoder mostly VANISHES (pipelined) and
+DECODE dominates — the opposite of jfk. Per-token decode ~15.6 ms (track01) vs 7.7 ms (jfk): the delta is
+larger self-attn context + longer carried-prompt prefill (windows 2-4 prefill 4× window-1's).
+
+**BUT this yields NO lever — decode is equally byte-exact-closed** ([[project_decode_frame_table]] +
+[[project_self_attn_kv_cache_lever]], re-read this tick): decode = mlp 31.9% (int8 GEMV, closed) + logits
+19.1% (133 MB/token tied-embedding DRAM read, bandwidth-DEAD) + int8 projections 32.8% (closed) + self_attn
+10.7% (O(tk) but per-head KV-dot ≤114 KB = **L2-resident, compute/latency-bound NOT DRAM-bound** → f16-KV
+MEASURED 2× SLOWER, dead in every form incl F16C; scores-dot SIMD transcript-UNSAFE = hallucinates on tiled
+jfk×3; output SAXPY already AVX2) + cross_attn 4.4% (closed). **Correction for the map: the frontier is
+exhausted in BOTH regimes — jfk (encode-bound) AND long-audio (decode-bound); I had only ever profiled the
+encode-bound one. Both are closed; no new lever.** The one genuine long-audio efficiency question — encoder
+work on windows 4-5 shows 0.00 ms so cross-window pipelining is already hiding it — is also already landed.
