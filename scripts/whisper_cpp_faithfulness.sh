@@ -16,10 +16,12 @@
 #   * WER vs GROUND TRUTH (optional 4th `|`-field = a reference .txt): the rigorous
 #     anchor. On jfk this is 0.0% for both models (native is exactly right).
 #
-# Native is forced to the real native engine (NATIVE_ROLLOUT_STAGE=sole) — WITHOUT
-# it `fw transcribe` can route to the whisper.cpp backend and NOT test native.
-# no-timestamps on both (the content-comparable path; note tiny.en *TS* drops ~50%
-# unless FW_RETRY_FAILED_WINDOW=1, so compare in no_ts or set that flag).
+# Native is PINNED with NATIVE_ROLLOUT_STAGE=sole (= NativeOnly). The DEFAULT stage
+# is `Primary` = native-PREFERRED (backend/mod.rs), so `fw transcribe` already uses
+# native normally — but Primary can silently FALL BACK to the whisper.cpp bridge if
+# native errors; `sole` removes that fallback so a bench can never accidentally time
+# the bridge. no-timestamps on both (the content-comparable path; note tiny.en *TS*
+# drops ~50% unless FW_RETRY_FAILED_WINDOW=1, so compare in no_ts or set that flag).
 #
 # Env:
 #   FW         franken_whisper `fw` binary   (default: $CARGO_TARGET_DIR/release/fw)
