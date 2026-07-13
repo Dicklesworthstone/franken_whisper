@@ -149,6 +149,13 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
     int8 encoder would mangle ("Frank at")** — it's correct. So the 88.5 % gap is filler + one acronym, NOT
     proper-noun errors: the content-critical tokens are faithful, confirming the shipped int8 encoder is
     proper-noun-safe on this clip vs the reference (not just vs a golden).
+  - **DEFINITIVE: int8 adds ZERO proper-noun divergence vs the reference on EITHER model (2026-07-12).**
+    On tiny.en track01, fw and wc render **every** proper noun identically — including the same mistake:
+    both say **"Frankenstein"** for FrankenSearch (the 39 M model's limit, NOT franken-int8 — whisper.cpp's
+    tiny.en makes the exact same error), and both agree on XF / Twitter / CAS / Daniel / Search. Turbo gets
+    FrankenSearch *right* (both). So proper-noun accuracy is **purely model-size-dependent and matched
+    exactly by the reference** at both sizes ⇒ the shipped int8 encoder costs nothing on the
+    faithfulness-critical axis; the "Frank at" fear ([[project_turbo_encoder_dominates]]) is fully closed.
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
