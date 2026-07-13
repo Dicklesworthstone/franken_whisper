@@ -20095,3 +20095,28 @@ completed evidence so the flip is a decision, not a re-measurement. Do NOT re-hu
 encoder-weight-f32 peak vein (closed: encoder f16-direct done, decoder weights are
 f16-resident-and-live, the 1.5 GB ggml blob is load-peak-only and dropped post-load ⇒
 reducing it needs incremental blob streaming, a large loader change).
+
+### 2026-07-13 CyanGull addendum — vein CONVERGED; exact flip-blocker mechanics
+Fresh code-verification this tick (so future ticks stop re-probing these):
+- **Decoder = no lever.** `decoder::load_linear` (decoder.rs:513-535) picks `WeightMat::F16`
+  (natural `[out,in]`, **no transpose**) whenever `f16_compute_enabled()` && the tensor is
+  f16 — the shipping config for turbo/tiny.en. `w_i8` is built from that **live** F16 (used
+  for prefill tq>1; i8 for tq==1), so there is NO dead weight to free and NO transpose to
+  skip. The `WeightMat::F32` branch is non-default and its f32 is live (never i8-quantized).
+  Embedding likewise f16-live (lookup + tied logits). So the encoder f16-direct trick has NO
+  decoder analog.
+- **`model_parse` (~136 ms turbo) = blob-read-bound.** `GgmlModel::load` reads the whole
+  1.5 GB file via the multi-thread `read_at` bands (~110 ms) then parses header/vocab/tensor-
+  dir (~26 ms). The read is already parallel/bandwidth-bound; the vocab is 51865 necessary
+  owned `Vec<u8>` (blob is dropped post-load). No byte-exact lever.
+- **Exact flip-blocker (for whoever does the owner flip):** the ONLY f32-reader is
+  `assert_quality_safe_int8_error_budget` (encoder.rs:2031) — it compares `layer.attn_q_w`
+  (retained f32) vs `dequant_i7_for_test(attn_q_i7)` at encoder.rs:2081 (+ k/v/fc1/fc2/attn.out).
+  A per-test `set_var("FW_ENC_FREE_F32","0")` is NOT reliable — `enc_free_f32()` is a `OnceLock`
+  cached on first read, so another test may fix it first. Clean fix: make the assert **re-derive**
+  the reference f32 from `model` (`load_linear_transposed(model, "encoder.blocks.{idx}.…", …)`)
+  instead of reading the (possibly-freed) `layer.*_w` field ⇒ free-safe by construction; then
+  the default is flippable. **Net: no autonomous byte-exact perf lever remains in the native
+  load/hot path; the sole remaining perf value is the owner flip (fully spec'd above) or a
+  fundamentally different area (GPU compute stack, incremental blob streaming) — both outside
+  the byte-exact autonomous envelope.**
