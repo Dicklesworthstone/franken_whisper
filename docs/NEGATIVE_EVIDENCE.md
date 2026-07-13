@@ -20300,3 +20300,16 @@ full → the disk-pressure reaper evicted the entire `/data/tmp/cargo-target` mi
 create a temp dir`; the `fw` binary + deps were removed). This afflicts ALL builds on the box right now,
 not just this diff ([[project_asupersync_oom_roulette]] / the "box turns hostile at ~86 % full" hazard).
 No code impact — a build/infra condition; retry when disk frees.
+
+### METHOD LESSON (the session's most reusable takeaway)
+The pre-session record declared the byte-exact autonomous envelope **CLOSED**. It was **premature**: this
+session landed FIVE real byte-exact wins AFTER that — blob-read band cap (−13 ms `model_parse`, MEASURED,
+`5fc0707`), read_wav mono fast path (1.26×, `87556b4`), encoder f16-direct quant (−2.31 GB peak + 1.68×
+weight build, `c701b45`/`ae5f618`), and vocab-move + fuse_qkv clone removals — plus 4 regression guards.
+**How:** by refusing to trust "closed" and instead *opening every file and reading the actual structure*
+(the wins hid in the load path's blob-read banding, the production wav decoder, and the encoder weight-
+quant layout — none of which the frontier's compute-focused sweep had examined). The "load path is at
+its floor" claim was also stale (f16-direct removed the transpose entirely). **For the next perf session:
+a `frontier says CLOSED` note means "the OBVIOUS levers are gone," not "no lever exists" — pivot to
+genuinely-untouched files/subsystems and read them line-by-line before concluding exhaustion.** Only NOW,
+after every file is personally opened + every win guarded, is it genuinely complete.
