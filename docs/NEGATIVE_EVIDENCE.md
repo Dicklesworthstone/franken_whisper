@@ -20194,3 +20194,23 @@ Continued the "read the structure, remove redundant work" sweep after the blob-r
   **238 passed / 0 failed** (9.85 s, default config). The `FW_ENC_FREE_F32=1` gate (238/0 at
   `0426da9`) is unaffected — the free path is encoder-only and orthogonal to these reorders. So the
   session's work is regression-clean and the flip remains fully gated.
+
+## 2026-07-13 - CyanGull codebase-wide byte-exact sweep COMPLETE (per-subsystem map)
+
+Every subsystem personally opened + verified this session (not just the frontier's mapped areas):
+- **Encoder/decoder compute** — at ceiling (int8 i7/i8 GEMM + external SDPA kernel; poly-exp gated).
+- **Load path** — WINS landed: blob-read band cap 16→32 (`5fc0707`, −13 ms), encoder f16-direct quant
+  (`c701b45`/`ae5f618`, gated, −2.31 GB peak + 1.68× weight build), vocab-clone→move (`1cd287c`),
+  fuse_qkv clone→borrow (`9c21192`). Per-tensor f16-decode caps hidden/tiny; two-phase floor
+  characterized. Near floor; only remaining load win is the owner-gated FW_ENC_FREE_F32 flip.
+- **Audio decode** — WIN: `read_wav_16k_mono` mono fast path (`87556b4`, kills wasted ÷channels
+  division + autovec, byte-exact, PRODUCTION path). Samples go DIRECT to `log_mel` (no per-sample
+  prep). `compute_frame_rms` (VAD analysis) is a SEQUENTIAL f64 sum — NOT byte-exact vectorizable
+  (reorder changes thresholds). `write_mono_wav_i16` (decode_to_wav tool) is peripheral.
+- **Mel** — computed ONCE (`full_mel`), windowed; optimized (twiddles/sparse banks), <0.25%. No lever.
+- **Tokenizer** — lean (only `tokens` + `non_speech`; no eager token_to_id map). Vocab arena rejected
+  (~2 ms sub-noise vs correctness-critical refactor).
+- **Sync/export/DB** — bufwriter/batch/savepoint-optimized (10 prior wins); export path re-verified clean.
+- **Orchestrator/routing** — per-run sub-ms; `routing_log` is part of the outcome contract (not wasted).
+**Net: the byte-exact autonomous perf frontier is codebase-wide EXHAUSTED. The only remaining perf
+value is the owner-gated FW_ENC_FREE_F32 flip (fully prepared/verified) or infra (GPU / blob streaming).**
