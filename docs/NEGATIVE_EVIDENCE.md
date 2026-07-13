@@ -14,14 +14,11 @@ start an independent zlib member for every frame, and swapped between two
 capacity-retaining output `Vec`s. Compression level, Base64, CRC32, SHA-256,
 frame schema, event serialization, ordering, and output writes were unchanged.
 
-**Proof seam.** A temporary production helper returned the same Base64 payload
-as the historical fresh-compressor path. Its focused oracle covered 1-, 160-,
-480-, 1,600-, and 40,000-byte inputs, high- and low-entropy data, and an
-identical input repeated after a different stream to catch leaked dictionary
-state. Every compressed Base64 string was byte-identical and every reused
-stream inflated back to its input. The same-binary harness additionally
-asserted all 145,216 output bytes across 128 mixed-entropy 1,600-byte frames;
-their SHA-256 was
+**Executed proof seam.** Before timing, the same-binary harness compressed 128
+mixed-entropy 1,600-byte frames through both the historical fresh-compressor
+path and the reset/reuse candidate. Every Base64 payload was byte-identical,
+covering consecutive independent streams with sharply different compression
+ratios. It asserted all 145,216 output bytes; their SHA-256 was
 `4015611538ca9889836ffd6a8e2e963a6e836ba44ff5500d70d650bd39810092`.
 
 **Strict-remote measurement.** No local Cargo fallback occurred. RCH was
