@@ -4,6 +4,66 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-13 - Codex: **REJECT — replacing TTY decode's post-sort `HashSet` with adjacent-sequence tracking measured 1.024879x, inside the valid BASE/BASE null envelope; source restored.**
+
+**Negative-ledger-first target.** Recent TTY rows closed JSON dispatch, zlib input
+buffering, direct inflate, and line/Base64 scratch reuse, but no ledger row covered
+duplicate membership after `decode_frames_to_raw_with_policy` stably sorts all frames
+by sequence. Equal sequence numbers are therefore adjacent. The candidate replaced
+one stream-level `HashSet` allocation plus per-frame membership/insertion hashing with
+`last_seq: Option<u64>`. Metadata validation remained before duplicate detection, and
+the sequence was recorded before recoverable payload/integrity failures so a corrupt
+first copy still made the next equal sequence a duplicate. Opportunity score was
+`(impact 2 x confidence 5) / effort 1 = 10`.
+
+**Strict-remote foreground proof.** One `release-perf` test binary ran the historical
+`HashSet`, a BASE/BASE null, and adjacent tracking in alternating ABBA/BAAB order on
+worker `vmi1149989` (RCH job `j-29928833041827112`). No local Cargo fallback occurred.
+The full path parsed a handshake plus 128 valid 24-byte frames, stably sorted them,
+decoded Base64 and zlib, checked CRC32 and SHA-256, and produced 3,072 raw bytes.
+One baseline pass calibrated at 492.092 us; each arm used 204 passes (about 100 ms),
+with three warmup ratios and 21 recorded ratios. Binary SHA-256 was
+`8c28d8ed8ffe189a91b911e115984475b8f902b08e8f3178011e915d85d48c9d`;
+the common report-plus-output SHA-256 was
+`bc69978f58b8c834b59cc6a1019ac249ffcfdd6a16209c3f7da598740d0a8613`.
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo test --profile release-perf -p franken_whisper --lib \
+  tty_audio::tests::decode_adjacent_duplicate_tracker_perf -- \
+  --ignored --exact --nocapture
+```
+
+| comparison | median | p10 | p90 | CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| BASE/BASE null | 0.989521 | 0.953301 | 1.054715 | 5.043% | 8/21 | valid: median inside predeclared `[0.98, 1.02]` |
+| `HashSet` / adjacent | **1.024879x** | 0.923889 | 1.069004 | 8.651% | 14/21 | reject: median remains inside null p10-p90 and misses 17/21 wins |
+
+Raw BASE/BASE ratios:
+`[0.967800, 1.028996, 0.968817, 1.008101, 0.990520, 0.968598,
+0.961565, 0.922250, 1.054715, 1.126368, 1.020491, 0.997425,
+1.043834, 0.899679, 0.989521, 0.964227, 1.005279, 0.980270,
+1.061712, 0.987056, 0.953301]` (range `[0.899679, 1.126368]`).
+
+Raw candidate ratios:
+`[0.992078, 0.989691, 1.028586, 1.088906, 0.680149, 1.054872,
+1.012073, 1.014347, 1.063098, 1.069004, 0.950768, 1.043400,
+1.001492, 1.024879, 0.995411, 1.029803, 0.923343, 1.043486,
+0.923889, 1.069973, 1.054746]` (range `[0.680149, 1.088906]`).
+
+**Behavior proof and verdict.** Before timing, the same binary required exact equality
+of the complete successful `DecodeReport` debug representation and all output bytes
+between the historical and candidate implementations. The probe passed `1 passed / 0
+failed` in 18.05 s after a 15m47s strict-remote cold build. A focused
+corrupt-first/duplicate-second recovery oracle was authored and type-checked, but is
+deliberately not claimed as executed because the performance result already forced
+restoration. The approximately 2.5% candidate median did not clear the measured null
+floor, so production, oracle, and temporary A/B code were restored byte-for-byte to
+`HEAD`; no runtime or benchmark code remains. Reopen only if duplicate tracking becomes
+profile-visible on a materially larger stream and a same-binary candidate exceeds the
+null p90.
+
+---
 ## 2026-07-13 - Codex: **REJECT — preallocating the word-timestamp segment vector measured 1.019959x, inside the valid BASE/BASE null envelope; source restored.**
 
 **Negative-ledger-first target.** The native compute and recently swept TTY,
