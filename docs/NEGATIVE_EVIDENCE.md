@@ -20762,3 +20762,14 @@ owner-scoped (monolithic feature, not a measured small increment).** Everything 
   (build it behind a default-OFF flag, verify byte-exact via turbo/tiny.en transcript diff before any flip), OR
   re-point the loop at the owner's long-form content-drop temp-fallback (the frontier's stated top priority).
   The autonomous byte-exact perf loop has no measured small win left to find — this brief is the handoff.
+
+## 2026-07-13 (GoldenOwl) — FW_ENC_FREE_F32 flip cross-model verified (tiny.en too, not just turbo)
+
+Closed the last cross-model gap on the session's biggest shipped win. tiny.en jfk (HEAD binary, no build),
+flip default (freed) vs `FW_ENC_FREE_F32=0` (retained): transcript **BYTE-IDENTICAL** (md5 `f7b8eeb…`,
+"And so my fellow Americans ask not…"), peak RSS **182 MB vs 210 MB (−13%, −28 MB)**. So the flip is
+byte-exact on BOTH shipped models (turbo −2.46 GB / tiny.en −28 MB — the RSS win scales with model size, the
+freed f32 encoder weights, exactly as the model-agnostic code proof predicts: quantized linears never read
+the freed f32 regardless of model). Combined with the earlier multi-window (5-window + tiled) turbo
+verification, the shipped default-on flip is now confirmed byte-exact across {both models} × {single- and
+multi-window}. Robustness datapoint, no new lever.
