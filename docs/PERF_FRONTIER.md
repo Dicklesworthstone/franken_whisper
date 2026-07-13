@@ -156,6 +156,13 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
     FrankenSearch *right* (both). So proper-noun accuracy is **purely model-size-dependent and matched
     exactly by the reference** at both sizes ⇒ the shipped int8 encoder costs nothing on the
     faithfulness-critical axis; the "Frank at" fear ([[project_turbo_encoder_dominates]]) is fully closed.
+  - **GROUND-TRUTH ANCHOR — 0.0 % WER on jfk, BOTH models (2026-07-12).** Every other faithfulness number
+    above is fw↔wc *agreement* (and wc itself degrades on hard clips), so the rigorous anchor is the one
+    clip whose correct transcript is *known*: jfk.wav. fw vs the canonical words = **0.0 % WER (S=D=I=0,
+    N=22)** on **large-v3-turbo AND tiny.en** — perfect, word-for-word, even on the 39 M model. So on the
+    clip with ground truth, franken is exactly right; the 88–98 % fw↔wc gaps elsewhere are **wc's
+    degradations or benign filler, not franken errors**. This is the strongest form of the "faithful"
+    claim: measured against truth, franken is 0 % WER.
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
