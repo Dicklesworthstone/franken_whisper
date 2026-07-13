@@ -20862,3 +20862,22 @@ windows +6% SLOWER int4-on (off ~723 ms vs on ~769 ms, alternating A/B, rep-1 di
 > halved-bandwidth gain, decode is dispatch/latency-bound. int4-fc1 is now dead on BOTH axes; doc comment on
 `int4_mlp0_enabled` corrected to say so. Reinforces "jfk-identical ≠ corpus-neutral" — validate flags on
 multi-window real audio, not just jfk.
+**Tick 2026-07-13b (this loop) — LANDED a gated audio-path lever + 2 perf-integrity datapoints (pivoted OFF
+the compute frontier, per the "wins hide in load/audio not compute" pattern).** (a) **`FRANKEN_WHISPER_WAV_
+PASSTHROUGH` (default OFF, `src/audio.rs`)**: an input already 16 kHz/mono/16-bit-PCM WAV is fed to the backend
+verbatim, skipping the symphonia decode→resample→i16-rewrite→reread roundtrip. MEASURED (built + verified,
+track01, alternating A/B rep-1 discarded): normalize stage **~44 ms → ~21 ms (−23 ms, ~1.9% e2e wall)**;
+transcript **BYTE-IDENTICAL** to default on track01 (real speech) + A/A null-control clean + fast-path log
+confirmed. NOT universally byte-exact (writer quantizes `×32767`, reader dequantizes `/32768`, so the default
+path attenuates every sample by 32767/32768; passthrough preserves the original, un-attenuated samples — a
+±1 LSB delta that rounds away on small-magnitude speech but could shift argmax on a FULL-SCALE wav), hence
+default-OFF pending an owner WER check before any flip. Bonus finding: the default normalize path silently
+attenuates already-normalized wavs by 32767/32768. (b) **decode int8 suite is corpus-APPROXIMATE, not byte-
+exact, on real audio**: A/B on track01 shows the shipped default (all int8 on, 254 w) diverges from the exact
+f16 decode (all int8 off, 239 w) by distributed token drift (full coverage both; each of logits/fc1/fc2/attn_out
+contributes) — the "transcript byte-exact vs f16" claims in the `mod.rs` decode-int8 doc comments are jfk-single-
+window-scoped, a legitimate Q8-class approximation (whisper.cpp ships Q8_0) but NOT byte-exact on corpus.
+(c) **`FRANKEN_WHISPER_ENC_INT8` is turbo-GEMM-size-gated**: on tiny.en it is ZERO speedup (encoder_window
+74.3→74.2 ms) + 55-word drift — the 1.47× is a large-model (n_state=1280) benefit; worthless on small models
+(SDPA-dominated + tiny GEMMs). dtw/word-ts confirmed sub-floor; orchestration gap (~120 ms) mostly inherent
+process startup.

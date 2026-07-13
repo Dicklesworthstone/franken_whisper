@@ -21,6 +21,17 @@ const FFMPEG_BIN_ENV: &str = "FRANKEN_WHISPER_FFMPEG_BIN";
 const FFPROBE_BIN_ENV: &str = "FRANKEN_WHISPER_FFPROBE_BIN";
 const FORCE_FFMPEG_NORMALIZE_ENV: &str = "FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE";
 const AUTO_PROVISION_FFMPEG_ENV: &str = "FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG";
+/// When set (default OFF), an input that is ALREADY a 16 kHz mono 16-bit PCM WAV
+/// is handed to the backend verbatim, skipping the symphonia decode → resample →
+/// i16-rewrite → reread roundtrip (measured ~4.6% of e2e wall on a pre-normalized
+/// wav; the whole normalize stage). NOT byte-exact vs the default path: the writer
+/// quantizes with `f32 * i16::MAX (32767)` while the native reader dequantizes with
+/// `i16 / 32768`, so the default path attenuates every sample by 32767/32768;
+/// pass-through preserves the original samples (arguably MORE faithful, but a
+/// different, un-attenuated stream that can shift a few argmax decisions on real
+/// speech). Owner-gated on a WER/transcript check before any default flip; hence
+/// default OFF. `FRANKEN_WHISPER_WAV_PASSTHROUGH=1`.
+const WAV_PASSTHROUGH_ENV: &str = "FRANKEN_WHISPER_WAV_PASSTHROUGH";
 const DEFAULT_STATE_DIR: &str = ".franken_whisper";
 const DEFAULT_STATE_HOME_DIR: &str = ".local/state/franken_whisper";
 const FFMPEG_TOOLS_DIR: &str = "tools/ffmpeg";
@@ -133,6 +144,23 @@ pub(crate) fn normalize_to_wav_with_timeout(
 ) -> FwResult<PathBuf> {
     let output = work_dir.join("normalized_16k_mono.wav");
 
+    // Opt-in fast path: an input already in the target format (16 kHz mono 16-bit
+    // PCM WAV) is fed to the backend verbatim, skipping the decode/resample/rewrite
+    // roundtrip. Not byte-exact vs the default path (writer ×32767 vs reader /32768
+    // attenuation) — see WAV_PASSTHROUGH_ENV — so it is default OFF and never
+    // overrides a forced ffmpeg normalize.
+    if prefer_wav_passthrough() && !force_ffmpeg_normalizer() && is_already_normalized_wav(input) {
+        tracing::info!(
+            stage = "normalize",
+            input = %input.display(),
+            "input already 16 kHz mono 16-bit PCM WAV; passing through (FRANKEN_WHISPER_WAV_PASSTHROUGH)"
+        );
+        if let Some(tok) = token {
+            tok.checkpoint()?;
+        }
+        return Ok(input.to_path_buf());
+    }
+
     // If the user explicitly forces ffmpeg, skip the built-in path entirely.
     if force_ffmpeg_normalizer() {
         tracing::info!(
@@ -218,6 +246,38 @@ fn force_ffmpeg_normalizer() -> bool {
         std::env::var(FORCE_FFMPEG_NORMALIZE_ENV).ok().as_deref(),
         false,
     )
+}
+
+/// Opt-in pass-through for inputs already in the target format (see
+/// [`WAV_PASSTHROUGH_ENV`]). Default OFF.
+fn prefer_wav_passthrough() -> bool {
+    bool_env_enabled_from_raw(std::env::var(WAV_PASSTHROUGH_ENV).ok().as_deref(), false)
+}
+
+/// Cheap header-only probe: is `input` already a 16 kHz, mono, 16-bit **integer**
+/// PCM WAV — i.e. exactly what the backend's `read_wav_16k_mono` consumes, so the
+/// decode → resample → rewrite roundtrip would be pure overhead? `hound` reads only
+/// the RIFF/`fmt ` header here (samples stay lazy), so this is O(1). Any open/parse
+/// error or format mismatch returns `false` and the caller falls through to the
+/// normal normalize path — the fast path never changes which inputs SUCCEED.
+fn is_already_normalized_wav(input: &Path) -> bool {
+    let ext_is_wav = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
+    if !ext_is_wav {
+        return false;
+    }
+    match hound::WavReader::open(input) {
+        Ok(reader) => {
+            let spec = reader.spec();
+            spec.channels == 1
+                && spec.sample_rate == 16_000
+                && spec.bits_per_sample == 16
+                && spec.sample_format == hound::SampleFormat::Int
+        }
+        Err(_) => false,
+    }
 }
 
 fn auto_provision_ffmpeg_enabled() -> bool {
