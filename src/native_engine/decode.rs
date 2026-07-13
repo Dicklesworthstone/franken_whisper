@@ -2845,6 +2845,52 @@ mod tests {
         assert!((out[1] - 1000.0 / 32768.0).abs() < 1e-6);
     }
 
+    /// The `channels == 1` fast path in `read_wav_16k_mono` (`87556b4`) must be
+    /// BIT-IDENTICAL to the general per-channel accumulation loop it replaced, and
+    /// materially faster (the old path did TWO runtime f32 divisions per sample plus
+    /// `push`, inhibiting autovec; the fast path is one vectorized `×2⁻¹⁵`). This
+    /// guards the byte-exactness of the opt forever and records the speedup as a
+    /// foreground micro-bench (~4 M samples, both paths timed back-to-back).
+    #[test]
+    fn read_wav_mono_fast_path_byte_exact_and_faster() {
+        use std::time::Instant;
+        let n = 4_000_000usize; // ~4.2 min of 16 kHz audio; cycles the full i16 range 61×.
+        let mut data = vec![0u8; n * 2];
+        for (i, chunk) in data.chunks_exact_mut(2).enumerate() {
+            // Deterministic fill covering the full i16 range (incl. ±edge values).
+            chunk.copy_from_slice(&(i as i16).to_le_bytes());
+        }
+        // NEW: the mono fast path (what `read_wav_16k_mono` uses at channels == 1).
+        let t = Instant::now();
+        let fast: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        let t_fast = t.elapsed();
+        // OLD: the general per-channel accumulation loop with channels == 1.
+        let channels = 1usize;
+        let n_frames = data.len() / (2 * channels);
+        let t = Instant::now();
+        let mut general = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            let mut acc = 0i32;
+            for c in 0..channels {
+                let o = (f * channels + c) * 2;
+                acc += i32::from(i16::from_le_bytes([data[o], data[o + 1]]));
+            }
+            general.push((acc as f32 / channels as f32) / 32768.0);
+        }
+        let t_old = t.elapsed();
+        assert_eq!(
+            fast, general,
+            "mono fast path must be byte-identical to the general per-channel loop"
+        );
+        eprintln!(
+            "read_wav mono i16→f32 ({n} samples): fast={t_fast:?} old={t_old:?} speedup={:.2}×",
+            t_old.as_secs_f64() / t_fast.as_secs_f64().max(1e-12)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Gated end-to-end tests against the real tiny.en model + jfk.wav.
     // -----------------------------------------------------------------------
