@@ -261,13 +261,19 @@ struct EncQuantPlan {
     proj: bool,
 }
 
-/// Load a linear's f32 `[in, out]` weight and, when `to_i7`, quantize it to i7. When
-/// `free`, the f32 is dropped in place (an empty `Mat` is returned) so it never
-/// outlives this call — bounding the transient f32 to ~one linear per rayon worker
-/// during the parallel layer load. Byte-exact: identical `load_linear_transposed`
-/// f32 and identical `nn::quantize_mat_to_i7` to the historical two-phase path; only
-/// the f32's lifetime differs. When `!free` (flag off / macOS / roundtrip harness)
-/// the f32 is retained exactly as before, so the shipping default is unchanged.
+/// Load a linear's `[in, out]` weight and, when `to_i7`, quantize it to i7. When
+/// `free`, the f32 is never handed back (an empty `Mat` is returned), bounding the
+/// transient f32 to ~one linear per rayon worker during the parallel layer load.
+///
+/// The `to_i7 && free` case — the FW_ENC_FREE_F32 peak path — quantizes STRAIGHT from
+/// the resident ggml f16 bytes via [`nn::quantize_f16_bytes_to_i7`], never building
+/// the transposed f32 `Mat` at all: this skips both the transpose and the f32
+/// round-trip (a load-time win) and leaves zero per-linear f32 transient (a further
+/// peak win beyond the load-quant fusion). Bit-identical to
+/// `quantize_mat_to_i7(&load_linear_transposed(..))`. f32-stored tensors (no f16
+/// bytes) fall back to materialize→quantize→free. When `!free` (flag off / macOS /
+/// roundtrip harness) the f32 is retained exactly as before ⇒ shipping default
+/// unchanged.
 fn load_linear_maybe_i7(
     model: &GgmlModel,
     name: &str,
@@ -276,12 +282,29 @@ fn load_linear_maybe_i7(
     to_i7: bool,
     free: bool,
 ) -> FwResult<(Mat, Option<nn::I7Mat>)> {
+    if to_i7 && free {
+        if let Ok((shape, raw)) = model.tensor_f16_bytes(name) {
+            if shape != [out_dim, in_dim] {
+                return Err(FwError::InvalidRequest(format!(
+                    "encoder tensor '{name}' has shape {shape:?}, expected {:?}",
+                    [out_dim, in_dim]
+                )));
+            }
+            return Ok((
+                Mat::from_vec(0, 0, Vec::new()),
+                Some(nn::quantize_f16_bytes_to_i7(raw, out_dim, in_dim)),
+            ));
+        }
+        // f32-stored fallback (no f16 bytes): materialize, quantize, drop.
+        let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+        return Ok((Mat::from_vec(0, 0, Vec::new()), Some(nn::quantize_mat_to_i7(&w))));
+    }
     let w = load_linear_transposed(model, name, out_dim, in_dim)?;
     if !to_i7 {
         return Ok((w, None));
     }
+    // to_i7 && !free: retain the f32 (shipping default / macOS / roundtrip harness).
     let i7 = nn::quantize_mat_to_i7(&w);
-    let w = if free { Mat::from_vec(0, 0, Vec::new()) } else { w };
     Ok((w, Some(i7)))
 }
 
