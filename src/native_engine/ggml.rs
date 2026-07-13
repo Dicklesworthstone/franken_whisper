@@ -741,6 +741,34 @@ mod tests {
     use super::*;
     use crate::native_engine::find_model_file;
 
+    /// `read_blob_parallel` (the multi-thread banded blob reader tuned by
+    /// `FW_BLOB_READ_WORKERS`, `5fc0707`) must be byte-identical to a serial
+    /// `std::fs::read` — the bands are disjoint and exhaustively cover `[0, len)`.
+    /// Guards both the sub-`MIN_PARALLEL` serial path and the parallel banded path
+    /// (a file just over 8 MiB) against an off-by-one band-offset regression that
+    /// would silently corrupt the loaded model. Content varies with byte offset so
+    /// any misplacement surfaces as a mismatch.
+    #[test]
+    fn read_blob_parallel_matches_serial_read() {
+        // Must exceed `read_blob_parallel`'s (function-local) `MIN_PARALLEL = 8 MiB`
+        // to exercise the parallel banded path.
+        const OVER_MIN_PARALLEL: usize = 8 * 1024 * 1024 + 12_345;
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (idx, &len) in [0usize, 1, 4096, OVER_MIN_PARALLEL].iter().enumerate() {
+            let bytes: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 3)) as u8).collect();
+            let path = dir.path().join(format!("blob_{idx}.bin"));
+            std::fs::write(&path, &bytes).expect("write");
+            let got = read_blob_parallel(&path).expect("read_blob_parallel");
+            assert_eq!(got.len(), len, "length mismatch at len={len}");
+            assert_eq!(got, bytes, "content mismatch at len={len} (band-offset bug?)");
+            assert_eq!(
+                got,
+                std::fs::read(&path).expect("fs::read"),
+                "parallel read differs from serial fs::read at len={len}"
+            );
+        }
+    }
+
     /// Builder for a minimal but fully valid in-memory ggml blob, used for
     /// hermetic parser coverage that doesn't require a real model file.
     struct SyntheticModel {
