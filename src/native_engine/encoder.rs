@@ -236,6 +236,55 @@ fn load_linear_transposed(
     ))
 }
 
+/// Weight-quant mode for the encoder `attn.out` linear (the residual-feeding one):
+/// f32 sgemm, i7 maddubs, or the full-i8 i32-accumulate GEMM.
+#[derive(Clone, Copy)]
+enum OutQuant {
+    F32,
+    I7,
+    I8,
+}
+
+/// Per-linear encoder weight-quant plan, derived ONCE from the `FW_*` flags +
+/// hparams before the parallel layer load, so each linear can be quantized the
+/// instant it is loaded (fusing the former separate post-load quant pass). Its f32
+/// is then a per-linear transient (freed immediately when `free`) instead of the
+/// whole f32 weight set being resident until a post-load quant — which is what lets
+/// PEAK RSS drop below the full f32 floor. See [`load_linear_maybe_i7`].
+#[derive(Clone, Copy)]
+struct EncQuantPlan {
+    q: bool,
+    k: bool,
+    v: bool,
+    out: OutQuant,
+    fc: bool,
+    proj: bool,
+}
+
+/// Load a linear's f32 `[in, out]` weight and, when `to_i7`, quantize it to i7. When
+/// `free`, the f32 is dropped in place (an empty `Mat` is returned) so it never
+/// outlives this call — bounding the transient f32 to ~one linear per rayon worker
+/// during the parallel layer load. Byte-exact: identical `load_linear_transposed`
+/// f32 and identical `nn::quantize_mat_to_i7` to the historical two-phase path; only
+/// the f32's lifetime differs. When `!free` (flag off / macOS / roundtrip harness)
+/// the f32 is retained exactly as before, so the shipping default is unchanged.
+fn load_linear_maybe_i7(
+    model: &GgmlModel,
+    name: &str,
+    out_dim: usize,
+    in_dim: usize,
+    to_i7: bool,
+    free: bool,
+) -> FwResult<(Mat, Option<nn::I7Mat>)> {
+    let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+    if !to_i7 {
+        return Ok((w, None));
+    }
+    let i7 = nn::quantize_mat_to_i7(&w);
+    let w = if free { Mat::from_vec(0, 0, Vec::new()) } else { w };
+    Ok((w, Some(i7)))
+}
+
 /// Fused dequant-transpose reading raw little-endian f16 bytes (`raw`,
 /// row-major `[rows, cols]` = ggml's `[out, in]`) DIRECTLY — no `Vec<u16>`
 /// intermediate. Output is row-major `[cols, rows]` (`[in, out]`) f32, ready for
@@ -417,162 +466,112 @@ impl EncoderWeights {
         // `model`, and now transposes SERIALLY, so this fans the 32 layers across
         // cores with no nested spawn. Order is preserved (`map`+`collect`), so the
         // assembled weights are byte-identical to the serial loop.
-        let mut layers = (0..n_layer)
-            .into_par_iter()
-            .map(|i| -> FwResult<EncoderLayer> {
-                let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
-                Ok(EncoderLayer {
-                    attn_ln_w: load_vec(model, &p("attn_ln.weight"), n_state)?,
-                    attn_ln_b: load_vec(model, &p("attn_ln.bias"), n_state)?,
-                    attn_q_w: load_linear_transposed(
-                        model,
-                        &p("attn.query.weight"),
-                        n_state,
-                        n_state,
-                    )?,
-                    attn_q_b: load_vec(model, &p("attn.query.bias"), n_state)?,
-                    // whisper key projection has NO bias.
-                    attn_k_w: load_linear_transposed(
-                        model,
-                        &p("attn.key.weight"),
-                        n_state,
-                        n_state,
-                    )?,
-                    attn_v_w: load_linear_transposed(
-                        model,
-                        &p("attn.value.weight"),
-                        n_state,
-                        n_state,
-                    )?,
-                    attn_v_b: load_vec(model, &p("attn.value.bias"), n_state)?,
-                    attn_out_w: load_linear_transposed(
-                        model,
-                        &p("attn.out.weight"),
-                        n_state,
-                        n_state,
-                    )?,
-                    attn_out_b: load_vec(model, &p("attn.out.bias"), n_state)?,
-                    mlp_ln_w: load_vec(model, &p("mlp_ln.weight"), n_state)?,
-                    mlp_ln_b: load_vec(model, &p("mlp_ln.bias"), n_state)?,
-                    mlp_fc_w: load_linear_transposed(
-                        model,
-                        &p("mlp.0.weight"),
-                        mlp_hidden,
-                        n_state,
-                    )?,
-                    mlp_fc_b: load_vec(model, &p("mlp.0.bias"), mlp_hidden)?,
-                    mlp_proj_w: load_linear_transposed(
-                        model,
-                        &p("mlp.2.weight"),
-                        n_state,
-                        mlp_hidden,
-                    )?,
-                    mlp_proj_b: load_vec(model, &p("mlp.2.bias"), n_state)?,
-                    attn_q_i7: None,
-                    attn_k_i7: None,
-                    attn_v_i7: None,
-                    attn_out_i7: None,
-                    mlp_fc_i7: None,
-                    mlp_proj_i7: None,
-                    attn_out_i8: None,
-                })
-            })
-            .collect::<FwResult<Vec<_>>>()?;
-
-        // Optional: quantize every linear weight to 7-bit int8 (maddubs GEMM path)
-        // ONCE, iff FRANKEN_WHISPER_ENC_INT8=1. Default off => all i7 fields stay
-        // None => the forward runs f32 sgemm byte-identically.
-        //
-        // FW_ENC_FREE_F32 (fused, default OFF): once a linear is quantized its f32
-        // `w_t` is DEAD (`enc_linear`/`attn.out` read the f32 only when the quant
-        // field is None), so drop it RIGHT AFTER quantizing it, INSIDE the parallel
-        // quant closure. The transient i7 buffers then never coexist with the full
-        // f32 weight set, so PEAK RSS (not just steady) drops by ~the i7 total — vs
-        // the historical post-loop free, which peaked at f32+i7 at the crossover
-        // ([[project_enc_free_f32_dead_weights]]: "peak unmoved"). Disabled off
-        // macOS (gpu_encode_stack reads the f32 directly) and by the weight-roundtrip
-        // harness (it rewrites `w_t` in place AFTER this pass).
+        // FW_ENC_FREE_F32 (default OFF): fuse the encoder weight quant INTO the
+        // parallel layer load. Each linear is quantized the instant it is loaded and
+        // its f32 dropped in place (`free_f32_now`), so at most ~one f32 linear per
+        // rayon worker is transient — instead of the FULL f32 weight set (~2.5 GB
+        // turbo) staying resident until a separate post-load quant pass. That drops
+        // PEAK RSS below the f32 floor the earlier interleaved post-load free
+        // (2ac1257) could not touch. Byte-exact: identical load + identical quantize
+        // funcs. Retaining the f32 (flag off / macOS / weight-roundtrip harness)
+        // reproduces the previous behavior exactly, so the shipping default (flag off)
+        // is unchanged — the f32 is only dropped early under the opt-in flag.
         #[cfg(target_os = "macos")]
         let free_f32_now = false;
         #[cfg(not(target_os = "macos"))]
         let free_f32_now = super::enc_free_f32() && super::enc_weight_roundtrip().is_none();
-        // Interleave the free PER WEIGHT (quantize wᵢ → free wᵢ's f32 → quantize wᵢ₊₁),
-        // NOT per layer: with 32 layers running concurrently in the rayon pool, a
-        // per-layer free (drop all 6 f32 only at the closure tail) leaves every layer
-        // holding 6×i7 + 6×f32 until the end, so at the synchronized crossover peak =
-        // f32+i7 — no peak win. Interleaved, each layer's f32 shrinks as its i7 grows,
-        // so the transient overshoot is bounded by ~(threads × one i7 weight) and PEAK
-        // ≈ the f32 set alone. `free_wt` replaces the f32 `w_t` with an empty Mat,
-        // dropping (freeing) the old backing Vec.
-        if super::enc_int8_enabled() {
-            layers.par_iter_mut().for_each(|l| {
-                l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
-                free_wt(free_f32_now, &mut l.attn_q_w);
-                l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
-                free_wt(free_f32_now, &mut l.attn_k_w);
-                l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
-                free_wt(free_f32_now, &mut l.attn_v_w);
-                l.attn_out_i7 = Some(nn::quantize_mat_to_i7(&l.attn_out_w));
-                free_wt(free_f32_now, &mut l.attn_out_w);
-                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
-                free_wt(free_f32_now, &mut l.mlp_fc_w);
-                l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
-                free_wt(free_f32_now, &mut l.mlp_proj_w);
-            });
+        // Which linears get which quant — the EXACT per-branch policy the former
+        // post-load pass applied (see the flag docs at each `enc_linear` call site).
+        let plan = if super::enc_int8_enabled() {
+            // FRANKEN_WHISPER_ENC_INT8: every linear i7.
+            EncQuantPlan { q: true, k: true, v: true, out: OutQuant::I7, fc: true, proj: true }
         } else if super::enc_int8_attn_in() {
-            // fc1 + attention INPUT projections (q/k/v) int8, keeping attn_out + fc2 f32.
-            // Q/K/V feed the attention SCORES → softmax (error-robust, the decode side
-            // runs qkv int8 default-on); attn_out + fc2 feed the RESIDUAL (not absorbed,
-            // the culprit class). Tests whether the prior whole-attention int8 proper-noun
-            // failure ([[project_turbo_encoder_dominates]]) came from the in-projections
-            // or from the residual-feeding out/fc2. `FW_ENC_INT8_ATTN_IN`, default off.
-            layers.par_iter_mut().for_each(|l| {
-                l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
-                free_wt(free_f32_now, &mut l.attn_q_w);
-                l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
-                free_wt(free_f32_now, &mut l.attn_k_w);
-                l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
-                free_wt(free_f32_now, &mut l.attn_v_w);
-                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
-                free_wt(free_f32_now, &mut l.mlp_fc_w);
-            });
+            // FW_ENC_INT8_ATTN_IN: q/k/v/fc1 i7, attn_out + fc2 stay f32.
+            EncQuantPlan { q: true, k: true, v: true, out: OutQuant::F32, fc: true, proj: false }
         } else if super::enc_attn_out_i8i32_for(&model.hparams) {
-            // FULL quality-safe int8: q/k/v/fc1/fc2 through the fast i7 maddubs
-            // (each individually proven proper-noun-safe), and the residual-feeding
-            // attn.out through the FULL-i8 i32-accumulate GEMM (the 1 extra weight
-            // bit vs i7 preserves proper nouns where i7 maddubs mangles them). This
-            // yields 0 f32 GEMMs/layer — the fast non-monotonic-mix state — at
-            // proven-safe quality. Default-on only for calibrated model hparams;
-            // unknown models and non-AVX2 builds deterministically keep f32.
-            // `FW_ENC_ATTN_OUT_I8I32=0` is the kill switch, `=1` forces probes.
-            layers.par_iter_mut().for_each(|l| {
-                l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
-                free_wt(free_f32_now, &mut l.attn_q_w);
-                l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
-                free_wt(free_f32_now, &mut l.attn_k_w);
-                l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
-                free_wt(free_f32_now, &mut l.attn_v_w);
-                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
-                free_wt(free_f32_now, &mut l.mlp_fc_w);
-                l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
-                free_wt(free_f32_now, &mut l.mlp_proj_w);
-                l.attn_out_i8 = Some(quantize_enc_i8(&l.attn_out_w));
-                free_wt(free_f32_now, &mut l.attn_out_w);
-            });
+            // Default quality-safe int8 for calibrated models: q/k/v/fc1/fc2 i7,
+            // residual-feeding attn_out through the full-i8 i32-accumulate GEMM.
+            EncQuantPlan { q: true, k: true, v: true, out: OutQuant::I8, fc: true, proj: true }
         } else if super::enc_int8_fc1_only() {
-            // fc1-ONLY int8 (maddubs): apply the PROVEN decode `mlp_0`/fc1-only recipe
-            // ([[project_int8_mlp_fc1_default_on]]) to the ENCODER MLP. Only `mlp.0`/fc1
-            // feeds GELU, whose saturation absorbs the weight-quant error before it
-            // reaches the residual — the exact reason decode fc1-only int8 is transcript
-            // byte-exact. Attention (proper-noun alignment, [[project_turbo_encoder_dominates]])
-            // and fc2 (residual-feeding) stay f32. `FW_ENC_INT8_FC1`, default off =
-            // byte-identical. Tests whether GELU-absorption survives the encoder's 32
-            // stacked layers (vs decode's 4).
-            layers.par_iter_mut().for_each(|l| {
-                l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
-                free_wt(free_f32_now, &mut l.mlp_fc_w);
-            });
-        }
+            // FW_ENC_INT8_FC1: fc1 only (GELU absorbs the quant error).
+            EncQuantPlan { q: false, k: false, v: false, out: OutQuant::F32, fc: true, proj: false }
+        } else {
+            // No int8: all f32, byte-identical to the pre-lever encoder.
+            EncQuantPlan { q: false, k: false, v: false, out: OutQuant::F32, fc: false, proj: false }
+        };
+
+        let mut layers = (0..n_layer)
+            .into_par_iter()
+            .map(|i| -> FwResult<EncoderLayer> {
+                let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
+                let (attn_q_w, attn_q_i7) = load_linear_maybe_i7(
+                    model, &p("attn.query.weight"), n_state, n_state, plan.q, free_f32_now,
+                )?;
+                // whisper key projection has NO bias.
+                let (attn_k_w, attn_k_i7) = load_linear_maybe_i7(
+                    model, &p("attn.key.weight"), n_state, n_state, plan.k, free_f32_now,
+                )?;
+                let (attn_v_w, attn_v_i7) = load_linear_maybe_i7(
+                    model, &p("attn.value.weight"), n_state, n_state, plan.v, free_f32_now,
+                )?;
+                let (attn_out_w, attn_out_i7, attn_out_i8) = match plan.out {
+                    OutQuant::F32 => (
+                        load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?,
+                        None,
+                        None,
+                    ),
+                    OutQuant::I7 => {
+                        let (w, i7) = load_linear_maybe_i7(
+                            model, &p("attn.out.weight"), n_state, n_state, true, free_f32_now,
+                        )?;
+                        (w, i7, None)
+                    }
+                    OutQuant::I8 => {
+                        let w =
+                            load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?;
+                        let i8 = quantize_enc_i8(&w);
+                        let w = if free_f32_now { Mat::from_vec(0, 0, Vec::new()) } else { w };
+                        (w, None, Some(i8))
+                    }
+                };
+                let (mlp_fc_w, mlp_fc_i7) = load_linear_maybe_i7(
+                    model, &p("mlp.0.weight"), mlp_hidden, n_state, plan.fc, free_f32_now,
+                )?;
+                let (mlp_proj_w, mlp_proj_i7) = load_linear_maybe_i7(
+                    model, &p("mlp.2.weight"), n_state, mlp_hidden, plan.proj, free_f32_now,
+                )?;
+                Ok(EncoderLayer {
+                    attn_ln_w: load_vec(model, &p("attn_ln.weight"), n_state)?,
+                    attn_ln_b: load_vec(model, &p("attn_ln.bias"), n_state)?,
+                    attn_q_w,
+                    attn_q_b: load_vec(model, &p("attn.query.bias"), n_state)?,
+                    attn_k_w,
+                    attn_v_w,
+                    attn_v_b: load_vec(model, &p("attn.value.bias"), n_state)?,
+                    attn_out_w,
+                    attn_out_b: load_vec(model, &p("attn.out.bias"), n_state)?,
+                    mlp_ln_w: load_vec(model, &p("mlp_ln.weight"), n_state)?,
+                    mlp_ln_b: load_vec(model, &p("mlp_ln.bias"), n_state)?,
+                    mlp_fc_w,
+                    mlp_fc_b: load_vec(model, &p("mlp.0.bias"), mlp_hidden)?,
+                    mlp_proj_w,
+                    mlp_proj_b: load_vec(model, &p("mlp.2.bias"), n_state)?,
+                    attn_q_i7,
+                    attn_k_i7,
+                    attn_v_i7,
+                    attn_out_i7,
+                    mlp_fc_i7,
+                    mlp_proj_i7,
+                    attn_out_i8,
+                })
+            })
+            .collect::<FwResult<Vec<_>>>()?;
+
+        // (Weight quant is now FUSED into the parallel layer load above — see the
+        // `EncQuantPlan` / `load_linear_maybe_i7` block — so the former separate
+        // post-load `par_iter_mut` quant pass, and the interleaved post-load free it
+        // grew into, are gone. Fusing lets FW_ENC_FREE_F32 free each f32 while only
+        // ~one linear per worker is transient, dropping PEAK below the f32 floor.)
 
         // bd-bcm7: enable ft_kernel_cpu's poly softmax for large-v3-turbo (proven WER-neutral:
         // byte-identical transcript, WER Δ 0.000, 1.0722× e2e). tiny.en stays off (uncertified).
@@ -597,11 +596,6 @@ impl EncoderWeights {
                 l.mlp_proj_w = nn::i7_roundtrip(&l.mlp_proj_w, block);
             });
         }
-
-        // (FW_ENC_FREE_F32 now frees each linear's dead f32 `w_t` INSIDE the quant
-        // closure above via `free_f32_now`, so the transient i7 buffers never coexist
-        // with the full f32 set — moving PEAK RSS, not just steady. The former
-        // post-loop free pass, which peaked at f32+i7 at the crossover, is gone.)
 
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;
@@ -1070,20 +1064,6 @@ fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
         let mut h = x.clone();
         nn::layer_norm(&mut h, w, b, LN_EPS);
         h
-    }
-}
-
-/// FW_ENC_FREE_F32 helper: when `cond`, drop a just-quantized linear's f32 `w_t`
-/// by replacing it with an empty `Mat` (frees the backing Vec). Called INSIDE the
-/// parallel quant closure, right after the corresponding i7/i8 field is set, so the
-/// transient i7 allocation never coexists with the full f32 weight set — moving PEAK
-/// RSS, not just steady. Byte-exact: `enc_linear`/`attn.out` read the f32 only when
-/// the quant field is `None`, which it no longer is. A no-op when `cond` is false
-/// (flag off, macOS, or the weight-roundtrip harness is active).
-#[inline]
-fn free_wt(cond: bool, w: &mut Mat) {
-    if cond {
-        *w = Mat::from_vec(0, 0, Vec::new());
     }
 }
 
