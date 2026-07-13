@@ -20226,3 +20226,17 @@ all consume the PATH), so removing it is a wide-blast-radius architectural chang
 Note: the 16-bit requant is NOT a quality regression (whisper expects 16 kHz/16-bit-grade audio); it's a
 compute+IO inefficiency for non-wav inputs only. The READ half of the round-trip is already optimized
 (`read_wav_16k_mono` mono fast path, `87556b4`); the write half + the round-trip itself remain.
+
+### Systematic scalar-antipattern grep — no fresh lever (so nobody re-greps)
+Grepped `÷` / `.round()` / clone-in-loop across `mel.rs`/`nn.rs`/`audio.rs` for the classes the memory
+exploits (round-doesn't-autovec, per-element division). Findings, all NON-levers by construction:
+- **Encoder weight quant** (`nn.rs` `quantize_rows_to_i7`/`quantize_enc_i8`) — `enc_ef_quant()` defaults
+  **ON**, so the default path is the serial error-feedback chain (latency-bound; SIMD-ing the round can't
+  help — it's inside the `err = target - q` dependency). The plain-round path is reachable only via
+  `FW_ENC_EF_QUANT=0` (non-default). Matches `project_load_time_quant_candidate` (EF-latency-bound, wash).
+- **Mel** — `÷4.0`/`÷2` are powers of two, already folded to `×const` by LLVM; twiddles precomputed. <0.25%.
+- **Audio** — the remaining `÷channels`/`.round()` loops are the MULTI-CHANNEL downmix (uncommon; mono is
+  fast-pathed) and the peripheral wav-slice writer (hound). `compute_frame_rms` = sequential f64 sum
+  (not byte-exact vectorizable).
+The clean vectorizable production loops (read_wav mono, blob-read bands) are already landed. **The
+scalar-antipattern hunt is exhausted.**
