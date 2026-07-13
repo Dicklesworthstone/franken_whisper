@@ -20374,3 +20374,30 @@ not isolated (box saturated), but it's on the default load path.
 The `f32::round`/software-f16 scalar-quant antipattern is now swept across BOTH engines: encoder activation
 quant (`26feafd`, 3.82×) + decoder weight quant at load (this, 3.78×). Both quant-input passes (act + wt)
 that feed the AVX2 GEMV kernels are now themselves AVX2.
+
+## 2026-07-13 (GoldenOwl) — 8th byte-exact win: AVX2+F16C BLOCK-WISE weight quant at LOAD (3.00×)
+
+Third and last scalar-quant site on a default hot path: `quantize_f16_to_int_blocked` (nn.rs) — the
+block-wise (block=32, Q8_0-style) f16→int quant that `Linear::quantize_i8w_f32a_blocked_if` runs at LOAD
+for the decoder **fc2/mlp_2** (`int8_mlp_fc2` DEFAULT-ON) and the i4-level probe. It was FULLY scalar:
+per 32-col block, `amax` via software `Float16::to_f32` fold + quant via `(w·inv).round().clamp(±L)` (L =
+127 for i8, 7 for the i4-level variant) — neither autovectorizes.
+
+**Fix (landed):** `quantize_f16_row_blocked_to_int_into` — AVX2+F16C row-level helper (SIMD constants
+hoisted once/row) that loops blocks internally: per block, `_mm256_cvtph_ps` amax tree-reduce + round-
+half-away/clamp(±max_level, runtime)/pack. Handles PARTIAL trailing blocks (scalar tail; no store crosses
+a block boundary). Scalar fallback = exact reference. Byte-exact (single `_mm256_mul_ps`, no FMA).
+
+**Measured — single-binary kernel A/B** (`quantize_f16_row_blocked_perf`, black_box'd, real turbo fc2
+[1280×5120] block=32): **scalar 9477.2 µs → avx2 3154.3 µs = 3.00×**, byte-identical (a touch below the
+per-row 3.78× — the 32-wide per-block amax reduce has more relative setup). Runs at LOAD.
+
+**Gate:** none — byte-exact (`quantize_f16_row_blocked_matches_scalar_reference`: full + partial blocks,
+BOTH max_level=127 and 7, ±clamp, exact-.5 half-away, per-block scale bit-match; full
+`native_engine::nn::tests` 46/0/3-ignored green), `cfg(avx2,f16c)` + scalar fallback. Kernel A/B kept as
+`#[ignore]`d `quantize_f16_row_blocked_perf`. **The scalar-quant antipattern sweep is now COMPLETE across
+every default hot path** — encoder activation quant (`26feafd`), decoder per-row weight quant
+(`3e7f295`), decoder block-wise weight quant (this). Remaining scalar quant sites are NON-levers:
+`quantize_rows_to_i7` (encoder wt, `enc_ef` DEFAULT-ON = serial EF `err`-chain, not vectorizable) and the
+packed-nibble int4 kernel (fc1; check its gate/default separately if pursued — nibble packing complicates
+the store). Every quant-INPUT pass that feeds the AVX2 GEMV kernels (dot_i8, dot_f16c) is now AVX2.
