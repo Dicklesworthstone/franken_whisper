@@ -482,14 +482,42 @@ impl EncoderWeights {
         // Optional: quantize every linear weight to 7-bit int8 (maddubs GEMM path)
         // ONCE, iff FRANKEN_WHISPER_ENC_INT8=1. Default off => all i7 fields stay
         // None => the forward runs f32 sgemm byte-identically.
+        //
+        // FW_ENC_FREE_F32 (fused, default OFF): once a linear is quantized its f32
+        // `w_t` is DEAD (`enc_linear`/`attn.out` read the f32 only when the quant
+        // field is None), so drop it RIGHT AFTER quantizing it, INSIDE the parallel
+        // quant closure. The transient i7 buffers then never coexist with the full
+        // f32 weight set, so PEAK RSS (not just steady) drops by ~the i7 total — vs
+        // the historical post-loop free, which peaked at f32+i7 at the crossover
+        // ([[project_enc_free_f32_dead_weights]]: "peak unmoved"). Disabled off
+        // macOS (gpu_encode_stack reads the f32 directly) and by the weight-roundtrip
+        // harness (it rewrites `w_t` in place AFTER this pass).
+        #[cfg(target_os = "macos")]
+        let free_f32_now = false;
+        #[cfg(not(target_os = "macos"))]
+        let free_f32_now = super::enc_free_f32() && super::enc_weight_roundtrip().is_none();
+        // Interleave the free PER WEIGHT (quantize wᵢ → free wᵢ's f32 → quantize wᵢ₊₁),
+        // NOT per layer: with 32 layers running concurrently in the rayon pool, a
+        // per-layer free (drop all 6 f32 only at the closure tail) leaves every layer
+        // holding 6×i7 + 6×f32 until the end, so at the synchronized crossover peak =
+        // f32+i7 — no peak win. Interleaved, each layer's f32 shrinks as its i7 grows,
+        // so the transient overshoot is bounded by ~(threads × one i7 weight) and PEAK
+        // ≈ the f32 set alone. `free_wt` replaces the f32 `w_t` with an empty Mat,
+        // dropping (freeing) the old backing Vec.
         if super::enc_int8_enabled() {
             layers.par_iter_mut().for_each(|l| {
                 l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
+                free_wt(free_f32_now, &mut l.attn_q_w);
                 l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
+                free_wt(free_f32_now, &mut l.attn_k_w);
                 l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
+                free_wt(free_f32_now, &mut l.attn_v_w);
                 l.attn_out_i7 = Some(nn::quantize_mat_to_i7(&l.attn_out_w));
+                free_wt(free_f32_now, &mut l.attn_out_w);
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+                free_wt(free_f32_now, &mut l.mlp_fc_w);
                 l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
+                free_wt(free_f32_now, &mut l.mlp_proj_w);
             });
         } else if super::enc_int8_attn_in() {
             // fc1 + attention INPUT projections (q/k/v) int8, keeping attn_out + fc2 f32.
@@ -500,9 +528,13 @@ impl EncoderWeights {
             // or from the residual-feeding out/fc2. `FW_ENC_INT8_ATTN_IN`, default off.
             layers.par_iter_mut().for_each(|l| {
                 l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
+                free_wt(free_f32_now, &mut l.attn_q_w);
                 l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
+                free_wt(free_f32_now, &mut l.attn_k_w);
                 l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
+                free_wt(free_f32_now, &mut l.attn_v_w);
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+                free_wt(free_f32_now, &mut l.mlp_fc_w);
             });
         } else if super::enc_attn_out_i8i32_for(&model.hparams) {
             // FULL quality-safe int8: q/k/v/fc1/fc2 through the fast i7 maddubs
@@ -515,11 +547,17 @@ impl EncoderWeights {
             // `FW_ENC_ATTN_OUT_I8I32=0` is the kill switch, `=1` forces probes.
             layers.par_iter_mut().for_each(|l| {
                 l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&l.attn_q_w));
+                free_wt(free_f32_now, &mut l.attn_q_w);
                 l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&l.attn_k_w));
+                free_wt(free_f32_now, &mut l.attn_k_w);
                 l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&l.attn_v_w));
+                free_wt(free_f32_now, &mut l.attn_v_w);
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+                free_wt(free_f32_now, &mut l.mlp_fc_w);
                 l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_proj_w));
+                free_wt(free_f32_now, &mut l.mlp_proj_w);
                 l.attn_out_i8 = Some(quantize_enc_i8(&l.attn_out_w));
+                free_wt(free_f32_now, &mut l.attn_out_w);
             });
         } else if super::enc_int8_fc1_only() {
             // fc1-ONLY int8 (maddubs): apply the PROVEN decode `mlp_0`/fc1-only recipe
@@ -532,6 +570,7 @@ impl EncoderWeights {
             // stacked layers (vs decode's 4).
             layers.par_iter_mut().for_each(|l| {
                 l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&l.mlp_fc_w));
+                free_wt(free_f32_now, &mut l.mlp_fc_w);
             });
         }
 
@@ -559,38 +598,10 @@ impl EncoderWeights {
             });
         }
 
-        // FW_ENC_FREE_F32 (opt-in, default OFF): reclaim the f32 weight copies that
-        // are DEAD once quantized. `enc_linear` reads a linear's f32 `w_t` only when
-        // its i7 field is `None`, and `attn.out` reads its f32 only when neither i8
-        // nor i7 is present — so any linear whose quant field is `Some` never touches
-        // its f32 again in the forward. Freeing those saves ~2.5 GB steady-state RSS
-        // (turbo) and is byte-exact (the freed weight is never read). Skipped when the
-        // weight-roundtrip harness is active (it rewrites the f32 in place); guarded
-        // off macOS, where `gpu_encode_stack` reads the f32 weights directly.
-        #[cfg(not(target_os = "macos"))]
-        if super::enc_free_f32() && super::enc_weight_roundtrip().is_none() {
-            let free = || Mat::from_vec(0, 0, Vec::new());
-            for l in &mut layers {
-                if l.attn_q_i7.is_some() {
-                    l.attn_q_w = free();
-                }
-                if l.attn_k_i7.is_some() {
-                    l.attn_k_w = free();
-                }
-                if l.attn_v_i7.is_some() {
-                    l.attn_v_w = free();
-                }
-                if l.attn_out_i8.is_some() || l.attn_out_i7.is_some() {
-                    l.attn_out_w = free();
-                }
-                if l.mlp_fc_i7.is_some() {
-                    l.mlp_fc_w = free();
-                }
-                if l.mlp_proj_i7.is_some() {
-                    l.mlp_proj_w = free();
-                }
-            }
-        }
+        // (FW_ENC_FREE_F32 now frees each linear's dead f32 `w_t` INSIDE the quant
+        // closure above via `free_f32_now`, so the transient i7 buffers never coexist
+        // with the full f32 set — moving PEAK RSS, not just steady. The former
+        // post-loop free pass, which peaked at f32+i7 at the crossover, is gone.)
 
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;
@@ -1059,6 +1070,20 @@ fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
         let mut h = x.clone();
         nn::layer_norm(&mut h, w, b, LN_EPS);
         h
+    }
+}
+
+/// FW_ENC_FREE_F32 helper: when `cond`, drop a just-quantized linear's f32 `w_t`
+/// by replacing it with an empty `Mat` (frees the backing Vec). Called INSIDE the
+/// parallel quant closure, right after the corresponding i7/i8 field is set, so the
+/// transient i7 allocation never coexists with the full f32 weight set — moving PEAK
+/// RSS, not just steady. Byte-exact: `enc_linear`/`attn.out` read the f32 only when
+/// the quant field is `None`, which it no longer is. A no-op when `cond` is false
+/// (flag off, macOS, or the weight-roundtrip harness is active).
+#[inline]
+fn free_wt(cond: bool, w: &mut Mat) {
+    if cond {
+        *w = Mat::from_vec(0, 0, Vec::new());
     }
 }
 
