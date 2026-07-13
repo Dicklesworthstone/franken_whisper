@@ -20180,3 +20180,17 @@ Continued the "read the structure, remove redundant work" sweep after the blob-r
   drop — transcription decodes id→text only). Decode-forward clones (`decoder.rs:1701/1717/1772`) are
   per-step-small or draft-measurement-only. **The load path's redundant-clone/alloc angle is closed;
   the only remaining load win is the owner-gated `FW_ENC_FREE_F32` flip (eliminates the transpose).**
+
+## 2026-07-13 - CyanGull session build-path changes CERTIFIED (238/0) + mel confirmed closed
+
+- **Mel is NOT a lever (confirmed fresh):** `full_mel` is computed ONCE and windowed
+  (`decode.rs`: `forward_from_full_mel_window(&full_mel, offset)` in the window loop) — no
+  per-window recomputation of overlapping frames. Consistent with the "mel is a franken WIN /
+  <0.25%" record; there is no redundant-recompute lever here.
+- **Session build-path reorders certified regression-free:** this session's model-build changes
+  (vocab-clone→move `1cd287c`, `fuse_qkv` clone→borrow `9c21192`, blob-read band cap `5fc0707`) all
+  touched `LoadedModel`/`decoder`/`ggml` load code verified only by jfk transcript diff at commit
+  time. Ran the FULL gate on the current source: `cargo test --release --lib native_engine` =
+  **238 passed / 0 failed** (9.85 s, default config). The `FW_ENC_FREE_F32=1` gate (238/0 at
+  `0426da9`) is unaffected — the free path is encoder-only and orthogonal to these reorders. So the
+  session's work is regression-clean and the flip remains fully gated.
