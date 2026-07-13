@@ -559,6 +559,39 @@ impl EncoderWeights {
             });
         }
 
+        // FW_ENC_FREE_F32 (opt-in, default OFF): reclaim the f32 weight copies that
+        // are DEAD once quantized. `enc_linear` reads a linear's f32 `w_t` only when
+        // its i7 field is `None`, and `attn.out` reads its f32 only when neither i8
+        // nor i7 is present — so any linear whose quant field is `Some` never touches
+        // its f32 again in the forward. Freeing those saves ~2.5 GB steady-state RSS
+        // (turbo) and is byte-exact (the freed weight is never read). Skipped when the
+        // weight-roundtrip harness is active (it rewrites the f32 in place); guarded
+        // off macOS, where `gpu_encode_stack` reads the f32 weights directly.
+        #[cfg(not(target_os = "macos"))]
+        if super::enc_free_f32() && super::enc_weight_roundtrip().is_none() {
+            let free = || Mat::from_vec(0, 0, Vec::new());
+            for l in &mut layers {
+                if l.attn_q_i7.is_some() {
+                    l.attn_q_w = free();
+                }
+                if l.attn_k_i7.is_some() {
+                    l.attn_k_w = free();
+                }
+                if l.attn_v_i7.is_some() {
+                    l.attn_v_w = free();
+                }
+                if l.attn_out_i8.is_some() || l.attn_out_i7.is_some() {
+                    l.attn_out_w = free();
+                }
+                if l.mlp_fc_i7.is_some() {
+                    l.mlp_fc_w = free();
+                }
+                if l.mlp_proj_i7.is_some() {
+                    l.mlp_proj_w = free();
+                }
+            }
+        }
+
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;
 
