@@ -4,6 +4,80 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-13 - Codex: **SURFACE — resetting one zlib encoder and ping-ponging its output buffers measured 1.0646x, inside the same-binary BASE/BASE floor; source reverted.**
+
+**Negative-ledger-first target.** `stream_mic_to_ndjson` constructed and dropped a
+fresh `ZlibEncoder<Vec<u8>>` for every 1,600-byte default mic frame. No prior
+ledger row covered encoder-state reset or compression-output buffer reuse. The
+candidate kept one `ZlibEncoder`, used flate2's documented `reset` operation to
+start an independent zlib member for every frame, and swapped between two
+capacity-retaining output `Vec`s. Compression level, Base64, CRC32, SHA-256,
+frame schema, event serialization, ordering, and output writes were unchanged.
+
+**Proof seam.** A temporary production helper returned the same Base64 payload
+as the historical fresh-compressor path. Its focused oracle covered 1-, 160-,
+480-, 1,600-, and 40,000-byte inputs, high- and low-entropy data, and an
+identical input repeated after a different stream to catch leaked dictionary
+state. Every compressed Base64 string was byte-identical and every reused
+stream inflated back to its input. The same-binary harness additionally
+asserted all 145,216 output bytes across 128 mixed-entropy 1,600-byte frames;
+their SHA-256 was
+`4015611538ca9889836ffd6a8e2e963a6e836ba44ff5500d70d650bd39810092`.
+
+**Strict-remote measurement.** No local Cargo fallback occurred. RCH was
+degraded only by stale pressure telemetry on unrelated worker `ovh-b`; the
+deciding job completed remotely on `vmi1293453` as
+`j-29928833041826046`:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench --profile release-perf -p franken_whisper --bench tty_bench -- \
+  tty/compress_reset_ab --sample-size 20 --warm-up-time 0.5 \
+  --measurement-time 1 --noplot
+
+benchmark binary sha256:
+  86eab9ad90fe195282b1261e3d0285e77f1d187792098b56de32a7921db4635e
+```
+
+BASE/BASE ratios:
+
+```text
+0.988076 0.999343 0.975334 1.008334 0.956697 1.098513 0.969544
+1.096170 1.001422 0.971411 0.971616 1.010931 0.989484 1.117963
+0.998551 0.991383 1.108454 1.074262 1.050708 1.061017 0.913252
+1.006184 0.935072 1.162970 0.945561 1.004841 0.983446 1.104312
+1.095477 1.000408 0.927313
+```
+
+Null median/p10/p90 were **1.000408 / 0.945561 / 1.104312**, CV
+**6.226%**, range `[0.913252, 1.162970]`, wins 16/31. The predeclared
+`[0.98, 1.02]` null-median gate passed.
+
+BASE/reset-reuse ratios:
+
+```text
+1.208171 1.237279 0.886203 1.026368 1.047051 1.064646 1.035825
+1.028994 0.998824 1.116990 0.920866 1.337889 1.000391 1.018285
+0.932001 0.974967 1.400210 1.166431 1.171717 0.996152 1.134116
+1.080838 1.148270 1.014945 1.062717 1.100907 1.270320 1.183202
+1.171701 1.000535 1.113506
+```
+
+Candidate median was **1.064646x**, p10/p90 **0.974967 / 1.237279**,
+CV **10.921%**, range `[0.886203, 1.400210]`, wins 25/31. The median
+remained inside the null p90 of **1.104312x**, so
+`decision_eligible=false`. The candidate-only Criterion diagnostic was
+`[1.5104 ms, 1.6273 ms, 1.7355 ms]` for 128 frames; it is not a comparative
+result.
+
+**Verdict: below-floor SURFACE, not a keep.** The apparent 6.5% median gain is
+plausible but unresolved on this substrate. The production helper, mic-stream
+wiring, exact oracle, and temporary harness were manually restored byte-for-byte
+to `HEAD`; no runtime or benchmark code remains. Reopen only with a same-binary
+null envelope narrower than roughly 6%, or a larger profiled frame shape where
+compressor setup is a materially larger share.
+
+---
 ## 2026-07-12 - Codex: **SURFACE — reusing the per-stream TTY Base64 decode buffer measured 1.0081x, inside the same-binary BASE/BASE floor; source reverted.**
 
 **Negative-ledger-first target.** After the line-buffer candidate surfaced below
