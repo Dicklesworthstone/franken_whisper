@@ -1,0 +1,386 @@
+diff --git a/benches/native_engine_bench.rs b/benches/native_engine_bench.rs
+index 80b660f..b4f2bf0 100644
+--- a/benches/native_engine_bench.rs
++++ b/benches/native_engine_bench.rs
+@@ -509,6 +509,157 @@ fn bench_decoder_token_step_large(c: &mut Criterion) {
+     bench_decoder_token_step(c, MODEL_LARGE, "large");
+ }
+ 
++// ---------------------------------------------------------------------------
++// 3b. self-attention packed K — honest same-binary ORIG/candidate A/B
++// ---------------------------------------------------------------------------
++
++fn bench_self_attn_column_keys(c: &mut Criterion) {
++    use franken_whisper::native_engine::nn::{KvCache, attention_with_cache};
++
++    const N_STATE: usize = 1280;
++    const N_HEAD: usize = 20;
++    const CAPACITY: usize = 224;
++    const PREFILL: usize = CAPACITY - 1;
++    const PAIRED_REPS: usize = 25;
++
++    let mut lcg = Lcg::new(0xc011_0a7e);
++    let prefill_k = Mat::from_vec(
++        PREFILL,
++        N_STATE,
++        (0..PREFILL * N_STATE)
++            .map(|_| 0.1 * lcg.next_f32())
++            .collect(),
++    );
++    let prefill_v = Mat::from_vec(
++        PREFILL,
++        N_STATE,
++        (0..PREFILL * N_STATE)
++            .map(|_| 0.1 * lcg.next_f32())
++            .collect(),
++    );
++    let q = Mat::from_vec(
++        1,
++        N_STATE,
++        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
++    );
++    let k_new = Mat::from_vec(
++        1,
++        N_STATE,
++        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
++    );
++    let v_new = Mat::from_vec(
++        1,
++        N_STATE,
++        (0..N_STATE).map(|_| 0.1 * lcg.next_f32()).collect(),
++    );
++
++    let mut original = KvCache::new(CAPACITY, N_STATE);
++    let mut candidate = KvCache::new_column_major_keys_for_bench(CAPACITY, N_STATE);
++    original
++        .append(&prefill_k, &prefill_v)
++        .expect("prefill original cache");
++    candidate
++        .append(&prefill_k, &prefill_v)
++        .expect("prefill packed cache");
++
++    let original_out =
++        attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut original).expect("original step");
++    original.truncate_for_bench(PREFILL);
++    let candidate_out =
++        attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut candidate).expect("candidate step");
++    candidate.truncate_for_bench(PREFILL);
++    assert_eq!(
++        original_out
++            .data
++            .iter()
++            .map(|value| value.to_bits())
++            .collect::<Vec<_>>(),
++        candidate_out
++            .data
++            .iter()
++            .map(|value| value.to_bits())
++            .collect::<Vec<_>>(),
++        "packed K layout changed attention output"
++    );
++
++    let measure = |cache: &mut KvCache| {
++        let started = std::time::Instant::now();
++        let output =
++            attention_with_cache(&q, &k_new, &v_new, N_HEAD, cache).expect("self-attention step");
++        let elapsed = started.elapsed();
++        black_box(output.data.as_slice());
++        cache.truncate_for_bench(PREFILL);
++        elapsed
++    };
++
++    for rep in 0..3 {
++        if rep % 2 == 0 {
++            black_box(measure(&mut original));
++            black_box(measure(&mut candidate));
++        } else {
++            black_box(measure(&mut candidate));
++            black_box(measure(&mut original));
++        }
++    }
++
++    let mut original_ns = Vec::with_capacity(PAIRED_REPS);
++    let mut candidate_ns = Vec::with_capacity(PAIRED_REPS);
++    let mut ratios = Vec::with_capacity(PAIRED_REPS);
++    for rep in 0..PAIRED_REPS {
++        let (orig, cand) = if rep % 2 == 0 {
++            (measure(&mut original), measure(&mut candidate))
++        } else {
++            let cand = measure(&mut candidate);
++            let orig = measure(&mut original);
++            (orig, cand)
++        };
++        let orig = orig.as_nanos();
++        let cand = cand.as_nanos();
++        original_ns.push(orig);
++        candidate_ns.push(cand);
++        ratios.push(orig as f64 / cand as f64);
++    }
++    let mean_ratio = ratios.iter().sum::<f64>() / ratios.len() as f64;
++    let ratio_variance = ratios
++        .iter()
++        .map(|ratio| (ratio - mean_ratio).powi(2))
++        .sum::<f64>()
++        / (ratios.len() - 1) as f64;
++    let cv_pct = ratio_variance.sqrt() / mean_ratio * 100.0;
++    let wins = ratios.iter().filter(|&&ratio| ratio > 1.0).count();
++    original_ns.sort_unstable();
++    candidate_ns.sort_unstable();
++    eprintln!(
++        "SELF_K_PAIRED reach=actual_attention_with_cache parity=bit_exact reps={PAIRED_REPS} \
++         orig_median_ns={} candidate_median_ns={} ratio={mean_ratio:.6} cv_pct={cv_pct:.3} \
++         candidate_wins={wins}/{PAIRED_REPS}",
++        original_ns[PAIRED_REPS / 2],
++        candidate_ns[PAIRED_REPS / 2]
++    );
++
++    let mut group = c.benchmark_group("native_engine/self_attn_k_layout");
++    group.sample_size(20);
++    group.warm_up_time(Duration::from_millis(500));
++    group.measurement_time(Duration::from_secs(2));
++    group.bench_function("orig_row_major", |b| {
++        b.iter(|| {
++            let output = attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut original)
++                .expect("original step");
++            black_box(output.data.as_slice());
++            original.truncate_for_bench(PREFILL);
++        });
++    });
++    group.bench_function("candidate_column_major", |b| {
++        b.iter(|| {
++            let output = attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut candidate)
++                .expect("candidate step");
++            black_box(output.data.as_slice());
++            candidate.truncate_for_bench(PREFILL);
++        });
++    });
++    group.finish();
++}
++
+ // ---------------------------------------------------------------------------
+ // 4. logits_gemv_large — the [n_vocab, n_state] tied output projection
+ // ---------------------------------------------------------------------------
+@@ -1007,6 +1158,7 @@ criterion_group!(
+     bench_encoder_window_large,
+     bench_decoder_token_step_tiny,
+     bench_decoder_token_step_large,
++    bench_self_attn_column_keys,
+     bench_logits_gemv_large,
+     bench_f16_gemv_dequant,
+     bench_i7_qkv_activation_reuse,
+diff --git a/src/native_engine/nn.rs b/src/native_engine/nn.rs
+index 6a1c905..b9f0e4e 100644
+--- a/src/native_engine/nn.rs
++++ b/src/native_engine/nn.rs
+@@ -3809,6 +3809,11 @@ fn kv_f16_enabled() -> bool {
+ pub struct KvCache {
+     k: Vec<f32>,
+     v: Vec<f32>,
++    // Optional column-major key mirror `[state, capacity_tokens]`. This is a
++    // bench-gated packed-layout candidate for the single-token score dot: the
++    // d-outer/j-inner loop reads contiguous keys while preserving every
++    // score's d-ascending accumulation order exactly.
++    k_columns: Vec<f32>,
+     k16: Vec<Float16>,
+     v16: Vec<Float16>,
+     f16: bool,
+@@ -3822,11 +3827,31 @@ impl KvCache {
+     /// `n_state`.
+     #[must_use]
+     pub fn new(capacity_tokens: usize, n_state: usize) -> Self {
++        Self::new_with_column_keys(capacity_tokens, n_state, false)
++    }
++
++    /// Construct the packed-key candidate used by the honest in-binary A/B.
++    ///
++    /// The default constructor remains the historical row-major layout. This
++    /// constructor exists only to make both layouts reachable in one process;
++    /// promoting the candidate would change [`Self::new`] to request it.
++    #[doc(hidden)]
++    #[must_use]
++    pub fn new_column_major_keys_for_bench(capacity_tokens: usize, n_state: usize) -> Self {
++        Self::new_with_column_keys(capacity_tokens, n_state, true)
++    }
++
++    fn new_with_column_keys(capacity_tokens: usize, n_state: usize, column_keys: bool) -> Self {
+         let f16 = kv_f16_enabled();
+         let n = capacity_tokens * n_state;
+         Self {
+             k: if f16 { Vec::new() } else { vec![0.0; n] },
+             v: if f16 { Vec::new() } else { vec![0.0; n] },
++            k_columns: if column_keys && !f16 {
++                vec![0.0; n]
++            } else {
++                Vec::new()
++            },
+             k16: if f16 {
+                 vec![Float16::from_f32(0.0); n]
+             } else {
+@@ -3924,6 +3949,15 @@ impl KvCache {
+         } else {
+             self.k[off..off + span].copy_from_slice(&k.data);
+             self.v[off..off + span].copy_from_slice(&v.data);
++            if !self.k_columns.is_empty() {
++                for r in 0..t {
++                    let token = self.len + r;
++                    let src = &k.data[r * self.n_state..(r + 1) * self.n_state];
++                    for (d, &value) in src.iter().enumerate() {
++                        self.k_columns[d * self.capacity_tokens + token] = value;
++                    }
++                }
++            }
+         }
+         self.len += t;
+         Ok(())
+@@ -3968,6 +4002,22 @@ impl KvCache {
+     pub fn value_slice(&self) -> &[f32] {
+         &self.v[..self.len * self.n_state]
+     }
++
++    fn key_columns(&self) -> Option<&[f32]> {
++        (!self.k_columns.is_empty()).then_some(self.k_columns.as_slice())
++    }
++
++    /// Restore a previously populated prefix without modifying its bytes.
++    /// Used only by the paired benchmark so repeated arms do not time cache
++    /// construction or clone different-sized layouts.
++    #[doc(hidden)]
++    pub fn truncate_for_bench(&mut self, len: usize) {
++        assert!(
++            len <= self.len,
++            "KvCache benchmark truncate grows the cache"
++        );
++        self.len = len;
++    }
+ }
+ 
+ /// Multi-head scaled-dot-product attention.
+@@ -4812,6 +4862,16 @@ pub fn attention_with_cache(
+         return attention_raw(q, &k_f32, &v_f32, tk, n_head, Some(past_len));
+     }
+     if q.rows == 1 && fast_self_attn_enabled() {
++        if let Some(k_columns) = cache.key_columns() {
++            return attention_decode_step_column_keys(
++                q,
++                k_columns,
++                cache.value_slice(),
++                tk,
++                n_head,
++                cache.capacity_tokens,
++            );
++        }
+         return attention_decode_step(q, cache.key_slice(), cache.value_slice(), tk, n_head);
+     }
+     attention_raw(
+@@ -4883,6 +4943,70 @@ fn attention_decode_step(q: &Mat, k: &[f32], v: &[f32], tk: usize, n_head: usize
+     Ok(Mat::from_vec(1, n_state, out))
+ }
+ 
++/// Packed-key variant of [`attention_decode_step`]. Keys are mirrored as
++/// `[n_state, capacity_tokens]`, so the byte-exact d-outer score loop reads a
++/// contiguous token run. Each `scores[j]` still receives the same
++/// `qd * (k * scale)` terms in ascending `d` order; only independent score
++/// accumulators are interleaved, allowing LLVM to vectorize across `j` without
++/// changing any floating-point reduction.
++#[inline(never)]
++fn attention_decode_step_column_keys(
++    q: &Mat,
++    k_columns: &[f32],
++    v: &[f32],
++    tk: usize,
++    n_head: usize,
++    capacity_tokens: usize,
++) -> FwResult<Mat> {
++    let n_state = q.cols;
++    if n_head == 0 || !n_state.is_multiple_of(n_head) {
++        return Err(FwError::InvalidRequest(format!(
++            "attention: n_head {n_head} must divide n_state {n_state}"
++        )));
++    }
++    if k_columns.len() != capacity_tokens * n_state || v.len() != tk * n_state {
++        return Err(FwError::InvalidRequest(format!(
++            "attention: column-k/v slice len {}/{} != capacity*n_state/tk*n_state {}/{}",
++            k_columns.len(),
++            v.len(),
++            capacity_tokens * n_state,
++            tk * n_state
++        )));
++    }
++    let d_head = n_state / n_head;
++    if d_head == 0 {
++        return Err(FwError::InvalidRequest("attention: d_head == 0".into()));
++    }
++    let scale = (d_head as f32).powf(-0.25);
++    let q0 = q.row(0);
++    let mut out = vec![0.0f32; n_state];
++    let mut qh = vec![0.0f32; d_head];
++    let mut scores = vec![0.0f32; tk];
++    for h in 0..n_head {
++        let base = h * d_head;
++        for (d, slot) in qh.iter_mut().enumerate() {
++            *slot = q0[base + d] * scale;
++        }
++        scores.fill(0.0);
++        for (d, &qd) in qh.iter().enumerate() {
++            let column =
++                &k_columns[(base + d) * capacity_tokens..(base + d) * capacity_tokens + tk];
++            for (score, &key) in scores.iter_mut().zip(column) {
++                *score += qd * (key * scale);
++            }
++        }
++        let mut sm = Mat::from_vec(1, tk, std::mem::take(&mut scores));
++        softmax_rows(&mut sm);
++        scores = sm.data;
++        for (j, &sj) in scores.iter().enumerate() {
++            let vrow = &v[j * n_state + base..j * n_state + base + d_head];
++            let orow = &mut out[base..base + d_head];
++            axpy_f32_into(orow, sj, vrow);
++        }
++    }
++    Ok(Mat::from_vec(1, n_state, out))
++}
++
+ /// f16-storage variant of [`attention_decode_step`]: reads the KV cache f16
+ /// slices directly, `.to_f32()`-ing each element inside the two dot loops.
+ /// f16→f32 is lossless, so every f32 arithmetic value is IDENTICAL to
+@@ -6107,6 +6231,40 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn column_major_key_cache_matches_row_major_bit_exact() {
++        let mut rng = Lcg::new(0xc011_0a7e);
++        let n_head = 4;
++        let n_state = 32;
++        let n_tokens = 17;
++        let q_all = rng.mat(n_tokens, n_state);
++        let k_all = rng.mat(n_tokens, n_state);
++        let v_all = rng.mat(n_tokens, n_state);
++        let mut row_major = KvCache::new(n_tokens, n_state);
++        let mut column_major = KvCache::new_column_major_keys_for_bench(n_tokens, n_state);
++
++        for t in 0..n_tokens {
++            let q = Mat::from_vec(1, n_state, q_all.row(t).to_vec());
++            let k = Mat::from_vec(1, n_state, k_all.row(t).to_vec());
++            let v = Mat::from_vec(1, n_state, v_all.row(t).to_vec());
++            let original = attention_with_cache(&q, &k, &v, n_head, &mut row_major).unwrap();
++            let candidate = attention_with_cache(&q, &k, &v, n_head, &mut column_major).unwrap();
++            assert_eq!(
++                original
++                    .data
++                    .iter()
++                    .map(|value| value.to_bits())
++                    .collect::<Vec<_>>(),
++                candidate
++                    .data
++                    .iter()
++                    .map(|value| value.to_bits())
++                    .collect::<Vec<_>>(),
++                "packed keys changed the token-{t} output"
++            );
++        }
++    }
++
+     #[test]
+     fn kv_cache_append_overflow_and_reset() {
+         let mut cache = KvCache::new(2, 4);
