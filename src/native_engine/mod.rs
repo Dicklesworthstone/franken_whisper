@@ -318,6 +318,15 @@ pub(crate) fn int8_mlp_enabled() -> bool {
 /// integer-EXACT/non-saturating for i7, docs/NEGATIVE_EVIDENCE d8b8df6). NON-byte-
 /// exact vs f32 sgemm (int8 quantization) -> owner-gated on a transcript A/B, hence
 /// default off. Env: `FRANKEN_WHISPER_ENC_INT8=1`.
+///
+/// **e2e REALITY CHECK (turbo, 2026-07-13, `NEGATIVE_EVIDENCE` tick 13g): the
+/// 1.56-1.58x is a per-GEMM MICROBENCH; it does NOT translate to e2e.** Measured on
+/// real large-v3-turbo (jfk, 6 reps, alternating): `encoder_window` +3-4%,
+/// `backend_run` +2.2% only — because attn_sdpa (42.9% of encoder) is external and
+/// UNCHANGED, `attn_out` is already i8i32 by default, and the external f32 sgemm is
+/// already fast (int8 barely wins on CPU without VNNI on this Zen3 box).
+/// And it's non-byte-exact on real speech (track01: 2 word-diffs). ~2% e2e for a WER
+/// risk is not worth a default flip — keep OFF. Do not cite "1.5x" as an e2e figure.
 pub(crate) fn enc_int8_enabled() -> bool {
     const DEFAULT_ON: bool = false;
     static ON: OnceLock<bool> = OnceLock::new();
