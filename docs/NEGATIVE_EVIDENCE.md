@@ -21048,6 +21048,30 @@ dropped). Encoder int8 GEMM speedup now needs VNNI/GPU (hardware) or fewer MACs 
 no byte-exact CPU layout/schedule lever. **METHOD: remote rch build stalled 11 min on a degraded worker
 (`project_asupersync_oom_roulette`); cancelled → local incremental build 3m08s. Build remote is only faster on a
 HEALTHY fleet; check `rch status` posture first.**
+**Tick 2026-07-13u (fresh-context loop) — decode `maddubs` GEMV built + benched + DOUBLE-NEGATIVE (perf WASH +
+non-byte-exact); the DECODE int8 GEMV is NOT `dot_i8`-compute-bound (3rd confirmation).** The decode per-token
+GEMV (`gemv_i8`, ~77% of decode) uses the SIGNED `dot_i8` (`vpmovsxbw`×2 + `vpmaddwd`, ~8 vec-ops/32B) while the
+encoder uses the u7×i8 `maddubs` scheme (~3 ops/32B). Hypothesis (from the tick-13q attribution: `self_qkv` 10.9%
+of decode ≈ 1.7 ms/tok but its 4.9 MB weight is only ~0.12 ms of DRAM ⇒ looked compute-bound): route the decode
+I8Mat GEMVs through `maddubs` for ~2.7× fewer ops. Built it byte-exact-on-the-scheme behind `FW_DEC_MADDUBS=1`
+(new `MaddubsShadow`: re-quantize decode weights 8→**7-bit** `[-63,63]` at load — the overflow-safe trick so
+`u8_act(≤255)·w(≤63)` maddubs pairs stay < 32767 — + colsum offset; reuses `dot_maddubs_i7`/`quantize_row_i7_u8_into`).
+SAME-binary ABBA A/B on the 124 s mp3 (turbo, multi-window, DECODE-dominated 62.5%), summing per-window
+`decode_loop` spans, threads=32, rep0 discarded. **Result: WASH — decode_loop median 5336.6 ms (maddubs) vs 5307.1
+ms (signed) = ratio 1.006 (0.6 % SLOWER, within noise); the 2.7× op reduction bought NOTHING.** ⇒ the decode GEMV
+is **not** `dot_i8`-compute-bound — it is DRAM-weight-streaming / latency / dispatch bound (my "1.7 ms vs 0.12 ms
+DRAM ⇒ compute-bound" inference was WRONG; the small per-token GEMVs are latency/dispatch-limited, not vec-op-count
+limited). This is the 3rd independent confirmation after 13p (accumulators) + 13q (x-widen amortize) that decode
+GEMV compute is not the bottleneck. **Also non-byte-exact** (7-bit weights): transcript DRIFTS on real speech
+(track01 257→261 words, insertions like "it's, you know," + "in.That's"→"in,that's"), so even if it HAD won it
+would be a WER-gated owner call. Both axes fail ⇒ reverted surgically (nn.rs == HEAD, no stash). **SDPA path
+(the suggested primitive) checked + also closed:** encoder `attention` defaults to the EXTERNAL
+`ft_kernel_cpu::sdpa_forward_f32`, which is ALREADY flash-style (row-tiled, never materializes the `[tq,tk]`
+scores, MEASURED 2.35× over the in-tree per-head `attention_raw` fallback); its only remaining lever = the
+`FT_SDPA_POLY_EXP` poly-exp, already built + owner-gated (non-byte-exact). No fresh in-tree SDPA lever. NET across
+13t+13u: the two hand int8 GEMM kernels (encoder=compute-bound/maddubs-optimal, decode=DRAM/latency-bound) are both
+confirmed at their CPU floor by DIRECT build+measure, not assertion; remaining upside is hardware (VNNI/GPU) or
+WER-gated precision (owner).
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
