@@ -21027,3 +21027,19 @@ landed Phase-1 `logits_all` batched verify (2.36× amortization) the pieces are 
 LOOP remains the owner-ticketed build (bd-wzgh) — NOT autonomously built — but the "no draft" blocker that gated
 it for the whole campaign is GONE, with measured viability. This is the concrete next step for the one lever that
 attacks the dominant (64%) decode cost. See [[project_perf_loop_blocked_single_model]].
+**Tick 2026-07-13m (this loop) — MEASURED the true accept rate; it REFUTES 13l's optimism: distil is too weak a
+draft to WIN on real speech.** Built `examples/spec_accept_probe.rs` (greedy-decode turbo → committed tokens,
+then TEACHER-FORCE distil on that exact stream, count distil-argmax == turbo-next — the real K=1 accept, higher
+than independent transcripts NO, actually LOWER because token-level is stricter than word-LCS). Measured (turbo
+verify / distil draft, first 30 s window): **jfk 73.1% (19/26), jfk×3 tiled 81.2% (56/69), track01 real
+conversational speech 54.5% (42/77).** 13l ASSERTED "true accept is HIGHER than the 89.5% word-agreement" — WRONG:
+token-level accept is 54.5% on the realistic workload (the 89.5% was word-LCS, laxer). **Speedup at 54.5%:
+NET SLOWDOWN.** K=1 pass yields E[tok]=1+0.545=1.545 for cost = draft (0.61× turbo) + batched-verify (~1.2×) ≈
+1.81 turbo-equiv ⇒ **~0.85× (15% SLOWER)**; even at jfk's 73% it's ~0.96×; general-K is WORSE (rejected drafts
+waste K draft-decodes). The distil 2-layer decoder simply disagrees with turbo's 4-layer too often on ambiguous
+conversational speech — a weaker/cheaper draft is exactly the accept-vs-cost tension. **So spec-decode with the
+on-box `distil-large-v3` draft does NOT win the decode regime** (contra 13l/`SPEC_DECODE_PLAN`); it needs a draft
+that is BOTH much cheaper AND ~≥85% agreeing — none is on-box. The verify primitives (`logits_all`, `gemv_i8_batch`)
++ the probe remain for a future better draft. LESSON: a word-agreement proxy over-states token-accept badly;
+MEASURE the teacher-forced rate before believing a spec-decode EV (this is why I built the probe rather than
+trusting 89.5%). Correcting `SPEC_DECODE_PLAN` next.
