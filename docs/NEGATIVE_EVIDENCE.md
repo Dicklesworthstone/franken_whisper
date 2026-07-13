@@ -20130,3 +20130,13 @@ Fresh code-verification this tick (so future ticks stop re-probing these):
   to every release user. Left to the owner (not landed autonomously: shipping-default change,
   and this loop directive carries no "do NOT defer/hold" go-ahead — the documented trigger to
   land an owner-gated lever). Everything up to that one line is complete and green.
+
+  **MULTI-WINDOW byte-exactness hardened (2026-07-13):** all prior free-path byte-exact checks
+  were single-window `jfk`. Ran a realistic 5-window clip (`track01`, 124.5 s, `--no-timestamps`
+  = full coverage, no content-drop confound), `FW_ENC_FREE_F32=0` vs `=1`, standalone runs:
+  **turbo 257 words =0 == =1 BYTE-EXACT; tiny.en 254 words =0 == =1 BYTE-EXACT.** So the
+  f16-direct + free path is transcript-identical across cross-window state, all 5 encoder windows,
+  and the full decode loop on BOTH models — confirming the construction proof empirically on the
+  realistic workload, not just a single window. The flip's byte-exactness is now belt-and-braces.
+  (Box note: running 4 heavy transcribes in one shell loop kept evicting the `fw` binary under
+  disk pressure → false empties; standalone one-at-a-time runs are reliable here.)
