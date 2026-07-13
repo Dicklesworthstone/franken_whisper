@@ -20773,3 +20773,17 @@ freed f32 encoder weights, exactly as the model-agnostic code proof predicts: qu
 the freed f32 regardless of model). Combined with the earlier multi-window (5-window + tiled) turbo
 verification, the shipped default-on flip is now confirmed byte-exact across {both models} × {single- and
 multi-window}. Robustness datapoint, no new lever.
+
+## 2026-07-13 (GoldenOwl) — HONESTY refinement: FW_ENC_FREE_F32 is a MEMORY win; its −14% WALL is single-shot-only
+
+The session-headline "−14% wall" for the flip was single-shot jfk (load-dominated). MEASURED on the
+realistic decode-bound workload (track01, 124 s, HEAD binary, flip ON default vs `FW_ENC_FREE_F32=0`, 2 reps
+each): **wall 8.1-8.2 s vs 8.2-8.4 s = ~unchanged (within noise); RSS 2.82 GB vs 5.29 GB = −47%.** So for
+realistic long audio the load (~6.5% of e2e, amortized over 2 min of audio) is small, so the flip's
+freed-f32 + page-fault-tax WALL benefit vanishes into noise — but the **−47% RSS holds length-independently**
+(the weights stay freed the whole run). **Accurate framing: the flip is primarily a MEMORY (peak-RSS) win
+(−46% both models, all workloads); the −14% wall is CLI-cold-start / short-clip-only.** The session's
+realistic-workload WALL improvement comes from the unconditional AVX2 quant wins (encode/decode compute,
+26feafd/3e7f295/991df99), not the flip. No new lever — a correctness-of-claims refinement so the −10% e2e
+single-shot figure isn't over-generalized to server/long-audio usage (there it's ~memory-only + the quant
+compute wins).
