@@ -2957,6 +2957,122 @@ pub fn quantize_f16_to_i4_blocked(
     quantize_f16_to_int_blocked(w, out, inp, block, 7.0)
 }
 
+/// AVX2+F16C block-wise symmetric quantize of ONE f16 weight row: for each
+/// `block`-wide span, `scale[b] = max|w|/max_level` and `q[i] = (w[i]/scale[b])
+/// .round().clamp(±max_level) as i8`. Two vectorized passes/block via
+/// `_mm256_cvtph_ps` (exact f16→f32) — amax tree-reduce (= scalar fold for finite
+/// values) then round-HALF-AWAY (`f32::round`) + clamp + saturating-pack. Runtime
+/// `max_level` (127 for i8, 7 for the i4-level variant). **Byte-identical** to the
+/// scalar block loop; hoists the SIMD constants once per row. See
+/// `quantize_f16_row_blocked_matches_scalar`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "f16c"
+))]
+#[allow(unsafe_code)]
+fn quantize_f16_row_blocked_to_int_into(
+    wrow: &[Float16],
+    block: usize,
+    max_level: f32,
+    drow: &mut [i8],
+    srow: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    let inp = wrow.len();
+    debug_assert_eq!(drow.len(), inp, "blocked quant drow len mismatch");
+    let n_blocks = inp.div_ceil(block);
+    let wp = wrow.as_ptr();
+    // SAFETY: avx2+f16c by cfg. Every 128-bit f16 load / i64 store is bounded by an
+    // `i+8<=e` / `j+8<=e` guard (`e<=inp`), the `<8` remainders run scalar; no store
+    // crosses a block boundary (guard stops at `e`). Float16 is repr(transparent) u16.
+    unsafe {
+        let absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let half = _mm256_set1_ps(0.5);
+        let signmask = _mm256_set1_ps(-0.0);
+        let vmax = _mm256_set1_ps(max_level);
+        let vmin = _mm256_set1_ps(-max_level);
+        for b in 0..n_blocks {
+            let s = b * block;
+            let e = ((b + 1) * block).min(inp);
+            // pass 1: amax = max|f16→f32(w[i])| over [s,e)
+            let mut m = _mm256_setzero_ps();
+            let mut i = s;
+            while i + 8 <= e {
+                let v = _mm256_cvtph_ps(_mm_loadu_si128(wp.add(i).cast()));
+                m = _mm256_max_ps(m, _mm256_and_ps(v, absmask));
+                i += 8;
+            }
+            let mut tmp = [0.0f32; 8];
+            _mm256_storeu_ps(tmp.as_mut_ptr(), m);
+            let mut amax = tmp.iter().copied().fold(0.0f32, f32::max);
+            while i < e {
+                amax = amax.max(wrow.get_unchecked(i).to_f32().abs());
+                i += 1;
+            }
+            let scale = amax.max(1e-9) / max_level;
+            *srow.get_unchecked_mut(b) = scale;
+            let inv = 1.0 / scale;
+            // pass 2: (f16→f32(w)·inv) round-half-away, clamp ±max_level, pack to i8.
+            let vinv = _mm256_set1_ps(inv);
+            let mut j = s;
+            while j + 8 <= e {
+                let v = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(wp.add(j).cast())), vinv);
+                let vh = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, signmask)));
+                let r = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(vh);
+                let r = _mm256_min_ps(_mm256_max_ps(r, vmin), vmax);
+                let ri = _mm256_cvtps_epi32(r);
+                let lo = _mm256_castsi256_si128(ri);
+                let hi = _mm256_extracti128_si256::<1>(ri);
+                let i16s = _mm_packs_epi32(lo, hi);
+                let i8s = _mm_packs_epi16(i16s, i16s);
+                _mm_storel_epi64(drow.as_mut_ptr().add(j) as *mut __m128i, i8s);
+                j += 8;
+            }
+            while j < e {
+                *drow.get_unchecked_mut(j) = (wrow.get_unchecked(j).to_f32() * inv)
+                    .round()
+                    .clamp(-max_level, max_level) as i8;
+                j += 1;
+            }
+        }
+    }
+}
+
+/// Scalar fallback (non-avx2/f16c): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "f16c"
+)))]
+fn quantize_f16_row_blocked_to_int_into(
+    wrow: &[Float16],
+    block: usize,
+    max_level: f32,
+    drow: &mut [i8],
+    srow: &mut [f32],
+) {
+    let inp = wrow.len();
+    let n_blocks = inp.div_ceil(block);
+    for b in 0..n_blocks {
+        let s = b * block;
+        let e = ((b + 1) * block).min(inp);
+        let amax = wrow[s..e]
+            .iter()
+            .map(|h| h.to_f32().abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-9);
+        let sc = amax / max_level;
+        srow[b] = sc;
+        let inv = 1.0 / sc;
+        for i in s..e {
+            drow[i] = (wrow[i].to_f32() * inv)
+                .round()
+                .clamp(-max_level, max_level) as i8;
+        }
+    }
+}
+
 fn quantize_f16_to_int_blocked(
     w: &[Float16],
     out: usize,
@@ -2974,23 +3090,7 @@ fn quantize_f16_to_int_blocked(
         .enumerate()
         .for_each(|(o, (drow, srow))| {
             let wrow = &w[o * inp..(o + 1) * inp];
-            for b in 0..n_blocks {
-                let s = b * block;
-                let e = ((b + 1) * block).min(inp);
-                let amax = wrow[s..e]
-                    .iter()
-                    .map(|h| h.to_f32().abs())
-                    .fold(0.0f32, f32::max)
-                    .max(1e-9);
-                let sc = amax / max_level;
-                srow[b] = sc;
-                let inv = 1.0 / sc;
-                for i in s..e {
-                    drow[i] = (wrow[i].to_f32() * inv)
-                        .round()
-                        .clamp(-max_level, max_level) as i8;
-                }
-            }
+            quantize_f16_row_blocked_to_int_into(wrow, block, max_level, drow, srow);
         });
     I8BlockMat {
         data,
@@ -6110,6 +6210,128 @@ mod tests {
         }
         eprintln!(
             "quantize_f16_row_to_i8 [{rows}x{cols}] scalar={:.1}us avx2={:.1}us speedup={:.2}x",
+            best_scalar * 1e6,
+            best_avx2 * 1e6,
+            best_scalar / best_avx2
+        );
+    }
+
+    #[test]
+    fn quantize_f16_row_blocked_matches_scalar_reference() {
+        // AVX2+F16C block-wise weight quant (per-block amax + round) must be BIT-
+        // identical to the scalar block loop in quantize_f16_to_int_blocked, for both
+        // i8 (max_level=127) and the i4-level (max_level=7) variants, across full and
+        // PARTIAL trailing blocks and the ±max clamp. Verify both q AND per-block scale.
+        fn scalar(wrow: &[Float16], block: usize, max_level: f32) -> (Vec<i8>, Vec<f32>) {
+            let inp = wrow.len();
+            let n_blocks = inp.div_ceil(block);
+            let mut drow = vec![0i8; inp];
+            let mut srow = vec![0.0f32; n_blocks];
+            for b in 0..n_blocks {
+                let s = b * block;
+                let e = ((b + 1) * block).min(inp);
+                let amax = wrow[s..e]
+                    .iter()
+                    .map(|h| h.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-9);
+                let sc = amax / max_level;
+                srow[b] = sc;
+                let inv = 1.0 / sc;
+                for i in s..e {
+                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-max_level, max_level) as i8;
+                }
+            }
+            (drow, srow)
+        }
+        let mut s = 0x2B99_2DDF_A232_47D9u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            Float16::from_f32(((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0)
+        };
+        for &max_level in &[127.0f32, 7.0] {
+            // include partial trailing blocks (80 = 32+32+16, 100 = 32*3+4)
+            for &inp in &[0usize, 4, 16, 32, 33, 64, 80, 100, 5120] {
+                let wrow: Vec<Float16> = (0..inp).map(|_| nf()).collect();
+                let n_blocks = inp.div_ceil(32);
+                let mut drow = vec![0i8; inp];
+                let mut srow = vec![0.0f32; n_blocks];
+                quantize_f16_row_blocked_to_int_into(&wrow, 32, max_level, &mut drow, &mut srow);
+                let (wd, ws) = scalar(&wrow, 32, max_level);
+                assert_eq!(drow, wd, "blocked q mismatch inp={inp} max={max_level}");
+                let sb: Vec<u32> = srow.iter().map(|v| v.to_bits()).collect();
+                let wb: Vec<u32> = ws.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(sb, wb, "blocked scale mismatch inp={inp} max={max_level}");
+            }
+        }
+    }
+
+    // Single-binary kernel A/B: AVX2 blocked weight quant vs the scalar block loop,
+    // real turbo fc2 shape [1280,5120], block=32. Run: cargo test --release --lib
+    // quantize_f16_row_blocked_perf -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn quantize_f16_row_blocked_perf() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let (rows, cols, block) = (1280usize, 5120usize, 32usize); // decoder fc2 [out,in]
+        let mut s = 0x6C62_272E_07BB_0142u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            Float16::from_f32(((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0)
+        };
+        let w: Vec<Float16> = (0..rows * cols).map(|_| nf()).collect();
+        let n_blocks = cols.div_ceil(block);
+        let mut drow = vec![0i8; rows * cols];
+        let mut srow = vec![0.0f32; rows * n_blocks];
+        let scalar = |wrow: &[Float16], drow: &mut [i8], srow: &mut [f32]| {
+            for b in 0..n_blocks {
+                let (st, e) = (b * block, ((b + 1) * block).min(cols));
+                let amax = wrow[st..e]
+                    .iter()
+                    .map(|h| h.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-9);
+                let inv = 127.0 / amax;
+                srow[b] = amax / 127.0;
+                for i in st..e {
+                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        };
+        let (mut best_scalar, mut best_avx2) = (f64::MAX, f64::MAX);
+        for _ in 0..100 {
+            let t = Instant::now();
+            for r in 0..rows {
+                scalar(
+                    black_box(&w[r * cols..(r + 1) * cols]),
+                    &mut drow[r * cols..(r + 1) * cols],
+                    &mut srow[r * n_blocks..(r + 1) * n_blocks],
+                );
+            }
+            black_box(&drow);
+            let sc = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            for r in 0..rows {
+                quantize_f16_row_blocked_to_int_into(
+                    black_box(&w[r * cols..(r + 1) * cols]),
+                    block,
+                    127.0,
+                    &mut drow[r * cols..(r + 1) * cols],
+                    &mut srow[r * n_blocks..(r + 1) * n_blocks],
+                );
+            }
+            black_box(&drow);
+            let av = t.elapsed().as_secs_f64();
+            best_scalar = best_scalar.min(sc);
+            best_avx2 = best_avx2.min(av);
+        }
+        eprintln!(
+            "quantize_f16_row_blocked [{rows}x{cols} blk{block}] scalar={:.1}us avx2={:.1}us speedup={:.2}x",
             best_scalar * 1e6,
             best_avx2 * 1e6,
             best_scalar / best_avx2
