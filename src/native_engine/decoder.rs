@@ -1833,21 +1833,31 @@ pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
 /// concatenation changes neither the per-row [`dot8`] order nor the bias.
 /// bd-b4hp (BlackThrush, 2026-06-29).
 fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
-    let f16 = |w: &WeightMat| match w {
-        WeightMat::F16 { data, out, inp } => Some((data.clone(), *out, *inp)),
-        WeightMat::F32(_) => None,
+    // BORROW each projection's f16 data (a `&[Float16]`) rather than cloning it: the
+    // three slices are used only to size + `extend_from_slice` the concatenated
+    // weight, so cloning them first (~3·n_state² f16/layer ≈ 10 MB/layer on turbo)
+    // was pure waste. Byte-identical concat. Inlined per-weight matches (a closure
+    // returning a borrow tied to its `&WeightMat` arg won't infer the lifetime).
+    let (qd, qo, qi) = match &q.w {
+        WeightMat::F16 { data, out, inp } => (data.as_slice(), *out, *inp),
+        WeightMat::F32(_) => return None,
     };
-    let (qd, qo, qi) = f16(&q.w)?;
-    let (kd, ko, ki) = f16(&k.w)?;
-    let (vd, vo, vi) = f16(&v.w)?;
+    let (kd, ko, ki) = match &k.w {
+        WeightMat::F16 { data, out, inp } => (data.as_slice(), *out, *inp),
+        WeightMat::F32(_) => return None,
+    };
+    let (vd, vo, vi) = match &v.w {
+        WeightMat::F16 { data, out, inp } => (data.as_slice(), *out, *inp),
+        WeightMat::F32(_) => return None,
+    };
     if qi != ki || qi != vi || qo != ko || qo != vo {
         return None;
     }
     let (inp, out) = (qi, qo + ko + vo);
     let mut data = Vec::with_capacity(qd.len() + kd.len() + vd.len());
-    data.extend_from_slice(&qd);
-    data.extend_from_slice(&kd);
-    data.extend_from_slice(&vd);
+    data.extend_from_slice(qd);
+    data.extend_from_slice(kd);
+    data.extend_from_slice(vd);
     let mut bias = vec![0.0f32; out];
     if let Some(b) = &q.bias {
         bias[..qo].copy_from_slice(b);
