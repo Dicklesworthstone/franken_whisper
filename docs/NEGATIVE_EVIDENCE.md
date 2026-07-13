@@ -21001,3 +21001,15 @@ INHERENT cost of the (net-winning) pipeline trade, not a bug. The decode-dominat
 AMORTIZATION (spec-decode) — owner-gated AND still blocked (no vocab-compatible on-box draft: tiny.en vocab
 51864 ≠ turbo 51866). **NET: all three turbo regimes (encoder-bound jfk, load, decode-bound long-audio) now
 measured + closed; byte-exact autonomous surface exhausted at turbo scale. Remaining = owner/external/HW.**
+**Tick 2026-07-13k (this loop) — prefetch-encoder-thread-throttle FALSIFIED (tested + reverted) + a 13j
+correction.** Hypothesized the pipelined decode's ~20 ms/tok (vs ~8 ms/tok solo) is bandwidth CONTENTION from
+the concurrent 32-thread prefetch encoder, and — since that prefetch has slack (encode ~315 ms/win ≪ decode
+~1014 ms/win) — throttling it to fewer threads would free bandwidth for decode and net a win. Added
+`FW_PIPELINE_ENC_THREADS` (throttles ONLY the prefetch encode; inline/fallback keep `n_threads`; default =
+`n_threads` ⇒ no-op), built, A/B'd on turbo/track01 (transcript byte-IDENTICAL across counts): `backend_run`
+means t32 ~7961, t24 ~7976, t16 ~7925, t8 ~8009 ms — **all within ±1% (< wall noise ±3%). NO measurable win.**
+Reverted. **13j CORRECTION:** the decode's per-tok slowdown on track01 is NOT primarily prefetch-encoder
+contention — it is largely INTRINSIC self-attention KV-cache growth (track01 windows carry ~55 tokens vs jfk's
+27, so later tokens attend over a longer cache); that's why throttling the prefetch encoder does nothing. KV-cache
+decode is separately memory-CLOSED ([[project_self_attn_kv_cache_lever]]). Net: pipeline balance is not a tunable
+lever; the decode-dominated regime stays owner-gated (spec-decode) / HW.
