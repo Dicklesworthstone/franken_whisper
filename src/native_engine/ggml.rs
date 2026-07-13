@@ -518,7 +518,18 @@ pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
 
     // Below this size the thread spawn/join costs more than the copy it saves.
     const MIN_PARALLEL: usize = 8 * 1024 * 1024;
-    let workers = super::host_parallelism().min(16);
+    // Band count for the parallel blob memcpy. Default host∧32; `FW_BLOB_READ_WORKERS`
+    // overrides it. The old host∧16 cap left aggregate memory bandwidth on the table:
+    // on a 64-core box the 1.5 GB warm-cache turbo read (`model_parse` span, PERF_SPANS,
+    // interleaved) measured 8→~195 ms, 16→~122 ms, 24→~114 ms, 32→~113 ms, 48→~112 ms —
+    // so the knee is ~24-32 and 16→32 saves ~9 ms (−7.5%). Byte-identical either way
+    // (disjoint bands cover exactly `[0, len)`). Clamped to `[1, host_parallelism]`;
+    // on ≤16-core hosts the value is unchanged. `FW_BLOB_READ_WORKERS=16` reverts.
+    let workers = std::env::var("FW_BLOB_READ_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|w| w.clamp(1, super::host_parallelism()))
+        .unwrap_or_else(|| super::host_parallelism().min(32));
     if len < MIN_PARALLEL || workers < 2 {
         read_exact_at(&file, &mut blob, 0)?;
         return Ok(blob);
