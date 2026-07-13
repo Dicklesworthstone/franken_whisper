@@ -20488,3 +20488,34 @@ frees provably-dead weight; every other path is unchanged; and `FW_ENC_FREE_F32=
 This reframes the prior "memory-only" note (`project_enc_free_f32_dead_weights`) into a **−14% SINGLE-SHOT
 SPEED win** (single-shot = the CLI use case). Owner-gated levers remaining: SDPA poly-exp, enc int8
 calibration (WER), ToMe/pruning (WER).
+
+## 2026-07-13 (GoldenOwl) — post-flip page-fault-tax probe: allocator swap REGRESSES; decoder-f16-free is RSS-only
+
+After the FW_ENC_FREE_F32 flip (RSS 2.83 GB, faults 1.17 M) I chased the residual page-fault tax. Two dead
+ends, both MEASURED so nobody retries them:
+
+- **Allocator tuning REGRESSES — do NOT swap to jemalloc / cap arenas.** turbo/jfk `/usr/bin/time -v`:
+  glibc default **2.42 s / 1.16 M faults**; `MALLOC_ARENA_MAX=1` **2.98 s / 1.34 M** (single arena
+  serializes 32-thread allocs = lock contention); `LD_PRELOAD=libjemalloc.so.2` **3.10 s / 3.19 M faults**
+  (3× MORE faults). glibc's per-thread arenas + dynamic mmap threshold are already optimal for this
+  workload. Earlier `MALLOC_MMAP_THRESHOLD_/TRIM_THRESHOLD_` env tuning was also a no-op (1.77→1.88 M).
+  **The page-fault tax is inherent first-touch of NEEDED memory** (1.5 GB blob + i7/i8 encoder weights +
+  decoder f16/int8 + activations), NOT munmap re-fault churn → not reducible by the allocator.
+- **The 1.5 GB ggml blob is NOT retained post-load** (was a hypothesis): `LoadedModel` has no blob/ggml
+  field; `from_ggml` MOVES filters+vocab out and drops the `GgmlModel` (blob) at return (decode.rs:147).
+  So the blob is freed after load; it's peak-RSS-during-load, not steady dead RSS.
+- **Decoder pure-int8 f16 weights ARE dead but freeing is RSS-only + risky.** `Linear.w` (f16) is dead for
+  the pure-int8 attn projections (q/k/v/self_out/cross_q/cross_out: `w_i8` present, no block/int4) WHEN
+  `i8_batch_enabled()` (DEFAULT-ON) — the forward then uses `gemv_i8`/`gemv_i8_batch` for both tq==1 and
+  tq>1, never the f16 path (decoder.rs:334). ~630 MB freeable on turbo (6×[1280,1280]×2B×32L). BUT: (a)
+  RSS-ONLY — the decoder weight build HIDES behind the encoder build (`rayon::join`, decode.rs:134, enc
+  ~180 ms > dec ~102 ms), so freeing/not-building it gives NO wall win; (b) fc1/fc2 f16 must stay (they
+  deliberately use the f16 batch path at prefill, decoder.rs:313-320); (c) it needs the SAME careful prep
+  the encoder flip took multiple sessions for — find EVERY post-load `w` reader (tests, DTW, debug) before
+  clearing, exactly like the `assert_quality_safe_int8_error_budget` blocker that gated the encoder free.
+  So it's a gated dedicated-session RSS lever (`FW_DEC_FREE_F16`, ~630 MB, helps the "box hostile when
+  full" hazard), NOT a one-turn autonomous increment. Specified here; don't rush it.
+
+**Net:** no clean autonomous WALL lever remains post-flip. The compute path is owner/external (SDPA + int8
+GEMMs), the encoder build is EF-serial + decoder hidden, the fault tax is inherent + allocator-optimal, and
+the only fresh RSS lever (decoder-f16-free) is dedicated-session-worthy. Frontier = owner-gated as before.
