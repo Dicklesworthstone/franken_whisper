@@ -792,11 +792,24 @@ pub(crate) fn i8_batch_enabled() -> bool {
     })
 }
 
-/// PROBE (default off): int4 (block-wise, 4-bit weight × f32 activation) for
-/// `mlp_0`/fc1. fc1 feeds GELU, whose saturation absorbed int8 weight error to
-/// byte-exactness (fc1-only int8); this tests whether 4-bit is ALSO absorbed. If
-/// byte-exact it halves fc1's weight bandwidth again — a quality-neutral win past
-/// the Q8 floor. `FRANKEN_WHISPER_INT4_MLP0=1`.
+/// DEAD PROBE (default off) — kept as a gated scaffold; do NOT re-attempt. int4
+/// (block-wise, 4-bit weight × f32 activation) for `mlp_0`/fc1. fc1 feeds GELU,
+/// whose saturation absorbs int8 weight error to byte-exactness (fc1-only int8,
+/// default-on); 4-bit was the natural next byte-cut. Measured DEAD on BOTH axes:
+///
+/// 1. **NOT byte-exact on realistic audio.** `8ca4378` reported "byte-exact (GELU
+///    absorbs 4-bit)" — but that was jfk single-window ONLY. Re-measured 2026-07-13
+///    on track01 (124 s / 5-window real speech, tiny.en, no_ts): the transcript
+///    DRIFTS materially vs int4-off (both deterministic; A/A null-control clean) —
+///    e.g. "ranking this stuff" → "ranking and stuff like the video ranker". The
+///    4-bit error escapes GELU absorption on ambiguous speech and compounds across
+///    windows via the carried prompt (jfk-identical ≠ corpus-neutral).
+/// 2. **Perf REGRESSION, not just the `60eb294` microbench wash.** Re-measured e2e
+///    on that same decode-dominated clip: `decode_loop` +6% SLOWER int4-on vs off
+///    (AVX2 nibble-unpack cost > the halved-bandwidth benefit — decode is dispatch/
+///    latency-bound, not bandwidth-bound). See NEGATIVE_EVIDENCE 2026-07-13.
+///
+/// Stays default-off permanently. `FRANKEN_WHISPER_INT4_MLP0=1` to reproduce.
 pub(crate) fn int4_mlp0_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
