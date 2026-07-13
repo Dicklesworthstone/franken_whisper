@@ -70,10 +70,12 @@ model_spec() {
     large-v3-turbo|turbo)
       echo "ggml-large-v3-turbo.bin|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin|1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69" ;;
     distil-large-v3|distil)
-      # Speculative-decode DRAFT for large-v3-turbo: identical vocab (51866) + the SAME
-      # 32-layer large-v3 encoder (encoder computed ONCE, shared), but a 2-layer decoder
-      # (vs turbo's 4) ⇒ ~1.64× faster decode. Provision alongside turbo to prototype
-      # spec-decode on the decode-dominated long-audio regime (NEGATIVE_EVIDENCE tick 13l).
+      # TEST FIXTURE for examples/spec_accept_probe.rs (identical 51866 vocab + the SAME
+      # 32-layer large-v3 encoder as turbo, 2-layer decoder). NOT a perf option — MEASURED
+      # DEAD both ways (NEGATIVE_EVIDENCE 13m/13n): as a spec-decode draft the teacher-forced
+      # K=1 accept is only 54.5% on real speech ⇒ NET SLOWDOWN; and standalone it is ~1.5×
+      # SLOWER than turbo (its shared encoder is denied the attn_out-i8i32 speedup, which is
+      # NOT WER-neutral through distil's weaker 2-layer decoder). Keep only for the probe.
       echo "ggml-distil-large-v3.bin|https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin|2883a11b90fb10ed592d826edeaee7d2929bf1ab985109fe9e1e7b4d2b69a298" ;;
     *)
       die "unknown model '$1' (known: tiny.en [default], large-v3-turbo, distil-large-v3)" ;;
