@@ -4,6 +4,86 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-13 - Codex: **SURFACE / INVALID CV — moving consumed GGML metadata repeatedly showed a large clone-elimination signal, but neither BASE/BASE null passed the predeclared CV gate; source restored.**
+
+**Target.** `LoadedModel::from_ggml` consumes `GgmlModel`, yet clones its
+filterbank and all 50,257 parsed vocabulary buffers before dropping the originals.
+The candidate waited for the encoder/decoder weight-build borrows to end, then moved
+both fields into their final owners. That removes 50,257 inner allocations/copies plus
+the 128x201 f32 filter copy without changing tokenizer construction or inference math.
+The fresh opportunity score was `(3.5 impact x 5 confidence) / 1 effort = 17.5`; no
+existing negative-ledger row covered this ownership transfer.
+
+**Strict-remote same-binary evidence.** Both measured runs used worker
+`vmi1149989`, `--profile release-perf`, and the same hermetic turbo-shaped fixture:
+50,257 variable-length token buffers, `n_vocab=51,866`, and a 128x201 filterbank.
+Fixture construction stayed outside timing. After three warmups, each run recorded 21
+macro ratios, each the median of five alternating ABBA/BAAB microquartets. The
+predeclared decision gate required a BASE/BASE median in `[0.98, 1.02]`, null CV
+`<=3%`, clone/move median above `max(null p90, 1.05)`, candidate p10 above 1.0, and
+at least 18/21 wins.
+
+| run (RCH job) | comparison | median | p10 | p90 | CV | wins | verdict |
+|---|---|---:|---:|---:|---:|---:|---|
+| first (`j-29928833041826355`) | BASE/BASE | 1.008045 | 0.961418 | 1.048579 | **4.465%** | 12/21 | invalid null |
+| first | clone/move | 1.432997x | 1.376604 | 1.548140 | 5.759% | 21/21 | inadmissible signal |
+| unchanged confirmation (`j-29928833041826390`) | BASE/BASE | 1.010054 | 0.938213 | 1.072534 | **4.766%** | 11/21 | invalid null |
+| unchanged confirmation | clone/move | 1.439401x | 1.383371 | 1.488214 | 2.894% | 21/21 | inadmissible signal |
+
+First-run raw BASE/BASE ratios:
+`[1.015559527657424, 0.9795828438274835, 0.9738403597714617,
+1.0251142367521362, 1.052456748807244, 1.0080453615929152,
+1.0224406890655693, 0.9754272465808015, 0.9769513701268154,
+0.988020354776813, 1.0675637715798334, 1.0334567080448156,
+1.021135180800781, 1.0485790167032953, 0.9897679005757819,
+1.0307910146372443, 0.8618175463038369, 1.007910140770918,
+0.9334571491489069, 1.0261200825090722, 0.9614178088312652]`.
+
+First-run raw clone/move ratios:
+`[1.4141571072648935, 1.4283462149715007, 1.4791227117775285,
+1.4234697598563837, 1.4541616135431914, 1.195737746715479,
+1.5518482800228504, 1.3912942697753599, 1.4329973478116842,
+1.3766035009315971, 1.4122415853640704, 1.387284258066645,
+1.5481398375931987, 1.491509703621602, 1.4394208380194098,
+1.453967895433302, 1.5136142999342301, 1.2935402334250985,
+1.5487310313111207, 1.5136588509013373, 1.4205716710681446]`.
+
+Confirmation raw BASE/BASE ratios:
+`[0.9382134184746695, 0.9633772706815578, 1.016365328726526,
+1.07253367680266, 0.9245956489064407, 0.9714082896842413,
+0.986638034387585, 1.011728885824714, 0.9299337622618344,
+1.0100535131144353, 0.9955387033871091, 1.0132530801426916,
+1.056292956519139, 1.021111201892855, 1.1063435382562887,
+1.0877371604388222, 0.9907910147183054, 0.9645519362395978,
+0.9782937684344759, 1.0117847832645697, 1.033695335901633]`.
+
+Confirmation raw clone/move ratios:
+`[1.4546512547462127, 1.4345241154940374, 1.433863980451953,
+1.3833713146692557, 1.4073267249412775, 1.3289933347660965,
+1.4126962347171892, 1.4959527695472667, 1.4224949784074497,
+1.445177013825464, 1.489062545173825, 1.442026641393293,
+1.4419911922341897, 1.4651493116841454, 1.4624892531245748,
+1.4394012494684443, 1.4251281592974612, 1.3505825315124254,
+1.4414996304674028, 1.4882144540544262, 1.390182723159431]`.
+
+**Parity and provenance.** Before timing, the temporary oracle compared every filter
+f32 bit, every parsed token byte string, derived special-token fields, non-speech ids,
+SOT sequence, and representative decoded output. Both runs produced common output
+SHA-256 `43ea23df0168cd0099e2bd1736e52c9c36500a2a3d6d7e5d00aca07e191db532`.
+Candidate-only Criterion diagnostics were `[3.5332, 3.9434, 4.3809] ms` and
+`[3.5861, 4.0238, 4.2865] ms`. Earlier job `j-29928833041826328` was build proof
+only: RCH did not forward its opt-in environment gate, so it is excluded from
+performance evidence. No benchmark-binary SHA was captured; that is another reason
+this row is routing evidence rather than ship/reject authority. Every Cargo invocation
+was fail-closed remote-only; no local fallback occurred.
+
+**Verdict.** This is not a performance rejection. The ownership move is behavior-clean
+and showed a large positive component signal twice, but the required null control never
+became admissible, so production, test, and temporary benchmark source were restored.
+Retry only with a quieter remote placement or longer macroblocks that pass the same
+predeclared null gate; do not cite either approximately 1.44x ratio as a landed win.
+
+---
 ## 2026-07-13 - CloudyOsprey: **LANDED gated (`FW_ENC_FREE_F32`, default-OFF) — the f32 encoder weight copies are DEAD post-quant; freeing them is TRANSCRIPT-BYTE-IDENTICAL and reclaims −2.38 GB steady-state RSS (−64% of the compute-phase working set). A memory lever, not speed; peak RSS unchanged (freed after quant). The peak+load-speed win needs the fused dequant→i7 (spec below).**
 
 **Fresh lever the frontier missed.** In the default full-int8 encoder
