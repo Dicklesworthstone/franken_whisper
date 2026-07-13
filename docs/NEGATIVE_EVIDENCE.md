@@ -20620,3 +20620,20 @@ This turn's specific closures (so the next tick doesn't re-open them):
 fresh candidate — encoder-preconvert, decoder-free, allocator, decode-alloc — measured/reasoned closed).
 Recommend pausing the byte-exact PERF loop; the highest-value remaining work is owner-level (long-form
 content-drop temp-fallback, or the WER-gated SDPA-poly-exp / int8-calibration / ToMe levers).**
+
+## 2026-07-13 (GoldenOwl) — SDPA WRAPPER closed (the 43.5% span fully accounted, no in-repo lever)
+
+Read `nn::attention_from_i7_qkv` (nn.rs:4859, the DEFAULT encoder self-attn path) line-by-line to confirm
+the single biggest cost has no autonomous lever. The `attn_sdpa` span (43.5% of the encoder) decomposes
+entirely into: (1) the fused **QKV int8 maddubs GEMM** `maddubs_i7_qkv_headmajor` — writes q/k/v head-major
+so the standalone gather is SKIPPED (owner-closed int8 kernel); (2) `ft_kernel_cpu::sdpa_forward_f32` — the
+actual scores/softmax/·V kernel, **external** (frankentorch; the only lever is `FT_SDPA_POLY_EXP`, owner,
+non-byte-exact); (3) `sdpa_scatter_interleaved` — already tuned to 16 chunks
+([[project_sdpa_gather_threadcount_lead]]). The q/k/v/o/out buffers are `gemv_out_buf` (uninit, glibc
+free-list-reused — cheap). The ONLY in-repo residual is `sdpa_scale = (d_head).powf(-0.5)` recomputed
+32×/window ≈ 1.6 µs total — **sub-floor; hoisting it is exactly the sub-floor micro-lever the ledger
+reverts** (frontier "Recommendation"), so NOT landed. So the encoder's biggest single span is now
+individually verified un-touchable (int8-GEMM-closed + external-kernel + tuned-scatter). With SDPA, the int8
+GEMMs, decode, load-quant (EF-serial), LN/resid (bandwidth), conv (f32-sgemm) and the fault-tax all
+individually closed, the byte-exact autonomous surface is fully mapped and empty. No build this tick (known
+result). **Loop should pause; next value is owner-level.**
