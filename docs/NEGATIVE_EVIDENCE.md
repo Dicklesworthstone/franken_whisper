@@ -20436,3 +20436,27 @@ the vectorizable quant-INPUT passes (encoder activation, decoder per-row + block
 is EF-serial (impossible), strided-gather (microcoded), owner-gated (FW_ENC_FREE_F32 / FW_SIMD_EXP / SDPA
 poly-exp), external (SDPA kernel), or bandwidth-bound (LN, residual adds, logits GEMV). Next session: do
 NOT re-hunt scalar quant — pivot to owner-gated levers or a fresh subsystem/antipattern class.
+
+## 2026-07-13 (GoldenOwl) — MEASURED e2e confirmation: the 3 quant wins = ~10% turbo/jfk (byte-exact)
+
+Built the current-HEAD `fw` bin and re-ran the live turbo/jfk span table (`FRANKEN_WHISPER_PERF_SPANS=1`,
+`…ROLLOUT_STAGE=sole`), 3 samples (~1.5% run-to-run noise). Current HEAD vs the pre-session span (mean):
+
+| span            | pre-session | HEAD (mean/3) |  Δ         |
+|-----------------|-------------|---------------|------------|
+| model_weights   |  599.6 ms   |  ~528 ms      | −72 (−12%) |  ← decoder per-row+blocked wt-quant (3e7f295/991df99), at LOAD
+| encoder_window  | 1506.7 ms   | ~1355 ms      | −152 (−10%)|  ← encoder activation-quant (26feafd), 96×/window
+| backend_run     | 2565.1 ms   | ~2296 ms      | −269 (−10.5%)|
+
+Transcript BYTE-IDENTICAL (the JFK quote verbatim). **Caveat that makes this CONSERVATIVE:** the HEAD bin
+was built `CARGO_PROFILE_RELEASE_LTO=false` (the pre-session baseline was full LTO) — LTO-off is normally
+SLOWER, so a same-profile LTO build would show an even larger win. The ~10% drops are well beyond the ~1.5%
+run noise (unchanged owner-closed ops like attn_out / decode_loop wobble ±5% = the noise floor). So the
+session's 3 byte-exact AVX2 quant wins demonstrably move e2e ~10% on turbo, at zero transcript cost.
+
+**Fresh-span lever check (no new autonomous byte-exact lever):** current hot path is attn_sdpa 43.5%
+(QKV-GEMM+SDPA+scatter — owner poly-exp / external), the int8 GEMMs mlp_fc 17% + mlp_proj 17.4% + attn_out
+11.6% (owner-closed), LN/resid ~8% (bandwidth-bound). The encoder `encoder_window − SUM(labels)` gap is now
+~172 ms (was ~197) — the ~25 ms it shrank IS the QKV activation-quant I AVX2'd; the residual gap is the
+unwrapped QKV quant (now AVX2, small) + `ln_post` + per-layer alloc/page-fault/rayon-join overhead, none an
+obvious scalar lever. Decode gap likewise closed. Frontier remains owner-gated / external, as before.
