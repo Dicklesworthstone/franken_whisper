@@ -20736,3 +20736,29 @@ k-layer partial computation correlates with the full model regardless of speech 
 ceiling per the `FW_DRAFT_ACCEPT_LAYERS` probe [[project_draft_decoding_amortization]]) or a real draft
 model — NOT prompt-lookup. Concrete, cheap, decision-relevant data for the one remaining lever; still
 owner-scoped (needs the draft/verify/KV-rollback loop).
+
+## 2026-07-13 (GoldenOwl) — OWNER DECISION BRIEF: speculative decode is the ONLY remaining perf lever (consolidated)
+
+Consolidating this session's 3-turn decode analysis into one actionable place. **The autonomous byte-exact
+surface is empty in BOTH workload regimes; the ONLY remaining perf lever is speculative decode, and it is
+owner-scoped (monolithic feature, not a measured small increment).** Everything below is measured this session.
+
+- **Why decode:** for realistic long audio, decode = **62.5% of e2e** (track01, 5-window span `33ba7c9`); the
+  encoder pipelines to ~0 behind decode. Decode is DRAM-weight-streaming-bound (~342 MB f16/int8 decoder
+  weights re-streamed per token); every sub-op is at its byte-exact floor (mlp int4/int8, logits f16 133 MB/tok
+  bandwidth-dead, self_attn L2-resident compute so f16-KV is 2× SLOWER, projections int8).
+- **The lever:** speculative decode verifies K drafted tokens in ONE batched all-layer pass, amortizing the
+  weight stream K× — **greedy-verify is BYTE-EXACT vs greedy** (accept only tokens the full model agrees with).
+  Projected ~2-3× decode (⇒ ~1.5-1.8× e2e on long audio), **logits-bottleneck-capped** (each verified position
+  still needs the 133 MB/tok logits GEMV → R(8)≈2.9× ceiling, [[project_draft_decoding_amortization]]).
+- **Design decision (settled by measurement):** the draft MUST be **layer-skip self-draft** (content-independent;
+  `FW_DRAFT_ACCEPT_LAYERS` is the existing accept-rate probe) or a real draft model. **NOT prompt-lookup/n-gram** —
+  measured non-viable on real speech (hit-rate 0.7-6.4%, `9d0d07b`); speech doesn't repeat n-grams.
+- **Why it's not a one-turn autonomous land:** needs the draft/verify/accept loop + **KV-cache rollback on
+  rejection** (the draft's partial-layer cache writes are inconsistent with the full model's — the crux
+  correctness risk), and it only produces a measurable win when COMPLETE (no testable sub-increment). A real
+  draft model is owner/infra (a cheap multilingual model). Filed bd-wzgh.
+- **Recommendation:** authorize the layer-skip speculative-decode feature as a dedicated multi-turn effort
+  (build it behind a default-OFF flag, verify byte-exact via turbo/tiny.en transcript diff before any flip), OR
+  re-point the loop at the owner's long-form content-drop temp-fallback (the frontier's stated top priority).
+  The autonomous byte-exact perf loop has no measured small win left to find — this brief is the handoff.
