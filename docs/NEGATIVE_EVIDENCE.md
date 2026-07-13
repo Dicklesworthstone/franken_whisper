@@ -20161,3 +20161,22 @@ load STRUCTURE (no build needed; the effect is provably below the ±10 ms run-to
   (hidden or tiny). **Net: the load path is now genuinely near floor** — blob read tuned to the
   bandwidth knee (~24–32 bands), the big encoder transpose eliminable only via the gated f16-direct
   path, per-tensor decodes hidden/tiny. Don't sweep these caps again.
+
+## 2026-07-13 - CyanGull load-path clone/vocab sweep closed (vocab-clone landed; fuse_qkv cleaned; arena not worth it)
+
+Continued the "read the structure, remove redundant work" sweep after the blob-read win:
+- **LANDED (critical path):** `LoadedModel::from_ggml` cloned the whole vocab (`model.vocab_tokens
+  .clone()`, ~51 865 `Vec<u8>`) to build the tokenizer serial-BEFORE the borrowing weight builds —
+  reordered to build the tokenizer AFTER the `rayon::join` and MOVE vocab+filters out of the consumed
+  `model` (`1cd287c`). Byte-exact; drops those clones from the load critical path.
+- **LANDED (cleanup):** `fuse_qkv` cloned q/k/v f16 data (~10 MB/decoder-layer) only to
+  `extend_from_slice` the concat — now borrows (`9c21192`). Hidden behind the encoder build for the
+  calibrated small-decoder models (no wall change), real for larger models.
+- **REJECTED (not worth it):** the remaining vocab cost is the PARSE build (`ggml.rs:200`, 51 865
+  `read_bytes().to_vec()`), inherently serial (length-prefixed) and ~2 ms — an ARENA (`Vec<u8>` +
+  offsets) would cut it to 1 alloc but needs refactoring the correctness-critical `Tokenizer`
+  (`tokens: Vec<Vec<u8>>` → arena, adapt `id_to_token`/`non_speech`) for a **sub-noise** gain. Also
+  checked: the tokenizer is already LEAN (only `tokens` + `non_speech`; NO eager `token_to_id` map to
+  drop — transcription decodes id→text only). Decode-forward clones (`decoder.rs:1701/1717/1772`) are
+  per-step-small or draft-measurement-only. **The load path's redundant-clone/alloc angle is closed;
+  the only remaining load win is the owner-gated `FW_ENC_FREE_F32` flip (eliminates the transpose).**
