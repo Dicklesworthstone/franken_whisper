@@ -1984,6 +1984,41 @@ mod tests {
         Mat::from_vec(w.inp, w.out, data)
     }
 
+    /// The f16-direct attn.out i8 quant (`quantize_enc_i8_f16_bytes`, `ae5f618`) MUST
+    /// produce a bit-identical [`EncI8Mat`] to the two-phase
+    /// `quantize_enc_i8(transpose(f16→f32))` — the byte-exact basis of the attn.out
+    /// half of the f16-direct win (twin of the i7 guard in `nn.rs`). The live path runs
+    /// only under `FW_ENC_FREE_F32=1`, so this locks it into the DEFAULT suite. ggml row
+    /// `o` of the `[out, inp]` bytes IS column `o` of the transposed `[inp, out]` Mat,
+    /// both feeding the same `quantize_enc_i8_rows`.
+    #[test]
+    fn quantize_enc_i8_f16_bytes_matches_transposed_f32_path_byte_exact() {
+        let mut rng = Lcg::new(0x18D1_2EC7);
+        for &(out, inp) in &[(40usize, 24usize), (17, 31), (64, 16), (1, 8), (8, 1)] {
+            // Synthetic ggml [out, inp] f16 raw bytes (finite, varied).
+            let mut raw = vec![0u8; out * inp * 2];
+            for b2 in raw.chunks_exact_mut(2) {
+                let v = rng.next_f32() * 4.0;
+                b2.copy_from_slice(&Float16::from_f32(v).to_bits().to_le_bytes());
+            }
+            // Two-phase reference: transpose f16→f32 into [inp, out], then quantize.
+            let mut f32t = vec![0.0f32; inp * out];
+            for o in 0..out {
+                for i in 0..inp {
+                    let off = (o * inp + i) * 2;
+                    let v =
+                        Float16::from_bits(u16::from_le_bytes([raw[off], raw[off + 1]])).to_f32();
+                    f32t[i * out + o] = v;
+                }
+            }
+            let a = quantize_enc_i8(&Mat::from_vec(inp, out, f32t));
+            let b = quantize_enc_i8_f16_bytes(&raw, out, inp);
+            assert_eq!(a.data, b.data, "i8 data mismatch at {out}x{inp}");
+            assert_eq!(a.scale, b.scale, "i8 scale mismatch at {out}x{inp}");
+            assert_eq!((a.out, a.inp), (b.out, b.inp), "i8 dims mismatch at {out}x{inp}");
+        }
+    }
+
     fn quant_error(original: &Mat, dequant: &Mat) -> (f64, f64) {
         assert_eq!(original.rows, dequant.rows);
         assert_eq!(original.cols, dequant.cols);
