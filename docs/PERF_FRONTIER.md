@@ -142,6 +142,13 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
     (fw is *cleaner*, drops um/uh/you-know), NOT transcription errors. So don't quote a single faithfulness
     number: it's **88–98 % depending on how disfluent the audio is**, and the divergence is largely
     stylistic (verbatim-wc vs clean-fw), with core content captured by both.
+  - **PROPER NOUNS (the faithfulness-CRITICAL axis) match (2026-07-12):** on track01 turbo, fw and wc agree
+    exactly on **FrankenSearch, XF, Twitter, Franken, Franco, Daniel**; the only proper-noun difference is
+    **CAS** (a 3-letter acronym → fw "Coding"/"cast"), a model-grade acronym miss, NOT int8 mangling. This
+    matters because **FrankenSearch is the exact word [[project_turbo_encoder_dominates]] feared the shipped
+    int8 encoder would mangle ("Frank at")** — it's correct. So the 88.5 % gap is filler + one acronym, NOT
+    proper-noun errors: the content-critical tokens are faithful, confirming the shipped int8 encoder is
+    proper-noun-safe on this clip vs the reference (not just vs a golden).
 
 **Isolated encoder** (2026-07-12, idle box load ~7, `jfk.wav`, matched 32 threads —
 whisper.cpp's *best*: `-t 16`=4382 ms, **`-t 32`=~3210 ms**, `-t 48`=3212, `-t 64`=5448 ms, the
