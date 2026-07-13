@@ -20956,3 +20956,18 @@ the (well-tuned) external f32 sgemm on CPU **without VNNI** ([[project_isa_basel
 gap on this Zen3 box); int8's win needs VNNI/GPU. Corrected the `enc_int8_enabled` doc comment (mod.rs) to state
 the +2% e2e reality vs the 1.56–1.58× GEMM microbench. Comment-only, byte-exact. Encoder question CLOSED at turbo
 scale — the only encoder speedups left are external (ft_kernel), GPU, or VNNI hardware (all owner/infra).
+**Tick 2026-07-13h (this loop) — LANDED a byte-exact in-tree encoder win: parallel residual add at turbo scale.
+Self-correction: tick 13g's "LN/resid bandwidth-bound, closed" was WRONG for the residual (it was tiny.en-
+scoped).** `add_in_place` (the **attn** residual `x += y`; the mlp residual already used the parallel
+`add_bias_residual`) carried an explicit "parallelizing = MEASURED wash, do not re-parallelize" comment from
+2026-07-02 — but that rested on *cache-warmth*, true only for tiny.en's `[1500,384]`=576 K-elt (~2.3 MB, L2-warm)
+operand. At turbo the operand is `[1500,1280]`=1.92 M elts (~7.6 MB) — spills L2 into L3/DRAM where one core is
+far below aggregate bandwidth. Gated `add_in_place` to parallelize (`nn::worker_count`≤8) ABOVE `1<<20` elts
+(tiny.en 576 K stays serial ⇒ its measurement preserved, byte-identical; turbo 1.92 M parallelizes), kill-switch
+`FW_ENC_RESID_PAR=0`. **MEASURED (built + verified, turbo/jfk, 4-rep alternating): `attn_resid` 21.6 ms → 11.1 ms
+(−48%, ~10.5 ms/window); `encoder_window` ~1–2%.** Byte-exact: element-wise add ⇒ any chunking bit-identical;
+turbo transcript IDENTICAL parallel-vs-serial; tiny.en track01 md5 `f68af24506` UNCHANGED (stays serial). Small
+(~0.5% e2e/window, scales with #windows) but a genuine byte-exact IN-TREE encoder win — the FIRST since the
+frontier, found by re-testing a "closed/wash" claim at the newly-available turbo scale (`feedback_closed_means_
+pivot_not_stop`). LESSON: "measured wash" claims are SCALE-SCOPED — a tiny.en L2-warm result does not hold for
+turbo's L3/DRAM operands. Re-audit other tiny.en-era "serial-by-measurement"/"bandwidth-bound" closures at turbo.

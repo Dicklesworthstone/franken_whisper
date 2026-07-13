@@ -1624,20 +1624,49 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
 
 /// In-place element-wise `x += y` for matrices of identical shape.
 ///
-/// Kept SERIAL deliberately: parallelizing this was MEASURED a wash/slight-loss
-/// (2026-07-02, BlackThrush) — the residual operands are cache-warm from the
-/// matmul that just produced them and LLVM auto-vectorizes the loop, so rayon
-/// dispatch overhead outweighs any bandwidth gain (unlike the fused-LN clone,
-/// which was a *cold* memcpy pass). Do not re-parallelize.
+/// Element-wise, so ANY chunking is bit-identical to the serial loop.
+///
+/// SERIAL below `PAR_THRESHOLD`, parallel at/above it. The 2026-07-02 measurement
+/// that found parallelizing "a wash/slight-loss" was on tiny.en, whose residual
+/// operand `[1500, 384]` = 576 K elts (~2.3 MB) is L2-warm from the matmul that
+/// just produced it — there a single AVX2-vectorized pass already saturates the
+/// (warm) bandwidth and rayon dispatch is pure overhead. At turbo scale the operand
+/// `[1500, 1280]` = 1.92 M elts (~7.6 MB) spills L2 into L3/DRAM, where one core is
+/// far below aggregate bandwidth, so fanning the add across `worker_count` cores
+/// wins. The threshold (`1 << 20`) sits ABOVE tiny.en's 576 K (stays serial,
+/// preserving that measurement) and BELOW turbo's 1.92 M. Kill: `FW_ENC_RESID_PAR=0`.
 fn add_in_place(x: &mut Mat, y: &Mat) {
     debug_assert_eq!(
         (x.rows, x.cols),
         (y.rows, y.cols),
         "add_in_place shape mismatch"
     );
-    for (a, b) in x.data.iter_mut().zip(&y.data) {
-        *a += b;
+    const PAR_THRESHOLD: usize = 1 << 20;
+    let n = x.data.len();
+    let workers = nn::worker_count();
+    if n < PAR_THRESHOLD || workers < 2 || !enc_resid_par_enabled() {
+        for (a, b) in x.data.iter_mut().zip(&y.data) {
+            *a += b;
+        }
+        return;
     }
+    let band = n.div_ceil(workers).max(1);
+    x.data
+        .par_chunks_mut(band)
+        .zip(y.data.par_chunks(band))
+        .for_each(|(a, b)| {
+            for (av, bv) in a.iter_mut().zip(b) {
+                *av += bv;
+            }
+        });
+}
+
+/// Kill-switch for the turbo-scale parallel residual add (default ON). Set
+/// `FW_ENC_RESID_PAR=0` to force the serial `x += y` byte-for-byte.
+fn enc_resid_par_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENC_RESID_PAR").as_deref() != Ok("0"))
 }
 
 #[cfg(test)]
