@@ -242,6 +242,20 @@ pub fn emit_control_frame_to_writer<W: Write>(
     write_control_frame(writer, frame)
 }
 
+/// Serialize one audio frame into a reusable contiguous NDJSON line buffer.
+#[doc(hidden)]
+pub fn write_audio_frame_line<W: Write>(
+    writer: &mut W,
+    frame: &TtyAudioFrame,
+    line_buffer: &mut Vec<u8>,
+) -> FwResult<()> {
+    line_buffer.clear();
+    serde_json::to_writer(&mut *line_buffer, frame)?;
+    line_buffer.push(b'\n');
+    writer.write_all(line_buffer)?;
+    Ok(())
+}
+
 pub fn encode_to_writer<W: Write>(
     input_audio: &Path,
     chunk_ms: u32,
@@ -260,6 +274,7 @@ pub fn encode_to_writer<W: Write>(
         supported_codecs: vec![CODEC_MULAW_ZLIB_B64.to_owned()],
     };
     write_control_frame(writer, &handshake)?;
+    let mut frame_line = Vec::new();
 
     for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
         let crc = crc32_of(chunk);
@@ -274,7 +289,7 @@ pub fn encode_to_writer<W: Write>(
             crc32: Some(crc),
             payload_sha256: Some(sha256_hex(chunk)),
         };
-        writeln!(writer, "{}", serde_json::to_string(&frame)?)?;
+        write_audio_frame_line(writer, &frame, &mut frame_line)?;
     }
 
     Ok(())
@@ -1884,7 +1899,7 @@ mod tests {
         decompress_chunk, emit_control_frame_to_writer, emit_retransmit_loop_from_reader,
         emit_tty_transcript_partial, emit_tty_transcript_retract, ensure_parent_dir,
         mulaw_chunk_size, parse_audio_frames_for_decode, parse_frame_line, parse_frames,
-        retransmit_plan_from_reader, sha256_hex,
+        retransmit_plan_from_reader, sha256_hex, write_audio_frame_line,
     };
 
     fn make_frame(seq: u64, data: &[u8]) -> TtyAudioFrame {
@@ -2038,6 +2053,96 @@ mod tests {
         assert!(parsed.crc32.is_some());
         assert_eq!(parsed.payload_sha256, frame.payload_sha256);
         assert!(parsed.payload_sha256.is_some());
+    }
+
+    #[test]
+    fn buffered_audio_frame_writer_matches_owned_serde_lines_byte_exact() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            max_write: usize,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let count = buf.len().min(self.max_write);
+                self.bytes.extend_from_slice(&buf[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct FailAfterWriter {
+            written: usize,
+            limit: usize,
+        }
+
+        impl Write for FailAfterWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.written >= self.limit {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let count = buf.len().min(self.limit - self.written);
+                self.written += count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut first = make_frame(u64::MAX, &[0x5a; 4_096]);
+        first.codec = "mu\"law\\codec\n雪".to_owned();
+        let mut second = make_frame(0, b"");
+        second.crc32 = None;
+        second.payload_sha256 = None;
+        let mut third = first.clone();
+        third.seq = 42;
+
+        let mut expected = Vec::new();
+        for frame in [&first, &second, &third] {
+            writeln!(
+                expected,
+                "{}",
+                serde_json::to_string(frame).expect("serialize owned frame")
+            )
+            .expect("write expected line");
+        }
+
+        let mut actual = Vec::new();
+        let mut line_buffer = Vec::new();
+        for frame in [&first, &second, &third] {
+            write_audio_frame_line(&mut actual, frame, &mut line_buffer)
+                .expect("write buffered frame");
+        }
+
+        assert_eq!(actual, expected);
+
+        let mut short = ShortWriter {
+            bytes: Vec::new(),
+            max_write: 3,
+        };
+        let mut short_line = Vec::new();
+        for frame in [&first, &second, &third] {
+            write_audio_frame_line(&mut short, frame, &mut short_line)
+                .expect("complete short writes");
+        }
+        assert_eq!(short.bytes, expected);
+
+        let first_line_len = serde_json::to_string(&first)
+            .expect("serialize first frame")
+            .len()
+            + 1;
+        for limit in [first_line_len / 2, first_line_len - 1] {
+            let mut failing = FailAfterWriter { written: 0, limit };
+            let mut failing_line = Vec::new();
+            let error = write_audio_frame_line(&mut failing, &first, &mut failing_line)
+                .expect_err("injected write failure should propagate");
+            assert!(matches!(error, FwError::Io(_)));
+        }
     }
 
     #[test]

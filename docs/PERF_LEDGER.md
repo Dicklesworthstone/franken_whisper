@@ -51,6 +51,51 @@
 
 ## Levers
 
+### 2026-07-13 UTC — cod_fw — LANDED (byte-exact): scratch-buffered plain TTY audio-frame serialization — **1.174662× median**
+
+**What.** `encode_to_writer` serialized every `TtyAudioFrame` into a fresh owned
+`String`, then copied that string plus a newline into the output writer. It now
+serializes into one reusable `Vec<u8>`, appends the newline to that buffer, and emits
+the complete NDJSON line with `write_all`. This removes one allocation and one full
+encoded-line copy per audio frame while retaining a single contiguous writer call.
+
+**Quick strict-remote same-binary A/B (worker `vmi1152480`, job
+`j-29928833041826096`, `--profile release-perf`, 21 ABBA paired ratios, 128 frames at
+1,600 raw payload bytes/frame and 1,108 calibrated inner steps):**
+
+| comparison | median | p10 | p90 | wins | verdict |
+|---|---:|---:|---:|---:|---|
+| BASE/BASE null | 1.019621 | 0.922300 | 1.166953 | 12/21 | valid: median inside predeclared `[0.98, 1.02]` |
+| owned-string baseline / scratch-buffered candidate | **1.174662×** | 1.019441 | 1.419268 | 20/21 | **keep: median exceeds null p90** |
+
+Raw null ratios: `[0.907219, 0.983640, 1.060733, 1.044069, 1.091773,
+0.742776, 0.922300, 1.103162, 1.193225, 1.166953, 0.974108, 0.957747,
+0.971108, 1.025653, 0.951067, 1.019621, 1.094963, 1.784198, 0.989369,
+1.006676, 1.093058]`.
+
+Raw candidate ratios: `[0.811542, 1.449089, 1.252588, 1.189086, 1.023867,
+1.075064, 1.419268, 1.156617, 1.014781, 1.019441, 1.231417, 1.134868,
+1.426022, 1.328734, 1.361898, 1.174662, 1.258231, 1.077551, 1.075176,
+1.168671, 1.230530]`.
+
+Candidate CV was 13.480%; the null CV was 18.471%. A one-pass baseline calibration
+of 90.265 us selected 1,108 inner steps for approximately 100 ms per arm. The
+candidate-only Criterion row measured `[81.818, 89.617, 100.81] us` for 128 frames.
+Benchmark binary SHA-256 was
+`2f0120ebc9c5ca924ecfbef363e518790ab61e32868ef23b1f20058e35f65256`; the common
+80,114-byte output SHA-256 was
+`4fc930ebfb6a3c767dce8d402588acfab69ea440dcb8b133b91f8620a14b4c7a`. The strict
+remote invocation exited 0 with no local fallback.
+
+**Behavior proof.** The same-binary harness first compares the complete candidate
+output byte-for-byte with the old `serde_json::to_string` plus `writeln!` path. The
+focused oracle additionally covers large-to-small-to-large scratch reuse, maximum and
+zero sequence numbers, empty and 4 KiB payloads, absent optional integrity fields,
+quotes, backslashes, a newline, non-ASCII text, and a writer limited to three bytes per
+call. Injected partial-write failures remain `FwError::Io`; as before, serialization
+finishes before any writer call. The exact partial prefix left in a failing writer is
+not part of the NDJSON contract and can differ with write segmentation.
+
 ### 2026-07-13 UTC — cod_fw — LANDED (byte-exact): borrowed, scratch-buffered TTY mic-event serialization — **1.351209× median**
 
 **What.** `stream_mic_to_ndjson` cloned each payload-bearing `TtyAudioFrame` into an
