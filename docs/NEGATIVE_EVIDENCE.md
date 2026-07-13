@@ -20871,6 +20871,19 @@ halving cvts frees nothing. Reverted. **METHOD LESSON: even the "contention-immu
 DRIFTS ±3 % across separate PROCESS launches (box load varies) — a −4 % from comparing two separate runs was a
 false positive; only a SAME-binary back-to-back A/B (env kill-switch) is trustworthy for a sub-5 % kernel claim.
 The 2-acc `dot_i8` (tick 13p) + this confirm the decode GEMV kernel is at floor.
+**Tick 2026-07-13r (this loop) — decode ATTENTION kernels (self_attn 12.2% + cross_attn 9.6% of decode) are
+byte-exact-closed too; the whole decode loop is at floor.** Opened `attention_decode_step` (self-attn, tq=1):
+(1) the **score-dot is a LATENCY-bound scalar fadd chain** — `acc += qd*(krow[d]*scale)` summed d-ascending;
+adding accumulators/SIMD-reducing changes the d-order ⇒ non-byte-exact (measured transcript-unsafe, why it's
+scalar), and SIMD-ing the PRODUCTS doesn't help since the sequential acc-adds are the critical path. Pre-scaling
+K by `scale` at cache-append IS byte-exact (same product/order) and halves the score-dot mults, BUT the removed
+`*scale` mult is OFF the acc critical path (separate port) ⇒ a WASH — checked before building. (2) the **value
+aggregation is already AVX2** (`axpy_f32_into`, deliberately separate mul+add NOT fmadd, for byte-exact). (3)
+`cross_attention` is int8/f16/block-optimized (default-on int8 cross-KV, [[project_cross_v_block_win]]). NET:
+self+cross attention = ~22% of decode, both byte-exact-CLOSED (reduction-order constraints, not tunable). With
+13p (dot_i8 2-acc sufficient) + 13q (gemv sign-extend amortize wash), the ENTIRE decode loop (GEMVs ~77% +
+attention ~22%) is at the byte-exact floor. Remaining decode speedup needs non-byte-exact (SIMD score-dot / fmadd
+axpy, owner WER-gate) or off-CPU.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
