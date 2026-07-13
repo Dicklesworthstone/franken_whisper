@@ -550,10 +550,9 @@ impl EncoderWeights {
                         (w, i7, None)
                     }
                     OutQuant::I8 => {
-                        let w =
-                            load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?;
-                        let i8 = quantize_enc_i8(&w);
-                        let w = if free_f32_now { Mat::from_vec(0, 0, Vec::new()) } else { w };
+                        let (w, i8) = load_linear_i8_direct(
+                            model, &p("attn.out.weight"), n_state, n_state, free_f32_now,
+                        )?;
                         (w, None, Some(i8))
                     }
                 };
@@ -1120,12 +1119,13 @@ struct EncI8Mat {
     out: usize,
 }
 
-/// Quantize franken's `[inp, out]` weight (element `[i*out + o]`) to a cached
-/// `[out, inp]` i8 matrix, per-output-channel symmetric (amax/127). One-time load
-/// cost, parallel over output channels (disjoint rows ⇒ order-invariant).
-fn quantize_enc_i8(w_t: &Mat) -> EncI8Mat {
-    let inp = w_t.rows;
-    let out = w_t.cols;
+/// Shared inner for [`EncI8Mat`]: for output channel `o`, `weight(o, i)` yields the
+/// f32 weight at contraction index `i` (`0..inp`). Parallel over channels; identical
+/// amax/scale arithmetic for every caller — the ONLY thing that varies is WHERE the
+/// f32 comes from (a pre-transposed `[in, out]` `Mat`, or the raw ggml `[out, in]`
+/// f16 bytes read directly). `weight` is monomorphized ⇒ inlined. Single source of
+/// the i8 quant math (mirrors [`nn::quantize_rows_to_i7`]).
+fn quantize_enc_i8_rows(out: usize, inp: usize, weight: impl Fn(usize, usize) -> f32 + Sync) -> EncI8Mat {
     let mut data = vec![0i8; out * inp];
     let mut scale = vec![0.0f32; out];
     data.par_chunks_mut(inp)
@@ -1134,13 +1134,13 @@ fn quantize_enc_i8(w_t: &Mat) -> EncI8Mat {
         .for_each(|(o, (drow, s))| {
             let mut amax = 1e-9f32;
             for i in 0..inp {
-                amax = amax.max(w_t.data[i * out + o].abs());
+                amax = amax.max(weight(o, i).abs());
             }
             let sc = amax / 127.0;
             *s = sc;
             let inv = 1.0 / sc;
             for (i, d) in drow.iter_mut().enumerate() {
-                *d = (w_t.data[i * out + o] * inv).round().clamp(-127.0, 127.0) as i8;
+                *d = (weight(o, i) * inv).round().clamp(-127.0, 127.0) as i8;
             }
         });
     EncI8Mat {
@@ -1149,6 +1149,61 @@ fn quantize_enc_i8(w_t: &Mat) -> EncI8Mat {
         inp,
         out,
     }
+}
+
+/// Quantize franken's `[inp, out]` weight (element `[i*out + o]`) to a cached
+/// `[out, inp]` i8 matrix, per-output-channel symmetric (amax/127). One-time load
+/// cost, parallel over output channels (disjoint rows ⇒ order-invariant).
+fn quantize_enc_i8(w_t: &Mat) -> EncI8Mat {
+    let inp = w_t.rows;
+    let out = w_t.cols;
+    quantize_enc_i8_rows(out, inp, |o, i| w_t.data[i * out + o])
+}
+
+/// Quantize DIRECTLY from ggml's raw `[out, in]` f16 bytes (borrowed from the resident
+/// blob) to an [`EncI8Mat`], WITHOUT materializing the transposed f32 `Mat`.
+/// Bit-identical to `quantize_enc_i8(&load_linear_transposed(..))` — output channel `o`
+/// reads ggml row `o` (`raw[(o*inp + i)*2]`), the same value sequence the transposed
+/// path gathers for column `o` (same `Float16::from_bits`). See
+/// [`nn::quantize_f16_bytes_to_i7`] for the i7 twin. `raw.len()` must be `out*inp*2`.
+fn quantize_enc_i8_f16_bytes(raw: &[u8], out: usize, inp: usize) -> EncI8Mat {
+    debug_assert_eq!(raw.len(), out * inp * 2, "f16 byte length != out*inp*2");
+    quantize_enc_i8_rows(out, inp, |o, i| {
+        let off = (o * inp + i) * 2;
+        Float16::from_bits(u16::from_le_bytes([raw[off], raw[off + 1]])).to_f32()
+    })
+}
+
+/// Load the `attn.out` linear and quantize it to i8. When `free`, quantize STRAIGHT
+/// from the resident ggml f16 bytes (no transposed f32 `Mat`, no transpose) and return
+/// an empty `Mat`; f32-stored tensors fall back to materialize→quantize→free; `!free`
+/// retains the f32 (shipping default unchanged). Mirrors [`load_linear_maybe_i7`].
+fn load_linear_i8_direct(
+    model: &GgmlModel,
+    name: &str,
+    out_dim: usize,
+    in_dim: usize,
+    free: bool,
+) -> FwResult<(Mat, EncI8Mat)> {
+    if free {
+        if let Ok((shape, raw)) = model.tensor_f16_bytes(name) {
+            if shape != [out_dim, in_dim] {
+                return Err(FwError::InvalidRequest(format!(
+                    "encoder tensor '{name}' has shape {shape:?}, expected {:?}",
+                    [out_dim, in_dim]
+                )));
+            }
+            return Ok((
+                Mat::from_vec(0, 0, Vec::new()),
+                quantize_enc_i8_f16_bytes(raw, out_dim, in_dim),
+            ));
+        }
+        let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+        return Ok((Mat::from_vec(0, 0, Vec::new()), quantize_enc_i8(&w)));
+    }
+    let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+    let i8 = quantize_enc_i8(&w);
+    Ok((w, i8))
 }
 
 /// AVX2 i8×i8 → i32 dot (vpmovsxbw + vpmaddwd, 2 accumulators; sign-extend both
