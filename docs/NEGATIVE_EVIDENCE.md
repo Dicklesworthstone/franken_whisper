@@ -20235,8 +20235,11 @@ exploits (round-doesn't-autovec, per-element division). Findings, all NON-levers
   help — it's inside the `err = target - q` dependency). The plain-round path is reachable only via
   `FW_ENC_EF_QUANT=0` (non-default). Matches `project_load_time_quant_candidate` (EF-latency-bound, wash).
 - **Mel** — `÷4.0`/`÷2` are powers of two, already folded to `×const` by LLVM; twiddles precomputed. <0.25%.
-- **Audio** — the remaining `÷channels`/`.round()` loops are the MULTI-CHANNEL downmix (uncommon; mono is
-  fast-pathed) and the peripheral wav-slice writer (hound). `compute_frame_rms` = sequential f64 sum
-  (not byte-exact vectorizable).
-The clean vectorizable production loops (read_wav mono, blob-read bands) are already landed. **The
-scalar-antipattern hunt is exhausted.**
+- **Audio** — the remaining `÷channels`/`.round()` loops are the downmix general loop (audio.rs:770)
+  and the peripheral wav-slice writer (hound). CORRECTION (verified this tick): the stereo downmix is
+  ALREADY SIMD — `append_finite_downmix_to_mono` (audio.rs:786) uses `std::simd` deinterleave + ×0.5
+  for the common ALL-FINITE stereo case; the `÷channels` loop at 770 runs ONLY as the non-finite
+  (NaN/inf) fallback for corrupt audio. So it is NOT a lever (a "stereo fast path" already exists).
+  `compute_frame_rms` = sequential f64 sum (not byte-exact vectorizable).
+The clean vectorizable production loops (read_wav mono, blob-read bands) are already landed; the stereo
+downmix was already SIMD. **The scalar-antipattern hunt is exhausted.**
