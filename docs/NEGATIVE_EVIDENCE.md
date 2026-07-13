@@ -20637,3 +20637,28 @@ individually verified un-touchable (int8-GEMM-closed + external-kernel + tuned-s
 GEMMs, decode, load-quant (EF-serial), LN/resid (bandwidth), conv (f32-sgemm) and the fault-tax all
 individually closed, the byte-exact autonomous surface is fully mapped and empty. No build this tick (known
 result). **Loop should pause; next value is owner-level.**
+
+## 2026-07-13 (GoldenOwl) — CONSOLIDATED FRONTIER MAP (every hot region closed, in one place — point here, don't re-derive)
+
+Region-by-region map of turbo/jfk `backend_run` (~2.30 s post-flip), each verified this session by
+measurement or line-by-line read. **The byte-exact autonomous surface is fully mapped and empty.**
+
+| region | % of e2e | status | why no autonomous byte-exact lever |
+|---|---|---|---|
+| `attn_sdpa` (QKV GEMM+SDPA+scatter) | ~22% | CLOSED | QKV int8 maddubs (owner-closed) + `ft_kernel_cpu::sdpa_forward_f32` (EXTERNAL; only `FT_SDPA_POLY_EXP`, owner/non-byte-exact) + scatter (16-chunk tuned). `sdpa_scale` powf = sub-floor. |
+| int8 GEMMs `mlp_fc`/`mlp_proj`/`attn_out` | ~26% enc | CLOSED | compute-bound `dot_i8`/`dot_maddubs` (~50 GB/s, weight fits L2, hand-AVX2 ceiling, owner "don't re-audit"). Activation quant feeding them = AVX2 (my 26feafd). |
+| decode loop | ~9% | CLOSED | logits GEMV DRAM-bandwidth-bound (133 MB/token tied embedding); mlp/self-attn/argmax closed; KV score-dot SIMD transcript-unsafe. No DEC_PROF but perf-characterized. |
+| load `model_weights` | ~23% | CLOSED | encoder i7 wt-quant is EF-serial (`enc_ef` on = un-vectorizable err chain; `to_f32` already autovecs — preconvert WASH `fae42a1`); decoder wt-quant already AVX2 (3e7f295/991df99); decoder build hides behind encoder. |
+| load `model_parse` | ~6% | CLOSED | 1.5 GB blob read, banded host∧32, bandwidth-bound (~11 GB/s read()); mmap-free by design; vocab `to_vec` ~2 ms (arena rejected). |
+| LN + residuals | ~8% enc | CLOSED | bandwidth-bound (f64 LN hidden under bw; add_in_place serial-by-measurement). |
+| conv stem | ~2.4% enc | CLOSED | im2col + ft f32 sgemm (f32-2D-tiler characterized); 2.4% ⇒ any im2col win sub-floor. |
+| mel / tokenizer / cross_kv / per-window setup | <2% ea | CLOSED | mel computed once (4.6 ms); tokenizer lean; cross_kv quant AVX2 (7ce…); per-window orchestration sub-floor. |
+| page-fault tax | ~15% single-shot | CLOSED | inherent first-touch of needed memory; allocator tuning REGRESSES (jemalloc 3× faults); the dead-f32 portion already freed (`78ba068`). |
+
+**Session wins that got here (all default-on, byte-exact, measured ~10% e2e + −46% RSS):** `26feafd`
+(enc act-quant 3.82×), `3e7f295`/`991df99` (dec wt-quant 3.78×/3.00×), `78ba068` (`FW_ENC_FREE_F32` flip).
+**Dead-ends closed (don't retry):** decoder-weight-free (glibc retains, `e52ffe1`), allocator swap (regresses,
+`5b62120`), encoder-amax-preconvert (wash, `fae42a1`), decode-alloc pooling (free-list-reused wash).
+**Remaining value is owner/infra ONLY:** long-form content-drop temp-fallback (top priority, has a design
+tradeoff); WER-gated `FT_SDPA_POLY_EXP` / int8-calibration / ToMe / pruning; Linux GPU / VNNI (infra). **No
+byte-exact autonomous lever exists — future perf ticks should reference THIS map, not re-derive it.**
