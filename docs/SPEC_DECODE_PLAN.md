@@ -10,7 +10,37 @@ Realistic long audio is **decode-dominated (62.5% of e2e)** and DRAM-weight-stre
 stream K×. **Greedy-verify is BYTE-EXACT vs greedy** (accept only tokens the full model's argmax
 agrees with), so this ships to the default quality path — no WER gate.
 
+## ✅ UPDATE 2026-07-13 (later session) — DRAFT UNBLOCKED (real model provisioned) + EV was UNDER-stated
+Two claims in the ⚠ CORRECTION below are now SUPERSEDED by measurement (`NEGATIVE_EVIDENCE` ticks 13j–13l):
+
+1. **The DRAFT blocker is RESOLVED.** `distil-large-v3` IS a real, cheap, accurate, VOCAB-COMPATIBLE draft and
+   is now on-box (`fetch_test_models.sh --model distil-large-v3`, sha `2883a11b…`). Header-verified: n_vocab
+   **51866 == turbo**, the **SAME 32-layer/n_state-1280 large-v3 encoder** (⇒ encoder computed ONCE, shared by
+   draft+verify — no dual encode), and n_text_layer **2 (vs turbo's 4)**. Measured: distil decode **1.64×
+   faster** than turbo (132 vs 217 ms/27 tok); independent-transcript agreement (accept LOWER-bound) jfk
+   near-identical, **track01 89.5%**. So the draft is a SEPARATE cheap MODEL, not layer-skip — the layer-skip
+   deadness below still stands, but it is now MOOT.
+
+2. **EV was UNDER-stated: decode is NOT pipeline-hidden in no_ts.** The "~0 exposed in no_ts ⇒ 4-7% TS-only"
+   claim was tiny.en-scoped/wrong for turbo. MEASURED (tick 13j, turbo/track01 no_ts): decode_loop is **64% of
+   e2e** — pipelining hides the SMALLER phase, which on realistic long audio is the ENCODER (315 ms/win), NOT
+   the decode (1014 ms/win). So spec-decode attacks a **64%-exposed** cost in the DEFAULT no_ts path, and being
+   greedy-verify BYTE-EXACT it ships to the quality path. Realized e2e is a large fraction of that 64× accept —
+   **the BIGGEST remaining lever, not a secondary one.**
+
+**Architecture consequence:** with a real draft MODEL (own 2-layer decoder + own KV cache), the tractable build
+is the **general-K dual-cache** shape (Phase 3), NOT the read-only layer-skip Phase 2. K=1 first increment:
+distil autoregressively drafts 1 token from the committed prefix (its own cache), turbo verifies `[committed,
+draft]` batched (`logits_all`, all 4 turbo layers) → accept iff turbo's argmax₀ == draft; on reject truncate the
+draft's cache by 1. Gate `FW_SPEC_DECODE` default-OFF; merge criterion = transcript BYTE-IDENTICAL to greedy.
+**Still the owner-ticketed multi-turn build (bd-wzgh) — NOT built autonomously — but no longer blocked.** The
+next concrete measurement (before the full loop) is the TRUE teacher-forced accept rate (feed turbo's committed
+tokens to distil, count distil-argmax == turbo-next); the 89.5% independent-transcript figure is a lower bound.
+
 ## ⚠ CORRECTION 2026-07-13 — the DRAFT side is BLOCKED (both cheap drafts measured DEAD); this feature is owner/infra-gated
+> SUPERSEDED by the ✅ UPDATE above — a real draft model is now on-box; the layer-skip/prompt-lookup deadness
+> stands but is moot. Kept for the record.
+
 Reading `[[project_draft_decoding_amortization]]` in full (should have been step 0) closes the draft side:
 - **Layer-skip self-draft: MEASURED-DEAD, do-not-build.** The Whisper DECODER is only **4 layers** (turbo AND
   tiny.en — the "32" is the ENCODER). `FW_DRAFT_ACCEPT_LAYERS` probe: tiny.en k=1/2/3 = **1.7%/1.7%/62.9%**,
@@ -19,11 +49,8 @@ Reading `[[project_draft_decoding_amortization]]` in full (should have been step
   layer-skip drafter (my Phase-2/3 K=2/general-K plans below assumed a deep decoder — INVALID).
 - **Prompt-lookup / n-gram: MEASURED-DEAD** (0.7-6.4% on real speech, `9d0d07b`/`0ddbd3b`) — ASR output is
   novel token-by-token.
-- **⇒ the ONLY viable draft is a real, cheap, ACCURATE draft model, and NONE is on-box** (only turbo +
-  tiny.en, different vocabs). So speculative decode is **BLOCKED on owner/infra** (supply a draft model).
-- **EV is also modest + mode-gated:** decode is ~15% of e2e in TS mode and **~0 exposed in no_ts**
-  (pipeline-hidden), so realized e2e ≈ **4-7%, timestamp-mode ONLY** (ceiling R(8)≈2.9-3.7× × accept ÷
-  draft-cost). A SECONDARY lever, not the biggest.
+- **⇒ the ONLY viable draft is a real, cheap, ACCURATE draft model** — now RESOLVED (distil-large-v3, ✅ above).
+- **EV** — SUPERSEDED: decode is 64%-exposed in no_ts (✅ above), not 4-7% TS-only.
 
 ## What IS landable now (the verify side — real, byte-exact, but inert without a draft)
 The VERIFY primitives read the weights once for K tokens and are byte-exact — useful IF a draft model is ever
