@@ -20235,10 +20235,14 @@ videos — no per-video model reload — and the manifest write-amplification is
 transition, `pipeline.rs:430-440`.) Prefetching `download_one(N+1)` on a background thread DURING
 `transcribe_and_render(N)` would overlap the two for a batch-throughput win. Benefit is
 workload-dependent (∝ download-time / transcribe-time — largest for many SHORT videos; small when
-transcribe dominates a long video) and it's an architectural concurrency change (background download +
-cancel/error coordination with the existing `token`/manifest logic), NOT byte-exact — so **owner-level**,
-not a small autonomous increment. The per-video transcribe loop itself is correctly serial (each
-transcription already saturates all cores; concurrent videos would oversubscribe).
+transcribe dominates a long video) and it's an architectural concurrency change, NOT byte-exact — so
+**owner-level**, not a small autonomous increment. **Precise blocker (verified):** `download_one`
+(pipeline.rs:492) takes `manifest: &mut Manifest` — it MUTATES the shared manifest, so moving it to a
+background thread would data-race the main loop's `manifest.set_state`/`save`. A safe prefetch first
+needs `download_one` refactored to a PURE download (return `(PathBuf, VideoMeta)`, hoist all manifest
+mutation to the caller), then a bounded 1-deep prefetch (`spawn(download N+1)` → join at iter N+1) with
+cancel-token propagation. The per-video transcribe loop itself is correctly serial (each transcription
+already saturates all cores; concurrent videos would oversubscribe).
 
 ### Systematic scalar-antipattern grep — no fresh lever (so nobody re-greps)
 Grepped `÷` / `.round()` / clone-in-loop across `mel.rs`/`nn.rs`/`audio.rs` for the classes the memory
