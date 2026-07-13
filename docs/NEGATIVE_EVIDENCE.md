@@ -20971,3 +20971,18 @@ turbo transcript IDENTICAL parallel-vs-serial; tiny.en track01 md5 `f68af24506` 
 frontier, found by re-testing a "closed/wash" claim at the newly-available turbo scale (`feedback_closed_means_
 pivot_not_stop`). LESSON: "measured wash" claims are SCALE-SCOPED — a tiny.en L2-warm result does not hold for
 turbo's L3/DRAM operands. Re-audit other tiny.en-era "serial-by-measurement"/"bandwidth-bound" closures at turbo.
+**Tick 2026-07-13i (this loop) — the scale-scoped parallelism vein is now BOUNDED: the residual (13h) was the ONE
+real gap; the rest is already parallel or does not benefit. Two results:** (1) **LN worker-count hypothesis
+FALSIFIED (tested + reverted).** Hypothesized LN is f64-compute-bound at turbo scale (so `worker_count().min(8)`
+under-parallelizes it); added `ln_worker_count` (env `FW_LN_WORKERS`), built, A/B'd 8/16/32 on turbo/jfk
+(byte-identical across counts): **attn_ln+mlp_ln = w8 ~42.8 ms, w16 ~38.2 ms, w32 ~46.3 ms/window.** LN is NOT
+compute-bound — w32 REGRESSES (task-dispatch over 64 LN calls/window), w16 is only ~4.6 ms (~0.2% e2e, sub-floor).
+Reverted; `worker_count().min(8)` for LN is correct even at turbo (the "LN at bandwidth floor" memory holds at
+scale). (2) **Re-audit of the rest = all already parallel**, so no more residual-class gaps: `layer_norm_into`
+(par ≥1<<16), `gelu`/`gelu_add_bias` (par ≥1<<15), `matmul_bias_i8` act-quant + M4×N2 GEMM (both `par_chunks_mut`),
+`conv1d_wt` im2col (par ≥1<<16), `cross_kv` (layer-parallel `thread::scope` + `par_iter` int8), logits `gemv_i8`
+(par ≥1<<21, tuned `gemv_worker_count`→32). The residual measurement (serial 34→8-worker 66 GB/s = only 2×)
+confirms these bandwidth-bound streaming ops SATURATE ~8 workers ⇒ `worker_count().min(8)` is right. Also fixed
+the stale `add_bias_residual` doc comment (still said `add_in_place` is "deliberately serial" — false since 13h).
+NET: the turbo-scale in-tree encoder parallelism vein is mined; encoder residual (13h) was its one win. Remaining
+encoder cost is external (SDPA/sgemm), GPU, or VNNI — owner/infra.
