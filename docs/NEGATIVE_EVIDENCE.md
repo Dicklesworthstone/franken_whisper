@@ -20856,7 +20856,21 @@ NOT add a sampler/temp-escalation autonomously even gated — it's a reserved de
 (infra); (3) GPU / VNNI hardware
 (int8 barely beats f32 sgemm without VNNI on this Zen3 box); (4) WER-gated default-flip of enc-int8/poly-exp with
 a corpus WER harness. Generic "pick a perf lever" ticks now return only sub-floor or falsified results. 
-**Tick 2026-07-13p (this loop, DIRECTED to a kernel) — decode GEMV `dot_i8` 4-accumulator falsified (built + reverted, byte-exact).** `dot_i8` (the per-row int8 decode GEMV kernel, `nn.rs`) used 2 i32 accumulators; hypothesized it's `vpmaddwd`-latency-bound (~5 cyc, 2-way ILP = ~2/5 peak) on the CACHE-resident small projections (self/cross_out/qkv, weight in L2). Rewrote to 4 accumulators (64 i8/iter; bit-identical — i32 add associative). Built + measured turbo/track01 decode_loop: 2-acc ~4987 ms vs 4-acc ~4983 ms — **WITHIN NOISE, no speedup**; transcript BYTE-IDENTICAL (md5 b4f8cac64d, jfk 32c8f2208d). Falsified: the decode is NOT madd-latency-bound — the 66 MB/tok vocab-logits GEMV dominates and is DRAM-bandwidth-bound (2 vs 4 acc identical), and the small L2-resident projections are themselves bandwidth/`vpmovsxbw`-cvt-bound (the sign-extend, not the madd, gates them) or too small a fraction to move decode_loop. So `dot_i8`'s 2 accumulators are sufficient; the decode GEMV kernel is at floor. Reverted (no benefit + more code). Same conclusion for the encoder i8i32 `dot_i8_m4n2` which already has 8-way ILP via M4×N2 blocking.
+**Tick 2026-07-13p (this loop, DIRECTED to a kernel) — decode GEMV `dot_i8` 4-accumulator falsified (built + reverted, byte-exact).** `dot_i8` (the per-row int8 decode GEMV kernel, `nn.rs`) used 2 i32 accumulators; hypothesized it's `vpmaddwd`-latency-bound (~5 cyc, 2-way ILP = ~2/5 peak) on the CACHE-resident small projections (self/cross_out/qkv, weight in L2). Rewrote to 4 accumulators (64 i8/iter; bit-identical — i32 add associative). Built + measured turbo/track01 decode_loop: 2-acc ~4987 ms vs 4-acc ~4983 ms — **WITHIN NOISE, no speedup**; transcript BYTE-IDENTICAL (md5 b4f8cac64d, jfk 32c8f2208d). Falsified: the decode is NOT madd-latency-bound — the 66 MB/tok vocab-logits GEMV dominates and is DRAM-bandwidth-bound (2 vs 4 acc identical), and the small L2-resident projections are themselves bandwidth/`vpmovsxbw`-cvt-bound (the sign-extend, not the madd, gates them) or too small a fraction to move decode_loop. So `dot_i8`'s 2 accumulators are sufficient; the decode GEMV kernel is at floor. Reverted (no benefit + more code). Same conclusion for the encoder i8i32 `dot_i8_m4n2` which already has 8-way ILP via M4×N2 blocking. 
+**Tick 2026-07-13q (this loop) — decode GEMV activation-sign-extend amortization = WASH (controlled A/B), + a
+methodology catch.** First got the REAL turbo decode attribution (`decoder_attrib`, contention-immune, 200
+steps): decode is NOT logits-dominated — **mlp_fc_gelu 27.4% / logits 19.8% / self_attn 12.2% / self_qkv 10.9% /
+cross_attn 9.6% / self+cross out+q ~19%** — so ~77% is int8 GEMVs (`dot_i8`). Hypothesis: `dot_i8(w,x)`
+`vpmovsxbw`-widens BOTH operands per row, but in a GEMV `x` is constant across the `out` rows, so pre-widening it
+to i16 ONCE (new `dot_i8w_i16x`) halves the sign-extend — should win on the CACHE-resident projections
+(cvt-bound), gated to skip the DRAM-bound 66 MB logits. Built + byte-exact (track01 b4f8cac64d, jfk 32c8f2208d).
+A SEPARATE-run attrib compare looked like a −4 % win (per-step 9.700→9.30). **But the definitive SAME-binary A/B
+(kill-switch `FW_GEMV_I8_AMORTIZE`, alternating 4 pairs) = WASH: OFF ~9.34 vs ON ~9.37 ms/tok, pairs inconsistent
+(within ±3 % noise).** The projections are NOT `vpmovsxbw`-bound — the cvt overlaps the madd/load ports on Zen3, so
+halving cvts frees nothing. Reverted. **METHOD LESSON: even the "contention-immune" in-process `decoder_attrib`
+DRIFTS ±3 % across separate PROCESS launches (box load varies) — a −4 % from comparing two separate runs was a
+false positive; only a SAME-binary back-to-back A/B (env kill-switch) is trustworthy for a sub-5 % kernel claim.
+The 2-acc `dot_i8` (tick 13p) + this confirm the decode GEMV kernel is at floor.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
