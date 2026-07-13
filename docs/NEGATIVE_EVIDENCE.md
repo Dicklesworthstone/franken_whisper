@@ -20832,11 +20832,13 @@ dual-KV-cache + rollback), owner-ticketed bd-wzgh. Full spec = the "OWNER DECISI
 re-point at the content-drop temp-fallback / pause the byte-exact loop.** No small autonomous lever remains.
 
 ### LOOP-STATUS (update-in-place; do NOT append a new entry per tick once converged)
-`571168a` CONVERGED — byte-exact autonomous frontier exhausted, 4 wins shipped+certified (full matrix +
-lib 229/0), sole lever (speculative decode) owner-scoped. **Post-convergence ticks re-confirm this terminal
-state; they should EDIT this line (bump the commit / note any genuinely-new datapoint), not append a new
-dated section — the ledger is the record, not a per-tick log.** Ticks since close: verified off-hot-path
-files sub-floor + ft kernels owner-closed/out-of-scope; declined to autonomously build owner-ticketed
-bd-wzgh spec-decode. Awaiting owner scope decision (authorize spec-decode / content-drop temp-fallback /
-pause). Genuinely no small byte-exact autonomous lever remains — do not re-derive; cite the CONSOLIDATED
-FRONTIER MAP + OWNER DECISION BRIEF above.
+CONVERGED @ `571168a` (2 post-close ticks re-confirmed, latest this edit). Byte-exact autonomous frontier
+exhausted, 4 wins shipped+certified (full matrix + lib 229/0), sole lever (speculative decode) owner-scoped.
+**Post-convergence ticks re-confirm this terminal state; they EDIT this line (bump the tick / note any
+genuinely-new datapoint), they do NOT append a new dated section — the ledger is the record, not a per-tick
+log.** Re-confirmed across ticks: off-hot-path files (mel/tokenizer/audio/sync) sub-floor; ft kernels
+owner-closed/out-of-scope; decode hot-path composition (mlp/logits/projections/self_attn/cross_attn) 100%
+accounted + every sub-op at byte-exact floor; declined to autonomously build owner-ticketed bd-wzgh
+spec-decode. Awaiting owner scope decision (authorize spec-decode / content-drop temp-fallback / pause).
+Genuinely no small byte-exact autonomous lever remains — do not re-derive; cite the CONSOLIDATED FRONTIER
+MAP + OWNER DECISION BRIEF above.
