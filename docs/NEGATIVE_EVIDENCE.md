@@ -20662,3 +20662,19 @@ measurement or line-by-line read. **The byte-exact autonomous surface is fully m
 **Remaining value is owner/infra ONLY:** long-form content-drop temp-fallback (top priority, has a design
 tradeoff); WER-gated `FT_SDPA_POLY_EXP` / int8-calibration / ToMe / pruning; Linux GPU / VNNI (infra). **No
 byte-exact autonomous lever exists — future perf ticks should reference THIS map, not re-derive it.**
+
+## 2026-07-13 (GoldenOwl) — FW_ENC_FREE_F32 flip verified byte-exact on MULTI-WINDOW (cross-window state), not just jfk
+
+Robustness gap closed: this session had only single-window-jfk-tested the `78ba068` flip's byte-exactness.
+Re-ran on current-HEAD `fw` (no build) over the pre-decoded multi-window wavs, turbo, default (all 4 wins,
+flip ON/freed) vs `FW_ENC_FREE_F32=0` (retained):
+- **track01.wav — 124 s = 5 windows, real speech** (cross-window prompt carrying + full decode): **BYTE-
+  IDENTICAL** (md5 `b4f8cac…`, 1329 ch both), transcript coherent ("…quick demo of the search tool I made
+  using my new FrankenSearch library…").
+- **jfk_x3.wav — 33 s = 2 windows, tiled**: BYTE-IDENTICAL (327 ch both).
+So the freed-vs-retained equivalence (the code proof: quantized linears never read the freed f32) holds
+across multi-window cross-window decoder state, not just the single 30 s jfk window — confirming the
+session's biggest shipped default-on change is safe on the harder path. (The quant wins 26feafd/3e7f295/
+991df99 are unconditional AVX2 so can't be runtime-A/B'd, but are byte-exact by their matches-scalar unit
+tests + this shows the composed default binary decodes multi-window audio correctly.) No new lever; a
+robustness datapoint for the shipped work.
