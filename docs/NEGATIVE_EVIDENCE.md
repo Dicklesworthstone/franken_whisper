@@ -4,6 +4,68 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-13 - Codex: **REJECT — preallocating the word-timestamp segment vector measured 1.019959x, inside the valid BASE/BASE null envelope; source restored.**
+
+**Negative-ledger-first target.** The native compute and recently swept TTY,
+storage, and synchronization families were already closed. No existing row covered
+`extract_word_level_segments` capacity growth. The checked-in normalization surface
+also identified `normalize/insanely_fast_batch/100x20` as a millisecond-scale row
+(historical interval `[1.1473 ms, 1.2984 ms, 1.4611 ms]`). Each word-level payload
+already exposes its nested word counts, while the extractor grew its output from
+`Vec::new()`. The candidate counted word entries plus regular-chunk fallbacks once,
+then used `Vec::with_capacity`; opportunity score `(impact 2 x confidence 4) / effort
+1 = 8`.
+
+**Strict-remote foreground proof.** One `release-perf` test binary ran legacy
+allocation, a BASE/BASE null, and the candidate in alternating ABBA/BAAB order on
+worker `vmi1149989` (RCH job `j-29928833041827051`). The hermetic shape was 100
+chunks x 20 word timestamps; each of 21 ratios combined two 16-iteration samples per
+arm. Binary SHA-256:
+`9075d2f222d62b8894af9330fdf25b33ae606c5b52d1ea317daf5d0865c8cc12`.
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo test --profile release-perf -p franken_whisper --lib \
+  backend::tests::word_level_segment_preallocation_perf -- \
+  --ignored --nocapture --exact
+```
+
+| comparison | median | p10 | p90 | CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| BASE/BASE null | 1.001514 | 0.965627 | 1.085804 | 5.840% | 11/21 | valid: median inside predeclared `[0.98, 1.02]` |
+| unreserved / preallocated | **1.019959x** | 0.913499 | 1.076509 | 6.010% | 13/21 | reject: median does not exceed null p90 |
+
+Raw BASE/BASE ratios:
+`[0.9792611082079888, 1.0350241056717062, 1.0178344934508126,
+1.0015140951199875, 0.91158614228951, 1.0212313431285804,
+1.127033919269586, 1.0129673659775662, 0.9675344960935245,
+0.9864408775372472, 0.8749545014706221, 0.9656270847855603,
+0.9764437006244489, 0.9924141514778426, 1.0858035816318181,
+1.1001216922585615, 0.9811116786583491, 1.0305877586080598,
+1.0757754843173433, 1.017892687952638, 0.9850321742775974]`.
+
+Raw candidate ratios:
+`[1.0765090662429997, 0.8789103299622933, 1.0568691786892972,
+1.0387262145670226, 1.0870452509390711, 1.0199590900580764,
+1.0973768415929432, 1.0365922215826964, 1.038188842083892,
+1.0465366974093044, 1.0276935605331587, 0.9134990020471507,
+0.9003308356954375, 0.9530500413917155, 0.969820857342207,
+1.0699265512106264, 0.9743206994834545, 0.9961382521150866,
+0.9817506166493527, 1.016670560668778, 1.0187342358908777]`.
+
+**Behavior proof and verdict.** Before timing, the same binary compared all 2,000
+output segments field by field: ordering, start/end values, text, speaker, and
+confidence were identical. Floating-point operations and RNG were unchanged (the
+candidate only reserved capacity); mixed empty-word-array plus regular-chunk fallback
+semantics also passed. The probe finished `1 passed / 0 failed`. An earlier
+current-main Criterion screen (`j-29928833041827011`) was cancelled and excluded
+after its remote fat-LTO link stopped making progress; it never ran a benchmark and
+never fell back locally. Because the candidate's approximately 2% median is within
+the measured null spread, production, oracle, and temporary probe code were restored
+manually. Retry only if a larger profiled word-timestamp shape makes vector growth a
+top contributor and a same-binary candidate clears the null p90.
+
+---
 ## 2026-07-13 - Codex: **SURFACE / INVALID CV — moving consumed GGML metadata repeatedly showed a large clone-elimination signal, but neither BASE/BASE null passed the predeclared CV gate; source restored.**
 
 **Target.** `LoadedModel::from_ggml` consumes `GgmlModel`, yet clones its
