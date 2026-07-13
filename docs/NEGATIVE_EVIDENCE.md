@@ -20708,3 +20708,17 @@ jfk×3; output SAXPY already AVX2) + cross_attn 4.4% (closed). **Correction for 
 exhausted in BOTH regimes — jfk (encode-bound) AND long-audio (decode-bound); I had only ever profiled the
 encode-bound one. Both are closed; no new lever.** The one genuine long-audio efficiency question — encoder
 work on windows 4-5 shows 0.00 ms so cross-window pipelining is already hiding it — is also already landed.
+
+**Follow-up (the decode-bound lever's status): `FW_DRAFT_ACCEPT_LAYERS` is a VIABILITY PROBE, not a landable
+speedup.** decoder.rs:1697/1720 computes the k-layer draft argmax AND the full argmax and accumulates an
+accept-rate counter (`drain_draft_accept`, consumed only by a bench, not the `fw` CLI) — it ADDS overhead to
+measure whether layer-skip speculation would pay, it does NOT skip work. So it is NOT a gated win to flip
+(unlike `FW_ENC_FREE_F32`). The real decode-bound lever = a full **speculative-decode** implementation
+(draft proposes K, target verifies K in one batched all-layer pass amortizing the ~342 MB/token weight
+stream, greedy-verify accepts the matching prefix = BYTE-EXACT vs greedy) — but it needs the draft/verify
+loop + **KV-cache rollback on rejection** (intricate, correctness-risky) and its speedup is logits-bottleneck-
+capped (each verified position still needs the 133 MB/token logits GEMV → R(8)≈2.9× ceiling per
+[[project_draft_decoding_amortization]]). That is a big owner-scoped/dedicated-session feature (bd-wzgh), not
+a small autonomous increment. Logits-head-shrink (skip always-suppressed vocab rows, e.g. the ~1501
+timestamp tokens in no_ts mode) is sub-floor (~0.36% e2e, mode-specific). So the decode-bound regime, like
+the encode-bound one, has no small byte-exact autonomous lever — the only real lever is owner-scoped.
