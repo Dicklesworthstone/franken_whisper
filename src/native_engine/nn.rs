@@ -3895,9 +3895,11 @@ pub fn gelu_add_bias(x: &mut Mat, bias: &[f32]) {
 /// output. Pays ONLY when that output is partly-DRAM — its producing sgemm's
 /// working set > L3 (e.g. `mlp.proj`/fc2: `[1500,5120]` input + `[5120,1280]`
 /// weight = ~56 MiB stream evicts the 7.68 MiB output before the bias pass reads
-/// row 0) — so the serial bias RMW is bandwidth-starved single-core. The residual
-/// add alone stays cache-warm (why `encoder::add_in_place` is deliberately
-/// serial); the win here is removing the DRAM-bound bias pass, not the add.
+/// row 0) — so the serial bias RMW is bandwidth-starved single-core. (The residual
+/// add was ALSO DRAM-starved at turbo scale for the same reason — `encoder::
+/// add_in_place` is now parallel above a 1<<20-elt threshold, `e43b50a`, −48% on
+/// `attn_resid`; only tiny.en's L2-warm `[1500,384]` operand stays serial.) The win
+/// here is removing the DRAM-bound bias pass; the fused add rides along for free.
 /// Parallel over whole-row bands (bias alignment trivial, rows independent).
 pub fn add_bias_residual(x: &mut Mat, proj: &Mat, bias: &[f32]) {
     debug_assert_eq!(
