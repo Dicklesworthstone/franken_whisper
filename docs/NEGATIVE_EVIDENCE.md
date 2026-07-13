@@ -20519,3 +20519,27 @@ ends, both MEASURED so nobody retries them:
 **Net:** no clean autonomous WALL lever remains post-flip. The compute path is owner/external (SDPA + int8
 GEMMs), the encoder build is EF-serial + decoder hidden, the fault tax is inherent + allocator-optimal, and
 the only fresh RSS lever (decoder-f16-free) is dedicated-session-worthy. Frontier = owner-gated as before.
+
+## 2026-07-13 (GoldenOwl) — decoder-weight-free is a DEAD END for RSS: free-after-alloc ≠ never-alloc (implemented, measured, REVERTED)
+
+Implemented + benched the decoder self-attn q/k/v free (last turn's specified `FW_DEC_FREE_QKV` lever) and
+**reverted it — it doesn't deliver.** Full mapping first: on the f16 path `fuse_qkv` builds a fused
+`attn_qkv` and `project_qkv` runs it exclusively; the separate `attn_q/k/v` are read ONLY as the
+`FW_NO_QKV_FUSE` fallback (decoder.rs), so with fusion on + that hatch off they are dead (~470 MB on turbo:
+3·[1280,1280] f16+i8 × 32 L). Added a gated `free_weight_data()` (empty the f16 `w` + drop the int8 copies)
+after `fuse_qkv`. **Transcript BYTE-IDENTICAL** off-vs-on (md5 `32c8f2…`) — the deadness proof holds.
+
+**BUT the RSS win is ~60 MB, not ~470 MB** (`/proc/<pid>/status` VmRSS sampling, steady-state during decode:
+OFF 1355 MB → ON 1295 MB; peak UNCHANGED ~2.7 GB). **Mechanism — the reusable lesson:** freeing a `Vec`
+AFTER it's been allocated + faulted does NOT return the RSS — glibc keeps the freed pages in its per-arena
+free-list (its dynamic `M_MMAP_THRESHOLD` grows past the 3.28 MB weight size after the first few frees, so
+later frees land on the heap and are never `munmap`'d). Only ~13% was reclaimed. This is why the ENCODER
+free (`FW_ENC_FREE_F32`, −2.46 GB) worked and this does NOT: the encoder free is **NEVER-ALLOC** (f16-direct
+quant never builds the f32 → those pages are never faulted in → −610 k faults), whereas the decoder q/k/v
+**MUST be allocated** (fuse_qkv reads their f16 to build the fused matrix), so freeing after is a no-op for
+RSS. `malloc_trim(0)` would reclaim the free-list but is unsafe libc FFI, **denied** by `#![deny(unsafe_code)]`.
+
+**Conclusion (don't retry): "free dead weights after load" only reduces RSS when it becomes "never allocate
+them" (encoder pattern). Any decoder-weight-free that still allocates-then-frees is a dead end** (≤13% reclaim,
+peak unmoved, no wall since the decoder build hides behind the encoder). Reverted; no shipped change. The
+encoder f16-direct free is the ONE effective weight-RSS lever and it's already default-on (`78ba068`).
