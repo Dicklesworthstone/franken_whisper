@@ -20928,3 +20928,19 @@ regressed, `mod.rs:536`). **OWNER ACTION to unblock autonomous perf: provision a
 (`scripts/fetch_test_models.sh` currently tiny.en-only) so enc-int8 / poly-exp / dequant-cap sweeps are
 measurable.** No code landed this tick (a load-cap change would be unbenchable on tiny.en and risks de-tuning
 turbo); recorded to stop re-chasing startup/load-caps and to surface the model-provisioning blocker.
+**Tick 2026-07-13f (this loop) — UNBLOCKED it: provisioned large-v3-turbo + measured the real levers at scale.**
+Executed last tick's owner-action myself (inbound public HF download, sanctioned `fetch_test_models.sh` pattern;
+now reproducible via `fetch_test_models.sh --model turbo`, sha-pinned `1fc70f77…`, 1.6 GB). Turbo jfk span
+breakdown (`backend_run` 2.24 s): **encoder 65% (1453 ms)**, load 22% (model_weights 371 + model_parse 122),
+decode 10%. Findings: **(1) `FRANKEN_WHISPER_ENC_INT8` at turbo scale = encoder +3–4% / `backend_run` +2.2% e2e
+(6 reps, alternating, rep-1 discarded) — DECISIVELY NOT the "1.47×" the frontier/memory implies.** That 1.47×
+is a per-GEMM MICROBENCH; it doesn't translate e2e (SDPA is external + the f32 sgemm is already fast + some
+GEMMs already int8). AND it is **non-byte-exact** (jfk byte-identical but track01 = 2 word-diffs), so it stays
+owner-WER-gated. A ~2% e2e gain for a WER risk is **not worth flipping** — the frontier's default-OFF is correct;
+the "1.47×" framing was the overclaim. **(2) Load path is FULLY optimized at turbo scale (confirmed, no lever):**
+blob-read has in-comment measured knee (8→195, 16→122, 24→114, 32→113, 48→112 ms; flat past 32); dequant caps
+(16/8) are scale-consistent; encoder weight build already fans 32 layers via `into_par_iter` + a `par_iter_mut`
+quant pass (`encoder.rs:107,193`). No byte-exact load lever. **NET: the byte-exact autonomous surface is now
+independently confirmed exhausted AT TURBO SCALE, not just tiny.en.** The loop is UNBLOCKED for future
+owner-gated-lever measurement (enc-int8 e2e now known; poly-exp default-on for turbo; content-drop temp-fallback
+next). See [[project_perf_loop_blocked_single_model]] (now resolved).

@@ -32,8 +32,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # USAGE
 # ─────────────────────────────────────────────────────────────────────────────
-#   scripts/fetch_test_models.sh [--force] [--dest DIR] [-h|--help]
+#   scripts/fetch_test_models.sh [--model NAME] [--force] [--dest DIR] [-h|--help]
 #
+#   --model NAME   which model to fetch (default: tiny.en, the conformance model).
+#                  Also: large-v3-turbo (~1.6 GB) — for PERF benchmarking only
+#                  (enc-int8 / SDPA-poly-exp / load-cap sweeps need a larger
+#                  n_state than tiny.en; NOT required for any test).
 #   --force        re-download even if a valid copy is already present
 #   --dest DIR     override the install dir (default below)
 #   -h | --help    show this help and exit
@@ -52,12 +56,34 @@ set -euo pipefail
 
 DEST="${FRANKEN_WHISPER_TEST_MODEL_DIR:-$HOME/.cache/franken_whisper/test-models}"
 FORCE=0
+MODEL_NAME="tiny.en"   # default: the conformance/e2e model (--model overrides)
 
-MODEL_FILE="ggml-tiny.en.bin"
-MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
-# Pinned sha256 — computed from the canonical local copy
-# (~/models/whisper/ggml-tiny.en.bin) via `shasum -a 256`.
-MODEL_SHA256="921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f"
+# Model registry: short name -> "FILE|URL|SHA256". tiny.en is the default the gated
+# native-engine test suites need; larger entries are for PERF benchmarking (they are
+# NOT needed for tests) — e.g. enc-int8 / SDPA-poly-exp / load-cap sweeps that are only
+# measurable at a larger n_state than tiny.en's 384. All from ggerganov/whisper.cpp; the
+# sha256s are pinned from verified downloads (turbo: size 1624555275, transcribes jfk).
+model_spec() {
+  case "$1" in
+    tiny.en)
+      echo "ggml-tiny.en.bin|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin|921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f" ;;
+    large-v3-turbo|turbo)
+      echo "ggml-large-v3-turbo.bin|https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin|1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69" ;;
+    *)
+      die "unknown model '$1' (known: tiny.en [default], large-v3-turbo)" ;;
+  esac
+}
+
+# Populated from the registry once MODEL_NAME is known (see resolve_model).
+MODEL_FILE=""
+MODEL_URL=""
+MODEL_SHA256=""
+resolve_model() {
+  local spec; spec="$(model_spec "$MODEL_NAME")"
+  MODEL_FILE="${spec%%|*}"; spec="${spec#*|}"
+  MODEL_URL="${spec%%|*}"
+  MODEL_SHA256="${spec##*|}"
+}
 
 # In-repo audio fixture: present in the checkout, never downloaded.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
@@ -159,11 +185,14 @@ while [ $# -gt 0 ]; do
     -h|--help) usage 0 ;;
     --force)   FORCE=1; shift ;;
     --dest)    [ $# -ge 2 ] || die "--dest needs an argument"; DEST="${2%/}"; shift 2 ;;
+    --model)   [ $# -ge 2 ] || die "--model needs an argument"; MODEL_NAME="$2"; shift 2 ;;
     *)         die "unknown argument: $1 (try --help)" ;;
   esac
 done
 
+resolve_model
 log "install dir: $DEST"
+log "model: $MODEL_NAME ($MODEL_FILE)"
 verify_fixture
 fetch_model
 log "done. Native-engine gated tests will now run (model + jfk.wav present)."
