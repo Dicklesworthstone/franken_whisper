@@ -20055,3 +20055,43 @@ result: fail; existing UBS rust security heuristics flag non-secret byte/string
 ubs --skip-rust=8 docs/NEGATIVE_EVIDENCE.md src/native_engine/decode.rs
 result: pass; 0 critical, warnings only.
 ```
+
+## 2026-07-13 - CyanGull FW_ENC_FREE_F32 is now a LOAD-SPEED lever (the "load path at its floor" claim is CORRECTED)
+
+### Context
+PERF_FRONTIER stated "the single-shot load path is fully characterized and at its floor"
+(the f16→f32 weight dequant is bandwidth-bound; the i7 re-quant EF chain is latency-bound;
+cache-blocking the strided quant was a measured wash). That was true for the **two-phase**
+load (dequant_transpose → f32 Mat → quantize). This session's encoder f16-direct quant
+(`c701b45` i7 + `ae5f618` attn_out i8) changed the load STRUCTURE: under `FW_ENC_FREE_F32`
+the calibrated encoder quantizes i7/i8 **directly from the resident ggml f16 blob bytes**,
+building **no transposed f32 Mat and doing no transpose at all** (the i7/i8 store layout IS
+ggml `[out,in]`). So the dominant load cost — the per-weight transpose ("`model_weights`
+≈ 1.97 s on large", the FUSED dequant-transpose) — is *eliminated* for every quantized
+linear. This is a genuine WORK reduction, not the bandwidth/latency wall the prior claim
+described.
+
+### Fresh measurement (isolated, not wall-clock)
+Turbo, `jfk.wav`, prebuilt `fw`, `FRANKEN_WHISPER_PERF_SPANS=1`, the **`model_weights` span**
+(the weight-build phase — isolates the quant/transpose work from compute + ambient
+contention). ABBA `0,1,1,0,0,1`, `model_parse` unchanged (~130 ms) confirming isolation:
+
+```
+model_weights phase:
+  FW_ENC_FREE_F32=0 (two-phase, keeps f32): 414.1 / 400.9 / 417.2 ms  (mean ~410.7)
+  FW_ENC_FREE_F32=1 (f16-direct):           239.2 / 256.3 / 238.4 ms  (mean ~244.6)
+  => ~1.68x FASTER weight build (-166 ms, -40%), byte-identical transcript
+```
+
+### Verdict — a POSITIVE finding + a blocker correction
+`FW_ENC_FREE_F32` is no longer "memory-only, RTF unchanged": it now also **speeds the weight
+build ~1.68x (−166 ms turbo)** AND cuts **PEAK RSS −2.31 GB (5.05→2.74 GB, −46%)** — both
+byte-exact. So two of the three historical reasons the flag stayed default-OFF are now
+obsolete ((a) "memory only" and (b) "peak doesn't move"). The ONLY remaining blocker is (c):
+the `#[cfg(test)]` asserts that read the f32 post-load on a calibrated model
+(`assert_quality_safe_int8_error_budget`) — an **owner-gated flip** (`cargo test --lib
+native_engine` must pass, or gate the free on `cfg(not(test))`). This entry records the
+completed evidence so the flip is a decision, not a re-measurement. Do NOT re-hunt the
+encoder-weight-f32 peak vein (closed: encoder f16-direct done, decoder weights are
+f16-resident-and-live, the 1.5 GB ggml blob is load-peak-only and dropped post-load ⇒
+reducing it needs incremental blob streaming, a large loader change).
