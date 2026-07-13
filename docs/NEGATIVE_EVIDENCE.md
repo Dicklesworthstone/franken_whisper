@@ -21058,3 +21058,14 @@ bug; broadening it default-ON would be a ~10% quality regression on the distil p
 f32-encoder = slower-but-exact; that is the right default.) Same jfk-exact-but-corpus-drifts trap as int4/decode-
 int8 — always WER-check on real multi-window speech, never jfk. LESSON: an "int8 is quality-safe" calibration is
 a PROPERTY OF THE WHOLE MODEL (encoder error × decoder robustness), not the encoder alone.
+
+**Tick 2026-07-13o (this loop) — exp/logprobs is NOT a scale-scoped decode cost (FW_SIMD_EXP within noise at turbo
+LONG-audio too).** Hypothesis: `compute_logprobs`' per-token exp-sum over 51866 (for the plog/avg_logprob) would
+be a real cost at 250-token long audio (10× jfk's 27), reviving the poly-exp lever the memory calls "within
+noise" (that was jfk-scoped). MEASURED (no build, `FW_SIMD_EXP` runtime flag, turbo/track01, summed decode_loop,
+3 alternating pairs): libm ~4690 ms vs poly ~4715 ms — **no speedup (within noise, poly slightly SLOWER)**; and
+byte-IDENTICAL transcript (0 word-diffs) on track01. FALSIFIED: the decode is GEMV-DRAM-bandwidth-bound (66 MB/tok
+logits + weights); the per-token exp-sum/log-softmax + suppression passes (~207 KB in-cache after the GEMV read)
+are HIDDEN under that stream even at 250 tokens. So `compute_logprobs` (and its no_ts full-vector materialize +
+sanitize copy) is sub-floor; poly-exp buys nothing on CPU here. Decode is fully accounted at turbo long-audio
+scale: GEMV bandwidth (dominant) + everything-else-hidden. No byte-exact decode lever.
