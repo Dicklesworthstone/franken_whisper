@@ -20285,3 +20285,7 @@ hidden; mel sub-floor; encoder/decode thread counts owner-tuned to 32 per the me
 exhausted and its wins measured + guarded. Remaining perf value is owner-decisions only: the one-line
 `FW_ENC_FREE_F32` flip (byte-exact, verified, doubly-guarded), the non-wav round-trip, the batch prefetch
 (blocker pinned), or infra (GPU/blob-stream). Further autonomous byte-exact ticks will be repetitive.
+- **`dtw.rs`** (word-timestamp DTW alignment) opened — the last unexamined core file. It runs ONLY when
+  `params.word_timestamps` (decode.rs:1169/1595, an opt-in mode) and its overhead is negligible per the
+  frontier (fw word-ts ≈ fw segment-ts wall ⇒ `dtw.rs` sub-floor). Doubly sub-floor ⇒ no lever. **Every
+  source file in the native engine + audio + youtube path is now personally opened and accounted for.**
