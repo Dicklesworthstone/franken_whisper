@@ -111,6 +111,13 @@ faithful — cleaner than wc on the one clip where either engine degraded.**
   franken's greedy int8 decoder stays faithful; **franken is faster AND cleaner** on this clip. (Note: this
   is the reverse of the tiny.en content-drop above — the greedy repetition/drop failure mode is
   clip-and-decoder-specific and afflicts BOTH engines on different audio.)
+  - **MATCHED-GREEDY (2026-07-13): the speed is ~2.29× (not 2.58×), and the faithfulness win HOLDS — even
+    STRENGTHENS — under wc-greedy.** The 2.58× above was fw vs wc-DEFAULT (beam-5); forcing wc greedy
+    (`-bs 1 -bo 1`) on sjobs turbo: fw 48.7 s vs wc-greedy 111.4 s = **2.29×** (vs wc-default 119 s = 2.44×)
+    — small correction, this clip is encoder-heavy (28 windows). And wc-greedy ALSO degrades: **1478 words,
+    max-5gram-rep = 8, truncated "…state." tail** — worse than fw (1855 words, 5gram-rep = 3, clean) though
+    not as bad as wc-beam-5 (1090 / 19). So franken is cleaner than BOTH whisper.cpp decode modes here, and
+    ~2.29× faster matched-greedy.
   - **REFINED (2026-07-12): the wc sjobs loop is TURBO-specific, not general.** Same clip on **tiny.en
     no_ts** (`-t 16`, 2 reps): **both engines clean and full-coverage** — fw 1849 words vs wc 1852, both
     max-5gram-rep = 3, fw ends "…portrait to landscape." So this is a *valid same-content* comparison:
