@@ -116,6 +116,79 @@ independently re-verified by a second agent at the code level + one empirical
 micro-bench). Remaining levers stay owner/infra-gated (WER-corpus, GPU, VNNI).
 
 ---
+## 2026-07-13 - Codex: **SURFACE / INVALID NULL — sorting borrowed pipeline-adapter frame references measured 1.0280x, inside a broad BASE/BASE envelope; source reverted.**
+
+**Negative-ledger-first target.** `TtyAudioPipelineAdapter::ingest_frames` cloned
+every `TtyAudioFrame` before sorting, duplicating the codec, Base64 payload, and
+SHA-256 strings even though ingest never mutates its input. No ledger row covered this
+adapter or clone-before-sort site. The candidate collected `Vec<&TtyAudioFrame>` and
+retained stable `sort_by_key`, so equal sequence numbers still kept their input order
+and the first duplicate still won. Opportunity score was
+`(impact 4 * confidence 5) / effort 1 = 20`.
+
+**Strict-remote same-binary probe.** No local Cargo fallback occurred. RCH worker
+`vmi1152480`, job `j-29928833041826173`, compiled and ran the historical cloned sort
+and borrowed-reference candidate in one `--profile release-perf` binary:
+
+```text
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench --profile release-perf -p franken_whisper --bench tty_bench -- \
+  tty/pipeline_ingest_sort_ab --sample-size 20 --warm-up-time 0.5 \
+  --measurement-time 1 --noplot
+
+benchmark binary sha256:
+  076a2849c65054c41c34430714309f5943b94a3a2db0b69852ff58288d8311bf
+```
+
+The complete ingest path remained timed: stable sort, Base64 decode, zlib inflate,
+CRC32/SHA-256 verification, and `BTreeMap` insertion. Each arm processed 64 reversed
+batches of 128 high-entropy frames at 1,600 raw bytes/frame (8,192 frames and
+13,107,200 raw bytes total). One historical batch calibrated at 657.613 us; the
+64-batch cap therefore produced roughly 42 ms rather than the nominal 100 ms target.
+
+BASE/BASE ratios:
+
+```text
+1.049649 1.001992 0.962205 0.995590 1.038430 0.925339 1.019451
+1.015330 1.070764 1.156663 0.604870 0.963347 1.039232 1.044044
+1.197924 1.767224 1.080635 1.025538 1.107840 0.997561 1.013133
+```
+
+Null median/p10/p90 were **1.025538 / 0.962205 / 1.156663**, CV
+**18.949%**, range `[0.604870, 1.767224]`, wins 15/21. The predeclared
+`[0.98, 1.02]` null-median gate failed, so comparative evidence from this run is
+not decision-valid.
+
+BASE/borrowed-sort ratios:
+
+```text
+0.782793 0.892326 1.642312 1.222443 1.335504 0.964159 1.213572
+0.806032 1.017809 1.354326 1.481296 1.003910 1.028001 0.806394
+1.159740 0.902886 0.568726 1.445147 0.893641 1.067521 1.297500
+```
+
+Candidate median was **1.028001x**, p10/p90 **0.806032 / 1.445147**,
+CV **24.858%**, range `[0.568726, 1.642312]`, wins 13/21. It remained inside
+the null envelope even if the null-median gate were ignored. The candidate-only
+Criterion diagnostic was `[635.40 us, 696.07 us, 757.70 us]` for one 128-frame
+ingest; it is not comparative evidence.
+
+**Proof boundary.** The executed harness checked equal ingested counts, adapter
+counts, and total decoded byte lengths. Its printed
+`b65fcfac0086c6966c8118d8832fec73bdc8b8377a34d844e1c9fa2af505bee9` SHA-256
+described the generated raw input, not either adapter's stored output. A stronger
+exact-map/stable-duplicate/error-state oracle was authored but deliberately not
+claimed as executed because the invalid null already forced restoration.
+
+**Verdict: null-control SURFACE, not a keep or authoritative rejection.** The
+production refactor, temporary reference API, parity test, and A/B harness were
+manually restored byte-for-byte to `HEAD`; no runtime or benchmark code remains.
+On this complete-ingest shape, eliminating payload clones was below the much larger
+decode/integrity/map cost and below the worker's noise floor. Reopen only with a
+tighter nested short-block null design, a full stored-output digest oracle, and a
+shape where clone traffic is independently profiled as material.
+
+---
 ## 2026-07-13 - Codex: **SURFACE — resetting one zlib encoder and ping-ponging its output buffers measured 1.0646x, inside the same-binary BASE/BASE floor; source reverted.**
 
 **Negative-ledger-first target.** `stream_mic_to_ndjson` constructed and dropped a
