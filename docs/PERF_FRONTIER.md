@@ -406,6 +406,16 @@ lever — the soak+flip is already done.** The recipe + hazards below are retain
 
 ## Recommendation
 
+**BOTTOM LINE (validated end-to-end this session, 2026-07-12):** franken is **~1.4–2.3× faster** than
+whisper.cpp across *every* model×mode×clip measured (turbo + tiny.en; no_ts/seg-TS/word-TS; track01 124.5 s
++ sjobs 840 s) **AND faithful** — **0.0 % WER vs ground truth on jfk (both models)**, 88–98 % agreement with
+whisper.cpp on the other clips (the gap is filler/stylistic + segmentation, NOT errors; proper nouns match
+with **zero int8 divergence**; on hard clips franken is *cleaner* than wc, which loops). The autonomous
+byte-exact **perf frontier is exhaustively CLOSED** and the "faster faithful whisper" **product claim is
+CONFIRMED with hard numbers**. So this loop has run to completion — **redirect** to the owner-scoped items
+below, or to the flagged **correctness** decision (`FW_RETRY_FAILED_WINDOW` default-on, re-confirmed
+current-code above).
+
 Pause the autonomous *byte-exact* loop — further ticks only re-measure settled ground or
 land sub-floor micro-levers the ledger reverts. **Rows 1 & 2 of the table above are no longer
 the start point** (both MOOT/DONE per the §CORRECTION: `FW_ENC_INT8_FC1` is inert under the
