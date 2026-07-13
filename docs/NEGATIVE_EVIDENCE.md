@@ -20573,3 +20573,23 @@ Linux GPU / VNNI (infra). **TOP PRIORITY per the frontier is the long-form tiny.
 bug** (`FW_RETRY_FAILED_WINDOW` landed gated; proper fix = temp fallback, owner — has a design tradeoff so
 NOT autonomously flippable). **Recommend pausing the autonomous byte-exact PERF loop** — the vein is
 exhausted for real this time (extended 4×, every fresh candidate now measured-and-closed).
+
+## 2026-07-13 (GoldenOwl) — encoder-i7-amax f16-preconvert = WASH/LOSS (impl, byte-exact, microbenched 0.83×, REVERTED)
+
+Re-opened the encoder i7 weight-quant on a hunch that `quantize_rows_to_i7`'s per-element `Float16::to_f32`
+(the default f16-direct path, called in the amax pass + the EF pass) was "2× scalar software-f16" worth
+eliminating by pre-converting each row to an f32 scratch once via `_mm256_cvtph_ps` (a clean row-filler
+refactor feeding the SAME amax/EF kernel). **Implemented + byte-exact** (`nn::tests` 51/0 incl. the existing
+`quantize_f16_bytes_matches_transposed_f32_path_byte_exact` bit-for-bit guard + a new
+`f16_bytes_to_f32_matches_scalar` incl. subnormal/±0 edges). **But the single-binary amax A/B REVERSED the
+premise: `f16_row_amax [1280×1280] software=91.6 µs → cvtph=110.9 µs = 0.83× (SLOWER).`**
+
+**Why the premise was wrong (the reusable lesson):** 91.6 µs for 1.64 M conversions = **~18 G elem/s** — the
+OLD path is ALREADY vectorized. `Float16::to_f32()` in the amax **autovectorizes** (no `.round()` to block
+it, unlike the decoder-quant wins where the round was the blocker), so there was no scalar software-f16 to
+kill. And in the SERIAL EF loop the conversion `to_f32(w[i])` is **independent of the `err` chain** (only
+`target = conv·inv + err` touches `err`), so the CPU pipelines it UNDER the round-latency err chain → it was
+already free. Pre-converting just adds a buffer write+read + an extra pass. Net wash/loss. **Reverted; no
+shipped change.** Corollary: `Float16::to_f32` is only a lever when a NON-autovectorizing op (`.round()`) is
+fused into the same loop (the decoder wt-quant case, `3e7f295`/`991df99`); a pure `to_f32→abs→max` fold
+autovecs on its own. Don't re-attempt the encoder-quant f16-preconvert.
