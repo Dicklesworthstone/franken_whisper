@@ -21013,3 +21013,17 @@ contention — it is largely INTRINSIC self-attention KV-cache growth (track01 w
 27, so later tokens attend over a longer cache); that's why throttling the prefetch encoder does nothing. KV-cache
 decode is separately memory-CLOSED ([[project_self_attn_kv_cache_lever]]). Net: pipeline balance is not a tunable
 lever; the decode-dominated regime stays owner-gated (spec-decode) / HW.
+**Tick 2026-07-13l (this loop) — UNBLOCKED spec-decode: provisioned a viable DRAFT model + measured viability.**
+The decode-dominated regime's sole lever is spec-decode amortization; it had been "blocked — no vocab-compatible
+on-box draft." RESOLVED: **`distil-large-v3` is an ideal turbo draft** — cheap 48-byte ggml-header probe then a
+verified download confirm: **n_vocab 51866 (IDENTICAL to turbo), the SAME 32-layer / n_state 1280 large-v3
+encoder** (so the encoder is computed ONCE and shared between draft+verify), and **n_text_layer 2 (vs turbo's
+4)**. Provisioned (1.5 GB, sha `2883a11b…`) + reproducible: `fetch_test_models.sh --model distil-large-v3`.
+MEASURED (built fw loads the 2-layer model fine, jfk transcript correct): **distil decode 132 ms vs turbo 217 ms
+for 27 tok = 1.64× faster draft**; agreement (acceptance PROXY) **jfk near-identical (only punctuation), track01
+89.5% word-match** (230/257) — true per-token accept is HIGHER (spec-decode re-syncs after each mismatch). So
+spec-decode is VIABLE: a shared-encoder, 1.64×-faster, ~90%-agreeing draft now exists on-box; combined with the
+landed Phase-1 `logits_all` batched verify (2.36× amortization) the pieces are present. The full draft/verify
+LOOP remains the owner-ticketed build (bd-wzgh) — NOT autonomously built — but the "no draft" blocker that gated
+it for the whole campaign is GONE, with measured viability. This is the concrete next step for the one lever that
+attacks the dominant (64%) decode cost. See [[project_perf_loop_blocked_single_model]].
