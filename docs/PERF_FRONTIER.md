@@ -4,6 +4,12 @@
 > (measured wins) and `NEGATIVE_EVIDENCE.md` (rejections + blockers). This file is
 > the short answer to "what's left and exactly how to do it." Owned by swarm agent
 > **BlackThrush**. Last updated 2026-07-12.
+>
+> **⏩ 2026-07-13 addendum (GoldenOwl):** the "CLOSED" claim below was extended 4× this day —
+> AVX2 encoder act-quant (`26feafd`), AVX2+F16C decoder wt-quant ×2 (`3e7f295`/`991df99`), and
+> `FW_ENC_FREE_F32` flipped DEFAULT-ON (`78ba068`, −14% wall / −46% RSS) = **measured ~10% e2e,
+> byte-exact**. THEN re-confirmed genuinely closed (scalar-quant vein swept, allocator-tuning + decoder-
+> weight-free both dead-ends). Detail + the "don't-retry" list: `NEGATIVE_EVIDENCE.md` 2026-07-13.
 
 ## ⚠ TOP PRIORITY IS NOW A CORRECTNESS BUG, NOT A PERF LEVER (2026-07-12)
 

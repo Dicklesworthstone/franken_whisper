@@ -20543,3 +20543,33 @@ RSS. `malloc_trim(0)` would reclaim the free-list but is unsafe libc FFI, **deni
 them" (encoder pattern). Any decoder-weight-free that still allocates-then-frees is a dead end** (≤13% reclaim,
 peak unmoved, no wall since the decoder build hides behind the encoder). Reverted; no shipped change. The
 encoder f16-direct free is the ONE effective weight-RSS lever and it's already default-on (`78ba068`).
+
+## 2026-07-13 (GoldenOwl) — SESSION CONVERGENCE: frontier extended 4× then genuinely re-closed
+
+`PERF_FRONTIER.md` (owned by BlackThrush, "Last updated 2026-07-12") declares the byte-exact envelope CLOSED
+and recommends pausing the loop. **That was again PREMATURE** — this session (GoldenOwl) landed **4 measured
+byte-exact wins after it**, then verified the vein is NOW actually closed. Superseding record:
+
+**LANDED (all byte-exact, all default-on, MEASURED):**
+1. `26feafd` — AVX2 encoder activation-quant (`quantize_act_i7/_gelu`), **3.82× kernel**, runs 96×/window.
+2. `3e7f295` — AVX2+F16C decoder per-row weight-quant (`quantize_f16_to_i8`) at load, **3.78× kernel**.
+3. `991df99` — AVX2+F16C decoder block-wise weight-quant (`quantize_f16_to_int_blocked`), **3.00× kernel**.
+4. `78ba068` — flipped `FW_ENC_FREE_F32` DEFAULT-ON: **−14% wall (2.73→2.35 s) + −46% peak RSS
+   (5.29→2.83 GB) + −610 k page faults**, byte-exact (the retained f32 encoder weights were pure fault tax).
+**Net, MEASURED via fresh turbo/jfk span (`25470e0`): backend_run 2565→~2296 ms ≈ −10% e2e, transcript
+byte-identical.** The method that found them: chase the live-span `SUM`-vs-`encoder_window` gap + the
+`f32::round`/software-f16 scalar antipattern; then `perf stat` the page-fault tax.
+
+**NOW GENUINELY CLOSED (this session's dead-ends, don't retry):** scalar-quant/round vein swept across every
+default hot path (`42a71a5`; encoder wt quant is EF-serial = un-vectorizable, decode dots already AVX2);
+allocator tuning REGRESSES (jemalloc 3× faults, arena-cap slower — `5b62120`); decoder-weight-free is a dead
+end (free-after-alloc reclaims only ~13%, glibc retains pages; `e52ffe1`); the fault tax is inherent
+first-touch of needed memory; the encoder-amax-preconvert would net only ~1.3% e2e AND break the
+shared-quant-kernel byte-identical-by-construction guarantee (not landed).
+
+**GENUINELY REMAINING = owner/infra only** (as the frontier says, now re-confirmed post-4-wins): SDPA
+poly-exp (`FT_SDPA_POLY_EXP`, non-byte-exact, ~1.069×), encoder int8 calibration / ToMe / pruning (WER loop),
+Linux GPU / VNNI (infra). **TOP PRIORITY per the frontier is the long-form tiny.en content-drop CORRECTNESS
+bug** (`FW_RETRY_FAILED_WINDOW` landed gated; proper fix = temp fallback, owner — has a design tradeoff so
+NOT autonomously flippable). **Recommend pausing the autonomous byte-exact PERF loop** — the vein is
+exhausted for real this time (extended 4×, every fresh candidate now measured-and-closed).
