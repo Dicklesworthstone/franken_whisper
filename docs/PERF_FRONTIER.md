@@ -55,17 +55,19 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
 |---|---|---|---|---|---|
 | jfk 11 s (encoder only) | turbo | — | **2.29×** (framing-independent) | — | — |
 | track01 124.5 s | turbo | no_ts | **2.07×** | 2.30× | full (259 w) |
-| track01 | turbo | seg-TS | *(not yet measured)* | 1.77×³ | full |
-| track01 | turbo | word-TS (DTW) | *(not yet measured)* | 1.71×³ | full |
+| track01 | turbo | seg-TS | **~1.79×** (≈ default) | 1.77× | full |
+| track01 | turbo | word-TS (DTW) | ~1.71×³ (≈ default) | 1.71× | full |
 | track01 | tiny.en | no_ts | **1.10×** | 1.87–1.93× | full (254 w) |
-| track01 | tiny.en | seg-TS (retry¹) | *(not yet measured)* | 1.39×³ | full |
+| track01 | tiny.en | seg-TS (retry¹) | *(not yet measured⁴)* | 1.39× | full |
 | **sjobs 840 s / 28 win** | turbo | no_ts | **2.29×** | 2.44–2.58×² | fw clean / **wc loops (both modes)** |
 | sjobs 840 s | tiny.en | no_ts | **1.47×** | 2.06× | both clean (valid) |
 
 ¹ tiny.en TS default drops ~50% (content-drop bug) → non-comparable; `FW_RETRY_FAILED_WINDOW=1` restores full
 coverage (slower but correct). ² sjobs: wc degrades into repetition loops in *both* decode modes (beam-5 worse
-than greedy); fw stays clean either way. ³ the seg-TS/word-TS rows still carry vs-DEFAULT numbers — apply the
-same matched-greedy correction (small for these encoder-dominated turbo cells, large for tiny.en). Whole-pipeline
+than greedy); fw stays clean either way. ³ **TS-mode has ~NO beam tax** (measured: turbo seg-TS wc-default
+22.4 s ≈ wc-greedy 22.5 s), so the turbo TS/word-TS cells are ALREADY ~matched-greedy — the beam-5 tax is a
+**no_ts phenomenon**, not a blanket correction. ⁴ tiny.en TS (decode-heavy + the retry) not yet measured
+matched-greedy; likely a smaller correction than no_ts since TS has no beam tax. Whole-pipeline
 rows are load-sensitive on this shared box; the isolated-encoder 2.29× (beam-independent) and the fw-vs-fw
 self-improvement are the confound-free anchors. **Net (matched-greedy, the fair comparison): franken is ~2–2.3×
 on encoder-heavy turbo, ~1.1–1.5× on decode-heavy tiny.en (clip-length-dependent — longer ⇒ more encoder ⇒
