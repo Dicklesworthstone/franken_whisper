@@ -416,6 +416,16 @@ CONFIRMED with hard numbers**. So this loop has run to completion — **redirect
 below, or to the flagged **correctness** decision (`FW_RETRY_FAILED_WINDOW` default-on, re-confirmed
 current-code above).
 
+**Validation COVERAGE + what's resource-blocked (so the owner knows what to supply to extend it):** the
+numbers above cover **English** speech on the **two real on-box models** — `tiny.en` (74 MB, English-only)
+and `large-v3-turbo` (1.5 GB, multilingual-capable). Two axes remain UN-measured and are **blocked on
+missing on-box assets, not effort**: (1) **multilingual** — turbo *can* do it, but there is **no non-English
+audio on box** (all clips — jfk / track01 / sjobs / test_10s_speech — are English); (2) the **intermediate
+models** (base / small / medium) — only 562 KB *test stubs* are present, no real weights. To extend the
+faster-and-faithful validation to those, the owner needs to drop in non-English speech clips and/or the real
+base/small/medium ggml models; then the same harness (`decode_to_wav` → interleaved `fw` vs `whisper-cli`,
+WER + word-agreement) applies unchanged.
+
 Pause the autonomous *byte-exact* loop — further ticks only re-measure settled ground or
 land sub-floor micro-levers the ledger reverts. **Rows 1 & 2 of the table above are no longer
 the start point** (both MOOT/DONE per the §CORRECTION: `FW_ENC_INT8_FC1` is inert under the
