@@ -20798,3 +20798,14 @@ regression-clean: **229 passed / 0 failed / 3 ignored** (the 3 ignored = the kep
 the transcript checks (turbo single+multi-window byte-identical, tiny.en byte-identical), the session's four
 default-on wins (`26feafd`/`3e7f295`/`991df99`/`78ba068`) are shipped, green, and byte-exact. Session
 verification surface COMPLETE. No new lever.
+
+## 2026-07-13 (GoldenOwl) — flip byte-exact in TIMESTAMP mode too (closes the mode axis)
+
+Faithfulness has a MODE axis ([[project_no_ts_tail_truncation_fix]]: re-diff EACH mode) — all prior flip
+checks were `--no-timestamps`. TS mode exercises the DTW/segment/timestamp emission path. Verified turbo jfk
+`--json` (timestamps ON), flip default (freed) vs `FW_ENC_FREE_F32=0` (retained): the full JSON differs ONLY
+in per-run metadata (run_id, decision_id, elapsed_ms/service_ms, temp `path`/`normalized_wav_path`), while
+**every CONTENT+TIMESTAMP field (`text`, `t0`, `t1`, `start`, `end`, `seek`, `no_speech_prob`) is
+BYTE-IDENTICAL** (both 26320 B). So the shipped flip is now byte-exact-verified across the FULL matrix:
+**{turbo, tiny.en} × {single-window, 5-window + tiled} × {no_ts, timestamps}.** Mode-axis coverage closed;
+the session's default-on wins are comprehensively certified. No new lever.
