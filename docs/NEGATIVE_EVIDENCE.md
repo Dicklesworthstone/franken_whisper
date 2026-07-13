@@ -20346,3 +20346,31 @@ scalar-reference fallback, matching the sibling-kernel convention. Kernel A/B ke
 `quantize_row_i7_u8_perf`. **Method (again):** "complete" meant the file-level sweep was done, not that
 the compute spans had been read from the INSIDE — the win hid in the unprofiled `encoder_window` gap
 (activation quant is not span-wrapped for QKV). Reading the live span table (SUM vs window) surfaced it.
+
+## 2026-07-13 (GoldenOwl) — 7th byte-exact win: AVX2+F16C decoder weight-quant at LOAD (3.78×)
+
+Same antipattern, DECODER LOAD path this time. `quantize_f16_to_i8` (nn.rs) — the f16→int8 quant that
+`Linear::quantize_if` runs at LOAD for every decoder int8 weight (attention projections: `int8_attn`
+DEFAULT-ON; mlp: `int8_mlp` DEFAULT-ON) — had a fully SCALAR default path: the non-EF branch
+(`dec_ef_quant()`/FW_DEC_EF is DEFAULT-OFF) computed `amax` via software `Float16::to_f32` in a fold
+AND quantized via `(h.to_f32()*inv).round().clamp(±127)` — neither LLVM-autovectorizes (software f16→f32
++ scalarized `f32::round`). The i8 GEMV kernel (`dot_i8`) and the f16 GEMV (`dot_f16c`, `_mm256_cvtph_ps`)
+were both hand-AVX2, but the WEIGHT QUANT that FEEDS the i8 GEMV was left scalar.
+
+**Fix (landed):** `quantize_f16_row_to_i8_into` — AVX2+F16C helper (cfg `avx2`+`f16c`, scalar fallback),
+two vectorized passes via `_mm256_cvtph_ps` (EXACT f16→f32, the same conversion `dot_f16c` relies on):
+(1) `amax = max|w|` (tree-reduce max = scalar fold for finite values), (2) round-half-away + clamp + pack
+to i8. Returns the same `amax/127` scale (`inv = 1.0/(amax/127.0)`, matching the original's double-round).
+EF path stays scalar (serial `err` chain, not vectorizable). Byte-exact: single `_mm256_mul_ps` (no FMA).
+
+**Measured — single-binary kernel A/B** (`quantize_f16_row_to_i8_perf`, black_box'd, real turbo decoder
+attn-projection [1280×1280]): **scalar 1386.7 µs → avx2 366.8 µs = 3.78×**, byte-identical. Runs at LOAD
+over all decoder int8 attention/mlp weights (load = ~35% of single-shot turbo wall). e2e load-fraction
+not isolated (box saturated), but it's on the default load path.
+
+**Gate:** none — byte-exact (`quantize_f16_row_to_i8_matches_scalar_reference`: SIMD body + <8 tail +
+±127 clamp + exact-.5 half-away + scale bit-match; full `native_engine::nn::tests` 45/0/2-ignored green),
+`cfg(avx2,f16c)` + scalar-reference fallback. Kernel A/B kept as `#[ignore]`d `quantize_f16_row_to_i8_perf`.
+The `f32::round`/software-f16 scalar-quant antipattern is now swept across BOTH engines: encoder activation
+quant (`26feafd`, 3.82×) + decoder weight quant at load (this, 3.78×). Both quant-input passes (act + wt)
+that feed the AVX2 GEMV kernels are now themselves AVX2.
