@@ -49,7 +49,7 @@ worked it end-to-end. **This outranks every perf lever below.** Full write-up: `
 
 ## ⚡ Current-code headline vs whisper.cpp is ~1.4–2.3× across all model×modes (a WIN in every one) — "~1.2×" is STALE
 
-**Quick reference (all 2026-07-12, matched threads — wc's best: turbo `-t 32`, tiny.en `-t 16`; total wall unless noted).** franken wins every cell; evidence + caveats in the bullets below.
+**Quick reference (all 2026-07-12, matched threads — wc's best: turbo `-t 32`, tiny.en `-t 16`; total wall unless noted).** franken wins every cell; evidence + caveats in the bullets below. **⚠ These speed cells are fw-greedy vs whisper.cpp's DEFAULT (beam/best-of-5) — NOT matched-greedy. Matched-greedy (fair) is lower: turbo ~2.07× (small correction, encoder-dominated), tiny.en ~1.10× (the "1.93×" was mostly wc's beam-5 decode tax). Only the isolated encoder 2.29× is framing-independent. See the "CORRECTION 2026-07-13" in the Recommendation.**
 
 | clip | model | mode | fw | whisper.cpp | ratio | coverage |
 |---|---|---|---|---|---|---|
@@ -412,15 +412,27 @@ lever — the soak+flip is already done.** The recipe + hazards below are retain
 
 ## Recommendation
 
-**BOTTOM LINE (validated end-to-end this session, 2026-07-12):** franken is **~1.4–2.3× faster** than
-whisper.cpp across *every* model×mode×clip measured (turbo + tiny.en; no_ts/seg-TS/word-TS; track01 124.5 s
-+ sjobs 840 s) **AND faithful** — **0.0 % WER vs ground truth on jfk (both models)**, 88–98 % agreement with
-whisper.cpp on the other clips (the gap is filler/stylistic + segmentation, NOT errors; proper nouns match
-with **zero int8 divergence**; on hard clips franken is *cleaner* than wc, which loops). The autonomous
-byte-exact **perf frontier is exhaustively CLOSED** and the "faster faithful whisper" **product claim is
-CONFIRMED with hard numbers**. So this loop has run to completion — **redirect** to the owner-scoped items
-below, or to the flagged **correctness** decision (`FW_RETRY_FAILED_WINDOW` default-on, re-confirmed
-current-code above).
+**⚠ CORRECTION 2026-07-13 — the headline speed numbers used whisper.cpp's DEFAULT decode (beam/best-of-5),
+which is NOT matched-greedy. The fair numbers are lower — dramatically for tiny.en.** franken is
+**greedy-only**; whisper.cpp's *default* is beam-5/best-of-5 (~5× the decode work AND higher quality). The
+`whisper_cpp_ab.sh` harness correctly forces wc to greedy (`-bs 1 -bo 1`); my ad-hoc headline runs did NOT,
+so they compared fw-greedy vs wc-DEFAULT-beam and partly credited franken for wc doing more work. Measured
+both (track01, no_ts, matched threads):
+
+| clip | fw / wc-**default** (old headline) | fw / wc-**greedy** (FAIR) |
+|---|---|---|
+| turbo   | 2.30× | **2.07×** (encoder-dominated ⇒ small correction; the int8 encoder is beam-independent) |
+| tiny.en | 1.87× | **1.10×** (decode-dominated ⇒ HUGE correction — the "1.93×" was mostly wc's beam-5 tax) |
+
+**So the honest speed claim is: matched-greedy, franken is ~2.1× on turbo but only ~1.1× on tiny.en.** The
+one framing-independent, robust win is the **isolated encoder (2.29×, beam-independent)**. The old
+"~1.4–2.3× every mode" numbers are the *vs-wc-out-of-box-default* framing (valid as a UX comparison, but wc
+beam-5 is slower AND more accurate, so it's not a pure speed number). **Faithful** half stands: **0.0 % WER
+vs ground truth on jfk (both models)**, ~92 % agreement on real speech (gap = filler/stylistic, proper nouns
+match, zero int8 divergence; franken cleaner where wc loops). The byte-exact **perf frontier is CLOSED**;
+the loop has run to completion — **redirect** to the owner-scoped items below or the correctness decision
+(`FW_RETRY_FAILED_WINDOW`). (tiny.en/turbo TS/word-TS + sjobs headline cells above still carry the
+vs-default numbers — apply the same matched-greedy correction; only the encoder 2.29× is framing-independent.)
 
 **Validation COVERAGE + what's resource-blocked (so the owner knows what to supply to extend it):** the
 numbers above cover **English** speech on the **two real on-box models** — `tiny.en` (74 MB, English-only)
