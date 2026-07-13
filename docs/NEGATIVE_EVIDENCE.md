@@ -20722,3 +20722,17 @@ capped (each verified position still needs the 133 MB/token logits GEMV → R(8)
 a small autonomous increment. Logits-head-shrink (skip always-suppressed vocab rows, e.g. the ~1501
 timestamp tokens in no_ts mode) is sub-floor (~0.36% e2e, mode-specific). So the decode-bound regime, like
 the encode-bound one, has no small byte-exact autonomous lever — the only real lever is owner-scoped.
+
+**Speculation-viability data for the owner (rules out the CHEAPEST speculative-decode path).** Dumped the
+real decode-bound token stream (`PROBE_DUMP_TOKENS=1`, track01, 305 tokens / 5 windows, no build) and
+simulated **prompt-lookup / n-gram speculation** (draft the next token from the most-recent earlier match of
+the current N-gram — the "free" draft that needs NO draft model and NO layer-skip). Result: **non-viable for
+whisper transcription** — single-token hit-rate N=1 **6.4%**, N=2 **1.0%**, N=3 **0.7%**, avg accepted-run
+~1.0-1.7 tok. Real speech does not repeat n-grams (unlike code/structured text where prompt-lookup shines),
+and the carried prior-window prompt is *different* continuous speech, so it adds no repetition. ⇒ **the
+free/cheap speculation approach would yield ≈0 decode speedup here.** So if the owner builds speculative
+decode (the sole decode-bound lever), it MUST use the **layer-skip self-draft** (content-independent — the
+k-layer partial computation correlates with the full model regardless of speech repetition; R(8)≈2.9×
+ceiling per the `FW_DRAFT_ACCEPT_LAYERS` probe [[project_draft_decoding_amortization]]) or a real draft
+model — NOT prompt-lookup. Concrete, cheap, decision-relevant data for the one remaining lever; still
+owner-scoped (needs the draft/verify/KV-rollback loop).
