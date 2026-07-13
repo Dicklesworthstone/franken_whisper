@@ -2038,6 +2038,100 @@ pub struct I8Mat {
     pub inp: usize,
 }
 
+/// AVX2+F16C symmetric int8 quantize of ONE f16 weight row into `out`, returning
+/// the per-row `amax/127` scale. Two vectorized passes via `_mm256_cvtph_ps`
+/// (`vcvtph2ps` — EXACT f16→f32, bit-identical to `Float16::to_f32` for finite
+/// weights, same conversion [`dot_f16c`] relies on): (1) `amax = max_i |w[i]|`,
+/// (2) `out[i] = (w[i]·127/amax).round().clamp(-127,127) as i8` with round-HALF-
+/// AWAY (`trunc(v+copysign(0.5,v))` = `f32::round`) then saturating-pack to i8.
+/// **Byte-identical** to the scalar non-EF loop below (same exact f16→f32, amax is
+/// order-invariant for finite values, same round+clamp) but avoids the software
+/// f16→f32 AND the scalarized `f32::round` — neither of which LLVM autovectorizes
+/// (`project_round_doesnt_vectorize`). Mirrors [`quantize_act_i8_into`]'s pack.
+/// See `quantize_f16_row_to_i8_matches_scalar`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "f16c"
+))]
+#[allow(unsafe_code)]
+fn quantize_f16_row_to_i8_into(w: &[Float16], out: &mut [i8]) -> f32 {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(w.len(), out.len(), "quantize_f16_row_to_i8_into len mismatch");
+    let n = w.len();
+    let wp = w.as_ptr();
+    // SAFETY: avx2+f16c guaranteed by cfg; every 128-bit f16 load is bounded by the
+    // `i+8<=n` / `j+8<=n` guard, the `<8` remainders run scalar. Float16 is
+    // repr(transparent) over u16 so a 128-bit load reads 8 contiguous lanes.
+    unsafe {
+        // pass 1: amax = max over |f16→f32(w[i])| (tree-reduce max == scalar fold
+        // for finite values; abs = clear sign bit, matching f32::abs).
+        let absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let mut m = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_cvtph_ps(_mm_loadu_si128(wp.add(i).cast()));
+            m = _mm256_max_ps(m, _mm256_and_ps(v, absmask));
+            i += 8;
+        }
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), m);
+        let mut amax = tmp.iter().copied().fold(0.0f32, f32::max);
+        while i < n {
+            amax = amax.max(w.get_unchecked(i).to_f32().abs());
+            i += 1;
+        }
+        let scale = amax.max(1e-9) / 127.0;
+        let inv = 1.0 / scale;
+        // pass 2: (f16→f32(w)·inv) round-half-away, clamp ±127, pack to i8.
+        let vinv = _mm256_set1_ps(inv);
+        let half = _mm256_set1_ps(0.5);
+        let signmask = _mm256_set1_ps(-0.0);
+        let c127 = _mm256_set1_ps(127.0);
+        let cm127 = _mm256_set1_ps(-127.0);
+        let mut j = 0;
+        while j + 8 <= n {
+            let v = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(wp.add(j).cast())), vinv);
+            let vh = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, signmask)));
+            let r = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(vh);
+            let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
+            let ri = _mm256_cvtps_epi32(r);
+            let lo = _mm256_castsi256_si128(ri);
+            let hi = _mm256_extracti128_si256::<1>(ri);
+            let i16s = _mm_packs_epi32(lo, hi); // [lo0..3, hi0..3]
+            let i8s = _mm_packs_epi16(i16s, i16s); // low 8 bytes = elems 0..7
+            _mm_storel_epi64(out.as_mut_ptr().add(j) as *mut __m128i, i8s);
+            j += 8;
+        }
+        while j < n {
+            *out.get_unchecked_mut(j) =
+                (w.get_unchecked(j).to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+            j += 1;
+        }
+        scale
+    }
+}
+
+/// Scalar fallback (non-avx2/f16c): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "f16c"
+)))]
+fn quantize_f16_row_to_i8_into(w: &[Float16], out: &mut [i8]) -> f32 {
+    let amax = w
+        .iter()
+        .map(|h| h.to_f32().abs())
+        .fold(0.0f32, f32::max)
+        .max(1e-9);
+    let scale = amax / 127.0;
+    let inv = 1.0 / scale;
+    for (d, h) in out.iter_mut().zip(w) {
+        *d = (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    scale
+}
+
 /// Per-output-row symmetric int8 quantization of a natural `[out, in]` f16
 /// weight: `scale[o] = max_i |w[o,i]| / 127`, `q[o,i] = round(w[o,i]/scale[o])`.
 /// Parallel over rows (each independent). The inverse `w ≈ q * scale` is what
@@ -2052,19 +2146,20 @@ pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
         .enumerate()
         .for_each(|(o, (drow, s))| {
             let wrow = &w[o * inp..(o + 1) * inp];
-            let amax = wrow
-                .iter()
-                .map(|h| h.to_f32().abs())
-                .fold(0.0f32, f32::max)
-                .max(1e-9);
-            let sc = amax / 127.0;
-            *s = sc;
-            let inv = 1.0 / sc;
             if ef {
                 // Error-feedback weight quant (FW_DEC_EF; same scheme as encoder
                 // EF-weights): carry each weight's rounding residual forward along the
                 // contraction dim so the per-row dot has less accumulated quant bias.
                 // Static operand ⇒ stable. Same i8 format/scale ⇒ gemv_i8 kernel unchanged.
+                // SERIAL dependency (err chain) ⇒ not vectorizable; kept scalar.
+                let amax = wrow
+                    .iter()
+                    .map(|h| h.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-9);
+                let sc = amax / 127.0;
+                *s = sc;
+                let inv = 1.0 / sc;
                 let mut err = 0.0f32;
                 for (d, h) in drow.iter_mut().zip(wrow) {
                     let target = h.to_f32() * inv + err;
@@ -2073,9 +2168,9 @@ pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
                     *d = q as i8;
                 }
             } else {
-                for (d, h) in drow.iter_mut().zip(wrow) {
-                    *d = (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
-                }
+                // Default path: AVX2+F16C amax + round (byte-identical to the scalar
+                // non-EF loop). Returns the same `amax/127` scale.
+                *s = quantize_f16_row_to_i8_into(wrow, drow);
             }
         });
     I8Mat {
@@ -5907,6 +6002,114 @@ mod tests {
         }
         eprintln!(
             "quantize_row_i7_u8 [{rows}x{cols}] scalar={:.1}us avx2={:.1}us speedup={:.2}x",
+            best_scalar * 1e6,
+            best_avx2 * 1e6,
+            best_scalar / best_avx2
+        );
+    }
+
+    #[test]
+    fn quantize_f16_row_to_i8_matches_scalar_reference() {
+        // The AVX2+F16C decoder weight-quant helper (amax reduce + round, one row)
+        // must be BIT-identical to the scalar non-EF loop in quantize_f16_to_i8:
+        // exact f16→f32, order-invariant amax, round HALF-AWAY (f32::round), ±127
+        // clamp. Also verify the returned scale matches. Exercise SIMD body + <8 tail.
+        fn scalar(w: &[Float16]) -> (Vec<i8>, f32) {
+            let amax = w
+                .iter()
+                .map(|h| h.to_f32().abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-9);
+            let scale = amax / 127.0;
+            let inv = 1.0 / scale;
+            let q = w
+                .iter()
+                .map(|h| (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8)
+                .collect();
+            (q, scale)
+        }
+        let mut s = 0xD1B5_4A32_D192_ED03u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            Float16::from_f32(((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0)
+        };
+        for &n in &[0usize, 1, 5, 7, 8, 9, 15, 16, 17, 1280, 5120] {
+            let w: Vec<Float16> = (0..n).map(|_| nf()).collect();
+            let mut got = vec![0i8; n];
+            let gs = quantize_f16_row_to_i8_into(&w, &mut got);
+            let (want, ws) = scalar(&w);
+            assert_eq!(got, want, "f16→i8 quant mismatch at n={n}");
+            assert_eq!(gs.to_bits(), ws.to_bits(), "f16→i8 scale mismatch at n={n}");
+        }
+        // Clamp edge: a row whose amax maps other values across the ±127 saturation,
+        // and exact-.5 half-away via f16-representable 0.5/1.5/2.5.
+        let w: Vec<Float16> = [0.5f32, 1.5, 2.5, -0.5, -2.5, 3.0, -3.0, 0.0]
+            .iter()
+            .map(|&v| Float16::from_f32(v))
+            .collect();
+        let mut got = vec![0i8; w.len()];
+        let _ = quantize_f16_row_to_i8_into(&w, &mut got);
+        let (want, _) = scalar(&w);
+        assert_eq!(got, want, "f16→i8 clamp/half-away mismatch");
+    }
+
+    // Single-binary kernel A/B: AVX2+F16C quantize_f16_row_to_i8_into vs the scalar
+    // non-EF loop it replaces, on a real turbo decoder attention-projection shape
+    // ([1280,1280]). Run: cargo test --release --lib quantize_f16_row_to_i8_perf --
+    // --ignored --nocapture
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn quantize_f16_row_to_i8_perf() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let (rows, cols) = (1280usize, 1280usize); // decoder attn projection [out,in]
+        let mut s = 0x14D4_9C2A_7B01_55F1u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            Float16::from_f32(((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0)
+        };
+        let w: Vec<Float16> = (0..rows * cols).map(|_| nf()).collect();
+        let mut out = vec![0i8; rows * cols];
+        let scalar = |wr: &[Float16], o: &mut [i8]| {
+            let amax = wr
+                .iter()
+                .map(|h| h.to_f32().abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-9);
+            let inv = 127.0 / amax;
+            for (d, h) in o.iter_mut().zip(wr) {
+                *d = (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        };
+        let (mut best_scalar, mut best_avx2) = (f64::MAX, f64::MAX);
+        for _ in 0..200 {
+            let t = Instant::now();
+            for r in 0..rows {
+                scalar(
+                    black_box(&w[r * cols..(r + 1) * cols]),
+                    &mut out[r * cols..(r + 1) * cols],
+                );
+            }
+            black_box(&out);
+            let sc = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            for r in 0..rows {
+                let _ = quantize_f16_row_to_i8_into(
+                    black_box(&w[r * cols..(r + 1) * cols]),
+                    &mut out[r * cols..(r + 1) * cols],
+                );
+            }
+            black_box(&out);
+            let av = t.elapsed().as_secs_f64();
+            best_scalar = best_scalar.min(sc);
+            best_avx2 = best_avx2.min(av);
+        }
+        eprintln!(
+            "quantize_f16_row_to_i8 [{rows}x{cols}] scalar={:.1}us avx2={:.1}us speedup={:.2}x",
             best_scalar * 1e6,
             best_avx2 * 1e6,
             best_scalar / best_avx2
