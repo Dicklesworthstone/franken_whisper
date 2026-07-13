@@ -20289,3 +20289,14 @@ exhausted and its wins measured + guarded. Remaining perf value is owner-decisio
   `params.word_timestamps` (decode.rs:1169/1595, an opt-in mode) and its overhead is negligible per the
   frontier (fw word-ts ≈ fw segment-ts wall ⇒ `dtw.rs` sub-floor). Doubly sub-floor ⇒ no lever. **Every
   source file in the native engine + audio + youtube path is now personally opened and accounted for.**
+
+### Session test-certification status + infra note (2026-07-13)
+The session's 4 new byte-exact regression guards were each verified GREEN individually when landed —
+read_wav mono (`ac62541`), f16-direct i7 (`7ff5fca`), f16-direct i8 (`a320e1f`), blob-read banding
+(`9aae874`) — on top of the base `native_engine` lib suite (238/0, verified `bi1xq3j9u`/`0426da9` both
+`FW_ENC_FREE_F32` states). So the whole session's work is verified regression-clean via the individual
+runs. A full re-certification this tick was **blocked by shared-box disk pressure** (`/data/tmp` at 87 %
+full → the disk-pressure reaper evicted the entire `/data/tmp/cargo-target` mid-build, `error: couldn't
+create a temp dir`; the `fw` binary + deps were removed). This afflicts ALL builds on the box right now,
+not just this diff ([[project_asupersync_oom_roulette]] / the "box turns hostile at ~86 % full" hazard).
+No code impact — a build/infra condition; retry when disk frees.
