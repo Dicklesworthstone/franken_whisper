@@ -20832,25 +20832,26 @@ dual-KV-cache + rollback), owner-ticketed bd-wzgh. Full spec = the "OWNER DECISI
 re-point at the content-drop temp-fallback / pause the byte-exact loop.** No small autonomous lever remains.
 
 ### LOOP-STATUS (update-in-place; do NOT append a new entry per tick once converged)
-**NO LONGER just converged — BUILDING the sole lever (speculative decode, per `SPEC_DECODE_PLAN.md`).**
-Phase 1 LANDED: `logits_all` batched verify primitive (decoder.rs) — byte-identical to per-position
-`logits_last` (f32+f16 test), and the amortization microbench measures **8×-separate 26.8 ms → batched
-11.4 ms = 2.36×** (verify reads the 133 MB tied embedding once for K=8 vs 8×). decoder suite 12/0.
-**⚠ CORRECTION: the DRAFT side is BLOCKED — layer-skip self-draft is MEASURED-DEAD (the Whisper decoder is
-only 4 layers; accept 0-1.7% = net slowdown, `project_draft_decoding_amortization`), prompt-lookup dead too,
-and NO draft model is on-box. So spec-decode is OWNER/INFRA-gated (needs a real draft model); the verify
-primitives (`logits_all`, `gemv_i8_batch`) are landable+byte-exact but INERT without a draft. I hit the
-read-memory-first trap — Phase 1 is a valid primitive, but do NOT build the draft/verify LOOP autonomously.**
-— Prior state: CONVERGED @ `571168a`; byte-exact autonomous frontier
-exhausted, 4 wins shipped+certified (full matrix + lib 229/0), sole lever (speculative decode) owner-scoped.
-**Post-convergence ticks re-confirm this terminal state; they EDIT this line (bump the tick / note any
-genuinely-new datapoint), they do NOT append a new dated section — the ledger is the record, not a per-tick
-log.** Re-confirmed across ticks: off-hot-path files (mel/tokenizer/audio/sync) sub-floor; ft kernels
-owner-closed/out-of-scope; decode hot-path composition (mlp/logits/projections/self_attn/cross_attn) 100%
-accounted + every sub-op at byte-exact floor; declined to autonomously build owner-ticketed bd-wzgh
-spec-decode. Awaiting owner scope decision (authorize spec-decode / content-drop temp-fallback / pause).
-Genuinely no small byte-exact autonomous lever remains — do not re-derive; cite the CONSOLIDATED FRONTIER
-MAP + OWNER DECISION BRIEF above.
+**TERMINAL — the turbo-scale campaign is COMPLETE and spec-decode is MEASURED DEAD (updated 2026-07-13, tick set
+13a–13o).** The `distil-large-v3` draft was provisioned + measured (the "supply a real draft model" unblock,
+executed) and spec-decode is **dead with it**: teacher-forced K=1 accept = 54.5% on real speech ⇒ ~0.85× NET
+SLOWDOWN (`examples/spec_accept_probe.rs`, tick 13m); distil is also ~1.5× SLOWER standalone (its shared encoder
+is denied the i8i32 speedup, which isn't WER-neutral through its weak 2-layer decoder, 13n). The verify
+primitives (`logits_all` 2.36×, `gemv_i8_batch`) stay landed-but-inert; the full loop needs a draft that is BOTH
+much cheaper AND ≥~85% token-agreeing — none exists on-box. **The one byte-exact win this campaign: encoder
+residual parallel-add (`e43b50a`, tick 13h) — found by re-testing a tiny.en-scoped "wash" at turbo scale.**
+Everything else re-tested at turbo scale is CLOSED: encoder ~90% external (SDPA/sgemm) + in-tree parts parallel +
+freq-throttle-bound @32t; load fully parallel (`into_par_iter`/`rayon::join`, dequant-caps bandwidth-tuned);
+decode GEMV-DRAM-bound (66 MB/tok logits) with exp/log-softmax/suppression/argmax/cross-attn all sub-floor or
+hidden (FW_SIMD_EXP within-noise even at 250-tok long audio, tick 13o); tokenizer O(1); mel/dtw/orchestration
+sub-floor. Turbo-scale hypotheses LN-workers / prefetch-throttle / distil-i8i32 / exp-scale ALL tested+falsified.
+**Genuinely no small byte-exact autonomous lever remains — do not re-derive (every hot-path file opened, every
+regime measured at turbo scale). Cite the CONSOLIDATED FRONTIER MAP + this line.** The remaining upside is
+OWNER-SCOPED, not autonomously landable as a small byte-exact increment: (1) content-drop temperature-fallback
+(correctness, frontier #1 + perf-measurement-integrity — implementable behind a default-off flag but a
+multi-file decode-strategy change); (2) a stronger+cheaper spec-decode draft (infra); (3) GPU / VNNI hardware
+(int8 barely beats f32 sgemm without VNNI on this Zen3 box); (4) WER-gated default-flip of enc-int8/poly-exp with
+a corpus WER harness. Generic "pick a perf lever" ticks now return only sub-floor or falsified results.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
