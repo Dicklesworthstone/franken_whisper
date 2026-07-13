@@ -20120,3 +20120,13 @@ Fresh code-verification this tick (so future ticks stop re-probing these):
   load/hot path; the sole remaining perf value is the owner flip (fully spec'd above) or a
   fundamentally different area (GPU compute stack, incremental blob streaming) — both outside
   the byte-exact autonomous envelope.**
+
+  **UPDATE (`289108a` + full-gate verify): the flip prerequisite is DONE and GREEN.** The
+  re-derive fix landed (`289108a`, test-only); the FULL memory-stated gate now passes UNDER the
+  flag — `FW_ENC_FREE_F32=1 cargo test --release --lib native_engine` = **238 passed / 0 failed**
+  (8.97 s; default off = 238/0 too, no regression). So flipping `FW_ENC_FREE_F32` default-ON
+  (`mod.rs:345 DEFAULT_ON: false → true`, kill-switch `=0` preserved) is a fully-verified,
+  byte-exact, trivially-reversible one-liner that ships **−2.31 GB peak + ~1.68× weight build**
+  to every release user. Left to the owner (not landed autonomously: shipping-default change,
+  and this loop directive carries no "do NOT defer/hold" go-ahead — the documented trigger to
+  land an owner-gated lever). Everything up to that one line is complete and green.
