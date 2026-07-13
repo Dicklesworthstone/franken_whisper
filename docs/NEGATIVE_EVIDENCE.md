@@ -21043,3 +21043,18 @@ that is BOTH much cheaper AND ~≥85% agreeing — none is on-box. The verify pr
 + the probe remain for a future better draft. LESSON: a word-agreement proxy over-states token-accept badly;
 MEASURE the teacher-forced rate before believing a spec-decode EV (this is why I built the probe rather than
 trusting 89.5%). Correcting `SPEC_DECODE_PLAN` next.
+
+**Tick 2026-07-13n (this loop) — "encoder-int8 calibration is encoder-only" hypothesis FALSIFIED (built + reverted).**
+Noticed distil-large-v3 is ~1.5× SLOWER than turbo on track01 (12.5 s vs 8.1 s) DESPITE a lighter 2-layer decoder,
+because its BYTE-IDENTICAL 32-layer large-v3 encoder is denied the `attn_out` i8i32 speedup: `calibrated_encoder_
+int8_model` = `tiny_en || is_large_v3_turbo`, and `is_large_v3_turbo` pins `n_text_layer == 4` (distil is 2). The
+i8i32 calibration LOOKS encoder-specific, so I broadened it to key on the ENCODER shape (`large_v3_encoder`,
+n_audio_* / n_mels, no n_text_layer). Built; turbo BYTE-UNAFFECTED (jfk md5 32c8f2208d, it always matched) and
+distil dropped **12.5 s → 8.2 s (~1.5×)**. **BUT the WER check FAILED:** distil i8i32-vs-f32 is byte-exact on jfk
+but **DRIFTS 25 words (~10%) on track01** (real speech). ⇒ the encoder-int8 WER-neutrality is NOT encoder-only —
+it depends on the DECODER'S ROBUSTNESS to the encoder's int8 error, and distil's weaker 2-layer decoder AMPLIFIES
+it (turbo's 4-layer absorbs it). So keying the calibration on the FULL model (incl. decoder) is CORRECT, not a
+bug; broadening it default-ON would be a ~10% quality regression on the distil path. Reverted. (distil stays
+f32-encoder = slower-but-exact; that is the right default.) Same jfk-exact-but-corpus-drifts trap as int4/decode-
+int8 — always WER-check on real multi-window speech, never jfk. LESSON: an "int8 is quality-safe" calibration is
+a PROPERTY OF THE WHOLE MODEL (encoder error × decoder robustness), not the encoder alone.
