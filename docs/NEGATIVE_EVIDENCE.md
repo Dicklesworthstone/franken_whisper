@@ -20832,7 +20832,7 @@ dual-KV-cache + rollback), owner-ticketed bd-wzgh. Full spec = the "OWNER DECISI
 re-point at the content-drop temp-fallback / pause the byte-exact loop.** No small autonomous lever remains.
 
 ### LOOP-STATUS (update-in-place; do NOT append a new entry per tick once converged)
-CONVERGED @ `571168a` (2 post-close ticks re-confirmed, latest this edit). Byte-exact autonomous frontier
+CONVERGED @ `571168a` (post-close ticks keep re-confirming; latest bump this edit). Byte-exact autonomous frontier
 exhausted, 4 wins shipped+certified (full matrix + lib 229/0), sole lever (speculative decode) owner-scoped.
 **Post-convergence ticks re-confirm this terminal state; they EDIT this line (bump the tick / note any
 genuinely-new datapoint), they do NOT append a new dated section — the ledger is the record, not a per-tick
