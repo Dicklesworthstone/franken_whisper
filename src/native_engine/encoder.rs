@@ -2072,13 +2072,37 @@ mod tests {
                 "quality-safe policy must not use the rejected all-i7 attn.out path"
             );
 
+            // FW_ENC_FREE_F32 free-safety: re-derive the reference f32 weights from
+            // `model` (byte-identical to `load_linear_transposed` at load) instead of
+            // reading `layer.*_w`, which the runtime FREES under `FW_ENC_FREE_F32=1`
+            // (leaving an empty `Mat` that panics `quant_error`'s shape assert). This
+            // makes the budget assert independent of the free flag — the ONLY blocker
+            // to flipping FW_ENC_FREE_F32 default-ON. The dequant Mats carry the
+            // `[inp, out]` dims (rows=inp, cols=out) ⇒ `load_linear_transposed`
+            // wants `(out, in) = (d.cols, d.rows)`.
+            let ref_f32 = |suffix: &str, d: &Mat| -> Mat {
+                load_linear_transposed(
+                    &model,
+                    &format!("encoder.blocks.{idx}.{suffix}"),
+                    d.cols,
+                    d.rows,
+                )
+                .expect("re-derive reference f32 weight")
+            };
+            let attn_q_w = ref_f32("attn.query.weight", &attn_q);
+            let attn_k_w = ref_f32("attn.key.weight", &attn_k);
+            let attn_v_w = ref_f32("attn.value.weight", &attn_v);
+            let mlp_fc_w = ref_f32("mlp.0.weight", &mlp_fc);
+            let mlp_proj_w = ref_f32("mlp.2.weight", &mlp_proj);
+            let attn_out_w = ref_f32("attn.out.weight", &attn_out);
+
             let max_i7_abs = 0.035;
             let max_i8_abs = 0.012;
             assert_quant_budget(
                 model_name,
                 idx,
                 "attn_q_i7",
-                &layer.attn_q_w,
+                &attn_q_w,
                 &attn_q,
                 decision.quant_rel_rmse_budget,
                 max_i7_abs,
@@ -2087,7 +2111,7 @@ mod tests {
                 model_name,
                 idx,
                 "attn_k_i7",
-                &layer.attn_k_w,
+                &attn_k_w,
                 &attn_k,
                 decision.quant_rel_rmse_budget,
                 max_i7_abs,
@@ -2096,7 +2120,7 @@ mod tests {
                 model_name,
                 idx,
                 "attn_v_i7",
-                &layer.attn_v_w,
+                &attn_v_w,
                 &attn_v,
                 decision.quant_rel_rmse_budget,
                 max_i7_abs,
@@ -2105,7 +2129,7 @@ mod tests {
                 model_name,
                 idx,
                 "mlp_fc_i7",
-                &layer.mlp_fc_w,
+                &mlp_fc_w,
                 &mlp_fc,
                 decision.quant_rel_rmse_budget,
                 max_i7_abs,
@@ -2114,7 +2138,7 @@ mod tests {
                 model_name,
                 idx,
                 "mlp_proj_i7",
-                &layer.mlp_proj_w,
+                &mlp_proj_w,
                 &mlp_proj,
                 decision.quant_rel_rmse_budget,
                 max_i7_abs,
@@ -2123,7 +2147,7 @@ mod tests {
                 model_name,
                 idx,
                 "attn_out_i8",
-                &layer.attn_out_w,
+                &attn_out_w,
                 &attn_out,
                 decision.quant_rel_rmse_budget * 0.55,
                 max_i8_abs,
