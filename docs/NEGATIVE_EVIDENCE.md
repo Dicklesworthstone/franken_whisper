@@ -20944,3 +20944,15 @@ quant pass (`encoder.rs:107,193`). No byte-exact load lever. **NET: the byte-exa
 independently confirmed exhausted AT TURBO SCALE, not just tiny.en.** The loop is UNBLOCKED for future
 owner-gated-lever measurement (enc-int8 e2e now known; poly-exp default-on for turbo; content-drop temp-fallback
 next). See [[project_perf_loop_blocked_single_model]] (now resolved).
+**Tick 2026-07-13g (this loop) — turbo ENCODER sub-op breakdown recorded ⇒ encoder is ~90% EXTERNAL, closing the
+in-tree encoder-lever question at scale.** Default config (enc_int8 OFF), turbo/jfk, `encoder_window` 1440 ms /
+sub-op SUM 1252 ms: **attn_sdpa 42.9%** (536 ms, `ft_kernel_cpu::sdpa_forward_f32`, external), **mlp_proj 18.0%**
+(225 ms), **mlp_fc 17.7%** (221 ms), **attn_out 11.7%** (146 ms) — the three GEMMs (~47%) route through the
+EXTERNAL `ft_kernel_cpu` f32 sgemm (`nn::matmul`→`matmul_into_uninit`), and `attn_out` is ALREADY i8i32 by default
+for turbo (calibrated-model policy, `encoder_int8_policy_decision`). In-tree remainder = conv_stem 2.2% + LN/resid
+~9% (bandwidth-bound) + pos_emb 0.1% — all closed. So ~90% of the encoder is owner-owned external code; there is
+**no in-tree byte-exact encoder lever**. WHY enc_int8 only buys +2% despite GEMMs being 47%: i7 int8 barely beats
+the (well-tuned) external f32 sgemm on CPU **without VNNI** ([[project_isa_baseline]] — VNNI is an unreachable HW
+gap on this Zen3 box); int8's win needs VNNI/GPU. Corrected the `enc_int8_enabled` doc comment (mod.rs) to state
+the +2% e2e reality vs the 1.56–1.58× GEMM microbench. Comment-only, byte-exact. Encoder question CLOSED at turbo
+scale — the only encoder speedups left are external (ft_kernel), GPU, or VNNI hardware (all owner/infra).
