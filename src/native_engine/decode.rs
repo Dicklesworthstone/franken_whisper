@@ -2015,14 +2015,27 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
     let data = data.ok_or_else(|| bad("no data chunk"))?;
     let n_frames = data.len() / (2 * channels);
     let mut out = Vec::with_capacity(n_frames);
-    for f in 0..n_frames {
-        let mut acc = 0i32;
-        for c in 0..channels {
-            let o = (f * channels + c) * 2;
-            let s = i16::from_le_bytes([data[o], data[o + 1]]);
-            acc += i32::from(s);
+    if channels == 1 {
+        // Mono fast path (the whisper input format, so the common case): a plain
+        // i16→f32 map — `s as f32 / 32768.0` — that LLVM autovectorizes (vcvt + mul
+        // by 2⁻¹⁵). The general per-channel accumulation loop below inhibits autovec.
+        // BYTE-IDENTICAL to that loop with `channels == 1`: `acc == i32(s)`, and both
+        // `i32(s) as f32` and `i16 s as f32` give the exact integer (i16 ⊂ f32
+        // mantissa), while `/1.0` is the identity and `/32768.0` (÷2¹⁵) is exact.
+        out.extend(
+            data.chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+        );
+    } else {
+        for f in 0..n_frames {
+            let mut acc = 0i32;
+            for c in 0..channels {
+                let o = (f * channels + c) * 2;
+                let s = i16::from_le_bytes([data[o], data[o + 1]]);
+                acc += i32::from(s);
+            }
+            out.push((acc as f32 / channels as f32) / 32768.0);
         }
-        out.push((acc as f32 / channels as f32) / 32768.0);
     }
     Ok(out)
 }
