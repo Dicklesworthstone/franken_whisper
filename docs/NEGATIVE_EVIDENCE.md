@@ -20140,3 +20140,24 @@ Fresh code-verification this tick (so future ticks stop re-probing these):
   realistic workload, not just a single window. The flip's byte-exactness is now belt-and-braces.
   (Box note: running 4 heavy transcribes in one shell loop kept evicting the `fw` binary under
   disk pressure → false empties; standalone one-at-a-time runs are reliable here.)
+
+## 2026-07-13 - CyanGull the OTHER load-path parallel-decode caps are NOT levers (only the blob read was)
+
+After the blob-read band-cap win (`5fc0707`, `host∧16→32`, −13 ms `model_parse`), I swept the
+remaining hardcoded parallel-decode caps in `ggml.rs` for the same treatment — REJECTED by the
+load STRUCTURE (no build needed; the effect is provably below the ±10 ms run-to-run noise floor):
+- **`dequant_f16_to_halves_parallel` `host∧16`** (ggml.rs:612, f16 bytes → `Vec<Float16>`): its one
+  big consumer is the **66 M-element token embedding** (`load_embedding`), built inside the DECODER
+  weight build. `LoadedModel::from_ggml` runs encoder‖decoder via `rayon::join`, and the encoder
+  build (~180 ms, the per-weight transpose) DOMINATES the decoder build (~102 ms) — so the embedding
+  decode is **hidden behind the encoder critical path**; raising its cap moves `model_weights` by 0
+  in the default config. (Only under `FW_ENC_FREE_F32` does the encoder build shrink, and even then
+  the 132 MB near-memcpy at 16→32 bands is ~1–2 ms — sub-noise.)
+- **`dequant_f16_parallel` `host∧8`** (ggml.rs:644, f16 → f32): reached only by `tensor_f32` for
+  tensors ≥1 M elems, i.e. **conv2 (~10 MB) + pos_emb (~8 MB)** on the encoder critical path. Those
+  are ~1–2 orders of magnitude smaller than the 1.5 GB blob; 8→32 bands saves <1 ms — sub-noise.
+- Why the blob read WAS a lever and these are not: `read_blob_parallel` is a **1.5 GB serial-critical
+  prerequisite BEFORE** the parallel builds; the per-tensor decodes are **inside** the parallel builds
+  (hidden or tiny). **Net: the load path is now genuinely near floor** — blob read tuned to the
+  bandwidth knee (~24–32 bands), the big encoder transpose eliminable only via the gated f16-direct
+  path, per-tensor decodes hidden/tiny. Don't sweep these caps again.
