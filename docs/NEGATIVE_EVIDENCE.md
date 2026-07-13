@@ -20851,3 +20851,14 @@ accounted + every sub-op at byte-exact floor; declined to autonomously build own
 spec-decode. Awaiting owner scope decision (authorize spec-decode / content-drop temp-fallback / pause).
 Genuinely no small byte-exact autonomous lever remains — do not re-derive; cite the CONSOLIDATED FRONTIER
 MAP + OWNER DECISION BRIEF above.
+**Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
+scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
+(124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
+clean (both deterministic). (1) **Non-byte-exact** — transcript DRIFTS materially (e.g. "ranking this stuff"
+→ "ranking and stuff like the video ranker"), so `8ca4378`'s "int4 fc1 is transcript byte-exact (GELU absorbs
+4-bit)" holds jfk-single-window ONLY; the 4-bit error escapes GELU on ambiguous speech + compounds via the
+carried prompt. (2) **Perf REGRESSION** (not just `60eb294`'s microbench wash): `decode_loop` summed over 5
+windows +6% SLOWER int4-on (off ~723 ms vs on ~769 ms, alternating A/B, rep-1 discarded) — nibble-unpack cost
+> halved-bandwidth gain, decode is dispatch/latency-bound. int4-fc1 is now dead on BOTH axes; doc comment on
+`int4_mlp0_enabled` corrected to say so. Reinforces "jfk-identical ≠ corpus-neutral" — validate flags on
+multi-window real audio, not just jfk.
