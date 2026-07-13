@@ -20884,6 +20884,24 @@ self+cross attention = ~22% of decode, both byte-exact-CLOSED (reduction-order c
 13p (dot_i8 2-acc sufficient) + 13q (gemv sign-extend amortize wash), the ENTIRE decode loop (GEMVs ~77% +
 attention ~22%) is at the byte-exact floor. Remaining decode speedup needs non-byte-exact (SIMD score-dot / fmadd
 axpy, owner WER-gate) or off-CPU.
+**Tick 2026-07-13s (fresh-context loop) — PREFILL (the map's one uncharacterized sized line, ~5.6% long-audio
+e2e) confirmed at floor by READING (verify-before-building, no build wasted); + corpus-WER harness = INFRA-gated.**
+Per [[feedback_closed_means_pivot_not_stop]] I pivoted to the least-audited sized region the CONSOLIDATED
+FRONTIER MAP only summarized: prefill (the initial batched `forward_step` over the carried prompt, `tq>1`, which
+grows 4× windows 2-4 vs window-1). Read `decoder.rs:269/308`, `mod.rs:300/775-785`, `nn.rs:2667/3441-3447`:
+prefill is ALREADY deliberately tuned — int8-batched projections via `gemv_i8_batch` (4-col landed,
+[[project_i8_batch_4col_landed]]) with the MLP kept on the **f16 batch path BY DESIGN** (flipping it to int8 is
+an explicit WER-gated owner call, `mod.rs:785`: "Changes prefill numerics f16→int8, so gated"), and the batched
+worker-count is measured-tuned (16 vs 8 = 1.50×, `nn.rs:3446`). So prefill is byte-exact-floor / owner-WER-gated,
+NOT a fresh autonomous lever. Separately probed the ledger's stated remaining class — WER-gated default-flips
+(enc-int8, poly-exp, int8-prefill, wav-passthrough) blocked only for lack of a corpus WER harness: the on-box
+`legacy_whispercpp/whisper.cpp/tests/librispeech/` is EVAL-SCAFFOLDING ONLY (eval.py + normalizers + Makefile);
+`.gitignore` excludes `LibriSpeech/` + reference `*.txt` ⇒ **no labeled corpus audio on-box, so a real WER
+harness is INFRA-gated** (needs the LibriSpeech download). Working tree this turn had ZERO `.rs` source edits
+(pure `.beads`/Cargo.lock orchestrator churn) — nothing to commit/stash from source. NET: every autonomous
+avenue checked freshly this turn is at byte-exact floor or owner/infra-gated — TERMINAL re-confirmed with new
+datapoints, not re-derivation. Cite the CONSOLIDATED FRONTIER MAP + the OWNER DECISION BRIEF; no small
+autonomous byte-exact lever remains.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
