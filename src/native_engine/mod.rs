@@ -336,18 +336,24 @@ pub(crate) fn enc_int8_enabled() -> bool {
 /// ([`encoder::enc_linear`] reads the f32 `w_t` **only** when the i7 field is
 /// `None`), so once a linear is quantized its f32 copy is dead weight — ~2.5 GB
 /// of steady-state RSS on turbo (78 MiB/layer × 32). Freeing it is **byte-exact**
-/// (the forward never reads a freed weight). `FW_ENC_FREE_F32`, **default OFF**
-/// (opt-in) so the shipped behavior is byte-for-byte unchanged; the freed-vs-kept
-/// A/B must be transcript-identical. NOT applied when the weight-roundtrip harness
-/// is active (it rewrites the f32 in place) nor on macOS (the GPU encode stack
-/// reads the f32 weights) — see the `from_ggml` guard.
+/// (the forward never reads a freed weight) and load-time frees the f32 quant
+/// source too, so the ~2.5 GB is never first-touched: MEASURED on turbo/jfk
+/// −46% peak RSS (5.29→2.83 GB) AND **−12% single-shot wall** (2.77→2.43 s) via
+/// −610 k page faults (1.77→1.16 M) — the retained f32 was pure page-fault tax.
+/// `FW_ENC_FREE_F32`, **default ON** (kill-switch: `FW_ENC_FREE_F32=0` restores the
+/// retained-f32 behavior byte-for-byte). Freeing is per-linear conditional on that
+/// linear having an i7/i8 copy (an un-quantized linear keeps its f32 regardless),
+/// and is NOT applied when the weight-roundtrip harness is active (it rewrites the
+/// f32 in place) nor on macOS (the GPU encode stack reads the f32) — see the
+/// `from_ggml` guard. Transcript verified byte-identical off-vs-on (turbo/jfk).
 pub(crate) fn enc_free_f32() -> bool {
-    const DEFAULT_ON: bool = false;
+    const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("FW_ENC_FREE_F32") {
-        Ok(v) => matches!(
+        // Kill-switch: explicit 0/off/false/no restores the retained-f32 behavior.
+        Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
+            "0" | "off" | "false" | "no"
         ),
         Err(_) => DEFAULT_ON,
     })
