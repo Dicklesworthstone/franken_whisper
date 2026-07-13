@@ -20809,3 +20809,24 @@ in per-run metadata (run_id, decision_id, elapsed_ms/service_ms, temp `path`/`no
 BYTE-IDENTICAL** (both 26320 B). So the shipped flip is now byte-exact-verified across the FULL matrix:
 **{turbo, tiny.en} × {single-window, 5-window + tiled} × {no_ts, timestamps}.** Mode-axis coverage closed;
 the session's default-on wins are comprehensively certified. No new lever.
+
+## 2026-07-13 (GoldenOwl) — SESSION CLOSE (30-sec summary for the owner)
+
+**Shipped (4 byte-exact, default-on, cert-green wins):** AVX2 encoder act-quant `26feafd`; AVX2+F16C decoder
+weight-quant `3e7f295`+`991df99`; `FW_ENC_FREE_F32` flip `78ba068`. **Effect:** single-shot turbo/jfk ~10%
+e2e; peak RSS −46% (all workloads, both models); the −14% wall is single-shot-only (long-audio load is
+amortized → the flip is a MEMORY win there, the realistic wall gain is the quant compute wins).
+**Verified:** full `native_engine` lib 229/0; transcript+timestamp byte-identical across {turbo, tiny.en} ×
+{single, 5-window+tiled} × {no_ts, TS}.
+
+**Frontier: byte-exact autonomous surface EXHAUSTED in BOTH regimes** (encode-bound short clips; decode-bound
+long audio = 62.5%). Full region map = the "CONSOLIDATED FRONTIER MAP" entry above (`c0f31e9`). Every hot
+region owner-closed / external (ft SDPA) / bandwidth-bound / EF-serial. Dead-ends closed this session
+(don't retry): decoder-weight-free (glibc retains), allocator swap (regresses), encoder-amax-preconvert
+(to_f32 autovecs), decode-alloc pooling, prompt-lookup speculation (0.7-6.4% on real speech).
+
+**The ONE remaining perf lever = speculative decode** (decode-bound realistic workload, byte-exact
+greedy-verify, ~1.5-1.8× e2e). It is OWNER-SCOPED: monolithic (layer-skip draft + logits-doubling +
+dual-KV-cache + rollback), owner-ticketed bd-wzgh. Full spec = the "OWNER DECISION BRIEF" entry above
+(`4d8fd85`). **Owner: authorize it (I'll build layer-skip behind a default-off flag, byte-exact verified) /
+re-point at the content-drop temp-fallback / pause the byte-exact loop.** No small autonomous lever remains.
