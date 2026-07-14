@@ -593,9 +593,12 @@ impl WindowManager {
 
     /// Look up a window mutably by its id.
     pub fn get_window_mut(&mut self, window_id: u64) -> Option<&mut WindowState> {
+        // `create_window` assigns IDs in append order, and windows are never
+        // removed or reordered, so a valid ID is its stable vector index.
+        let index = usize::try_from(window_id).ok()?;
         self.windows
-            .iter_mut()
-            .find(|ws| ws.window.window_id == window_id)
+            .get_mut(index)
+            .filter(|ws| ws.window.window_id == window_id)
     }
 
     /// Merge segments from all resolved windows into a single sorted,
@@ -1434,6 +1437,245 @@ mod tests {
             confidence,
             speaker: None,
         }
+    }
+
+    fn get_window_mut_historical(
+        manager: &mut WindowManager,
+        window_id: u64,
+    ) -> Option<&mut WindowState> {
+        manager
+            .windows
+            .iter_mut()
+            .find(|state| state.window.window_id == window_id)
+    }
+
+    fn window_mut_direct_index_fixture(window_count: usize) -> WindowManager {
+        let mut manager = WindowManager::new("direct-index-run", 3_000, 500);
+        for index in 0..window_count {
+            let position_ms = u64::try_from(index).expect("fixture index fits u64") * 2_500;
+            manager.next_window(position_ms, &format!("audio-{index:04}"));
+        }
+        manager
+    }
+
+    #[test]
+    fn window_mut_direct_index_matches_historical() {
+        const WINDOW_COUNT: usize = 1_024;
+        let mut historical = window_mut_direct_index_fixture(WINDOW_COUNT);
+        let mut candidate = window_mut_direct_index_fixture(WINDOW_COUNT);
+
+        for window_id in 0..WINDOW_COUNT as u64 {
+            let historical_bytes = get_window_mut_historical(&mut historical, window_id)
+                .map(|state| serde_json::to_vec(state).expect("serialize historical state"));
+            let candidate_bytes = candidate
+                .get_window_mut(window_id)
+                .map(|state| serde_json::to_vec(state).expect("serialize candidate state"));
+            assert_eq!(
+                candidate_bytes, historical_bytes,
+                "lookup mismatch for window {window_id}"
+            );
+        }
+
+        for window_id in [WINDOW_COUNT as u64, u64::MAX] {
+            assert!(get_window_mut_historical(&mut historical, window_id).is_none());
+            assert!(candidate.get_window_mut(window_id).is_none());
+        }
+
+        for (window_id, status) in [
+            (0, WindowStatus::FastInProgress),
+            (511, WindowStatus::FastComplete),
+            (1_023, WindowStatus::Resolved),
+        ] {
+            get_window_mut_historical(&mut historical, window_id)
+                .expect("historical fixture window")
+                .status = status;
+            candidate
+                .get_window_mut(window_id)
+                .expect("candidate fixture window")
+                .status = status;
+        }
+        assert_eq!(
+            serde_json::to_vec(&candidate.windows).expect("serialize candidate windows"),
+            serde_json::to_vec(&historical.windows).expect("serialize historical windows"),
+            "complete post-mutation window state"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn window_mut_direct_index_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const WINDOW_COUNT: usize = 1_024;
+        const TARGET_WINDOW_ID: u64 = WINDOW_COUNT as u64 - 1;
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 2;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        fn time_historical(manager: &mut WindowManager, window_id: u64, iterations: usize) -> u128 {
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..iterations {
+                let state =
+                    get_window_mut_historical(black_box(&mut *manager), black_box(window_id))
+                        .expect("historical target window");
+                checksum = checksum.wrapping_add(black_box(state.window.end_ms));
+            }
+            black_box(checksum);
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(manager: &mut WindowManager, window_id: u64, iterations: usize) -> u128 {
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..iterations {
+                let state = black_box(&mut *manager)
+                    .get_window_mut(black_box(window_id))
+                    .expect("candidate target window");
+                checksum = checksum.wrapping_add(black_box(state.window.end_ms));
+            }
+            black_box(checksum);
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let mut historical = window_mut_direct_index_fixture(WINDOW_COUNT);
+        let mut candidate = window_mut_direct_index_fixture(WINDOW_COUNT);
+        let historical_bytes =
+            serde_json::to_vec(&historical.windows).expect("serialize historical fixture");
+        let candidate_bytes =
+            serde_json::to_vec(&candidate.windows).expect("serialize candidate fixture");
+        assert_eq!(candidate_bytes, historical_bytes, "exact fixture bytes");
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "window_mut_direct_index binary_sha256={:x} state_bytes={} state_sha256={:x} windows={} target_window_id={} advance_ms=2500",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            WINDOW_COUNT,
+            TARGET_WINDOW_ID
+        );
+
+        let historical_calibration =
+            time_historical(&mut historical, TARGET_WINDOW_ID, CALIBRATION_ITERATIONS);
+        let candidate_calibration =
+            time_candidate(&mut candidate, TARGET_WINDOW_ID, CALIBRATION_ITERATIONS);
+        let historical_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / historical_calibration.max(1))
+        .clamp(1, 16_777_216) as usize;
+        let candidate_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / candidate_calibration.max(1))
+        .clamp(1, 16_777_216) as usize;
+        eprintln!(
+            "window_mut_direct_index calibration_iterations={CALIBRATION_ITERATIONS} historical_calibration_ns={historical_calibration} candidate_calibration_ns={candidate_calibration} historical_iterations={historical_iterations} candidate_iterations={candidate_iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(
+                &mut historical,
+                TARGET_WINDOW_ID,
+                historical_iterations,
+            ));
+            black_box(time_candidate(
+                &mut candidate,
+                TARGET_WINDOW_ID,
+                candidate_iterations,
+            ));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first =
+                time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations);
+            let null_second =
+                time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical_time, candidate_time) = if sample % 2 == 0 {
+                (
+                    time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations),
+                    time_candidate(&mut candidate, TARGET_WINDOW_ID, candidate_iterations),
+                )
+            } else {
+                let candidate_time =
+                    time_candidate(&mut candidate, TARGET_WINDOW_ID, candidate_iterations);
+                let historical_time =
+                    time_historical(&mut historical, TARGET_WINDOW_ID, historical_iterations);
+                (historical_time, candidate_time)
+            };
+            historical_times.push(historical_time);
+            candidate_times.push(candidate_time);
+            speedups.push(
+                (historical_time as f64 / historical_iterations as f64)
+                    / (candidate_time as f64 / candidate_iterations as f64),
+            );
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "window_mut_direct_index samples={SAMPLES} historical_iterations={historical_iterations} candidate_iterations={candidate_iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_per_lookup_median_ns={} candidate_per_lookup_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times) / historical_iterations as u128,
+            median_ns(&candidate_times) / candidate_iterations as u128,
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "window_mut_direct_index null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
     }
 
     fn levenshtein_historical(a: &str, b: &str) -> usize {

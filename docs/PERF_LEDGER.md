@@ -51,6 +51,61 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (state-byte exact): directly index append-only mutable streaming windows — **637.612513x newest-window lookup median**
+
+**What.** Each speculative window receives fast-result, quality-result, and
+resolve updates. All three called `WindowManager::get_window_mut`, which linearly
+scanned every retained window even though `create_window` assigns IDs from zero
+in strict append order and the vector is never removed from or reordered. A
+valid ID is therefore its stable vector index. Mutable lookup now converts the
+ID to `usize`, performs one checked `get_mut`, and verifies the stored ID. This
+changes the three per-window routing lookups from O(n) to O(1). The immutable
+accessor and every state transition are unchanged. Negative-ledger-first search
+found no prior lookup/index row or source attempt. Opportunity score:
+`(impact 4 x confidence 5) / effort 1 = 20`.
+
+**Exactness.** The same release-perf binary compared serialized `WindowState`
+bytes from the historical scan and candidate lookup for all 1,024 valid IDs,
+then verified both rejected IDs `1024` and `u64::MAX`. It also mutated the first,
+middle, and newest windows through both accessors and compared the entire
+199,731-byte state vector. Ordering, state values, floating-point fields, and
+strings matched exactly. Fixture SHA256:
+`28b25ac291ba5d8a0c3a1acef438e70119598c360e084d5483445b263a133ee2`.
+
+| comparison | p10 | median | p90 | normalized per-lookup medians | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.904871 | **0.992324** | **1.068548** | — | — | — | valid null |
+| linear newest-ID scan / checked direct index | **547.007934x** | **637.612513x** | 776.996694x | ~600.8 ns / ~0.95 ns | 13.77% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+BASE/BASE ratios:
+`[0.898239, 1.041168, 0.840166, 0.953237, 0.949931, 0.904871,
+1.023590, 1.008319, 1.095808, 1.074405, 0.984594, 0.992771,
+0.992324, 1.056900, 0.990992, 0.913398, 1.057705, 1.068548,
+1.006596, 0.961099, 0.916227]`.
+
+Historical/candidate normalized per-lookup ratios:
+`[708.716625, 547.007934, 641.223571, 777.904226, 510.257313,
+672.774561, 627.547190, 680.250449, 602.550486, 747.396944,
+483.338987, 776.996694, 762.387797, 990.888076, 587.004551,
+637.612513, 604.405542, 596.294532, 660.491086, 602.890059,
+567.372291]`.
+
+**Reproduction.** One fail-closed foreground invocation ran both arms:
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 env -u CARGO_TARGET_DIR rch --no-self-healing exec -- cargo test --config profile.release-perf.lto=false --config profile.release-perf.codegen-units=16 --profile release-perf -p franken_whisper --lib window_mut_direct_index -- --include-ignored --nocapture`.
+Worker `vmi1227854`; job `j-29928833041828222`; benchmark-binary SHA256
+`8c37e3833f3a465c8c56d068bc2cff51d6c9b588bf1826aa1ee6389250562ef0`;
+2/2 filtered tests passed. Historical and candidate arms used 6,392 and 153,609
+lookups respectively, with ratios normalized per lookup. The two-call cold
+calibration underfilled the nominal 50-ms target for this sub-nanosecond
+candidate, but the 21-sample null median remained admissible and the conservative
+candidate p10 exceeded the null p90 by more than 500x.
+
+**Scope.** The fixture targets window 1,023 after 2,500-ms advances, equivalent
+to the newest-window routing shape after roughly 42.7 minutes of retained
+streaming state. This is a direct lookup-component result, not end-to-end ASR
+latency; absolute savings scale linearly with retained window count and remain
+small beside model inference for short sessions.
+
 ### 2026-07-14 UTC — Codex — LANDED (drift-byte exact): reuse zero character distance to skip unchanged-transcript word DP — **27.907895x confirmation-drift median**
 
 **What.** `CorrectionDrift::compute` always computes character edit distance
