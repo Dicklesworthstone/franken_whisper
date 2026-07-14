@@ -4,6 +4,69 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **REJECT / NO-SHIP — same-binary i7 row-block coarsening is 0.879877x median; the reopened substrate ambiguity is closed and source is restored.**
+
+**Negative-ledger-first target and attribution.** Bead
+`bd-i7-rows-gated-and-substrate-invalid-o0bu` correctly reopened the old
+`FW_I7_ROWBLOCK_MIN_LEN=8` rejection because its historical and candidate arms
+ran in separate RCH invocations. The full-transcription profile already attached
+to that bead attributes 43.717% of self-time to the encoder i7/int8 family and
+14.34% directly to the `matmul_bias_i7_quantized` Rayon body. This rerun therefore
+targeted that profiled wrapper, not another speculative dot tile. Opportunity
+score was `(impact 4 x confidence 4) / effort 2 = 8`.
+
+**One lever and behavior proof.** A test-only runtime selector changed only
+Rayon's minimum split length for the existing 375 four-row blocks: historical
+`with_min_len(1)` versus candidate `with_min_len(8)`. Both arms shared the same
+atomic selector load, iterator adapter, allocation, M4xN4/M4xN2 dot kernels,
+dequantization, bias, and stores. `with_min_len(1)` is Rayon's default minimum and
+therefore preserves the historical splitting constraint. The same binary compared
+all 1,920,000 f32 outputs from a `1500x1280 -> 1280` projection bit-for-bit. They
+matched; the little-endian `to_bits()` stream had SHA-256
+`6803c12d6951697f1744d73b331e1ea6800709a1d3927b3afd6e92f4a5bc0499`.
+
+**Strict-remote foreground proof.** The sole benchmark command was
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch
+--no-self-healing exec -- cargo test --profile release --lib
+native_engine::nn::tests::i7_rowblock_min_len_perf -- --ignored --exact
+--nocapture --test-threads=1`. RCH job `j-29928833041828385` ran only on
+`vmi1227854`; no local fallback occurred. The requested worker pool again reported
+a cache miss, so the allowed release build took 15m30s. Benchmark-binary SHA-256
+was `fb3e37481f60e83a6c17927c22e52e60f94b71137a2a56875bb02bd08664c321`.
+The timed region used an isolated eight-thread Rayon pool, two complete
+projections per arm, three warmups, 21 alternating historical/historical null
+pairs, and 21 alternating historical/coarsened pairs.
+
+The null median passed the predeclared `[0.95, 1.05]` guard. Candidate p10 failed
+to clear both null p90 and the 1.05 floor, the candidate median regressed by about
+12%, and the candidate won only 4/21 pairs.
+
+| comparison | p10 | median | p90 | arm medians / 2 projections | wins | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| min-length 1 / min-length 1 null | 0.735093 | **0.977603** | **1.106995** | — | — | valid median, wide envelope |
+| min-length 1 / min-length 8 | **0.747692x** | **0.879877x** | 1.161498x | 9,118,325 ns / 10,246,376 ns | **4/21** | **reject: candidate materially slower** |
+
+BASE/BASE ratios:
+`[0.881531, 0.942630, 0.811814, 0.719066, 1.106995, 0.527764,
+0.948274, 0.911777, 0.977603, 0.925508, 0.990561, 1.108219,
+1.159223, 0.735093, 1.075375, 1.000159, 0.997932, 1.012996,
+1.077470, 0.858079, 1.018026]`.
+
+Historical/coarsened ratios:
+`[0.891548, 0.822006, 0.747436, 1.181005, 1.161498, 0.879087,
+1.045288, 0.740445, 0.871202, 0.879877, 0.856775, 0.882699,
+0.815748, 0.916062, 0.909969, 0.931064, 0.876221, 1.255765,
+0.747692, 0.951907, 0.814352]`.
+
+**Verdict.** This same-binary, one-invocation result supplies the missing
+admissible evidence: coarsening the existing four-row i7 traversal reduces useful
+load balance and is a no-ship. The production source and temporary selector/oracle
+were restored manually; only this row remains. Do not retry minimum split lengths,
+`with_min_len`, or equivalent row-block batching on this kernel. The bead's
+separate bias-specialization half remains open until it receives its own
+same-binary null-controlled rerun.
+
+---
 ## 2026-07-14 - Codex: **REJECT / NO-SHIP — four-entry inline speculative event storage removed the first `Vec` allocation but measured 1.002796x median; source restored.**
 
 **Negative-ledger-first target and attribution.** For a current one-window
