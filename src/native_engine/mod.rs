@@ -368,6 +368,25 @@ pub(crate) fn enc_free_f32() -> bool {
     })
 }
 
+/// Optional cap on how many encoder layers are loaded+quantized concurrently
+/// (`FW_LOAD_WORKERS=<N>`). Unset (default) = uncapped: the layer load fans
+/// across the full rayon pool exactly as before (byte-identical). A small `N`
+/// bounds the transient per-linear buffers held live during the parallel load
+/// — most useful with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14), where each in-flight
+/// linear is an *owned* pread buffer: fewer concurrent loaders → lower peak RSS,
+/// traded against a longer `model_weights` phase. Byte-exact for any `N` (thread
+/// count never changes the quantized output — same isomorphism as the layer
+/// `into_par_iter` itself). `0` / non-numeric = uncapped.
+pub(crate) fn load_worker_cap() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FW_LOAD_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+    })
+}
+
 /// Whether to run ONLY the ENCODER MLP up-projection (`mlp.0`/fc1, feeding GELU) through the
 /// maddubs i7 int8 GEMM, leaving attention (q/k/v/out) and fc2/`mlp.2` on f32 sgemm.
 /// `FW_ENC_INT8_FC1`, **default OFF = f32 = byte-identical**.
