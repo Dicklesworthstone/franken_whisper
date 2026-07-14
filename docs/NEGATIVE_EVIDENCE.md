@@ -4,6 +4,63 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **HOLD / NO-SHIP — single-clone fast-partial fan-out measured 1.493683x median, but its 1.082879x p10 stayed inside a wide BASE/BASE envelope; source restored.**
+
+**Negative-ledger-first target.** After the landed speculative bridge ownership
+transfer, each window still constructed equivalent `PartialTranscript` values for
+the correction tracker and window manager by deep-cloning the original fast segment
+vector twice. Existing rows covered the upstream bridge holders and a terminal event
+log handoff, not this partial-state fan-out. The candidate constructed one partial,
+cloned it once for the tracker, and moved the original into window state. Event
+payload bytes/order, partial fields/status, tracker statistics, and final window
+state were unchanged. Opportunity score was `(impact 3 x confidence 5) / effort 1 =
+15`.
+
+**Behavior proof.** The same release-perf binary compared a test-local mirror of
+the historical fan-out with the production candidate across empty, singleton, and
+12-segment inputs, with events both enabled and disabled. Normalized complete state
+bytes matched, including tracker and window partials, status, latency totals, event
+payload/order, nullable timestamps/confidence/speaker, negative zero, newlines, and
+Unicode. The timed no-event fixture contained 12 segments and serialized to 4,714
+bytes with SHA-256
+`955a23f38c359afca547acf1d212a331bb86a79cafd798ea36918f20c1bffb7c`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041828177` ran only on
+worker `vmi1227854` with `RCH_REQUIRE_REMOTE=1`, `--profile release-perf`, LTO
+disabled, and 16 codegen units; no local Cargo fallback occurred. Benchmark-binary
+SHA-256 was
+`39ca186425d9070ce7b6795d2e6ef33c2336f67e25686996234a2be28cd21949`.
+The focused `emit_events=false` boundary performed 4,096 complete fast-partial
+fan-outs per arm. After three warmups, the same binary ran 21 alternating
+historical/historical null pairs and 21 alternating historical/single-clone pairs.
+The null median passed `[0.95, 1.05]`, but null p90 reached `1.282071`; candidate p10
+was only `1.082879`, two candidate pairs regressed, and candidate CV was 41.59%.
+
+| comparison | p10 | median | p90 | arm medians / 4,096 fan-outs | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.884852 | **1.034956** | **1.282071** | — | — | — | valid median, wide envelope |
+| two deep clones / one clone plus move | **1.082879x** | **1.493683x** | 1.621409x | 9,983,284 ns / 7,065,423 ns | **41.59%** | 19/21 | **no-ship: p10 below null p90 and 1.10 floor** |
+
+BASE/BASE ratios:
+`[0.944446, 1.005239, 0.739892, 1.198123, 1.006644, 0.987612,
+0.884852, 0.752380, 1.154507, 1.282071, 1.015962, 1.068856,
+0.983946, 1.034956, 1.458147, 1.101036, 1.244989, 1.056734,
+0.954310, 1.406005, 1.132788]`.
+
+Historical/single-clone ratios:
+`[1.389622, 1.850475, 1.531804, 1.560348, 1.479492, 1.621409,
+1.149320, 1.520139, 1.322065, 0.881724, 1.536522, 1.289484,
+1.422801, 1.324551, 1.536051, 1.493683, 1.553609, 1.082879,
+1.756214, 0.482792, 1.543057]`.
+
+**Verdict.** The median supports the ownership hypothesis, but the conservative
+tail does not separate from either the measured null envelope or the 1.10 practical
+floor. The production helper, oracle, and benchmark were restored manually; only
+this row remains. Do not retry this exact 12-segment no-event fan-out based on the
+median. Reopen only with allocator-stabilized proof or attributed end-to-end
+speculative-stream evidence.
+
+---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — direct pre-sized speculative segment aggregation measured 1.126518x median, but its 1.047070x p10 missed the predeclared 1.10 floor; source restored.**
 
 **Negative-ledger-first target.** `WindowManager::merge_segments` cloned each
