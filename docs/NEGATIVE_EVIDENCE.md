@@ -4,6 +4,85 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **HOLD / NO-SHIP — allocation-free SRT/VTT timestamp display showed ~1.29x medians, but VTT did not clear its same-binary null envelope; source restored.**
+
+**Negative-ledger-first target.** `write_srt` and `write_vtt` called their timestamp
+formatters twice per emitted segment; each formatter allocated a short `String` that
+was immediately written and dropped. Adjacent ledger closures covered buffered
+subtitle output and allocation-free CSV quoting, but not timestamp formatting. The
+candidate returned a small `Display` wrapper holding the pre-rounded millisecond
+count, so the existing `writeln!` calls formatted each timestamp directly into the
+buffered writer. Opportunity score was `(impact 3 x confidence 4) / effort 1 = 12`.
+
+**Behavior proof.** The same test binary required exact string equality with the
+historical formatter for negative values, signed zero, sub-millisecond and rollover
+boundaries, ordinary values, very large hours, NaN, and both infinities. This
+preserved the exact `(seconds * 1000.0).round() as u64` cast behavior, zero padding,
+and SRT/VTT separator choice. Before timing, complete 32-segment SRT and VTT
+artifacts also matched byte-for-byte. The SRT artifact was 3,127 bytes with SHA-256
+`73fbc10e0ab9f403923f809fecd37a9ba495513168a0354ae1ef2c3473edec06`;
+the VTT artifact was 3,048 bytes with SHA-256
+`6ceff0f58a2e2e64e1126ef62bfa1438f00e911aad1d892e13adc1455f9de48a`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041827971` ran on worker
+`vmi1227854` with `--profile release-perf`, LTO disabled, and 16 codegen units; no
+local fallback occurred. Benchmark-binary SHA-256 was
+`958cfcb78ab89cda0653a8464c26001e0d10a414331f4edec0838f11de2f80ec`.
+Each format used three warmups, 21 alternating historical/historical null pairs,
+and 21 alternating historical/candidate pairs, with arms calibrated to about 50 ms.
+The predeclared gate required a null median in `[0.95, 1.05]`, candidate p10 above
+`max(null p90, 1.05)`, and at least 18/21 wins for **both** formats.
+
+| format | iterations | BASE/BASE p10 / median / p90 | historical/candidate p10 / median / p90 | historical / candidate median ns | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| SRT | 3,690 | 0.914340 / 1.009592 / 1.072787 | **1.087039 / 1.291581x / 1.633835** | 39,556,656 / 30,231,852 | 13.30% | 20/21 | passes format-local gate |
+| VTT | 4,120 | 0.977439 / 1.017094 / **1.264164** | **1.143138 / 1.296222x / 1.620132** | 47,104,588 / 36,593,136 | 16.48% | 20/21 | **no-ship: candidate p10 below null p90** |
+
+Raw SRT BASE/BASE ratios:
+`[0.9143404449417801, 1.0184600756937296, 0.8812406234608674,
+1.0360715157205131, 0.983679719497423, 1.0727868868438721,
+1.0149062919592524, 0.9324284418397027, 0.9452546745560383,
+1.0235730341507556, 0.9885862200198546, 1.0324362734488564,
+0.8633500443599569, 1.009591830068175, 0.9658720776021053,
+1.1632720416984597, 1.0308485208092724, 1.057711614924823,
+0.9698307780797926, 1.4171138761965265, 0.9720766155890074]`.
+
+Raw SRT candidate ratios:
+`[1.1298590715543315, 0.964032839560317, 1.2182390415821227,
+1.310269678483475, 1.3213962712698935, 1.1170901738738783,
+1.0870386494931679, 1.54457026137736, 1.291581265933218,
+1.2594723264455685, 1.4032005829203227, 1.0310456855142927,
+1.3021883689779965, 1.2531478873915205, 1.2144473868678083,
+1.633835350134864, 1.6954346831019365, 1.306454534193004,
+1.8062865400739023, 1.3541933423710353, 1.2564075942752786]`.
+
+Raw VTT BASE/BASE ratios:
+`[1.150438850902608, 0.8637806462630465, 1.1353124177456915,
+1.0343894814846637, 1.1989683308847967, 1.07419622858352,
+1.2717272351236668, 1.1908828121766553, 1.0501643068639939,
+0.9918146521948014, 1.0054164753329229, 0.9919739838303985,
+1.0055280573428256, 1.017093677927774, 0.992442069989474,
+0.977439346847778, 1.0082282926933843, 1.0141873718938363,
+0.8768318529345497, 1.3777159271964907, 1.2641642285791748]`.
+
+Raw VTT candidate ratios:
+`[1.2208991435704177, 1.620131843367597, 1.6954945218798732,
+1.6210319165480278, 1.0112401339554422, 1.3283941225696905,
+0.9785548399774475, 1.3417882114199617, 1.2856761574387654,
+1.2695157360982394, 1.3027813678080857, 1.2990643378660303,
+1.2828545722011038, 1.2962223280923644, 1.2967386796168465,
+1.2568604514142652, 1.283616660692942, 1.2862822287150675,
+1.438617014720047, 1.3085000522026535, 1.1431382923835771]`.
+
+**Verdict.** The SRT signal was strong, and both format medians were attractive,
+but the shared production lever was required to clear both predeclared format gates.
+VTT candidate p10 (`1.143138`) remained inside its unusually wide BASE/BASE envelope
+(`p90 = 1.264164`), so this evidence cannot support a production keep. The source,
+numeric oracle, artifact oracle, and benchmark were restored manually; only this row
+remains. Reopen only with a less noisy VTT harness or attributed end-to-end profile,
+not from the medians alone.
+
+---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — terminal speculative event-log ownership move failed the current-like null-controlled gate; source restored.**
 
 **Negative-ledger-first target.** `execute_backend_speculative` copied every
