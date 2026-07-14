@@ -22237,3 +22237,34 @@ logits + weights); the per-token exp-sum/log-softmax + suppression passes (~207 
 are HIDDEN under that stream even at 250 tokens. So `compute_logprobs` (and its no_ts full-vector materialize +
 sanitize copy) is sub-floor; poly-exp buys nothing on CPU here. Decode is fully accounted at turbo long-audio
 scale: GEMV bandwidth (dominant) + everything-else-hidden. No byte-exact decode lever.
+
+---
+## 2026-07-14 - cod_fw: bd-z4o7 REJECT — reusing Symphonia's decoded `SampleBuffer` is below the packet-conversion noise floor
+
+**Attribution first.** The built-in real-codec normalization loop allocated a
+`SampleBuffer<f32>` for every decoded packet. Symphonia implements
+`SampleBuffer::new` as a zero-filled `Vec` converted into a boxed slice, while
+its MP3 decoder reuses a fixed 1,152-frame internal buffer. The tested lever
+therefore retained one grow-only conversion buffer per input file, leaving the
+decode, planar-to-interleaved copy, finite sanitization, and downmix arithmetic
+unchanged.
+
+**Foreground remote A/B.** One same-binary Criterion run used a stereo
+1,152-frame MP3-sized packet and ordinary `--profile release` on RCH worker
+`vmi1227854` (strict remote; no local fallback):
+
+`RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 RCH_WORKERS=vmi1227854 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo bench --profile release --bench normalize_bench -- audio_decode_packet_buffer --warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`
+
+- fresh allocation per packet: **[1.3877 us, 1.5465 us, 1.6632 us]**
+- reused conversion buffer: **[1.3948 us, 1.5003 us, 1.5845 us]**
+- median ratio: **0.970x time** (about **3.0% lower**), with broadly overlapping
+  intervals and no decisive separation
+
+**Decision: reject and revert.** The small median movement is below the keep
+floor and cannot support a real-codec or end-to-end normalization claim. Packet
+conversion remains dominated by the required planar-to-interleaved copy; the
+allocator/zero-fill removal is sub-floor at the representative MP3 packet size.
+Both production changes and the temporary A/B harness were reverted; this row
+is the only shipped artifact. Do not retry buffer reuse without allocation
+counts or a workload that demonstrates a materially larger packet-conversion
+share.
