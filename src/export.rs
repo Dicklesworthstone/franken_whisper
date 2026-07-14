@@ -110,22 +110,35 @@ fn write_srt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
     Ok(())
 }
 
-fn write_csv(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
-    let mut file = BufWriter::new(File::create(path)?);
-    writeln!(file, "start,end,speaker,text")?;
+fn write_csv_escaped(writer: &mut impl Write, value: &str) -> std::io::Result<()> {
+    let bytes = value.as_bytes();
+    let mut copied = 0;
+    for (quote, _) in value.match_indices('"') {
+        writer.write_all(&bytes[copied..quote])?;
+        writer.write_all(b"\"\"")?;
+        copied = quote + 1;
+    }
+    writer.write_all(&bytes[copied..])
+}
+
+fn write_csv_rows(writer: &mut impl Write, result: &TranscriptionResult) -> std::io::Result<()> {
+    writeln!(writer, "start,end,speaker,text")?;
     for seg in &result.segments {
         let start = seg.start_sec.unwrap_or(0.0);
         let end = seg.end_sec.unwrap_or(0.0);
         let speaker = seg.speaker.as_deref().unwrap_or("");
-        // simple CSV escaping: replace " with "" and wrap in "
-        let escaped_speaker = speaker.replace('\"', "\"\"");
-        let escaped_text = seg.text.replace('\"', "\"\"");
-        writeln!(
-            file,
-            "{},{},\"{}\",\"{}\"",
-            start, end, escaped_speaker, escaped_text
-        )?;
+        write!(writer, "{start},{end},\"")?;
+        write_csv_escaped(writer, speaker)?;
+        writer.write_all(b"\",\"")?;
+        write_csv_escaped(writer, &seg.text)?;
+        writer.write_all(b"\"\n")?;
     }
+    Ok(())
+}
+
+fn write_csv(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
+    let mut file = BufWriter::new(File::create(path)?);
+    write_csv_rows(&mut file, result)?;
     file.flush()?;
     Ok(())
 }
@@ -172,6 +185,30 @@ fn write_lrc(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn historical_csv_bytes(result: &TranscriptionResult) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        writeln!(bytes, "start,end,speaker,text").expect("write CSV header");
+        for seg in &result.segments {
+            let start = seg.start_sec.unwrap_or(0.0);
+            let end = seg.end_sec.unwrap_or(0.0);
+            let speaker = seg.speaker.as_deref().unwrap_or("");
+            let escaped_speaker = speaker.replace('"', "\"\"");
+            let escaped_text = seg.text.replace('"', "\"\"");
+            writeln!(
+                bytes,
+                "{start},{end},\"{escaped_speaker}\",\"{escaped_text}\""
+            )
+            .expect("write historical CSV row");
+        }
+        bytes
+    }
+
+    fn streaming_csv_bytes(result: &TranscriptionResult) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_csv_rows(&mut bytes, result).expect("write streaming CSV rows");
+        bytes
+    }
 
     fn owned_json_transcript_bytes(segments: &[TranscriptionSegment]) -> Vec<u8> {
         serde_json::to_vec_pretty(&serde_json::json!({ "transcription": segments }))
@@ -225,6 +262,206 @@ mod tests {
         assert_eq!(
             content,
             "start,end,speaker,text\n1,2,\"Speaker 1, \"\"Boss\"\"\",\"Hello, \"\"world\"\"\"\n"
+        );
+    }
+
+    #[test]
+    fn streaming_csv_escape_matches_historical_bytes() {
+        let cases = [
+            (None, ""),
+            (Some("speaker"), "plain transcript"),
+            (Some("\"start"), "middle \" quote"),
+            (Some("end\""), "consecutive \"\" quotes"),
+            (Some("comma, CR\rLF\n"), "backslash \\ and 日本語 🎧"),
+        ];
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: String::new(),
+            language: None,
+            segments: cases
+                .into_iter()
+                .enumerate()
+                .map(|(index, (speaker, text))| TranscriptionSegment {
+                    start_sec: (index != 0).then_some(index as f64 * 1.25),
+                    end_sec: Some(index as f64 * 1.25 + 1.0),
+                    text: text.to_owned(),
+                    speaker: speaker.map(str::to_owned),
+                    confidence: None,
+                })
+                .collect(),
+            acceleration: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+
+        assert_eq!(
+            streaming_csv_bytes(&result),
+            historical_csv_bytes(&result),
+            "streaming CSV escape changed output bytes"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn streaming_csv_escape_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const ITERATIONS: usize = 4_000;
+
+        fn write_historical_rows(
+            writer: &mut impl Write,
+            result: &TranscriptionResult,
+        ) -> std::io::Result<()> {
+            writeln!(writer, "start,end,speaker,text")?;
+            for seg in &result.segments {
+                let start = seg.start_sec.unwrap_or(0.0);
+                let end = seg.end_sec.unwrap_or(0.0);
+                let speaker = seg.speaker.as_deref().unwrap_or("");
+                let escaped_speaker = speaker.replace('"', "\"\"");
+                let escaped_text = seg.text.replace('"', "\"\"");
+                writeln!(
+                    writer,
+                    "{start},{end},\"{escaped_speaker}\",\"{escaped_text}\""
+                )?;
+            }
+            Ok(())
+        }
+
+        fn time_historical(result: &TranscriptionResult, output: &mut Vec<u8>) -> u128 {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                output.clear();
+                write_historical_rows(output, black_box(result)).expect("write historical CSV");
+                black_box(output.as_slice());
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_streaming(result: &TranscriptionResult, output: &mut Vec<u8>) -> u128 {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                output.clear();
+                write_csv_rows(output, black_box(result)).expect("write streaming CSV");
+                black_box(output.as_slice());
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        let result = TranscriptionResult {
+            backend: crate::model::BackendKind::WhisperCpp,
+            transcript: String::new(),
+            language: Some("en".to_owned()),
+            segments: (0..32)
+                .map(|index| TranscriptionSegment {
+                    start_sec: Some(f64::from(index) * 1.25),
+                    end_sec: Some(f64::from(index + 1) * 1.25),
+                    text: if index % 8 == 0 {
+                        format!(
+                            "segment {index:02}: measured \"quoted\" transcript with Unicode λ and 🎧"
+                        )
+                    } else {
+                        format!(
+                            "segment {index:02}: measured transcript output with Unicode λ and 🎧"
+                        )
+                    },
+                    speaker: (index % 4 == 0).then(|| format!("SPEAKER_{:02}", index % 3)),
+                    confidence: Some(0.85 + f64::from(index % 10) / 100.0),
+                })
+                .collect(),
+            acceleration: None,
+            raw_output: serde_json::json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let expected = historical_csv_bytes(&result);
+        assert_eq!(streaming_csv_bytes(&result), expected, "exact CSV bytes");
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "csv_streaming_escape binary_sha256={:x} shape=current_like segments={} output_bytes={} output_sha256={:x}",
+            Sha256::digest(executable),
+            result.segments.len(),
+            expected.len(),
+            Sha256::digest(&expected)
+        );
+
+        let mut null_first_output = Vec::with_capacity(expected.len());
+        let mut null_second_output = Vec::with_capacity(expected.len());
+        let mut historical_output = Vec::with_capacity(expected.len());
+        let mut streaming_output = Vec::with_capacity(expected.len());
+        for _ in 0..3 {
+            black_box(time_historical(&result, &mut historical_output));
+            black_box(time_streaming(&result, &mut streaming_output));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut streaming_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let first = time_historical(&result, &mut null_first_output);
+            let second = time_historical(&result, &mut null_second_output);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, streaming) = if sample % 2 == 0 {
+                (
+                    time_historical(&result, &mut historical_output),
+                    time_streaming(&result, &mut streaming_output),
+                )
+            } else {
+                let streaming = time_streaming(&result, &mut streaming_output);
+                let historical = time_historical(&result, &mut historical_output);
+                (historical, streaming)
+            };
+            historical_times.push(historical);
+            streaming_times.push(streaming);
+            speedups.push(historical as f64 / streaming as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "csv_streaming_escape samples={SAMPLES} iterations={ITERATIONS} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} streaming_arm_median_ns={} speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&streaming_times)
+        );
+        eprintln!("csv_streaming_escape null_ratios={null_ratios:?} speedups={speedups:?}");
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.05),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.05)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
         );
     }
 
