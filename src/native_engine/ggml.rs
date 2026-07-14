@@ -38,10 +38,11 @@
 //!
 //! # Memory
 //!
-//! The whole file is read into a single `Vec<u8>` blob and tensor entries
-//! index into it by `(byte_offset, byte_len)`. Files run up to ~3 GB, which
-//! is acceptable for now. TODO(bd-A14 memory bead): switch to a seek-based /
-//! mmap-free streaming loader to avoid holding the entire blob resident.
+//! By default the whole file is read into a single `Vec<u8>` blob and tensor
+//! entries index into it by `(byte_offset, byte_len)`. Files run up to ~3 GB.
+//! bd-A14 (peak-RSS reduction): `FW_STREAM_LOAD=1` (unix) instead keeps only an
+//! open handle and preads each tensor payload on demand, never allocating the
+//! blob — see [`TensorSource`]. Byte-identical weights; gated default-off.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -59,7 +60,7 @@ const GGML_MAGIC: u32 = 0x6767_6d6c;
 /// fixed `ne[4]`). Any `n_dims` outside `1..=GGML_MAX_DIMS` is malformed.
 const GGML_MAX_DIMS: usize = 4;
 
-/// A single tensor's location and metadata within the model [`GgmlModel::blob`].
+/// A single tensor's location and metadata within the model file.
 ///
 /// `shape` is stored in **row-major (PyTorch) logical order**: the ggml file
 /// stores dimensions reversed (fastest-moving axis `ne[0]` first), and we
@@ -75,9 +76,9 @@ pub struct TensorEntry {
     pub shape: Vec<usize>,
     /// Element storage type for this tensor (`F32` or `F16`).
     pub dtype: GgmlDType,
-    /// Byte offset of the tensor payload within [`GgmlModel::blob`].
+    /// Byte offset of the tensor payload within the model file.
     byte_offset: usize,
-    /// Byte length of the tensor payload within [`GgmlModel::blob`].
+    /// Byte length of the tensor payload within the model file.
     byte_len: usize,
 }
 
@@ -105,10 +106,40 @@ pub struct GgmlModel {
     /// `hparams.n_vocab`; the gap is special/extra tokens synthesized by id —
     /// see [`GgmlModel::n_extra_tokens`]).
     pub vocab_tokens: Vec<Vec<u8>>,
-    /// Tensor directory: tensor name → location/metadata in [`Self::blob`].
+    /// Tensor directory: tensor name → location/metadata in [`Self::source`].
     tensors: HashMap<String, TensorEntry>,
-    /// The entire model file read into memory; tensor payloads are slices.
-    blob: Vec<u8>,
+    /// Backing store for tensor payload bytes (see [`TensorSource`]).
+    source: TensorSource,
+}
+
+/// Backing store for tensor payload bytes.
+///
+/// The default path holds the whole model file resident and every
+/// [`GgmlModel::tensor_raw`] borrows a sub-slice (`Cow::Borrowed`, zero-copy).
+/// The gated streaming path (`FW_STREAM_LOAD=1`, unix only) keeps only an open
+/// file handle and preads each tensor payload on demand (`Cow::Owned`); it
+/// never allocates the ~1.6 GB blob, cutting peak RSS (bd-A14). Weights are
+/// byte-identical either way — the same file bytes reach the same dequant/quant
+/// code; only where the bytes live (one resident blob vs. per-tensor pread
+/// buffers) differs.
+#[derive(Debug)]
+enum TensorSource {
+    /// Whole file resident in memory; payloads are borrowed slices.
+    Resident(Vec<u8>),
+    /// Open handle; payloads are pread on demand via positioned reads
+    /// ([`read_exact_at`], `FileExt::read_at` on a shared handle — thread-safe
+    /// with no cursor, so concurrent per-tensor loads compose).
+    #[cfg(unix)]
+    Streamed(std::fs::File),
+}
+
+/// Whether the gated streaming loader (`FW_STREAM_LOAD=1`) is enabled. Unix
+/// only — the on-demand path relies on `FileExt::read_at` positioned reads
+/// against a shared handle. Default-off; only the literal `1` enables it.
+#[cfg(unix)]
+fn stream_load_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_STREAM_LOAD").as_deref() == Ok("1"))
 }
 
 impl GgmlModel {
@@ -125,6 +156,12 @@ impl GgmlModel {
     ///   structure, or trailing bytes after the tensor directory.
     /// - [`FwError::Unsupported`] for a quantized `ftype`.
     pub fn load(path: &Path) -> FwResult<Self> {
+        // bd-A14: opt-in streaming loader preads each tensor on demand instead
+        // of holding the whole ~1.6 GB file resident (peak-RSS win, default-off).
+        #[cfg(unix)]
+        if stream_load_enabled() {
+            return Self::load_streamed(path);
+        }
         let blob = read_blob_parallel(path)?;
         Self::parse(blob)
     }
@@ -288,7 +325,165 @@ impl GgmlModel {
             filters,
             vocab_tokens,
             tensors,
-            blob,
+            source: TensorSource::Resident(blob),
+        })
+    }
+
+    /// bd-A14 streaming loader (`FW_STREAM_LOAD=1`, unix): scan the directory
+    /// from an open handle, **seeking over** each tensor payload instead of
+    /// reading it, then retain the handle so payloads are pread on demand. This
+    /// never allocates the whole-file blob, so peak RSS drops by the file size
+    /// (~1.6 GB for large-v3-turbo).
+    ///
+    /// The scan reads only the small non-payload bytes (magic, hparams, mel
+    /// filterbank, vocab, and each tensor's `n_dims`/`name_len`/`ttype`/dims/
+    /// name); the large payloads are skipped with `seek`. The directory it
+    /// builds is **byte-for-byte identical** to [`Self::parse`]'s (same offsets,
+    /// lengths, dtypes, shapes) — asserted by `streamed_dir_matches_resident`.
+    ///
+    /// Errors mirror [`Self::parse`] (bad magic, malformed/truncated structure,
+    /// unsupported dtype, trailing bytes).
+    #[cfg(unix)]
+    fn load_streamed(path: &Path) -> FwResult<Self> {
+        let file = std::fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        // The directory scan uses a SEPARATE buffered handle (dropped when the
+        // scan ends); `file` is kept only for the on-demand payload preads.
+        let scan = std::fs::File::open(path)?;
+        let mut cur = StreamCursor::new(std::io::BufReader::with_capacity(1 << 20, scan), len);
+
+        let magic = cur.read_u32()?;
+        if magic != GGML_MAGIC {
+            return Err(FwError::InvalidRequest(format!(
+                "bad ggml magic: got {magic:#010x}, expected {GGML_MAGIC:#010x}"
+            )));
+        }
+
+        let hparams = WhisperHParams {
+            n_vocab: cur.read_i32()?,
+            n_audio_ctx: cur.read_i32()?,
+            n_audio_state: cur.read_i32()?,
+            n_audio_head: cur.read_i32()?,
+            n_audio_layer: cur.read_i32()?,
+            n_text_ctx: cur.read_i32()?,
+            n_text_state: cur.read_i32()?,
+            n_text_head: cur.read_i32()?,
+            n_text_layer: cur.read_i32()?,
+            n_mels: cur.read_i32()?,
+            ftype: cur.read_i32()?,
+        };
+        if hparams.ftype != 0 && hparams.ftype != 1 {
+            return Err(FwError::Unsupported(format!(
+                "quantized ggml ftype {} is not supported (only ftype 0=f32, 1=f16)",
+                hparams.ftype
+            )));
+        }
+
+        // Mel filterbank.
+        let n_mel = usize_from_i32(cur.read_i32()?, "filters.n_mel")?;
+        let n_fft_bins = usize_from_i32(cur.read_i32()?, "filters.n_fft")?;
+        let n_filter = n_mel
+            .checked_mul(n_fft_bins)
+            .ok_or_else(|| FwError::InvalidRequest("mel filterbank size overflow".to_owned()))?;
+        let filter_cap = n_filter.min(cur.remaining() / 4);
+        let mut data = Vec::with_capacity(filter_cap);
+        for _ in 0..n_filter {
+            data.push(cur.read_f32()?);
+        }
+        let filters = MelFilterbank {
+            n_mel,
+            n_fft_bins,
+            data,
+        };
+
+        // Vocab — raw byte-level BPE tokens.
+        let n_vocab_file = usize_from_i32(cur.read_i32()?, "file vocab count")?;
+        let vocab_cap = n_vocab_file.min(cur.remaining() / 4);
+        let mut vocab_tokens = Vec::with_capacity(vocab_cap);
+        for _ in 0..n_vocab_file {
+            let len = cur.read_u32()? as usize;
+            vocab_tokens.push(cur.read_vec(len)?);
+        }
+
+        // Tensor directory — loop until EOF, seeking over each payload.
+        let mut tensors: HashMap<String, TensorEntry> = HashMap::new();
+        loop {
+            if cur.at_end() {
+                break;
+            }
+            let n_dims = usize_from_i32(cur.read_i32()?, "tensor n_dims")?;
+            let name_len = usize_from_i32(cur.read_i32()?, "tensor name length")?;
+            let ttype = cur.read_i32()?;
+            if n_dims == 0 || n_dims > GGML_MAX_DIMS {
+                return Err(FwError::InvalidRequest(format!(
+                    "tensor n_dims {n_dims} out of range 1..={GGML_MAX_DIMS}"
+                )));
+            }
+            let dtype = match ttype {
+                0 => GgmlDType::F32,
+                1 => GgmlDType::F16,
+                other => {
+                    return Err(FwError::Unsupported(format!(
+                        "tensor element type {other} is not supported (only 0=f32, 1=f16)"
+                    )));
+                }
+            };
+
+            let mut ne = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                ne.push(usize_from_i32(cur.read_i32()?, "tensor dimension")?);
+            }
+
+            let name_bytes = cur.read_vec(name_len)?;
+            let name = String::from_utf8(name_bytes).map_err(|_| {
+                FwError::InvalidRequest("tensor name is not valid UTF-8".to_owned())
+            })?;
+
+            let mut shape = ne;
+            shape.reverse();
+
+            let n_elements: usize = shape
+                .iter()
+                .copied()
+                .try_fold(1usize, |acc, d| acc.checked_mul(d))
+                .ok_or_else(|| {
+                    FwError::InvalidRequest(format!("tensor '{name}' element count overflow"))
+                })?;
+            let bpe = match dtype {
+                GgmlDType::F32 => 4usize,
+                GgmlDType::F16 => 2usize,
+            };
+            let byte_len = n_elements.checked_mul(bpe).ok_or_else(|| {
+                FwError::InvalidRequest(format!("tensor '{name}' byte length overflow"))
+            })?;
+
+            let byte_offset = cur.pos();
+            cur.skip(byte_len)?;
+
+            tensors.insert(
+                name,
+                TensorEntry {
+                    shape,
+                    dtype,
+                    byte_offset,
+                    byte_len,
+                },
+            );
+        }
+
+        if !cur.at_end() {
+            return Err(FwError::InvalidRequest(format!(
+                "trailing bytes after tensor directory: {} byte(s) unconsumed",
+                cur.remaining()
+            )));
+        }
+
+        Ok(Self {
+            hparams,
+            filters,
+            vocab_tokens,
+            tensors,
+            source: TensorSource::Streamed(file),
         })
     }
 
@@ -330,18 +525,28 @@ impl GgmlModel {
     ///
     /// - [`FwError::InvalidRequest`] if `name` is unknown or the stored byte
     ///   length is inconsistent with the shape/dtype (corruption).
-    /// Raw little-endian bytes of a tensor entry — the SINGLE byte-access choke point
-    /// for every tensor accessor. Today it borrows from the resident blob (`Cow::Borrowed`,
-    /// zero-copy); a future `FW_STREAM_LOAD` variant will `pread` the bytes on demand
-    /// (`Cow::Owned`) so the read overlaps the weight quant. `Cow` lets both share one
-    /// call site with no signature churn in the callers.
+    /// Raw little-endian bytes of a tensor entry — the SINGLE byte-access choke
+    /// point for every tensor accessor. On the resident source it borrows a blob
+    /// sub-slice (`Cow::Borrowed`, zero-copy); on the gated streaming source
+    /// (`FW_STREAM_LOAD`) it preads the payload into an owned buffer
+    /// (`Cow::Owned`). `Cow` lets both share one call site with no caller churn.
     fn tensor_raw(&self, name: &str, entry: &TensorEntry) -> FwResult<Cow<'_, [u8]>> {
-        self.blob
-            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
-            .map(Cow::Borrowed)
-            .ok_or_else(|| {
-                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
-            })
+        match &self.source {
+            TensorSource::Resident(blob) => blob
+                .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
+                .map(Cow::Borrowed)
+                .ok_or_else(|| {
+                    FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
+                }),
+            #[cfg(unix)]
+            TensorSource::Streamed(file) => {
+                let mut buf = vec![0u8; entry.byte_len];
+                read_exact_at(file, &mut buf, entry.byte_offset as u64).map_err(|e| {
+                    FwError::InvalidRequest(format!("tensor '{name}' payload pread failed: {e}"))
+                })?;
+                Ok(Cow::Owned(buf))
+            }
+        }
     }
 
     pub fn tensor_f32(&self, name: &str) -> FwResult<(Vec<usize>, Vec<f32>)> {
@@ -731,6 +936,98 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Little-endian streaming cursor over a seekable reader, mirroring [`Cursor`]'s
+/// interface for the bd-A14 [`GgmlModel::load_streamed`] directory scan. Unlike
+/// [`Cursor`] it never materializes the whole file: metadata is read through the
+/// buffered reader and tensor payloads are [`Self::skip`]ped with a `seek`. Every
+/// read is bounds-checked against the known file length so a crafted length
+/// cannot force a huge allocation before hitting EOF (matching [`Cursor`]).
+#[cfg(unix)]
+struct StreamCursor<R: std::io::Read + std::io::Seek> {
+    inner: R,
+    pos: usize,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl<R: std::io::Read + std::io::Seek> StreamCursor<R> {
+    fn new(inner: R, len: usize) -> Self {
+        Self { inner, pos: 0, len }
+    }
+
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.len
+    }
+
+    fn remaining(&self) -> usize {
+        self.len.saturating_sub(self.pos)
+    }
+
+    /// EOF-underflow error mirroring [`Cursor::read_bytes`]'s message shape.
+    fn eof(&self, len: usize) -> FwError {
+        FwError::InvalidRequest(format!(
+            "unexpected end of file: needed {len} byte(s) at offset {}, have {}",
+            self.pos, self.len
+        ))
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> FwResult<()> {
+        if buf.len() > self.remaining() {
+            return Err(self.eof(buf.len()));
+        }
+        self.inner.read_exact(buf).map_err(|_| self.eof(buf.len()))?;
+        self.pos += buf.len();
+        Ok(())
+    }
+
+    /// Read `len` bytes into a fresh `Vec`. The `remaining()` guard in
+    /// [`Self::read_exact`] rejects an over-long `len` before allocating.
+    fn read_vec(&mut self, len: usize) -> FwResult<Vec<u8>> {
+        if len > self.remaining() {
+            return Err(self.eof(len));
+        }
+        let mut v = vec![0u8; len];
+        self.read_exact(&mut v)?;
+        Ok(v)
+    }
+
+    /// Advance past `len` bytes without reading them (payload skip via `seek`).
+    fn skip(&mut self, len: usize) -> FwResult<()> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| FwError::InvalidRequest("read length overflow".to_owned()))?;
+        if end > self.len {
+            return Err(self.eof(len));
+        }
+        self.inner
+            .seek(std::io::SeekFrom::Current(len as i64))
+            .map_err(|_| self.eof(len))?;
+        self.pos = end;
+        Ok(())
+    }
+
+    fn read_u32(&mut self) -> FwResult<u32> {
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn read_i32(&mut self) -> FwResult<i32> {
+        Ok(self.read_u32()? as i32)
+    }
+
+    fn read_f32(&mut self) -> FwResult<f32> {
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(f32::from_le_bytes(b))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,6 +1369,64 @@ mod tests {
     }
 
     // ── gated tests against the real tiny.en model ──
+
+    /// bd-A14: the streaming loader (`load_streamed`) must build a directory
+    /// byte-for-byte identical to the resident [`GgmlModel::parse`], and its
+    /// on-demand preads must return the exact same payload bytes the resident
+    /// blob slices do. This is the drift guard for the two parallel scanners.
+    #[cfg(unix)]
+    #[test]
+    fn streamed_dir_matches_resident() {
+        let Some(path) = find_model_file("tiny.en") else {
+            eprintln!("SKIP streamed_dir_matches_resident: ggml-tiny.en.bin not found");
+            return;
+        };
+        let resident =
+            GgmlModel::parse(read_blob_parallel(&path).expect("read blob")).expect("resident parse");
+        let streamed = GgmlModel::load_streamed(&path).expect("streamed parse");
+
+        // Header / filterbank / vocab identical.
+        assert_eq!(resident.hparams, streamed.hparams, "hparams differ");
+        assert_eq!(resident.filters.n_mel, streamed.filters.n_mel);
+        assert_eq!(resident.filters.n_fft_bins, streamed.filters.n_fft_bins);
+        assert_eq!(resident.filters.data, streamed.filters.data, "mel data differ");
+        assert_eq!(resident.vocab_tokens, streamed.vocab_tokens, "vocab differ");
+
+        // Tensor directory identical (names, offsets, lengths, shapes, dtype).
+        assert_eq!(
+            resident.tensors.len(),
+            streamed.tensors.len(),
+            "tensor count differs"
+        );
+        for (name, r) in &resident.tensors {
+            let s = streamed
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("streamed missing tensor '{name}'"));
+            assert_eq!(r.byte_offset, s.byte_offset, "offset differs for '{name}'");
+            assert_eq!(r.byte_len, s.byte_len, "len differs for '{name}'");
+            assert_eq!(r.shape, s.shape, "shape differs for '{name}'");
+            assert_eq!(
+                format!("{:?}", r.dtype),
+                format!("{:?}", s.dtype),
+                "dtype differs for '{name}'"
+            );
+        }
+
+        // Payload bytes identical for a representative sample: resident borrows
+        // the blob, streamed preads — the bytes must match exactly.
+        let mut names: Vec<&String> = resident.tensors.keys().collect();
+        names.sort();
+        for name in names.iter().take(8) {
+            let rb = resident
+                .tensor_raw(name, &resident.tensors[*name])
+                .expect("resident raw");
+            let sb = streamed
+                .tensor_raw(name, &streamed.tensors[*name])
+                .expect("streamed raw");
+            assert_eq!(rb.as_ref(), sb.as_ref(), "payload bytes differ for '{name}'");
+        }
+    }
 
     #[test]
     fn real_tiny_en_full_parse() {
