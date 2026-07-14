@@ -21323,6 +21323,25 @@ structural pruning catastrophic; load-overlap = dedicated-effort). The remaining
 (decode, byte-exact-greedy-verify), (3) flipping the gated WER-candidates (ToMe / enc-int8 / poly-exp) default-on
 behind a corpus WER harness (infra: no on-box LibriSpeech). Cite THIS tick + the CONSOLIDATED FRONTIER MAP; the
 quick-lever loop now returns only sub-floor / catastrophic / cross-layer results.
+**Tick 2026-07-14ee (fresh-context loop) — the concurrent model PRE-LOAD (`FW_PRELOAD`, overlap the cold load with
+ingest/normalize) was BUILT (cleanly, disproving 14dd's "too invasive" deferral) but benched a WASH — reverted.**
+Applied the 14dd lesson (don't defer on an apparent blocker): the pre-load IS a clean ~20-line change now that
+`FW_LOAD_DEDUP` (aa9754d) makes a fire-and-forget spawn race-safe — a gated `std::thread::spawn` before the stage
+loop (`orchestrator.rs:1500`), a `native_engine::preload_model_path` resolver (mirrors the backend's
+`request.model`→`default_model_spec`→`resolve_model`), and `FW_PRELOAD` force-implying dedup. Built + SAME-binary
+ABBA cold on jfk + track01 (turbo, fresh process, verified the pre-load fires: `default_model_spec` reads the
+env the bench sets). **Result: transcript BYTE-IDENTICAL both, but perf WASH — jfk 2286(off) vs 2318(on) ms
+(within noise, nominally slower); track01 8151 vs 8087 (within noise, ~0.8%).** Root cause: on-box the model
+file is PAGE-CACHED so the "cold" load is a fast memcpy+quant (~290 ms), NOT disk-bound; the normalize window
+(fast symphonia decode) is short relative to it; and the pre-load's 32-thread quant CONTENDS with normalize on
+the busy box (other agents' builds) ⇒ the overlap benefit is offset. The pre-load is structurally sound and would
+help a genuinely cold-DISK load on an IDLE box (or a slow-decode input), but that is unmeasurable here + the
+common case (warm page cache) is a wash ⇒ not landable. Reverted (orchestrator.rs + mod.rs == HEAD; the aa9754d
+dedup win is untouched). **NET: the pre-load half of the load-overlap frontier is now measured (wash on warm
+cache), not just deferred; the streaming-loader half needs unsafe (shared-mutable blob) or accessor-signature
+changes (borrow→owned pread) — genuinely multi-turn. The byte-exact perf is spent for quick turns.** (Method win:
+14dd's "cross-layer, don't attempt" was too pessimistic — it WAS cleanly buildable; the negative is the MEASURED
+wash, not an unimplementability. Prefer building + measuring over deferring.)
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
