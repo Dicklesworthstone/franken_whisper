@@ -51,8 +51,9 @@ use franken_whisper::native_engine::decoder::{self, DecoderState};
 use franken_whisper::native_engine::encoder;
 use franken_whisper::native_engine::ggml::GgmlModel;
 use franken_whisper::native_engine::mel::{self, FRAMES_PER_CHUNK, N_SAMPLES_30S, SAMPLE_RATE};
+use franken_whisper::native_engine::tokenizer::Tokenizer;
 use franken_whisper::native_engine::{
-    Mat, Mel, MelFilterbank, NativeWhisperModel, find_model_file,
+    Mat, Mel, MelFilterbank, NativeWhisperModel, WhisperHParams, find_model_file,
 };
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1339,104 @@ fn bench_sanitize_downmix(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Tokenizer construction (hermetic, real Whisper vocabulary cardinality)
+// ---------------------------------------------------------------------------
+
+#[rustfmt::skip]
+const TOKENIZER_SUPPRESS_SYMBOLS: &[&str] = &[
+    "\"", "#", "(", ")", "*", "+", "/", ":", ";", "<", "=", ">", "@", "[", "\\", "]", "^",
+    "_", "`", "{", "|", "}", "~", "「", "」", "『", "』", "<<", ">>", "<<<", ">>>", "--",
+    "---", "-(", "-[", "('", "(\"", "((", "))", "(((", ")))", "[[", "]]", "{{", "}}", "♪♪",
+    "♪♪♪", "♩", "♪", "♫", "♬", "♭", "♮", "♯",
+];
+
+fn tokenizer_suppress_patterns() -> Vec<Vec<u8>> {
+    let mut patterns = Vec::with_capacity(TOKENIZER_SUPPRESS_SYMBOLS.len() * 2 + 2);
+    for symbol in TOKENIZER_SUPPRESS_SYMBOLS {
+        patterns.push(symbol.as_bytes().to_vec());
+        let mut prefixed = Vec::with_capacity(symbol.len() + 1);
+        prefixed.push(b' ');
+        prefixed.extend_from_slice(symbol.as_bytes());
+        patterns.push(prefixed);
+    }
+    patterns.push(b" -".to_vec());
+    patterns.push(b" '".to_vec());
+    patterns
+}
+
+fn tokenizer_bench_vocab() -> Vec<Vec<u8>> {
+    // ggml tiny.en / large-v3-turbo files store 50,257 base tokens; the
+    // remaining declared ids are synthesized control/timestamp tokens.
+    const N_FILE_TOKENS: usize = 50_257;
+    let mut vocab: Vec<Vec<u8>> = (0..N_FILE_TOKENS)
+        .map(|id| format!("token-{id:05}").into_bytes())
+        .collect();
+    let patterns = tokenizer_suppress_patterns();
+    let stride = N_FILE_TOKENS / (patterns.len() + 1);
+    for (index, pattern) in patterns.into_iter().enumerate() {
+        vocab[(index + 1) * stride] = pattern;
+    }
+    vocab
+}
+
+fn tokenizer_bench_hparams() -> WhisperHParams {
+    WhisperHParams {
+        n_vocab: 51_866,
+        n_audio_ctx: 1500,
+        n_audio_state: 1280,
+        n_audio_head: 20,
+        n_audio_layer: 32,
+        n_text_ctx: 448,
+        n_text_state: 1280,
+        n_text_head: 20,
+        n_text_layer: 4,
+        n_mels: 128,
+        ftype: 1,
+    }
+}
+
+fn legacy_build_non_speech(tokens: Vec<Vec<u8>>, patterns: &[Vec<u8>]) -> (Vec<Vec<u8>>, Vec<i32>) {
+    let mut ids = Vec::new();
+    for pattern in patterns {
+        if let Some(id) = tokens.iter().position(|token| token == pattern)
+            && let Ok(id) = i32::try_from(id)
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    (tokens, ids)
+}
+
+fn bench_tokenizer_from_vocab(c: &mut Criterion) {
+    let hparams = tokenizer_bench_hparams();
+    let vocab = tokenizer_bench_vocab();
+    let patterns = tokenizer_suppress_patterns();
+    let expected = legacy_build_non_speech(vocab.clone(), &patterns).1;
+    let candidate = Tokenizer::from_vocab(&hparams, vocab.clone());
+    assert_eq!(candidate.non_speech_tokens(), expected);
+
+    let mut group = c.benchmark_group("native_engine/tokenizer_from_vocab");
+    group.throughput(criterion::Throughput::Elements(vocab.len() as u64));
+    group.bench_function("legacy_pattern_major", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(legacy_build_non_speech(tokens, black_box(&patterns))),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("single_vocab_scan", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(Tokenizer::from_vocab(black_box(&hparams), tokens)),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
 
@@ -1361,6 +1460,7 @@ criterion_group!(
     bench_resample,
     bench_downmix,
     bench_sanitize_downmix,
+    bench_tokenizer_from_vocab,
     bench_e2e_tiny_jfk,
     bench_e2e_tiny_jfk_no_timestamps,
     bench_e2e_large_jfk,
