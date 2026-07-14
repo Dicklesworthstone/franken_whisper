@@ -4,6 +4,65 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **REJECT / NO-SHIP — four-entry inline speculative event storage removed the first `Vec` allocation but measured 1.002796x median; source restored.**
+
+**Negative-ledger-first target and attribution.** For a current one-window
+confirmation, `SpeculativeStreamingPipeline` retains one partial event, one
+confirmation event, and one final statistics event. The historical empty
+`Vec<RunEvent>` grows to capacity four on that three-event burst, so the candidate
+used `SmallVec<[RunEvent; 4]>` to keep the complete current-like event log inline.
+This removes exactly one event-vector heap allocation without changing event
+construction or payload ownership. Existing rows cover the terminal event-vector
+clone and other orchestration event snapshots, not retained event-vector storage.
+Opportunity score was `(impact 2 x confidence 4) / effort 1 = 8`.
+
+**Behavior proof.** The same release test binary moved identical prebuilt
+`RunEvent` values through the historical and inline stores. The fixture covered
+ordered sequence numbers, fixed RFC 3339 timestamps, all four owned event strings,
+nested/null JSON, Unicode, and the current partial/confirm/statistics codes.
+Serialized slices were byte-identical: three events, 1,371 bytes, SHA-256
+`044a3423ea12673439ade5bd158e60e0244a51396715474c4de893e6cf04373f`.
+The historical store reported capacity four and the candidate did not spill.
+
+**Strict-remote foreground proof.** The sole benchmark command was
+`RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch exec -- cargo test --profile
+release --lib streaming::tests::inline_event_storage_perf -- --ignored --exact
+--nocapture`. RCH selected only worker `vmi1227854`; no local fallback occurred.
+The worker's selected cache pool was cold despite the worker affinity, so the
+allowed release-profile build took 14m44s. Benchmark-binary SHA-256 was
+`1e700420d81b7ca99ffda3afd03e8aeba3f2b0c8ad539ff0b75a2f55f61fbf18`.
+
+After three warmups, that binary ran 21 alternating `Vec`/`Vec` null pairs and
+21 alternating `Vec`/inline pairs at 8,192 three-event stores per arm. The null
+median passed the predeclared `[0.95, 1.05]` guard, but candidate p10 failed to
+clear both null p90 and the 1.05 direct-boundary floor. The candidate won only
+11/21 pairs.
+
+| comparison | p10 | median | p90 | arm medians / 8,192 stores | wins | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `Vec` / `Vec` null | 0.918841 | **0.998728** | **1.072627** | — | — | valid median, wide envelope |
+| heap-backed `Vec` / four-entry inline store | **0.939294x** | **1.002796x** | 1.049587x | 48,227,922 ns / 47,897,037 ns | **11/21** | **reject: p10 below null p90 and 1.05** |
+
+BASE/BASE ratios:
+`[0.958940, 0.918841, 1.160346, 0.800599, 1.068835, 0.998728,
+1.107860, 0.969010, 1.069805, 0.977853, 0.961613, 0.913764,
+1.001087, 1.009078, 0.954259, 0.937716, 1.000461, 1.013207,
+1.072627, 0.995973, 0.999509]`.
+
+Historical/inline ratios:
+`[0.939294, 1.037205, 1.021231, 1.049587, 1.036328, 0.932663,
+1.062578, 0.898286, 0.978661, 1.043827, 0.943107, 0.967505,
+1.002796, 0.991574, 1.109113, 0.993837, 0.962112, 1.005229,
+0.977327, 1.004141, 1.010448]`.
+
+**Verdict.** Inline storage is byte-exact and removes the structural allocation,
+but that allocation is not a measurable current-like event-boundary cost. The
+production source, temporary benchmark, and direct dependency were restored
+manually; only this ledger row remains. Do not retry `SmallVec` or another inline
+event container for this three-event shape without a product profile that first
+attributes material time to the retained vector itself.
+
+---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — borrowed quality-confirm handoff measured 1.146369x median, but its 0.965153x p10 stayed inside the null envelope; source restored.**
 
 **Negative-ledger-first target.** On each speculative quality result, the
