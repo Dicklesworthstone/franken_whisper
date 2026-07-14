@@ -51,6 +51,56 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (Unicode-exact): trim common transcript affixes before character edit-distance DP — **32.274625x correction-drift median**
+
+**What.** `CorrectionDrift::compute` materialized the full character-level
+Levenshtein matrix even when the fast and quality transcripts shared almost all
+of their leading and trailing text. `levenshtein` now removes equal Unicode
+scalar prefixes and suffixes before allocating and evaluating the two-row DP
+matrix. Removing either equal affix preserves Levenshtein distance exactly; the
+word-level WER calculation, confidence aggregation, and segment delta are
+unchanged. Negative-ledger-first search found no prior row or source attempt for
+this primitive. Opportunity score: `(impact 4 x confidence 5) / effort 1 = 20`.
+
+**Exactness.** The same release-perf binary compared the candidate against a
+test-local copy of the historical full-matrix implementation across the 121
+pairings of an 11-string corpus (empty, prefix-only, suffix-only, ASCII,
+combining-mark, CJK, and emoji cases), then compared serialized full
+`CorrectionDrift` bytes on the measured 12-segment fixture. Both gates passed.
+Result bytes: 121; SHA256
+`53bca99571c9154b506a842000c9562c3b8ddc265fa401566b16b2dc8cc853f2`.
+
+| comparison | p10 | median | p90 | arm medians / 6 full drift calls | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.906502 | **1.045812** | **1.177932** | — | — | — | valid null |
+| historical full matrix / affix-trimmed matrix | **28.626606x** | **32.274625x** | 37.196827x | 32,297,493 ns / 1,005,860 ns | 23.53% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+BASE/BASE ratios:
+`[1.166860, 1.057312, 1.064063, 1.017366, 0.998095, 1.045812,
+0.906502, 1.062218, 0.985414, 1.166456, 1.049476, 1.177932,
+1.893011, 0.996841, 0.931243, 1.345532, 0.883212, 1.078427,
+0.971707, 0.871390, 1.027730]`.
+
+Historical/candidate ratios:
+`[36.942686, 32.374317, 32.814358, 32.094186, 39.506938, 37.977404,
+33.856425, 30.888032, 31.574491, 17.310329, 28.626606, 37.140542,
+32.274625, 28.651295, 37.196827, 34.538527, 33.919280, 32.247717,
+23.436156, 28.844420, 30.528252]`.
+
+**Reproduction.** One fail-closed foreground invocation ran both the historical
+null and historical/candidate arms:
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 env -u CARGO_TARGET_DIR rch --no-self-healing exec -- cargo test --config profile.release-perf.lto=false --config profile.release-perf.codegen-units=16 --profile release-perf -p franken_whisper --lib correction_drift_common_affix -- --include-ignored --nocapture`.
+Worker `vmi1227854`; job `j-29928833041828192`; benchmark-binary SHA256
+`3b1b3a5f6a358a3df64004389bb194d4873846699e0791cbea9902c6a4e92a21`;
+2/2 filtered tests passed. The measured fixture contains 12 fast and 12 quality
+segments (1,772 characters per concatenated transcript) with one middle-word
+correction and shared surrounding context.
+
+**Scope.** This is a synthetic full-`CorrectionDrift::compute` boundary result,
+not end-to-end ASR latency. Gain scales with the equal leading/trailing context
+around a correction; unrelated transcripts still execute the historical DP
+extent plus two linear affix scans.
+
 ### 2026-07-14 UTC — Codex — LANDED (byte-exact): transfer speculative-stream bridge segments through lane holders — **1.659752x two-lane median**
 
 **What.** Every speculative window converted the fast and quality lanes from
