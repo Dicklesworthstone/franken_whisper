@@ -51,6 +51,69 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed robot-stage serialization — **3.912157x current-like median**
+
+**What.** `emit_robot_stage` previously built an owned `serde_json::Value`,
+deep-cloning the event timestamp, stage, code, message, and arbitrary JSON
+payload, and then serialized that temporary DOM into the final output `String`.
+The emit-only path now serializes a private borrowed `Serialize` view directly.
+`run_stage_value` remains as a test-only historical oracle, so value-level tests
+keep their original representation and the production change is one ownership
+lever. Negative-ledger-first review found no prior row for this CLI robot-stage
+path; the adjacent borrowed TTY mic-event keep and fixed-shape control-frame rows
+cover different emitters.
+
+**Strict-remote foreground proof.** One `release-perf` test binary contained the
+historical owned-DOM arm, the borrowed arm, exact byte oracles, 21 alternating
+BASE/BASE pairs, and 21 alternating historical/candidate pairs. The measured
+boundary includes the final `serde_json::to_string` allocation used by
+`emit_line`, but excludes common stdout locking and terminal I/O. RCH job
+`j-29928833041827519` ran on worker `vmi1152480` with opt-level 3, LTO disabled,
+and 16 codegen units; no local fallback occurred. Benchmark-binary SHA-256:
+`4428b92bc04a4c2488ae6ff0c22142c77e36fee3c5a4915041f48decaa8cd4fd`.
+
+| shape / comparison | p10 | median | p90 | historical arm median | borrowed arm median | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| current-like historical / historical null | 0.834479 | **1.005232** | **1.124948** | — | — | valid: median inside predeclared `[0.98, 1.02]` |
+| current-like historical / borrowed | **3.418174x** | **3.912157x** | 4.113675x | 34,459,668 ns / 20,000 events | 8,712,437 ns / 20,000 events | **keep: candidate p10 exceeds null p90** |
+| nested historical / historical null | 0.966237 | **0.998235** | **1.028594** | — | — | valid: median inside predeclared `[0.98, 1.02]` |
+| nested historical / borrowed | **3.961232x** | **4.375300x** | 4.628488x | 35,821,046 ns / 2,000 events | 8,081,859 ns / 2,000 events | **keep: candidate p10 exceeds null p90** |
+
+Current-like BASE/BASE ratios:
+`[1.005232, 0.798763, 1.108910, 1.017513, 0.985148, 1.008619,
+1.003815, 0.782232, 1.001127, 1.001530, 1.033027, 1.124948,
+1.256223, 1.081513, 1.051771, 1.197437, 1.027659, 0.970290,
+0.834479, 0.996617, 0.999637]`.
+
+Current-like historical/borrowed ratios:
+`[3.989016, 4.054479, 3.829270, 3.945070, 3.695409, 4.113675,
+4.009683, 3.861343, 3.857688, 3.912157, 3.990173, 2.480684,
+3.873513, 4.899538, 3.939241, 3.418174, 3.870716, 7.972873,
+3.289166, 3.746467, 4.010567]`.
+
+Nested BASE/BASE ratios:
+`[1.000325, 0.989575, 0.982020, 0.942234, 1.002543, 0.966237,
+0.984538, 0.998235, 1.579255, 0.936820, 1.006456, 1.025839,
+0.979153, 1.043475, 1.014744, 1.028594, 0.981038, 0.992873,
+0.987762, 1.000004, 0.999149]`.
+
+Nested historical/borrowed ratios:
+`[4.375300, 4.448396, 4.504837, 4.061777, 4.400071, 4.412590,
+4.446535, 4.297780, 5.243999, 4.432278, 4.324668, 4.267244,
+4.392145, 3.641482, 4.628488, 4.354792, 4.693964, 4.332210,
+3.961232, 3.094552, 4.208714]`.
+
+**Behavior proof.** Before either timed shape, the same binary required exact
+serialized-byte equality between the historical owned `Value` and borrowed view.
+The permanent oracle covers empty fields, `seq` zero and `u64::MAX`, quotes,
+backslashes, newlines, NUL, Unicode, null/array/nested-object payloads, payload
+insertion order, and an explicit golden top-level field order. Both the oracle and
+foreground benchmark passed (`2 passed, 0 failed`, 5.65 s timed path). A
+post-benchmark `#[cfg(test)]` annotation only removes the now-orphaned historical
+oracle from non-test builds; under the measured test configuration its generated
+path is unchanged. Ratio versus LEGACY ORIGINAL for the current-like serialization
+boundary: **3.912157x**.
+
 ### 2026-07-14 UTC — LANDED (gated default-OFF, WER-candidate): ToMe encoder token-merging — **encoder_window −24% (R=200) / −18% (R=100), transcript-identical on jfk**
 
 **What.** Structural FLOP-reduction for the encoder (the short-clip-dominant, byte-exact-
