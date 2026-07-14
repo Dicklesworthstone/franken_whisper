@@ -746,6 +746,139 @@ fn enc_prof_add(i: usize, ns: u128) {
     ENC_PROF.with(|p| p.borrow_mut()[i] += ns);
 }
 
+/// `FW_TOME_R` — ToMe token-merge count (bipartite soft matching). Default 0 (OFF,
+/// byte-identical). When >0, `r` encoder tokens are merged after layer `FW_TOME_LAYER`,
+/// so the remaining layers run at a shorter sequence — a STRUCTURAL FLOP reduction that
+/// shrinks BOTH the int8 GEMMs and the SDPA. NON-byte-exact (merged tokens lose detail)
+/// ⇒ WER-gated owner candidate; measured for drift before any flip.
+fn tome_r() -> usize {
+    use std::sync::OnceLock;
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("FW_TOME_R")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// 0-based encoder layer index after which the ToMe merge happens (default 3).
+fn tome_after_layer() -> usize {
+    use std::sync::OnceLock;
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("FW_TOME_LAYER")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(3)
+    })
+}
+
+/// Bipartite soft matching token merge (ToMe, Bolya et al. 2023). Partition tokens
+/// alternately into A (even positions) and B (odd); each A token draws one edge to its
+/// most-cosine-similar B token; the `r` highest-similarity A tokens merge (count-weighted
+/// average) into their B partner. Returns `[seq-r, d]` merged activations + an
+/// `unmerge_map` (original position → merged row) for [`tome_unmerge`].
+fn tome_merge(x: &Mat, r: usize) -> (Mat, Vec<usize>) {
+    let seq = x.rows;
+    let d = x.cols;
+    let n_a = seq.div_ceil(2); // even rows 0,2,4,...
+    let n_b = seq / 2; // odd rows 1,3,5,...
+    let r = r.min(n_a).min(seq.saturating_sub(1));
+    let mut a_data = vec![0f32; n_a * d];
+    let mut b_data = vec![0f32; n_b * d];
+    for a in 0..n_a {
+        a_data[a * d..(a + 1) * d].copy_from_slice(x.row(2 * a));
+    }
+    for b in 0..n_b {
+        b_data[b * d..(b + 1) * d].copy_from_slice(x.row(2 * b + 1));
+    }
+    // sim[a,b] = A[a]·B[b] via the (parallel) sgemm; cosine = sim / (|A||B|).
+    let a_mat = Mat::from_vec(n_a, d, a_data.clone());
+    let b_t = transpose(&b_data, n_b, d); // [d, n_b]
+    let sim = nn::matmul(&a_mat, &b_t)
+        .unwrap_or_else(|_| Mat::from_vec(n_a, n_b.max(1), vec![0.0; n_a * n_b.max(1)]));
+    let norm = |data: &[f32], i: usize| -> f32 {
+        data[i * d..(i + 1) * d]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+            .max(1e-9)
+    };
+    let a_norm: Vec<f32> = (0..n_a).map(|a| norm(&a_data, a)).collect();
+    let b_norm: Vec<f32> = (0..n_b).map(|b| norm(&b_data, b)).collect();
+    let mut best_b = vec![0usize; n_a];
+    let mut best_sim = vec![f32::NEG_INFINITY; n_a];
+    for a in 0..n_a {
+        let row = sim.row(a);
+        for (b, &s) in row.iter().enumerate().take(n_b) {
+            let cos = s / (a_norm[a] * b_norm[b]);
+            if cos > best_sim[a] {
+                best_sim[a] = cos;
+                best_b[a] = b;
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..n_a).collect();
+    order.sort_by(|&i, &j| {
+        best_sim[j]
+            .partial_cmp(&best_sim[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut do_merge = vec![false; n_a];
+    for &a in order.iter().take(r) {
+        do_merge[a] = true;
+    }
+    // merged = B rows (with merged A count-weighted-averaged in), then the kept A rows.
+    let mut merged = b_data.clone();
+    let mut counts = vec![1usize; n_b];
+    for a in 0..n_a {
+        if do_merge[a] {
+            let b = best_b[a];
+            let arow = &a_data[a * d..(a + 1) * d];
+            for (k, &av) in arow.iter().enumerate() {
+                merged[b * d + k] += av;
+            }
+            counts[b] += 1;
+        }
+    }
+    for b in 0..n_b {
+        if counts[b] > 1 {
+            let c = counts[b] as f32;
+            for k in 0..d {
+                merged[b * d + k] /= c;
+            }
+        }
+    }
+    let mut umap = vec![0usize; seq];
+    for b in 0..n_b {
+        umap[2 * b + 1] = b;
+    }
+    let mut slot = n_b;
+    for a in 0..n_a {
+        if do_merge[a] {
+            umap[2 * a] = best_b[a];
+        } else {
+            merged.extend_from_slice(&a_data[a * d..(a + 1) * d]);
+            umap[2 * a] = slot;
+            slot += 1;
+        }
+    }
+    (Mat::from_vec(seq - r, d, merged), umap)
+}
+
+/// Expand a ToMe-merged `[seq-r, d]` activation back to `[orig_seq, d]` by broadcasting
+/// each merged row to all original positions that mapped into it (via `unmerge_map`).
+fn tome_unmerge(merged: &Mat, umap: &[usize], orig_seq: usize) -> Mat {
+    let d = merged.cols;
+    let mut out = vec![0f32; orig_seq * d];
+    for (pos, &m) in umap.iter().enumerate().take(orig_seq) {
+        out[pos * d..(pos + 1) * d].copy_from_slice(merged.row(m));
+    }
+    Mat::from_vec(orig_seq, d, out)
+}
+
 fn forward_time_major(
     w: &EncoderWeights,
     x: Mat,
@@ -803,9 +936,24 @@ fn forward_time_major(
         let n_run = encoder_layer_limit()
             .unwrap_or(w.layers.len())
             .min(w.layers.len());
-        for layer in w.layers.iter().take(n_run) {
+        // ToMe structural token merge (FW_TOME_R>0, default off): after layer
+        // `tome_after_layer`, merge `r` tokens so the remaining blocks run at a
+        // shorter sequence, then unmerge before ln_post. NON-byte-exact.
+        let tome = tome_r();
+        let tome_after = tome_after_layer();
+        let mut tome_state: Option<(Vec<usize>, usize)> = None;
+        for (li, layer) in w.layers.iter().take(n_run).enumerate() {
             encoder_block(&mut x, layer, w.n_head)?;
+            if tome > 0 && tome_state.is_none() && li == tome_after && x.rows > tome + 2 {
+                let orig_seq = x.rows;
+                let (merged, umap) = tome_merge(&x, tome);
+                x = merged;
+                tome_state = Some((umap, orig_seq));
+            }
             checkpoint()?;
+        }
+        if let Some((umap, orig_seq)) = tome_state {
+            x = tome_unmerge(&x, &umap, orig_seq);
         }
     }
 
