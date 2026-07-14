@@ -51,6 +51,47 @@
 
 ## Levers
 
+### 2026-07-14 UTC — cod_fw — LANDED (text exact): owned UTF-8 tokenizer decode handoff — **2.45x median**
+
+**Profile / negative-ledger boundary.** `Tokenizer::decode` is called for every
+segment emitted by `build_segments`. It already owned the concatenated token
+bytes, but `String::from_utf8_lossy(&bytes).into_owned()` allocated a second
+buffer and copied the complete transcript even when its UTF-8 was valid. The
+ledger had no row for this ownership handoff; model-load zero-fill and the
+decoder/attention kernels were explicitly closed and were not retried.
+
+**Change.** Consume the owned byte vector with `String::from_utf8`. Normal
+valid transcript text now reuses that allocation directly. A
+`FromUtf8Error` still routes its original bytes through
+`String::from_utf8_lossy`, preserving the prior replacement behavior for
+malformed/orphan byte sequences.
+
+**Exactness.** Four focused remote tests passed, covering a Unicode code point
+split across two tokens, an orphan `0xff` byte and its replacement character,
+special-token skipping, and bracketed special-token rendering. The hermetic
+benchmark also asserts the complete returned string equals the historical
+owned-copy implementation before Criterion starts.
+
+| same-binary arm (256 tokens / 2,816 valid UTF-8 bytes) | interval | median |
+|---|---:|---:|
+| lossy borrowed slice + owned copy | 3.5658–4.6885 us | **4.0853 us** |
+| owned byte-vector handoff | 1.4394–1.8623 us | **1.6676 us** |
+
+That is **59.2% lower token-to-text materialization time / 2.45x throughput**,
+with non-overlapping intervals. Both arms ran in one foreground `--profile
+release` Criterion process on RCH worker `vmi1152480`; Cargo reused the
+prelinked binary (0.42 s), the remote command took 9.63 s, and the full RCH
+invocation returned in 76.7 s. Command: `RCH_REQUIRE_REMOTE=1
+RCH_NO_SELF_HEALING=1 RCH_WORKER=vmi1152480 rch exec -- env
+CARGO_HOME=/root/.cargo CARGO_NET_OFFLINE=true cargo bench --profile release
+--bench native_engine_bench -- native_engine/tokenizer_decode_utf8
+--warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`.
+
+**Scope.** This removes one allocation and full-text copy per segment decode;
+it does not claim a decoder-kernel or end-to-end transcription gain. Production
+code and its A/B landed in `a60ca0b`; bead `bd-wmpk` is closed with the measured
+evidence.
+
 ### 2026-07-14 UTC — cod_fw — LANDED (token-ID exact): tokenizer suppression discriminant prefilter — **4.95x median**
 
 **Profile / negative-ledger boundary.** Parsing the on-box
