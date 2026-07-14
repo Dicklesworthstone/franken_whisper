@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendDiscoveryEntry, BackendsReport, RunEvent, RunReport, TranscriptionSegment,
+    AccelerationReport, BackendDiscoveryEntry, BackendKind, BackendsReport, RunEvent, RunReport,
+    TranscriptionSegment,
 };
 
 pub const ROBOT_SCHEMA_VERSION: &str = "1.0.0";
@@ -141,7 +142,7 @@ pub fn emit_robot_stage(run_id: &str, event: &RunEvent) -> FwResult<()> {
 }
 
 pub fn emit_robot_complete(report: &RunReport) -> FwResult<()> {
-    emit_line(&run_complete_value(report))
+    emit_line(&BorrowedComplete::new(report))
 }
 
 pub fn emit_robot_report(report: &RunReport) -> FwResult<()> {
@@ -680,7 +681,11 @@ pub fn emit_health_report(report: &HealthReport) -> FwResult<()> {
 /// Extract acceleration stream ownership/cancellation telemetry from run evidence.
 #[must_use]
 pub fn acceleration_context_from_evidence(evidence: &[Value]) -> Option<Value> {
-    evidence.iter().rev().find_map(|entry| {
+    acceleration_context_ref_from_evidence(evidence).cloned()
+}
+
+fn acceleration_context_ref_from_evidence(evidence: &[Value]) -> Option<&Value> {
+    evidence.iter().rev().find(|entry| {
         let has_stream_owner = entry
             .get("logical_stream_owner_id")
             .and_then(Value::as_str)
@@ -688,11 +693,7 @@ pub fn acceleration_context_from_evidence(evidence: &[Value]) -> Option<Value> {
         let has_fence = entry
             .get("cancellation_fence")
             .is_some_and(Value::is_object);
-        if has_stream_owner && has_fence {
-            Some(entry.clone())
-        } else {
-            None
-        }
+        has_stream_owner && has_fence
     })
 }
 
@@ -996,6 +997,46 @@ impl<'a> BorrowedStage<'a> {
     }
 }
 
+#[derive(Serialize)]
+struct BorrowedComplete<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    run_id: &'a str,
+    trace_id: &'a str,
+    started_at: &'a str,
+    finished_at: &'a str,
+    backend: BackendKind,
+    language: Option<&'a str>,
+    transcript: &'a str,
+    segments: &'a [TranscriptionSegment],
+    acceleration: Option<&'a AccelerationReport>,
+    warnings: &'a [String],
+    evidence: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceleration_context: Option<&'a Value>,
+}
+
+impl<'a> BorrowedComplete<'a> {
+    fn new(report: &'a RunReport) -> Self {
+        Self {
+            event: "run_complete",
+            schema_version: ROBOT_SCHEMA_VERSION,
+            run_id: &report.run_id,
+            trace_id: &report.trace_id,
+            started_at: &report.started_at_rfc3339,
+            finished_at: &report.finished_at_rfc3339,
+            backend: report.result.backend,
+            language: report.result.language.as_deref(),
+            transcript: &report.result.transcript,
+            segments: &report.result.segments,
+            acceleration: report.result.acceleration.as_ref(),
+            warnings: &report.warnings,
+            evidence: &report.evidence,
+            acceleration_context: acceleration_context_ref_from_evidence(&report.evidence),
+        }
+    }
+}
+
 #[cfg(test)]
 fn run_stage_value(run_id: &str, event: &RunEvent) -> serde_json::Value {
     json!({
@@ -1011,6 +1052,7 @@ fn run_stage_value(run_id: &str, event: &RunEvent) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
 fn run_complete_value(report: &RunReport) -> serde_json::Value {
     let mut value = json!({
         "event": "run_complete",
@@ -1042,12 +1084,13 @@ mod tests {
     use crate::model::RunEvent;
 
     use super::{
-        BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS, RUN_COMPLETE_REQUIRED_FIELDS,
-        RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS, SPECULATION_STATS_REQUIRED_FIELDS,
-        STAGE_REQUIRED_FIELDS, TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
-        TRANSCRIPT_CORRECT_REQUIRED_FIELDS, TRANSCRIPT_PARTIAL_REQUIRED_FIELDS,
-        TRANSCRIPT_RETRACT_REQUIRED_FIELDS, robot_schema_value, run_complete_value,
-        run_error_value, run_stage_value, run_start_value, transcript_partial_value,
+        BorrowedComplete, BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS,
+        RUN_COMPLETE_REQUIRED_FIELDS, RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS,
+        SPECULATION_STATS_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS,
+        TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+        TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS, robot_schema_value,
+        run_complete_value, run_error_value, run_stage_value, run_start_value,
+        transcript_partial_value,
     };
 
     #[test]
@@ -1933,6 +1976,262 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse back");
         assert_eq!(parsed["event"], "run_complete");
+    }
+
+    #[test]
+    fn borrowed_complete_serialization_matches_owned_value_bytes() {
+        use crate::model::{AccelerationBackend, AccelerationReport, TranscriptionSegment};
+
+        fn assert_byte_parity(report: &crate::model::RunReport) -> Vec<u8> {
+            let owned = serde_json::to_vec(&run_complete_value(report)).expect("owned complete");
+            let borrowed =
+                serde_json::to_vec(&BorrowedComplete::new(report)).expect("borrowed complete");
+            assert_eq!(borrowed, owned, "run_complete bytes differ");
+            borrowed
+        }
+
+        let mut empty = test_report(vec![], vec![]);
+        empty.result.language = None;
+        empty.result.transcript.clear();
+        let empty_bytes = assert_byte_parity(&empty);
+        assert_eq!(
+            String::from_utf8(empty_bytes).expect("empty complete is UTF-8"),
+            r#"{"event":"run_complete","schema_version":"1.0.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"warnings":[],"evidence":[]}"#,
+        );
+
+        let mut rich = test_report(vec![], vec![]);
+        rich.run_id = "run-\"quoted\"\\line\nnext".to_owned();
+        rich.result.transcript = "hello\nλ 🎧 \\ \"world\"".repeat(8);
+        rich.result.segments = vec![
+            TranscriptionSegment {
+                start_sec: Some(-0.0),
+                end_sec: Some(1.25),
+                text: "first\nsegment".to_owned(),
+                speaker: Some("SPEAKER_00".to_owned()),
+                confidence: Some(0.9375),
+            },
+            TranscriptionSegment {
+                start_sec: None,
+                end_sec: None,
+                text: "第二段 🚀".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+        rich.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 257,
+            normalized_confidences: true,
+            pre_mass: Some(3.5),
+            post_mass: None,
+            notes: vec!["accelerated\npath".to_owned()],
+        });
+        rich.warnings = vec!["warning \"quoted\"".to_owned()];
+        rich.evidence = vec![
+            json!({
+                "logical_stream_owner_id": "ignored",
+                "cancellation_fence": [],
+            }),
+            json!({
+                "logical_stream_owner_id": "owner-first",
+                "cancellation_fence": {"generation": 1},
+            }),
+            json!({"nested": [{"ordered_first": true}, null]}),
+            json!({
+                "logical_stream_owner_id": "owner-last",
+                "cancellation_fence": {},
+                "extra": "kept",
+            }),
+        ];
+        let rich_line =
+            String::from_utf8(assert_byte_parity(&rich)).expect("rich complete is UTF-8");
+        let evidence_offset = rich_line.find("\"evidence\"").expect("evidence field");
+        let context_offset = rich_line
+            .rfind("\"acceleration_context\"")
+            .expect("acceleration context field");
+        assert!(
+            context_offset > evidence_offset,
+            "context must remain final"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&rich_line).expect("parse rich");
+        assert_eq!(
+            parsed["acceleration_context"]["logical_stream_owner_id"],
+            "owner-last"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn borrowed_complete_serialization_perf() {
+        use crate::model::{AccelerationBackend, AccelerationReport, TranscriptionSegment};
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "robot_complete_serialization binary_sha256={:x}",
+            Sha256::digest(executable)
+        );
+
+        fn time_owned(report: &crate::model::RunReport, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = run_complete_value(black_box(report));
+                let encoded = serde_json::to_string(black_box(&value)).expect("owned complete");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_borrowed(report: &crate::model::RunReport, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = BorrowedComplete::new(black_box(report));
+                let encoded = serde_json::to_string(black_box(&value)).expect("borrowed complete");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn run_shape(name: &str, report: &crate::model::RunReport, iterations: usize) {
+            let owned_bytes =
+                serde_json::to_vec(&run_complete_value(report)).expect("owned complete");
+            let borrowed_bytes =
+                serde_json::to_vec(&BorrowedComplete::new(report)).expect("borrowed complete");
+            assert_eq!(borrowed_bytes, owned_bytes, "{name} byte parity");
+            eprintln!(
+                "robot_complete_serialization shape={name} output_bytes={} output_sha256={:x}",
+                owned_bytes.len(),
+                Sha256::digest(&owned_bytes)
+            );
+
+            for _ in 0..3 {
+                black_box(time_owned(report, iterations));
+                black_box(time_borrowed(report, iterations));
+            }
+
+            let mut null_ratios = Vec::with_capacity(SAMPLES);
+            let mut speedups = Vec::with_capacity(SAMPLES);
+            let mut owned_times = Vec::with_capacity(SAMPLES);
+            let mut borrowed_times = Vec::with_capacity(SAMPLES);
+
+            for sample in 0..SAMPLES {
+                let null_first = time_owned(report, iterations);
+                let null_second = time_owned(report, iterations);
+                let (null_numerator, null_denominator) = if sample % 2 == 0 {
+                    (null_first, null_second)
+                } else {
+                    (null_second, null_first)
+                };
+                null_ratios.push(null_numerator as f64 / null_denominator as f64);
+
+                let (owned, borrowed) = if sample % 2 == 0 {
+                    (
+                        time_owned(report, iterations),
+                        time_borrowed(report, iterations),
+                    )
+                } else {
+                    let borrowed = time_borrowed(report, iterations);
+                    let owned = time_owned(report, iterations);
+                    (owned, borrowed)
+                };
+                owned_times.push(owned);
+                borrowed_times.push(borrowed);
+                speedups.push(owned as f64 / borrowed as f64);
+            }
+
+            eprintln!(
+                "robot_complete_serialization shape={name} samples={SAMPLES} iterations={iterations} null_p10={:.6} null_median={:.6} null_p90={:.6} owned_arm_median_ns={} borrowed_arm_median_ns={} speedup_p10={:.6} speedup_median={:.6} speedup_p90={:.6}",
+                percentile(&null_ratios, 10),
+                percentile(&null_ratios, 50),
+                percentile(&null_ratios, 90),
+                median_ns(&owned_times),
+                median_ns(&borrowed_times),
+                percentile(&speedups, 10),
+                percentile(&speedups, 50),
+                percentile(&speedups, 90),
+            );
+            eprintln!(
+                "robot_complete_serialization shape={name} null_ratios={null_ratios:?} speedups={speedups:?}"
+            );
+        }
+
+        let mut current_like = test_report(vec![], vec![]);
+        current_like.result.transcript =
+            "The quick brown fox crosses the low-latency speech pipeline. ".repeat(18);
+        current_like.result.segments = (0..10)
+            .map(|index| TranscriptionSegment {
+                start_sec: Some(f64::from(index) * 0.75),
+                end_sec: Some(f64::from(index + 1) * 0.75),
+                text: format!("segment {index}: measured robot output"),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{index:02}")),
+                confidence: Some(0.9 + f64::from(index) / 1_000.0),
+            })
+            .collect();
+        current_like.warnings = vec!["normalization used ffmpeg".to_owned()];
+        current_like.evidence = vec![
+            json!({"contract": "backend_selection", "action": "native"}),
+            json!({"contract": "calibration", "score": 0.93}),
+            json!({"contract": "checkpoint", "stage": "persist", "result": "ok"}),
+        ];
+
+        let mut heavy = test_report(vec![], vec![]);
+        heavy.result.transcript = "wide transcript payload with Unicode λ and 🎧; ".repeat(700);
+        heavy.result.segments = (0..128)
+            .map(|index| TranscriptionSegment {
+                start_sec: Some(f64::from(index) * 0.5),
+                end_sec: Some(f64::from(index + 1) * 0.5),
+                text: format!(
+                    "segment {index:03}: long nested transcription text with escaped \"quotes\""
+                ),
+                speaker: Some(format!("SPEAKER_{:02}", index % 8)),
+                confidence: Some(0.8 + f64::from(index % 20) / 100.0),
+            })
+            .collect();
+        heavy.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 65_536,
+            normalized_confidences: true,
+            pre_mass: Some(127.75),
+            post_mass: Some(127.5),
+            notes: (0..8).map(|index| format!("note-{index}")).collect(),
+        });
+        heavy.warnings = (0..16)
+            .map(|index| format!("heavy warning {index}"))
+            .collect();
+        heavy.evidence = (0..32)
+            .map(|index| {
+                json!({
+                    "contract": format!("contract-{index}"),
+                    "posterior": {"accepted": index % 2 == 0, "score": f64::from(index) / 32.0},
+                    "actions": ["keep", "fallback"],
+                })
+            })
+            .collect();
+        heavy.evidence.push(json!({
+            "logical_stream_owner_id": "stream-owner-heavy",
+            "cancellation_fence": {"epoch": 17, "closed": false},
+            "calibration": {"ece": 0.0125},
+        }));
+
+        run_shape("current_like", &current_like, 5_000);
+        run_shape("heavy", &heavy, 100);
     }
 
     // --- emit_robot_report shape tests (value-level, not stdout) ---

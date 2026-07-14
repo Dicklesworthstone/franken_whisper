@@ -74,7 +74,7 @@ uncontended mutex + one cache re-check ≈ µs). Byte-exact ⇒ no WER gate need
 
 **Rollback.** `FW_LOAD_DEDUP=0` (default), or revert the `mod.rs` `load_canonical` split.
 
-### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed robot-complete serialization — **2.969109x current-like median**
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed robot-complete serialization — **3.113394x current-like median**
 
 **What.** `emit_robot_complete` previously deep-cloned the transcript, segments,
 acceleration report, warnings, and evidence into an owned `serde_json::Value`,
@@ -91,40 +91,40 @@ historical owned-DOM arm, the borrowed arm, exact byte oracles, 21 alternating
 BASE/BASE pairs, and 21 alternating historical/candidate pairs. The measured
 boundary includes the final `serde_json::to_string` allocation used by
 `emit_line`, but excludes common stdout and terminal I/O. RCH job
-`j-29928833041827555` ran on worker `vmi1149989` with opt-level 3, LTO disabled,
+`j-29928833041827605` ran on worker `vmi1149989` with opt-level 3, LTO disabled,
 and 16 codegen units; no local fallback occurred. Benchmark-binary SHA-256:
-`6f4e72dca2a35618e849a128cf405b19d1674fe6d48447f905d092fc93110ef4`.
+`d1080ebc5e4fd8bda8a98d4dadc0dc6b91e57ea9150752bdf8b3599682e95003`.
 
 | shape / comparison | p10 | median | p90 | historical arm median | borrowed arm median | verdict |
 |---|---:|---:|---:|---:|---:|---|
-| current-like historical / historical null | 0.875599 | **0.979480** | **1.133257** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
-| current-like historical / borrowed | **2.693004x** | **2.969109x** | 3.892649x | 53,441,069 ns / 5,000 reports | 16,389,473 ns / 5,000 reports | **keep: candidate p10 exceeds null p90** |
-| heavy historical / historical null | 0.923569 | **0.995685** | **1.095340** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
-| heavy historical / borrowed | **2.297239x** | **2.550173x** | 3.252529x | 15,077,731 ns / 100 reports | 5,401,665 ns / 100 reports | **keep: candidate p10 exceeds null p90** |
+| current-like historical / historical null | 0.917587 | **0.992979** | **1.100159** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
+| current-like historical / borrowed | **2.804521x** | **3.113394x** | 3.799338x | 50,316,734 ns / 5,000 reports | 16,306,250 ns / 5,000 reports | **keep: candidate p10 exceeds null p90** |
+| heavy historical / historical null | 0.933657 | **0.991453** | **1.068212** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
+| heavy historical / borrowed | **2.673136x** | **2.793387x** | 3.034086x | 14,887,994 ns / 100 reports | 5,310,876 ns / 100 reports | **keep: candidate p10 exceeds null p90** |
 
 Current-like BASE/BASE ratios:
-`[0.979480, 0.960446, 0.854446, 1.232285, 0.706310, 0.996913,
-1.134996, 1.125429, 0.900583, 1.030204, 0.919679, 1.016977,
-0.905077, 1.133257, 1.050693, 0.911067, 0.875599, 1.027725,
-0.936275, 0.930631, 0.988006]`.
+`[0.992979, 1.134558, 0.949017, 0.938657, 0.990580, 0.888316,
+1.004172, 1.045418, 0.899127, 0.990094, 1.037976, 0.991255,
+1.006441, 1.100159, 1.037649, 0.958116, 0.917587, 1.180409,
+1.054774, 1.002104, 0.949114]`.
 
 Current-like historical/borrowed ratios:
-`[3.892649, 4.099705, 2.818644, 2.905518, 4.186313, 3.563049,
-3.140283, 3.366298, 2.826101, 2.903056, 2.360997, 2.890784,
-2.969109, 3.139343, 2.742624, 2.693004, 2.746408, 3.199101,
-2.303705, 3.193429, 3.790344]`.
+`[2.955500, 3.275678, 3.436460, 3.597242, 3.001944, 3.275937,
+3.065592, 3.931001, 2.944908, 2.925846, 2.804521, 3.119520,
+3.850167, 3.113394, 2.734107, 3.799338, 3.555373, 3.110763,
+3.063738, 2.569212, 3.250461]`.
 
 Heavy BASE/BASE ratios:
-`[1.001049, 0.883479, 1.029476, 0.980782, 0.967498, 1.095462,
-1.092859, 0.999714, 0.970073, 0.969770, 1.038889, 1.160985,
-0.954703, 1.095340, 0.995685, 0.929869, 0.873606, 1.058524,
-1.063618, 0.992597, 0.923569]`.
+`[1.068159, 0.984993, 0.980071, 1.025348, 0.990263, 0.920916,
+0.933657, 0.930627, 1.068212, 0.971146, 0.969166, 1.104376,
+0.993769, 0.971959, 1.004191, 1.239435, 0.990981, 1.001524,
+0.991453, 1.062043, 1.000749]`.
 
 Heavy historical/borrowed ratios:
-`[2.932954, 2.811840, 2.453730, 2.890457, 3.626403, 2.257380,
-2.733826, 2.550173, 3.175333, 2.527598, 2.484257, 2.513215,
-3.640306, 2.542205, 2.998129, 3.252529, 2.620467, 2.418875,
-2.297239, 2.220778, 2.457188]`.
+`[3.461040, 2.733855, 3.537037, 3.034086, 2.695802, 2.815389,
+2.673798, 2.839636, 2.791008, 2.639948, 2.511604, 2.831908,
+2.765801, 2.793387, 2.705831, 2.673136, 2.806323, 2.759546,
+2.800177, 2.872315, 2.796743]`.
 
 **Behavior proof.** Before either timed shape, the same binary required exact
 serialized-byte equality between the historical owned `Value` and the borrowed
@@ -137,10 +137,10 @@ bytes (SHA-256
 heavy output was 59,668 bytes (SHA-256
 `85604bd436cc0dce07a4de473fa4077b88f88d3f308237ddfa497ebc6727680a`).
 Both the permanent oracle and foreground benchmark passed (`2 passed, 0
-failed`, 5.40 s timed path). This emitter runs once per robot report, so the
+failed`, 5.31 s timed path). This emitter runs once per robot report, so the
 claim is intentionally limited to serialization rather than end-to-end ASR.
 Ratio versus LEGACY ORIGINAL for the current-like serialization boundary:
-**2.969109x**.
+**3.113394x**.
 
 ### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed robot-stage serialization — **3.912157x current-like median**
 
