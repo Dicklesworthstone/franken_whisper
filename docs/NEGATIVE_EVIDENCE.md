@@ -21165,6 +21165,22 @@ for whisper's audio encoder: merging EARLY all-at-once (layer 3) beats spreading
 layers give the most-poolable representations and each later merge event compounds drift. Reverted `FW_TOME_LAYERS`
 (encoder.rs == landed `dd4c5af` single-merge, the optimal config). The landed ToMe knob to tune is `FW_TOME_R`
 (more merge = more speed + more drift, one curve), NOT layer-spreading. Don't re-try progressive ToMe.
+**Tick 2026-07-14aa (fresh-context loop) — ToMe-NO-UNMERGE (`FW_TOME_KEEP_MERGED`, feed the merged encoder
+output straight to the decoder cross-attention) = REGRESSION, falsified + reverted; BUT the same run confirmed
+the landed ToMe is −10.4 % e2e on realistic long-audio (a valuable characterization).** Hypothesis: keep the
+merged (fewer) encoder frames so the decoder cross-attention + per-token cross-KV read run over fewer frames,
+extending the win into decode. Shape-safe (`decoder.rs:887` reads `encoder_out.rows`, and tail-truncation already
+feeds variable frame counts). Built `FW_TOME_KEEP_MERGED`, benched track01 (124 s, decode-dominated, turbo, no_ts):
+**keep-merged is SLOWER — decode_loop 7151 ms vs 5984 (unmerge) / 6514 (baseline); wall 10024 ms vs 8560 / 9553**,
+and erratic across R (R=400 back to ~baseline 6515). The coarser cross-attention changes decode DYNAMICS (step
+count / EOT timing / confidence) far more than the ~1 %-of-decode per-token frame saving helps — a net LOSS.
+Reverted (encoder.rs == landed `dd4c5af`). **Lesson: the decoder is NOT robust to a coarsened cross-attention
+context the way the encoder blocks are to merged self-attention — unmerge (full `[n_ctx,n_state]` output) is
+REQUIRED; don't feed merged frames to the decoder.** **BONUS (the real value of this tick):** the same track01
+run FINALLY characterized the LANDED ToMe on the realistic long-audio workload (it was only jfk-encoder_window
+before): **R=200 unmerge = wall 8560 vs 9553 baseline = −10.4 % e2e** (decode content-drift small, 255 vs 257 w,
+22 word-lines) — so the encoder is NOT fully pipelined-away and the ToMe win SURVIVES to e2e even in the
+decode-dominated regime. Recorded in the PERF_LEDGER ToMe entry.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
