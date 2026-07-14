@@ -21136,6 +21136,22 @@ floor.** Every decode sub-frame is now closed by DIRECT measurement (mlp/proj GE
 + logits precision 13v/threading + head-shrink 13x; attention 13r; cross-KV/SDPA gated). No small byte-exact
 autonomous decode lever remains; real EV = the streaming loader (bd-A14, `ggml.rs:44`, ~4.7 % single-shot, byte-
 exact but a multi-turn restructure) or owner-scoped spec-decode.
+**Tick 2026-07-13y (fresh-context loop, DIRECTED off decode to a LARGER STRUCTURAL primitive) — ToMe encoder
+token-merging LANDED (gated default-off, WER-candidate): encoder_window −24 % (R=200) / −18 % (R=100),
+transcript-IDENTICAL on jfk — the session's FIRST real win after 6 decode negatives.** Full detail = the
+PERF_LEDGER entry `2026-07-14 UTC — ToMe`. The insight that broke the 6-negative streak: the byte-exact CPU
+surface is genuinely empty, but the encoder int8 GEMM is COMPUTE-bound (measured, 13t) ⇒ the only encoder lever
+is FEWER MACs = a STRUCTURAL sequence-length reduction (ToMe), which shrinks BOTH the int8 GEMMs and the SDPA and
+whose similarity overhead (one parallel `A@Bᵀ` sgemm) is negligible vs the per-token×per-layer GEMM FLOPs saved.
+Built `encoder.rs::tome_merge`/`tome_unmerge` (bipartite soft matching, merge after `FW_TOME_LAYER`=3, unmerge
+before `ln_post`), gated `FW_TOME_R` (default 0 = byte-identical, R=0 md5 `b4f8cac64d` == baseline). **WER caveat
+(why it's gated, not default-on):** transcript-identical on jfk (single-window clean) but DRIFTS on 124 s
+multi-window `track01` real speech (R=100 261 w, R=200 255 w vs 257 w — a few words, Q8-class) ⇒ owner WER-gate
+before any flip, exactly like `enc_int8`/`poly_exp`/`cross_v_block`. **METHOD LESSON for the loop: when 6
+micro-ticks on one subsystem wash, the fix is a DIFFERENT-ALTITUDE primitive (structural FLOP reduction), not a
+7th micro-tweak — the compute-bound wall that kills byte-exact kernel tweaks is exactly what a structural
+token-count reduction sidesteps.** alien-graveyard has no transformer primitive (distributed-systems corpus); the
+ToMe idea is standard vision-transformer literature applied to whisper's audio encoder.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control

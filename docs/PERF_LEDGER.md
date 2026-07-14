@@ -51,6 +51,99 @@
 
 ## Levers
 
+### 2026-07-14 UTC — LANDED (gated default-OFF, WER-candidate): ToMe encoder token-merging — **encoder_window −24% (R=200) / −18% (R=100), transcript-identical on jfk**
+
+**What.** Structural FLOP-reduction for the encoder (the short-clip-dominant, byte-exact-
+floored stack). After 6 decode/GEMV micro-ticks came back wash/sub-floor and the encoder
+int8 GEMM was measured compute-bound (maddubs-optimal, cache-blocking regressed −3.4%), the
+only lever left on a compute-bound encoder is FEWER MACs. Implemented **ToMe** (Bolya 2023
+bipartite soft matching, `encoder.rs::tome_merge`/`tome_unmerge`): after layer `FW_TOME_LAYER`
+(default 3), the `FW_TOME_R` most-cosine-similar token pairs merge (count-weighted average) so
+the remaining ~28 blocks run at a shorter sequence — shrinking BOTH the int8 GEMMs and the
+external SDPA — then unmerge (broadcast) before `ln_post` so the decoder cross-attention still
+sees the full `[n_ctx, n_state]`. Similarity is one parallel sgemm (`A @ Bᵀ`), negligible vs the
+per-token×per-layer GEMM FLOPs saved.
+
+**Measured** (turbo, jfk single-window = pure encoder signal, threads=32, `PERF_SPANS`,
+alternated, local build): `encoder_window` R=0 ~1572 ms → **R=100 ~1294 ms (−18%)** → **R=200
+~1191 ms (−24%)**. Encoder is ~82–90% of single-shot e2e ⇒ ~15–20% e2e on short clips; less on
+long audio (encoder pipelines behind decode, `project_window_pipelining_lever`).
+
+**Numerics / WER.** NON-byte-exact (merged tokens lose frame detail) but **TRANSCRIPT-IDENTICAL
+on jfk** at R=100 AND R=200 (whisper.cpp conformance is transcription-level, not bit-level). On
+the harder 124 s multi-window `track01` real speech it **DRIFTS moderately** — R=100 261 w, R=200
+255 w vs 257 w baseline (a few words changed/inserted/dropped, Q8-class, e.g. "just" dropped,
+"it,but"→"it.But"). So "jfk-identical ≠ corpus-neutral" ([[project_final_window_early_eot_bug]]).
+⇒ **WER-gated owner candidate**, default OFF, exactly like `FRANKEN_WHISPER_ENC_INT8` /
+`FT_SDPA_POLY_EXP` / `FW_CROSS_V_BLOCK`.
+
+**Gate / safety.** `FW_TOME_R=0` (default) ⇒ the merge branch is dead ⇒ **byte-identical** to the
+prior encoder (R=0 md5 `b4f8cac64d` == baseline, verified via turbo transcript diff). CPU path
+only (inside `if !gpu_encode_stack`). Owner: run a corpus WER harness at R∈{50,100,200} to pick
+the accuracy/speed knee before any default-on flip.
+
+**Rollback.** `FW_TOME_R=0`, or revert `encoder.rs` (self-contained: two fns + one gated loop branch).
+
+### 2026-07-14 UTC — cod_fw — LANDED (byte-exact): project recent-run transcript previews in SQL — **1.429596× median**
+
+**What.** `RunStore::list_recent_runs` selected every complete transcript, copied it
+into a Rust `String`, and only then retained 140 characters. The query now selects
+`substr(transcript, 1, 140)`, activating FrankenSQLite's `ColumnSubstrPrefix` opcode
+so ordinary ASCII TEXT rows copy only the requested prefix from record storage.
+Unicode retains SQLite's character-aware fallback. A manually injected BLOB takes a
+conditional same-snapshot length projection, preserving the historical `<blob:N>`
+representation without loading full transcripts on valid TEXT rows.
+
+**Negative-ledger-first target.** Existing storage closure covered N+1 detail loads,
+indexes, and sync paths, but neither `list_recent_runs` nor wide-column projection.
+The checked-in Criterion fixture uses roughly 49-byte transcripts, so the focused
+harness measured that current-like control and a 16-KiB transcript shape. It directly
+timed the complete production `list_recent_runs(100)` entry point; the target-shape
+calibration selected nine calls per approximately 30-ms arm, proving that the timed
+path was active rather than optimized away.
+
+**Quick strict-remote same-binary A/B** (worker `vmi1293453`, job
+`j-29928833041827317`, `--profile release-perf` with LTO disabled, 21 alternating
+paired repetitions):
+
+| shape / comparison | p10 | median | p90 | CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| 49 B historical / historical null | 0.888759 | 1.014118 | 1.100544 | 8.15% | 12/21 | valid: median in `[0.97, 1.03]` |
+| 49 B historical / SQL prefix | 1.046341 | **1.106140×** | 1.212694 | 5.79% | 20/21 | positive control |
+| 16 KiB historical / historical null | 0.900154 | 0.979322 | 1.127253 | 10.75% | 8/21 | valid: median in `[0.97, 1.03]` |
+| 16 KiB historical / SQL prefix | **1.233442** | **1.429596×** | **1.541685** | 12.33% | **21/21** | **keep: p10 exceeds null p90** |
+
+Target-shape raw BASE/BASE ratios:
+`[0.9232461071207244, 1.0343348611438117, 1.008015264588581,
+0.9170384422354155, 0.9704154634527794, 1.0707543166943618,
+0.9896507671607353, 1.0579419274100743, 0.9282431707886686,
+0.9665624747548677, 1.0978389522412975, 1.0174900200346428,
+0.9001537514734798, 0.8110857574678844, 0.9536874291307142,
+0.9607534185770888, 1.30844933380509, 1.1415022371556407,
+1.1272526871815138, 0.8497255347619083, 0.9793218718586854]`.
+
+Target-shape raw candidate ratios:
+`[1.2334422529560587, 1.6808492920610139, 1.4512422688974689,
+2.005806683753943, 1.3385702881263122, 1.3158706273355,
+1.43754629859367, 1.4295956655305018, 1.5416847473351527,
+1.3465070874798764, 1.1450453551612356, 1.2223682261138749,
+1.451202337786771, 1.444673672665019, 1.4905502063309937,
+1.3832727481399778, 1.2829478423920762, 1.505467055626014,
+1.4709115368882575, 1.4202814193058284, 1.310854260462121]`.
+
+Benchmark binary SHA-256 was
+`7cd4f28c902a5032108560b54802e7fe12e71e3fa5305cbd0120ec0b1e9a829a`.
+The strict remote invocation exited 0 and the two focused tests completed in
+4.91 seconds. An independent preceding run on worker `vmi1264463` corroborated
+the target signal at 1.495714× median and 20/21 wins.
+
+**Behavior proof.** Before timing, the same binary serialized candidate and
+historical `Vec<RunSummary>` values and compared the bytes exactly for empty,
+139/140/141-character, 16-KiB, emoji, CJK, combining-mark, whitespace, and
+ordering/limit cases. It also injected a 300-byte BLOB and proved the rare fallback
+still returns `<blob:300>`. Both focused tests passed. Ratio vs LEGACY ORIGINAL for
+the 100-row, 16-KiB transcript boundary: **1.429596×**.
+
 ### 2026-07-13 UTC — cod_fw — LANDED (byte-exact): move unstreamed events into the retained log — **1.399743× median**
 
 **What.** `EventLog::push` always deep-cloned each completed `RunEvent` into
