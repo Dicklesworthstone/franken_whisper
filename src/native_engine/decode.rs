@@ -140,11 +140,13 @@ impl LoadedModel {
         // FW_LOAD_WORKERS: bound the TOTAL concurrency of the encoder∥decoder
         // weight build — both builds' internal layer `into_par_iter`s run inside
         // this pool, so a single cap covers the whole load (incl. the decoder's
-        // ~133 MB token embedding). Unset = uncapped, byte-identical to the plain
-        // ambient-pool join. A small N caps the live per-tensor load buffers —
-        // under FW_STREAM_LOAD each in-flight tensor is an owned pread buffer, so
-        // fewer concurrent loaders cut peak RSS, traded against a longer load.
-        // Byte-exact for any N (thread count never changes the built weights).
+        // ~133 MB token embedding). Defaults to host∧32 (the all-core freq-throttle
+        // knee; ~11% faster model_weights than the uncapped 64-way ambient pool
+        // on the 64-core box). A smaller N further caps the live per-tensor load
+        // buffers — under FW_STREAM_LOAD each in-flight tensor is an owned pread
+        // buffer, so fewer concurrent loaders cut peak RSS, traded against a
+        // longer load. `FW_LOAD_WORKERS=0` restores the uncapped ambient join.
+        // Byte-exact for any cap (thread count never changes the built weights).
         let build_weights = || {
             rayon::join(
                 || EncoderWeights::from_ggml(&model),

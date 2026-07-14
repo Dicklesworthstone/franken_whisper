@@ -368,25 +368,33 @@ pub(crate) fn enc_free_f32() -> bool {
     })
 }
 
-/// Optional cap on how many model-weight tensors load+quantize concurrently
-/// across the whole (encoder ∥ decoder) weight build (`FW_LOAD_WORKERS=<N>`).
-/// Applied as a scoped rayon pool around the `rayon::join` in
-/// [`decode::LoadedModel::from_ggml`], so both builds' layer `into_par_iter`s
-/// share it. Unset (default) = uncapped: the load fans across the full ambient
-/// rayon pool exactly as before (byte-identical). A small `N` bounds the
-/// transient per-tensor buffers held live during the parallel load — most useful
-/// with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14), where each in-flight tensor is an
-/// *owned* pread buffer (incl. the ~133 MB token embedding): fewer concurrent
-/// loaders → lower peak RSS, traded against a longer `model_weights` phase.
-/// Byte-exact for any `N` (thread count never changes the quantized output).
-/// `0` / non-numeric = uncapped.
+/// Cap on how many model-weight tensors load+quantize concurrently across the
+/// whole (encoder ∥ decoder) weight build. Applied as a scoped rayon pool around
+/// the `rayon::join` in [`decode::LoadedModel::from_ggml`], so both builds' layer
+/// `into_par_iter`s share it.
+///
+/// **Default = `host_parallelism()∧32`** (the all-core AVX freq-throttle knee —
+/// the same optimum the encoder *compute* already uses). Uncapped, the load fans
+/// across the full ambient pool (64-way on the 64-core box) AND each weight's
+/// `thread::scope` workers pile on top → oversubscription + throttle. Capping to
+/// 32 measured `model_weights` ~441 ms → ~394 ms (−11%, ~2% e2e single-shot),
+/// **byte-exact** (thread count never changes the quantized output); it also cut
+/// load-time voluntary context switches (122 k → far fewer). On ≤32-core hosts
+/// `host∧32 == host`, so nothing changes there.
+///
+/// `FW_LOAD_WORKERS=<N>` overrides: a smaller `N` further bounds the transient
+/// per-tensor buffers (most useful with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14),
+/// where each in-flight tensor is an owned pread buffer incl. the ~133 MB token
+/// embedding — lower peak RSS, traded against a longer load). `FW_LOAD_WORKERS=0`
+/// (or non-numeric) = **uncapped** kill-switch (restores the old ambient pool).
 pub(crate) fn load_worker_cap() -> Option<usize> {
     static CAP: OnceLock<Option<usize>> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("FW_LOAD_WORKERS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n >= 1)
+    *CAP.get_or_init(|| match std::env::var("FW_LOAD_WORKERS") {
+        // Explicit override: <N> caps to N; 0 / non-numeric = uncapped kill-switch.
+        Ok(v) => v.trim().parse::<usize>().ok().filter(|&n| n >= 1),
+        // Default: cap at the ~32-thread throttle knee (byte-exact; single scoped
+        // pool covers both enc and dec builds via the join in from_ggml).
+        Err(_) => Some(host_parallelism().min(32)),
     })
 }
 
