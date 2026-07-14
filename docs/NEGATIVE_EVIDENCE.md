@@ -21039,6 +21039,22 @@ dual-KV-cache + rollback), owner-ticketed bd-wzgh. Full spec = the "OWNER DECISI
 re-point at the content-drop temp-fallback / pause the byte-exact loop.** No small autonomous lever remains.
 
 ### LOOP-STATUS (update-in-place; do NOT append a new entry per tick once converged)
+**2026-07-14 ARC UPDATE (ticks 13t–14ff): the "TERMINAL" below was RE-OPENED per `feedback_closed_means_pivot_not_stop`
+and mined — landing 2 NEW wins before re-converging.** (1) **ToMe encoder token-merging** LANDED gated (`FW_TOME_R`,
+`dd4c5af`): encoder_window −24 % (R=200) / −10 % e2e on long audio, transcript-identical jfk, WER-gated
+([[project_tome_encoder_landed]]). (2) **In-flight model-load DEDUP** LANDED gated BYTE-EXACT (`FW_LOAD_DEDUP`,
+`aa9754d`): ~4.2× on N=4 concurrent cold loads ([[project_load_dedup_landed]]). Then the frontier RE-CLOSED,
+comprehensively by MEASUREMENT: encoder MLP-neuron + decoder-layer pruning both CATASTROPHIC (empty transcripts —
+capacity ≠ redundancy, needs retraining, 14bb/14cc); ToMe progressive + no-unmerge falsified (13z/14aa); model
+PRE-LOAD overlap = WASH on warm page-cache (14ee); decode kernels floored from 4 angles (13p/q/u/w); int4 logits +
+maddubs decode wash (13u/v); load streaming loader needs unsafe/accessor-rewrite (multi-turn); spec-decode DEAD on
+BOTH drafts (distil 54.5 % accept ⇒ 0.85×; layer-skip self-draft 0–11.8 % accept ⇒ dead, both below the 47–82 %
+break-even). **Rule confirmed: the encoder yields to structural REDUNDANCY reduction (ToMe) only; the decoder
+yields to nothing (distilled-minimal). The byte-exact single-turn frontier is spent; remaining upside is
+owner/multi-turn/infra: (a) flip the gated candidates (ToMe/enc-int8/poly-exp) default-on behind a corpus WER
+harness [infra: no on-box LibriSpeech]; (b) streaming loader [multi-turn, needs unsafe]; (c) a cheap multilingual
+draft model for spec-decode [infra]. Cite this + the CONSOLIDATED FRONTIER MAP; do NOT re-mine quick byte-exact levers.**
+
 **TERMINAL — the turbo-scale campaign is COMPLETE and spec-decode is MEASURED DEAD (updated 2026-07-13, tick set
 13a–13o).** The `distil-large-v3` draft was provisioned + measured (the "supply a real draft model" unblock,
 executed) and spec-decode is **dead with it**: teacher-forced K=1 accept = 54.5% on real speech ⇒ ~0.85× NET
