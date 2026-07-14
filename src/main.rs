@@ -10,7 +10,7 @@ use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
     backends_discovery_value, build_backends_report, build_health_report, emit_health_report,
     emit_pretty_run_report, emit_robot_complete, emit_robot_error, emit_robot_stage,
-    emit_robot_start, robot_schema_value, routing_decision_value,
+    emit_robot_start, robot_schema_value, routing_decision_line,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
@@ -123,13 +123,15 @@ fn run(cli: Cli) -> FwResult<()> {
                             || event.code == "backend.routing.safe_mode"
                             || event.code == "backend.routing.calibration_guardrail"
                         {
-                            let entry = routing_decision_value(
-                                &details.run_id,
-                                &event.ts_rfc3339,
-                                &event.code,
-                                &event.payload,
+                            println!(
+                                "{}",
+                                routing_decision_line(
+                                    &details.run_id,
+                                    &event.ts_rfc3339,
+                                    &event.code,
+                                    &event.payload,
+                                )?
                             );
-                            println!("{}", serde_json::to_string(&entry)?);
                         }
                     }
                 }
