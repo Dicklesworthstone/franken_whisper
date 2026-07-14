@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
     AccelerationReport, BackendDiscoveryEntry, BackendKind, BackendsReport, RunEvent, RunReport,
-    TranscriptionSegment,
+    TranscriptionResult, TranscriptionSegment,
 };
 
 pub const ROBOT_SCHEMA_VERSION: &str = "1.0.0";
@@ -150,6 +150,178 @@ pub fn emit_robot_report(report: &RunReport) -> FwResult<()> {
         emit_robot_stage(&report.run_id, event)?;
     }
     emit_robot_complete(report)
+}
+
+/// Emit the human-facing pretty JSON report while transferring its owned
+/// payloads into the temporary JSON DOM instead of cloning the complete report.
+pub fn emit_pretty_run_report(report: RunReport) -> FwResult<()> {
+    let value = owned_run_report_value(report)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn owned_run_report_value(report: RunReport) -> serde_json::Result<Value> {
+    let acceleration_context = acceleration_context_ref_from_evidence(&report.evidence).cloned();
+    let RunReport {
+        run_id,
+        trace_id,
+        started_at_rfc3339,
+        finished_at_rfc3339,
+        input_path,
+        normalized_wav_path,
+        request,
+        result,
+        events,
+        warnings,
+        evidence,
+        replay,
+    } = report;
+
+    let mut object = Map::new();
+    object.insert("run_id".to_owned(), Value::String(run_id));
+    object.insert("trace_id".to_owned(), Value::String(trace_id));
+    object.insert(
+        "started_at_rfc3339".to_owned(),
+        Value::String(started_at_rfc3339),
+    );
+    object.insert(
+        "finished_at_rfc3339".to_owned(),
+        Value::String(finished_at_rfc3339),
+    );
+    object.insert("input_path".to_owned(), Value::String(input_path));
+    object.insert(
+        "normalized_wav_path".to_owned(),
+        Value::String(normalized_wav_path),
+    );
+    object.insert("request".to_owned(), serde_json::to_value(request)?);
+    object.insert(
+        "result".to_owned(),
+        owned_transcription_result_value(result)?,
+    );
+    object.insert(
+        "events".to_owned(),
+        Value::Array(events.into_iter().map(owned_run_event_value).collect()),
+    );
+    object.insert("warnings".to_owned(), owned_string_array(warnings));
+    object.insert("evidence".to_owned(), Value::Array(evidence));
+    object.insert("replay".to_owned(), owned_replay_value(replay));
+    if let Some(context) = acceleration_context {
+        object.insert("acceleration_context".to_owned(), context);
+    }
+    Ok(Value::Object(object))
+}
+
+fn owned_transcription_result_value(result: TranscriptionResult) -> serde_json::Result<Value> {
+    let TranscriptionResult {
+        backend,
+        transcript,
+        language,
+        segments,
+        acceleration,
+        raw_output,
+        artifact_paths,
+    } = result;
+
+    let mut object = Map::new();
+    object.insert("backend".to_owned(), serde_json::to_value(backend)?);
+    object.insert("transcript".to_owned(), Value::String(transcript));
+    object.insert(
+        "language".to_owned(),
+        language.map_or(Value::Null, Value::String),
+    );
+    object.insert(
+        "segments".to_owned(),
+        Value::Array(
+            segments
+                .into_iter()
+                .map(owned_transcription_segment_value)
+                .collect::<serde_json::Result<Vec<_>>>()?,
+        ),
+    );
+    object.insert(
+        "acceleration".to_owned(),
+        match acceleration {
+            Some(report) => owned_acceleration_value(report)?,
+            None => Value::Null,
+        },
+    );
+    object.insert("raw_output".to_owned(), raw_output);
+    object.insert(
+        "artifact_paths".to_owned(),
+        owned_string_array(artifact_paths),
+    );
+    Ok(Value::Object(object))
+}
+
+fn owned_acceleration_value(report: AccelerationReport) -> serde_json::Result<Value> {
+    let mut object = Map::new();
+    object.insert("backend".to_owned(), serde_json::to_value(report.backend)?);
+    object.insert("input_values".to_owned(), Value::from(report.input_values));
+    object.insert(
+        "normalized_confidences".to_owned(),
+        Value::Bool(report.normalized_confidences),
+    );
+    object.insert(
+        "pre_mass".to_owned(),
+        serde_json::to_value(report.pre_mass)?,
+    );
+    object.insert(
+        "post_mass".to_owned(),
+        serde_json::to_value(report.post_mass)?,
+    );
+    object.insert("notes".to_owned(), owned_string_array(report.notes));
+    Ok(Value::Object(object))
+}
+
+fn owned_transcription_segment_value(segment: TranscriptionSegment) -> serde_json::Result<Value> {
+    let mut object = Map::new();
+    object.insert(
+        "start_sec".to_owned(),
+        serde_json::to_value(segment.start_sec)?,
+    );
+    object.insert("end_sec".to_owned(), serde_json::to_value(segment.end_sec)?);
+    object.insert("text".to_owned(), Value::String(segment.text));
+    object.insert(
+        "speaker".to_owned(),
+        segment.speaker.map_or(Value::Null, Value::String),
+    );
+    object.insert(
+        "confidence".to_owned(),
+        serde_json::to_value(segment.confidence)?,
+    );
+    Ok(Value::Object(object))
+}
+
+fn owned_run_event_value(event: RunEvent) -> Value {
+    let mut object = Map::new();
+    object.insert("seq".to_owned(), Value::from(event.seq));
+    object.insert("ts_rfc3339".to_owned(), Value::String(event.ts_rfc3339));
+    object.insert("stage".to_owned(), Value::String(event.stage));
+    object.insert("code".to_owned(), Value::String(event.code));
+    object.insert("message".to_owned(), Value::String(event.message));
+    object.insert("payload".to_owned(), event.payload);
+    Value::Object(object)
+}
+
+fn owned_replay_value(replay: crate::model::ReplayEnvelope) -> Value {
+    let mut object = Map::new();
+    if let Some(value) = replay.input_content_hash {
+        object.insert("input_content_hash".to_owned(), Value::String(value));
+    }
+    if let Some(value) = replay.backend_identity {
+        object.insert("backend_identity".to_owned(), Value::String(value));
+    }
+    if let Some(value) = replay.backend_version {
+        object.insert("backend_version".to_owned(), Value::String(value));
+    }
+    if let Some(value) = replay.output_payload_hash {
+        object.insert("output_payload_hash".to_owned(), Value::String(value));
+    }
+    Value::Object(object)
+}
+
+fn owned_string_array(values: Vec<String>) -> Value {
+    Value::Array(values.into_iter().map(Value::String).collect())
 }
 
 /// Build a [`BackendsReport`] by probing all registered engines.
@@ -1088,9 +1260,9 @@ mod tests {
         RUN_COMPLETE_REQUIRED_FIELDS, RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS,
         SPECULATION_STATS_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS,
         TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
-        TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS, robot_schema_value,
-        run_complete_value, run_error_value, run_stage_value, run_start_value,
-        transcript_partial_value,
+        TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS,
+        owned_run_report_value, robot_schema_value, run_complete_value, run_error_value,
+        run_stage_value, run_start_value, transcript_partial_value,
     };
 
     #[test]
@@ -1722,6 +1894,290 @@ mod tests {
             evidence,
             replay: crate::model::ReplayEnvelope::default(),
         }
+    }
+
+    fn historical_pretty_run_report(report: &crate::model::RunReport) -> String {
+        let mut value = serde_json::to_value(report).expect("historical report DOM");
+        if let Some(acceleration_context) =
+            super::acceleration_context_from_evidence(&report.evidence)
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("acceleration_context".to_owned(), acceleration_context);
+        }
+        serde_json::to_string_pretty(&value).expect("historical pretty report")
+    }
+
+    fn owned_pretty_run_report(report: crate::model::RunReport) -> String {
+        let value = owned_run_report_value(report).expect("owned report DOM");
+        serde_json::to_string_pretty(&value).expect("owned pretty report")
+    }
+
+    #[test]
+    fn owned_pretty_run_report_serialization_matches_historical_bytes() {
+        use crate::model::{
+            AccelerationBackend, AccelerationReport, ReplayEnvelope, TranscriptionSegment,
+        };
+
+        let mut empty = test_report(vec![], vec![]);
+        empty.result.language = None;
+        empty.result.transcript.clear();
+        empty.result.raw_output = serde_json::Value::Null;
+        assert_eq!(
+            owned_pretty_run_report(empty.clone()).as_bytes(),
+            historical_pretty_run_report(&empty).as_bytes(),
+            "empty report bytes differ"
+        );
+
+        let mut rich = test_report(
+            vec![RunEvent {
+                seq: u64::MAX,
+                ts_rfc3339: "2026-07-13T23:59:59.999999999-04:00".to_owned(),
+                stage: "backend\nquoted".to_owned(),
+                code: "backend.λ".to_owned(),
+                message: "line one\nline two \"quoted\" 🎧".to_owned(),
+                payload: json!({
+                    "z-last": [null, -0.0, {"nested": "日本語"}],
+                    "a-first": true,
+                }),
+            }],
+            vec![
+                json!({"ordinary": {"z": 1, "a": 2}}),
+                json!({
+                    "logical_stream_owner_id": "owner-last",
+                    "cancellation_fence": {"generation": 17, "closed": false},
+                    "extra": ["kept", null],
+                }),
+            ],
+        );
+        rich.run_id = "run-\"quoted\"\\line\nnext".to_owned();
+        rich.trace_id = "ffffffffffffffffffffffffffffffff".to_owned();
+        rich.input_path = "audio/λ input.wav".to_owned();
+        rich.normalized_wav_path = "tmp/normalized 日本語.wav".to_owned();
+        rich.result.transcript = "hello\nλ 🎧 \\ \"world\"".repeat(16);
+        rich.result.language = Some("zh-Hant".to_owned());
+        rich.result.segments = vec![
+            TranscriptionSegment {
+                start_sec: Some(-0.0),
+                end_sec: Some(1.25),
+                text: "first\nsegment".to_owned(),
+                speaker: Some("SPEAKER_00".to_owned()),
+                confidence: Some(0.9375),
+            },
+            TranscriptionSegment {
+                start_sec: None,
+                end_sec: None,
+                text: "第二段 🚀".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+        rich.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 65_537,
+            normalized_confidences: true,
+            pre_mass: Some(-0.0),
+            post_mass: None,
+            notes: vec!["accelerated\npath".to_owned(), "λ".to_owned()],
+        });
+        rich.result.raw_output = json!({
+            "segments": [{"text": "raw", "tokens": [1, 2, 3]}],
+            "model": "tiny.en",
+        });
+        rich.result.artifact_paths = vec!["one.json".to_owned(), "two.srt".to_owned()];
+        rich.warnings = vec!["warning \"quoted\"".to_owned()];
+        rich.replay = ReplayEnvelope {
+            input_content_hash: Some("input-hash".to_owned()),
+            backend_identity: Some("native:test".to_owned()),
+            backend_version: Some("1.2.3".to_owned()),
+            output_payload_hash: Some("output-hash".to_owned()),
+        };
+
+        let historical = historical_pretty_run_report(&rich);
+        let owned = owned_pretty_run_report(rich);
+        assert_eq!(
+            owned.as_bytes(),
+            historical.as_bytes(),
+            "rich report bytes differ"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&owned).expect("parse owned report"),
+            serde_json::from_str::<serde_json::Value>(&historical)
+                .expect("parse historical report")
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn owned_pretty_run_report_serialization_perf() {
+        use crate::model::{AccelerationBackend, AccelerationReport, TranscriptionSegment};
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 500;
+        const SAMPLES: usize = 21;
+
+        fn time_historical(base: &crate::model::RunReport) -> u128 {
+            let reports = (0..ITERATIONS).map(|_| base.clone()).collect::<Vec<_>>();
+            let started = Instant::now();
+            for report in reports {
+                drop(black_box(historical_pretty_run_report(black_box(&report))));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_owned(base: &crate::model::RunReport) -> u128 {
+            let reports = (0..ITERATIONS).map(|_| base.clone()).collect::<Vec<_>>();
+            let started = Instant::now();
+            for report in reports {
+                drop(black_box(owned_pretty_run_report(black_box(report))));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        let mut report = test_report(vec![], vec![]);
+        report.result.transcript =
+            "The quick brown fox crosses the measured speech pipeline. ".repeat(18);
+        report.result.segments = (0..10)
+            .map(|index| TranscriptionSegment {
+                start_sec: Some(f64::from(index) * 0.75),
+                end_sec: Some(f64::from(index + 1) * 0.75),
+                text: format!("segment {index}: measured pretty JSON output"),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{index:02}")),
+                confidence: Some(0.9 + f64::from(index) / 1_000.0),
+            })
+            .collect();
+        report.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 16_000,
+            normalized_confidences: true,
+            pre_mass: Some(9.75),
+            post_mass: Some(9.5),
+            notes: vec!["native acceleration accepted".to_owned()],
+        });
+        report.result.raw_output = json!({
+            "model": "tiny.en",
+            "text": "raw backend payload with nested token metadata ".repeat(80),
+            "segments": (0..10)
+                .map(|index| json!({
+                    "id": index,
+                    "tokens": [50364 + index, 100, 200, 50365 + index],
+                    "temperature": 0.0,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        report.events = (0..20)
+            .map(|index| RunEvent {
+                seq: index,
+                ts_rfc3339: format!("2026-07-13T21:30:{:02}-04:00", index % 60),
+                stage: format!("stage-{}", index % 5),
+                code: format!("stage.{}.ok", index % 5),
+                message: format!("stage {index} completed with measured metadata"),
+                payload: json!({
+                    "elapsed_ms": 100 + index,
+                    "posterior": {"accepted": index % 2 == 0, "score": 0.9375},
+                    "actions": ["keep", "fallback"],
+                }),
+            })
+            .collect();
+        report.warnings = vec!["normalization used ffmpeg".to_owned()];
+        report.evidence = vec![
+            json!({"contract": "backend_selection", "action": "native"}),
+            json!({"contract": "calibration", "score": 0.93}),
+            json!({
+                "logical_stream_owner_id": "owner-current-like",
+                "cancellation_fence": {"generation": 7, "closed": true},
+            }),
+        ];
+
+        let historical = historical_pretty_run_report(&report);
+        let owned = owned_pretty_run_report(report.clone());
+        assert_eq!(
+            owned.as_bytes(),
+            historical.as_bytes(),
+            "benchmark byte parity"
+        );
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "transcribe_pretty_json_ownership binary_sha256={:x}",
+            Sha256::digest(executable)
+        );
+        eprintln!(
+            "transcribe_pretty_json_ownership shape=current_like iterations={ITERATIONS} output_bytes={} output_sha256={:x}",
+            historical.len(),
+            Sha256::digest(historical.as_bytes())
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&report));
+            black_box(time_owned(&report));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut owned_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&report);
+            let null_second = time_historical(&report);
+            let (null_numerator, null_denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(null_numerator as f64 / null_denominator as f64);
+
+            let (historical, owned) = if sample % 2 == 0 {
+                (time_historical(&report), time_owned(&report))
+            } else {
+                let owned = time_owned(&report);
+                let historical = time_historical(&report);
+                (historical, owned)
+            };
+            historical_times.push(historical);
+            owned_times.push(owned);
+            speedups.push(historical as f64 / owned as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "transcribe_pretty_json_ownership shape=current_like samples={SAMPLES} iterations={ITERATIONS} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} owned_arm_median_ns={} speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&owned_times),
+        );
+        eprintln!(
+            "transcribe_pretty_json_ownership shape=current_like null_ratios={null_ratios:?} speedups={speedups:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90,
+            "candidate p10 {speedup_p10:.6} did not clear null p90 {null_p90:.6}"
+        );
+        assert!(wins >= 17, "candidate won only {wins}/{SAMPLES} pairs");
     }
 
     fn test_event(seq: u64, stage: &str, code: &str) -> RunEvent {

@@ -51,6 +51,56 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): transfer owned `RunReport` payloads into pretty-JSON DOM — **1.356328x current-like median**
+
+**What.** Normal `fw transcribe --json` previously passed `&RunReport` to
+`serde_json::to_value`, deep-cloning the transcript, segments, events, raw
+backend output, evidence, warnings, and artifact paths into a temporary DOM
+immediately before the report was dropped. The JSON path now consumes the
+report and transfers those owned payloads into an order-preserving DOM. The
+request retains its ordinary serde conversion, and the one evidence object
+also exposed as `acceleration_context` is still cloned because the output
+intentionally contains it twice. Negative-ledger-first review found adjacent
+rows for the robot `run_complete` envelope and transcript artifact export, but
+neither covers the normal CLI's complete pretty `RunReport` schema.
+
+**Exactness.** The same release-perf binary compared the historical
+`to_value(&report)` plus context insertion with the ownership-transfer path for
+empty, rich edge-case, and current-like reports. Pretty-serialized bytes were
+identical, including declaration-order keys, optional replay/context fields,
+`-0.0`, nulls, escaped newlines and quotes, Unicode, nested arbitrary JSON, all
+result/event fields, and last-matching acceleration context. The measured
+19,034-byte output had SHA-256
+`027ccca29def05b46dff9a0e58cadd44296345405c03cff0c64bce2ccc245ae8`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041827756` ran on
+worker `vmi1264463` with `--profile release-perf`, opt-level 3, LTO disabled,
+and 16 codegen units; no local fallback occurred. Benchmark-binary SHA-256 was
+`74708b1588146d6f8a9d46fa7fece1a75bf13ea3bc239224c7dd44be3311fc17`.
+The single binary used three warmups, 21 alternating historical/historical
+null pairs, and 21 alternating historical/ownership-transfer pairs, with 500
+prebuilt current-like reports per arm. The measured boundary includes DOM
+construction, pretty serialization, and destruction, but excludes report
+construction, ASR, and stdout. The null median passed the predeclared
+`[0.95, 1.05]` guard; candidate p10 cleared null p90 and won every pair.
+
+| comparison | p10 | median | p90 | arm medians / 500 reports | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.898697 | **0.989213** | **1.136746** | — | — | — | valid null |
+| historical / ownership transfer | **1.247138x** | **1.356328x** | 1.472567x | 66,564,941 ns / 48,864,864 ns | 7.68% | **21/21** | **keep: p10 exceeds null p90** |
+
+BASE/BASE ratios:
+`[0.983013, 0.917983, 1.094861, 0.968069, 1.140262, 0.851078,
+0.945072, 0.986144, 1.100047, 0.964290, 0.898697, 0.811865,
+0.989213, 1.022740, 0.947728, 1.239098, 1.136746, 1.027431,
+1.010757, 1.088481, 1.010827]`.
+
+Historical/ownership-transfer ratios:
+`[1.469579, 1.451763, 1.355491, 1.324111, 1.301181, 1.131403,
+1.432583, 1.524604, 1.247138, 1.405653, 1.540467, 1.401115,
+1.282555, 1.356328, 1.335074, 1.472567, 1.326303, 1.389596,
+1.178119, 1.453193, 1.347556]`.
+
 ### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed JSON-artifact transcript envelope — **2.657453x current-like median**
 
 **What.** `write_json` previously materialized the complete transcript as an
