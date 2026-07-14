@@ -50,6 +50,7 @@ impl Default for SpeculativeConfig {
 }
 
 /// Bridge a `TranscriptionSegment` (model) to a `TranscriptSegment` (backend).
+#[cfg(test)]
 fn to_backend_segment(s: &TranscriptionSegment) -> TranscriptSegment {
     TranscriptSegment {
         start_ms: s.start_sec.map(|v| (v * 1000.0) as u64).unwrap_or(0),
@@ -59,6 +60,7 @@ fn to_backend_segment(s: &TranscriptionSegment) -> TranscriptSegment {
     }
 }
 
+#[cfg(test)]
 fn bridge_and_store_segments(
     holder: &Mutex<Vec<TranscriptionSegment>>,
     original: Vec<TranscriptionSegment>,
@@ -66,6 +68,14 @@ fn bridge_and_store_segments(
     let bridged = original.iter().map(to_backend_segment).collect();
     *holder.lock().unwrap_or_else(|error| error.into_inner()) = original;
     bridged
+}
+
+fn store_segments_without_executor_payload(
+    holder: &Mutex<Vec<TranscriptionSegment>>,
+    original: Vec<TranscriptionSegment>,
+) -> Vec<TranscriptSegment> {
+    *holder.lock().unwrap_or_else(|error| error.into_inner()) = original;
+    Vec::new()
 }
 
 fn take_stored_segments(holder: &Mutex<Vec<TranscriptionSegment>>) -> Vec<TranscriptionSegment> {
@@ -163,11 +173,14 @@ impl SpeculativeStreamingPipeline {
         let fast_holder_bridge = fast_holder.clone();
         let quality_holder_bridge = quality_holder.clone();
 
+        // `SpeculativeCorrect` ignores both executor payloads, and this pipeline's
+        // early/compare callbacks are no-ops. Preserve the original model segments
+        // in the holders without cloning text into an unobserved backend view.
         let fast_bridge = move || -> Vec<TranscriptSegment> {
-            bridge_and_store_segments(fast_holder_bridge.as_ref(), fast_fn())
+            store_segments_without_executor_payload(fast_holder_bridge.as_ref(), fast_fn())
         };
         let quality_bridge = move || -> Vec<TranscriptSegment> {
-            bridge_and_store_segments(quality_holder_bridge.as_ref(), quality_fn())
+            store_segments_without_executor_payload(quality_holder_bridge.as_ref(), quality_fn())
         };
 
         let result = executor.execute_with_early_emit(
@@ -562,6 +575,21 @@ mod tests {
         (bridged, recovered)
     }
 
+    fn payload_free_store_and_recover(
+        original: Vec<TranscriptionSegment>,
+    ) -> (Vec<TranscriptSegment>, Vec<TranscriptionSegment>) {
+        let holder = Mutex::new(Vec::new());
+        let payload = store_segments_without_executor_payload(&holder, original);
+        let recovered = take_stored_segments(&holder);
+        debug_assert!(
+            holder
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        (payload, recovered)
+    }
+
     #[test]
     fn to_backend_segment_converts_seconds_to_ms_and_defaults() {
         // Normal conversion: seconds → ms.
@@ -625,8 +653,80 @@ mod tests {
     }
 
     #[test]
+    fn bridge_payload_elision_preserves_stream_visible_bytes() {
+        let cases = [
+            Vec::new(),
+            vec![TranscriptionSegment {
+                start_sec: Some(0.125),
+                end_sec: Some(1.875),
+                text: " λ \"quoted\"\n🎧".to_owned(),
+                speaker: Some("speaker-a".to_owned()),
+                confidence: Some(0.975),
+            }],
+            vec![
+                TranscriptionSegment {
+                    start_sec: None,
+                    end_sec: Some(-0.0),
+                    text: String::new(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(3.25),
+                    end_sec: None,
+                    text: "multi-byte Καλημέρα 世界".to_owned(),
+                    speaker: Some(String::new()),
+                    confidence: Some(-0.0),
+                },
+            ],
+        ];
+
+        for (index, segments) in cases.iter().enumerate() {
+            let current = transferred_bridge_and_recover(segments.clone());
+            let payload_free = payload_free_store_and_recover(segments.clone());
+            assert!(
+                payload_free.0.is_empty(),
+                "case {index} executor payload must stay empty"
+            );
+            assert_eq!(
+                serde_json::to_vec(&payload_free.1).expect("serialize payload-free segments"),
+                serde_json::to_vec(&current.1).expect("serialize current segments"),
+                "case {index} recovered model-segment bytes"
+            );
+        }
+
+        let executor = ConcurrentTwoLaneExecutor::new(QualitySelector::SpeculativeCorrect);
+        let current = executor.execute_with_early_emit(
+            || {
+                vec![TranscriptSegment {
+                    start_ms: 0,
+                    end_ms: 10,
+                    text: "fast".to_owned(),
+                    confidence: 0.8,
+                }]
+            },
+            || {
+                vec![TranscriptSegment {
+                    start_ms: 0,
+                    end_ms: 10,
+                    text: "quality".to_owned(),
+                    confidence: 0.9,
+                }]
+            },
+            |_, _| {},
+            |_, _, _, _| {},
+        );
+        let payload_free =
+            executor.execute_with_early_emit(Vec::new, Vec::new, |_, _| {}, |_, _, _, _| {});
+        assert_eq!(payload_free.selected, current.selected);
+        assert_eq!(payload_free.selection_reason, current.selection_reason);
+        assert!(payload_free.primary_result.is_empty());
+        assert!(payload_free.secondary_result.is_empty());
+    }
+
+    #[test]
     #[ignore = "perf microbench, not a correctness gate"]
-    fn bridge_segment_ownership_transfer_perf() {
+    fn bridge_payload_elision_perf() {
         use sha2::{Digest as _, Sha256};
         use std::hint::black_box;
         use std::time::Instant;
@@ -641,7 +741,7 @@ mod tests {
                     start_sec: Some(f64::from(index) * 0.24),
                     end_sec: Some(f64::from(index) * 0.24 + 0.22),
                     text: format!(
-                        " {lane} streaming segment {index:02}: ownership transfer preserves the original UTF-8 transcript λ 🎧"
+                        " {lane} streaming segment {index:02}: payload elision preserves the original UTF-8 transcript λ 🎧"
                     ),
                     speaker: None,
                     confidence: Some(0.78 + f64::from(index) / 100.0),
@@ -659,22 +759,7 @@ mod tests {
                 .collect()
         }
 
-        fn time_historical(
-            fast: &[TranscriptionSegment],
-            quality: &[TranscriptionSegment],
-            iterations: usize,
-        ) -> u128 {
-            let inputs = prepared_inputs(fast, quality, iterations);
-            let started = Instant::now();
-            for (fast_segments, quality_segments) in inputs {
-                let fast_result = historical_bridge_and_recover(fast_segments);
-                let quality_result = historical_bridge_and_recover(quality_segments);
-                drop(black_box((fast_result, quality_result)));
-            }
-            started.elapsed().as_nanos()
-        }
-
-        fn time_transferred(
+        fn time_current(
             fast: &[TranscriptionSegment],
             quality: &[TranscriptionSegment],
             iterations: usize,
@@ -684,6 +769,21 @@ mod tests {
             for (fast_segments, quality_segments) in inputs {
                 let fast_result = transferred_bridge_and_recover(fast_segments);
                 let quality_result = transferred_bridge_and_recover(quality_segments);
+                drop(black_box((fast_result, quality_result)));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_payload_free(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let inputs = prepared_inputs(fast, quality, iterations);
+            let started = Instant::now();
+            for (fast_segments, quality_segments) in inputs {
+                let fast_result = payload_free_store_and_recover(fast_segments);
+                let quality_result = payload_free_store_and_recover(quality_segments);
                 drop(black_box((fast_result, quality_result)));
             }
             started.elapsed().as_nanos()
@@ -716,47 +816,60 @@ mod tests {
 
         let fast = fixture_segments("fast");
         let quality = fixture_segments("quality");
-        let historical = (
-            historical_bridge_and_recover(fast.clone()),
-            historical_bridge_and_recover(quality.clone()),
-        );
-        let transferred = (
+        let current = (
             transferred_bridge_and_recover(fast.clone()),
             transferred_bridge_and_recover(quality.clone()),
         );
-        let historical_bytes = serde_json::to_vec(&historical).expect("serialize historical");
-        let transferred_bytes = serde_json::to_vec(&transferred).expect("serialize transferred");
-        assert_eq!(transferred_bytes, historical_bytes, "fixture byte parity");
+        let payload_free = (
+            payload_free_store_and_recover(fast.clone()),
+            payload_free_store_and_recover(quality.clone()),
+        );
+        assert!(payload_free.0.0.is_empty());
+        assert!(payload_free.1.0.is_empty());
+        let current_visible_bytes = serde_json::to_vec(&(&current.0.1, &current.1.1))
+            .expect("serialize current visible state");
+        let payload_free_visible_bytes =
+            serde_json::to_vec(&(&payload_free.0.1, &payload_free.1.1))
+                .expect("serialize payload-free visible state");
+        assert_eq!(
+            payload_free_visible_bytes, current_visible_bytes,
+            "stream-visible fixture byte parity"
+        );
 
         let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
             .expect("read test executable");
         eprintln!(
-            "stream_bridge_transfer binary_sha256={:x} rows_per_lane={} output_bytes={} output_sha256={:x}",
+            "stream_bridge_payload_elision binary_sha256={:x} rows_per_lane={} visible_bytes={} visible_sha256={:x}",
             Sha256::digest(executable),
             fast.len(),
-            historical_bytes.len(),
-            Sha256::digest(&historical_bytes),
+            current_visible_bytes.len(),
+            Sha256::digest(&current_visible_bytes),
         );
 
-        let calibration = time_historical(&fast, &quality, CALIBRATION_ITERATIONS);
-        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration)
-            .clamp(128, 4_096) as usize;
+        let current_calibration = time_current(&fast, &quality, CALIBRATION_ITERATIONS);
+        let payload_free_calibration = time_payload_free(&fast, &quality, CALIBRATION_ITERATIONS);
+        let current_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / current_calibration.max(1))
+        .clamp(128, 8_192) as usize;
+        let payload_free_iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128)
+            / payload_free_calibration.max(1))
+        .clamp(128, 8_192) as usize;
         eprintln!(
-            "stream_bridge_transfer calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+            "stream_bridge_payload_elision calibration_iterations={CALIBRATION_ITERATIONS} current_calibration_ns={current_calibration} payload_free_calibration_ns={payload_free_calibration} current_iterations={current_iterations} payload_free_iterations={payload_free_iterations}"
         );
 
         for _ in 0..3 {
-            black_box(time_historical(&fast, &quality, iterations));
-            black_box(time_transferred(&fast, &quality, iterations));
+            black_box(time_current(&fast, &quality, current_iterations));
+            black_box(time_payload_free(&fast, &quality, payload_free_iterations));
         }
 
         let mut null_ratios = Vec::with_capacity(SAMPLES);
         let mut speedups = Vec::with_capacity(SAMPLES);
-        let mut historical_times = Vec::with_capacity(SAMPLES);
-        let mut transferred_times = Vec::with_capacity(SAMPLES);
+        let mut current_times = Vec::with_capacity(SAMPLES);
+        let mut payload_free_times = Vec::with_capacity(SAMPLES);
         for sample in 0..SAMPLES {
-            let null_first = time_historical(&fast, &quality, iterations);
-            let null_second = time_historical(&fast, &quality, iterations);
+            let null_first = time_current(&fast, &quality, current_iterations);
+            let null_second = time_current(&fast, &quality, current_iterations);
             let (numerator, denominator) = if sample % 2 == 0 {
                 (null_first, null_second)
             } else {
@@ -764,19 +877,22 @@ mod tests {
             };
             null_ratios.push(numerator as f64 / denominator as f64);
 
-            let (historical, transferred) = if sample % 2 == 0 {
+            let (current, payload_free) = if sample % 2 == 0 {
                 (
-                    time_historical(&fast, &quality, iterations),
-                    time_transferred(&fast, &quality, iterations),
+                    time_current(&fast, &quality, current_iterations),
+                    time_payload_free(&fast, &quality, payload_free_iterations),
                 )
             } else {
-                let transferred = time_transferred(&fast, &quality, iterations);
-                let historical = time_historical(&fast, &quality, iterations);
-                (historical, transferred)
+                let payload_free = time_payload_free(&fast, &quality, payload_free_iterations);
+                let current = time_current(&fast, &quality, current_iterations);
+                (current, payload_free)
             };
-            historical_times.push(historical);
-            transferred_times.push(transferred);
-            speedups.push(historical as f64 / transferred as f64);
+            current_times.push(current);
+            payload_free_times.push(payload_free);
+            speedups.push(
+                (current as f64 / current_iterations as f64)
+                    / (payload_free as f64 / payload_free_iterations as f64),
+            );
         }
 
         let null_p10 = percentile(&null_ratios, 10);
@@ -787,13 +903,13 @@ mod tests {
         let speedup_p90 = percentile(&speedups, 90);
         let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
         eprintln!(
-            "stream_bridge_transfer samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} transferred_arm_median_ns={} transferred_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
-            median_ns(&historical_times),
-            median_ns(&transferred_times),
-            coefficient_of_variation(&transferred_times) * 100.0,
+            "stream_bridge_payload_elision samples={SAMPLES} current_iterations={current_iterations} payload_free_iterations={payload_free_iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} current_per_window_median_ns={} payload_free_per_window_median_ns={} payload_free_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&current_times) / current_iterations as u128,
+            median_ns(&payload_free_times) / payload_free_iterations as u128,
+            coefficient_of_variation(&payload_free_times) * 100.0,
         );
         eprintln!(
-            "stream_bridge_transfer null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} transferred_times_ns={transferred_times:?}"
+            "stream_bridge_payload_elision null_ratios={null_ratios:?} speedups={speedups:?} current_times_ns={current_times:?} payload_free_times_ns={payload_free_times:?}"
         );
 
         assert!(
