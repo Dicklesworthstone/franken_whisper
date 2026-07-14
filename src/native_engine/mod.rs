@@ -1293,9 +1293,25 @@ pub struct NativeWhisperModel {
 struct ModelCache {
     weak: HashMap<PathBuf, Weak<NativeWhisperModel>>,
     resident: Option<(PathBuf, Arc<NativeWhisperModel>)>,
+    /// In-flight cold loads keyed by canonical path (`FW_LOAD_DEDUP`). A peer parsing
+    /// the same model holds this per-path lock so concurrent cold loads serialize on
+    /// the parse rather than all parsing (the default path re-checks + discards the
+    /// redundant parse — correct but N× parse work + peak RSS on a cold burst). Empty
+    /// unless the flag is set.
+    loading: HashMap<PathBuf, Arc<Mutex<()>>>,
 }
 
 static MODEL_CACHE: Mutex<Option<ModelCache>> = Mutex::new(None);
+
+/// `FW_LOAD_DEDUP=1` — serialize concurrent COLD loads of the same model on a per-path
+/// lock so only one thread parses (peers wait then hit the cache), avoiding the default
+/// double-parse race (both parse, one discarded). Byte-exact; default OFF (a server that
+/// loads a model resident-once never races, so it is opt-in for lazy/burst deployments).
+fn load_dedup_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_LOAD_DEDUP").ok().as_deref() == Some("1"))
+}
 
 impl NativeWhisperModel {
     /// Load (or fetch from the global cache) the model at `path`.
@@ -1376,6 +1392,58 @@ impl NativeWhisperModel {
             }
         }
 
+        // Serialize concurrent COLD loads of the same model (FW_LOAD_DEDUP): peers
+        // wait on a per-path lock and then hit the freshly-published cache, instead
+        // of all parsing. The default path below re-checks + discards the redundant
+        // parse (correct, but pays N× parse work + peak RSS on a cold burst).
+        if load_dedup_enabled() {
+            let plock = {
+                let mut guard = lock_cache();
+                let cache = guard.get_or_insert_with(ModelCache::default);
+                Arc::clone(
+                    cache
+                        .loading
+                        .entry(canonical.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(()))),
+                )
+            };
+            // Held across the parse below — `plock` and `_held` are both locals of
+            // this block (no self-referential borrow); dropped on return. Lock order
+            // is always per-path THEN cache (cache is only taken briefly), no deadlock.
+            let _held = plock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A peer may have published while we waited on the per-path lock.
+            {
+                let mut guard = lock_cache();
+                let cache = guard.get_or_insert_with(ModelCache::default);
+                if let Some((rp, r)) = &cache.resident
+                    && rp == &canonical
+                {
+                    return Ok(Arc::clone(r));
+                }
+                if let Some(w) = cache.weak.get(&canonical)
+                    && let Some(existing) = w.upgrade()
+                {
+                    if keep_resident {
+                        cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                    }
+                    return Ok(existing);
+                }
+            }
+            let model = Self::do_parse_and_publish(canonical.clone(), keep_resident)?;
+            // Drop our in-flight marker (waiting peers hold their own `Arc` clone).
+            if let Some(cache) = lock_cache().as_mut() {
+                cache.loading.remove(&canonical);
+            }
+            return Ok(model);
+        }
+        Self::do_parse_and_publish(canonical, keep_resident)
+    }
+
+    /// Parse the ggml model, quantize weights, publish to the cache, and warm the
+    /// version tag on a background thread. Shared by the plain and `FW_LOAD_DEDUP`
+    /// load paths; its own re-check-under-lock still handles a racing publisher on the
+    /// plain (non-deduped) path.
+    fn do_parse_and_publish(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
         // Parse outside the lock so a slow load doesn't block other paths.
         let t_parse = std::time::Instant::now();
         let ggml = ggml::GgmlModel::load(&canonical)?;
