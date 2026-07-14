@@ -4,6 +4,47 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **SURFACED / INVALID BENCH — direct fixed-path timestamp lookups reached no timed samples before the strict-remote 285-second cap; source restored.**
+
+**Negative-ledger-first pivot and attribution.** `bv --robot-triage` data hash
+`ceada26dbbe76ef4` still ranked stale audio-normalization and scheduler beads,
+while the recent decoder, attention, streaming, tokenizer, mel/FFT, resampling,
+and model-load rows already close their measured veins. The fresh backend
+normalization seam was `extract_segments_from_json`: every segment reparses the
+same RFC6901 strings for `/offsets/{from,to}` and `/timestamp/{0,1,start,end}`.
+Historical normalization evidence places 500-chunk parsing around 0.65--0.83 ms,
+making fixed-path traversal an attributable component rather than an end-to-end
+claim.
+
+**One lever and proof design.** Bead `bd-zbsm` replaced only those constant
+`serde_json::Value::pointer` calls with direct object/array access. It preserved
+field precedence, the no-fallback behavior when an earlier field exists but is
+nonnumeric, and JSON Pointer's unusual equivalence between array index `0` and
+object key `"0"`. A 500-node same-binary Criterion A/B covered direct,
+`start_sec`, array, numeric-key object, named-key object, millisecond offsets,
+and malformed-offset shapes; it asserted exact result-vector parity before
+timing. The declared keep gate was a >=10% win with non-overlapping intervals.
+
+**Strict-remote failure.** The sole foreground command was
+`RCH_WORKER=vmi1152480 RCH_WORKERS=vmi1152480 RCH_REQUIRE_REMOTE=1
+RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env
+CARGO_HOME=/root/.cargo CARGO_NET_OFFLINE=true cargo bench --profile release
+--bench normalize_bench -- normalize/timestamp_lookup_ab --warm-up-time 0.5
+--measurement-time 1 --sample-size 10 --noplot`. RCH job
+`j-29928833041828697` was admitted to `vmi1152480` with no local fallback, but
+RCH selected a cold worker-scoped target pool. Dependency-root sync consumed
+55.500 seconds, followed by a full release dependency build. The explicit
+285-second foreground ceiling returned exit 124 before `franken_whisper`
+finished linking and before the parity oracle or either timed case ran.
+
+**Verdict.** There is no admissible ratio, so this is neither a keep nor a
+performance rejection. The production candidate, regression test, and A/B
+harness were restored manually; only this infrastructure-invalid evidence
+remains. Retry only against a confirmed warm `normalize_bench` release artifact
+that can enter Criterion inside the cap. Do not substitute local Cargo or infer
+a win from avoiding pointer parsing.
+
+---
 ## 2026-07-14 - Codex: **SURFACED / INVALID BENCH — VAD-to-separation waveform-analysis reuse reached no timed samples before the strict-remote five-minute cap; source restored.**
 
 **Negative-ledger-first pivot and attribution.** `bv --robot-triage` data hash
