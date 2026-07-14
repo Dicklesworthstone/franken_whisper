@@ -51,6 +51,64 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): transfer speculative-stream bridge segments through lane holders — **1.659752x two-lane median**
+
+**What.** Every speculative window converted the fast and quality lanes from
+`TranscriptionSegment` to the two-lane executor's `TranscriptSegment` shape
+while retaining the original model segments for correction and window state.
+Each lane deep-cloned the original vector into its mutex holder and then
+deep-cloned it again when recovering it after the executor joined. The bridge
+now builds the compact executor view, moves the original vector into the holder,
+and takes it back out with `mem::take`. This removes four deep segment/string
+clones per window across the two lanes. Executor inputs, lane scheduling,
+latencies, correction ownership, event order, poison recovery, and downstream
+state are unchanged. A negative-ledger-first search found no row for these
+speculative-stream holder clones or ownership transfer. Opportunity score was
+`(impact 3 x confidence 5) / effort 1 = 15`.
+
+**Exactness.** The oracle mirrored the historical clone-in/clone-out bridge and
+compared it against the production transfer helpers. It compared the compact
+backend vectors directly and the recovered original model-segment JSON bytes
+across empty input, nullable timestamps/confidence/speaker, negative zero,
+escaped text, newlines, Unicode, and multi-segment input. All bytes matched.
+The benchmark's 12-fast/12-quality fixture serialized to 8,159 bytes with
+SHA-256 `898b04c512c614b06a8eb618dfc7e2b1cd32a941c075163ab5b978374d16483f`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041828133` ran only on
+worker `vmi1227854` with `RCH_REQUIRE_REMOTE=1`, `--profile release-perf`, LTO
+disabled, and 16 codegen units; no local Cargo fallback occurred. Benchmark-
+binary SHA-256 was
+`3465698d4593dc7fb6bb7d232dc18277825a046ea083ded002aeceb4dded7138`.
+The direct boundary used 12 model segments per lane and 4,096 complete two-lane
+bridge transfers per arm. Input vectors were prepared outside the timed region.
+After three warmups, the same binary ran 21 alternating historical/historical
+null pairs and 21 alternating historical/transfer pairs. The null median passed
+the predeclared `[0.95, 1.05]` guard; candidate p10 cleared
+`max(null p90, 1.10)`, and the candidate won all 21 pairs.
+
+| comparison | p10 | median | p90 | arm medians / 4,096 two-lane transfers | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.971581 | **1.012392** | **1.128779** | — | — | — | valid null |
+| clone-in/out / move-in/take-out | **1.491522x** | **1.659752x** | 1.767311x | 17,471,317 ns / 10,419,746 ns | 7.83% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+BASE/BASE ratios:
+`[1.168133, 0.992007, 0.989808, 1.128779, 1.059196, 0.927355,
+1.013712, 1.081026, 0.972234, 1.156477, 0.971581, 1.035554,
+0.862757, 1.026261, 0.978168, 1.012392, 0.991430, 1.036000,
+1.012951, 1.003350, 0.985562]`.
+
+Historical/transfer ratios:
+`[1.801111, 1.866828, 1.632230, 1.640221, 1.464735, 1.761097,
+1.747512, 1.575013, 1.684391, 1.767311, 1.491522, 1.207528,
+1.728472, 1.646372, 1.601227, 1.557447, 1.659752, 1.641590,
+1.694970, 1.668619, 1.681777]`.
+
+**Scope.** This proves the segment bridge/holder boundary, not end-to-end
+streaming TTFT. Audio slicing, backend inference, executor scheduling,
+correction drift, and event emission were outside the timed region and will
+normally dominate. The absolute benefit scales with segment count and text
+length per speculative window.
+
 ### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrow routing-history fields during NDJSON serialization — **2.894664x current-like median**
 
 **What.** The `robot routing-history` path built an owned `serde_json::Value`
