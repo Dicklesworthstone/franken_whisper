@@ -447,6 +447,15 @@ pub struct WindowState {
     pub status: WindowStatus,
 }
 
+/// Scalar window fields needed by the internal streaming loop after a window
+/// has been retained by [`WindowManager`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowReceipt {
+    pub(crate) window_id: u64,
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+}
+
 /// Manages the lifecycle of overlapping audio windows for speculative
 /// dual-model transcription.
 pub struct WindowManager {
@@ -476,12 +485,7 @@ impl WindowManager {
         }
     }
 
-    fn create_window(
-        &mut self,
-        audio_position_ms: u64,
-        end_ms: u64,
-        audio_hash: &str,
-    ) -> SpeculationWindow {
+    fn store_window(&mut self, audio_position_ms: u64, end_ms: u64, audio_hash: String) -> usize {
         let id = self.next_window_id;
         self.next_window_id += 1;
 
@@ -491,17 +495,37 @@ impl WindowManager {
             audio_position_ms,
             end_ms,
             self.overlap_ms,
-            audio_hash.to_owned(),
+            audio_hash,
         );
 
+        let index = self.windows.len();
         self.windows.push(WindowState {
-            window: window.clone(),
+            window,
             fast_result: None,
             quality_result: None,
             status: WindowStatus::Pending,
         });
 
-        window
+        index
+    }
+
+    fn create_window(
+        &mut self,
+        audio_position_ms: u64,
+        end_ms: u64,
+        audio_hash: &str,
+    ) -> SpeculationWindow {
+        let index = self.store_window(audio_position_ms, end_ms, audio_hash.to_owned());
+        self.windows[index].window.clone()
+    }
+
+    fn bounded_end_ms(&self, audio_position_ms: u64, max_end_ms: u64) -> Option<u64> {
+        if audio_position_ms >= max_end_ms {
+            return None;
+        }
+        let natural_end = audio_position_ms.saturating_add(self.window_size_ms);
+        let end_ms = natural_end.min(max_end_ms);
+        (end_ms > audio_position_ms).then_some(end_ms)
     }
 
     /// Create the next speculation window starting at `audio_position_ms`.
@@ -520,15 +544,26 @@ impl WindowManager {
         max_end_ms: u64,
         audio_hash: &str,
     ) -> Option<SpeculationWindow> {
-        if audio_position_ms >= max_end_ms {
-            return None;
-        }
-        let natural_end = audio_position_ms.saturating_add(self.window_size_ms);
-        let end_ms = natural_end.min(max_end_ms);
-        if end_ms <= audio_position_ms {
-            return None;
-        }
+        let end_ms = self.bounded_end_ms(audio_position_ms, max_end_ms)?;
         Some(self.create_window(audio_position_ms, end_ms, audio_hash))
+    }
+
+    /// Retain a bounded window while moving its already-owned audio hash and
+    /// return only the scalar fields consumed by the internal streaming loop.
+    pub(crate) fn next_window_bounded_receipt(
+        &mut self,
+        audio_position_ms: u64,
+        max_end_ms: u64,
+        audio_hash: String,
+    ) -> Option<WindowReceipt> {
+        let end_ms = self.bounded_end_ms(audio_position_ms, max_end_ms)?;
+        let index = self.store_window(audio_position_ms, end_ms, audio_hash);
+        let window = &self.windows[index].window;
+        Some(WindowReceipt {
+            window_id: window.window_id,
+            start_ms: window.start_ms,
+            end_ms: window.end_ms,
+        })
     }
 
     /// Record the fast model result for a window.
@@ -1437,6 +1472,301 @@ mod tests {
             confidence,
             speaker: None,
         }
+    }
+
+    const RECEIPT_RUN_ID: &str = "run-2026-07-14T12:34:56Z-0123456789abcdef0123456789abcdef";
+    const RECEIPT_AUDIO_HASH_SEED: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn streaming_window_receipt_state_bytes(manager: &WindowManager) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "window_size_ms": manager.window_size_ms,
+            "overlap_ms": manager.overlap_ms,
+            "min_window_ms": manager.min_window_ms,
+            "max_window_ms": manager.max_window_ms,
+            "next_window_id": manager.next_window_id,
+            "run_id": &manager.run_id,
+            "windows": &manager.windows,
+        }))
+        .expect("serialize streaming window receipt state")
+    }
+
+    fn streaming_window_receipt_historical(
+        window_count: usize,
+    ) -> (WindowManager, Vec<WindowReceipt>) {
+        let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let max_end_ms = u64::try_from(window_count)
+            .expect("window count fits u64")
+            .saturating_mul(2_500)
+            .saturating_add(500);
+        let mut receipts = Vec::with_capacity(window_count);
+        for index in 0..window_count {
+            let position_ms = u64::try_from(index)
+                .expect("fixture index fits u64")
+                .saturating_mul(2_500);
+            let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+            let window = manager
+                .next_window_bounded(position_ms, max_end_ms, &audio_hash)
+                .expect("historical bounded window");
+            receipts.push(WindowReceipt {
+                window_id: window.window_id,
+                start_ms: window.start_ms,
+                end_ms: window.end_ms,
+            });
+        }
+        (manager, receipts)
+    }
+
+    fn streaming_window_receipt_candidate(
+        window_count: usize,
+    ) -> (WindowManager, Vec<WindowReceipt>) {
+        let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let max_end_ms = u64::try_from(window_count)
+            .expect("window count fits u64")
+            .saturating_mul(2_500)
+            .saturating_add(500);
+        let mut receipts = Vec::with_capacity(window_count);
+        for index in 0..window_count {
+            let position_ms = u64::try_from(index)
+                .expect("fixture index fits u64")
+                .saturating_mul(2_500);
+            let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+            receipts.push(
+                manager
+                    .next_window_bounded_receipt(position_ms, max_end_ms, audio_hash)
+                    .expect("candidate bounded window"),
+            );
+        }
+        (manager, receipts)
+    }
+
+    #[test]
+    fn streaming_window_receipt_preserves_complete_state() {
+        let (mut historical, historical_receipts) = streaming_window_receipt_historical(513);
+        let (mut candidate, candidate_receipts) = streaming_window_receipt_candidate(513);
+        assert_eq!(candidate_receipts, historical_receipts, "scalar receipts");
+        assert_eq!(
+            streaming_window_receipt_state_bytes(&candidate),
+            streaming_window_receipt_state_bytes(&historical),
+            "complete retained window state"
+        );
+
+        assert!(
+            historical
+                .next_window_bounded(1_282_500, 1_282_500, "unused")
+                .is_none()
+        );
+        assert!(
+            candidate
+                .next_window_bounded_receipt(1_282_500, 1_282_500, "unused".to_owned())
+                .is_none()
+        );
+        assert_eq!(
+            streaming_window_receipt_state_bytes(&candidate),
+            streaming_window_receipt_state_bytes(&historical),
+            "rejected boundary leaves state unchanged"
+        );
+
+        let mut historical_tail = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let mut candidate_tail = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+        let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:2500:3000");
+        let historical_window = historical_tail
+            .next_window_bounded(2_500, 2_601, &audio_hash)
+            .expect("historical truncated window");
+        let candidate_receipt = candidate_tail
+            .next_window_bounded_receipt(2_500, 2_601, audio_hash)
+            .expect("candidate truncated window");
+        assert_eq!(
+            candidate_receipt,
+            WindowReceipt {
+                window_id: historical_window.window_id,
+                start_ms: historical_window.start_ms,
+                end_ms: historical_window.end_ms,
+            }
+        );
+        assert_eq!(
+            streaming_window_receipt_state_bytes(&candidate_tail),
+            streaming_window_receipt_state_bytes(&historical_tail),
+            "truncated final-window state"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn streaming_window_receipt_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_WINDOWS: usize = 256;
+        const EXACTNESS_WINDOWS: usize = 513;
+        const TARGET_ARM_NS: u128 = 30_000_000;
+
+        fn time_historical(window_count: usize) -> u128 {
+            let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+            let max_end_ms = u64::try_from(window_count)
+                .expect("window count fits u64")
+                .saturating_mul(2_500)
+                .saturating_add(500);
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for index in 0..window_count {
+                let position_ms = u64::try_from(index)
+                    .expect("fixture index fits u64")
+                    .saturating_mul(2_500);
+                let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+                let window = manager
+                    .next_window_bounded(position_ms, max_end_ms, &audio_hash)
+                    .expect("historical timed window");
+                checksum = checksum
+                    .wrapping_add(window.window_id)
+                    .wrapping_add(window.start_ms)
+                    .wrapping_add(window.end_ms);
+            }
+            black_box((&manager.windows, checksum));
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(window_count: usize) -> u128 {
+            let mut manager = WindowManager::new(RECEIPT_RUN_ID, 3_000, 500);
+            let max_end_ms = u64::try_from(window_count)
+                .expect("window count fits u64")
+                .saturating_mul(2_500)
+                .saturating_add(500);
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for index in 0..window_count {
+                let position_ms = u64::try_from(index)
+                    .expect("fixture index fits u64")
+                    .saturating_mul(2_500);
+                let audio_hash = format!("{RECEIPT_AUDIO_HASH_SEED}:{position_ms}:3000");
+                let receipt = manager
+                    .next_window_bounded_receipt(position_ms, max_end_ms, audio_hash)
+                    .expect("candidate timed window");
+                checksum = checksum
+                    .wrapping_add(receipt.window_id)
+                    .wrapping_add(receipt.start_ms)
+                    .wrapping_add(receipt.end_ms);
+            }
+            black_box((&manager.windows, checksum));
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let (historical, historical_receipts) =
+            streaming_window_receipt_historical(EXACTNESS_WINDOWS);
+        let (candidate, candidate_receipts) = streaming_window_receipt_candidate(EXACTNESS_WINDOWS);
+        let historical_bytes = streaming_window_receipt_state_bytes(&historical);
+        let candidate_bytes = streaming_window_receipt_state_bytes(&candidate);
+        assert_eq!(candidate_receipts, historical_receipts, "exact receipts");
+        assert_eq!(candidate_bytes, historical_bytes, "exact retained state");
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "streaming_window_receipt binary_sha256={:x} state_bytes={} state_sha256={:x} exactness_windows={} run_id_bytes={} audio_hash_seed_bytes={}",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            EXACTNESS_WINDOWS,
+            RECEIPT_RUN_ID.len(),
+            RECEIPT_AUDIO_HASH_SEED.len()
+        );
+
+        let historical_calibration = time_historical(CALIBRATION_WINDOWS);
+        let candidate_calibration = time_candidate(CALIBRATION_WINDOWS);
+        let window_count = ((TARGET_ARM_NS * CALIBRATION_WINDOWS as u128)
+            / historical_calibration.max(1))
+        .clamp(CALIBRATION_WINDOWS as u128, 16_384) as usize;
+        eprintln!(
+            "streaming_window_receipt calibration_windows={CALIBRATION_WINDOWS} historical_calibration_ns={historical_calibration} candidate_calibration_ns={candidate_calibration} timed_windows={window_count}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(window_count));
+            black_box(time_candidate(window_count));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(window_count);
+            let null_second = time_historical(window_count);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical_time, candidate_time) = if sample % 2 == 0 {
+                (time_historical(window_count), time_candidate(window_count))
+            } else {
+                let candidate_time = time_candidate(window_count);
+                let historical_time = time_historical(window_count);
+                (historical_time, candidate_time)
+            };
+            historical_times.push(historical_time);
+            candidate_times.push(candidate_time);
+            speedups.push(historical_time as f64 / candidate_time as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "streaming_window_receipt samples={SAMPLES} timed_windows={window_count} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_per_window_median_ns={} candidate_per_window_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times) / window_count as u128,
+            median_ns(&candidate_times) / window_count as u128,
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "streaming_window_receipt null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
     }
 
     fn get_window_mut_historical(
