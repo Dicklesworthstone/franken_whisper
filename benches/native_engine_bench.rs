@@ -40,6 +40,7 @@
 //! `logits_gemv_large` and `encoder_window_large` / `decoder_token_step_large`
 //! numbers for the f16 levers specifically.
 
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -1379,6 +1380,28 @@ fn tokenizer_bench_vocab() -> Vec<Vec<u8>> {
     vocab
 }
 
+fn tokenizer_prefilter_bench_vocab() -> Vec<Vec<u8>> {
+    let mut vocab = tokenizer_bench_vocab();
+    let patterns: HashSet<Vec<u8>> = tokenizer_suppress_patterns().into_iter().collect();
+    // Profiled from the on-box ggml-tiny.en vocabulary: 881 / 50,257
+    // entries (1.753%) have a first non-prefix-space byte that could match a
+    // suppress pattern. Preserve all exact patterns and add non-matching quote
+    // prefixes until this hermetic vocabulary has the same candidate count.
+    let mut candidates = patterns.len();
+    for (id, token) in vocab.iter_mut().enumerate() {
+        if candidates >= 881 {
+            break;
+        }
+        if patterns.contains(token.as_slice()) {
+            continue;
+        }
+        *token = format!("\"candidate-{id:05}").into_bytes();
+        candidates += 1;
+    }
+    assert_eq!(candidates, 881);
+    vocab
+}
+
 fn tokenizer_bench_hparams() -> WhisperHParams {
     WhisperHParams {
         n_vocab: 51_866,
@@ -1409,6 +1432,25 @@ fn legacy_build_non_speech(tokens: Vec<Vec<u8>>, patterns: &[Vec<u8>]) -> (Vec<V
     (tokens, ids)
 }
 
+fn single_scan_without_discriminant_prefilter(tokens: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<i32>) {
+    let patterns = tokenizer_suppress_patterns();
+    let mut remaining = HashSet::with_capacity(patterns.len());
+    remaining.extend(patterns);
+
+    let mut ids = Vec::with_capacity(remaining.len());
+    for (id, token) in tokens.iter().enumerate() {
+        if remaining.remove(token.as_slice())
+            && let Ok(id) = i32::try_from(id)
+        {
+            ids.push(id);
+        }
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    (tokens, ids)
+}
+
 fn bench_tokenizer_from_vocab(c: &mut Criterion) {
     let hparams = tokenizer_bench_hparams();
     let vocab = tokenizer_bench_vocab();
@@ -1427,6 +1469,32 @@ fn bench_tokenizer_from_vocab(c: &mut Criterion) {
         );
     });
     group.bench_function("single_vocab_scan", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(Tokenizer::from_vocab(black_box(&hparams), tokens)),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn bench_tokenizer_suppress_prefilter(c: &mut Criterion) {
+    let hparams = tokenizer_bench_hparams();
+    let vocab = tokenizer_prefilter_bench_vocab();
+    let expected = single_scan_without_discriminant_prefilter(vocab.clone()).1;
+    let candidate = Tokenizer::from_vocab(&hparams, vocab.clone());
+    assert_eq!(candidate.non_speech_tokens(), expected);
+
+    let mut group = c.benchmark_group("native_engine/tokenizer_suppress_prefilter");
+    group.throughput(criterion::Throughput::Elements(vocab.len() as u64));
+    group.bench_function("hash_every_token", |bch| {
+        bch.iter_batched(
+            || vocab.clone(),
+            |tokens| black_box(single_scan_without_discriminant_prefilter(tokens)),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("discriminant_prefilter", |bch| {
         bch.iter_batched(
             || vocab.clone(),
             |tokens| black_box(Tokenizer::from_vocab(black_box(&hparams), tokens)),
@@ -1461,6 +1529,7 @@ criterion_group!(
     bench_downmix,
     bench_sanitize_downmix,
     bench_tokenizer_from_vocab,
+    bench_tokenizer_suppress_prefilter,
     bench_e2e_tiny_jfk,
     bench_e2e_tiny_jfk_no_timestamps,
     bench_e2e_large_jfk,

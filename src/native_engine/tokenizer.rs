@@ -255,8 +255,30 @@ impl Tokenizer {
         remaining.insert(b" -".to_vec());
         remaining.insert(b" '".to_vec());
 
+        // Most vocabulary entries begin with letters/digits and cannot equal
+        // any suppress pattern. For space-prefixed patterns, the byte after
+        // the single prefix space is the useful discriminator. Avoid hashing
+        // an entire token unless that byte occurs in at least one pattern.
+        let mut candidate_discriminants = [false; 256];
+        for pattern in &remaining {
+            let discriminant = match pattern.as_slice() {
+                [b' ', byte, ..] => *byte,
+                [byte, ..] => *byte,
+                [] => continue,
+            };
+            candidate_discriminants[usize::from(discriminant)] = true;
+        }
+
         let mut ids = Vec::with_capacity(remaining.len());
         for (id, token) in self.tokens.iter().enumerate() {
+            let discriminant = match token.as_slice() {
+                [b' ', byte, ..] => *byte,
+                [byte, ..] => *byte,
+                [] => continue,
+            };
+            if !candidate_discriminants[usize::from(discriminant)] {
+                continue;
+            }
             // Removing a match preserves the old first-id semantics when a
             // malformed vocabulary contains duplicate byte strings.
             if remaining.remove(token.as_slice())
@@ -665,6 +687,7 @@ mod tests {
         v[11] = b" (".to_vec(); // space-prefixed paren
         v[12] = b" -".to_vec(); // special hyphen case
         v[13] = b"\"".to_vec(); // duplicate: first matching id wins
+        v[14] = Vec::new(); // empty entries cannot match a suppress pattern
         let tk = Tokenizer::from_vocab(&hp(51864, 4), v);
         let ns = tk.non_speech_tokens();
         assert!(ns.contains(&10), "bare quote suppressed");
