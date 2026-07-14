@@ -51,6 +51,45 @@
 
 ## Levers
 
+### 2026-07-14 UTC — cod_fw — LANDED (token-ID exact): single-pass tokenizer suppression index — **1.299x median**
+
+**Profile / negative-ledger boundary.** Full transcription profiles correctly
+place tokenization below the steady-state floor, but model loading remains a
+measured 4.74% one-time frame. The untouched constructor exception was
+`Tokenizer::build_non_speech`: for each bare and space-prefixed suppression
+symbol it restarted a linear scan over the 50,257-token file vocabulary, about
+130 vocabulary passes per model load. Prior tokenizer rows rejected a vocab
+arena and build overlap; neither covered this repeated suppression lookup.
+
+**Change.** Build the roughly 130-byte-pattern `HashSet` once, scan the large
+vocabulary once, and remove each match after its first token ID. Removal retains
+the legacy first-ID behavior even for malformed duplicate token strings; the
+result is naturally ID-sorted, so no output sort is needed.
+
+**Exactness.** The focused remote release test passed 1/1 and now explicitly
+covers duplicate suppress-token bytes. The hermetic benchmark also asserts the
+complete candidate suppression-ID vector equals the legacy pattern-major
+algorithm before Criterion begins.
+
+| same-binary arm (50,257 tokens) | interval | median |
+|---|---:|---:|
+| legacy pattern-major scans | 1.8037–2.0631 ms | **1.9141 ms** |
+| single vocabulary scan | 1.3034–1.6345 ms | **1.4739 ms** |
+
+That is **23.0% lower constructor time / 1.299x throughput**, with
+non-overlapping intervals. Both arms ran in one foreground `--profile release`
+Criterion process on RCH worker `vmi1152480`; Cargo was warm (0.28 s), the timed
+remote command took 9.58 s, and the full RCH invocation returned in 82.1 s.
+Command: `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=vmi1152480 rch
+exec -- env CARGO_HOME=/root/.cargo CARGO_NET_OFFLINE=true cargo bench --profile
+release --bench native_engine_bench -- native_engine/tokenizer_from_vocab
+--warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`.
+
+**Scope.** This is a real model-construction win, not a claim about warmed
+transcription throughput. Production code and the hermetic A/B landed in
+`5d3d660`; bead `bd-non-gemm-lane-empty-turbo-x67v` is closed with the measured
+exception to its steady-state profile conclusion.
+
 ### 2026-07-14 UTC — Codex — LANDED (state-byte exact): retain owned streaming windows once and return scalar receipts — **1.272263x median**
 
 **What.** `process_duration_loop` already owned each formatted audio-hash
