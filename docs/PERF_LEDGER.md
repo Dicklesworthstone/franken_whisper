@@ -88,66 +88,6 @@ the accuracy/speed knee before any default-on flip.
 
 **Rollback.** `FW_TOME_R=0`, or revert `encoder.rs` (self-contained: two fns + one gated loop branch).
 
-### 2026-07-14 UTC — cod_fw — LANDED (byte-exact): project recent-run transcript previews in SQL — **1.429596× median**
-
-**What.** `RunStore::list_recent_runs` selected every complete transcript, copied it
-into a Rust `String`, and only then retained 140 characters. The query now selects
-`substr(transcript, 1, 140)`, activating FrankenSQLite's `ColumnSubstrPrefix` opcode
-so ordinary ASCII TEXT rows copy only the requested prefix from record storage.
-Unicode retains SQLite's character-aware fallback. A manually injected BLOB takes a
-rare complete-query fallback, preserving the historical `<blob:N>` representation
-from one coherent snapshot while BLOB-free result sets retain the direct projection.
-
-**Negative-ledger-first target.** Existing storage closure covered N+1 detail loads,
-indexes, and sync paths, but neither `list_recent_runs` nor wide-column projection.
-The checked-in Criterion fixture uses roughly 49-byte transcripts, so the focused
-harness measured that current-like control and a 16-KiB transcript shape. It directly
-timed the complete production `list_recent_runs(100)` entry point; the target-shape
-calibration selected nine calls per approximately 30-ms arm, proving that the timed
-path was active rather than optimized away.
-
-**Quick strict-remote same-binary A/B** (worker `vmi1293453`, job
-`j-29928833041827317`, `--profile release-perf` with LTO disabled, 21 alternating
-paired repetitions):
-
-| shape / comparison | p10 | median | p90 | CV | wins | verdict |
-|---|---:|---:|---:|---:|---:|---|
-| 49 B historical / historical null | 0.888759 | 1.014118 | 1.100544 | 8.15% | 12/21 | valid: median in `[0.97, 1.03]` |
-| 49 B historical / SQL prefix | 1.046341 | **1.106140×** | 1.212694 | 5.79% | 20/21 | positive control |
-| 16 KiB historical / historical null | 0.900154 | 0.979322 | 1.127253 | 10.75% | 8/21 | valid: median in `[0.97, 1.03]` |
-| 16 KiB historical / SQL prefix | **1.233442** | **1.429596×** | **1.541685** | 12.33% | **21/21** | **keep: p10 exceeds null p90** |
-
-Target-shape raw BASE/BASE ratios:
-`[0.9232461071207244, 1.0343348611438117, 1.008015264588581,
-0.9170384422354155, 0.9704154634527794, 1.0707543166943618,
-0.9896507671607353, 1.0579419274100743, 0.9282431707886686,
-0.9665624747548677, 1.0978389522412975, 1.0174900200346428,
-0.9001537514734798, 0.8110857574678844, 0.9536874291307142,
-0.9607534185770888, 1.30844933380509, 1.1415022371556407,
-1.1272526871815138, 0.8497255347619083, 0.9793218718586854]`.
-
-Target-shape raw candidate ratios:
-`[1.2334422529560587, 1.6808492920610139, 1.4512422688974689,
-2.005806683753943, 1.3385702881263122, 1.3158706273355,
-1.43754629859367, 1.4295956655305018, 1.5416847473351527,
-1.3465070874798764, 1.1450453551612356, 1.2223682261138749,
-1.451202337786771, 1.444673672665019, 1.4905502063309937,
-1.3832727481399778, 1.2829478423920762, 1.505467055626014,
-1.4709115368882575, 1.4202814193058284, 1.310854260462121]`.
-
-Benchmark binary SHA-256 was
-`7cd4f28c902a5032108560b54802e7fe12e71e3fa5305cbd0120ec0b1e9a829a`.
-The strict remote invocation exited 0 and the two focused tests completed in
-4.91 seconds. An independent preceding run on worker `vmi1264463` corroborated
-the target signal at 1.495714× median and 20/21 wins.
-
-**Behavior proof.** Before timing, the same binary serialized candidate and
-historical `Vec<RunSummary>` values and compared the bytes exactly for empty,
-139/140/141-character, 16-KiB, emoji, CJK, combining-mark, whitespace, and
-ordering/limit cases. It also injected a 300-byte BLOB and proved the rare fallback
-still returns `<blob:300>`. Both focused tests passed. Ratio vs LEGACY ORIGINAL for
-the 100-row, 16-KiB transcript boundary: **1.429596×**.
-
 ### 2026-07-13 UTC — cod_fw — LANDED (byte-exact): move unstreamed events into the retained log — **1.399743× median**
 
 **What.** `EventLog::push` always deep-cloned each completed `RunEvent` into
