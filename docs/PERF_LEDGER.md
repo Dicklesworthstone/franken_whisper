@@ -51,6 +51,73 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (timestamp-normalized state exact): reuse correction drift instead of recomputing both Levenshtein metrics — **2.005024x synthetic correction-boundary median**
+
+**What.** `CorrectionTracker::submit_quality_result` computed character- and
+word-level drift over the fast and quality transcripts to choose Confirm versus
+Correct. On the Correct branch it then cloned every fast segment and called
+`CorrectionEvent::new`, which recomputed the same drift from unchanged segment
+data. The tracker now moves the already-computed `CorrectionDrift` into a private
+event constructor and retains the public self-contained constructor for ordinary
+callers. Decision thresholds, stats, IDs, segment ownership/order, stored-event
+cloning, and map removal are unchanged. Negative-ledger-first search found no row
+for this duplicate correction-path scan. Opportunity score was
+`(impact 5 x confidence 5) / effort 1 = 25`.
+
+**Exactness.** A fixed-timestamp oracle independently recomputed the historical
+metrics and compared complete serialized `CorrectionEvent` bytes with the
+precomputed-metrics route across Unicode, nullable confidence/speaker, timestamps,
+and divergent text. Both routes intentionally share the private final field
+assembler; source review confirmed it is the unchanged struct literal and that no
+segment data mutates between the two historical drift computations. The benchmark
+also ran a test-local mirror of the complete historical successful Correct branch
+against the production candidate entry point, normalized only their live wall-clock
+timestamp, and compared the serialized decision, stored correction, partial status,
+every tracker counter, next correction ID, and window-map state. The 5,586-byte
+normalized state matched exactly with SHA-256
+`d1c3500d683fe2ffcc630438a9ca18cf20e3ac2e007f698ffb07fd584ccc6c08`.
+The candidate samples the live correction timestamp after the same ID and model-ID
+allocation but without the historical fast-segment clone that preceded it, so its
+absolute timestamp may be slightly earlier; format, operation order, and event
+semantics are unchanged.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041828038` ran only on
+worker `vmi1227854` with `--profile release-perf`, LTO disabled, and 16 codegen
+units; no local fallback occurred. Benchmark-binary SHA-256 was
+`c088b27ab6f0f0de90a9bb08ede3f6e61161dc550b7499ace690c53fb2b7e870`.
+The direct boundary used a synthetic 12-fast/12-quality-segment fixture. The
+candidate arm called the production entry point; the historical arm mirrored the
+complete pre-change successful Correct branch. Fresh trackers and input clones were
+prepared outside each timed arm. Timing included the initial decision drift,
+status/stats/map updates, event construction, stored-event clone, and live timestamp
+in both arms.
+After three warmups, the same binary ran 21 alternating historical/historical
+null pairs and 21 alternating historical/reuse pairs at eight submissions per
+arm. The null median passed `[0.95, 1.05]`; candidate p10 cleared
+`max(null p90, 1.10)` and the candidate won all 21 pairs.
+
+| comparison | p10 | median | p90 | arm medians / 8 submissions | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.913044 | **0.991722** | **1.081465** | — | — | — | valid null |
+| historical / drift reuse | **1.754409x** | **2.005024x** | 2.190186x | 50,045,866 ns / 24,412,919 ns | 11.84% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+BASE/BASE ratios:
+`[1.008916, 0.968901, 0.990880, 0.979916, 1.298825, 1.081465,
+1.027048, 0.872102, 0.993977, 0.913044, 0.822973, 0.989331,
+0.985861, 0.986120, 1.069563, 0.991722, 1.006646, 0.992057,
+0.998967, 0.920452, 1.455585]`.
+
+Historical/drift-reuse ratios:
+`[2.507303, 2.105146, 2.102683, 2.190186, 1.752736, 1.451171,
+1.754409, 2.179429, 1.981435, 2.212877, 2.001472, 2.005024,
+1.993563, 1.954903, 1.984258, 1.991478, 2.010139, 1.999740,
+2.009154, 2.033016, 2.025565]`.
+
+**Scope.** This proves a direct correction-branch win, not end-to-end ASR speed.
+Confirm submissions are unchanged, and whole-run impact scales with correction
+rate while model inference normally dominates. No workload-profile attribution is
+claimed for this synthetic fixture.
+
 ### 2026-07-14 UTC — Codex — LANDED (event-exact): elide the pre-persist `RunReport` event snapshot — **1.933799x current-like median**
 
 **What.** `run_pipeline_body` constructed a `RunReport` by cloning the complete
