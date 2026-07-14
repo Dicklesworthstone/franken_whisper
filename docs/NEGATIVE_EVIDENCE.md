@@ -4,6 +4,48 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **INVALID-RUN / HOLD — correction lifecycle lookup consolidation never reached the timed path; source restored.**
+
+**Negative-ledger-first target.** `CorrectionTracker::submit_quality_result`
+successfully resolves each streaming quality window but currently probes
+`window_to_seq` once to read and once to remove, then probes `partials` once to
+read and once again to mutate. The candidate consumed the window mapping with one
+`remove`, held one mutable partial lookup through drift calculation and status
+transition, and reinserted the mapping before returning the unchanged desync error.
+The earlier landed correction-tracker row covers duplicate Levenshtein work, not
+these residual map probes; no negative-ledger row covered this lookup family.
+Opportunity score was `(impact 3 x confidence 4) / effort 1 = 12`.
+
+**Planned behavior and timing gates.** The same-binary oracle covered Confirm,
+Correct (with only the live correction timestamp normalized), missing-window, and
+desynchronized-state outcomes, including sorted map key/value state, every partial,
+stored corrections, counters, next correction ID, decision bytes, and exact error
+text. The timed fixture was the hot empty/silence confirmation boundary with 2,048
+active windows per sweep. The predeclared keep gate required a 21-pair BASE/BASE
+null median in `[0.95, 1.05]`, candidate p10 above `max(null p90, 1.10)`, and at
+least 18/21 wins.
+
+**Strict-remote invalid run.** The sole foreground Cargo invocation used
+`RCH_REQUIRE_REMOTE=1`, `RCH_NO_SELF_HEALING=1`, `RCH_WORKER=vmi1227854`, and
+`rch --no-self-healing exec -- cargo test --profile release-perf --lib
+correction_lookup_consolidation_ -- --include-ignored --nocapture
+--test-threads=1`. RCH job `j-29928833041828241` was admitted only to worker
+`vmi1227854`; no local fallback occurred. After a cache-miss build, rustc rejected
+the test-only candidate timer at `src/speculation.rs:1711` with `E0382: use of
+moved value: tracker`: `black_box(tracker)` needed the fresh reborrow
+`black_box(&mut *tracker)`. RCH reported exit 101 after 624.5 seconds total (50.9
+seconds sync, 573.7 seconds build).
+
+The compiler error occurred before the test binary or timed path ran. Therefore
+there is **no benchmark-binary hash, exact-state hash, null distribution, candidate
+distribution, or performance verdict**. The one-invocation budget was consumed, so
+the run was not retried and no local Cargo substitute was used. Production source
+and the test harness were fully restored; only this ledger row remains. This is a
+surfaced invalid-run hold, not evidence that the lookup consolidation wins or
+loses. A future fresh turn may retry only with the explicit mutable reborrow and
+the same predeclared gates.
+
+---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — single-clone fast-partial fan-out measured 1.493683x median, but its 1.082879x p10 stayed inside a wide BASE/BASE envelope; source restored.**
 
 **Negative-ledger-first target.** After the landed speculative bridge ownership
