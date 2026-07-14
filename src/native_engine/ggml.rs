@@ -43,6 +43,7 @@
 //! is acceptable for now. TODO(bd-A14 memory bead): switch to a seek-based /
 //! mmap-free streaming loader to avoid holding the entire blob resident.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -329,17 +330,26 @@ impl GgmlModel {
     ///
     /// - [`FwError::InvalidRequest`] if `name` is unknown or the stored byte
     ///   length is inconsistent with the shape/dtype (corruption).
+    /// Raw little-endian bytes of a tensor entry — the SINGLE byte-access choke point
+    /// for every tensor accessor. Today it borrows from the resident blob (`Cow::Borrowed`,
+    /// zero-copy); a future `FW_STREAM_LOAD` variant will `pread` the bytes on demand
+    /// (`Cow::Owned`) so the read overlaps the weight quant. `Cow` lets both share one
+    /// call site with no signature churn in the callers.
+    fn tensor_raw(&self, name: &str, entry: &TensorEntry) -> FwResult<Cow<'_, [u8]>> {
+        self.blob
+            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| {
+                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
+            })
+    }
+
     pub fn tensor_f32(&self, name: &str) -> FwResult<(Vec<usize>, Vec<f32>)> {
         let entry = self
             .tensors
             .get(name)
             .ok_or_else(|| FwError::InvalidRequest(format!("unknown tensor '{name}'")))?;
-        let raw = self
-            .blob
-            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
-            .ok_or_else(|| {
-                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
-            })?;
+        let raw = self.tensor_raw(name, entry)?;
 
         let n_elements = entry.n_elements();
         let values = match entry.dtype {
@@ -365,7 +375,7 @@ impl GgmlModel {
                         n_elements
                     )));
                 }
-                dequant_f16_parallel(raw, n_elements)
+                dequant_f16_parallel(&raw, n_elements)
             }
         };
 
@@ -401,12 +411,7 @@ impl GgmlModel {
                  (f16-compute path applies only to f16-stored tensors)"
             )));
         }
-        let raw = self
-            .blob
-            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
-            .ok_or_else(|| {
-                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
-            })?;
+        let raw = self.tensor_raw(name, entry)?;
         let n_elements = entry.n_elements();
         if raw.len() != n_elements * 2 {
             return Err(FwError::InvalidRequest(format!(
@@ -446,12 +451,7 @@ impl GgmlModel {
                  (f16-compute path applies only to f16-stored tensors)"
             )));
         }
-        let raw = self
-            .blob
-            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
-            .ok_or_else(|| {
-                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
-            })?;
+        let raw = self.tensor_raw(name, entry)?;
         let n_elements = entry.n_elements();
         if raw.len() != n_elements * 2 {
             return Err(FwError::InvalidRequest(format!(
@@ -462,7 +462,7 @@ impl GgmlModel {
         }
         Ok((
             entry.shape.clone(),
-            dequant_f16_to_halves_parallel(raw, n_elements),
+            dequant_f16_to_halves_parallel(&raw, n_elements),
         ))
     }
 
@@ -470,7 +470,7 @@ impl GgmlModel {
     /// `Vec<u16>` copy — for a fused dequant-transpose that reads straight from
     /// the blob. Errors exactly like [`Self::tensor_f16`] (unknown / f32-stored /
     /// size-mismatched).
-    pub fn tensor_f16_bytes(&self, name: &str) -> FwResult<(Vec<usize>, &[u8])> {
+    pub fn tensor_f16_bytes(&self, name: &str) -> FwResult<(Vec<usize>, Cow<'_, [u8]>)> {
         let entry = self
             .tensors
             .get(name)
@@ -480,12 +480,7 @@ impl GgmlModel {
                 "tensor '{name}' is stored as f32, not f16"
             )));
         }
-        let raw = self
-            .blob
-            .get(entry.byte_offset..entry.byte_offset + entry.byte_len)
-            .ok_or_else(|| {
-                FwError::InvalidRequest(format!("tensor '{name}' payload out of bounds"))
-            })?;
+        let raw = self.tensor_raw(name, entry)?;
         let n_elements = entry.n_elements();
         if raw.len() != n_elements * 2 {
             return Err(FwError::InvalidRequest(format!(
