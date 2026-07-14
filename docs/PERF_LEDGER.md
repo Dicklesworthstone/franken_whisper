@@ -51,6 +51,69 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (state-byte exact): retain owned streaming windows once and return scalar receipts — **1.272263x median**
+
+**What.** `process_duration_loop` already owned each formatted audio-hash
+`String`, but passed it by reference to `next_window_bounded`. Window creation
+then copied the hash into a returned `SpeculationWindow` and deep-cloned that
+window into retained state, including another run ID and audio-hash allocation;
+the loop read only `window_id`, `start_ms`, and `end_ms` before dropping the
+returned strings. The loop now moves the formatted hash directly into retained
+state and receives a copy-only `WindowReceipt`. The public full-window APIs keep
+their original behavior. This removes three transient string allocations/copies
+and one whole-window clone per duration-loop window. Negative-ledger-first search
+found no prior row for window creation, audio-hash ownership, or scalar receipts.
+Opportunity score: `(impact 4 x confidence 5) / effort 2 = 10`.
+
+**Exactness.** The same release binary compared every scalar receipt and the
+complete serialized `WindowManager` state for 513 windows, including window
+order, IDs, run IDs, audio hashes, bounds, overlap, status, optional results,
+manager limits, and next ID. It also covered a rejected zero-length boundary and
+a 101 ms truncated final window. The 154,692 state bytes matched exactly; SHA256
+`7f179511cfeea1999de3880addb19d059e9448cad7d1066b73da8d1122f8aace`.
+
+| comparison | p10 | median | p90 | per-window medians | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| full-window / full-window null | 0.949642 | **1.002749** | **1.043826** | — | — | — | valid null |
+| copied full window / moved hash plus scalar receipt | **1.230903x** | **1.272263x** | 1.622757x | 171 ns / 131 ns | 16.66% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+Full-window/full-window BASE/BASE ratios:
+`[1.043826, 0.956278, 1.053035, 0.969825, 1.025935, 1.022370,
+1.008092, 0.997123, 0.949642, 0.916894, 0.968976, 0.996570,
+0.960740, 1.016277, 1.061162, 0.879816, 1.017586, 1.002749,
+0.997794, 1.011532, 1.008245]`.
+
+Full-window/scalar-receipt ratios:
+`[1.321299, 1.641721, 1.246156, 1.226803, 1.484768, 1.689354,
+1.271192, 1.241232, 1.265498, 1.263699, 1.272263, 1.318451,
+1.230903, 1.200549, 1.622757, 1.299259, 1.370873, 1.461604,
+1.251502, 1.271419, 1.277765]`.
+
+Full-window arm times (ns, 16,384 windows each):
+`[3696334, 2634014, 2572442, 2517330, 2392353, 2596117, 2847183,
+2973542, 3018860, 2738430, 2735236, 2804339, 3293572, 3353653,
+2840313, 2679382, 2757128, 2754044, 2970208, 3000022, 2950598]`.
+
+Scalar-receipt arm times (ns, 16,384 windows each):
+`[2797499, 1604422, 2064301, 2051943, 1611264, 1536751, 2239775,
+2395638, 2385512, 2166995, 2149899, 2126995, 2675736, 2793433,
+1750301, 2062238, 2011221, 1884262, 2373314, 2359585, 2309187]`.
+
+**Reproduction.** The one fresh Cargo invocation ran synchronously in the
+foreground and was fail-closed remote-only:
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 env -u CARGO_TARGET_DIR rch --no-self-healing exec -- cargo test --profile release --lib streaming_window_receipt_ -- --include-ignored --nocapture --test-threads=1`.
+RCH job `j-29928833041828324` ran only on `vmi1227854`; no local fallback
+occurred. Benchmark-binary SHA256 was
+`f9dfae6fb05ce98e013cc47631bc8ea6ad6b7d2dc5107b771f5d20c7eb53e727`;
+2/2 filtered tests passed. Both arms used the same 16,384-window count after
+three warmups; 256-window calibration was 61,702 ns full-window versus 42,694
+ns receipt. RCH reported a cold-cache release build and exit 0.
+
+**Scope.** This measures the hot allocation/routing boundary around retained
+window creation, not model inference or end-to-end ASR latency. The fixture used
+a 57-byte run ID and a 64-byte SHA-like hash seed; the absolute median saving was
+about 40 ns per created window.
+
 ### 2026-07-14 UTC — Codex — LANDED (stream-visible byte exact): elide unobserved two-lane executor segment payloads — **2.142022x bridge median**
 
 **What.** After each speculative fast and quality lane returned its model

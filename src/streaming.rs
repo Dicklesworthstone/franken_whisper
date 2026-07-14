@@ -345,10 +345,10 @@ impl SpeculativeStreamingPipeline {
             let step_ms = window_size_ms.saturating_sub(self.config.overlap_ms).max(1);
 
             let audio_hash = format!("{audio_hash_seed}:{position_ms}:{window_size_ms}");
-            let Some(window) = self.window_manager.next_window_bounded(
+            let Some(window) = self.window_manager.next_window_bounded_receipt(
                 position_ms,
                 total_duration_ms,
-                &audio_hash,
+                audio_hash,
             ) else {
                 break;
             };
