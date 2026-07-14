@@ -4,6 +4,64 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **HOLD / NO-SHIP — borrowed quality-confirm handoff measured 1.146369x median, but its 0.965153x p10 stayed inside the null envelope; source restored.**
+
+**Negative-ledger-first target.** On each speculative quality result, the
+streaming path deep-cloned the complete quality segment vector into window state
+before moving the original into `CorrectionTracker::submit_quality_result`. The
+candidate let confirmation drift borrow the slice, moved the original vector into
+window state, and cloned only when a correction had to retain the quality payload.
+Existing rows cover fast-partial fan-out and bridge ownership, not this residual
+quality-confirm handoff. Opportunity score was
+`(impact 4 x confidence 5) / effort 2 = 10`.
+
+**Behavior proof.** The same release-perf binary proved exact full-state parity
+for the Confirm path and normalized Correct-event parity for the correction path.
+The Confirm fixture serialized to 30,172 identical bytes with SHA256
+`e9ca30cd3054e2d4597aa6fd251984232785b38afd6ee380dd93fa74311d679a`.
+That state covered window records, partials, window-to-sequence mappings,
+corrections, counters, next IDs, drift values, decisions, Unicode, nullable
+metadata, and signed zero. The Correct oracle normalized only the live correction
+timestamp before comparing stored and returned correction bytes.
+
+**Strict-remote recovered proof.** The sole Cargo invocation was
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 env -u CARGO_TARGET_DIR rch --no-self-healing exec -- cargo test --profile release-perf --lib quality_confirm_borrowed_handoff_ -- --include-ignored --nocapture --test-threads=1`.
+RCH job `j-29928833041828304` ran only on worker `vmi1227854`; no local
+fallback occurred. Benchmark-binary SHA256 was
+`33d36119825c3abd6cab200c03e0ab9bba825d0ec3717a017d0763b3e457fee1`.
+The recovered process table showed that the benchmark had finished and no matching
+process remained. Both parity oracles passed. The benchmark then failed its
+predeclared performance assertion, producing RCH exit 101 after 882.7 seconds; that
+exit is the intentional no-ship gate, not a build or parity failure.
+
+After three warmups, the same binary ran 21 alternating cloned/cloned null pairs
+and 21 alternating cloned/borrowed pairs. Both arms calibrated to the 4,096-window
+cap. The null median passed `[0.95, 1.05]`, but candidate p10 did not clear either
+null p90 or the 1.10 practical floor, and four candidate pairs lost.
+
+| comparison | p10 | median | p90 | per-window medians | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| cloned / cloned null | 0.874481 | **0.978241** | **1.161085** | — | — | — | valid median, wide envelope |
+| unconditional clone / borrowed confirmation | **0.965153x** | **1.146369x** | 1.621550x | 4,899 ns / 4,192 ns | 13.12% | **17/21** | **no-ship: p10 below null p90 and 1.10** |
+
+BASE/BASE ratios:
+`[0.978241, 1.212034, 1.146076, 1.063297, 0.874481, 1.060076,
+0.971410, 0.882231, 0.991298, 1.110510, 0.651845, 0.899337,
+0.915105, 1.049977, 1.198908, 0.948650, 0.902507, 0.786448,
+1.074979, 0.895921, 1.161085]`.
+
+Cloned/borrowed ratios:
+`[1.466167, 1.152195, 1.175508, 1.082693, 1.132020, 1.139361,
+1.129245, 0.982323, 1.230978, 1.165317, 1.621550, 1.146369,
+1.065171, 0.855263, 0.965153, 1.624181, 0.805241, 1.106172,
+1.481190, 1.879195, 1.590027]`.
+
+**Verdict.** Borrowing confirms is exact and lowers the median cost, but the
+conservative tail does not separate from the measured null envelope. Production
+source and the temporary oracle/benchmark were restored manually; only this ledger
+row remains. Do not retry this exact quality-confirm handoff based on its median.
+
+---
 ## 2026-07-14 - Codex: **REJECT / NO-SHIP — direct transcript concatenation removed an allocation but measured only 1.074814x median and lost the tail gate; source restored.**
 
 **Negative-ledger-first target.** Every speculative confirmation/correction calls
