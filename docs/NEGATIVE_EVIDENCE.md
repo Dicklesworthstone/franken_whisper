@@ -4,6 +4,46 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **SURFACED / INVALID BENCH — VAD-to-separation waveform-analysis reuse reached no timed samples before the strict-remote five-minute cap; source restored.**
+
+**Negative-ledger-first pivot and attribution.** `bv --robot-triage` data hash
+`066298c3e0d5b876` still advertised the stale audio-normalization and scheduler
+quick wins. Their existing rows close native normalization/SIMD resampling and
+the long-form scheduling vein, while `bd-kl26`'s schema probe was already
+measured sub-floor. The fresh pipeline seam was duplicate work: when a request
+enables both VAD and diarization source separation, `vad_energy_detect` and
+`source_separate` each call `native_audio::analyze_wav` on the same normalized
+PCM16 file, repeating the file read, WAV parse, and every 20 ms RMS frame.
+
+**One lever and proof design.** Bead `bd-nejb` carried VAD's immutable
+`NativeAudioAnalysis` through `PipelineIntermediate` for the immediately
+following separation stage. Standalone separation and native-parse failure kept
+the historical recompute/fallback path. A same-binary release oracle compared
+the complete `SeparateReport` exactly before an order-alternated 15-pair A/B on
+a 10-second 16 kHz mono fixture; the keep gate required at least 2x at p10 and
+15/15 wins. No floating-point operation was reordered because the candidate
+reused the already-computed struct rather than recomputing it.
+
+**Strict-remote failure.** The sole foreground command was
+`RCH_WORKER=vmi1152480 RCH_WORKERS=vmi1152480 RCH_REQUIRE_REMOTE=1
+RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env
+CARGO_HOME=/root/.cargo CARGO_NET_OFFLINE=true cargo test --profile release
+--lib orchestrator::tests::source_separate_cached_analysis_perf -- --ignored
+--exact --nocapture --test-threads=1`. RCH job `j-29928833041828681` stayed on
+`vmi1152480`; no local fallback occurred. Dependency-root transfer consumed
+53.999 seconds, after which the worker began compiling `franken_whisper` but
+emitted no test output. The foreground job was interrupted at the explicit
+five-minute ceiling with exit 130, before the parity oracle or any timed A/B
+sample ran.
+
+**Verdict.** There is no admissible ratio, so this is neither a keep nor a
+performance rejection. The runtime candidate and temporary oracle were restored
+manually; only this evidence remains. Retry only when the worker has a warm
+release lib-test artifact capable of reaching the timed body inside five
+minutes. Do not substitute a local Cargo run or infer a win from eliminated
+work alone.
+
+---
 ## 2026-07-14 - Codex: **BLOCKED / NO-SHIP — `bd-9sc3` has no admissible diarization compute target before the ECAPA substrate lands.**
 
 **Negative-ledger-first routing.** `bv --robot-triage` (data hash
