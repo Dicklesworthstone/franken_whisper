@@ -21114,6 +21114,28 @@ access/schedule lever; the ledgered "12.5 GB/s ≪ peak" latency-bound-ness does
 Also surveyed this turn (no build, all already-worked): cross-attention K/V is already int8/f16/block gated
 (`cross_kh_i8`/`cross_vh_i8`/`cross_vh_i8_block`), and SDPA poly-exp (`FW_SDPA_POLY_EXP`) is DEFAULT-ON for turbo
 (proven WER-neutral, `encoder.rs:598`) — neither is a fresh lever.
+**Tick 2026-07-13x (fresh-context loop) — logits HEAD-SHRINK (no_ts) built + benched: BYTE-EXACT but SUB-FLOOR
+(estimate CONVERTED to measurement).** The ledger previously only ESTIMATED the "skip the always-suppressed
+no_ts timestamp tail in the logits GEMV" lever as ~0.36 % (never built). Built it: `gemv_i8_active` (a partial
+int8 GEMV computing rows `[0, active)` bit-identically to `gemv_i8`, tail filled `-inf`) + `FW_LOGITS_SKIP=N`
+probe wired into `logits_last`. First confirmed the logits GEMV is already thread-maxed (`wide_gemv_cap=32`,
+`nn.rs:140` — 48/64 REGRESS on cross-CCD sync, so bandwidth-saturated ⇒ no threading lever). SAME-binary ABBA on
+the 124 s decode-mp3 (turbo, no_ts, skip 1501 = the timestamp tail), per-window `decode_loop`, rep0 discarded:
+**transcript BYTE-IDENTICAL (md5 `b4f8cac64d`, 257 w both) — the no_speech/avg_logprob softmax subtlety did NOT
+bite on 5-window real speech** (the tail is suppressed to -inf before those softmaxes anyway); but perf **WITHIN
+NOISE** — decode_loop A(full) median 5528.7 ms vs B(skip) 5645.7 ms (nominally SLOWER, B variance 5471-5742 ≫ the
+theoretical ~0.58 %-of-decode = ~0.36 % e2e win, which is undetectable under the ~2-3 % box noise). ⇒ the
+head-shrink is byte-exact-in-practice but **SUB-FLOOR** (the ledger's estimate is now measured, not asserted).
+Not landed (sub-floor per the "don't land <0.25 % micro-levers" rule; also a residual theoretical byte-exactness
+caveat — a full-scale clip where a timestamp logit is large could shift the SOT-step no_speech softmax, so it
+would be default-off/WER-gated like `FW_WAV_PASSTHROUGH` even if pursued). Reverted surgically (nn.rs + decoder.rs
+== HEAD, no stash). **This is the 6th consecutive build+measure this session and the first BYTE-EXACT one that
+isn't a regression — but it's sub-floor, so it confirms rather than reopens: the logits frame yields to precision
+(int8, landed) and thread-saturation (32, tuned), and its last byte-exact scrap (head-shrink) is below the noise
+floor.** Every decode sub-frame is now closed by DIRECT measurement (mlp/proj GEMV compute 13p/q/u + prefetch 13w
++ logits precision 13v/threading + head-shrink 13x; attention 13r; cross-KV/SDPA gated). No small byte-exact
+autonomous decode lever remains; real EV = the streaming loader (bd-A14, `ggml.rs:44`, ~4.7 % single-shot, byte-
+exact but a multi-turn restructure) or owner-scoped spec-decode.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
