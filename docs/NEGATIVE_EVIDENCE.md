@@ -4,6 +4,19 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Opus (load-cap session): **THREADING AXIS CLOSED after 4 landed wins — the ENCODER is NOT over-threaded; `default_threads()` already = physical cores (32 on this 32c/64t Threadripper) = the AVX all-core throttle knee. The LOAD was the SOLE 64-logical over-threaded phase (it runs before `ensure_default_rayon_pool()`); now fixed default-ON. NO-BUILD confirmed.**
+
+Landed this session (all byte-exact, `large-v3-turbo`/jfk): `FW_STREAM_LOAD` seek-based streaming ggml loader, −33% peak RSS 2.70→1.80 GB, gated (e4bd16b/17bc81c); `FW_LOAD_WORKERS` whole enc∥dec build cap, −46% RSS @N=8, gated (7f2fd6c → lifted to the `rayon::join` altitude 4e0b1a1); and **default-ON** load cap = `host∧32` = −~11% `model_weights` (~2% e2e single-shot, 60eb989).
+
+The default-32 load win prompted "is the ENCODER (64% of e2e) also over-threaded?" — **NO** (measured, no build):
+- Box = AMD Threadripper PRO 5975WX = **32 physical × 2 SMT = 64 logical** (`cpu0 thread_siblings_list = 0,32`).
+- `default_threads()` = `physical_cores().max(32)` = **32**; `ensure_default_rayon_pool()` (decode.rs:1107) builds the global pool at 32 BEFORE encode, so the dominant encoder GEMM (`matmul_bias_i8`, `par_chunks_mut` on the ambient pool) already runs at 32 = the knee.
+- `RAYON_NUM_THREADS` sweep on the `encoder_window` span: default(32) ties-or-beats r32/r64; all deltas are noise at 68% freq-scaling. No lever.
+- The LOAD was over-threaded ONLY because `LoadedModel::from_ggml` runs BEFORE `ensure_default_rayon_pool()`, on rayon's raw 64-logical default — 60eb989's scoped 32-cap closes exactly that gap (and doubles as the RSS knob via lower N).
+
+Re-confirmed closed this turn: attn+mlp residuals (both parallel at turbo, e43b50a), LayerNorm (row-band parallel >1<<16 elts, nn.rs:3536), decoder f16 `token_embedding` (NOT freeable — needed for byte-exact input-embed; the i8 copy is additive for logits), orchestration/audio (~44 ms of 2.4 s wall; routing 3 ms). Byte-exact autonomous CPU frontier re-exhausted; remaining is owner/GPU/WER-gated.
+
+---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — allocation-free SRT/VTT timestamp display showed ~1.29x medians, but VTT did not clear its same-binary null envelope; source restored.**
 
 **Negative-ledger-first target.** `write_srt` and `write_vtt` called their timestamp
