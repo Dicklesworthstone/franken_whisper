@@ -368,15 +368,18 @@ pub(crate) fn enc_free_f32() -> bool {
     })
 }
 
-/// Optional cap on how many encoder layers are loaded+quantized concurrently
-/// (`FW_LOAD_WORKERS=<N>`). Unset (default) = uncapped: the layer load fans
-/// across the full rayon pool exactly as before (byte-identical). A small `N`
-/// bounds the transient per-linear buffers held live during the parallel load
-/// — most useful with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14), where each in-flight
-/// linear is an *owned* pread buffer: fewer concurrent loaders → lower peak RSS,
-/// traded against a longer `model_weights` phase. Byte-exact for any `N` (thread
-/// count never changes the quantized output — same isomorphism as the layer
-/// `into_par_iter` itself). `0` / non-numeric = uncapped.
+/// Optional cap on how many model-weight tensors load+quantize concurrently
+/// across the whole (encoder ∥ decoder) weight build (`FW_LOAD_WORKERS=<N>`).
+/// Applied as a scoped rayon pool around the `rayon::join` in
+/// [`decode::LoadedModel::from_ggml`], so both builds' layer `into_par_iter`s
+/// share it. Unset (default) = uncapped: the load fans across the full ambient
+/// rayon pool exactly as before (byte-identical). A small `N` bounds the
+/// transient per-tensor buffers held live during the parallel load — most useful
+/// with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14), where each in-flight tensor is an
+/// *owned* pread buffer (incl. the ~133 MB token embedding): fewer concurrent
+/// loaders → lower peak RSS, traded against a longer `model_weights` phase.
+/// Byte-exact for any `N` (thread count never changes the quantized output).
+/// `0` / non-numeric = uncapped.
 pub(crate) fn load_worker_cap() -> Option<usize> {
     static CAP: OnceLock<Option<usize>> = OnceLock::new();
     *CAP.get_or_init(|| {

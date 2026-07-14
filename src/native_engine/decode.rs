@@ -137,10 +137,28 @@ impl LoadedModel {
         // on the weights build). Bit-identical (disjoint tensors → separate
         // structs); `rayon::join` runs serially on a 1-thread pool, so it is safe
         // everywhere.
-        let (encoder, decoder) = rayon::join(
-            || EncoderWeights::from_ggml(&model),
-            || DecoderWeights::from_ggml(&model),
-        );
+        // FW_LOAD_WORKERS: bound the TOTAL concurrency of the encoder∥decoder
+        // weight build — both builds' internal layer `into_par_iter`s run inside
+        // this pool, so a single cap covers the whole load (incl. the decoder's
+        // ~133 MB token embedding). Unset = uncapped, byte-identical to the plain
+        // ambient-pool join. A small N caps the live per-tensor load buffers —
+        // under FW_STREAM_LOAD each in-flight tensor is an owned pread buffer, so
+        // fewer concurrent loaders cut peak RSS, traded against a longer load.
+        // Byte-exact for any N (thread count never changes the built weights).
+        let build_weights = || {
+            rayon::join(
+                || EncoderWeights::from_ggml(&model),
+                || DecoderWeights::from_ggml(&model),
+            )
+        };
+        let (encoder, decoder) = match super::load_worker_cap() {
+            Some(cap) => rayon::ThreadPoolBuilder::new()
+                .num_threads(cap)
+                .build()
+                .map_err(|e| FwError::Io(std::io::Error::other(format!("load worker pool: {e}"))))?
+                .install(build_weights),
+            None => build_weights(),
+        };
         let encoder = encoder?;
         let decoder = decoder?;
         // Build the tokenizer and take the filterbank AFTER the borrowing weight

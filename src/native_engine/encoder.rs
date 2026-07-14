@@ -523,11 +523,14 @@ impl EncoderWeights {
             EncQuantPlan { q: false, k: false, v: false, out: OutQuant::F32, fc: false, proj: false }
         };
 
-        // FW_LOAD_WORKERS: optionally bound how many layers load concurrently to
-        // cap the transient per-linear load buffers (peak RSS, esp. under
-        // FW_STREAM_LOAD where each in-flight linear is an owned pread buffer).
-        // Unset = uncapped, byte-identical to the plain layer par_iter below.
-        let build_layer = |i: usize| -> FwResult<EncoderLayer> {
+        // Fan the per-layer weight build across the ambient rayon pool. The load
+        // concurrency (and thus the transient per-tensor load-buffer footprint,
+        // esp. the owned pread buffers under FW_STREAM_LOAD) is bounded ONE level
+        // up, at the encoder∥decoder `rayon::join` in `decode::LoadedModel::
+        // from_ggml`, so both builds share a single FW_LOAD_WORKERS cap.
+        let mut layers = (0..n_layer)
+            .into_par_iter()
+            .map(|i| -> FwResult<EncoderLayer> {
                 let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
                 let (attn_q_w, attn_q_i7) = load_linear_maybe_i7(
                     model, &p("attn.query.weight"), n_state, n_state, plan.q, free_f32_now,
@@ -588,21 +591,8 @@ impl EncoderWeights {
                     mlp_proj_i7,
                     attn_out_i8,
                 })
-        };
-        let build_all = || {
-            (0..n_layer)
-                .into_par_iter()
-                .map(&build_layer)
-                .collect::<FwResult<Vec<_>>>()
-        };
-        let mut layers = match super::load_worker_cap() {
-            Some(cap) if cap < n_layer => rayon::ThreadPoolBuilder::new()
-                .num_threads(cap)
-                .build()
-                .map_err(|e| FwError::Io(std::io::Error::other(format!("load worker pool: {e}"))))?
-                .install(build_all)?,
-            _ => build_all()?,
-        };
+            })
+            .collect::<FwResult<Vec<_>>>()?;
 
         // (Weight quant is now FUSED into the parallel layer load above — see the
         // `EncQuantPlan` / `load_linear_maybe_i7` block — so the former separate
