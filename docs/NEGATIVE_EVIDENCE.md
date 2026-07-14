@@ -22268,3 +22268,46 @@ Both production changes and the temporary A/B harness were reverted; this row
 is the only shipped artifact. Do not retry buffer reuse without allocation
 counts or a workload that demonstrates a materially larger packet-conversion
 share.
+
+---
+## 2026-07-14 - cod_fw: **REJECT / NO-SHIP — preallocated transcript fallback regressed the 500-segment median by 9.02%; source restored.**
+
+**Negative-ledger-first target.** The shared backend fallback
+`transcript_from_segments` runs when a backend omits its top-level transcript.
+It collects nonblank segment texts into a temporary `Vec<&str>`, joins them,
+then clones the trimmed result. The candidate made two allocation-free scans,
+reserved the exact joined byte capacity, wrote directly into one `String`, and
+trimmed that buffer in place. This was distinct from the prior correction-drift
+concatenation reject because the fallback also appeared to remove the final
+`trim().to_owned()` allocation. Opportunity score was
+`(impact 2 x confidence 3) / effort 1 = 6`.
+
+**Behavior proof.** A legacy collect/join oracle covered empty input, empty and
+whitespace-only segments, leading/trailing whitespace, preserved internal
+spaces and tabs, and Unicode whitespace/text. The targeted ordinary-release
+test passed remotely (`1 passed; 0 failed`) on RCH worker `vmi1227854`:
+
+`RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 RCH_WORKERS=vmi1227854 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --profile release --lib backend::tests::transcript_from_segments_matches_collect_join_reference -- --exact`
+
+**Foreground remote A/B.** One completed same-binary Criterion run used 500
+segments, ten samples, one-second warmup, one-second measurement, ordinary
+`--profile release`, and RCH worker `vmi1152480`:
+
+`RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1152480 RCH_WORKERS=vmi1152480 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_HOME=/root/.cargo CARGO_NET_OFFLINE=true cargo bench --profile release --bench normalize_bench -- normalize/transcript_from_segments_ab --warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`
+
+- legacy collect/join: **[5.3147 us, 6.3355 us, 7.2024 us]**
+- direct preallocated write: **[6.3268 us, 6.9068 us, 7.4819 us]**
+- candidate/legacy median: **1.0902x time**, a **9.02% regression**
+
+The completed benchmark returned in 74.2 seconds end to end (7.5 seconds in
+Cargo plus measurement). RCH's default per-job isolated `CARGO_HOME` changed
+registry source paths and invalidated its pooled target between invocations; an
+explicit persistent worker Cargo home plus offline mode was required to reuse
+the prelinked release binary and keep the measured command below five minutes.
+
+**Decision: reject and revert.** The second trim/filter scan costs more than the
+removed allocations on this representative fallback size, and the confidence
+intervals do not support any smaller-shape win. Production source and the
+temporary A/B/parity harness were restored manually; only this ledger row is
+shipped. Do not retry two-pass exact-capacity assembly for this helper without a
+single-pass capacity strategy that avoids repeated Unicode trimming.
