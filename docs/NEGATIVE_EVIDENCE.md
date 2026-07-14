@@ -4,6 +4,91 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **HOLD / NO-SHIP — SQL transcript-prefix projection measured 1.425339x on 16-KiB rows, but the 49-byte current-like guard did not clear; source restored.**
+
+**Negative-ledger-first target.** Existing storage closure covered N+1 detail
+loads, indexes, and sync paths, but not `RunStore::list_recent_runs`, which selected
+each complete transcript and only then retained 140 characters. FrankenSQLite has a
+specialized `ColumnSubstrPrefix` opcode for `substr(transcript, 1, 140)`, so the
+candidate projected the preview in SQL. The focused same-binary harness timed the
+complete production entry point over 100 rows at both the checked-in benchmark's
+approximately 49-byte transcript shape and a 16-KiB target shape. Each shape ran a
+21-pair BASE/BASE null before the alternating historical/candidate comparison.
+
+**Correctness closure.** The exact serialized `Vec<RunSummary>` bytes matched for
+empty, 139/140/141-character, 16-KiB, emoji, CJK, combining-mark, whitespace,
+ordering, and limit cases. Because SQLite permits schema-invalid BLOB values, the
+final candidate discarded a projected result containing any BLOB and reran the
+complete historical query. A BLOB primary key colliding with a rendered TEXT key
+proved that all returned rows came from one coherent query snapshot and retained the
+historical `<blob:300>` marker. An earlier keyed fallback was discarded before the
+shipping decision because it could rebind a rendered BLOB ID and mix snapshots.
+
+**Strict-remote foreground proof.** The primary admissible run used worker
+`vmi1293453`, RCH job `j-29928833041827394`, `--profile release-perf` with LTO
+disabled, and binary SHA-256
+`81c8ebce736fcfe14d95dfb1737838d9ffabe71cb42ffec70c290d29e24119f8`.
+The byte oracle passed. The 16-KiB result cleanly separated from its null control,
+but the predeclared current-like guard required the short candidate median to be at
+least the short null median; it missed by 0.205%.
+
+| shape / comparison | p10 | median | p90 | CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| 49 B historical / historical null | 0.907818 | 0.996450 | 1.045248 | 7.13% | 9/21 | valid null |
+| 49 B historical / SQL prefix | 0.912777 | **0.994400x** | 1.229829 | 43.35% | 10/21 | **no-ship: below null median** |
+| 16 KiB historical / historical null | 0.728819 | 0.976811 | 1.069549 | 21.60% | 9/21 | valid null |
+| 16 KiB historical / SQL prefix | **1.199037** | **1.425339x** | **1.629839** | 14.38% | **20/21** | target win; p10 above null p90 |
+
+Primary-run raw short BASE/BASE ratios:
+`[0.9553521342152305, 1.095945267884775, 0.949472187581043,
+0.9330454476343859, 1.0105321235674012, 1.0058940759283745,
+0.9078184650143658, 1.0297527405846605, 1.0452483624897402,
+0.975214197040764, 1.0417753656299966, 0.9543080112609867,
+0.7889429932990619, 1.0394944950136282, 0.9356439724044358,
+0.9977557919094656, 0.8555029117607194, 1.0642966452036207,
+1.0279636482490022, 0.9964502681841507, 0.9937249991650309]`.
+
+Primary-run raw short candidate ratios:
+`[0.9767438995189793, 1.0265674228698112, 0.9943996478484386,
+3.2279070350258476, 1.468558061619534, 1.0367513834880724,
+0.9758545916196126, 1.0194570764354345, 0.9896803143144448,
+0.9235095520454406, 0.9850207443047816, 1.1244299387688448,
+0.9914819022293965, 1.229829237663745, 1.0990297821068475,
+1.146577487443509, 1.04885859463055, 0.9684458471136961,
+0.9127768398112044, 0.8462110341986789, 0.7400735006864854]`.
+
+Primary-run raw 16-KiB BASE/BASE ratios:
+`[1.069548918464253, 0.916371167447596, 1.0045852087061253,
+1.0329097887637708, 1.0473247994192025, 1.0349533805140751,
+0.881378142876569, 0.8437742953212105, 0.6531138139381253,
+0.8726897816362674, 1.3255915606001776, 0.9779405577433118,
+0.7288189994785904, 1.097678406329756, 0.9744041005243057,
+1.0062295913478894, 0.9511454047119776, 0.2571878061020136,
+1.0490765059115432, 0.9768105438981386, 0.9159277683674516]`.
+
+Primary-run raw 16-KiB candidate ratios:
+`[1.199501307736968, 1.4602136839605053, 1.2761612550652572,
+0.9271384344367148, 1.6067565335929004, 1.4878962470400985,
+1.4760922597781339, 1.6889475687464122, 1.138393124339596,
+1.4779411656875867, 1.4908831888278484, 1.6298393438595677,
+1.3726546599003473, 1.3669536592750595, 1.3230311130718113,
+1.1990370723674286, 1.4253389844042366, 1.2401529114754088,
+1.8743340401650743, 1.4335297416724369, 1.4243868935732937]`.
+
+**Final one-pass check and verdict.** Folding BLOB detection into the existing row
+decode removed the extra scan, but its exact-source run on `vmi1167313` (job
+`j-29928833041827417`, binary SHA-256
+`62df0da7069929daaeb5407a18705509410ee9fa52f1e4c9b27a3437cc101f6d`)
+was not admissible: the short BASE/BASE median was `1.030845`, just outside the
+predeclared `[0.97, 1.03]` window. Its short candidate median was still lower at
+`1.016506`; the 16-KiB candidate remained strong at `1.395609x` median with p10
+`1.189675` above null p90 `1.030149`. No local Cargo fallback occurred. Since the
+current-like shape never produced an admissible no-regression result, production,
+oracle, and A/B code were restored byte-for-byte to `HEAD`. Reopen only with a way
+to avoid per-row fallback detection on schema-valid databases, or when real recent-run
+transcript widths justify an explicit long-row policy.
+
+---
 ## 2026-07-13 - Codex: **REJECT — replacing TTY decode's post-sort `HashSet` with adjacent-sequence tracking measured 1.024879x, inside the valid BASE/BASE null envelope; source restored.**
 
 **Negative-ledger-first target.** Recent TTY rows closed JSON dispatch, zlib input
