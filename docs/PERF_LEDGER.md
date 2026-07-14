@@ -51,6 +51,61 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrow routing-history fields during NDJSON serialization — **2.894664x current-like median**
+
+**What.** The `robot routing-history` path built an owned `serde_json::Value`
+for every selected stored routing event, cloning the run ID, timestamp, event
+code, and seven payload fields immediately before serializing and dropping that
+DOM. It now serializes a private borrowed struct directly. The existing public
+`routing_decision_value` API remains unchanged as the historical implementation
+and conformance oracle. Event filtering, field names/order, null behavior, and
+line-oriented output are unchanged. A negative-ledger-first search found no row
+covering routing-decision serialization or these temporary payload clones.
+Opportunity score was `(impact 3 x confidence 5) / effort 1 = 15`.
+
+**Exactness.** The release-perf binary compared the historical owned-DOM bytes,
+the private borrowed-struct bytes, and the production `routing_decision_line`
+bytes across a current-like payload, a payload with every field missing, and a
+payload containing explicit null, nested objects/arrays, Unicode, quotes,
+newlines, negative zero, a large float, and an ignored field. All routes were
+byte-identical. A fixed golden line also locks field order. The 20-row benchmark
+fixture produced 7,144 bytes with SHA-256
+`de4f74e1b57d5ab66aa9cd39d97014d41476b9884038dfa0ff9a3d7f094b0d42`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041828102` ran only on
+worker `vmi1227854` with `--profile release-perf`, LTO disabled, and 16 codegen
+units; no local Cargo fallback occurred. Benchmark-binary SHA-256 was
+`b363728a1f8ff51a5f128334f381d7f8f903512706ade14665d6ae06360c439f`.
+The direct boundary serialized 20 current-like routing rows 128 times per arm.
+After three warmups, the same binary ran 21 alternating historical/historical
+null pairs and 21 alternating historical/borrowed pairs. The null median passed
+the predeclared `[0.95, 1.05]` guard; candidate p10 cleared
+`max(null p90, 1.10)`, and the candidate won all 21 pairs. Candidate CV was
+25.58% and is recorded as informational; the conservative p10 and win-count
+gates still cleared despite the noisy worker and first-sample outlier.
+
+| comparison | p10 | median | p90 | arm medians / 128 x 20 rows | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.878757 | **0.979805** | **1.175030** | — | — | — | valid null |
+| historical DOM / borrowed struct | **2.535447x** | **2.894664x** | 4.276219x | 5,652,570 ns / 1,928,931 ns | 25.58% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+BASE/BASE ratios:
+`[0.979805, 0.749381, 1.031067, 0.722263, 0.943256, 0.961585,
+0.985139, 0.924836, 1.175030, 1.929393, 0.936914, 1.008394,
+1.053492, 1.025216, 1.037338, 1.292732, 0.978792, 0.878757,
+1.015146, 0.977811, 0.965337]`.
+
+Historical-DOM/borrowed-struct ratios:
+`[59.098017, 2.751703, 5.229815, 2.896755, 2.721973, 3.314541,
+3.037823, 1.556364, 2.980824, 2.535447, 2.809754, 3.010656,
+2.856726, 3.291783, 2.894664, 4.276219, 3.474011, 2.691254,
+2.417125, 2.876770, 2.852039]`.
+
+**Scope.** This proves a direct serialization-boundary win for selected rows
+returned by `robot routing-history`, not an end-to-end CLI or database-query
+speedup. The command currently emits at most 20 stored runs by default, so total
+latency impact remains bounded and storage access may dominate.
+
 ### 2026-07-14 UTC — Codex — LANDED (timestamp-normalized state exact): reuse correction drift instead of recomputing both Levenshtein metrics — **2.005024x synthetic correction-boundary median**
 
 **What.** `CorrectionTracker::submit_quality_result` computed character- and
