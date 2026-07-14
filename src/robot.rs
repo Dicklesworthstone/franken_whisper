@@ -379,6 +379,17 @@ pub fn routing_decision_value(
     })
 }
 
+/// Serialize one `routing_decision` NDJSON line without building an owned JSON
+/// object for values that already live in the stored event payload.
+pub fn routing_decision_line(
+    run_id: &str,
+    ts: &str,
+    code: &str,
+    payload: &Value,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&BorrowedRoutingDecision::new(run_id, ts, code, payload))
+}
+
 // ---------------------------------------------------------------------------
 // bd-20g.3: Streaming partial transcript events
 // ---------------------------------------------------------------------------
@@ -1153,6 +1164,41 @@ struct BorrowedStage<'a> {
     payload: &'a Value,
 }
 
+#[derive(Serialize)]
+struct BorrowedRoutingDecision<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    run_id: &'a str,
+    ts: &'a str,
+    code: &'a str,
+    decision_id: Option<&'a Value>,
+    chosen_action: Option<&'a Value>,
+    calibration_score: Option<&'a Value>,
+    e_process: Option<&'a Value>,
+    fallback_active: Option<&'a Value>,
+    recommended_order: Option<&'a Value>,
+    mode: Option<&'a Value>,
+}
+
+impl<'a> BorrowedRoutingDecision<'a> {
+    fn new(run_id: &'a str, ts: &'a str, code: &'a str, payload: &'a Value) -> Self {
+        Self {
+            event: "routing_decision",
+            schema_version: ROBOT_SCHEMA_VERSION,
+            run_id,
+            ts,
+            code,
+            decision_id: payload.get("decision_id"),
+            chosen_action: payload.get("chosen_action"),
+            calibration_score: payload.get("calibration_score"),
+            e_process: payload.get("e_process"),
+            fallback_active: payload.get("fallback_active"),
+            recommended_order: payload.get("recommended_order"),
+            mode: payload.get("mode"),
+        }
+    }
+}
+
 impl<'a> BorrowedStage<'a> {
     fn new(run_id: &'a str, event: &'a RunEvent) -> Self {
         Self {
@@ -1256,13 +1302,14 @@ mod tests {
     use crate::model::RunEvent;
 
     use super::{
-        BorrowedComplete, BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS,
+        BorrowedComplete, BorrowedRoutingDecision, BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS,
         RUN_COMPLETE_REQUIRED_FIELDS, RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS,
         SPECULATION_STATS_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS,
         TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
         TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS,
-        owned_run_report_value, robot_schema_value, run_complete_value, run_error_value,
-        run_stage_value, run_start_value, transcript_partial_value,
+        owned_run_report_value, robot_schema_value, routing_decision_line, routing_decision_value,
+        run_complete_value, run_error_value, run_stage_value, run_start_value,
+        transcript_partial_value,
     };
 
     #[test]
@@ -3912,6 +3959,271 @@ mod tests {
                 "routing_decision missing required field `{field}`"
             );
         }
+    }
+
+    #[test]
+    fn borrowed_routing_decision_serialization_matches_owned_value_bytes() {
+        let cases = [
+            json!({
+                "decision_id": "dec-1",
+                "chosen_action": "try_whisper_cpp",
+                "calibration_score": 0.91,
+                "e_process": 1.23,
+                "fallback_active": false,
+                "recommended_order": ["whisper_cpp", "insanely_fast"],
+                "mode": "adaptive",
+            }),
+            json!({}),
+            json!({
+                "decision_id": null,
+                "chosen_action": {"nested": ["λ", "🎧", {"quote": "\""}]},
+                "calibration_score": -0.0,
+                "e_process": 1.0e30,
+                "fallback_active": true,
+                "recommended_order": [{"backend": "native"}, null],
+                "mode": "safe\nmode",
+                "ignored": "must not be emitted",
+            }),
+        ];
+
+        for (index, payload) in cases.iter().enumerate() {
+            let run_id = format!("run-{index}-λ");
+            let ts = format!("2026-07-14T00:00:0{index}Z");
+            let code = format!("backend.routing.case_{index}");
+            let owned = serde_json::to_vec(&routing_decision_value(&run_id, &ts, &code, payload))
+                .expect("owned routing decision");
+            let borrowed =
+                serde_json::to_vec(&BorrowedRoutingDecision::new(&run_id, &ts, &code, payload))
+                    .expect("borrowed routing decision");
+            assert_eq!(borrowed, owned, "case {index} byte parity");
+            assert_eq!(
+                routing_decision_line(&run_id, &ts, &code, payload)
+                    .expect("routing decision line")
+                    .as_bytes(),
+                owned,
+                "case {index} production line parity",
+            );
+        }
+
+        assert_eq!(
+            routing_decision_line(
+                "run-123",
+                "2026-02-22T00:00:00Z",
+                "backend.routing.decision_contract",
+                &cases[0],
+            )
+            .expect("golden routing decision"),
+            r#"{"event":"routing_decision","schema_version":"1.0.0","run_id":"run-123","ts":"2026-02-22T00:00:00Z","code":"backend.routing.decision_contract","decision_id":"dec-1","chosen_action":"try_whisper_cpp","calibration_score":0.91,"e_process":1.23,"fallback_active":false,"recommended_order":["whisper_cpp","insanely_fast"],"mode":"adaptive"}"#,
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn borrowed_routing_decision_serialization_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 32;
+        const TARGET_ARM_NS: u128 = 40_000_000;
+
+        struct RoutingRow {
+            run_id: String,
+            ts: String,
+            code: String,
+            payload: serde_json::Value,
+        }
+
+        fn fixture_rows() -> Vec<RoutingRow> {
+            (0..20)
+                .map(|index| RoutingRow {
+                    run_id: format!("run-{index:02}-0123456789abcdef"),
+                    ts: format!("2026-07-14T00:00:{index:02}Z"),
+                    code: if index % 3 == 0 {
+                        "backend.routing.safe_mode".to_owned()
+                    } else {
+                        "backend.routing.decision_contract".to_owned()
+                    },
+                    payload: json!({
+                        "decision_id": format!("decision-{index:02}"),
+                        "chosen_action": if index % 2 == 0 { "native" } else { "whisper_cpp" },
+                        "calibration_score": 0.75 + f64::from(index) / 100.0,
+                        "e_process": 1.25 + f64::from(index) / 10.0,
+                        "fallback_active": index % 3 == 0,
+                        "recommended_order": ["native", "whisper_cpp", "insanely_fast"],
+                        "mode": if index % 3 == 0 { "safe" } else { "adaptive" },
+                        "ignored_evidence": {
+                            "posterior": [0.5, 0.3, 0.2],
+                            "note": "stored payload remains borrowed λ 🎧",
+                        },
+                    }),
+                })
+                .collect()
+        }
+
+        fn time_owned(rows: &[RoutingRow], iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                for row in rows {
+                    let value = routing_decision_value(
+                        black_box(&row.run_id),
+                        black_box(&row.ts),
+                        black_box(&row.code),
+                        black_box(&row.payload),
+                    );
+                    let line =
+                        serde_json::to_string(black_box(&value)).expect("owned routing decision");
+                    drop(black_box(line));
+                }
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_borrowed(rows: &[RoutingRow], iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                for row in rows {
+                    let line = routing_decision_line(
+                        black_box(&row.run_id),
+                        black_box(&row.ts),
+                        black_box(&row.code),
+                        black_box(&row.payload),
+                    )
+                    .expect("borrowed routing decision");
+                    drop(black_box(line));
+                }
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let rows = fixture_rows();
+        let owned_lines = rows
+            .iter()
+            .map(|row| {
+                serde_json::to_string(&routing_decision_value(
+                    &row.run_id,
+                    &row.ts,
+                    &row.code,
+                    &row.payload,
+                ))
+                .expect("owned fixture line")
+            })
+            .collect::<Vec<_>>();
+        let borrowed_lines = rows
+            .iter()
+            .map(|row| {
+                routing_decision_line(&row.run_id, &row.ts, &row.code, &row.payload)
+                    .expect("borrowed fixture line")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(borrowed_lines, owned_lines, "fixture byte parity");
+        let output = owned_lines.join("\n");
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "routing_decision_borrowed binary_sha256={:x} rows={} output_bytes={} output_sha256={:x}",
+            Sha256::digest(executable),
+            rows.len(),
+            output.len(),
+            Sha256::digest(output.as_bytes()),
+        );
+
+        let calibration = time_owned(&rows, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration)
+            .clamp(128, 10_000) as usize;
+        eprintln!(
+            "routing_decision_borrowed calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_owned(&rows, iterations));
+            black_box(time_borrowed(&rows, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut owned_times = Vec::with_capacity(SAMPLES);
+        let mut borrowed_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_owned(&rows, iterations);
+            let null_second = time_owned(&rows, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (owned, borrowed) = if sample % 2 == 0 {
+                (
+                    time_owned(&rows, iterations),
+                    time_borrowed(&rows, iterations),
+                )
+            } else {
+                let borrowed = time_borrowed(&rows, iterations);
+                let owned = time_owned(&rows, iterations);
+                (owned, borrowed)
+            };
+            owned_times.push(owned);
+            borrowed_times.push(borrowed);
+            speedups.push(owned as f64 / borrowed as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "routing_decision_borrowed samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} owned_arm_median_ns={} borrowed_arm_median_ns={} borrowed_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&owned_times),
+            median_ns(&borrowed_times),
+            coefficient_of_variation(&borrowed_times) * 100.0,
+        );
+        eprintln!(
+            "routing_decision_borrowed null_ratios={null_ratios:?} speedups={speedups:?} owned_times_ns={owned_times:?} borrowed_times_ns={borrowed_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard",
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)",
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18",
+        );
     }
 
     #[test]
