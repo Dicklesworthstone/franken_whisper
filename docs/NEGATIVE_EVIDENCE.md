@@ -21297,6 +21297,32 @@ structural TOKEN reduction (ToMe merges REDUNDANT tokens, transcript-safe at R=2
 to FEATURE reduction (neuron pruning drops learned features → catastrophic without retraining).** No viable
 operating point (fine-tuning is owner/training-scoped). Reverted (nn.rs + encoder.rs == HEAD, no dead code kept).
 So the encoder structural frontier = ToMe (landed) only; MLP/attention neuron-or-layer pruning all need training.
+**Tick 2026-07-14dd (fresh-context loop) — the LAST byte-exact frontier (LOAD-path overlap, ~23% single-shot) is
+CODE-TRACED to be cross-layer-invasive / concurrency-refactor / not-single-turn-benchable — SCOPED to a dedicated
+effort, not a quick lever.** After ToMe landed + all inference-time structural pruning falsified (13z-14cc), the
+only remaining BYTE-EXACT (non-WER-gated, landable-without-owner) lever is overlapping the 1.5 GB blob read
+(~113 ms) + weight quant (~180 ms enc, EF-serial) with each other or with the audio normalize. Traced all three
+concrete forms this turn and each is blocked for a *quick* turn:
+- **Concurrent model PRE-LOAD (overlap load with audio-normalize, ~3-5% cold single-shot).** The model path IS
+  known early (request), the cache IS process-global (`ModelCache {weak, resident}`, `mod.rs:1293`), but the
+  normalize→transcribe sequencing lives in the **staged production orchestrator** (`orchestrator.rs`: budgeted
+  stages, replay envelopes, cancellation tokens, `execute_backend` at 1567, model resolved deep at ~2208). A
+  clean spawn-before-normalize / join-before-transcribe injection is a cross-stage change to replay-critical code
+  — too risky to land+verify in one quick turn.
+- **In-flight load DEDUP (avoid the double-parse race at `mod.rs:1381-1408`: concurrent same-model cold loads BOTH
+  parse, one discarded).** Designed it (per-path `Arc<Mutex>` + re-check-under-lock, consistent lock order =
+  deadlock-safe) but holding the guard ACROSS the parse hits a self-referential-guard borrow ⇒ needs a refactor
+  of `load_canonical` into `check_cache`/`parse_and_cache` helpers. AND it's not CLI-benchable (process-global
+  cache; the CLI does one load) — only a synthetic N-thread example, for a scenario the resident-once model makes
+  rare. Niche + refactor ⇒ not a quick lever.
+- **Streaming loader (`ggml.rs:44` TODO bd-A14, quant reads tensors as bands arrive).** Per-tensor read-readiness
+  watermark restructuring parse + accessors + quant — genuinely multi-turn.
+**NET: the byte-exact single-turn frontier is spent** (ToMe is the landed win; decode + encoder kernels floored;
+structural pruning catastrophic; load-overlap = dedicated-effort). The remaining perf upside is owner/multi-turn:
+(1) load-overlap (byte-exact, needs orchestrator or load_canonical refactor — bd-A14 / new bead), (2) spec-decode
+(decode, byte-exact-greedy-verify), (3) flipping the gated WER-candidates (ToMe / enc-int8 / poly-exp) default-on
+behind a corpus WER harness (infra: no on-box LibriSpeech). Cite THIS tick + the CONSOLIDATED FRONTIER MAP; the
+quick-lever loop now returns only sub-floor / catastrophic / cross-layer results.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
