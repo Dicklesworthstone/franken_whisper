@@ -51,6 +51,48 @@
 
 ## Levers
 
+### 2026-07-14 UTC — cod_fw — LANDED (token-ID exact): tokenizer suppression discriminant prefilter — **4.95x median**
+
+**Profile / negative-ledger boundary.** Parsing the on-box
+`ggml-tiny.en.bin` vocabulary attributed the remaining single-scan cost before
+editing: only 881 of 50,257 tokens (1.753%) begin with a byte that can occur in
+an exact bare or single-space-prefixed suppression pattern. The prior
+single-pass row removed repeated vocabulary scans, but no ledger row covered a
+cheap discriminant before the remaining `HashSet` lookup.
+
+**Change.** Derive a 256-entry candidate-byte mask from the exact suppression
+pattern set. During the one vocabulary scan, probe and remove from the
+`HashSet` only when the token's first byte (or its second byte after one leading
+space) can match. The `HashSet` remains the authority for full-token equality,
+and successful removal still preserves the first-ID behavior for duplicate
+token strings.
+
+**Exactness.** The focused remote test
+`native_engine::tokenizer::tests::non_speech_set_matches_symbols` passed 1/1,
+including empty and duplicate vocabulary entries. Before Criterion starts, the
+hermetic A/B asserts the complete candidate suppression-ID vector equals the
+hash-every-token reference.
+
+| same-binary arm (50,257 tokens; 881 candidate discriminants) | interval | median |
+|---|---:|---:|
+| hash every token | 1.2841–1.3659 ms | **1.3174 ms** |
+| discriminant prefilter | 176.46–361.57 us | **266.10 us** |
+
+That is **79.8% lower measured time / 4.95x throughput**, with non-overlapping
+intervals. Both arms ran in one foreground `--profile release` Criterion
+process on RCH worker `vmi1152480`; Cargo reused the prelinked binary (0.31 s),
+the remote command took 10.10 s, and the full RCH invocation returned in 82.0
+s. Command: `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1
+RCH_WORKER=vmi1152480 rch exec -- env CARGO_HOME=/root/.cargo
+CARGO_NET_OFFLINE=true cargo bench --profile release --bench
+native_engine_bench -- native_engine/tokenizer_suppress_prefilter
+--warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`.
+
+**Scope.** This improves one-time tokenizer/model construction; it does not
+claim a warmed transcription-throughput gain. Production code and the
+hermetic A/B landed in `dbc03c5`; bead `bd-70bv` is closed with the measured
+evidence.
+
 ### 2026-07-14 UTC — cod_fw — LANDED (token-ID exact): single-pass tokenizer suppression index — **1.299x median**
 
 **Profile / negative-ledger boundary.** Full transcription profiles correctly
