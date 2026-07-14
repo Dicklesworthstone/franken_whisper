@@ -4,6 +4,63 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **HOLD / NO-SHIP — direct pre-sized speculative segment aggregation measured 1.126518x median, but its 1.047070x p10 missed the predeclared 1.10 floor; source restored.**
+
+**Negative-ledger-first target.** `WindowManager::merge_segments` cloned each
+resolved window's chosen `Vec<TranscriptionSegment>` and then moved that temporary
+vector into a growing aggregate. No existing ledger row covered these per-window
+temporary vectors. The candidate made one counting pass over the chosen quality or
+fast slices, allocated the aggregate at exact capacity, and cloned each slice
+directly into it. Stable timestamp sorting, timestamp-less ordering, overlap
+deduplication, confidence tie-breaking, and returned ownership were unchanged.
+Opportunity score was `(impact 3 x confidence 5) / effort 1 = 15`.
+
+**Behavior proof.** The same release-perf binary compared the production candidate
+with a test-local mirror of the historical implementation. Complete serialized
+merged-segment bytes matched across quality preference, fast fallback, an explicitly
+empty quality result, an unresolved window, a resolved window without results,
+cross-window timestamp overlap, missing timestamps/confidence/speaker, Unicode, and
+192 resolved windows. The timed fixture produced 195 merged segments and 26,918
+bytes with SHA-256
+`e8f64ecca6f15c4578b3d564274511c25d2ca411f2875dd41e079ab7b2e269e2`.
+The separately filtered 64-window correctness oracle also passed.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041828151` ran only on
+worker `vmi1227854` with `RCH_REQUIRE_REMOTE=1`, `--profile release-perf`, LTO
+disabled, and 16 codegen units; no local Cargo fallback occurred. Benchmark-binary
+SHA-256 was
+`c3320a9297dc348628fd6a9a0ca399efba58c009388753e2408ab0f7af6878a6`.
+Each arm performed 1,258 complete merges of the 192-window fixture. After three
+warmups, the same binary ran 21 alternating historical/historical null pairs and 21
+alternating historical/direct-aggregation pairs. The null median passed the
+predeclared `[0.95, 1.05]` guard, and the candidate won every pair, but its p10 did
+not clear `max(null p90, 1.10)`.
+
+| comparison | p10 | median | p90 | arm medians / 1,258 merges | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.893120 | **1.008617** | **1.063450** | — | — | — | valid null |
+| cloned temporary Vec / direct aggregate | **1.047070x** | **1.126518x** | 1.161497x | 35,923,189 ns / 31,476,759 ns | 6.55% | **21/21** | **no-ship: p10 below 1.10 floor** |
+
+BASE/BASE ratios:
+`[1.022543, 1.128103, 1.047161, 1.030877, 0.952479, 0.972384,
+0.977182, 1.005261, 0.893120, 0.686305, 1.018902, 0.970979,
+1.063450, 1.204314, 1.008617, 0.914511, 0.886170, 1.034663,
+1.016658, 0.970401, 1.022536]`.
+
+Historical/direct-aggregation ratios:
+`[1.145788, 1.152847, 1.095873, 1.094381, 1.219391, 1.134845,
+1.008776, 1.106563, 1.080943, 1.194327, 1.013266, 1.047070,
+1.161497, 1.152264, 1.126518, 1.144505, 1.154803, 1.074500,
+1.087355, 1.083531, 1.145106]`.
+
+**Verdict.** Exactness and an attractive median are insufficient because the
+conservative tail did not separate from the 1.10 practical floor. The production
+change, oracle, and benchmark were restored manually; only this row remains. Do not
+retry exact-capacity direct aggregation for this two-segment-per-window merge shape
+from the median alone. Reopen only for a materially different real segment-density
+distribution or an attributed end-to-end streaming profile.
+
+---
 ## 2026-07-14 - Opus (load-cap session): **THREADING AXIS CLOSED after 4 landed wins — the ENCODER is NOT over-threaded; `default_threads()` already = physical cores (32 on this 32c/64t Threadripper) = the AVX all-core throttle knee. The LOAD was the SOLE 64-logical over-threaded phase (it runs before `ensure_default_rayon_pool()`); now fixed default-ON. NO-BUILD confirmed.**
 
 Landed this session (all byte-exact, `large-v3-turbo`/jfk): `FW_STREAM_LOAD` seek-based streaming ggml loader, −33% peak RSS 2.70→1.80 GB, gated (e4bd16b/17bc81c); `FW_LOAD_WORKERS` whole enc∥dec build cap, −46% RSS @N=8, gated (7f2fd6c → lifted to the `rayon::join` altitude 4e0b1a1); and **default-ON** load cap = `host∧32` = −~11% `model_weights` (~2% e2e single-shot, 60eb989).
