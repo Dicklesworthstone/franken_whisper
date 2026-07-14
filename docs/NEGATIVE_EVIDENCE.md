@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **REJECT / NO-SHIP — direct transcript concatenation removed an allocation but measured only 1.074814x median and lost the tail gate; source restored.**
+
+**Negative-ledger-first target.** Every speculative confirmation/correction calls
+`CorrectionDrift::compute`, which joins the fast and quality segment texts. The
+current `concat_segment_text` first collects a temporary `Vec<&str>` and then
+allocates the joined `String`; the candidate precomputed the exact byte capacity
+and pushed each text plus its separator directly into one `String`. Existing rows
+covered edit-distance affix trimming and unchanged-text word-DP elision, not this
+remaining concatenation allocation. Opportunity score was
+`(impact 3 x confidence 4) / effort 1 = 12`.
+
+**Behavior proof.** The same release-perf binary compared exact joined bytes for
+empty input, one segment, multiple empty texts, leading whitespace, newlines,
+quotes, Unicode, nullable confidence, signed zero, and NaN metadata. The timed
+24-segment streaming fixture produced 1,511 identical bytes with SHA256
+`2916b65e8293ed2a5ec06faffe9a61e13f378feef509b2832fc51ad08e1ee4ef`.
+Ordering, separator placement, UTF-8 bytes, floating-point behavior, and RNG were
+unchanged.
+
+**Strict-remote foreground proof.** The sole Cargo invocation was
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 env -u CARGO_TARGET_DIR rch --no-self-healing exec -- cargo test --profile release-perf --lib concat_segment_text_direct_write_ -- --include-ignored --nocapture --test-threads=1`.
+RCH job `j-29928833041828290` ran only on worker `vmi1227854`; no local fallback
+occurred. Benchmark-binary SHA256 was
+`b0990dcc54e4670f28cf4cc617171851f42a1f4bc2f186be5884cc8e6d7e2eb4`.
+The exactness test passed. After three warmups, the same binary ran 21 alternating
+collect/join null pairs and 21 alternating collect/join versus direct-write pairs.
+The null median passed `[0.95, 1.05]`, but candidate p10 did not clear either the
+null p90 or the 1.10 practical floor, and five candidate pairs lost.
+
+| comparison | p10 | median | p90 | normalized per-call medians | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| collect/join / collect/join null | 0.810535 | **0.991745** | **1.124420** | — | — | — | valid median, wide envelope |
+| temporary pointer vector / direct write | **0.981921x** | **1.074814x** | 1.257774x | 110 ns / 100 ns | 12.66% | **16/21** | **reject: p10 below null p90 and 1.10** |
+
+BASE/BASE ratios:
+`[1.201559, 1.009970, 1.064150, 1.124420, 0.691988, 0.876512,
+1.055629, 1.014662, 1.240348, 0.879721, 0.844118, 1.033865,
+0.935696, 0.958847, 0.955028, 1.020155, 0.911703, 0.991745,
+1.098695, 0.807578, 0.810535]`.
+
+Collect/join versus direct-write ratios:
+`[1.107474, 1.075697, 1.111689, 0.981921, 1.136791, 1.257774,
+0.968780, 1.052424, 1.162881, 1.249529, 1.269564, 0.991584,
+1.785492, 1.061352, 1.044172, 1.015119, 0.910005, 1.074814,
+1.063631, 0.992314, 1.110890]`.
+
+**Verdict.** Removing the intermediate allocation is byte-exact but does not
+produce a stable practical win on this current-like boundary. Production source
+and the temporary oracle/benchmark were restored manually; only this ledger row
+remains. Do not retry this exact direct-write concatenation shape from its median.
+
+---
 ## 2026-07-14 - Codex: **INVALID-RUN / HOLD — correction lifecycle lookup consolidation never reached the timed path; source restored.**
 
 **Negative-ledger-first target.** `CorrectionTracker::submit_quality_result`
