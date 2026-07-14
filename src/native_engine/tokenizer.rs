@@ -23,6 +23,7 @@
 //! (`time = (id - timestamp_begin) * 0.02`).
 
 use super::WhisperHParams;
+use std::collections::HashSet;
 
 /// Language list ported verbatim from whisper.cpp's `g_lang` map
 /// (`whisper.cpp` lines 280-381). Each entry is `(code, id, english_name)`.
@@ -238,32 +239,36 @@ impl Tokenizer {
     /// in [`NON_SPEECH_SYMBOLS`], both bare and `' '`-prefixed, plus the special
     /// `" -"` and `" '"` cases. Ported from whisper.cpp lines 6279-6295.
     fn build_non_speech(&self) -> Vec<i32> {
-        let mut ids: Vec<i32> = Vec::new();
-        let push_if_present = |s: &str, ids: &mut Vec<i32>| {
-            if let Some(id) = self.token_id_for_bytes(s.as_bytes())
-                && !ids.contains(&id)
+        // Index the small suppress-pattern side once, then walk the large
+        // vocabulary once.  The previous pattern-major search restarted a
+        // linear 50k-token scan for every bare/prefixed symbol (~130 scans).
+        let mut remaining = HashSet::with_capacity(NON_SPEECH_SYMBOLS.len() * 2 + 2);
+        for sym in NON_SPEECH_SYMBOLS {
+            // whisper.cpp line 6281: { token, " " + token }.
+            remaining.insert(sym.as_bytes().to_vec());
+            let mut prefixed = Vec::with_capacity(sym.len() + 1);
+            prefixed.push(b' ');
+            prefixed.extend_from_slice(sym.as_bytes());
+            remaining.insert(prefixed);
+        }
+        // whisper.cpp lines 6290-6294: also suppress " -" and " '".
+        remaining.insert(b" -".to_vec());
+        remaining.insert(b" '".to_vec());
+
+        let mut ids = Vec::with_capacity(remaining.len());
+        for (id, token) in self.tokens.iter().enumerate() {
+            // Removing a match preserves the old first-id semantics when a
+            // malformed vocabulary contains duplicate byte strings.
+            if remaining.remove(token.as_slice())
+                && let Ok(id) = i32::try_from(id)
             {
                 ids.push(id);
             }
-        };
-        for sym in NON_SPEECH_SYMBOLS {
-            // whisper.cpp line 6281: { token, " " + token }.
-            push_if_present(sym, &mut ids);
-            push_if_present(&format!(" {sym}"), &mut ids);
+            if remaining.is_empty() {
+                break;
+            }
         }
-        // whisper.cpp lines 6290-6294: also suppress " -" and " '".
-        push_if_present(" -", &mut ids);
-        push_if_present(" '", &mut ids);
-        ids.sort_unstable();
         ids
-    }
-
-    /// First id (if any) whose token bytes exactly equal `bytes`.
-    fn token_id_for_bytes(&self, bytes: &[u8]) -> Option<i32> {
-        self.tokens
-            .iter()
-            .position(|t| t.as_slice() == bytes)
-            .and_then(|i| i32::try_from(i).ok())
     }
 
     /// Declared vocabulary size (`n_vocab` from the model header).
@@ -659,11 +664,13 @@ mod tests {
         v[10] = b"\"".to_vec(); // bare quote
         v[11] = b" (".to_vec(); // space-prefixed paren
         v[12] = b" -".to_vec(); // special hyphen case
+        v[13] = b"\"".to_vec(); // duplicate: first matching id wins
         let tk = Tokenizer::from_vocab(&hp(51864, 4), v);
         let ns = tk.non_speech_tokens();
         assert!(ns.contains(&10), "bare quote suppressed");
         assert!(ns.contains(&11), "space-prefixed paren suppressed");
         assert!(ns.contains(&12), "space-hyphen suppressed");
+        assert!(!ns.contains(&13), "duplicate token id is not added");
         // Sorted and de-duplicated.
         let mut sorted = ns.to_vec();
         sorted.sort_unstable();
