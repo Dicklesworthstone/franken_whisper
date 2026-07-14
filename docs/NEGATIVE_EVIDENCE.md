@@ -4,6 +4,68 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **REJECT / NO-SHIP — request-scoped DTW median-filter scratch measured 0.998717x median with 10/21 wins; source restored.**
+
+**Negative-ledger-first target and attribution.** Bead `bd-vsg6` calls out
+request/window-scoped scratch only when allocation work is material. A strict-remote
+release stage profile of the current `64 token x 1500 frame x 6 head` DTW shape
+measured gather at 221,336 ns, normalization at 1,772,945 ns, median filtering at
+20,435,996 ns, head averaging at 53,611 ns, and path construction at 386,482 ns.
+Median filtering therefore represented **89.3558%** of the isolated 22,870,370 ns
+pipeline. RCH job `j-29928833041828413` ran on `vmi1227854` with no local
+fallback. Opportunity score was `(impact 5 x confidence 5) / effort 2 = 12.5`.
+
+**One lever and behavior proof.** The candidate replaced each token row's source
+copy and width-seven median-window allocation with one frame-row buffer and one
+window buffer reused across the request, then accumulated each completed row in
+the historical head/token order. At this shape that removes 384 source/window
+allocation pairs. A same-binary oracle compared all 96,000 averaged f32 cells
+with `to_bits()`; they were exact, with little-endian output SHA-256
+`aa655facb4c81b76f4acec054023596f5aff48f19d3419bc742e0d5cf6850b3e`.
+
+**Strict-remote foreground proof.** The one timed A/B command was
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch
+--no-self-healing exec -- cargo test --profile release --lib
+native_engine::dtw::tests::dtw_median_scratch_perf -- --ignored --exact
+--nocapture --test-threads=1`. RCH job `j-29928833041828435` stayed on
+`vmi1227854`; no local fallback occurred. RCH unexpectedly chose another cold
+target pool despite worker affinity, so the permitted release build took 15m10s
+and reported `Cache: MISS`; the timed test itself finished in 3.47s. One preceding
+strict-remote compile attempt reached no timed code because the temporary harness
+had a missing formatting argument, and is excluded from the evidence.
+
+After three warmups, the corrected binary ran 21 historical/historical null pairs
+and 21 alternating historical/scratch pairs, with two full transformations per
+arm. The predeclared gate required a null median in `[0.95, 1.05]`, candidate
+median above `max(null p90, 1.05)`, candidate p10 above `1.0`, and at least 18/21
+wins.
+
+| comparison | p10 | median | p90 | wins | verdict |
+|---|---:|---:|---:|---:|---|
+| per-row scratch / per-row scratch null | 0.867146 | **0.992650** | **1.177600** | — | valid median, wide envelope |
+| per-row scratch / request-scoped scratch | **0.873770x** | **0.998717x** | 1.083560x | **10/21** | **reject: indistinguishable from noise** |
+
+BASE/BASE ratios:
+`[1.260968, 1.014589, 0.773814, 1.127511, 0.949538, 0.992650,
+0.915599, 0.950691, 0.867146, 1.257488, 1.177600, 0.956624,
+1.003785, 0.885593, 0.925612, 1.003837, 0.952148, 1.114254,
+1.050647, 1.089372, 0.840111]`.
+
+Historical/request-scoped ratios:
+`[1.018068, 0.789766, 0.998717, 1.083560, 1.023670, 0.909238,
+1.056052, 1.006034, 0.989685, 1.084017, 0.941510, 0.917097,
+1.070909, 0.873770, 0.931220, 0.927956, 0.926107, 1.138927,
+0.860140, 1.013256, 1.008810]`.
+
+**Verdict.** Allocation removal is exact but does not move this sort-dominated
+kernel: its median is effectively neutral, its p10 is below one and below the
+null envelope, and it won fewer than half the pairs. Production DTW source and
+the temporary profiler/oracle were restored manually; only this ledger row
+remains. Do not retry request-scoped row/window scratch around the existing
+comparison sort. A fresh DTW lever should change the median-selection algorithm
+or another attributed primitive rather than allocation lifetime alone.
+
+---
 ## 2026-07-14 - Codex: **REJECT / NO-SHIP — same-binary i7 row-block coarsening is 0.879877x median; the reopened substrate ambiguity is closed and source is restored.**
 
 **Negative-ledger-first target and attribution.** Bead
