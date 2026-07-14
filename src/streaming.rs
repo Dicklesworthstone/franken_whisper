@@ -59,6 +59,20 @@ fn to_backend_segment(s: &TranscriptionSegment) -> TranscriptSegment {
     }
 }
 
+fn bridge_and_store_segments(
+    holder: &Mutex<Vec<TranscriptionSegment>>,
+    original: Vec<TranscriptionSegment>,
+) -> Vec<TranscriptSegment> {
+    let bridged = original.iter().map(to_backend_segment).collect();
+    *holder.lock().unwrap_or_else(|error| error.into_inner()) = original;
+    bridged
+}
+
+fn take_stored_segments(holder: &Mutex<Vec<TranscriptionSegment>>) -> Vec<TranscriptionSegment> {
+    let mut stored = holder.lock().unwrap_or_else(|error| error.into_inner());
+    std::mem::take(&mut *stored)
+}
+
 /// The speculative streaming pipeline orchestrator.
 ///
 /// Rather than holding engine references directly, the pipeline accepts
@@ -150,16 +164,10 @@ impl SpeculativeStreamingPipeline {
         let quality_holder_bridge = quality_holder.clone();
 
         let fast_bridge = move || -> Vec<TranscriptSegment> {
-            let original = fast_fn();
-            *fast_holder_bridge.lock().unwrap_or_else(|e| e.into_inner()) = original.clone();
-            original.iter().map(to_backend_segment).collect()
+            bridge_and_store_segments(fast_holder_bridge.as_ref(), fast_fn())
         };
         let quality_bridge = move || -> Vec<TranscriptSegment> {
-            let original = quality_fn();
-            *quality_holder_bridge
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = original.clone();
-            original.iter().map(to_backend_segment).collect()
+            bridge_and_store_segments(quality_holder_bridge.as_ref(), quality_fn())
         };
 
         let result = executor.execute_with_early_emit(
@@ -169,10 +177,7 @@ impl SpeculativeStreamingPipeline {
             |_primary, _secondary, _p_lat, _q_lat| {},
         );
 
-        let fast_segments = fast_holder
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let fast_segments = take_stored_segments(fast_holder.as_ref());
 
         // Register with tracker and window manager.
         let fast_ts = chrono::Utc::now().to_rfc3339();
@@ -210,10 +215,7 @@ impl SpeculativeStreamingPipeline {
         }
 
         // Use captured original model segments (no round-trip conversion).
-        let quality_segments = quality_holder
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let quality_segments = take_stored_segments(quality_holder.as_ref());
         self.window_manager
             .record_quality_result(window_id, quality_segments.clone());
 
@@ -532,6 +534,34 @@ mod tests {
         }
     }
 
+    fn historical_bridge_and_recover(
+        original: Vec<TranscriptionSegment>,
+    ) -> (Vec<TranscriptSegment>, Vec<TranscriptionSegment>) {
+        let holder = Mutex::new(Vec::new());
+        *holder.lock().unwrap_or_else(|error| error.into_inner()) = original.clone();
+        let bridged = original.iter().map(to_backend_segment).collect();
+        let recovered = holder
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        (bridged, recovered)
+    }
+
+    fn transferred_bridge_and_recover(
+        original: Vec<TranscriptionSegment>,
+    ) -> (Vec<TranscriptSegment>, Vec<TranscriptionSegment>) {
+        let holder = Mutex::new(Vec::new());
+        let bridged = bridge_and_store_segments(&holder, original);
+        let recovered = take_stored_segments(&holder);
+        debug_assert!(
+            holder
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        (bridged, recovered)
+    }
+
     #[test]
     fn to_backend_segment_converts_seconds_to_ms_and_defaults() {
         // Normal conversion: seconds → ms.
@@ -548,6 +578,236 @@ mod tests {
         assert_eq!(bs2.start_ms, 0);
         assert_eq!(bs2.end_ms, 0);
         assert!((bs2.confidence - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bridge_segment_ownership_transfer_matches_historical_bytes() {
+        let cases = [
+            Vec::new(),
+            vec![TranscriptionSegment {
+                start_sec: Some(0.125),
+                end_sec: Some(1.875),
+                text: " λ \\\"quoted\\\"\n🎧".to_owned(),
+                speaker: Some("speaker-a".to_owned()),
+                confidence: Some(0.975),
+            }],
+            vec![
+                TranscriptionSegment {
+                    start_sec: None,
+                    end_sec: Some(-0.0),
+                    text: String::new(),
+                    speaker: None,
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(3.25),
+                    end_sec: None,
+                    text: "multi-byte Καλημέρα 世界".to_owned(),
+                    speaker: Some(String::new()),
+                    confidence: Some(-0.0),
+                },
+            ],
+        ];
+
+        for (index, segments) in cases.iter().enumerate() {
+            let historical = historical_bridge_and_recover(segments.clone());
+            let transferred = transferred_bridge_and_recover(segments.clone());
+            assert_eq!(
+                transferred.0, historical.0,
+                "case {index} backend bridge parity"
+            );
+            assert_eq!(
+                serde_json::to_vec(&transferred.1).expect("serialize transferred segments"),
+                serde_json::to_vec(&historical.1).expect("serialize historical segments"),
+                "case {index} original segment byte parity"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn bridge_segment_ownership_transfer_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 64;
+        const TARGET_ARM_NS: u128 = 30_000_000;
+
+        fn fixture_segments(lane: &str) -> Vec<TranscriptionSegment> {
+            (0..12)
+                .map(|index| TranscriptionSegment {
+                    start_sec: Some(f64::from(index) * 0.24),
+                    end_sec: Some(f64::from(index) * 0.24 + 0.22),
+                    text: format!(
+                        " {lane} streaming segment {index:02}: ownership transfer preserves the original UTF-8 transcript λ 🎧"
+                    ),
+                    speaker: None,
+                    confidence: Some(0.78 + f64::from(index) / 100.0),
+                })
+                .collect()
+        }
+
+        fn prepared_inputs(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> Vec<(Vec<TranscriptionSegment>, Vec<TranscriptionSegment>)> {
+            (0..iterations)
+                .map(|_| (fast.to_vec(), quality.to_vec()))
+                .collect()
+        }
+
+        fn time_historical(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let inputs = prepared_inputs(fast, quality, iterations);
+            let started = Instant::now();
+            for (fast_segments, quality_segments) in inputs {
+                let fast_result = historical_bridge_and_recover(fast_segments);
+                let quality_result = historical_bridge_and_recover(quality_segments);
+                drop(black_box((fast_result, quality_result)));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_transferred(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let inputs = prepared_inputs(fast, quality, iterations);
+            let started = Instant::now();
+            for (fast_segments, quality_segments) in inputs {
+                let fast_result = transferred_bridge_and_recover(fast_segments);
+                let quality_result = transferred_bridge_and_recover(quality_segments);
+                drop(black_box((fast_result, quality_result)));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let fast = fixture_segments("fast");
+        let quality = fixture_segments("quality");
+        let historical = (
+            historical_bridge_and_recover(fast.clone()),
+            historical_bridge_and_recover(quality.clone()),
+        );
+        let transferred = (
+            transferred_bridge_and_recover(fast.clone()),
+            transferred_bridge_and_recover(quality.clone()),
+        );
+        let historical_bytes = serde_json::to_vec(&historical).expect("serialize historical");
+        let transferred_bytes = serde_json::to_vec(&transferred).expect("serialize transferred");
+        assert_eq!(transferred_bytes, historical_bytes, "fixture byte parity");
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "stream_bridge_transfer binary_sha256={:x} rows_per_lane={} output_bytes={} output_sha256={:x}",
+            Sha256::digest(executable),
+            fast.len(),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+        );
+
+        let calibration = time_historical(&fast, &quality, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration)
+            .clamp(128, 4_096) as usize;
+        eprintln!(
+            "stream_bridge_transfer calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&fast, &quality, iterations));
+            black_box(time_transferred(&fast, &quality, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut transferred_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&fast, &quality, iterations);
+            let null_second = time_historical(&fast, &quality, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, transferred) = if sample % 2 == 0 {
+                (
+                    time_historical(&fast, &quality, iterations),
+                    time_transferred(&fast, &quality, iterations),
+                )
+            } else {
+                let transferred = time_transferred(&fast, &quality, iterations);
+                let historical = time_historical(&fast, &quality, iterations);
+                (historical, transferred)
+            };
+            historical_times.push(historical);
+            transferred_times.push(transferred);
+            speedups.push(historical as f64 / transferred as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "stream_bridge_transfer samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} transferred_arm_median_ns={} transferred_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&transferred_times),
+            coefficient_of_variation(&transferred_times) * 100.0,
+        );
+        eprintln!(
+            "stream_bridge_transfer null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} transferred_times_ns={transferred_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard",
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)",
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18",
+        );
     }
 
     #[test]
