@@ -341,6 +341,23 @@ fn concat_segment_text(segments: &[TranscriptionSegment]) -> String {
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
+    // A shared prefix or suffix contributes zero edits, so exclude both from
+    // the dynamic-programming matrix while retaining Unicode scalar semantics.
+    let common_prefix = a_chars
+        .iter()
+        .zip(&b_chars)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let a_chars = &a_chars[common_prefix..];
+    let b_chars = &b_chars[common_prefix..];
+    let common_suffix = a_chars
+        .iter()
+        .rev()
+        .zip(b_chars.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let a_chars = &a_chars[..a_chars.len() - common_suffix];
+    let b_chars = &b_chars[..b_chars.len() - common_suffix];
     let m = a_chars.len();
     let n = b_chars.len();
 
@@ -1414,6 +1431,294 @@ mod tests {
             confidence,
             speaker: None,
         }
+    }
+
+    fn levenshtein_historical(a: &str, b: &str) -> usize {
+        let a_chars: Vec<char> = a.chars().collect();
+        let b_chars: Vec<char> = b.chars().collect();
+        let m = a_chars.len();
+        let n = b_chars.len();
+
+        if m == 0 {
+            return n;
+        }
+        if n == 0 {
+            return m;
+        }
+
+        let mut prev = (0..=n).collect::<Vec<usize>>();
+        let mut curr = vec![0usize; n + 1];
+
+        for i in 1..=m {
+            curr[0] = i;
+            for j in 1..=n {
+                let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                    0
+                } else {
+                    1
+                };
+                curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+
+        prev[n]
+    }
+
+    fn correction_drift_historical(
+        fast_segments: &[TranscriptionSegment],
+        quality_segments: &[TranscriptionSegment],
+    ) -> CorrectionDrift {
+        let fast_text = concat_segment_text(fast_segments);
+        let quality_text = concat_segment_text(quality_segments);
+        let text_edit_distance = levenshtein_historical(&fast_text, &quality_text);
+        let fast_words = fast_text.split_whitespace().collect::<Vec<_>>();
+        let quality_words = quality_text.split_whitespace().collect::<Vec<_>>();
+        let word_edit_dist = levenshtein_words(&fast_words, &quality_words);
+        let max_words = fast_words.len().max(quality_words.len()).max(1);
+
+        CorrectionDrift {
+            wer_approx: word_edit_dist as f64 / max_words as f64,
+            confidence_delta: (mean_confidence(fast_segments) - mean_confidence(quality_segments))
+                .abs(),
+            segment_count_delta: quality_segments.len() as i32 - fast_segments.len() as i32,
+            text_edit_distance,
+        }
+    }
+
+    fn correction_drift_common_affix_fixture()
+    -> (Vec<TranscriptionSegment>, Vec<TranscriptionSegment>) {
+        let mut fast = Vec::with_capacity(12);
+        let mut quality = Vec::with_capacity(12);
+        for index in 0..12 {
+            let shared = format!(
+                "window segment {index:02} preserves the already agreed streaming transcript context and stable timing detail"
+            );
+            let fast_text = if index == 5 {
+                format!(
+                    "{shared}; the reviewed dosage uses the brown marker before the shared clinical suffix"
+                )
+            } else {
+                format!("{shared}; no correction is required for this portion")
+            };
+            let quality_text = if index == 5 {
+                format!(
+                    "{shared}; the reviewed dosage uses the green marker before the shared clinical suffix"
+                )
+            } else {
+                format!("{shared}; no correction is required for this portion")
+            };
+            fast.push(TranscriptionSegment {
+                text: fast_text,
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 4 != 0).then_some(0.78 + f64::from(index) / 200.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            });
+            quality.push(TranscriptionSegment {
+                text: quality_text,
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 5 != 0).then_some(0.88 + f64::from(index) / 300.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            });
+        }
+        (fast, quality)
+    }
+
+    #[test]
+    fn correction_drift_common_affix_matches_historical() {
+        let corpus = [
+            "",
+            "a",
+            "same transcript",
+            "shared prefix old shared suffix",
+            "shared prefix new shared suffix",
+            "café λ old 🎧 suffix",
+            "café λ new 🎧 suffix",
+            "日本語の記録",
+            "日本人の記録",
+            "combining e\u{301} marker",
+            "emoji 👋🌍 tail",
+        ];
+        for left in corpus {
+            for right in corpus {
+                assert_eq!(
+                    levenshtein(left, right),
+                    levenshtein_historical(left, right),
+                    "distance mismatch for {left:?} versus {right:?}"
+                );
+            }
+        }
+
+        let (fast, quality) = correction_drift_common_affix_fixture();
+        let historical = correction_drift_historical(&fast, &quality);
+        let candidate = CorrectionDrift::compute(&fast, &quality);
+        assert_eq!(
+            serde_json::to_vec(&candidate).expect("serialize candidate drift"),
+            serde_json::to_vec(&historical).expect("serialize historical drift"),
+            "full correction drift bytes"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn correction_drift_common_affix_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 2;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        fn time_historical(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(correction_drift_historical(
+                    black_box(fast),
+                    black_box(quality),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(CorrectionDrift::compute(
+                    black_box(fast),
+                    black_box(quality),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let (fast, quality) = correction_drift_common_affix_fixture();
+        let historical_bytes = serde_json::to_vec(&correction_drift_historical(&fast, &quality))
+            .expect("serialize historical drift");
+        let candidate_bytes = serde_json::to_vec(&CorrectionDrift::compute(&fast, &quality))
+            .expect("serialize candidate drift");
+        assert_eq!(candidate_bytes, historical_bytes, "exact drift bytes");
+
+        let fast_chars = concat_segment_text(&fast).chars().count();
+        let quality_chars = concat_segment_text(&quality).chars().count();
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "correction_drift_common_affix binary_sha256={:x} result_bytes={} result_sha256={:x} fast_segments={} quality_segments={} fast_chars={} quality_chars={}",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            fast.len(),
+            quality.len(),
+            fast_chars,
+            quality_chars
+        );
+
+        let calibration = time_historical(&fast, &quality, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration.max(1))
+            .clamp(1, 131_072) as usize;
+        eprintln!(
+            "correction_drift_common_affix calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&fast, &quality, iterations));
+            black_box(time_candidate(&fast, &quality, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&fast, &quality, iterations);
+            let null_second = time_historical(&fast, &quality, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, candidate) = if sample % 2 == 0 {
+                (
+                    time_historical(&fast, &quality, iterations),
+                    time_candidate(&fast, &quality, iterations),
+                )
+            } else {
+                let candidate = time_candidate(&fast, &quality, iterations);
+                let historical = time_historical(&fast, &quality, iterations);
+                (historical, candidate)
+            };
+            historical_times.push(historical);
+            candidate_times.push(candidate);
+            speedups.push(historical as f64 / candidate as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "correction_drift_common_affix samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} candidate_arm_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&candidate_times),
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "correction_drift_common_affix null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
     }
 
     #[test]
