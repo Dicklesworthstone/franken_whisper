@@ -51,6 +51,50 @@
 
 ## Levers
 
+### 2026-07-14 UTC — cod_fw — LANDED (timestamp exact): direct fixed-path JSON lookup — **6.03x point estimate**
+
+**Profile / negative-ledger boundary.** After the native-engine non-GEMM,
+mel/audio, tokenizer, and model-load veins were confirmed closed, backend output
+normalization remained an unresolved infrastructure-invalid candidate rather
+than a rejection. `extract_segments_from_json` parsed the same RFC6901 strings
+for every segment timestamp. Historical 500-chunk normalization measurements
+place the whole path around 0.65--0.83 ms, so the repeated fixed-path traversal
+is an attributable component without claiming end-to-end transcription impact.
+
+**Change and exactness.** Constant `/offsets/{from,to}` and
+`/timestamp/{0,1,start,end}` traversals now use direct object/array access.
+Field precedence and the no-fallback rule for present-but-nonnumeric earlier
+fields are unchanged. Numeric object keys remain supported so
+`{"timestamp":{"0":...}}` retains JSON Pointer's array-index-equivalent
+behavior. The hermetic 500-node oracle covers direct fields, `_sec` fields,
+arrays, numeric-key objects, named-key objects, millisecond offsets, and
+malformed offsets; it asserted the complete result vector equal before timing.
+A focused regression test also protects numeric object keys.
+
+| same-binary arm (500 mixed segment nodes) | interval | point estimate |
+|---|---:|---:|
+| RFC6901 pointer reference | 255.28--299.58 us | **282.08 us** |
+| direct field/index lookup | 43.908--48.999 us | **46.771 us** |
+
+That is **83.4% lower fixed timestamp-lookup time / 6.03x throughput**, with
+non-overlapping intervals. The exact fixture oracle ran inside the measured
+binary before Criterion. The declared >=10% gate cleared.
+
+**Remote provenance.** Uncapped strict-remote warm-up job
+`j-29928833041828713` built `native_engine_bench` on `vmi1152480` in the release
+profile and exited 0 after 12m07s. Measurement job `j-29928833041828732` reused
+the same worker and target pool, compiled incrementally, then ran 0.5-second
+warm-ups and 1-second measurements with 10 samples per arm; exit 0, no local
+fallback. Command: `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1
+RCH_WORKER=vmi1152480 rch --no-self-healing exec -- env
+CARGO_HOME=/root/.cargo CARGO_NET_OFFLINE=true cargo bench --profile release
+--bench native_engine_bench -- native_engine/timestamp_lookup_ab
+--warm-up-time 0.5 --measurement-time 1 --sample-size 10 --noplot`.
+
+**Scope.** This is a component win in backend JSON segment normalization, not a
+native compute or end-to-end ASR ratio. Production and its A/B landed in
+`912948f`; bead `bd-zbsm` is closed with the measured evidence.
+
 ### 2026-07-14 UTC — cod_fw — LANDED (text exact): owned UTF-8 tokenizer decode handoff — **2.45x median**
 
 **Profile / negative-ledger boundary.** `Tokenizer::decode` is called for every

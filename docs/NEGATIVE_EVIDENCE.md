@@ -4,6 +4,24 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **RESOLVED / LANDED — warmed strict-remote retry measured direct fixed-path timestamp lookup at 6.03x; the earlier timeout remains infrastructure history, not a rejection.**
+
+The prescribed uncapped warm-up completed first: RCH job
+`j-29928833041828713` built `native_engine_bench` with `--profile release` on
+`vmi1152480` in 12m07s and exited 0. The sole subsequent measurement, job
+`j-29928833041828732`, used the same worker and target pool with Criterion's
+short 0.5-second warm-up and 1-second measurement windows. It returned real
+same-binary intervals: RFC6901 pointer reference 255.28--299.58 us (282.08 us
+point estimate) versus direct field/index lookup 43.908--48.999 us (46.771 us),
+an **83.4% reduction / 6.03x throughput** with disjoint intervals.
+
+The 500-node fixture asserted exact results before timing across every accepted
+timestamp shape, including numeric object keys and malformed earlier offsets.
+Production landed in `912948f`; bead `bd-zbsm` is closed. This resolution
+supersedes the no-verdict state below without rewriting its accurate account of
+the original infrastructure failure.
+
+---
 ## 2026-07-14 - Codex: **SURFACED / INVALID BENCH — direct fixed-path timestamp lookups reached no timed samples before the strict-remote 285-second cap; source restored.**
 
 **Negative-ledger-first pivot and attribution.** `bv --robot-triage` data hash
