@@ -241,6 +241,31 @@ impl CorrectionEvent {
     ) -> Self {
         let quality_confidence_mean = mean_confidence(&corrected_segments);
         let drift = CorrectionDrift::compute(fast_segments, &corrected_segments);
+        Self::from_precomputed_metrics(
+            correction_id,
+            retracted_seq,
+            window_id,
+            quality_model_id,
+            corrected_segments,
+            quality_latency_ms,
+            quality_confidence_mean,
+            drift,
+            corrected_at_rfc3339,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_precomputed_metrics(
+        correction_id: u64,
+        retracted_seq: u64,
+        window_id: u64,
+        quality_model_id: String,
+        corrected_segments: Vec<TranscriptionSegment>,
+        quality_latency_ms: u64,
+        quality_confidence_mean: f64,
+        drift: CorrectionDrift,
+        corrected_at_rfc3339: String,
+    ) -> Self {
         Self {
             correction_id,
             retracted_seq,
@@ -758,20 +783,25 @@ impl CorrectionTracker {
                 ))
             })?;
             partial.retract();
-            let fast_segments = partial.segments.clone();
 
             let correction_id = self.next_correction_id;
             self.next_correction_id += 1;
 
-            let correction = CorrectionEvent::new(
+            let quality_model_id = quality_model_id.to_owned();
+            let corrected_at_rfc3339 = chrono::Utc::now().to_rfc3339();
+            let quality_confidence_mean = mean_confidence(&quality_segments);
+            // The decision above already computed both Levenshtein metrics.
+            // Reuse them instead of cloning the fast segments and rescanning.
+            let correction = CorrectionEvent::from_precomputed_metrics(
                 correction_id,
                 seq,
                 window_id,
-                quality_model_id.to_owned(),
+                quality_model_id,
                 quality_segments,
                 quality_latency_ms,
-                chrono::Utc::now().to_rfc3339(),
-                &fast_segments,
+                quality_confidence_mean,
+                drift,
+                corrected_at_rfc3339,
             );
 
             self.corrections.push(correction.clone());
@@ -1384,6 +1414,381 @@ mod tests {
             confidence,
             speaker: None,
         }
+    }
+
+    #[test]
+    fn correction_drift_reuse_matches_historical_event_bytes() {
+        let fast = vec![
+            TranscriptionSegment {
+                text: "hello λ world".to_owned(),
+                start_sec: Some(0.0),
+                end_sec: Some(1.25),
+                confidence: Some(0.75),
+                speaker: Some("SPEAKER_00".to_owned()),
+            },
+            TranscriptionSegment {
+                text: "line two with 🎧".to_owned(),
+                start_sec: Some(1.25),
+                end_sec: Some(2.5),
+                confidence: None,
+                speaker: None,
+            },
+        ];
+        let quality = vec![
+            TranscriptionSegment {
+                text: "hello λ earth".to_owned(),
+                start_sec: Some(0.0),
+                end_sec: Some(1.25),
+                confidence: Some(0.95),
+                speaker: Some("SPEAKER_00".to_owned()),
+            },
+            TranscriptionSegment {
+                text: "line two with 🎧 and punctuation.".to_owned(),
+                start_sec: Some(1.25),
+                end_sec: Some(2.5),
+                confidence: None,
+                speaker: None,
+            },
+        ];
+        let corrected_at = "2026-07-14T00:00:00.000000000Z";
+
+        let historical = CorrectionEvent::new(
+            17,
+            23,
+            29,
+            "quality-v2".to_owned(),
+            quality.clone(),
+            431,
+            corrected_at.to_owned(),
+            &fast,
+        );
+        let quality_confidence_mean = mean_confidence(&quality);
+        let drift = CorrectionDrift::compute(&fast, &quality);
+        let reused = CorrectionEvent::from_precomputed_metrics(
+            17,
+            23,
+            29,
+            "quality-v2".to_owned(),
+            quality,
+            431,
+            quality_confidence_mean,
+            drift,
+            corrected_at.to_owned(),
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&reused).expect("serialize reused correction event"),
+            serde_json::to_vec(&historical).expect("serialize historical correction event")
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn correction_drift_reuse_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 2;
+        const TARGET_ARM_NS: u128 = 40_000_000;
+        const CORRECTED_AT: &str = "2026-07-14T00:00:00.000000000Z";
+
+        fn make_tracker(fast: &[TranscriptionSegment]) -> CorrectionTracker {
+            let mut tracker = CorrectionTracker::new(CorrectionTolerance {
+                always_correct: true,
+                ..CorrectionTolerance::default()
+            });
+            tracker.register_partial(PartialTranscript::new(
+                23,
+                29,
+                "fast-v1".to_owned(),
+                fast.to_vec(),
+                137,
+                "2026-07-14T00:00:00.000000000Z".to_owned(),
+            ));
+            tracker
+        }
+
+        fn submit_historical(
+            tracker: &mut CorrectionTracker,
+            quality_segments: Vec<TranscriptionSegment>,
+        ) -> CorrectionDecision {
+            let window_id = 29;
+            let quality_latency_ms = 431;
+            let seq = *tracker
+                .window_to_seq
+                .get(&window_id)
+                .expect("registered historical window");
+            let drift = {
+                let partial = tracker
+                    .partials
+                    .get(&seq)
+                    .expect("registered historical partial");
+                CorrectionDrift::compute(&partial.segments, &quality_segments)
+            };
+
+            tracker.stats.windows_processed += 1;
+            tracker.stats.total_quality_latency_ms += quality_latency_ms;
+            tracker.stats.cumulative_wer += drift.wer_approx;
+            if drift.wer_approx > tracker.stats.max_observed_wer {
+                tracker.stats.max_observed_wer = drift.wer_approx;
+            }
+
+            let needs_correction = tracker.tolerance.always_correct
+                || drift.wer_approx > tracker.tolerance.max_wer
+                || drift.confidence_delta > tracker.tolerance.max_confidence_delta
+                || drift.text_edit_distance > tracker.tolerance.max_edit_distance;
+            assert!(needs_correction, "fixture must exercise correction path");
+
+            let partial = tracker
+                .partials
+                .get_mut(&seq)
+                .expect("registered historical partial");
+            partial.retract();
+            let fast_segments = partial.segments.clone();
+
+            let correction_id = tracker.next_correction_id;
+            tracker.next_correction_id += 1;
+            let correction = CorrectionEvent::new(
+                correction_id,
+                seq,
+                window_id,
+                "quality-v2".to_owned(),
+                quality_segments,
+                quality_latency_ms,
+                chrono::Utc::now().to_rfc3339(),
+                &fast_segments,
+            );
+            tracker.corrections.push(correction.clone());
+            tracker.stats.corrections_emitted += 1;
+            tracker.window_to_seq.remove(&window_id);
+
+            CorrectionDecision::Correct { correction }
+        }
+
+        fn normalized_state_bytes(
+            tracker: &CorrectionTracker,
+            decision: CorrectionDecision,
+        ) -> Option<Vec<u8>> {
+            let CorrectionDecision::Correct {
+                correction: mut event,
+            } = decision
+            else {
+                return None;
+            };
+            event.corrected_at_rfc3339 = CORRECTED_AT.to_owned();
+            let mut stored = tracker.corrections.clone();
+            for correction in &mut stored {
+                correction.corrected_at_rfc3339 = CORRECTED_AT.to_owned();
+            }
+            let partial = tracker
+                .partials
+                .get(&23)
+                .expect("retained corrected partial");
+            serde_json::to_vec(&serde_json::json!({
+                "decision": event,
+                "stored_corrections": stored,
+                "partial_status": partial.status,
+                "windows_processed": tracker.stats.windows_processed,
+                "corrections_emitted": tracker.stats.corrections_emitted,
+                "confirmations_emitted": tracker.stats.confirmations_emitted,
+                "total_fast_latency_ms": tracker.stats.total_fast_latency_ms,
+                "total_quality_latency_ms": tracker.stats.total_quality_latency_ms,
+                "cumulative_wer": tracker.stats.cumulative_wer,
+                "max_observed_wer": tracker.stats.max_observed_wer,
+                "next_correction_id": tracker.next_correction_id,
+                "window_mapping_empty": tracker.window_to_seq.is_empty(),
+            }))
+            .ok()
+        }
+
+        fn time_historical(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let mut cases = (0..iterations)
+                .map(|_| (make_tracker(fast), quality.to_vec()))
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            for (tracker, quality_segments) in &mut cases {
+                black_box(submit_historical(
+                    black_box(tracker),
+                    std::mem::take(quality_segments),
+                ));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_reused(
+            fast: &[TranscriptionSegment],
+            quality: &[TranscriptionSegment],
+            iterations: usize,
+        ) -> u128 {
+            let mut cases = (0..iterations)
+                .map(|_| (make_tracker(fast), quality.to_vec()))
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            for (tracker, quality_segments) in &mut cases {
+                black_box(
+                    black_box(tracker)
+                        .submit_quality_result(
+                            29,
+                            "quality-v2",
+                            std::mem::take(quality_segments),
+                            431,
+                        )
+                        .expect("candidate correction submission"),
+                );
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let fast = (0..12)
+            .map(|index| TranscriptionSegment {
+                text: format!(
+                    "fast segment {index:02} carries current-window transcript words, Unicode λ, and measured correction detail"
+                ),
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 4 != 0).then_some(0.70 + f64::from(index) / 100.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            })
+            .collect::<Vec<_>>();
+        let quality = (0..12)
+            .map(|index| TranscriptionSegment {
+                text: format!(
+                    "quality segment {index:02} carries corrected-window transcript words, Unicode λ, and authoritative correction detail"
+                ),
+                start_sec: Some(f64::from(index) * 1.25),
+                end_sec: Some(f64::from(index + 1) * 1.25),
+                confidence: (index % 5 != 0).then_some(0.85 + f64::from(index) / 200.0),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{:02}", index % 2)),
+            })
+            .collect::<Vec<_>>();
+
+        let mut historical_tracker = make_tracker(&fast);
+        let historical_decision = submit_historical(&mut historical_tracker, quality.clone());
+        let historical_bytes = normalized_state_bytes(&historical_tracker, historical_decision)
+            .expect("historical fixture must correct and serialize");
+        let mut reused_tracker = make_tracker(&fast);
+        let reused_decision = reused_tracker
+            .submit_quality_result(29, "quality-v2", quality.clone(), 431)
+            .expect("candidate correction submission");
+        let reused_bytes = normalized_state_bytes(&reused_tracker, reused_decision)
+            .expect("candidate fixture must correct and serialize");
+        assert_eq!(
+            reused_bytes, historical_bytes,
+            "complete normalized correction state bytes"
+        );
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "correction_drift_reuse binary_sha256={:x} state_bytes={} state_sha256={:x} fast_segments={} quality_segments={}",
+            Sha256::digest(executable),
+            historical_bytes.len(),
+            Sha256::digest(&historical_bytes),
+            fast.len(),
+            quality.len()
+        );
+
+        let calibration = time_historical(&fast, &quality, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration.max(1))
+            .clamp(1, 2_000) as usize;
+        eprintln!(
+            "correction_drift_reuse calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&fast, &quality, iterations));
+            black_box(time_reused(&fast, &quality, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut reused_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&fast, &quality, iterations);
+            let null_second = time_historical(&fast, &quality, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, reused) = if sample % 2 == 0 {
+                (
+                    time_historical(&fast, &quality, iterations),
+                    time_reused(&fast, &quality, iterations),
+                )
+            } else {
+                let reused = time_reused(&fast, &quality, iterations);
+                let historical = time_historical(&fast, &quality, iterations);
+                (historical, reused)
+            };
+            historical_times.push(historical);
+            reused_times.push(reused);
+            speedups.push(historical as f64 / reused as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "correction_drift_reuse samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} reused_arm_median_ns={} reused_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&reused_times),
+            coefficient_of_variation(&reused_times) * 100.0
+        );
+        eprintln!(
+            "correction_drift_reuse null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} reused_times_ns={reused_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
     }
 
     #[test]
