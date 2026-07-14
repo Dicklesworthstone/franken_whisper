@@ -8,9 +8,9 @@ use franken_whisper::cli::{
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
-    acceleration_context_from_evidence, backends_discovery_value, build_backends_report,
-    build_health_report, emit_health_report, emit_robot_complete, emit_robot_error,
-    emit_robot_stage, emit_robot_start, robot_schema_value, routing_decision_value,
+    backends_discovery_value, build_backends_report, build_health_report, emit_health_report,
+    emit_pretty_run_report, emit_robot_complete, emit_robot_error, emit_robot_stage,
+    emit_robot_start, robot_schema_value, routing_decision_value,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
@@ -56,14 +56,7 @@ fn run(cli: Cli) -> FwResult<()> {
             let report = engine.transcribe(request)?;
 
             if args.json {
-                let mut value = serde_json::to_value(&report)?;
-                if let Some(acceleration_context) =
-                    acceleration_context_from_evidence(&report.evidence)
-                    && let Some(object) = value.as_object_mut()
-                {
-                    object.insert("acceleration_context".to_owned(), acceleration_context);
-                }
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                emit_pretty_run_report(report)?;
             } else {
                 println!("{}", report.result.transcript);
             }
