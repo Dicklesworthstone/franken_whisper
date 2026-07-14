@@ -21152,6 +21152,19 @@ micro-ticks on one subsystem wash, the fix is a DIFFERENT-ALTITUDE primitive (st
 7th micro-tweak — the compute-bound wall that kills byte-exact kernel tweaks is exactly what a structural
 token-count reduction sidesteps.** alien-graveyard has no transformer primitive (distributed-systems corpus); the
 ToMe idea is standard vision-transformer literature applied to whisper's audio encoder.
+**Tick 2026-07-13z (fresh-context loop) — PROGRESSIVE ToMe (merge a little at each of N layers) FALSIFIED as a
+tradeoff improvement over the landed single-merge — reverted, single-merge is optimal for whisper's encoder.**
+The ViT ToMe literature says gradual merging (small `r` over several layers) preserves accuracy better than one
+big merge for the same total reduction. Built it (`FW_TOME_LAYERS` composing the unmerge maps across per-layer
+merges) and swept on turbo (jfk encoder_window + track01 word-drift vs baseline, threads=32): **at EQUAL total
+merge (200 tokens): single (R=200,L=1) = 22 track01 word-diffs; progressive (R=40,L=5) = 28 — MORE drift, similar
+perf.** Drift rises monotonically with total merge regardless of spreading (single 22 → prog200 28 → prog300 31 →
+prog360 37); all jfk-IDENTICAL; encoder_window noisy ±5% (single ~1211, prog300 ~1167 — prog300 merges 300 so it's
+just further along the SAME tradeoff curve, not a better one). ⇒ the "gradual is gentler" hypothesis does NOT hold
+for whisper's audio encoder: merging EARLY all-at-once (layer 3) beats spreading over 3-7, likely because early
+layers give the most-poolable representations and each later merge event compounds drift. Reverted `FW_TOME_LAYERS`
+(encoder.rs == landed `dd4c5af` single-merge, the optimal config). The landed ToMe knob to tune is `FW_TOME_R`
+(more merge = more speed + more drift, one curve), NOT layer-spreading. Don't re-try progressive ToMe.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
