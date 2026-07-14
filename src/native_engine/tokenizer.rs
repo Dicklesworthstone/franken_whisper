@@ -421,7 +421,15 @@ impl Tokenizer {
                 bytes.extend_from_slice(b);
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        // The byte vector is already owned, so the normal valid-UTF-8 path can
+        // hand its allocation straight to `String`. `from_utf8_lossy` on a
+        // borrowed slice would allocate and copy the complete transcript even
+        // when validation succeeds. Preserve its exact replacement semantics
+        // only for malformed/orphan byte sequences.
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        }
     }
 
     /// Like [`Tokenizer::decode`] but renders special tokens as the bracketed
