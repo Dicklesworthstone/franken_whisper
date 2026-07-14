@@ -3132,13 +3132,13 @@ fn extract_word_level_segments(chunks: &[Value]) -> Vec<TranscriptionSegment> {
                 let start = sanitize_timestamp(
                     word_node
                         .get("start")
-                        .or_else(|| word_node.pointer("/timestamp/0"))
+                        .or_else(|| timestamp_index_value(word_node, 0, "0"))
                         .and_then(number_to_secs),
                 );
                 let end = sanitize_timestamp(
                     word_node
                         .get("end")
-                        .or_else(|| word_node.pointer("/timestamp/1"))
+                        .or_else(|| timestamp_index_value(word_node, 1, "1"))
                         .and_then(number_to_secs),
                 );
                 let text = word_node
@@ -3244,29 +3244,41 @@ fn segments_from_nodes(nodes: &[Value]) -> Vec<TranscriptionSegment> {
 }
 
 fn segment_start(node: &Value) -> Option<f64> {
-    let raw = if let Some(value) = node.pointer("/offsets/from") {
+    let raw = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("from")) {
         number_millis_to_secs(value)
     } else {
         node.get("start")
             .or_else(|| node.get("start_sec"))
-            .or_else(|| node.pointer("/timestamp/0"))
-            .or_else(|| node.pointer("/timestamp/start"))
+            .or_else(|| timestamp_index_value(node, 0, "0"))
+            .or_else(|| {
+                node.get("timestamp")
+                    .and_then(|timestamp| timestamp.get("start"))
+            })
             .and_then(number_to_secs)
     };
     sanitize_timestamp(raw)
 }
 
 fn segment_end(node: &Value) -> Option<f64> {
-    let raw = if let Some(value) = node.pointer("/offsets/to") {
+    let raw = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("to")) {
         number_millis_to_secs(value)
     } else {
         node.get("end")
             .or_else(|| node.get("end_sec"))
-            .or_else(|| node.pointer("/timestamp/1"))
-            .or_else(|| node.pointer("/timestamp/end"))
+            .or_else(|| timestamp_index_value(node, 1, "1"))
+            .or_else(|| {
+                node.get("timestamp")
+                    .and_then(|timestamp| timestamp.get("end"))
+            })
             .and_then(number_to_secs)
     };
     sanitize_timestamp(raw)
+}
+
+#[inline]
+fn timestamp_index_value<'a>(node: &'a Value, index: usize, key: &str) -> Option<&'a Value> {
+    let timestamp = node.get("timestamp")?;
+    timestamp.get(index).or_else(|| timestamp.get(key))
 }
 
 fn number_to_secs(value: &Value) -> Option<f64> {
@@ -6335,6 +6347,20 @@ mod tests {
         assert_eq!(segments[1].end_sec, Some(2.5));
         // "text" field used as fallback for "word"
         assert_eq!(segments[1].text, "world");
+    }
+
+    #[test]
+    fn timestamp_numeric_object_keys_match_json_pointer_semantics() {
+        let input = serde_json::json!({
+            "segments": [
+                {"text": "hello", "timestamp": {"0": 1.25, "1": 2.5}}
+            ]
+        });
+
+        let segments = extract_segments_from_json(&input);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_sec, Some(1.25));
+        assert_eq!(segments[0].end_sec, Some(2.5));
     }
 
     #[test]

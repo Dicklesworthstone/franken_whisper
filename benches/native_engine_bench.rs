@@ -46,6 +46,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use serde_json::{Value, json};
 
 use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel};
 use franken_whisper::native_engine::decoder::{self, DecoderState};
@@ -1540,6 +1541,120 @@ fn bench_tokenizer_decode_utf8(c: &mut Criterion) {
     group.finish();
 }
 
+fn timestamp_nodes(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| {
+            let start = i as f64 * 0.25;
+            let end = start + 0.2;
+            match i % 7 {
+                0 => json!({"start": start, "end": end}),
+                1 => json!({"start_sec": start, "end_sec": end}),
+                2 => json!({"timestamp": [start, end]}),
+                3 => json!({"timestamp": {"0": start, "1": end}}),
+                4 => json!({"timestamp": {"start": start, "end": end}}),
+                5 => json!({"offsets": {"from": start * 1000.0, "to": end * 1000.0}}),
+                _ => json!({
+                    "offsets": {"from": "invalid", "to": "invalid"},
+                    "start": start,
+                    "end": end,
+                }),
+            }
+        })
+        .collect()
+}
+
+fn timestamp_number(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_i64().map(|v| v as f64))
+}
+
+fn pointer_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
+    let start = if let Some(value) = node.pointer("/offsets/from") {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("start")
+            .or_else(|| node.get("start_sec"))
+            .or_else(|| node.pointer("/timestamp/0"))
+            .or_else(|| node.pointer("/timestamp/start"))
+            .and_then(timestamp_number)
+    };
+    let end = if let Some(value) = node.pointer("/offsets/to") {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("end")
+            .or_else(|| node.get("end_sec"))
+            .or_else(|| node.pointer("/timestamp/1"))
+            .or_else(|| node.pointer("/timestamp/end"))
+            .and_then(timestamp_number)
+    };
+    (start, end)
+}
+
+fn direct_timestamp_value<'a>(node: &'a Value, index: usize, key: &str) -> Option<&'a Value> {
+    let timestamp = node.get("timestamp")?;
+    timestamp.get(index).or_else(|| timestamp.get(key))
+}
+
+fn direct_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
+    let start = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("from")) {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("start")
+            .or_else(|| node.get("start_sec"))
+            .or_else(|| direct_timestamp_value(node, 0, "0"))
+            .or_else(|| {
+                node.get("timestamp")
+                    .and_then(|timestamp| timestamp.get("start"))
+            })
+            .and_then(timestamp_number)
+    };
+    let end = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("to")) {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        node.get("end")
+            .or_else(|| node.get("end_sec"))
+            .or_else(|| direct_timestamp_value(node, 1, "1"))
+            .or_else(|| {
+                node.get("timestamp")
+                    .and_then(|timestamp| timestamp.get("end"))
+            })
+            .and_then(timestamp_number)
+    };
+    (start, end)
+}
+
+fn bench_timestamp_lookup_ab(c: &mut Criterion) {
+    let nodes = timestamp_nodes(500);
+    let reference: Vec<_> = nodes.iter().map(pointer_timestamp_pair).collect();
+    let direct: Vec<_> = nodes.iter().map(direct_timestamp_pair).collect();
+    assert_eq!(
+        direct, reference,
+        "direct lookups must preserve pointer semantics"
+    );
+
+    let mut group = c.benchmark_group("native_engine/timestamp_lookup_ab");
+    group.bench_function("pointer_reference", |b| {
+        b.iter(|| {
+            let mut checksum = 0.0;
+            for node in &nodes {
+                let (start, end) = pointer_timestamp_pair(black_box(node));
+                checksum += start.unwrap_or_default() + end.unwrap_or_default();
+            }
+            black_box(checksum)
+        });
+    });
+    group.bench_function("direct_fields", |b| {
+        b.iter(|| {
+            let mut checksum = 0.0;
+            for node in &nodes {
+                let (start, end) = direct_timestamp_pair(black_box(node));
+                checksum += start.unwrap_or_default() + end.unwrap_or_default();
+            }
+            black_box(checksum)
+        });
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -1567,6 +1682,7 @@ criterion_group!(
     bench_tokenizer_from_vocab,
     bench_tokenizer_suppress_prefilter,
     bench_tokenizer_decode_utf8,
+    bench_timestamp_lookup_ab,
     bench_e2e_tiny_jfk,
     bench_e2e_tiny_jfk_no_timestamps,
     bench_e2e_large_jfk,
