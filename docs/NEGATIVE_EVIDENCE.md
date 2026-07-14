@@ -20,6 +20,15 @@ Re-confirmed closed this turn: attn+mlp residuals (both parallel at turbo, e43b5
 - **Conv stem is fully parallel** (not a single-threaded hotspot as hypothesized): im2col fans over output-row bands (`conv1d_wt`, nn.rs:4232, threshold 1<<16) and the GEMM routes to the internally-rayon-parallel ft sgemm (`matmul`→`matmul_into_uninit`→`ft_kernel_cpu` for m>1). The "only conv2 hits the f32-2D-tiler" note ≠ serial. Don't re-hunt conv.
 - **Load-cap default (32) sits on a FLAT optimal plateau:** `model_weights` min-of-4 vs `FW_LOAD_WORKERS` — 24→394, 28→356, 32→352, 36→356, 40→342, 48→344 ms. 28–48 all within ~15 ms noise (only ≤24 regresses); no value meaningfully beats 32, so 60eb989's default is right. `host∧32` vs `default_threads()` only diverge on >32-physical-core boxes (untestable here; both fall inside this plateau).
 - **`FW_STREAM_LOAD` default-flip stays owner-gated:** the cold-cache load-latency question can't be validated here — page-cache eviction needs `drop_caches` (sudo, dcg-blocked, and antisocial on a shared box). Warm evidence only (neutral wall, −26% minor faults, on top of −33% peak RSS). Fully prepped; needs a cold + multi-model + corpus pass the owner owns.
+- **Audio-input path re-read:** `backend/native_audio.rs` is VAD/silence analysis (`analyze_wav`/`compute_frame_rms`/`active_regions`), NOT the model decode. The model's default-ON normalize (~1.9% e2e, ffmpeg roundtrip) can't flip to `FW_WAV_PASSTHROUGH` byte-exactly — the ×32767-write vs /32768-read scale mismatch makes the skip non-byte-exact (WER-gated). No byte-exact lever.
+
+**HANDOFF — byte-exact autonomous CPU frontier CLOSED (verified 7 turns: load/threading/RSS/conv/audio/orchestration). Ranked remaining levers, all owner/infra/WER-gated:**
+1. **ToMe `FW_TOME_R`** — encoder −24% ≈ **−15% e2e** (biggest). Non-byte-exact BY CONSTRUCTION (merges tokens); transcript-identical jfk, drifts track01 → needs a WER/corpus gate.
+2. **`FW_STREAM_LOAD` default-flip** — −33% peak RSS for all users; warm-validated, blocked only on cold-cache + multi-model latency (needs page-cache eviction, unavailable on shared box).
+3. **temp-fallback / `FW_RETRY_FAILED_WINDOW` default-on** — correctness (fixes the ~48% tiny.en long-form content drop); fully evidenced, owner faithfulness call.
+4. **SDPA/sgemm poly-exp/int8-calib (in `ft_kernel_cpu`, cross-repo) + GPU offload** — infra/hardware.
+
+Nothing byte-exact remains on-box. A productive next step requires a WER/corpus harness for (1)/(3), page-cache control for (2), or cross-repo/hardware scope — otherwise further "pick a byte-exact lever" turns will keep landing here.
 
 ---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — allocation-free SRT/VTT timestamp display showed ~1.29x medians, but VTT did not clear its same-binary null envelope; source restored.**
