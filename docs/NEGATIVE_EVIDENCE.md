@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **BLOCKED / NO-SHIP — `bd-9sc3` has no admissible diarization compute target before the ECAPA substrate lands.**
+
+**Negative-ledger-first routing.** `bv --robot-triage` (data hash
+`32f38ab0154c982d`) ranked the neural diarization work (`bd-ohex`) as the
+highest fresh Whisper subsystem. The related performance bead `bd-9sc3`
+explicitly accepts a closed negative report. The 2026-07-12 sweep below had
+already rejected allocation hunting in the current native diarizer as
+per-request/per-segment and sub-floor, so this pass attributed the production
+path before making any source change.
+
+**Profile/attribution and one evaluated lever.** The current backend does not
+contain ECAPA/TitaNet inference or waveform speaker embeddings. It constructs
+one six-`f64` temporal/lexical vector per decoded transcript segment, then runs
+scalar heuristic clustering. The concrete local lever was to replace
+`cluster_members: Vec<Vec<SpeakerEmbedding>>` plus full centroid recomputation
+with six running sums and a count per cluster. That would remove one six-value
+clone and at most six additions per previously assigned member, but only at the
+decoded-segment cardinality; it cannot reduce model inference. The remaining
+quadratic silhouette pass likewise operates on six scalar values per segment
+and only produces a report metric. Inflating synthetic segment counts would
+manufacture a workload unrelated to real Whisper output rather than measure
+the requested noisy multi-speaker pipeline.
+
+**Verdict.** No runtime source was changed and no Cargo benchmark was launched:
+there is no representative neural compute path to optimize or corpus/model
+pair with which to compare it, while the only heuristic lever is already below
+the admitted end-to-end timing floor. `bd-ohex` is the prerequisite. Reopen
+performance work after a real speaker encoder and a checked-in multi-speaker
+corpus gate exist; then profile encoder inference, embedding transfer, and
+clustering separately with the same release binary and worker. This is a
+substrate blocker, not evidence that neural diarization has no optimization
+headroom.
+
+---
 ## 2026-07-14 - Codex: **HOLD / INVALID NULL — packed self-K measured a 3.499165x median and 21/21 wins, but BASE/BASE was biased at 0.939439x; source restored.**
 
 **Negative-ledger-first pivot and attribution.** The preceding DTW, i7 row-block,
