@@ -21281,6 +21281,22 @@ which has 32 layers of redundancy) — reverted (no probe kept; there's no N tha
 FLOP floor: the only structural decode lever is speculative-decode (owner) — you cannot cheapen the per-token
 forward by dropping layers on an already-distilled 4-layer decoder.** Cache-consistency of a deterministic
 layer-skip IS sound (a reusable finding), but the decoder can't afford to lose any depth.
+**Tick 2026-07-14cc (fresh-context loop) — encoder MLP hidden-neuron PRUNING (`FW_ENC_MLP_KEEP`) is catastrophically
+WER-sensitive (verified NOT a bug); the encoder yields to TOKEN-merging (ToMe) but NOT NEURON-pruning.** The
+encoder MLP (fc1 1280→5120 + gelu + fc2 5120→1280) is the biggest per-token encoder cost (~39% of enc sub-ops)
+that ToMe only reduces proportionally, so tried structured neuron pruning: keep the top-K of the 5120 hidden
+neurons by fc1-row L2 importance, drop the rest from fc1's output rows + fc2's input cols + fc1 bias (added
+`I7Mat::row_l2_norms`/`gather_rows`/`gather_cols` — no re-quant, just slice i7 + recompute fc2 colsum; the MLP
+forward is shape-generic so pruned dims flow through). Built + swept jfk: **perf real (encoder_window −9% at
+keep=4096, −20% at 2560) but the transcript EMPTIES.** Ruled out a bug with a drop-1 discriminator: keep=5119
+(drop 1) → CORRECT 22-word jfk; keep=5000 (drop 2.3%) → 8 words (degraded, loses first half); keep=4608 (drop
+10%) → 0 words; keep=4096 (drop 20%) → 0 words. So the arithmetic is correct (drop-1 perfect) but whisper's
+encoder MLP is EXTREMELY sensitive to neuron removal — even 2.3% per-layer pruning, COMPOUNDED over 32 layers
+with no fine-tuning, destroys the encoder representation ⇒ empty/garbage. **Key contrast: the encoder yields to
+structural TOKEN reduction (ToMe merges REDUNDANT tokens, transcript-safe at R=200 = 36% of jfk tokens) but NOT
+to FEATURE reduction (neuron pruning drops learned features → catastrophic without retraining).** No viable
+operating point (fine-tuning is owner/training-scoped). Reverted (nn.rs + encoder.rs == HEAD, no dead code kept).
+So the encoder structural frontier = ToMe (landed) only; MLP/attention neuron-or-layer pruning all need training.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
