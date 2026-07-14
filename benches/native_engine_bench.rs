@@ -1504,6 +1504,42 @@ fn bench_tokenizer_suppress_prefilter(c: &mut Criterion) {
     group.finish();
 }
 
+fn tokenizer_decode_with_owned_copy(tokenizer: &Tokenizer, ids: &[i32]) -> String {
+    let mut bytes = Vec::new();
+    for &id in ids {
+        if tokenizer.is_special(id) {
+            continue;
+        }
+        if let Some(token) = tokenizer.token_bytes(id) {
+            bytes.extend_from_slice(token);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn bench_tokenizer_decode_utf8(c: &mut Criterion) {
+    let hparams = tokenizer_bench_hparams();
+    let tokenizer = Tokenizer::from_vocab(&hparams, tokenizer_bench_vocab());
+    let ids: Vec<i32> = (0..256).collect();
+    let expected = tokenizer_decode_with_owned_copy(&tokenizer, &ids);
+    assert_eq!(tokenizer.decode(&ids), expected);
+
+    let mut group = c.benchmark_group("native_engine/tokenizer_decode_utf8");
+    group.throughput(criterion::Throughput::Bytes(expected.len() as u64));
+    group.bench_function("lossy_owned_copy", |bch| {
+        bch.iter(|| {
+            black_box(tokenizer_decode_with_owned_copy(
+                black_box(&tokenizer),
+                black_box(&ids),
+            ))
+        });
+    });
+    group.bench_function("owned_vec_handoff", |bch| {
+        bch.iter(|| black_box(black_box(&tokenizer).decode(black_box(&ids))));
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -1530,6 +1566,7 @@ criterion_group!(
     bench_sanitize_downmix,
     bench_tokenizer_from_vocab,
     bench_tokenizer_suppress_prefilter,
+    bench_tokenizer_decode_utf8,
     bench_e2e_tiny_jfk,
     bench_e2e_tiny_jfk_no_timestamps,
     bench_e2e_large_jfk,
