@@ -221,7 +221,7 @@ fn load_linear_transposed(
         return Ok(Mat::from_vec(
             in_dim,
             out_dim,
-            dequant_transpose_f16_bytes(raw, out_dim, in_dim),
+            dequant_transpose_f16_bytes(&raw, out_dim, in_dim),
         ));
     }
 
@@ -292,7 +292,7 @@ fn load_linear_maybe_i7(
             }
             return Ok((
                 Mat::from_vec(0, 0, Vec::new()),
-                Some(nn::quantize_f16_bytes_to_i7(raw, out_dim, in_dim)),
+                Some(nn::quantize_f16_bytes_to_i7(&raw, out_dim, in_dim)),
             ));
         }
         // f32-stored fallback (no f16 bytes): materialize, quantize, drop.
@@ -1343,7 +1343,7 @@ fn load_linear_i8_direct(
             }
             return Ok((
                 Mat::from_vec(0, 0, Vec::new()),
-                quantize_enc_i8_f16_bytes(raw, out_dim, in_dim),
+                quantize_enc_i8_f16_bytes(&raw, out_dim, in_dim),
             ));
         }
         let w = load_linear_transposed(model, name, out_dim, in_dim)?;
