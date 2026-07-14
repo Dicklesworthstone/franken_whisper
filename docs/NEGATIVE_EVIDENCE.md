@@ -4,6 +4,72 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **HOLD / INVALID NULL — packed self-K measured a 3.499165x median and 21/21 wins, but BASE/BASE was biased at 0.939439x; source restored.**
+
+**Negative-ledger-first pivot and attribution.** The preceding DTW, i7 row-block,
+and streaming allocation lanes were excluded, as were the already-settled mel/FFT
+and audio-resampler primitives. The packed f32 self-K candidate was admissible:
+the 2026-07-10 row explicitly parked it as unmeasured after strict RCH failed
+before Cargo ran, and the older loop-swap rejection exercised a private replica
+rather than production `attention_with_cache`. A real long-form
+`large-v3-turbo` profile attributes 0.17% of transcription self-time to
+`attention_with_cache`; within that symbol, the scalar key-score multiply/add
+chain accounts for 52.87% of samples. Because main now contains the dormant
+packed implementation and exactness test, default routing scored
+`(impact 1 x confidence 5) / effort 1 = 5`.
+
+**One lever and behavior proof.** The candidate made main's existing state-major
+f32 key mirror the default for `KvCache::new`, retaining the token-major keys for
+prefill and adding `FW_KV_COLUMN_KEYS=0` as the rollback. The f16 cache path was
+unchanged. At turbo geometry the mirror costs 2,293,760 bytes per decoder layer,
+or 8.75 MiB over four layers. The timed path included the per-token mirror scatter
+and production `attention_with_cache`, softmax, and score-times-V work at the
+maximum 448-token cache depth. All 1,280 output f32 values matched the historical
+row-major path bit-for-bit; their little-endian SHA-256 was
+`9f9ea93fd81fed011887b106051803218784002f206090dbd09846d8f2abd259`.
+
+**Strict-remote foreground evidence.** The sole A/B command was
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch
+--no-self-healing exec -- cargo test --profile release --lib
+native_engine::nn::tests::kv_column_keys_perf -- --ignored --exact --nocapture
+--test-threads=1`. RCH job `j-29928833041828437` stayed on `vmi1227854`; no
+local fallback occurred. RCH rewrote to the same worker target pool used by the
+previous release test but nevertheless reported `Cache: MISS`, so the requested
+warm gate cold-built for 15m30s; the timed test itself finished in 1.13s.
+
+After three warmups, the binary ran 21 order-alternated row-major/row-major null
+pairs and 21 row-major/packed pairs, 32 complete maximum-depth attention steps
+per arm. The predeclared gate required null median in `[0.95, 1.05]`, candidate
+median above `max(null p90, 1.05)`, candidate p10 above one, and at least 18/21
+wins.
+
+| comparison | p10 | median | p90 | wins | verdict |
+|---|---:|---:|---:|---:|---|
+| row-major / row-major null | 0.748065 | **0.939439** | 1.092850 | — | **invalid: median below 0.95** |
+| row-major / packed self-K | **3.120577x** | **3.499165x** | 3.791227x | **21/21** | strong direction, inadmissible run |
+
+BASE/BASE ratios:
+`[0.895116, 1.017636, 0.969894, 1.001961, 0.880920, 0.872047,
+0.833556, 0.941771, 0.918733, 0.896914, 0.939439, 1.113275,
+0.974103, 1.082744, 1.092850, 1.115179, 1.079370, 0.746009,
+0.735778, 0.748065, 0.784578]`.
+
+Historical/packed ratios:
+`[3.523166, 3.587302, 3.199407, 3.266013, 3.066268, 3.321502,
+3.216672, 3.499165, 3.299897, 3.120577, 3.618895, 3.791227,
+3.584163, 3.510507, 2.825098, 3.680003, 3.228716, 3.934475,
+3.432648, 3.528430, 3.927581]`.
+
+**Verdict.** The packed layout is exact and its directional signal is far outside
+the null envelope, but the predeclared control validity condition failed by
+1.056 percentage points. It therefore cannot be called a measured win or made
+default from this run. Production routing and the temporary oracle were restored
+manually; only this evidence remains. The primitive is held, not rejected. Any
+future retry must eliminate the repeatable row-cache placement bias with symmetric
+allocation/page-touch controls; the active performance search should now move to
+a different subsystem rather than spend another turn on KV.
+
+---
 ## 2026-07-14 - Codex: **REJECT / NO-SHIP — request-scoped DTW median-filter scratch measured 0.998717x median with 10/21 wins; source restored.**
 
 **Negative-ledger-first target and attribution.** Bead `bd-vsg6` calls out
