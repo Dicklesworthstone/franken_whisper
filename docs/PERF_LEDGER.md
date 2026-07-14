@@ -51,6 +51,55 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): stream CSV quote escaping without replacement strings — **1.357949x current-like median**
+
+**What.** `write_csv` previously called `str::replace` for both speaker and
+transcript text on every segment, materializing two temporary strings before
+writing each row. It now scans the borrowed UTF-8 fields and writes ordinary
+chunks plus doubled quotes directly into the existing `BufWriter`. This
+removes the replacement-string allocation and copy while preserving the CSV
+schema, number formatting, row order, buffering, and explicit flush. A
+negative-ledger-first scan found the earlier export buffering keep, but no row
+covering field escaping or these per-row temporary strings.
+
+**Exactness.** The candidate and a frozen helper containing the historical two
+`replace` calls produced identical complete CSV bytes for empty fields,
+missing speakers, ordinary text, quotes at field boundaries, interior and
+consecutive quotes, commas, CR/LF, backslashes, Unicode, and mixed timestamp
+presence. The timed 32-segment artifact also compared exact bytes before
+measurement. It included eight speaker labels and four quote-bearing
+transcripts; its 2,632-byte output had SHA-256
+`c2b956856b54490d3c15de0ed3926b31697062c4523aca8ca8f18c7ac244a02f`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041827839` ran only on
+worker `vmi1227854` with `--profile release-perf`, LTO disabled, and 16 codegen
+units; no local fallback occurred. Benchmark-binary SHA-256 was
+`cdcc675ceebca5e3ac86bc9787493acec2c9d9869cd753f82c8e756757955afa`.
+The same binary ran the exhaustive byte oracle, three warmups, 21 alternating
+historical/historical null pairs, and 21 alternating historical/streaming
+pairs, with 4,000 complete artifacts per arm and emitted bytes black-boxed.
+The null median passed the predeclared `[0.95, 1.05]` guard; candidate p10
+cleared `max(null p90, 1.05)` and the candidate won all 21 pairs. The raw
+paired-ratio CV was 14.36%; the explicit null envelope therefore remains the
+shipping comparator.
+
+| comparison | p10 | median | p90 | arm medians / 4,000 artifacts | wins | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.878467 | **1.005045** | **1.181035** | — | — | valid null |
+| historical / streaming escape | **1.186256x** | **1.357949x** | 1.536390x | 27,248,344 ns / 20,649,323 ns | **21/21** | **keep: p10 exceeds null p90** |
+
+BASE/BASE ratios:
+`[1.482286, 1.088386, 0.878467, 1.059214, 1.005045, 0.903651,
+1.136422, 0.824354, 1.155589, 0.815663, 0.955999, 1.067933,
+1.213056, 1.042401, 1.005449, 0.987145, 1.002337, 0.894513,
+1.181035, 0.935545, 0.972950]`.
+
+Historical/streaming-escape ratios:
+`[1.186256, 1.437660, 1.475239, 1.204278, 1.290702, 1.322026,
+1.281008, 1.472994, 1.159137, 2.008997, 1.536390, 1.794632,
+1.378769, 1.348428, 1.424344, 1.379553, 1.294464, 1.354050,
+1.174497, 1.388006, 1.357949]`.
+
 ### 2026-07-14 UTC — Codex — LANDED (byte-exact): transfer owned `RunReport` payloads into pretty-JSON DOM — **1.356328x current-like median**
 
 **What.** Normal `fw transcribe --json` previously passed `&RunReport` to
