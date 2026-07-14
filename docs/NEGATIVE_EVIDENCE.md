@@ -4,6 +4,45 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-14 - Codex: **HOLD / NO-SHIP — terminal speculative event-log ownership move failed the current-like null-controlled gate; source restored.**
+
+**Negative-ledger-first target.** `execute_backend_speculative` copied every
+`RunEvent` with `pipeline.events().to_vec()` immediately before dropping the
+`SpeculativeStreamingPipeline`. No existing ledger row covered this terminal
+handoff; the adjacent landed `EventLog::push` move removes a different clone
+while ordinary events are inserted. The candidate added a consuming
+`SpeculativeStreamingPipeline::into_events` accessor and used it only after
+statistics and merged segments had been computed. Opportunity score was
+`(impact 4 x confidence 5) / effort 1 = 20`.
+
+**Behavior proof.** The same test binary compared the historical clone and
+candidate move for empty, 20-event, and 1,000-event vectors containing ordered
+sequence numbers, fixed timestamps, owned strings, nullable fields, nested JSON,
+newlines, quotes, and Unicode. Serialized event-vector bytes matched exactly.
+The current-like 20-event vector was 7,962 bytes with SHA-256
+`ebd112c2270504cb3a584eee28161d90f1df8b07cc350c132a62b15183af3bc8`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041827696` ran on
+worker `vmi1293453` with `--profile release-perf`, opt-level 3, LTO disabled,
+and 16 codegen units; no local fallback occurred. Benchmark-binary SHA-256 was
+`b57beac14fb382c6d6d0ae967908dedbba534ebad877e5de40fbb3ec1966cb57`.
+The current-like shape used 5,000 prebuilt pipelines x 20 events, three warmups,
+21 alternating historical/historical null pairs, and 21 alternating
+historical/move pairs. Its null median passed the predeclared `[0.95, 1.05]`
+guard, but candidate p10 was only `0.842383` versus null p90 `1.086422`.
+The harness therefore rejected the candidate before its diagnostic print and
+before the planned 1,000-event long shape; no unprinted median or long-shape
+result is claimed.
+
+**Verdict.** Exactness is proven, but the production-like shape did not separate
+from the measured floor and included materially slower candidate-tail samples.
+The source, oracle, and benchmark were restored manually; only this evidence row
+remains. Do not retry the terminal `events().to_vec()` ownership move from
+structural reasoning alone. Reopen only if a full speculative-pipeline profile
+attributes material time to this copy and a rerun prints all statistics before
+enforcing the gate.
+
+---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — SQL transcript-prefix projection measured 1.425339x on 16-KiB rows, but the 49-byte current-like guard did not clear; source restored.**
 
 **Negative-ledger-first target.** Existing storage closure covered N+1 detail
