@@ -21181,6 +21181,21 @@ run FINALLY characterized the LANDED ToMe on the realistic long-audio workload (
 before): **R=200 unmerge = wall 8560 vs 9553 baseline = −10.4 % e2e** (decode content-drift small, 255 vs 257 w,
 22 word-lines) — so the encoder is NOT fully pipelined-away and the ToMe win SURVIVES to e2e even in the
 decode-dominated regime. Recorded in the PERF_LEDGER ToMe entry.
+**Tick 2026-07-14bb (fresh-context loop) — DECODER layer pruning (`FW_DECODER_LAYERS`) DOUBLY catastrophic
+(empty output AND slower) — the turbo/tiny decoder is at its minimal viable depth; reverted.** The encoder has
+a layer-pruning probe (`FW_ENCODER_LAYERS`) but the decoder — the long-audio bottleneck (62.5%) — had none, so
+built `FW_DECODER_LAYERS=N` (run only the first N decoder blocks; a DETERMINISTIC skip ⇒ skipped layers' KV
+caches are never appended nor read, so `cache_len` stays consistent — this IS cache-safe, verified: N=all4 =
+257 w = baseline). Benched track01 (turbo, 4 decoder layers): **N=3 (drop 1 layer) → EMPTY transcript (0 words)
+AND decode_loop 10993 ms vs 5278 baseline (≈2× SLOWER), wall 13535 vs 8104; N=2 same (0 words, 8830 ms).** Two
+findings: (1) the turbo decoder (distilled from large-v3's 32 layers down to 4) is at its MINIMUM viable depth —
+dropping even 1 of 4 produces garbage/no valid EOT ⇒ empty output; (2) counter-intuitively it's SLOWER, not
+faster: the broken decoder never emits a clean EOT ⇒ runaway decoding to max-length / window RETRIES ⇒ MORE
+decode work despite fewer layers-per-step. So decoder pruning has NO viable operating point (unlike the encoder,
+which has 32 layers of redundancy) — reverted (no probe kept; there's no N that works). **Confirms the decode
+FLOP floor: the only structural decode lever is speculative-decode (owner) — you cannot cheapen the per-token
+forward by dropping layers on an already-distilled 4-layer decoder.** Cache-consistency of a deterministic
+layer-skip IS sound (a reusable finding), but the decoder can't afford to lose any depth.
 **Tick 2026-07-13 (this loop) — NEW datapoint, `int4_mlp0` falsified on BOTH axes (was a lingering default-off
 scaffold, not previously e2e-tested on realistic audio):** ran the real prebuilt `fw` (no build) on track01
 (124 s / 5-window real speech, tiny.en, no_ts) A/B `FRANKEN_WHISPER_INT4_MLP0` off-vs-on, A/A null-control
