@@ -51,6 +51,61 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (drift-byte exact): reuse zero character distance to skip unchanged-transcript word DP — **27.907895x confirmation-drift median**
+
+**What.** `CorrectionDrift::compute` always computes character edit distance
+before approximate word error rate. A zero character distance proves that the
+concatenated Unicode scalar sequences are identical, yet the historical path
+still split both strings, allocated two word vectors, and evaluated the
+quadratic word-level Levenshtein matrix to obtain zero again. The unchanged-text
+path now returns WER `0.0` directly after the required character metric. The
+non-identical correction path is structurally unchanged and performs no new
+comparison scan. Negative-ledger-first search found no prior identity-shortcut
+row or source attempt. Opportunity score:
+`(impact 4 x confidence 5) / effort 1 = 20`.
+
+**Exactness.** The same release-perf binary compared serialized full
+`CorrectionDrift` bytes against a test-local mirror of current main before this
+lever for four cases: the measured Unicode fixture with different confidence
+and speaker metadata, empty inputs, differently segmented inputs with identical
+concatenated text, and a divergent Unicode fallback. All matched. Historical
+zero divided by `max_words >= 1` and candidate literal `0.0` are both positive
+IEEE-754 zero. Result bytes: 104; SHA256
+`2fe8a8c051f390119fee36238243706b5b6e01b6c094796352ddef2bb0223f27`.
+
+| comparison | p10 | median | p90 | normalized per-call medians | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.938037 | **1.046727** | **1.225762** | — | — | — | valid null |
+| unconditional word DP / zero-distance shortcut | **22.747072x** | **27.907895x** | 31.947460x | 77,668 ns / 2,861 ns | 76.65% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+BASE/BASE ratios:
+`[1.101065, 1.020949, 1.046727, 0.980215, 1.168956, 1.103815,
+1.168207, 0.956621, 1.177964, 0.992084, 1.119496, 0.938037,
+0.991654, 1.048975, 1.037314, 0.843433, 0.763287, 1.012973,
+1.225762, 1.345160, 1.244533]`.
+
+Historical/candidate normalized per-call ratios:
+`[28.231704, 26.391098, 26.724453, 26.258699, 22.747072, 6.008015,
+23.940905, 27.410583, 34.157233, 28.684514, 22.439040, 27.541822,
+27.907895, 27.987220, 25.163377, 31.940783, 33.175931, 31.788144,
+31.947460, 28.917916, 30.912547]`.
+
+**Reproduction.** One fail-closed foreground invocation ran both arms:
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 env -u CARGO_TARGET_DIR rch --no-self-healing exec -- cargo test --config profile.release-perf.lto=false --config profile.release-perf.codegen-units=16 --profile release-perf -p franken_whisper --lib correction_drift_identity_shortcut -- --include-ignored --nocapture`.
+Worker `vmi1227854`; job `j-29928833041828212`; benchmark-binary SHA256
+`53cea00397654051f9159a5aec13c2b259110106873f7eef28f7e70518438395`;
+2/2 filtered tests passed. Historical and candidate arms calibrated separately
+to approximately 50 ms (469 versus 11,774 calls), and all speedups are normalized
+per call. One candidate arm was interrupted by a large host outlier, producing
+the informational 76.65% CV; the conservative candidate p10 still exceeded the
+null p90 by more than 18x.
+
+**Scope.** The measured boundary is full `CorrectionDrift::compute` on 12 fast
+and 12 quality segments with 1,283 identical concatenated characters but
+different metadata. This is not end-to-end ASR latency. Overall gain scales with
+the rate and length of unchanged speculative confirmations; corrected text still
+runs the historical word metric.
+
 ### 2026-07-14 UTC — Codex — LANDED (Unicode-exact): trim common transcript affixes before character edit-distance DP — **32.274625x correction-drift median**
 
 **What.** `CorrectionDrift::compute` materialized the full character-level
