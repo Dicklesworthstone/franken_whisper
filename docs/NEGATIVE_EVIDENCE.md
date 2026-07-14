@@ -16,6 +16,11 @@ The default-32 load win prompted "is the ENCODER (64% of e2e) also over-threaded
 
 Re-confirmed closed this turn: attn+mlp residuals (both parallel at turbo, e43b50a), LayerNorm (row-band parallel >1<<16 elts, nn.rs:3536), decoder f16 `token_embedding` (NOT freeable — needed for byte-exact input-embed; the i8 copy is additive for logits), orchestration/audio (~44 ms of 2.4 s wall; routing 3 ms). Byte-exact autonomous CPU frontier re-exhausted; remaining is owner/GPU/WER-gated.
 
+**Follow-up re-audit (same session, NO-BUILD) — three more paths closed:**
+- **Conv stem is fully parallel** (not a single-threaded hotspot as hypothesized): im2col fans over output-row bands (`conv1d_wt`, nn.rs:4232, threshold 1<<16) and the GEMM routes to the internally-rayon-parallel ft sgemm (`matmul`→`matmul_into_uninit`→`ft_kernel_cpu` for m>1). The "only conv2 hits the f32-2D-tiler" note ≠ serial. Don't re-hunt conv.
+- **Load-cap default (32) sits on a FLAT optimal plateau:** `model_weights` min-of-4 vs `FW_LOAD_WORKERS` — 24→394, 28→356, 32→352, 36→356, 40→342, 48→344 ms. 28–48 all within ~15 ms noise (only ≤24 regresses); no value meaningfully beats 32, so 60eb989's default is right. `host∧32` vs `default_threads()` only diverge on >32-physical-core boxes (untestable here; both fall inside this plateau).
+- **`FW_STREAM_LOAD` default-flip stays owner-gated:** the cold-cache load-latency question can't be validated here — page-cache eviction needs `drop_caches` (sudo, dcg-blocked, and antisocial on a shared box). Warm evidence only (neutral wall, −26% minor faults, on top of −33% peak RSS). Fully prepped; needs a cold + multi-model + corpus pass the owner owns.
+
 ---
 ## 2026-07-14 - Codex: **HOLD / NO-SHIP — allocation-free SRT/VTT timestamp display showed ~1.29x medians, but VTT did not clear its same-binary null envelope; source restored.**
 
