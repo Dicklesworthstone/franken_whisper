@@ -1661,7 +1661,11 @@ async fn run_pipeline_body(
         normalized_wav_path: normalized_wav_str,
         request: request.clone(),
         result,
-        events: log.events.clone(),
+        events: if has_persist {
+            Vec::new()
+        } else {
+            log.events.clone()
+        },
         warnings: std::mem::take(&mut inter.warnings),
         evidence: pcx.evidence().to_vec(),
         replay: crate::model::ReplayEnvelope {
@@ -4276,6 +4280,332 @@ mod tests {
         source_separate, split_long_regions, stage_budget_ms, stage_failure_code,
         stage_failure_message, stage_latency_profile, state_root, vad_energy_detect,
     };
+
+    #[test]
+    fn report_event_snapshot_elision_preserves_pipeline_tail_events() {
+        fn request(root: &std::path::Path, db_name: &str, persist: bool) -> TranscribeRequest {
+            TranscribeRequest {
+                input: InputSource::File {
+                    path: root.join("unused.wav"),
+                },
+                backend: BackendKind::Auto,
+                model: None,
+                language: None,
+                translate: false,
+                diarize: false,
+                persist,
+                db_path: root.join(db_name),
+                timeout_ms: None,
+                backend_params: BackendParams::default(),
+            }
+        }
+
+        fn codes(report: &RunReport) -> Vec<&str> {
+            report
+                .events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect()
+        }
+
+        fn assert_contiguous_events(events: &[RunEvent]) {
+            assert!(
+                events
+                    .iter()
+                    .enumerate()
+                    .all(|(index, event)| event.seq == index as u64 + 1),
+                "event sequence must remain contiguous"
+            );
+        }
+
+        let dir = tempdir().expect("tempdir should be available");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let persist_config = PipelineConfig::new(vec![PipelineStage::Persist]);
+
+        let persisted = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "persist.sqlite3", true),
+                dir.path(),
+                None,
+                &persist_config,
+            ))
+            .expect("persist-only pipeline should succeed");
+        assert_eq!(
+            codes(&persisted),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.start",
+                "persist.ok",
+            ]
+        );
+        assert_contiguous_events(&persisted.events);
+
+        let stored = RunStore::open(&dir.path().join("persist.sqlite3"))
+            .expect("store should open")
+            .load_run_details(&persisted.run_id)
+            .expect("stored report should load")
+            .expect("stored report should exist");
+        assert_eq!(
+            stored
+                .events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.start",
+            ]
+        );
+        assert_contiguous_events(&stored.events);
+
+        let skipped = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "skip.sqlite3", false),
+                dir.path(),
+                None,
+                &persist_config,
+            ))
+            .expect("disabled persistence should return a report");
+        assert_eq!(
+            codes(&skipped),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.skip",
+            ]
+        );
+        assert_contiguous_events(&skipped.events);
+
+        let no_persist = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "absent.sqlite3", true),
+                dir.path(),
+                None,
+                &PipelineConfig::new(Vec::new()),
+            ))
+            .expect("empty pipeline should return a report");
+        assert_eq!(
+            codes(&no_persist),
+            vec!["orchestration.budgets", "orchestration.latency_profile"]
+        );
+        assert_contiguous_events(&no_persist.events);
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn report_event_snapshot_elision_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 128;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        struct ReportShell {
+            events: Vec<RunEvent>,
+        }
+
+        fn fixture_log() -> EventLog {
+            let trace_id = "0123456789abcdef0123456789abcdef";
+            let events = (0..20)
+                .map(|index| RunEvent {
+                    seq: index + 1,
+                    ts_rfc3339: format!("2026-07-14T00:00:{index:02}Z"),
+                    stage: format!("stage_{}", index % 6),
+                    code: format!("stage.{}.ok", index % 6),
+                    message: format!(
+                        "current-like pipeline event {index:02}: {}",
+                        "measured payload with quotes \"text\", Unicode λ and 🎧 ".repeat(2)
+                    ),
+                    payload: json!({
+                        "index": index,
+                        "trace_id": trace_id,
+                        "nested": {
+                            "label": format!("payload-{index:02}"),
+                            "values": [index, index + 1, index + 2],
+                            "detail": "structured event payload ".repeat(4),
+                        },
+                    }),
+                })
+                .collect();
+
+            EventLog {
+                run_id: "perf-run".to_owned(),
+                trace_id: trace_id.to_owned(),
+                seq: 20,
+                events,
+                event_tx: None,
+                stage_start: None,
+            }
+        }
+
+        fn restore_log(log: &mut EventLog) {
+            let removed = log.events.pop().expect("remove persist.start");
+            assert_eq!(removed.code, "persist.start");
+            log.seq -= 1;
+            log.clear_stage_start();
+        }
+
+        fn time_historical(log: &mut EventLog, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let mut report = ReportShell {
+                    events: log.events.clone(),
+                };
+                log.mark_stage_start();
+                log.push(
+                    "persist",
+                    "persist.start",
+                    "writing run report to frankensqlite",
+                    json!({"db_path": "current-like.sqlite3", "budget_ms": 20_000}),
+                );
+                report.events = log.events.clone();
+                restore_log(log);
+                drop(black_box(report));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(log: &mut EventLog, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let mut report = ReportShell { events: Vec::new() };
+                log.mark_stage_start();
+                log.push(
+                    "persist",
+                    "persist.start",
+                    "writing run report to frankensqlite",
+                    json!({"db_path": "current-like.sqlite3", "budget_ms": 20_000}),
+                );
+                report.events = log.events.clone();
+                restore_log(log);
+                drop(black_box(report));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let mut historical_log = fixture_log();
+        let mut candidate_log = fixture_log();
+        let fixture_bytes = serde_json::to_vec(&historical_log.events)
+            .expect("serialize current-like event fixture");
+        assert_eq!(
+            fixture_bytes,
+            serde_json::to_vec(&candidate_log.events).expect("serialize candidate fixture")
+        );
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "report_event_snapshot_elision binary_sha256={:x} events={} fixture_bytes={} fixture_sha256={:x}",
+            Sha256::digest(executable),
+            historical_log.events.len(),
+            fixture_bytes.len(),
+            Sha256::digest(&fixture_bytes)
+        );
+
+        let calibration = time_historical(&mut historical_log, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration)
+            .clamp(512, 20_000) as usize;
+        eprintln!(
+            "report_event_snapshot_elision calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&mut historical_log, iterations));
+            black_box(time_candidate(&mut candidate_log, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&mut historical_log, iterations);
+            let null_second = time_historical(&mut historical_log, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, candidate) = if sample % 2 == 0 {
+                (
+                    time_historical(&mut historical_log, iterations),
+                    time_candidate(&mut candidate_log, iterations),
+                )
+            } else {
+                let candidate = time_candidate(&mut candidate_log, iterations);
+                let historical = time_historical(&mut historical_log, iterations);
+                (historical, candidate)
+            };
+            historical_times.push(historical);
+            candidate_times.push(candidate);
+            speedups.push(historical as f64 / candidate as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "report_event_snapshot_elision samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} candidate_arm_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&candidate_times),
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "report_event_snapshot_elision null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert_eq!(historical_log.events.len(), 20);
+        assert_eq!(candidate_log.events.len(), 20);
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.05),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.05)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
+    }
 
     #[test]
     fn event_log_streams_and_accumulates_with_monotonic_sequence() {

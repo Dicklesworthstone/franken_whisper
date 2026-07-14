@@ -51,6 +51,56 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (event-exact): elide the pre-persist `RunReport` event snapshot — **1.933799x current-like median**
+
+**What.** `run_pipeline_body` constructed a `RunReport` by cloning the complete
+event log, but every pipeline containing `Persist` then unconditionally replaced
+that snapshot after emitting either `persist.start` or `persist.skip`. The report
+now starts with an empty event vector only when a `Persist` stage is present; the
+existing post-event assignment remains the single snapshot. Pipelines without
+`Persist` retain the historical clone. Negative-ledger-first review found the
+rejected terminal speculative-pipeline ownership move, but that row covers a
+different handoff and does not cover this clone that is always overwritten.
+Opportunity score was `(impact 4 x confidence 5) / effort 1 = 20`.
+
+**Exactness.** The same release-perf binary exercised the actual orchestration
+path in all three branches. A persist-only pipeline returned the ordered event
+codes `orchestration.budgets`, `orchestration.latency_profile`, `persist.start`,
+and `persist.ok`; its stored database snapshot retained the historical first
+three codes. Persistence-disabled returned the same two orchestration events
+followed by `persist.skip`, while a pipeline with no `Persist` stage retained the
+two historical orchestration events. Every branch also proved contiguous event
+sequence numbers. The timed 20-event nested-JSON fixture serialized to 9,575
+bytes with SHA-256
+`de0d54c3b35f652d88be47948eef454772433797181ea194e053f0ec8e1413f4`.
+
+**Strict-remote foreground proof.** RCH job `j-29928833041827903` ran only on
+worker `vmi1264463` with `--profile release-perf`, LTO disabled, and 16 codegen
+units; no local Cargo fallback occurred. Benchmark-binary SHA-256 was
+`c05799eb758a709a85a30a3670f4fbf5e4dbf31f2356481250f52ee6a93ff02c`.
+The direct snapshot/persist-tail boundary used three warmups, 21 alternating
+historical/historical null pairs, and 21 alternating historical/candidate pairs,
+with 818 complete transitions per arm. It printed all statistics before enforcing
+the predeclared gate. The null median passed `[0.95, 1.05]`; candidate p10 cleared
+`max(null p90, 1.05)` and the candidate won all 21 pairs.
+
+| comparison | p10 | median | p90 | arm medians / 818 transitions | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| historical / historical null | 0.870784 | **0.962681** | **1.050650** | — | — | — | valid null |
+| historical / one snapshot | **1.750419x** | **1.933799x** | 2.287652x | 47,167,151 ns / 25,118,537 ns | 13.94% | **21/21** | **keep: p10 exceeds null p90 and 1.05 floor** |
+
+BASE/BASE ratios:
+`[0.893793, 0.846566, 1.050650, 0.886816, 1.256978, 0.964898,
+0.856377, 1.015301, 0.984085, 0.957224, 0.870784, 1.152204,
+1.044716, 1.036325, 0.931027, 0.967474, 1.013368, 0.939982,
+0.934395, 0.897999, 0.962681]`.
+
+Historical/one-snapshot ratios:
+`[2.068533, 1.926523, 2.141440, 2.054167, 2.287652, 1.933799,
+1.750419, 1.710622, 2.191191, 1.961359, 1.858517, 1.393919,
+1.877783, 2.469524, 1.900342, 1.887955, 1.924240, 1.920381,
+2.019286, 2.268228, 2.385713]`.
+
 ### 2026-07-14 UTC — Codex — LANDED (byte-exact): stream CSV quote escaping without replacement strings — **1.357949x current-like median**
 
 **What.** `write_csv` previously called `str::replace` for both speaker and
