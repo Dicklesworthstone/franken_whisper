@@ -51,6 +51,97 @@
 
 ## Levers
 
+### 2026-07-14 UTC — LANDED (gated default-OFF, BYTE-EXACT): in-flight model-load DEDUP — **~4.2× on N=4 concurrent cold loads**
+
+**What.** `NativeWhisperModel::load_canonical` parses "outside the lock" then re-checks; so
+N concurrent COLD loads of the SAME model ALL parse the ~1.5 GB blob (N× parse work + N× peak
+RSS + core/BW oversubscription), and N−1 of the parses are then discarded. `FW_LOAD_DEDUP=1`
+adds a per-path `Arc<Mutex<()>>` (new `ModelCache.loading`): peers serialize on it and hit the
+freshly-published cache instead of parsing. Refactored the parse+publish into
+`do_parse_and_publish` (a pure move) so the guard is held across it without a self-referential
+borrow; lock order is always per-path THEN cache (cache taken only briefly) ⇒ deadlock-free.
+
+**Measured** (turbo 1.5 GB, `examples/load_dedup_probe` — N threads `Barrier`-released together
+so all miss the cold cache, fresh process each): **N=4 total wall 2380/2280 ms (dedup off) →
+567/531 ms (on) = ~4.2×**; per-thread flattens to a single parse (~531 ms) vs 1642–2380 ms
+(4 contending parses). Also N× less peak RSS (one 1.5 GB blob resident instead of four).
+
+**Safety.** Default OFF ⇒ the plain path runs, **BYTE-IDENTICAL** (jfk turbo transcript md5
+`32c8f2208d` == baseline; the extraction is a pure move + the non-dedup branch is unchanged).
+A single-load CLI or a resident-once server never races, so this is opt-in for lazy/burst-
+loading deployments; flip-ready to default-on after soak (single-load overhead is one
+uncontended mutex + one cache re-check ≈ µs). Byte-exact ⇒ no WER gate needed.
+
+**Rollback.** `FW_LOAD_DEDUP=0` (default), or revert the `mod.rs` `load_canonical` split.
+
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed robot-complete serialization — **2.969109x current-like median**
+
+**What.** `emit_robot_complete` previously deep-cloned the transcript, segments,
+acceleration report, warnings, and evidence into an owned `serde_json::Value`,
+then serialized that temporary DOM into the final output `String`. Qualifying
+acceleration-context evidence was cloned a second time. The emit-only path now
+serializes a private borrowed `Serialize` view directly, while the public owned
+context extractor retains its API and the historical `run_complete_value` stays
+as a test-only oracle. Negative-ledger-first review found no prior result for
+this completion emitter; the adjacent borrowed robot-stage row covers a
+different path.
+
+**Strict-remote foreground proof.** One `release-perf` test binary contained the
+historical owned-DOM arm, the borrowed arm, exact byte oracles, 21 alternating
+BASE/BASE pairs, and 21 alternating historical/candidate pairs. The measured
+boundary includes the final `serde_json::to_string` allocation used by
+`emit_line`, but excludes common stdout and terminal I/O. RCH job
+`j-29928833041827555` ran on worker `vmi1149989` with opt-level 3, LTO disabled,
+and 16 codegen units; no local fallback occurred. Benchmark-binary SHA-256:
+`6f4e72dca2a35618e849a128cf405b19d1674fe6d48447f905d092fc93110ef4`.
+
+| shape / comparison | p10 | median | p90 | historical arm median | borrowed arm median | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| current-like historical / historical null | 0.875599 | **0.979480** | **1.133257** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
+| current-like historical / borrowed | **2.693004x** | **2.969109x** | 3.892649x | 53,441,069 ns / 5,000 reports | 16,389,473 ns / 5,000 reports | **keep: candidate p10 exceeds null p90** |
+| heavy historical / historical null | 0.923569 | **0.995685** | **1.095340** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
+| heavy historical / borrowed | **2.297239x** | **2.550173x** | 3.252529x | 15,077,731 ns / 100 reports | 5,401,665 ns / 100 reports | **keep: candidate p10 exceeds null p90** |
+
+Current-like BASE/BASE ratios:
+`[0.979480, 0.960446, 0.854446, 1.232285, 0.706310, 0.996913,
+1.134996, 1.125429, 0.900583, 1.030204, 0.919679, 1.016977,
+0.905077, 1.133257, 1.050693, 0.911067, 0.875599, 1.027725,
+0.936275, 0.930631, 0.988006]`.
+
+Current-like historical/borrowed ratios:
+`[3.892649, 4.099705, 2.818644, 2.905518, 4.186313, 3.563049,
+3.140283, 3.366298, 2.826101, 2.903056, 2.360997, 2.890784,
+2.969109, 3.139343, 2.742624, 2.693004, 2.746408, 3.199101,
+2.303705, 3.193429, 3.790344]`.
+
+Heavy BASE/BASE ratios:
+`[1.001049, 0.883479, 1.029476, 0.980782, 0.967498, 1.095462,
+1.092859, 0.999714, 0.970073, 0.969770, 1.038889, 1.160985,
+0.954703, 1.095340, 0.995685, 0.929869, 0.873606, 1.058524,
+1.063618, 0.992597, 0.923569]`.
+
+Heavy historical/borrowed ratios:
+`[2.932954, 2.811840, 2.453730, 2.890457, 3.626403, 2.257380,
+2.733826, 2.550173, 3.175333, 2.527598, 2.484257, 2.513215,
+3.640306, 2.542205, 2.998129, 3.252529, 2.620467, 2.418875,
+2.297239, 2.220778, 2.457188]`.
+
+**Behavior proof.** Before either timed shape, the same binary required exact
+serialized-byte equality between the historical owned `Value` and the borrowed
+view. The permanent oracle covers absent and present acceleration context,
+null optionals, empty vectors, mixed optional segment fields, floats, quotes,
+backslashes, newlines, Unicode, nested ordered evidence, the last-eligible
+context rule, and explicit top-level field order. Current-like output was 2,701
+bytes (SHA-256
+`c82a8012101f2f670d0c8d063efd6acdd3f96447842e0ce31620d1a73da5db7b`);
+heavy output was 59,668 bytes (SHA-256
+`85604bd436cc0dce07a4de473fa4077b88f88d3f308237ddfa497ebc6727680a`).
+Both the permanent oracle and foreground benchmark passed (`2 passed, 0
+failed`, 5.40 s timed path). This emitter runs once per robot report, so the
+claim is intentionally limited to serialization rather than end-to-end ASR.
+Ratio versus LEGACY ORIGINAL for the current-like serialization boundary:
+**2.969109x**.
+
 ### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed robot-stage serialization — **3.912157x current-like median**
 
 **What.** `emit_robot_stage` previously built an owned `serde_json::Value`,
