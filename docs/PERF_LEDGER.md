@@ -66,8 +66,12 @@ per-token×per-layer GEMM FLOPs saved.
 
 **Measured** (turbo, jfk single-window = pure encoder signal, threads=32, `PERF_SPANS`,
 alternated, local build): `encoder_window` R=0 ~1572 ms → **R=100 ~1294 ms (−18%)** → **R=200
-~1191 ms (−24%)**. Encoder is ~82–90% of single-shot e2e ⇒ ~15–20% e2e on short clips; less on
-long audio (encoder pipelines behind decode, `project_window_pipelining_lever`).
+~1191 ms (−24%)**. Encoder is ~82–90% of single-shot e2e ⇒ ~15–20% e2e on short clips.
+**REALISTIC long-audio confirmed (2026-07-14 follow-up, track01 124 s / 5-window, decode-
+dominated): R=200 total wall 8560 ms vs 9553 ms baseline = −10.4 % e2e** (encoder_window −24 %
+holds per-window; the encoder is NOT fully pipelined away, so the win survives to e2e even on
+the decode-dominated regime). track01 drift 22 word-lines (255 vs 257 w). So the ToMe win is
+real on BOTH single-shot (~20 % e2e) and realistic long-audio (−10 % e2e), not jfk-only.
 
 **Numerics / WER.** NON-byte-exact (merged tokens lose frame detail) but **TRANSCRIPT-IDENTICAL
 on jfk** at R=100 AND R=200 (whisper.cpp conformance is transcription-level, not bit-level). On
@@ -91,8 +95,8 @@ into a Rust `String`, and only then retained 140 characters. The query now selec
 `substr(transcript, 1, 140)`, activating FrankenSQLite's `ColumnSubstrPrefix` opcode
 so ordinary ASCII TEXT rows copy only the requested prefix from record storage.
 Unicode retains SQLite's character-aware fallback. A manually injected BLOB takes a
-conditional same-snapshot length projection, preserving the historical `<blob:N>`
-representation without loading full transcripts on valid TEXT rows.
+rare complete-query fallback, preserving the historical `<blob:N>` representation
+from one coherent snapshot while BLOB-free result sets retain the direct projection.
 
 **Negative-ledger-first target.** Existing storage closure covered N+1 detail loads,
 indexes, and sync paths, but neither `list_recent_runs` nor wide-column projection.
