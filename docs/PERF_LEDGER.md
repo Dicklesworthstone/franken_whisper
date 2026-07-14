@@ -51,6 +51,78 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (stream-visible byte exact): elide unobserved two-lane executor segment payloads — **2.142022x bridge median**
+
+**What.** After each speculative fast and quality lane returned its model
+segments, the streaming bridge still constructed a parallel
+`Vec<TranscriptSegment>` for `ConcurrentTwoLaneExecutor`, including a clone of
+every transcript string. That executor is private to `process_window_by_id`,
+uses the fixed `QualitySelector::SpeculativeCorrect` selector (which does not
+inspect either segment vector), and receives literal no-op early/compare
+callbacks. The pipeline independently recovers the original model segments
+from its two holders and never reads the executor payloads. Each bridge now
+moves the originals directly into its holder and returns an empty executor
+payload, removing 24 conversions and text clones per measured window. This is
+the fresh residual after the earlier bridge ownership-transfer keep, not a
+retry of that lever. Negative-ledger-first search found no prior payload-elision
+row or source attempt. Opportunity score:
+`(impact 4 x confidence 5) / effort 1 = 20`.
+
+**Exactness.** The same release-perf binary compared serialized recovered
+model-segment bytes for empty, nullable, negative-zero, Unicode, speaker,
+confidence, and timestamp cases. It also ran the current non-empty and
+candidate empty payloads through `ConcurrentTwoLaneExecutor` and proved the
+selected lane and selection reason identical; the candidate payloads were
+explicitly asserted empty. On the measured 12-fast + 12-quality fixture, the
+4,259 stream-visible bytes matched exactly; SHA256
+`ef83f9975172855d612e658a09522d870587622eca6ad3ed0e9020666d29d335`.
+The executor's lane latency fields intentionally fall with the removed bridge
+work; state/event ordering and recovered model segments are unchanged.
+
+| comparison | p10 | median | p90 | normalized per-window medians | candidate CV | wins | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| current / current null | 0.900771 | **0.967244** | **1.028540** | — | — | — | valid null |
+| build backend payload / store originals only | **1.805209x** | **2.142022x** | 2.750711x | 2,544 ns / 1,213 ns | 15.68% | **21/21** | **keep: p10 exceeds null p90 and 1.10 floor** |
+
+Current/current BASE/BASE ratios:
+`[0.996033, 0.987074, 0.925730, 0.924809, 0.774344, 0.900771,
+0.986063, 0.993367, 0.952845, 1.098999, 0.974855, 1.028540,
+0.950913, 0.945921, 0.960927, 0.962116, 0.997345, 1.108328,
+1.027106, 0.967244, 0.802152]`.
+
+Current/payload-free normalized per-window ratios:
+`[2.142022, 2.026262, 1.923624, 2.838914, 1.914303, 2.814320,
+2.750711, 2.746557, 2.514291, 1.815403, 2.316843, 1.825289,
+2.094491, 1.736369, 1.805209, 2.046835, 2.482782, 1.490792,
+2.233704, 2.176197, 2.279886]`.
+
+Current arm times (ns, 8,192 windows each):
+`[20844125, 20633340, 19977067, 27252399, 22579967, 23636900,
+20957686, 20728433, 20141343, 19962585, 21833118, 21949051,
+20520171, 18341055, 19556337, 20879820, 20707962, 21002173,
+20348984, 21889983, 22657103]`.
+
+Payload-free arm times (ns, 8,192 windows each):
+`[9731053, 10182959, 10385123, 9599585, 11795396, 8398796,
+7619008, 7547060, 8010745, 10996229, 9423651, 12024970,
+9797212, 10562878, 10833284, 10201027, 8340629, 14087931,
+9109972, 10058824, 9937823]`.
+
+**Reproduction.** One fail-closed foreground invocation ran the exactness test,
+null control, and candidate comparison:
+`RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 env -u CARGO_TARGET_DIR rch --no-self-healing exec -- cargo test --profile release-perf --lib bridge_payload_elision_ -- --include-ignored --nocapture --test-threads=1`.
+Worker `vmi1227854`; job `j-29928833041828262`; benchmark-binary SHA256
+`6d7f9080d82a363d3bfecce7bcfd99b663dde8e5eba0f3bd81e70f229272493d`;
+2/2 filtered tests passed. Both arms used 8,192 windows per sample after three
+warmups; calibration was 67,361 ns current versus 17,357 ns payload-free. RCH
+reported a cache miss, but both arms and the null control ran interleaved in the
+same binary on the same worker.
+
+**Scope.** This is the direct post-inference bridge/holder boundary for one
+speculative streaming window, not model inference or end-to-end ASR latency.
+The absolute median saving was about 1.33 microseconds per 24-segment window;
+benefit scales with returned segment count and text length.
+
 ### 2026-07-14 UTC — Codex — LANDED (state-byte exact): directly index append-only mutable streaming windows — **637.612513x newest-window lookup median**
 
 **What.** Each speculative window receives fast-result, quality-result, and
