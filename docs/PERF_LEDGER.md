@@ -51,6 +51,71 @@
 
 ## Levers
 
+### 2026-07-14 UTC — Codex — LANDED (byte-exact): borrowed JSON-artifact transcript envelope — **2.657453x current-like median**
+
+**What.** `write_json` previously materialized the complete transcript as an
+owned `serde_json::Value` before pretty-serializing it, duplicating every
+segment string and scalar into a temporary DOM. It now serializes a private
+borrowed `JsonTranscript` view directly into the existing `BufWriter`.
+Negative-ledger-first review found only the earlier raw-file-to-`BufWriter`
+export row; that result covers output buffering, not this owned-DOM boundary.
+
+**Strict-remote foreground proof.** One `release-perf` test binary contained
+the historical owned-DOM arm, the borrowed arm, exact byte oracles, 21
+alternating BASE/BASE pairs, and 21 alternating historical/candidate pairs.
+The measured boundary includes envelope construction and pretty serialization
+into a `Vec<u8>`, but excludes common file creation, `BufWriter`, flush, and
+filesystem costs. RCH job `j-29928833041827665` ran on worker `vmi1293453`
+with opt-level 3, LTO disabled, and 16 codegen units; no local fallback
+occurred. Benchmark-binary SHA-256:
+`3642b7ff939938d34b2b189b0bcb1c1d097b8c61dec92824fac5e7a61f2ec583`.
+
+| shape / comparison | p10 | median | p90 | historical arm median | borrowed arm median | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| current-like historical / historical null | 0.950093 | **0.987546** | **1.052493** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
+| current-like historical / borrowed | **2.349241x** | **2.657453x** | 3.030919x | 25,207,768 ns / 1,000 artifacts | 9,530,807 ns / 1,000 artifacts | **keep: candidate p10 exceeds null p90** |
+| long historical / historical null | 0.904348 | **0.989267** | **1.114309** | — | — | valid: median inside the predeclared `[0.95, 1.05]` guard |
+| long historical / borrowed | **3.552338x** | **4.153932x** | 4.754648x | 43,784,667 ns / 8 artifacts | 10,780,466 ns / 8 artifacts | **keep: candidate p10 exceeds null p90** |
+
+Current-like BASE/BASE ratios:
+`[0.976041, 1.002661, 0.999937, 1.038185, 1.041191, 1.052493,
+0.908025, 1.151734, 1.150981, 0.957891, 0.950093, 0.985149,
+0.984789, 1.025489, 0.962996, 0.978647, 0.926400, 0.979040,
+1.014640, 0.987546, 1.038778]`.
+
+Current-like historical/borrowed ratios:
+`[2.657453, 2.798250, 3.102734, 2.775977, 2.658913, 2.609970,
+2.770860, 2.327100, 2.585714, 3.730045, 2.623963, 2.494409,
+2.634636, 2.953838, 3.030919, 2.215459, 2.349241, 2.961786,
+2.730100, 2.470666, 2.590325]`.
+
+Long BASE/BASE ratios:
+`[1.043950, 0.904348, 1.014026, 1.051606, 1.088787, 1.007098,
+0.896972, 0.865539, 0.961929, 0.940893, 1.024706, 0.989267,
+1.221877, 0.973216, 1.021834, 1.141809, 0.968244, 0.928534,
+0.984460, 1.114309, 0.963657]`.
+
+Long historical/borrowed ratios:
+`[3.601907, 5.448209, 4.754648, 4.587010, 3.958467, 4.153932,
+5.974877, 4.654437, 4.157306, 3.718360, 3.217239, 4.483822,
+3.552338, 4.202893, 3.934187, 3.402064, 4.684623, 3.981350,
+4.672092, 3.869566, 3.771745]`.
+
+**Behavior proof.** Before either timed shape, the same binary required exact
+pretty-serialized byte equality between the historical owned `Value` and the
+borrowed view. The permanent oracle covers an empty transcript, all-null and
+empty segment fields, negative zero, fractional values, quotes, backslashes,
+newlines, Unicode, optional speaker/confidence fields, and an explicit golden
+top-level layout. Current-like output was 6,311 bytes (SHA-256
+`0b6954f1120b45e520963bafa5b54b113a3d3899f2293dcece4e32b593908fc8`);
+long output was 1,078,000 bytes (SHA-256
+`39dca890108f006ec5ecde4331a655a78b5e35a17dbfe95c7c873f4020d1b944`).
+Both the permanent oracle and foreground benchmark passed (`2 passed, 0
+failed`, 5.46 s timed path). The claim is intentionally limited to JSON
+artifact envelope construction and serialization, not filesystem or end-to-end
+ASR. Ratio versus LEGACY ORIGINAL for the current-like serialization boundary:
+**2.657453x**.
+
 ### 2026-07-14 UTC — LANDED (gated default-OFF, BYTE-EXACT): in-flight model-load DEDUP — **~4.2× on N=4 concurrent cold loads**
 
 **What.** `NativeWhisperModel::load_canonical` parses "outside the lock" then re-checks; so
