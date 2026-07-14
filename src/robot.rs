@@ -137,7 +137,7 @@ pub fn emit_robot_error_from_fw(error: &FwError) -> FwResult<()> {
 }
 
 pub fn emit_robot_stage(run_id: &str, event: &RunEvent) -> FwResult<()> {
-    emit_line(&run_stage_value(run_id, event))
+    emit_line(&BorrowedStage::new(run_id, event))
 }
 
 pub fn emit_robot_complete(report: &RunReport) -> FwResult<()> {
@@ -967,6 +967,36 @@ fn run_error_value(message: &str, code: &str) -> serde_json::Value {
     })
 }
 
+#[derive(Serialize)]
+struct BorrowedStage<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    run_id: &'a str,
+    seq: u64,
+    ts: &'a str,
+    stage: &'a str,
+    code: &'a str,
+    message: &'a str,
+    payload: &'a Value,
+}
+
+impl<'a> BorrowedStage<'a> {
+    fn new(run_id: &'a str, event: &'a RunEvent) -> Self {
+        Self {
+            event: "stage",
+            schema_version: ROBOT_SCHEMA_VERSION,
+            run_id,
+            seq: event.seq,
+            ts: &event.ts_rfc3339,
+            stage: &event.stage,
+            code: &event.code,
+            message: &event.message,
+            payload: &event.payload,
+        }
+    }
+}
+
+#[cfg(test)]
 fn run_stage_value(run_id: &str, event: &RunEvent) -> serde_json::Value {
     json!({
         "event": "stage",
@@ -1012,12 +1042,12 @@ mod tests {
     use crate::model::RunEvent;
 
     use super::{
-        HEALTH_REPORT_REQUIRED_FIELDS, RUN_COMPLETE_REQUIRED_FIELDS, RUN_ERROR_REQUIRED_FIELDS,
-        RUN_START_REQUIRED_FIELDS, SPECULATION_STATS_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS,
-        TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
-        TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS, robot_schema_value,
-        run_complete_value, run_error_value, run_stage_value, run_start_value,
-        transcript_partial_value,
+        BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS, RUN_COMPLETE_REQUIRED_FIELDS,
+        RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS, SPECULATION_STATS_REQUIRED_FIELDS,
+        STAGE_REQUIRED_FIELDS, TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+        TRANSCRIPT_CORRECT_REQUIRED_FIELDS, TRANSCRIPT_PARTIAL_REQUIRED_FIELDS,
+        TRANSCRIPT_RETRACT_REQUIRED_FIELDS, robot_schema_value, run_complete_value,
+        run_error_value, run_stage_value, run_start_value, transcript_partial_value,
     };
 
     #[test]
@@ -1700,6 +1730,196 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse back");
         assert_eq!(parsed["event"], "stage");
+    }
+
+    #[test]
+    fn borrowed_stage_serialization_matches_owned_value_bytes() {
+        let cases = [
+            (
+                "run",
+                RunEvent {
+                    seq: 7,
+                    ts_rfc3339: "ts".to_owned(),
+                    stage: "stage".to_owned(),
+                    code: "code".to_owned(),
+                    message: "message".to_owned(),
+                    payload: json!(null),
+                },
+            ),
+            (
+                "run-\"quoted\"\\line\nnext",
+                RunEvent {
+                    seq: u64::MAX,
+                    ts_rfc3339: "2026-07-13T21:30:00-04:00".to_owned(),
+                    stage: "backend/λ".to_owned(),
+                    code: "backend.\0ok".to_owned(),
+                    message: "line one\nline two 🚀".to_owned(),
+                    payload: json!({
+                        "ordered_first": [true, false, null],
+                        "ordered_second": {"quote": "\\\"", "emoji": "🎧"},
+                    }),
+                },
+            ),
+            (
+                "",
+                RunEvent {
+                    seq: 0,
+                    ts_rfc3339: String::new(),
+                    stage: String::new(),
+                    code: String::new(),
+                    message: String::new(),
+                    payload: json!([0, "scalar", {"deep": [{"value": 1.25}]}]),
+                },
+            ),
+        ];
+
+        for (run_id, event) in &cases {
+            let owned = serde_json::to_vec(&run_stage_value(run_id, event)).expect("owned stage");
+            let borrowed =
+                serde_json::to_vec(&BorrowedStage::new(run_id, event)).expect("borrowed stage");
+            assert_eq!(borrowed, owned, "stage bytes differ for run_id {run_id:?}");
+        }
+
+        assert_eq!(
+            serde_json::to_string(&BorrowedStage::new(cases[0].0, &cases[0].1))
+                .expect("golden stage"),
+            r#"{"event":"stage","schema_version":"1.0.0","run_id":"run","seq":7,"ts":"ts","stage":"stage","code":"code","message":"message","payload":null}"#,
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn borrowed_stage_serialization_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "robot_stage_serialization binary_sha256={:x}",
+            Sha256::digest(executable)
+        );
+
+        fn time_owned(run_id: &str, event: &RunEvent, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = run_stage_value(black_box(run_id), black_box(event));
+                let encoded = serde_json::to_string(black_box(&value)).expect("owned stage");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_borrowed(run_id: &str, event: &RunEvent, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = BorrowedStage::new(black_box(run_id), black_box(event));
+                let encoded = serde_json::to_string(black_box(&value)).expect("borrowed stage");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn run_shape(name: &str, event: &RunEvent, iterations: usize) {
+            let run_id = "run-perf-0123456789abcdef";
+            let owned_bytes =
+                serde_json::to_vec(&run_stage_value(run_id, event)).expect("owned stage");
+            let borrowed_bytes =
+                serde_json::to_vec(&BorrowedStage::new(run_id, event)).expect("borrowed stage");
+            assert_eq!(borrowed_bytes, owned_bytes, "{name} byte parity");
+
+            for _ in 0..3 {
+                black_box(time_owned(run_id, event, iterations));
+                black_box(time_borrowed(run_id, event, iterations));
+            }
+
+            let mut null_ratios = Vec::with_capacity(SAMPLES);
+            let mut speedups = Vec::with_capacity(SAMPLES);
+            let mut owned_times = Vec::with_capacity(SAMPLES);
+            let mut borrowed_times = Vec::with_capacity(SAMPLES);
+
+            for sample in 0..SAMPLES {
+                let null_first = time_owned(run_id, event, iterations);
+                let null_second = time_owned(run_id, event, iterations);
+                let (null_numerator, null_denominator) = if sample % 2 == 0 {
+                    (null_first, null_second)
+                } else {
+                    (null_second, null_first)
+                };
+                null_ratios.push(null_numerator as f64 / null_denominator as f64);
+
+                let (owned, borrowed) = if sample % 2 == 0 {
+                    (
+                        time_owned(run_id, event, iterations),
+                        time_borrowed(run_id, event, iterations),
+                    )
+                } else {
+                    let borrowed = time_borrowed(run_id, event, iterations);
+                    let owned = time_owned(run_id, event, iterations);
+                    (owned, borrowed)
+                };
+                owned_times.push(owned);
+                borrowed_times.push(borrowed);
+                speedups.push(owned as f64 / borrowed as f64);
+            }
+
+            eprintln!(
+                "robot_stage_serialization shape={name} samples={SAMPLES} iterations={iterations} null_median={:.6} null_p90={:.6} owned_arm_median_ns={} borrowed_arm_median_ns={} speedup_median={:.6} speedup_p10={:.6}",
+                percentile(&null_ratios, 50),
+                percentile(&null_ratios, 90),
+                median_ns(&owned_times),
+                median_ns(&borrowed_times),
+                percentile(&speedups, 50),
+                percentile(&speedups, 10),
+            );
+            eprintln!(
+                "robot_stage_serialization shape={name} null_ratios={null_ratios:?} speedups={speedups:?}"
+            );
+        }
+
+        let current_like = RunEvent {
+            seq: 3,
+            ts_rfc3339: "2026-07-13T21:30:00-04:00".to_owned(),
+            stage: "backend".to_owned(),
+            code: "backend.ok".to_owned(),
+            message: "backend completed".to_owned(),
+            payload: json!({"resolved_backend": "native", "elapsed_ms": 711}),
+        };
+        let nested = RunEvent {
+            seq: 9,
+            ts_rfc3339: "2026-07-13T21:30:00-04:00".to_owned(),
+            stage: "backend".to_owned(),
+            code: "backend.routing.decision_contract".to_owned(),
+            message: "routing evidence ready".to_owned(),
+            payload: json!({
+                "posterior": (0..32)
+                    .map(|index| json!({
+                        "backend": format!("candidate-{index}"),
+                        "probability": f64::from(index) / 32.0,
+                        "available": index % 3 != 0,
+                    }))
+                    .collect::<Vec<_>>(),
+                "fallback_active": false,
+            }),
+        };
+
+        run_shape("current_like", &current_like, 20_000);
+        run_shape("nested", &nested, 2_000);
     }
 
     #[test]
