@@ -459,13 +459,37 @@ fn description_intro(description: Option<&str>) -> Option<String> {
     if desc.is_empty() {
         return None;
     }
-    // Flatten newlines/runs of whitespace so the blockquote stays one line.
-    let flat: String = desc.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.is_empty() {
-        return None;
+
+    // Flatten only the prefix the Markdown can retain. YouTube descriptions
+    // may be thousands of characters long, but the artifact needs at most the
+    // first 280 normalized characters plus an ellipsis.
+    let mut intro = String::with_capacity(DESCRIPTION_INTRO_CHARS + 3);
+    let mut chars_written = 0usize;
+    let mut first_word = true;
+    let mut truncated = false;
+
+    'words: for word in desc.split_whitespace() {
+        if !first_word {
+            if chars_written == DESCRIPTION_INTRO_CHARS {
+                truncated = true;
+                break;
+            }
+            intro.push(' ');
+            chars_written += 1;
+        }
+        first_word = false;
+
+        for ch in word.chars() {
+            if chars_written == DESCRIPTION_INTRO_CHARS {
+                truncated = true;
+                break 'words;
+            }
+            intro.push(ch);
+            chars_written += 1;
+        }
     }
-    let mut intro: String = flat.chars().take(DESCRIPTION_INTRO_CHARS).collect();
-    if flat.chars().count() > DESCRIPTION_INTRO_CHARS {
+
+    if truncated {
         intro.push('…');
     }
     Some(intro)
@@ -605,7 +629,98 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> FwResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::hint::black_box;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    struct DescriptionPerfStats {
+        median: f64,
+        p10: f64,
+        p90: f64,
+        wins: usize,
+    }
+
+    fn historical_description_intro(description: Option<&str>) -> Option<String> {
+        let desc = description?.trim();
+        if desc.is_empty() {
+            return None;
+        }
+        let flat = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.is_empty() {
+            return None;
+        }
+        let mut intro = flat
+            .chars()
+            .take(DESCRIPTION_INTRO_CHARS)
+            .collect::<String>();
+        if flat.chars().count() > DESCRIPTION_INTRO_CHARS {
+            intro.push('…');
+        }
+        Some(intro)
+    }
+
+    fn measure_description_intro<const HISTORICAL: bool>(
+        description: &str,
+        iterations: usize,
+    ) -> Duration {
+        let started = Instant::now();
+        let mut checksum = 0usize;
+        for _ in 0..iterations {
+            let intro = if HISTORICAL {
+                historical_description_intro(Some(black_box(description)))
+            } else {
+                description_intro(Some(black_box(description)))
+            };
+            checksum ^= intro.as_ref().map_or(0, String::len);
+            black_box(&intro);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_description_ratios<const BASE_HISTORICAL: bool, const TEST_HISTORICAL: bool>(
+        description: &str,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (base, test) = if repetition % 2 == 0 {
+                (
+                    measure_description_intro::<BASE_HISTORICAL>(description, iterations),
+                    measure_description_intro::<TEST_HISTORICAL>(description, iterations),
+                )
+            } else {
+                let test = measure_description_intro::<TEST_HISTORICAL>(description, iterations);
+                let base = measure_description_intro::<BASE_HISTORICAL>(description, iterations);
+                (base, test)
+            };
+            ratios.push(base.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
+    }
+
+    fn description_perf_stats(ratios: &[f64]) -> DescriptionPerfStats {
+        let mut sorted = ratios.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let last = sorted.len() - 1;
+        DescriptionPerfStats {
+            median: sorted[sorted.len() / 2],
+            p10: sorted[last / 10],
+            p90: sorted[last * 9 / 10],
+            wins: ratios.iter().filter(|ratio| **ratio > 1.0).count(),
+        }
+    }
+
+    fn format_description_ratios(ratios: &[f64]) -> String {
+        ratios
+            .iter()
+            .map(|ratio| format!("{ratio:.6}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 
     fn seg(start: f64, end: f64, text: &str) -> TranscriptionSegment {
         TranscriptionSegment {
@@ -878,6 +993,113 @@ mod tests {
         let md = render_markdown(&input);
         assert!(md.contains('…'), "long description should be ellipsized");
         assert_golden("markdown_description.md", &md);
+    }
+
+    #[test]
+    fn bounded_description_intro_matches_historical_semantics() {
+        let exactly_at_limit = "x".repeat(DESCRIPTION_INTRO_CHARS);
+        let beyond_limit = "x".repeat(DESCRIPTION_INTRO_CHARS + 1);
+        let separator_at_limit = format!("{}\tword", "x".repeat(DESCRIPTION_INTRO_CHARS));
+        let unicode = "  αβγ\u{2003}東京\nemoji🙂  café\t".repeat(80);
+        let cases = [
+            None,
+            Some(""),
+            Some(" \n\t "),
+            Some("one word"),
+            Some(exactly_at_limit.as_str()),
+            Some(beyond_limit.as_str()),
+            Some(separator_at_limit.as_str()),
+            Some(unicode.as_str()),
+        ];
+
+        for case in cases {
+            assert_eq!(
+                description_intro(case),
+                historical_description_intro(case),
+                "bounded normalization changed output for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn bounded_description_intro_perf() {
+        const TARGET_ARM_SECS: f64 = 0.020;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 1.10;
+        const REQUIRED_WINS: usize = 13;
+
+        let phrase = " alpha\tβeta \n gamma delta🙂 epsilon ";
+        let mut description = String::with_capacity(5_100);
+        while description.len() < 5_000 {
+            description.push_str(phrase);
+        }
+
+        let historical = historical_description_intro(Some(&description));
+        let bounded = description_intro(Some(&description));
+        assert_eq!(bounded, historical, "timed fixture must remain byte exact");
+        let output = bounded.expect("non-empty description intro");
+        let output_sha256 = format!("{:x}", Sha256::digest(output.as_bytes()));
+
+        let calibration = measure_description_intro::<true>(&description, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(64, 131_072);
+
+        black_box(paired_description_ratios::<true, true>(
+            &description,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios =
+            paired_description_ratios::<true, true>(&description, iterations, PAIRED_REPETITIONS);
+        let null = description_perf_stats(&null_ratios);
+
+        black_box(paired_description_ratios::<true, false>(
+            &description,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios =
+            paired_description_ratios::<true, false>(&description, iterations, PAIRED_REPETITIONS);
+        let candidate = description_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate.median >= MIN_CANDIDATE_MEDIAN
+            && candidate.p10 > null.p90
+            && candidate.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "YOUTUBE_DESCRIPTION_CALIBRATION input_bytes={} output_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            description.len(),
+            output.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "YOUTUBE_DESCRIPTION_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            format_description_ratios(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "YOUTUBE_DESCRIPTION_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            format_description_ratios(&candidate_ratios),
+            candidate.median,
+            candidate.p10,
+            candidate.p90,
+            candidate.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
     }
 
     // --- JSON golden + schema tests -------------------------------------

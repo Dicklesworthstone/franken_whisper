@@ -51,6 +51,50 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): bound YouTube description-intro normalization to the retained prefix — **10.51x median**
+
+**Profile / negative-ledger boundary.** `bv --robot-triage` data hash
+`c33abc558565423c` still surfaced broad native-engine and transport beads whose
+decoder, DTW, TTY, normalization, and schema-probe primitives are already
+closed in `NEGATIVE_EVIDENCE`. No ledger row covered the YouTube Markdown
+renderer's description teaser. Static allocation attribution found that
+`description_intro` retains at most 280 normalized characters but first
+collected every word into `Vec<&str>`, joined the entire description into a new
+`String`, copied the prefix, and scanned the full flattened string again to
+decide whether to append an ellipsis. A realistic 5,031-byte description thus
+paid work proportional to the full input for a 319-byte UTF-8 output.
+
+**One lever and exactness.** Bead `bd-pzph` replaced that full materialization
+with one bounded `split_whitespace` pass. It writes the same single ASCII space
+between words, counts Unicode scalar values exactly as the historical
+`chars().take(280)` path did, and stops only when the 281st normalized character
+proves that an ellipsis is required. The same-binary release oracle compared
+the production result with the historical implementation before every timed
+run. The 319 output bytes matched exactly, SHA-256
+`eb116dd9616ec3bf8e071ebed41e6780c722f989bdfbe1f5e7d9b545691f8beb`;
+the committed unit oracle additionally covers `None`, empty/all-whitespace,
+exactly 280 characters, 281 characters, a word separator at the boundary, and
+Unicode words/whitespace.
+
+**Strict-remote release A/B.** On worker `vmi1152480`, uncapped warm-up job
+`j-29928833041828911` built the release lib-test target successfully. RCH then
+discarded that warmed target and rebuilt it in measurement job
+`j-29928833041828936`; no timeout was applied. The actual hermetic test took
+0.88 seconds, using 15 order-alternated pairs with 1,343 iterations per arm and
+a 20 ms historical-arm target. BASE/BASE raw ratios were
+`[0.873817,0.992481,0.440674,0.986748,1.019594,1.025818,1.046966,1.010541,0.986428,1.063892,0.996946,0.980945,1.007639,0.983333,0.957319]`:
+median 0.992481, p10 0.873817, p90 1.025818, CV 15.604%. The declared null
+median gate `[0.97,1.03]` passed; CV remains informational and reflects one
+isolated 0.440674 scheduling outlier.
+
+Historical/bounded raw ratios were
+`[9.477595,9.646209,10.561062,10.618089,10.446500,10.561624,9.554997,10.380221,10.778487,11.397722,10.514384,10.789270,10.657276,10.493251,10.369096]`:
+median **10.514384x**, p10 9.554997, p90 10.778487, CV 4.875%, and
+15/15 wins. This clears the predeclared 1.10x median, candidate-p10-above-null-p90,
+and 13/15-win gates by wide margins. Scope is deliberately component-level:
+the win removes work from the optional Markdown description teaser; it is not
+an end-to-end transcription throughput claim.
+
 ### 2026-07-15 UTC — cod_fw — LANDED (exact vector): shared segment-time parent lookups — **1.27x / 21.1% lower**
 
 **Profile / negative-ledger boundary.** The immediately preceding direct-field
