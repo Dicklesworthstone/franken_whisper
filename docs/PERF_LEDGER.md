@@ -51,6 +51,44 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): emit YouTube paragraph text directly — **2.37x median**
+
+**Profile / negative-ledger boundary.** `bv --robot-triage` data hash
+`9b82b50d9841644c` kept the YouTube ingestion epic among the quick wins. The
+negative ledger's adjacent subtitle buffering/allocation work did not cover
+Markdown paragraph-text assembly, and neither ledger contained a
+`paragraph_text` row. Allocation attribution found one heap `String` per
+emitted paragraph: the renderer trimmed and joined every segment into that
+temporary, then copied it into the already-live Markdown output buffer.
+
+**One lever and exactness.** Bead `bd-27v1.6` now appends each non-empty,
+trimmed segment directly to the Markdown buffer, retaining one ASCII separator
+between pieces. Timestamp/speaker layout and paragraph grouping are unchanged;
+an all-empty paragraph truncates the unwritten prefix and follows the historical
+skip path. The release oracle matched the temporary-`String` implementation for
+six classes spanning empty paragraphs, empty and whitespace-only segments,
+single text, mixed empty/multiline text, and Unicode. The timed fixture also
+matched exactly: 369 bytes, SHA-256
+`bc4cf97598420f700cb2a8e2de41d866f0d9fe119bf5d9d40ac21a22f755dc43`.
+
+**Strict-remote release A/B.** Worker `vmi1152480` completed the uncapped
+`--profile release` warm-up as job `j-29928833041829129`, followed by exact
+parity job `j-29928833041829143` (1/1 passed). Foreground measurement job
+`j-29928833041829148` reused that release binary; the hermetic test finished in
+0.26 seconds with 21,692 iterations per arm, 20 ms target arms, and 15
+order-alternated pairs. BASE/BASE ratios were
+`[0.901561,0.866521,0.906523,0.921788,1.016667,1.012718,1.046774,1.014099,0.845524,1.027280,1.034734,0.994857,0.931111,0.971078,1.005076]`:
+median 0.994857, p10 0.866521, p90 1.027280, CV 6.758%; the declared
+null-median gate `[0.97,1.03]` passed.
+
+Historical/direct ratios were
+`[2.568596,2.398300,0.744969,1.709512,2.215804,1.947799,2.075459,2.240249,2.295663,7.750075,2.707650,2.882399,2.595396,2.374805,2.485947]`:
+median **2.374805x**, p10 1.709512, p90 2.707650, CV 58.181%, and
+14/15 wins. Despite the informational outlier-driven CV, this clears every
+predeclared decision gate: 1.10x median, candidate p10 above null p90, and at
+least 13/15 wins. Scope is component-level: one allocation removed per rendered
+YouTube transcript paragraph, not end-to-end ASR throughput.
+
 ### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): emit YouTube paragraph timestamp links directly — **2.51x median**
 
 **Profile / negative-ledger boundary.** `bv --robot-triage` data hash
