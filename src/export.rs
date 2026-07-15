@@ -65,7 +65,26 @@ fn format_timestamp_vtt(seconds: f64) -> String {
     format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 }
 
-fn format_timestamp_srt(seconds: f64) -> String {
+#[derive(Clone, Copy)]
+struct SrtTimestamp(u64);
+
+impl std::fmt::Display for SrtTimestamp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_ms = self.0;
+        let h = total_ms / 3_600_000;
+        let m = (total_ms % 3_600_000) / 60_000;
+        let s = (total_ms % 60_000) / 1000;
+        let ms = total_ms % 1000;
+        write!(formatter, "{h:02}:{m:02}:{s:02},{ms:03}")
+    }
+}
+
+fn format_timestamp_srt(seconds: f64) -> SrtTimestamp {
+    SrtTimestamp((seconds * 1000.0).round() as u64)
+}
+
+#[cfg(test)]
+fn format_timestamp_srt_owned(seconds: f64) -> String {
     let total_ms = (seconds * 1000.0).round() as u64;
     let h = total_ms / 3_600_000;
     let m = (total_ms % 3_600_000) / 60_000;
@@ -231,9 +250,26 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_srt() {
-        assert_eq!(format_timestamp_srt(0.0), "00:00:00,000");
-        assert_eq!(format_timestamp_srt(1.5), "00:00:01,500");
-        assert_eq!(format_timestamp_srt(3661.123), "01:01:01,123");
+        let cases = [
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            0.000_49,
+            0.000_5,
+            1.5,
+            59.999_5,
+            3_661.123,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        for seconds in cases {
+            assert_eq!(
+                format_timestamp_srt(seconds).to_string(),
+                format_timestamp_srt_owned(seconds),
+                "timestamp bytes changed for {seconds:?}"
+            );
+        }
     }
 
     #[test]
