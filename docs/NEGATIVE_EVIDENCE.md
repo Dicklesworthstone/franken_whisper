@@ -4,6 +4,57 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-15 - Codex: **HOLD / INVALID NULL — borrowed YouTube paragraph slices measured 1.210838x median and 15/15 wins, but BASE/BASE was biased at 0.965115x; source restored.**
+
+**Negative-ledger-first attribution.** `bv --robot-triage` data hash
+`c279d177af16caea` still ranked the YouTube ingestion epic `bd-27v1` as a quick
+win. The existing YouTube renderer rows cover timestamp formatting, paragraph
+text assembly, Markdown capacity, JSON capacity, description flattening, and
+speaker-label formatting, but not paragraph representation. Bead `bd-27v1.7`
+tested one representation lever: paragraphs are contiguous in the input, yet
+the historical grouping path allocates one inner `Vec<&TranscriptionSegment>`
+per paragraph and pushes every borrowed segment pointer. On the timed 96-segment,
+24-paragraph fixture that is 24 avoidable inner allocations plus 96 pointer
+writes. The candidate represented each paragraph as a borrowed input slice while
+leaving gap, speaker, and word-cap boundary predicates unchanged.
+
+**Parity and release A/B.** Exact parity covered empty, singleton, gap,
+speaker-change, word-cap, NaN, and infinity fixtures; it compared paragraph
+start bits, speakers, segment counts, and every segment's pointer identity.
+Strict-remote release parity job `j-29928833041829172` passed on `vmi1152480`.
+The timed fixture also asserted the complete 640-byte grouping signature before
+sampling; its SHA-256 was
+`69692080fc90a29edf3e56a17394f02f5c12f093cbbe2f1b512ce4401667d2b2`.
+After three warmup pairs, 15 order-alternated historical/historical null pairs
+returned ratios
+`[0.965115,0.873837,1.182656,0.928646,1.181927,0.975131,0.936026,0.972387,0.861566,0.942394,0.889686,0.915953,1.102293,1.131883,1.305765]`:
+median **0.965115x**, p10 0.873837, p90 1.181927, mean 1.011018, CV
+13.360%, and 5/15 wins. This missed the predeclared `[0.97,1.03]` null-median
+validity band.
+
+The corresponding historical/slice ratios were
+`[1.170029,1.086830,1.133562,1.237652,1.265548,1.171214,1.226643,1.230607,1.210838,1.126614,1.175286,1.267617,1.238223,1.369166,1.102177]`:
+median **1.210838x**, p10 1.102177, p90 1.265548, mean 1.200800, CV
+6.161%, and 15/15 wins. Although the median and win-count conditions cleared,
+candidate p10 did not exceed the noisy null p90 of 1.181927, and the invalid
+null made `keep_eligible=false` under the declared conjunctive gate.
+
+**Remote provenance and verdict.** The first uncapped release warm-up,
+`j-29928833041829162`, succeeded on `vmi1152480`. RCH then ignored worker
+affinity and routed attempts `j-29928833041829176` and
+`j-29928833041829178` to cold `vmi1227854`, where offline dependency resolution
+failed before any timed sample; those are infrastructure history, not evidence.
+Untimed online warm-up `j-29928833041829182` populated that worker's release
+test target and exited 0. The sole valid measurement, job
+`j-29928833041829205`, then used the same worker and target pool, compiled
+incrementally in 0.28 seconds, and completed the paired timed body in 1.08
+seconds. The apparent 21.1% component win is promising but not admissible
+against the failed null-control gate, so production and the temporary A/B
+harness were restored; only this evidence row and bead closure land. Retry only
+with a materially lower-variance fixture or longer per-arm timing that first
+demonstrates a valid null control.
+
+---
 ## 2026-07-15 - Codex: **REJECTED — serialize-once replay for 3x critical TTY control-frame FEC measured only 1.038x median with 12/21 wins.**
 
 **Negative-ledger-first attribution.** `bv --robot-triage` and the TTY rows in
