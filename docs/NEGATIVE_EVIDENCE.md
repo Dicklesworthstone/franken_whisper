@@ -4,6 +4,51 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-15 - Codex: **REJECTED — serialize-once replay for 3x critical TTY control-frame FEC measured only 1.038x median with 12/21 wins.**
+
+**Negative-ledger-first attribution.** `bv --robot-triage` and the TTY rows in
+this ledger showed that Base64 fusion, zlib reset/reuse, decode scratch,
+duplicate tracking, borrowed ingest sorting, audio-frame scratch serialization,
+mic-event borrowed serialization, direct inflate, and buffered zlib reads were
+already measured. The untested residual in `bd-cy9u` was poor-link critical
+control-frame FEC: `emit_critical_frame_with_fec` formatted the same NDJSON
+control frame three times when the adaptive controller selected redundancy 3.
+Bead `bd-zlwq` tested one lever: preserve the redundancy-1 direct path, but for
+redundancy greater than one serialize once into a byte buffer and replay it.
+
+**Parity and release A/B.** The same-binary harness used a poor-link controller
+and handshake frame, asserted the complete 291 output bytes exactly against
+three historical serializer calls, and produced output SHA-256
+`12342c2ce781bfc600b6352ab1641514d007c1473afd802e59d404cac37390e3`.
+The release binary SHA-256 was
+`b7ff61356284ecd2fa0bc539771c54b838f2f8a2b990dfa54522fc97c251352c`.
+An order-alternated 21-pair BASE/BASE null control returned ratios
+`[0.914729,1.166261,0.995821,1.095748,1.091350,1.186146,0.923821,0.871610,1.226505,1.003973,1.192659,0.850930,0.851504,1.139715,1.212751,0.952345,1.057048,0.990901,0.996631,0.957728,0.916968]`:
+median 0.996631, p10 0.871610, p90 1.192659, CV 11.995%, so the
+declared `[0.98,1.02]` null-median validity gate passed.
+
+The corresponding BASE/candidate ratios were
+`[0.963400,1.113204,0.949929,1.038107,0.971926,0.802642,1.164656,0.823933,0.886481,1.259873,1.119233,0.930022,1.274844,1.043894,0.926879,0.977455,1.008406,1.071197,1.331923,1.058112,1.230113]`:
+median **1.038107x**, p10 0.886481, p90 1.259873, CV 13.995%, and
+12/21 wins. This missed all decisive keep conditions: median at least 1.05x,
+candidate p10 above the null p90, and at least 17/21 wins. Criterion's
+candidate-only diagnostic was 217.28--235.09 ns and is not comparative proof.
+
+**Remote provenance and verdict.** Strict-remote worker `vmi1152480` first
+completed uncapped release warm-up job `j-29928833041828812`. An initial bench
+attempt `j-29928833041828835` hit a transient external `fsqlite-pager` missing
+`blake3` declaration before any timing and is infrastructure history, not
+evidence. After that dependency was repaired, locked warm-up job
+`j-29928833041828855` exited 0; locked measurement job
+`j-29928833041828879` then exited 0 with the real ratios above using Criterion
+0.5-second warm-up, 1-second measurement time, and 10 samples. RCH unexpectedly
+rebuilt the target despite the warm-up, but no timeout was applied. The 3.8%
+median component gain is below the noise-separated keep floor, so production
+and the A/B harness were restored; only this rejection row and bead closure
+land. Do not retry this serialize-once FEC-control replay without a lower-noise
+fixture or a materially larger fused transport change.
+
+---
 ## 2026-07-14 - Codex: **RESOLVED / LANDED — warmed strict-remote retry measured direct fixed-path timestamp lookup at 6.03x; the earlier timeout remains infrastructure history, not a rejection.**
 
 The prescribed uncapped warm-up completed first: RCH job
