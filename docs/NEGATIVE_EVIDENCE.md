@@ -4,6 +4,55 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-15 - Codex: **HOLD / INVALID NULL — projected yt-dlp playlist JSON measured 4.250978x median and 15/15 wins, but BASE/BASE was biased at 1.026139x; source restored.**
+
+**Negative-ledger-first attribution.** `bv --robot-triage` data hash
+`88c8b37f94328505` again surfaced audio normalization (`bd-3nw3`) and
+long-form scheduling (`bd-3vhz`), whose existing evidence already closes
+native normalization/SIMD and the available scheduling primitives. The prior
+YouTube renderer vein had also ended on an invalid null control, so bead
+`bd-27v1.8` pivoted to the untouched flat-playlist ingestion parser. Each
+historical line was decoded into a complete `serde_json::Value` object even
+though `VideoRef` retains only `id`, `title`, `url`, `webpage_url`,
+and `duration`. The candidate deserialized only those five fields as
+`Value`s, skipped description/channel/thumbnail subtrees, and moved retained
+strings out instead of cloning them.
+
+**Parity and release A/B.** Strict-remote release parity job
+`j-29928833041829235` passed exact output semantics on worker
+`vmi1227854`, including ignored fat fields, missing/empty/wrong-typed fields,
+escaped strings, negative-zero duration bits, and malformed JSON. The timed
+fixture contained 128 representative 1.6 KB entries (159,890 input bytes);
+both implementations produced the same 19,474-byte `VideoRef` signature with
+SHA-256
+`ff6e6efd04230fc5676b900d57323196cb3760d4e2981ec3a8ae1c6df0d58b86`.
+After three warmup pairs, 15 order-alternated historical/historical null pairs
+returned ratios
+`[0.931662,0.996672,1.047030,1.030986,0.987473,1.064137,1.026139,1.056325,1.019137,0.954259,1.073991,1.032943,1.010704,1.049657,0.825710]`:
+median **1.026139x**, p10 0.931662, p90 1.056325, mean 1.007122, CV
+6.346%, and 10/15 wins. The median missed the predeclared
+`[0.98,1.02]` null-control validity band.
+
+The corresponding historical/projected-parser ratios were
+`[5.436913,4.617443,4.141188,4.794459,4.250978,3.654878,3.338940,4.769342,4.438407,5.130737,3.915730,5.660896,3.989680,4.022356,4.093450]`:
+median **4.250978x**, p10 3.654878, p90 5.130737, mean 4.417026, CV
+14.753%, and 15/15 wins. The candidate cleared its 1.20x median, separation,
+and 13/15 win-count conditions, but the invalid null made the declared
+conjunctive gate `keep_eligible=false`.
+
+**Remote provenance and verdict.** Uncapped strict-remote release warm-up job
+`j-29928833041829229` completed on `vmi1227854`; no cold build was placed
+under a timeout. The sole foreground measurement, job
+`j-29928833041829238`, reused that worker and release target, compiled
+incrementally in 0.22 seconds, and completed the paired body in 2.66 seconds.
+Its exit 101 came only from the predeclared keep-gate assertion after all
+ratios were printed, not from infrastructure or an interrupted timed path. The
+large component result is promising but inadmissible against the failed null
+control, so production and the temporary A/B harness were restored; only this
+evidence row and bead closure land. Retry only with a materially
+lower-variance or longer-arm fixture that first establishes a valid null.
+
+---
 ## 2026-07-15 - Codex: **HOLD / INVALID NULL — borrowed YouTube paragraph slices measured 1.210838x median and 15/15 wins, but BASE/BASE was biased at 0.965115x; source restored.**
 
 **Negative-ledger-first attribution.** `bv --robot-triage` data hash
