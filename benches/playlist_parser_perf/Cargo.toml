@@ -12,3 +12,8 @@ serde_json = "1"
 name = "playlist_parser_perf"
 path = "bench.rs"
 harness = false
+
+[[bench]]
+name = "metadata_parser_perf"
+path = "metadata_bench.rs"
+harness = false

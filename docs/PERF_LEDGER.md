@@ -4,6 +4,29 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-15 — LANDED — projected yt-dlp full-metadata parser (bd-27v1.10)
+
+**Profiled target.** `fetch_metadata` parsed every `yt-dlp -j` response into a
+complete `serde_json::Value` tree, then cloned just ten retained fields into
+`VideoMeta`. Real metadata includes large ignored `formats`, thumbnails,
+subtitle, caption, tag, and header subtrees, making DOM allocation and teardown
+the attributable parser cost. This lever uses a custom Serde visitor to retain
+only those ten values, validate-and-skip unknown subtrees, and move retained
+strings into `VideoMeta`. Duplicate retained keys still use the last value.
+
+**Proof and measurement.** The same-binary release harness covered every
+retained field, empty/null/wrong-typed values, missing ids, duplicate keys,
+scalar/array roots, malformed JSON, URL fallback, and exact `f64::to_bits()`
+duration parity against the prior DOM path. Each timed arm parsed 192 metadata
+objects from a 24-object, 469,758-byte realistic fixture. Strict-remote job
+`j-29928833041829498` on `vmi1227854` returned BASE/BASE median **1.014289x**
+(p90 1.140519x, CV 8.657%) and DOM/projected median **5.534731x**
+(p10 5.019897x, CV 9.656%, 15/15 wins). The predeclared gates all passed:
+null median in `[0.98,1.02]`, candidate median at least 1.20x, candidate p10
+above null p90, and at least 13/15 wins. Strict-remote release check job
+`j-29928833041829489` also passed; its two dead-code warnings predate this
+change.
+
 ## 2026-07-15 — LANDED — projected yt-dlp flat-playlist parser (bd-27v1.9)
 
 **Negative-ledger retry.** The `bd-27v1.8` candidate had previously measured a
