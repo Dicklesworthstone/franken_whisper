@@ -185,6 +185,45 @@ fn format_upload_date(raw: &str) -> String {
     }
 }
 
+/// Append the optional video metadata as one Markdown line.
+fn push_metadata_line(out: &mut String, video: &RenderVideo) {
+    let mut has_part = false;
+
+    if let Some(channel) = video
+        .channel
+        .as_deref()
+        .filter(|channel| !channel.trim().is_empty())
+    {
+        out.push_str("**Channel:** ");
+        out.push_str(channel);
+        has_part = true;
+    }
+    if let Some(date) = video
+        .upload_date
+        .as_deref()
+        .filter(|date| !date.trim().is_empty())
+    {
+        if has_part {
+            out.push_str(" · ");
+        }
+        out.push_str("**Uploaded:** ");
+        out.push_str(&format_upload_date(date));
+        has_part = true;
+    }
+    if let Some(duration) = video.duration_sec {
+        if has_part {
+            out.push_str(" · ");
+        }
+        out.push_str("**Duration:** ");
+        out.push_str(&format_duration(duration));
+        has_part = true;
+    }
+
+    if has_part {
+        out.push('\n');
+    }
+}
+
 /// Deep-link URL into the video at the given start second.
 fn deep_link(id: &str, start_sec: f64) -> String {
     format!("https://youtu.be/{id}?t={}", floor_secs(start_sec))
@@ -317,20 +356,7 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
     out.push_str("\n\n");
 
     // Metadata line: channel · uploaded · duration.
-    let mut meta_parts: Vec<String> = Vec::new();
-    if let Some(channel) = v.channel.as_deref().filter(|c| !c.trim().is_empty()) {
-        meta_parts.push(format!("**Channel:** {channel}"));
-    }
-    if let Some(date) = v.upload_date.as_deref().filter(|d| !d.trim().is_empty()) {
-        meta_parts.push(format!("**Uploaded:** {}", format_upload_date(date)));
-    }
-    if let Some(dur) = v.duration_sec {
-        meta_parts.push(format!("**Duration:** {}", format_duration(dur)));
-    }
-    if !meta_parts.is_empty() {
-        out.push_str(&meta_parts.join(" · "));
-        out.push('\n');
-    }
+    push_metadata_line(&mut out, v);
 
     // Source / provenance line.
     let provider = transcribed_provider(r);
@@ -635,7 +661,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[derive(Debug)]
-    struct DescriptionPerfStats {
+    struct PairedPerfStats {
         median: f64,
         p10: f64,
         p90: f64,
@@ -702,11 +728,11 @@ mod tests {
         ratios
     }
 
-    fn description_perf_stats(ratios: &[f64]) -> DescriptionPerfStats {
+    fn paired_perf_stats(ratios: &[f64]) -> PairedPerfStats {
         let mut sorted = ratios.to_vec();
         sorted.sort_by(f64::total_cmp);
         let last = sorted.len() - 1;
-        DescriptionPerfStats {
+        PairedPerfStats {
             median: sorted[sorted.len() / 2],
             p10: sorted[last / 10],
             p90: sorted[last * 9 / 10],
@@ -714,12 +740,80 @@ mod tests {
         }
     }
 
-    fn format_description_ratios(ratios: &[f64]) -> String {
+    fn format_ratios(ratios: &[f64]) -> String {
         ratios
             .iter()
             .map(|ratio| format!("{ratio:.6}"))
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    fn historical_push_metadata_line(out: &mut String, video: &RenderVideo) {
+        let mut parts = Vec::new();
+        if let Some(channel) = video
+            .channel
+            .as_deref()
+            .filter(|channel| !channel.trim().is_empty())
+        {
+            parts.push(format!("**Channel:** {channel}"));
+        }
+        if let Some(date) = video
+            .upload_date
+            .as_deref()
+            .filter(|date| !date.trim().is_empty())
+        {
+            parts.push(format!("**Uploaded:** {}", format_upload_date(date)));
+        }
+        if let Some(duration) = video.duration_sec {
+            parts.push(format!("**Duration:** {}", format_duration(duration)));
+        }
+        if !parts.is_empty() {
+            out.push_str(&parts.join(" · "));
+            out.push('\n');
+        }
+    }
+
+    fn measure_metadata_line<const HISTORICAL: bool>(
+        video: &RenderVideo,
+        iterations: usize,
+    ) -> Duration {
+        let started = Instant::now();
+        let mut out = String::with_capacity(160);
+        let mut checksum = 0usize;
+        for _ in 0..iterations {
+            out.clear();
+            if HISTORICAL {
+                historical_push_metadata_line(&mut out, black_box(video));
+            } else {
+                push_metadata_line(&mut out, black_box(video));
+            }
+            checksum ^= out.len();
+            black_box(out.as_str());
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_metadata_ratios<const BASE_HISTORICAL: bool, const TEST_HISTORICAL: bool>(
+        video: &RenderVideo,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (base, test) = if repetition % 2 == 0 {
+                (
+                    measure_metadata_line::<BASE_HISTORICAL>(video, iterations),
+                    measure_metadata_line::<TEST_HISTORICAL>(video, iterations),
+                )
+            } else {
+                let test = measure_metadata_line::<TEST_HISTORICAL>(video, iterations);
+                let base = measure_metadata_line::<BASE_HISTORICAL>(video, iterations);
+                (base, test)
+            };
+            ratios.push(base.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
     }
 
     fn seg(start: f64, end: f64, text: &str) -> TranscriptionSegment {
@@ -815,6 +909,119 @@ mod tests {
         assert_eq!(format_upload_date("20240115"), "2024-01-15");
         assert_eq!(format_upload_date("notadate"), "notadate");
         assert_eq!(format_upload_date("2024-01-15"), "2024-01-15");
+    }
+
+    #[test]
+    fn direct_metadata_line_matches_historical_semantics() {
+        for mask in 0_u8..8 {
+            let mut video = sample_video();
+            video.channel = (mask & 1 != 0).then(|| "Example Channel".to_owned());
+            video.upload_date = (mask & 2 != 0).then(|| "20240115".to_owned());
+            video.duration_sec = (mask & 4 != 0).then_some(3725.75);
+
+            let mut historical = "prefix\n".to_owned();
+            historical_push_metadata_line(&mut historical, &video);
+            let mut direct = "prefix\n".to_owned();
+            push_metadata_line(&mut direct, &video);
+            assert_eq!(direct, historical, "optional-field mask {mask:#05b}");
+        }
+
+        for (channel, date) in [
+            (Some(""), Some("")),
+            (Some(" \n\t "), Some(" \n\t ")),
+            (Some("  preserved  "), Some("not-a-date")),
+        ] {
+            let mut video = sample_video();
+            video.channel = channel.map(str::to_owned);
+            video.upload_date = date.map(str::to_owned);
+            video.duration_sec = None;
+
+            let mut historical = String::new();
+            historical_push_metadata_line(&mut historical, &video);
+            let mut direct = String::new();
+            push_metadata_line(&mut direct, &video);
+            assert_eq!(direct, historical, "channel={channel:?}, date={date:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn direct_metadata_line_perf() {
+        const TARGET_ARM_SECS: f64 = 0.020;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 1.10;
+        const REQUIRED_WINS: usize = 13;
+
+        let video = sample_video();
+        let mut historical = String::new();
+        historical_push_metadata_line(&mut historical, &video);
+        let mut direct = String::new();
+        push_metadata_line(&mut direct, &video);
+        assert_eq!(direct, historical, "timed fixture must remain byte exact");
+        let output_sha256 = format!("{:x}", Sha256::digest(direct.as_bytes()));
+
+        let calibration = measure_metadata_line::<true>(&video, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(256, 1_048_576);
+
+        black_box(paired_metadata_ratios::<true, true>(
+            &video,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios =
+            paired_metadata_ratios::<true, true>(&video, iterations, PAIRED_REPETITIONS);
+        let null = paired_perf_stats(&null_ratios);
+
+        black_box(paired_metadata_ratios::<true, false>(
+            &video,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios =
+            paired_metadata_ratios::<true, false>(&video, iterations, PAIRED_REPETITIONS);
+        let candidate = paired_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate.median >= MIN_CANDIDATE_MEDIAN
+            && candidate.p10 > null.p90
+            && candidate.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "YOUTUBE_METADATA_CALIBRATION output_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            direct.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "YOUTUBE_METADATA_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            format_ratios(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "YOUTUBE_METADATA_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            format_ratios(&candidate_ratios),
+            candidate.median,
+            candidate.p10,
+            candidate.p90,
+            candidate.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
     }
 
     #[test]
@@ -1055,7 +1262,7 @@ mod tests {
         ));
         let null_ratios =
             paired_description_ratios::<true, true>(&description, iterations, PAIRED_REPETITIONS);
-        let null = description_perf_stats(&null_ratios);
+        let null = paired_perf_stats(&null_ratios);
 
         black_box(paired_description_ratios::<true, false>(
             &description,
@@ -1064,7 +1271,7 @@ mod tests {
         ));
         let candidate_ratios =
             paired_description_ratios::<true, false>(&description, iterations, PAIRED_REPETITIONS);
-        let candidate = description_perf_stats(&candidate_ratios);
+        let candidate = paired_perf_stats(&candidate_ratios);
         let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
         let keep_eligible = null_valid
             && candidate.median >= MIN_CANDIDATE_MEDIAN
@@ -1082,7 +1289,7 @@ mod tests {
         );
         eprintln!(
             "YOUTUBE_DESCRIPTION_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
-            format_description_ratios(&null_ratios),
+            format_ratios(&null_ratios),
             null.median,
             null.p10,
             null.p90,
@@ -1091,7 +1298,7 @@ mod tests {
         );
         eprintln!(
             "YOUTUBE_DESCRIPTION_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
-            format_description_ratios(&candidate_ratios),
+            format_ratios(&candidate_ratios),
             candidate.median,
             candidate.p10,
             candidate.p90,
