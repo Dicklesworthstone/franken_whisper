@@ -210,6 +210,12 @@ a win from avoiding pointer parsing.
 ---
 ## 2026-07-14 - Codex: **SURFACED / INVALID BENCH — VAD-to-separation waveform-analysis reuse reached no timed samples before the strict-remote five-minute cap; source restored.**
 
+> **Resolved 2026-07-15.** The prescribed uncapped warm-up completed as
+> `j-29928833041829259`; warmed strict-remote retry
+> `j-29928833041829271` then passed its null control and measured a
+> 772.199364x median Separate-stage component win with exact report parity.
+> Production landed; see the corresponding `docs/PERF_LEDGER.md` row.
+
 **Negative-ledger-first pivot and attribution.** `bv --robot-triage` data hash
 `066298c3e0d5b876` still advertised the stale audio-normalization and scheduler
 quick wins. Their existing rows close native normalization/SIMD resampling and
