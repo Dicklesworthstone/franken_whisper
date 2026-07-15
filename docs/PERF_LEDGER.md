@@ -51,6 +51,55 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (bit-exact): reuse VAD waveform analysis in source separation — **772.20x median component speedup**
+
+**Profile / negative-ledger boundary.** `bv --robot-triage` data hash
+`d54676f497cffb7a` again exposed only the stale audio-normalization and
+long-form-scheduler quick wins, whose concrete primitives are already closed.
+The negative ledger instead contained an infrastructure-invalid, never-timed
+attempt for bead `bd-nejb` and explicitly allowed a retry after warming the
+release lib-test artifact. Call-graph attribution showed that canonical
+`Vad -> Separate` execution called `native_audio::analyze_wav` twice on the
+same normalized WAV. The second call repeated the file read, RIFF chunk walk,
+PCM allocation, and every 20 ms RMS frame without changing any input.
+
+**One lever and exactness.** VAD now returns its successful immutable
+`NativeAudioAnalysis` alongside the unchanged `VadReport`.
+`PipelineIntermediate` retains it behind `Arc`, and Separate clones that
+`Arc` into its budget worker instead of recomputing the waveform analysis.
+Standalone Separate, custom stage orders where VAD has not run, and native-VAD
+parse failures retain the historical recompute/fallback paths. The release
+oracle compared every VAD field, region endpoint bit pattern, every
+`SeparateReport` floating-point bit pattern, counts, flags, and note bytes.
+The timed 10-second fixture also matched its complete 125-byte report signature,
+SHA-256
+`c52675e3ee6312a17aa2447fb74fe588e72dbfc4d66d986590b09c3515ae2dc9`.
+
+**Strict-remote release A/B.** Worker `vmi1227854` completed the uncapped
+`--profile release` warm-up as job `j-29928833041829259`, followed by exact
+parity job `j-29928833041829268` (1/1 passed with a 0.23-second incremental
+build). The sole foreground measurement, job `j-29928833041829271`, reused
+that release target and completed the timed body in 6.53 seconds. A 320,044-byte
+10-second PCM16 fixture calibrated the historical Separate path at 181,082 ns;
+553 iterations produced 100 ms target arms. After three warmup pairs, the 15
+order-alternated BASE/BASE ratios were
+`[0.869085,1.020291,0.885424,0.927644,1.011820,1.016956,0.961802,1.073838,1.016150,0.929799,0.901161,0.982029,1.147342,0.908459,1.058245]`:
+median **0.982029x**, p10 0.885424, p90 1.058245, mean 0.980670, CV
+8.011%, and 7/15 wins. The predeclared null-median gate `[0.97,1.03]`
+passed.
+
+Historical/reused-analysis ratios were
+`[635.071283,780.889591,821.897612,706.228530,1124.254985,1065.497357,737.101211,772.199364,963.981449,908.297457,674.148929,740.399191,720.915195,740.421301,1102.386279]`:
+median **772.199364x**, p10 674.148929, p90 1065.497357, mean
+832.912649, CV 19.258%, and 15/15 wins. This clears every predeclared gate:
+valid null, at least 2x candidate median, candidate p10 above null p90, and
+15/15 wins.
+
+**Scope.** This removes about 181 microseconds from the warm-page-cache
+Separate stage on the 10-second fixture and avoids a redundant PCM allocation;
+the 772x ratio is for report construction after VAD already paid for waveform
+analysis, not end-to-end transcription throughput.
+
 ### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): emit YouTube paragraph text directly — **2.37x median**
 
 **Profile / negative-ledger boundary.** `bv --robot-triage` data hash

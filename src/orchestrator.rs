@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
@@ -1344,6 +1345,8 @@ struct PipelineIntermediate {
     normalized_input_sha256: Option<String>,
     backend_output_sha256: Option<String>,
     backend_runtime: Option<backend::BackendRuntimeMetadata>,
+    /// Native waveform analysis produced by VAD for later audio stages.
+    native_audio_analysis: Option<Arc<backend::native_audio::NativeAudioAnalysis>>,
     /// VAD result: regions of voice activity as (start_sec, end_sec) pairs.
     vad_regions: Option<Vec<(f64, f64)>>,
     /// Whether VAD determined the audio is silence-only (skip transcription).
@@ -1363,6 +1366,7 @@ impl PipelineIntermediate {
             normalized_input_sha256: None,
             backend_output_sha256: None,
             backend_runtime: None,
+            native_audio_analysis: None,
             vad_regions: None,
             vad_silence_only: false,
             vocal_isolated: false,
@@ -2885,6 +2889,17 @@ fn vad_energy_detect(
     config: &VadConfig,
     token: &CancellationToken,
 ) -> FwResult<VadReport> {
+    vad_energy_detect_with_analysis(normalized_wav, config, token).map(|(report, _)| report)
+}
+
+fn vad_energy_detect_with_analysis(
+    normalized_wav: &Path,
+    config: &VadConfig,
+    token: &CancellationToken,
+) -> FwResult<(
+    VadReport,
+    Option<backend::native_audio::NativeAudioAnalysis>,
+)> {
     token.checkpoint()?;
 
     let analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
@@ -2895,7 +2910,7 @@ fn vad_energy_detect(
             fallback_report.notes.push(format!(
                 "native_audio parse failed; deterministic legacy fallback activated: {error}"
             ));
-            return Ok(fallback_report);
+            return Ok((fallback_report, None));
         }
     };
 
@@ -2965,17 +2980,20 @@ fn vad_energy_detect(
         })
         .collect();
 
-    Ok(VadReport {
-        frames_total,
-        frames_voiced,
-        voice_ratio,
-        silence_only,
-        regions,
-        detector: "native_audio_waveform",
-        fallback_triggered: false,
-        activity_threshold: config.rms_threshold,
-        notes: Vec::new(),
-    })
+    Ok((
+        VadReport {
+            frames_total,
+            frames_voiced,
+            voice_ratio,
+            silence_only,
+            regions,
+            detector: "native_audio_waveform",
+            fallback_triggered: false,
+            activity_threshold: config.rms_threshold,
+            notes: Vec::new(),
+        },
+        Some(analysis),
+    ))
 }
 
 fn merge_regions_by_gap(regions: &mut Vec<VadRegionMs>, max_gap_ms: u64) {
@@ -3173,8 +3191,8 @@ async fn execute_vad(
     let vad_token = pcx.stage_token(vad_budget_ms); // ubs:ignore — cancellation token is not a secret
     let config_for_run = vad_config.clone();
 
-    let report = match run_stage_with_budget("vad", vad_budget_ms, move || {
-        vad_energy_detect(&vad_wav, &config_for_run, &vad_token)
+    let (report, analysis) = match run_stage_with_budget("vad", vad_budget_ms, move || {
+        vad_energy_detect_with_analysis(&vad_wav, &config_for_run, &vad_token)
     }) {
         Ok(report) => report,
         Err(error) => {
@@ -3189,6 +3207,7 @@ async fn execute_vad(
         }
     };
 
+    inter.native_audio_analysis = analysis.map(Arc::new);
     let vad_code = if report.silence_only {
         inter.vad_silence_only = true;
         // Provide an empty result for silence-only audio.
@@ -3269,23 +3288,37 @@ struct SeparateReport {
 /// fraction exceeds the minimum threshold, indicating the audio has
 /// sufficient vocal content for downstream transcription.
 fn source_separate(normalized_wav: &Path, token: &CancellationToken) -> FwResult<SeparateReport> {
+    source_separate_with_analysis(normalized_wav, None, token)
+}
+
+fn source_separate_with_analysis(
+    normalized_wav: &Path,
+    cached_analysis: Option<&backend::native_audio::NativeAudioAnalysis>,
+    token: &CancellationToken,
+) -> FwResult<SeparateReport> {
     token.checkpoint()?;
 
     // Attempt native audio analysis.  If the file cannot be parsed
     // (e.g. not a valid PCM16 mono WAV), fall back gracefully.
-    let analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
-        Ok(a) => a,
-        Err(reason) => {
-            return Ok(SeparateReport {
-                vocal_isolated: true,
-                speech_coverage: 0.0,
-                avg_rms: 0.0,
-                active_region_count: 0,
-                notes: vec![format!(
-                    "analysis unavailable ({reason}); assuming vocal content present"
-                )],
-            });
-        }
+    let recomputed_analysis;
+    let analysis = if let Some(analysis) = cached_analysis {
+        analysis
+    } else {
+        recomputed_analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
+            Ok(analysis) => analysis,
+            Err(reason) => {
+                return Ok(SeparateReport {
+                    vocal_isolated: true,
+                    speech_coverage: 0.0,
+                    avg_rms: 0.0,
+                    active_region_count: 0,
+                    notes: vec![format!(
+                        "analysis unavailable ({reason}); assuming vocal content present"
+                    )],
+                });
+            }
+        };
+        &recomputed_analysis
     };
 
     token.checkpoint()?;
@@ -3348,11 +3381,12 @@ async fn execute_separate(
     );
 
     let sep_wav = normalized_wav.clone();
+    let cached_analysis = inter.native_audio_analysis.clone();
     let sep_budget_ms = stage_budgets.separate_ms;
     let sep_token = pcx.stage_token(sep_budget_ms); // ubs:ignore — cancellation token is not a secret
 
     let report = match run_stage_with_budget("separate", sep_budget_ms, move || {
-        source_separate(&sep_wav, &sep_token)
+        source_separate_with_analysis(&sep_wav, cached_analysis.as_deref(), &sep_token)
     }) {
         Ok(report) => report,
         Err(error) => {
@@ -4250,12 +4284,14 @@ impl EventLog {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
     use std::path::PathBuf;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     use asupersync::runtime::RuntimeBuilder;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use crate::error::FwError;
@@ -4277,8 +4313,9 @@ mod tests {
         optional_stage_skip, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
         recommended_budget, resolve_speaker_target, run_pipeline, run_stage_with_budget,
         sanitize_process_pid, sha256_bytes_hex, sha256_file, sha256_json_value, silhouette_score,
-        source_separate, split_long_regions, stage_budget_ms, stage_failure_code,
-        stage_failure_message, stage_latency_profile, state_root, vad_energy_detect,
+        source_separate, source_separate_with_analysis, split_long_regions, stage_budget_ms,
+        stage_failure_code, stage_failure_message, stage_latency_profile, state_root,
+        vad_energy_detect, vad_energy_detect_with_analysis,
     };
 
     #[test]
@@ -9234,6 +9271,271 @@ mod tests {
         // Missing file → graceful fallback.
         assert!(result.vocal_isolated);
         assert!(result.notes[0].contains("analysis unavailable"));
+    }
+
+    fn assert_vad_reports_equal(actual: &VadReport, expected: &VadReport) {
+        assert_eq!(actual.frames_total, expected.frames_total);
+        assert_eq!(actual.frames_voiced, expected.frames_voiced);
+        assert_eq!(actual.voice_ratio.to_bits(), expected.voice_ratio.to_bits());
+        assert_eq!(actual.silence_only, expected.silence_only);
+        assert_eq!(
+            actual
+                .regions
+                .iter()
+                .map(|(start, end)| (start.to_bits(), end.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .regions
+                .iter()
+                .map(|(start, end)| (start.to_bits(), end.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(actual.detector, expected.detector);
+        assert_eq!(actual.fallback_triggered, expected.fallback_triggered);
+        assert_eq!(
+            actual.activity_threshold.to_bits(),
+            expected.activity_threshold.to_bits()
+        );
+        assert_eq!(actual.notes, expected.notes);
+    }
+
+    fn assert_separate_reports_equal(actual: &SeparateReport, expected: &SeparateReport) {
+        assert_eq!(actual.vocal_isolated, expected.vocal_isolated);
+        assert_eq!(
+            actual.speech_coverage.to_bits(),
+            expected.speech_coverage.to_bits()
+        );
+        assert_eq!(actual.avg_rms.to_bits(), expected.avg_rms.to_bits());
+        assert_eq!(actual.active_region_count, expected.active_region_count);
+        assert_eq!(actual.notes, expected.notes);
+    }
+
+    fn representative_vad_samples(sample_rate: u32, seconds: usize) -> Vec<i16> {
+        let sample_rate = sample_rate as usize;
+        (0..sample_rate * seconds)
+            .map(|index| {
+                if (index / (sample_rate / 2)) % 4 == 0 {
+                    0
+                } else {
+                    let phase = index as f64 * 330.0 * std::f64::consts::TAU / sample_rate as f64;
+                    (phase.sin() * 9_000.0) as i16
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cached_vad_analysis_preserves_vad_and_separation_reports() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cached-analysis.wav");
+        write_pcm16_mono_wav_for_vad(&path, 16_000, &representative_vad_samples(16_000, 4));
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = VadConfig::default();
+
+        let historical_vad = vad_energy_detect(&path, &config, &token).unwrap();
+        let (candidate_vad, analysis) =
+            vad_energy_detect_with_analysis(&path, &config, &token).unwrap();
+        assert_vad_reports_equal(&candidate_vad, &historical_vad);
+        let analysis = analysis.expect("valid WAV analysis should be reusable");
+
+        let historical_separation = source_separate(&path, &token).unwrap();
+        let cached_separation =
+            source_separate_with_analysis(&path, Some(&analysis), &token).unwrap();
+        assert_separate_reports_equal(&cached_separation, &historical_separation);
+    }
+
+    #[derive(Debug)]
+    struct SourceSeparationPerfStats {
+        median: f64,
+        p10: f64,
+        p90: f64,
+        wins: usize,
+    }
+
+    fn source_separation_perf_stats(ratios: &[f64]) -> SourceSeparationPerfStats {
+        let mut sorted = ratios.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let last = sorted.len() - 1;
+        SourceSeparationPerfStats {
+            median: sorted[sorted.len() / 2],
+            p10: sorted[last / 10],
+            p90: sorted[last * 9 / 10],
+            wins: ratios.iter().filter(|ratio| **ratio > 1.0).count(),
+        }
+    }
+
+    fn source_separation_ratios_text(ratios: &[f64]) -> String {
+        ratios
+            .iter()
+            .map(|ratio| format!("{ratio:.6}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn separate_report_signature(report: &SeparateReport) -> String {
+        use std::fmt::Write as _;
+
+        let mut signature = format!(
+            "{}|{:016x}|{:016x}|{}",
+            report.vocal_isolated,
+            report.speech_coverage.to_bits(),
+            report.avg_rms.to_bits(),
+            report.active_region_count,
+        );
+        for note in &report.notes {
+            write!(signature, "|{}:{note}", note.len()).expect("writing to a String cannot fail");
+        }
+        signature
+    }
+
+    fn measure_source_separation<const CACHED: bool>(
+        path: &std::path::Path,
+        analysis: &Arc<crate::backend::native_audio::NativeAudioAnalysis>,
+        iterations: usize,
+    ) -> Duration {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..iterations {
+            let report = if CACHED {
+                let analysis = Arc::clone(analysis);
+                source_separate_with_analysis(path, Some(analysis.as_ref()), &token)
+            } else {
+                source_separate(path, &token)
+            }
+            .expect("timed source separation should succeed");
+            checksum ^= report.speech_coverage.to_bits();
+            checksum = checksum.wrapping_add(report.avg_rms.to_bits());
+            checksum = checksum.wrapping_add(report.active_region_count as u64);
+            black_box(&report);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_source_separation_ratios<const BASE_CACHED: bool, const TEST_CACHED: bool>(
+        path: &std::path::Path,
+        analysis: &Arc<crate::backend::native_audio::NativeAudioAnalysis>,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (baseline, test) = if repetition % 2 == 0 {
+                (
+                    measure_source_separation::<BASE_CACHED>(path, analysis, iterations),
+                    measure_source_separation::<TEST_CACHED>(path, analysis, iterations),
+                )
+            } else {
+                let test = measure_source_separation::<TEST_CACHED>(path, analysis, iterations);
+                let baseline = measure_source_separation::<BASE_CACHED>(path, analysis, iterations);
+                (baseline, test)
+            };
+            ratios.push(baseline.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn source_separate_cached_analysis_perf() {
+        const TARGET_ARM_SECS: f64 = 0.100;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 2.0;
+        const REQUIRED_WINS: usize = 15;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("source-separation-perf.wav");
+        let samples = representative_vad_samples(16_000, 10);
+        write_pcm16_mono_wav_for_vad(&path, 16_000, &samples);
+        let analysis = Arc::new(
+            crate::backend::native_audio::analyze_wav(&path, None)
+                .expect("performance fixture should analyze"),
+        );
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let historical = source_separate(&path, &token).unwrap();
+        let candidate =
+            source_separate_with_analysis(&path, Some(analysis.as_ref()), &token).unwrap();
+        assert_separate_reports_equal(&candidate, &historical);
+        let historical_signature = separate_report_signature(&historical);
+        let candidate_signature = separate_report_signature(&candidate);
+        assert_eq!(candidate_signature, historical_signature);
+        let output_sha256 = format!("{:x}", Sha256::digest(candidate_signature.as_bytes()));
+
+        let calibration = measure_source_separation::<false>(&path, &analysis, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(1, 4_096);
+
+        black_box(paired_source_separation_ratios::<false, false>(
+            &path,
+            &analysis,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios = paired_source_separation_ratios::<false, false>(
+            &path,
+            &analysis,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let null = source_separation_perf_stats(&null_ratios);
+
+        black_box(paired_source_separation_ratios::<false, true>(
+            &path,
+            &analysis,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios = paired_source_separation_ratios::<false, true>(
+            &path,
+            &analysis,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let candidate_stats = source_separation_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate_stats.median >= MIN_CANDIDATE_MEDIAN
+            && candidate_stats.p10 > null.p90
+            && candidate_stats.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "VAD_SEPARATE_CALIBRATION duration_sec=10 samples={} wav_bytes={} signature_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            samples.len(),
+            44 + samples.len() * 2,
+            candidate_signature.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "VAD_SEPARATE_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            source_separation_ratios_text(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "VAD_SEPARATE_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            source_separation_ratios_text(&candidate_ratios),
+            candidate_stats.median,
+            candidate_stats.p10,
+            candidate_stats.p90,
+            candidate_stats.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
     }
 
     #[test]
