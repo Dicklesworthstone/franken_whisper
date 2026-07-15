@@ -51,6 +51,43 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): assemble YouTube metadata line directly — **1.90x median**
+
+**Profile / negative-ledger boundary.** `bv --robot-triage` data hash
+`ce93f1f80c1f6386` left the YouTube ingestion epic actionable, while the
+negative ledger had no row for Markdown metadata assembly. Allocation
+attribution found that the all-fields path built a `Vec<String>`, three
+component strings, two formatter temporaries, and a joined string before
+copying 82 bytes into the renderer's existing output buffer.
+
+**One lever and exactness.** Bead `bd-27v1.2` now writes channel, separators,
+labels, and the two formatter results directly into that output buffer. This
+removes the vector, channel/component wrappers, and joined-string allocation
+while leaving date and duration formatting semantics unchanged. The release
+oracle matched the historical bytes for all eight optional-field combinations,
+empty and whitespace-only fields, preserved channel whitespace, and a
+noncanonical date. The timed all-fields fixture also matched exactly:
+82 bytes, SHA-256
+`7de6040a13abca9229c2344951595b6edfe9b9afa96b913d34dca4feaadc86ce`.
+
+**Strict-remote release A/B.** Worker `vmi1152480` ran the uncapped cold
+warm-up as job `j-29928833041828974` (`--profile release`, exit 0), then
+the focused parity job `j-29928833041829010` (1/1 passed). Foreground
+measurement job `j-29928833041829011` reused the warmed release test binary;
+the hermetic test itself finished in 0.37 seconds with 16,502 iterations per
+arm, 20 ms target arms, and 15 order-alternated pairs. BASE/BASE ratios were
+`[0.798951,0.780282,0.883212,0.862343,0.884256,1.292017,1.015750,0.986487,0.743258,0.997745,0.995530,1.005463,1.015966,0.997944,0.990322]`:
+median 0.990322, p10 0.780282, p90 1.015750, CV 14.043%; the declared
+null-median gate `[0.97,1.03]` passed.
+
+Historical/direct ratios were
+`[1.930681,1.853266,1.779135,1.967861,1.935863,1.900069,1.864530,1.846821,1.843908,2.005643,1.882011,2.024526,2.000333,1.891002,1.937981]`:
+median **1.900069x**, p10 1.843908, p90 2.000333, CV 3.638%, and
+15/15 wins. This clears the declared 1.10x median,
+candidate-p10-above-null-p90, and 13/15-win gates. Scope is component-level:
+one metadata line per rendered Markdown artifact, not end-to-end ASR
+throughput.
+
 ### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): bound YouTube description-intro normalization to the retained prefix — **10.51x median**
 
 **Profile / negative-ledger boundary.** `bv --robot-triage` data hash
