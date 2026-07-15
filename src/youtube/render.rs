@@ -224,6 +224,39 @@ fn push_metadata_line(out: &mut String, video: &RenderVideo) {
     }
 }
 
+/// Append the source URL and transcription provenance as one Markdown line.
+fn push_source_line(out: &mut String, video: &RenderVideo, run: &RenderRun) {
+    let display_url = video
+        .webpage_url
+        .strip_prefix("https://")
+        .or_else(|| video.webpage_url.strip_prefix("http://"))
+        .unwrap_or(&video.webpage_url);
+
+    out.push_str("**Source:** [");
+    out.push_str(display_url);
+    out.push_str("](");
+    out.push_str(&video.webpage_url);
+    out.push_str(") · **Transcribed:** franken_whisper");
+    if let Some(tag) = run
+        .version_tag
+        .as_deref()
+        .filter(|tag| !tag.trim().is_empty())
+    {
+        out.push(' ');
+        out.push_str(tag);
+    }
+    out.push_str(" (");
+    out.push_str(&run.engine);
+    out.push_str(", ");
+    out.push_str(&run.model);
+    out.push(')');
+    if let Some(rtf) = run.rtf {
+        out.push_str(" · RTF ");
+        out.push_str(&format_rtf(rtf));
+    }
+    out.push_str("\n\n");
+}
+
 /// Deep-link URL into the video at the given start second.
 fn deep_link(id: &str, start_sec: f64) -> String {
     format!("https://youtu.be/{id}?t={}", floor_secs(start_sec))
@@ -359,18 +392,7 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
     push_metadata_line(&mut out, v);
 
     // Source / provenance line.
-    let provider = transcribed_provider(r);
-    let mut src_parts: Vec<String> = vec![format!(
-        "**Source:** [{}]({})",
-        display_url(&v.webpage_url),
-        v.webpage_url
-    )];
-    src_parts.push(format!("**Transcribed:** {provider}"));
-    if let Some(rtf) = r.rtf {
-        src_parts.push(format!("RTF {}", format_rtf(rtf)));
-    }
-    out.push_str(&src_parts.join(" · "));
-    out.push_str("\n\n");
+    push_source_line(&mut out, v, r);
 
     // Honesty note.
     out.push_str(
@@ -425,15 +447,6 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
     out
 }
 
-/// Provenance string for the source line:
-/// `franken_whisper <version> (<engine>, <model>)` (version omitted if absent).
-fn transcribed_provider(r: &RenderRun) -> String {
-    match r.version_tag.as_deref().filter(|t| !t.trim().is_empty()) {
-        Some(tag) => format!("franken_whisper {tag} ({}, {})", r.engine, r.model),
-        None => format!("franken_whisper ({}, {})", r.engine, r.model),
-    }
-}
-
 /// Footer line: full provenance including backend, wall time, and RTF.
 fn footer_line(r: &RenderRun) -> String {
     let version = match r.version_tag.as_deref().filter(|t| !t.trim().is_empty()) {
@@ -467,14 +480,6 @@ fn format_wall(wall_ms: u64) -> String {
 /// RTF formatted to two decimals (e.g. `0.04`).
 fn format_rtf(rtf: f64) -> String {
     format!("{rtf:.2}")
-}
-
-/// Strip the scheme from a URL for display text (keeps it tidy in the link).
-fn display_url(url: &str) -> String {
-    url.strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url)
-        .to_owned()
 }
 
 /// Produce the quoted description intro (first [`DESCRIPTION_INTRO_CHARS`]
@@ -773,6 +778,33 @@ mod tests {
         }
     }
 
+    fn historical_push_source_line(out: &mut String, video: &RenderVideo, run: &RenderRun) {
+        let provider = match run
+            .version_tag
+            .as_deref()
+            .filter(|tag| !tag.trim().is_empty())
+        {
+            Some(tag) => format!("franken_whisper {tag} ({}, {})", run.engine, run.model),
+            None => format!("franken_whisper ({}, {})", run.engine, run.model),
+        };
+        let display_url = video
+            .webpage_url
+            .strip_prefix("https://")
+            .or_else(|| video.webpage_url.strip_prefix("http://"))
+            .unwrap_or(&video.webpage_url)
+            .to_owned();
+        let mut parts = vec![format!(
+            "**Source:** [{}]({})",
+            display_url, video.webpage_url
+        )];
+        parts.push(format!("**Transcribed:** {provider}"));
+        if let Some(rtf) = run.rtf {
+            parts.push(format!("RTF {}", format_rtf(rtf)));
+        }
+        out.push_str(&parts.join(" · "));
+        out.push_str("\n\n");
+    }
+
     fn measure_metadata_line<const HISTORICAL: bool>(
         video: &RenderVideo,
         iterations: usize,
@@ -809,6 +841,51 @@ mod tests {
             } else {
                 let test = measure_metadata_line::<TEST_HISTORICAL>(video, iterations);
                 let base = measure_metadata_line::<BASE_HISTORICAL>(video, iterations);
+                (base, test)
+            };
+            ratios.push(base.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
+    }
+
+    fn measure_source_line<const HISTORICAL: bool>(
+        video: &RenderVideo,
+        run: &RenderRun,
+        iterations: usize,
+    ) -> Duration {
+        let started = Instant::now();
+        let mut out = String::with_capacity(192);
+        let mut checksum = 0usize;
+        for _ in 0..iterations {
+            out.clear();
+            if HISTORICAL {
+                historical_push_source_line(&mut out, black_box(video), black_box(run));
+            } else {
+                push_source_line(&mut out, black_box(video), black_box(run));
+            }
+            checksum ^= out.len();
+            black_box(out.as_str());
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_source_ratios<const BASE_HISTORICAL: bool, const TEST_HISTORICAL: bool>(
+        video: &RenderVideo,
+        run: &RenderRun,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (base, test) = if repetition % 2 == 0 {
+                (
+                    measure_source_line::<BASE_HISTORICAL>(video, run, iterations),
+                    measure_source_line::<TEST_HISTORICAL>(video, run, iterations),
+                )
+            } else {
+                let test = measure_source_line::<TEST_HISTORICAL>(video, run, iterations);
+                let base = measure_source_line::<BASE_HISTORICAL>(video, run, iterations);
                 (base, test)
             };
             ratios.push(base.as_secs_f64() / test.as_secs_f64());
@@ -1009,6 +1086,120 @@ mod tests {
         );
         eprintln!(
             "YOUTUBE_METADATA_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            format_ratios(&candidate_ratios),
+            candidate.median,
+            candidate.p10,
+            candidate.p90,
+            candidate.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
+    }
+
+    #[test]
+    fn direct_source_line_matches_historical_semantics() {
+        let urls = [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ];
+        let versions = [None, Some(""), Some(" \n\t "), Some("v0.2.0")];
+
+        for url in urls {
+            for version in versions {
+                for rtf in [None, Some(0.04)] {
+                    let mut video = sample_video();
+                    video.webpage_url = url.to_owned();
+                    let mut run = sample_run();
+                    run.version_tag = version.map(str::to_owned);
+                    run.rtf = rtf;
+
+                    let mut historical = "prefix\n".to_owned();
+                    historical_push_source_line(&mut historical, &video, &run);
+                    let mut direct = "prefix\n".to_owned();
+                    push_source_line(&mut direct, &video, &run);
+                    assert_eq!(
+                        direct, historical,
+                        "url={url:?}, version={version:?}, rtf={rtf:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn direct_source_line_perf() {
+        const TARGET_ARM_SECS: f64 = 0.020;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 1.10;
+        const REQUIRED_WINS: usize = 13;
+
+        let video = sample_video();
+        let run = sample_run();
+        let mut historical = String::new();
+        historical_push_source_line(&mut historical, &video, &run);
+        let mut direct = String::new();
+        push_source_line(&mut direct, &video, &run);
+        assert_eq!(direct, historical, "timed fixture must remain byte exact");
+        let output_sha256 = format!("{:x}", Sha256::digest(direct.as_bytes()));
+
+        let calibration = measure_source_line::<true>(&video, &run, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(256, 1_048_576);
+
+        black_box(paired_source_ratios::<true, true>(
+            &video,
+            &run,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios =
+            paired_source_ratios::<true, true>(&video, &run, iterations, PAIRED_REPETITIONS);
+        let null = paired_perf_stats(&null_ratios);
+
+        black_box(paired_source_ratios::<true, false>(
+            &video,
+            &run,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios =
+            paired_source_ratios::<true, false>(&video, &run, iterations, PAIRED_REPETITIONS);
+        let candidate = paired_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate.median >= MIN_CANDIDATE_MEDIAN
+            && candidate.p10 > null.p90
+            && candidate.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "YOUTUBE_SOURCE_CALIBRATION output_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            direct.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "YOUTUBE_SOURCE_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            format_ratios(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "YOUTUBE_SOURCE_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
             format_ratios(&candidate_ratios),
             candidate.median,
             candidate.p10,

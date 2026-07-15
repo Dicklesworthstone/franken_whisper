@@ -51,6 +51,45 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): assemble YouTube source/provenance line directly — **5.77x median**
+
+**Profile / negative-ledger boundary.** `bv --robot-triage` data hash
+`6a9f6c492c820e46` again ranked the YouTube ingestion epic as an actionable
+quick win, while neither ledger contained a source/provenance-line row.
+Allocation attribution found that the all-fields path created a vector, source
+display string, provider string, three wrapper strings, an RTF formatter
+temporary, and a joined string before copying 170 bytes into the renderer's
+existing output buffer.
+
+**One lever and exactness.** Bead `bd-27v1.3` now appends the source URL,
+scheme-stripped display URL, provider/version/engine/model fields, separators,
+and optional RTF directly into that output buffer. Only the existing two-decimal
+RTF formatter temporary remains. The release oracle matched historical output
+for 24 combinations spanning `https://`, `http://`, and scheme-free URLs;
+absent, empty, whitespace-only, and present version tags; and absent/present
+RTF. The timed all-fields fixture also matched exactly: 170 bytes, SHA-256
+`d2fbf394d2fed063b1cb2d352bff0ee068cc5bf86bd53fb5f4cda3c3c2edddc1`.
+
+**Strict-remote release A/B.** Two initial pinned admissions were refused for
+slot pressure before compilation and are not evidence. Worker `vmi1152480`
+then ran the uncapped warm-up as job `j-29928833041829024`
+(`--profile release`, exit 0), followed by parity job
+`j-29928833041829039` (1/1 passed). Foreground measurement job
+`j-29928833041829041` reused the warmed release binary; the hermetic test
+finished in 0.36 seconds with 12,107 iterations per arm, 20 ms target arms, and
+15 order-alternated pairs. BASE/BASE ratios were
+`[1.007377,0.957829,1.113544,1.780392,0.977176,1.223717,1.062857,1.056388,1.096108,1.104659,0.929705,0.971755,0.994488,1.022575,0.999165]`:
+median 1.022575, p10 0.957829, p90 1.113544, CV 18.984%; the declared
+null-median gate `[0.97,1.03]` passed. CV is informational; the isolated
+1.780392 scheduling outlier did not move the median outside admission.
+
+Historical/direct ratios were
+`[5.768084,5.648885,5.551890,5.455374,6.261142,5.486323,7.158189,5.959180,6.177829,4.706317,6.924354,7.431122,6.011627,4.914099,5.596637]`:
+median **5.768084x**, p10 4.914099, p90 6.924354, CV 12.922%, and
+15/15 wins. This clears the declared 1.10x median,
+candidate-p10-above-null-p90, and 13/15-win gates. Scope is component-level:
+one source line per rendered Markdown artifact, not end-to-end ASR throughput.
+
 ### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): assemble YouTube metadata line directly — **1.90x median**
 
 **Profile / negative-ledger boundary.** `bv --robot-triage` data hash
