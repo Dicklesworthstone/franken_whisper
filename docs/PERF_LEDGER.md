@@ -4,6 +4,28 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-15 — LANDED — projected yt-dlp flat-playlist parser (bd-27v1.9)
+
+**Negative-ledger retry.** The `bd-27v1.8` candidate had previously measured a
+4.250978x median but was restored because its very short BASE/BASE arm missed
+the null band by 0.6%. Profiling attributed the cost to constructing a complete
+`serde_json::Value` tree for every roughly 1.2 KiB yt-dlp line even though
+`VideoRef` retains only `id`, `title`, `url`/`webpage_url`, and `duration`.
+This retry made that one representation change: deserialize only the retained
+fields, skip unknown subtrees, and move retained strings into `VideoRef`.
+
+**Proof and measurement.** The same-binary release harness covered retained and
+ignored fields, escaped strings, empty/missing/wrong-typed fields, URL fallback,
+negative-zero duration bits, and malformed JSON. Each timed arm parsed 4,096
+lines from a 128-entry, 152,082-byte realistic fixture. Strict-remote job
+`j-29928833041829463` on `vmi1227854` returned BASE/BASE median **0.994521x**
+(p90 1.293669x, CV 13.515%) and historical/projected median **3.512695x**
+(p10 3.012683x, CV 7.076%, 15/15 wins). The predeclared gates all passed:
+null median in `[0.98,1.02]`, candidate median at least 1.20x, candidate p10
+above null p90, and at least 13/15 wins. Output ordering and fallback semantics
+are unchanged; retained strings and the optional `f64` duration are exact,
+including `to_bits()` parity.
+
 ## Measurement protocol
 
 - **Harness:** `benches/native_engine_bench.rs` (criterion).

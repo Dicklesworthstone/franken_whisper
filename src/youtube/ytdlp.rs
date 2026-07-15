@@ -534,9 +534,9 @@ pub fn expand_playlist(
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(value) => {
-                if let Some(video_ref) = video_ref_from_json(&value) {
+        match parse_flat_playlist_line(line) {
+            Ok(video_ref) => {
+                if let Some(video_ref) = video_ref {
                     refs.push(video_ref);
                 } else {
                     tracing::warn!(
@@ -589,25 +589,50 @@ fn is_capture_truncation_failure(err: &FwError) -> bool {
     }
 }
 
-/// Map a single flat-playlist JSON object into a [`VideoRef`], or `None` if it
-/// lacks a usable id.
-fn video_ref_from_json(value: &serde_json::Value) -> Option<VideoRef> {
-    let id = value.get("id").and_then(serde_json::Value::as_str)?;
-    if id.is_empty() {
-        return None;
-    }
-    let title = string_field(value, "title").unwrap_or_default();
-    let url = string_field(value, "url")
-        .or_else(|| string_field(value, "webpage_url"))
+/// The only fields retained from yt-dlp's much larger flat-playlist objects.
+/// Unknown fields are parsed for validity but skipped without building a full
+/// `serde_json::Value` tree.
+#[derive(serde::Deserialize)]
+struct FlatPlaylistEntry {
+    #[serde(default)]
+    id: serde_json::Value,
+    #[serde(default)]
+    title: serde_json::Value,
+    #[serde(default)]
+    url: serde_json::Value,
+    #[serde(default)]
+    webpage_url: serde_json::Value,
+    #[serde(default)]
+    duration: serde_json::Value,
+}
+
+/// Parse one flat-playlist line and move the retained strings into a
+/// [`VideoRef`]. Missing, empty, or non-string ids remain skippable entries.
+fn parse_flat_playlist_line(line: &str) -> serde_json::Result<Option<VideoRef>> {
+    serde_json::from_str(line).map(video_ref_from_flat_entry)
+}
+
+fn video_ref_from_flat_entry(entry: FlatPlaylistEntry) -> Option<VideoRef> {
+    let id = non_empty_json_string(entry.id)?;
+    let title = non_empty_json_string(entry.title).unwrap_or_default();
+    let url = non_empty_json_string(entry.url)
+        .or_else(|| non_empty_json_string(entry.webpage_url))
         .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
-    let duration_sec = value.get("duration").and_then(serde_json::Value::as_f64);
+    let duration_sec = entry.duration.as_f64();
 
     Some(VideoRef {
-        id: id.to_owned(),
+        id,
         title,
         url,
         duration_sec,
     })
+}
+
+fn non_empty_json_string(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) if !value.is_empty() => Some(value),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,19 +1530,90 @@ mod tests {
     }
 
     #[test]
-    fn video_ref_from_json_url_fallback_to_synthetic() {
-        let value = serde_json::json!({"id": "xyz", "title": "T"});
-        let r = video_ref_from_json(&value).unwrap();
+    fn projected_video_ref_url_fallback_to_synthetic() {
+        let r = parse_flat_playlist_line(r#"{"id":"xyz","title":"T"}"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.url, "https://www.youtube.com/watch?v=xyz");
         assert_eq!(r.duration_sec, None);
     }
 
     #[test]
-    fn video_ref_from_json_no_id_is_none() {
-        let value = serde_json::json!({"title": "T"});
-        assert!(video_ref_from_json(&value).is_none());
-        let empty_id = serde_json::json!({"id": ""});
-        assert!(video_ref_from_json(&empty_id).is_none());
+    fn projected_video_ref_no_id_is_none() {
+        assert!(
+            parse_flat_playlist_line(r#"{"title":"T"}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_flat_playlist_line(r#"{"id":""}"#).unwrap().is_none());
+    }
+
+    fn legacy_video_ref_from_json(value: &serde_json::Value) -> Option<VideoRef> {
+        let id = value.get("id").and_then(serde_json::Value::as_str)?;
+        if id.is_empty() {
+            return None;
+        }
+        let title = string_field(value, "title").unwrap_or_default();
+        let url = string_field(value, "url")
+            .or_else(|| string_field(value, "webpage_url"))
+            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+        let duration_sec = value.get("duration").and_then(serde_json::Value::as_f64);
+        Some(VideoRef {
+            id: id.to_owned(),
+            title,
+            url,
+            duration_sec,
+        })
+    }
+
+    fn legacy_parse_flat_playlist_line(line: &str) -> serde_json::Result<Option<VideoRef>> {
+        serde_json::from_str(line).map(|value| legacy_video_ref_from_json(&value))
+    }
+
+    fn assert_video_refs_exact(left: &Option<VideoRef>, right: &Option<VideoRef>) {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                assert_eq!(left.id, right.id);
+                assert_eq!(left.title, right.title);
+                assert_eq!(left.url, right.url);
+                assert_eq!(
+                    left.duration_sec.map(f64::to_bits),
+                    right.duration_sec.map(f64::to_bits)
+                );
+            }
+            (None, None) => {}
+            _ => panic!("projected and legacy parsers disagreed: {left:?} != {right:?}"),
+        }
+    }
+
+    #[test]
+    fn projected_playlist_parser_matches_value_dom_reference() {
+        for line in [
+            r#"{"id":"abc","title":"title","url":"https://youtu.be/abc","webpage_url":"ignored","duration":1.25,"description":{"fat":[1,2,3]}}"#,
+            r#"{"id":"escaped\\\"id","title":"snowman ☃","webpage_url":"https://example.test/watch","duration":-0.0}"#,
+            r#"{"id":"abc","title":"","url":"","webpage_url":"","duration":7}"#,
+            r#"{"id":"abc","title":7,"url":false,"webpage_url":"fallback","duration":"9"}"#,
+            r#"{"id":""}"#,
+            r#"{"id":42}"#,
+            r#"{"title":"missing id"}"#,
+            r#"[]"#,
+            r#"null"#,
+            r#"{"id":"unterminated""#,
+        ] {
+            let legacy = legacy_parse_flat_playlist_line(line);
+            let projected = parse_flat_playlist_line(line);
+            match (legacy, projected) {
+                (Ok(legacy), Ok(projected)) => assert_video_refs_exact(&legacy, &projected),
+                (Err(_), Err(_)) => {}
+                // A valid non-object JSON value was historically classified as
+                // an entry without an id; the projected struct rejects it as a
+                // parse mismatch. Both production paths skip the line.
+                (Ok(None), Err(_)) | (Err(_), Ok(None)) => {}
+                (legacy, projected) => {
+                    panic!("parse outcome mismatch for {line:?}: {legacy:?} != {projected:?}")
+                }
+            }
+        }
     }
 
     // ---- fetch_metadata (via stub) ---------------------------------------
