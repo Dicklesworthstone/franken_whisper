@@ -376,6 +376,7 @@ fn group_paragraphs(segments: &[TranscriptionSegment]) -> Vec<Paragraph<'_>> {
 
 /// Join a paragraph's segment texts into a single trimmed prose string,
 /// collapsing inter-segment whitespace to a single space.
+#[cfg(test)]
 fn paragraph_text(p: &Paragraph<'_>) -> String {
     let mut out = String::new();
     for seg in &p.segments {
@@ -389,6 +390,27 @@ fn paragraph_text(p: &Paragraph<'_>) -> String {
         out.push_str(piece);
     }
     out
+}
+
+/// Append a paragraph's trimmed segment texts directly to `out`.
+///
+/// Returns whether at least one non-empty segment was written. Whitespace
+/// between non-empty segments is collapsed to one ASCII space, matching the
+/// historical temporary-`String` path.
+fn push_paragraph_text(out: &mut String, p: &Paragraph<'_>) -> bool {
+    let mut wrote_text = false;
+    for seg in &p.segments {
+        let piece = seg.text.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if wrote_text {
+            out.push(' ');
+        }
+        out.push_str(piece);
+        wrote_text = true;
+    }
+    wrote_text
 }
 
 // ---------------------------------------------------------------------------
@@ -449,10 +471,7 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
         let paragraphs = group_paragraphs(input.segments);
         let mut wrote_any = false;
         for p in &paragraphs {
-            let text = paragraph_text(p);
-            if text.is_empty() {
-                continue;
-            }
+            let paragraph_start = out.len();
             push_timestamp_link(&mut out, &v.id, p.start_sec);
             if let Some(spk) = p.speaker.filter(|s| !s.trim().is_empty()) {
                 out.push(' ');
@@ -460,7 +479,10 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
                 out.push(':');
             }
             out.push(' ');
-            out.push_str(&text);
+            if !push_paragraph_text(&mut out, p) {
+                out.truncate(paragraph_start);
+                continue;
+            }
             out.push_str("\n\n");
             wrote_any = true;
         }
@@ -849,6 +871,16 @@ mod tests {
         out.push_str(&format!("**[{label}]({link})**"));
     }
 
+    fn historical_push_paragraph_text(out: &mut String, paragraph: &Paragraph<'_>) -> bool {
+        let text = paragraph_text(paragraph);
+        if text.is_empty() {
+            false
+        } else {
+            out.push_str(&text);
+            true
+        }
+    }
+
     fn measure_title_heading<const HISTORICAL: bool>(title: &str, iterations: usize) -> Duration {
         let started = Instant::now();
         let mut out = String::with_capacity(128);
@@ -1015,6 +1047,49 @@ mod tests {
             } else {
                 let test = measure_timestamp_link::<TEST_HISTORICAL>(id, start_sec, iterations);
                 let base = measure_timestamp_link::<BASE_HISTORICAL>(id, start_sec, iterations);
+                (base, test)
+            };
+            ratios.push(base.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
+    }
+
+    fn measure_paragraph_text<const HISTORICAL: bool>(
+        paragraph: &Paragraph<'_>,
+        iterations: usize,
+    ) -> Duration {
+        let started = Instant::now();
+        let mut out = String::with_capacity(512);
+        let mut checksum = 0usize;
+        for _ in 0..iterations {
+            out.clear();
+            let wrote = if HISTORICAL {
+                historical_push_paragraph_text(&mut out, black_box(paragraph))
+            } else {
+                push_paragraph_text(&mut out, black_box(paragraph))
+            };
+            checksum ^= out.len() ^ usize::from(wrote);
+            black_box(out.as_str());
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_paragraph_text_ratios<const BASE_HISTORICAL: bool, const TEST_HISTORICAL: bool>(
+        paragraph: &Paragraph<'_>,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (base, test) = if repetition % 2 == 0 {
+                (
+                    measure_paragraph_text::<BASE_HISTORICAL>(paragraph, iterations),
+                    measure_paragraph_text::<TEST_HISTORICAL>(paragraph, iterations),
+                )
+            } else {
+                let test = measure_paragraph_text::<TEST_HISTORICAL>(paragraph, iterations);
+                let base = measure_paragraph_text::<BASE_HISTORICAL>(paragraph, iterations);
                 (base, test)
             };
             ratios.push(base.as_secs_f64() / test.as_secs_f64());
@@ -1552,6 +1627,159 @@ mod tests {
         );
         eprintln!(
             "YOUTUBE_TIMESTAMP_LINK_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            format_ratios(&candidate_ratios),
+            candidate.median,
+            candidate.p10,
+            candidate.p90,
+            candidate.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
+    }
+
+    #[test]
+    fn direct_paragraph_text_matches_historical_semantics() {
+        let cases: Vec<Vec<TranscriptionSegment>> = vec![
+            Vec::new(),
+            vec![seg(0.0, 1.0, "")],
+            vec![seg(0.0, 1.0, " \t\n ")],
+            vec![seg(0.0, 1.0, "  one segment  ")],
+            vec![
+                seg(0.0, 1.0, "  leading and trailing  "),
+                seg(1.0, 2.0, ""),
+                seg(2.0, 3.0, "\tsecond\nline\t"),
+            ],
+            vec![
+                seg(0.0, 1.0, " Καλημέρα "),
+                seg(1.0, 2.0, "世界"),
+                seg(2.0, 3.0, " emoji 🎙️ "),
+            ],
+        ];
+
+        for segments in &cases {
+            let paragraph = Paragraph {
+                start_sec: 0.0,
+                speaker: None,
+                segments: segments.iter().collect(),
+            };
+            let mut historical = "prefix: ".to_owned();
+            let historical_wrote = historical_push_paragraph_text(&mut historical, &paragraph);
+            let mut direct = "prefix: ".to_owned();
+            let direct_wrote = push_paragraph_text(&mut direct, &paragraph);
+            assert_eq!(direct_wrote, historical_wrote);
+            assert_eq!(direct, historical);
+        }
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn direct_paragraph_text_perf() {
+        const TARGET_ARM_SECS: f64 = 0.020;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 1.10;
+        const REQUIRED_WINS: usize = 13;
+
+        let segments = vec![
+            seg(
+                0.0,
+                1.0,
+                "  Native speech systems should spend their time decoding audio,  ",
+            ),
+            seg(
+                1.0,
+                2.0,
+                "not repeatedly allocating intermediate transcript strings.",
+            ),
+            seg(2.0, 3.0, ""),
+            seg(
+                3.0,
+                4.0,
+                " Each segment is already owned by the transcription result, ",
+            ),
+            seg(
+                4.0,
+                5.0,
+                "so the renderer can borrow, trim, and append it directly.",
+            ),
+            seg(5.0, 6.0, "   "),
+            seg(
+                6.0,
+                7.0,
+                "This fixture includes empty pieces and boundary whitespace",
+            ),
+            seg(
+                7.0,
+                8.0,
+                "while preserving internal punctuation and Unicode: café 世界 🎙️.  ",
+            ),
+        ];
+        let paragraph = Paragraph {
+            start_sec: 0.0,
+            speaker: None,
+            segments: segments.iter().collect(),
+        };
+        let mut historical = String::new();
+        let historical_wrote = historical_push_paragraph_text(&mut historical, &paragraph);
+        let mut direct = String::new();
+        let direct_wrote = push_paragraph_text(&mut direct, &paragraph);
+        assert_eq!(direct_wrote, historical_wrote);
+        assert_eq!(direct, historical, "timed fixture must remain byte exact");
+        let output_sha256 = format!("{:x}", Sha256::digest(direct.as_bytes()));
+
+        let calibration = measure_paragraph_text::<true>(&paragraph, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(256, 1_048_576);
+
+        black_box(paired_paragraph_text_ratios::<true, true>(
+            &paragraph,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios =
+            paired_paragraph_text_ratios::<true, true>(&paragraph, iterations, PAIRED_REPETITIONS);
+        let null = paired_perf_stats(&null_ratios);
+
+        black_box(paired_paragraph_text_ratios::<true, false>(
+            &paragraph,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios =
+            paired_paragraph_text_ratios::<true, false>(&paragraph, iterations, PAIRED_REPETITIONS);
+        let candidate = paired_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate.median >= MIN_CANDIDATE_MEDIAN
+            && candidate.p10 > null.p90
+            && candidate.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "YOUTUBE_PARAGRAPH_TEXT_CALIBRATION output_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            direct.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "YOUTUBE_PARAGRAPH_TEXT_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            format_ratios(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "YOUTUBE_PARAGRAPH_TEXT_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
             format_ratios(&candidate_ratios),
             candidate.median,
             candidate.p10,
