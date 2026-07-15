@@ -22637,3 +22637,48 @@ does not compensate for that lost loop optimization.
 back at `HEAD`; only this evidence row ships. Do not retry decode/RMS loop fusion
 without assembly or instruction-count evidence showing a formulation that
 preserves the optimizer's bulk-loop quality.
+
+---
+## 2026-07-15 - Codex: **HOLD / INVALID NULL — owned safetensors backing measured 1.912682x median and 15/15 wins, but BASE/BASE was biased at 1.023241x; source restored.**
+
+**Negative-ledger-first attribution.** `bv --robot-triage` left the recent
+decoder, attention, streaming, mel, tokenizer, storage-schema, and YouTube
+parser seams either exhausted or explicitly ledgered. Bead `bd-p2s8.1`
+pivoted to the untouched auxiliary-model weight loader. Profiling the source
+showed that `SafetensorsFile::load` received an owned full-file `Vec<u8>` from
+`std::fs::read`, then `from_bytes(&bytes)` copied the complete tensor data
+section into a second `Vec`. The one candidate shared header validation between
+the owned and borrowed entry points, retained the disk-owned file buffer with a
+data-section offset, and deliberately preserved `from_bytes(&[u8])` copy
+semantics.
+
+**Exactness and owned-buffer A/B.** The production parity oracle compared disk
+and borrowed loads for sorted names, metadata, shapes, and every decoded
+`f32::to_bits()` value. The same-binary harness then isolated the attributed
+post-read cost with a 33,578,391-byte owned buffer containing 256 tensor
+entries and a 32 MiB payload. Both arms cloned that buffer to model ownership
+returned by `std::fs::read`, parsed the same JSON directory, validated the same
+offsets, and produced identical signatures; only the historical arm copied the
+payload a second time. Fifteen order-alternated BASE/BASE ratios were
+`[0.973743,0.918833,1.054568,0.930694,0.935393,1.057532,1.004168,0.957626,1.141543,1.118931,0.988803,1.055677,1.023241,1.280810,1.030659]`:
+median **1.023241x**, p90 **1.141543x**, CV 9.242%. The median missed the
+predeclared `[0.98,1.02]` null-validity band by 0.003241.
+
+Historical/owned-backing ratios were
+`[1.951053,1.973886,1.844099,2.016875,1.951692,2.339522,1.716693,1.851934,2.083845,1.905352,1.895909,1.641361,1.667455,2.054523,1.912682]`:
+median **1.912682x**, p10 **1.667455x**, CV 9.117%, and **15/15 wins**. The
+candidate cleared its 1.20x median, candidate-p10-above-null-p90, and 13/15
+win-count conditions, but the predeclared conjunctive gate fails when the null
+median is invalid.
+
+**Remote provenance and verdict.** Untimed strict-remote warm-up job
+`j-29928833041829512` built the ordinary `--profile release` benchmark first.
+The sole foreground measurement, strict-remote job `j-29928833041829523` on
+`vmi1227854`, completed the timed body in the same process without an external
+timeout. A separate full-workspace test attempt emitted compiler progress and
+then crossed the two-minute no-output liveness threshold; it was interrupted
+as infrastructure history and is not used as lever evidence. UBS reported zero
+critical findings and clean format/check/test-build phases. Production source
+was manually restored; the small isolated harness remains so a future retry can
+increase per-arm work enough to establish a valid null before reusing this
+promising component result.
