@@ -51,6 +51,46 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (exact vector): shared segment-time parent lookups — **1.27x / 21.1% lower**
+
+**Profile / negative-ledger boundary.** The immediately preceding direct-field
+timestamp lookup keep reduced the 500-node mixed-schema extractor to 46.771 us,
+leaving repeated parent-object hashing as the measured residue. Start and end
+were still independently looking up `offsets` and, for timestamp-shaped nodes,
+`timestamp`, even though both values come from the same segment object. No
+existing negative-evidence row covered sharing those parent lookups.
+
+**Change and exactness.** `segment_times` now resolves both fields together. It
+loads `offsets` once, preserves the existing field precedence and the rule that
+a present-but-nonnumeric offset/direct field blocks later fallbacks, and loads
+`timestamp` at most once only when either side needs it. Both flat segment
+normalization and the word-chunk fallback use the paired result. Before timing,
+the release benchmark asserted the complete output vector equal to the current
+direct-field implementation across 500 nodes spanning direct fields, `_sec`
+fields, timestamp arrays, numeric-key objects, named-key objects, millisecond
+offsets, and malformed offsets.
+
+| same-binary arm (500 mixed segment nodes) | interval | point estimate |
+|---|---:|---:|
+| independent direct-field lookups | 43.603--46.999 us | **45.496 us** |
+| shared parent lookups | 34.930--36.364 us | **35.878 us** |
+
+The candidate is **21.1% lower time / 1.268x throughput**, with non-overlapping
+intervals and exact fixture parity, clearing the declared >=10% component gate.
+
+**Remote provenance.** Strict-remote warm-up job `j-29928833041828756` built
+`native_engine_bench` with `--profile release` on `vmi1152480` and exited 0.
+Measurement job `j-29928833041828779` ran on the same worker and target pool;
+RCH unexpectedly reported a target-cache miss and rebuilt, but the uncapped
+build completed before Criterion ran. Criterion then used a 0.5-second warm-up,
+1-second measurement, and 10 samples per arm; exit 0, no local fallback. The
+earlier job `j-29928833041828754` stopped before compilation because a different
+worker lacked an offline registry entry and is infrastructure, not evidence.
+
+**Scope.** This is a component win in backend JSON segment normalization, not
+an end-to-end ASR ratio. Production, its hermetic A/B, and bead `bd-kq7n` land
+together.
+
 ### 2026-07-14 UTC — cod_fw — LANDED (timestamp exact): direct fixed-path JSON lookup — **6.03x point estimate**
 
 **Profile / negative-ledger boundary.** After the native-engine non-GEMM,

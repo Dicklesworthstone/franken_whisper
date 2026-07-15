@@ -1622,6 +1622,55 @@ fn direct_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
     (start, end)
 }
 
+fn shared_parent_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
+    let offsets = node.get("offsets");
+    let start_offset = offsets.and_then(|offsets| offsets.get("from"));
+    let end_offset = offsets.and_then(|offsets| offsets.get("to"));
+    let start_direct = if start_offset.is_none() {
+        node.get("start").or_else(|| node.get("start_sec"))
+    } else {
+        None
+    };
+    let end_direct = if end_offset.is_none() {
+        node.get("end").or_else(|| node.get("end_sec"))
+    } else {
+        None
+    };
+    let timestamp = if (start_offset.is_none() && start_direct.is_none())
+        || (end_offset.is_none() && end_direct.is_none())
+    {
+        node.get("timestamp")
+    } else {
+        None
+    };
+
+    let start = if let Some(value) = start_offset {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        start_direct
+            .or_else(|| {
+                timestamp.and_then(|timestamp| {
+                    timestamp.get(0).or_else(|| timestamp.get("0"))
+                })
+            })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("start")))
+            .and_then(timestamp_number)
+    };
+    let end = if let Some(value) = end_offset {
+        timestamp_number(value).map(|value| value / 1000.0)
+    } else {
+        end_direct
+            .or_else(|| {
+                timestamp.and_then(|timestamp| {
+                    timestamp.get(1).or_else(|| timestamp.get("1"))
+                })
+            })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("end")))
+            .and_then(timestamp_number)
+    };
+    (start, end)
+}
+
 fn bench_timestamp_lookup_ab(c: &mut Criterion) {
     let nodes = timestamp_nodes(500);
     let reference: Vec<_> = nodes.iter().map(pointer_timestamp_pair).collect();
@@ -1629,6 +1678,11 @@ fn bench_timestamp_lookup_ab(c: &mut Criterion) {
     assert_eq!(
         direct, reference,
         "direct lookups must preserve pointer semantics"
+    );
+    let shared_parent: Vec<_> = nodes.iter().map(shared_parent_timestamp_pair).collect();
+    assert_eq!(
+        shared_parent, direct,
+        "shared parent lookups must preserve direct-field semantics"
     );
 
     let mut group = c.benchmark_group("native_engine/timestamp_lookup_ab");
@@ -1647,6 +1701,16 @@ fn bench_timestamp_lookup_ab(c: &mut Criterion) {
             let mut checksum = 0.0;
             for node in &nodes {
                 let (start, end) = direct_timestamp_pair(black_box(node));
+                checksum += start.unwrap_or_default() + end.unwrap_or_default();
+            }
+            black_box(checksum)
+        });
+    });
+    group.bench_function("shared_parent_fields", |b| {
+        b.iter(|| {
+            let mut checksum = 0.0;
+            for node in &nodes {
+                let (start, end) = shared_parent_timestamp_pair(black_box(node));
                 checksum += start.unwrap_or_default() + end.unwrap_or_default();
             }
             black_box(checksum)

@@ -3172,9 +3172,10 @@ fn extract_word_level_segments(chunks: &[Value]) -> Vec<TranscriptionSegment> {
             }
         } else {
             // Fallback: treat chunk as a regular segment.
+            let (start_sec, end_sec) = segment_times(chunk);
             segments.push(TranscriptionSegment {
-                start_sec: segment_start(chunk),
-                end_sec: segment_end(chunk),
+                start_sec,
+                end_sec,
                 text: chunk
                     .get("text")
                     .and_then(Value::as_str)
@@ -3208,8 +3209,7 @@ fn segments_from_nodes(nodes: &[Value]) -> Vec<TranscriptionSegment> {
     nodes
         .iter()
         .map(|node| {
-            let start = segment_start(node);
-            let end = segment_end(node);
+            let (start, end) = segment_times(node);
 
             let text = node
                 .get("text")
@@ -3243,36 +3243,66 @@ fn segments_from_nodes(nodes: &[Value]) -> Vec<TranscriptionSegment> {
         .collect()
 }
 
-fn segment_start(node: &Value) -> Option<f64> {
-    let raw = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("from")) {
+fn segment_times(node: &Value) -> (Option<f64>, Option<f64>) {
+    let offsets = node.get("offsets");
+    let start_offset = offsets.and_then(|offsets| offsets.get("from"));
+    let end_offset = offsets.and_then(|offsets| offsets.get("to"));
+
+    let start_direct = if start_offset.is_none() {
+        node.get("start").or_else(|| node.get("start_sec"))
+    } else {
+        None
+    };
+    let end_direct = if end_offset.is_none() {
+        node.get("end").or_else(|| node.get("end_sec"))
+    } else {
+        None
+    };
+
+    let timestamp = if (start_offset.is_none() && start_direct.is_none())
+        || (end_offset.is_none() && end_direct.is_none())
+    {
+        node.get("timestamp")
+    } else {
+        None
+    };
+
+    let start = if let Some(value) = start_offset {
         number_millis_to_secs(value)
     } else {
-        node.get("start")
-            .or_else(|| node.get("start_sec"))
-            .or_else(|| timestamp_index_value(node, 0, "0"))
+        start_direct
             .or_else(|| {
-                node.get("timestamp")
-                    .and_then(|timestamp| timestamp.get("start"))
+                timestamp.and_then(|timestamp| {
+                    timestamp.get(0).or_else(|| timestamp.get("0"))
+                })
             })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("start")))
             .and_then(number_to_secs)
     };
-    sanitize_timestamp(raw)
+    let end = if let Some(value) = end_offset {
+        number_millis_to_secs(value)
+    } else {
+        end_direct
+            .or_else(|| {
+                timestamp.and_then(|timestamp| {
+                    timestamp.get(1).or_else(|| timestamp.get("1"))
+                })
+            })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("end")))
+            .and_then(number_to_secs)
+    };
+
+    (sanitize_timestamp(start), sanitize_timestamp(end))
 }
 
+#[cfg(test)]
+fn segment_start(node: &Value) -> Option<f64> {
+    segment_times(node).0
+}
+
+#[cfg(test)]
 fn segment_end(node: &Value) -> Option<f64> {
-    let raw = if let Some(value) = node.get("offsets").and_then(|offsets| offsets.get("to")) {
-        number_millis_to_secs(value)
-    } else {
-        node.get("end")
-            .or_else(|| node.get("end_sec"))
-            .or_else(|| timestamp_index_value(node, 1, "1"))
-            .or_else(|| {
-                node.get("timestamp")
-                    .and_then(|timestamp| timestamp.get("end"))
-            })
-            .and_then(number_to_secs)
-    };
-    sanitize_timestamp(raw)
+    segment_times(node).1
 }
 
 #[inline]
