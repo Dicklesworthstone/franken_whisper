@@ -22595,3 +22595,45 @@ intervals do not support any smaller-shape win. Production source and the
 temporary A/B/parity harness were restored manually; only this ledger row is
 shipped. Do not retry two-pass exact-capacity assembly for this helper without a
 single-pass capacity strategy that avoids repeated Unicode trimming.
+
+---
+## 2026-07-15 - Codex: **REJECT — fusing PCM16 decode with frame-RMS accumulation was 2.50x slower; source restored.**
+
+**Negative-ledger-first attribution.** `bv --robot-triage` exposed only stale
+audio-normalization and scheduling perf beads. The tokenizer/BPE and storage
+schema-probe alternatives were already explicitly closed by prior profiles and
+real A/Bs. The distinct native VAD/source-separation analyzer still decoded a
+30-second mono WAV into a 480,000-element `Vec<i16>` and then reread that whole
+buffer in `compute_frame_rms`. The candidate fused byte decoding with the same
+sequential f64 RMS accumulation, removing the ~0.96 MB intermediate and second
+pass. Opportunity score was `(impact 3 x confidence 4) / effort 2 = 6`.
+
+**Behavior proof.** A standalone no-dependency release harness compared the
+historical decode-then-RMS implementation with the fused stream across empty,
+partial-frame, exact-frame, read-buffer-boundary, and 30-second inputs. Every
+frame's `f32::to_bits()` matched. Sample order, division, multiply, f64 addition,
+frame boundary, square root, and f32 cast were unchanged; only their placement
+relative to PCM materialization differed.
+
+**Foreground strict-remote A/B.** An uncapped warm-up first built the ordinary
+`release` bench on `vmi1227854` in 0.38 seconds after sync. The one timed command
+then reused the same worker and binary:
+
+`RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 RCH_WORKERS=vmi1227854 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo bench --profile release --manifest-path benches/native_audio_analysis_perf/Cargo.toml --bench pcm_rms -- --measurement-time 1 --sample-size 10`
+
+- BASE/BASE null: p10 **0.927256x**, median **0.989781x**, p90 **1.089563x**
+- decode then RMS: median **18.051802 ms**
+- fused decode/RMS: median **45.038365 ms**
+- legacy/fused speedup: p10 **0.337851x**, median **0.399580x**, p90
+  **0.437843x**, **0/10 wins**
+
+The null median passed the predeclared `[0.97, 1.03]` validity band, while the
+candidate missed every keep gate and regressed by about 149%. The required
+stateful per-sample closure prevents the compiler from retaining the efficient
+bulk decode plus separately optimized fold shape; eliminating memory traffic
+does not compensate for that lost loop optimization.
+
+**Decision: reject and restore.** Production `native_audio.rs` is byte-for-byte
+back at `HEAD`; only this evidence row ships. Do not retry decode/RMS loop fusion
+without assembly or instruction-count evidence showing a formulation that
+preserves the optimizer's bulk-loop quality.
