@@ -51,6 +51,43 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): normalize YouTube title directly into heading — **1.89x median**
+
+**Profile / negative-ledger boundary.** `bv --robot-triage` data hash
+`6fcad6e06983b4a4` kept the YouTube ingestion epic actionable, while neither
+ledger contained a title-heading normalization row. Allocation attribution
+found that `render_markdown` collected every `split_whitespace` item into a
+`Vec<&str>`, joined those items into a new `String`, then copied that string
+into the renderer's existing output buffer.
+
+**One lever and exactness.** Bead `bd-27v1.4` now emits the normalized words
+and their single-space separators directly into the heading buffer. The
+release oracle matched the historical collect/join path for six cases spanning
+empty and whitespace-only titles, one word, repeated spaces, newlines/tabs,
+and Unicode whitespace/text. The timed fixture also matched exactly: 80 output
+bytes, SHA-256
+`add4de7f7d0d37b8d8afded7fde4dbe15b01b05f6907cebc9754bcd150cae338`.
+
+**Strict-remote release A/B.** Two attempts on `vmi1227854` lacked the offline
+`metal` index and one attempt on `vmi1149989` lacked `ctrlc`; all failed before
+compilation and are infrastructure, not evidence. Worker `vmi1152480` then ran
+the uncapped warm-up as job `j-29928833041829059` (`--profile release`, exit
+0), followed by parity job `j-29928833041829078` (1/1 passed). Foreground
+measurement job `j-29928833041829082` reused the warmed release binary; the
+hermetic test finished in 0.35 seconds with 19,763 iterations per arm, 20 ms
+target arms, and 15 order-alternated pairs. BASE/BASE ratios were
+`[0.984094,0.990488,0.988720,0.983323,1.075524,0.995847,0.993831,1.015830,1.003735,1.046855,0.987634,1.022761,1.019923,0.975465,1.016219]`:
+median 0.995847, p10 0.983323, p90 1.022761, CV 2.685%; the declared
+null-median gate `[0.97,1.03]` passed.
+
+Historical/direct ratios were
+`[1.861289,2.005105,2.016035,1.697302,1.885475,1.970018,2.301572,2.055613,1.847231,1.811873,0.833913,2.339507,1.845961,1.873251,2.038423]`:
+median **1.885475x**, p10 1.697302, p90 2.055613, CV 17.977%, and
+14/15 wins. This clears the declared 1.10x median,
+candidate-p10-above-null-p90, and 13/15-win gates. Scope is component-level:
+one title heading per rendered Markdown artifact, not end-to-end ASR
+throughput.
+
 ### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): assemble YouTube source/provenance line directly — **5.77x median**
 
 **Profile / negative-ledger boundary.** `bv --robot-triage` data hash

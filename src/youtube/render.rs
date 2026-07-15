@@ -185,6 +185,20 @@ fn format_upload_date(raw: &str) -> String {
     }
 }
 
+/// Append the title as a single normalized Markdown H1.
+fn push_title_heading(out: &mut String, title: &str) {
+    out.push_str("# ");
+    let mut first = true;
+    for word in title.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(word);
+        first = false;
+    }
+    out.push_str("\n\n");
+}
+
 /// Append the optional video metadata as one Markdown line.
 fn push_metadata_line(out: &mut String, video: &RenderVideo) {
     let mut has_part = false;
@@ -384,9 +398,7 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
 
     // H1. Collapse internal whitespace/newlines so a multi-line title cannot
     // break the heading into the body.
-    out.push_str("# ");
-    out.push_str(&v.title.split_whitespace().collect::<Vec<_>>().join(" "));
-    out.push_str("\n\n");
+    push_title_heading(&mut out, &v.title);
 
     // Metadata line: channel · uploaded · duration.
     push_metadata_line(&mut out, v);
@@ -753,6 +765,12 @@ mod tests {
             .join(",")
     }
 
+    fn historical_push_title_heading(out: &mut String, title: &str) {
+        out.push_str("# ");
+        out.push_str(&title.split_whitespace().collect::<Vec<_>>().join(" "));
+        out.push_str("\n\n");
+    }
+
     fn historical_push_metadata_line(out: &mut String, video: &RenderVideo) {
         let mut parts = Vec::new();
         if let Some(channel) = video
@@ -803,6 +821,46 @@ mod tests {
         }
         out.push_str(&parts.join(" · "));
         out.push_str("\n\n");
+    }
+
+    fn measure_title_heading<const HISTORICAL: bool>(title: &str, iterations: usize) -> Duration {
+        let started = Instant::now();
+        let mut out = String::with_capacity(128);
+        let mut checksum = 0usize;
+        for _ in 0..iterations {
+            out.clear();
+            if HISTORICAL {
+                historical_push_title_heading(&mut out, black_box(title));
+            } else {
+                push_title_heading(&mut out, black_box(title));
+            }
+            checksum ^= out.len();
+            black_box(out.as_str());
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_title_ratios<const BASE_HISTORICAL: bool, const TEST_HISTORICAL: bool>(
+        title: &str,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (base, test) = if repetition % 2 == 0 {
+                (
+                    measure_title_heading::<BASE_HISTORICAL>(title, iterations),
+                    measure_title_heading::<TEST_HISTORICAL>(title, iterations),
+                )
+            } else {
+                let test = measure_title_heading::<TEST_HISTORICAL>(title, iterations);
+                let base = measure_title_heading::<BASE_HISTORICAL>(title, iterations);
+                (base, test)
+            };
+            ratios.push(base.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
     }
 
     fn measure_metadata_line<const HISTORICAL: bool>(
@@ -986,6 +1044,107 @@ mod tests {
         assert_eq!(format_upload_date("20240115"), "2024-01-15");
         assert_eq!(format_upload_date("notadate"), "notadate");
         assert_eq!(format_upload_date("2024-01-15"), "2024-01-15");
+    }
+
+    #[test]
+    fn direct_title_heading_matches_historical_semantics() {
+        let cases = [
+            "",
+            " \n\t ",
+            "one",
+            "  two   words  ",
+            "line one\nline two\tline three",
+            "αβγ\u{2003}東京  emoji🙂\tcafé",
+        ];
+
+        for title in cases {
+            let mut historical = "prefix\n".to_owned();
+            historical_push_title_heading(&mut historical, title);
+            let mut direct = "prefix\n".to_owned();
+            push_title_heading(&mut direct, title);
+            assert_eq!(direct, historical, "title={title:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn direct_title_heading_perf() {
+        const TARGET_ARM_SECS: f64 = 0.020;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 1.10;
+        const REQUIRED_WINS: usize = 13;
+
+        let title =
+            "  Rust Speech Systems:\tNative Whisper, Streaming,\nDiarization, and Fast Search  ";
+        let mut historical = String::new();
+        historical_push_title_heading(&mut historical, title);
+        let mut direct = String::new();
+        push_title_heading(&mut direct, title);
+        assert_eq!(direct, historical, "timed fixture must remain byte exact");
+        let output_sha256 = format!("{:x}", Sha256::digest(direct.as_bytes()));
+
+        let calibration = measure_title_heading::<true>(title, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(256, 1_048_576);
+
+        black_box(paired_title_ratios::<true, true>(
+            title,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios = paired_title_ratios::<true, true>(title, iterations, PAIRED_REPETITIONS);
+        let null = paired_perf_stats(&null_ratios);
+
+        black_box(paired_title_ratios::<true, false>(
+            title,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios =
+            paired_title_ratios::<true, false>(title, iterations, PAIRED_REPETITIONS);
+        let candidate = paired_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate.median >= MIN_CANDIDATE_MEDIAN
+            && candidate.p10 > null.p90
+            && candidate.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "YOUTUBE_TITLE_CALIBRATION input_bytes={} output_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            title.len(),
+            direct.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "YOUTUBE_TITLE_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            format_ratios(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "YOUTUBE_TITLE_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            format_ratios(&candidate_ratios),
+            candidate.median,
+            candidate.p10,
+            candidate.p90,
+            candidate.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
     }
 
     #[test]
