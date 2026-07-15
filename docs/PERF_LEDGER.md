@@ -51,6 +51,46 @@
 
 ## Levers
 
+### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): emit YouTube paragraph timestamp links directly — **2.51x median**
+
+**Profile / negative-ledger boundary.** `bv --robot-triage` data hash
+`ddb0d4a90650a6c1` kept the YouTube ingestion epic actionable, while the
+negative ledger explicitly left timestamp formatting outside its adjacent
+subtitle buffered-output/CSV allocation experiments. Allocation attribution in
+`render_markdown` found three per-paragraph heap strings on every emitted
+timestamp: the label, the deep link, and the final Markdown wrapper, which was
+then copied into the renderer's existing output buffer.
+
+**One lever and exactness.** Bead `bd-27v1.5` now writes the timestamp label,
+deep link, and Markdown punctuation directly into that buffer. Paragraph
+grouping and text assembly are unchanged. The release oracle matched the
+historical three-allocation path byte-for-byte for 42 combinations spanning
+ordinary, Unicode, and special-character IDs plus negative, signed-zero,
+subsecond, minute/hour-boundary, 24-hour, huge, NaN, and infinite timestamps.
+The timed fixture also matched exactly: 50 output bytes, SHA-256
+`1e283317d06ae07216e1a62731ec8e7dc6818b85bdaac9244eecc2f72276c9f8`.
+
+**Strict-remote release A/B.** An initial admission drifted away from the
+pinned worker and was cancelled before compilation; two other workers failed
+before compilation because their registry/lock state was incomplete. These
+were infrastructure, not evidence. Worker `vmi1152480` completed the uncapped
+`--profile release` warm-up as job `j-29928833041829103`, followed by exact
+parity job `j-29928833041829118` (1/1 passed). Foreground measurement job
+`j-29928833041829119` reused that release binary; the hermetic test finished in
+0.24 seconds with 11,099 iterations per arm, 20 ms target arms, and 15
+order-alternated pairs. BASE/BASE ratios were
+`[1.044794,1.437099,1.099260,0.961616,0.956568,1.064133,1.017005,1.024859,1.026082,0.992253,1.302297,0.914769,1.011745,0.780763,0.949795]`:
+median 1.017005, p10 0.914769, p90 1.099260, CV 14.973%; the declared
+null-median gate `[0.97,1.03]` passed.
+
+Historical/direct ratios were
+`[2.988725,2.065093,2.665586,4.010288,2.422891,2.638155,2.401586,2.514717,2.370137,2.574378,2.613195,2.509461,2.426345,1.630518,2.622455]`:
+median **2.514717x**, p10 2.065093, p90 2.665586, CV 19.566%, and
+15/15 wins. This clears the declared 1.10x median,
+candidate-p10-above-null-p90, and 13/15-win gates. Scope is component-level:
+one timestamp link per rendered YouTube transcript paragraph, not end-to-end
+ASR throughput.
+
 ### 2026-07-15 UTC — cod_fw — LANDED (byte-exact): normalize YouTube title directly into heading — **1.89x median**
 
 **Profile / negative-ledger boundary.** `bv --robot-triage` data hash

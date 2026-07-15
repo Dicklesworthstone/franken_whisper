@@ -128,6 +128,7 @@ pub struct RenderInput<'a> {
 ///
 /// `m:ss` below one hour (e.g. `1:23`), `h:mm:ss` at or after one hour
 /// (e.g. `1:01:01`). Negative / non-finite inputs are clamped to zero.
+#[cfg(test)]
 fn format_timestamp_label(seconds: f64) -> String {
     let total = floor_secs(seconds);
     let h = total / 3600;
@@ -137,6 +138,26 @@ fn format_timestamp_label(seconds: f64) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+/// Append a paragraph timestamp and YouTube deep link directly to `out`.
+fn push_timestamp_link(out: &mut String, id: &str, start_sec: f64) {
+    use std::fmt::Write as _;
+
+    let total = floor_secs(start_sec);
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        write!(
+            out,
+            "**[{h}:{m:02}:{s:02}](https://youtu.be/{id}?t={total})**"
+        )
+        .expect("writing to a String cannot fail");
+    } else {
+        write!(out, "**[{m}:{s:02}](https://youtu.be/{id}?t={total})**")
+            .expect("writing to a String cannot fail");
     }
 }
 
@@ -272,6 +293,7 @@ fn push_source_line(out: &mut String, video: &RenderVideo, run: &RenderRun) {
 }
 
 /// Deep-link URL into the video at the given start second.
+#[cfg(test)]
 fn deep_link(id: &str, start_sec: f64) -> String {
     format!("https://youtu.be/{id}?t={}", floor_secs(start_sec))
 }
@@ -431,9 +453,7 @@ pub fn render_markdown(input: &RenderInput<'_>) -> String {
             if text.is_empty() {
                 continue;
             }
-            let label = format_timestamp_label(p.start_sec);
-            let link = deep_link(&v.id, p.start_sec);
-            out.push_str(&format!("**[{label}]({link})**"));
+            push_timestamp_link(&mut out, &v.id, p.start_sec);
             if let Some(spk) = p.speaker.filter(|s| !s.trim().is_empty()) {
                 out.push(' ');
                 out.push_str(spk);
@@ -823,6 +843,12 @@ mod tests {
         out.push_str("\n\n");
     }
 
+    fn historical_push_timestamp_link(out: &mut String, id: &str, start_sec: f64) {
+        let label = format_timestamp_label(start_sec);
+        let link = deep_link(id, start_sec);
+        out.push_str(&format!("**[{label}]({link})**"));
+    }
+
     fn measure_title_heading<const HISTORICAL: bool>(title: &str, iterations: usize) -> Duration {
         let started = Instant::now();
         let mut out = String::with_capacity(128);
@@ -944,6 +970,51 @@ mod tests {
             } else {
                 let test = measure_source_line::<TEST_HISTORICAL>(video, run, iterations);
                 let base = measure_source_line::<BASE_HISTORICAL>(video, run, iterations);
+                (base, test)
+            };
+            ratios.push(base.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
+    }
+
+    fn measure_timestamp_link<const HISTORICAL: bool>(
+        id: &str,
+        start_sec: f64,
+        iterations: usize,
+    ) -> Duration {
+        let started = Instant::now();
+        let mut out = String::with_capacity(96);
+        let mut checksum = 0usize;
+        for _ in 0..iterations {
+            out.clear();
+            if HISTORICAL {
+                historical_push_timestamp_link(&mut out, black_box(id), black_box(start_sec));
+            } else {
+                push_timestamp_link(&mut out, black_box(id), black_box(start_sec));
+            }
+            checksum ^= out.len();
+            black_box(out.as_str());
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_timestamp_link_ratios<const BASE_HISTORICAL: bool, const TEST_HISTORICAL: bool>(
+        id: &str,
+        start_sec: f64,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (base, test) = if repetition % 2 == 0 {
+                (
+                    measure_timestamp_link::<BASE_HISTORICAL>(id, start_sec, iterations),
+                    measure_timestamp_link::<TEST_HISTORICAL>(id, start_sec, iterations),
+                )
+            } else {
+                let test = measure_timestamp_link::<TEST_HISTORICAL>(id, start_sec, iterations);
+                let base = measure_timestamp_link::<BASE_HISTORICAL>(id, start_sec, iterations);
                 (base, test)
             };
             ratios.push(base.as_secs_f64() / test.as_secs_f64());
@@ -1359,6 +1430,128 @@ mod tests {
         );
         eprintln!(
             "YOUTUBE_SOURCE_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            format_ratios(&candidate_ratios),
+            candidate.median,
+            candidate.p10,
+            candidate.p90,
+            candidate.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
+    }
+
+    #[test]
+    fn direct_timestamp_link_matches_historical_semantics() {
+        let ids = ["abc", "dQw4w9WgXcQ", "μ[]() ?"];
+        let starts = [
+            -5.0,
+            -0.0,
+            0.0,
+            0.999,
+            59.999,
+            60.0,
+            3599.999,
+            3600.0,
+            3661.9,
+            86_400.0,
+            4_294_967_295.75,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+
+        for id in ids {
+            for start_sec in starts {
+                let mut historical = "prefix\n".to_owned();
+                historical_push_timestamp_link(&mut historical, id, start_sec);
+                let mut direct = "prefix\n".to_owned();
+                push_timestamp_link(&mut direct, id, start_sec);
+                assert_eq!(direct, historical, "id={id:?}, start_sec={start_sec:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn direct_timestamp_link_perf() {
+        const TARGET_ARM_SECS: f64 = 0.020;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 1.10;
+        const REQUIRED_WINS: usize = 13;
+
+        let id = "dQw4w9WgXcQ";
+        let start_sec = 3725.75;
+        let mut historical = String::new();
+        historical_push_timestamp_link(&mut historical, id, start_sec);
+        let mut direct = String::new();
+        push_timestamp_link(&mut direct, id, start_sec);
+        assert_eq!(direct, historical, "timed fixture must remain byte exact");
+        let output_sha256 = format!("{:x}", Sha256::digest(direct.as_bytes()));
+
+        let calibration = measure_timestamp_link::<true>(id, start_sec, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(256, 1_048_576);
+
+        black_box(paired_timestamp_link_ratios::<true, true>(
+            id,
+            start_sec,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios = paired_timestamp_link_ratios::<true, true>(
+            id,
+            start_sec,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let null = paired_perf_stats(&null_ratios);
+
+        black_box(paired_timestamp_link_ratios::<true, false>(
+            id,
+            start_sec,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios = paired_timestamp_link_ratios::<true, false>(
+            id,
+            start_sec,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let candidate = paired_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate.median >= MIN_CANDIDATE_MEDIAN
+            && candidate.p10 > null.p90
+            && candidate.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "YOUTUBE_TIMESTAMP_LINK_CALIBRATION output_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            direct.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "YOUTUBE_TIMESTAMP_LINK_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            format_ratios(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "YOUTUBE_TIMESTAMP_LINK_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
             format_ratios(&candidate_ratios),
             candidate.median,
             candidate.p10,
