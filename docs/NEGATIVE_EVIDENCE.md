@@ -23509,3 +23509,39 @@ only further *franken-visible* encoder lever is **ToMe** (`FW_TOME_R`, −24% en
 track01-drift). So the encoder frontier is: poly-exp captured, GEMMs int8-closed, SDPA-kernel external, ToMe
 WER-gated. **No autonomous byte-exact lever; a6f1632's "poly-exp is the owner's pending lever" is superseded — it's
 already shipped; the next SDPA gain is a frankentorch-kernel change or the WER-gated ToMe.**
+
+---
+## 2026-07-16 - BlackThrush: **REJECT (real A/B) — diarizer Step-2b constraint-merge is NOT an O(u³) hotspot: cluster count `u` is dimension-bounded ≤~6 by the 6D cosine geometry, so the matrix-maintenance rewrite REGRESSES; the real cost (centroid re-sum) is fp-associativity-locked.**
+
+**Fresh pivot after re-confirming the model/non-model frontier is owner-closed** (audio.rs hot loops already
+SIMD'd+bit-exact-tested; `accelerate.rs` VAD/layernorm/softmax are dead scaffolding called only within the module
+on tiny arrays; tty_audio mulaw is ffmpeg-shelled + test-only; sync.rs is the already-mined DB lane). Pivoted to
+`orchestrator.rs::diarize_segments` — the diarizer vein that yielded 3 byte-exact O(n²)→O(1) keeps this run
+(868614b/75c307e/5ac19a4). Structural read surfaced **Step-2b** (orchestrator.rs:4067–4098): the constraint-merge
+loop `while centroids.len() > max_k { for i { for j>i { euclidean_distance } } … merge }` recomputes the **entire
+pairwise centroid distance matrix on every merge** — textbook O(u³) agglomerative antipattern (u = unconstrained
+cluster count).
+
+**Candidate (byte-exact O(u²)):** maintain the symmetric distance matrix; a merge changes only ONE centroid
+(`keep`), so recompute just its row/col + mirror the `swap_remove(remove)` index churn. Byte-exact **by
+construction** — the matrix always equals `{euclidean_distance(centroids[i],centroids[j])}` computed with the same
+fn, so the i-asc/j-asc strict-`<` argmin scan picks the identical `best_pair` each merge. Standalone A/B
+(`scratchpad/diar_merge`, 41 reps, order-alternated, **assert byte-identical `assignments` — PASSED on all 10 sweep
+points**):
+
+- realistic embeddings (monotone-midpoint + varied dims), n∈{200,500,1000,2000}, max_k∈{2,3,4}: **u = 4–6**,
+  merges = 1–4, `merge_ref` 0.9–33 µs. Candidate **speedup 0.90–0.98× (REGRESSION)** — the Vec<Vec<f64>> matrix
+  alloc/bookkeeping isn't amortized over so few merges.
+- **adversarial "spread" generator** (one dominant random axis per segment, forced low cosine sim), n up to 800:
+  **u STILL caps at 6**, merges=4, speedup **0.83–0.98×**.
+
+**Root cause / reusable insight:** greedy cosine clustering in a **fixed 6-D** feature space cannot produce more
+than ~D well-separated direction-clusters, so **u is structurally bounded ≤~6 regardless of segment count** — there
+is NO cubic blowup to fix. The `for i/for j` scan over ≤6 centroids is ~30 distance ops; the loop's ACTUAL cost
+grows with n via `SpeakerEmbedding::centroid(&cluster_members[keep])` (line 4097) re-summing O(n) members each
+merge — but that is **identical in both arms** and is **fp-associativity-locked** (a running-sum merge
+`Σkeep + Σremove` ≠ the sequential `Σ(keep ++ remove)` that `centroid()` computes, so the 75c307e running-sum trick
+does NOT extend to Step-2b — which is exactly why the comment at 4011 leaves it "untouched"). At n=2000 the whole
+merge is ~32 µs, once per transcript ⇒ sub-floor. **Do NOT "optimize" this O(u³)-looking loop; u is bounded and the
+rewrite regresses.** The diarizer clustering vein is now fully mined (Step-1 extract, Step-2 assign, Step-2b merge,
+silhouette all measured).
