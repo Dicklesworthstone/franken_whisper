@@ -342,13 +342,21 @@ impl NativeEngineRolloutStage {
     /// - `4`: sole
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        let normalized = value.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "shadow" | "0" => Some(Self::Shadow),
-            "validated" | "1" => Some(Self::Validated),
-            "fallback" | "2" => Some(Self::Fallback),
-            "primary" | "3" => Some(Self::Primary),
-            "sole" | "4" => Some(Self::Sole),
+        let normalized = value.trim();
+        match normalized.len() {
+            1 => match normalized.as_bytes()[0] {
+                b'0' => Some(Self::Shadow),
+                b'1' => Some(Self::Validated),
+                b'2' => Some(Self::Fallback),
+                b'3' => Some(Self::Primary),
+                b'4' => Some(Self::Sole),
+                _ => None,
+            },
+            4 if normalized.eq_ignore_ascii_case("sole") => Some(Self::Sole),
+            6 if normalized.eq_ignore_ascii_case("shadow") => Some(Self::Shadow),
+            7 if normalized.eq_ignore_ascii_case("primary") => Some(Self::Primary),
+            8 if normalized.eq_ignore_ascii_case("fallback") => Some(Self::Fallback),
+            9 if normalized.eq_ignore_ascii_case("validated") => Some(Self::Validated),
             _ => None,
         }
     }
@@ -463,6 +471,29 @@ mod tests {
             NativeEngineRolloutStage::parse("sole"),
             Some(NativeEngineRolloutStage::Sole)
         );
+    }
+
+    #[test]
+    fn rollout_stage_parse_accepts_every_ascii_case_permutation() {
+        for (name, expected) in [
+            ("shadow", NativeEngineRolloutStage::Shadow),
+            ("validated", NativeEngineRolloutStage::Validated),
+            ("fallback", NativeEngineRolloutStage::Fallback),
+            ("primary", NativeEngineRolloutStage::Primary),
+            ("sole", NativeEngineRolloutStage::Sole),
+        ] {
+            let letters = name.as_bytes();
+            for mask in 0..(1usize << letters.len()) {
+                let mut spelling = letters.to_vec();
+                for (index, byte) in spelling.iter_mut().enumerate() {
+                    if mask & (1 << index) != 0 {
+                        *byte = byte.to_ascii_uppercase();
+                    }
+                }
+                let spelling = std::str::from_utf8(&spelling).expect("ASCII stage name");
+                assert_eq!(NativeEngineRolloutStage::parse(spelling), Some(expected));
+            }
+        }
     }
 
     #[test]
@@ -1517,7 +1548,7 @@ mod tests {
 
     #[test]
     fn rollout_stage_parse_whitespace_and_mixed_case() {
-        // parse() trims and lowercases before matching — exercise that path.
+        // parse() trims Unicode whitespace and compares ASCII case-insensitively.
         assert_eq!(
             NativeEngineRolloutStage::parse("  SHADOW  "),
             Some(NativeEngineRolloutStage::Shadow)
@@ -1530,8 +1561,33 @@ mod tests {
             NativeEngineRolloutStage::parse("\tSole\n"),
             Some(NativeEngineRolloutStage::Sole)
         );
+        assert_eq!(
+            NativeEngineRolloutStage::parse("\u{a0}PRIMARY\u{2003}"),
+            Some(NativeEngineRolloutStage::Primary)
+        );
+        assert_eq!(
+            NativeEngineRolloutStage::parse("\u{2028}3\u{2029}"),
+            Some(NativeEngineRolloutStage::Primary)
+        );
         // Whitespace-only → empty after trim → None.
         assert_eq!(NativeEngineRolloutStage::parse("   "), None);
+    }
+
+    #[test]
+    fn rollout_stage_parse_rejects_noncanonical_shapes() {
+        for value in [
+            "so le",
+            "03",
+            "+3",
+            "٣",
+            "\u{200b}sole",
+            "sole\u{feff}",
+            "ſhadow",
+            "PRİMARY",
+            "ＳＯＬＥ",
+        ] {
+            assert_eq!(NativeEngineRolloutStage::parse(value), None, "{value:?}");
+        }
     }
 
     #[test]
