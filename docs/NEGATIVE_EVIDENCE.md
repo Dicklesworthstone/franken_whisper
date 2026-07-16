@@ -23333,3 +23333,24 @@ sensitive like DRAM) — the DP is compute-bound (min-of-3 + branch), and the la
 `dtw_path` is at its floor; the **whole DTW module** (median network + cost-construction + DP) is now measured
 and exhausted. Confirms the [[non-model surface exhausted]] consolidation — remaining perf is owner-scoped or
 fsqlite-blocked (ab4d21d).
+
+---
+
+## 2026-07-16 - BlackThrush: **CORRECTION — the ab4d21d fsqlite blocker root-cause (2-arg `try_acquire` arity) is WRONG; current fsqlite-core code is correct for the API. Build state UNCONFIRMED this turn (rch gave no output within budget).**
+
+**Retract the ab4d21d diagnosis.** Verified this turn: (1) asupersync `Bulkhead::try_acquire` has an **IDENTICAL
+signature in 0.3.4 and 0.3.5** — `fn try_acquire(&self, weight: u32) -> Option<BulkheadPermit>` (`diff` of both
+registry sources = identical); it did NOT change. (2) `../frankensqlite/crates/fsqlite-core/src/remote_effects.rs`
+calls only `try_acquire(1)` (2×, the native asupersync path) and `try_acquire()` (3×, the non-native fallback
+bulkhead) — **NO 2-arg `try_acquire(1, admission_now())` call exists** (the 3 `admission_now()` uses are
+elsewhere, not in `try_acquire`). So the "2-arg arity mismatch" I asserted in ab4d21d (and echoed in ~10 prior
+entries) does NOT match the code — either fsqlite-core was fixed since my original (~10-turn-old) reading, or
+that reading was stale/mistaken. **Do not chase a `try_acquire` arity fix in ../frankensqlite.**
+
+**Build state UNCONFIRMED.** Could not determine whether the full crate builds now: `rch exec -- cargo build --lib`
+AND targeted `-p fsqlite-core` both produced **zero output** across ~9 min (rch buffers stdout until the piped
+command completes, and each build exceeds the 2-min command budget; likely worker eviction) → pivoted per the
+"hang >2min / evicts" rule. **Next session: confirm the build directly** — the blocker may already be RESOLVED
+(deps are now cached from this session's partial builds, so a retry should be faster; if rch keeps buffering with
+no output, get the real compiler error another way). If it builds: run the ~10 landings' guard tests + profile
+real e2e. If it still fails: capture the ACTUAL error before ledgering a new root-cause.
