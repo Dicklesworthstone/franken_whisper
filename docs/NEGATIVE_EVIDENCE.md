@@ -23196,3 +23196,30 @@ through a `HashingWriter<BufWriter<File>>`. **The lever is sink/payload-dependen
 unbuffered/raw sink. Into a `BufWriter` (or with large per-item payloads), `to_string`'s one big
 write wins; if you must avoid the alloc there, use a **reused scratch buffer + one `write_all`**,
 not raw `to_writer`. sync.rs left unchanged (current `writeln!(to_string)` is near-optimal there).
+
+---
+
+## 2026-07-16 - BlackThrush: **REJECT ×2 — DTW cost-matrix construction (word-ts) is at its byte-exact floor: head-buffer reuse WASHES, transpose-normalize is SLOWER.**
+
+**Profiled the one DTW piece I hadn't (`build_cost_matrix` head loop, `dtw.rs`; opt-in
+`--word-timestamps`, per-window).** Per head (typically 8) it allocs `vec![0.0f32; n_tokens*n_frames]`
+(~300 KB), copies the head's text rows in, `normalize_over_tokens` (strided z-norm over the token axis),
+`median_filter`×n_tokens, accumulates. Isolated bench (`scratchpad/dtw_head_perf`, 50 tokens × 1500 frames
+× 8 heads, 31 pairs, 3 runs each; byte-exact `to_bits` assert on the averaged output).
+
+- **Head-buffer reuse (hoist the per-head alloc out of the loop) = WASH, ~1.00× (9–19/31 wins).** In
+  ISOLATION (copy + a light touch) the alloc reuse looked like **~1.13×** (real mmap/first-touch faults on
+  the 300 KB buffers — glibc does NOT fully elide them). But with the REAL `normalize_over_tokens` +
+  `median_filter` inner work included, per-head is ~1 ms (8-head build ~8 ms) and the ~25 µs alloc saving
+  dilutes to **~0.3% = noise.** LESSON: measure the isolated op against its REAL surrounding work before
+  believing an alloc-reuse ratio.
+- **Transpose → contiguous-normalize → transpose-back = REJECT, ~0.96× (3–10/31 wins), byte-exact.**
+  `normalize_over_tokens` reads the token axis STRIDED (stride = n_frames), which looked cache-hostile.
+  Transposing to `[frame][token]` makes the z-norm unit-stride and is bit-identical (same token-order sum).
+  But it's SLOWER: the ~300 KB working set is **L2-resident**, so the strided reduction is L2-hit-bound
+  (not DRAM-bound), and two full N-element transposes cost MORE than they save.
+
+**DTW cost-construction is byte-exact-exhausted.** `normalize_over_tokens` is L2-resident strided (fine;
+one-pass variance would break byte-exactness), `median_filter` already optimized (the width-7 network,
+98a1dbf), the alloc churn washes, and the `dtw_path` DP is a standard two-matrix O(tokens×frames). No
+production change. Whole DTW module (median + cost-construction + DP) now mapped and at its floor.
