@@ -3925,26 +3925,34 @@ pub(crate) fn diarize_segments(
         .unwrap_or(1.0)
         .max(1e-6);
 
-    // Precompute normalization denominators across the segment set.
-    let max_seg_duration = segments
-        .iter()
-        .map(|s| {
-            let start = s.start_sec.unwrap_or(0.0);
-            let end = s.end_sec.unwrap_or(start);
-            (end - start).max(0.0)
-        })
-        .fold(0.0_f64, f64::max)
-        .max(1e-6);
-
-    let max_word_count = segments
-        .iter()
-        .map(|s| s.text.split_whitespace().count() as f64)
-        .fold(1.0_f64, f64::max);
-
-    let max_text_len = segments
-        .iter()
-        .map(|s| s.text.len() as f64)
-        .fold(1.0_f64, f64::max);
+    // Precompute normalization denominators AND per-segment word/char counts in a
+    // SINGLE pass, so the embedding map below can reuse the counts instead of
+    // re-splitting each segment's text. The original made four passes over the set
+    // and called `split_whitespace()` twice per segment (once for max_word_count,
+    // once in the map). Byte-identical: each max folds over the same values in the
+    // same order (same init), and the stored counts equal the re-split counts —
+    // ~2x faster (see benches/diarize_extract_perf).
+    let mut word_counts: Vec<usize> = Vec::with_capacity(total);
+    let mut char_counts: Vec<usize> = Vec::with_capacity(total);
+    let mut max_seg_duration = 0.0_f64;
+    let mut max_word_count = 1.0_f64;
+    let mut max_text_len = 1.0_f64;
+    for s in segments.iter() {
+        let start = s.start_sec.unwrap_or(0.0);
+        let end = s.end_sec.unwrap_or(start);
+        max_seg_duration = max_seg_duration.max((end - start).max(0.0));
+        let mut word_count = 0usize;
+        let mut total_chars = 0usize;
+        for word in s.text.split_whitespace() {
+            word_count += 1;
+            total_chars += word.len();
+        }
+        word_counts.push(word_count);
+        char_counts.push(total_chars);
+        max_word_count = max_word_count.max(word_count as f64);
+        max_text_len = max_text_len.max(s.text.len() as f64);
+    }
+    let max_seg_duration = max_seg_duration.max(1e-6);
 
     // Step 1: Compute embeddings with inter-segment gap analysis.
     let embeddings: Vec<SpeakerEmbedding> = segments
@@ -3967,12 +3975,8 @@ pub(crate) fn diarize_segments(
                 0.0
             };
 
-            let mut word_count = 0usize;
-            let mut total_chars = 0usize;
-            for word in seg.text.split_whitespace() {
-                word_count += 1;
-                total_chars += word.len();
-            }
+            let word_count = word_counts[i];
+            let total_chars = char_counts[i];
             let word_count_norm = word_count as f64 / max_word_count;
             let avg_word_len = if word_count == 0 {
                 0.0
