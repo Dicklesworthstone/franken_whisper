@@ -23718,3 +23718,22 @@ the production edit was manually reverted. The reusable harness remains at `benc
 future lower-jitter same-worker remeasure. Harness hashes: `Cargo.toml`
 `74500c5579abe8b2514a104161547703458a4e3afac667a858952f032de88764`, `bench.rs`
 `e4115343bc4437cc63e7a3a6be140ab4ed50b7018eec3c5db39d97a87d9356ff`.
+
+---
+## 2026-07-16 - BlackThrush: **CORRECTION — the `run_streaming` per-segment callback clone (438f902, "~11.7× owner lever") is DEAD in production; `StreamingEngine::run_streaming` has ZERO production callers (test-only). Don't pursue it.**
+
+Grepped the gate before the invasive public-trait change ([[project_grep_the_gate.md]]) — and it's not hot, it's
+**dead**. Every `.run_streaming(...)` and `streaming_engine_for(...)` call site in the crate is inside `mod tests`
+(backend/mod.rs:6640–6851, the `streaming_default_impl_*` unit tests). `streaming_engine_for`/`all_streaming_engines`
+are `pub` factories with **no internal production caller**, and neither `cli.rs`, `orchestrator.rs`, nor `main.rs`
+references `StreamingEngine`/`run_streaming`. **Production streaming is `SpeculativeStreamingPipeline`** (orchestrator
+`execute_backend_speculative`), NOT the `StreamingEngine` trait — and that pipeline's clones were already the ones
+optimized this session (fan-out 08cef78, merge 45632bf, event-move 78157a8). So the ~11.7× `on_segment(segment.clone())`
+A/B (scratchpad/segclone) is a microbench of a code path franken_whisper never executes in production; eliminating it
+(the ~6-file public-trait refactor) would optimize dead code. **438f902 overclaimed it as a "REAL lever" — it is not.**
+
+**Net state of the peripheral autonomous frontier (verified this session):** standalone byte-exact surface exhausted;
+ledger-hold-mining vein exhausted (7 landed, only marginal NE~L720 remains); the last surfaced "owner lever" is dead
+code. Remaining real perf = model engine (owner: encoder GEMM/SDPA, decode logits, GPU/VNNI) + content-drop temp-
+fallback (owner). No autonomous byte-exact lever remains peripheral. Lesson reinforced: **grep the gate for a
+PRODUCTION caller before valuing (or building) a lever — a clean microbench ratio on dead code is worth 0.**
