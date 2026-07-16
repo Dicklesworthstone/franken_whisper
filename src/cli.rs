@@ -751,7 +751,18 @@ pub enum TtyAudioControlCommand {
 }
 
 impl TranscribeArgs {
+    /// Build a request while retaining these CLI arguments.
+    ///
+    /// Terminal production call sites should prefer [`Self::into_request`] so
+    /// owned values can be moved into the request.
     pub fn to_request(&self) -> FwResult<TranscribeRequest> {
+        self.clone().into_request()
+    }
+
+    /// Consume terminal CLI arguments into a request, moving their owned
+    /// strings and paths instead of cloning them immediately before the CLI
+    /// object is discarded.
+    pub fn into_request(mut self) -> FwResult<TranscribeRequest> {
         let mut mode_count = 0usize;
         if self.input.is_some() {
             mode_count += 1;
@@ -774,8 +785,8 @@ impl TranscribeArgs {
             ));
         }
 
-        let input = if let Some(path) = &self.input {
-            InputSource::File { path: path.clone() }
+        let input = if let Some(path) = self.input.take() {
+            InputSource::File { path }
         } else if self.stdin {
             InputSource::Stdin {
                 hint_extension: None,
@@ -783,9 +794,9 @@ impl TranscribeArgs {
         } else {
             InputSource::Microphone {
                 seconds: self.mic_seconds,
-                device: self.mic_device.clone(),
-                ffmpeg_format: self.mic_ffmpeg_format.clone(),
-                ffmpeg_source: self.mic_ffmpeg_source.clone(),
+                device: self.mic_device.take(),
+                ffmpeg_format: self.mic_ffmpeg_format.take(),
+                ffmpeg_source: self.mic_ffmpeg_source.take(),
             }
         };
 
@@ -839,7 +850,7 @@ impl TranscribeArgs {
         // VAD params — only build if --vad flag is set.
         let vad = if self.vad {
             Some(VadParams {
-                model_path: self.vad_model.clone(),
+                model_path: self.vad_model.take(),
                 threshold: self.vad_threshold,
                 min_speech_duration_ms: self.vad_min_speech_ms,
                 min_silence_duration_ms: self.vad_min_silence_ms,
@@ -870,7 +881,7 @@ impl TranscribeArgs {
             if self.no_stem || self.diarization_model.is_some() || self.suppress_numerals {
                 Some(DiarizationConfig {
                     no_stem: self.no_stem,
-                    whisper_model: self.diarization_model.clone(),
+                    whisper_model: self.diarization_model.take(),
                     suppress_numerals: self.suppress_numerals,
                     device: self.gpu_device.clone(),
                     batch_size: self.batch_size,
@@ -879,6 +890,10 @@ impl TranscribeArgs {
                 None
             };
 
+        let fast_model = self.fast_model.take();
+        let quality_model = self.quality_model.take();
+        let speculative = self.speculative_request_with_models(fast_model, quality_model);
+
         let backend_params = BackendParams {
             output_formats,
             timestamp_level: self.timestamp_level,
@@ -886,14 +901,14 @@ impl TranscribeArgs {
             vad,
             speaker_constraints,
             diarization_config,
-            gpu_device: self.gpu_device.clone(),
+            gpu_device: self.gpu_device.take(),
             flash_attention: if self.flash_attention {
                 Some(true)
             } else {
                 None
             },
-            insanely_fast_hf_token: self.hf_token.clone(),
-            insanely_fast_transcript_path: self.transcript_path.clone(),
+            insanely_fast_hf_token: self.hf_token.take(),
+            insanely_fast_transcript_path: self.transcript_path.take(),
             no_timestamps: self.no_timestamps,
             detect_language_only: self.detect_language_only,
             batch_size: self.batch_size,
@@ -901,7 +916,7 @@ impl TranscribeArgs {
             threads: self.threads,
             processors: self.processors,
             no_gpu: self.no_gpu,
-            prompt: self.prompt.clone(),
+            prompt: self.prompt.take(),
             carry_initial_prompt: self.carry_initial_prompt,
             no_fallback: self.no_fallback,
             suppress_nst: self.suppress_nst,
@@ -909,25 +924,25 @@ impl TranscribeArgs {
             duration_ms: self.duration_ms,
             audio_ctx: self.audio_ctx,
             word_threshold: self.word_threshold,
-            suppress_regex: self.suppress_regex.clone(),
+            suppress_regex: self.suppress_regex.take(),
             tiny_diarize: self.tiny_diarize,
             word_timestamps: None,
             insanely_fast_tuning: None,
             alignment: None,
             punctuation: None,
             source_separation: None,
-            speculative: self.to_speculative_request(),
+            speculative,
         };
 
         Ok(TranscribeRequest {
             input,
             backend: self.backend,
-            model: self.model.clone(),
-            language: self.language.clone(),
+            model: self.model.take(),
+            language: self.language.take(),
             translate: self.translate,
             diarize: self.diarize,
             persist: !self.no_persist,
-            db_path: self.db.clone(),
+            db_path: std::mem::take(&mut self.db),
             timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),
             backend_params,
         })
@@ -988,6 +1003,14 @@ impl TranscribeArgs {
     /// `model.rs` free of any dependency on `streaming.rs`.
     #[must_use]
     pub fn to_speculative_request(&self) -> Option<crate::model::SpeculativeRequest> {
+        self.speculative_request_with_models(self.fast_model.clone(), self.quality_model.clone())
+    }
+
+    fn speculative_request_with_models(
+        &self,
+        fast_model: Option<String>,
+        quality_model: Option<String>,
+    ) -> Option<crate::model::SpeculativeRequest> {
         if !self.speculative {
             return None;
         }
@@ -997,14 +1020,8 @@ impl TranscribeArgs {
         Some(crate::model::SpeculativeRequest {
             window_size_ms,
             overlap_ms,
-            fast_model_name: self
-                .fast_model
-                .clone()
-                .unwrap_or_else(|| "auto-fast".to_owned()),
-            quality_model_name: self
-                .quality_model
-                .clone()
-                .unwrap_or_else(|| "auto-quality".to_owned()),
+            fast_model_name: fast_model.unwrap_or_else(|| "auto-fast".to_owned()),
+            quality_model_name: quality_model.unwrap_or_else(|| "auto-quality".to_owned()),
             max_wer_tolerance: self.correction_tolerance_wer,
             adaptive: !self.no_adaptive,
             always_correct: self.always_correct,
@@ -1094,6 +1111,61 @@ mod tests {
             no_adaptive: false,
             always_correct: false,
         }
+    }
+
+    #[test]
+    fn consuming_request_is_byte_identical_to_borrowed_request() {
+        let mut args = minimal_args();
+        args.input = Some(PathBuf::from("audio/naïve input.wav"));
+        args.model = Some("models/large-v3-turbo".to_owned());
+        args.language = Some("日本語".to_owned());
+        args.db = PathBuf::from("state/telemetry.sqlite3");
+        args.vad = true;
+        args.vad_model = Some(PathBuf::from("models/silero-vad.bin"));
+        args.no_stem = true;
+        args.diarization_model = Some("pyannote/speaker-diarization".to_owned());
+        args.gpu_device = Some("cuda:0".to_owned());
+        args.hf_token = Some("token-with-control-\n-boundary".to_owned());
+        args.transcript_path = Some(PathBuf::from("artifacts/transcript.json"));
+        args.prompt = Some("Unicode prompt: déjà vu".to_owned());
+        args.suppress_regex = Some("[♪♫]+".to_owned());
+        args.speculative = true;
+        args.fast_model = Some("tiny.en".to_owned());
+        args.quality_model = Some("large-v3-turbo".to_owned());
+
+        let retained = args.to_request().expect("retained request");
+        let consumed = args.into_request().expect("consumed request");
+        assert_eq!(
+            serde_json::to_vec(&retained).expect("serialize retained request"),
+            serde_json::to_vec(&consumed).expect("serialize consumed request")
+        );
+    }
+
+    #[test]
+    fn consuming_request_preserves_validation_errors() {
+        let mut args = minimal_args();
+        args.input = None;
+        let retained = args
+            .to_request()
+            .expect_err("retained no-input error")
+            .to_string();
+        let consumed = args
+            .into_request()
+            .expect_err("consumed no-input error")
+            .to_string();
+        assert_eq!(retained, consumed);
+
+        let mut args = minimal_args();
+        args.stdin = true;
+        let retained = args
+            .to_request()
+            .expect_err("retained conflicting-input error")
+            .to_string();
+        let consumed = args
+            .into_request()
+            .expect_err("consumed conflicting-input error")
+            .to_string();
+        assert_eq!(retained, consumed);
     }
 
     #[test]

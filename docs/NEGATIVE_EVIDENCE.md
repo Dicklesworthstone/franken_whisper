@@ -4,6 +4,55 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-16 - BlackThrush: **KEEP — consuming terminal CLI arguments removes redundant request-builder clones; 3.8283x on fully populated short requests with a 1.0237x BASE/BASE null (bd-nxeg).**
+
+**Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
+(`data_hash=e626b9ee0a769880`) left the established native-engine, TTY, replay,
+storage, sync, audio, punctuation, process, and robot-builder lanes either
+exhausted or already owned. The fresh CLI seam had no ledger or Git-history
+collision: both production `TranscribeArgs` call sites built a terminal
+`TranscribeRequest` through `&self`, cloned every owned string/path, and then
+discarded the boxed arguments. Strict-remote untimed cold build job
+`j-29933730227290971` and capped profile job `j-29933730227290978` ran
+`cargo bench --profile release` with LTO disabled on `vmi1227854`.
+
+**Profile evidence.** The dependency-free ownership-shape harness modeled the
+terminal boundary with prebuilt argument pools so input construction was
+outside the timed region. Historical versus consuming medians were **23.080 ms
+vs 18.647 ms (1.2377x)** for 100,000 minimal requests, **51.626 ms vs 13.265 ms
+(3.8920x)** for 50,000 fully populated 64-byte-field requests, and **45.222 ms
+vs 2.596 ms (17.4169x)** for 128 fully populated 64 KiB-field requests. The
+candidate reduces modeled cloned payload from 1,152 to 64 bytes/request in the
+short shape and from 1,179,648 to 65,536 bytes/request in the large shape:
+**94.44% eliminated**, clearing the attribution gate before production edits.
+
+**One lever and parity contract.** `TranscribeArgs::into_request` now consumes
+the terminal CLI value and moves its input/model/language/database/VAD/
+diarization/token/prompt/regex/speculative fields into the request. The only
+remaining owned duplicate is `gpu_device` when both backend and diarization
+configuration require it. Human and robot production call sites consume the
+boxed arguments; the retained `to_request(&self)` API delegates through a
+clone and provides the historical-value oracle. Unit oracles compare exact
+serialized request bytes over a fully populated Unicode/control-character
+fixture and exact error strings for both invalid input-mode cases. Existing
+CLI tests continue to exercise the consuming implementation through the
+retained API.
+
+**Real foreground A/B (`--profile release`, LTO off).** Capped same-worker job
+`j-29933730227290990` ran **21 mirrored ABBA pairs** over 50,000 fully populated
+short requests per arm. Historical median was **59,472,087 ns**, consuming
+median was **15,535,023 ns**, giving **3.8283x** throughput / **73.88%** time
+reduction. The interleaved BASE/BASE identity control was **1.0237x**
+(57,850,676 vs 56,513,682 ns), far below the candidate effect. Both paths
+returned checksum **1,251,282,575,000**.
+
+**Verdict:** keep. The result is deliberately scoped to the once-per-command
+CLI/configuration ownership boundary; it is not an ASR inference, streaming,
+or end-to-end throughput claim. The isolated
+`benches/cli_request_ownership_perf` harness preserves the release/LTO-off
+reproduction. `AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — allocation-free abbreviation suffix checks measured 0.475479x, 0.280962x, and 0.057075x historical, but every null-control CV exceeded the predeclared ceiling; source restored (bd-qggt).**
 
 **Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`

@@ -51,11 +51,12 @@ fn main() {
 fn run(cli: Cli) -> FwResult<()> {
     match cli.command {
         Command::Transcribe(args) => {
-            let request = args.to_request()?;
+            let json = args.json;
+            let request = (*args).into_request()?;
             let engine = FrankenWhisperEngine::new()?;
             let report = engine.transcribe(request)?;
 
-            if args.json {
+            if json {
                 emit_pretty_run_report(report)?;
             } else {
                 println!("{}", report.result.transcript);
@@ -65,7 +66,7 @@ fn run(cli: Cli) -> FwResult<()> {
         Command::Robot { command } => match command {
             RobotCommand::Run(args) => {
                 emit_robot_start(args.robot_summary())?;
-                let request = match args.to_request() {
+                let request = match (*args).into_request() {
                     Ok(request) => request,
                     Err(error) => {
                         emit_robot_error(&error.to_string(), error.robot_error_code())?;
