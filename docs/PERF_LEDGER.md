@@ -4,6 +4,50 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-15 — LANDED — buffered PCM16 WAV emission (bd-3nw3)
+
+**Profile / negative-ledger boundary.** The audio negative ledger already ruled
+out SampleBuffer reuse, fused decode-plus-RMS, resample/downmix retries, and a
+non-byte-exact WAV passthrough. A fresh stage profile instead separated the
+unchanged float-to-PCM16 quantizer from the historical `hound::WavWriter`
+per-sample emission loop on a deterministic 30-second, 480,000-sample fixture.
+Strict-remote release job `j-29933307944763498` on `vmi1227854` measured
+343,144 ns quantizer and 1,116,321 ns finalized-WAV medians, attributing
+**69.2612%** of the historical component time to the writer path before any
+production edit.
+
+**One lever and exactness.** `write_mono_wav_i16` now uses hound's typed i16
+writer in bounded 8,192-sample chunks instead of calling the generic fallible
+writer once per sample. Sanitization, saturation, rounding, sample order,
+header construction, and finalization are unchanged. The full-WAV byte oracle
+matched the historical implementation for the 30-second timed fixture and for
+lengths 0, 1, 8,191, 8,192, 8,193, and 16,391 containing signed zero, bounds,
+out-of-range finite values, NaN, infinities, halves, and epsilon tails. The
+timed fixture was 960,044 bytes with FNV64 `5333aca43842217d`; the measured
+release binary identified itself as FNV64 `5dd26cb63eec9725`.
+
+**Strict-remote release A/B.** Worker `vmi1153651` completed the uncapped,
+non-LTO `--profile release` warm-up as job `j-29933307944763512`. The sole
+capped foreground measurement, job `j-29933307944763522`, reused that worker
+and completed its timed body in 8.45 seconds. After calibration and warm-up,
+the 15 order-alternated BASE/BASE ratios were
+`[1.003330,0.972060,0.850388,0.919560,1.161378,0.802098,0.997746,1.006244,0.921692,1.352013,0.996306,1.228571,1.015915,1.047072,1.134673]`:
+median **1.003330x** and p90 1.161378. The predeclared null-median gate
+`[0.97,1.03]` passed.
+
+Historical/buffered ratios were
+`[4.719353,4.472081,4.881929,5.569001,5.061850,4.688320,4.891748,4.283993,4.599932,4.452854,4.860571,4.388198,4.637356,4.762283,4.868418]`:
+p10 **4.388198x**, median **4.719353x**, p90 4.891748, and 15/15 wins. This
+clears every predeclared gate: valid null median, candidate median at least
+1.10x, candidate p10 above null p90, at least 13/15 wins, and exact full-file
+byte parity.
+
+**Scope.** This is a component result for PCM16 encoding into an in-memory WAV
+sink after decode/resample; filesystem latency and the rest of normalization
+are intentionally excluded. It is not an end-to-end claim against ffmpeg or
+whisper.cpp, so the broader real-corpus/RSS acceptance work in `bd-3nw3`
+remains open.
+
 ## 2026-07-15 — LANDED — projected yt-dlp full-metadata parser (bd-27v1.10)
 
 **Profiled target.** `fetch_metadata` parsed every `yt-dlp -j` response into a
