@@ -4,6 +4,48 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — borrowed SRT block lines measured 1.322022x median, but did not separate from the null tail; source restored (bd-1h3p).**
+
+**Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
+(`data_hash=69e74dd970ca8e09`) exposed no parser-specific perf bead, and the ledger
+contained only SRT/VTT *output timestamp formatting* results, not SRT input
+parsing. The fresh `whisper-diarization` bridge parser owned every nonblank line
+as a `String`, joined each block, then immediately split it back into borrowed
+lines. Before any production edit, strict-remote profile jobs
+`j-29933307944763823`/`j-29933307944763832` on `vmi1227854` measured an
+8,192-block realistic corpus: historical median **24,693,594 ns** versus a
+preassembled-block control at **18,322,053 ns** (**1.3478x**), attributing
+**25.80%** of runtime to the block ownership/assembly boundary.
+
+**One lever and exact oracle.** The candidate retained nonblank lines as
+`Vec<&str>` and passed the slice directly to the unchanged block parser. It
+removed only per-line `to_owned`, per-block newline joining, and immediate
+re-splitting; timestamp arithmetic, text joining/ownership, speaker extraction,
+segment order, and error behavior stayed unchanged. Before timing, the isolated
+`benches/srt_parse_perf` harness asserted exact segment count/order, exact text
+and speaker values, and `f64::to_bits` timestamp equality across LF, CRLF,
+indexless, malformed-time, fallback, Unicode, whitespace, empty, and the full
+8,192-block corpus.
+
+**Real foreground A/B (`--profile release`, LTO off).** Untimed warm-up job
+`j-29933307944763841` compiled the final same-binary harness on
+`vmi1153651`; the sole capped measurement, job `j-29933307944763845`, ran on
+that same worker. It used 21 order-alternated ABBA pairs per comparison, four
+8,192-block parses per timed arm. BASE/BASE had median **0.997833x** but a very
+wide tail (`p90=1.273010x`; range **0.758744–1.833089x**). The borrowed-line
+candidate had p10 **1.113316x**, median **1.322022x**, and **21/21 wins**.
+Despite that promising median, the predeclared separation gate failed because
+candidate p10 did not exceed null p90. This is a real A/B result, not a build
+timeout, but the loaded worker's null variance makes it inadmissible as a keep.
+
+**Verdict:** hold, do not ship from this evidence. Production
+`src/backend/whisper_diarization.rs` was restored exactly to current `main`;
+the isolated harness remains as the parity oracle and reproduction artifact.
+Retry only on a quieter same worker or with longer calibrated arms that produce
+a narrow null distribution. `bd-1h3p` is closed as a measured hold.
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-16 - BlackThrush: **REJECTED — allocation-free successful-frame SHA-256 verification is 0.813251x with 1/21 wins; source restored (bd-cy9u).**
 
 **Fresh boundary and profile first.** The older SHA negative row tested a lowercase
