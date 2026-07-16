@@ -23436,3 +23436,24 @@ So both current hot spots — decode (logits) and encoder (SDPA) — are **owner
 confirmed owner-scoped on the REAL current build.** The only actionable note for the owner: post-int8-opt, SDPA
 is now the single biggest encoder cost (~50%), so `FT_SDPA_POLY_EXP` / an SDPA-kernel improvement in frankentorch
 has more encoder headroom than the turbo frame table (SDPA 11.5%) suggested.
+
+---
+
+## 2026-07-16 - BlackThrush: **VERIFY + REJECT (A/B) — the #1 encoder cost (`attn_sdpa`, ~50%) is owner-closed on the FRANKEN side; the last franken-side SDPA knob (`FW_SDPA_GATHER_CHUNKS`) is flat.**
+
+Followed up aff103e's SDPA-dominance finding by VERIFYING (code-read, not assumption) whether anything on the
+franken side of `attn_sdpa` is a lever. The current encoder attention path is `nn::attention_from_i7_qkv`
+(nn.rs:4861): (1) `maddubs_i7_qkv_headmajor` — int8 QKV GEMM writing **head-major** qa/ka/va (owner-closed
+maddubs; the "gather" is FUSED here, which is why the encoder.rs:991 `drain_sdpa_split` diagnostic prints
+nothing — that split is for an older, unfused path); (2) `ft_kernel_cpu::sdpa_forward_f32` — EXTERNAL kernel
+(frankentorch; only `FT_SDPA_POLY_EXP`, owner/non-byte-exact); (3) `sdpa_scatter_interleaved` with
+`FW_SDPA_GATHER_CHUNKS` (default 16). **All three sub-parts are owner-closed or already-tuned — no franken-side
+autonomous byte-exact lever.**
+
+**Real A/B on the one remaining knob** (`FW_SDPA_GATHER_CHUNKS`, byte-exact across values per its docstring;
+current fresh `--release fw`, tiny.en ~90s, 2 reps each): backend_run **8→1096/1135 ms, 16→1049/1108 ms,
+32→1038/1054 ms** — the ~3% spread is **within the ~10% run-to-run variance**, so **no clean win; 16 (default)
+stays.** Confirms [[project_sdpa_gather_threadcount_lead]] ("gather is FLAT, don't re-dig") on the current build.
+Net: the encoder SDPA frontier is code-verified owner/external-closed; combined with decode (logits-GEMV
+bandwidth-dead, aff103e), **both dominant hot spots are verified-closed — the autonomous perf loop is at its
+floor; the remaining levers (SDPA kernel/POLY_EXP in frankentorch, spec-decode) are owner-scoped.**
