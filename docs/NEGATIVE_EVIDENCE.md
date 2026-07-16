@@ -23138,3 +23138,35 @@ in-tree guard (byte-exact ⇒ unchanged). Landed default-on, no flag.
 **Diarizer-clustering vein now exhausted:** extraction (O(n), fused), greedy centroid
 (O(n²)→O(n)), silhouette (O(n²)→½). `cosine_similarity` O(n·k) and the Step-2b merge
 O(k²)/merge are sub-floor (k = speakers, tiny).
+
+---
+
+## 2026-07-16 - BlackThrush: **KEEP / VALID NULL — robot NDJSON emit_line streams to_writer instead of to_string+println; ~1.2–1.3×, byte-exact.**
+
+**Fresh subsystem (diarizer vein exhausted; pivoted per the memory note).** Surveyed the
+remaining fresh subsystems and confirmed they're mined/sub-floor: TTY FEC is simple frame
+redundancy (crypto/zlib/base64 are optimized crates); `speculation::levenshtein` is already
+two-row + prefix/suffix-trimmed and its exact result is reported (no early-exit);
+`youtube::naming` uses the unique video-id suffix (no collision loop); `resolve_videos`
+already HashSet-dedups (the "#1 hotspot fix"). Landed the one real lever found: the robot
+NDJSON emitter.
+
+**Lever (byte-exact).** `robot::emit_line` did `println!("{}", serde_json::to_string(value)?)`
+— allocating an intermediate `String` (+ UTF-8 validation) per event before writing. Switched
+to `serde_json::to_writer(&mut stdout.lock(), value)` + `write_all(b"\n")`, streaming the JSON
+straight into the line-buffered handle. Emitted bytes are IDENTICAL (JSON + '\n'), the newline
+flushes the line exactly as `println!` did, and no per-event/per-report `String` is allocated.
+Robot mode emits one line per event (per segment / stage / progress) — agent-facing, high call
+frequency.
+
+**Valid-null A/B** (new `benches/robot_emit_perf`, isolated `--profile release`, LTO off,
+`codegen-units=1`; realistic `transcript.partial`-shaped events into a reused `Vec<u8>` sink;
+25 pairs, 3 runs, n ∈ {64,512,4096}). null median **0.997–1.008** (valid); speedup median
+**1.30–1.32× (n=64)**, **~1.19× (n=512/4096)** — larger at small n where the per-event String
+alloc is a bigger fraction; **21–25/25 wins** every size/run. Byte-exact: the bench asserts
+identical NDJSON bytes at every n; a standalone mirror (`scratchpad/robot_verify`) confirms
+byte-identical output incl. Unicode/nested/null/array values and that the write pattern
+compiles. Scope: the flush syscall is common to both arms (dilutes the per-event win in the
+streaming case) but the serialization is a strict improvement and eliminates the allocation;
+biggest for large single-emission reports. Full-crate test still fsqlite-core/asupersync-
+blocked. Landed default-on, no flag.

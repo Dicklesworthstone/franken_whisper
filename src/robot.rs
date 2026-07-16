@@ -1130,7 +1130,15 @@ pub fn robot_schema_value() -> serde_json::Value {
 }
 
 fn emit_line<T: Serialize>(value: &T) -> FwResult<()> {
-    println!("{}", serde_json::to_string(value)?);
+    // Stream the JSON straight to a locked stdout instead of allocating an
+    // intermediate `String` (+ UTF-8 validation) via `to_string`. The emitted
+    // bytes are identical (JSON + '\n'), and the newline flushes the line-buffered
+    // handle exactly as `println!` did. ~1.2-1.3x on emission, no per-event
+    // allocation (see benches/robot_emit_perf).
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer(&mut out, value)?;
+    out.write_all(b"\n")?;
     Ok(())
 }
 
