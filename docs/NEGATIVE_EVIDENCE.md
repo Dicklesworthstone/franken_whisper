@@ -23737,3 +23737,24 @@ ledger-hold-mining vein exhausted (7 landed, only marginal NE~L720 remains); the
 code. Remaining real perf = model engine (owner: encoder GEMM/SDPA, decode logits, GPU/VNNI) + content-drop temp-
 fallback (owner). No autonomous byte-exact lever remains peripheral. Lesson reinforced: **grep the gate for a
 PRODUCTION caller before valuing (or building) a lever — a clean microbench ratio on dead code is worth 0.**
+
+---
+## 2026-07-16 - BlackThrush: **REJECT (real A/B) — ggml `dequant_f16_to_halves_parallel` per-element loop is ALREADY at the memcpy/bandwidth floor; explicit bulk `copy_from_slice` is a WASH/regression. Closes ggml.rs.**
+
+Structural read of `src/native_engine/ggml.rs` (the last unmapped native-engine hot-path file). Post-`enc_free_f32`
+([[project_enc_free_f32_dead_weights]], default-ON) the ~800M f16 matmul weights load via
+`dequant_f16_to_halves_parallel` (802) — a per-element `*o = Float16::from_bits(u16::from_le_bytes(*c))` loop. Since
+`Float16` is `#[repr(transparent)]` over `u16` and the host is little-endian, that loop IS a byte copy, so a bulk
+`copy_from_slice` on the output's byte view is byte-identical and *looked* like a memcpy win.
+
+**It isn't.** A/B (`scratchpad/halves`, 61 order-alternated pairs, per-worker chunk sizes 10M/50M elements, asserts
+byte-identical u16 output): null tight (1.02 / 1.00); **old(loop)/new(bulk) = 0.841× @10M (bulk SLOWER), 1.002× @50M
+(wash)**. LLVM already lowers the `from_le_bytes` element loop to an efficient memcpy, and at 50M (100 MB) it's
+**DRAM-bandwidth-bound** (~6.8 ms), where an explicit copy can't beat it. REJECT.
+
+The other ggml dequant path, `dequant_f16_parallel` (→f32, software scalar `half::to_f32`), is now OFF the big-weight
+path (enc_free_f32 moved those to halves; decoder weights are int8) — it handles only conv2 (~4.9M) + positional
+(~1.9M) + LN/bias, ~7-10M elements ≈ ~1 ms parallel. An F16C-slice-API rewrite (byte-exact — f16→f32 is lossless) is
+possible but **sub-floor** (≤1 ms on load, once per run; load is already near-floor per [[project_load_time_quant_candidate]]).
+**ggml.rs load/dequant path is CLOSED** (stream-load + halves-copy + enc_free_f32 already landed; the residuals are
+memcpy-floor or sub-floor). Don't re-mine.
