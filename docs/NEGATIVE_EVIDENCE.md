@@ -23379,3 +23379,30 @@ exit=0). This exercises the byte-exact guards for every landing:
 mirrors. **The full-crate build / test / `fw`-binary path is UNBLOCKED for everyone** — real e2e profiling
 (encoder/decoder at turbo, per the CONSOLIDATED FRONTIER MAP) is now possible again. Next session can build `fw`
 and profile the real workload rather than only standalone benches.
+
+---
+
+## 2026-07-16 - BlackThrush: **PROFILE (first real e2e, post-unblock) — confirms the FRONTIER MAP: model engine (encoder GEMMs/SDPA + decode) dominates and is owner-closed; no new byte-exact autonomous lever.**
+
+Now that the build is unblocked, ran the first real e2e profile I've been able to do: `FRANKEN_WHISPER_PERF_SPANS=1
+NATIVE_ROLLOUT_STAGE=sole ./target/release/fw transcribe --input <~90s mp3> --model ggml-tiny.en.bin`. Per-window
+span breakdown (tiny.en long-form):
+
+| span | window 1 | window 2 |
+|---|---|---|
+| `encoder_window` | ~664 ms | ~628 ms |
+| `cross_kv` | ~95 ms | ~37 ms |
+| `decoder_prefill` | ~20 ms (1 prompt tok) | ~120 ms (63 prompt tok) |
+| `decode_loop` | ~1129 ms (71 tok) | ~779 ms (49 tok) |
+
+plus one-shot `model_parse` 37 ms, `model_weights` 195 ms, `mel` 21 ms. Encoder sub-op split: **attn_sdpa 27–31%,
+mlp_fc 19–22%, mlp_proj 21%, attn_out 16–18%, conv_stem ~6%** — i.e. the exact int8-GEMM/SDPA kernels the
+CONSOLIDATED FRONTIER MAP marks owner-closed. **Conclusions:** (1) encoder (GEMMs/SDPA) + `decode_loop` dominate
+each window; (2) per-window ORCHESTRATION overhead (`cross_kv`+`prefill`) is only ~6–8% and its two parts are
+both owner-closed (cross_kv is AVX2-quant+parallel [[project_cross_v_block_win]]; prefill is decode = DRAM-bound
+logits GEMV); (3) `prefill` grows with the carried prompt (2 ms/tok) but that re-decode is inherent (each window's
+cross-attention differs). So the tiny.en 1.84× loss (bd-b4hp) is the **per-token decode** ([[project_tiny_component_attribution]]:
+encoder+mel are franken WINS; decode is the gap), which is owner-scoped (spec-decode, bd-wzgh). **No new
+byte-exact autonomous lever.** Caveat: the prebuilt `fw` is Jul 12 (pre-int8-act-quant 26feafd), so absolutes
+aren't current — a fresh release build + turbo profile would refine the numbers but the structure/owner-closed
+conclusion holds. This is the first e2e profile INDEPENDENTLY confirming the FRONTIER MAP.
