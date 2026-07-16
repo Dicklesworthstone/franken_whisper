@@ -23545,3 +23545,32 @@ does NOT extend to Step-2b — which is exactly why the comment at 4011 leaves i
 merge is ~32 µs, once per transcript ⇒ sub-floor. **Do NOT "optimize" this O(u³)-looking loop; u is bounded and the
 rewrite regresses.** The diarizer clustering vein is now fully mined (Step-1 extract, Step-2 assign, Step-2b merge,
 silhouette all measured).
+
+---
+## 2026-07-16 - BlackThrush: **KEEP / VALID NULL — YouTube `group_paragraphs` now represents each paragraph as a borrowed contiguous slice `&[Seg]` instead of a per-paragraph `Vec<&Seg>`; resolves the 2026-07-15 Codex HOLD (bd-27v1.7). 1.28–1.73× (grows with paragraph count), byte-exact.**
+
+Validates the Codex INVALID-NULL hold (line ~235: 1.210838× median, 15/15 wins, but BASE/BASE null was
+biased 0.965115× at CV 13.4% so `keep_eligible=false`). Per [[feedback_invalid_null_hold_is_a_win]] a HOLD on a
+biased null is a real win blocked by a noisy harness — re-ran the A/B with warm-up + 61 order-alternated pairs and
+the null **collapsed to 1.0000–1.0049 (CV 7–19%)**, i.e. Codex's 0.965 was pure harness bias, not a real base
+delta. `scratchpad/para_group` (own minimal `Seg`; asserts paragraph count + `start_sec` bits + speaker +
+**segment pointer identity** on n∈{96,500,2000,8000}):
+
+- vec/slice median **1.2798× (n=96, matches Codex's 96-seg fixture) → 1.2976× (500) → 1.4651× (2000) → 1.7349×
+  (8000)**; p10 decisively clears the null p90 at every size (e.g. n=2000 p10=1.42 vs null≈1.00); wins 59–61/61.
+- **BYTE-EXACT by construction:** a paragraph is a contiguous run of the input, so `&segments[start..i]` holds the
+  identical `&Seg` sequence a `Vec<&Seg>` would push. Pointer-identity assert PASSES on all sizes.
+
+**Landed** `src/youtube/render.rs`: `Paragraph.segments: Vec<&'a TranscriptionSegment>` → `&'a [TranscriptionSegment]`;
+`group_paragraphs` rewritten to track a half-open index range and push borrowed slices (zero per-paragraph alloc);
+`push_paragraph_text`/`paragraph_text` iterate `p.segments` directly. Verified: local `cargo check --lib --release`
+clean; `cargo test --lib --release -- youtube::render` = **29 passed / 0 failed** (incl. the byte-exact
+`direct_paragraph_text_matches_historical_semantics` + `group_paragraphs` boundary tests). This is a Pareto
+improvement (simpler code + fewer allocations + byte-exact), not a complexity-adding micro-opt; the win scales with
+transcript length (thousands of paragraphs on long/hour-scale YouTube renders — bd-27v1).
+
+**Infra note:** the full-crate compile via `rch exec` OOM'd deterministically in the `num-traits` build-script
+(`648518346341351440 bytes`, SIGABRT) on BOTH ovh-b and (routed) ovh-b again — a fleet-wide toolchain-churn failure
+under today's nightly `1.99.0 (d0babd8b6, 2026-07-15)` ([[project_rch_targets_toolchain_churn]]), NOT worker RAM
+and NOT this change. Verified LOCAL instead (release dep cache was toolchain-fresh); per
+[[project_asupersync_oom_roulette]] correctness gates run local anyway.

@@ -323,7 +323,9 @@ fn seg_end(seg: &TranscriptionSegment) -> f64 {
 struct Paragraph<'a> {
     start_sec: f64,
     speaker: Option<&'a str>,
-    segments: Vec<&'a TranscriptionSegment>,
+    /// Paragraphs are contiguous runs of the input, so each is represented as a
+    /// borrowed slice of the original segments — zero per-paragraph allocation.
+    segments: &'a [TranscriptionSegment],
 }
 
 /// Group raw segments into Markdown paragraphs.
@@ -337,39 +339,50 @@ struct Paragraph<'a> {
 ///   (readability cap).
 fn group_paragraphs(segments: &[TranscriptionSegment]) -> Vec<Paragraph<'_>> {
     let mut paragraphs: Vec<Paragraph<'_>> = Vec::new();
-    let mut current: Option<Paragraph<'_>> = None;
+    // Track the current paragraph as a half-open index range `[para_start, i)`
+    // into `segments`; on each break we push the borrowed slice. This is
+    // byte-identical to owning a `Vec<&Seg>` per paragraph (same contiguous
+    // segment sequence) but allocates nothing per paragraph.
+    let mut para_start: Option<usize> = None;
+    let mut current_start_sec = 0.0_f64;
+    let mut current_speaker: Option<&str> = None;
     let mut current_words = 0usize;
     let mut prev_end: Option<f64> = None;
 
-    for seg in segments {
+    for (i, seg) in segments.iter().enumerate() {
         let speaker = seg.speaker.as_deref();
         let start = seg_start(seg);
         let seg_words = word_count(&seg.text);
 
         let gap_break = prev_end.is_some_and(|pe| start - pe > PARAGRAPH_GAP_SEC);
-        let speaker_break = current.as_ref().is_some_and(|p| p.speaker != speaker);
-        let word_break = current.is_some() && current_words >= PARAGRAPH_WORD_CAP;
+        let speaker_break = para_start.is_some() && current_speaker != speaker;
+        let word_break = para_start.is_some() && current_words >= PARAGRAPH_WORD_CAP;
 
-        if current.is_none() || gap_break || speaker_break || word_break {
-            if let Some(done) = current.take() {
-                paragraphs.push(done);
+        if para_start.is_none() || gap_break || speaker_break || word_break {
+            if let Some(s) = para_start.take() {
+                paragraphs.push(Paragraph {
+                    start_sec: current_start_sec,
+                    speaker: current_speaker,
+                    segments: &segments[s..i],
+                });
             }
-            current = Some(Paragraph {
-                start_sec: start,
-                speaker,
-                segments: vec![seg],
-            });
+            para_start = Some(i);
+            current_start_sec = start;
+            current_speaker = speaker;
             current_words = seg_words;
-        } else if let Some(p) = current.as_mut() {
-            p.segments.push(seg);
+        } else {
             current_words += seg_words;
         }
 
         prev_end = Some(seg_end(seg));
     }
 
-    if let Some(done) = current.take() {
-        paragraphs.push(done);
+    if let Some(s) = para_start.take() {
+        paragraphs.push(Paragraph {
+            start_sec: current_start_sec,
+            speaker: current_speaker,
+            segments: &segments[s..],
+        });
     }
     paragraphs
 }
@@ -379,7 +392,7 @@ fn group_paragraphs(segments: &[TranscriptionSegment]) -> Vec<Paragraph<'_>> {
 #[cfg(test)]
 fn paragraph_text(p: &Paragraph<'_>) -> String {
     let mut out = String::new();
-    for seg in &p.segments {
+    for seg in p.segments {
         let piece = seg.text.trim();
         if piece.is_empty() {
             continue;
@@ -399,7 +412,7 @@ fn paragraph_text(p: &Paragraph<'_>) -> String {
 /// historical temporary-`String` path.
 fn push_paragraph_text(out: &mut String, p: &Paragraph<'_>) -> bool {
     let mut wrote_text = false;
-    for seg in &p.segments {
+    for seg in p.segments {
         let piece = seg.text.trim();
         if piece.is_empty() {
             continue;
@@ -1665,7 +1678,7 @@ mod tests {
             let paragraph = Paragraph {
                 start_sec: 0.0,
                 speaker: None,
-                segments: segments.iter().collect(),
+                segments: segments.as_slice(),
             };
             let mut historical = "prefix: ".to_owned();
             let historical_wrote = historical_push_paragraph_text(&mut historical, &paragraph);
@@ -1724,7 +1737,7 @@ mod tests {
         let paragraph = Paragraph {
             start_sec: 0.0,
             speaker: None,
-            segments: segments.iter().collect(),
+            segments: segments.as_slice(),
         };
         let mut historical = String::new();
         let historical_wrote = historical_push_paragraph_text(&mut historical, &paragraph);
