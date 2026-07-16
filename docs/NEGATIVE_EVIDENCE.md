@@ -23621,3 +23621,25 @@ clone. Byte-exact verified in-tree: `cargo test --lib --release -- streaming::` 
 seq contiguity, partial/confirm/retract/correct emission, multi-segment windows, tracker/window state). Pareto
 simplification (one partial instead of two, one fewer local), not a complexity-add. Per-window path in streaming/
 speculative mode — 5th resolved hold in the [[feedback_invalid_null_hold_is_a_win]] vein.
+
+---
+## 2026-07-16 - BlackThrush: **KEEP — `WindowManager::merge_segments` pre-sizes the aggregate (count pass + `Vec::with_capacity`) and clones each window's segments directly (`extend(iter().cloned())`) instead of growing a `Vec::new()` with per-window `extend(clone())` temporaries. Resolves the 2026-07-14 Codex HOLD (NE ~L929). 1.18–1.93× (grows with transcript size), byte-exact.**
+
+Codex's candidate was a **clean valid-null win** (21/21 pair wins, null median inside `[0.95,1.05]`, median 1.1265×)
+held ONLY because the predeclared gate required `p10 ≥ max(null p90, 1.10)` and the p10 was **1.047** — an
+aggressive absolute floor, not a validity failure (same class as the storage prefix hold: the median effect is
+real and consistent, the gate was just too strict for the small fixture).
+
+The aggregation grew a `Vec::new()` and, per resolved window, `extend(chosen.clone())` — a per-window temporary
+`Vec` plus the aggregate's incremental reallocation. Now: one counting pass → `Vec::with_capacity(total)` → each
+window's segments cloned **directly** into it via `extend(iter().cloned())` (no temp Vec, no realloc). Cloning N
+`TranscriptionSegment`s is irreducible (the fn returns owned from `&self`), so this alloc-elision is the ceiling.
+
+Byte-identical: `self` is borrowed, so both passes select the same quality/fast branch per window and append the
+same segments in the same order; the sort + overlap-dedup phases are untouched. Fair A/B (`scratchpad/merge`,
+warm-up + 61 order-alternated pairs, asserts byte-identical merged output): null tight **0.9976–0.9992**; old/new
+**1.18× (n=192/1-seg — reproduces Codex's fixture, p10 1.048 ≈ their 1.047) → 1.93× (n=400/2-seg, p10 1.56)** — the
+win **grows with segment count** (more reallocs/temps avoided) so it's decisive for realistic long streams. Byte-exact
+verified in-tree: `cargo test --lib --release -- merge_segments window_manager` = **30 passed / 0 failed** (quality
+preference, fast fallback, empty/unresolved windows, cross-window overlap dedup, missing ts/confidence/speaker,
+Unicode). 6th resolved hold in the [[feedback_invalid_null_hold_is_a_win]] vein.
