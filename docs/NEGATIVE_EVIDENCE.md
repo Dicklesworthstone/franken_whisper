@@ -4,6 +4,44 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-16 - BlackThrush: **REJECTED — allocation-free successful-frame SHA-256 verification is 0.813251x with 1/21 wins; source restored (bd-cy9u).**
+
+**Fresh boundary and profile first.** The older SHA negative row tested a lowercase
+hex *renderer* for orchestrator replay hashes; it did not test the TTY decoder's
+successful-frame verification path. This dig targeted the two fresh TTY consumers
+that currently compute `format!("{digest:x}")` and then perform a
+case-insensitive comparison. Before any production edit, strict-remote profile job
+`j-29933307944763719` on `vmi1153651` measured 4,096 successful 24-byte frames:
+digest-only median **324,353 ns** versus historical digest-plus-format-and-compare
+median **826,536 ns**, attributing **60.7575%** of that synthetic path to the
+post-digest work.
+
+**One lever and exact oracle.** The candidate compared each digest nibble directly
+against lower- or uppercase ASCII and allocated the historical lowercase string
+only on mismatch. Its oracle matched the historical `Option<String>` result and
+lowercase error payload for lower/uppercase success, every mismatched nibble,
+wrong lengths, non-hex ASCII, Unicode, and empty through 80,000-byte payloads. No
+wire format, hashing, recovery, or error behavior changed.
+
+**Real foreground A/B (`--profile release`, LTO off).** Untimed warm-up job
+`j-29933307944763756` compiled the final same-binary harness on `vmi1227854`.
+The sole capped measurement, job `j-29933307944763763` on that same worker, used
+21 order-alternated pairs over 4,096 real minimum-size 20 ms / 160-byte frames,
+with each arm calibrated to roughly 25 ms. BASE/BASE ratios had median
+**1.000322x** and p90 **1.159570x**, clearing the predeclared null-median band
+`[0.97,1.03]`. Historical/direct-compare ratios had p10 **0.750903x**, median
+**0.813251x**, p90 **0.884230x**, and only **1/21 wins**. The predeclared primary
+gate failed, so the harness correctly stopped before its 1,600-byte secondary
+shape; this is a measured reject, not a build timeout.
+
+**Verdict:** drop. Although formatting is attributable in the digest-only profile,
+the replacement's 64 bytewise case-insensitive nibble comparisons cost more than
+the optimized formatter. Production `src/tty_audio.rs` was restored exactly; the
+isolated `benches/tty_sha_verify_perf` harness remains as the parity oracle and
+reproduction artifact. `bd-cy9u` remains open for the broader transport/FEC scope.
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-15 - Codex: **REJECTED / INVALID NULL — reusable YouTube manifest JSON scratch measured only 1.006925x median with 8/15 wins; source restored.**
 
 **Negative-ledger-first attribution.** `bv --robot-triage` data hash
