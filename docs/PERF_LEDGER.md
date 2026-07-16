@@ -4,6 +4,59 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-16 — LANDED — seek and decode only speculative PCM16 WAV windows (bd-5rje)
+
+**Negative-ledger-first profile boundary.** `bv --robot-triage`
+(`data_hash=84dcfafe1d443131`) exposed only broad or already exhausted audio perf
+work, and the negative ledger contained no result for
+`slice_pcm_wav_to_temp_path`. That function decoded and allocated every sample
+in a normalized source WAV before retaining one speculative window. Before any
+production edit, an ordinary non-LTO `--profile release` stage profile used a
+deterministic ten-minute, 16 kHz mono PCM16 source and a 30-second middle
+window. On strict-remote worker `vmi1264463`, full-source decode measured
+**155,858,437 ns** median, header/bounds **1,663 ns**, selected-window writing
+**1,338,989 ns**, and the full historical slice path **164,294,953 ns**. Full
+decode therefore accounted for **94.8650%** of the historical component time.
+
+**One lever and exactness.** The canonical two-byte PCM16 path now derives the
+declared frame count from the parsed WAV header, validates the final declared
+frame, seeks to the clamped start frame, and decodes only the selected samples.
+It still owns the selected window before creating the destination, preserving
+source/output path-collision behavior and ensuring a truncated declared tail
+fails before an existing destination is touched. Every non-16-bit integer PCM
+format retains the historical full-read path because Hound's seek offset is not safe for all
+valid-bits/container-width combinations. The same-binary oracle matched the
+historical finalized WAV bytes for beginning, middle, reversed/empty, and
+out-of-bounds ranges. The timed output was 960,044 bytes with FNV64
+`197d345ea9e4658e`; the measured release binary identified itself as FNV64
+`db0b956a927debb2`.
+
+**Strict-remote release A/B.** The uncapped cold warm-up, capped profile, and
+capped foreground A/B all ran with `AGENT_NAME=BlackThrush`,
+`RCH_REQUIRE_REMOTE=1`, and `RCH_WORKER=vmi1264463`; the timed commands used
+`--profile release`, `lto=false`, and a 180-second cap inside the remote
+command. The A/B used 21 order-alternated ABBA pairs after three warm-up pairs.
+BASE/BASE ratios were
+`[1.032844,0.965181,1.008720,0.968063,1.078119,0.987054,0.999300,1.003079,1.028912,1.009088,1.019963,1.006049,0.994999,0.991137,0.999336,0.977206,1.059310,1.027256,1.018249,1.031963,1.025997]`:
+p10 **0.977206x**, median **1.008720x**, p90 **1.032844x**, and CV
+**2.6764%**, clearing the predeclared null median `[0.98,1.02]` and CV-at-most
+3% gates.
+
+Historical/windowed ratios were
+`[18.919229,18.700278,18.122219,20.310913,18.105860,13.315866,20.685889,19.074358,21.227469,18.957054,20.132193,20.165914,20.471629,18.373994,19.656551,18.577457,19.701074,18.332598,21.719574,20.725027,22.326073]`:
+p10 **18.122219x**, median **19.656551x**, p90 **21.227469x**, and 21/21
+wins. Aggregate two-invocation medians were 337,155,641 ns historical versus
+17,127,043 ns windowed. This clears every predeclared keep gate: valid null,
+candidate median at least 1.10x, candidate p10 above null p90, at least 19/21
+wins, and exact finalized-byte parity.
+
+**Scope.** This is a decode-plus-write component result on an in-memory
+ten-minute PCM16 fixture; filesystem latency and downstream backend inference
+are intentionally excluded. Production coverage additionally fixes the
+truncated-tail and exact source/output-collision cases. The optimization is
+limited to the canonical normalized PCM16 shape; other bit depths are a
+correctness-preserving fallback, not part of the speedup claim.
+
 ## 2026-07-15 — LANDED — buffered PCM16 WAV emission (bd-3nw3)
 
 **Profile / negative-ledger boundary.** The audio negative ledger already ruled

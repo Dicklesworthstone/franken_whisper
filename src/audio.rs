@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -1016,6 +1016,35 @@ fn hound_error_to_fw(error: hound::Error) -> FwError {
     FwError::Io(std::io::Error::other(error.to_string()))
 }
 
+fn wav_container_bytes_per_sample(source: &Path) -> Option<u16> {
+    let mut file = fs::File::open(source).ok()?;
+    let mut riff_header = [0_u8; 12];
+    file.read_exact(&mut riff_header).ok()?;
+    if &riff_header[..4] != b"RIFF" || &riff_header[8..] != b"WAVE" {
+        return None;
+    }
+
+    loop {
+        let mut chunk_header = [0_u8; 8];
+        file.read_exact(&mut chunk_header).ok()?;
+        let chunk_len = u32::from_le_bytes(chunk_header[4..].try_into().ok()?);
+        if &chunk_header[..4] == b"fmt " {
+            if chunk_len < 16 {
+                return None;
+            }
+            let mut format = [0_u8; 16];
+            file.read_exact(&mut format).ok()?;
+            let channels = u16::from_le_bytes(format[2..4].try_into().ok()?);
+            let block_align = u16::from_le_bytes(format[12..14].try_into().ok()?);
+            return (channels != 0 && block_align % channels == 0)
+                .then_some(block_align / channels);
+        }
+
+        let padded_len = i64::from(chunk_len) + i64::from(chunk_len & 1);
+        file.seek(SeekFrom::Current(padded_len)).ok()?;
+    }
+}
+
 /// Slice a normalized WAV file at the byte-exact sample range corresponding
 /// to `[start_ms, end_ms)` and write the result to a new file in `dest_dir`.
 ///
@@ -1037,7 +1066,7 @@ pub fn slice_pcm_wav_to_temp_path(
     start_ms: u64,
     end_ms: u64,
 ) -> FwResult<PathBuf> {
-    let reader = hound::WavReader::open(source).map_err(hound_error_to_fw)?;
+    let mut reader = hound::WavReader::open(source).map_err(hound_error_to_fw)?;
     let spec = reader.spec();
     if spec.sample_format != hound::SampleFormat::Int {
         return Err(FwError::Unsupported(format!(
@@ -1046,22 +1075,70 @@ pub fn slice_pcm_wav_to_temp_path(
             spec.sample_format,
         )));
     }
-    let samples: Vec<i32> = reader
-        .into_samples::<i32>()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(hound_error_to_fw)?;
 
     let channels = u64::from(spec.channels.max(1));
     let sample_rate = u64::from(spec.sample_rate.max(1));
-    let total_frames = (samples.len() as u64) / channels;
-    let total_duration_ms = (total_frames * 1000) / sample_rate;
+    let range_for_frames = |total_frames: u64| {
+        let total_duration_ms = (total_frames * 1000) / sample_rate;
+        let clamped_start = start_ms.min(total_duration_ms);
+        let clamped_end = end_ms.max(clamped_start).min(total_duration_ms);
+        let start_frame = (clamped_start * sample_rate) / 1000;
+        let end_frame = (clamped_end * sample_rate) / 1000;
+        (clamped_start, clamped_end, start_frame, end_frame)
+    };
 
-    let clamped_start = start_ms.min(total_duration_ms);
-    let clamped_end = end_ms.max(clamped_start).min(total_duration_ms);
-    let start_frame = (clamped_start * sample_rate) / 1000;
-    let end_frame = (clamped_end * sample_rate) / 1000;
-    let start_sample = (start_frame * channels) as usize;
-    let end_sample = ((end_frame * channels) as usize).min(samples.len());
+    let seekable_pcm16 =
+        spec.bits_per_sample == 16 && wav_container_bytes_per_sample(source) == Some(2);
+    let (samples, clamped_start, clamped_end, start_sample, end_sample) = if seekable_pcm16 {
+        let total_frames = u64::from(reader.duration());
+        let (clamped_start, clamped_end, start_frame, end_frame) = range_for_frames(total_frames);
+
+        // Hound's duration is derived from the declared data-chunk size. Check the
+        // final frame before creating the destination so a truncated source retains
+        // the historical full-read error and never clobbers an existing output.
+        if total_frames > 0 {
+            reader
+                .seek((total_frames - 1) as u32)
+                .map_err(FwError::Io)?;
+            for sample in reader.samples::<i32>().take(channels as usize) {
+                sample.map_err(hound_error_to_fw)?;
+            }
+        }
+
+        reader.seek(start_frame as u32).map_err(FwError::Io)?;
+        let selected_samples = ((end_frame - start_frame) * channels) as usize;
+        let samples = reader
+            .into_samples::<i32>()
+            .take(selected_samples)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(hound_error_to_fw)?;
+        if samples.len() != selected_samples {
+            return Err(FwError::Io(std::io::Error::other(
+                "Failed to read enough bytes.",
+            )));
+        }
+        let end_sample = samples.len();
+        (samples, clamped_start, clamped_end, 0, end_sample)
+    } else {
+        // Hound's seek offset uses valid bits rather than container width. Keep the
+        // historical full-read path for every non-16-bit format and for PCM16 stored
+        // in a wider container.
+        let samples = reader
+            .into_samples::<i32>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(hound_error_to_fw)?;
+        let total_frames = (samples.len() as u64) / channels;
+        let (clamped_start, clamped_end, start_frame, end_frame) = range_for_frames(total_frames);
+        let start_sample = (start_frame * channels) as usize;
+        let end_sample = ((end_frame * channels) as usize).min(samples.len());
+        (
+            samples,
+            clamped_start,
+            clamped_end,
+            start_sample,
+            end_sample,
+        )
+    };
     let slice = &samples[start_sample..end_sample];
 
     let slice_path = dest_dir.join(format!("slice_{clamped_start}_{clamped_end}.wav"));
@@ -1809,6 +1886,42 @@ mod tests {
     }
 
     #[test]
+    fn slice_pcm_wav_to_temp_path_falls_back_for_wide_pcm16_container() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("wide-pcm16.wav");
+        let samples = [4_000_i32, 11_999_i32];
+        let data_len = (samples.len() * 4) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&64_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(&source, bytes).expect("write wide wav");
+        assert_eq!(super::wav_container_bytes_per_sample(&source), Some(4));
+
+        let historical_error = hound::WavReader::open(&source)
+            .expect("open wide wav")
+            .into_samples::<i32>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("hound rejects wide PCM16 samples")
+            .to_string();
+        let error = super::slice_pcm_wav_to_temp_path(&source, dir.path(), 0, 1)
+            .expect_err("wide PCM16 retains historical fallback error");
+        assert!(error.to_string().contains(&historical_error));
+    }
+
+    #[test]
     fn slice_pcm_wav_to_temp_path_clamps_oob_range() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source.wav");
@@ -1844,6 +1957,52 @@ mod tests {
             .collect::<Result<_, _>>()
             .expect("read samples");
         assert_eq!(samples.len(), 0);
+    }
+
+    #[test]
+    fn slice_pcm_wav_to_temp_path_checks_truncated_tail_before_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.wav");
+        write_counter_wav(&source, 4_000, 16_000);
+
+        let mut source_bytes = std::fs::read(&source).expect("read source wav");
+        source_bytes.pop().expect("source has sample bytes");
+        std::fs::write(&source, source_bytes).expect("truncate final sample");
+
+        let destination = dir.path().join("slice_100_100.wav");
+        std::fs::write(&destination, b"destination sentinel").expect("write sentinel");
+        let error = super::slice_pcm_wav_to_temp_path(&source, dir.path(), 100, 100)
+            .expect_err("truncated declared tail must fail");
+
+        assert!(error.to_string().contains("Failed to read enough bytes."));
+        assert_eq!(
+            std::fs::read(destination).expect("read sentinel"),
+            b"destination sentinel"
+        );
+    }
+
+    #[test]
+    fn slice_pcm_wav_to_temp_path_preserves_source_output_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reference_source = dir.path().join("reference.wav");
+        let colliding_source = dir.path().join("slice_250_750.wav");
+        write_counter_wav(&reference_source, 16_000, 16_000);
+        std::fs::copy(&reference_source, &colliding_source).expect("copy collision source");
+
+        let reference_dest = dir.path().join("reference-dest");
+        std::fs::create_dir(&reference_dest).expect("create reference destination");
+        let reference =
+            super::slice_pcm_wav_to_temp_path(&reference_source, &reference_dest, 250, 750)
+                .expect("reference slice");
+        let expected = std::fs::read(reference).expect("read reference slice");
+
+        let collided = super::slice_pcm_wav_to_temp_path(&colliding_source, dir.path(), 250, 750)
+            .expect("colliding slice");
+        assert_eq!(collided, colliding_source);
+        assert_eq!(
+            std::fs::read(collided).expect("read collided slice"),
+            expected
+        );
     }
 
     #[test]
