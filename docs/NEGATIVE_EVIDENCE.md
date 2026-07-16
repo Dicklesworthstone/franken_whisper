@@ -22939,3 +22939,44 @@ fsqlite-core/asupersync full-crate build unblocks). Scope: export is one-shot pe
 (sub-floor for a single transcription's e2e), but this is a real per-cue throughput win
 for large/batch subtitle export and simply completes the SRT parity. Landed default-on,
 byte-exact, no flag.
+
+---
+
+## 2026-07-16 - BlackThrush: **KEEP / VALID NULL — silhouette_score halved via symmetric distance accumulation; ~2.9×, byte-exact (diarization).**
+
+**Fresh-subsystem pivot (export/render veins exhausted).** After sweeping the export
+writers (SRT/VTT/CSV/JSON/LRC all now allocation-free) and confirming `youtube/render.rs`
+is already A/B-optimized (`push_*` direct-write, `format_timestamp_label`/`paragraph_text`
+are `#[cfg(test)]` historical), pivoted into the **heuristic diarizer's clustering**
+(`orchestrator.rs`, never perf-touched). `diarize_segments` computes a **silhouette
+score** quality metric (called once per diarization run, `orchestrator::n` →
+whisper_diarization_native) that was **O(n²)** in `SpeakerEmbedding::euclidean_distance`
+(6-D, one `sqrt` per pair), n = number of segments.
+
+**Lever (byte-exact).** The pairwise distance matrix is **symmetric** — `d(i,j) == d(j,i)`
+bit-for-bit, since `(a-b)*(a-b) == (b-a)*(b-a)` in IEEE-754 (negation flips only the sign
+bit, the multiply clears it) and the 6-lane sum is over the same fixed order. The old form
+computed **every ordered pair** (n(n-1) distances) *and* re-scanned all n points once per
+other cluster in the b(i) step (`clusters×n` iterations). The new form computes **each
+unordered pair's distance once** (n(n-1)/2 `sqrt`) in a single upper-triangle pass, folding
+it into per-point per-cluster running sums for both endpoints. **Byte-identical**: each
+`cluster_sum[i][c]` still accumulates `d(i,k)` over `k` in strictly increasing index order
+(k<i terms from earlier outer iterations, k>i from i's own), so every a(i), b(i), s(i) and
+the mean match the naive scan bit-for-bit. Extra memory is `n × clusters` f64+u64 (tiny,
+≪ a full n² matrix).
+
+**Valid-null A/B** (new `benches/silhouette_perf`, isolated `--profile release`, LTO off,
+`codegen-units=1`; size sweep n ∈ {200,600,1500,3000}, clusters=4, 25 pairs, 7 runs). null
+median **0.995–1.013** (valid) at every size; speedup median **2.83–3.02×**, p10 ≥ 2.37,
+**25/25 wins** every size/run. Absolute: n=3000 orig ~30 ms → cand ~10.4 ms; n=1500 (~1 h
+of speech) 7.5 ms → 2.6 ms. The >2× (vs the naive-halving 2×) is the b-loop's `clusters×n`
+iteration overhead also collapsing to one pass.
+
+**Byte-exact — verified.** The bench asserts identical `f64::to_bits` at every size AND on
+a singleton-cluster / empty-cluster edge (a_count==0 branch). New in-tree test
+`silhouette_score_matches_naive_double_scan_bit_for_bit` compares against an inline naive
+reference over 6 (n,k) configs incl. n=2, singleton, empty clusters; it plus the exact
+production body were run green in a standalone mirror (`scratchpad/sil_verify`) — the full
+crate is still fsqlite-core/asupersync-blocked. Scope: the silhouette is a per-run
+diarization quality metric (opt-in `--diarize`), scaling with recording length; a real
+byte-exact win on that path, not an e2e transcription claim. Landed default-on, no flag.
