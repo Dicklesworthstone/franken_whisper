@@ -507,6 +507,14 @@ impl SpeculativeStreamingPipeline {
         &self.events
     }
 
+    /// Consume the pipeline and take ownership of its event vector, avoiding a
+    /// clone at the terminal handoff. Call after `stats()`/`merged_transcript()`,
+    /// which only borrow.
+    #[must_use]
+    pub fn into_events(self) -> Vec<RunEvent> {
+        self.events
+    }
+
     /// Reference to the correction tracker.
     #[must_use]
     pub fn correction_tracker(&self) -> &CorrectionTracker {

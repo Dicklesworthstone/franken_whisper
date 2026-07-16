@@ -23643,3 +23643,23 @@ win **grows with segment count** (more reallocs/temps avoided) so it's decisive 
 verified in-tree: `cargo test --lib --release -- merge_segments window_manager` = **30 passed / 0 failed** (quality
 preference, fast fallback, empty/unresolved windows, cross-window overlap dedup, missing ts/confidence/speaker,
 Unicode). 6th resolved hold in the [[feedback_invalid_null_hold_is_a_win]] vein.
+
+---
+## 2026-07-16 - BlackThrush: **KEEP — terminal speculative event handoff MOVES the event vector (`SpeculativeStreamingPipeline::into_events`) instead of cloning it (`events().to_vec()`). Resolves the 2026-07-14 Codex HOLD (NE ~L1092). ~4.8× on the isolated clone→move, byte-exact.**
+
+`execute_backend_speculative` (orchestrator.rs:2261) did `pipeline.events().to_vec()` — a deep clone of the entire
+`Vec<RunEvent>` (each event owns 5 Strings) — immediately before dropping the pipeline. Added a consuming
+`into_events(self) -> Vec<RunEvent>` accessor and reordered so `stats()`/`merged_transcript()` (both `&self`) run
+first, then the events are **moved** out last. Byte-identical: the move returns the same Vec `to_vec` would have
+cloned, and stats/merged are computed from borrows beforehand (verified: `cargo test --lib --release -- streaming::`
+= **74 passed / 0 failed**, incl. the pipeline event-accessor/ordering tests).
+
+**Why Codex held it — and why it's actually a clean win:** Codex measured the whole terminal handoff on a **20-event**
+fixture and got p10 **0.842** (inside null p90 1.086) — but the `to_vec` is a small fraction of that handoff, so the
+measurement was noise-dominated, and "the harness rejected before the planned 1,000-event long shape," so the case
+where the clone actually matters was never measured. **Isolating the operation** (`scratchpad/events`, warm-up + 61
+pairs, pooled owned pipelines): null tight **0.99–1.02**; old(clone)/new(move) **4.76× (20 events, 61/61 wins) →
+2.7–3.2× (1000–5000 events)**; p10 clears the null massively at every size. The move is strictly less work than the
+clone (Pareto) and `into_events` is a cleaner terminal API than `events().to_vec()` on a to-be-dropped pipeline.
+**Lesson: measure the OPERATION, not the diluted whole — a clone→move on a small-but-real Vec reads as noise inside a
+larger handoff but is a decisive, free win in isolation.** 7th resolved hold in the [[feedback_invalid_null_hold_is_a_win]] vein.

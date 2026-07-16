@@ -2258,9 +2258,11 @@ async fn execute_backend_speculative(
             // Always carry partial events + stats + merged segments out, so
             // the outer handler can forward speculation events to the NDJSON
             // log regardless of whether the pipeline succeeded or failed.
-            let emitted = pipeline.events().to_vec();
             let stats = pipeline.stats();
             let merged = pipeline.merged_transcript();
+            // Move the event vector out last (consuming the terminal pipeline)
+            // instead of cloning it via `events().to_vec()`.
+            let emitted = pipeline.into_events();
             Ok((inner_result, emitted, stats, merged))
         });
 
