@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — borrowed adaptive-router success metric measured 0.000163x historical with 42/42 wins, but null CV exceeded the predeclared ceiling; source restored (bd-upk1).**
+
+**Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
+(`data_hash=bd52c074f0ed70fe`) left the established native-engine, streaming,
+speculation, robot, export, YouTube, diarization, process-log, SRT, TTY, and
+audio-metadata veins already represented in this ledger. The open `bd-upk1`
+bead instead identified an unledgered adaptive-router ownership boundary:
+`execute_backend` cloned the complete global `RouterState` and then built full
+`BackendMetrics` merely to read one `success_rate`. The saturated state carries
+three 50-record histories, 50 calibration observations, and a 200-entry
+string-heavy evidence ledger.
+
+Before any production edit, strict-remote untimed warm-up job
+`j-29933730227290825` and capped profile job `j-29933730227290830` ran
+`--profile release` with LTO disabled on `vmi1153651`. Across 11 profile
+samples, mutex lock-only cost **13.714 ns/call**, the full snapshot clone cost
+**296,128.762 ns/call** (**97.2882%** of historical), the borrowed full-metrics
+calculation cost **671.369 ns/call**, the complete historical read cost
+**304,383.048 ns/call**, and the direct scalar design cost **45.798 ns/call**.
+
+**One lever and exact oracle.** The candidate held the mutex guard, borrowed
+the selected history, and counted successful records directly; it did not
+clone router state, build latency samples, or clone the last error. The
+standalone `benches/router_success_metric_perf` harness asserted exact
+`Option<f64>::to_bits()` parity for absent state, empty state, partial and
+saturated histories, `Auto`, and all three concrete backends (**13 cases**).
+It preserved the historical `None`, `Auto => 0.0`, empty-history `0.5`, and
+success-count/length rules.
+
+**Real foreground A/B (`--profile release`, LTO off).** Measurement job
+`j-29933730227290843` reused `vmi1153651` and the warmed release binary. It
+ran 21 order-alternated ABBA pairs for both historical/historical and
+historical/direct comparisons, producing 42 ratios per comparison; ratios are
+candidate divided by historical, so lower is better. BASE/BASE had p10
+**0.873491x**, median **0.993517x**, p90 **1.224718x**, CV **13.8557%**, and
+22/42 ratios below one. The direct scalar read had p10 **0.000121x**, median
+**0.000163x**, p90 **0.000190x**, and **42/42 wins**, with median component
+costs of **44.990 ns/call** versus **275,551.762 ns/call**. The candidate
+cleared the magnitude, separation, and win-count gates, but the identity null
+failed the predeclared CV ceiling of 3%; the harness therefore returned
+`verdict=REJECT`. This is a completed, real A/B result, not a build timeout.
+
+**Verdict:** hold rather than relax the null gate after observing a very large
+component result. Production `src/backend/mod.rs` and `src/orchestrator.rs`
+were restored exactly to current `main`; the isolated harness remains as the
+reproduction and bit-parity artifact. Retry only with longer historical arms
+on a quieter same worker, and batch the nanosecond-scale candidate so neither
+side is dominated by timer granularity. Any eventual claim is limited to this
+adaptive prediction-metric read, not end-to-end transcription. `bd-upk1` is
+closed as a measured invalid-null hold. `AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — direct redacted process-log assembly measured 1.969320x median with 21/21 wins, but null CV exceeded the predeclared ceiling; source restored (bd-b8xo).**
 
 **Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
@@ -23758,3 +23810,27 @@ path (enc_free_f32 moved those to halves; decoder weights are int8) — it handl
 possible but **sub-floor** (≤1 ms on load, once per run; load is already near-floor per [[project_load_time_quant_candidate]]).
 **ggml.rs load/dequant path is CLOSED** (stream-load + halves-copy + enc_free_f32 already landed; the residuals are
 memcpy-floor or sub-floor). Don't re-mine.
+
+---
+## 2026-07-16 - BlackThrush: **CONSOLIDATION — the "fleet micro-vein" classes (discovery / N+1-read / persist-write / no-alloc-parse) are ALL CLEARED in franken_whisper. GREP-THE-GATE before re-deriving (nearly re-tried already-rejected multi-row persist this turn).**
+
+Pivoted into the class other agents are actively mining (18ff9a0 filter-before-stat, 884529f no-alloc parse, 250d81b
+N+1 batch) and verified franken_whisper's instances are done/optimal/rejected — one map so these stop being re-derived
+(I nearly re-tried multi-row persist below; last turn re-derived ggml — [[project_load_time_quant_candidate]]):
+
+- **Directory-scan discovery = optimal.** Native model discovery filter-before-stat LANDED by another agent (18ff9a0,
+  `benches/model_discovery_perf`). `whisper_cpp_native::first_model_in_search_dirs` already gates the header IO by a
+  name check (`starts_with("ggml-")&&ends_with(".bin")`) — no metadata-probe-before-filter; swapping `entry.path()`→
+  `entry.file_name()` just trades a PathBuf alloc for an OsString alloc (not a win). `audio::find_file_named`'s
+  `file_type()` is intrinsic to a recursive walk + one-time ffmpeg-provision (sub-floor). No lever.
+- **N+1 reads = batched.** `RunStore::load_run_details_batch` (storage.rs:388, default-ON `FW_STORAGE_BATCH_HISTORY`)
+  = two `WHERE id IN (..)` queries + in-memory HashMap join (the 394 loop is only the kill-switch fallback). Routing-
+  history N+1 done (250d81b). export/import N+1 done ([[project_bufwriter_file_write_antipattern]]).
+- **Persist writes = at floor.** `persist_report` per-row INSERT uses savepoint-skip (b4f6213, ~1.48×). **Multi-row
+  chunked INSERT was MEASURED and REJECTED (~5% SLOWER, NE 2026-07-12 line ~2300, `FW_PERSIST_MULTIROW`)** — the
+  dynamic-SQL + row-Vec packing overhead beats the per-statement savings. Per-row `run_id`/`text` clones are API-bound
+  (owned params). DON'T re-try multi-row persist.
+- no-alloc enum parse (rollout stages 884529f) = fleet-cleared; the class is once-per-config (sub-floor) anyway.
+
+**No autonomous lever this turn** — the fleet's micro-veins join the standalone byte-exact surface + ledger-hold vein +
+model engine as exhausted/owner. GREP-THE-GATE ([[project_grep_the_gate]]) + this map before valuing any peripheral candidate.
