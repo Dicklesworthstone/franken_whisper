@@ -23297,3 +23297,25 @@ int8/SDPA/spec-decode/GPU per the CONSOLIDATED FRONTIER MAP) or BLOCKED (fsqlite
 breaks the full-crate build → no `fw`-binary profiling or in-tree guard-test validation of my ~10 landings).**
 Future autonomous sessions: cite this + the FRONTIER MAP; the peripheral micro-lever vein is dry — don't
 re-probe export/sync/robot/dtw/diarize/streaming/concat. `process.rs` is another agent's active area.
+
+---
+
+## 2026-07-16 - BlackThrush: **BLOCKER ROOT-CAUSED — the full-crate build break is UPSTREAM in ../frankensqlite (fsqlite-core uses asupersync 0.3.4's `try_acquire` API while fsqlite-types requires ^0.3.5); franken_whisper CANNOT pin around it.**
+
+**Precise diagnosis** (supersedes the vague "fsqlite-core/asupersync-0.3.5 breaks" in ~10 prior entries — it is
+NOT a franken_whisper Cargo mistake). franken_whisper `Cargo.toml` declares `asupersync = "0.3.4"` (caret →
+resolves to 0.3.5). The break: `../frankensqlite/crates/fsqlite-core/src/remote_effects.rs` calls the OLD 2-arg
+`bulkhead.try_acquire(weight, admission_now())` (asupersync 0.3.4 API), but asupersync **0.3.5** changed it to
+1-arg (`try_acquire(count) -> Result<SemaphorePermit>`), so fsqlite-core (v0.1.16) fails to compile (E0061).
+
+**Why franken_whisper can't fix it:** `cargo update -p asupersync --precise 0.3.4` **ERRORS** — sibling crate
+`fsqlite-types v0.1.16` requires `asupersync = "^0.3.5"` (needs ≥0.3.5), so the resolver refuses 0.3.4. So
+../frankensqlite is internally **inconsistent**: its manifest (fsqlite-types) requires 0.3.5 while its code
+(fsqlite-core) uses 0.3.4's API. **The fix must land in ../frankensqlite** — update fsqlite-core's `try_acquire`
+call sites in `remote_effects.rs` to the 0.3.5 1-arg signature (and drop the `admission_now()` arg). A separate
+project; out of franken_whisper's scope to edit.
+
+**Impact / status:** blocks `cargo build`/`cargo test --lib`/the `fw` binary for EVERYONE → no e2e profiling and
+my ~10 byte-exact landings' in-tree guard tests (dtw/silhouette/greedy/extraction/safetensors/vtt) can't run
+until this is reconciled. Someone IS actively touching ../frankensqlite (Cargo.lock gained `blake3` on
+fsqlite-pager this session), so a fix may be in progress. No franken_whisper change possible; flagged to agents.
