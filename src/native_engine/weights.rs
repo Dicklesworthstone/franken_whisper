@@ -111,8 +111,15 @@ pub struct SafetensorsFile {
     tensors: BTreeMap<String, TensorEntry>,
     /// Optional `__metadata__` object from the header, preserved verbatim.
     metadata: Option<Value>,
-    /// The raw tensor data section (everything after the JSON header).
+    /// Backing byte buffer. For [`from_bytes`](Self::from_bytes) this is a fresh
+    /// copy of just the data section (with `data_offset == 0`). For
+    /// [`load`](Self::load) this is the whole `std::fs::read` buffer, retained
+    /// without a second copy (with `data_offset == header_end`). Either way,
+    /// tensor `i` lives at `data[data_offset + begin_i .. data_offset + end_i]`.
     data: Vec<u8>,
+    /// Byte offset of the data section within [`data`](Self::data): `0` for the
+    /// borrowed/copied path, `header_end` for the retained-whole-file path.
+    data_offset: usize,
 }
 
 impl SafetensorsFile {
@@ -147,7 +154,19 @@ impl SafetensorsFile {
     /// JSON; [`FwError::InvalidRequest`] for any structural violation above.
     pub fn load(path: &Path) -> FwResult<Self> {
         let bytes = std::fs::read(path)?;
-        Self::from_bytes(&bytes)
+        // Retain the whole file buffer and index tensors past the header, instead
+        // of `from_bytes`' second `to_vec()` of the entire data section. The tensor
+        // bytes read are byte-identical (`bytes[header_end..][begin..end]` ==
+        // `bytes[header_end + begin .. header_end + end]`), so every decoded value
+        // matches the copying path bit-for-bit; this only avoids the extra 32 MB+
+        // allocation + memcpy (and the transient peak of holding both buffers).
+        let (tensors, metadata, header_end) = Self::parse_directory(&bytes)?;
+        Ok(Self {
+            tensors,
+            metadata,
+            data: bytes,
+            data_offset: header_end,
+        })
     }
 
     /// Parse from an in-memory safetensors byte buffer (the testable core of
@@ -162,6 +181,30 @@ impl SafetensorsFile {
     ///
     /// See [`load`](Self::load).
     pub fn from_bytes(bytes: &[u8]) -> FwResult<Self> {
+        let (tensors, metadata, header_end) = Self::parse_directory(bytes)?;
+        // Borrowed entry point: copy just the data section out (offset 0). This
+        // preserves the historical `from_bytes(&[u8])` ownership semantics — the
+        // returned file does not borrow `bytes`.
+        let data = bytes[header_end..].to_vec();
+        Ok(Self {
+            tensors,
+            metadata,
+            data,
+            data_offset: 0,
+        })
+    }
+
+    /// Validate the header length prefix + JSON directory and build the tensor
+    /// table and `__metadata__`, WITHOUT copying the data section. Returns the
+    /// tensor directory, optional metadata, and `header_end` (the byte offset of
+    /// the data section). Tensor `data_offsets` are validated against the data
+    /// section length (`bytes.len() - header_end`) and stored relative to it, so
+    /// callers index them as `data[data_offset + begin .. data_offset + end]`.
+    /// Shared by [`from_bytes`](Self::from_bytes) (copies the section) and
+    /// [`load`](Self::load) (retains the whole buffer).
+    fn parse_directory(
+        bytes: &[u8],
+    ) -> FwResult<(BTreeMap<String, TensorEntry>, Option<Value>, usize)> {
         if bytes.len() < 8 {
             return Err(FwError::InvalidRequest(format!(
                 "safetensors file too short: {} bytes (need at least an 8-byte header length)",
@@ -197,8 +240,7 @@ impl SafetensorsFile {
             FwError::InvalidRequest("safetensors header is not a JSON object".to_owned())
         })?;
 
-        let data = bytes[header_end..].to_vec();
-        let data_len = data.len();
+        let data_len = bytes.len() - header_end;
 
         let mut metadata = None;
         let mut tensors = BTreeMap::new();
@@ -211,11 +253,7 @@ impl SafetensorsFile {
             tensors.insert(name.clone(), entry);
         }
 
-        Ok(Self {
-            tensors,
-            metadata,
-            data,
-        })
+        Ok((tensors, metadata, header_end))
     }
 
     /// Materialize tensor `name` as `(shape, row-major f32 data)`.
@@ -246,7 +284,7 @@ impl SafetensorsFile {
             ))
         })?;
 
-        let raw = &self.data[entry.begin..entry.end];
+        let raw = &self.data[self.data_offset + entry.begin..self.data_offset + entry.end];
         let n_elements: usize = entry.shape.iter().product();
         let width = entry.dtype.byte_width();
         if raw.len() != n_elements * width {
@@ -935,6 +973,69 @@ mod tests {
         let file = SafetensorsFile::load(&path).expect("load from disk");
         let (_, vals) = file.tensor_f32("x").expect("decode");
         assert_eq!(vals, vec![3.5, -1.25]);
+    }
+
+    #[test]
+    fn load_matches_from_bytes_bit_for_bit() {
+        // The retained-whole-buffer disk `load` path must decode every tensor
+        // identically to the copying `from_bytes` path — only the backing buffer
+        // and `data_offset` differ, so this pins the offset arithmetic byte-exact.
+        // Cover several tensors, F32 + F16, a zero-length tensor, and a tensor at
+        // the very end of the data section.
+        let dir = TempDir::new("exact");
+        let tensors = vec![
+            SynTensor {
+                name: "a.w",
+                dtype: "F32",
+                shape: vec![3],
+                payload: f32_payload(&[1.0, -2.5, 3.25]),
+            },
+            SynTensor {
+                name: "b.empty",
+                dtype: "F32",
+                shape: vec![0],
+                payload: f32_payload(&[]),
+            },
+            SynTensor {
+                name: "c.f16",
+                dtype: "F16",
+                shape: vec![4],
+                payload: f16_payload(&[0x3c00, 0xbc00, 0x0000, 0x7bff]),
+            },
+            SynTensor {
+                name: "d.tail",
+                dtype: "F32",
+                shape: vec![2, 2],
+                payload: f32_payload(&[9.0, 8.0, 7.0, 6.0]),
+            },
+        ];
+        let bytes = build_safetensors(&tensors, Some(serde_json::json!({"k": "v"})));
+        let path = write_file(dir.path(), "exact.safetensors", &bytes);
+
+        let disk = SafetensorsFile::load(&path).expect("load from disk");
+        let mem = SafetensorsFile::from_bytes(&bytes).expect("from_bytes");
+
+        // Same directory; the disk path retains the whole file, the mem path
+        // copies just the (smaller) data section.
+        assert_eq!(
+            disk.names().collect::<Vec<_>>(),
+            mem.names().collect::<Vec<_>>()
+        );
+        assert_eq!(disk.data.len(), bytes.len(), "disk path retains the whole file");
+        assert!(disk.data_offset > 0, "disk path indexes past the header");
+        assert_eq!(mem.data_offset, 0, "from_bytes copies just the data section");
+        assert_eq!(mem.data.len(), bytes.len() - disk.data_offset);
+
+        for name in ["a.w", "b.empty", "c.f16", "d.tail"] {
+            let (disk_shape, disk_vals) = disk.tensor_f32(name).expect("disk decode");
+            let (mem_shape, mem_vals) = mem.tensor_f32(name).expect("mem decode");
+            assert_eq!(disk_shape, mem_shape, "shape differs for {name}");
+            assert_eq!(
+                disk_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                mem_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "decoded f32 bits differ for {name}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
