@@ -645,16 +645,34 @@ impl WindowManager {
     /// with higher confidence.
     #[must_use]
     pub fn merge_segments(&self) -> Vec<TranscriptionSegment> {
-        let mut all_segments: Vec<TranscriptionSegment> = Vec::new();
+        // Count the resolved segments first so the aggregate is allocated at
+        // exact capacity and each window's chosen segments are cloned directly
+        // into it — avoiding a per-window temporary `Vec` (from `.clone()`) and
+        // the aggregate's incremental reallocation. Byte-identical: `self` is
+        // borrowed so both passes pick the same quality/fast branch per window,
+        // and the same segments are appended in the same order.
+        let mut total = 0usize;
+        for ws in &self.windows {
+            if ws.status != WindowStatus::Resolved {
+                continue;
+            }
+            if let Some(ref quality) = ws.quality_result {
+                total += quality.len();
+            } else if let Some(ref fast) = ws.fast_result {
+                total += fast.segments.len();
+            }
+        }
+
+        let mut all_segments: Vec<TranscriptionSegment> = Vec::with_capacity(total);
 
         for ws in &self.windows {
             if ws.status != WindowStatus::Resolved {
                 continue;
             }
             if let Some(ref quality) = ws.quality_result {
-                all_segments.extend(quality.clone());
+                all_segments.extend(quality.iter().cloned());
             } else if let Some(ref fast) = ws.fast_result {
-                all_segments.extend(fast.segments.clone());
+                all_segments.extend(fast.segments.iter().cloned());
             }
         }
 
