@@ -23064,3 +23064,35 @@ a real byte-exact win there (a 1-hour multi-speaker recording is ~1500+ segments
 an e2e transcription claim. Landed default-on, no flag. The diarizer greedy/centroid
 follow-up flagged after the silhouette win is now closed; `cosine_similarity` is O(n·k)
 (k = speakers, tiny) — not a lever.
+
+---
+
+## 2026-07-16 - BlackThrush: **KEEP / VALID NULL — diarizer Step-1 extraction fused 4 passes → 2 (one split/seg); ~2.1×, byte-exact.**
+
+**Third and final hot spot in the diarizer-clustering vein (after silhouette 868614b +
+greedy-centroid 75c307e).** With both O(n²) parts gone, `diarize_segments`' Step-1
+embedding **extraction** is the largest remaining heuristic cost. It made **four passes**
+over the segments (`max_seg_duration`, `max_word_count`, `max_text_len`, then the embedding
+map) and called `text.split_whitespace()` **twice per segment** — once to count words for
+`max_word_count`, once inside the map for word_count/total_chars.
+
+**Lever (byte-exact).** Fuse the three max-folds + the per-segment word/char counting into
+**one pass** that stores `(word_count, total_chars)` per segment; the embedding map (pass 2)
+reuses the stored counts instead of re-splitting. **Byte-identical**: each max folds over
+the same values in the same order with the same init (`0.0`/`1.0`), and the stored counts
+equal the re-split counts, so every feature is bit-for-bit unchanged. Also eliminates the
+redundant `split_whitespace` (the dominant per-segment cost).
+
+**Valid-null A/B** (new `benches/diarize_extract_perf`, isolated `--profile release`, LTO
+off, `codegen-units=1`; realistic 3–15-word segments; 25 pairs, 3 runs). null median
+**0.993–1.013** (valid) at every size; speedup median **2.02–2.25×**, p10 ≥ 1.85, **24–25/25
+wins**. Absolute: n=3000 ~600 µs → ~270 µs. Byte-exact assert (identical `f64::to_bits` of
+all 6 features per segment) green at every n. Scope: opt-in `--diarize` extraction, O(n) —
+a modest byte-exact constant-factor win completing the diarizer-heuristic optimization
+(extraction + greedy-centroid + silhouette all now done); not an e2e transcription claim.
+Full-crate test still fsqlite-core/asupersync-blocked; existing `--diarize` tests are the
+in-tree guard (byte-exact ⇒ unchanged). Landed default-on, no flag.
+
+**Diarizer-clustering vein now exhausted:** extraction (O(n), fused), greedy centroid
+(O(n²)→O(n)), silhouette (O(n²)→½). `cosine_similarity` O(n·k) and the Step-2b merge
+O(k²)/merge are sub-floor (k = speakers, tiny).
