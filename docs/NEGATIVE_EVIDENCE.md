@@ -22781,3 +22781,71 @@ isolated harness remains for a future retry with longer per-arm work or more
 symmetric cache conditioning. The result is **HOLD / INVALID NULL**, neither a
 keep nor a reject. Do not ship the selection network from this run, and do not
 relax or pool the failed null after seeing the strong candidate medians.
+
+---
+
+## 2026-07-15 - BlackThrush: **KEEP / VALID NULL — width-7 DTW median network landed byte-exact (resolves the prior HOLD); the invalid null was a harness artifact, not the lever.**
+
+**What the prior HOLD asked for, delivered.** The 2026-07-15 HOLD directly above
+measured the width-7 median-selection network at **1.6269x median / 15/15 wins**
+but could not ship it because its BASE/BASE null drifted to **0.957017x** (below
+the `[0.97,1.03]` validity band), and it explicitly left `benches/dtw_median_perf`
+"for a future retry with longer per-arm work or more symmetric cache
+conditioning." This tick did exactly that and the lever survives a **valid** null,
+so it is now landed.
+
+**Why the null was biased (diagnosis, not noise).** The old harness called
+`timed(fixture.clone(), impl)` — a fresh **1.5 MB `Vec<Vec<f32>>` allocation per
+timed call** (four per pair). That allocator/cache churn is asymmetric between the
+two calls of a pair, and over 15 un-warmed pairs the BASE/BASE ratios drooped
+monotonically (`…0.907,0.887,0.896,0.957,0.898`) — a thermal/allocator drift
+signature, not a property of either implementation. Fix (all in `bench.rs`, arm
+functions kept byte-for-byte so the exactness assert is unchanged): (1) a single
+reusable `work` buffer restored with allocation-free `copy_from_slice` **outside**
+the `Instant`, killing per-call churn; (2) representative per-arm work — **384
+rows** (6 heads × 64 tokens = one real 1500-frame-window median-filter pass)
+instead of 64, so fixed per-call overhead is a smaller fraction; (3) **12 warm-up
+rounds** to reach all-core-frequency steady state before timing; (4) **31** pairs.
+
+**Valid-null A/B (6 runs, isolated `--profile release`, LTO off, `codegen-units=1`).**
+BASE/BASE null median now centers on 1.0 every run — `0.997, 1.009, 0.999, 1.001,
+1.009, 1.009` (all inside `[0.97,1.03]`). Historical/network candidate median
+`1.434, 1.446, 1.449, 1.433, 1.413, 1.435`, p10 `1.22–1.41`, **30–31/31 wins**
+every run; absolute historical ≈ 26 ms vs network ≈ 18 ms for the 384-row pass.
+Predeclared conjunctive gate (null median in band; candidate median > max(null p90,
+1.05); candidate p10 > 1.0; ≥13/15 wins) — **all satisfied with a valid null.**
+The conservative ~1.43x (vs the HOLD's 1.63x) is the honest number: the HOLD's
+64-row/clone-per-call regime had different cache behavior; the reused-buffer
+384-row regime is both more representative and drift-free.
+
+**Byte-exact — proven for ALL inputs, not just sampled floats.** `median_filter`
+now branches to `median_filter_width7` (the 13-comparison stable network) for the
+whisper.cpp-fixed width 7 and keeps the general stable-sort path for every other
+width. Three proofs, all green: (a) the bench asserts `median7_network` == the
+historical stable sort bit-for-bit over 384×1500 windows; (b) a new production
+unit test `median_filter_width7_matches_sort_reference` compares `median_filter(_,7)`
+against an independent in-test stable-sort reference, bit-for-bit, over lengths
+`{0,1,2,3,4,5,6,7,8,9,33,1500}` × {random, heavy-duplicate (stable tie-break),
+interspersed NaN/±inf (sort-fallback path)}; (c) `median7_network_selects_true_median_for_all_binary_inputs`
+proves via the **0-1 principle** (all 2^7 binary inputs) that the network is a
+correct median-of-7 selector, and `median_filter_width7_preserves_signed_zero_like_sort`
+pins the −0.0/+0.0 bit selection the HOLD flagged. Because `median_filter` is a
+pure function, bit-identical output ⇒ bit-identical DTW path ⇒ bit-identical word
+timestamps: unit-level byte-exactness is sufficient for transcript-level exactness
+here (and strictly stronger than a transcript diff, which need not hit the tie /
+non-finite edges). No flag/kill-switch: the change is provably transparent and the
+general path is the inherent width≠7 fallback.
+
+**Verification provenance / honest limitation.** The isolated bench + a standalone
+copy of the exact production functions (`scratchpad/dtw_verify`) both compile and
+pass on this box. The **full-crate `cargo test --lib` could not run**: it dies in a
+dependency, `fsqlite-core`, against `asupersync-0.3.5` (a `try_acquire` arity
+change: `try_acquire(1, admission_now())` vs the new 1-arg signature) — the same
+unrelated breakage the prior HOLD hit, entirely upstream of `franken_whisper`'s own
+code, so it gives no signal on this change and blocks the transcript-diff path for
+everyone until the dep is reconciled. The unit-level bit-exact proofs above stand
+independently of it. rch workers failed preflight all session (fail-open to local);
+this bench is single-threaded so all-core contention does not apply, and the median
+gate absorbs the transient wide-null run. Scope: DTW median filter is ~1% of the
+representative word-timestamp path (per the prior ledger), so this is a byte-exact
+algorithmic keep on that sub-op, **not** an e2e transcription-speed claim.

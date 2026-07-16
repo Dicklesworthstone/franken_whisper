@@ -1,9 +1,20 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-const ROWS: usize = 64;
+// Per-call workload. 6 attention heads x 64 tokens = 384 rows is one real DTW
+// median-filter invocation for a single 30 s (1500-frame) window, so each timed
+// arm does the work of one production `align_tokens` median-filter pass rather
+// than 1/6th of it. Larger per-arm work shrinks the fixed per-call overhead
+// (the `row.to_vec()` scratch, branch-predictor warm-up) as a fraction of the
+// measured span, which is what a *valid null* (BASE/BASE ~ 1.0) requires.
+const ROWS: usize = 384;
 const FRAMES: usize = 1500;
-const PAIRS: usize = 15;
+const PAIRS: usize = 31;
+// Warm-up rounds before any timed pair, run until the CPU reaches all-core
+// frequency steady-state so later pairs do not drift slower than earlier ones
+// (the 0.957 null bias in the 2026-07-15 HOLD was a monotonic thermal droop
+// over 15 un-warmed pairs).
+const WARMUP_ROUNDS: usize = 12;
 
 struct Lcg(u64);
 
@@ -96,18 +107,22 @@ fn fixture() -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn transform(rows: &mut [Vec<f32>], implementation: fn(&mut [f32])) {
-    for row in rows.iter_mut() {
+/// Restore `work` from `pristine` (a straight per-row `copy_from_slice` memcpy,
+/// reusing `work`'s existing allocation) and then time only the transform. The
+/// restore is deliberately OUTSIDE the `Instant` and allocation-free, so — unlike
+/// the prior `fixture.clone()`-per-call harness — no 1.5 MB allocation churns the
+/// allocator/cache asymmetrically between the two arms. Both arms see identically
+/// prepared memory; the only difference timed is the median implementation.
+fn timed(work: &mut [Vec<f32>], pristine: &[Vec<f32>], implementation: fn(&mut [f32])) -> Duration {
+    for (dst, src) in work.iter_mut().zip(pristine) {
+        dst.copy_from_slice(src);
+    }
+    let started = Instant::now();
+    for row in work.iter_mut() {
         implementation(black_box(row));
     }
-    black_box(rows);
-}
-
-fn timed(mut rows: Vec<Vec<f32>>, implementation: fn(&mut [f32])) -> Duration {
-    let started = Instant::now();
-    transform(&mut rows, implementation);
     let elapsed = started.elapsed();
-    black_box(rows);
+    black_box(&*work);
     elapsed
 }
 
@@ -130,10 +145,17 @@ fn output_hash(rows: &[Vec<f32>]) -> u64 {
 
 fn main() {
     let fixture = fixture();
+
+    // Byte-exactness: the network must reproduce the historical stable-sort
+    // median bit-for-bit (same FNV-1a digest across refactors of the harness).
     let mut expected = fixture.clone();
     let mut actual = fixture.clone();
-    transform(&mut expected, historical_sort);
-    transform(&mut actual, median7_network);
+    for row in expected.iter_mut() {
+        historical_sort(row);
+    }
+    for row in actual.iter_mut() {
+        median7_network(row);
+    }
     assert_eq!(
         actual
             .iter()
@@ -148,9 +170,13 @@ fn main() {
     );
     println!("DTW_MEDIAN_OUTPUT_FNV64={:016x}", output_hash(&actual));
 
-    for _ in 0..3 {
-        black_box(timed(fixture.clone(), historical_sort));
-        black_box(timed(fixture.clone(), median7_network));
+    // Single reusable working buffer; restored from `fixture` before every timed
+    // call inside `timed` (allocation-free memcpy, outside the timer).
+    let mut work = fixture.clone();
+
+    for _ in 0..WARMUP_ROUNDS {
+        black_box(timed(&mut work, &fixture, historical_sort));
+        black_box(timed(&mut work, &fixture, median7_network));
     }
 
     let mut null_ratios = Vec::with_capacity(PAIRS);
@@ -158,8 +184,9 @@ fn main() {
     let mut historical_ns = Vec::with_capacity(PAIRS);
     let mut candidate_ns = Vec::with_capacity(PAIRS);
     for pair in 0..PAIRS {
-        let null_first = timed(fixture.clone(), historical_sort);
-        let null_second = timed(fixture.clone(), historical_sort);
+        // Null (BASE/BASE): two adjacent historical calls, order-alternated.
+        let null_first = timed(&mut work, &fixture, historical_sort);
+        let null_second = timed(&mut work, &fixture, historical_sort);
         let null_ratio = if pair.is_multiple_of(2) {
             null_first.as_secs_f64() / null_second.as_secs_f64()
         } else {
@@ -167,14 +194,16 @@ fn main() {
         };
         null_ratios.push(null_ratio);
 
+        // Candidate: adjacent historical vs network, order-alternated, so both
+        // arms share whatever residual drift remains across the pair.
         let (historical, candidate) = if pair.is_multiple_of(2) {
             (
-                timed(fixture.clone(), historical_sort),
-                timed(fixture.clone(), median7_network),
+                timed(&mut work, &fixture, historical_sort),
+                timed(&mut work, &fixture, median7_network),
             )
         } else {
-            let candidate = timed(fixture.clone(), median7_network);
-            let historical = timed(fixture.clone(), historical_sort);
+            let candidate = timed(&mut work, &fixture, median7_network);
+            let historical = timed(&mut work, &fixture, historical_sort);
             (historical, candidate)
         };
         historical_ns.push(historical.as_nanos());
@@ -182,6 +211,7 @@ fn main() {
         candidate_ratios.push(historical.as_secs_f64() / candidate.as_secs_f64());
     }
 
+    let null_p10 = percentile(&null_ratios, 10);
     let null_median = percentile(&null_ratios, 50);
     let null_p90 = percentile(&null_ratios, 90);
     let candidate_p10 = percentile(&candidate_ratios, 10);
@@ -191,11 +221,12 @@ fn main() {
         .iter()
         .filter(|&&ratio| ratio > 1.0)
         .count();
+    println!("ROWS={ROWS} FRAMES={FRAMES} PAIRS={PAIRS} WARMUP={WARMUP_ROUNDS}");
     println!("BASE_BASE_RATIOS={null_ratios:?}");
     println!("HISTORICAL_NETWORK_RATIOS={candidate_ratios:?}");
     println!("HISTORICAL_NS={historical_ns:?}");
     println!("NETWORK_NS={candidate_ns:?}");
-    println!("NULL_MEDIAN={null_median:.6} NULL_P90={null_p90:.6}");
+    println!("NULL_P10={null_p10:.6} NULL_MEDIAN={null_median:.6} NULL_P90={null_p90:.6}");
     println!(
         "CANDIDATE_P10={candidate_p10:.6} CANDIDATE_MEDIAN={candidate_median:.6} CANDIDATE_P90={candidate_p90:.6} WINS={wins}/{PAIRS}"
     );
