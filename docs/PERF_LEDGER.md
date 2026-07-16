@@ -4,6 +4,58 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-16 — LANDED — front-loaded cancellable child polling (bd-2mbr)
+
+**Negative-ledger-first profile boundary.** `bv --robot-triage`
+(`data_hash=9df0d621105adfdb`) and `docs/NEGATIVE_EVIDENCE.md` showed that the
+recent audio, diarizer, storage, and render veins were already mined. A fresh
+process-control profile instead isolated `run_command_cancellable`'s fixed
+50 ms sleep. Before any production edit, the ordinary non-LTO
+`--profile release` harness measured direct/fixed medians of 2,897/52,589 us
+for an immediate child and 9,932/54,124 us for a 5 ms child: polling delay was
+respectively **94.4904%** and **81.6499%** of the historical component time.
+The first doubling schedule overshot the 100 ms control, so the profiled lever
+was narrowed before landing.
+
+**One lever and exactness.** The cancellable path now uses early sleeps of
+1/2/4/8/16/19 ms, producing poll points at 1/3/7/15/31/50 ms before returning
+to the historical 50 ms cadence. This front-loads detection for short-lived
+tools without increasing the steady-state polling rate or moving the 50 and
+100 ms control points. Child lifecycle, pipe readers, `try_wait`, cancellation,
+timeout, kill/wait, output validation, and error construction are unchanged.
+The same-binary oracle matched status code plus every stdout/stderr byte for
+delays 0/5/100 ms and exit codes 0/17 (six shapes). The harness source SHA-256
+was `e6953e0adaebc679beb1db045b00ef95dd06438291894d245065cf118815e07a`.
+
+**Strict-remote release A/B.** Untimed warm-up job
+`j-29933730227290432` and capped foreground measurement job
+`j-29933730227290436` both ran on `vmi1167313` with
+`AGENT_NAME=BlackThrush`, `RCH_REQUIRE_REMOTE=1`, `--profile release`, and
+`lto=false`; only the target runner carrying the measurement had a 120-second
+cap. The 75 ms BASE/BASE control shares the same 100 ms detection point under
+both schedules and returned candidate/base ratios p10 **0.817178x**, median
+**0.985517x**, p90 **1.050087x**, and CV 12.4970%:
+
+`[0.647866, 0.663488, 0.817178, 0.896369, 0.939107, 0.967498, 0.971394, 0.972462, 0.979445, 0.980093, 0.985517, 0.986025, 1.000686, 1.001411, 1.005653, 1.022066, 1.024974, 1.032629, 1.050087, 1.051407, 1.057730, 1.214078]`.
+
+For the profiled 5 ms child, candidate/base paired ratios were p10
+**0.169989x**, median **0.238070x**, p90 **0.438762x**, with 41/42 wins. The
+candidate p90 is below the null p10; the paired median is a **4.2004x**
+baseline/candidate speedup. Independent arm medians were 53,322 us fixed and
+13,093 us front-loaded (**4.0726x**):
+
+`[0.156058, 0.156554, 0.156926, 0.168843, 0.169989, 0.170248, 0.175029, 0.182014, 0.182934, 0.185097, 0.187177, 0.190316, 0.198183, 0.208457, 0.211137, 0.216718, 0.218076, 0.219246, 0.220029, 0.230173, 0.238070, 0.238082, 0.247605, 0.261335, 0.271436, 0.272106, 0.305698, 0.311652, 0.312819, 0.329455, 0.333997, 0.343997, 0.349938, 0.359318, 0.376574, 0.404999, 0.438762, 0.466692, 0.482627, 0.601046, 0.682114, 2.138012]`.
+
+The immediate-child median was 0.171745x but its p90 overlapped the null; the
+100 ms median was 0.971439x and also overlapped the null. Neither is claimed.
+Strict-remote release library check job `j-29933730227290394` passed on
+`vmi1152480`; its two `orchestrator.rs` dead-code warnings predate this lever.
+
+**Scope.** This is a subprocess completion/capture component result for a
+deterministic 5 ms child on a remote Linux worker, not an end-to-end ASR claim.
+It applies to short external-tool invocations through the cancellable helper;
+long-running command polling retains the historical 50 ms ceiling.
+
 ## 2026-07-16 — LANDED — seek and decode only speculative PCM16 WAV windows (bd-5rje)
 
 **Negative-ledger-first profile boundary.** `bv --robot-triage`

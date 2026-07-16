@@ -150,12 +150,27 @@ pub fn run_command_with_timeout(
     validate_command_output(&rendered, output)
 }
 
+// The early sleeps total 50ms, preserving the original polling phase and
+// steady-state ceiling after accelerating short-lived subprocesses.
+const CANCELLABLE_POLL_CEILING_MS: u64 = 50;
+const CANCELLABLE_EARLY_POLL_MS: [u64; 6] = [1, 2, 4, 8, 16, 19];
+
+fn cancellable_poll_delay(iteration: usize) -> Duration {
+    Duration::from_millis(
+        CANCELLABLE_EARLY_POLL_MS
+            .get(iteration)
+            .copied()
+            .unwrap_or(CANCELLABLE_POLL_CEILING_MS),
+    )
+}
+
 /// Run a subprocess with cancellation-aware polling.
 ///
-/// Instead of a fixed timeout, this variant polls `token.checkpoint()` on every
-/// iteration (50ms sleep). If the checkpoint returns `Err(Cancelled)`, the
-/// child process is killed immediately and the error is propagated. An optional
-/// hard timeout is still respected as a safety net.
+/// Instead of a fixed timeout, this variant polls `token.checkpoint()` after
+/// front-loaded sleeps that rejoin the original 50ms cadence at 50ms. If the
+/// checkpoint returns `Err(Cancelled)`, the child process is killed immediately
+/// and the error is propagated. An optional hard timeout is still respected as
+/// a safety net.
 pub(crate) fn run_command_cancellable(
     program: &str,
     args: &[String],
@@ -181,6 +196,7 @@ pub(crate) fn run_command_cancellable(
 
     let mut child = command.spawn()?;
     let started_at = Instant::now();
+    let mut poll_iteration = 0usize;
 
     let stdout_pipe = child.stdout.take().ok_or_else(|| {
         FwError::Io(std::io::Error::other(format!(
@@ -242,7 +258,8 @@ pub(crate) fn run_command_cancellable(
             ));
         }
 
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(cancellable_poll_delay(poll_iteration));
+        poll_iteration = poll_iteration.saturating_add(1);
     }
 }
 
@@ -310,7 +327,16 @@ mod tests {
 
     use crate::orchestrator::CancellationToken;
 
-    use super::{render_command_for_log, run_command_cancellable};
+    use super::{cancellable_poll_delay, render_command_for_log, run_command_cancellable};
+
+    #[test]
+    fn cancellable_poll_schedule_rejoins_fixed_cadence() {
+        let delays: [u128; 8] =
+            std::array::from_fn(|iteration| cancellable_poll_delay(iteration).as_millis());
+
+        assert_eq!(delays, [1, 2, 4, 8, 16, 19, 50, 50]);
+        assert_eq!(delays[..6].iter().sum::<u128>(), 50);
+    }
 
     #[test]
     fn cancellable_completes_fast_command() {
