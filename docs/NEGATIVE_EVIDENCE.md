@@ -23319,3 +23319,17 @@ project; out of franken_whisper's scope to edit.
 my ~10 byte-exact landings' in-tree guard tests (dtw/silhouette/greedy/extraction/safetensors/vtt) can't run
 until this is reconciled. Someone IS actively touching ../frankensqlite (Cargo.lock gained `blake3` on
 fsqlite-pager this session), so a fix may be in progress. No franken_whisper change possible; flagged to agents.
+
+---
+
+## 2026-07-16 - BlackThrush: **REJECT — `dtw_path` DP acc/trace layout transpose (row-major→column-major) is a WASH (L2-resident); closes the last unmeasured DTW piece.**
+
+The `dtw_path` DP (dtw.rs:500) uses row-major `at(i,j)=i*(m+1)+j` but iterates `i` inner (fixed `j`), striding
+`acc`/`trace` by `m+1` — looked cache-hostile, so tried column-major `at(i,j)=j*(n+1)+i` (contiguous inner-`i`,
+byte-exact: layout changes only the storage index, path/trace values identical — assert passes). **REJECT, ~0.97×
+(n=50) to ~1.00× (n=200), wins 3–30/41** (`scratchpad/dtw_dp_perf`, n×1500, 41 pairs, 3 runs). The acc(~306 KB)+
+trace(~76 KB) working set is **L2-resident**, so the strided access is L2-hit-bound (L2 isn't stride/row-buffer
+sensitive like DRAM) — the DP is compute-bound (min-of-3 + branch), and the layout doesn't touch that.
+`dtw_path` is at its floor; the **whole DTW module** (median network + cost-construction + DP) is now measured
+and exhausted. Confirms the [[non-model surface exhausted]] consolidation — remaining perf is owner-scoped or
+fsqlite-blocked (ab4d21d).
