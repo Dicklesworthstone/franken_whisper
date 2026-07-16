@@ -23406,3 +23406,33 @@ encoder+mel are franken WINS; decode is the gap), which is owner-scoped (spec-de
 byte-exact autonomous lever.** Caveat: the prebuilt `fw` is Jul 12 (pre-int8-act-quant 26feafd), so absolutes
 aren't current — a fresh release build + turbo profile would refine the numbers but the structure/owner-closed
 conclusion holds. This is the first e2e profile INDEPENDENTLY confirming the FRONTIER MAP.
+
+---
+
+## 2026-07-16 - BlackThrush: **AUTHORITATIVE current-code e2e profile (fresh release build) — supersedes the stale one above; decode-dominated + encoder now SDPA-dominated, both owner-closed. No autonomous lever.**
+
+Built a **fresh `--release fw`** (rch, 11m58s) and re-profiled tiny.en long-form (~90s mp3, 6 windows) with
+current code — the prior entry's numbers were on the Jul 12 pre-int8-opt binary. Current is **~10× faster**:
+`backend_run` **1108 ms** (was ~4 s stale). Breakdown:
+
+| | current (fresh) | stale (Jul 12) |
+|---|---|---|
+| model_weights (load) | 43 ms | 195 ms |
+| encoder_window / win | **~72 ms** | ~630 ms |
+| decode_loop / win | ~100–168 ms (~2–3 ms/tok) | ~780–1130 ms (~16 ms/tok) |
+| cross_kv / win | 6–8 ms | 37–95 ms |
+
+**Totals over 6 windows: Σdecode ≈ 615 ms (~55% of backend_run), Σencoder ≈ 326 ms (~29%), load ~5%, mel ~1%.**
+Two findings:
+1. **Long-audio is DECODE-dominated (~55%)** — confirms the FRONTIER MAP's two-regime result (turbo long-audio
+   62.5% decode). Decode = logits-GEMV bandwidth-dead + spec-decode = owner (bd-wzgh).
+2. **The encoder is now SDPA-DOMINATED: `attn_sdpa` ≈ 50% of encoder** (up from 27–31% stale), because the int8
+   activation-quant win (26feafd) made the GEMMs (mlp_fc 8–9%, mlp_proj 12–14%, attn_out 6–8%) cheap while SDPA
+   (external `ft_kernel_cpu::sdpa_forward_f32`, f32, NOT int8) stayed put. SDPA is owner-closed (external kernel;
+   only `FT_SDPA_POLY_EXP`, owner/non-byte-exact, ~1.069× e2e).
+
+So both current hot spots — decode (logits) and encoder (SDPA) — are **owner-closed**; per-window orchestration
+(cross_kv 6–8 ms + prefill 2–22 ms) is ~5–12% and also closed. **No new byte-exact autonomous lever; frontier
+confirmed owner-scoped on the REAL current build.** The only actionable note for the owner: post-int8-opt, SDPA
+is now the single biggest encoder cost (~50%), so `FT_SDPA_POLY_EXP` / an SDPA-kernel improvement in frankentorch
+has more encoder headroom than the turbo frame table (SDPA 11.5%) suggested.
