@@ -3998,6 +3998,15 @@ pub(crate) fn diarize_segments(
     let similarity_threshold = 0.92;
     let mut cluster_members: Vec<Vec<SpeakerEmbedding>> = Vec::new();
     let mut centroids: Vec<SpeakerEmbedding> = Vec::new();
+    // Running per-cluster feature sums, so an assignment updates the centroid in
+    // O(1) (add + divide) instead of recomputing `centroid()` over every member
+    // (O(cluster_size) per assignment == O(n^2) for a dominant speaker). Each sum
+    // accumulates members in the same push order `centroid()` re-sums them, so the
+    // stored centroid — and thus every subsequent cosine decision and the whole
+    // assignment sequence — is BYTE-IDENTICAL to the recompute form (verified by
+    // benches/diarize_cluster_perf + the equivalence test). `cluster_members` is
+    // still maintained for the Step-2b constraint merge, which is left untouched.
+    let mut cluster_sums: Vec<[f64; 6]> = Vec::new();
     let mut assignments: Vec<usize> = Vec::with_capacity(total);
 
     for (idx, emb) in embeddings.iter().enumerate() {
@@ -4020,18 +4029,26 @@ pub(crate) fn diarize_segments(
             if let Some(cid) = best_cluster {
                 assignments.push(cid);
                 cluster_members[cid].push(emb.clone());
-                centroids[cid] = SpeakerEmbedding::centroid(&cluster_members[cid]);
+                for k in 0..6 {
+                    cluster_sums[cid][k] += emb.features[k];
+                }
+                let count = cluster_members[cid].len() as f64;
+                centroids[cid] = SpeakerEmbedding {
+                    features: std::array::from_fn(|k| cluster_sums[cid][k] / count),
+                };
             } else {
                 // Defensive fallback: should not happen unless centroids bookkeeping diverges.
                 let new_id = centroids.len();
                 centroids.push(emb.clone());
                 cluster_members.push(vec![emb.clone()]);
+                cluster_sums.push(emb.features);
                 assignments.push(new_id);
             }
         } else {
             let new_id = centroids.len();
             centroids.push(emb.clone());
             cluster_members.push(vec![emb.clone()]);
+            cluster_sums.push(emb.features);
             assignments.push(new_id);
         }
     }

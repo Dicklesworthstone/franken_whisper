@@ -23018,3 +23018,49 @@ production body were run green in a standalone mirror (`scratchpad/sil_verify`) 
 crate is still fsqlite-core/asupersync-blocked. Scope: the silhouette is a per-run
 diarization quality metric (opt-in `--diarize`), scaling with recording length; a real
 byte-exact win on that path, not an e2e transcription claim. Landed default-on, no flag.
+
+---
+
+## 2026-07-16 - BlackThrush: **KEEP / VALID NULL — diarizer greedy clustering O(n²)→O(n) via running-sum centroid; 3–24× (grows with n), byte-exact.**
+
+**Same fresh vein as 868614b (diarizer clustering), the follow-up my ledger flagged.**
+`diarize_segments` (orchestrator.rs) greedily assigns each segment to the nearest cluster
+centroid, then **recomputed that centroid from scratch on every assignment**
+(`centroids[cid] = SpeakerEmbedding::centroid(&cluster_members[cid])`, summing ALL members
+= O(cluster_size)). For a dominant speaker the cluster grows to O(n), so the total centroid
+work is O(n²). n = segment count.
+
+**Lever (byte-exact).** Maintain a **running per-cluster feature sum**; an assignment does
+`cluster_sums[cid] += emb.features` (6 adds) then `centroid = cluster_sums / count` (6
+divs) — O(1). Byte-identical because the running sum accumulates members in the same push
+order `centroid()` re-sums them (`cluster_sums[cid][k]` = `m0[k]+m1[k]+…` left-to-right ==
+the recompute's per-feature sum), the count is the same `cluster_members[cid].len()`, and
+the division is the same — so every stored centroid, every subsequent `cosine_similarity`
+decision, and thus the entire assignment sequence is bit-identical. `cluster_members` is
+still maintained for the untouched Step-2b constraint-merge (which stays a from-scratch
+`centroid()` — not hot, few merges over few clusters), so `SpeakerEmbedding::centroid` is
+not dead.
+
+**Valid-null A/B** (new `benches/diarize_cluster_perf`, isolated `--profile release`, LTO
+off, `codegen-units=1`; clustered fixture = 3 speaker directions + small noise so clusters
+grow big; 21 pairs, 3 runs). null median **0.999–1.023** (valid) at every size; **21/21
+wins** every size/run; speedup **grows with n as the O(n²) term is removed**:
+
+| n | recompute median | running median | speedup median |
+|---|---|---|---|
+| 500  | ~57 µs  | ~19 µs  | **~3.0×** |
+| 1500 | ~336 µs | ~46 µs  | **~7.2×** |
+| 3000 | ~1.21 ms| ~87 µs  | **~14.0×** |
+| 6000 | ~4.54 ms| ~186 µs | **~24.3×** |
+
+**Byte-exact — verified.** The bench asserts identical assignments AND bit-identical
+centroids (`f64::to_bits`) at every n. A standalone mirror (`scratchpad/diar_verify`) runs
+the EXACT production form (maintains `cluster_members` + `cluster_sums`, count via `.len()`)
+vs the recompute over clustered (big-cluster), scattered (noise 0.9 → many singletons),
+tiny (n=2), and single-cluster inputs — all bit-identical. Full-crate test still blocked by
+the fsqlite-core/asupersync breakage; the existing `--diarize` tests are the in-tree guard
+(byte-exact ⇒ unchanged). Scope: opt-in diarization path, scaling with recording length —
+a real byte-exact win there (a 1-hour multi-speaker recording is ~1500+ segments = ~7×), not
+an e2e transcription claim. Landed default-on, no flag. The diarizer greedy/centroid
+follow-up flagged after the silhouette win is now closed; `cosine_similarity` is O(n·k)
+(k = speakers, tiny) — not a lever.
