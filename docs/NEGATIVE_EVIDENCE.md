@@ -22729,3 +22729,55 @@ critical findings and clean format/check/test-build phases. Production source
 was manually restored; the small isolated harness remains so a future retry can
 increase per-arm work enough to establish a valid null before reusing this
 promising component result.
+
+---
+## 2026-07-15 - Codex: **HOLD / INVALID NULL — width-seven DTW median selection measured 1.626900x median and 15/15 wins, but BASE/BASE was biased at 0.957017x; source restored.**
+
+**Negative-ledger-first attribution.** Bead `bd-vsg6` remained open after the
+request-scoped scratch candidate was rejected. That row explicitly routed the
+next attempt away from allocation lifetime and toward a different median
+selection algorithm. Its strict-remote stage profile attributed 20,435,996 ns
+of a 22,870,370 ns isolated `64 token x 1500 frame x 6 head` DTW transform to
+width-seven median filtering (**89.3558%**). The fresh lever replaced the stable
+full sort of every seven-value window with a fixed 13-comparison median network.
+Original-slot tags preserved stable ordering for equal finite values, including
+the selected bit pattern for signed zero; non-finite windows retained the
+historical stable-sort fallback. No scratch-lifetime change was retried.
+
+**Exactness and same-binary A/B.** A zero-dependency release harness exercised
+64 rows x 1,500 frames. It compared every one of the 96,000 output
+`f32::to_bits()` values and produced identical output with deterministic FNV-1a
+digest `02d2ea02744cd34d`. The predeclared conjunctive gate required BASE/BASE
+median in `[0.97, 1.03]`, candidate median above `max(null p90, 1.05)`, candidate
+p10 above `1.0`, and at least 13/15 wins.
+
+Fifteen order-alternated BASE/BASE ratios were
+`[1.043232,0.967138,1.056606,0.938622,1.009028,0.954527,1.007047,0.953103,1.003015,0.984899,0.907916,0.887727,0.896406,0.957017,0.898915]`:
+median **0.957017x**, p90 **1.009028x**. The median missed the lower null bound
+by 0.012983.
+
+Historical-sort/network ratios were
+`[1.465818,1.574576,1.626900,1.680327,1.578566,1.752752,1.586841,1.659183,1.581319,1.643970,1.765782,1.555973,1.458328,1.715802,1.753288]`:
+p10 **1.465818x**, median **1.626900x**, p90 **1.752752x**, and **15/15 wins**.
+Historical arm times were 5.989824-6.724405 ms; network times were
+3.627145-4.219552 ms. The directional component result clears every candidate
+threshold, but the predeclared null condition is binding. This is not an
+end-to-end transcription claim; the prior ledger places DTW near 1% of the
+representative word-timestamp path.
+
+**Strict-remote foreground provenance and verdict.** Full-crate warm-up job
+`j-29933307944763403` failed before the timed path in an unrelated
+`fsqlite-core`/`asupersync` API mismatch, then emitted no output for two minutes
+and was interrupted under the session liveness rule. It is not reject evidence.
+Untimed isolated warm-up job `j-29933307944763438` built ordinary
+`--profile release` with LTO explicitly disabled. The sole foreground
+measurement, job `j-29933307944763445` on `vmi1227854`, reused that binary and
+completed its timed body under the measurement-only 60-second cap:
+
+`RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 RCH_WORKERS=vmi1227854 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_HOME=/root/.cargo CARGO_PROFILE_RELEASE_LTO=false timeout 60s cargo bench --profile release --manifest-path benches/dtw_median_perf/Cargo.toml --bench dtw_median`
+
+Production `src/native_engine/dtw.rs` was manually restored to `HEAD`; the
+isolated harness remains for a future retry with longer per-arm work or more
+symmetric cache conditioning. The result is **HOLD / INVALID NULL**, neither a
+keep nor a reject. Do not ship the selection network from this run, and do not
+relax or pool the failed null after seeing the strong candidate medians.
