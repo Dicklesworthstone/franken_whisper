@@ -22903,3 +22903,39 @@ offset arithmetic + byte-exactness were verified in a standalone mirror
 (`scratchpad/st_verify`, all edge cases green): owned-load and from_bytes yield
 byte-identical tensor bytes, and owned-load bytes equal the source bytes. rch workers
 failed preflight all session (fail-open to local; single-threaded bench).
+
+---
+
+## 2026-07-16 - BlackThrush: **KEEP / VALID NULL — VTT timestamps allocation-free (parity with the landed SRT lever); ~1.44×, byte-exact.**
+
+**Fresh-subsystem pivot (HOLD-rescue vein exhausted).** Both prior HOLD/INVALID-NULLs
+(DTW 98a1dbf, safetensors bbb607f) are landed and no others exist — every other ledger
+entry is a genuine measured REJECT. Pivoted into the export writers and found a missed
+twin of an already-landed optimization: `6de0c5e perf(export): format SRT timestamps
+without allocation` replaced SRT's `format!`-into-`String` timestamp with an
+allocation-free `SrtTimestamp` `Display` wrapper, but **`format_timestamp_vtt` was left
+returning a `format!`-allocated `String`** — `write_vtt` emits two per cue, so every VTT
+segment paid two heap allocations the SRT path had already eliminated.
+
+**Lever (byte-exact).** Added `VttTimestamp(u64)` (`Display` → `HH:MM:SS.mmm`, `.`
+separator) and made `format_timestamp_vtt` return it; `write_vtt` already interpolated
+the result inline, so it is now allocation-free with **zero change to the emitted bytes**
+(same computation `(sec*1000).round() as u64`, same format string). `format_timestamp_vtt_owned`
+kept `#[cfg(test)]` as the reference, mirroring the SRT structure exactly.
+
+**Valid-null A/B** (new `benches/vtt_timestamp_perf`, mirror of `srt_timestamp_perf`;
+256 cues, isolated `--profile release`, LTO off; 3 runs, --sample-size 30). null median
+**0.998 / 1.002 / 1.000** (valid); allocating-vs-inline speedup median **1.440 / 1.449 /
+1.435**, p10 ≥ 1.28, **30/30 wins** each run (allocating ~21–26 ms, inline ~14–18 ms for
+256 cues). Same magnitude as the SRT lever it matches.
+
+**Byte-exact — verified.** The bench asserts `write_inline == write_allocating` over 256
+cues. A standalone mirror (`scratchpad/vtt_verify`) additionally proves the `Display`
+wrapper matches the `format!` reference across edge times (sub-ms rounding, hour
+rollover, 86 399.9995 s) and that full `write_vtt` output (300 cues, `None`-guarded
+segments) is byte-identical between the two forms; the new in-tree unit test
+`test_format_timestamp_vtt` carries the same equivalence assertion (runs once the
+fsqlite-core/asupersync full-crate build unblocks). Scope: export is one-shot per file
+(sub-floor for a single transcription's e2e), but this is a real per-cue throughput win
+for large/batch subtitle export and simply completes the SRT parity. Landed default-on,
+byte-exact, no flag.
