@@ -56,7 +56,32 @@ fn write_txt(path: &Path, result: &TranscriptionResult) -> FwResult<()> {
     Ok(())
 }
 
-fn format_timestamp_vtt(seconds: f64) -> String {
+/// VTT cue timestamp (`HH:MM:SS.mmm`) rendered straight into the output writer
+/// via [`Display`](std::fmt::Display), with no intermediate `String` allocation —
+/// the same allocation-free lever already applied to SRT (`SrtTimestamp`, commit
+/// 6de0c5e). `write_vtt` emits two of these per cue; the previous `format!`-into-
+/// `String` form allocated twice per segment. Byte-identical output.
+#[derive(Clone, Copy)]
+struct VttTimestamp(u64);
+
+impl std::fmt::Display for VttTimestamp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_ms = self.0;
+        let h = total_ms / 3_600_000;
+        let m = (total_ms % 3_600_000) / 60_000;
+        let s = (total_ms % 60_000) / 1000;
+        let ms = total_ms % 1000;
+        write!(formatter, "{h:02}:{m:02}:{s:02}.{ms:03}")
+    }
+}
+
+fn format_timestamp_vtt(seconds: f64) -> VttTimestamp {
+    VttTimestamp((seconds * 1000.0).round() as u64)
+}
+
+/// Independent `format!`-based reference used by the byte-exactness unit test.
+#[cfg(test)]
+fn format_timestamp_vtt_owned(seconds: f64) -> String {
     let total_ms = (seconds * 1000.0).round() as u64;
     let h = total_ms / 3_600_000;
     let m = (total_ms % 3_600_000) / 60_000;
@@ -243,9 +268,18 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_vtt() {
-        assert_eq!(format_timestamp_vtt(0.0), "00:00:00.000");
-        assert_eq!(format_timestamp_vtt(1.5), "00:00:01.500");
-        assert_eq!(format_timestamp_vtt(3661.123), "01:01:01.123");
+        assert_eq!(format_timestamp_vtt(0.0).to_string(), "00:00:00.000");
+        assert_eq!(format_timestamp_vtt(1.5).to_string(), "00:00:01.500");
+        assert_eq!(format_timestamp_vtt(3661.123).to_string(), "01:01:01.123");
+        // The allocation-free Display wrapper must match the format!-based
+        // reference bit-for-bit across a range of times (incl. hour rollover).
+        for &sec in &[0.0, 0.4999, 0.5, 1.5, 59.999, 3599.999, 3661.123, 86_399.9995] {
+            assert_eq!(
+                format_timestamp_vtt(sec).to_string(),
+                format_timestamp_vtt_owned(sec),
+                "VTT timestamp mismatch at {sec}"
+            );
+        }
     }
 
     #[test]
