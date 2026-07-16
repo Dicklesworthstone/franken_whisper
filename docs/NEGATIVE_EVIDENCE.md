@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — direct redacted process-log assembly measured 1.969320x median with 21/21 wins, but null CV exceeded the predeclared ceiling; source restored (bd-b8xo).**
+
+**Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
+(`data_hash=03371a2986fe0b8c`) exposed no narrow process-rendering bead, while the
+open perf rows were broad, model-bound, stale, or already exhausted in this
+ledger. Neither ledger nor `git log -S` contained a prior optimization of
+`src/process.rs::render_command_for_log`, whose historical path owned the
+program and every rendered argument in a `Vec<String>` and then copied them
+again through `join`. Before any production edit, strict-remote corrected
+warm-up job `j-29933307944763911` and capped profile job
+`j-29933307944763921` ran `--profile release` with LTO disabled on
+`vmi1264463`. Across realistic ffmpeg, yt-dlp, and 64-argument backend shapes,
+historical rendering had a **7,164.704 ns** median per mixed corpus;
+collect-only was **6,141.423 ns**, classification/length scanning was
+**1,546.813 ns**, and a pre-rendered join/output-copy floor was **621.616 ns**.
+The independently timed stages are not additive, but collection minus scanning
+attributes a material **64.1284%** of historical time to intermediate owned-token
+churn.
+
+**One lever and exact oracle.** The candidate performed a faithful first scan
+to compute the redacted byte length, then appended the program, separators,
+flags, masks, and ordinary arguments directly into one exactly sized `String`.
+It changed no quoting or redaction rule. The isolated
+`benches/process_log_render_perf` harness asserted exact byte equality against
+the historical implementation for **40** cases: all 13 sensitive aliases in
+separate and inline forms, empty program/arguments, exact whitespace,
+consecutive/trailing flags, multiple `=`, case-sensitive near misses, Unicode,
+tabs/newlines/NULs, long values, 256 arguments, and the realistic timing corpus;
+it also asserted unique secret markers were absent.
+
+**Real foreground A/B (`--profile release`, LTO off).** Untimed no-run warm-up
+job `j-29933307944763942` compiled the final same-binary harness; the sole
+capped measurement, job `j-29933307944763952`, ran on the same
+`vmi1264463` worker. It used 21 order-alternated pairs for both
+historical/historical and historical/direct comparisons, with identical work
+counts and arms calibrated from a 75 ms target. BASE/BASE had p10
+**0.908931x**, median **1.005609x**, p90 **1.034018x**, and CV **5.4593%**.
+The direct builder had p10 **1.748345x**, median **1.969320x**, p90
+**2.097441x**, and **21/21 wins**. It cleared the median, separation, magnitude,
+and win-count gates, but failed the predeclared null-CV ceiling of 3%; the
+harness therefore returned `verdict=REJECT`. This is a real A/B result, not a
+build timeout.
+
+**Verdict:** hold rather than move the gate after seeing a large ratio.
+Production `src/process.rs` was restored exactly to current `main`; the isolated
+harness remains as the reproduction and byte-parity artifact. Retry only with
+longer arms or a quieter same worker that brings BASE/BASE CV to at most 3%.
+Any eventual claim is component-only because subprocess runtime dominates this
+pre-spawn renderer. `bd-b8xo` is closed as a measured invalid-null hold.
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — borrowed SRT block lines measured 1.322022x median, but did not separate from the null tail; source restored (bd-1h3p).**
 
 **Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
