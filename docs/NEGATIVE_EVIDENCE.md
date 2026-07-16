@@ -23275,3 +23275,25 @@ not raw `to_writer`. sync.rs left unchanged (current `writeln!(to_string)` is ne
 one-pass variance would break byte-exactness), `median_filter` already optimized (the width-7 network,
 98a1dbf), the alloc churn washes, and the `dtw_path` DP is a standard two-matrix O(tokens×frames). No
 production change. Whole DTW module (median + cost-construction + DP) now mapped and at its floor.
+
+---
+
+## 2026-07-16 - BlackThrush: **REJECT — streaming `concat_segment_text` manual-push is SLOWER than collect+join; streaming/merge already efficient. Non-model standalone-benchable surface CONSOLIDATED as exhausted.**
+
+**Swept the streaming path (fresh, uncontested — another agent is on `process.rs`).** `WindowManager::merge_segments`
+(speculation.rs) is O(n log n) sort + **O(n) ADJACENT dedup** (compares each sorted segment only to
+`deduped.last()`, not O(n²)) — already efficient. `concat_segment_text` uses `iter().map(text).collect::<Vec<&str>>().join(" ")`:
+tried replacing the intermediate `Vec<&str>` with a manual `String::with_capacity` + `push_str` loop —
+**REJECT, ~0.92× (SLOWER)** at realistic window sizes (n=20/200, 400 pairs; the n=8 "1.17×" is timer-quantization
+noise on sub-µs durations). `[&str]::join` bulk-copies with an exact pre-sized alloc and beats per-`push_str`
+overhead; the `Vec<&str>` of pointers is negligible. `scratchpad/concat_perf`.
+
+**★ CONSOLIDATED: the standalone-benchable, non-model, byte-exact surface is EXHAUSTED** (this session's sweep).
+Every recent micro-candidate is a wash or reject because the existing code / std is already optimal:
+to_writer-for-sync-export (0.85×), DTW head-reuse (1.00× wash) + transpose-normalize (0.96×), concat manual
+(0.92×). LANDED wins this session-run are done: robot emit_line (to_writer, small-payload-only), diarizer
+×3 (silhouette/greedy/extract), safetensors, DTW median, VTT. **Remaining perf is OWNER-scoped (encoder/decoder
+int8/SDPA/spec-decode/GPU per the CONSOLIDATED FRONTIER MAP) or BLOCKED (fsqlite-core/asupersync-0.3.5 still
+breaks the full-crate build → no `fw`-binary profiling or in-tree guard-test validation of my ~10 landings).**
+Future autonomous sessions: cite this + the FRONTIER MAP; the peripheral micro-lever vein is dry — don't
+re-probe export/sync/robot/dtw/diarize/streaming/concat. `process.rs` is another agent's active area.
