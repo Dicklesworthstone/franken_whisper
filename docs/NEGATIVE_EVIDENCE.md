@@ -4,6 +4,62 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — allocation-free abbreviation suffix checks measured 0.475479x, 0.280962x, and 0.057075x historical, but every null-control CV exceeded the predeclared ceiling; source restored (bd-qggt).**
+
+**Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
+(`data_hash=b7be1562e4dbb9b9`) surfaced broad non-performance work, while the open
+schema-scan performance bead `bd-kl26` was already exhausted by the exact
+negative row below. The fresh punctuation seam was unledgered:
+`is_abbreviation_period` lowercased and allocated the entire text prefix for
+every period, making long punctuation-rich segments repeat prefix-sized work.
+Before any production edit, strict-remote untimed warm-up job
+`j-29933730227290897` and capped profile job `j-29933730227290903` ran
+`--profile release` with LTO disabled on `vmi1153651`. For 16 realistic 4 KiB
+segments and 4,762 period checks per round, historical time was **104,907,996
+ns**; prefix lowercasing alone was **41,249,126 ns** (**39.32%**), clearing the
+predeclared 30% attribution gate. The allocation-free design measured
+**28,973,874 ns**, or **0.276184x** historical, in that profiling pass.
+
+**One lever and exact oracle.** The candidate replaced whole-prefix
+`to_ascii_lowercase` with an allocation-free, ASCII-case-insensitive suffix
+comparison over the existing bytes, retaining the original start/ASCII-space
+word-alignment rule. The standalone
+`benches/punctuation_abbreviation_perf` harness asserted exact predicate parity
+for **3,637 cases** spanning every abbreviation, ASCII case permutations,
+start/whitespace/non-whitespace boundaries, Unicode prefixes and whitespace,
+near misses, decimals, and ellipses. It also asserted byte-identical full Rule
+4 output over short, medium, and stress fixtures: **196,881 bytes**, FNV-1a-64
+**`ab008b2394605bcf`**.
+
+**Real foreground A/B (`--profile release`, LTO off).** After a saturated
+first worker produced invalid nulls, the run switched workers as required.
+Untimed final warm-up job `j-29933730227290937` and capped measurement job
+`j-29933730227290942` ran on `vmi1227854`; the release artifact rebuilt in
+1.12 s for warm-up and checked the cache in 0.02 s for measurement. The final
+run used 21 mirrored ABBA samples per null and candidate, three untimed
+in-process warm-ups, and arms calibrated to roughly 160 ms. Ratios are
+candidate divided by historical, so lower is better. For 256 x 256 B segments,
+BASE/BASE had median **1.018771x**, p10 **0.951694x**, p90 **1.087018x**, and
+CV **6.5092%**; candidate median was **0.475479x**, p10 **0.437172x**, and p90
+**0.508792x**. For 16 x 4 KiB segments, the null had median **0.991589x**, p10
+**0.882905x**, p90 **1.078749x**, and CV **11.0364%**; candidate median was
+**0.280962x**, p10 **0.256918x**, and p90 **0.315814x**. For one 64 KiB stress
+segment, the null had median **0.984738x**, p10 **0.958886x**, p90
+**1.050130x**, and CV **4.5623%**; candidate median was **0.057075x**, p10
+**0.053137x**, and p90 **0.065752x**. All three candidates had **21/21 wins**
+and separated from their null tails, but all three identity controls failed the
+predeclared CV ceiling of 3%. The harness returned exit 2 after 70.2 s; this is
+a completed real A/B verdict, not a build timeout.
+
+**Verdict:** hold rather than weaken the null gate after observing the result.
+Production `src/orchestrator.rs` was restored exactly to current `main`; the
+isolated harness remains as the byte-parity oracle and reproduction artifact.
+Retry only on a quieter same worker with unchanged gates. Any eventual claim is
+limited to punctuation abbreviation classification, not end-to-end ASR.
+`bd-qggt` is closed as a measured invalid-null hold.
+`AGENT_NAME=BlackThrush`.
+
+---
 ## 2026-07-16 - BlackThrush: **HOLD / INVALID NULL — borrowed adaptive-router success metric measured 0.000163x historical with 42/42 wins, but null CV exceeded the predeclared ceiling; source restored (bd-upk1).**
 
 **Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`
