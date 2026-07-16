@@ -159,7 +159,6 @@ impl SpeculativeStreamingPipeline {
         Q: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
     {
         let seq = self.next_seq();
-        let fast_model_name = self.config.fast_model_name.clone();
         let quality_model_name = self.config.quality_model_name.clone();
 
         let executor = ConcurrentTwoLaneExecutor::new(QualitySelector::SpeculativeCorrect);
@@ -194,27 +193,14 @@ impl SpeculativeStreamingPipeline {
 
         // Register with tracker and window manager.
         let fast_ts = chrono::Utc::now().to_rfc3339();
-        let partial = PartialTranscript::new(
-            seq,
-            window_id,
-            fast_model_name,
-            fast_segments.clone(),
-            result.primary_latency_ms,
-            fast_ts.clone(),
-        );
-        self.correction_tracker.register_partial(partial);
 
-        let fast_partial_for_wm = PartialTranscript::new(
-            seq,
-            window_id,
-            self.config.fast_model_name.clone(),
-            fast_segments.clone(),
-            result.primary_latency_ms,
-            fast_ts.clone(),
-        );
-        self.window_manager
-            .record_fast_result(window_id, fast_partial_for_wm);
-
+        // Emit the speculative partial events first: they only borrow the fast
+        // segments/timestamp, so the single `PartialTranscript` built afterward can
+        // MOVE `fast_segments`/`fast_ts` in and be cloned just once for the window
+        // manager — one deep segment-vector clone instead of two. The tracker and
+        // window-manager updates emit no events, and the correction decision below
+        // is built from tracker state either way, so the event stream and all state
+        // are byte-identical to registering before emission.
         if self.config.emit_events {
             for segment in &fast_segments {
                 let payload =
@@ -226,6 +212,18 @@ impl SpeculativeStreamingPipeline {
                 );
             }
         }
+
+        let partial = PartialTranscript::new(
+            seq,
+            window_id,
+            self.config.fast_model_name.clone(),
+            fast_segments,
+            result.primary_latency_ms,
+            fast_ts,
+        );
+        self.correction_tracker.register_partial(partial.clone());
+        self.window_manager
+            .record_fast_result(window_id, partial);
 
         // Use captured original model segments (no round-trip conversion).
         let quality_segments = take_stored_segments(quality_holder.as_ref());

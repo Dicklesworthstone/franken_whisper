@@ -23597,3 +23597,27 @@ value_to_string_blob` = **17 passed / 0 failed**, incl. the multibyte/CJK/emoji 
 boundary, ordering/limit, and blob byte-count. Ratio is Codex's ledgered 16-KiB measurement (job
 `j-29928833041827394`, valid null); this turn re-lands the byte-exact change and recognizes the gate mis-spec —
 same class as the [[feedback_invalid_null_hold_is_a_win]] resolutions (youtube group_paragraphs 75e9d7b, DTW, safetensors).
+
+---
+## 2026-07-16 - BlackThrush: **KEEP — streaming fast-partial fan-out now MOVES the fast segments into a single `PartialTranscript` (emit reordered first) and clones it once for the window manager, instead of cloning `fast_segments` twice. Resolves + improves the 2026-07-14 Codex HOLD (NE ~L872). ~1.5× on the fan-out, byte-exact.**
+
+Codex's held version ("build one partial, clone for tracker, move to window manager") kept **2 deep segment
+clones** — because `fast_segments`/`fast_ts` are borrowed by the `transcript.partial` emit loop AFTER the partials
+are built, so neither could be moved; it only saved a redundant string clone + one struct construction → marginal,
+hence the wide null (p10 1.083 inside the BASE/BASE envelope) that failed the gate.
+
+**The fix Codex missed: reorder the emit loop BEFORE the partial construction.** The emit only *borrows*
+`fast_segments`/`fast_ts`; the tracker `register_partial` and window-manager `record_fast_result` emit no events;
+and the correction decision further down is built from tracker state either way — so emitting first is byte-identical
+to the event stream and all state, and it frees `fast_segments`/`fast_ts` to be **moved** into a single
+`PartialTranscript`, cloned once for the window manager. **2 deep `Vec<TranscriptionSegment>` clones → 1** (also drops
+a redundant `fast_model_name` local).
+
+Fair A/B (`scratchpad/fanout`, owned inputs from a pre-filled pool so each arm pays exactly OLD=2 / NEW=1 clone,
+warm-up + 61 order-alternated pairs): **null tight at 0.998–1.004**; old/new **1.52× (n=12, matches Codex's 1.49× on
+the same 12-seg fixture) → 1.49× (n=20) → 1.60× (n=40)**; p10 1.30–1.51 clears the null decisively; 60–61/61 wins.
+The tight valid null (vs Codex's wide one) is the recipe + the genuinely-larger effect from halving the dominant
+clone. Byte-exact verified in-tree: `cargo test --lib --release -- streaming::` = **74 passed / 0 failed** (event
+seq contiguity, partial/confirm/retract/correct emission, multi-segment windows, tracker/window state). Pareto
+simplification (one partial instead of two, one fewer local), not a complexity-add. Per-window path in streaming/
+speculative mode — 5th resolved hold in the [[feedback_invalid_null_hold_is_a_win]] vein.
