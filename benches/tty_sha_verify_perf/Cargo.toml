@@ -1,0 +1,20 @@
+[package]
+name = "tty-sha-verify-perf"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+sha2 = "=0.10.9"
+
+[[bench]]
+name = "tty_sha_verify"
+path = "bench.rs"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1
