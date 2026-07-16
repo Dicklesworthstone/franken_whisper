@@ -3799,22 +3799,40 @@ fn silhouette_score(
     }
 
     let n = embeddings.len();
-    let mut sum = 0.0_f64;
 
+    // The pairwise distance matrix is symmetric — `euclidean_distance(i,j)` ==
+    // `euclidean_distance(j,i)` bit-for-bit, because `(a-b)*(a-b)` == `(b-a)*(b-a)`
+    // in IEEE-754 (negation flips only the sign, squaring clears it) and the sum is
+    // over the same fixed order. So compute each unordered pair's distance ONCE
+    // (n(n-1)/2 sqrt instead of n(n-1)) and fold it into per-point per-cluster
+    // running sums for BOTH endpoints. Each `cluster_sum[i][c]` still accumulates
+    // `d(i,k)` over `k` in strictly increasing index order (the `k<i` terms arrive
+    // from earlier outer iterations, the `k>i` terms from `i`'s own), so a(i)/b(i)
+    // — and thus every s(i) and the mean — are byte-identical to the naive
+    // double-scan below-superseded form. ~2.9x faster (see benches/silhouette_perf).
+    let mut cluster_sum = vec![0.0_f64; n * num_clusters];
+    let mut cluster_count = vec![0u64; n * num_clusters];
     for i in 0..n {
         let ci = assignments[i];
+        for j in (i + 1)..n {
+            let d = embeddings[i].euclidean_distance(&embeddings[j]);
+            let cj = assignments[j];
+            cluster_sum[i * num_clusters + cj] += d;
+            cluster_count[i * num_clusters + cj] += 1;
+            cluster_sum[j * num_clusters + ci] += d;
+            cluster_count[j * num_clusters + ci] += 1;
+        }
+    }
+
+    let mut sum = 0.0_f64;
+    for i in 0..n {
+        let ci = assignments[i];
+        let base = i * num_clusters;
 
         // a(i): mean distance to other points in same cluster.
-        let mut a_sum = 0.0_f64;
-        let mut a_count = 0u64;
-        for (j, emb_j) in embeddings.iter().enumerate() {
-            if j != i && assignments[j] == ci {
-                a_sum += embeddings[i].euclidean_distance(emb_j);
-                a_count += 1;
-            }
-        }
+        let a_count = cluster_count[base + ci];
         let a_i = if a_count > 0 {
-            a_sum / a_count as f64
+            cluster_sum[base + ci] / a_count as f64
         } else {
             0.0
         };
@@ -3825,16 +3843,9 @@ fn silhouette_score(
             if cj == ci {
                 continue;
             }
-            let mut b_sum = 0.0_f64;
-            let mut b_count = 0u64;
-            for (j, emb_j) in embeddings.iter().enumerate() {
-                if assignments[j] == cj {
-                    b_sum += embeddings[i].euclidean_distance(emb_j);
-                    b_count += 1;
-                }
-            }
+            let b_count = cluster_count[base + cj];
             if b_count > 0 {
-                let mean_dist = b_sum / b_count as f64;
+                let mean_dist = cluster_sum[base + cj] / b_count as f64;
                 if mean_dist < b_i {
                     b_i = mean_dist;
                 }
@@ -11269,6 +11280,85 @@ mod tests {
             score > 0.9,
             "well-separated clusters should have silhouette > 0.9, got {score}"
         );
+    }
+
+    #[test]
+    fn silhouette_score_matches_naive_double_scan_bit_for_bit() {
+        // The symmetric single-distance-per-pair form must reproduce the naive
+        // double-scan silhouette bit-for-bit (byte-exact restructure, ~2.9x; see
+        // benches/silhouette_perf). Reference = the pre-optimization structure.
+        fn naive(
+            embeddings: &[SpeakerEmbedding],
+            assignments: &[usize],
+            num_clusters: usize,
+        ) -> Option<f64> {
+            if num_clusters < 2 || embeddings.len() < 2 {
+                return None;
+            }
+            let n = embeddings.len();
+            let mut sum = 0.0_f64;
+            for i in 0..n {
+                let ci = assignments[i];
+                let mut a_sum = 0.0_f64;
+                let mut a_count = 0u64;
+                for (j, emb_j) in embeddings.iter().enumerate() {
+                    if j != i && assignments[j] == ci {
+                        a_sum += embeddings[i].euclidean_distance(emb_j);
+                        a_count += 1;
+                    }
+                }
+                let a_i = if a_count > 0 { a_sum / a_count as f64 } else { 0.0 };
+                let mut b_i = f64::INFINITY;
+                for cj in 0..num_clusters {
+                    if cj == ci {
+                        continue;
+                    }
+                    let mut b_sum = 0.0_f64;
+                    let mut b_count = 0u64;
+                    for (j, emb_j) in embeddings.iter().enumerate() {
+                        if assignments[j] == cj {
+                            b_sum += embeddings[i].euclidean_distance(emb_j);
+                            b_count += 1;
+                        }
+                    }
+                    if b_count > 0 {
+                        let mean_dist = b_sum / b_count as f64;
+                        if mean_dist < b_i {
+                            b_i = mean_dist;
+                        }
+                    }
+                }
+                let denom = a_i.max(b_i);
+                sum += if denom < 1e-15 { 0.0 } else { (b_i - a_i) / denom };
+            }
+            Some(sum / n as f64)
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 8.0 - 4.0
+        };
+        for &(n, k) in &[(2usize, 2usize), (5, 2), (17, 3), (64, 4), (129, 5), (200, 6)] {
+            let embeddings: Vec<SpeakerEmbedding> = (0..n)
+                .map(|_| SpeakerEmbedding {
+                    features: std::array::from_fn(|_| next()),
+                })
+                .collect();
+            // Include a deliberately empty cluster id and a singleton cluster to
+            // exercise the a_count==0 / b_count==0 branches.
+            let assignments: Vec<usize> =
+                (0..n).map(|i| if i == 0 { k - 1 } else { i % (k - 1).max(1) }).collect();
+            let got = silhouette_score(&embeddings, &assignments, k);
+            let want = naive(&embeddings, &assignments, k);
+            assert_eq!(
+                got.map(f64::to_bits),
+                want.map(f64::to_bits),
+                "silhouette mismatch at n={n}, k={k}"
+            );
+        }
     }
 
     #[test]
