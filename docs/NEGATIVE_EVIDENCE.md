@@ -23170,3 +23170,29 @@ compiles. Scope: the flush syscall is common to both arms (dilutes the per-event
 streaming case) but the serialization is a strict improvement and eliminates the allocation;
 biggest for large single-emission reports. Full-crate test still fsqlite-core/asupersync-
 blocked. Landed default-on, no flag.
+
+---
+
+## 2026-07-16 - BlackThrush: **REJECT + qualifier — `to_writer` does NOT generalize to sync JSONL export (it's ~0.85×/SLOWER there); the reused-scratch fix is only ~1.05× (sub-floor). NOT landed.**
+
+**Corrects the `to_writer`-over-`to_string` technique note (from the robot baddd86 win).** Tried
+to apply the same lever to `sync.rs` `export_table_{runs,segments,events}` (+ the incremental
+runs export), which write JSONL rows in a loop via `writeln!(writer, "{}", to_string(&obj)?)`
+through a `HashingWriter<BufWriter<File>>`. **The lever is sink/payload-dependent:**
+
+- **Naive `to_writer(&mut writer, &obj); write_all(b"\n")` = REJECT, ~0.85× (SLOWER), 0/25 wins**
+  (new `benches/sync_export_emit_perf`, realistic 12-field runs rows with embedded transcript
+  JSON, `BufWriter<Vec>`; 3 runs, rows ∈ {100,1000,8000}, null ~1.0). serde writes the JSON
+  **token-by-token** — many small `BufWriter` writes (+ a HashingWriter hash-update each in prod)
+  — which LOSES to `to_string`'s single big `String` write for large rows. Opposite of robot
+  `emit_line` (small events into a raw/unbuffered `Vec` sink, where `to_writer` won ~1.2–1.3×).
+- **Reused-scratch (`scratch.clear(); to_writer(&mut scratch, obj); scratch.push(b'\n'); writer.write_all(&scratch)`)
+  = marginal ~1.05× median (18–25/25 wins, p10 sometimes <1.0, noisy).** It removes the per-row
+  `String` alloc AND keeps one big write, but for large rows the JSON escaping dominates so the
+  alloc saving is a small fraction. At 8000 rows: ~22 ms → ~21 ms — **~1 ms on a *periodic*
+  `fw sync export-jsonl`, sub-floor.** NOT worth the 5-site churn + revert risk.
+
+**Takeaway (updates memory):** `to_writer` beats `to_string` **only** for small payloads into an
+unbuffered/raw sink. Into a `BufWriter` (or with large per-item payloads), `to_string`'s one big
+write wins; if you must avoid the alloc there, use a **reused scratch buffer + one `write_all`**,
+not raw `to_writer`. sync.rs left unchanged (current `writeln!(to_string)` is near-optimal there).
