@@ -23457,3 +23457,32 @@ stays.** Confirms [[project_sdpa_gather_threadcount_lead]] ("gather is FLAT, don
 Net: the encoder SDPA frontier is code-verified owner/external-closed; combined with decode (logits-GEMV
 bandwidth-dead, aff103e), **both dominant hot spots are verified-closed — the autonomous perf loop is at its
 floor; the remaining levers (SDPA kernel/POLY_EXP in frankentorch, spec-decode) are owner-scoped.**
+
+---
+
+## 2026-07-16 - BlackThrush: **AUTHORITATIVE TURBO frame-table UPDATE (current --release fw) — SDPA is now ~26% of e2e (was 11.5% in the stale map); the encoder frontier shifted post-int8-opt.**
+
+First turbo (primary-workload) profile on the current optimized build — the CONSOLIDATED FRONTIER MAP's turbo
+frame table (i7 int8 GEMM ~28%, sgemm 14.3%, **SDPA 11.5%**, rayon 11.3%) predates the int8-act-quant wins and is
+now STALE. `~90s mp3, 6 windows, default mode`:
+
+| span | Σ over 6 win | % backend_run |
+|---|---|---|
+| `encoder_window` | 7173 ms | **64%** |
+| `decode_loop` | 3012 ms | 27% |
+| `model_weights` (load) | 405 ms | 3.6% |
+| `decoder_prefill` | 242 ms | 2.2% |
+| `cross_kv` | 194 ms | 1.7% |
+| `model_parse` | 135 ms | 1.2% |
+| `mel` | 14 ms | 0.1% |
+| **`backend_run`** | **11201 ms** | (RTF ~0.12) |
+
+Encoder sub-op split (per window): **`attn_sdpa` 41–42% (510–527 ms)**, `mlp_fc` 20% (249–268 ms), `mlp_proj`
+19% (233–259 ms), `attn_out` 11% (132–136 ms), `conv_stem` 2%. So **`attn_sdpa` ≈ 41% × 64% ≈ 26% of e2e** — the
+single biggest cost, **>2× the old map's 11.5%**. The int8 act-quant win (26feafd) made the GEMMs cheap while
+SDPA (external f32 `ft_kernel_cpu::sdpa_forward_f32`) stayed put, so SDPA rose to dominate. **Two regimes** (per
+[[project_window_pipelining_lever]]): this default run is NOT pipelined (all 6 windows show full `encoder_window`)
+→ encoder-dominated (64%); no_ts mode pipelines the encoder behind decode → decode-dominated (map's 62.5%). Both
+regimes' hot spots (SDPA + decode logits-GEMV) are owner/external-closed (SDPA verified 0ad5f58; decode aff103e).
+**No autonomous byte-exact lever. The owner's single highest-value lever is now unambiguously SDPA (~26% of e2e,
+FT_SDPA_POLY_EXP / an SDPA-kernel win in frankentorch), far more headroom than the stale frame table implied.**
