@@ -22849,3 +22849,57 @@ this bench is single-threaded so all-core contention does not apply, and the med
 gate absorbs the transient wide-null run. Scope: DTW median filter is ~1% of the
 representative word-timestamp path (per the prior ledger), so this is a byte-exact
 algorithmic keep on that sub-op, **not** an e2e transcription-speed claim.
+
+---
+
+## 2026-07-16 - BlackThrush: **KEEP / VALID NULL — safetensors owned-backing landed byte-exact (resolves the 2026-07-15 HOLD); wins 1.3–4.9× across a size sweep.**
+
+**Resolves the second HOLD/INVALID-NULL.** The 2026-07-15 safetensors HOLD (bd-p2s8.1)
+measured the owned-backing lever at **1.912682× / 15/15 wins** but shelved it because
+BASE/BASE drifted to **1.023241×** (band `[0.98,1.02]`, missed by 0.003). Same root
+cause as the DTW HOLD and same fix ([[feedback_invalid_null_hold_is_a_win]]): the
+harness `fixture.to_vec()`d a **33.5 MB buffer per timed call** (8 mmaps/pair), whose
+first-touch page-fault + munmap variance biased the null. This tick reused the buffers
+(refill via `copy_from_slice` into a resident buffer, no per-call mmap), added 12
+warm-up rounds, 31 pairs, 2 rounds/call, and swept payload sizes.
+
+**Valid-null size sweep (5 runs, isolated `--profile release`, LTO off, `codegen-units=1`).**
+BASE/BASE null median lands inside `[0.98,1.02]` at **every size, every run**:
+
+| payload | null median (5 runs) | candidate (historical copy / owned) median | wins |
+|---|---|---|---|
+| 4 MiB  | 0.996–1.003 | ~1.32–1.36× | 31/31 (one run 30/31) |
+| 32 MiB | 1.004–1.015 | ~2.60–2.81× | 31/31 |
+| 64 MiB | 0.996–1.013 | ~2.76–2.97× | 31/31 |
+| 128 MiB| 0.991–1.003 | ~4.87–4.92× | 31/31 |
+
+The ratio grows monotonically with payload — exactly a memcpy-bound copy-elimination
+(both arms pay the common `fs::read`; historical additionally memcpys the whole data
+section). **Sizes deliberately avoid ~16 MiB**: a 16 MiB payload = 32 MiB working set
+sits exactly on this box's ~32 MiB L3-per-CCD knee, so its BASE/BASE null goes bimodal
+(CV 8–15%, median wandering 0.977–1.031) — a pure hardware-measurement artifact, not
+the lever; the lever still wins ~2×/31-of-31 there too (corroborating run in-session).
+4 MiB is in-cache so its candidate CV is high (small absolute times, frequency drift)
+but its median is rock-stable ~1.32× and it wins ≥30/31 (copying 8 MiB extra is always
+strictly more work; the lone sub-1.0 pair is timer jitter).
+
+**Landed byte-exact default-on** (`src/native_engine/weights.rs`). `SafetensorsFile`
+gains a `data_offset`; a shared `parse_directory(&[u8])` validates the header/directory
+without copying; `from_bytes(&[u8])` keeps its copy (`data_offset = 0`, unchanged
+ownership contract) while `load(path)` **retains the whole `fs::read` buffer**
+(`data_offset = header_end`) and `tensor_f32` reads `data[data_offset+begin..+end]`.
+Byte-exact by slice identity: `bytes[header_end..][begin..end]` **is** `bytes[header_end+begin..header_end+end]`
+— same source bytes, zero numerical change (matches cod_fw's original parity oracle).
+Also **−~32 MB peak RSS** per auxiliary-model load (no transient double buffer) and one
+fewer 32 MB+ alloc/memcpy. Scope: the safetensors loader feeds **auxiliary models**
+(diarize/align/separate, bd-p2s8), not the main whisper ggml path — a real load-time +
+peak-RSS win on those runs, not an e2e transcription claim.
+
+**Verification / honest limitation.** Same fsqlite-core/asupersync-0.3.5 breakage blocks
+the full-crate build/tests, so the new production test `load_matches_from_bytes_bit_for_bit`
+(decodes F32+F16, zero-length, tail tensors both ways, asserts identical `to_bits()`)
+could not run in-tree — it stands as a permanent guard for when the dep is fixed. The
+offset arithmetic + byte-exactness were verified in a standalone mirror
+(`scratchpad/st_verify`, all edge cases green): owned-load and from_bytes yield
+byte-identical tensor bytes, and owned-load bytes equal the source bytes. rch workers
+failed preflight all session (fail-open to local; single-threaded bench).
