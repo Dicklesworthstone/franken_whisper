@@ -23688,3 +23688,33 @@ peripheral files; findings so the map stays accurate and these aren't re-mined:
 - whisper_cpp_native word-split (`explode_segments_to_words`/`group_word_segments_by_len`) = opt-in (`--word-timestamps`)
   + reference-backend (not the native hot path) ⇒ low value. export.rs re-confirmed fully optimized (BufWriter + `to_writer`
   + alloc-free CSV escaping + alloc-free SRT/VTT timestamps). No standalone byte-exact autonomous lever remains peripheral.
+
+---
+## 2026-07-16 - BlackThrush: **NO-SHIP / INVALID CONTROL — collapse the two audio-file admission metadata probes into one snapshot (`bd-cf43`). Candidate 0.500948× with 42/42 wins, but null CV was 13.61%; source reverted.**
+
+Negative-ledger-first review plus `bv --robot-triage` (`data_hash=130f3c1bf6991f27`) showed the broad audio-normalization
+kernel was already mined, so this turn pivoted to the fresh file-ingest admission seam in `materialize_input_with_token`.
+The historical file arm calls `Path::exists()` and then `Path::is_file()`, which performs two metadata probes. The one
+lever replaced both with one `fs::metadata()` snapshot and kept the same stable-path outcomes and exact error strings.
+
+**Profile first** (`--profile release`, LTO explicitly off, remote-only worker `vmi1153651`): `exists()` = **1355.130
+ns/call**, `is_file()` = **1421.462 ns/call**, historical pair = **2805.152 ns/call**, one-snapshot design = **1398.038
+ns/call (49.8382%)**. The exact oracle passed all 11 cases: regular file, directory, missing and empty paths, symlinks to
+files/directories, broken symlink, FIFO, Unix socket, device, and `/proc/self/exe`. For stable paths the returned path and
+error text are identical; under concurrent path mutation the candidate observes one coherent snapshot instead of the
+historical two-snapshot TOCTOU window. The initial profile attempt used an overlong Unix-socket fixture path and was
+discarded before sampling; the corrected `/tmp` fixture produced the profile above.
+
+**Real A/B, but the predeclared control gate rejected it.** After an untimed remote warm-up build, the foreground
+measurement ran 21 ABBA pairs / 42 ratios on the same worker and warmed release binary (job
+`j-29933730227290770`; executable-only 120 s cap):
+
+- null historical/historical: p10 **0.857229×**, median **0.996920×**, p90 **1.144885×**, CV **13.6088%**, 21/42 wins;
+- candidate/historical: p10 **0.450034×**, median **0.500948×**, p90 **0.547506×**, CV **9.2510%**, **42/42 wins**.
+
+The candidate cleared the separation, all-wins, median, and null-median checks, but the fixed `null CV <= 3%` check
+failed. Therefore the ~2× directional result is **not admissible landing evidence**, despite being a real completed A/B;
+the production edit was manually reverted. The reusable harness remains at `benches/audio_input_metadata_perf/` for a
+future lower-jitter same-worker remeasure. Harness hashes: `Cargo.toml`
+`74500c5579abe8b2514a104161547703458a4e3afac667a858952f032de88764`, `bench.rs`
+`e4115343bc4437cc63e7a3a6be140ab4ed50b7018eec3c5db39d97a87d9356ff`.
