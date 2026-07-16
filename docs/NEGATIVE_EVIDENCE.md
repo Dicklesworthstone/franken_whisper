@@ -23354,3 +23354,28 @@ command completes, and each build exceeds the 2-min command budget; likely worke
 (deps are now cached from this session's partial builds, so a retry should be faster; if rch keeps buffering with
 no output, get the real compiler error another way). If it builds: run the ~10 landings' guard tests + profile
 real e2e. If it still fails: capture the ACTUAL error before ledgering a new root-cause.
+
+---
+
+## 2026-07-16 - BlackThrush: **✅ RESOLVED — full-crate build UNBLOCKED; all ~10 byte-exact landings VALIDATED in-tree (71 guard tests pass). The ~2-week blocker is gone.**
+
+**The build works.** `rch exec -- cargo build --lib` → **`Finished dev profile in 5m09s`, exit=0** (the slow "no
+output" of prior turns was rch's SYNC phase for 57 dep roots — frankenjax/frankensqlite/frankentorch — not a
+hang). Crucially it compiled **past `fsqlite-core`** (→ ft-core → fsqlite → franken_whisper) with no error — so
+fsqlite-core was fixed upstream, exactly as the 322f4b2 retraction predicted (the "try_acquire arity" cause was
+never real). Only 2 benign franken_whisper lib warnings.
+
+**All my landings are now validated IN-TREE** (previously only standalone-mirror-verified for ~10 sessions).
+`rch exec -- cargo test --lib -- median_filter_width7 median7_network silhouette load_matches_from_bytes
+format_timestamp_vtt diarize` → **`test result: ok. 71 passed; 0 failed`** (`Finished test profile in 5m37s`,
+exit=0). This exercises the byte-exact guards for every landing:
+- DTW width-7 median network (`median_filter_width7_matches_sort_reference`, `median7_network_selects_true_median_for_all_binary_inputs`, `median_filter_width7_preserves_signed_zero_like_sort`) — 98a1dbf.
+- silhouette symmetric-distance (`silhouette_score_matches_naive_double_scan_bit_for_bit` + the silhouette suite) — 868614b.
+- safetensors owned-backing (`load_matches_from_bytes_bit_for_bit`) — bbb607f.
+- VTT alloc-free timestamps (`test_format_timestamp_vtt`) — b1d6715.
+- diarizer greedy-centroid (75c307e) + Step-1 extraction (5ac19a4) — via the full `diarize*` test suite (byte-exact ⇒ all pass).
+
+**Implication:** the ~10 byte-exact landings this session-run are confirmed correct on the real types, not just
+mirrors. **The full-crate build / test / `fw`-binary path is UNBLOCKED for everyone** — real e2e profiling
+(encoder/decoder at turbo, per the CONSOLIDATED FRONTIER MAP) is now possible again. Next session can build `fw`
+and profile the real workload rather than only standalone benches.
