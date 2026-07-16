@@ -172,22 +172,46 @@ impl RunStore {
             tok.checkpoint()?;
         }
 
-        // Use SQL ORDER BY and LIMIT for efficient and memory-safe queries.
-        let sql = if limit > 0 {
-            format!(
-                "SELECT id, started_at, finished_at, backend, transcript FROM runs \
-                 ORDER BY started_at DESC, id DESC LIMIT {limit}"
-            )
-        } else {
-            "SELECT id, started_at, finished_at, backend, transcript FROM runs \
-             ORDER BY started_at DESC, id DESC"
-                .to_owned()
+        // Project only the 140-char preview in SQL (fsqlite's `ColumnSubstrPrefix`
+        // fast path) so a large transcript is never materialized or transferred
+        // just to be truncated. `substr(transcript, 1, 140)` returns the first 140
+        // characters, byte-identical to the historical `.chars().take(140)` for
+        // TEXT (and coerced numeric) values. A BLOB value renders differently under
+        // projection (`<blob:<=140>` vs the full `<blob:N>`), so if the projected
+        // result contains any BLOB transcript we re-run with the full column and
+        // fall back to the historical rendering — byte-exact for every DB state.
+        let build_sql = |expr: &str| {
+            if limit > 0 {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     ORDER BY started_at DESC, id DESC LIMIT {limit}"
+                )
+            } else {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     ORDER BY started_at DESC, id DESC"
+                )
+            }
         };
 
         let rows = self
             .connection
-            .query(&sql)
+            .query(&build_sql("substr(transcript, 1, 140)"))
             .map_err(|error| FwError::Storage(error.to_string()))?;
+
+        // BLOB transcripts render by byte length, which the projection would
+        // shorten; re-run with the full column so the preview matches the
+        // historical `<blob:N>` marker exactly.
+        let rows = if rows
+            .iter()
+            .any(|row| matches!(row.get(4), Some(SqliteValue::Blob(_))))
+        {
+            self.connection
+                .query(&build_sql("transcript"))
+                .map_err(|error| FwError::Storage(error.to_string()))?
+        } else {
+            rows
+        };
 
         rows.into_iter()
             .map(|row| {
