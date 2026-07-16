@@ -23486,3 +23486,26 @@ SDPA (external f32 `ft_kernel_cpu::sdpa_forward_f32`) stayed put, so SDPA rose t
 regimes' hot spots (SDPA + decode logits-GEMV) are owner/external-closed (SDPA verified 0ad5f58; decode aff103e).
 **No autonomous byte-exact lever. The owner's single highest-value lever is now unambiguously SDPA (~26% of e2e,
 FT_SDPA_POLY_EXP / an SDPA-kernel win in frankentorch), far more headroom than the stale frame table implied.**
+
+---
+
+## 2026-07-16 - BlackThrush: **CORRECTION + A/B — SDPA poly-exp is ALREADY default-on for turbo (my a6f1632 SDPA=26% is POST-poly-exp); it's WER-certified but NOT byte-exact (drifts track01). The residual SDPA is external dot-products = owner-only.**
+
+Refines a6f1632. `configure_sdpa_poly_exp` (mod.rs:577) makes `ft_kernel_cpu`'s 8-lane poly softmax **DEFAULT-ON
+for large-v3-turbo** (`is_large_v3_turbo && !FW_SDPA_POLY_EXP==0`; `FT_SDPA_POLY_EXP=1` forces any model). So my
+turbo profile's `attn_sdpa` = 26% of e2e is **already with poly-exp applied** — poly-exp is NOT a pending lever,
+it's captured. Measured the on/off A/B on turbo (track01 ~90s, current `--release fw`):
+
+- **e2e:** ON (default) 11648/12579 ms vs OFF (`FW_SDPA_POLY_EXP=0`) 12413/12418 ms → **~2–3% e2e here** (noisy,
+  2 reps; the docstring's certified **1.0722×** is on jfk with 5 paired reps — magnitude is workload-dependent).
+- **transcript:** ON vs OFF **DIFFER** (1347 vs 1349 chars — ~2-char drift on track01). So poly-exp is
+  **WER-certified (jfk byte-identical, WER Δ0.000 vs whisper.cpp) but NOT byte-exact** vs the franken OFF path on
+  real speech. That's why it's turbo-ONLY (tiny.en regressed track01, stays off) and correctly a WER-gated flag.
+
+**Corrected picture:** the SDPA poly-exp lever is DONE (default-on turbo, owner-certified). The residual
+`attn_sdpa` (26% of e2e, post-poly-exp) is the Q·Kᵀ / softmax·V **dot-products in the external
+`ft_kernel_cpu::sdpa_forward_f32`** (owner/frankentorch) — no franken byte-exact lever (verified 0ad5f58). The
+only further *franken-visible* encoder lever is **ToMe** (`FW_TOME_R`, −24% encoder, also WER-gated: jfk-identical,
+track01-drift). So the encoder frontier is: poly-exp captured, GEMMs int8-closed, SDPA-kernel external, ToMe
+WER-gated. **No autonomous byte-exact lever; a6f1632's "poly-exp is the owner's pending lever" is superseded — it's
+already shipped; the next SDPA gain is a frankentorch-kernel change or the WER-gated ToMe.**
