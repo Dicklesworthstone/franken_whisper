@@ -4,6 +4,68 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-16 — LANDED — allocation-free native rollout-stage parsing (bd-bz12)
+
+**Negative-ledger-first fresh pivot and profile boundary.** `bv --robot-triage`
+(`data_hash=f9769806bb9eaca8`) and both performance ledgers showed that recent
+native-engine, DTW, diarizer, audio, rendering, and model-discovery veins were
+already heavily mined, while `NativeEngineRolloutStage::parse` had never been
+measured or optimized since its initial implementation. This is a small but
+repeated config seam: normal auto routing parses the rollout environment about
+six times on a first-success request (at most ten across three candidates), and
+speculative streaming adds four parses per completed window. Before production
+was edited, strict-remote non-LTO release profile job `j-29933730227290665` on
+`vmi1153651` measured a realistic 25-value corpus. The historical parser took
+**1,103.704 ns** per corpus, `trim().to_ascii_lowercase()` alone took
+**988.570 ns** (**89.5684%** of historical), and matching pre-normalized values
+took **135.384 ns**. These stages were timed independently and are not asserted
+to be additive.
+
+**One lever and exactness.** The parser still performs Rust's Unicode-aware
+boundary `trim`, but dispatches the remaining byte length, handles numeric
+aliases directly, and makes at most one `eq_ignore_ascii_case` comparison for a
+named stage. This removes the owned lowercase `String` without changing ASCII
+case behavior, Unicode-whitespace acceptance, internal-whitespace rejection,
+or any named/numeric mapping. Production tests cover all **976** ASCII case
+permutations, Unicode boundary whitespace, numeric aliases, and canonical
+rejections. The dependency-free harness additionally asserted historical versus
+candidate equality across **45,341** case/whitespace/invalid/Unicode/generated
+inputs (`oracle_checksum=5230582781572390902`). Measured harness SHA-256:
+`e710e057c5fee504aa237934aba96e9983977efb01827f9200be6213e9ca1c9d`;
+production source SHA-256:
+`48cfd742d0f821d05becdb6dca6e87778b547f7b637e230b28a283036d8fda7c`.
+
+**Strict-remote release A/B.** The initial untimed warm-up
+`j-29933730227290642` landed on `ovh-b`; its first capped profile attempt
+`j-29933730227290655` raised SIGILL before sampling, so it was discarded as
+non-evidence. Per worker policy, the lane switched and pinned both RCH worker
+selectors to `vmi1153651`: untimed warm-up `j-29933730227290658`, profile job
+`j-29933730227290665`, and sole foreground A/B job `j-29933730227290675` all
+used `--profile release`, `lto=false`, and `AGENT_NAME=BlackThrush`; only the
+post-warm executable carried a 120-second runner cap. The A/B used 21
+order-alternated ABBA pairs, producing 42 ratios per comparison. BASE/BASE had
+p10 **0.804678x**, median **1.000443x**, p90 **1.168671x**, and CV **15.3672%**.
+Allocation-free/historical ratios were p10 **0.330627x**, median **0.384370x**,
+p90 **0.423088x**, CV **12.0917%**, and **42/42 wins**. Candidate p90 was far
+below null p10, clearing the predeclared separation gate. Independent arm
+medians were **929.656 ns** historical and **358.681 ns** allocation-free per
+corpus (**2.5919x**); the paired median corresponds to a **2.6017x** component
+speedup.
+
+**Remote production-gate note.** Focused release test job
+`j-29933730227290688` failed closed before Cargo on RCH dependency-preflight
+error `RCH-E412`; no local fallback ran. A requested worker switch was routed
+back to `vmi1153651`, where the retry began rebuilding an evicted release
+cache, so it was interrupted per worker policy rather than treated as a test
+result. Correctness evidence for this landing is therefore the 45,341-case
+exact A/B oracle plus the production tests added above; the full workspace gate
+remains an infrastructure hold, not a benchmark rejection.
+
+**Scope.** This is a rollout/config parser component result, not an inference or
+end-to-end ASR claim. Absolute savings are sub-microsecond per mixed corpus, but
+they remove one heap allocation from every rollout-stage parse while preserving
+exact behavior.
+
 ## 2026-07-16 — LANDED — filter model names before metadata probes (bd-u3ed)
 
 **Negative-ledger-first profile boundary.** `bv --robot-triage`
