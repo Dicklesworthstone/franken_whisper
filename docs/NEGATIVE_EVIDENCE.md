@@ -4,6 +4,53 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-15 - Codex: **REJECTED / INVALID NULL — reusable YouTube manifest JSON scratch measured only 1.006925x median with 8/15 wins; source restored.**
+
+**Negative-ledger-first attribution.** `bv --robot-triage` data hash
+`1e4e219a37a4ff8b` still exposed only stale audio-normalization and long-form
+scheduler quick wins whose concrete primitives are already closed. Bead
+`bd-8ug0` instead tested an unledgered YouTube manifest persistence primitive.
+`Manifest::save` rebuilt a full pretty-JSON `String` for every terminal video
+transition, then copied it to the atomic temp file. The existing release
+write-volume probe attributed 12,065,628 cumulative bytes to the retained
+one-save-per-video pattern at 200 entries and completed both its historical
+and current save loops in 0.23 seconds. The one candidate serialized the same
+manifest into a retained `Vec<u8>` capacity, preserving the single
+`fs::write` and same-directory rename.
+
+**Exactness and same-binary release A/B.** Strict-remote release parity job
+`j-29928833041829330` passed on `vmi1227854`: both first and repeated saves
+matched `serde_json::to_vec_pretty` byte-for-byte, the scratch was logically
+empty after each save, and its capacity was reused. The sole foreground
+measurement used a 200-entry completed manifest, 128 full atomic saves per
+arm, three warm-up pairs, and 15 order-alternated pairs. BASE/BASE ratios were
+`[1.983872,0.662670,0.808847,0.468982,1.500557,0.640302,1.127816,1.389626,1.232228,1.557555,0.754012,0.744302,0.605963,0.855786,0.871085]`:
+median **0.855786x**, p10 0.605963, p90 1.557555, mean 1.013574, CV
+41.304%, and 6/15 wins. This missed the predeclared `[0.97,1.03]` null-median
+validity band.
+
+Historical/reused-scratch ratios were
+`[0.843094,0.676284,1.506725,1.571710,1.241048,1.542652,0.766377,0.690335,1.006925,1.480762,0.778031,0.547363,0.928045,1.457555,1.180554]`:
+median **1.006925x**, p10 0.676284, p90 1.542652, mean 1.081164, CV
+32.480%, and 8/15 wins. Independently of the invalid null, this missed the
+1.05x median, candidate-p10-above-null-p90, and 13/15-win keep gates. Atomic
+filesystem variance dominates the allocation being removed at this size.
+
+**Remote provenance and verdict.** Per the liveness rule, silent warm-up jobs
+`j-29928833041829294`, `j-29928833041829302`, and
+`j-29928833041829312` were interrupted after two output-free minutes and are
+infrastructure history, not evidence. The uncapped monitored retry
+`j-29928833041829318` proved live by daemon heartbeat and completed the full
+`--profile release` LTO warm-up in 7m09s. Measurement job
+`j-29928833041829334` then reused that exact worker/target, built
+incrementally in 0.22 seconds, and completed the timed body in 6.03 seconds;
+exit 101 came only from the predeclared null/keep assertions after all ratios
+were printed. Production and the temporary A/B harness were restored. Do not
+retry this exact retained-JSON-scratch lever without a materially different,
+allocator-attributed harness that first establishes a valid null; the observed
+full-save result is neutral and non-separated.
+
+---
 ## 2026-07-15 - Codex: **HOLD / INVALID NULL — projected yt-dlp playlist JSON measured 4.250978x median and 15/15 wins, but BASE/BASE was biased at 1.026139x; source restored.**
 
 **Negative-ledger-first attribution.** `bv --robot-triage` data hash
