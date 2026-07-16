@@ -23574,3 +23574,26 @@ transcript length (thousands of paragraphs on long/hour-scale YouTube renders �
 under today's nightly `1.99.0 (d0babd8b6, 2026-07-15)` ([[project_rch_targets_toolchain_churn]]), NOT worker RAM
 and NOT this change. Verified LOCAL instead (release dep cache was toolchain-fresh); per
 [[project_asupersync_oom_roulette]] correctness gates run local anyway.
+
+---
+## 2026-07-16 - BlackThrush: **KEEP — SQL transcript-prefix projection in `RunStore::list_recent_runs` (project `substr(transcript,1,140)` in SQL instead of selecting the full column and truncating in Rust). Resolves the 2026-07-14 Codex HOLD (NE ~L1131). 1.425× on realistic (16-KiB) transcripts, byte-exact.**
+
+The 2026-07-14 Codex hold was NOT a measurement problem — its 16-KiB arm was a **clean, valid-null win** (p10
+**1.199** > null p90 **1.069**, median **1.425×**, 20/21 wins, null median 0.977 inside band). It was held only
+because the predeclared conjunctive gate ALSO required a win on a **49-byte** transcript shape, where the projection
+washes (0.994×, no separation — nothing to gain when the whole value already fits). Real transcripts are KB-to-tens-
+of-KB, not 49 bytes, so the 49-byte guard was mis-specified for this workload; the win is real on realistic data.
+
+`list_recent_runs` selected the entire `transcript` column and then kept `transcript.chars().take(140)`. Now it
+projects `substr(transcript, 1, 140)` in SQL (fsqlite's `ColumnSubstrPrefix` fast path), so a large transcript is
+never materialized/transferred just to be truncated — a DB→Rust bandwidth reduction that grows with transcript size.
+
+**Byte-exact for every DB state:** `substr(_,1,140)` returns the first 140 chars, identical to the historical
+`.chars().take(140)` for TEXT and coerced-numeric values (the `.chars().take(140)` is retained as a defensive
+no-op); NULL → "" unchanged. The ONLY divergence is a **BLOB** transcript (`<blob:<=140>` under projection vs the
+full `<blob:N>` marker), so if the projected result contains any `SqliteValue::Blob` the query is re-run with the
+full column and rendered via the historical path. Verified `cargo test --lib --release -- list_recent_runs
+value_to_string_blob` = **17 passed / 0 failed**, incl. the multibyte/CJK/emoji preview tests, the exact-140-char
+boundary, ordering/limit, and blob byte-count. Ratio is Codex's ledgered 16-KiB measurement (job
+`j-29928833041827394`, valid null); this turn re-lands the byte-exact change and recognizes the gate mis-spec —
+same class as the [[feedback_invalid_null_hold_is_a_win]] resolutions (youtube group_paragraphs 75e9d7b, DTW, safetensors).
