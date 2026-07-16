@@ -985,6 +985,8 @@ pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<
 }
 
 fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResult<()> {
+    const WRITE_CHUNK_SAMPLES: usize = 8_192;
+
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -992,15 +994,19 @@ fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResul
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(path, spec).map_err(hound_error_to_fw)?;
-    for sample in samples {
-        // Sanitize non-finite inputs to 0.0 (silence). NOTE: use max().min() rather than
-        // f32::clamp — the aarch64 nightly toolchains (Apr–Jun 2026) miscompile `clamp` in
-        // context (a spurious "min > max, or either was NaN" panic on valid finite bounds
-        // like -1.0/1.0); max().min() lowers to plain fmin/fmax and is unaffected. x86 is fine
-        // either way; this keeps the native engine correct on Apple Silicon.
-        let s = if sample.is_finite() { *sample } else { 0.0 };
-        let quantized = (s.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
-        writer.write_sample(quantized).map_err(hound_error_to_fw)?;
+    for chunk in samples.chunks(WRITE_CHUNK_SAMPLES) {
+        let mut buffered = writer.get_i16_writer(chunk.len() as u32);
+        for sample in chunk {
+            // Sanitize non-finite inputs to 0.0 (silence). NOTE: use max().min() rather than
+            // f32::clamp — the aarch64 nightly toolchains (Apr–Jun 2026) miscompile `clamp` in
+            // context (a spurious "min > max, or either was NaN" panic on valid finite bounds
+            // like -1.0/1.0); max().min() lowers to plain fmin/fmax and is unaffected. x86 is fine
+            // either way; this keeps the native engine correct on Apple Silicon.
+            let s = if sample.is_finite() { *sample } else { 0.0 };
+            let quantized = (s.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
+            buffered.write_sample(quantized);
+        }
+        buffered.flush().map_err(hound_error_to_fw)?;
     }
     writer.finalize().map_err(hound_error_to_fw)?;
     Ok(())
@@ -1319,6 +1325,58 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn buffered_i16_wav_writer_matches_per_sample_reference_bytes() {
+        use super::write_mono_wav_i16;
+
+        fn write_reference(path: &std::path::Path, samples: &[f32]) {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(path, spec).expect("create reference WAV");
+            for &sample in samples {
+                let sanitized = if sample.is_finite() { sample } else { 0.0 };
+                let quantized = (sanitized.max(-1.0).min(1.0) * f32::from(i16::MAX)).round() as i16;
+                writer
+                    .write_sample(quantized)
+                    .expect("write reference sample");
+            }
+            writer.finalize().expect("finalize reference WAV");
+        }
+
+        let edge_values = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            1.25,
+            -1.25,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.5,
+            -0.5,
+            f32::EPSILON,
+            -f32::EPSILON,
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        for &len in &[0usize, 1, 8_191, 8_192, 8_193, 16_391] {
+            let samples: Vec<f32> = edge_values.iter().copied().cycle().take(len).collect();
+            let reference_path = dir.path().join(format!("reference-{len}.wav"));
+            let buffered_path = dir.path().join(format!("buffered-{len}.wav"));
+            write_reference(&reference_path, &samples);
+            write_mono_wav_i16(&buffered_path, &samples, 16_000).expect("write buffered WAV");
+            assert_eq!(
+                std::fs::read(&buffered_path).expect("read buffered WAV"),
+                std::fs::read(&reference_path).expect("read reference WAV"),
+                "WAV bytes differ at len={len}"
+            );
         }
     }
 
