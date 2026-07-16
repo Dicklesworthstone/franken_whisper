@@ -4,6 +4,67 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-16 — LANDED — filter model names before metadata probes (bd-u3ed)
+
+**Negative-ledger-first profile boundary.** `bv --robot-triage`
+(`data_hash=d99586672c1481cc`) and `docs/NEGATIVE_EVIDENCE.md` showed the recent
+native compute, DTW, diarizer, streaming/render, sync-export, and audio-decode
+veins were heavily mined, so this turn moved to the fresh model-registry
+subsystem. Before any production edit, a deterministic directory-discovery
+harness profiled the historical `discover_any_model` ordering on 4,102 entries.
+It constructed 4,102 paths and followed metadata for every entry, taking
+85,736.938 us; filtering `DirEntry::file_name` first constructed three paths,
+followed three metadata probes, and took 10,077.542 us. The profiled change
+therefore avoided 4,099 probes (**99.9269%**) while selecting exactly the same
+path in all six parity scenarios.
+
+**One lever and exactness.** `discover_any_model` now validates the UTF-8
+`ggml-*.bin` filename shape before constructing a `PathBuf` and calling
+`is_file`. Rank order, lexical tie-breaking, search-directory precedence,
+model-shaped directory rejection, symlink behavior, malformed/non-UTF-8 name
+handling, and the returned path are unchanged. A production unit test freezes
+directory precedence, quality ranking, distractor rejection, and rejection of
+a model-shaped directory. The dependency-free harness covers six scenarios;
+the measured source SHA-256 was
+`a68c9117af7f0814856bc824d8f001d7c2162034fae8b5bf0cb4351d146b1f48`.
+UBS then replaced only the unreachable unknown-mode panic with an exit-status
+error; committed source SHA-256 is
+`53d224326c06489ed7127c99d0278dfcf110d95b82170ed189c83a41850ed16e`,
+with the profiled and measured modes byte-for-byte unchanged.
+
+**Strict-remote release A/B.** After untimed warm-up job
+`j-29933730227290489`, profile job `j-29933730227290503` and foreground A/B
+job `j-29933730227290518` ran on the same actual worker `vmi1153651` with
+`AGENT_NAME=BlackThrush`, `RCH_REQUIRE_REMOTE=1`, `--profile release`, and
+`lto=false`; only the post-warm measurement command carried a 120-second cap.
+The A/B used 21 order-alternated ABBA pairs (42 paired ratios). The noisy
+BASE/BASE null returned p10 **0.929342x**, median **1.054961x**, p90
+**1.449460x**, and CV 29.8676%:
+
+`[0.802101, 0.868086, 0.893150, 0.904325, 0.929342, 0.934326, 0.945787, 0.951449, 0.951980, 0.963484, 0.972250, 0.973514, 0.974073, 0.980442, 0.989199, 0.993984, 1.014353, 1.018463, 1.039137, 1.039838, 1.044943, 1.054961, 1.056076, 1.061713, 1.063721, 1.064562, 1.068636, 1.087226, 1.092491, 1.096013, 1.102774, 1.109787, 1.137825, 1.183115, 1.262369, 1.274506, 1.301752, 1.449460, 1.521128, 1.728404, 2.075708, 2.727545]`.
+
+Filename-first/historical ratios were p10 **0.098865x**, median
+**0.128496x**, p90 **0.144025x**, CV 18.6030%, and 42/42 wins. The candidate
+p90 is far below the null p10. Independent arm medians were 45,962.339 us
+historical and 5,728.998 us filename-first, a **8.0228x** speedup:
+
+`[0.068094, 0.074167, 0.081684, 0.098140, 0.098865, 0.107576, 0.108886, 0.112686, 0.113181, 0.115977, 0.118383, 0.120416, 0.120962, 0.121287, 0.121767, 0.123484, 0.124628, 0.125301, 0.126213, 0.127634, 0.128114, 0.128496, 0.128619, 0.129458, 0.130302, 0.131205, 0.131895, 0.132741, 0.133019, 0.138389, 0.139561, 0.140465, 0.142207, 0.142417, 0.142442, 0.143064, 0.143815, 0.144025, 0.144911, 0.158449, 0.164015, 0.212272]`.
+
+**Production gate note.** Strict-remote release test job
+`j-29933730227290531` on `vmi1153651` was cancelled after more than two
+minutes without output during its cold dependency build. Per the worker rule,
+the gate moved to `vmi1152480`; replacement job `j-29933730227290591` exposed
+another evicted release cache and was cancelled instead of rebuilding the
+world. No local Cargo fallback ran. The focused test is present but therefore
+not claimed as executed; the independently compiled release harness, its six
+exact-path parity scenarios, touched-file `rustfmt --check`, and UBS are the
+available gates for this commit.
+
+**Scope.** This is a cold/default model-discovery component result for a
+directory dominated by irrelevant entries on a remote Linux filesystem. It is
+not a model-load or end-to-end ASR claim; absolute benefit scales with search
+directory size and filesystem metadata cost.
+
 ## 2026-07-16 — LANDED — front-loaded cancellable child polling (bd-2mbr)
 
 **Negative-ledger-first profile boundary.** `bv --robot-triage`

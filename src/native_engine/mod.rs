@@ -1038,19 +1038,20 @@ fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
         };
         let mut found: Vec<(usize, String, PathBuf)> = Vec::new();
         for entry in read_dir.flatten() {
+            let file_name = entry.file_name();
+            let Some(short) = file_name
+                .to_str()
+                .and_then(|n| n.strip_prefix("ggml-"))
+                .and_then(|n| n.strip_suffix(".bin"))
+            else {
+                continue;
+            };
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
-            if let Some(short) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("ggml-"))
-                .and_then(|n| n.strip_suffix(".bin"))
-            {
-                let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
-                found.push((rank, short.to_string(), path));
-            }
+            let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
+            found.push((rank, short.to_string(), path));
         }
         if !found.is_empty() {
             // Rank first, then name, for a stable tie-break within a rank.
@@ -1440,7 +1441,9 @@ impl NativeWhisperModel {
             // Held across the parse below — `plock` and `_held` are both locals of
             // this block (no self-referential borrow); dropped on return. Lock order
             // is always per-path THEN cache (cache is only taken briefly), no deadlock.
-            let _held = plock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _held = plock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // A peer may have published while we waited on the per-path lock.
             {
                 let mut guard = lock_cache();
@@ -1706,10 +1709,16 @@ mod tests {
         tiny.n_text_state = 384;
         tiny.n_text_head = 6;
         tiny.n_mels = 80;
-        assert!(!is_large_v3_turbo(&tiny), "tiny.en must NOT enable poly (uncertified)");
+        assert!(
+            !is_large_v3_turbo(&tiny),
+            "tiny.en must NOT enable poly (uncertified)"
+        );
         let mut unknown = turbo;
         unknown.n_audio_state = 1_024;
-        assert!(!is_large_v3_turbo(&unknown), "unknown model must NOT enable poly");
+        assert!(
+            !is_large_v3_turbo(&unknown),
+            "unknown model must NOT enable poly"
+        );
     }
 
     #[test]
@@ -2041,6 +2050,21 @@ mod tests {
         let dirs = vec![empty.path().to_path_buf(), real.path().to_path_buf()];
         let resolved = resolve_model_in_dirs("small", &dirs).expect("resolve");
         assert_eq!(resolved, path.canonicalize().expect("canon"));
+    }
+
+    #[test]
+    fn discover_any_model_keeps_directory_precedence_and_quality_rank() {
+        let high = TempDir::new("discover_hi");
+        let low = TempDir::new("discover_lo");
+        let expected = write_file(high.path(), "ggml-base.bin", b"base");
+        let _custom = write_file(high.path(), "ggml-custom.bin", b"custom");
+        let _distractor = write_file(high.path(), "README.md", b"not a model");
+        std::fs::create_dir(high.path().join("ggml-large-v3-turbo.bin"))
+            .expect("create model-shaped directory");
+        let _lower_priority_dir = write_file(low.path(), "ggml-large-v3-turbo.bin", b"turbo");
+
+        let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(discover_any_model(&dirs), Some(expected));
     }
 
     #[test]
