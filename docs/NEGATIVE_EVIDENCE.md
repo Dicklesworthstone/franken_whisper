@@ -23663,3 +23663,28 @@ pairs, pooled owned pipelines): null tight **0.99–1.02**; old(clone)/new(move)
 clone (Pareto) and `into_events` is a cleaner terminal API than `events().to_vec()` on a to-be-dropped pipeline.
 **Lesson: measure the OPERATION, not the diluted whole — a clone→move on a small-but-real Vec reads as noise inside a
 larger handoff but is a decisive, free win in isolation.** 7th resolved hold in the [[feedback_invalid_null_hold_is_a_win]] vein.
+
+---
+## 2026-07-16 - BlackThrush: **FRESH-PIVOT PROFILE (ledger-hold vein exhausted) — robot Value-builders are architecturally clone-bound; the one real non-sub-floor lever (`run_streaming` per-segment callback clone, A/B ~11.7×) is an OWNER-coordination public-trait change. No clean autonomous lever this turn.**
+
+Ledger-hold-mining vein is exhausted (7 landed this session; only marginal NE~L720 remains). Pivoted across fresh
+peripheral files; findings so the map stays accurate and these aren't re-mined:
+
+- **robot.rs event/output Value-builders — architecturally clone-bound, NOT a borrowed-struct win.** `transcript_partial_value`/
+  `owned_transcription_*_value` build `json!`/`Map` `Value` trees. The streaming hot path can't avoid it: `RunEvent.payload`
+  is an owned `serde_json::Value` **stored** in the event log (`push_event`), so the Value must be materialized (and its
+  strings cloned) for storage — a borrowed `Serialize` struct (the `BorrowedRoutingDecision` pattern) only helps the
+  *immediate-emit* path (`emit_transcript_partials`), which has **no production hot caller** (only robot.rs-internal + tests).
+  The once-per-run `--robot` output (`owned_run_report_value`) could drop its intermediate Value tree, but it's sub-floor
+  (once per transcription) and the conversion is byte-exactness-risky: `preserve_order` is OFF ⇒ `Map` serializes keys
+  **BTreeMap-sorted**, so every nested struct would need alphabetical field declaration to stay byte-exact. Not worth it.
+- **`StreamingEngine::run_streaming` per-segment callback clone — REAL lever, OWNER-coordination.** The batch-then-replay
+  default (and each backend's free `run_streaming`) does `for segment in &result.segments { on_segment(segment.clone()); }`.
+  A/B (`scratchpad/segclone`, 61 pairs, null tight ~1.0): the per-segment **clone is ~11.7× the borrow-only callback work**
+  (11.7×@200/1000/5000 segs, 61/61 wins). Eliminable via `on_segment: Fn(&TranscriptionSegment)` — but that changes the
+  **public `StreamingEngine` trait signature** + all impls + the three free `run_streaming` fns + the `RunStreamingFn` alias
+  + every closure call site (~6 files incl. the 365 KB backend/mod.rs), and is byte-exact ONLY if every `on_segment` closure
+  is borrow-safe (a storing closure would just move the clone to the call site). Public-API + shared-tree collision ⇒ owner.
+- whisper_cpp_native word-split (`explode_segments_to_words`/`group_word_segments_by_len`) = opt-in (`--word-timestamps`)
+  + reference-backend (not the native hot path) ⇒ low value. export.rs re-confirmed fully optimized (BufWriter + `to_writer`
+  + alloc-free CSV escaping + alloc-free SRT/VTT timestamps). No standalone byte-exact autonomous lever remains peripheral.
