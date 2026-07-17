@@ -23982,3 +23982,28 @@ code; it compiled clean last turn). Verified instead via (a) a standalone mirror
 byte-exactness by construction; (c) name-collision + visibility grep (`router_success_rate_for` is a new `pub fn`,
 `BackendKind` already imported). Committed to protect the change from a concurrent `git add -A` sweep; the 37 router
 tests (as in 0b29f5c) will re-confirm once the dep builds.
+
+---
+## 2026-07-16 - BlackThrush: **BLOCKER RECURRED (root-caused, precise fix) — franken_whisper builds are DOWN fleet-wide: committed frankensqlite 4c31e674 is internally inconsistent (fsqlite-core codes against asupersync 0.3.4 but its Cargo.toml requires 0.3.5). NOT fixable from franken_whisper.**
+
+The fsqlite-core/asupersync `try_acquire` mismatch (previously ledgered + "RESOLVED dc77bc4") has **recurred**. Cold-
+built the COMMITTED frankensqlite (`git worktree add /tmp/... 4c31e674` + Cargo `paths` override) to isolate it from
+any agent's uncommitted WIP — it fails identically:
+```
+error[E0061]: this method takes 1 argument but 2 arguments were supplied
+  --> crates/fsqlite-core/src/remote_effects.rs:644:49
+      if let Some(permit) = self.bulkhead.try_acquire(1, admission_now()) { ...
+```
+**Root cause:** asupersync **0.3.5** `Bulkhead::try_acquire(&self, weight: u32)` takes ONE arg (verified in
+`~/.cargo/registry/.../asupersync-0.3.5/src/combinator/bulkhead.rs:290`); fsqlite-core passes two
+(`1, admission_now()`). frankensqlite's workspace `Cargo.toml` requires `asupersync = "0.3.5"`, and franken_whisper's
+`asupersync = "0.3.4"` unifies UP to 0.3.5 — so no version satisfies both fsqlite-core's 2-arg CODE and its own 0.3.5
+requirement. **Precise upstream fix (frankensqlite, 1 line): `remote_effects.rs:644` → `self.bulkhead.try_acquire(1)`**
+(drop `admission_now()`; the 0.3.5 bulkhead API has no time arg). This is frankensqlite's repo — franken_whisper can
+neither force 0.3.4 (frankensqlite forbids it) nor patch it, so it MUST be fixed upstream. It only "built" at 0b29f5c
+via a stale `fsqlite-core` rlib cache that has since gone cold.
+
+**Impact:** all `cargo build/test` of franken_whisper are blocked ⇒ no verified perf work this turn. **d702273** (2nd
+router clone-elim) remains isolation-verified (`scratchpad/router_accessor`: type-checks + to_bits-identical) + byte-
+exact by construction, full-crate re-confirm PENDING this fix. **0b29f5c** (bd-upk1) was fully compiled+tested two turns
+ago. GREP-THE-GATE before re-diagnosing: it's `remote_effects.rs:644`, asupersync 0.3.5 1-arg bulkhead.
