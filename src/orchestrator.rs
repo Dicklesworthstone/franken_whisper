@@ -1914,9 +1914,10 @@ async fn execute_backend(
         // Capture the adaptive prediction BEFORE deciding whether to use it.
         // This allows calibration tracking even when we fall back to static order.
         let top_backend = selection.recommended_order[0];
-        let predicted_success = backend::router_state_snapshot()
-            .map(|state| state.metrics_for(top_backend).success_rate)
-            .unwrap_or(0.5);
+        // Read just this backend's success_rate under the router lock instead of
+        // cloning the entire RouterState (byte-identical; see
+        // `router_success_rate_for`).
+        let predicted_success = backend::router_success_rate_for(top_backend).unwrap_or(0.5);
         let prediction = (top_backend, predicted_success);
 
         if selection.calibration_score < min_calibration {

@@ -23963,3 +23963,22 @@ noisy A/B** — verified `cargo test --lib --release -- router backend_base_loss
 passed / 0 failed**. Eliminates the ~105 µs clone (→ ~254 ns retained `metrics_for`, ~410× on the read) + its allocator
 churn per Auto decision. The owner's full `success_rate_for` candidate (5847×, direct scalar, no `metrics_for`) needs the
 to_bits oracle to certify; this minimal guard-hold captures ~99.8% of the win with zero oracle dependence.
+
+---
+## 2026-07-16 - BlackThrush: **KEEP — second `RouterState` clone-to-read site eliminated: `run_backend_selection` (orchestrator.rs) now reads one backend's `success_rate` via a lock-borrowing accessor instead of `router_state_snapshot()`. Same bd-upk1 pattern, byte-exact BY CONSTRUCTION.**
+
+After landing bd-upk1 (0b29f5c), grepped the other `router_state_snapshot()` callers and found a second PRODUCTION site:
+`orchestrator.rs:1917` did `backend::router_state_snapshot().map(|s| s.metrics_for(top).success_rate).unwrap_or(0.5)` —
+the same ~105 µs full-`RouterState` clone (3×50 histories + 50 calibrations + 200-entry evidence ledger) just to read
+ONE scalar. Added `backend::router_success_rate_for(kind) -> Option<f64>` (locks `ROUTER_STATE`, borrows, returns
+`state.metrics_for(kind).success_rate`) and swapped the call. Byte-identical by construction (same `metrics_for` on the
+live state vs a bit-perfect clone) — same ~410× on the read as bd-upk1 (bench `router_success_metric_perf`: snapshot_clone
+105,491 ns/call vs retained metrics_for ~254 ns).
+
+**Verification note (honest):** the full-crate `cargo check` was concurrently blocked by an unrelated **frankensqlite
+WIP** (another agent's uncommitted `fsqlite-vdbe/src/codegen.rs:12148` `alloc_regs(n_probe as usize)` type error — NOT my
+code; it compiled clean last turn). Verified instead via (a) a standalone mirror of the exact accessor
+(`scratchpad/router_accessor`) — **type-checks + `to_bits`-identical to the clone path on None/empty/partial/full**; (b)
+byte-exactness by construction; (c) name-collision + visibility grep (`router_success_rate_for` is a new `pub fn`,
+`BackendKind` already imported). Committed to protect the change from a concurrent `git add -A` sweep; the 37 router
+tests (as in 0b29f5c) will re-confirm once the dep builds.
