@@ -2674,10 +2674,20 @@ pub fn evaluate_backend_selection(
 
     let duration = normalized_duration_seconds.unwrap_or(30.0);
 
-    // Snapshot the global router state (if any) for use in the contract.
-    let rs_snapshot = router_state_snapshot();
-    let contract =
-        BackendSelectionContract::with_router_state(request, duration, rs_snapshot.as_ref());
+    // Borrow the global router state under its lock for the eager loss/matrix
+    // build AND the evidence reads below (calibration / evidence-JSON / brier /
+    // fallback), instead of cloning the entire state (3×50 histories + 50
+    // calibration observations + a 200-entry string-heavy evidence ledger, a
+    // ~105 µs allocation-heavy clone per `Auto` routing decision). The contract
+    // retains no reference (`with_router_state` returns an owned `Self`), every
+    // read is `&self`, and nothing between here and the last read re-locks
+    // `ROUTER_STATE` — so the guard is dropped after `fallback_reason` below,
+    // before the post-decision update at the tail. Byte-identical by
+    // construction: a read of the live state equals a read of a bit-perfect
+    // clone.
+    let rs_guard = ROUTER_STATE.lock().ok();
+    let rs_ref: Option<&RouterState> = rs_guard.as_ref().and_then(|state| state.as_ref());
+    let contract = BackendSelectionContract::with_router_state(request, duration, rs_ref);
 
     let availability = [
         (
@@ -2725,10 +2735,7 @@ pub fn evaluate_backend_selection(
     sorted_probs.sort_by(|a, b| b.total_cmp(a));
     let max_prob = sorted_probs.first().copied().unwrap_or(0.0);
     let second_prob = sorted_probs.get(1).copied().unwrap_or(0.0);
-    let calibration_score = rs_snapshot
-        .as_ref()
-        .map(|rs| rs.calibration_score())
-        .unwrap_or(0.5);
+    let calibration_score = rs_ref.map(|rs| rs.calibration_score()).unwrap_or(0.5);
 
     let ts_ms = Utc::now().timestamp_millis() as u64;
     let decision_random = (uuid::Uuid::new_v4().as_u128()) & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
@@ -2868,14 +2875,16 @@ pub fn evaluate_backend_selection(
     let loss_matrix_hash = loss_matrix_content_hash(&contract.losses);
 
     // Build the adaptive router state snapshot for the routing log.
-    let router_state_json = rs_snapshot
-        .as_ref()
+    let router_state_json = rs_ref
         .map(RouterState::to_evidence_json)
         .unwrap_or(serde_json::json!(null));
 
     // bd-efr.2: Include Brier score from calibration state.
-    let brier_score = rs_snapshot.as_ref().and_then(|rs| rs.brier_score());
-    let router_state_fallback_reason = rs_snapshot.as_ref().and_then(|rs| rs.fallback_reason());
+    let brier_score = rs_ref.and_then(|rs| rs.brier_score());
+    let router_state_fallback_reason = rs_ref.and_then(|rs| rs.fallback_reason());
+    // Last use of the borrowed state; release the lock before the post-decision
+    // `ROUTER_STATE` update at the tail (std `Mutex` is not reentrant).
+    drop(rs_guard);
     let fallback_active = outcome.fallback_active || rollout_forced_static;
     let fallback_reason = effective_fallback_reason(
         router_state_fallback_reason,

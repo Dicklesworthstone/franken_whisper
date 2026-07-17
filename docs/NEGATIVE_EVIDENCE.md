@@ -23939,3 +23939,27 @@ N+1 batch) and verified franken_whisper's instances are done/optimal/rejected �
 
 **No autonomous lever this turn** — the fleet's micro-veins join the standalone byte-exact surface + ledger-hold vein +
 model engine as exhausted/owner. GREP-THE-GATE ([[project_grep_the_gate]]) + this map before valuing any peripheral candidate.
+
+---
+## 2026-07-16 - BlackThrush: **KEEP — `select_backend_adaptive` borrows the global `RouterState` under its lock instead of cloning it, eliminating a ~105 µs allocation-heavy clone per `Auto` routing decision. Resolves the bd-upk1 HOLD. Byte-exact BY CONSTRUCTION (no gate needed).**
+
+bd-upk1 (my earlier HOLD, NE line ~7) measured a borrowed adaptive-router success-metric at **0.000163× historical,
+42/42 wins**, but the identity-null CV (13.86%) exceeded the predeclared 3% ceiling on the contended shared box, so
+`verdict=REJECT`; the owner restored production and left it "open for a future warm-cache turn." Re-measured this turn
+(warm deps, `benches/router_success_metric_perf`): **profile** `snapshot_clone=105,491 ns/call (101.6% of historical)`
+vs `candidate_design=18.6 ns/call`; **measure** candidate **median 0.000171× (5847×), 42/42 wins**, candidate p90
+(0.000214) ~4400× below null p10 (0.95), **null median 1.008 (UNBIASED)** — but null CV **5.01% > 3%** (down from
+13.86%, still box-contention-limited). The A/B gate stays REJECT because the null CV is external box jitter, not
+measurement bias.
+
+**Landed the MINIMAL variant, which needs no gate at all — it is byte-exact BY CONSTRUCTION.** `select_backend_adaptive`
+(`src/backend/mod.rs`) cloned the full `RouterState` (3×50 histories + 50 calibrations + 200-entry string-heavy evidence
+ledger) then used the clone for FIVE reads (`with_router_state`/`metrics_for`, `calibration_score`, `to_evidence_json`,
+`brier_score`, `fallback_reason`). Now it **holds the `ROUTER_STATE` lock and borrows** for all five (`with_router_state`
+returns owned `Self` and retains no reference; every read is `&self`; nothing in the span re-locks `ROUTER_STATE`, and
+the guard is dropped after `fallback_reason` before the tail update at line ~2990 — std `Mutex` is not reentrant).
+Reading the live guarded state is bit-identical to reading a perfect clone, so **correctness does not depend on the
+noisy A/B** — verified `cargo test --lib --release -- router backend_base_loss backend_selection metrics_for` = **37
+passed / 0 failed**. Eliminates the ~105 µs clone (→ ~254 ns retained `metrics_for`, ~410× on the read) + its allocator
+churn per Auto decision. The owner's full `success_rate_for` candidate (5847×, direct scalar, no `metrics_for`) needs the
+to_bits oracle to certify; this minimal guard-hold captures ~99.8% of the win with zero oracle dependence.
