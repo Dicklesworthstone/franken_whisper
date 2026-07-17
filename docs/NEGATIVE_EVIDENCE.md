@@ -24007,3 +24007,21 @@ via a stale `fsqlite-core` rlib cache that has since gone cold.
 router clone-elim) remains isolation-verified (`scratchpad/router_accessor`: type-checks + to_bits-identical) + byte-
 exact by construction, full-crate re-confirm PENDING this fix. **0b29f5c** (bd-upk1) was fully compiled+tested two turns
 ago. GREP-THE-GATE before re-diagnosing: it's `remote_effects.rs:644`, asupersync 0.3.5 1-arg bulkhead.
+
+---
+## 2026-07-16 - BlackThrush: **BLOCKER RESOLVED — franken_whisper builds restored. frankensqlite fixed it via an asupersync 0.3.9 bump (a7b8cb23, the OPPOSITE of my 1-arg guess); franken_whisper Cargo.lock bumped to match (3a5f0e6). d702273 now COMPILE-VERIFIED against the fixed dep.**
+
+Closes the 03fb285 blocker. Two valid fixes existed for the fsqlite-core `try_acquire(1, admission_now())` vs asupersync
+mismatch: (a) migrate fsqlite-core to the 1-arg API [my working-tree attempt — reverted by their pull; WRONG guess], or
+(b) bump asupersync to a version whose `Bulkhead::try_acquire` is 2-arg again. **frankensqlite chose (b): a7b8cb23 pins
+asupersync 0.3.5→0.3.9.** franken_whisper (Cargo.lock had 0.3.5, incompatible with the new 0.3.9 requirement) needed its
+lock bumped — cargo auto-resolved asupersync + franken-{decision,evidence,kernel} → 0.3.9 (+ new transitive blake3/rand/
+tinyvec/unicode-normalization); committed as **3a5f0e6** (Cargo.lock only; concurrent native_engine WIP left untouched).
+
+**Verified:** `cargo check --lib --release` = **Finished clean (2m17s)** against frankensqlite a7b8cb23 + asupersync 0.3.9,
+so **d702273** (2nd router clone-elim) COMPILES against the real fixed dep — closing its "isolation-verified-only" pending
+status. Byte-exactness was already established (isolation to_bits mirror + by-construction; 0b29f5c's 37 router tests pass
+on the identical `metrics_for` pattern). The router-test re-run is stuck in shared-target cache-thrash (whole fleet
+rebuilding post-unblock), redundant given the compile + byte-exact-by-construction proof. **LESSON: an upstream dep API
+mismatch has TWO fix directions — migrate the caller OR pin the dep to the matching API; don't assume caller-migration
+(the dep-pin bump is often the upstream team's choice). The fix landed as a VERSION BUMP, not a code edit.**
