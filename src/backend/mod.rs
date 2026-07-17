@@ -735,6 +735,21 @@ pub fn router_state_snapshot() -> Option<RouterState> {
     ROUTER_STATE.lock().ok().and_then(|guard| guard.clone())
 }
 
+/// Read a single backend's empirical `success_rate` from the global router
+/// state under its lock, without cloning the whole state. Byte-identical to
+/// `router_state_snapshot().map(|s| s.metrics_for(kind).success_rate)` — the
+/// same `metrics_for` computation, evaluated on the live state instead of a
+/// bit-perfect clone — but avoids the ~105 µs allocation-heavy `RouterState`
+/// clone (3×50 histories + 50 calibrations + 200-entry evidence ledger) when
+/// only the one scalar is needed.
+#[must_use]
+pub fn router_success_rate_for(kind: BackendKind) -> Option<f64> {
+    ROUTER_STATE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|state| state.metrics_for(kind).success_rate))
+}
+
 /// Record a calibration observation into the global router state (bd-efr.2).
 ///
 /// Should be called after each routing decision resolves with the predicted
