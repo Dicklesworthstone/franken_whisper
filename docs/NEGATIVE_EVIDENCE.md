@@ -4,6 +4,30 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - cod: **BLOCKED — `RoutingEvidenceLedger::diagnostics` Brier Vec profile never reached a valid remote worker; zero source delta.**
+
+Exact searches of both ledgers and recent Git history found no prior
+`avg_brier`/`brier_values` optimization. A profile-only `pipeline_bench` row was
+prepared for the complete 200-entry diagnostics snapshot and its historical
+optional-Brier `Vec<f64>` materialization; production was not touched.
+
+No timing was admitted. Job `j-29942429901652369` selected `ovh-b`, already
+invalidated by a SIGILL release build in this turn, and was cancelled. Retry
+`j-29942429901652370` selected disk-pressure-constrained `vmi1149989` while it
+was already hosting another four-slot 29-minute build, so that noisy cold route
+was cancelled. A six-slot retry was refused under strict remote policy with
+`critical_pressure=1, insufficient_slots=8, hard_preflight=3`. No Cargo ran
+locally. The profile harness was manually removed; `pipeline_bench.rs` matches
+HEAD and there is zero production delta.
+
+**Concrete retry condition:** a non-critical, non-SIGILL worker must admit the
+release `pipeline_bench` with a reusable cache and unsaturated slots. Measure
+the whole diagnostics caller and Brier substage first; proceed only if the
+materialization is at least 10% of the caller. Any candidate then needs exact
+serialized JSON parity, 21 same-worker order-alternated A/B and null pairs,
+candidate CV `<5%`, at least 18/21 wins, and p10 separation above
+`max(null p90, 1.10)`.
+
 ## 2026-07-22 - cod: **KEEP (bd-kdg7.2) — stream-fused `RouterState::metrics_for` removes its successful-latency Vec; 3.6695x median, 21/21 wins, 2.1502% CV, exact serialized behavior.**
 
 **Freshness and profile first.** Exact ledger and recent-log searches found no
