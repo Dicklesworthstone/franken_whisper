@@ -4,6 +4,45 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - WhiteCreek: **KEEP (increment on the FW_TEMP_FALLBACK ladder, same gate, byte-exact-by-construction) — whisper.cpp `greedy.best_of = 5` per ladder rung: each t > 0 rung decodes 5 independent sampling candidates and adopts the best `sequence_score`; track01 recovery improves 1226 → 1273 chars, deterministic, `FW_TEMP_BEST_OF=1` reproduces the single-candidate ladder BYTE-FOR-BYTE (bd-6goy).**
+
+**What landed (decode.rs only):** `sequence_score` = whisper.cpp
+`whisper_sequence_score` under the default `length_penalty = -1.0` (score =
+avg logprob of the result slice; `result_len == 0` scores the −999 sentinel so
+an empty candidate never wins); a `WindowCandidate` stash + rung state
+(`cand_idx`/`rung_best`); the sampling seed gains a candidate lane
+(`^ cand_idx << 40`, candidate 0 ≡ the old stream). Each t > 0 rung re-enters
+the window loop [`temp_best_of`] times (encode reused via `retry_enc_cache`),
+ties keep the earlier candidate (wc's strict-better replacement), and the
+winner is adopted into the window locals via a shadowing tuple — the quality
+gate, emission, DTW re-forward, prompt carry, and seek advance all see only the
+winner. Worst case per failed window = 1 + 5 rungs × 5 candidates = **26
+decodes — exactly whisper.cpp's own worst case** (1 + 5 temps × 5 decoders);
+clean windows pay one branch test.
+
+**Measured (local release build, tiny.en, track01 124.5s TS = the bd-r0qd
+regime):** gate-ON default (best_of=5) **1273 chars / 17 segs** vs
+single-candidate 1226 / 22 — the middle windows recover richer, more coherent
+text (reference: prompt-reset retry 1301, wc ≈ 1400); md5-deterministic across
+runs. Cost on this pathological clip 3.8 s → 11.8 s (RTF 0.095 — still ~10×
+realtime; only failed windows pay). Default (gate off): 643 chars, untouched.
+
+**Regression proofs:** `FW_TEMP_FALLBACK=1 FW_TEMP_BEST_OF=1` on the NEW binary
+is **byte-identical to the pre-best_of baseline** on track01 (md5 ea8fc828… =
+the 42f77b1-era determinism hash) AND jfk (be4284a9…) — even cross-toolchain
+(baseline = rch build, new = local AVX2 build; the default-OFF control matched
+too, b7145179…). Gates: decode suite 60/0 (new `sequence_score` unit test
+pins the wc semantics), gate-ON full suite 257/0 (one run hit the KNOWN bd-0ivd
+DTW load-flake — first 64-core sighting, logged there; rerun clean), fleet rch
+`clippy --lib -D warnings` clean, fmt clean.
+
+**Bookkeeping:** the fleet-shared `/data/tmp/cargo-target` release cache is
+E0514-poisoned for the 2026-07-21 local nightly (stale `cc` build-script
+artifacts; memory `project_rch_targets_toolchain_churn`) — this session built
+release into `/data/tmp/cargo-target-wt` instead of `cargo clean`ing the
+fleet's warm cache. **Residual for bd-6goy:** `prompt_reset_since` and beam
+search. Default-on flip: still the owner's call.
+
 ## 2026-07-22 - cod: **LAND STRUCTURAL / BENCH-FREE (not a perf KEEP) — borrow the configured quality-model name during speculative correction, removing one `String` clone per window (bd-oacy).**
 
 Both performance ledgers and recent history were searched first for
