@@ -401,17 +401,131 @@ fn process_logits(
     (logits, logprobs)
 }
 
+/// Sampler `exp` acceleration gate (`FW_SIMD_EXP=1`, default OFF — an owner
+/// escape hatch, NOT a default change). When on, [`compute_logprobs`] computes its
+/// vocab-wide `logsumexp` with a vectorized AVX2 degree-5 poly exp instead of scalar
+/// libm `f32::exp` — MEASURED 16.7× on the 51866-vocab pass (`examples/exp_sampler_probe`).
+/// NON-byte-exact (~2.5e-5 logprob delta), so kept off by default: franken deliberately
+/// runs the accurate libm exp (mirrors frankentorch's deliberately-unwired
+/// `ft_kernel_cpu::exp_f64x4`; the owner's accuracy/speed call). NOTE: this same
+/// flag ALSO gates the attention `exp` (`nn::softmax_rows` poly, cross+self) since
+/// b276b89, which — unlike the sampler exp — perturbs the RAW logits themselves
+/// (attention weights feed the hidden states). The sampler exp is provably
+/// no_ts-neutral (the token is `argmax` of the RAW logits and the timestamp-forcing
+/// rule cannot fire because timestamps are masked to -inf); the attention-softmax
+/// perturbation is only EMPIRICALLY sub-margin. Both together were MODEL-VERIFIED
+/// byte-identical for the no_ts transcript: turbo `FW_SIMD_EXP` off-vs-on over jfk
+/// ×1/×3/×8 (108/288/978 chars, multi-window) diffs to zero, and timestamp-mode
+/// jfk×3 text+segments also matched. Only timestamp boundaries / logprob metadata
+/// can shift in principle (the ~2.5e-5 delta), and e2e wall-clock is within noise
+/// (the exp is parallelized ~20-way), so this stays a default-OFF escape hatch.
+fn simd_exp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_SIMD_EXP").is_some())
+}
+
+/// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
+/// (matching the scalar `l > -inf` guard). AVX2 degree-5 poly exp: range-reduce
+/// `x = k·ln2 + r`, `exp(r)` via Horner, `2^k` by float-bit construction. Numerics-
+/// affecting (~2.5e-5 vs libm) — only reached under [`simd_exp_enabled`].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[allow(unsafe_code)]
+fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
+    use core::arch::x86_64::*;
+    let n = logits.len();
+    let lp = logits.as_ptr();
+    // SAFETY: avx2+fma guaranteed by this fn's cfg; every load is bounded by the
+    // `i+8<=n` guard and the `< 8` remainder runs scalar.
+    unsafe {
+        let vmax = _mm256_set1_ps(max);
+        let ninf = _mm256_set1_ps(f32::NEG_INFINITY);
+        let log2e = _mm256_set1_ps(1.442_695_f32);
+        let ln2 = _mm256_set1_ps(0.693_147_2_f32);
+        let lo = _mm256_set1_ps(-87.3365_f32);
+        let c0 = _mm256_set1_ps(1.0);
+        let c1 = _mm256_set1_ps(1.0);
+        let c2 = _mm256_set1_ps(0.5);
+        let c3 = _mm256_set1_ps(0.166_666_67_f32);
+        let c4 = _mm256_set1_ps(0.041_666_66_f32);
+        let c5 = _mm256_set1_ps(0.008_333_33_f32);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let l = _mm256_loadu_ps(lp.add(i));
+            let keep = _mm256_cmp_ps::<_CMP_GT_OQ>(l, ninf); // l > -inf
+            let xv = _mm256_max_ps(_mm256_sub_ps(l, vmax), lo);
+            let kf = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+                _mm256_mul_ps(xv, log2e),
+            );
+            let r = _mm256_fnmadd_ps(kf, ln2, xv);
+            let mut p = _mm256_fmadd_ps(c5, r, c4);
+            p = _mm256_fmadd_ps(p, r, c3);
+            p = _mm256_fmadd_ps(p, r, c2);
+            p = _mm256_fmadd_ps(p, r, c1);
+            p = _mm256_fmadd_ps(p, r, c0);
+            let ki = _mm256_cvtps_epi32(kf);
+            let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+                ki,
+                _mm256_set1_epi32(127),
+            )));
+            let e = _mm256_and_ps(_mm256_mul_ps(p, pow2), keep); // zero masked lanes
+            acc = _mm256_add_ps(acc, e);
+            i += 8;
+        }
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        let mut s = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        while i < n {
+            let l = logits[i];
+            if l > f32::NEG_INFINITY {
+                s += (l - max).exp();
+            }
+            i += 1;
+        }
+        s
+    }
+}
+
+/// Scalar fallback (non-avx2): identical to the default libm loop.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
+    let mut s = 0.0f32;
+    for &l in logits {
+        if l > f32::NEG_INFINITY {
+            s += (l - max).exp();
+        }
+    }
+    s
+}
+
 /// Numerically-stable log-softmax (whisper.cpp `whisper_compute_logprobs`,
 /// lines 6138-6158). `-inf` logits map to `-inf` logprobs.
 fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
+    // Sanitize non-finite logits to `-inf` up front. A `+inf` activation
+    // (overflow) would otherwise drive `logit_max` to `+inf`, making
+    // `(l - logit_max).exp() = exp(+inf - +inf) = exp(NaN) = NaN` and poisoning
+    // every logprob (and, downstream, the confidence/avg_logprob/no_speech math).
+    // Mapping NaN/+inf to `-inf` makes them behave like already-masked lanes.
+    let logits: Vec<f32> = logits
+        .iter()
+        .map(|&l| if l.is_finite() { l } else { f32::NEG_INFINITY })
+        .collect();
     let logit_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut logsumexp = 0.0f32;
-    for &l in logits {
-        if l > f32::NEG_INFINITY {
-            logsumexp += (l - logit_max).exp();
+    // Default (gate off): exact scalar libm — byte-identical to before. Gate on:
+    // vectorized poly exp (16.7×, ~2.5e-5 delta), the owner's opt-in escape hatch.
+    let logsumexp_raw = if simd_exp_enabled() {
+        logsumexp_sum_simd(&logits, logit_max)
+    } else {
+        let mut s = 0.0f32;
+        for &l in &logits {
+            if l > f32::NEG_INFINITY {
+                s += (l - logit_max).exp();
+            }
         }
-    }
-    let logsumexp = logsumexp.ln() + logit_max;
+        s
+    };
+    let logsumexp = logsumexp_raw.ln() + logit_max;
     logits
         .iter()
         .map(|&l| {
@@ -424,19 +538,87 @@ fn compute_logprobs(logits: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Argmax over `logits`, returning `(id, logprob_of_id)`. Mirrors
-/// `whisper_sample_token(best=true)` (whisper.cpp 6503-6510): the chosen id is
-/// the argmax of the (post-filter) probabilities — equivalently logits — and
-/// `plog` is its log-softmax value.
-fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
+/// First index of the maximum over `logits` (scalar reference: strict `>`, so ties keep the
+/// FIRST index). LLVM does NOT autovectorize this — the running `best_i` is a loop-carried
+/// data dependency — so on the 51866-vocab sampler pass (SERIAL critical path, per token) it
+/// stays scalar. See [`argmax_idx`] for the AVX2 form.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn argmax_idx(l: &[f32]) -> usize {
     let mut best_i = 0usize;
     let mut best = f32::NEG_INFINITY;
-    for (i, &l) in logits.iter().enumerate() {
-        if l > best {
-            best = l;
+    for (i, &v) in l.iter().enumerate() {
+        if v > best {
+            best = v;
             best_i = i;
         }
     }
+    best_i
+}
+
+/// AVX2 first-index argmax, BYTE-EXACT vs the scalar loop in ALL cases (finite / `-inf` /
+/// NaN / empty): the strict `_CMP_GT_OQ` blend skips NaN and `-inf` exactly as scalar `>`
+/// does, and per lane keeps the first index in that lane's stride; the horizontal reduce then
+/// takes the max value and the MIN index among ties ⇒ the global FIRST index. MEASURED 5.1×
+/// over 51866 (`examples/sampler_maxargmax_probe`), ~14.6 µs/token off the serial sampler.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn argmax_idx(l: &[f32]) -> usize {
+    use core::arch::x86_64::*;
+    let n = l.len();
+    let n8 = n & !7;
+    // SAFETY: avx2 guaranteed by this fn's cfg; every load is bounded by `i < n8 <= n`
+    // (i advances by 8, i+8 <= n8) and the `< 8` remainder runs scalar.
+    unsafe {
+        let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+        let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let mut vidx = _mm256_setzero_si256();
+        let mut i = 0usize;
+        while i < n8 {
+            let v = _mm256_loadu_ps(l.as_ptr().add(i));
+            let gt = _mm256_cmp_ps::<_CMP_GT_OQ>(v, vmax); // strict > ⇒ keep first, skip NaN/-inf
+            vmax = _mm256_blendv_ps(vmax, v, gt);
+            let idx = _mm256_add_epi32(_mm256_set1_epi32(i as i32), lane);
+            vidx = _mm256_castps_si256(_mm256_blendv_ps(
+                _mm256_castsi256_ps(vidx),
+                _mm256_castsi256_ps(idx),
+                gt,
+            ));
+            i += 8;
+        }
+        let mut vals = [0.0f32; 8];
+        let mut idxs = [0i32; 8];
+        _mm256_storeu_ps(vals.as_mut_ptr(), vmax);
+        _mm256_storeu_si256(idxs.as_mut_ptr().cast(), vidx);
+        // Max value across lanes; among lanes tied at that value, the MIN index (= global first).
+        let mut best = f32::NEG_INFINITY;
+        let mut best_i = usize::MAX;
+        for k in 0..8 {
+            let (v, ix) = (vals[k], idxs[k] as usize);
+            if v > best || (v == best && ix < best_i) {
+                best = v;
+                best_i = ix;
+            }
+        }
+        if best_i == usize::MAX {
+            best_i = 0; // empty or all-(-inf)/NaN: match scalar's initial best_i = 0
+        }
+        while i < n {
+            if l[i] > best {
+                best = l[i];
+                best_i = i;
+            }
+            i += 1;
+        }
+        best_i
+    }
+}
+
+/// Argmax over `logits`, returning `(id, logprob_of_id)`. Mirrors
+/// `whisper_sample_token(best=true)` (whisper.cpp 6503-6510): the chosen id is
+/// the argmax of the (post-filter) probabilities — equivalently logits — and
+/// `plog` is its log-softmax value. The index scan is [`argmax_idx`] (AVX2, byte-exact).
+fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
+    let best_i = argmax_idx(logits);
     (
         i32::try_from(best_i).unwrap_or(0),
         logprobs.get(best_i).copied().unwrap_or(0.0),
@@ -584,7 +766,9 @@ fn confidence(plogs: &[f32]) -> Option<f64> {
         return None;
     }
     let mean = plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / plogs.len() as f64;
-    Some(mean.exp().clamp(0.0, 1.0))
+    // `clamp` panics on NaN under the current nightly; guard the exp result.
+    let c = mean.exp();
+    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
 }
 
 /// Per-segment **text** confidence (fix #8): `exp(mean text-token logprob)`
@@ -603,6 +787,7 @@ fn text_confidence(tk: &Tokenizer, tokens: &[i32], plogs: &[f32]) -> Option<f64>
         if tok < tk.timestamp_begin
             && !tk.is_special(tok)
             && let Some(&p) = plogs.get(i)
+            && p.is_finite()
         {
             sum += f64::from(p);
             count += 1;
@@ -612,7 +797,9 @@ fn text_confidence(tk: &Tokenizer, tokens: &[i32], plogs: &[f32]) -> Option<f64>
         return None;
     }
     let mean = sum / count as f64;
-    Some(mean.exp().clamp(0.0, 1.0))
+    // `clamp` panics on NaN under the current nightly; guard the exp result.
+    let c = mean.exp();
+    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
 }
 
 /// Construct a [`TranscriptionSegment`] from centisecond bounds + text.
@@ -650,6 +837,28 @@ fn tail_truncate_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE")
             .map_or(true, |v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+    })
+}
+
+/// Cross-window ENCODE/DECODE pipelining (default ON; kill switch `FW_PIPELINE_WINDOWS=0`).
+///
+/// In `no_timestamps` mode the seek advance is always a full `CHUNK_CS` (timestamp
+/// tokens are masked, so `seek_delta_cs` never changes), which makes window N+1's
+/// mel offset known BEFORE window N is decoded. Since window N's decode is a
+/// latency-bound single stream that leaves cores idle (NEGATIVE_EVIDENCE 2026-07-02
+/// perf profile: ~8% of samples are idle rayon workers), we compute window N+1's
+/// (compute-bound, core-hungry) encode CONCURRENTLY on those idle cores via a
+/// scoped encoder thread. The prefetched encode is byte-identical to the inline one
+/// (same fn, same args), so transcripts are unchanged — a pure RTF lever. MEASURED
+/// ~1.19-1.31× on the transcribe phase of a 3-window turbo run, transcript
+/// byte-identical. Inert in timestamp mode (next offset is data-dependent) and for
+/// single-window audio, so the conformance path (timestamps=true) is untouched.
+fn pipeline_windows_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FW_PIPELINE_WINDOWS")
+            .map_or(true, |v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
     })
 }
 
@@ -838,6 +1047,41 @@ pub fn transcribe_samples(
     // Tail-window encoder-context truncation kill switch, resolved once.
     let tail_truncate = tail_truncate_enabled();
 
+    // Cross-window pipelining (no_timestamps only; default off): a persistent
+    // scoped encoder thread computes the NEXT window's encode while THIS window
+    // decodes on the calling thread. The while loop stays lexically top-level in
+    // the scope closure, so its break/continue/`?` still target the loop, and
+    // `thread::scope` joins the encoder thread on ANY exit (incl. `?`). Byte-exact:
+    // the prefetched encode is the same fn+args as the inline one. See
+    // `pipeline_windows_enabled`.
+    let pipeline = pipeline_windows_enabled() && cfg.no_timestamps;
+    let enc_n_threads = params.n_threads;
+    let pipe_result: FwResult<()> = std::thread::scope(|scope| {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<FwResult<super::Mat>>();
+        let _enc_worker = if pipeline {
+            let enc_w = &m.encoder;
+            let mel_ref = &full_mel;
+            Some(scope.spawn(move || {
+                // Speculative prefetch: use a no-op checkpoint (cancellation of the
+                // MAIN decode still gates progress; a wasted prefetch is harmless).
+                let noop = || Ok(());
+                while let Ok((off, mf)) = req_rx.recv() {
+                    let r = encoder::forward_from_full_mel_window(
+                        enc_w, mel_ref, off, mf, enc_n_threads, &noop,
+                    );
+                    if res_tx.send(r).is_err() {
+                        break;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        // The frame_offset already dispatched to the encoder thread (its result is
+        // in flight / waiting on `res_rx`), or None when nothing is prefetched.
+        let mut prefetched: Option<usize> = None;
+
     let mut seek_cs: i64 = 0;
     while seek_cs + DELTA_MIN < seek_end_cs {
         checkpoint()?;
@@ -869,14 +1113,37 @@ pub fn transcribe_samples(
             );
         }
         let t_enc = std::time::Instant::now();
-        let enc = encoder::forward_from_full_mel_window(
-            &m.encoder,
-            &full_mel,
-            frame_offset,
-            mel_frames,
-            params.n_threads,
-            checkpoint,
-        )?;
+        // Take the prefetched encode if the pipeline already computed THIS window
+        // (overlapped with the previous window's decode); otherwise encode inline.
+        let enc = if pipeline && prefetched == Some(frame_offset) {
+            match res_rx.recv() {
+                Ok(r) => r?,
+                Err(_) => encoder::forward_from_full_mel_window(
+                    &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
+                )?,
+            }
+        } else {
+            encoder::forward_from_full_mel_window(
+                &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
+            )?
+        };
+        // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
+        // no_timestamps advance is always CHUNK_CS, so the next offset is known and
+        // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
+        prefetched = None;
+        if pipeline {
+            let next_seek = seek_cs + CHUNK_CS;
+            if next_seek + DELTA_MIN < seek_end_cs {
+                let next_off = frame_offset + CHUNK_CS as usize;
+                let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
+                    .unwrap_or(0)
+                    .min(FRAMES_PER_CHUNK);
+                let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
+                if req_tx.send((next_off, next_ctx * 2)).is_ok() {
+                    prefetched = Some(next_off);
+                }
+            }
+        }
         super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
         let t_xkv = std::time::Instant::now();
         let mut st = DecoderState::new(&m.decoder, &enc)?;
@@ -924,7 +1191,12 @@ pub fn transcribe_samples(
             usize::try_from(tk.no_speech)
                 .ok()
                 .and_then(|i| lp.get(i).copied())
-                .map_or(0.0, |x| f64::from(x.exp()))
+                .map_or(0.0, |x| {
+                    // Defense-in-depth: a non-finite logprob must not export a
+                    // NaN no_speech_prob into the silence gate / routing snapshot.
+                    let p = f64::from(x.exp());
+                    if p.is_finite() { p } else { 0.0 }
+                })
         };
 
         // Greedy decode loop.
@@ -1002,6 +1274,14 @@ pub fn transcribe_samples(
             EMPTY_WINDOW_AVG_LOGPROB
         } else {
             result_plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / result_plogs.len() as f64
+        };
+        // A non-finite mean (a NaN/inf plog escaping the decoder) degrades to the
+        // finite empty-window sentinel so the silence gate and routing snapshot
+        // never see NaN (a NaN would silently read as "not silence").
+        let avg_logprob = if avg_logprob.is_finite() {
+            avg_logprob
+        } else {
+            EMPTY_WINDOW_AVG_LOGPROB
         };
 
         // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
@@ -1100,6 +1380,13 @@ pub fn transcribe_samples(
         // adjusted) advance, NOT the emission delta (fix #5).
         seek_cs += seek_advance_cs.max(DELTA_MIN);
     }
+
+        // Close the encoder-thread channel so the scoped worker exits; `scope`
+        // then joins it before returning.
+        drop(req_tx);
+        Ok(())
+    });
+    pipe_result?;
 
     // English-only models never report a language; multilingual report the used
     // (possibly auto-detected) one.
@@ -1562,6 +1849,94 @@ mod tests {
     // ----- Rule 1: blank + eot suppression at step 0 only -----
 
     #[test]
+    fn logsumexp_sum_simd_matches_scalar() {
+        // The FW_SIMD_EXP path (`logsumexp_sum_simd`) must match the scalar libm
+        // Σ exp(l−max) within the poly tolerance across all code paths (SIMD body,
+        // <8 scalar tail) and edge cases, and treat -inf lanes as EXACTLY 0 (matching
+        // the default loop's `l > -inf` guard). Guards the gated escape hatch.
+        fn scalar(logits: &[f32], max: f32) -> f32 {
+            let mut s = 0.0f32;
+            for &l in logits {
+                if l > f32::NEG_INFINITY {
+                    s += (l - max).exp();
+                }
+            }
+            s
+        }
+        let mut st = 0x1357_9BDF_2468_ACE0u64;
+        let mut nf = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / (1u64 << 24) as f32
+        };
+        for &n in &[0usize, 1, 7, 8, 9, 15, 16, 17, 1000, 51866] {
+            let mut v: Vec<f32> = (0..n)
+                .map(|_| {
+                    let u = nf();
+                    if u < 0.1 { f32::NEG_INFINITY } else { -30.0 * nf() }
+                })
+                .collect();
+            if n > 0 {
+                v[n / 2] = 0.0; // a finite max at 0
+            }
+            let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let got = logsumexp_sum_simd(&v, max);
+            let want = scalar(&v, max);
+            let rel = (got - want).abs() / want.abs().max(1e-30);
+            assert!(rel < 1e-3, "n={n}: simd {got} vs scalar {want} rel {rel:.2e}");
+        }
+        // All-masked (-inf, max=-inf) → sum exactly 0 (mask zeroes the NaN lanes).
+        assert_eq!(logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn argmax_idx_matches_scalar() {
+        // The AVX2 `argmax_idx` must return the SAME first-max index as the scalar loop in
+        // every case: SIMD body + <8 tail, ties (first index wins), -inf and NaN lanes
+        // (skipped exactly as scalar `>`), and empty/all-masked (index 0). This is the token
+        // selection (whisper greedy = argmax of raw logits) so it must be bit-for-bit.
+        fn scalar(l: &[f32]) -> usize {
+            let mut best_i = 0usize;
+            let mut best = f32::NEG_INFINITY;
+            for (i, &v) in l.iter().enumerate() {
+                if v > best {
+                    best = v;
+                    best_i = i;
+                }
+            }
+            best_i
+        }
+        let mut st = 0x0F0F_1234_DEAD_BEEFu64;
+        let mut nf = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            ((st >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 60.0
+        };
+        for &n in &[0usize, 1, 2, 7, 8, 9, 15, 16, 17, 31, 1000, 51866] {
+            let mut v: Vec<f32> = (0..n)
+                .map(|_| {
+                    let u = (nf() + 30.0) / 60.0; // back to [0,1)
+                    if u < 0.08 { f32::NEG_INFINITY } else { nf() }
+                })
+                .collect();
+            // Force a duplicate maximum to exercise the first-index tie-break.
+            if n >= 20 {
+                v[5] = 1000.0;
+                v[17] = 1000.0; // scalar keeps index 5 (first)
+            }
+            assert_eq!(argmax_idx(&v), scalar(&v), "n={n}");
+        }
+        // NaN lanes must be skipped exactly like scalar `>` (NaN > x is false).
+        let with_nan = vec![f32::NAN, -1.0, 3.0, f32::NAN, 2.0, 3.0, f32::NAN, 0.0, -5.0];
+        assert_eq!(argmax_idx(&with_nan), scalar(&with_nan)); // first 3.0 at index 2
+        // Empty and all-masked → 0 (matches scalar initial best_i).
+        assert_eq!(argmax_idx(&[]), 0);
+        assert_eq!(argmax_idx(&vec![f32::NEG_INFINITY; 20]), 0);
+    }
+
+    #[test]
     fn blank_and_eot_suppressed_at_step0() {
         let tk = synth_tokenizer();
         let cfg = base_cfg(&tk);
@@ -1891,6 +2266,41 @@ mod tests {
     }
 
     #[test]
+    fn text_confidence_finite_on_nan_plog() {
+        // A NaN token logprob must be skipped (not summed into the mean) and the
+        // clamp must never see NaN. `hello world` with a good and a NaN plog →
+        // confidence reflects only the finite plog and stays a finite [0, 1].
+        let tk = synth_tokenizer();
+        let tokens = vec![2i32, 3i32];
+        let plogs = vec![0.0f32, f32::NAN];
+        let conf = text_confidence(&tk, &tokens, &plogs).expect("finite text token present");
+        assert!(conf.is_finite(), "confidence must be finite, got {conf}");
+        assert!((0.0..=1.0).contains(&conf), "confidence in [0,1], got {conf}");
+        assert!((conf - 1.0).abs() < 1e-9, "only the finite plog (0.0) counts → exp(0)=1");
+
+        // Every text-token plog non-finite → all skipped → None (no NaN mean, no
+        // clamp panic).
+        assert!(text_confidence(&tk, &tokens, &[f32::NAN, f32::INFINITY]).is_none());
+    }
+
+    #[test]
+    fn compute_logprobs_finite_on_positive_inf_logit() {
+        // A `+inf` logit (activation overflow) must not manufacture NaN logprobs
+        // via `exp(+inf - +inf)`. The `+inf` lane is sanitized to a masked
+        // (`-inf`) lane; the finite lanes must still yield finite logprobs
+        // instead of a NaN-poisoned whole vector.
+        let lp = compute_logprobs(&[f32::INFINITY, 0.0, -1.0]);
+        assert!(lp[1].is_finite(), "logprob for finite logit 0.0 must be finite, got {}", lp[1]);
+        assert!(lp[2].is_finite(), "logprob for finite logit -1.0 must be finite, got {}", lp[2]);
+        assert!(!lp[1].is_nan() && !lp[2].is_nan(), "no NaN logprobs");
+
+        // A NaN logit is likewise neutralized (mapped to a masked lane) rather
+        // than poisoning the finite lanes.
+        let lp2 = compute_logprobs(&[f32::NAN, 0.0, -1.0]);
+        assert!(lp2[1].is_finite() && lp2[2].is_finite(), "NaN logit must not poison finite lanes");
+    }
+
+    #[test]
     fn segments_two_pairs() {
         let tk = synth_tokenizer();
         let beg = tk.timestamp_begin;
@@ -2096,6 +2506,15 @@ mod tests {
         let c = confidence(&[-2.0, -2.0]).unwrap();
         assert!(c > 0.0 && c < 1.0);
         assert!(confidence(&[]).is_none());
+    }
+
+    #[test]
+    fn confidence_finite_on_nan_plog() {
+        // A NaN plog makes the mean NaN; the guarded clamp must not panic on the
+        // current nightly and must degrade to a finite 0.0.
+        let c = confidence(&[f32::NAN, 0.0]).expect("non-empty plogs → Some");
+        assert!(c.is_finite(), "confidence must be finite on NaN input, got {c}");
+        assert_eq!(c, 0.0);
     }
 
     // -----------------------------------------------------------------------
