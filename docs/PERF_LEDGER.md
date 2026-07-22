@@ -4,6 +4,36 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — BLOCKED — router evidence Brier diagnostics materialization
+
+**Fresh candidate, no timed evidence.** After the streamed router-latency KEEP,
+both ledgers and recent history were searched for `avg_brier`, `brier_values`,
+and `RoutingEvidenceLedger::diagnostics`; no prior attempt exists. The proposed
+profile would measure the full 200-entry diagnostics snapshot and its historical
+`filter_map(...).collect::<Vec<f64>>()` Brier substage before considering any
+production edit. This is a separate evidence-ledger structure from the closed
+speculation-window Brier retry and does not satisfy that retry predicate.
+
+**RCH blocker.** No sample reached execution. Strict-remote job
+`j-29942429901652369` routed to `ovh-b`, which had already raised SIGILL in this
+turn's release benchmark build, so it was cancelled before repeating invalid
+worker evidence. Four-slot retry `j-29942429901652370` routed to
+`vmi1149989`, already occupied by another four-slot 29-minute build and known to
+the fleet as disk-pressure constrained, so it was cancelled before a noisy cold
+build. A six-slot request intended to select an idle worker was refused
+fail-closed with **`critical_pressure=1, insufficient_slots=8,
+hard_preflight=3`**; no local fallback ran. The profile-only harness was
+manually removed and `pipeline_bench.rs` again matches HEAD. Production was
+never edited.
+
+**Retry predicate.** Reopen only when RCH admits `pipeline_bench` to a
+non-critical, non-SIGILL worker with a reusable release cache and enough free
+slots to avoid sharing a saturated worker. Profile the complete 200-entry
+`diagnostics()` caller and the Brier materialization substage first. Consider a
+streamed sum/count candidate only if that substage is at least 10% of the
+measured caller; then require the standard 21-pair same-worker interleaved A/B,
+historical/historical null, candidate CV `<5%`, and exact serialized JSON bytes.
+
 ## 2026-07-22 — LANDED — streamed router latency aggregation (bd-kdg7.2)
 
 **Negative-ledger-first profile boundary.** Both ledgers and the recent Git log
