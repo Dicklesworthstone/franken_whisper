@@ -2089,7 +2089,8 @@ mod tests {
         let check = |w: &DecoderWeights, tag: &str| {
             let all = logits_all(w, &x).unwrap();
             for t in 0..tq {
-                let row = Mat::from_vec(1, N_STATE, x.data[t * N_STATE..(t + 1) * N_STATE].to_vec());
+                let row =
+                    Mat::from_vec(1, N_STATE, x.data[t * N_STATE..(t + 1) * N_STATE].to_vec());
                 let one = logits_last(w, &row).unwrap();
                 assert_eq!(
                     all[t * N_VOCAB..(t + 1) * N_VOCAB]

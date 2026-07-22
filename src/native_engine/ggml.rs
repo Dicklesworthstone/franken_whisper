@@ -979,7 +979,9 @@ impl<R: std::io::Read + std::io::Seek> StreamCursor<R> {
         if buf.len() > self.remaining() {
             return Err(self.eof(buf.len()));
         }
-        self.inner.read_exact(buf).map_err(|_| self.eof(buf.len()))?;
+        self.inner
+            .read_exact(buf)
+            .map_err(|_| self.eof(buf.len()))?;
         self.pos += buf.len();
         Ok(())
     }
@@ -1047,12 +1049,17 @@ mod tests {
         const OVER_MIN_PARALLEL: usize = 8 * 1024 * 1024 + 12_345;
         let dir = tempfile::tempdir().expect("tempdir");
         for (idx, &len) in [0usize, 1, 4096, OVER_MIN_PARALLEL].iter().enumerate() {
-            let bytes: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 3)) as u8).collect();
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(31) ^ (i >> 3)) as u8)
+                .collect();
             let path = dir.path().join(format!("blob_{idx}.bin"));
             std::fs::write(&path, &bytes).expect("write");
             let got = read_blob_parallel(&path).expect("read_blob_parallel");
             assert_eq!(got.len(), len, "length mismatch at len={len}");
-            assert_eq!(got, bytes, "content mismatch at len={len} (band-offset bug?)");
+            assert_eq!(
+                got, bytes,
+                "content mismatch at len={len} (band-offset bug?)"
+            );
             assert_eq!(
                 got,
                 std::fs::read(&path).expect("fs::read"),
@@ -1381,15 +1388,18 @@ mod tests {
             eprintln!("SKIP streamed_dir_matches_resident: ggml-tiny.en.bin not found");
             return;
         };
-        let resident =
-            GgmlModel::parse(read_blob_parallel(&path).expect("read blob")).expect("resident parse");
+        let resident = GgmlModel::parse(read_blob_parallel(&path).expect("read blob"))
+            .expect("resident parse");
         let streamed = GgmlModel::load_streamed(&path).expect("streamed parse");
 
         // Header / filterbank / vocab identical.
         assert_eq!(resident.hparams, streamed.hparams, "hparams differ");
         assert_eq!(resident.filters.n_mel, streamed.filters.n_mel);
         assert_eq!(resident.filters.n_fft_bins, streamed.filters.n_fft_bins);
-        assert_eq!(resident.filters.data, streamed.filters.data, "mel data differ");
+        assert_eq!(
+            resident.filters.data, streamed.filters.data,
+            "mel data differ"
+        );
         assert_eq!(resident.vocab_tokens, streamed.vocab_tokens, "vocab differ");
 
         // Tensor directory identical (names, offsets, lengths, shapes, dtype).
@@ -1424,7 +1434,11 @@ mod tests {
             let sb = streamed
                 .tensor_raw(name, &streamed.tensors[*name])
                 .expect("streamed raw");
-            assert_eq!(rb.as_ref(), sb.as_ref(), "payload bytes differ for '{name}'");
+            assert_eq!(
+                rb.as_ref(),
+                sb.as_ref(),
+                "payload bytes differ for '{name}'"
+            );
         }
     }
 

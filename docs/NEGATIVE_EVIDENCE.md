@@ -4,6 +4,30 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - WhiteCreek: **WIP EVALUATION (bd-frp7) — the prior swarm's 6 uncommitted `src/native_engine/` edits (decoder/dtw/encoder/ggml/nn/weights) are a PURE `cargo fmt` normalization; landed as-is with a token-identity proof, no re-verification needed.**
+
+**Evaluation method (no build):** for each of the 6 modified files, `git show
+HEAD:<file>` and the working-tree copy were both run through
+`rustfmt --edition 2024` and byte-compared. **All 6 canonical outputs are
+IDENTICAL** (dtw/encoder/nn additionally differ pre-canonicalization only by
+rustfmt-inserted trailing commas; decoder/ggml/weights are identical modulo
+whitespace alone). Therefore the WIP contains **zero semantic change** — same
+token stream, same compile/test behavior as HEAD, which is already
+compile-verified (300a8a9: d702273 verified clean post asupersync-0.3.9 bump).
+No canned phrases, no logic, nothing to A/B: this was the tail of the tree's
+long-standing repo-wide uncommitted `cargo fmt` (see the 1caba18/2026-07-12
+entry noting decode.rs's slice of the same sweep). Landed verbatim per the
+"treat prior WIP as your own, never revert" directive.
+
+**Residual fmt-dirt (NOT touched, honestly scoped):** tree-wide
+`cargo fmt --check` still fails on ~30 committed files outside my lane
+(`benches/*`, `examples/*_probe.rs`, `src/sync.rs`, `src/orchestrator.rs`,
+`src/backend/mod.rs`, `src/streaming.rs`, `src/export.rs`, `src/tty_audio.rs`).
+`src/backend/mod.rs`/`src/streaming.rs` are perf-active in another agent's lane
+(router/streaming); formatting them from this seat risks tramping live WIP.
+This commit strictly reduces fmt-dirt; the `src/native_engine/` slice is now
+clean.
+
 ## 2026-07-16 - BlackThrush: **KEEP — consuming terminal CLI arguments removes redundant request-builder clones; 3.8283x on fully populated short requests with a 1.0237x BASE/BASE null (bd-nxeg).**
 
 **Negative-ledger-first fresh pivot and profile first.** `bv --robot-triage`

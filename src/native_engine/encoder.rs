@@ -297,7 +297,10 @@ fn load_linear_maybe_i7(
         }
         // f32-stored fallback (no f16 bytes): materialize, quantize, drop.
         let w = load_linear_transposed(model, name, out_dim, in_dim)?;
-        return Ok((Mat::from_vec(0, 0, Vec::new()), Some(nn::quantize_mat_to_i7(&w))));
+        return Ok((
+            Mat::from_vec(0, 0, Vec::new()),
+            Some(nn::quantize_mat_to_i7(&w)),
+        ));
     }
     let w = load_linear_transposed(model, name, out_dim, in_dim)?;
     if !to_i7 {
@@ -507,20 +510,55 @@ impl EncoderWeights {
         // post-load pass applied (see the flag docs at each `enc_linear` call site).
         let plan = if super::enc_int8_enabled() {
             // FRANKEN_WHISPER_ENC_INT8: every linear i7.
-            EncQuantPlan { q: true, k: true, v: true, out: OutQuant::I7, fc: true, proj: true }
+            EncQuantPlan {
+                q: true,
+                k: true,
+                v: true,
+                out: OutQuant::I7,
+                fc: true,
+                proj: true,
+            }
         } else if super::enc_int8_attn_in() {
             // FW_ENC_INT8_ATTN_IN: q/k/v/fc1 i7, attn_out + fc2 stay f32.
-            EncQuantPlan { q: true, k: true, v: true, out: OutQuant::F32, fc: true, proj: false }
+            EncQuantPlan {
+                q: true,
+                k: true,
+                v: true,
+                out: OutQuant::F32,
+                fc: true,
+                proj: false,
+            }
         } else if super::enc_attn_out_i8i32_for(&model.hparams) {
             // Default quality-safe int8 for calibrated models: q/k/v/fc1/fc2 i7,
             // residual-feeding attn_out through the full-i8 i32-accumulate GEMM.
-            EncQuantPlan { q: true, k: true, v: true, out: OutQuant::I8, fc: true, proj: true }
+            EncQuantPlan {
+                q: true,
+                k: true,
+                v: true,
+                out: OutQuant::I8,
+                fc: true,
+                proj: true,
+            }
         } else if super::enc_int8_fc1_only() {
             // FW_ENC_INT8_FC1: fc1 only (GELU absorbs the quant error).
-            EncQuantPlan { q: false, k: false, v: false, out: OutQuant::F32, fc: true, proj: false }
+            EncQuantPlan {
+                q: false,
+                k: false,
+                v: false,
+                out: OutQuant::F32,
+                fc: true,
+                proj: false,
+            }
         } else {
             // No int8: all f32, byte-identical to the pre-lever encoder.
-            EncQuantPlan { q: false, k: false, v: false, out: OutQuant::F32, fc: false, proj: false }
+            EncQuantPlan {
+                q: false,
+                k: false,
+                v: false,
+                out: OutQuant::F32,
+                fc: false,
+                proj: false,
+            }
         };
 
         // Fan the per-layer weight build across the ambient rayon pool. The load
@@ -533,14 +571,29 @@ impl EncoderWeights {
             .map(|i| -> FwResult<EncoderLayer> {
                 let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
                 let (attn_q_w, attn_q_i7) = load_linear_maybe_i7(
-                    model, &p("attn.query.weight"), n_state, n_state, plan.q, free_f32_now,
+                    model,
+                    &p("attn.query.weight"),
+                    n_state,
+                    n_state,
+                    plan.q,
+                    free_f32_now,
                 )?;
                 // whisper key projection has NO bias.
                 let (attn_k_w, attn_k_i7) = load_linear_maybe_i7(
-                    model, &p("attn.key.weight"), n_state, n_state, plan.k, free_f32_now,
+                    model,
+                    &p("attn.key.weight"),
+                    n_state,
+                    n_state,
+                    plan.k,
+                    free_f32_now,
                 )?;
                 let (attn_v_w, attn_v_i7) = load_linear_maybe_i7(
-                    model, &p("attn.value.weight"), n_state, n_state, plan.v, free_f32_now,
+                    model,
+                    &p("attn.value.weight"),
+                    n_state,
+                    n_state,
+                    plan.v,
+                    free_f32_now,
                 )?;
                 let (attn_out_w, attn_out_i7, attn_out_i8) = match plan.out {
                     OutQuant::F32 => (
@@ -550,22 +603,41 @@ impl EncoderWeights {
                     ),
                     OutQuant::I7 => {
                         let (w, i7) = load_linear_maybe_i7(
-                            model, &p("attn.out.weight"), n_state, n_state, true, free_f32_now,
+                            model,
+                            &p("attn.out.weight"),
+                            n_state,
+                            n_state,
+                            true,
+                            free_f32_now,
                         )?;
                         (w, i7, None)
                     }
                     OutQuant::I8 => {
                         let (w, i8) = load_linear_i8_direct(
-                            model, &p("attn.out.weight"), n_state, n_state, free_f32_now,
+                            model,
+                            &p("attn.out.weight"),
+                            n_state,
+                            n_state,
+                            free_f32_now,
                         )?;
                         (w, None, Some(i8))
                     }
                 };
                 let (mlp_fc_w, mlp_fc_i7) = load_linear_maybe_i7(
-                    model, &p("mlp.0.weight"), mlp_hidden, n_state, plan.fc, free_f32_now,
+                    model,
+                    &p("mlp.0.weight"),
+                    mlp_hidden,
+                    n_state,
+                    plan.fc,
+                    free_f32_now,
                 )?;
                 let (mlp_proj_w, mlp_proj_i7) = load_linear_maybe_i7(
-                    model, &p("mlp.2.weight"), n_state, mlp_hidden, plan.proj, free_f32_now,
+                    model,
+                    &p("mlp.2.weight"),
+                    n_state,
+                    mlp_hidden,
+                    plan.proj,
+                    free_f32_now,
                 )?;
                 Ok(EncoderLayer {
                     attn_ln_w: load_vec(model, &p("attn_ln.weight"), n_state)?,
@@ -1278,7 +1350,11 @@ struct EncI8Mat {
 /// f32 comes from (a pre-transposed `[in, out]` `Mat`, or the raw ggml `[out, in]`
 /// f16 bytes read directly). `weight` is monomorphized ⇒ inlined. Single source of
 /// the i8 quant math (mirrors [`nn::quantize_rows_to_i7`]).
-fn quantize_enc_i8_rows(out: usize, inp: usize, weight: impl Fn(usize, usize) -> f32 + Sync) -> EncI8Mat {
+fn quantize_enc_i8_rows(
+    out: usize,
+    inp: usize,
+    weight: impl Fn(usize, usize) -> f32 + Sync,
+) -> EncI8Mat {
     let mut data = vec![0i8; out * inp];
     let mut scale = vec![0.0f32; out];
     data.par_chunks_mut(inp)
@@ -2197,7 +2273,11 @@ mod tests {
             let b = quantize_enc_i8_f16_bytes(&raw, out, inp);
             assert_eq!(a.data, b.data, "i8 data mismatch at {out}x{inp}");
             assert_eq!(a.scale, b.scale, "i8 scale mismatch at {out}x{inp}");
-            assert_eq!((a.out, a.inp), (b.out, b.inp), "i8 dims mismatch at {out}x{inp}");
+            assert_eq!(
+                (a.out, a.inp),
+                (b.out, b.inp),
+                "i8 dims mismatch at {out}x{inp}"
+            );
         }
     }
 
