@@ -116,13 +116,57 @@ binary's native_engine filter. So the naive suspects are all clean — the
 sensitivity hides deeper (nested parallelism inside gemv/sgemm kernels, or a
 load-adaptive split somewhere in the encoder path feeding cross-K/V).
 
-**NEXT (recorded so the bisection resumes, not restarts):** with the canonical
-reproducer, run 4-rep kill-switch arms and attribute per-test: `FW_CROSS_F16=0`
-(cross-attn kernel flip — in flight this session), `FW_ATTN_NO_SDPA=1` (encoder
-fused SDPA off), `FW_SDPA_GATHER_CHUNKS=0`, `FW_GEMV_I8_PAR` variants, and a
-stage-level bit-compare probe (mel×2 / encoder×2 / record×2) if the env arms
-don't isolate it. ~50% base rate ⇒ 4 clean reps ≈ P 6% false-negative; extend
-any clean arm before believing it.
+**KILL-SWITCH ARMS (same session, 4 reps each on disjoint 4-core masks, run
+concurrently — box load higher than the solo baseline, so compare PERSISTENCE
+not rates): ALL THREE EXONERATED — the flake survives every numeric-path swap:**
+- `FW_CROSS_F16=0` (cross-attn f16/i8 kernels → f32 matmul path): **4/4 failed**
+  (+1 foreground rep = 5/5). The decode/record cross-attn kernel choice is NOT
+  the source.
+- `FW_ATTN_NO_SDPA=1` (encoder fused SDPA off): **3/4 failed.** Fused SDPA is
+  NOT the source.
+- `FW_SDPA_GATHER_CHUNKS=0` (legacy per-op chunking): **3/4 failed.** Reshape
+  chunking is NOT the source.
+
+Combined with `FW_DECODE_ZEROINIT` (uninit) already exonerated: the divergence
+survives every accessible kernel-path flip.
+
+**STAGE PROBE RESULTS (same session) — the engine keeps proving bit-stable
+outside the full suite; the trigger is the full suite's SPECIFIC in-process
+sibling mix, nothing weaker:**
+- `bd_0ivd_stage_determinism_probe` (#[ignore] tool in decode.rs tests; built +
+  run from a sibling worktree at HEAD because the shared tree's uncommitted
+  backend/mod.rs WIP wouldn't compile): mel×2 / encoder×2 / full transcribe×2
+  bit-compared per iteration under `taskset -c 0-3`.
+  - With 3 generic rayon-busywork sibling threads: **5/5 iterations bit-stable.**
+  - With 2 sibling threads running REAL tiny.en encoder forwards (shared pool +
+    allocator + kernels): **3/3 bit-stable** (499 s run).
+- Cross-process retest WITH core scarcity (full suite looping on the SAME
+  `taskset -c 0-3` mask as the test process): **0/6** — closes the last
+  cross-process configuration; same-process-full-suite-only is CONFIRMED.
+- Second static sweep: every par site adjacent to a reduction in
+  nn/encoder/mel/decoder is a serial fold INSIDE a disjoint per-row closure —
+  deterministic. No demand-split parallel float reduction exists in-engine.
+
+**LANDED THIS INCREMENT:** (1) the probe tool (permanent, `--ignored`);
+(2) `gated_e2e_dtw_word_timestamps_deterministic` is now SELF-DIAGNOSING — on
+divergence it runs a tie-break third transcribe and prints which side was the
+outlier + max |Δt|, so every future CI flake yields evidence for free;
+(3) **secondary flap ROOT-CAUSED + FIXED**: `ModelCache::resident` is a
+deliberate SINGLE global slot; the two resident-slot unit tests evicted each
+other under concurrent scheduling (`drop(a)` → sibling resident load → `weak
+.upgrade()` gone). Engine correct, tests now serialize on a shared
+`RESIDENT_SLOT_TEST_LOCK` (verified 3×4/4 green).
+
+**STATE: primary flake still un-root-caused but tightly cornered** — it needs
+the full suite's own sibling tests in-process (suspects the probe can't yet
+mimic: the 1.5 GB large-v3-turbo load tests' page/allocator pressure, or a
+test-only shared structure). The self-diagnosing test is the tripwire: next
+in-suite failure reports outlier-side + magnitude. NOT a production-reachable
+defect so far as measured — production runs one transcribe per process-window,
+and every direct reproduction attempt outside the test harness is bit-stable.
+(Local-nightly note: clippy on rustc 1.99.0-nightly 2026-07-21 introduces ~34
+NEW lints on pre-existing code (doc-indent, LOG2_E, collapsible-if…) — fleet
+rch clippy is the green gate; don't chase local-nightly drift mid-cycle.)
 
 ## 2026-07-22 - WhiteCreek: **KEEP (increment on 42f77b1, same gate, byte-exact-by-construction) — entropy repetition gate for `FW_TEMP_FALLBACK`: whisper.cpp `entropy_thold` (2.4) ported faithfully; degenerate low-entropy tails now trigger the ladder. Zero spurious firing on real speech (gate-ON old-vs-new binaries byte-identical on track01 AND jfk).**
 
