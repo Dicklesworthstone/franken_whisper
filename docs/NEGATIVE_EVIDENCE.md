@@ -4,6 +4,60 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - cod: **LAND STRUCTURAL / BENCH-FREE (not a perf KEEP) — borrow the configured quality-model name during speculative correction, removing one `String` clone per window (bd-oacy).**
+
+Both performance ledgers and recent history were searched first for
+`quality_model_name.clone`, model-name ownership, and
+`submit_quality_result`; the only source occurrence was the untouched initial
+implementation. This is a fresh ownership-transfer sibling, not a retry of the
+closed quality-segment handoff or transcript-concatenation levers. The
+alien-graveyard primitive is narrow-interface ownership/borrowing: the
+speculative loop's immutable config already owns the quality model name, while
+the tracker accepts `&str` and needs ownership only when it creates a correction
+event.
+
+Historically every processed window cloned the configured `String` before any
+model work, then passed a borrow of that temporary into the tracker. The loop
+now borrows `self.config.quality_model_name` directly. This removes exactly one
+`String::clone` call per window; for a non-empty `N`-byte model name that is one
+heap allocation plus `N` copied bytes. Confirmation keeps no model-name copy in
+either implementation. Correction still performs its one required `to_owned`
+inside `CorrectionEvent`, so event ownership is unchanged.
+
+Behavior is isomorphic by ownership and field separation: the config is not
+mutated during `process_window_by_id`; the tracker observes the same UTF-8
+bytes; correction records still own the same model ID; confirm/correct payloads,
+timestamps, state transitions, statistics, window contents, and fallback paths
+are untouched. The first strict-remote admission audit selected `ovh-a`, synced
+all 57 dependency roots, then stopped before Cargo with **RCH-E410** because
+`frankensqlite/crates/fsqlite/tests/agg_in_list_composite_prefix_oracle.rs` was
+still declared but absent on the worker. That entrypoint appeared while this
+lever was in progress. A post-edit attempt reached Cargo on `ovh-b` but SIGILLed
+in the `zerocopy` build script and was discarded as invalid worker evidence.
+
+The pinned non-SIGILL retry on `ovh-a` passed strict-remote
+`cargo check --lib -j2` in **2m22s** with three unrelated warnings. The same
+worker then ran `cargo test --lib -j2 streaming::tests::`: **74 passed, 0
+failed, 1 ignored**, with 3,298 filtered out; the test body finished in 0.22s.
+This covers confirm and correction decisions, exact quality-model IDs in event
+payloads, state/statistics, event sequencing, and duration-loop behavior.
+`rustfmt --check` reported one pre-existing wrapping hunk at line 221 outside
+this change; `git diff --check` passed. A local UBS invocation was
+non-admissible because it unexpectedly launched `cargo audit`/`cargo deny`
+despite the requested skips; it is excluded from all evidence. No local build,
+test, or benchmark ran. There are still **0** criterion samples, A/B pairs,
+null pairs, or CV values.
+
+**No timing claim / concrete retry condition:** this structural land is not a
+KEEP. Profile the model-free speculative window orchestration after RCH admits
+the dependency closure; only promote it if model-name cloning is at least 10%
+of that caller and `pipeline_bench` supplies 21 same-worker alternating
+clone/borrow pairs plus clone/clone null, exact serialized events and tracker
+state, candidate CV `<5%`, at least 18/21 wins, null median in `[0.95, 1.05]`,
+and candidate p10 above `max(null p90, 1.10)`. The exact ownership removal is
+closed unless the configured name later needs independent mutation during a
+window.
+
 ## 2026-07-22 - cod: **LAND STRUCTURAL / BENCH-FREE (not a perf KEEP) — move the router failure string after trace emission, eliminating one allocation and byte copy per failed backend (bd-kdg7.5).**
 
 Both performance ledgers and recent history were searched first for

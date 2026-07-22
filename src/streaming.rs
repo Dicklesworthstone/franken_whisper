@@ -159,7 +159,6 @@ impl SpeculativeStreamingPipeline {
         Q: FnOnce() -> Vec<TranscriptionSegment> + Send + 'static,
     {
         let seq = self.next_seq();
-        let quality_model_name = self.config.quality_model_name.clone();
 
         let executor = ConcurrentTwoLaneExecutor::new(QualitySelector::SpeculativeCorrect);
 
@@ -233,7 +232,7 @@ impl SpeculativeStreamingPipeline {
         // Submit to correction tracker.
         let decision = self.correction_tracker.submit_quality_result(
             window_id,
-            &quality_model_name,
+            &self.config.quality_model_name,
             quality_segments,
             result.secondary_latency_ms,
         )?;

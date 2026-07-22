@@ -4,6 +4,54 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — LANDED STRUCTURAL / UNMEASURED — borrow speculative quality-model name (bd-oacy)
+
+**Classification and freshness.** This is a bench-free ownership land after a
+fresh strict-remote retry of the adaptive loss hoist hit its recorded RCH-E410
+predicate again. It is deliberately **not a performance KEEP**. Exact searches
+of both ledgers and recent history for `quality_model_name.clone`, model-name
+ownership, and `submit_quality_result` found no prior attempt; the source clone
+was unchanged since the initial implementation. The closed quality-segment
+handoff and transcript-concatenation rows are different data paths.
+
+**One allocation removed per speculative window.** `process_window_by_id`
+historically cloned the immutable configured quality-model `String` and used
+only `&quality_model_name` in one tracker call. It now passes
+`&self.config.quality_model_name` directly. Every window therefore removes one
+`String::clone`; for a non-empty `N`-byte name this is one heap allocation plus
+`N` copied bytes. Corrections retain the tracker's necessary `to_owned` when
+constructing `CorrectionEvent`; confirmations retain no model-name copy.
+
+**Behavior isomorphism and remote gates.** The config is unchanged throughout
+the call, Rust borrows disjoint config/tracker fields, and the tracker receives
+the same UTF-8 bytes. Correction ownership, event JSON, timestamps, state
+transitions, statistics, window contents, and fallback behavior are unchanged.
+The first strict-remote `cargo check --lib -j2` audit stopped before Cargo with
+**RCH-E410** because the declared frankensqlite test entrypoint
+`agg_in_list_composite_prefix_oracle.rs` was absent. It appeared during this
+lever. A post-edit `ovh-b` attempt then reached Cargo but SIGILLed in
+`zerocopy`'s build script and was discarded as invalid worker evidence.
+
+Pinned non-SIGILL `ovh-a` passed strict-remote `cargo check --lib -j2` in
+**2m22s** (three unrelated warnings) and then ran the full streaming test
+module: **74 passed, 0 failed, 1 ignored**, 3,298 filtered; test execution took
+0.22s. Confirm/correct outcomes, exact quality-model IDs in event payloads,
+state/statistics, event ordering, and duration-loop behavior all passed.
+`git diff --check` passed; `rustfmt --check` stopped on one pre-existing wrap at
+line 221 outside the change. UBS is excluded because its local invocation
+unexpectedly launched `cargo audit`/`cargo deny` despite skip flags. No local
+build, test, or benchmark ran. No criterion sample, A/B pair, null pair, or CV
+exists, so the classification remains structural/unmeasured.
+
+**Measurement promotion predicate.** Do not cite this row as timed evidence.
+After the RCH dependency closure admits, profile model-free speculative window
+orchestration and proceed only if this clone is at least 10% of the caller. A
+timed KEEP additionally requires 21 same-worker alternating clone/borrow pairs,
+21 clone/clone null pairs, exact serialized event and tracker-state parity,
+candidate CV `<5%`, at least 18/21 wins, null median in `[0.95, 1.05]`, and p10
+above `max(null p90, 1.10)`. The ownership removal itself is closed unless the
+configured name later requires independent per-window mutation.
+
 ## 2026-07-22 — LANDED STRUCTURAL / UNMEASURED — move router failure string after trace (bd-kdg7.5)
 
 **Classification.** This is the operator-requested bench-free follow-on after
