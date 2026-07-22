@@ -500,11 +500,48 @@ const TEMP_FALLBACK_LADDER: [f64; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
 /// exactly the recovery that fixes the bd-r0qd carried-prompt × int8 early-EOT drop.
 const TEMP_PROMPT_RESET: f64 = 0.5;
 
+/// whisper.cpp `entropy_thold` (default 2.4, "similar to OpenAI's
+/// compression_ratio_threshold"): a window whose result-token tail is this
+/// repetitive is a degenerate loop and fails the quality gate.
+const ENTROPY_THRESHOLD: f64 = 2.4;
+
+/// The entropy tail length (whisper.cpp 6599: the last 32 result tokens). The
+/// check only fires when `result_len > ENTROPY_WINDOW` (whisper.cpp 7540 uses
+/// strict `>`), so short windows — naturally low-entropy — are never judged.
+const ENTROPY_WINDOW: usize = 32;
+
+/// Shannon entropy (nats) of the token-id distribution over the last
+/// [`ENTROPY_WINDOW`] entries of `tokens` — a faithful port of the whisper.cpp
+/// sequence-entropy block (whisper.cpp 6597-6617): count each distinct id in the
+/// tail (timestamp tokens included, exactly as upstream), then `-Σ p·ln p`. A
+/// uniformly repeated tail scores 0.0; 32 distinct tokens score `ln 32 ≈ 3.47`.
+fn token_tail_entropy(tokens: &[i32]) -> f64 {
+    let tail = &tokens[tokens.len().saturating_sub(ENTROPY_WINDOW)..];
+    if tail.is_empty() {
+        return 0.0;
+    }
+    let mut counts: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+    for &t in tail {
+        *counts.entry(t).or_insert(0) += 1;
+    }
+    let n = tail.len() as f64;
+    counts
+        .values()
+        .map(|&c| {
+            let p = f64::from(c) / n;
+            -p * p.ln()
+        })
+        .sum()
+}
+
 /// `FW_TEMP_FALLBACK` (default-OFF): whisper.cpp-faithful temperature fallback —
 /// the bd-r0qd fix-spec's "proper fix" (#3) and the fallback half of bd-6goy. A
-/// non-silent window that either closes no timestamp (`result_len == 0`, the
-/// confirmed long-form drop) or averages below [`LOGPROB_THRESHOLD`] (whisper.cpp
-/// `logprob_thold`) is re-decoded at the [`TEMP_FALLBACK_LADDER`] temperatures —
+/// non-silent window that closes no timestamp (`result_len == 0`, the confirmed
+/// long-form drop), averages below [`LOGPROB_THRESHOLD`] (whisper.cpp
+/// `logprob_thold`), or loops into a low-entropy repetitive tail
+/// ([`ENTROPY_THRESHOLD`], whisper.cpp `entropy_thold`, checked only when
+/// `result_len > `[`ENTROPY_WINDOW`]) is re-decoded at the
+/// [`TEMP_FALLBACK_LADDER`] temperatures —
 /// multinomial sampling instead of argmax, deterministic per-(window, attempt)
 /// seed, prompt dropped above [`TEMP_PROMPT_RESET`] — reusing the window's encode.
 /// The first attempt that clears the gate wins; the final rung is accepted as-is
@@ -1617,13 +1654,30 @@ pub fn transcribe_samples(
 
             // FW_TEMP_FALLBACK (default-off, bd-6goy / bd-r0qd fix-spec #3): the
             // whisper.cpp fallback ladder. A non-silent window that closed no
-            // timestamp OR averaged below the logprob threshold re-decodes this SAME
-            // seek at the next ladder temperature, reusing the stashed encode. The
-            // ladder is finite, so this cannot loop; the final rung's decode is
-            // accepted as-is below (whisper.cpp keeps its last decode too). Unset ⇒
-            // never fires ⇒ byte-exact.
-            let quality_failed =
-                !is_no_speech && (result_len == 0 || avg_logprob < LOGPROB_THRESHOLD);
+            // timestamp, averaged below the logprob threshold, or looped into a
+            // low-entropy repetitive tail (whisper.cpp entropy_thold, 7540)
+            // re-decodes this SAME seek at the next ladder temperature, reusing the
+            // stashed encode. The ladder is finite, so this cannot loop; the final
+            // rung's decode is accepted as-is below (whisper.cpp keeps its last
+            // decode too). Unset ⇒ never fires ⇒ byte-exact.
+            //
+            // The entropy tail is taken over the result slice like upstream
+            // (`sequence.tokens.resize(result_len)` precedes the score). Minor
+            // divergence: in no_ts our result_len includes the terminal EOT; one
+            // unique id in a 33+-token tail moves the entropy negligibly.
+            let tail_entropy = {
+                let take = result_len.min(decoded.len());
+                // Only priced when the gate is on: the default path never counts.
+                if temp_fallback_enabled() && take > ENTROPY_WINDOW {
+                    Some(token_tail_entropy(&decoded[..take]))
+                } else {
+                    None
+                }
+            };
+            let quality_failed = !is_no_speech
+                && (result_len == 0
+                    || avg_logprob < LOGPROB_THRESHOLD
+                    || tail_entropy.is_some_and(|e| e < ENTROPY_THRESHOLD));
             if temp_fallback_enabled()
                 && quality_failed
                 && temp_attempt < TEMP_FALLBACK_LADDER.len()
@@ -1635,6 +1689,7 @@ pub fn transcribe_samples(
                     seek_sec = seek_cs as f64 / 100.0,
                     avg_logprob,
                     result_len,
+                    tail_entropy = tail_entropy.unwrap_or(f64::NAN),
                     retry_temperature = window_temp,
                     "window failed the quality gate — temperature-fallback retry"
                 );
@@ -2430,6 +2485,35 @@ mod tests {
             assert_eq!(tok, best);
             assert_eq!(plog.to_bits(), best_plog.to_bits());
         }
+    }
+
+    #[test]
+    fn token_tail_entropy_matches_whisper_cpp_reference() {
+        // Faithful to whisper.cpp 6597-6617: Shannon entropy (nats) over the
+        // token-id counts of the LAST 32 entries only.
+        // Uniformly repeated tail → 0.0 (degenerate loop, the entropy_thold case).
+        assert_eq!(token_tail_entropy(&vec![7i32; 40]), 0.0);
+        // 32 distinct ids → ln 32 (maximum for the window).
+        let distinct: Vec<i32> = (0..32).collect();
+        assert!((token_tail_entropy(&distinct) - 32f64.ln()).abs() < 1e-12);
+        // Two ids at 16/16 in the tail → ln 2, and the prefix must be IGNORED:
+        // 100 leading distinct ids change nothing.
+        let mut two_id: Vec<i32> = (1000..1100).collect();
+        two_id.extend(std::iter::repeat_n(1, 16));
+        two_id.extend(std::iter::repeat_n(2, 16));
+        assert!((token_tail_entropy(&two_id) - 2f64.ln()).abs() < 1e-12);
+        // Hand-computed mixed case: tail of 24×A + 8×B over 32 →
+        // -(0.75 ln 0.75 + 0.25 ln 0.25).
+        let mut mixed = vec![5i32; 24];
+        mixed.extend(std::iter::repeat_n(9, 8));
+        let expect = -(0.75f64 * 0.75f64.ln() + 0.25f64 * 0.25f64.ln());
+        assert!((token_tail_entropy(&mixed) - expect).abs() < 1e-12);
+        // Threshold calibration sanity (wc defaults): a fully repetitive tail is
+        // far below 2.4; a fully diverse tail is above it.
+        assert!(token_tail_entropy(&vec![7i32; 33]) < ENTROPY_THRESHOLD);
+        assert!(token_tail_entropy(&distinct) > ENTROPY_THRESHOLD);
+        // Empty input is defined (0.0), matching "no evidence of a loop".
+        assert_eq!(token_tail_entropy(&[]), 0.0);
     }
 
     #[test]
