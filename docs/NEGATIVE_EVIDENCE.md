@@ -4,6 +4,36 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - cod: **LAND STRUCTURAL / BENCH-FREE (not a perf KEEP) — move the router failure string after trace emission, eliminating one allocation and byte copy per failed backend (bd-kdg7.5).**
+
+Both performance ledgers and recent history were searched first for
+`update_router_state`, `error_message.clone`, and routing-outcome ownership;
+the lever was fresh. The function already owns `Option<String>` but cloned a
+present error into `RoutingOutcomeRecord` solely because the trace macro still
+borrowed the input. It now captures the RFC3339 timestamp at the same point,
+lets tracing borrow the input, then moves that input into the record. For an
+`N`-byte failure string the work change is exact: **1 heap allocation + N copied
+bytes → 0** inside this boundary. `None` remains allocation-free.
+
+This is behavior-isomorphic by ownership: trace fields and bytes are identical;
+the record receives the same string bytes; timestamp remains captured before
+trace emission; lock, eviction, and evidence serialization are untouched. A
+new oracle drives the public update path and checks the one failure sample,
+zero success count/latency bits, and exact last-error bytes. Strict-remote
+`cargo check --lib` passed on `ovh-a` in **1m37s**. The focused two-slot test
+was admitted remotely but concurrent frankensqlite API-migration WIP failed
+first with **13** unrelated trait/type errors, so the oracle has no execution
+verdict yet. RCH refused remote-required `cargo fmt --check` with `RCH-E301`
+because it classifies fmt as non-compilation; no local Cargo fallback ran.
+
+**No timing claim / retry condition:** this is not a KEEP under the measured
+policy. Only add a timed verdict when a realistic failure-heavy profile makes
+outcome materialization at least 10% of the caller and `pipeline_bench` supplies
+21 same-worker alternating A/B and null pairs, candidate CV `<5%`, at least
+18/21 wins, and candidate p10 above `max(null p90, 1.10)`. Re-run the focused
+oracle when frankensqlite compiles; the exact allocation removal is otherwise
+closed unless trace and record later need independent string ownership.
+
 ## 2026-07-22 - cod: **BLOCKED / NO VERDICT — adaptive router loss-matrix base-loss hoist has a measured 9-to-3 work reduction, but RCH-E410 prevented every A/B sample; source restored (bd-kdg7.4).**
 
 Mandatory ledger and recent-log searches found no previous

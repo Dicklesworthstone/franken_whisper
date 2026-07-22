@@ -695,13 +695,9 @@ pub fn update_router_state(
     latency_ms: u64,
     error_message: Option<String>,
 ) {
-    let record = RoutingOutcomeRecord {
-        backend,
-        success,
-        latency_ms,
-        error_message: error_message.clone(),
-        recorded_at_rfc3339: Utc::now().to_rfc3339(),
-    };
+    // Preserve the historical timestamp-before-trace ordering while retaining
+    // ownership of the error string until the trace subscriber has borrowed it.
+    let recorded_at_rfc3339 = Utc::now().to_rfc3339();
 
     // Emit the evidence ledger entry via tracing.
     tracing::info!(
@@ -713,6 +709,14 @@ pub fn update_router_state(
         error_message = error_message.as_deref().unwrap_or(""),
         "routing outcome recorded"
     );
+
+    let record = RoutingOutcomeRecord {
+        backend,
+        success,
+        latency_ms,
+        error_message,
+        recorded_at_rfc3339,
+    };
 
     if let Ok(mut guard) = ROUTER_STATE.lock() {
         let state = guard.get_or_insert_with(RouterState::new);
@@ -4150,7 +4154,7 @@ mod tests {
         posterior_success_probability, prior_for, probe_system_health,
         probe_system_health_uncached, quality_proxy, runtime_metadata,
         runtime_metadata_with_implementation, sanitize_timestamp, segment_end, segment_start,
-        static_fallback_selection_outcome, transcript_from_segments,
+        static_fallback_selection_outcome, transcript_from_segments, update_router_state,
     };
     use crate::conformance::NativeEngineRolloutStage;
     use crate::model::{
@@ -7446,6 +7450,35 @@ mod tests {
         assert!(!parsed.success);
         assert_eq!(parsed.latency_ms, 500);
         assert!(parsed.error_message.is_some());
+    }
+
+    #[test]
+    fn update_router_state_retains_failure_message_after_trace_borrow() {
+        let _guard = ROUTER_STATE_TEST_MUTEX
+            .lock()
+            .expect("router state test lock");
+        if let Ok(mut state) = super::ROUTER_STATE.lock() {
+            *state = None;
+        }
+
+        let expected = "backend failed after emitting structured trace";
+        update_router_state(
+            BackendKind::WhisperDiarization,
+            false,
+            1_234,
+            Some(expected.to_owned()),
+        );
+
+        let state = super::router_state_snapshot().expect("router state should exist");
+        let metrics = state.metrics_for(BackendKind::WhisperDiarization);
+        assert_eq!(metrics.sample_count, 1);
+        assert_eq!(metrics.success_count, 0);
+        assert_eq!(metrics.avg_latency_ms.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(metrics.last_error.as_deref(), Some(expected));
+
+        if let Ok(mut state) = super::ROUTER_STATE.lock() {
+            *state = None;
+        }
     }
 
     // -- RouterState serialization --
