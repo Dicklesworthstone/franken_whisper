@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - WhiteCreek: **KEEP (increment on 42f77b1, same gate, byte-exact-by-construction) — entropy repetition gate for `FW_TEMP_FALLBACK`: whisper.cpp `entropy_thold` (2.4) ported faithfully; degenerate low-entropy tails now trigger the ladder. Zero spurious firing on real speech (gate-ON old-vs-new binaries byte-identical on track01 AND jfk).**
+
+**What landed (decode.rs only):** the ladder's failure detector gains whisper.cpp's
+third signal — Shannon entropy (nats) over the token-id counts of the last 32
+RESULT tokens (`whisper_sequence_score`, whisper.cpp 6597-6617; timestamp tokens
+included exactly as upstream), failing when `result_len > 32 && entropy < 2.4`
+(strict `>`, wc 7540 — short windows are naturally low-entropy and never judged).
+This is the loop-detector that catches wc-style repetition artifacts ("how you
+started the firm ×3") which the existing `result_len == 0` / `avg_logprob`
+triggers cannot see. Computed ONLY under `temp_fallback_enabled()` ⇒ the default
+path never even counts tokens; gate unset stays byte-exact by construction. One
+documented divergence: in no_ts our `result_len` includes the terminal EOT (one
+unique id in a ≥33-token tail ⇒ negligible entropy shift).
+
+**Evidence:** unit test `token_tail_entropy_matches_whisper_cpp_reference` pins
+the math to hand-computed values (0.0 repeated / ln 32 distinct / ln 2 at 16+16 /
+mixed 24+8, prefix-ignorance, threshold calibration sanity). decode suite 59/0;
+`clippy --lib -- -D warnings` clean; rustfmt clean. **A/B (fresh release
+`e2e_probe` vs the preserved pre-entropy binary, both `FW_TEMP_FALLBACK=1`,
+tiny.en): track01 md5 ea8fc828… == pre-entropy == the 42f77b1 determinism hash;
+jfk md5 be4284a9… identical too** ⇒ the new trigger fires ZERO times on real
+speech (wc's shipped calibration), no regression to the landed recovery
+(643→1226 chars unchanged). Default (gate off): track01 = 13 segs / 643 chars,
+identical. **HONEST LIMIT: no on-box clip naturally trips the entropy condition**
+— firing behavior is proven at the unit level + inherited from wc's default
+calibration, not demonstrated end-to-end; a degenerate-loop trigger clip would
+complete the pack (same situation the 2026-07-12 entries hit for bd-r0qd).
+
+**Residual (bd-6goy still OPEN):** best_of parallel candidates,
+`prompt_reset_since`, beam search. Flip remains the owner's call.
+
 ## 2026-07-22 - WhiteCreek: **KEEP (gated, default-off, byte-exact-by-construction) — `FW_TEMP_FALLBACK` whisper.cpp-faithful temperature-fallback ladder recovers BOTH dropped long-form windows on the bd-r0qd trigger: track01 tiny.en TS 643→1226 chars / 13→22 segs, deterministic across runs (bd-6goy fallback half, bd-r0qd fix-spec #3).**
 
 **What landed (decode.rs only):** on a non-silent window that closes no timestamp
