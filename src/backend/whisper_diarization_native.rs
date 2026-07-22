@@ -730,7 +730,7 @@ mod tests {
     fn write_samples_wav(dir: &Path, name: &str, samples: &[f32]) -> PathBuf {
         let pcm: Vec<i16> = samples
             .iter()
-            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .map(|s| (if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 } * 32767.0) as i16)
             .collect();
         let path = dir.join(name);
         write_pcm16_mono_wav(&path, 16_000, &pcm);

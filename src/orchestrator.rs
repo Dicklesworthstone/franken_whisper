@@ -2521,9 +2521,15 @@ fn ctc_forced_align(
         });
     };
 
-    if duration <= 0.0 {
+    // Fail closed on a non-finite (NaN/±inf) or subnormal/underflow duration.
+    // A denormal such as f64::MIN_POSITIVE is > 0.0 yet would make sec_per_char
+    // underflow and pin every timestamp to the denormal; NaN would silently
+    // slip past a `<= 0.0` check and be written verbatim. Returning the
+    // all-fallback report carries the authoritative backend offsets through
+    // unchanged.
+    if !duration.is_finite() || duration < 1e-6 {
         notes.push(format!(
-            "audio duration non-positive ({duration:.3}s); skipping alignment"
+            "audio duration non-positive or non-finite ({duration:.3}s); skipping alignment"
         ));
         return Ok(AlignmentReport {
             segments_total: total,
@@ -2536,7 +2542,7 @@ fn ctc_forced_align(
     // Total character count for proportional distribution.
     let total_chars: usize = segments.iter().map(|s| s.text.trim().len().max(1)).sum();
     let chars_per_sec = total_chars as f64 / duration;
-    if chars_per_sec <= 0.0 {
+    if !chars_per_sec.is_finite() || chars_per_sec <= 0.0 {
         notes.push("zero character density; skipping alignment".to_owned());
         return Ok(AlignmentReport {
             segments_total: total,
@@ -2561,18 +2567,26 @@ fn ctc_forced_align(
         let orig_start = segment.start_sec;
         let orig_end = segment.end_sec;
 
+        // The backend/whisper-cli offsets are authoritative. A segment that
+        // carries no original timestamp must NOT be assigned a fabricated one:
+        // a missing original must not be treated as zero drift (which would let
+        // the synthetic cursor timeline overwrite it), so skip it and leave it
+        // untouched.
+        let (Some(os), Some(oe)) = (orig_start, orig_end) else {
+            fallback += 1;
+            continue;
+        };
+
         // Check drift guardrails.
-        let start_drift = orig_start
-            .map(|os| (aligned_start - os).abs())
-            .unwrap_or(0.0);
-        let end_drift = orig_end.map(|oe| (aligned_end - oe).abs()).unwrap_or(0.0);
+        let start_drift = (aligned_start - os).abs();
+        let end_drift = (aligned_end - oe).abs();
 
         let aligned_duration = aligned_end - aligned_start;
 
         if start_drift > config.max_drift_sec || end_drift > config.max_drift_sec {
             // Drift exceeds tolerance -- keep original timestamps.
             fallback += 1;
-            cursor = orig_end.unwrap_or(aligned_end).max(aligned_end);
+            cursor = oe.max(aligned_end);
             continue;
         }
 
@@ -2584,13 +2598,20 @@ fn ctc_forced_align(
                  below minimum {:.3}s; falling back",
                 config.min_segment_duration_sec
             ));
-            cursor = orig_end.unwrap_or(aligned_end).max(aligned_end);
+            cursor = oe.max(aligned_end);
             continue;
         }
 
-        segment.start_sec = Some(aligned_start);
-        segment.end_sec = Some(aligned_end);
-        corrected += 1;
+        // Only overwrite when the aligned values are finite -- never write a
+        // non-finite timestamp over an authoritative offset.
+        if aligned_start.is_finite() && aligned_end.is_finite() {
+            segment.start_sec = Some(aligned_start);
+            segment.end_sec = Some(aligned_end);
+            corrected += 1;
+        } else {
+            // Non-finite aligned values: keep the authoritative original.
+            fallback += 1;
+        }
     }
 
     Ok(AlignmentReport {
@@ -7945,6 +7966,75 @@ mod tests {
             report.notes.iter().any(|n| n.contains("non-positive")),
             "should note non-positive duration"
         );
+    }
+
+    #[test]
+    fn ctc_align_nonfinite_or_denormal_duration_preserves_offsets() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig::default();
+        // NaN, +inf, and the smallest positive (denormal-class) duration must
+        // all fail closed: every segment falls back and the authoritative
+        // whisper-cli offsets are carried through unchanged (no 2.225e-308, no
+        // NaN in the output).
+        for bad in [f64::NAN, f64::INFINITY, f64::MIN_POSITIVE] {
+            let mut segments = vec![
+                make_segment(0.0, 4.4, "hello"),
+                make_segment(5.2, 8.0, "world"),
+            ];
+            let report = ctc_forced_align(&mut segments, Some(bad), &config, &token).unwrap();
+            assert_eq!(report.segments_total, 2);
+            assert_eq!(
+                report.segments_corrected, 0,
+                "bad duration {bad} must not correct any segment"
+            );
+            assert_eq!(
+                report.segments_fallback, 2,
+                "bad duration {bad} must fall back all segments"
+            );
+            assert_eq!(segments[0].start_sec, Some(0.0));
+            assert_eq!(segments[0].end_sec, Some(4.4));
+            assert_eq!(segments[1].start_sec, Some(5.2));
+            assert_eq!(segments[1].end_sec, Some(8.0));
+        }
+    }
+
+    #[test]
+    fn ctc_align_none_timestamps_left_untouched() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig::default();
+        // Explicit finite duration so the alignment loop runs; the segment has
+        // no original timestamps, so alignment must skip it rather than
+        // fabricate offsets (missing must not be treated as zero drift).
+        let mut segments = vec![make_segment_no_timestamps("hello world")];
+        let report = ctc_forced_align(&mut segments, Some(10.0), &config, &token).unwrap();
+        assert_eq!(report.segments_total, 1);
+        assert_eq!(report.segments_corrected, 0);
+        assert_eq!(report.segments_fallback, 1);
+        assert_eq!(segments[0].start_sec, None, "missing start must stay None");
+        assert_eq!(segments[0].end_sec, None, "missing end must stay None");
+    }
+
+    #[test]
+    fn ctc_align_skips_missing_but_corrects_present_timestamps() {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = AlignConfig {
+            max_drift_sec: 10.0,
+            min_segment_duration_sec: 0.001,
+        };
+        // First segment carries authoritative offsets (aligned), second has
+        // none (skipped, left None); both accounted for in the report.
+        let mut segments = vec![
+            make_segment(0.0, 5.0, "hello"),
+            make_segment_no_timestamps("world"),
+        ];
+        let report = ctc_forced_align(&mut segments, Some(10.0), &config, &token).unwrap();
+        assert_eq!(report.segments_total, 2);
+        assert_eq!(report.segments_corrected, 1);
+        assert_eq!(report.segments_fallback, 1);
+        assert!(segments[0].start_sec.unwrap().is_finite());
+        assert!(segments[0].end_sec.unwrap().is_finite());
+        assert_eq!(segments[1].start_sec, None);
+        assert_eq!(segments[1].end_sec, None);
     }
 
     #[test]

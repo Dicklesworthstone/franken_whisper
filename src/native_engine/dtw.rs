@@ -447,7 +447,13 @@ pub fn dtw_path(cost: &Mat) -> Vec<(usize, usize)> {
             } else {
                 (c2, 2i8)
             };
-            acc[at(i, j)] = cost.data[(i - 1) * m + (j - 1)] + c;
+            // Sanitize a NaN cost (e.g. from a poisoned upstream softmax) to
+            // +inf so a NaN frame is never selected as a path minimum — a NaN
+            // makes every `<` comparison false and would silently bias the path
+            // toward the hold-frame branch and corrupt token boundaries.
+            let cell = cost.data[(i - 1) * m + (j - 1)];
+            let cell = if cell.is_nan() { inf } else { cell };
+            acc[at(i, j)] = cell + c;
             trace[at(i, j)] = t;
         }
     }
@@ -676,6 +682,10 @@ fn normalize_over_tokens(data: &mut [f32], n_tokens: usize, n_frames: usize) {
         }
         var /= n;
         let inv_std = 1.0 / (var + 1e-9).sqrt();
+        // Defensive: if this column carried NaN attention weights (a poisoned
+        // upstream softmax makes mean/var/inv_std NaN), degrade inv_std to a
+        // finite 0.0 rather than scaling by NaN.
+        let inv_std = if inv_std.is_finite() { inv_std } else { 0.0 };
         for t in 0..n_tokens {
             let v = &mut data[t * n_frames + f];
             *v = (*v - mean) * inv_std;
@@ -968,6 +978,27 @@ mod tests {
         for win in path.windows(2) {
             assert!(win[1].0 >= win[0].0 && win[1].1 >= win[0].1);
             // each step advances at least one axis.
+            assert!(win[1] != win[0]);
+        }
+    }
+
+    #[test]
+    fn dtw_nan_costs_produce_monotonic_finite_path() {
+        // A poisoned upstream softmax can leave NaN in the cost matrix. NaN
+        // costs are sanitized to +inf so a NaN frame is never chosen as a path
+        // minimum; the backtrace must still yield a full, monotonic path (and
+        // must not panic). 4 tokens x 6 frames with a NaN spike in the interior.
+        let mut data: Vec<f32> = (0..(4 * 6)).map(|x| (x % 5) as f32 - 2.0).collect();
+        data[2 * 6 + 3] = f32::NAN;
+        let cost = Mat::from_vec(4, 6, data);
+        let path = dtw_path(&cost);
+        assert_eq!(path.first(), Some(&(0, 0)));
+        assert_eq!(path.last(), Some(&(3, 5)));
+        for win in path.windows(2) {
+            assert!(
+                win[1].0 >= win[0].0 && win[1].1 >= win[0].1,
+                "not monotonic: {path:?}"
+            );
             assert!(win[1] != win[0]);
         }
     }
