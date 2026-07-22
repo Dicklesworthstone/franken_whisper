@@ -907,7 +907,7 @@ mod enabled {
             self.amplitudes
                 .iter()
                 .map(|&amp| {
-                    let clamped = amp.clamp(0.0, 1.0);
+                    let clamped = if amp.is_finite() { amp.clamp(0.0, 1.0) } else { 0.0 };
                     let idx = (clamped * 8.0).round() as usize;
                     WAVEFORM_BLOCKS[idx.min(8)]
                 })
@@ -961,7 +961,7 @@ mod enabled {
         /// and stored. If the buffer exceeds `max_samples`, the oldest sample
         /// is removed.
         pub(crate) fn push_energy(&mut self, rms: f32) {
-            let clamped = rms.clamp(0.0, 1.0);
+            let clamped = if rms.is_finite() { rms.clamp(0.0, 1.0) } else { 0.0 };
             if clamped > self.peak_energy {
                 self.peak_energy = clamped;
             }
@@ -4004,6 +4004,23 @@ mod enabled {
             assert_eq!(wf.len(), 4);
         }
 
+        #[test]
+        fn waveform_display_non_finite_renders_without_panic() {
+            // NaN/Inf amplitudes (e.g. derived from NaN audio) must not panic the
+            // render path on the nightly toolchain; they sanitize to 0.0 (space).
+            let wf = WaveformDisplay::new(vec![
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::MIN_POSITIVE,
+            ]);
+            let bars = wf.amplitude_bars();
+            assert_eq!(bars.chars().count(), 4);
+            // NaN/Inf clamp to 0.0 → space; the denormal MIN_POSITIVE also rounds
+            // to the empty block.
+            assert_eq!(bars, "    ", "non-finite/denormal amplitudes render as spaces");
+        }
+
         // ── SearchState and search/filter/export tests (bd-339.3) ──────────
 
         use super::SearchState;
@@ -4653,6 +4670,21 @@ mod enabled {
             state2.push_energy(0.5);
             state2.push_energy(0.6);
             assert_eq!(state2.len(), 1, "max_samples clamped to 1");
+        }
+
+        #[test]
+        fn waveform_state_push_energy_non_finite_does_not_panic() {
+            // RMS derived from NaN audio (sum of squares → NaN, or 0/0 over an
+            // empty window) must not panic the live TUI on the nightly toolchain;
+            // non-finite energies sanitize to 0.0 and leave the peak untouched.
+            let mut state = WaveformState::new();
+            state.push_energy(f32::NAN);
+            state.push_energy(f32::INFINITY);
+            state.push_energy(f32::NEG_INFINITY);
+            assert_eq!(state.len(), 3, "non-finite energies are still stored");
+            assert_eq!(state.peak(), 0.0, "non-finite energies do not raise the peak");
+            // Stored values sanitize to 0.0 → all spaces, no panic on render.
+            assert_eq!(state.render_bars(), "   ");
         }
 
         // ── render_speaker_colored_line tests (bd-339.2) ──────────────────

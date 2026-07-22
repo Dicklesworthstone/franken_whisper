@@ -132,7 +132,15 @@ fn confidence_vector(segments: &[TranscriptionSegment]) -> Vec<f64> {
 
 fn apply_confidences(segments: &mut [TranscriptionSegment], values: &[f64]) {
     for (segment, value) in segments.iter_mut().zip(values.iter().copied()) {
-        segment.confidence = Some(value);
+        // Sanitize before stamping: a NaN/Inf value would flow into the
+        // downstream confidence clamps (whisper_cpp_native/decode) and panic on
+        // the current nightly. Finite values keep their [0, 1] semantics.
+        let v = if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        segment.confidence = Some(v);
     }
 }
 
@@ -1045,9 +1053,19 @@ fn normalize_with_frankentorch(values: &[f64]) -> Result<Vec<f64>, String> {
         .tensor_softmax(tensor, 0)
         .map_err(|error| error.to_string())?;
 
-    session
+    let out = session
         .tensor_values(normalized)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    // GPU softmax can emit NaN/Inf (all-(-inf) inputs, overflow, or a NaN in
+    // values). A non-finite/degenerate result would be stamped onto segment
+    // confidences and panic the downstream clamps, so fall back to the
+    // defensive CPU path when the tensor output is not a usable distribution.
+    if out.iter().all(|v| v.is_finite()) && out.iter().sum::<f64>() > f64::EPSILON {
+        Ok(out)
+    } else {
+        Ok(normalize_cpu(values))
+    }
 }
 
 #[cfg(feature = "gpu-frankenjax")]
@@ -1065,11 +1083,25 @@ fn normalize_with_frankenjax(values: &[f64]) -> Result<Vec<f64>, String> {
         .and_then(Value::as_f64_scalar)
         .ok_or_else(|| "reduce output did not contain scalar".to_owned())?;
 
-    if total <= f64::EPSILON {
+    // Mirror normalize_cpu's defenses: the raw ReduceSumVec total does no finite
+    // filtering, so a NaN/Inf input (or the denormal 2.225e-308) yields a
+    // non-finite or vanishing total. `total <= f64::EPSILON` is false for NaN,
+    // so guard finiteness explicitly and fall back to a uniform distribution.
+    if !total.is_finite() || total <= f64::EPSILON {
         return Ok(vec![1.0 / values.len() as f64; values.len()]);
     }
 
-    Ok(values.iter().map(|value| value / total).collect())
+    Ok(values
+        .iter()
+        .map(|value| {
+            let safe = if value.is_finite() && *value > 0.0 {
+                *value
+            } else {
+                0.0
+            };
+            safe / total
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,6 +1794,62 @@ mod tests {
         apply_confidences(&mut segments, &[]);
         // No values to apply — original confidence unchanged.
         assert_eq!(segments[0].confidence, Some(0.5));
+    }
+
+    #[test]
+    fn apply_confidences_sanitizes_non_finite_values() {
+        use super::apply_confidences;
+        let mut segments = vec![
+            seg("a", None),
+            seg("b", None),
+            seg("c", None),
+            seg("d", None),
+        ];
+        // NaN/Inf must not panic the downstream confidence clamps and must be
+        // sanitized to a finite value in [0, 1]; finite values keep their value.
+        apply_confidences(
+            &mut segments,
+            &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.42],
+        );
+        assert_eq!(segments[0].confidence, Some(0.0));
+        assert_eq!(segments[1].confidence, Some(0.0));
+        assert_eq!(segments[2].confidence, Some(0.0));
+        assert_eq!(segments[3].confidence, Some(0.42));
+        for segment in &segments {
+            let c = segment.confidence.expect("confidence set");
+            assert!(c.is_finite(), "confidence must be finite, got {c}");
+            assert!((0.0..=1.0).contains(&c), "confidence in [0,1], got {c}");
+        }
+    }
+
+    #[cfg(feature = "gpu-frankentorch")]
+    #[test]
+    fn normalize_with_frankentorch_non_finite_falls_back_to_finite() {
+        use super::normalize_with_frankentorch;
+        // A NaN-carrying input must never yield a non-finite normalized vector;
+        // the GPU path validates its output and falls back to normalize_cpu.
+        let out = normalize_with_frankentorch(&[f64::NAN, 1.0, 2.0])
+            .expect("normalize_with_frankentorch should not error");
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "normalized output must be finite, got {out:?}"
+        );
+    }
+
+    #[cfg(feature = "gpu-frankenjax")]
+    #[test]
+    fn normalize_with_frankenjax_non_finite_stays_finite() {
+        use super::normalize_with_frankenjax;
+        // A NaN in the input makes the raw ReduceSumVec total non-finite; the
+        // finiteness guard degrades to a uniform (finite) distribution.
+        let out = normalize_with_frankenjax(&[f64::NAN, 1.0, 2.0])
+            .expect("normalize_with_frankenjax should not error");
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "normalized output must be finite, got {out:?}"
+        );
     }
 
     // --- Direct build_report tests ---
