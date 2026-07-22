@@ -4,6 +4,52 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - WhiteCreek: **DIAGNOSIS (bd-0ivd, partial — reproducer found, uninit class EXONERATED): the DTW word-timestamp nondeterminism is genuine threading-order sensitivity in a parallel numeric path, reproducible ON-BOX at ~50% via `taskset -c 0-3` + the FULL native_engine lib suite. It is NOT an uninit-buffer bug and NOT reachable by cross-process load.**
+
+**What flakes:** `gated_e2e_dtw_word_timestamps_deterministic` — two back-to-back
+`transcribe_samples` calls on identical jfk samples in the same process disagree
+on a word boundary by 1-2 encoder frames ("ask" end 4.62 vs 4.58 s); TEXT never
+differs (argmax margins absorb the perturbation, DTW timings are continuous and
+expose it). First seen on remote rch workers (3/3 full-suite runs, 2026-07-22);
+`resident_cache_keeps_one_model_alive_after_drop` flapped once there too
+(separate suspect, cache-eviction race under load — not chased yet).
+
+**Experiment matrix (all no-build, direct test-binary `franken_whisper-2339d26…`
+on the 64-core box, models in `~/.cache/franken_whisper/test-models`):**
+- 64-core full suite ×2 → **0 fail**. Roomy cores don't trigger it.
+- Targeted DTW test ×8 + CROSS-PROCESS full-suite load loop → **0 fail** ⇒
+  external CPU pressure is insufficient; the trigger needs SAME-PROCESS siblings
+  sharing the global rayon pool/allocator.
+- `taskset -c 0-3` full suite → **REPRODUCED ~50%** (fail, pass; ~136 s/run).
+  4 test threads + a 32-thread rayon pool on 4 cores = heavy oversubscription;
+  this also explains the remote-worker hit rate (constrained, shared boxes).
+  **This is the canonical reproducer.**
+- `gated_e2e`-filtered subset under the same taskset ×4 → **0 fail** ⇒ the heavy
+  non-e2e sibling kernels (nn/encoder unit tests) are a necessary ingredient.
+- **`FW_DECODE_ZEROINIT=1` (all uninit-output sites zero-forced) ×4 → 2/4 fail =
+  baseline rate ⇒ the uninit-vec class (`gemv_out_buf`/`matmul_into_uninit`) is
+  EXONERATED.**
+- `RAYON_NUM_THREADS=1` ×1 → 0 fail, but ~359 s/run and confounded (serializing
+  the engine reshapes the whole contention profile) — weak discriminator,
+  abandoned.
+
+**Static sweep (pre-experiments):** dtw.rs is fully serial; the cross-attn
+recording path pushes per-head scores serially in head order after an
+index-ordered `collect` (deterministic); ft-kernel-cpu par sites are all
+disjoint-output `for_each`/`par_chunks` (no parallel float reductions); perf
+thread-locals are measurement-only; no `env::set_var` inside the lib test
+binary's native_engine filter. So the naive suspects are all clean — the
+sensitivity hides deeper (nested parallelism inside gemv/sgemm kernels, or a
+load-adaptive split somewhere in the encoder path feeding cross-K/V).
+
+**NEXT (recorded so the bisection resumes, not restarts):** with the canonical
+reproducer, run 4-rep kill-switch arms and attribute per-test: `FW_CROSS_F16=0`
+(cross-attn kernel flip — in flight this session), `FW_ATTN_NO_SDPA=1` (encoder
+fused SDPA off), `FW_SDPA_GATHER_CHUNKS=0`, `FW_GEMV_I8_PAR` variants, and a
+stage-level bit-compare probe (mel×2 / encoder×2 / record×2) if the env arms
+don't isolate it. ~50% base rate ⇒ 4 clean reps ≈ P 6% false-negative; extend
+any clean arm before believing it.
+
 ## 2026-07-22 - WhiteCreek: **KEEP (increment on 42f77b1, same gate, byte-exact-by-construction) — entropy repetition gate for `FW_TEMP_FALLBACK`: whisper.cpp `entropy_thold` (2.4) ported faithfully; degenerate low-entropy tails now trigger the ladder. Zero spurious firing on real speech (gate-ON old-vs-new binaries byte-identical on track01 AND jfk).**
 
 **What landed (decode.rs only):** the ladder's failure detector gains whisper.cpp's
