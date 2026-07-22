@@ -256,6 +256,201 @@ pub(crate) fn f16_compute_enabled() -> bool {
     )
 }
 
+/// Whether to run the tied-output (logits) projection through the int8/Q8
+/// weight-quantized GEMV ([`nn::gemv_i8`]) instead of the f16 fused GEMV.
+///
+/// The logits stream is the model's largest tensor (`[n_vocab, n_state]`, 132 MB
+/// f16 for large-v3-turbo) and is DRAM-bandwidth-bound in decode; int8 halves the
+/// bytes (measured 1.86× single-thread, 3.5× tight-loop vs f16). It is a
+/// NUMERICS-AFFECTING approximation (int8 ≈ 256 levels vs f16 ≈ 1000s), but the
+/// logits are the FINAL projection — argmax-robust, and quantizing here leaves the
+/// hidden state untouched. Validated transcript-identical to both the f16 path and
+/// the whisper-cli golden reference on jfk for tiny.en AND large-v3-turbo across
+/// every dispatch path (the whisper.cpp reference itself runs `MATMUL_INT8`), so it
+/// is **ON by default**. Set `FRANKEN_WHISPER_INT8_LOGITS=0` to force the exact f16
+/// path (bit-level A/B, or a hypothetical regressing input).
+pub(crate) fn int8_logits_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_LOGITS") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
+/// Whether to run the decoder MLP up-projection (fc1 `[4·n_state, n_state]`,
+/// `mlp_0`, feeding GELU) through the int8/Q8 GEMV ([`nn::gemv_i8`]) on the
+/// per-token decode path (`tq == 1`). The down-projection (`mlp_2`) stays f16.
+///
+/// The MLP is ~28% of decode. In real per-token decode the working set (4×26 MB
+/// MLP + 132 MB logits ≈ 250 MB) ≫ 128 MB L3, so the MLP weights are DRAM-resident
+/// and int8 (half the bytes) is MEASURED 1.65–1.76× per linear (cache-cold probe).
+///
+/// **fc1-only** is the safe subset: `mlp_2` writes DIRECTLY into the residual
+/// stream, so its per-token int8 rounding compounds across layers/tokens and was
+/// the source of a turbo trailing-artifact under the both-quant variant (6c4b53d).
+/// `mlp_0`'s error is instead absorbed by GELU saturation before it reaches the
+/// residual, so quantizing ONLY it is transcript byte-exact vs the f16 baseline on
+/// both tiny.en and large-v3-turbo (jfk golden) — hence **ON by default**. It still
+/// captures ~1.20× on the MLP-GEMV span (~4.6% e2e decode). whisper.cpp's Q8_0
+/// models quantize the whole MLP, so int8 here is a proven-safe class of target.
+/// Disable with `FRANKEN_WHISPER_INT8_MLP=0`. Prefill (`tq > 1`) keeps the f16 path.
+pub(crate) fn int8_mlp_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_MLP") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
+/// Whether to run the decoder **attention** input projections (fused self `qkv`
+/// and `cross_attn_q`) through the int8/Q8 GEMV on the per-token decode path
+/// (`tq == 1`). The output projections (`self_out`, `cross_out`) stay f16.
+///
+/// Same DRAM-resident-bandwidth rationale as [`int8_mlp_enabled`]: in real decode
+/// the 4-layer weight set ≫ L3, so these projection weights are streamed from DRAM
+/// each token and int8 halves the bytes. Safety mirrors the fc1-only MLP finding —
+/// the input projections feed attention SCORES → softmax (error-robust, like
+/// `mlp_0`→GELU), whereas the output projections write the residual directly (the
+/// `mlp_2` failure mode) and are excluded. The fused `qkv` also carries V (which
+/// reaches the attention output), but softmax-weighted averaging bounds that error;
+/// the byte-exact-vs-f16 golden gate is what validates the default flip. Disable
+/// with `FRANKEN_WHISPER_INT8_ATTN=0`. Prefill (`tq > 1`) keeps the f16 path.
+pub(crate) fn int8_attn_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_ATTN") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
+/// Route the per-window cross-K/V PROJECTIONS (encoder_out @ Wk/Wv, tq=1500)
+/// through dequant-once f32 tiled sgemm instead of the f16 batched GEMV
+/// ([`gemv_f16_batch`]). MEASURED 2.25× faster on the turbo cross shape
+/// (233.96 → 103.95 ms for the 8 GEMMs, `cross_f16path_probe`) — the same reason
+/// the ENCODER dequants-once to f32. NOT bit-exact (different accumulation order,
+/// max|Δ| ~6.9e-6), so it is gated and was proven transcript-neutral before
+/// defaulting on: jfk+tiny.en (the `ln.json` byte-exact gate asset) AND jfk×6
+/// large-v3-turbo both produce a BYTE-IDENTICAL transcript gate-ON vs gate-OFF
+/// (the 6.9e-6 divergence is fully absorbed). `=0` restores the f16 GEMV path.
+pub(crate) fn cross_proj_f32_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                _ => DEFAULT_ON,
+            },
+            Err(_) => DEFAULT_ON,
+        },
+    )
+}
+
+/// Route the prefill / multi-token (`tq > 1`) per-row-int8 projections through
+/// the int8 BATCHED GEMV ([`nn::gemv_i8_batch`]) instead of the f16 batched GEMV
+/// ([`nn::gemv_f16_batch`]). Reads HALF the weight bytes of the f16 path and is
+/// BIT-IDENTICAL to running the prompt batch as `tq` separate per-token
+/// [`nn::gemv_i8`] calls (same per-row activation quant + per-row weight scale).
+/// Applies only to linears whose `tq == 1` path is already `gemv_i8` (qkv /
+/// cross_q / self_out / cross_out, and mlp_0 when int4 is off) — i.e. those with
+/// a `w_i8` copy and neither a block nor int4 copy — so prefill uses the SAME
+/// quantization those linears already use per token. It also raises the
+/// draft-decoding amortization ceiling (`examples/draft_amortization_probe.rs`).
+/// Changes prefill numerics f16→int8, so gated + transcript-checked before any
+/// default flip. Proven transcript BYTE-IDENTICAL gate-on vs gate-off (turbo
+/// jfk×6, timestamp mode) AND bit-identical to per-token `gemv_i8` (0/15360
+/// entries differ, `examples/gemv_i8_batch_probe.rs`), so defaulted ON. MEASURED
+/// 3–12% faster on the cold-weight `tq>1` path (`examples/draft_amortization_probe.rs`,
+/// best-of-60: K=2 +12%, K=4 +2.9%, K=8 +5.0%). `FRANKEN_WHISPER_INT8_BATCH=0` restores f16.
+pub(crate) fn i8_batch_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_BATCH") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            _ => DEFAULT_ON,
+        },
+        Err(_) => DEFAULT_ON,
+    })
+}
+
+/// PROBE (default off): int4 (block-wise, 4-bit weight × f32 activation) for
+/// `mlp_0`/fc1. fc1 feeds GELU, whose saturation absorbed int8 weight error to
+/// byte-exactness (fc1-only int8); this tests whether 4-bit is ALSO absorbed. If
+/// byte-exact it halves fc1's weight bandwidth again — a quality-neutral win past
+/// the Q8 floor. `FRANKEN_WHISPER_INT4_MLP0=1`.
+pub(crate) fn int4_mlp0_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRANKEN_WHISPER_INT4_MLP0")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+/// Whether to run `mlp_2` (fc2, the MLP down-projection) through the MIXED
+/// BLOCK-WISE int8-weight × f32-activation GEMV ([`nn::gemv_i8w_f32a_blocked`]) on
+/// the per-token decode path. fc2's weight is the bandwidth-bound operand (13 MB
+/// f16 → 6.5 MB int8 per token), so quantizing ONLY the weight captures that win;
+/// the activation stays f32. A per-ROW int8 weight scale was too coarse and broke
+/// turbo (the trailing artifact, like full-int8 `mlp_2` at 6c4b53d), but per-BLOCK
+/// scales (32-elt, whisper.cpp-Q8_0-class) are transcript BYTE-EXACT vs f16 on both
+/// tiny.en and large-v3-turbo — hence **ON by default**. ~1.25× on the MLP-GEMV
+/// span (~7% e2e decode). Disable with `FRANKEN_WHISPER_INT8_MLP_FC2=0`.
+pub(crate) fn int8_mlp_fc2_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_MLP_FC2") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
+/// Whether to int8-quantize the attention **output** projections (`self_out`,
+/// `cross_out`) on the per-token decode path. These write DIRECTLY into the
+/// residual stream — the `mlp_2` failure mode — so they were expected to break
+/// exactness. Empirically they do NOT: transcript is byte-exact vs f16 on both
+/// tiny.en and large-v3-turbo (jfk), INCLUDING the exact turbo clip where the
+/// both-quant MLP produced a trailing artifact. The difference is magnitude — the
+/// attention output is a softmax-weighted average of value vectors (bounded, 1280-d),
+/// so its per-token int8 rounding is far smaller than `mlp_2`'s 5120-d GELU-hidden
+/// input and stays under the argmax margin. Hence **ON by default**; ~1.15× on the
+/// two output-proj spans (~2.3% e2e decode). Disable with
+/// `FRANKEN_WHISPER_INT8_ATTN_OUT=0`. Prefill (`tq > 1`) keeps the f16 path.
+pub(crate) fn int8_attn_out_enabled() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_INT8_ATTN_OUT") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
 /// Emit one measurement-only span line (see [`perf_spans_enabled`]).
 pub(crate) fn perf_span(span: &str, ms: f64, extra: &str) {
     if perf_spans_enabled() {
@@ -317,14 +512,87 @@ pub fn find_model_file(short_name: &str) -> Option<PathBuf> {
 /// set `$FRANKEN_WHISPER_MODEL_DIR`) is obvious. A canonicalization failure on
 /// an existing path surfaces as [`FwError::Io`].
 pub fn resolve_model(spec: &str) -> FwResult<PathBuf> {
+    // Tolerate blank/whitespace specs — a common "dumb error" is `--model ""`
+    // from an empty shell variable. Treat those as "no model specified" rather
+    // than trying to open a file literally named "" (which fails obscurely).
+    let spec = spec.trim();
+
     // Form 1: an existing path wins, even if it happens to look like a name.
-    let as_path = Path::new(spec);
-    if as_path.is_file() {
-        return Ok(as_path.canonicalize()?);
+    if !spec.is_empty() {
+        let as_path = Path::new(spec);
+        if as_path.is_file() {
+            return Ok(as_path.canonicalize()?);
+        }
     }
 
-    // Form 2: short-name lookup across the shared search dirs.
-    resolve_model_in_dirs(spec, &model_search_dirs())
+    let dirs = model_search_dirs();
+
+    // "Unspecified" (blank, or the `default` sentinel): try the conventional
+    // `ggml-default.bin`, then fall back to auto-discovering ANY ggml model
+    // already on disk so the tool just works instead of hard-failing on a
+    // missing default. An *explicit* short-name that is missing still errors
+    // below — silently substituting a different model would betray the request.
+    if spec.is_empty() || spec.eq_ignore_ascii_case("default") {
+        if let Ok(p) = resolve_model_in_dirs("default", &dirs) {
+            return Ok(p);
+        }
+        if let Some(p) = discover_any_model(&dirs) {
+            tracing::info!(
+                model = %p.display(),
+                "no model specified and no ggml-default.bin found; auto-selected an available ggml model"
+            );
+            return Ok(p.canonicalize()?);
+        }
+        // Nothing on disk at all: return the conventional, actionable error.
+        return resolve_model_in_dirs("default", &dirs);
+    }
+
+    // Form 2: explicit short-name lookup across the shared search dirs.
+    resolve_model_in_dirs(spec, &dirs)
+}
+
+/// Auto-discover any usable `ggml-*.bin` model already on disk. Used **only**
+/// when the caller specified no model (blank / `default`) and no
+/// `ggml-default.bin` exists, so a machine that has *a* model transcribes
+/// instead of erroring. Scans [`model_search_dirs`] in precedence order and,
+/// within the first dir that holds any models, picks deterministically by a
+/// quality preference (best first) so the choice is stable across runs. Never
+/// downloads — it only ever selects a file the operator already placed (the
+/// "data never leaves the machine" stance is preserved).
+fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
+    // Best-first preference; unknown names sort last but stay eligible, so an
+    // operator's custom `ggml-<x>.bin` is still used when it is all that exists.
+    const PREF: &[&str] = &[
+        "large-v3-turbo", "large-v3", "large-v2", "large", "medium.en", "medium", "small.en",
+        "small", "base.en", "base", "tiny.en", "tiny",
+    ];
+    for dir in dirs {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut found: Vec<(usize, String, PathBuf)> = Vec::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(short) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("ggml-"))
+                .and_then(|n| n.strip_suffix(".bin"))
+            {
+                let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
+                found.push((rank, short.to_string(), path));
+            }
+        }
+        if !found.is_empty() {
+            // Rank first, then name, for a stable tie-break within a rank.
+            found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            return Some(found.into_iter().next().expect("non-empty").2);
+        }
+    }
+    None
 }
 
 /// Resolve a short-name `spec` against an explicit, ordered list of search
@@ -446,15 +714,24 @@ fn header_ftype_ok(path: &Path) -> bool {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The default inference thread count: the machine's available parallelism,
-/// capped at 16.
+/// capped at 32.
 ///
-/// The cap reflects diminishing returns past ~16 threads for whisper's matmul
-/// sizes and keeps a single transcription from monopolizing very large hosts.
-/// Falls back to `1` when parallelism cannot be queried. Callers should plumb
-/// `BackendParams.threads` through and only fall back to this when unset.
+/// The cap was 16, but that MEASURED as far too low for the large-v3-turbo
+/// encoder (the dominant ~82% cost, big `[1500,1280]×[1280,K]` sgemms). Fresh
+/// sweep on a 64-core box (`examples/encoder_scale_probe.rs`, min-of-N):
+/// encoder::forward best 4100 ms/win @16 → **3022 ms/win @32 (1.34×)**, then
+/// regresses (48 → 3304, 64 → 3991 ms; cross-CCD sync — same wall whisper.cpp
+/// `-t64` hits). matmul thread-count does not change per-element k-accumulation
+/// order, so this is BYTE-EXACT: turbo transcript IDENTICAL @16 vs @32 (jfk×3
+/// and jfk×6, `e2e_probe`), e2e **~1.23–1.28×** (jfk×6 14.56 s → 11.3–12.3 s).
+/// 32 is the perf optimum AND still leaves half a 64-core host free (48/64
+/// regress anyway), preserving the "don't fully monopolize" intent. Falls back
+/// to `1` when parallelism cannot be queried. Callers should plumb
+/// `BackendParams.threads` through and only fall back to this when unset;
+/// `RAYON_NUM_THREADS` still overrides the pool entirely.
 #[must_use]
 pub fn default_threads() -> usize {
-    host_parallelism().min(16)
+    host_parallelism().min(32)
 }
 
 /// Host parallelism, queried ONCE and cached for the process.
@@ -1195,7 +1472,7 @@ mod tests {
     #[test]
     fn default_threads_in_bounds() {
         let n = default_threads();
-        assert!((1..=16).contains(&n), "threads {n} must be 1..=16");
+        assert!((1..=32).contains(&n), "threads {n} must be 1..=32");
     }
 
     // ─────────────────────────────────────────────────────────────────────

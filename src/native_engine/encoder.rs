@@ -117,11 +117,13 @@ pub struct EncoderWeights {
     n_head: usize,
     /// Maximum audio context (`hparams.n_audio_ctx`, e.g. 1500).
     n_ctx: usize,
-    /// `conv1` flat weight `[n_state, n_mels, K]` and bias `[n_state]`.
-    conv1_w: Vec<f32>,
+    /// `conv1` weight PRE-TRANSPOSED to `[n_mels*K, n_state]` (the `[Cin*K, Cout]` layout
+    /// `nn::conv1d_wt` / `matmul_bias` consume) + bias `[n_state]`. Transposed once at load
+    /// so the per-window encode never re-transposes it.
+    conv1_wt: Mat,
     conv1_b: Vec<f32>,
-    /// `conv2` flat weight `[n_state, n_state, K]` and bias `[n_state]`.
-    conv2_w: Vec<f32>,
+    /// `conv2` weight PRE-TRANSPOSED to `[n_state*K, n_state]` + bias `[n_state]`.
+    conv2_wt: Mat,
     conv2_b: Vec<f32>,
     /// Positional embedding `[n_ctx, n_state]` (file tensor, row-major).
     pos_emb: Mat,
@@ -369,11 +371,17 @@ impl EncoderWeights {
         }
         let mlp_hidden = n_state * MLP_RATIO;
 
-        // Conv stem: ggml shapes are [Cout, Cin, K]; nn::conv1d wants this flat
-        // [Cout, Cin, K] order verbatim, so no transpose.
-        let conv1_w = load_shaped(model, "encoder.conv1.weight", &[n_state, n_mels, CONV_K])?;
+        // Conv stem: ggml shapes are [Cout, Cin, K] = flat [Cout, Cin*K]. Pre-transpose
+        // ONCE here to [Cin*K, Cout] (what `nn::conv1d_wt`/`matmul_bias` consume) so the
+        // per-window encode skips the (redundant, ~15 ms/window on turbo conv2) transpose.
+        // `transpose_serial([Cout, Cin*K])` is bit-identical to conv1d's inline transpose.
+        let conv1_patch = n_mels * CONV_K;
+        let conv1_raw = load_shaped(model, "encoder.conv1.weight", &[n_state, n_mels, CONV_K])?;
+        let conv1_wt = Mat::from_vec(conv1_patch, n_state, nn::transpose_serial(&conv1_raw, n_state, conv1_patch));
         let conv1_b = load_vec(model, "encoder.conv1.bias", n_state)?;
-        let conv2_w = load_shaped(model, "encoder.conv2.weight", &[n_state, n_state, CONV_K])?;
+        let conv2_patch = n_state * CONV_K;
+        let conv2_raw = load_shaped(model, "encoder.conv2.weight", &[n_state, n_state, CONV_K])?;
+        let conv2_wt = Mat::from_vec(conv2_patch, n_state, nn::transpose_serial(&conv2_raw, n_state, conv2_patch));
         let conv2_b = load_vec(model, "encoder.conv2.bias", n_state)?;
 
         // Positional embedding: file tensor [n_ctx, n_state], used verbatim.
@@ -450,9 +458,9 @@ impl EncoderWeights {
             n_state,
             n_head,
             n_ctx,
-            conv1_w,
+            conv1_wt,
             conv1_b,
-            conv2_w,
+            conv2_wt,
             conv2_b,
             pos_emb,
             layers,
@@ -545,22 +553,55 @@ pub fn forward_from_full_mel_window(
     forward_time_major(w, x, checkpoint)
 }
 
+// ── THROWAWAY encoder sub-op profiler (gated on FRANKEN_WHISPER_PERF_SPANS) ──
+// Accumulates wall-time per sub-op across all layers into a thread-local, emitted
+// once at the end of forward_time_major. Zero cost when perf spans are off.
+thread_local! {
+    static ENC_PROF: std::cell::RefCell<[u128; 12]> = const { std::cell::RefCell::new([0; 12]) };
+}
+const ENC_PROF_LABELS: [&str; 12] = [
+    "conv_stem", "pos_emb", "attn_ln", "qkv_proj", "attn_sdpa", "attn_out",
+    "attn_resid", "mlp_ln", "mlp_fc", "gelu", "mlp_proj", "mlp_resid",
+];
+fn enc_prof_add(i: usize, ns: u128) {
+    ENC_PROF.with(|p| p.borrow_mut()[i] += ns);
+}
+
 fn forward_time_major(
     w: &EncoderWeights,
     x: Mat,
     checkpoint: &dyn Fn() -> FwResult<()>,
 ) -> FwResult<Mat> {
+    let measure = crate::native_engine::perf_spans_enabled();
+    macro_rules! et {
+        ($i:expr, $b:expr) => {{
+            if measure {
+                let __t = std::time::Instant::now();
+                let __r = $b;
+                enc_prof_add($i, __t.elapsed().as_nanos());
+                __r
+            } else {
+                $b
+            }
+        }};
+    }
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
-    let mut x = nn::conv1d(
-        &x, &w.conv1_w, w.n_state, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
-    )?;
-    nn::gelu(&mut x);
+    let mut x = et!(0, {
+        let mut x = nn::conv1d_wt(
+            &x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
+        )?;
+        nn::gelu(&mut x);
+        x
+    });
 
     // conv2 (stride 2): [3000, n_state] -> [1500, n_state], +gelu.
-    let mut x = nn::conv1d(
-        &x, &w.conv2_w, w.n_state, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
-    )?;
-    nn::gelu(&mut x);
+    let mut x = et!(0, {
+        let mut x = nn::conv1d_wt(
+            &x, &w.conv2_wt, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
+        )?;
+        nn::gelu(&mut x);
+        x
+    });
 
     let n_ctx = x.rows;
     if n_ctx > w.n_ctx {
@@ -571,16 +612,50 @@ fn forward_time_major(
     }
 
     // Add positional embedding (file tensor), sliced to the first n_ctx rows.
-    add_pos_emb(&mut x, &w.pos_emb, n_ctx);
+    et!(1, add_pos_emb(&mut x, &w.pos_emb, n_ctx));
 
-    // Residual transformer blocks.
-    for layer in &w.layers {
-        encoder_block(&mut x, layer, w.n_head)?;
-        checkpoint()?;
+    // Residual transformer blocks. On Apple Silicon with a large model the whole
+    // stack runs on the GPU (fused: activations resident, one command buffer/sync
+    // per layer instead of per-op CPU<->GPU ping-pong); every other case uses the
+    // CPU blocks. `FRANKEN_WHISPER_GPU=0` forces the CPU path.
+    if !gpu_encode_stack(&mut x, w) {
+        for layer in &w.layers {
+            encoder_block(&mut x, layer, w.n_head)?;
+            checkpoint()?;
+        }
     }
 
     // Final ln_post.
     nn::layer_norm(&mut x, &w.ln_post_w, &w.ln_post_b, LN_EPS);
+
+    if measure {
+        ENC_PROF.with(|p| {
+            let a = p.borrow();
+            let total: u128 = a.iter().sum();
+            eprintln!("--- encoder sub-op breakdown (sum over layers, one window) ---");
+            for (i, lbl) in ENC_PROF_LABELS.iter().enumerate() {
+                if a[i] > 0 {
+                    let ms = a[i] as f64 / 1e6;
+                    let pct = if total > 0 { a[i] as f64 / total as f64 * 100.0 } else { 0.0 };
+                    eprintln!("  {lbl:<12} {ms:>8.1} ms  {pct:>5.1}%");
+                }
+            }
+            eprintln!("  {:<12} {:>8.1} ms (encoder sub-op total)", "SUM", total as f64 / 1e6);
+        });
+        ENC_PROF.with(|p| *p.borrow_mut() = [0; 12]);
+        // Split attn_sdpa into gather / kernel / scatter (sum over layers).
+        let sp = nn::drain_sdpa_split();
+        let stot: u128 = sp.iter().sum();
+        if stot > 0 {
+            let labels = ["sdpa_gather", "sdpa_kernel", "sdpa_scatter"];
+            eprintln!("  -- attn_sdpa internal split --");
+            for (i, lbl) in labels.iter().enumerate() {
+                let ms = sp[i] as f64 / 1e6;
+                let pct = sp[i] as f64 / stot as f64 * 100.0;
+                eprintln!("  {lbl:<14} {ms:>8.1} ms  {pct:>5.1}% of attn_sdpa");
+            }
+        }
+    }
 
     Ok(x)
 }
@@ -597,37 +672,218 @@ fn add_pos_emb(x: &mut Mat, pos_emb: &Mat, n_ctx: usize) {
     }
 }
 
+/// Run the encoder transformer stack on the GPU (Apple Silicon), keeping
+/// activations resident and batching each layer into one command buffer (one
+/// sync/layer). Returns `false` — so the caller uses the CPU blocks — off macOS,
+/// with no GPU, on a small model, or when disabled via `FRANKEN_WHISPER_GPU=0`.
+/// Weights are uploaded once and cached per model. All Metal lives in
+/// `ft-kernel-metal`, so this crate keeps `#![deny(unsafe_code)]`.
+#[cfg(target_os = "macos")]
+fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    // `FRANKEN_WHISPER_FUSED_ENC=0` disables just the fused encoder (the per-matmul
+    // GEMM offload in `nn` still applies) — for A/B against the fused path.
+    if matches!(
+        std::env::var("FRANKEN_WHISPER_FUSED_ENC").ok().as_deref(),
+        Some("0")
+    ) {
+        return false;
+    }
+    if w.n_state < GPU_ENCODER_MIN_N_STATE || !gpu_encoder_enabled() {
+        return false;
+    }
+
+    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<ft_kernel_metal::fused::EncoderGpu>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Identify the model by a cheap content fingerprint (shape + a few weight
+    // samples), NOT by `w`'s address: this static cache outlives the borrowed
+    // `EncoderWeights`, so a dropped model replaced by a DIFFERENT model reusing the
+    // same address would otherwise alias a stale resident encoder. The fingerprint
+    // also lets the same model loaded twice share one upload.
+    let key: u64 = {
+        fn mix(h: u64, v: u64) -> u64 {
+            (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        h = mix(h, w.n_state as u64);
+        h = mix(h, w.n_head as u64);
+        h = mix(h, w.layers.len() as u64);
+        for l in [w.layers.first(), w.layers.last()].into_iter().flatten() {
+            for s in [
+                l.attn_q_w.data.first(),
+                l.attn_q_w.data.last(),
+                l.mlp_fc_w.data.first(),
+                l.mlp_proj_w.data.last(),
+                l.attn_ln_w.first(),
+                l.attn_ln_w.last(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                h = mix(h, u64::from(s.to_bits()));
+            }
+        }
+        h
+    };
+
+    let enc = {
+        let mut guard = match cache.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if !guard.contains_key(&key) {
+            let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
+                .layers
+                .iter()
+                .map(|l| ft_kernel_metal::fused::LayerWeightsRef {
+                    ln1_g: &l.attn_ln_w,
+                    ln1_b: &l.attn_ln_b,
+                    wq: &l.attn_q_w.data,
+                    bq: &l.attn_q_b,
+                    wk: &l.attn_k_w.data,
+                    wv: &l.attn_v_w.data,
+                    bv: &l.attn_v_b,
+                    wo: &l.attn_out_w.data,
+                    bo: &l.attn_out_b,
+                    ln2_g: &l.mlp_ln_w,
+                    ln2_b: &l.mlp_ln_b,
+                    w1: &l.mlp_fc_w.data,
+                    b1: &l.mlp_fc_b,
+                    w2: &l.mlp_proj_w.data,
+                    b2: &l.mlp_proj_b,
+                })
+                .collect();
+            match ft_kernel_metal::fused::EncoderGpu::new(
+                w.n_state,
+                w.n_head,
+                w.n_state * 4,
+                &refs,
+            ) {
+                Ok(enc) => {
+                    guard.insert(key, Arc::new(enc));
+                }
+                Err(_) => return false,
+            }
+        }
+        Arc::clone(guard.get(&key).expect("just inserted"))
+    };
+
+    match enc.forward(&x.data, x.rows) {
+        Ok(out) => {
+            x.data = out;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gpu_encode_stack(_x: &mut Mat, _w: &EncoderWeights) -> bool {
+    false
+}
+
+/// Minimum `n_state` (model width) for the GPU encoder: medium/large whisper
+/// models (large-v3 = 1280). Smaller models keep the CPU path — their encoder is
+/// already fast and GPU launch overhead would not pay off.
+#[cfg(target_os = "macos")]
+const GPU_ENCODER_MIN_N_STATE: usize = 1024;
+
+/// Whether the GPU encoder is usable and enabled (probed once, cached).
+#[cfg(target_os = "macos")]
+fn gpu_encoder_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        let disabled = matches!(
+            std::env::var("FRANKEN_WHISPER_GPU").ok().as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
+        );
+        !disabled && ft_kernel_metal::fused::is_available()
+    })
+}
+
 /// One residual encoder block, mutating `x` (`[n_ctx, n_state]`) in place.
 ///
 /// `x = x + attn_out(attn(ln_attn(x)))` then `x = x + mlp(ln_mlp(x))`. The
 /// attention is bidirectional (no causal mask): every output row depends on
 /// every input row.
-fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<()> {
-    // ── self-attention residual ──
-    let mut h = x.clone();
-    nn::layer_norm(&mut h, &layer.attn_ln_w, &layer.attn_ln_b, LN_EPS);
+/// Default-ON gate for the fused `layer_norm`-into-uninit path (kill switch
+/// `FW_ENCODER_FUSED_LN=0` restores `x.clone()` + in-place `layer_norm`).
+fn fused_ln_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENCODER_FUSED_LN").as_deref() != Ok("0"))
+}
 
-    let q = nn::matmul_bias(&h, &layer.attn_q_w, Some(&layer.attn_q_b))?;
-    let k = nn::matmul_bias(&h, &layer.attn_k_w, None)?; // no key bias
-    let v = nn::matmul_bias(&h, &layer.attn_v_w, Some(&layer.attn_v_b))?;
+/// `layer_norm(x)` returning a fresh `[rows, cols]` `Mat`. Fused path writes the
+/// normalized rows straight into an uninitialized buffer (no clone memcpy);
+/// clone path is the byte-identical legacy `x.clone()` + in-place norm.
+#[inline]
+fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
+    if fused_ln_enabled() {
+        let mut data = nn::gemv_out_buf(x.rows * x.cols);
+        nn::layer_norm_into(x, &mut data, w, b, LN_EPS);
+        Mat::from_vec(x.rows, x.cols, data)
+    } else {
+        let mut h = x.clone();
+        nn::layer_norm(&mut h, w, b, LN_EPS);
+        h
+    }
+}
+
+fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<()> {
+    let measure = crate::native_engine::perf_spans_enabled();
+    macro_rules! et {
+        ($i:expr, $b:expr) => {{
+            if measure {
+                let __t = std::time::Instant::now();
+                let __r = $b;
+                enc_prof_add($i, __t.elapsed().as_nanos());
+                __r
+            } else {
+                $b
+            }
+        }};
+    }
+    // ── self-attention residual ──
+    // `h = layer_norm(x)` into a fresh uninit buffer — byte-identical to
+    // `x.clone()` + in-place `layer_norm`, minus the clone's redundant memcpy
+    // (x is preserved for the residual `add_in_place` below regardless).
+    // Kill switch FW_ENCODER_FUSED_LN=0 restores the clone path (A/B + escape).
+    let h = et!(2, ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b));
+
+    let (q, k, v) = et!(3, {
+        let q = nn::matmul_bias(&h, &layer.attn_q_w, Some(&layer.attn_q_b))?;
+        let k = nn::matmul_bias(&h, &layer.attn_k_w, None)?; // no key bias
+        let v = nn::matmul_bias(&h, &layer.attn_v_w, Some(&layer.attn_v_b))?;
+        (q, k, v)
+    });
 
     // Bidirectional self-attention: causal_offset = None.
-    let attn = nn::attention(&q, &k, &v, n_head, None)?;
-    let attn = nn::matmul_bias(&attn, &layer.attn_out_w, Some(&layer.attn_out_b))?;
-    add_in_place(x, &attn);
+    let attn = et!(4, nn::attention(&q, &k, &v, n_head, None)?);
+    let attn = et!(5, nn::matmul_bias(&attn, &layer.attn_out_w, Some(&layer.attn_out_b))?);
+    et!(6, add_in_place(x, &attn));
 
-    // ── MLP residual ──
-    let mut h = x.clone();
-    nn::layer_norm(&mut h, &layer.mlp_ln_w, &layer.mlp_ln_b, LN_EPS);
-    let mut h = nn::matmul_bias(&h, &layer.mlp_fc_w, Some(&layer.mlp_fc_b))?;
-    nn::gelu(&mut h);
-    let h = nn::matmul_bias(&h, &layer.mlp_proj_w, Some(&layer.mlp_proj_b))?;
-    add_in_place(x, &h);
+    // ── MLP residual ── (same fused layer_norm-into-uninit, no clone memcpy)
+    let h = et!(7, ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b));
+    let mut h = et!(8, nn::matmul_bias(&h, &layer.mlp_fc_w, Some(&layer.mlp_fc_b))?);
+    et!(9, nn::gelu(&mut h));
+    let h = et!(10, nn::matmul_bias(&h, &layer.mlp_proj_w, Some(&layer.mlp_proj_b))?);
+    et!(11, add_in_place(x, &h));
 
     Ok(())
 }
 
 /// In-place element-wise `x += y` for matrices of identical shape.
+///
+/// Kept SERIAL deliberately: parallelizing this was MEASURED a wash/slight-loss
+/// (2026-07-02, BlackThrush) — the residual operands are cache-warm from the
+/// matmul that just produced them and LLVM auto-vectorizes the loop, so rayon
+/// dispatch overhead outweighs any bandwidth gain (unlike the fused-LN clone,
+/// which was a *cold* memcpy pass). Do not re-parallelize.
 fn add_in_place(x: &mut Mat, y: &Mat) {
     debug_assert_eq!(
         (x.rows, x.cols),
@@ -709,9 +965,9 @@ mod tests {
             n_state,
             n_head,
             n_ctx: pe_ctx,
-            conv1_w: rng.vec(n_state * n_mels * CONV_K, s),
+            conv1_wt: rng.mat(n_mels * CONV_K, n_state, s),
             conv1_b: rng.vec(n_state, s),
-            conv2_w: rng.vec(n_state * n_state * CONV_K, s),
+            conv2_wt: rng.mat(n_state * CONV_K, n_state, s),
             conv2_b: rng.vec(n_state, s),
             pos_emb: rng.mat(pe_ctx, n_state, s),
             layers,
