@@ -354,12 +354,17 @@ impl RoutingEvidenceLedger {
         };
 
         let avg_brier: Option<f64> = {
-            let brier_values: Vec<f64> =
-                self.entries.iter().filter_map(|e| e.brier_score).collect();
-            if brier_values.is_empty() {
+            let (sum, count) = self
+                .entries
+                .iter()
+                .filter_map(|entry| entry.brier_score)
+                .fold((0.0, 0_usize), |(sum, count), score| {
+                    (sum + score, count + 1)
+                });
+            if count == 0 {
                 None
             } else {
-                Some(brier_values.iter().sum::<f64>() / brier_values.len() as f64)
+                Some(sum / count as f64)
             }
         };
 
@@ -8820,6 +8825,40 @@ mod tests {
             (avg_brier - 0.2).abs() < 1e-10,
             "avg brier should be 0.2, got {avg_brier}"
         );
+    }
+
+    #[test]
+    fn routing_evidence_ledger_streamed_brier_is_json_identical() {
+        fn historical_brier_average(ledger: &RoutingEvidenceLedger) -> Option<f64> {
+            let values: Vec<f64> = ledger
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.brier_score)
+                .collect();
+            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+        }
+
+        for scores in [
+            vec![],
+            vec![None, None],
+            vec![Some(0.1), None, Some(0.2), Some(0.3)],
+            (0..200)
+                .map(|sample| (sample % 5 != 0).then_some(0.08 + f64::from(sample % 17) * 0.01))
+                .collect(),
+        ] {
+            let mut ledger = RoutingEvidenceLedger::new(scores.len().max(1));
+            for (index, score) in scores.into_iter().enumerate() {
+                ledger.record(make_ledger_entry(&format!("d{index}"), false, score));
+            }
+
+            let streamed = ledger.diagnostics();
+            let mut historical = streamed.clone();
+            historical["avg_brier_score"] = serde_json::json!(historical_brier_average(&ledger));
+            assert_eq!(
+                serde_json::to_vec(&streamed).expect("serialize streamed diagnostics"),
+                serde_json::to_vec(&historical).expect("serialize historical diagnostics")
+            );
+        }
     }
 
     #[test]
