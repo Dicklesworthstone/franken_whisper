@@ -4,6 +4,19 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - WhiteCreek: **CLOSED, NO CODE NEEDED (bd-6goy residual "prompt_reset_since") — whisper.cpp has NO post-acceptance prompt reset; the ladder is already at full wc prompt/temperature parity. SOURCE-VERIFIED, don't re-open.**
+
+`prompt_reset_since` is OpenAI `transcribe.py` machinery only. In whisper.cpp
+(in-repo checkout, src/whisper.cpp) the COMPLETE temperature↔prompt surface is:
+(1) prompt-build conditioning `t_cur < WHISPER_HISTORY_CONDITIONING_TEMP_CUTOFF`
+(= 0.5, line 145 + 7103) — ported as `window_temp <= TEMP_PROMPT_RESET`; the
+`<` vs `<=` boundary is UNREACHABLE (no ladder rung equals 0.5), so semantics
+are identical on the actual ladder; (2) `prompt_past1` is rebuilt from the
+ACCEPTED window's tokens afterwards (7603-7612) with no temperature-based
+reset — ours updates `prompt_past` from the adopted best-candidate tokens the
+same way; (3) the short-tail prompt clear (7040-7043) was ported long ago.
+Nothing to implement. **bd-6goy residual is now: beam search only.**
+
 ## 2026-07-22 - WhiteCreek: **KEEP (increment on the FW_TEMP_FALLBACK ladder, same gate, byte-exact-by-construction) — whisper.cpp `greedy.best_of = 5` per ladder rung: each t > 0 rung decodes 5 independent sampling candidates and adopts the best `sequence_score`; track01 recovery improves 1226 → 1273 chars, deterministic, `FW_TEMP_BEST_OF=1` reproduces the single-candidate ladder BYTE-FOR-BYTE (bd-6goy).**
 
 **What landed (decode.rs only):** `sequence_score` = whisper.cpp
