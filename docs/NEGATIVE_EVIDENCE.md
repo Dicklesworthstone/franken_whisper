@@ -24106,3 +24106,50 @@ on the identical `metrics_for` pattern). The router-test re-run is stuck in shar
 rebuilding post-unblock), redundant given the compile + byte-exact-by-construction proof. **LESSON: an upstream dep API
 mismatch has TWO fix directions — migrate the caller OR pin the dep to the matching API; don't assume caller-migration
 (the dep-pin bump is often the upstream team's choice). The fix landed as a VERSION BUMP, not a code edit.**
+
+---
+## 2026-07-22 - cod: **BLOCKED / NO VERDICT — duplicate speculation-controller Brier scan profiles at 18.026% of `apply`, but strict-remote release validation never reached the candidate A/B timed path.**
+
+Ledger/history screening found no prior entry for precomputing the Brier score
+inside `SpeculationWindowController::apply`. The historical path scans the same
+immutable 20-entry calibration window once in `recommend()` and immediately
+again for fallback/evidence. This is a fit for the alien-graveyard incremental-
+computation primitive (reuse a derived value within one state snapshot), not a
+policy change: state space, actions, loss thresholds, posterior/confidence,
+calibration metric, fallback triggers, and evidence fields would remain exact.
+Recommendation-contract score: impact=2, confidence=5, reuse=3, effort=1,
+friction=1 => **EV 30.0**.
+
+**Profile before production edit:** strict-remote command
+`cargo bench --profile release --bench pipeline_bench -- pipeline/speculation_controller ...`
+ran as job `j-29942429901652015` on `vmi1227854`. Criterion medians were:
+
+- `calibration_brier_window_20`: **20.779 ns** `[20.105, 21.454]`;
+- historical `apply_window_20`: **115.27 ns** `[109.60, 122.02]`;
+- redundant-scan share: **20.779 / 115.27 = 18.026%**.
+
+The candidate (compute once, feed identical `f64` bits to recommendation and
+fallback/evidence) and a five-regime exact-action/`brier_score.to_bits()` oracle
+were prepared. They produced **no valid result**. Fleet saturation first denied
+four-slot placement (`insufficient_slots=8, hard_preflight=4`); reducing to
+`-j2` admitted `j-29942429901652062` on `vmi1264463`. That job spent about three
+minutes syncing 57 dependency roots and cold-compiled until RCH returned
+**`RCH-E104: SSH command timed out after 1800s`**. No local Cargo fallback ran.
+The retry was explicitly pinned to `vmi1264463` as
+`j-29942429901652139`, but the nominally pooled target began recompiling
+foundational crates from scratch; it was cancelled before another timeout.
+Neither job executed the conformance test or the 21-sample interleaved A/B/null
+harness, so there is no candidate ratio, null distribution, candidate CV, or
+KEEP/REJECT basis. The speculative source and benchmark edits were manually
+restored and `git diff --exit-code -- src/speculation.rs benches/pipeline_bench.rs`
+returned **0**.
+
+**Concrete retry predicate:** retry only when an admissible worker has the
+release-test artifact genuinely warm enough for the focused test to start below
+RCH's 1,800-second limit, or when the remote command timeout exceeds the observed
+cold build. On one pinned worker, require the exact action/fallback/evidence
+oracle plus Brier `to_bits` equality, then 21 order-alternated historical/
+candidate pairs and historical/historical null pairs with null median
+`0.95..=1.05`, candidate CV `<5%`, at least `18/21` wins, and candidate p10
+`> max(null p90, 1.10)`. Until that predicate holds, **do not ship and do not
+record this as a rejection**; the measured hotspot remains open.

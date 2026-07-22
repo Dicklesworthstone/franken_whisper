@@ -4,6 +4,40 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — BLOCKED — speculation controller duplicate Brier scan (bd-kdg7.1)
+
+**Profile-first evidence.** After screening both ledgers and recent history, the
+fresh candidate was `SpeculationWindowController::apply`: it calls
+`recommend()`, which scans the 20-sample calibration window for the Brier score,
+then immediately scans the same immutable window again for fallback/evidence.
+Strict-remote `pipeline_bench` job `j-29942429901652015` on `vmi1227854`
+measured one scan at **20.779 ns** median `[20.105, 21.454]` and the historical
+`apply` caller at **115.27 ns** median `[109.60, 122.02]`. One redundant scan is
+therefore **18.026%** of the profiled caller. This fits the alien-graveyard
+incremental-computation primitive: reuse one derived value inside one immutable
+decision snapshot. Pre-edit EV inputs were impact=2, confidence=5, reuse=3,
+effort=1, friction=1, score **30.0**.
+
+**No admissible candidate result.** The proposed one-scan implementation and
+its exact action/Brier-bit oracle were prepared, but no candidate or null sample
+reached execution. Strict-remote release-test job `j-29942429901652062` on
+`vmi1264463` spent three minutes syncing and then cold-compiled until RCH's hard
+1,800-second SSH limit returned **`RCH-E104`**; fail-closed policy prevented a
+local fallback. A bounded retry explicitly pinned to the same worker as
+`j-29942429901652139`, but the pooled target restarted foundational compilation
+instead of reusing the warm artifacts, so it was cancelled before another
+timeout. Consequently there is no interleaved historical/candidate A/B, null
+control, candidate CV, or conformance-test exit to support a KEEP or REJECT.
+Production and benchmark edits were manually restored; both files match HEAD.
+
+**Retry predicate.** This candidate remains open only when one admissible worker
+already has a release-test artifact warm enough to run the focused conformance
+test under 1,800 seconds, or RCH supplies a timeout above the observed cold-build
+duration. Then rerun the exact-action/`to_bits` oracle plus 21 order-alternated
+historical/candidate pairs and historical/historical null pairs on that same
+worker; require null median in `[0.95, 1.05]`, candidate CV `<5%`, at least 18/21
+wins, and candidate p10 above `max(null p90, 1.10)` before landing.
+
 ## 2026-07-16 — LANDED — allocation-free native rollout-stage parsing (bd-bz12)
 
 **Negative-ledger-first fresh pivot and profile boundary.** `bv --robot-triage`
