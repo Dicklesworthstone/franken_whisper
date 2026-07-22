@@ -383,6 +383,164 @@ fn bench_router_metrics(c: &mut Criterion) {
     });
 }
 
+/// Same-worker A/B for hoisting the three state-invariant backend aggregates
+/// out of the adaptive loss matrix's three availability rows.
+fn bench_router_loss_hoist(c: &mut Criterion) {
+    const BACKENDS: [BackendKind; 3] = [
+        BackendKind::WhisperCpp,
+        BackendKind::InsanelyFast,
+        BackendKind::WhisperDiarization,
+    ];
+
+    fn checksum(metrics: &BackendMetrics) -> u64 {
+        metrics.success_rate.to_bits()
+            ^ metrics.avg_latency_ms.to_bits().rotate_left(7)
+            ^ (metrics.sample_count as u64).rotate_left(13)
+            ^ (metrics.success_count as u64).rotate_left(19)
+            ^ metrics
+                .last_error
+                .as_ref()
+                .map_or(0, |error| error.len() as u64)
+    }
+
+    fn historical_loss_inputs(state: &RouterState) -> u64 {
+        let mut result = 0_u64;
+        for state_idx in 0..3_u32 {
+            for backend in BACKENDS {
+                let metrics = black_box(state.metrics_for(backend));
+                result = result.rotate_left(state_idx + 1) ^ checksum(&metrics);
+            }
+        }
+        result
+    }
+
+    fn hoisted_loss_inputs(state: &RouterState) -> u64 {
+        let metrics: [BackendMetrics; 3] =
+            std::array::from_fn(|index| black_box(state.metrics_for(BACKENDS[index])));
+        let mut result = 0_u64;
+        for state_idx in 0..3_u32 {
+            for backend_metrics in &metrics {
+                result = result.rotate_left(state_idx + 1) ^ checksum(backend_metrics);
+            }
+        }
+        result
+    }
+
+    fn measure<F>(inner_steps: usize, mut operation: F) -> Duration
+    where
+        F: FnMut() -> u64,
+    {
+        let started = Instant::now();
+        let mut aggregate = 0_u64;
+        for _ in 0..inner_steps {
+            aggregate ^= black_box(operation());
+        }
+        black_box(aggregate);
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut state = RouterState::new();
+    for backend in BACKENDS {
+        for sample in 0..50_u64 {
+            state.record_outcome(RoutingOutcomeRecord {
+                backend,
+                success: sample % 4 != 0,
+                latency_ms: 350 + sample * 17,
+                error_message: (sample % 4 == 0).then(|| format!("{backend:?} failure {sample}")),
+                recorded_at_rfc3339: format!("2026-07-22T12:{sample:02}:00Z"),
+            });
+        }
+    }
+
+    let historical_metrics: Vec<BackendMetrics> = (0..3)
+        .flat_map(|_| BACKENDS.map(|backend| state.metrics_for(backend)))
+        .collect();
+    let cached_metrics: [BackendMetrics; 3] =
+        std::array::from_fn(|index| state.metrics_for(BACKENDS[index]));
+    let mut candidate_metrics = Vec::with_capacity(9);
+    for _ in 0..3 {
+        candidate_metrics.extend(cached_metrics.iter());
+    }
+    assert_eq!(
+        serde_json::to_vec(&historical_metrics).expect("serialize historical loss inputs"),
+        serde_json::to_vec(&candidate_metrics).expect("serialize hoisted loss inputs")
+    );
+    assert_eq!(historical_loss_inputs(&state), hoisted_loss_inputs(&state));
+
+    let inner_steps = 200_000;
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure(inner_steps, || historical_loss_inputs(&state));
+            let null_b = measure(inner_steps, || historical_loss_inputs(&state));
+            let baseline = measure(inner_steps, || historical_loss_inputs(&state));
+            let candidate = measure(inner_steps, || hoisted_loss_inputs(&state));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate = measure(inner_steps, || hoisted_loss_inputs(&state));
+            let baseline = measure(inner_steps, || historical_loss_inputs(&state));
+            let null_b = measure(inner_steps, || historical_loss_inputs(&state));
+            let null_a = measure(inner_steps, || historical_loss_inputs(&state));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let null_median = median(&null_ratios);
+    let null_p90 = percentile(&sorted_null, 0.9);
+    let speedup_p10 = percentile(&sorted_speedups, 0.1);
+    let candidate_cv = cv(&candidate_ns);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "ROUTER_LOSS_HOIST_AB inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={null_median:.6} null_p90={null_p90:.6} speedup_p10={speedup_p10:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={candidate_cv:.6} wins={wins}/21",
+        percentile(&sorted_null, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+    );
+
+    assert!((0.95..=1.05).contains(&null_median));
+    assert!(candidate_cv < 0.05);
+    assert!(wins >= 18);
+    assert!(speedup_p10 > null_p90.max(1.10));
+
+    c.bench_function("pipeline/router_loss_hoist/history_50", |b| {
+        b.iter(|| hoisted_loss_inputs(black_box(&state)));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -449,6 +607,7 @@ criterion_group!(
     bench_pipeline_config_validation,
     bench_pipeline_has_stage,
     bench_router_metrics,
+    bench_router_loss_hoist,
     bench_export_srt_buffering,
 );
 criterion_main!(benches);

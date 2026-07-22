@@ -4,6 +4,45 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - cod: **KEEP (bd-gucz) — retry predicate satisfied; adaptive loss-matrix base-loss hoist cuts 9 aggregates to 3, 2.419x median, 21/21 wins, 0.283% CV, exact loss-bit parity.**
+
+This retry obeyed the earlier `bd-kdg7.4` CLOSED/BLOCKED predicate. Before any
+edit, both ledgers and recent history were searched for the function, 9-to-3
+hoist, and blocker. The formerly missing frankensqlite
+`agg_in_list_composite_prefix_oracle.rs` entrypoint is now present; pinned
+non-SIGILL worker `ovh-a` admitted strict-remote `pipeline_bench` and reached
+execution. The prior profile measured a 50-record `metrics_for` aggregate at
+**67.819 ns** median `[65.506, 70.257]`. The historical loss-matrix loop called
+the aggregate plus posterior/loss arithmetic once per backend in each of three
+availability rows: **9 calls for 3 state-invariant values**.
+
+The candidate computes those three values once into a fixed array and reuses
+them. A production oracle recomputes the old per-row reference and checks every
+cell by `f64::to_bits` across diarize off/on, 0/30/600-second durations, mixed
+histories for all three backends, prediction history, availability penalties,
+sanitization, and the fallback action. It passed **1/1** under strict-remote
+`cargo test --lib -j2` on `ovh-a`. Before timing, the benchmark also proves
+byte-identical serialized `BackendMetrics` inputs and an equal full checksum.
+
+The same release executable ran 21 order-alternated historical/candidate pairs
+and 21 historical/historical null pairs at 200,000 constructions per arm.
+Speedup p10/median/p90 was **2.413922x / 2.418995x / 2.460754x**, with
+**21/21** wins. Candidate latency p10/median/p90 was
+**187.775 / 188.465 / 188.857 ns** and CV was **0.2829%**. Null
+p10/median/p90 was **0.993621x / 0.999396x / 1.003279x**. Criterion's separate
+10-sample estimate for `pipeline/router_loss_hoist/history_50` was
+**[187.71, 189.04, 190.90] ns**. All predeclared gates passed; strict-remote
+`cargo check --bench pipeline_bench -j2` also passed. The guardrail policy has
+no pipeline comparator, so this component's interleaved null gate is its
+regression boundary. Strict-remote RCH refused the shell guardrail wrapper as a
+non-compilation command with **RCH-E301**, preventing its internal Cargo call
+from falling back locally. Strict-remote clippy reported 36 findings; the one
+inside this lever was fixed and the bitwise oracle repassed, while the other 35
+are outside this diff in peer-owned/native, audio, orchestrator, sync, and
+backend code. `git diff --check` passed; direct `rustfmt --check` reported only
+four pre-existing hunks outside this change. This supersedes the earlier
+no-verdict blocker; it does not make an end-to-end transcription claim.
+
 ## 2026-07-22 - WhiteCreek: **CLOSED, NO CODE NEEDED (bd-6goy residual "prompt_reset_since") — whisper.cpp has NO post-acceptance prompt reset; the ladder is already at full wc prompt/temperature parity. SOURCE-VERIFIED, don't re-open.**
 
 `prompt_reset_since` is OpenAI `transcribe.py` machinery only. In whisper.cpp
