@@ -4,6 +4,63 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - WhiteCreek: **KEEP (gated, default-off, byte-exact-by-construction) — `FW_TEMP_FALLBACK` whisper.cpp-faithful temperature-fallback ladder recovers BOTH dropped long-form windows on the bd-r0qd trigger: track01 tiny.en TS 643→1226 chars / 13→22 segs, deterministic across runs (bd-6goy fallback half, bd-r0qd fix-spec #3).**
+
+**What landed (decode.rs only):** on a non-silent window that closes no timestamp
+(`result_len == 0`) OR averages below `LOGPROB_THRESHOLD` (-1.0, whisper.cpp
+`logprob_thold`), re-decode the SAME seek at whisper.cpp's ladder temperatures
+[0.2, 0.4, 0.6, 0.8, 1.0]: multinomial sampling from `softmax(logits/t)`
+(SplitMix64, seeded per (window, attempt) ⇒ **replayable** — two gate-ON runs
+md5-identical, verified), prompt dropped above t = 0.5 (wc semantics; the exact
+bd-r0qd recovery), encode reused via the existing `retry_enc_cache`, final rung
+accepted as-is (wc keeps its last decode too). Plus a prefetch double-dispatch
+guard: a same-seek re-entry now keeps the in-flight next-window encode instead of
+re-sending (the pre-existing `res_rx` desync-by-one hazard was unreachable only
+because `FW_RETRY_FAILED_WINDOW` is TS-only; the ladder's logprob trigger reaches
+no_ts, so the guard is required — default-inert, the predicate is impossible
+outside a retry). `FW_RETRY_FAILED_WINDOW` is superseded when both are set.
+
+**Measured (fresh `e2e_probe` release, tiny.en, track01_16k.wav 124.5s, TS mode
+= the confirmed drop regime):** default 13 segs / **643** chars with the two
+known 30 s gaps → `FW_TEMP_FALLBACK=1` 22 segs / **1226** chars — both windows
+recovered with coherent real content; reference `FW_RETRY_FAILED_WINDOW=1` =
+1301 chars / 21 segs (same recovery class; the ladder's t=0.2/0.4 rungs keep the
+carried prompt so its accepted text differs slightly from blunt prompt-reset).
+Wall cost only on failed windows: 1.18 s → 3.78 s on this pathological clip; a
+clean clip pays one branch test per window.
+
+**Default byte-exactness:** gate unset ⇒ ladder never fires, `window_temp` stays
+0.0 ⇒ argmax path unchanged; `gated_e2e_jfk_tiny_en_matches_reference` (golden
+transcript) green post-change. Gates: `cargo clippy --lib -- -D warnings` clean,
+rustfmt clean, decode-filtered lib tests 58/0, sampler unit tests (determinism /
+mask-respect / degenerate-input) added.
+
+**HONEST TEST CAVEAT — pre-existing load flakes, NOT this change:** under the
+FULL `cargo test --lib native_engine` parallel load,
+`gated_e2e_dtw_word_timestamps_deterministic` fails intermittently **with the
+gate OFF too** (default path provably runtime-inert; word boundary "ask" end
+4.62 vs 4.58 s between two same-process runs), and
+`resident_cache_keeps_one_model_alive_after_drop` flapped once (model-cache
+subsystem, untouched by this diff). Isolated runs: both green (DTW test 1/0 with
+gate ON). The DTW determinism test has load-dependent nondeterminism upstream of
+this change — worth its own bead.
+
+**Residual (bd-6goy stays OPEN):** entropy/compression-ratio gate, `best_of`
+parallel candidates, `prompt_reset_since` after a t>0.5 acceptance, and beam
+search are NOT implemented; the ladder triggers only on the two failure signals
+above. **The default-on flip remains the owner's faithfulness call** (this
+ledger, 2026-07-14 frontier: "NOT autonomously flippable") — the evidence pack
+for that call now includes a wc-faithful ladder, not just prompt-reset.
+
+**BUILD BLOCKER (recurrence of the 300a8a9 class, resolved in-session):**
+frankensqlite bumped 0.1.16→0.1.18→0.1.19 while franken_whisper's lock pinned
+0.1.16 ⇒ cargo re-resolution ⇒ fatal against THIS BOX's stale crates.io index
+mirror (online max serde 1.0.223 vs locked 1.0.228 — even unsandboxed). Local
+hand-bump of the 20 fsqlite lock entries + routing the build through rch (live
+index on workers) resolved it; cargo re-locked to 0.1.19 (+ a new
+`thiserror` edge). **Lesson: on this box a lock/manifest drift is fatal LOCALLY
+but fine via rch — fix the lock, don't fight the index.**
+
 ## 2026-07-22 - WhiteCreek: **WIP EVALUATION (bd-frp7) — the prior swarm's 6 uncommitted `src/native_engine/` edits (decoder/dtw/encoder/ggml/nn/weights) are a PURE `cargo fmt` normalization; landed as-is with a token-identity proof, no re-verification needed.**
 
 **Evaluation method (no build):** for each of the 6 modified files, `git show
