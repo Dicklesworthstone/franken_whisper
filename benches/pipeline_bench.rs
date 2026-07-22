@@ -5,12 +5,14 @@
 //! calculation via `PipelineConfig` construction and validation.
 
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use franken_whisper::model::{RunEvent, StreamedRunEvent};
+use franken_whisper::backend::{BackendMetrics, RouterState, RoutingOutcomeRecord};
+use franken_whisper::model::{BackendKind, RunEvent, StreamedRunEvent};
 use franken_whisper::orchestrator::{PipelineBuilder, PipelineConfig, PipelineStage};
 
 // ---------------------------------------------------------------------------
@@ -234,6 +236,153 @@ fn bench_pipeline_has_stage(c: &mut Criterion) {
     });
 }
 
+/// Profile the adaptive router's per-backend aggregate over its full retained
+/// history window. `evaluate_backend_selection` invokes this aggregate for
+/// every backend while building the loss matrix and again while constructing
+/// the evidence snapshot.
+fn bench_router_metrics(c: &mut Criterion) {
+    fn historical_metrics(history: &[RoutingOutcomeRecord]) -> BackendMetrics {
+        let sample_count = history.len();
+        let success_count = history.iter().filter(|record| record.success).count();
+        let success_rate = success_count as f64 / sample_count as f64;
+        let successful_latencies: Vec<f64> = history
+            .iter()
+            .filter(|record| record.success)
+            .map(|record| record.latency_ms as f64)
+            .collect();
+        let avg_latency_ms = if successful_latencies.is_empty() {
+            0.0
+        } else {
+            successful_latencies.iter().sum::<f64>() / successful_latencies.len() as f64
+        };
+        let last_error = history
+            .iter()
+            .rev()
+            .find_map(|record| record.error_message.clone());
+        BackendMetrics {
+            success_rate,
+            avg_latency_ms,
+            last_error,
+            sample_count,
+            success_count,
+        }
+    }
+
+    fn measure_metrics<F>(inner_steps: usize, mut metrics: F) -> Duration
+    where
+        F: FnMut() -> BackendMetrics,
+    {
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..inner_steps {
+            let result = black_box(metrics());
+            checksum ^= result.avg_latency_ms.to_bits();
+            checksum = checksum.rotate_left(1) ^ result.success_rate.to_bits();
+            black_box(&result);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut state = RouterState::new();
+    let mut history = Vec::with_capacity(50);
+    for i in 0..50_u64 {
+        let record = RoutingOutcomeRecord {
+            backend: BackendKind::WhisperCpp,
+            success: i % 4 != 0,
+            latency_ms: 350 + i * 17,
+            error_message: (i % 4 == 0).then(|| format!("backend failure {i}")),
+            recorded_at_rfc3339: format!("2026-07-22T12:{i:02}:00Z"),
+        };
+        state.record_outcome(record.clone());
+        history.push(record);
+    }
+
+    let historical = historical_metrics(&history);
+    let streamed = state.metrics_for(BackendKind::WhisperCpp);
+    assert_eq!(
+        serde_json::to_vec(&streamed).expect("serialize streamed metrics"),
+        serde_json::to_vec(&historical).expect("serialize historical metrics")
+    );
+    assert_eq!(
+        streamed.avg_latency_ms.to_bits(),
+        historical.avg_latency_ms.to_bits()
+    );
+
+    // One remote executable performs the null and candidate comparisons in an
+    // order-alternated sequence. Each historical arm runs for about 200 ms at
+    // the profiled 200 ns/call baseline, smoothing shared-worker scheduling.
+    let inner_steps = 1_000_000;
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure_metrics(inner_steps, || historical_metrics(&history));
+            let null_b = measure_metrics(inner_steps, || historical_metrics(&history));
+            let baseline = measure_metrics(inner_steps, || historical_metrics(&history));
+            let candidate =
+                measure_metrics(inner_steps, || state.metrics_for(BackendKind::WhisperCpp));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate =
+                measure_metrics(inner_steps, || state.metrics_for(BackendKind::WhisperCpp));
+            let baseline = measure_metrics(inner_steps, || historical_metrics(&history));
+            let null_b = measure_metrics(inner_steps, || historical_metrics(&history));
+            let null_a = measure_metrics(inner_steps, || historical_metrics(&history));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "ROUTER_METRICS_AB inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={:.6} null_p90={:.6} speedup_p10={:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={:.6} wins={wins}/21",
+        percentile(&sorted_null, 0.1),
+        median(&null_ratios),
+        percentile(&sorted_null, 0.9),
+        percentile(&sorted_speedups, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+        cv(&candidate_ns),
+    );
+
+    c.bench_function("pipeline/router_metrics/history_50", |b| {
+        b.iter(|| state.metrics_for(black_box(BackendKind::WhisperCpp)));
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -299,6 +448,7 @@ criterion_group!(
     bench_sha256_json_value,
     bench_pipeline_config_validation,
     bench_pipeline_has_stage,
+    bench_router_metrics,
     bench_export_srt_buffering,
 );
 criterion_main!(benches);

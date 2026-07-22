@@ -4,6 +4,56 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - cod: **KEEP (bd-kdg7.2) — stream-fused `RouterState::metrics_for` removes its successful-latency Vec; 3.6695x median, 21/21 wins, 2.1502% CV, exact serialized behavior.**
+
+**Freshness and profile first.** Exact ledger and recent-log searches found no
+prior attempt at the `successful_latencies` materialization. The historical
+aggregate remained after a different router-state clone lever. Before editing
+production, strict-remote `pipeline_bench` job `j-29942429901652194` on `ovh-a`
+measured the 50-record historical function at **200.34 ns** median
+`[197.57, 203.56]`. Adaptive selection consumes this aggregate for each of
+three backends in both its loss calculation and evidence snapshot. The chosen
+alien primitive was stream fusion: sum successful latency in the original
+iteration order without first collecting a heap vector.
+
+**Mandatory negative-evidence checkpoint.** The first same-binary remote A/B,
+job `j-29942429901652223` on `vmi1227854`, was **INVALID**, not proof: although
+the candidate won 21/21 pairs with p10/median/p90 speedup
+**3.4916x / 3.8173x / 4.2876x**, candidate CV was **6.0735%**, above the 5%
+gate. Its historical/historical null was also broad at p10/median/p90
+**0.8460x / 1.0144x / 1.2980x**. The concrete retry condition was longer
+same-worker arms that reduced candidate CV below 5%, retained at least 18/21
+wins, kept null median in `[0.95, 1.05]`, and put candidate p10 above
+`max(null p90, 1.10)`.
+
+**Admissible KEEP.** The retry used 1,000,000 calls per arm (~200 ms historical)
+inside one release executable. Strict-remote job `j-29942429901652276` on
+`hz1` produced **21/21** wins, speedup p10/median/p90
+**3.6208x / 3.6695x / 3.9433x**, and candidate CV **2.1502%**. Its interleaved
+historical/historical null was **0.9681x / 0.9934x / 1.0749x** at
+p10/median/p90. The criterion candidate estimate was
+`[65.506, 67.819, 70.257] ns`; it is not cross-worker-compared to the profile
+absolute. The benchmark exact oracle compared complete serialized
+`BackendMetrics` bytes and `avg_latency_ms.to_bits()` against the historical
+materialized reference. The production unit oracle covers four success masks
+over the full 50-record window, preserving floating addition order, zero-success
+behavior, last-error selection, counts, rates, and JSON evidence.
+
+**Scope and reopen rule.** This closes only the per-backend router aggregate;
+it is not an ASR or end-to-end latency claim. Reopen this exact lever only if
+the history representation or metric schema changes enough that the direct fold
+no longer preserves serialized bytes; otherwise it is landed and CLOSED.
+
+**Gate-artifact disclosure.** The release benchmark compiled and exercised the
+production path. The focused unit-test retry was prevented from reaching Cargo
+by RCH `RCH-E410` dependency preflight after a concurrent frankensqlite test
+entrypoint appeared, then routed to a cold worker and was cancelled. Remote
+guardrail jobs `j-29942429901652338` and `j-29942429901652352` compiled final
+non-test source but could not evaluate the policy: the worker had only this
+`pipeline_bench` result, while all enforced entries reference uncollected
+`tty_bench` artifacts (and the provisional entries reference `sync_bench`). No
+local Cargo fallback ran.
+
 ## 2026-07-22 - WhiteCreek: **DIAGNOSIS (bd-0ivd, partial — reproducer found, uninit class EXONERATED): the DTW word-timestamp nondeterminism is genuine threading-order sensitivity in a parallel numeric path, reproducible ON-BOX at ~50% via `taskset -c 0-3` + the FULL native_engine lib suite. It is NOT an uninit-buffer bug and NOT reachable by cross-process load.**
 
 **What flakes:** `gated_e2e_dtw_word_timestamps_deterministic` — two back-to-back

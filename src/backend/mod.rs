@@ -546,15 +546,15 @@ impl RouterState {
         let success_count = history.iter().filter(|r| r.success).count();
         let success_rate = success_count as f64 / sample_count as f64;
 
-        let successful_latencies: Vec<f64> = history
+        let successful_latency_sum = history
             .iter()
             .filter(|r| r.success)
             .map(|r| r.latency_ms as f64)
-            .collect();
-        let avg_latency_ms = if successful_latencies.is_empty() {
+            .sum::<f64>();
+        let avg_latency_ms = if success_count == 0 {
             0.0
         } else {
-            successful_latencies.iter().sum::<f64>() / successful_latencies.len() as f64
+            successful_latency_sum / success_count as f64
         };
 
         let last_error = history.iter().rev().find_map(|r| r.error_message.clone());
@@ -4136,16 +4136,17 @@ impl ConcurrentTwoLaneExecutor {
 mod tests {
     use super::{
         ADAPTIVE_FALLBACK_CALIBRATION_THRESHOLD, ADAPTIVE_MIN_SAMPLES, BackendHealthReport,
-        BackendImplementation, BackendSelectionContract, CANONICAL_SEGMENT_TOLERANCE_MS,
-        CalibrationState, Engine, InsanelyFastEngine, NativeEngineContract, QualitySelector,
-        ROUTER_HISTORY_WINDOW, RouterState, RoutingEvidenceLedger, RoutingEvidenceLedgerEntry,
-        RoutingOutcomeRecord, SegmentConformanceReport, SegmentConformanceViolation,
-        SegmentViolationKind, ShadowDivergenceKind, ShadowRunConfig, ShadowRunDivergence,
-        ShadowRunReport, TranscriptSegment, TwoLaneExecutor, WhisperCppEngine,
-        WhisperDiarizationEngine, auto_priority, bridge_error_recoverable,
-        bridge_native_recovery_from_raw, check_segment_conformance, compare_shadow_results,
-        duration_bucket, evaluate_backend_selection, extract_segments_from_json, is_hf_token_set,
-        latency_proxy, native_runtime_metadata, number_millis_to_secs, number_to_secs,
+        BackendImplementation, BackendMetrics, BackendSelectionContract,
+        CANONICAL_SEGMENT_TOLERANCE_MS, CalibrationState, Engine, InsanelyFastEngine,
+        NativeEngineContract, QualitySelector, ROUTER_HISTORY_WINDOW, RouterState,
+        RoutingEvidenceLedger, RoutingEvidenceLedgerEntry, RoutingOutcomeRecord,
+        SegmentConformanceReport, SegmentConformanceViolation, SegmentViolationKind,
+        ShadowDivergenceKind, ShadowRunConfig, ShadowRunDivergence, ShadowRunReport,
+        TranscriptSegment, TwoLaneExecutor, WhisperCppEngine, WhisperDiarizationEngine,
+        auto_priority, bridge_error_recoverable, bridge_native_recovery_from_raw,
+        check_segment_conformance, compare_shadow_results, duration_bucket,
+        evaluate_backend_selection, extract_segments_from_json, is_hf_token_set, latency_proxy,
+        native_runtime_metadata, number_millis_to_secs, number_to_secs,
         posterior_success_probability, prior_for, probe_system_health,
         probe_system_health_uncached, quality_proxy, runtime_metadata,
         runtime_metadata_with_implementation, sanitize_timestamp, segment_end, segment_start,
@@ -4159,6 +4160,7 @@ mod tests {
     use franken_decision::DecisionContract;
     use franken_kernel::DecisionId;
     use franken_kernel::TraceId;
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
@@ -7044,6 +7046,60 @@ mod tests {
         let m = state.metrics_for(BackendKind::WhisperCpp);
         assert_eq!(m.avg_latency_ms, 0.0, "all-failure avg latency should be 0");
         assert_eq!(m.success_rate, 0.0);
+    }
+
+    #[test]
+    fn metrics_for_streamed_latency_sum_matches_materialized_reference_bytes() {
+        fn historical_metrics(history: &VecDeque<RoutingOutcomeRecord>) -> BackendMetrics {
+            let sample_count = history.len();
+            let success_count = history.iter().filter(|record| record.success).count();
+            let successful_latencies: Vec<f64> = history
+                .iter()
+                .filter(|record| record.success)
+                .map(|record| record.latency_ms as f64)
+                .collect();
+            let avg_latency_ms = if successful_latencies.is_empty() {
+                0.0
+            } else {
+                successful_latencies.iter().sum::<f64>() / successful_latencies.len() as f64
+            };
+            BackendMetrics {
+                success_rate: success_count as f64 / sample_count as f64,
+                avg_latency_ms,
+                last_error: history
+                    .iter()
+                    .rev()
+                    .find_map(|record| record.error_message.clone()),
+                sample_count,
+                success_count,
+            }
+        }
+
+        for success_period in [1_usize, 2, 4, usize::MAX] {
+            let mut state = RouterState::new();
+            for i in 0..ROUTER_HISTORY_WINDOW {
+                let success = success_period != usize::MAX && i % success_period == 0;
+                let mut outcome =
+                    make_outcome(BackendKind::WhisperCpp, success, 350 + (i as u64 * 17));
+                if !success {
+                    outcome.error_message = Some(format!("failure-{i}"));
+                }
+                state.record_outcome(outcome);
+            }
+
+            let historical = historical_metrics(&state.histories[0]);
+            let streamed = state.metrics_for(BackendKind::WhisperCpp);
+            assert_eq!(
+                serde_json::to_vec(&streamed).expect("serialize streamed metrics"),
+                serde_json::to_vec(&historical).expect("serialize historical metrics"),
+                "metrics bytes diverged for success period {success_period}"
+            );
+            assert_eq!(
+                streamed.avg_latency_ms.to_bits(),
+                historical.avg_latency_ms.to_bits(),
+                "average latency bits diverged for success period {success_period}"
+            );
+        }
     }
 
     // -- calibration_score --
