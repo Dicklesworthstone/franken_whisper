@@ -4,6 +4,55 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — KEEP — stream routing-diagnostics Brier aggregation (bd-oazu)
+
+**Closed-lever retry predicate and profile first.** Before touching the
+candidate, both ledgers and recent Git history were searched for
+`RoutingEvidenceLedger::diagnostics`, Brier aggregation, temporary `Vec`
+materialization, and the earlier `bd-kdg7.3` blocker. Its recorded retry
+predicate now holds: strict-remote release `pipeline_bench` was admitted to
+non-SIGILL worker `ovh-a` and completed. The 200-entry realistic caller profile
+measured full diagnostics at **1.3869 us** median `[1.3855, 1.3880]` and the
+historical Brier `Vec` substage at **394.85 ns** median `[394.28, 395.24]`.
+The substage was therefore **28.47%** of the measured caller, clearing the
+predeclared 10% activation threshold. The selected alien primitive is a
+streaming reduction that eliminates intermediate materialization.
+
+**One lever and behavior isomorphism.** Diagnostics now accumulates optional
+Brier scores as `(sum, count)` in one pass instead of collecting a temporary
+`Vec<f64>` and scanning it again. Entry order, floating-point addition order,
+empty/all-`None` behavior, JSON keys, and every non-Brier diagnostic are
+unchanged. A production oracle compared the complete serialized diagnostics
+bytes against the historical implementation for empty, all-`None`, mixed, and
+realistic 200-entry ledgers; strict-remote `cargo test --lib -j2
+backend::tests::routing_evidence_ledger_streamed_brier_is_json_identical --
+--exact` passed **1/1** on `ovh-a`. The A/B executable also checked equal Brier
+bits and byte-equal serialized diagnostics before timing.
+
+**Same-worker interleaved A/B and null.** One release `pipeline_bench`
+executable on `ovh-a` ran 21 order-alternated historical-Vec/candidate-stream
+pairs and 21 historical/historical identity-null pairs, with 250,000
+aggregations per arm. The candidate won **21/21**. Speedup p10/median/p90 was
+**3.770171x / 3.882256x / 4.011933x**. Candidate latency p10/median/p90 was
+**90.708 / 90.926 / 91.308 ns**, with **1.5442% CV**. Null
+p10/median/p90 was **0.964531x / 0.982603x / 1.080055x**; candidate p10 clears
+both the 1.10 minimum and null p90. All predeclared gates passed. Criterion
+independently measured the post-change full caller at **1.0193 us** median
+`[1.0162, 1.0230]`, a reported **26.38%** improvement against its stored
+same-worker profile baseline, and the streamed substage at **94.395 ns** median
+`[94.126, 94.707]`.
+
+**Invalid attempt and policy boundary.** The first candidate command is
+excluded: the requested Brier filter never executed because a retained,
+unrelated loss-hoist setup failed first at **16.45% CV** on a noisy worker.
+The harness now skips custom setup whose own Criterion filter was not
+requested; the clean rerun above exited zero. Strict-remote `cargo check
+--bench pipeline_bench -j2` passed. The repository guardrail policy enumerates
+tty/sync release baselines and has no comparator for this pipeline component,
+so the interleaved null-controlled gate is the regression boundary. Direct
+`rustfmt --check` reports only four pre-existing hunks outside this lever. No
+local Cargo evidence was used, and no end-to-end transcription claim is made.
+
 ## 2026-07-22 — KEEP — hoist adaptive router base losses (bd-gucz)
 
 **Closed-lever retry predicate and profile first.** This is the admissible

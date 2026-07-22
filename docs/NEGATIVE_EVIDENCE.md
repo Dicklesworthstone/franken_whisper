@@ -4,6 +4,45 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - cod: **KEEP (bd-oazu) — streamed router Brier diagnostics removes the temporary Vec, 3.882x median, 21/21 wins, 1.544% CV, byte-identical JSON.**
+
+This is the admissible retry of the earlier `bd-kdg7.3` RCH blocker. Before
+any production edit, both ledgers and recent history were searched for the
+diagnostics caller, Brier `Vec`, streaming reductions, and the blocker. Its
+predicate now holds: non-SIGILL worker `ovh-a` admitted and completed
+strict-remote release `pipeline_bench`. Profile first measured the complete
+200-entry diagnostics snapshot at **1.3869 us** median `[1.3855, 1.3880]` and
+the historical Brier materialization/average at **394.85 ns** median
+`[394.28, 395.24]`, or **28.47%** of the caller. This cleared the predeclared
+10% threshold for a production attempt.
+
+The candidate folds present Brier scores into `(sum, count)` in one pass.
+The exact oracle covers empty, all-`None`, mixed, and realistic 200-entry
+ledgers and compares the complete serialized diagnostics bytes with the
+historical implementation. It passed **1/1** via strict-remote `cargo test
+--lib -j2` on `ovh-a`; the release harness repeated bit and serialized-byte
+parity before timing.
+
+One same-worker release executable ran 21 alternating-order A/B pairs and 21
+historical/historical null pairs at 250,000 aggregations per arm. Speedup
+p10/median/p90 was **3.770171x / 3.882256x / 4.011933x**, with **21/21** wins.
+Candidate latency p10/median/p90 was **90.708 / 90.926 / 91.308 ns** and CV was
+**1.5442%**. Null p10/median/p90 was
+**0.964531x / 0.982603x / 1.080055x**. Candidate p10 clears both the null p90
+and 1.10 minimum. Criterion measured post-change full diagnostics at
+**1.0193 us** median `[1.0162, 1.0230]`, reporting a **26.38%** improvement
+against its stored same-worker profile baseline, and the streamed substage at
+**94.395 ns** median `[94.126, 94.707]`.
+
+The first candidate command is explicitly excluded: the Brier filter never
+ran because unrelated retained loss-hoist setup failed first at **16.45% CV**.
+Filter-aware setup made the zero-exit rerun above isolated and admissible.
+Strict-remote `cargo check --bench pipeline_bench -j2` passed. The policy has
+no pipeline comparator, so the A/B/null gate is this component's regression
+boundary. Direct formatting audit found only four pre-existing hunks outside
+the change; no local Cargo evidence was used. This supersedes the earlier
+blocked no-verdict row and does not authorize ggml dequant retries.
+
 ## 2026-07-22 - cod: **KEEP (bd-gucz) — retry predicate satisfied; adaptive loss-matrix base-loss hoist cuts 9 aggregates to 3, 2.419x median, 21/21 wins, 0.283% CV, exact loss-bit parity.**
 
 This retry obeyed the earlier `bd-kdg7.4` CLOSED/BLOCKED predicate. Before any
