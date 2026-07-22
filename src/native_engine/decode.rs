@@ -491,6 +491,33 @@ fn retry_failed_window_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_RETRY_FAILED_WINDOW").is_some())
 }
 
+/// whisper.cpp's temperature-fallback ladder (initial greedy pass at 0.0, then
+/// `temperature_inc = 0.2` per retry): the retry temperatures, in order.
+const TEMP_FALLBACK_LADDER: [f64; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
+
+/// Above this retry temperature the carried prior-window prompt is dropped for the
+/// attempt (whisper.cpp conditions on no previous text once `t > 0.5`) — which is
+/// exactly the recovery that fixes the bd-r0qd carried-prompt × int8 early-EOT drop.
+const TEMP_PROMPT_RESET: f64 = 0.5;
+
+/// `FW_TEMP_FALLBACK` (default-OFF): whisper.cpp-faithful temperature fallback —
+/// the bd-r0qd fix-spec's "proper fix" (#3) and the fallback half of bd-6goy. A
+/// non-silent window that either closes no timestamp (`result_len == 0`, the
+/// confirmed long-form drop) or averages below [`LOGPROB_THRESHOLD`] (whisper.cpp
+/// `logprob_thold`) is re-decoded at the [`TEMP_FALLBACK_LADDER`] temperatures —
+/// multinomial sampling instead of argmax, deterministic per-(window, attempt)
+/// seed, prompt dropped above [`TEMP_PROMPT_RESET`] — reusing the window's encode.
+/// The first attempt that clears the gate wins; the final rung is accepted as-is
+/// (whisper.cpp keeps its last decode too). Unset ⇒ the ladder never fires and
+/// token selection stays the argmax path ⇒ byte-identical by construction.
+/// Supersedes `FW_RETRY_FAILED_WINDOW` when both are set (the ladder's `t > 0.5`
+/// rungs contain that retry's prompt reset).
+fn temp_fallback_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_TEMP_FALLBACK").is_some())
+}
+
 /// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
 /// (matching the scalar `l > -inf` guard). AVX2 degree-5 poly exp: range-reduce
 /// `x = k·ln2 + r`, `exp(r)` via Horner, `2^k` by float-bit construction. Numerics-
@@ -697,6 +724,71 @@ fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
     (
         i32::try_from(best_i).unwrap_or(0),
         logprobs.get(best_i).copied().unwrap_or(0.0),
+    )
+}
+
+/// SplitMix64 step — the deterministic PRNG behind temperature sampling. One `u64`
+/// of state, platform-independent: the same (window, attempt) always draws the same
+/// tokens, so a `FW_TEMP_FALLBACK` transcript is exactly replayable.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Multinomial draw from `softmax(logits / temperature)` — the non-greedy arm of
+/// whisper.cpp's `whisper_sample_token` (logits are divided by the temperature
+/// before the softmax). Masked lanes (`-inf`; NaN treated as masked) carry zero
+/// mass and are never drawn. The returned `plog` is the drawn id's TEMPERATURE-1
+/// log-softmax from `logprobs`, so the window's `avg_logprob` quality gate keeps
+/// measuring true model confidence, not the flattened sampling distribution.
+/// Degenerate inputs (no finite lane / underflowed mass) fall back to [`argmax`].
+fn sample_token_at_temperature(
+    logits: &[f32],
+    logprobs: &[f32],
+    temperature: f64,
+    rng: &mut u64,
+) -> (i32, f32) {
+    let inv_t = 1.0 / temperature.max(1e-6);
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|l| l.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return argmax(logits, logprobs);
+    }
+    let weight = |l: f32| -> f64 {
+        if l.is_finite() {
+            (f64::from(l - max) * inv_t).exp()
+        } else {
+            0.0
+        }
+    };
+    let total: f64 = logits.iter().map(|&l| weight(l)).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return argmax(logits, logprobs);
+    }
+    // 53-bit uniform in [0, 1), then walk the (un-normalized) cumulative mass. The
+    // walk re-derives each weight so `acc` sums the exact terms `total` summed.
+    let target = (splitmix64(rng) >> 11) as f64 / (1u64 << 53) as f64 * total;
+    let mut acc = 0.0f64;
+    for (i, &l) in logits.iter().enumerate() {
+        acc += weight(l);
+        if acc > target {
+            return (
+                i32::try_from(i).unwrap_or(0),
+                logprobs.get(i).copied().unwrap_or(0.0),
+            );
+        }
+    }
+    // FP rounding pushed the walk past the end (target ≈ total): last unmasked lane.
+    let last = logits.iter().rposition(|l| l.is_finite()).unwrap_or(0);
+    (
+        i32::try_from(last).unwrap_or(0),
+        logprobs.get(last).copied().unwrap_or(0.0),
     )
 }
 
@@ -1258,6 +1350,12 @@ pub fn transcribe_samples(
         // Set for one iteration when retrying a failed window with the carried prompt
         // cleared (FW_RETRY_FAILED_WINDOW). Reset once the window completes.
         let mut force_empty_prompt = false;
+        // FW_TEMP_FALLBACK ladder position for the CURRENT seek: 0 = the normal
+        // greedy pass; k > 0 = re-decoding at TEMP_FALLBACK_LADDER[k - 1]. Reset to 0
+        // once a window is accepted, so every window starts greedy.
+        let mut temp_attempt: usize = 0;
+        // The temperature the current attempt decodes at (0.0 = argmax/greedy path).
+        let mut window_temp: f64 = 0.0;
         // Holds `(frame_offset, enc)` from a window's first attempt so a
         // FW_RETRY_FAILED_WINDOW retry (same seek) reuses the identical encode instead
         // of paying a full re-encode. Only ever populated when the flag is on.
@@ -1331,17 +1429,26 @@ pub fn transcribe_samples(
             // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
             // no_timestamps advance is always CHUNK_CS, so the next offset is known and
             // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
-            prefetched = None;
-            if pipeline {
-                let next_seek = seek_cs + CHUNK_CS;
-                if next_seek + DELTA_MIN < seek_end_cs {
-                    let next_off = frame_offset + CHUNK_CS as usize;
-                    let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
-                        .unwrap_or(0)
-                        .min(FRAMES_PER_CHUNK);
-                    let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
-                    if req_tx.send((next_off, next_ctx * 2)).is_ok() {
-                        prefetched = Some(next_off);
+            //
+            // A same-seek re-entry (FW_TEMP_FALLBACK / FW_RETRY_FAILED_WINDOW) arrives
+            // here with the next window's encode ALREADY dispatched and unconsumed
+            // (`prefetched == Some(next_off)`); re-sending would queue a duplicate
+            // result and desync every later window's recv by one. Keep the in-flight
+            // one instead. Outside a retry this predicate is impossible (a fresh
+            // window has consumed or never set it), so the default path is untouched.
+            let next_off = frame_offset + CHUNK_CS as usize;
+            if prefetched != Some(next_off) {
+                prefetched = None;
+                if pipeline {
+                    let next_seek = seek_cs + CHUNK_CS;
+                    if next_seek + DELTA_MIN < seek_end_cs {
+                        let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
+                            .unwrap_or(0)
+                            .min(FRAMES_PER_CHUNK);
+                        let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
+                        if req_tx.send((next_off, next_ctx * 2)).is_ok() {
+                            prefetched = Some(next_off);
+                        }
                     }
                 }
             }
@@ -1373,10 +1480,12 @@ pub fn transcribe_samples(
             let mut prompt: Vec<i32> = Vec::new();
             // Carry the prior-window text prompt unless conditioning is disabled
             // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
-            // `FW_NO_CONTEXT=1`) or this is a failed-window retry (`force_empty_prompt`,
-            // FW_RETRY_FAILED_WINDOW). Default (unset) keeps the carry ⇒ byte-identical.
+            // `FW_NO_CONTEXT=1`), this is a failed-window retry (`force_empty_prompt`,
+            // FW_RETRY_FAILED_WINDOW), or a FW_TEMP_FALLBACK attempt above the prompt-
+            // reset temperature. Default (unset) keeps the carry ⇒ byte-identical.
             let prompt_carried = !condition_on_prev_disabled()
                 && !force_empty_prompt
+                && window_temp <= TEMP_PROMPT_RESET
                 && !prompt_past.is_empty()
                 && max_prompt_ctx > 1;
             if prompt_carried {
@@ -1416,6 +1525,10 @@ pub fn transcribe_samples(
             let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
             let mut result_len = 0usize;
             let mut step_logits = prefill_logits;
+            // Deterministic per-(window, attempt) sampling stream (FW_TEMP_FALLBACK):
+            // only ever drawn from when `window_temp > 0.0`.
+            let mut sample_rng: u64 =
+                0x5851_F42D_4C95_7F2D ^ (seek_cs as u64) ^ ((temp_attempt as u64) << 48);
 
             for i in 0..n_max_tokens {
                 let (filtered, logprobs) = process_logits(
@@ -1427,7 +1540,11 @@ pub fn transcribe_samples(
                     seek_delta_cs,
                     decoded.len(),
                 );
-                let (tok, plog) = argmax(&filtered, &logprobs);
+                let (tok, plog) = if window_temp > 0.0 {
+                    sample_token_at_temperature(&filtered, &logprobs, window_temp, &mut sample_rng)
+                } else {
+                    argmax(&filtered, &logprobs)
+                };
                 decoded.push(tok);
                 plogs.push(plog);
 
@@ -1498,6 +1615,36 @@ pub fn transcribe_samples(
             let is_no_speech =
                 no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
 
+            // FW_TEMP_FALLBACK (default-off, bd-6goy / bd-r0qd fix-spec #3): the
+            // whisper.cpp fallback ladder. A non-silent window that closed no
+            // timestamp OR averaged below the logprob threshold re-decodes this SAME
+            // seek at the next ladder temperature, reusing the stashed encode. The
+            // ladder is finite, so this cannot loop; the final rung's decode is
+            // accepted as-is below (whisper.cpp keeps its last decode too). Unset ⇒
+            // never fires ⇒ byte-exact.
+            let quality_failed =
+                !is_no_speech && (result_len == 0 || avg_logprob < LOGPROB_THRESHOLD);
+            if temp_fallback_enabled()
+                && quality_failed
+                && temp_attempt < TEMP_FALLBACK_LADDER.len()
+            {
+                window_temp = TEMP_FALLBACK_LADDER[temp_attempt];
+                temp_attempt += 1;
+                tracing::debug!(
+                    target: "franken_whisper::native_engine::decode",
+                    seek_sec = seek_cs as f64 / 100.0,
+                    avg_logprob,
+                    result_len,
+                    retry_temperature = window_temp,
+                    "window failed the quality gate — temperature-fallback retry"
+                );
+                retry_enc_cache = Some((frame_offset, enc));
+                continue; // re-decode this window at the raised temperature
+            }
+            // Window accepted (or the ladder is exhausted): next window starts greedy.
+            temp_attempt = 0;
+            window_temp = 0.0;
+
             // FW_RETRY_FAILED_WINDOW (default-off): a window that closed NO timestamp
             // (`result_len == 0`, not silence) while carrying a prior-window prompt is
             // the bd-r0qd long-form drop — the carried prompt × int8 numerics made the
@@ -1506,6 +1653,7 @@ pub fn transcribe_samples(
             // targeted) before accepting the drop. `force_empty_prompt` makes it fire at
             // most once per seek, so no infinite loop; unset ⇒ never fires ⇒ byte-exact.
             if retry_failed_window_enabled()
+                && !temp_fallback_enabled()
                 && result_len == 0
                 && !is_no_speech
                 && !force_empty_prompt
@@ -2231,6 +2379,78 @@ mod tests {
         // Empty and all-masked → 0 (matches scalar initial best_i).
         assert_eq!(argmax_idx(&[]), 0);
         assert_eq!(argmax_idx(&vec![f32::NEG_INFINITY; 20]), 0);
+    }
+
+    #[test]
+    fn sample_token_deterministic_and_respects_masks() {
+        // FW_TEMP_FALLBACK sampler: identical seeds must replay identical draws
+        // bit-for-bit (transcript replayability), and masked (`-inf`) / NaN lanes
+        // must carry zero mass. plog is the id's temperature-1 log-softmax.
+        let logits = vec![f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY, 0.5, f32::NAN];
+        let logprobs = vec![
+            f32::NEG_INFINITY,
+            -0.3,
+            f32::NEG_INFINITY,
+            -0.8,
+            f32::NEG_INFINITY,
+        ];
+        let (mut r1, mut r2) = (42u64, 42u64);
+        let mut drew = [false; 5];
+        for _ in 0..64 {
+            let (t1, p1) = sample_token_at_temperature(&logits, &logprobs, 0.8, &mut r1);
+            let (t2, p2) = sample_token_at_temperature(&logits, &logprobs, 0.8, &mut r2);
+            assert_eq!(
+                (t1, p1.to_bits()),
+                (t2, p2.to_bits()),
+                "same seed, same draw"
+            );
+            assert!(t1 == 1 || t1 == 3, "masked/NaN lane drawn: {t1}");
+            let expected_plog = if t1 == 1 { -0.3 } else { -0.8 };
+            assert_eq!(p1, expected_plog, "plog must come from `logprobs`");
+            drew[usize::try_from(t1).unwrap()] = true;
+        }
+        // At t = 0.8 with a 0.5-nat gap both live lanes appear within 64 draws
+        // (P(all-one-lane) < 1e-9): the draw is genuinely multinomial, not argmax.
+        assert!(
+            drew[1] && drew[3],
+            "sampler collapsed to a single lane: {drew:?}"
+        );
+    }
+
+    #[test]
+    fn sample_token_low_temperature_recovers_argmax() {
+        // t → 0 sharpens softmax(logits/t) onto the max lane: an 6-nat gap at
+        // t = 0.05 is a 120-nat gap, so every draw must equal the argmax choice.
+        let logits = vec![0.0, 8.0, 1.0, 2.0];
+        let logprobs = compute_logprobs(&logits);
+        let mut rng = 99u64;
+        for _ in 0..64 {
+            let (tok, plog) = sample_token_at_temperature(&logits, &logprobs, 0.05, &mut rng);
+            let (best, best_plog) = argmax(&logits, &logprobs);
+            assert_eq!(tok, best);
+            assert_eq!(plog.to_bits(), best_plog.to_bits());
+        }
+    }
+
+    #[test]
+    fn sample_token_degenerate_inputs_fall_back_to_argmax() {
+        // All-masked (no finite lane) and empty inputs must not panic or draw a
+        // masked id — they defer to argmax's established conventions.
+        let masked = vec![f32::NEG_INFINITY; 4];
+        let masked_lp = vec![f32::NEG_INFINITY; 4];
+        let mut rng = 1u64;
+        let (tok, _) = sample_token_at_temperature(&masked, &masked_lp, 0.4, &mut rng);
+        assert_eq!(tok, argmax(&masked, &masked_lp).0);
+        let (tok_empty, _) = sample_token_at_temperature(&[], &[], 0.4, &mut rng);
+        assert_eq!(tok_empty, argmax(&[], &[]).0);
+        // A single unmasked lane always wins regardless of the draw.
+        let one = vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 2.0];
+        let one_lp = vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0];
+        for _ in 0..32 {
+            let (tok, plog) = sample_token_at_temperature(&one, &one_lp, 1.0, &mut rng);
+            assert_eq!(tok, 2);
+            assert_eq!(plog, 0.0);
+        }
     }
 
     #[test]
