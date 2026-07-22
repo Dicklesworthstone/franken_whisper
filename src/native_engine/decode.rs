@@ -3473,6 +3473,130 @@ mod tests {
         };
         let a = transcribe_samples(&model, &samples, &params, &noop).unwrap();
         let b = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+        if a.word_timings != b.word_timings {
+            // bd-0ivd self-diagnosis: this flakes ONLY inside a full parallel
+            // suite run (isolated + synthetic-load repro attempts all bit-stable,
+            // NEGATIVE_EVIDENCE 2026-07-22). Turn the failure into evidence: a
+            // tie-break run says which side was the outlier, and the max timing
+            // delta bounds the perturbation.
+            let c = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+            let max_delta = |x: &DecodeOutput, y: &DecodeOutput| -> f64 {
+                let (Some(xw), Some(yw)) = (&x.word_timings, &y.word_timings) else {
+                    return f64::NAN;
+                };
+                xw.iter()
+                    .flatten()
+                    .zip(yw.iter().flatten())
+                    .map(|(p, q)| {
+                        (p.start_sec - q.start_sec)
+                            .abs()
+                            .max((p.end_sec - q.end_sec).abs())
+                    })
+                    .fold(0.0f64, f64::max)
+            };
+            eprintln!(
+                "bd-0ivd DIVERGENCE: a==c {} | b==c {} | max|Δt| a-vs-b {:.4}s \
+                 (run the tie-break verdict + delta into the bd-0ivd ledger entry)",
+                a.word_timings == c.word_timings,
+                b.word_timings == c.word_timings,
+                max_delta(&a, &b),
+            );
+        }
         assert_eq!(a.word_timings, b.word_timings);
+    }
+
+    /// bd-0ivd bisection tool, NOT a CI test: pins the word-timestamp
+    /// nondeterminism to a stage (mel / encoder / decode+record+DTW) under
+    /// self-generated rayon-pool contention. Run under the canonical reproducer
+    /// conditions: `taskset -c 0-3 <test-bin> --ignored --exact
+    /// native_engine::decode::tests::bd_0ivd_stage_determinism_probe`.
+    /// The sibling threads mimic the full suite's in-process pool pressure
+    /// (cross-process load measured insufficient; see NEGATIVE_EVIDENCE
+    /// 2026-07-22). An assert failure NAMES the first divergent stage.
+    #[test]
+    #[ignore = "bd-0ivd diagnosis tool — run manually under taskset oversubscription"]
+    fn bd_0ivd_stage_determinism_probe() {
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP bd_0ivd_stage_determinism_probe: tiny.en model or jfk.wav missing");
+            return;
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let mel_threads = super::super::host_parallelism().min(16);
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            max_text_ctx: None,
+            word_timestamps: true,
+            model_hint: Some("tiny.en".to_owned()),
+        };
+        // Sibling load = REAL engine work sharing the global rayon pool,
+        // allocator, and kernels — generic par_iter busywork measured
+        // insufficient (5/5 bit-stable, 2026-07-22), matching the finding that
+        // only the full suite's heavy sibling mix triggers the flake.
+        let sibling_mel = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let stopr = &stop;
+                let modelr = &model;
+                let melr = &sibling_mel;
+                scope.spawn(move || {
+                    while !stopr.load(Ordering::Relaxed) {
+                        let frames = FRAMES_PER_CHUNK.min(melr.n_frames);
+                        let _ = encoder::forward_from_full_mel_window(
+                            &modelr.encoder,
+                            melr,
+                            0,
+                            frames,
+                            4,
+                            &noop,
+                        );
+                    }
+                });
+            }
+            for it in 0..3 {
+                let mel_a = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
+                let mel_b = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
+                assert_eq!(
+                    mel_a.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    mel_b.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "STAGE=mel diverged (iteration {it})"
+                );
+                let frames = FRAMES_PER_CHUNK.min(mel_a.n_frames);
+                let enc_a = encoder::forward_from_full_mel_window(
+                    &model.encoder,
+                    &mel_a,
+                    0,
+                    frames,
+                    4,
+                    &noop,
+                )
+                .unwrap();
+                let enc_b = encoder::forward_from_full_mel_window(
+                    &model.encoder,
+                    &mel_a,
+                    0,
+                    frames,
+                    4,
+                    &noop,
+                )
+                .unwrap();
+                assert_eq!(
+                    enc_a.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    enc_b.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "STAGE=encoder diverged (iteration {it})"
+                );
+                let a = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+                let b = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+                assert_eq!(
+                    a.word_timings, b.word_timings,
+                    "STAGE=decode+record+dtw diverged (mel+encoder were bit-stable; iteration {it})"
+                );
+                eprintln!("probe iteration {it}: all stages bit-stable");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
     }
 }
