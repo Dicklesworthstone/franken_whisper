@@ -4,6 +4,44 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — LANDED STRUCTURAL / UNMEASURED — move router failure string after trace (bd-kdg7.5)
+
+**Classification.** This is the operator-requested bench-free follow-on after
+the loss-hoist RCH blocker. It is deliberately **not a performance KEEP** and
+makes no latency or end-to-end claim. Exact ledger and recent-log searches for
+`update_router_state`, `error_message.clone`, and routing-outcome ownership
+found no prior attempt.
+
+**One allocation removed by ownership.** `update_router_state` owns its
+`Option<String>`, but historically cloned the string into
+`RoutingOutcomeRecord` so tracing could borrow the original. The timestamp is
+now captured at the same pre-trace point, tracing borrows the owned input, and
+the input is moved into the record after the macro returns. A failed backend
+with an `N`-byte error therefore removes exactly one heap allocation and one
+`N`-byte copy; the success/`None` path never allocated in either version.
+
+**Behavior isomorphism and gates.** Timestamp-before-trace ordering, every
+trace field, record contents, mutex acquisition, history eviction, and evidence
+serialization are unchanged; moving a `String` after its last borrow preserves
+its bytes where cloning previously duplicated them. A focused oracle records a
+failure through the public update path and asserts counts, zero successful
+latency bits, and exact last-error bytes. Strict-remote `cargo check --lib`
+completed on `ovh-a` in **1m37s** (two existing dead-code warnings). The
+focused `cargo test -j2` reached remote compilation but stopped in concurrent
+frankensqlite WIP with **13** trait/type migration errors before the
+`franken_whisper` test target compiled, so it is a gate hold, not a test pass.
+RCH refused `cargo fmt --check` as non-compilation command under remote-required
+mode (`RCH-E301`); direct `rustfmt --check` reported only three pre-existing
+hunks outside this change. No local Cargo ran.
+
+**Measurement promotion predicate.** Do not cite this row as timed evidence.
+Promote it to a measured KEEP only if a realistic failure-heavy router profile
+shows outcome materialization at least 10% of its caller and a same-worker
+`pipeline_bench` obtains 21 alternating clone/move pairs plus clone/clone null,
+candidate CV `<5%`, at least 18/21 wins, and p10 above
+`max(null p90, 1.10)`. The exact ownership removal itself is closed unless the
+trace/record boundary begins requiring two independently owned strings.
+
 ## 2026-07-22 — BLOCKED — adaptive loss-matrix base-loss hoist (bd-kdg7.4)
 
 **Fresh, profile-led candidate; no verdict.** Exact searches of both ledgers
