@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - cod: **BLOCKED / NO VERDICT — adaptive router loss-matrix base-loss hoist has a measured 9-to-3 work reduction, but RCH-E410 prevented every A/B sample; source restored (bd-kdg7.4).**
+
+Mandatory ledger and recent-log searches found no previous
+`backend_base_loss_adaptive` hoist. `with_router_state` currently rebuilds each
+backend's state-invariant base loss in all three availability rows, executing
+**9** full-history aggregates for **3** distinct values. The immediately prior
+strict-remote profile measured the current 50-record aggregate at **67.819 ns**
+median `[65.506, 70.257]`; this makes the six redundant scans measured work,
+but does not by itself measure the complete contract or candidate.
+
+The prepared `pipeline_bench` executable contained 21 alternating historical
+nine-scan/candidate three-scan pairs, 21 historical/historical null pairs,
+candidate CV, and exact serialized metrics parity. The production test also
+compared every loss-matrix cell by `f64::to_bits` against the per-row historical
+reference across two diarize modes and three durations. RCH selected
+`vmi1227854` and completed the dependency sync, but preflight then stopped
+before Cargo with **RCH-E410**: required source entrypoint
+`frankensqlite/crates/fsqlite/tests/agg_in_list_composite_prefix_oracle.rs`
+was absent on the worker. Remote-required mode refused local fallback.
+Consequently **0** A/B/null samples ran, no CV exists, and this is not a KEEP or
+REJECT. Both production and benchmark edits were manually restored and match
+HEAD.
+
+**Concrete retry condition:** RCH must first admit the dependency closure with
+that frankensqlite test entrypoint present remotely (or no longer declared),
+then execute the exact same-binary pipeline harness. Require null median in
+`[0.95, 1.05]`, candidate CV `<5%`, at least 18/21 wins, candidate p10 above
+`max(null p90, 1.10)`, serialized metric equality, and bit-equal loss cells.
+
 ## 2026-07-22 - cod: **BLOCKED — `RoutingEvidenceLedger::diagnostics` Brier Vec profile never reached a valid remote worker; zero source delta.**
 
 Exact searches of both ledgers and recent Git history found no prior

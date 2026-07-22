@@ -4,6 +4,37 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — BLOCKED — adaptive loss-matrix base-loss hoist (bd-kdg7.4)
+
+**Fresh, profile-led candidate; no verdict.** Exact searches of both ledgers
+and recent history found no prior attempt to hoist
+`BackendSelectionContract::backend_base_loss_adaptive` out of the loss
+matrix's three availability rows. The current loop computes three distinct
+backend base losses three times each: **9** calls to `metrics_for` and the
+posterior/loss arithmetic for **3** immutable values. The preceding admissible
+strict-remote profile prices one current 50-record `metrics_for` call at
+**67.819 ns** median `[65.506, 70.257]`, so the redundant six scans were a
+measured constituent and the alien primitive was loop-invariant computation.
+
+**Remote failure and restoration.** A same-binary `pipeline_bench` harness was
+prepared with 21 order-alternated nine-scan/three-scan pairs, 21 nine-scan
+identity-null pairs, candidate CV reporting, and a full serialized-metrics
+oracle. Production additionally had a per-cell `f64::to_bits` loss-matrix
+oracle across diarize modes and durations. RCH selected `vmi1227854`, synced
+the dependency closure, then refused execution before Cargo with **RCH-E410**:
+`frankensqlite/crates/fsqlite/tests/agg_in_list_composite_prefix_oracle.rs`
+was a required package source entrypoint but absent remotely. Strict-remote
+policy refused local fallback. Thus there are **0 A/B samples**, no null, no
+CV, and no conformance exit; production and benchmark changes were manually
+restored and both files match HEAD.
+
+**Retry predicate.** Reopen only after RCH's dependency closure successfully
+syncs that frankensqlite test entrypoint (or the concurrent manifest reference
+is removed by its owner) and `pipeline_bench` reaches execution. Then require
+the prepared exact metrics/loss-bit oracles, 21 same-worker alternating pairs,
+null median in `[0.95, 1.05]`, candidate CV `<5%`, at least 18/21 wins, and
+candidate p10 above `max(null p90, 1.10)` before landing the 9-to-3 hoist.
+
 ## 2026-07-22 — BLOCKED — router evidence Brier diagnostics materialization
 
 **Fresh candidate, no timed evidence.** After the streamed router-latency KEEP,
