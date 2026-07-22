@@ -4,6 +4,64 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — LANDED — streamed router latency aggregation (bd-kdg7.2)
+
+**Negative-ledger-first profile boundary.** Both ledgers and the recent Git log
+had no prior attempt to remove `RouterState::metrics_for`'s temporary
+`successful_latencies: Vec<f64>`; the earlier router entry retained this
+aggregate after eliminating a separate state clone. Before production was
+edited, strict-remote `pipeline_bench` job `j-29942429901652194` on `ovh-a`
+measured the historical 50-outcome aggregate at **200.34 ns** median
+`[197.57, 203.56]`. Adaptive selection calls it for all three backends while
+building the loss matrix and again while serializing evidence, making this a
+repeated measured router seam. The selected alien-graveyard primitive is stream
+fusion/materialization elimination: fold the successful latency sum directly
+over the retained history instead of allocating and revisiting a vector.
+
+**One lever and behavior isomorphism.** `metrics_for` now computes the sum in
+the same filter/map iteration order and divides by the already-computed
+`success_count`; the empty-success result remains `0.0`. Success rate, last
+error search, history bounds, and evidence schema are untouched. The criterion
+harness aborts unless the complete serialized `BackendMetrics` bytes and
+`avg_latency_ms.to_bits()` equal the historical materialized reference. A
+production oracle repeats that proof for all-success, alternating-success,
+one-in-four-success, and all-failure 50-entry histories, including last-error
+selection.
+
+**Strict-remote interleaved A/B.** The first 21-pair same-binary trial,
+`j-29942429901652223` on `vmi1227854`, showed **21/21** wins and **3.8173x**
+median speedup, but was inadmissible because candidate CV was **6.0735%**; its
+short ~50 ms arms also produced a broad null (median **1.0144x**, p90
+**1.2980x**). No verdict was taken. The sole admissible retry increased each
+arm to 1,000,000 calls (~200 ms historical). Job `j-29942429901652276` ran all
+historical/candidate and historical/historical arms inside one release
+executable on `hz1`, alternating order across 21 pairs. It returned **21/21**
+wins; speedup p10/median/p90 was **3.6208x / 3.6695x / 3.9433x**; candidate CV
+was **2.1502%**. The null p10/median/p90 was
+**0.9681x / 0.9934x / 1.0749x**. Candidate p10 is far beyond null p90 and the
+predeclared 1.10x floor. The same executable's criterion estimate was
+`[65.506, 67.819, 70.257] ns`; this absolute estimate is reported only for the
+candidate and is not compared across workers to the profile baseline.
+
+**Scope.** This is a component win for adaptive router statistics over the full
+50-record history, not an end-to-end transcription claim. At the current six
+aggregate calls per adaptive decision, the paired component ratio implies
+removing six small heap materializations; absolute request impact remains
+sub-microsecond and depends on adaptive routing being enabled.
+
+**Remote gate note.** The release benchmark compiled the production path and
+executed both the byte/bit oracle and Criterion successfully. A focused unit
+test first exposed two missing test-module imports; those were corrected. Its
+retry was then blocked before Cargo by RCH dependency preflight `RCH-E410` on a
+concurrently added frankensqlite test entrypoint, and subsequent routing sent
+the test to a cold worker, which was cancelled rather than spending another
+full-cache build. Guardrail jobs `j-29942429901652338` and
+`j-29942429901652352` compiled the final non-test source remotely but reported
+the expected ten failures because only `pipeline_bench` had been collected on
+that worker; the policy's unrelated `tty_bench` and `sync_bench` estimate files
+were absent. No local Cargo fallback ran. These are gate-artifact/substrate
+holds, not counterevidence to the exact same-executable router A/B.
+
 ## 2026-07-22 — BLOCKED — speculation controller duplicate Brier scan (bd-kdg7.1)
 
 **Profile-first evidence.** After screening both ledgers and recent history, the
