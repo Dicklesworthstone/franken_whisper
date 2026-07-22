@@ -542,10 +542,12 @@ fn token_tail_entropy(tokens: &[i32]) -> f64 {
 /// ([`ENTROPY_THRESHOLD`], whisper.cpp `entropy_thold`, checked only when
 /// `result_len > `[`ENTROPY_WINDOW`]) is re-decoded at the
 /// [`TEMP_FALLBACK_LADDER`] temperatures —
-/// multinomial sampling instead of argmax, deterministic per-(window, attempt)
-/// seed, prompt dropped above [`TEMP_PROMPT_RESET`] — reusing the window's encode.
-/// The first attempt that clears the gate wins; the final rung is accepted as-is
-/// (whisper.cpp keeps its last decode too). Unset ⇒ the ladder never fires and
+/// multinomial sampling instead of argmax, deterministic per-(window, rung,
+/// candidate) seed, prompt dropped above [`TEMP_PROMPT_RESET`] — reusing the
+/// window's encode. Each rung decodes [`temp_best_of`] independent candidates
+/// and adopts the best [`sequence_score`] (whisper.cpp `greedy.best_of`). The
+/// first rung whose winner clears the gate ends the ladder; the final rung's
+/// winner is accepted as-is (whisper.cpp keeps its last decode too). Unset ⇒ the ladder never fires and
 /// token selection stays the argmax path ⇒ byte-identical by construction.
 /// Supersedes `FW_RETRY_FAILED_WINDOW` when both are set (the ladder's `t > 0.5`
 /// rungs contain that retry's prompt reset).
@@ -553,6 +555,57 @@ fn temp_fallback_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FW_TEMP_FALLBACK").is_some())
+}
+
+/// whisper.cpp `greedy.best_of` (default 5): how many independent sampling
+/// candidates each `t > 0` ladder rung decodes before the best
+/// [`sequence_score`] wins. `FW_TEMP_BEST_OF` overrides (clamped to [1, 32]);
+/// `1` restores the single-candidate ladder byte-for-byte (first candidate of
+/// every rung draws from the identical seed stream). Only read under
+/// [`temp_fallback_enabled`], so the default path never consults it.
+fn temp_best_of() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_TEMP_BEST_OF")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(5, |n| n.clamp(1, 32))
+    })
+}
+
+/// whisper.cpp `whisper_sequence_score` under the default `length_penalty =
+/// -1.0` (penalty = `result_len`): `sum(plogs[..result_len]) / result_len`,
+/// i.e. the result slice's average logprob. A candidate that closed no result
+/// (`result_len == 0` — whisper.cpp leaves its score unset and fails the
+/// decoder) scores the [`EMPTY_WINDOW_AVG_LOGPROB`] sentinel so it never beats
+/// a candidate that produced tokens.
+fn sequence_score(plogs: &[f32], result_len: usize) -> f64 {
+    let take = result_len.min(plogs.len());
+    if take == 0 {
+        return EMPTY_WINDOW_AVG_LOGPROB;
+    }
+    let s = plogs[..take].iter().map(|&p| f64::from(p)).sum::<f64>() / take as f64;
+    if s.is_finite() {
+        s
+    } else {
+        EMPTY_WINDOW_AVG_LOGPROB
+    }
+}
+
+/// One completed decode attempt of a window at a `t > 0` ladder rung — the
+/// state the post-selection code (segment emission, DTW, prompt carry, seek
+/// advance) consumes. The rung's best-scoring candidate is adopted back into
+/// the window locals; the encode (and thus `DecoderState`'s cross-K/V) is
+/// identical across candidates, so adoption is sound for the DTW re-forward.
+struct WindowCandidate {
+    score: f64,
+    decoded: Vec<i32>,
+    plogs: Vec<f32>,
+    result_len: usize,
+    seek_delta_cs: i64,
+    avg_logprob: f64,
+    no_speech_prob: f64,
 }
 
 /// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
@@ -1393,6 +1446,11 @@ pub fn transcribe_samples(
         let mut temp_attempt: usize = 0;
         // The temperature the current attempt decodes at (0.0 = argmax/greedy path).
         let mut window_temp: f64 = 0.0;
+        // best_of state within the current t > 0 rung: candidate index and the
+        // best-scoring candidate so far (whisper.cpp ranks its `best_of`
+        // decoders by sequence score and keeps the winner).
+        let mut cand_idx: usize = 0;
+        let mut rung_best: Option<WindowCandidate> = None;
         // Holds `(frame_offset, enc)` from a window's first attempt so a
         // FW_RETRY_FAILED_WINDOW retry (same seek) reuses the identical encode instead
         // of paying a full re-encode. Only ever populated when the flag is on.
@@ -1562,10 +1620,15 @@ pub fn transcribe_samples(
             let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
             let mut result_len = 0usize;
             let mut step_logits = prefill_logits;
-            // Deterministic per-(window, attempt) sampling stream (FW_TEMP_FALLBACK):
-            // only ever drawn from when `window_temp > 0.0`.
-            let mut sample_rng: u64 =
-                0x5851_F42D_4C95_7F2D ^ (seek_cs as u64) ^ ((temp_attempt as u64) << 48);
+            // Deterministic per-(window, rung, candidate) sampling stream
+            // (FW_TEMP_FALLBACK): only ever drawn from when `window_temp > 0.0`.
+            // Candidate 0 of every rung matches the pre-best_of stream exactly,
+            // so `FW_TEMP_BEST_OF=1` reproduces the single-candidate ladder
+            // byte-for-byte.
+            let mut sample_rng: u64 = 0x5851_F42D_4C95_7F2D
+                ^ (seek_cs as u64)
+                ^ ((temp_attempt as u64) << 48)
+                ^ ((cand_idx as u64) << 40);
 
             for i in 0..n_max_tokens {
                 let (filtered, logprobs) = process_logits(
@@ -1647,8 +1710,60 @@ pub fn transcribe_samples(
                 EMPTY_WINDOW_AVG_LOGPROB
             };
 
+            // FW_TEMP_FALLBACK best_of (whisper.cpp greedy.best_of = 5): at a
+            // t > 0 rung each loop re-entry decodes ONE independent sampling
+            // candidate; the rung's best sequence_score is adopted into the
+            // window locals here, and everything downstream (quality gate,
+            // emission, DTW, prompt carry, seek advance) sees only the winner.
+            // Never entered at window_temp == 0.0, so the greedy pass and the
+            // whole default path are untouched.
+            let (decoded, plogs, result_len, seek_delta_cs, avg_logprob, no_speech_prob) =
+                if temp_fallback_enabled() && window_temp > 0.0 {
+                    let cand = WindowCandidate {
+                        score: sequence_score(&plogs, result_len),
+                        decoded,
+                        plogs,
+                        result_len,
+                        seek_delta_cs,
+                        avg_logprob,
+                        no_speech_prob,
+                    };
+                    // Ties keep the EARLIER candidate (whisper.cpp's ranking
+                    // scans decoders in order and replaces only on a strictly
+                    // better score).
+                    let best = match rung_best.take() {
+                        Some(b) if b.score >= cand.score => b,
+                        _ => cand,
+                    };
+                    if cand_idx + 1 < temp_best_of() {
+                        rung_best = Some(best);
+                        cand_idx += 1;
+                        retry_enc_cache = Some((frame_offset, enc));
+                        continue; // decode this rung's next candidate
+                    }
+                    cand_idx = 0;
+                    (
+                        best.decoded,
+                        best.plogs,
+                        best.result_len,
+                        best.seek_delta_cs,
+                        best.avg_logprob,
+                        best.no_speech_prob,
+                    )
+                } else {
+                    (
+                        decoded,
+                        plogs,
+                        result_len,
+                        seek_delta_cs,
+                        avg_logprob,
+                        no_speech_prob,
+                    )
+                };
+
             // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
-            // silence, emit nothing, advance the full window.
+            // silence, emit nothing, advance the full window. At a completed
+            // t > 0 rung this evaluates the ADOPTED best candidate.
             let is_no_speech =
                 no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
 
@@ -1684,6 +1799,8 @@ pub fn transcribe_samples(
             {
                 window_temp = TEMP_FALLBACK_LADDER[temp_attempt];
                 temp_attempt += 1;
+                cand_idx = 0;
+                rung_best = None;
                 tracing::debug!(
                     target: "franken_whisper::native_engine::decode",
                     seek_sec = seek_cs as f64 / 100.0,
@@ -1699,6 +1816,8 @@ pub fn transcribe_samples(
             // Window accepted (or the ladder is exhausted): next window starts greedy.
             temp_attempt = 0;
             window_temp = 0.0;
+            cand_idx = 0;
+            rung_best = None;
 
             // FW_RETRY_FAILED_WINDOW (default-off): a window that closed NO timestamp
             // (`result_len == 0`, not silence) while carrying a prior-window prompt is
@@ -2485,6 +2604,25 @@ mod tests {
             assert_eq!(tok, best);
             assert_eq!(plog.to_bits(), best_plog.to_bits());
         }
+    }
+
+    #[test]
+    fn sequence_score_matches_whisper_cpp_defaults() {
+        // whisper.cpp `whisper_sequence_score` with length_penalty = -1.0 (the
+        // default): penalty = result_len ⇒ score = avg logprob of the result.
+        assert_eq!(sequence_score(&[-0.5, -1.5], 2), -1.0);
+        // Only the result slice counts (a trailing eot plog is excluded).
+        assert_eq!(sequence_score(&[-0.5, -1.5, -9.0], 2), -1.0);
+        // No result ⇒ sentinel: never beats a token-producing candidate.
+        assert_eq!(sequence_score(&[], 0), EMPTY_WINDOW_AVG_LOGPROB);
+        assert_eq!(sequence_score(&[-0.5], 0), EMPTY_WINDOW_AVG_LOGPROB);
+        // result_len beyond plogs clamps defensively.
+        assert_eq!(sequence_score(&[-2.0], 5), -2.0);
+        // Non-finite input degrades to the sentinel, mirroring avg_logprob.
+        assert_eq!(
+            sequence_score(&[f32::NEG_INFINITY, -1.0], 2),
+            EMPTY_WINDOW_AVG_LOGPROB
+        );
     }
 
     #[test]
