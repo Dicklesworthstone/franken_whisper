@@ -573,7 +573,11 @@ pub struct I7Mat {
 /// with no indirection. This is the single source of the quant arithmetic — the two
 /// public entry points below must stay bit-identical by sharing it.
 #[must_use]
-fn quantize_rows_to_i7(out: usize, inp: usize, weight: impl Fn(usize, usize) -> f32 + Sync) -> I7Mat {
+fn quantize_rows_to_i7(
+    out: usize,
+    inp: usize,
+    weight: impl Fn(usize, usize) -> f32 + Sync,
+) -> I7Mat {
     let mut data = vec![0i8; out * inp];
     let mut scale = vec![0.0f32; out];
     let mut colsum = vec![0i32; out];
@@ -2057,7 +2061,11 @@ pub struct I8Mat {
 #[allow(unsafe_code)]
 fn quantize_f16_row_to_i8_into(w: &[Float16], out: &mut [i8]) -> f32 {
     use core::arch::x86_64::*;
-    debug_assert_eq!(w.len(), out.len(), "quantize_f16_row_to_i8_into len mismatch");
+    debug_assert_eq!(
+        w.len(),
+        out.len(),
+        "quantize_f16_row_to_i8_into len mismatch"
+    );
     let n = w.len();
     let wp = w.as_ptr();
     // SAFETY: avx2+f16c guaranteed by cfg; every 128-bit f16 load is bounded by the
@@ -2104,8 +2112,9 @@ fn quantize_f16_row_to_i8_into(w: &[Float16], out: &mut [i8]) -> f32 {
             j += 8;
         }
         while j < n {
-            *out.get_unchecked_mut(j) =
-                (w.get_unchecked(j).to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+            *out.get_unchecked_mut(j) = (w.get_unchecked(j).to_f32() * inv)
+                .round()
+                .clamp(-127.0, 127.0) as i8;
             j += 1;
         }
         scale
@@ -2345,35 +2354,59 @@ fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i3
             let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
             aa0 = _mm256_add_epi32(
                 aa0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i)),
+                ),
             );
             aa1 = _mm256_add_epi32(
                 aa1,
-                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i + 16) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w1,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i + 16) as *const __m128i)),
+                ),
             );
             ab0 = _mm256_add_epi32(
                 ab0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i)),
+                ),
             );
             ab1 = _mm256_add_epi32(
                 ab1,
-                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i + 16) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w1,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i + 16) as *const __m128i)),
+                ),
             );
             ac0 = _mm256_add_epi32(
                 ac0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i) as *const __m128i)),
+                ),
             );
             ac1 = _mm256_add_epi32(
                 ac1,
-                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i + 16) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w1,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i + 16) as *const __m128i)),
+                ),
             );
             ad0 = _mm256_add_epi32(
                 ad0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i) as *const __m128i)),
+                ),
             );
             ad1 = _mm256_add_epi32(
                 ad1,
-                _mm256_madd_epi16(w1, _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i + 16) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w1,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i + 16) as *const __m128i)),
+                ),
             );
             i += 32;
         }
@@ -2381,19 +2414,31 @@ fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i3
             let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
             aa0 = _mm256_add_epi32(
                 aa0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(ap.add(i) as *const __m128i)),
+                ),
             );
             ab0 = _mm256_add_epi32(
                 ab0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(bp.add(i) as *const __m128i)),
+                ),
             );
             ac0 = _mm256_add_epi32(
                 ac0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(cp.add(i) as *const __m128i)),
+                ),
             );
             ad0 = _mm256_add_epi32(
                 ad0,
-                _mm256_madd_epi16(w0, _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i) as *const __m128i))),
+                _mm256_madd_epi16(
+                    w0,
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(dp.add(i) as *const __m128i)),
+                ),
             );
             i += 16;
         }
@@ -2443,12 +2488,7 @@ fn dot_i8_2col(w: &[i8], xa: &[i8], xb: &[i8]) -> (i32, i32) {
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
 fn dot_i8_4col(w: &[i8], xa: &[i8], xb: &[i8], xc: &[i8], xd: &[i8]) -> (i32, i32, i32, i32) {
-    (
-        dot_i8(w, xa),
-        dot_i8(w, xb),
-        dot_i8(w, xc),
-        dot_i8(w, xd),
-    )
+    (dot_i8(w, xa), dot_i8(w, xb), dot_i8(w, xc), dot_i8(w, xd))
 }
 
 /// Symmetric int8 quantize of an activation into `out` (`len == x.len()`):
@@ -3032,7 +3072,8 @@ fn quantize_f16_row_blocked_to_int_into(
             while j < e {
                 *drow.get_unchecked_mut(j) = (wrow.get_unchecked(j).to_f32() * inv)
                     .round()
-                    .clamp(-max_level, max_level) as i8;
+                    .clamp(-max_level, max_level)
+                    as i8;
                 j += 1;
             }
         }
@@ -5698,7 +5739,11 @@ mod tests {
             assert_eq!(a.data, b.data, "i7 data mismatch at {out}x{inp}");
             assert_eq!(a.scale, b.scale, "scale mismatch at {out}x{inp}");
             assert_eq!(a.colsum, b.colsum, "colsum mismatch at {out}x{inp}");
-            assert_eq!((a.out, a.inp), (b.out, b.inp), "dims mismatch at {out}x{inp}");
+            assert_eq!(
+                (a.out, a.inp),
+                (b.out, b.inp),
+                "dims mismatch at {out}x{inp}"
+            );
         }
     }
 
@@ -6241,7 +6286,9 @@ mod tests {
                 srow[b] = sc;
                 let inv = 1.0 / sc;
                 for i in s..e {
-                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-max_level, max_level) as i8;
+                    drow[i] = (wrow[i].to_f32() * inv)
+                        .round()
+                        .clamp(-max_level, max_level) as i8;
                 }
             }
             (drow, srow)
@@ -6546,7 +6593,10 @@ mod tests {
         let xn = vec![-127i8; 5120];
         let xp = vec![127i8; 5120];
         let (a, b, c, d) = dot_i8_4col(&w, &xn, &xp, &xn, &xp);
-        assert_eq!((a, b, c, d), (-82_580_480, 82_580_480, -82_580_480, 82_580_480));
+        assert_eq!(
+            (a, b, c, d),
+            (-82_580_480, 82_580_480, -82_580_480, 82_580_480)
+        );
     }
 
     #[test]
@@ -7193,10 +7243,8 @@ mod tests {
         row_major.append(&prefill_k, &prefill_v).unwrap();
         column_major.append(&prefill_k, &prefill_v).unwrap();
 
-        let expected =
-            attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut row_major).unwrap();
-        let actual =
-            attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut column_major).unwrap();
+        let expected = attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut row_major).unwrap();
+        let actual = attention_with_cache(&q, &k_new, &v_new, N_HEAD, &mut column_major).unwrap();
         assert_eq!(row_major.len(), CAPACITY);
         assert_eq!(column_major.len(), CAPACITY);
         assert_eq!(

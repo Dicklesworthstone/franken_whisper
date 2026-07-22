@@ -1072,7 +1072,9 @@ mod tests {
         // -0.0 and +0.0 compare Equal, so both the network's slot tie-break and
         // the general path's stable sort keep input order and select the same
         // sign bit. Bit-for-bit agreement here pins the signed-zero handling.
-        let row = vec![-0.0f32, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, 0.0];
+        let row = vec![
+            -0.0f32, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, 0.0,
+        ];
         let expected = reference_median7(&row);
         let mut got = row.clone();
         median_filter(&mut got, 7);

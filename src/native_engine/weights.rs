@@ -1021,9 +1021,16 @@ mod tests {
             disk.names().collect::<Vec<_>>(),
             mem.names().collect::<Vec<_>>()
         );
-        assert_eq!(disk.data.len(), bytes.len(), "disk path retains the whole file");
+        assert_eq!(
+            disk.data.len(),
+            bytes.len(),
+            "disk path retains the whole file"
+        );
         assert!(disk.data_offset > 0, "disk path indexes past the header");
-        assert_eq!(mem.data_offset, 0, "from_bytes copies just the data section");
+        assert_eq!(
+            mem.data_offset, 0,
+            "from_bytes copies just the data section"
+        );
         assert_eq!(mem.data.len(), bytes.len() - disk.data_offset);
 
         for name in ["a.w", "b.empty", "c.f16", "d.tail"] {
