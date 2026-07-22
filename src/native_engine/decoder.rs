@@ -176,11 +176,161 @@ struct Linear {
     w: WeightMat,
     /// Optional bias, length `out`.
     bias: Option<Vec<f32>>,
+    /// Optional int8/Q8 copy of an f16 `w` (built by [`Linear::quantized`] when
+    /// [`super::int8_mlp_enabled`] is on). Present ⇒ the per-token decode forward
+    /// (`tq == 1`) takes the memory-halved [`nn::gemv_i8`]; `None` ⇒ f16/f32 path
+    /// unchanged (bit-identical). Only the MLP up-projection (`mlp_0`) carries it;
+    /// `mlp_2` stays f16 to keep the residual stream exact (see `int8_mlp_enabled`).
+    w_i8: Option<nn::I8Mat>,
+    /// Block-wise int8 weight for the MIXED decode GEMV ([`nn::gemv_i8w_f32a_blocked`]:
+    /// block-int8 weight × f32 activation). Set for `mlp_2` (fc2): its GELU-hidden
+    /// input has outliers, and even a per-row int8 WEIGHT scale (`w_i8`) is too coarse
+    /// (breaks turbo); block scales (Q8_0-style) are fine enough to stay exact while
+    /// still halving the bandwidth-bound weight read. Takes priority over `w_i8` in
+    /// `forward`. See [`super::int8_mlp_fc2_enabled`].
+    w_i8_block: Option<nn::I8BlockMat>,
+    /// PACKED int4 weight (Q4_0, two nibbles/byte) for the mixed 4-bit-weight ×
+    /// f32-activation GEMV ([`nn::gemv_i4_packed_f32a`]). Set only for `mlp_0`/fc1,
+    /// whose GELU output absorbs the 4-bit error byte-exactly (see
+    /// [`super::int4_mlp0_enabled`]); reads HALF the fc1 weight bytes of `w_i8`.
+    /// Takes priority over `w_i8_block`/`w_i8` in `forward`.
+    w_i4_pack: Option<nn::I4BlockMat>,
 }
 
 impl Linear {
+    /// Attach an int8-quantized copy of an f16 weight for the memory-halved decode
+    /// GEMV, when [`super::int8_mlp_enabled`] is on. No-op on f32/gate-off (so the
+    /// forward stays bit-identical to f16). Applied only to the bandwidth-bound MLP
+    /// up-projection (`mlp_0`), never `mlp_2` or the small attention projections.
+    fn quantized(self) -> Self {
+        self.quantize_if(super::int8_mlp_enabled())
+    }
+
+    /// Attach the int8 copy iff `enabled`. Lets attention projections gate on
+    /// [`super::int8_attn_enabled`] while the MLP gates on [`super::int8_mlp_enabled`].
+    fn quantize_if(mut self, enabled: bool) -> Self {
+        if enabled {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                self.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
+            }
+        }
+        self
+    }
+
+    /// Attach a BLOCK-WISE int8 weight copy for the mixed block-int8-weight ×
+    /// f32-activation GEMV, iff `enabled`. For `mlp_2`/fc2 (see `int8_mlp_fc2_enabled`).
+    /// Block size 32 matches whisper.cpp's Q8_0.
+    fn quantize_i8w_f32a_blocked_if(mut self, enabled: bool) -> Self {
+        const BLOCK: usize = 32;
+        if enabled {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                self.w_i8_block = Some(nn::quantize_f16_to_i8_blocked(data, *out, *inp, BLOCK));
+            }
+        }
+        self
+    }
+
+    /// Attach a PACKED int4 weight copy (Q4_0, two nibbles/byte) for the mixed
+    /// 4-bit-weight × f32-activation GEMV, iff `enabled`. Reads HALF the fc1 weight
+    /// bytes of the int8 path and is byte-identical to the int4 probe (the probe
+    /// proved mlp_0/fc1 is 4-bit exact under GELU; this is the bandwidth win). Takes
+    /// priority over `w_i8_block`/`w_i8` in `forward`. For `mlp_0`/fc1 only — its
+    /// GELU output absorbs the 4-bit error (see `int4_mlp0_enabled`).
+    fn quantize_i4_packed_if(mut self, enabled: bool) -> Self {
+        if enabled {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                self.w_i4_pack = Some(nn::quantize_f16_to_i4_packed(data, *out, *inp));
+            }
+        }
+        self
+    }
+
+    /// Dequantize an f16 weight to f32 and pre-transpose to `[in, out]`, so
+    /// `forward` runs the tiled f32 sgemm ([`nn::matmul_bias`]) instead of the f16
+    /// batched GEMV ([`nn::gemv_f16_batch`]), iff `enabled`. For the per-window
+    /// cross-K/V projections (encoder_out @ Wk/Wv, tq=1500): MEASURED 2.25× faster
+    /// on turbo (`examples/cross_f16path_probe.rs`), the same win the ENCODER gets
+    /// from dequant-once-to-f32. NOT bit-exact (different accumulation, max|Δ|
+    /// ~6.9e-6), so gated by [`super::cross_proj_f32_enabled`] + golden-checked.
+    fn dequant_to_f32_if(mut self, enabled: bool) -> Self {
+        if enabled {
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                let natural: Vec<f32> = data.iter().map(|h| h.to_f32()).collect();
+                self.w = WeightMat::F32(transpose(&Mat::from_vec(*out, *inp, natural)));
+            }
+        }
+        self
+    }
+
     /// Apply `y = x @ W^T + b` over `x` (`[tq, in]`), returning `[tq, out]`.
     fn forward(&self, x: &Mat) -> FwResult<Mat> {
+        // Per-token decode (tq==1) with an int8 copy present: the memory-halved int8
+        // GEMV (weights are DRAM-resident at decode time → int8 ~1.7×). Bias fuses in
+        // as the f16 path adds it. Prefill (tq>1) falls through to the f16 batch.
+        if x.rows == 1 {
+            // mlp_0/fc1 packed-int4 mixed path (4-bit weight × f32 activation): half
+            // the fc1 weight read, byte-identical to the int4 probe. Highest priority.
+            if let Some(w4) = &self.w_i4_pack {
+                if x.cols != w4.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i4-pack) forward: x.cols {} != in {}",
+                        x.cols, w4.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(w4.out);
+                nn::gemv_i4_packed_f32a(w4, &x.data, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(1, w4.out, y));
+            }
+            // fc2 block-wise mixed path (int8 weight × f32 activation) takes priority.
+            if let Some(wb) = &self.w_i8_block {
+                if x.cols != wb.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8-block) forward: x.cols {} != in {}",
+                        x.cols, wb.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(wb.out);
+                nn::gemv_i8w_f32a_blocked(wb, &x.data, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(1, wb.out, y));
+            }
+            if let Some(w_i8) = &self.w_i8 {
+                if x.cols != w_i8.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8) forward: x.cols {} != in {}",
+                        x.cols, w_i8.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(w_i8.out);
+                nn::gemv_i8(w_i8, &x.data, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(1, w_i8.out, y));
+            }
+        }
+        // Prefill / multi-token (tq>1): int8 BATCHED GEMV for the pure-int8
+        // linears (qkv / cross_q / self_out / cross_out, and mlp_0 when int4 is
+        // off) — half the f16 batch's weight bytes, and BIT-IDENTICAL to running
+        // the batch as `tq` per-token `gemv_i8` calls (same quant those linears
+        // use at tq==1). Skipped when a block (`w_i8_block`) or int4 (`w_i4_pack`)
+        // copy is present: fc2's BLOCK-batch was MEASURED to REGRESS the tq>1 path
+        // (batching already amortizes the weight read, so int8's half-bytes edge
+        // vanishes and the per-block-scale + int8→f32 overhead loses to the f16c
+        // fused dot — see NEGATIVE_EVIDENCE), so those stay on the f16 batch path.
+        if x.rows > 1
+            && super::i8_batch_enabled()
+            && self.w_i4_pack.is_none()
+            && self.w_i8_block.is_none()
+        {
+            if let Some(w_i8) = &self.w_i8 {
+                if x.cols != w_i8.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8-batch) forward: x.cols {} != in {}",
+                        x.cols, w_i8.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(x.rows * w_i8.out);
+                nn::gemv_i8_batch(w_i8, &x.data, x.rows, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(x.rows, w_i8.out, y));
+            }
+        }
         match &self.w {
             WeightMat::F32(w_t) => nn::matmul_bias(x, w_t, self.bias.as_deref()),
             WeightMat::F16 { data, out, inp } => {
@@ -256,6 +406,12 @@ pub struct DecoderWeights {
     /// natural rows. Otherwise it is a plain f32 [`WeightMat::F32`] in the same
     /// `[n_vocab, n_state]` orientation.
     token_embedding: WeightMat,
+    /// Optional int8/Q8 copy of the tied output (logits) projection, built at
+    /// load only when [`super::int8_logits_enabled`] is set and the embedding is
+    /// f16. When present, [`logits_last`] runs the memory-halved [`nn::gemv_i8`]
+    /// instead of the f16 GEMV. `None` (the default) leaves the f16 path exactly
+    /// as-is (bit-identical, conformance unchanged).
+    token_embedding_i8: Option<nn::I8Mat>,
     /// Learned positional embedding `[n_text_ctx, n_state]`.
     positional_embedding: Mat,
     layers: Vec<DecoderLayer>,
@@ -356,7 +512,7 @@ fn load_linear(
         Some(name) => Some(load_vec(model, name, out_dim)?),
         None => None,
     };
-    Ok(Linear { w, bias })
+    Ok(Linear { w, bias, w_i8: None, w_i8_block: None, w_i4_pack: None })
 }
 
 /// Load the token embedding `[n_vocab, n_state]` in its NATURAL orientation
@@ -435,6 +591,14 @@ impl DecoderWeights {
 
         let token_embedding =
             load_embedding(model, "decoder.token_embedding.weight", n_vocab, n_state)?;
+        // Optional int8 copy of the tied logits projection (the model's largest,
+        // DRAM-bandwidth-bound tensor). Built once at load, gated OFF by default.
+        let token_embedding_i8 = match (&token_embedding, super::int8_logits_enabled()) {
+            (WeightMat::F16 { data, out, inp }, true) => {
+                Some(nn::quantize_f16_to_i8(data, *out, *inp))
+            }
+            _ => None,
+        };
         let positional_embedding =
             load_mat(model, "decoder.positional_embedding", n_text_ctx, n_state)?;
         let ln = load_layer_norm(model, "decoder.ln", n_state)?;
@@ -478,36 +642,43 @@ impl DecoderWeights {
                     Some(&format!("{p}.attn.out.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .quantize_if(super::int8_attn_out_enabled()),
                 cross_attn_ln: load_layer_norm(model, &format!("{p}.cross_attn_ln"), n_state)?,
+                // Cross-attn query feeds only the attention scores (softmax), never
+                // the residual — safe to int8 (see `int8_attn_enabled`).
                 cross_attn_q: load_linear(
                     model,
                     &format!("{p}.cross_attn.query.weight"),
                     Some(&format!("{p}.cross_attn.query.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .quantize_if(super::int8_attn_enabled()),
                 cross_attn_k: load_linear(
                     model,
                     &format!("{p}.cross_attn.key.weight"),
                     None, // key has no bias
                     n_state,
                     n_state,
-                )?,
+                )?
+                .dequant_to_f32_if(super::cross_proj_f32_enabled()),
                 cross_attn_v: load_linear(
                     model,
                     &format!("{p}.cross_attn.value.weight"),
                     Some(&format!("{p}.cross_attn.value.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .dequant_to_f32_if(super::cross_proj_f32_enabled()),
                 cross_attn_out: load_linear(
                     model,
                     &format!("{p}.cross_attn.out.weight"),
                     Some(&format!("{p}.cross_attn.out.bias")),
                     n_state,
                     n_state,
-                )?,
+                )?
+                .quantize_if(super::int8_attn_out_enabled()),
                 mlp_ln: load_layer_norm(model, &format!("{p}.mlp_ln"), n_state)?,
                 mlp_0: load_linear(
                     model,
@@ -515,16 +686,30 @@ impl DecoderWeights {
                     Some(&format!("{p}.mlp.0.bias")),
                     mlp_hidden,
                     n_state,
-                )?,
+                )?
+                .quantized()
+                // int4 PACKED: GELU absorbs mlp_0 error byte-exactly (proven by the
+                // probe), so fc1 goes to 4-bit at HALF the int8 weight read. Overrides
+                // the full-int8 path above when enabled (forward prefers w_i4_pack).
+                .quantize_i4_packed_if(super::int4_mlp0_enabled()),
+                // mlp_2 (down-proj) writes DIRECTLY into the residual stream. Full
+                // int8 (weight+activation) broke turbo (6c4b53d) — the per-vector
+                // activation scale crushed the GELU-hidden outliers. The MIXED
+                // int8-weight × f32-activation path (`quantize_i8w_f32a_if`) keeps
+                // the activation full-precision while still halving the (bandwidth-
+                // bound) weight read; gated on `int8_mlp_fc2_enabled` (default off
+                // until the golden gate clears). Off ⇒ f16, bit-identical.
                 mlp_2: load_linear(
                     model,
                     &format!("{p}.mlp.2.weight"),
                     Some(&format!("{p}.mlp.2.bias")),
                     n_state,
                     mlp_hidden,
-                )?,
+                )?
+                .quantize_i8w_f32a_blocked_if(super::int8_mlp_fc2_enabled()),
             };
-            layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v);
+            layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v)
+                .map(|l| l.quantize_if(super::int8_attn_enabled()));
             Ok(layer)
         };
         // Spread the layers across rayon when there are FEW of them: each
@@ -549,6 +734,7 @@ impl DecoderWeights {
 
         Ok(Self {
             token_embedding,
+            token_embedding_i8,
             positional_embedding,
             layers,
             ln,
@@ -619,6 +805,11 @@ pub struct DecoderState {
     /// `FW_CROSS_F16=0` falls back to the f32 `cross_kh_t`/`cross_vh` above.
     cross_kh_f16: Vec<Vec<Float16>>,
     cross_vh_f16: Vec<Vec<Float16>>,
+    /// int8/Q8 copies of `cross_kh_f16`/`cross_vh_f16` (same layout, per head),
+    /// built when [`int8_cross_kv_enabled`] is on. Empty ⇒ f16 path. Halves the
+    /// per-token DRAM read of the encoder K/V. See [`int8_cross_kv_enabled`].
+    cross_kh_i8: Vec<nn::I8Mat>,
+    cross_vh_i8: Vec<nn::I8Mat>,
     /// Number of tokens currently in the self-attention cache.
     len: usize,
     /// Number of encoder frames (cross-attention key/value length).
@@ -743,39 +934,109 @@ impl DecoderState {
         // (rows = output dims, for `out = gemv_f16(Vt, scores)`).
         let mut cross_kh_f16: Vec<Vec<Float16>> = Vec::with_capacity(n_layer * n_head);
         let mut cross_vh_f16: Vec<Vec<Float16>> = Vec::with_capacity(n_layer * n_head);
-        for li in 0..n_layer {
-            let ck = &cross_k[li];
-            let cv = &cross_v[li];
-            for h in 0..n_head {
+        // PARALLEL per-head build (BlackThrush, 2026-07-02): the n_layer×n_head
+        // (layer,head) pairs are independent; the serial nested loop ran ~63 ms/
+        // window on turbo (4×20 pairs, each 4 buffer builds with f16 conversions
+        // over enc×d_head = 96 K elems). Fanning the OUTER loop across rayon is
+        // MEASURED 4.99× (63.1→12.7 ms, `examples/cross_build_probe.rs`) and
+        // BYTE-IDENTICAL — the indexed `collect` preserves the li-major/h-minor
+        // push order and each pair's per-element arithmetic is unchanged (probe:
+        // parallel == serial for all four buffers). Same granularity-flip as the
+        // sibling cross-cache quantize below (b22f8ae).
+        // The f32 kh_t/vh buffers are consumed ONLY by the `FW_CROSS_F16=0` escape-hatch
+        // cross path (`cross_step`'s `!use_f16` branch); the default f16/i8 path uses only
+        // k_nat/v_t (+ DTW `scores_all`, built in the f16 path too). So when the f16 path is
+        // active (default), skip building kh_t (a large-stride transpose) + vh entirely —
+        // MEASURED 1.95× on the cross-build (`examples/cross_f32skip_probe`), the f16 buffers
+        // bit-identical. `need_f32` mirrors the exact `use_f16` gate in `cross_step`, so the
+        // (empty) kh_t/vh are never read.
+        let need_f32 = !cross_f16_enabled();
+        let built: Vec<(Vec<f32>, Vec<Float16>, Vec<f32>, Vec<Float16>)> = (0..n_layer * n_head)
+            .into_par_iter()
+            .map(|idx| {
+                let (li, h) = (idx / n_head, idx % n_head);
+                let ck = &cross_k[li];
+                let cv = &cross_v[li];
                 let base = h * d_head;
-                // kh_t [d_head, enc_frames]: kh_t[d][j] = ck.row(j)[base + d].
-                let mut kh_t = vec![0.0f32; d_head * enc_frames];
+                // kh_t [d_head, enc_frames]: kh_t[d][j] = ck.row(j)[base + d] (f32 path only).
+                let mut kh_t = if need_f32 { vec![0.0f32; d_head * enc_frames] } else { Vec::new() };
                 // k_nat [enc_frames, d_head] f16: row j = ck.row(j)[base..base+d_head].
                 let mut k_nat = Vec::<Float16>::with_capacity(enc_frames * d_head);
-                for j in 0..enc_frames {
-                    let src = &ck.row(j)[base..base + d_head];
-                    for (d, &s) in src.iter().enumerate() {
-                        kh_t[d * enc_frames + j] = s;
-                        k_nat.push(Float16::from_f32(s));
+                if need_f32 {
+                    for j in 0..enc_frames {
+                        let src = &ck.row(j)[base..base + d_head];
+                        for (d, &s) in src.iter().enumerate() {
+                            kh_t[d * enc_frames + j] = s;
+                            k_nat.push(Float16::from_f32(s));
+                        }
+                    }
+                } else {
+                    for j in 0..enc_frames {
+                        let src = &ck.row(j)[base..base + d_head];
+                        for &s in src {
+                            k_nat.push(Float16::from_f32(s));
+                        }
                     }
                 }
-                cross_kh_t.push(Mat::from_vec(d_head, enc_frames, kh_t));
-                cross_kh_f16.push(k_nat);
-                // vh [enc_frames, d_head]: row j = cv.row(j)[base..base+d_head].
-                let mut vh = vec![0.0f32; enc_frames * d_head];
-                // v_t [d_head, enc_frames] f16: v_t[d][j] = cv.row(j)[base + d].
+                // vh [enc_frames, d_head] (f32 path only); v_t [d_head, enc_frames] f16.
+                let mut vh = if need_f32 { vec![0.0f32; enc_frames * d_head] } else { Vec::new() };
                 let mut v_t = vec![Float16::from_bits(0); d_head * enc_frames];
                 for j in 0..enc_frames {
                     let src = &cv.row(j)[base..base + d_head];
-                    vh[j * d_head..(j + 1) * d_head].copy_from_slice(src);
+                    if need_f32 {
+                        vh[j * d_head..(j + 1) * d_head].copy_from_slice(src);
+                    }
                     for (d, &s) in src.iter().enumerate() {
                         v_t[d * enc_frames + j] = Float16::from_f32(s);
                     }
                 }
-                cross_vh.push(Mat::from_vec(enc_frames, d_head, vh));
-                cross_vh_f16.push(v_t);
-            }
+                (kh_t, k_nat, vh, v_t)
+            })
+            .collect();
+        for (kh_t, k_nat, vh, v_t) in built {
+            // Empty (0×0) placeholders when the f32 path is inactive — never indexed.
+            cross_kh_t.push(if need_f32 {
+                Mat::from_vec(d_head, enc_frames, kh_t)
+            } else {
+                Mat::from_vec(0, 0, Vec::new())
+            });
+            cross_kh_f16.push(k_nat);
+            cross_vh.push(if need_f32 {
+                Mat::from_vec(enc_frames, d_head, vh)
+            } else {
+                Mat::from_vec(0, 0, Vec::new())
+            });
+            cross_vh_f16.push(v_t);
         }
+
+        // int8/Q8 the window-constant cross K/V once (gated). K is [enc_frames,
+        // d_head] (per-key-row scale), V is [d_head, enc_frames] (per-output-dim
+        // scale) — the exact `out×inp` layouts `gemv_i8` consumes. Only when the
+        // f16 cross path is active (the i8 GEMV replaces the f16 one there).
+        let (cross_kh_i8, cross_vh_i8) = if int8_cross_kv_enabled() && cross_f16_enabled() {
+            (
+                // PARALLEL outer loop over the ~n_layer×n_head small per-head mats
+                // (BlackThrush, 2026-07-02): the serial `.iter()` quantized each mat
+                // one-at-a-time, and for the K mats `quantize_f16_to_i8`'s inner
+                // `par_chunks` is over 1500 tiny 64-elem rows (rayon-overhead-bound),
+                // so the whole pass ran at ~half speed. Fanning the OUTER loop across
+                // rayon (each mat then quantized on one worker) is MEASURED 1.87× on
+                // the cross-cache quantize (7.15→3.82 ms, cross_quant_probe) and
+                // BYTE-IDENTICAL — `collect` from an indexed parallel iterator
+                // preserves layer/head order, and each mat's per-row arithmetic is
+                // unchanged (probe: i8 data + scales bit-equal to the serial form).
+                cross_kh_f16
+                    .par_iter()
+                    .map(|k| nn::quantize_f16_to_i8(k, enc_frames, d_head))
+                    .collect(),
+                cross_vh_f16
+                    .par_iter()
+                    .map(|v| nn::quantize_f16_to_i8(v, d_head, enc_frames))
+                    .collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         Ok(Self {
             kv,
@@ -783,6 +1044,8 @@ impl DecoderState {
             cross_vh,
             cross_kh_f16,
             cross_vh_f16,
+            cross_kh_i8,
+            cross_vh_i8,
             len: 0,
             enc_frames,
             n_state: w.n_state,
@@ -893,6 +1156,53 @@ fn cross_f16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FW_CROSS_F16").as_deref() != Ok("0"))
 }
 
+/// Kill-switch (default OFF) that forces `cross_attention` to accumulate the full
+/// `[tq, tk]` softmax scores even when NOT recording DTW word timestamps — i.e.
+/// the pre-optimization behavior. Default (unset) skips that pure-waste alloc on
+/// the steady-state decode path (see `cross_attention`). Set `FW_CROSS_SCORES_KEEP=1`
+/// to restore the old behavior for A/B timing; it does not affect numerics.
+fn cross_scores_keep_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_CROSS_SCORES_KEEP").is_some())
+}
+
+/// Per-layer head slice of the (optionally empty) int8 cross K/V. Empty vec (gate
+/// off) ⇒ `&[]`, which `cross_attention` reads as "use the f16 path".
+fn cross_kv_i8_slice(all: &[nn::I8Mat], h0: usize, n_head: usize) -> &[nn::I8Mat] {
+    if all.is_empty() {
+        &[]
+    } else {
+        &all[h0..h0 + n_head]
+    }
+}
+
+/// Whether to int8/Q8 the window-constant cross-attention K/V (encoder keys and
+/// values) on the per-token decode path. The encoder K/V (~30 MB f16 for turbo)
+/// are read in full every decode token, so they are DRAM-resident and int8 halves
+/// that bandwidth — the same lever as the weight GEMVs, applied to the largest
+/// per-token-resident *activation* cache. Built once per window in
+/// [`DecoderState::new`]. Numerics: K feeds the cross scores → softmax
+/// (error-robust); V feeds the cross output → `cross_out` → residual, but the
+/// encoder values are bounded and the softmax weights sum to 1, so the byte-exact
+/// golden gate validates safety. Requires the f16 cross path (`FW_CROSS_F16` != 0).
+/// Disable with `FRANKEN_WHISPER_INT8_CROSS_KV=0`. Prefill (`tq > 1`) is unaffected
+/// (the same per-row GEMVs run for each query row).
+fn int8_cross_kv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    // Default ON: measured 1.31× on the cross_attn span and transcript byte-exact
+    // vs f16 on tiny.en + large-v3-turbo (e2e golden 6/6). `=0` restores f16.
+    *ON.get_or_init(|| !matches!(
+        std::env::var("FRANKEN_WHISPER_INT8_CROSS_KV")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cross_attention(
     q: &Mat,
@@ -900,6 +1210,8 @@ fn cross_attention(
     cross_vh: &[Mat],
     cross_kh_f16: &[Vec<Float16>],
     cross_vh_f16: &[Vec<Float16>],
+    cross_kh_i8: &[nn::I8Mat],
+    cross_vh_i8: &[nn::I8Mat],
     tk: usize,
     n_head: usize,
     record: bool,
@@ -915,6 +1227,9 @@ fn cross_attention(
     let d_head = n_state / n_head;
     let q_scale = (d_head as f32).powf(-0.25);
     let use_f16 = cross_f16_enabled();
+    // Build the full softmax-scores matrix only when a consumer exists: DTW
+    // recording (`record`), or the A/B kill-switch. Otherwise it is discarded.
+    let build_scores = record || cross_scores_keep_enabled();
 
     // Compute one head's scores [tq, tk] and output [tq, d_head]. Per-head
     // math (scaled q·k^T → softmax → @v) is byte-for-byte the serial path;
@@ -935,7 +1250,20 @@ fn cross_attention(
             // uninit), half the K/V bandwidth (f16). Numerics-affecting (f16
             // dequant + dot8 order) — transcription-tolerance, like the rest of
             // the f16 decode path.
-            let mut scores_all = Vec::with_capacity(tq * tk);
+            // int8/Q8 the two GEMVs when the quantized K/V are present (gated in
+            // `DecoderState::new`); `gemv_i8` quantizes the query/softmax-weight
+            // input vector internally, so the DRAM read of the encoder K/V is
+            // halved. Otherwise the f16c `gemv_f16` path.
+            let use_i8 = !cross_kh_i8.is_empty();
+            // `scores_all` (the full `[tq, tk]` softmax weights) is ONLY consumed
+            // when recording DTW word-timestamp attention (`record`). In the
+            // steady-state decode path (`record == false`, the default) the caller
+            // takes `(_, out_h)` and drops the scores, so accumulating them is pure
+            // waste — at tq=1 a tk≈1500-float alloc + memcpy per head, i.e. per
+            // token 32 layers × 20 heads = 640 discarded ~6 KB vecs. Skip it when
+            // not recording; the numeric path (scale → gemv → softmax → gemv) is
+            // untouched, so `out_h` and the transcript are BIT-IDENTICAL.
+            let mut scores_all = if build_scores { Vec::with_capacity(tq * tk) } else { Vec::new() };
             let mut out_all = Vec::with_capacity(tq * d_head);
             let mut qh = vec![0.0f32; d_head];
             for i in 0..tq {
@@ -944,16 +1272,26 @@ fn cross_attention(
                     *d = s * q_scale;
                 }
                 let mut srow = nn::gemv_out_buf(tk);
-                nn::gemv_f16(&cross_kh_f16[h], tk, d_head, &qh, None, &mut srow);
+                if use_i8 {
+                    nn::gemv_i8(&cross_kh_i8[h], &qh, None, &mut srow);
+                } else {
+                    nn::gemv_f16(&cross_kh_f16[h], tk, d_head, &qh, None, &mut srow);
+                }
                 let mut sm = Mat::from_vec(1, tk, srow);
                 nn::softmax_rows(&mut sm);
                 let mut oh = nn::gemv_out_buf(d_head);
-                nn::gemv_f16(&cross_vh_f16[h], d_head, tk, &sm.data, None, &mut oh);
-                scores_all.extend_from_slice(&sm.data);
+                if use_i8 {
+                    nn::gemv_i8(&cross_vh_i8[h], &sm.data, None, &mut oh);
+                } else {
+                    nn::gemv_f16(&cross_vh_f16[h], d_head, tk, &sm.data, None, &mut oh);
+                }
+                if build_scores {
+                    scores_all.extend_from_slice(&sm.data);
+                }
                 out_all.extend_from_slice(&oh);
             }
             return Ok((
-                Mat::from_vec(tq, tk, scores_all),
+                Mat::from_vec(tq, if build_scores { tk } else { 0 }, scores_all),
                 Mat::from_vec(tq, d_head, out_all),
             ));
         }
@@ -1180,6 +1518,8 @@ pub fn forward_step(
                 &st.cross_vh[h0..h0 + w.n_head],
                 &st.cross_kh_f16[h0..h0 + w.n_head],
                 &st.cross_vh_f16[h0..h0 + w.n_head],
+                cross_kv_i8_slice(&st.cross_kh_i8, h0, w.n_head),
+                cross_kv_i8_slice(&st.cross_vh_i8, h0, w.n_head),
                 st.enc_frames,
                 w.n_head,
                 st.record_cross_attn,
@@ -1234,6 +1574,16 @@ pub fn forward_step(
 pub fn logits_last(w: &DecoderWeights, x_last: &Mat) -> FwResult<Vec<f32>> {
     let n_vocab = w.n_vocab;
     let n_state = w.n_state;
+
+    // int8 tied-output path (opt-in, `int8_logits_enabled`): the memory-halved
+    // GEMV over the per-row-quantized embedding. Numerics-affecting approximation
+    // of the f16 arm; present only when the gate was on at load.
+    if let Some(i8) = &w.token_embedding_i8 {
+        debug_assert_eq!((i8.out, i8.inp), (n_vocab, n_state));
+        let mut logits = nn::gemv_out_buf(i8.out);
+        nn::gemv_i8(i8, &x_last.data, None, &mut logits);
+        return Ok(logits);
+    }
 
     // f16-resident embedding: fused dequant-GEMV directly over the natural
     // `[n_vocab, n_state]` rows. `out[o] = dot(emb[o, :], x_last)`, contiguous
@@ -1344,6 +1694,9 @@ fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Option<Linear> {
     Some(Linear {
         w: WeightMat::F16 { data, out, inp },
         bias: Some(bias),
+        w_i8: None,
+        w_i8_block: None,
+        w_i4_pack: None,
     })
 }
 
@@ -1451,6 +1804,9 @@ mod tests {
             Linear {
                 w: WeightMat::F32(rng.mat(inp, out)),
                 bias: if bias { Some(rng.vec(out)) } else { None },
+                w_i8: None,
+                w_i8_block: None,
+                w_i4_pack: None,
             }
         };
         let ln = |rng: &mut Lcg| LayerNorm {
@@ -1485,6 +1841,7 @@ mod tests {
         }
         DecoderWeights {
             token_embedding: WeightMat::F32(rng.mat(N_VOCAB, N_STATE)),
+            token_embedding_i8: None,
             positional_embedding: rng.mat(N_CTX, N_STATE),
             layers,
             ln: ln(&mut rng),
