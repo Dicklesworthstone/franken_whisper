@@ -388,6 +388,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "block"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -650,10 +656,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "core-graphics-types"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d44a101f213f6c4cdc1853d4b78aef6db6bdfa3468798cc1d9912f4735013eb"
+dependencies = [
+ "bitflags 2.13.0",
+ "core-foundation",
+ "libc",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -1219,6 +1246,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "foreign-types"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d737d9aa519fb7b749cbc3b962edcf310a8dd1f4b67c91c4f83975dbdd17d965"
+dependencies = [
+ "foreign-types-macros",
+ "foreign-types-shared",
+]
+
+[[package]]
+name = "foreign-types-macros"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a5c6c585bc94aaf2c7b51dd4c2ba22680844aba4c687be581871a6f518c5742"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "foreign-types-shared"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
+
+[[package]]
 name = "franken-decision"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1274,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "franken_whisper"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync 0.3.4",
  "base64",
@@ -1294,6 +1348,7 @@ dependencies = [
  "ft-api",
  "ft-core",
  "ft-kernel-cpu",
+ "ft-kernel-metal",
  "ftui",
  "half",
  "hound",
@@ -1312,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -1326,14 +1381,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-types",
 ]
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -1349,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync 0.3.5",
  "blake3",
@@ -1385,14 +1440,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1403,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1413,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1424,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1436,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1445,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1455,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync 0.3.5",
  "blake3",
@@ -1478,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1488,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "argon2",
  "bumpalo",
@@ -1509,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1521,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1537,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync 0.3.5",
  "bitflags 2.13.0",
@@ -1554,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync 0.3.5",
  "crossbeam-deque",
@@ -1575,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "advisory-lock",
  "asupersync 0.3.5",
@@ -1591,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync 0.3.5",
  "blake3",
@@ -1655,6 +1710,13 @@ dependencies = [
  "matrixmultiply",
  "rayon",
  "wide",
+]
+
+[[package]]
+name = "ft-kernel-metal"
+version = "0.1.0"
+dependencies = [
+ "metal",
 ]
 
 [[package]]
@@ -2188,6 +2250,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "malloc_buf"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2219,6 +2290,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "metal"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7047791b5bc903b8cd963014b355f71dc9864a9a0b727057676c1dcae5cbc15"
+dependencies = [
+ "bitflags 2.13.0",
+ "block",
+ "core-graphics-types",
+ "foreign-types",
+ "log",
+ "objc",
+ "paste",
 ]
 
 [[package]]
@@ -2324,6 +2410,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "objc"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915b1b472bc21c53464d6c8461c9d3af805ba1ef837e1cac254428f4a77177b1"
+dependencies = [
+ "malloc_buf",
 ]
 
 [[package]]
@@ -2446,6 +2541,12 @@ dependencies = [
  "rand_core 0.6.4",
  "subtle",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pastey"
@@ -2695,9 +2796,9 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rapidhash"
-version = "4.4.1"
+version = "4.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5e48930979c155e2f33aa36ab3119b5ee81332beb6482199a8ecd6029b80b59"
+checksum = "32b266a82f4aa99bb5c25e28d11cc44ace63d91adbcbcee4d323e2ae3d49ef37"
 dependencies = [
  "rustversion",
 ]
@@ -3328,7 +3429,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",

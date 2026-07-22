@@ -253,10 +253,57 @@ fn matmul_into_uninit(
     unsafe {
         data.set_len(numel);
     }
+    // GPU auto-offload (Apple Silicon): route large GEMMs to the Metal tiled
+    // kernel when a GPU is present. Falls through to the CPU sgemm on any error,
+    // for small matmuls (launch overhead), or when disabled by
+    // `FRANKEN_WHISPER_GPU=0`. All Metal/unsafe is isolated in ft-kernel-metal, so
+    // this crate keeps `#![deny(unsafe_code)]`.
+    #[cfg(target_os = "macos")]
+    {
+        let m = lhs_meta.shape()[0];
+        let k = lhs_meta.shape()[1];
+        let n = rhs_meta.shape()[1];
+        // Size check first (cheap) so small/short models never even probe for a
+        // GPU — `metal_offload_enabled()` builds the Metal context (device +
+        // kernel compile) on first call, which would otherwise tax a fast tiny.en
+        // run that has no GEMM large enough to offload anyway.
+        if m.saturating_mul(k).saturating_mul(n) >= METAL_MIN_MKN
+            && metal_offload_enabled()
+            && ft_kernel_metal::sgemm(lhs, rhs, &mut data, m, k, n).is_ok()
+        {
+            return Ok(data);
+        }
+    }
     ft_kernel_cpu::matmul_tensor_contiguous_f32_into(&mut data, lhs, rhs, lhs_meta, rhs_meta)
         .map_err(kernel_err)?;
     Ok(data)
 }
+
+/// Runtime gate for GPU matmul offload (Apple Silicon). `true` iff a Metal GPU is
+/// present and the user hasn't set `FRANKEN_WHISPER_GPU=0`. Probed once, cached.
+#[cfg(target_os = "macos")]
+fn metal_offload_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let disabled = matches!(
+            std::env::var("FRANKEN_WHISPER_GPU").ok().as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
+        );
+        !disabled && ft_kernel_metal::is_available()
+    })
+}
+
+/// Below this `m*k*n`, per-call GPU launch/sync + buffer-copy overhead outweighs
+/// the compute win, so the matmul stays on the (already fast, multi-threaded) CPU.
+/// MEASURED on an M4 Pro: tiny.en GEMMs (≤9e8) run *slower* on the GPU, while
+/// large-v3-class GEMMs (≥2.5e9) win ~15% wall-clock and offload ~3× the CPU work.
+/// The threshold sits between them so only large models auto-offload — small
+/// models keep the optimal CPU path, with no regression. (This is a GEMM-only
+/// first cut; a batched/overlapped GPU pipeline would widen the win and lower the
+/// break-even, at which point this constant should drop.)
+#[cfg(target_os = "macos")]
+const METAL_MIN_MKN: usize = 2_000_000_000;
 
 /// Allocate an `[n]` f32 buffer that the caller **fully overwrites** before any
 /// read, skipping the dead serial zero-init — the same dead-work elision as
@@ -813,6 +860,734 @@ pub fn gemv_f16(
         });
 }
 
+/// Per-output-row symmetric-int8-quantized weight (`[out, in]` row-major) with a
+/// per-row f32 scale. Cuts the resident bytes in HALF vs [`WeightMat::F16`] — the
+/// lever for the memory-bandwidth-bound vocab-class logits GEMV (measured 1.86×
+/// single-thread vs f16 on `[51866,1280]`; the logits stream is DRAM-bandwidth-
+/// bound, so halving the bytes ~halves the time). Numerics-affecting (int8 ≈ 256
+/// levels): built + used only behind [`super::int8_logits_enabled`].
+#[derive(Debug, Clone)]
+pub struct I8Mat {
+    /// Quantized weights, `out * in` elements row-major, each in `[-127, 127]`.
+    pub data: Vec<i8>,
+    /// Per-output-row dequant scale (`amax_row / 127`), `out` elements.
+    pub scales: Vec<f32>,
+    /// Output dimension (rows).
+    pub out: usize,
+    /// Input dimension (contraction length).
+    pub inp: usize,
+}
+
+/// Per-output-row symmetric int8 quantization of a natural `[out, in]` f16
+/// weight: `scale[o] = max_i |w[o,i]| / 127`, `q[o,i] = round(w[o,i]/scale[o])`.
+/// Parallel over rows (each independent). The inverse `w ≈ q * scale` is what
+/// [`gemv_i8`] reconstructs.
+pub fn quantize_f16_to_i8(w: &[Float16], out: usize, inp: usize) -> I8Mat {
+    debug_assert_eq!(w.len(), out * inp);
+    let mut data = vec![0i8; out * inp];
+    let mut scales = vec![0.0f32; out];
+    data.par_chunks_mut(inp)
+        .zip(scales.par_iter_mut())
+        .enumerate()
+        .for_each(|(o, (drow, s))| {
+            let wrow = &w[o * inp..(o + 1) * inp];
+            let amax = wrow
+                .iter()
+                .map(|h| h.to_f32().abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-9);
+            let sc = amax / 127.0;
+            *s = sc;
+            let inv = 1.0 / sc;
+            for (d, h) in drow.iter_mut().zip(wrow) {
+                *d = (h.to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        });
+    I8Mat { data, scales, out, inp }
+}
+
+/// Signed int8 dot → i32. Explicit AVX2 (`vpmovsxbw`+`vpmaddwd`+`vpaddd`, 2
+/// independent i32 accumulators) instead of the scalar loop: LLVM's autovec of the
+/// scalar reduction caps at **~28 GB/s** cache-resident (compute-bound, too few
+/// accumulators to hide `vpmaddwd` latency), while this hits **~50 GB/s** = **1.8×**
+/// cache-resident and **1.13×** on the DRAM-bound `[51866,1280]` logits stream
+/// (`examples/dot_i8_probe`). **Bit-identical to the scalar loop**: i8·i8 ∈
+/// `[-16129,16129]` and decode contraction `≤5120` ⇒ `|Σ| ≤ 82.6M < 2³¹`, so there
+/// is NO i32 overflow and integer add is associative — the vectorized pairwise-i32
+/// sum equals the scalar sum exactly (verified 0-diff over the full logits matrix).
+/// Feeds every int8 decode GEMV ([`gemv_i8`], [`gemv_i8_batch`]) at half the f16
+/// weight bytes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(w.len(), x.len(), "dot_i8 length mismatch");
+    let n = w.len();
+    let (wp, xp) = (w.as_ptr(), x.as_ptr());
+    // SAFETY: avx2 guaranteed by this fn's cfg; every 128-bit load is bounded by the
+    // `i+16<=n` / `i+32<=n` guard and the `< 16` remainder runs scalar; no overflow
+    // (see doc), so the reduction is bit-identical to the scalar path.
+    unsafe {
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 32 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+            let x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i + 16) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(w1, x1));
+            i += 32;
+        }
+        while i + 16 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            i += 16;
+        }
+        // Horizontal sum (exact integer add, order-independent).
+        let s = _mm256_add_epi32(a0, a1);
+        let lo = _mm256_castsi256_si128(s);
+        let hi = _mm256_extracti128_si256::<1>(s);
+        let q = _mm_add_epi32(lo, hi);
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+        let mut acc = _mm_cvtsi128_si32(q);
+        while i < n {
+            acc += (*w.get_unchecked(i) as i32) * (*x.get_unchecked(i) as i32);
+            i += 1;
+        }
+        acc
+    }
+}
+
+/// Scalar fallback (non-x86 / no avx2): the reference the AVX2 path reproduces exactly.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+    let mut acc: i32 = 0;
+    for (a, b) in w.iter().zip(x.iter()) {
+        acc += (*a as i32) * (*b as i32);
+    }
+    acc
+}
+
+/// Symmetric int8 quantize of an activation into `out` (`len == x.len()`):
+/// `out[i] = (x[i]·xinv).round().clamp(-127,127) as i8`. The AVX2 path computes
+/// `round()` as `trunc(v + copysign(0.5, v))` (= round-HALF-AWAY = `f32::round`
+/// for finite `v` — activations are always finite post-GEMM), then clamps and
+/// saturating-packs to i8 — **byte-identical** to the scalar map but **~5× faster**
+/// (`f32::round` has no direct AVX rounding mode, so LLVM scalarizes the map;
+/// measured `examples/quant_i8_probe`, 0-diff over ±127 clamp edges). Runs ~7×/token
+/// in decode.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn quantize_act_i8_into(x: &[f32], xinv: f32, out: &mut [i8]) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(x.len(), out.len(), "quantize_act_i8_into len mismatch");
+    let n = x.len();
+    let xp = x.as_ptr();
+    // SAFETY: avx2 guaranteed by cfg; every load/store is bounded by the `i+8<=n`
+    // guard and the `< 8` remainder runs scalar.
+    unsafe {
+        let vinv = _mm256_set1_ps(xinv);
+        let half = _mm256_set1_ps(0.5);
+        let signmask = _mm256_set1_ps(-0.0); // 0x80000000
+        let c127 = _mm256_set1_ps(127.0);
+        let cm127 = _mm256_set1_ps(-127.0);
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_mul_ps(_mm256_loadu_ps(xp.add(i)), vinv);
+            let vh = _mm256_add_ps(v, _mm256_or_ps(half, _mm256_and_ps(v, signmask)));
+            let r = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(vh);
+            let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
+            let ri = _mm256_cvtps_epi32(r);
+            let lo = _mm256_castsi256_si128(ri);
+            let hi = _mm256_extracti128_si256::<1>(ri);
+            let i16s = _mm_packs_epi32(lo, hi); // order-preserving: [lo0..3, hi0..3]
+            let i8s = _mm_packs_epi16(i16s, i16s); // low 8 bytes = elems 0..7
+            _mm_storel_epi64(out.as_mut_ptr().add(i) as *mut __m128i, i8s);
+            i += 8;
+        }
+        while i < n {
+            *out.get_unchecked_mut(i) =
+                (*x.get_unchecked(i) * xinv).round().clamp(-127.0, 127.0) as i8;
+            i += 1;
+        }
+    }
+}
+
+/// Scalar fallback (non-avx2): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn quantize_act_i8_into(x: &[f32], xinv: f32, out: &mut [i8]) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o = (v * xinv).round().clamp(-127.0, 127.0) as i8;
+    }
+}
+
+/// `o[d] += a * x[d]` for every `d`. BYTE-IDENTICAL to the scalar loop
+/// `for (o, x) { *o += a * x }`: `*o += a*x` is mul-then-add (TWO IEEE roundings),
+/// and the AVX2 path uses SEPARATE `_mm256_mul_ps` + `_mm256_add_ps` — **not**
+/// `fmadd`, which would fuse to a single rounding and diverge in the last ULP.
+/// The vectorization is across the INDEPENDENT output slots `d`, so for each
+/// `o[d]` the accumulation order over successive calls (the decode `j`-ascending
+/// score·V SAXPY) is preserved exactly. See `axpy_f32_into_matches_scalar`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn axpy_f32_into(o: &mut [f32], a: f32, x: &[f32]) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(o.len(), x.len(), "axpy_f32_into len mismatch");
+    let n = o.len();
+    let xp = x.as_ptr();
+    let op = o.as_mut_ptr();
+    // SAFETY: avx2 guaranteed by cfg; loads/stores bounded by `i+8<=n`, remainder scalar.
+    unsafe {
+        let va = _mm256_set1_ps(a);
+        let mut i = 0;
+        while i + 8 <= n {
+            let ov = _mm256_loadu_ps(op.add(i));
+            let xv = _mm256_loadu_ps(xp.add(i));
+            // mul then add — two roundings, matching the scalar `*o += a*x`.
+            let r = _mm256_add_ps(ov, _mm256_mul_ps(va, xv));
+            _mm256_storeu_ps(op.add(i), r);
+            i += 8;
+        }
+        while i < n {
+            *o.get_unchecked_mut(i) += a * *x.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
+/// Scalar fallback (non-avx2): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn axpy_f32_into(o: &mut [f32], a: f32, x: &[f32]) {
+    for (oo, &xx) in o.iter_mut().zip(x) {
+        *oo += a * xx;
+    }
+}
+
+/// Fused int8 GEMV: `out[o] = (Σ_i q_w[o,i] · q_x[i]) · scale_w[o] · scale_x`.
+/// Quantizes the activation `x` to int8 per-vector (symmetric), then dots each
+/// weight row. Parallelizes over output-row bands exactly like [`gemv_f16`]
+/// (wide worker cap for the vocab-class logits). A numerics-affecting int8
+/// approximation of the f16 GEMV — the caller gates it ([`super::int8_logits_enabled`]).
+pub fn gemv_i8(w: &I8Mat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
+    let (out, inp) = (w.out, w.inp);
+    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8 weight shape mismatch");
+    debug_assert_eq!(x.len(), inp, "gemv_i8 x length mismatch");
+    debug_assert_eq!(out_slice.len(), out, "gemv_i8 out length mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8 bias length mismatch");
+    // Quantize the activation once (per-vector symmetric), shared by all rows.
+    let xamax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+    let xs = xamax / 127.0;
+    let xinv = 1.0 / xs;
+    let mut xi8 = vec![0i8; inp];
+    quantize_act_i8_into(x, xinv, &mut xi8);
+
+    let fill = |o_base: usize, slice: &mut [f32]| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            let o = o_base + i;
+            let acc = dot_i8(&w.data[o * inp..(o + 1) * inp], &xi8) as f32 * w.scales[o] * xs;
+            *slot = acc + bias.map_or(0.0, |b| b[o]);
+        }
+    };
+
+    // Parallelize only GEMVs whose `out*inp` clears this bar. At `1<<19` the small
+    // decode projections (`self_out`/`cross_q`/`cross_out` = n_state² = 1.64 M for
+    // large/turbo) were parallelized, but their per-row int8 dot is ~0.03 ms of
+    // compute — `par_chunks_mut`'s rayon coordination cost DOMINATED it (MEASURED
+    // serial 1.3–1.8× faster on those spans, min-of-8). `1<<21` (2.10 M) keeps them
+    // serial while `qkv` (4.9 M), `mlp_0` (6.5 M) and the vocab logits (66 M) — which
+    // genuinely amortize the spawn — stay parallel (also for medium's 3.15 M `qkv`).
+    // Bit-identical: parallel vs serial is a disjoint output-row partition, same math.
+    // Escape hatch / tuner: `FW_GEMV_I8_PAR`.
+    let par_threshold = {
+        use std::sync::OnceLock;
+        static T: OnceLock<usize> = OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("FW_GEMV_I8_PAR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 21)
+        })
+    };
+    let workers = gemv_worker_count(out);
+    if out * inp < par_threshold || workers < 2 {
+        fill(0, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
+}
+
+/// Batched fused int8 GEMV for the prefill / multi-token path (`tq > 1`) — the
+/// int8 analog of [`gemv_f16_batch`]. Each weight row `w[o]` is read ONCE and
+/// dotted against ALL `tq` activation rows, so the (bandwidth-bound) weight read
+/// is amortized over the batch at HALF the bytes of the f16 batch path. Each
+/// activation ROW is quantized per-vector by its OWN amax, exactly as [`gemv_i8`]
+/// does per token, and each output row keeps its own weight scale — so every
+/// `(t, o)` entry equals `gemv_i8`'s and the result is BIT-IDENTICAL to running
+/// the batch as `tq` separate [`gemv_i8`] calls. `out_slice` is `[tq, out]`
+/// row-major (same layout as [`gemv_f16_batch`]). Quantifies + captures the
+/// draft-decoding amortization (`examples/draft_amortization_probe.rs`).
+pub fn gemv_i8_batch(
+    w: &I8Mat,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+) {
+    let (out, inp) = (w.out, w.inp);
+    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8_batch weight shape mismatch");
+    debug_assert_eq!(x.len(), tq * inp, "gemv_i8_batch x length mismatch");
+    debug_assert_eq!(out_slice.len(), tq * out, "gemv_i8_batch out length mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8_batch bias length mismatch");
+    if tq == 1 {
+        gemv_i8(w, x, bias, out_slice);
+        return;
+    }
+
+    // Per-ROW activation quantization (each row by its own amax → identical to the
+    // per-token gemv_i8), shared by every output row.
+    let mut xi8 = vec![0i8; tq * inp];
+    let mut xs = vec![0.0f32; tq];
+    for t in 0..tq {
+        let row = &x[t * inp..(t + 1) * inp];
+        let xamax = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+        let s = xamax / 127.0;
+        xs[t] = s;
+        let inv = 1.0 / s;
+        // Same AVX2 copysign+trunc quantize as gemv_i8 (byte-identical to the scalar
+        // `.round()` map for finite activations; ~5× — f32::round doesn't vectorize).
+        quantize_act_i8_into(row, inv, &mut xi8[t * inp..(t + 1) * inp]);
+    }
+
+    // Disjoint-column-band structure identical to gemv_f16_batch; the only change
+    // is the per-(o,t) value = `dot_i8(w[o], xi8[t]) * scale_w[o] * scale_x[t] + b`,
+    // in the SAME product order as gemv_i8 (bit-identical).
+    let compute_band = |o0: usize, o1: usize, dst: &mut [f32]| {
+        for o in o0..o1 {
+            let wrow = &w.data[o * inp..(o + 1) * inp];
+            let so = w.scales[o];
+            let b = bias.map_or(0.0, |bb| bb[o]);
+            for t in 0..tq {
+                dst[t * out + o] =
+                    dot_i8(wrow, &xi8[t * inp..(t + 1) * inp]) as f32 * so * xs[t] + b;
+            }
+        }
+    };
+
+    const PAR_THRESHOLD: usize = 1 << 21;
+    const COMPUTE_BOUND_MACS: usize = 1 << 26;
+    let avail = avail_parallelism();
+    let work = tq.saturating_mul(out).saturating_mul(inp);
+    let workers = batch_gemv_cap()
+        .map(|c| avail.min(c))
+        .unwrap_or_else(|| {
+            if work >= COMPUTE_BOUND_MACS {
+                avail.min(16)
+            } else {
+                gemv_worker_count(out)
+            }
+        });
+    if work < PAR_THRESHOLD || workers < 2 {
+        compute_band(0, out, out_slice);
+        return;
+    }
+
+    // Each worker fills a private [tq, out] buffer for its band, then disjoint-merge
+    // (each column written by exactly one worker → `0.0 + x == x`), same as gemv_f16_batch.
+    let band = out.div_ceil(workers).max(1);
+    let parts: Vec<(usize, usize, Vec<f32>)> = std::thread::scope(|s| {
+        let compute_band = &compute_band;
+        let mut handles = Vec::new();
+        let mut o0 = 0;
+        while o0 < out {
+            let o1 = (o0 + band).min(out);
+            handles.push(s.spawn(move || {
+                let mut local = vec![0.0f32; tq * out];
+                compute_band(o0, o1, &mut local);
+                (o0, o1, local)
+            }));
+            o0 = o1;
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (o0, o1, local) in parts {
+        for t in 0..tq {
+            out_slice[t * out + o0..t * out + o1]
+                .copy_from_slice(&local[t * out + o0..t * out + o1]);
+        }
+    }
+}
+
+/// Dot of an int8 weight row against an **f32** activation (no activation
+/// quantization): `Σ_i (w[i] as f32) · x[i]`. Scalar fallback.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
+    let n = w.len().min(x.len());
+    let mut acc = 0.0f32;
+    for i in 0..n {
+        acc += (w[i] as f32) * x[i];
+    }
+    acc
+}
+
+/// AVX2 int8-weight × f32-activation dot: sign-extend 8 int8 → i32
+/// (`vpmovsxbd`) → f32 (`vcvtdq2ps`) → `vfmadd` against the f32 activation. Four
+/// accumulators reduced in the same `((0+1)+(2+3))+((4+5)+(6+7))` order as
+/// [`dot_f16c`], so it is the f16-dot with the weight source swapped from f16 to
+/// int8 — the win is bandwidth (int8 weight = half the f16 bytes), the activation
+/// stays full precision (unlike `gemv_i8`, which also quantizes `x`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8w_f32(w: &[i8], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = w.len().min(x.len());
+    let xp = x.as_ptr();
+    // SAFETY: every load is bounded by the `i+32`/`i+8`/`i<n` guards over
+    // n = min(w.len, x.len); avx2+fma are guaranteed by this fn's target_feature cfg.
+    unsafe {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            // Each 64-bit load holds 8 int8; cvtepi8_epi32 widens to 8 i32.
+            let w0 = _mm_loadl_epi64(w.as_ptr().add(i).cast());
+            let w1 = _mm_loadl_epi64(w.as_ptr().add(i + 8).cast());
+            let w2 = _mm_loadl_epi64(w.as_ptr().add(i + 16).cast());
+            let w3 = _mm_loadl_epi64(w.as_ptr().add(i + 24).cast());
+            a0 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w0)),
+                _mm256_loadu_ps(xp.add(i)),
+                a0,
+            );
+            a1 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w1)),
+                _mm256_loadu_ps(xp.add(i + 8)),
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w2)),
+                _mm256_loadu_ps(xp.add(i + 16)),
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w3)),
+                _mm256_loadu_ps(xp.add(i + 24)),
+                a3,
+            );
+            i += 32;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        while i + 8 <= n {
+            let p = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(w.as_ptr().add(i).cast()))),
+                _mm256_loadu_ps(xp.add(i)),
+            );
+            let mut t = [0.0f32; 8];
+            _mm256_storeu_ps(t.as_mut_ptr(), p);
+            s += ((t[0] + t[1]) + (t[2] + t[3])) + ((t[4] + t[5]) + (t[6] + t[7]));
+            i += 8;
+        }
+        while i < n {
+            s += (w[i] as f32) * x[i];
+            i += 1;
+        }
+        s
+    }
+}
+
+/// Block-wise int8 weight (Q8_0-style): int8 data plus ONE dequant scale per
+/// `block` consecutive input columns per row, so a wide row with outliers keeps
+/// fine resolution in the calm blocks. `scales` is `out * n_blocks` row-major
+/// (`n_blocks = ceil(inp/block)`). Used for `mlp_2`/fc2, where a single per-row
+/// scale (`I8Mat`) is too coarse (breaks turbo) but block scales are byte-exact.
+#[derive(Debug, Clone)]
+pub struct I8BlockMat {
+    pub data: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub out: usize,
+    pub inp: usize,
+    pub block: usize,
+}
+
+/// Quantize a natural `[out, inp]` f16 weight to block-wise int8 (`block`
+/// columns share a symmetric `amax/127` scale). Mirrors [`quantize_f16_to_i8`]
+/// but per block, so the whisper.cpp-Q8_0-class accuracy on wide rows.
+pub fn quantize_f16_to_i8_blocked(w: &[Float16], out: usize, inp: usize, block: usize) -> I8BlockMat {
+    quantize_f16_to_int_blocked(w, out, inp, block, 127.0)
+}
+
+/// Block-wise 4-bit variant (levels in `[-7, 7]`, stored one-per-`i8` — the
+/// values still ride the [`gemv_i8w_f32a_blocked`] dot, so this measures 4-bit
+/// PRECISION without the packed-nibble kernel). For probing whether a GELU-absorbed
+/// weight (`mlp_0`) tolerates int4 byte-exactly before writing the packed kernel.
+pub fn quantize_f16_to_i4_blocked(w: &[Float16], out: usize, inp: usize, block: usize) -> I8BlockMat {
+    quantize_f16_to_int_blocked(w, out, inp, block, 7.0)
+}
+
+fn quantize_f16_to_int_blocked(
+    w: &[Float16],
+    out: usize,
+    inp: usize,
+    block: usize,
+    max_level: f32,
+) -> I8BlockMat {
+    debug_assert_eq!(w.len(), out * inp);
+    debug_assert!(block > 0);
+    let n_blocks = inp.div_ceil(block);
+    let mut data = vec![0i8; out * inp];
+    let mut scales = vec![0.0f32; out * n_blocks];
+    data.par_chunks_mut(inp)
+        .zip(scales.par_chunks_mut(n_blocks))
+        .enumerate()
+        .for_each(|(o, (drow, srow))| {
+            let wrow = &w[o * inp..(o + 1) * inp];
+            for b in 0..n_blocks {
+                let s = b * block;
+                let e = ((b + 1) * block).min(inp);
+                let amax = wrow[s..e]
+                    .iter()
+                    .map(|h| h.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-9);
+                let sc = amax / max_level;
+                srow[b] = sc;
+                let inv = 1.0 / sc;
+                for i in s..e {
+                    drow[i] = (wrow[i].to_f32() * inv).round().clamp(-max_level, max_level) as i8;
+                }
+            }
+        });
+    I8BlockMat { data, scales, out, inp, block }
+}
+
+/// Mixed block-wise GEMV: block-int8 weight × **f32** activation.
+/// `out[o] = Σ_b (scale[o,b] · Σ_{i∈b} w_i8[o,i]·x[i]) + bias[o]`. Keeps
+/// [`gemv_i8`]'s halved weight-bandwidth win but with per-block weight scales and
+/// a full-precision activation, so it is accurate enough for the residual-feeding
+/// `mlp_2`/fc2 (the per-row [`I8Mat`] variant broke turbo). Parallelization mirrors
+/// [`gemv_i8`]; the per-block dot reuses [`dot_i8w_f32`].
+pub fn gemv_i8w_f32a_blocked(w: &I8BlockMat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
+    let (out, inp, block) = (w.out, w.inp, w.block);
+    let n_blocks = inp.div_ceil(block);
+    debug_assert_eq!(w.data.len(), out * inp, "gemv_i8w_f32a_blocked weight shape mismatch");
+    debug_assert_eq!(x.len(), inp, "gemv_i8w_f32a_blocked x length mismatch");
+    debug_assert_eq!(out_slice.len(), out, "gemv_i8w_f32a_blocked out length mismatch");
+    debug_assert_eq!(w.scales.len(), out * n_blocks, "gemv_i8w_f32a_blocked scales shape mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i8w_f32a_blocked bias length mismatch");
+    let fill = |o_base: usize, slice: &mut [f32]| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            let o = o_base + i;
+            let wrow = &w.data[o * inp..(o + 1) * inp];
+            let srow = &w.scales[o * n_blocks..(o + 1) * n_blocks];
+            let mut acc = 0.0f32;
+            for (b, &sc) in srow.iter().enumerate() {
+                let s = b * block;
+                let e = ((b + 1) * block).min(inp);
+                acc += dot_i8w_f32(&wrow[s..e], &x[s..e]) * sc;
+            }
+            *slot = acc + bias.map_or(0.0, |bb| bb[o]);
+        }
+    };
+    let par_threshold = {
+        use std::sync::OnceLock;
+        static T: OnceLock<usize> = OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("FW_GEMV_I8_PAR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1 << 21)
+        })
+    };
+    let workers = gemv_worker_count(out);
+    if out * inp < par_threshold || workers < 2 {
+        fill(0, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
+}
+
+/// PACKED block-wise 4-bit weight (Q4_0-style), fixed `block == 32`. Two signed
+/// nibbles ride in each byte: for block `b`, byte `j` (`0..16`) holds `w[b*32+j]`
+/// in the low nibble and `w[b*32+j+16]` in the high nibble, each a 4-bit two's
+/// complement of a value in `[-7, 7]` (symmetric `amax/7` scale, ONE per block).
+/// So `data` is `out * inp/2` bytes — HALF the [`I8BlockMat`] weight read, the
+/// point of the type: the int4-probe ([`quantize_f16_to_i4_blocked`]) proved
+/// mlp_0/fc1 is 4-bit byte-exact (GELU-absorbed) but stored one value per byte
+/// (no bandwidth win); this packs them so the DRAM-bound decode read actually
+/// halves. `scales` is `out * n_blocks` row-major (`n_blocks = inp/32`).
+#[derive(Debug, Clone)]
+pub struct I4BlockMat {
+    pub data: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub out: usize,
+    pub inp: usize,
+}
+
+/// Quantize a natural `[out, inp]` f16 weight to PACKED block-wise int4. Produces
+/// the SAME per-element 4-bit values as [`quantize_f16_to_i4_blocked`] (same
+/// `amax/7` block scale, same round+clamp), just packed two-per-byte in the Q4_0
+/// layout — so [`gemv_i4_packed_f32a`] is byte-exact with the unpacked int4 probe.
+/// Requires `inp % 32 == 0` (fc1 input is `d_model` ∈ {384,512,768,1024,1280}).
+pub fn quantize_f16_to_i4_packed(w: &[Float16], out: usize, inp: usize) -> I4BlockMat {
+    const BLOCK: usize = 32;
+    debug_assert_eq!(w.len(), out * inp);
+    assert_eq!(inp % BLOCK, 0, "i4-packed requires inp % 32 == 0, got inp={inp}");
+    let n_blocks = inp / BLOCK;
+    let row_bytes = inp / 2;
+    let mut data = vec![0u8; out * row_bytes];
+    let mut scales = vec![0.0f32; out * n_blocks];
+    data.par_chunks_mut(row_bytes)
+        .zip(scales.par_chunks_mut(n_blocks))
+        .enumerate()
+        .for_each(|(o, (drow, srow))| {
+            let wrow = &w[o * inp..(o + 1) * inp];
+            for b in 0..n_blocks {
+                let base = b * BLOCK;
+                let amax = wrow[base..base + BLOCK]
+                    .iter()
+                    .map(|h| h.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-9);
+                let sc = amax / 7.0;
+                srow[b] = sc;
+                let inv = 1.0 / sc;
+                let q = |k: usize| -> u8 {
+                    let v = (wrow[base + k].to_f32() * inv).round().clamp(-7.0, 7.0) as i32;
+                    (v & 0x0F) as u8 // 4-bit two's complement of v ∈ [-7,7]
+                };
+                for j in 0..16 {
+                    drow[b * 16 + j] = q(j) | (q(j + 16) << 4);
+                }
+            }
+        });
+    I4BlockMat { data, scales, out, inp }
+}
+
+/// Dot of ONE packed 32-block (16 bytes → 32 signed nibbles) against 32 f32
+/// activations, in the EXACT accumulator/reduction order of [`dot_i8w_f32`] on a
+/// 32-element slice, so the packed path is bit-identical to the int4 probe.
+/// Scalar fallback: unpack into an `[i8; 32]` and defer to [`dot_i8w_f32`].
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[inline]
+fn dot_i4_block_packed(packed: &[u8], x: &[f32]) -> f32 {
+    let mut tmp = [0i8; 32];
+    for j in 0..16 {
+        let byte = packed[j] as i32;
+        tmp[j] = (((byte & 0x0F) ^ 0x08) - 0x08) as i8;
+        tmp[j + 16] = ((((byte >> 4) & 0x0F) ^ 0x08) - 0x08) as i8;
+    }
+    dot_i8w_f32(&tmp, x)
+}
+
+/// AVX2 packed-int4 block dot. Unpacks the 16 bytes into two `__m128i` of signed
+/// int8 (low nibbles → w[0..16], high nibbles → w[16..32]) via `(nib ^ 8) - 8`
+/// (4-bit sign-extend), then runs the same four-accumulator fmadd + tree reduce as
+/// [`dot_i8w_f32`]. The unpack is fully vectorized (no per-nibble scalar work) so
+/// the halved weight read is not eaten by decode-time compute.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i4_block_packed(packed: &[u8], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let xp = x.as_ptr();
+    // SAFETY: caller guarantees packed.len() >= 16 and x.len() >= 32 (one 32-block);
+    // avx2+fma are guaranteed by this fn's target_feature cfg.
+    unsafe {
+        let v = _mm_loadu_si128(packed.as_ptr().cast());
+        let mask0f = _mm_set1_epi8(0x0F);
+        let c8 = _mm_set1_epi8(8);
+        // low nibbles = w[0..16], high nibbles = w[16..32], each 0..15 then
+        // sign-extended from 4 bits via (nib ^ 8) - 8.
+        let lo_u = _mm_and_si128(v, mask0f);
+        let hi_u = _mm_and_si128(_mm_srli_epi16(v, 4), mask0f);
+        let lo = _mm_sub_epi8(_mm_xor_si128(lo_u, c8), c8);
+        let hi = _mm_sub_epi8(_mm_xor_si128(hi_u, c8), c8);
+        // Four groups matching dot_i8w_f32's a0..a3 on a 32-slice:
+        // w[0..8]=lo[0..8], w[8..16]=lo[8..16], w[16..24]=hi[0..8], w[24..32]=hi[8..16].
+        let w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+        let w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)));
+        let w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+        let w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)));
+        // fmadd against zero (not mul) to mirror dot_i8w_f32 exactly — bit-identical
+        // even in the signed-zero lane corner.
+        let z = _mm256_setzero_ps();
+        let a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), z);
+        let a1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp.add(8)), z);
+        let a2 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xp.add(16)), z);
+        let a3 = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xp.add(24)), z);
+        let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]))
+    }
+}
+
+/// Mixed PACKED-int4 GEMV: packed-int4 weight × **f32** activation. Same math as
+/// [`gemv_i8w_f32a_blocked`] (`out[o] = Σ_b scale[o,b]·dot(block_b, x_b) + bias`)
+/// but reads HALF the weight bytes. Byte-identical to the int4 probe on
+/// `gemv_i8w_f32a_blocked`. Parallelization mirrors [`gemv_i8`]. For `mlp_0`/fc1
+/// (GELU-absorbed; see [`super::int4_mlp0_enabled`]).
+pub fn gemv_i4_packed_f32a(w: &I4BlockMat, x: &[f32], bias: Option<&[f32]>, out_slice: &mut [f32]) {
+    const BLOCK: usize = 32;
+    let (out, inp) = (w.out, w.inp);
+    let n_blocks = inp / BLOCK;
+    let row_bytes = inp / 2;
+    debug_assert_eq!(w.data.len(), out * row_bytes, "gemv_i4_packed weight shape mismatch");
+    debug_assert_eq!(x.len(), inp, "gemv_i4_packed x length mismatch");
+    debug_assert_eq!(out_slice.len(), out, "gemv_i4_packed out length mismatch");
+    debug_assert_eq!(w.scales.len(), out * n_blocks, "gemv_i4_packed scales shape mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out), "gemv_i4_packed bias length mismatch");
+    let fill = |o_base: usize, slice: &mut [f32]| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            let o = o_base + i;
+            let wrow = &w.data[o * row_bytes..(o + 1) * row_bytes];
+            let srow = &w.scales[o * n_blocks..(o + 1) * n_blocks];
+            let mut acc = 0.0f32;
+            for (b, &sc) in srow.iter().enumerate() {
+                acc += dot_i4_block_packed(&wrow[b * 16..b * 16 + 16], &x[b * BLOCK..b * BLOCK + BLOCK]) * sc;
+            }
+            *slot = acc + bias.map_or(0.0, |bb| bb[o]);
+        }
+    };
+    let par_threshold = {
+        use std::sync::OnceLock;
+        static T: OnceLock<usize> = OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("FW_GEMV_I8_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 21)
+        })
+    };
+    let workers = gemv_worker_count(out);
+    if out * inp < par_threshold || workers < 2 {
+        fill(0, out_slice);
+        return;
+    }
+    let band = out.div_ceil(workers).max(1);
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
+}
+
 /// Batched fused dequant + GEMV: `out[t, o] = bias[o] + dot(W[o, :], x[t, :])`
 /// for `tq` activation rows `x` (`[tq, in]` row-major) against a natural
 /// `[out, in]` f16 weight, producing `[tq, out]` row-major.
@@ -1046,47 +1821,217 @@ fn norm_rows(block: &mut [f32], cols: usize, w: &[f32], b: &[f32], eps: f64) {
     }
 }
 
+/// Out-of-place [`layer_norm`]: read `src` `[rows, cols]`, write normalized rows
+/// into `dst` (`len == rows*cols`). Byte-identical to `x.clone()` +
+/// `layer_norm(&mut x)` (same per-row f64 SoA math, same contiguous band split),
+/// but skips the intermediate clone's full-buffer memcpy — the encoder does two
+/// `x.clone()`s per layer purely to preserve `x` for the residual, and that copy
+/// is a redundant pass this fuses into the normalize (~985 MB/window of memcpy
+/// removed on turbo). `dst` may be uninitialized (every element is written).
+pub fn layer_norm_into(src: &Mat, dst: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
+    let cols = src.cols;
+    debug_assert_eq!(dst.len(), src.rows * cols, "layer_norm_into: dst len mismatch");
+    if cols == 0 || w.len() != cols || b.len() != cols {
+        // Degenerate no-op mirrors in-place `layer_norm` (which leaves x
+        // untouched) ⇒ dst must equal src, since the clone would have copied it.
+        dst.copy_from_slice(&src.data);
+        return;
+    }
+    let eps = f64::from(eps);
+    const PAR_THRESHOLD: usize = 1 << 16;
+    let rows = src.rows;
+    if rows * cols < PAR_THRESHOLD || worker_count() < 2 {
+        norm_rows_into(&src.data, dst, cols, w, b, eps);
+        return;
+    }
+    let band_rows = rows.div_ceil(worker_count()).max(1);
+    // Same contiguous band split as `layer_norm` (byte-identical), reading the
+    // matching `src` band and writing the `dst` band.
+    dst.par_chunks_mut(band_rows * cols)
+        .zip(src.data.par_chunks(band_rows * cols))
+        .for_each(|(dband, sband)| norm_rows_into(sband, dband, cols, w, b, eps));
+}
+
+/// Out-of-place `norm_rows`: identical f64 SoA math, reading `src` and writing
+/// `dst` (both `[nrows, cols]`) instead of mutating in place.
+fn norm_rows_into(src: &[f32], dst: &mut [f32], cols: usize, w: &[f32], b: &[f32], eps: f64) {
+    const L: usize = 8;
+    type V = Simd<f64, L>;
+    let n = cols as f64;
+    let nrows = src.len() / cols;
+    let nfull = nrows - nrows % L;
+
+    let mut soa = vec![V::splat(0.0); cols]; // reused per 8-row group
+    let mut g = 0;
+    while g < nfull {
+        for (j, s) in soa.iter_mut().enumerate() {
+            let mut a = [0.0f64; L];
+            for (lane, al) in a.iter_mut().enumerate() {
+                *al = f64::from(src[(g + lane) * cols + j]);
+            }
+            *s = V::from_array(a);
+        }
+        let mut sum = V::splat(0.0);
+        for s in &soa {
+            sum += *s;
+        }
+        let mean = sum / V::splat(n);
+        let mut var = V::splat(0.0);
+        for s in &soa {
+            let d = *s - mean;
+            var += d * d;
+        }
+        var /= V::splat(n);
+        let inv = V::splat(1.0) / (var + V::splat(eps)).sqrt();
+        for (j, s) in soa.iter().enumerate() {
+            let normed = (*s - mean) * inv * V::splat(f64::from(w[j])) + V::splat(f64::from(b[j]));
+            let arr = normed.to_array();
+            for (lane, &val) in arr.iter().enumerate() {
+                dst[(g + lane) * cols + j] = val as f32;
+            }
+        }
+        g += L;
+    }
+
+    for r in nfull..nrows {
+        let srow = &src[r * cols..(r + 1) * cols];
+        let drow = &mut dst[r * cols..(r + 1) * cols];
+        let mut sum = 0.0f64;
+        for &v in srow.iter() {
+            sum += f64::from(v);
+        }
+        let mean = sum / n;
+        let mut var = 0.0f64;
+        for &v in srow.iter() {
+            let d = f64::from(v) - mean;
+            var += d * d;
+        }
+        var /= n;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for ((d, &s), (&wi, &bi)) in drow.iter_mut().zip(srow.iter()).zip(w.iter().zip(b.iter())) {
+            let normed = (f64::from(s) - mean) * inv_std;
+            *d = (normed * f64::from(wi) + f64::from(bi)) as f32;
+        }
+    }
+}
+
 /// whisper.cpp coefficient `sqrt(2/pi)` (`SQRT_2_OVER_PI` in ggml `vec.h`).
 const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6;
 /// whisper.cpp `GELU_COEF_A`.
 const GELU_COEF_A: f32 = 0.044_715;
 
-/// In-place exact whisper.cpp tanh-approximation GELU.
+/// The `1 << 16`-entry f16 GELU lookup table, precomputed once, EXACTLY as ggml
+/// builds `ggml_table_gelu_f16` (`ggml-cpu.c`): for every f16 bit pattern `i`,
+/// `table[i] = f16→f32( f32→f16( gelu_tanh( f16→f32(i) ) ) )` — i.e. the tanh
+/// GELU of the dequantized half, re-rounded to f16, then widened back to f32 (the
+/// value ggml's `GGML_GELU_FP16` path returns). Stored pre-widened to f32 so the
+/// hot lookup is one `f32→f16` index + one load, no per-element `tanh`.
 ///
-/// Matches ggml `ggml_gelu_f32` in
-/// `ggml/src/ggml-cpu/vec.h`:
-/// `0.5*x*(1 + tanh(sqrt(2/pi) * x * (1 + 0.044715*x*x)))`,
-/// which is the standard `0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))`
-/// (note `x*(1 + a*x*x) == x + a*x^3`). We deliberately use this tanh form
-/// rather than ft's `gelu_value_f32`, which is the *erf* GELU and would
-/// diverge from whisper's activations.
-/// Apply tanh-approx GELU to one contiguous slice. The scalar `tanh()` call
-/// blocks LLVM from vectorizing the loop, so the surrounding polynomial is hand-
-/// SIMD'd (8 lanes) with `tanh` still done scalar per lane — same op order and
-/// no FMA fusion as the scalar form, so bit-exact.
+/// `f16::from_bits`/`from_f32` use IEEE round-to-nearest-even, identical to ggml's
+/// `GGML_CPU_FP16_TO_FP32` / `GGML_CPU_FP32_TO_FP16` (f16c), so the table is
+/// bit-identical to whisper.cpp's — see [`gelu_slice`].
+fn gelu_table() -> &'static [f32; 1 << 16] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Box<[f32; 1 << 16]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = vec![0.0f32; 1 << 16].into_boxed_slice();
+        for (i, slot) in t.iter_mut().enumerate() {
+            let f = Float16::from_bits(i as u16).to_f32();
+            let g = 0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
+            *slot = Float16::from_f32(g).to_f32();
+        }
+        // Vec<f32> of exactly 1<<16 elements → Box<[f32; 1<<16]> (infallible).
+        t.try_into().expect("gelu table length 1<<16")
+    })
+}
+
+/// In-place GELU, bit-identical to whisper.cpp's shipped `ggml_vec_gelu_f32`.
+///
+/// whisper.cpp builds with `GGML_GELU_FP16` (see `ggml-cpu/vec.h`), so its GELU is
+/// NOT the live tanh but a **f16 lookup table** with a saturating clamp:
+/// `x <= -10 → 0`, `x >= 10 → x`, else `table[f16(x)]`. franken previously computed
+/// the live tanh form, which DIVERGED from ORIG (more accurate, but not what
+/// whisper actually runs). This matches whisper exactly — restoring
+/// bit-exact-with-whisper on the activation — and is far cheaper (a `vcvtps2ph` +
+/// table load per element vs a scalar `tanh` per lane). GELU is on the
+/// transcription-tolerance encoder/decoder path (never the bit-exact mel path).
+///
+/// x86-64-v3 path: 8-wide `vcvtps2ph` (round-to-nearest-even → the same f16 index
+/// as the scalar `Float16::from_f32`) → widen to 8 u32 indices → **8 explicit
+/// scalar table-loads** (NOT `vgatherdps`) → blend the clamp. On Zen3 (this box's
+/// 5975WX) `vgatherdps ymm` is microcoded and caps at ~2.2 Gelem/s even cache-hot;
+/// scalar loads from the L2-resident 256 KiB table pipeline at ~2-3/cyc and are
+/// byte-identical (same indices, same lane order), for a measured **1.18×
+/// cache-resident / 1.13× streaming** speedup over the gather (`examples/gelu_gather_probe`,
+/// max|Δ|=0 over 7.68M elems spanning both clamp regions). Bit-identical to the
+/// scalar fallback (max|Δ|=0 in `examples/gelu_probe`), ~4.4× faster than the old tanh.
+#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2"))]
+#[allow(unsafe_code)]
 fn gelu_slice(data: &mut [f32]) {
-    use std::simd::Simd;
-    const L: usize = 16;
-    type V = Simd<f32, L>;
+    use core::arch::x86_64::*;
+    let table = gelu_table();
     let n = data.len();
-    let nl = n - n % L;
-    let coef_a = V::splat(GELU_COEF_A);
-    let sqrt_2pi = V::splat(GELU_SQRT_2_OVER_PI);
-    let one = V::splat(1.0);
-    let half = V::splat(0.5);
-    let mut i = 0;
-    while i < nl {
-        let xv = V::from_slice(&data[i..i + L]);
-        // arg = sqrt(2/pi) * x * (1 + a*x*x)  — exact scalar op order.
-        let arg = (sqrt_2pi * xv) * (one + (coef_a * xv) * xv);
-        let aa = arg.to_array();
-        let tanh = V::from_array(std::array::from_fn(|k| aa[k].tanh()));
-        ((half * xv) * (one + tanh)).copy_to_slice(&mut data[i..i + L]);
-        i += L;
+    // SAFETY: all loads/stores are bounded by the `i+8<=n` guard; each table index
+    // is a widened f16 bit pattern (always 0..=65535, in-bounds for the 1<<16 table,
+    // so `get_unchecked` is sound); f16c/avx2 are guaranteed by this fn's
+    // target_feature cfg.
+    unsafe {
+        let neg10 = _mm256_set1_ps(-10.0);
+        let pos10 = _mm256_set1_ps(10.0);
+        let zero = _mm256_setzero_ps();
+        let mut i = 0;
+        let mut idxs = [0u32; 8];
+        while i + 8 <= n {
+            let x = _mm256_loadu_ps(data.as_ptr().add(i));
+            let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(x);
+            let idx = _mm256_cvtepu16_epi32(h);
+            // 8 scalar table-loads instead of `vgatherdps` (microcoded on Zen3).
+            // `_mm256_set_ps` lane j = table[idxs[j]] ⇒ identical to the gather.
+            _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
+            let g = _mm256_set_ps(
+                *table.get_unchecked(idxs[7] as usize),
+                *table.get_unchecked(idxs[6] as usize),
+                *table.get_unchecked(idxs[5] as usize),
+                *table.get_unchecked(idxs[4] as usize),
+                *table.get_unchecked(idxs[3] as usize),
+                *table.get_unchecked(idxs[2] as usize),
+                *table.get_unchecked(idxs[1] as usize),
+                *table.get_unchecked(idxs[0] as usize),
+            );
+            // Clamp (ggml GGML_GELU_FP16): x>=10 → x, x<=-10 → 0, else gathered.
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(x, pos10);
+            let le = _mm256_cmp_ps::<_CMP_LE_OQ>(x, neg10);
+            let r = _mm256_blendv_ps(g, x, ge);
+            let r = _mm256_blendv_ps(r, zero, le);
+            _mm256_storeu_ps(data.as_mut_ptr().add(i), r);
+            i += 8;
+        }
+        for v in &mut data[i..] {
+            let x = *v;
+            *v = if x <= -10.0 {
+                0.0
+            } else if x >= 10.0 {
+                x
+            } else {
+                table[Float16::from_f32(x).to_bits() as usize]
+            };
+        }
     }
-    for v in &mut data[nl..] {
+}
+
+/// Scalar fallback (non-x86 / no f16c+avx2): exact ggml `GGML_GELU_FP16` branch + clamp.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "avx2")))]
+fn gelu_slice(data: &mut [f32]) {
+    let table = gelu_table();
+    for v in data.iter_mut() {
         let x = *v;
-        *v = 0.5 * x * (1.0 + (GELU_SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh());
+        *v = if x <= -10.0 {
+            0.0
+        } else if x >= 10.0 {
+            x
+        } else {
+            table[Float16::from_f32(x).to_bits() as usize]
+        };
     }
 }
 
@@ -1106,6 +2051,99 @@ pub fn gelu(x: &mut Mat) {
     x.data.par_chunks_mut(chunk).for_each(gelu_slice);
 }
 
+/// Poly-exp softmax gate — shares the sampler's `FW_SIMD_EXP` env var (default OFF,
+/// an owner opt-in). When set, [`softmax_rows`] replaces the per-element scalar libm
+/// `.exp()` with an AVX2 poly (same Taylor/`ln2`-range-reduced poly family as
+/// `decode::logsumexp_sum_simd`). NON-byte-exact ⇒ owner/faithfulness-gated; default off
+/// is byte-identical to the pure-libm path. Measured 6.25× on the per-token decode softmax
+/// workload (`examples/decode_softmax_exp_probe`), cross-attn-dominated; the sampler's
+/// existing flag only covered `compute_logprobs`, so this captures the larger cross/self
+/// attention softmax exp (see docs/NEGATIVE_EVIDENCE.md 2026-07-03).
+fn simd_exp_softmax_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_SIMD_EXP").is_some())
+}
+
+/// AVX2 poly-exp softmax numerator: writes `exp(row[i]-max)` into `row` and returns the
+/// sum. `-inf`/NaN lanes map to 0 (via the `l > -inf` keep-mask, matching the scalar
+/// finite-guard: `NaN > -inf` and `-inf > -inf` are both false). Only reached under
+/// [`simd_exp_softmax_enabled`]; NON-byte-exact vs libm (poly + reordered sum).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[allow(unsafe_code)]
+fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
+    use core::arch::x86_64::*;
+    let n = row.len();
+    let p = row.as_mut_ptr();
+    // SAFETY: avx2+fma guaranteed by this fn's cfg; every load/store is bounded by the
+    // `i+8<=n` guard and the `< 8` remainder runs scalar. `x = row[i]-max <= 0` (max is the
+    // row max) so the pow2 scale never overflows; only the low clamp `lo` is needed.
+    unsafe {
+        let vmax = _mm256_set1_ps(max);
+        let ninf = _mm256_set1_ps(f32::NEG_INFINITY);
+        let log2e = _mm256_set1_ps(1.442_695_f32);
+        let ln2 = _mm256_set1_ps(0.693_147_2_f32);
+        let lo = _mm256_set1_ps(-87.3365_f32);
+        let c0 = _mm256_set1_ps(1.0);
+        let c1 = _mm256_set1_ps(1.0);
+        let c2 = _mm256_set1_ps(0.5);
+        let c3 = _mm256_set1_ps(0.166_666_67_f32);
+        let c4 = _mm256_set1_ps(0.041_666_66_f32);
+        let c5 = _mm256_set1_ps(0.008_333_33_f32);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let l = _mm256_loadu_ps(p.add(i));
+            let keep = _mm256_cmp_ps::<_CMP_GT_OQ>(l, ninf); // false for -inf AND NaN
+            let xv = _mm256_max_ps(_mm256_sub_ps(l, vmax), lo);
+            let kf = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+                _mm256_mul_ps(xv, log2e),
+            );
+            let r = _mm256_fnmadd_ps(kf, ln2, xv);
+            let mut pp = _mm256_fmadd_ps(c5, r, c4);
+            pp = _mm256_fmadd_ps(pp, r, c3);
+            pp = _mm256_fmadd_ps(pp, r, c2);
+            pp = _mm256_fmadd_ps(pp, r, c1);
+            pp = _mm256_fmadd_ps(pp, r, c0);
+            let ki = _mm256_cvtps_epi32(kf);
+            let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+                ki,
+                _mm256_set1_epi32(127),
+            )));
+            let e = _mm256_and_ps(_mm256_mul_ps(pp, pow2), keep); // zero masked lanes
+            _mm256_storeu_ps(p.add(i), e);
+            acc = _mm256_add_ps(acc, e);
+            i += 8;
+        }
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        while i < n {
+            // <8-element tail: libm exp (negligible count; the sum is non-byte-exact anyway).
+            let e = (row[i] - max).exp();
+            let e = if e.is_finite() { e } else { 0.0 };
+            row[i] = e;
+            s += e;
+            i += 1;
+        }
+        s
+    }
+}
+
+/// Scalar fallback (non-avx2 build): identical to the default libm loop.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+fn softmax_row_poly_numer(row: &mut [f32], max: f32) -> f32 {
+    let mut s = 0.0f32;
+    for v in row.iter_mut() {
+        let e = (*v - max).exp();
+        let e = if e.is_finite() { e } else { 0.0 };
+        *v = e;
+        s += e;
+    }
+    s
+}
+
 /// In-place numerically-stable per-row softmax (max-subtract).
 ///
 /// Each row is softmaxed independently: subtract the row max before
@@ -1117,21 +2155,33 @@ pub fn softmax_rows(x: &mut Mat) {
     if cols == 0 {
         return;
     }
-    // Per-row max-subtract / exp / normalize, order unchanged. Rows are
-    // independent, so fan out over contiguous row bands (disjoint slices of
-    // `x.data`). Threshold in elements keeps small score matrices serial.
-    let softmax_row = |row: &mut [f32]| {
+    // Default: per-row max-subtract / scalar-libm exp / normalize, order unchanged
+    // (byte-identical). `FW_SIMD_EXP` swaps the exp numerator for the AVX2 poly
+    // (owner-gated, non-byte-exact). Rows are independent, so fan out over contiguous
+    // row bands (disjoint slices of `x.data`); threshold in elements keeps small
+    // score matrices serial.
+    let use_simd = simd_exp_softmax_enabled();
+    let softmax_row = move |row: &mut [f32]| {
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         if !max.is_finite() {
             // All -inf (e.g. fully masked row): leave as-is to avoid NaNs.
             return;
         }
-        let mut sum = 0.0f32;
-        for v in row.iter_mut() {
-            let e = (*v - max).exp();
-            *v = e;
-            sum += e;
-        }
+        let sum = if use_simd {
+            softmax_row_poly_numer(row, max)
+        } else {
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                // A NaN score (e.g. from an upstream overflow) would make
+                // `(*v - max).exp()` NaN, poison `sum`, skip normalization, and
+                // leave NaN in the row. Treat non-finite contributions as 0.
+                let e = (*v - max).exp();
+                let e = if e.is_finite() { e } else { 0.0 };
+                *v = e;
+                sum += e;
+            }
+            sum
+        };
         if sum > 0.0 {
             let inv = 1.0 / sum;
             for v in row.iter_mut() {
@@ -1180,6 +2230,11 @@ pub fn softmax_rows(x: &mut Mat) {
 /// `bias.len() != cout`, `stride == 0`, or the padded input is shorter than
 /// the kernel (empty output).
 #[allow(clippy::too_many_arguments)]
+/// 1-D convolution with the weight in ggml `[Cout, Cin*K]` order. Transposes the weight
+/// to `[Cin*K, Cout]` and delegates to [`conv1d_wt`]. For the encoder stem the conv weights
+/// are CONSTANT across windows — prefer pre-transposing once at load and calling
+/// [`conv1d_wt`] directly; this entry re-transposes on every call (kept for the standalone
+/// API and as the byte-exact reference for [`conv1d_wt`]).
 pub fn conv1d(
     x: &Mat,
     w: &[f32],
@@ -1190,17 +2245,50 @@ pub fn conv1d(
     stride: usize,
     pad: usize,
 ) -> FwResult<Mat> {
+    let patch = cin * k;
+    if w.len() != cout * patch {
+        return Err(FwError::InvalidRequest(format!(
+            "conv1d: weight len {} != cout*cin*k = {}",
+            w.len(),
+            cout * patch
+        )));
+    }
+    // Reshape/transpose weights [Cout, Cin*K] -> w_t [Cin*K, Cout].
+    let mut w_t = vec![0.0f32; patch * cout];
+    for co in 0..cout {
+        for j in 0..patch {
+            w_t[j * cout + co] = w[co * patch + j];
+        }
+    }
+    conv1d_wt(x, &Mat::from_vec(patch, cout, w_t), cin, k, bias, stride, pad)
+}
+
+/// 1-D convolution taking the weight ALREADY transposed to `[Cin*K, Cout]` (the layout
+/// [`matmul_bias`] consumes) — skips the per-call weight transpose. The encoder stem
+/// pre-transposes its constant conv weights once at load ([`EncoderWeights::from_ggml`])
+/// and calls this, avoiding a redundant ~15 ms/window strided transpose on turbo (conv2).
+/// Byte-identical to [`conv1d`] fed the same weight (the transpose is a pure permutation).
+pub fn conv1d_wt(
+    x: &Mat,
+    w_t: &Mat,
+    cin: usize,
+    k: usize,
+    bias: &[f32],
+    stride: usize,
+    pad: usize,
+) -> FwResult<Mat> {
+    let patch = cin * k;
+    let cout = w_t.cols;
     if x.cols != cin {
         return Err(FwError::InvalidRequest(format!(
             "conv1d: x.cols {} != cin {cin}",
             x.cols
         )));
     }
-    if w.len() != cout * cin * k {
+    if w_t.rows != patch {
         return Err(FwError::InvalidRequest(format!(
-            "conv1d: weight len {} != cout*cin*k = {}",
-            w.len(),
-            cout * cin * k
+            "conv1d: w_t rows {} != cin*k = {patch}",
+            w_t.rows
         )));
     }
     if bias.len() != cout {
@@ -1226,7 +2314,6 @@ pub fn conv1d(
     // `cols[o*patch..(o+1)*patch]` band, so the construction fans out over
     // contiguous output-row bands. Each row reads disjoint output but shared
     // (read-only) `x`. Threshold in elements keeps small convs serial.
-    let patch = cin * k;
     let mut cols = vec![0.0f32; t_out * patch];
     let fill_row = |o: usize, row: &mut [f32]| {
         let start = o * stride; // position in the padded input
@@ -1256,8 +2343,8 @@ pub fn conv1d(
         let band_rows = t_out.div_ceil(worker_count()).max(1);
         std::thread::scope(|s| {
             let fill_row = &fill_row;
-            for (w, band) in cols.chunks_mut(band_rows * patch).enumerate() {
-                let o_base = w * band_rows;
+            for (wi, band) in cols.chunks_mut(band_rows * patch).enumerate() {
+                let o_base = wi * band_rows;
                 s.spawn(move || {
                     for (i, row) in band.chunks_mut(patch).enumerate() {
                         fill_row(o_base + i, row);
@@ -1268,17 +2355,22 @@ pub fn conv1d(
     }
     let im2col = Mat::from_vec(t_out, patch, cols);
 
-    // Reshape weights [Cout, Cin*K] -> w_t [Cin*K, Cout] (transpose).
-    let mut w_t = vec![0.0f32; patch * cout];
-    for co in 0..cout {
-        for j in 0..patch {
-            w_t[j * cout + co] = w[co * patch + j];
-        }
-    }
-    let w_t = Mat::from_vec(patch, cout, w_t);
-
     // [T_out, Cin*K] x [Cin*K, Cout] -> [T_out, Cout], then add bias.
-    matmul_bias(&im2col, &w_t, Some(bias))
+    matmul_bias(&im2col, w_t, Some(bias))
+}
+
+/// f16 KV-cache storage gate (`FW_KV_F16=1`, default off). Stores the
+/// self-attention key/value cache as f16 instead of f32 — HALF the per-step
+/// DRAM read of the cache (self_attn = 10.7% of decode, 35% of it the cache
+/// read). Proven TRANSCRIPT-NEUTRAL: the f16-rounded values are bit-identical to
+/// the `FW_KV_F16_SIM` round-through-f16 probe (which was byte-identical to f32
+/// in both modes), because `f16→f32` is exact — so `k16[d].to_f32()` equals the
+/// sim's stored value exactly. f16 is finer than the already-neutral int8 decode
+/// weights. Read at [`KvCache::new`]; process-wide.
+fn kv_f16_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_KV_F16").is_some())
 }
 
 /// Incremental key/value cache for autoregressive self-attention.
@@ -1287,10 +2379,17 @@ pub fn conv1d(
 /// major buffers; [`KvCache::append`] copies new per-token rows in and
 /// advances `len`. [`KvCache::keys`] / [`KvCache::values`] expose the
 /// populated prefix as a `[len, n_state]` [`Mat`] for [`attention`].
+///
+/// When [`kv_f16_enabled`] is on the storage is f16 (`k16`/`v16`, `k`/`v`
+/// empty), halving the per-step cache-read bandwidth; otherwise f32
+/// (`k`/`v`, `k16`/`v16` empty). The mode is fixed at construction.
 #[derive(Debug, Clone)]
 pub struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
+    k16: Vec<Float16>,
+    v16: Vec<Float16>,
+    f16: bool,
     len: usize,
     capacity_tokens: usize,
     n_state: usize,
@@ -1301,13 +2400,37 @@ impl KvCache {
     /// `n_state`.
     #[must_use]
     pub fn new(capacity_tokens: usize, n_state: usize) -> Self {
+        let f16 = kv_f16_enabled();
+        let n = capacity_tokens * n_state;
         Self {
-            k: vec![0.0; capacity_tokens * n_state],
-            v: vec![0.0; capacity_tokens * n_state],
+            k: if f16 { Vec::new() } else { vec![0.0; n] },
+            v: if f16 { Vec::new() } else { vec![0.0; n] },
+            k16: if f16 { vec![Float16::from_f32(0.0); n] } else { Vec::new() },
+            v16: if f16 { vec![Float16::from_f32(0.0); n] } else { Vec::new() },
+            f16,
             len: 0,
             capacity_tokens,
             n_state,
         }
+    }
+
+    /// Whether this cache stores f16 (vs f32).
+    #[must_use]
+    pub fn is_f16(&self) -> bool {
+        self.f16
+    }
+
+    /// Borrow the populated f16 key prefix (`[len, n_state]` row-major). Only
+    /// valid when [`Self::is_f16`]; panics otherwise (empty `k16`).
+    #[must_use]
+    pub fn key_slice_f16(&self) -> &[Float16] {
+        &self.k16[..self.len * self.n_state]
+    }
+
+    /// Borrow the populated f16 value prefix. See [`Self::key_slice_f16`].
+    #[must_use]
+    pub fn value_slice_f16(&self) -> &[Float16] {
+        &self.v16[..self.len * self.n_state]
     }
 
     /// Number of tokens currently cached.
@@ -1360,30 +2483,46 @@ impl KvCache {
         }
         let off = self.len * self.n_state;
         let span = t * self.n_state;
-        self.k[off..off + span].copy_from_slice(&k.data);
-        self.v[off..off + span].copy_from_slice(&v.data);
+        if self.f16 {
+            // f16 storage: convert on append (halves the per-step cache-read DRAM).
+            for (dst, &src) in self.k16[off..off + span].iter_mut().zip(&k.data) {
+                *dst = Float16::from_f32(src);
+            }
+            for (dst, &src) in self.v16[off..off + span].iter_mut().zip(&v.data) {
+                *dst = Float16::from_f32(src);
+            }
+        } else {
+            self.k[off..off + span].copy_from_slice(&k.data);
+            self.v[off..off + span].copy_from_slice(&v.data);
+        }
         self.len += t;
         Ok(())
     }
 
-    /// View of the cached keys as a `[len, n_state]` matrix.
+    /// View of the cached keys as a `[len, n_state]` matrix (dequantized from
+    /// f16 when the cache is f16).
     #[must_use]
     pub fn keys(&self) -> Mat {
-        Mat::from_vec(
-            self.len,
-            self.n_state,
-            self.k[..self.len * self.n_state].to_vec(),
-        )
+        let span = self.len * self.n_state;
+        let data = if self.f16 {
+            self.k16[..span].iter().map(|h| h.to_f32()).collect()
+        } else {
+            self.k[..span].to_vec()
+        };
+        Mat::from_vec(self.len, self.n_state, data)
     }
 
-    /// View of the cached values as a `[len, n_state]` matrix.
+    /// View of the cached values as a `[len, n_state]` matrix (dequantized from
+    /// f16 when the cache is f16).
     #[must_use]
     pub fn values(&self) -> Mat {
-        Mat::from_vec(
-            self.len,
-            self.n_state,
-            self.v[..self.len * self.n_state].to_vec(),
-        )
+        let span = self.len * self.n_state;
+        let data = if self.f16 {
+            self.v16[..span].iter().map(|h| h.to_f32()).collect()
+        } else {
+            self.v[..span].to_vec()
+        };
+        Mat::from_vec(self.len, self.n_state, data)
     }
 
     /// Borrow the populated key prefix as a contiguous `[len, n_state]`
@@ -1472,6 +2611,87 @@ fn use_sdpa_attn() -> bool {
     use std::sync::OnceLock;
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| std::env::var_os("FW_ATTN_NO_SDPA").is_none())
+}
+
+// THROWAWAY: split the fused-SDPA encoder attention into gather/kernel/scatter
+// wall-time (gated on FRANKEN_WHISPER_PERF_SPANS). Drained + printed by the
+// encoder profiler. Zero cost when perf spans are off.
+thread_local! {
+    static SDPA_SPLIT: std::cell::RefCell<[u128; 3]> = const { std::cell::RefCell::new([0; 3]) };
+}
+pub(crate) fn drain_sdpa_split() -> [u128; 3] {
+    SDPA_SPLIT.with(|p| {
+        let v = *p.borrow();
+        *p.borrow_mut() = [0; 3];
+        v
+    })
+}
+fn sdpa_split_add(i: usize, ns: u128) {
+    SDPA_SPLIT.with(|p| p.borrow_mut()[i] += ns);
+}
+
+/// Target chunk count for the fused-SDPA q/k/v gather AND output scatter, tunable via
+/// `FW_SDPA_GATHER_CHUNKS`. Default `0` means the historical per-op chunking (gather:
+/// one band per head; scatter: one band per output row) — byte-identical to the legacy
+/// code. A positive value splits BOTH reshape passes into that many balanced row-bands.
+///
+/// Motivation (`examples/sdpa_gather_cold_probe` + `sdpa_scatter_cold_probe`, cold/
+/// DRAM-bound): the gather/scatter are memory-bandwidth-bound and this 8-channel box
+/// saturates near ~12–16 concurrent streams. The legacy chunkings OVERSUBSCRIBE: the
+/// per-head gather (n_head=20) is a contention local min (MEASURED 1.73× slower than 16
+/// chunks) and the per-row scatter (tq=1500 fine chunks) is 1.6× slower than ~12 chunks —
+/// both byte-identical. Left OFF by default: thread-count is load-dependent and unreliable
+/// on the shared bench box (prior decode thread-count digs reverted 3×), and this could
+/// not be e2e-verified on the real encoder without the turbo model. Flip to 16 to A/B on
+/// a quiet box.
+fn sdpa_gather_chunks() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_SDPA_GATHER_CHUNKS").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Gather `src` (interleaved `[t, n_state]`, row stride `n_state`) into the head-major
+/// `dst` (`[hh, t, d_head]`): `dst[h*t*d_head + i*d_head + d] = src[i*n_state + h*d_head + d]`.
+/// Parallelized over `chunks` balanced row-bands of the flat `[hh*t, d_head]` output
+/// (each output row copied whole). `chunks == 0` ⇒ one band per head (== the historical
+/// `par_chunks_mut(t*d_head)`, bit-identical). Pure data movement — output is independent
+/// of `chunks`. See [`sdpa_gather_chunks`] / `sdpa_gather_head_major_chunk_invariant`.
+fn sdpa_gather_head_major(dst: &mut [f32], src: &[f32], hh: usize, t: usize, d_head: usize, n_state: usize, chunks: usize) {
+    let total_rows = hh * t;
+    let n = if chunks == 0 { hh } else { chunks.min(total_rows).max(1) };
+    let chunk_rows = total_rows.div_ceil(n).max(1);
+    dst.par_chunks_mut(chunk_rows * d_head).enumerate().for_each(|(c, blk)| {
+        let row0 = c * chunk_rows;
+        for (local, out_row) in blk.chunks_mut(d_head).enumerate() {
+            let r = row0 + local;
+            let h = r / t;
+            let i = r % t;
+            let base = i * n_state + h * d_head;
+            out_row.copy_from_slice(&src[base..base + d_head]);
+        }
+    });
+}
+
+/// Inverse of [`sdpa_gather_head_major`]: scatter head-major `o` (`[hh, t, d_head]`) into
+/// interleaved `out` (`[t, n_state]`): `out[i*n_state + h*d_head + d] = o[h*t*d_head + i*d_head + d]`.
+/// Parallelized over `chunks` balanced output-row bands (`chunks == 0` ⇒ one band per output
+/// row, == the historical `par_chunks_mut(n_state)` scatter, bit-identical). Pure data
+/// movement — output independent of `chunks`. See `sdpa_scatter_interleaved_chunk_invariant`.
+fn sdpa_scatter_interleaved(out: &mut [f32], o: &[f32], hh: usize, t: usize, d_head: usize, n_state: usize, chunks: usize) {
+    let n = if chunks == 0 { t } else { chunks.min(t).max(1) };
+    let rows_per = t.div_ceil(n).max(1);
+    out.par_chunks_mut(rows_per * n_state).enumerate().for_each(|(c, blk)| {
+        let i0 = c * rows_per;
+        for (local, orow) in blk.chunks_mut(n_state).enumerate() {
+            let i = i0 + local;
+            for h in 0..hh {
+                orow[h * d_head..(h + 1) * d_head]
+                    .copy_from_slice(&o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head]);
+            }
+        }
+    });
 }
 
 fn attention_raw(
@@ -1600,41 +2820,44 @@ fn attention_raw(
     // Encoder-only (causal_offset.is_none()): the decode's cached causal attention
     // has a cache_len offset the kernel's square-causal flag does not model.
     if causal_offset.is_none() && use_sdpa_attn() && n_head >= 2 && tq >= 64 {
+        let split = crate::native_engine::perf_spans_enabled();
+        macro_rules! st {
+            ($i:expr, $b:expr) => {{
+                if split {
+                    let __t = std::time::Instant::now();
+                    let __r = $b;
+                    sdpa_split_add($i, __t.elapsed().as_nanos());
+                    __r
+                } else {
+                    $b
+                }
+            }};
+        }
         let hh = n_head;
         let mut qa = gemv_out_buf(hh * tq * d_head);
         let mut ka = gemv_out_buf(hh * tk * d_head);
         let mut va = gemv_out_buf(hh * tk * d_head);
-        qa.par_chunks_mut(tq * d_head).enumerate().for_each(|(h, blk)| {
-            let base = h * d_head;
-            for i in 0..tq {
-                blk[i * d_head..(i + 1) * d_head].copy_from_slice(&q.row(i)[base..base + d_head]);
-            }
-        });
-        ka.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
-            let base = h * d_head;
-            for j in 0..tk {
-                blk[j * d_head..(j + 1) * d_head]
-                    .copy_from_slice(&k[j * n_state + base..j * n_state + base + d_head]);
-            }
-        });
-        va.par_chunks_mut(tk * d_head).enumerate().for_each(|(h, blk)| {
-            let base = h * d_head;
-            for j in 0..tk {
-                blk[j * d_head..(j + 1) * d_head]
-                    .copy_from_slice(&v[j * n_state + base..j * n_state + base + d_head]);
-            }
+        // The per-head gather/scatter is a strided memcpy transpose (interleaved
+        // [tq, n_state] <-> head-major [hh, tq, d_head]). It is ~20% of attn_sdpa
+        // and BANDWIDTH-bound: serial (one core) was MEASURED 4.5x SLOWER. Chunk count
+        // is `FW_SDPA_GATHER_CHUNKS` (default 0 == one-band-per-head, bit-identical to
+        // the historical gather); cold/DRAM-bound probe shows ~16 balanced chunks is
+        // 1.73x faster than per-head (n_head=20 = a contention local min). See
+        // `sdpa_gather_head_major` / NEGATIVE_EVIDENCE.
+        let gchunks = sdpa_gather_chunks();
+        st!(0, {
+            sdpa_gather_head_major(&mut qa, &q.data, hh, tq, d_head, n_state, gchunks);
+            sdpa_gather_head_major(&mut ka, k, hh, tk, d_head, n_state, gchunks);
+            sdpa_gather_head_major(&mut va, v, hh, tk, d_head, n_state, gchunks);
         });
         let sdpa_scale = (d_head as f32).powf(-0.5);
-        let o = ft_kernel_cpu::sdpa_forward_f32(
+        let o = st!(1, ft_kernel_cpu::sdpa_forward_f32(
             &qa, &ka, &va, hh, tq, tk, d_head, d_head, sdpa_scale, false,
-        );
-        out.par_chunks_mut(n_state).enumerate().for_each(|(i, orow)| {
-            for h in 0..hh {
-                orow[h * d_head..(h + 1) * d_head].copy_from_slice(
-                    &o[h * tq * d_head + i * d_head..h * tq * d_head + (i + 1) * d_head],
-                );
-            }
-        });
+        ));
+        // Scatter head-major `o` back to interleaved `out` — same FW_SDPA_GATHER_CHUNKS
+        // knob as the gather (per-row default is bit-identical; cold probe shows ~12
+        // chunks is 1.6× faster than the 1500 per-row fine chunks). See NEGATIVE_EVIDENCE.
+        st!(2, sdpa_scatter_interleaved(&mut out, &o, hh, tq, d_head, n_state, gchunks));
         return Ok(Mat::from_vec(tq, n_state, out));
     }
 
@@ -1690,6 +2913,13 @@ fn attention_raw(
 ///
 /// # Errors
 /// Propagates [`KvCache::append`] and [`attention`] errors.
+/// Escape hatch `FW_FAST_SELF_ATTN=0` restores the `attention_raw` decode path.
+fn fast_self_attn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_FAST_SELF_ATTN").as_deref() != Ok("0"))
+}
+
 pub fn attention_with_cache(
     q: &Mat,
     k_new: &Mat,
@@ -1705,6 +2935,41 @@ pub fn attention_with_cache(
     // path reads the identical bytes in the identical order, so the result is
     // bit-identical to the `Mat`-based attention.
     let tk = cache.len();
+    // Per-token (`tq == 1`) fast path: read K/V straight out of the cache with a
+    // per-key dot / per-key SAXPY, so no `kh`/`kh_t`/`vh` gather+transpose+alloc
+    // per head (`attention_raw` allocates ~6 buffers/head/token and transposes K).
+    // The summation order is identical to `attention_raw`'s m=1 SAXPY (sum over
+    // `d_head` ascending for scores, over `tk` ascending for the output), so the
+    // f32 result is BIT-IDENTICAL — verified byte-exact. Decode at `tq==1` attends
+    // to the whole cache (`limit == tk-1`), so the causal mask is a no-op and is
+    // skipped. Prefill (`tq > 1`) keeps `attention_raw`.
+    if cache.is_f16() {
+        // f16 storage: read the half-width cache DIRECTLY in the hot path
+        // (`.to_f32()` per element is lossless), halving the per-step cache-read
+        // DRAM. f16→f32 is exact, so `k16.to_f32()` equals the value the
+        // `FW_KV_F16_SIM` probe fed the f32 kernel (round-through-f16) — hence
+        // the transcript matches the proven-neutral SIM result bit-for-bit.
+        if q.rows == 1 && fast_self_attn_enabled() {
+            return attention_decode_step_f16(
+                q,
+                cache.key_slice_f16(),
+                cache.value_slice_f16(),
+                tk,
+                n_head,
+            );
+        }
+        // Prefill (rare `tq > 1`): dequant the f16 prefix to f32 scratch once,
+        // then the standard raw path. This is the multi-token prefill, not the
+        // per-step hot path, so the one-time dequant is amortized (and we do NOT
+        // dequant-to-scratch per step — that would revive the memmove the
+        // alloc-light rewrite killed).
+        let k_f32: Vec<f32> = cache.key_slice_f16().iter().map(|h| h.to_f32()).collect();
+        let v_f32: Vec<f32> = cache.value_slice_f16().iter().map(|h| h.to_f32()).collect();
+        return attention_raw(q, &k_f32, &v_f32, tk, n_head, Some(past_len));
+    }
+    if q.rows == 1 && fast_self_attn_enabled() {
+        return attention_decode_step(q, cache.key_slice(), cache.value_slice(), tk, n_head);
+    }
     attention_raw(
         q,
         cache.key_slice(),
@@ -1713,6 +2978,137 @@ pub fn attention_with_cache(
         n_head,
         Some(past_len),
     )
+}
+
+/// Allocation-light single-token (`tq == 1`) causal self-attention over a cache
+/// prefix. Bit-identical to [`attention_raw`] with `causal_offset == Some(tk-1)`.
+fn attention_decode_step(
+    q: &Mat,
+    k: &[f32],
+    v: &[f32],
+    tk: usize,
+    n_head: usize,
+) -> FwResult<Mat> {
+    let n_state = q.cols;
+    if n_head == 0 || !n_state.is_multiple_of(n_head) {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: n_head {n_head} must divide n_state {n_state}"
+        )));
+    }
+    if k.len() != tk * n_state || v.len() != tk * n_state {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: k/v slice len {}/{} != tk*n_state {}",
+            k.len(),
+            v.len(),
+            tk * n_state
+        )));
+    }
+    let d_head = n_state / n_head;
+    if d_head == 0 {
+        return Err(FwError::InvalidRequest("attention: d_head == 0".into()));
+    }
+    let scale = (d_head as f32).powf(-0.25);
+    let q0 = q.row(0);
+    let mut out = vec![0.0f32; n_state];
+    let mut qh = vec![0.0f32; d_head];
+    let mut scores = vec![0.0f32; tk];
+    for h in 0..n_head {
+        let base = h * d_head;
+        // Scaled query head (`qh[d] = q[d] * scale`), matching `attention_raw`.
+        for (d, slot) in qh.iter_mut().enumerate() {
+            *slot = q0[base + d] * scale;
+        }
+        // scores[j] = sum_d qh[d] * (k[j,base+d] * scale). Same per-term product
+        // and same summation order (d ascending) as the m=1 SAXPY over `kh_t`.
+        for (j, sj) in scores.iter_mut().enumerate() {
+            let krow = &k[j * n_state + base..j * n_state + base + d_head];
+            let mut acc = 0.0f32;
+            for (d, &qd) in qh.iter().enumerate() {
+                acc += qd * (krow[d] * scale);
+            }
+            *sj = acc;
+        }
+        // No causal mask: at tq==1 the query attends to every cached key.
+        let mut sm = Mat::from_vec(1, tk, std::mem::take(&mut scores));
+        softmax_rows(&mut sm);
+        scores = sm.data;
+        // out[base+d] += sum_j scores[j] * v[j,base+d] (j ascending == m=1 SAXPY).
+        // AVX2 `axpy_f32_into` vectorizes across the INDEPENDENT output slots `d`
+        // (separate mul+add, NOT fmadd) so the per-slot j-ascending sum is
+        // bit-identical to the scalar `*o += sj*vd` loop it replaces.
+        for (j, &sj) in scores.iter().enumerate() {
+            let vrow = &v[j * n_state + base..j * n_state + base + d_head];
+            let orow = &mut out[base..base + d_head];
+            axpy_f32_into(orow, sj, vrow);
+        }
+    }
+    Ok(Mat::from_vec(1, n_state, out))
+}
+
+/// f16-storage variant of [`attention_decode_step`]: reads the KV cache f16
+/// slices directly, `.to_f32()`-ing each element inside the two dot loops.
+/// f16→f32 is lossless, so every f32 arithmetic value is IDENTICAL to
+/// [`attention_decode_step`] fed the same keys/values rounded through f16 — i.e.
+/// exactly the `FW_KV_F16_SIM` probe path, which is proven transcript-neutral.
+/// The win is bandwidth: the cache read is half-width (f16), and it is read
+/// straight out of storage (no dequant-to-f32-scratch memmove per step).
+fn attention_decode_step_f16(
+    q: &Mat,
+    k: &[Float16],
+    v: &[Float16],
+    tk: usize,
+    n_head: usize,
+) -> FwResult<Mat> {
+    let n_state = q.cols;
+    if n_head == 0 || !n_state.is_multiple_of(n_head) {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: n_head {n_head} must divide n_state {n_state}"
+        )));
+    }
+    if k.len() != tk * n_state || v.len() != tk * n_state {
+        return Err(FwError::InvalidRequest(format!(
+            "attention: k/v slice len {}/{} != tk*n_state {}",
+            k.len(),
+            v.len(),
+            tk * n_state
+        )));
+    }
+    let d_head = n_state / n_head;
+    if d_head == 0 {
+        return Err(FwError::InvalidRequest("attention: d_head == 0".into()));
+    }
+    let scale = (d_head as f32).powf(-0.25);
+    let q0 = q.row(0);
+    let mut out = vec![0.0f32; n_state];
+    let mut qh = vec![0.0f32; d_head];
+    let mut scores = vec![0.0f32; tk];
+    for h in 0..n_head {
+        let base = h * d_head;
+        for (d, slot) in qh.iter_mut().enumerate() {
+            *slot = q0[base + d] * scale;
+        }
+        // Same per-term product and summation order as `attention_decode_step`,
+        // reading k as f16 (lossless `.to_f32()`).
+        for (j, sj) in scores.iter_mut().enumerate() {
+            let krow = &k[j * n_state + base..j * n_state + base + d_head];
+            let mut acc = 0.0f32;
+            for (d, &qd) in qh.iter().enumerate() {
+                acc += qd * (krow[d].to_f32() * scale);
+            }
+            *sj = acc;
+        }
+        let mut sm = Mat::from_vec(1, tk, std::mem::take(&mut scores));
+        softmax_rows(&mut sm);
+        scores = sm.data;
+        for (j, &sj) in scores.iter().enumerate() {
+            let vrow = &v[j * n_state + base..j * n_state + base + d_head];
+            let orow = &mut out[base..base + d_head];
+            for (o, &vd) in orow.iter_mut().zip(vrow) {
+                *o += sj * vd.to_f32();
+            }
+        }
+    }
+    Ok(Mat::from_vec(1, n_state, out))
 }
 
 /// Cache-blocked, multi-threaded out-of-place transpose: `data` viewed as
@@ -2023,6 +3419,190 @@ mod tests {
     }
 
     #[test]
+    fn quantize_act_i8_matches_scalar_reference() {
+        // The AVX2 quantize must be BIT-identical to the scalar map for finite
+        // activations, across all code paths (SIMD body, <8 tail) and the ±127 clamp
+        // edges, and must round HALF-AWAY (f32::round), NOT round-to-even.
+        fn scalar(x: &[f32], xinv: f32) -> Vec<i8> {
+            x.iter().map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8).collect()
+        }
+        let mut s = 0x243F_6A88_85A3_08D3u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0
+        };
+        for &n in &[0usize, 1, 5, 7, 8, 9, 15, 16, 17, 1280, 5120] {
+            let x: Vec<f32> = (0..n).map(|_| nf()).collect();
+            let amax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let xinv = 127.0 / amax; // maps amax -> ±127 (exercise the clamp edge)
+            let mut got = vec![0i8; n];
+            quantize_act_i8_into(&x, xinv, &mut got);
+            assert_eq!(got, scalar(&x, xinv), "quantize mismatch at n={n}");
+        }
+        // Exact-.5 inputs: half-AWAY (2.5->3), not round-to-even (which gives 2).
+        let x = vec![0.5f32, 1.5, 2.5, -0.5, -1.5, -2.5, 126.5, -126.5];
+        let mut got = vec![0i8; x.len()];
+        quantize_act_i8_into(&x, 1.0, &mut got);
+        assert_eq!(got, vec![1i8, 2, 3, -1, -2, -3, 127, -127]);
+    }
+
+    #[test]
+    fn axpy_f32_into_matches_scalar_reference() {
+        // `axpy_f32_into` (the decode score·V output SAXPY) must be BIT-identical to
+        // the scalar `*o += a*x` loop — separate mul+add (two roundings), NOT fmadd.
+        // Exercise the SIMD body, the <8 tail, and repeated accumulation (the real
+        // use accumulates over j into the same `o`). d_head=64 is the live shape.
+        fn scalar(o: &mut [f32], a: f32, x: &[f32]) {
+            for (oo, &xx) in o.iter_mut().zip(x) {
+                *oo += a * xx;
+            }
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut nf = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0
+        };
+        for &n in &[0usize, 1, 7, 8, 9, 15, 16, 64, 65, 128] {
+            let x: Vec<f32> = (0..n).map(|_| nf()).collect();
+            let init: Vec<f32> = (0..n).map(|_| nf()).collect();
+            let mut got = init.clone();
+            let mut want = init;
+            // Accumulate several SAXPYs (as the real j-loop does) — order must match.
+            for _ in 0..5 {
+                let a = nf();
+                axpy_f32_into(&mut got, a, &x);
+                scalar(&mut want, a, &x);
+            }
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "axpy_f32_into bit mismatch at n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdpa_gather_head_major_chunk_invariant() {
+        // The gather output must be IDENTICAL for any chunk count (pure data movement)
+        // and must equal the historical per-head reference. Covers chunks < / == / > hh
+        // and a non-divisor of hh*t.
+        let (hh, t, d_head) = (20usize, 37usize, 64usize);
+        let n_state = hh * d_head;
+        let mut s = 0x243F_6A88_85A3_08D3u64;
+        let src: Vec<f32> = (0..t * n_state)
+            .map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 })
+            .collect();
+        // Reference: the historical per-head gather.
+        let mut want = vec![0.0f32; hh * t * d_head];
+        for h in 0..hh {
+            let base = h * d_head;
+            for i in 0..t {
+                want[h * t * d_head + i * d_head..h * t * d_head + (i + 1) * d_head]
+                    .copy_from_slice(&src[i * n_state + base..i * n_state + base + d_head]);
+            }
+        }
+        for &chunks in &[0usize, 1, 3, 7, 16, 20, 23, 64, 100000] {
+            let mut got = vec![0.0f32; hh * t * d_head];
+            sdpa_gather_head_major(&mut got, &src, hh, t, d_head, n_state, chunks);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "gather diverged at chunks={chunks}"
+            );
+        }
+    }
+
+    #[test]
+    fn conv1d_wt_matches_conv1d() {
+        // conv1d_wt fed the externally-transposed weight must be BIT-identical to conv1d
+        // fed the ggml-order weight (the encoder pre-transposes at load via transpose_serial).
+        let (cout, cin, k) = (12usize, 5usize, 3usize);
+        let (t_in, stride, pad) = (17usize, 2usize, 1usize);
+        let patch = cin * k;
+        let mut s = 0x243F_6A88_85A3_08D3u64;
+        let mut nf = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 };
+        let x = Mat::from_vec(t_in, cin, (0..t_in * cin).map(|_| nf()).collect());
+        let w: Vec<f32> = (0..cout * patch).map(|_| nf()).collect();
+        let bias: Vec<f32> = (0..cout).map(|_| nf()).collect();
+        // Pre-transpose w [cout, patch] -> [patch, cout] (transpose_serial == conv1d's inline).
+        let w_t = Mat::from_vec(patch, cout, transpose_serial(&w, cout, patch));
+        let a = conv1d(&x, &w, cout, cin, k, &bias, stride, pad).unwrap();
+        let b = conv1d_wt(&x, &w_t, cin, k, &bias, stride, pad).unwrap();
+        assert_eq!((a.rows, a.cols), (b.rows, b.cols));
+        assert_eq!(
+            a.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "conv1d_wt diverged from conv1d"
+        );
+    }
+
+    #[test]
+    fn sdpa_scatter_interleaved_chunk_invariant() {
+        // Scatter output must be IDENTICAL for any chunk count and equal the per-row
+        // reference (pure data movement). Covers chunks < / == / > t and non-divisors.
+        let (hh, t, d_head) = (20usize, 37usize, 64usize);
+        let n_state = hh * d_head;
+        let mut s = 0xD1B5_4A32_D192_ED03u64;
+        let o: Vec<f32> = (0..hh * t * d_head)
+            .map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s >> 40) as f32 / (1u64 << 24) as f32 })
+            .collect();
+        // Reference: the historical per-row scatter.
+        let mut want = vec![0.0f32; t * n_state];
+        for i in 0..t {
+            for h in 0..hh {
+                want[i * n_state + h * d_head..i * n_state + (h + 1) * d_head]
+                    .copy_from_slice(&o[h * t * d_head + i * d_head..h * t * d_head + i * d_head + d_head]);
+            }
+        }
+        for &chunks in &[0usize, 1, 3, 12, 16, 37, 50, 1000] {
+            let mut got = vec![0.0f32; t * n_state];
+            sdpa_scatter_interleaved(&mut got, &o, hh, t, d_head, n_state, chunks);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "scatter diverged at chunks={chunks}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_i8_matches_scalar_reference() {
+        // The AVX2 `dot_i8` (x86) must be BIT-identical to the scalar reference for
+        // every decode contraction length, across all three code paths (32-wide,
+        // 16-wide tail, <16 scalar tail). Integer-exact: i8·i8 ∈ [-16129,16129] and
+        // n ≤ 5120 ⇒ |Σ| ≤ 82.6M < 2³¹, so no i32 overflow and the vectorized
+        // pairwise sum equals the scalar sum exactly (guards the gemv_i8 win landing).
+        fn scalar(w: &[i8], x: &[i8]) -> i32 {
+            let mut acc = 0i32;
+            for (a, b) in w.iter().zip(x) {
+                acc += (*a as i32) * (*b as i32);
+            }
+            acc
+        }
+        let mut s = 0xC0FF_EE12_3456_789Au64;
+        let mut ni8 = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 24) as i32 % 255 - 127) as i8
+        };
+        for &n in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 384, 1280, 5120] {
+            let w: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            let x: Vec<i8> = (0..n).map(|_| ni8()).collect();
+            assert_eq!(dot_i8(&w, &x), scalar(&w, &x), "dot_i8 mismatch at n={n}");
+        }
+        // Worst-case magnitude at the max decode length.
+        let w = vec![127i8; 5120];
+        let x = vec![-127i8; 5120];
+        assert_eq!(dot_i8(&w, &x), scalar(&w, &x));
+        assert_eq!(dot_i8(&w, &x), -82_580_480); // 5120 · 127 · (−127)
+    }
+
+    #[test]
     fn gemv_f16_batch_equals_per_token_gemv() {
         let mut rng = Lcg::new(17);
         let (out, inp, tq) = (300usize, 128usize, 5usize);
@@ -2184,14 +3764,17 @@ mod tests {
     fn gelu_known_values() {
         let mut x = Mat::from_vec(1, 3, vec![0.0, 1.0, -1.0]);
         gelu(&mut x);
-        // Compute expected from the tanh-approx formula directly.
+        // Expected: whisper.cpp's shipped f16-table GELU (GGML_GELU_FP16), i.e. the
+        // tanh form re-rounded through f16 at both the input index and the value.
         let f = |v: f32| {
-            0.5 * v * (1.0 + (GELU_SQRT_2_OVER_PI * v * (1.0 + GELU_COEF_A * v * v)).tanh())
+            let f = Float16::from_f32(v).to_f32();
+            let g = 0.5 * f * (1.0 + (GELU_SQRT_2_OVER_PI * f * (1.0 + GELU_COEF_A * f * f)).tanh());
+            Float16::from_f32(g).to_f32()
         };
-        assert!((x.data[0] - 0.0).abs() < 1e-6, "gelu(0)=0");
-        assert!((x.data[1] - f(1.0)).abs() < 1e-6);
-        assert!((x.data[2] - f(-1.0)).abs() < 1e-6);
-        // Spec reference magnitudes.
+        assert_eq!(x.data[0], f(0.0), "gelu(0) table-exact");
+        assert_eq!(x.data[1], f(1.0), "gelu(1) table-exact");
+        assert_eq!(x.data[2], f(-1.0), "gelu(-1) table-exact");
+        // Spec reference magnitudes (f16 table is within ~1e-3 of the exact tanh).
         assert!(
             (x.data[1] - 0.8412).abs() < 1e-3,
             "gelu(1)~0.8412, got {}",
@@ -2224,6 +3807,83 @@ mod tests {
         let s: f32 = x.row(0).iter().sum();
         assert!((s - 1.0).abs() < 1e-5, "sum {s}");
         assert!(x.data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn softmax_rows_sanitizes_nan() {
+        // A NaN score must not leave NaN in the output row (upstream overflow
+        // could otherwise poison the whole decoder residual stream).
+        let mut x = Mat::from_vec(1, 3, vec![f32::NAN, 1.0, 0.0]);
+        softmax_rows(&mut x);
+        assert!(
+            x.data.iter().all(|v| v.is_finite()),
+            "no NaN/inf in output row"
+        );
+        // The NaN lane contributes 0; the finite lanes normalize to sum 1.
+        let s: f32 = x.row(0).iter().sum();
+        assert!((s - 1.0).abs() < 1e-5, "sum {s}");
+        assert_eq!(x.row(0)[0], 0.0, "NaN lane maps to 0");
+    }
+
+    /// The gated `FW_SIMD_EXP` poly softmax numerator must match the scalar libm
+    /// softmax within a tight tolerance, over lengths that exercise the AVX2 body +
+    /// the `< 8` scalar tail, and must map `-inf`/NaN lanes to 0 exactly like scalar.
+    #[test]
+    fn softmax_row_poly_numer_matches_scalar() {
+        let mut rng = Lcg::new(0xB1AC_5017);
+        // Reference scalar softmax over one row (in place), returns the row.
+        let scalar = |v: &[f32]| -> Vec<f32> {
+            let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if !max.is_finite() {
+                return v.to_vec();
+            }
+            let mut row: Vec<f32> = v
+                .iter()
+                .map(|&x| {
+                    let e = (x - max).exp();
+                    if e.is_finite() {
+                        e
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let sum: f32 = row.iter().sum();
+            if sum > 0.0 {
+                let inv = 1.0 / sum;
+                for r in &mut row {
+                    *r *= inv;
+                }
+            }
+            row
+        };
+        // Lengths hit 1..=40 (tails 0..7) plus the 1500-wide cross-attn shape.
+        for &len in &[1usize, 4, 7, 8, 9, 15, 16, 33, 64, 128, 1500] {
+            let base: Vec<f32> = (0..len).map(|_| rng.next_f32() * 6.0).collect();
+            let want = scalar(&base);
+            let mut got = base.clone();
+            let max = got.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum = super::softmax_row_poly_numer(&mut got, max);
+            if sum > 0.0 {
+                let inv = 1.0 / sum;
+                for g in &mut got {
+                    *g *= inv;
+                }
+            }
+            let maxd = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(maxd < 1e-5, "len {len}: poly vs scalar max|Δ|={maxd:e}");
+        }
+        // Masked/NaN lanes -> 0 in the poly numerator (matches scalar finite-guard).
+        let mut row = vec![1.0f32, f32::NEG_INFINITY, 2.0, f32::NAN, 0.5, 3.0, -1.0, 4.0, 0.0];
+        let max = 4.0f32;
+        super::softmax_row_poly_numer(&mut row, max);
+        assert_eq!(row[1], 0.0, "-inf lane -> 0");
+        assert_eq!(row[3], 0.0, "NaN lane -> 0");
+        assert!(row.iter().all(|v| v.is_finite()), "no NaN/inf in poly output");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2533,5 +4193,45 @@ mod tests {
             attention(&q, &k, &v, 4, None).is_err(),
             "4 does not divide 6"
         );
+    }
+
+    /// The PACKED int4 GEMV must be BIT-IDENTICAL to the unpacked int4 probe
+    /// (`quantize_f16_to_i4_blocked` + `gemv_i8w_f32a_blocked`): same 4-bit values,
+    /// same block scales, same `dot_i8w_f32` accumulation order — only the storage
+    /// (2 nibbles/byte vs 1 value/byte) differs. This is the load-independent proof
+    /// that swapping mlp_0/fc1 to the packed kernel changes no output bit. Covers
+    /// several `inp` widths (d_model ∈ {384, 768, 1280}) and includes a bias.
+    #[test]
+    fn i4_packed_gemv_bit_identical_to_probe() {
+        let mut rng = Lcg::new(0xF16C_4B17);
+        for &inp in &[384usize, 768, 1280] {
+            let out = 96; // small out; must exceed the narrow worker cap? no — serial ok
+            let w: Vec<Float16> =
+                (0..out * inp).map(|_| Float16::from_f32(rng.next_f32() * 0.4)).collect();
+            let x: Vec<f32> = (0..inp).map(|_| rng.next_f32()).collect();
+            let bias: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
+
+            let probe = quantize_f16_to_i4_blocked(&w, out, inp, 32);
+            let mut y_probe = vec![0.0f32; out];
+            gemv_i8w_f32a_blocked(&probe, &x, Some(&bias), &mut y_probe);
+
+            let packed = quantize_f16_to_i4_packed(&w, out, inp);
+            let mut y_packed = vec![0.0f32; out];
+            gemv_i4_packed_f32a(&packed, &x, Some(&bias), &mut y_packed);
+
+            // Storage really is halved (one byte per two int4 weights).
+            assert_eq!(packed.data.len(), out * inp / 2, "packed size (inp={inp})");
+            assert_eq!(probe.data.len(), out * inp, "probe stores one value/byte");
+            // Every output element bit-for-bit equal.
+            for o in 0..out {
+                assert_eq!(
+                    y_packed[o].to_bits(),
+                    y_probe[o].to_bits(),
+                    "i4-packed != probe at o={o}, inp={inp}: {} vs {}",
+                    y_packed[o],
+                    y_probe[o]
+                );
+            }
+        }
     }
 }
