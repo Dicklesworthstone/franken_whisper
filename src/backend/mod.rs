@@ -2285,9 +2285,17 @@ impl BackendSelectionContract {
         // Loss matrix: 3 states × 4 actions (row-major).
         let n_actions = actions.len();
         let mut values = Vec::with_capacity(3 * n_actions);
+        let backend_base_losses: [f64; 3] = std::array::from_fn(|action_idx| {
+            Self::backend_base_loss_adaptive(
+                action_backends[action_idx],
+                request,
+                duration_secs,
+                router_state,
+            )
+        });
         for state_idx in 0..3 {
             for action_idx in 0..n_actions {
-                if action_idx >= action_backends.len() {
+                let Some(base) = backend_base_losses.get(action_idx).copied() else {
                     // fallback_error: correct when nothing available, wasteful otherwise.
                     values.push(match state_idx {
                         0 => 1000.0,
@@ -2295,27 +2303,20 @@ impl BackendSelectionContract {
                         2 => 5.0,
                         _ => 1000.0,
                     });
+                    continue;
+                };
+                let availability_penalty = match state_idx {
+                    0 => 0.0,
+                    1 => 333.0,
+                    2 => 1000.0,
+                    _ => 1000.0,
+                };
+                let v = base + availability_penalty;
+                values.push(if v.is_finite() {
+                    v.max(0.0)
                 } else {
-                    let backend = action_backends[action_idx];
-                    let base = Self::backend_base_loss_adaptive(
-                        backend,
-                        request,
-                        duration_secs,
-                        router_state,
-                    );
-                    let availability_penalty = match state_idx {
-                        0 => 0.0,
-                        1 => 333.0,
-                        2 => 1000.0,
-                        _ => 1000.0,
-                    };
-                    let v = base + availability_penalty;
-                    values.push(if v.is_finite() {
-                        v.max(0.0)
-                    } else {
-                        LARGE_FINITE_PENALTY
-                    });
-                }
+                    LARGE_FINITE_PENALTY
+                });
             }
         }
 
@@ -7381,6 +7382,71 @@ mod tests {
             !contract.adaptive_mode_active,
             "should not be adaptive without state"
         );
+    }
+
+    #[test]
+    fn adaptive_loss_hoist_matches_per_row_reference_bits() {
+        let mut state = RouterState::new();
+        for backend in [
+            BackendKind::WhisperCpp,
+            BackendKind::InsanelyFast,
+            BackendKind::WhisperDiarization,
+        ] {
+            for sample in 0..20_u64 {
+                state.record_outcome(make_outcome(backend, sample % 4 != 0, 250 + sample * 17));
+            }
+        }
+        for _ in 0..10 {
+            state.record_prediction_outcome(true);
+        }
+
+        for diarize in [false, true] {
+            let request = test_request(diarize);
+            for duration_secs in [0.0, 30.0, 600.0] {
+                let contract = BackendSelectionContract::with_router_state(
+                    &request,
+                    duration_secs,
+                    Some(&state),
+                );
+                let matrix = contract.loss_matrix();
+                for state_idx in 0..3 {
+                    for action_idx in 0..matrix.n_actions() {
+                        let expected = if action_idx >= contract.action_backends.len() {
+                            match state_idx {
+                                0 => 1000.0,
+                                1 => 500.0,
+                                2 => 5.0,
+                                _ => 1000.0,
+                            }
+                        } else {
+                            let base = BackendSelectionContract::backend_base_loss_adaptive(
+                                contract.action_backends[action_idx],
+                                &request,
+                                duration_secs,
+                                Some(&state),
+                            );
+                            let availability_penalty = match state_idx {
+                                0 => 0.0,
+                                1 => 333.0,
+                                2 => 1000.0,
+                                _ => 1000.0,
+                            };
+                            let value = base + availability_penalty;
+                            if value.is_finite() {
+                                value.max(0.0)
+                            } else {
+                                super::LARGE_FINITE_PENALTY
+                            }
+                        };
+                        assert_eq!(
+                            matrix.get(state_idx, action_idx).to_bits(),
+                            expected.to_bits(),
+                            "loss[{state_idx},{action_idx}] changed for diarize={diarize}, duration={duration_secs}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

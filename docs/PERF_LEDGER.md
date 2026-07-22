@@ -4,6 +4,61 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-22 — KEEP — hoist adaptive router base losses (bd-gucz)
+
+**Closed-lever retry predicate and profile first.** This is the admissible
+retry of the earlier `bd-kdg7.4` BLOCKED row, not a blind rerun. Before the
+lever was touched, both ledgers and recent Git history were searched for
+`backend_base_loss_adaptive`, the 9-to-3 hoist, and the prior blocker. Its exact
+predicate now holds: the missing frankensqlite
+`agg_in_list_composite_prefix_oracle.rs` entrypoint is present, strict-remote
+RCH admitted `pipeline_bench` to non-SIGILL worker `ovh-a`, and the benchmark
+executed. The preceding strict-remote profile priced one 50-record
+`RouterState::metrics_for` aggregate at **67.819 ns** median
+`[65.506, 70.257]`. The complete three-row loss matrix historically repeated
+that aggregate and the posterior/loss arithmetic **9 times for 3 immutable
+backend values**. The selected alien primitive is loop-invariant computation.
+
+**One lever and conformance.** `with_router_state` now computes the three
+backend base losses once into a fixed array and reuses them across the three
+availability rows. Action order, fallback-action cells, availability penalties,
+sanitization, state/action cardinality, and evidence schema are unchanged.
+The focused production oracle recomputes the historical per-row reference and
+compares every loss cell with `f64::to_bits` for diarize off/on, durations
+0/30/600 seconds, mixed-success histories for all three backends, prediction
+history, and the fallback action. Strict-remote `cargo test --lib -j2
+adaptive_loss_hoist_matches_per_row_reference_bits` passed **1/1** on `ovh-a`.
+The benchmark additionally requires byte-equal serialized `BackendMetrics`
+inputs and an equal full-input checksum before timing.
+
+**Same-worker interleaved A/B and null.** One release `pipeline_bench`
+executable on `ovh-a` ran 21 order-alternated historical-nine-scan/candidate-
+three-scan pairs and 21 historical/historical identity-null pairs, with 200,000
+loss-input constructions per arm. The candidate won **21/21** pairs. Speedup
+p10/median/p90 was **2.413922x / 2.418995x / 2.460754x**. Candidate latency
+p10/median/p90 was **187.775 / 188.465 / 188.857 ns**, with **0.2829% CV**.
+Null p10/median/p90 was **0.993621x / 0.999396x / 1.003279x**. Thus candidate
+p10 clears both the 1.10 minimum and null p90, CV is below 5%, and all
+predeclared gates pass. Criterion independently measured
+`pipeline/router_loss_hoist/history_50` at **[187.71, 189.04, 190.90] ns**
+(10 samples; two high outliers). This is a component-level router result, not
+an end-to-end transcription claim.
+
+**Remote gates and policy boundary.** Strict-remote `cargo check --bench
+pipeline_bench -j2` passed on `ovh-a`; only unrelated warnings in peer-owned
+`native_engine`/orchestrator code were emitted. The repository guardrail policy
+currently enumerates tty/sync release baselines and has no comparator for this
+new pipeline component row, so the admissible interleaved null-controlled gate
+above is the regression boundary for this lever. The mandated shell guardrail
+entrypoint contains a Cargo call; strict-remote RCH classified the wrapper as a
+non-compilation command and failed closed with **RCH-E301**, so it did not run
+locally. A strict-remote `cargo clippy --bench pipeline_bench -- -D warnings`
+audit reported 36 findings: its one lever-local `needless_range_loop` was fixed
+with checked array access and the exact oracle passed again; the other 35 are
+outside this diff in peer-owned/native, audio, orchestrator, sync, and backend
+code. `git diff --check` passed. Direct `rustfmt --check` reported only four
+pre-existing hunks outside this change. No local Cargo evidence was used.
+
 ## 2026-07-22 — LANDED STRUCTURAL / UNMEASURED — borrow speculative quality-model name (bd-oacy)
 
 **Classification and freshness.** This is a bench-free ownership land after a
