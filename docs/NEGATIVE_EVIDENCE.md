@@ -4,6 +4,43 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP-EVIDENCE (bd-r0qd / bd-6goy quality verdict) — `FW_TEMP_FALLBACK` is a REAL 2.75× WER improvement, not char-count hallucination: vs whisper.cpp (tiny.en, beam=5) on the long-form drop clip, native greedy = WER 0.528, native temp-fallback = WER 0.192. This is the quantified case for the owner's default-on flip.**
+
+**Method (honest, reproducible).** whisper.cpp is the reference oracle:
+`legacy_whispercpp/whisper.cpp/build/bin/whisper-cli -m ggml-tiny.en.bin -f
+track01_16k.wav -nt` (DEFAULT beam=5/best-of=5 — whisper.cpp's real default) →
+250-word reference (`wc_track01_ref.txt`, 1290 chars). Native arms via the local
+release `e2e_probe tiny.en track01_16k.wav 1` (TS mode, the confirmed bd-r0qd
+drop regime): default greedy = 643 chars / 125 words; `FW_TEMP_FALLBACK=1` = 1273
+chars / 237 words. WER = word-level Levenshtein after lowercase + punctuation-
+strip + whitespace-collapse (`scratchpad/wer.py`).
+
+**Result.**
+| arm | WER vs wc beam=5 | edits/250 | hyp words |
+|-----|-----------------|-----------|-----------|
+| native greedy (DEFAULT) | **0.528** | 132 | 125 |
+| native `FW_TEMP_FALLBACK` | **0.192** | 48 | 237 |
+
+- **The default's WER 0.528 IS the bd-r0qd bug quantified** — it is not "cleaner",
+  it drops ~half the reference words (125 vs 250). The prior "643→1273 chars"
+  framing undersold it: this is a real faithfulness failure, WER > 0.5.
+- **The fallback recovers to WER 0.192 — 2.75× better, 237/250 words covered**,
+  and the recovered text MATCHES whisper.cpp's content (Frankenstein library, CAS,
+  XF/Twitter-archive search, agent mail, three-tier system…) — NOT hallucination.
+- **Deterministic:** two `FW_TEMP_FALLBACK` runs byte-identical ⇒ WER 0.192 is
+  stable, not a sampling-luck artifact.
+
+**Honest residual.** 0.192 is still above the bd-frp7 jfk conformance gate (≤0.10),
+but (a) that gate is a SHORT single-window clip; this is a 124.5 s pathological
+long-form drop clip, and (b) the reference is whisper.cpp BEAM search while native
+runs sampling with NO beam — the residual ~0.09 is the expected greedy/sampling-vs-
+beam gap (DISC-003), i.e. exactly what native beam search (bd-6goy residual) would
+close. So: fallback is a large, real, deterministic faithfulness win; beam search
+is the remaining lever to reach the canonical gate. **This converts the "owner
+faithfulness call" from a char-count judgment into a measured WER case: default-on
+FW_TEMP_FALLBACK (or the narrower FW_RETRY_FAILED_WINDOW) cuts long-form WER 0.53→0.19.**
+
+---
 ## 2026-07-23 - WhiteCreek: **bd-0ivd SYNTHETIC-REPRO CONVERGED (stop digging, tripwire armed) — 14/14 probe iterations bit-stable across FOUR sibling configs; the concurrent-`transcribe_samples` sibling (the last recorded ingredient) is ALSO bit-stable. The flake reproduces ONLY inside the real libtest full suite; no direct/synthetic reproduction exists, and no production-reachable nondeterminism has been demonstrated.**
 
 **Fourth probe config (concurrent full transcribe WITH word timestamps — its own
