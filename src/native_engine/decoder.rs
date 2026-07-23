@@ -816,7 +816,16 @@ impl DecoderWeights {
 /// One [`DecoderState`] is built per audio window from that window's encoder
 /// output (which fixes the cross-attention keys/values for the whole window)
 /// and is then advanced token-by-token via [`forward_step`].
-#[derive(Debug)]
+///
+/// `Clone` is the beam-search hypothesis-fork primitive (bd-6goy): a surviving
+/// beam that expands into several children needs its self-attention KV state
+/// duplicated. A clone is a faithful fork — a cloned state forwards the same
+/// token to bit-identical logits (pinned by `clone_forwards_identically`).
+/// NOTE: cloning also duplicates the window-constant cross-K/V (~`enc_frames ×
+/// n_state × n_layer` per copy); a future beam decoder should share that via a
+/// reference/Arc rather than clone it per hypothesis. Not cloned anywhere on the
+/// greedy production path (byte-exact unaffected).
+#[derive(Debug, Clone)]
 pub struct DecoderState {
     /// One self-attention KV cache per layer.
     kv: Vec<KvCache>,
@@ -2222,6 +2231,52 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max < 1e-4, "incremental vs batch last-logit diff {max}");
+    }
+
+    #[test]
+    fn clone_forwards_identically() {
+        // Beam-search fork primitive (bd-6goy): a cloned DecoderState must be a
+        // faithful copy — forwarding the same continuation through the original
+        // and its clone yields BIT-IDENTICAL logits, and the clone advancing does
+        // not disturb the original (independent KV caches). This is the exact
+        // invariant per-hypothesis KV forking depends on.
+        let w = synthetic_weights(3);
+        let mut rng = Lcg::new(2024);
+        let enc = rng.mat(6, N_STATE);
+
+        // Prefill a shared prefix, then fork.
+        let mut original = DecoderState::new(&w, &enc).unwrap();
+        let _ = forward_step(&w, &mut original, &[1, 2, 3], &noop_checkpoint).unwrap();
+        let mut forked = original.clone();
+        assert_eq!(forked.len(), original.len());
+        assert_eq!(forked.enc_frames(), original.enc_frames());
+
+        // Same continuation token → bit-identical logits from both.
+        let a = forward_step(&w, &mut original, &[4], &noop_checkpoint).unwrap();
+        let b = forward_step(&w, &mut forked, &[4], &noop_checkpoint).unwrap();
+        assert_eq!(
+            a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "cloned state must forward bit-identically"
+        );
+
+        // Clone independence: clones are DEEP (independent KV caches), so a third
+        // clone diverging on a different token must not perturb two sibling
+        // clones that take the same step. Fork the shared len-3 prefix three ways;
+        // diverge one; the other two, fed the same token, stay bit-identical.
+        let mut base = DecoderState::new(&w, &enc).unwrap();
+        let _ = forward_step(&w, &mut base, &[1, 2, 3], &noop_checkpoint).unwrap();
+        let mut sib1 = base.clone();
+        let mut sib2 = base.clone();
+        let mut diverge = base.clone();
+        let _ = forward_step(&w, &mut diverge, &[7], &noop_checkpoint).unwrap();
+        let s1 = forward_step(&w, &mut sib1, &[5], &noop_checkpoint).unwrap();
+        let s2 = forward_step(&w, &mut sib2, &[5], &noop_checkpoint).unwrap();
+        assert_eq!(
+            s1.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            s2.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "a diverging sibling clone must not corrupt the others (deep KV copy)"
+        );
     }
 
     #[test]

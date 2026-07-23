@@ -4,6 +4,60 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **BLOCKER (fleet-wide, toolchain churn) — `cargo clippy -D warnings` is RED across the codebase after the floating nightly advanced (~2026-07-21+); ~34 NEWLY-promoted lints on PRE-EXISTING code, spanning multiple agents' files. My own increments are clippy-clean (verified per-file on the fleet); the gate cannot go green without a coordinated sweep or a toolchain pin.**
+
+**What.** The fleet workers (and the local nightly) now run a rustc/clippy where
+several `warn`-by-default lints fire on long-standing code; `-D warnings` promotes
+them to errors, so the AGENTS.md `clippy --all-targets -D warnings` gate fails
+fleet-wide. This is the recurring `project_rch_targets_toolchain_churn` pattern
+(floating nightly), now manifesting as lints rather than E0514.
+
+**Inventory (by lint, `cargo clippy --lib`):** doc-list-item-indent (~9:
+`decoder.rs:212-317`, `ggml.rs:528-532`, `whisper_cpp_native.rs:814`),
+collapsible-if (~7: `orchestrator.rs`, `sync.rs`), too-many-arguments (5),
+approximate-const `LOG2_E`/`LN_2` (`decode.rs:630-631` — **numerically risky to
+"fix"**: these are deliberate poly-exp literals; swapping to `f32::consts` could
+perturb the SIMD-exp output, so they need an `#[allow]` with rationale, not a
+blind replace), needless-range-loop (`cluster_sums`), dead-code
+(`vad_energy_detect`, `source_separate` — diarize/separate stubs), chunks_exact,
+manual-clamp, very-complex-type. Full set spans `native_engine/*`, `backend/`,
+`sync.rs`, `orchestrator.rs`.
+
+**Why not swept here.** (a) Most sites are outside the native-engine lane and in
+other agents' active files (shared-tree discipline — no unilateral mass edits).
+(b) The `LOG2_E`/`LN_2` sites are byte-exactness-sensitive. (c) It is toolchain
+churn, not a code-quality regression — the correct fix is owner/coordination-
+scoped: pin the toolchain, or one coordinated `#[allow]`/fix sweep. **My changes
+this session are individually clippy-clean** (confirmed: no hits at my changed
+lines in `decode.rs`/`decoder.rs`; I also removed my own newly-flagged `cand_idx`
+dead store from the best_of commit d3b3363). Per-change validation continues via
+`cargo test --lib` + the byte-exact jfk golden until the gate is restored.
+
+**Retry predicate.** Re-check `rch cargo clippy --all-targets -D warnings` after
+the next fleet toolchain settle (or a pin); if still red, escalate the sweep to
+the owner as a dedicated cross-lane task.
+
+---
+## 2026-07-23 - WhiteCreek: **KEEP (bd-6goy beam-search prerequisite, byte-exact) — `DecoderState: Clone` is the hypothesis-fork primitive, proven a faithful + independent copy (`clone_forwards_identically`): a cloned state forwards a token to BIT-IDENTICAL logits and a diverging sibling clone does not corrupt the others.**
+
+**Why.** Beam search (bd-6goy residual, the lever the 2026-07-23 WER verdict points
+at to close 0.16→0.10) forks a surviving beam into several children, each needing
+its own self-attention KV state advanced independently. That requires cloning a
+`DecoderState`. Added `#[derive(Clone)]` (all field types — `KvCache`, `Mat`,
+`I8Mat`/`I8BlockMat`, f16/i8 vecs — already `Clone`) with a doc note that a clone
+also duplicates the window-constant cross-K/V (a future beam decoder should share
+that via a reference/Arc rather than per-hypothesis clone).
+
+**Byte-exact + proven.** Nothing on the greedy production path clones a
+`DecoderState`, so decode is unchanged. New `clone_forwards_identically` test
+(synthetic weights, runs in CI — not gated): (1) prefill a prefix, clone, forward
+the SAME token through both → logits BIT-identical (`to_bits` compare); (2) fork
+three ways, diverge one on a different token, the other two forwarded the same
+token stay bit-identical ⇒ clones are DEEP/independent (no KV cross-contamination).
+`native_engine::decoder::tests` 13/0; jfk golden byte-exact. Clippy: my lines
+clean (the gate itself is blocked, see the entry above).
+
+---
 ## 2026-07-23 - WhiteCreek: **BUG FIX (bd-4slu conformance-harness correctness) — the native-vs-bridge gate's `word_error_rate_approx` was a POSITIONAL token counter, not WER: a single early word deletion cascaded to WER ≈ 1.0. Now delegates to the real edit-distance `conformance::word_error_rate`. The bd-frp7 "WER ≤ 0.10" gate was measuring the wrong thing.**
 
 **Defect.** `tests/conformance_comparator_tests.rs::word_error_rate_approx`
