@@ -754,6 +754,9 @@ fn beam_decode_window(
         cands.truncate(beam);
 
         let mut next_active: Vec<BeamHyp> = Vec::with_capacity(beam);
+        // Survivors' final hidden states, row-major `[n_survivors, n_state]`, for
+        // the single batched logits projection after the candidate loop.
+        let mut hidden_rows: Vec<f32> = Vec::new();
         for (hi, tok, plog, new_sum) in cands {
             let parent = &active[hi];
             let mut tokens = parent.tokens.clone();
@@ -793,9 +796,14 @@ fn beam_decode_window(
                 }
                 finished.push((tokens, plogs, has_ts, seek_delta_cs, result_len));
             } else {
+                // Forward the token through THIS hypothesis's KV to its final
+                // hidden state (per-hypothesis; the self-attn/MLP can't batch
+                // across differing KV caches). The tied-output LOGITS projection
+                // IS batched below — one weight read for the whole surviving beam.
                 let mut state = parent.state.clone();
-                let next_logits =
-                    decoder::forward_step(&m.decoder, &mut state, &[tok], checkpoint)?;
+                let (x_last, _draft) =
+                    decoder::forward_step_hidden(&m.decoder, &mut state, &[tok], checkpoint)?;
+                hidden_rows.extend_from_slice(&x_last.data);
                 next_active.push(BeamHyp {
                     state,
                     tokens,
@@ -804,8 +812,21 @@ fn beam_decode_window(
                     has_ts,
                     seek_delta_cs,
                     result_len,
-                    next_logits,
+                    next_logits: Vec::new(), // filled by the batched logits below
                 });
+            }
+        }
+        // Batched tied-output projection: one `logits_all` over all survivors'
+        // hidden states reads the [n_vocab, n_state] weight ONCE instead of once
+        // per hypothesis (the logits GEMV is bandwidth-bound on that weight).
+        // Byte-identical to per-hypothesis `logits_last` (the `logits_all` test
+        // pins that), so the beam's decisions are unchanged.
+        if !next_active.is_empty() {
+            let hidden = super::Mat::from_vec(next_active.len(), m.decoder.n_state(), hidden_rows);
+            let all_logits = decoder::logits_all(&m.decoder, &hidden)?;
+            let n_vocab = all_logits.len() / next_active.len();
+            for (h, hyp) in next_active.iter_mut().enumerate() {
+                hyp.next_logits = all_logits[h * n_vocab..(h + 1) * n_vocab].to_vec();
             }
         }
         active = next_active;
