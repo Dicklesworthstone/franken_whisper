@@ -1741,7 +1741,8 @@ pub fn transcribe_samples(
                         retry_enc_cache = Some((frame_offset, enc));
                         continue; // decode this rung's next candidate
                     }
-                    cand_idx = 0;
+                    // (cand_idx is reset by both downstream paths — the rung
+                    // advance and the window-accept block — before any next read.)
                     (
                         best.decoded,
                         best.plogs,
