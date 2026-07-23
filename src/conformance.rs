@@ -378,6 +378,102 @@ pub struct ShadowRunReport {
     pub passes_gate: bool,
 }
 
+/// Word-error-rate report for a hypothesis transcript against a reference.
+///
+/// `wer = edits / reference_words` (the standard ASR metric): the minimum
+/// word-level insertions + deletions + substitutions to turn the reference into
+/// the hypothesis, divided by the reference word count. `0.0` is a perfect
+/// match; values can exceed `1.0` when the hypothesis is much longer than the
+/// reference. An empty reference yields `wer = 0.0` iff the hypothesis is also
+/// empty, else `1.0` (every hypothesis word is an insertion, normalized by the
+/// conventional denominator of 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WerReport {
+    pub reference_words: usize,
+    pub hypothesis_words: usize,
+    pub edits: usize,
+    pub wer: f64,
+}
+
+impl WerReport {
+    /// Whether the WER is within `max_wer` (the native-rollout conformance gate
+    /// is `0.10`; see the bd-frp7 success criterion and
+    /// `docs/native_engine_contract.md` §2.2).
+    #[must_use]
+    pub fn within(self, max_wer: f64) -> bool {
+        self.wer <= max_wer
+    }
+}
+
+/// Normalize a transcript to comparable words for WER: lowercase, drop every
+/// character that is not an ASCII letter, digit, or intra-word apostrophe, then
+/// collapse whitespace. Mirrors the ad-hoc harness used for the 2026-07-23
+/// long-form WER verdict (`scratchpad/wer3.py`) so in-tree and hand runs agree.
+#[must_use]
+fn normalize_words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() || c == '\'' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Word-level Levenshtein edit distance between two token slices (unit costs for
+/// insert/delete/substitute), computed with an O(min(n,m)) rolling row.
+#[must_use]
+fn word_edit_distance(reference: &[String], hypothesis: &[String]) -> usize {
+    let n = reference.len();
+    let m = hypothesis.len();
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = usize::from(reference[i - 1] != hypothesis[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
+/// Compute the word error rate of `hypothesis` against `reference` using the
+/// standard ASR normalization (see [`normalize_words`]). This is the metric the
+/// bd-frp7 native-engine success criterion and the shadow-run text-tolerance are
+/// defined against; it was previously only computed by an out-of-tree script.
+#[must_use]
+pub fn word_error_rate(reference: &str, hypothesis: &str) -> WerReport {
+    let r = normalize_words(reference);
+    let h = normalize_words(hypothesis);
+    let edits = word_edit_distance(&r, &h);
+    let wer = if r.is_empty() {
+        if h.is_empty() { 0.0 } else { 1.0 }
+    } else {
+        edits as f64 / r.len() as f64
+    };
+    WerReport {
+        reference_words: r.len(),
+        hypothesis_words: h.len(),
+        edits,
+        wer,
+    }
+}
+
 /// Compare shadow-run results from a bridge adapter and native engine on the
 /// same input. Returns a `ShadowRunReport` summarizing parity.
 ///
@@ -416,9 +512,73 @@ mod tests {
     use super::{
         NativeEngineRolloutStage, SegmentComparisonReport, SegmentCompatibilityTolerance,
         SegmentConformancePolicy, compare_replay_envelopes, compare_segments_with_tolerance,
-        validate_segment_invariants, validate_segment_invariants_with_policy,
+        validate_segment_invariants, validate_segment_invariants_with_policy, word_error_rate,
     };
     use crate::model::{ReplayEnvelope, TranscriptionSegment};
+
+    #[test]
+    fn wer_identical_transcripts_is_zero() {
+        let r = word_error_rate("The quick brown fox.", "the quick brown fox");
+        assert_eq!(r.wer, 0.0);
+        assert_eq!(r.edits, 0);
+        assert_eq!(r.reference_words, 4);
+        assert!(r.within(0.10));
+    }
+
+    #[test]
+    fn wer_normalizes_case_and_punctuation() {
+        // Punctuation, case, and whitespace differences must not count as errors;
+        // intra-word apostrophes are preserved (don't != dont).
+        assert_eq!(
+            word_error_rate("Don't stop,  now!", "dont stop now").wer,
+            1.0 / 3.0
+        );
+        assert_eq!(word_error_rate("a b c", "A. B, C?").wer, 0.0);
+    }
+
+    #[test]
+    fn wer_counts_insertions_deletions_substitutions() {
+        // one substitution over 3 ref words
+        assert_eq!(word_error_rate("a b c", "a x c").edits, 1);
+        // one deletion
+        assert_eq!(word_error_rate("a b c", "a c").edits, 1);
+        // one insertion
+        assert_eq!(word_error_rate("a b c", "a b x c").edits, 1);
+        // full replacement: 3 substitutions / 3 ref = 1.0
+        assert_eq!(word_error_rate("a b c", "x y z").wer, 1.0);
+    }
+
+    #[test]
+    fn wer_empty_reference_edge_cases() {
+        assert_eq!(word_error_rate("", "").wer, 0.0);
+        assert_eq!(word_error_rate("", "spurious words").wer, 1.0);
+        // empty hypothesis vs non-empty reference = every word deleted = 1.0
+        assert_eq!(word_error_rate("a b c", "").wer, 1.0);
+    }
+
+    #[test]
+    fn wer_can_exceed_one_when_hypothesis_much_longer() {
+        // 3 ref words, hypothesis inserts 4 → 4 edits / 3 = 1.333…
+        let r = word_error_rate("a b c", "a b c d e f g");
+        assert_eq!(r.edits, 4);
+        assert!(r.wer > 1.0);
+        assert!(!r.within(0.10));
+    }
+
+    #[test]
+    fn wer_matches_longform_verdict_fixture() {
+        // Regression pin for the 2026-07-23 bd-r0qd verdict: the greedy default
+        // that drops a window scores far above the 0.10 gate, while a hypothesis
+        // that mirrors the reference scores 0.0. Uses a compact stand-in for the
+        // real transcripts so the metric's direction/gating is locked in-tree.
+        let reference = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let dropped_half = "alpha beta gamma delta epsilon"; // 5 deletions / 10
+        let complete = "Alpha, beta gamma. Delta epsilon zeta eta theta iota kappa!";
+        assert_eq!(word_error_rate(reference, dropped_half).wer, 0.5);
+        assert!(!word_error_rate(reference, dropped_half).within(0.10));
+        assert_eq!(word_error_rate(reference, complete).wer, 0.0);
+        assert!(word_error_rate(reference, complete).within(0.10));
+    }
 
     fn segment(start_sec: Option<f64>, end_sec: Option<f64>, text: &str) -> TranscriptionSegment {
         TranscriptionSegment {
