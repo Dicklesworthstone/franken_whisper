@@ -338,6 +338,8 @@ whisper-cli + `e2e_probe` + `scratchpad/wer3.py`.
 ---
 ## 2026-07-23 - WhiteCreek: **bd-0ivd SYNTHETIC-REPRO CONVERGED (stop digging, tripwire armed) — 14/14 probe iterations bit-stable across FOUR sibling configs; the concurrent-`transcribe_samples` sibling (the last recorded ingredient) is ALSO bit-stable. The flake reproduces ONLY inside the real libtest full suite; no direct/synthetic reproduction exists, and no production-reachable nondeterminism has been demonstrated.**
 
+**TRIPWIRE DATA POINT (2026-07-23 late, 64-core full suite — NOT a re-open, retry predicate NOT met):** a natural firing captured `a==c false | b==c true` — the outlier is run **a**, REVERSING the 4-core taskset's consistent `b`-outlier (6/6). So the outlier side is scheduling-dependent, not "always the 2nd run" — the earlier "canonical result, transient 2nd deviation" read was over-fit to the 4-core config. MXCSR across the 65-worker pool: widespread STICKY flags (0x1fa0 = +inexact, 0x1fb0 = +inexact+underflow) but **control bits (FTZ/DAZ/rounding) all default** ⇒ the flush-leak exoneration HOLDS and denormal-range math is confirmed present. `max |Δt| = 0.0400 s` (< the 0.1 s re-open threshold). Confirms the parked disposition; the self-diagnosing tripwire works. Still isolated-run clean (1/0); not a regression (259/1 with the 1 being this flake, across 14 commits of decode/decoder changes).
+
 **Fourth probe config (concurrent full transcribe WITH word timestamps — its own
 `LoadedModel`, DTW-recording batched forward, looping alongside 2 encoder-forward +
 1 model-load-churn siblings, taskset 0-3, 1067 s run): 3/3 bit-stable.** Running
