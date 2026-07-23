@@ -66,6 +66,20 @@ Input requirements:
 
 External orchestrated tools (invoked as subprocesses, never vendored): `whisper-cli` / `insanely-fast-whisper` / `python3` (backends), `ffmpeg`/`ffprobe` (normalization fallback), and `yt-dlp` for the `youtube` subcommand — each user-installed and overridable via env (`FRANKEN_WHISPER_*_BIN`; yt-dlp via `FRANKEN_WHISPER_YTDLP_BIN`).
 
+### Native engine (`src/native_engine/`)
+
+The REAL in-process pure-Rust Whisper engine lives in `src/native_engine/`
+(ggml parser, log-mel frontend, BPE tokenizer, encoder/decoder transformer,
+greedy decode with whisper.cpp's timestamp rules, cross-attention DTW word
+timestamps). It delegates matmuls to the FrankenTorch path deps
+(`../frankentorch/crates/ft-kernel-cpu` / `ft-core` — a Linux build FAILS if
+that checkout is absent). Behavior levers are env-gated `OnceLock` flags
+(`FW_*` / `FRANKEN_WHISPER_*`), default-off unless a ledger entry records the
+flip; grep `const DEFAULT_ON`/`get_or_init` before trusting any claim about
+what is on. Perf/behavior changes here require the evidence-ledger discipline
+(`docs/NEGATIVE_EVIDENCE.md` / `docs/PERF_LEDGER.md`) and byte-exactness or an
+explicit `DISCREPANCIES.md` entry.
+
 ---
 
 ## Porting Workflow (Spec-First)
