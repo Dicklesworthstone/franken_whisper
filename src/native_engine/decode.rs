@@ -842,6 +842,11 @@ fn beam_decode_window(
     target_feature = "fma"
 ))]
 #[allow(unsafe_code)]
+// The `log2e`/`ln2` range-reduction literals are part of this poly-exp's tuned,
+// WER-certified coefficient set — NOT free-standing math constants. "Correcting"
+// them to `f32::consts::{LOG2_E, LN_2}` would perturb the certified kernel's
+// numerics, so `approx_constant` is suppressed deliberately here.
+#[allow(clippy::approx_constant)]
 fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
     use core::arch::x86_64::*;
     let n = logits.len();
