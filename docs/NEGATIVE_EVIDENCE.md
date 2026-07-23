@@ -58,6 +58,23 @@ it — then re-measure vs the whisper.cpp oracle.
 ---
 ## 2026-07-23 - WhiteCreek: **BLOCKER (fleet-wide, toolchain churn) — `cargo clippy -D warnings` is RED across the codebase after the floating nightly advanced (~2026-07-21+); ~34 NEWLY-promoted lints on PRE-EXISTING code, spanning multiple agents' files. My own increments are clippy-clean (verified per-file on the fleet); the gate cannot go green without a coordinated sweep or a toolchain pin.**
 
+**PARTIAL RESOLUTION (later 2026-07-23):** the HARD-ERROR subset is cleared —
+plain `cargo clippy --lib` now Finishes (exit 0). The 4 fatal errors were
+`clippy::approx_constant` on the poly-exp `log2e`/`ln2` range-reduction literals
+(`decode.rs::logsumexp_sum_simd`, `nn.rs::softmax_row_poly_numer`) — deny-level
+even without `-D warnings`, so they broke plain `cargo clippy` entirely.
+Suppressed with a targeted `#[allow(clippy::approx_constant)]` + rationale (these
+are the certified poly-exp kernel's tuned literals; replacing them with
+`f32::consts` would perturb the WER-certified numerics — `#[allow]` is the only
+byte-safe fix). **NOTE the lint name is `approx_constant`, NOT the URL slug
+`approximate_constant` — the wrong name silently no-ops.** `#[allow]`-only ⇒
+zero code change (jfk golden byte-exact; nn 46/0). **Residual: ~30 `warn`-level
+lints** (collapsible-if / doc-indent / complex-type in native_engine + sync.rs /
+orchestrator.rs / audio.rs) that only fail under `-D warnings`; those remain the
+cross-lane owner-scoped sweep (mostly cosmetic toolchain churn). `--all-targets`
+adds more in tests/examples. The dependency `fsqlite-btree` also emits a warning
+under the new nightly but was not the fatal error.
+
 **What.** The fleet workers (and the local nightly) now run a rustc/clippy where
 several `warn`-by-default lints fire on long-standing code; `-D warnings` promotes
 them to errors, so the AGENTS.md `clippy --all-targets -D warnings` gate fails
