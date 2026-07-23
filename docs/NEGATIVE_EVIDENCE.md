@@ -4,6 +4,29 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **BUG FIX (bd-4slu conformance-harness correctness) — the native-vs-bridge gate's `word_error_rate_approx` was a POSITIONAL token counter, not WER: a single early word deletion cascaded to WER ≈ 1.0. Now delegates to the real edit-distance `conformance::word_error_rate`. The bd-frp7 "WER ≤ 0.10" gate was measuring the wrong thing.**
+
+**Defect.** `tests/conformance_comparator_tests.rs::word_error_rate_approx`
+compared `word[i]` vs `word[i]` and counted mismatches ÷ longer-length. Any
+mid-sequence insertion/deletion shifts every subsequent word out of alignment, so
+a near-perfect transcript missing ONE early word scored ~0.83–1.0. That feeds the
+gated `gated_bridge_vs_native_conformance_jfk_tiny_en` WER gate
+(`NATIVE_ROLLOUT_MAX_WER = 0.10`), so DISC-003's "WER ≤ 0.10" was enforced with a
+non-WER metric — it only happened to pass because jfk/tiny.en native≈bridge output
+is near-identical (no realignment to expose the cascade).
+
+**Fix.** `word_error_rate_approx` now delegates to
+`franken_whisper::conformance::word_error_rate(...).wer` (the validated
+edit-distance metric added earlier today). **All 7 of its unit tests stay green**
+(they are same-length, non-reordered cases where positional == edit-distance), plus
+a new `word_error_rate_approx_realigns_after_deletion` pins the fix: `"a b c d e f"`
+vs `"a c d e f"` was ~0.83 positional, now 0.167 (1 deletion / 6). Also gains
+normalization (case/punctuation no longer count as errors) — on near-identical
+gate output that can only LOWER the measured WER, never raise it, so the gate does
+not become stricter. Full comparator suite 27/0; fleet clippy pending→clean.
+Byte-safe: production decode paths untouched (test-only metric).
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP (bd-4slu / bd-frp7 gap fill, byte-safe pure addition) — first-class `word_error_rate` in `src/conformance.rs`; the WER gate the whole epic is defined against previously had NO in-tree implementation. Validated to reproduce the 2026-07-23 long-form verdict EXACTLY (0.528 / 0.164 / 0.192).**
 
 **Gap.** bd-frp7's success criterion and `docs/native_engine_contract.md` §2.2 are

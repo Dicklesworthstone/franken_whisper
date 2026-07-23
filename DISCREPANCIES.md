@@ -24,8 +24,9 @@
 - **Our impl:** The native in-process engine (`src/native_engine/decode.rs`) decodes **greedily** (temperature 0, no beam) at rollout stages below `primary`.
 - **Impact:** Occasional word-choice differences and timestamp drift between the two engines on the same audio. Measured on `jfk.wav` + `tiny.en`: text WER 0.0 but final-segment **end-timestamp drift ~240 ms** (native 11.00s vs bridge 10.76s). The transcript text matches; only the tail segment boundary shifts.
 - **Resolution:** **ACCEPTED for rollout stages below `primary`.** The bridge-vs-native conformance gate uses a dedicated **native-rollout tolerance profile** — WER ≤ 0.10 and per-segment timestamps within **0.3 s** — deliberately looser than the canonical 50 ms (`CANONICAL_TIMESTAMP_TOLERANCE_SEC`). **Revisit (tighten back toward canonical) when native beam search lands** and the engine is promoted to `primary`.
-- **Tests affected:** `tests/conformance_comparator_tests.rs::gated_bridge_vs_native_conformance_jfk_tiny_en` (the new bridge-vs-native real-engine comparison).
-- **Review date:** 2026-06-04
+- **WER metric:** the gate uses real edit-distance WER (`conformance::word_error_rate`, edits ÷ reference words, ASR-normalized). Measured long-form quality (2026-07-23, `tiny.en`, `example_audio_track_01`, vs `whisper-cli` beam=5): greedy default WER 0.528, `FW_RETRY_FAILED_WINDOW` 0.164, `FW_TEMP_FALLBACK` 0.192 — the residual above 0.10 is the greedy-vs-beam gap this discrepancy is about.
+- **Tests affected:** `tests/conformance_comparator_tests.rs::gated_bridge_vs_native_conformance_jfk_tiny_en` (the bridge-vs-native real-engine comparison).
+- **Review date:** 2026-06-04 (WER metric + long-form measurement added 2026-07-23)
 
 ## DISC-004: Tail-window encoder-context truncation (audio_ctx)
 - **Reference:** whisper.cpp's **default** behavior pads every 30 s window to the full `n_audio_ctx = 1500` encoder context (3000 mel frames), even a near-empty final window. whisper.cpp *also* ships an **opt-in** `audio_ctx` / `-ac` knob (`whisper_full_params.audio_ctx`, whisper.cpp 6967-6972; conv input is `2*n_ctx` wide with `n_ctx = exp_n_audio_ctx`, 1982/1995) that runs the encoder with a *reduced* context for shorter audio — explicitly trading a small accuracy hit for a large speedup.
