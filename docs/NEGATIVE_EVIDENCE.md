@@ -15,30 +15,40 @@ drop regime): default greedy = 643 chars / 125 words; `FW_TEMP_FALLBACK=1` = 127
 chars / 237 words. WER = word-level Levenshtein after lowercase + punctuation-
 strip + whitespace-collapse (`scratchpad/wer.py`).
 
-**Result.**
-| arm | WER vs wc beam=5 | edits/250 | hyp words |
-|-----|-----------------|-----------|-----------|
-| native greedy (DEFAULT) | **0.528** | 132 | 125 |
-| native `FW_TEMP_FALLBACK` | **0.192** | 48 | 237 |
+**Result (three-way, all vs the same wc beam=5 reference).**
+| arm | WER vs wc beam=5 | edits/250 | words covered | determinism |
+|-----|-----------------|-----------|---------------|-------------|
+| native greedy (DEFAULT) | **0.528** | 132 | 125/250 | deterministic |
+| `FW_TEMP_FALLBACK` (sampling ladder) | **0.192** | 48 | 237/250 | deterministic (seeded) |
+| **`FW_RETRY_FAILED_WINDOW`** (prompt-reset retry) | **0.164** | 41 | **246/250** | deterministic, byte-exact on good windows |
 
 - **The default's WER 0.528 IS the bd-r0qd bug quantified** — it is not "cleaner",
   it drops ~half the reference words (125 vs 250). The prior "643→1273 chars"
   framing undersold it: this is a real faithfulness failure, WER > 0.5.
-- **The fallback recovers to WER 0.192 — 2.75× better, 237/250 words covered**,
-  and the recovered text MATCHES whisper.cpp's content (Frankenstein library, CAS,
-  XF/Twitter-archive search, agent mail, three-tier system…) — NOT hallucination.
-- **Deterministic:** two `FW_TEMP_FALLBACK` runs byte-identical ⇒ WER 0.192 is
-  stable, not a sampling-luck artifact.
+- **BOTH recoveries are real (content matches whisper.cpp — Frankenstein library,
+  CAS, XF/Twitter-archive search, agent mail, three-tier system — NOT hallucination),
+  and BOTH are deterministic** (temp-fallback via seeded sampling, retry byte-exact
+  by construction; run-to-run byte-identical verified for each).
+- **★ REFINED RECOMMENDATION: `FW_RETRY_FAILED_WINDOW` is the BEST default-on
+  candidate, not just the safest.** It reaches WER **0.164** (246/250 words) —
+  *lower* than the full sampling ladder (0.192, 237 words) — because on THIS
+  failure mode (carried-prompt × int8 early-EOT drop) the minimal deterministic
+  prompt-reset retry recovers the window cleanly, whereas the temperature ladder's
+  multinomial draws add small word-choice noise. The retry is also byte-exact on
+  every NON-failed window (the sampling ladder is not), so flipping it default-on
+  perturbs nothing except the actual drops. The extra ladder machinery (entropy
+  gate, best_of) earns its keep only on OTHER failure modes (low-logprob non-drop
+  windows), not this one.
 
-**Honest residual.** 0.192 is still above the bd-frp7 jfk conformance gate (≤0.10),
+**Honest residual.** 0.164 is still above the bd-frp7 jfk conformance gate (≤0.10),
 but (a) that gate is a SHORT single-window clip; this is a 124.5 s pathological
 long-form drop clip, and (b) the reference is whisper.cpp BEAM search while native
-runs sampling with NO beam — the residual ~0.09 is the expected greedy/sampling-vs-
-beam gap (DISC-003), i.e. exactly what native beam search (bd-6goy residual) would
-close. So: fallback is a large, real, deterministic faithfulness win; beam search
-is the remaining lever to reach the canonical gate. **This converts the "owner
-faithfulness call" from a char-count judgment into a measured WER case: default-on
-FW_TEMP_FALLBACK (or the narrower FW_RETRY_FAILED_WINDOW) cuts long-form WER 0.53→0.19.**
+is greedy — the residual ~0.06 is the expected greedy-vs-beam gap (DISC-003), i.e.
+exactly what native beam search (bd-6goy residual) would close. **This converts the
+"owner faithfulness call" from a char-count judgment into a measured WER case:
+default-on `FW_RETRY_FAILED_WINDOW` cuts long-form WER 0.53 → 0.16 deterministically
+and byte-exactly outside the drops — the cleanest possible flip.** Reproducible:
+whisper-cli + `e2e_probe` + `scratchpad/wer3.py`.
 
 ---
 ## 2026-07-23 - WhiteCreek: **bd-0ivd SYNTHETIC-REPRO CONVERGED (stop digging, tripwire armed) — 14/14 probe iterations bit-stable across FOUR sibling configs; the concurrent-`transcribe_samples` sibling (the last recorded ingredient) is ALSO bit-stable. The flake reproduces ONLY inside the real libtest full suite; no direct/synthetic reproduction exists, and no production-reachable nondeterminism has been demonstrated.**
