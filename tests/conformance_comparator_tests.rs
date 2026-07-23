@@ -275,27 +275,20 @@ impl DriftMetrics {
 
 /// Approximate word error rate between two strings, computed as the fraction
 /// of words that differ when comparing token-by-token. This is a simplified
-/// Levenshtein-at-word-level approximation using the longer string's word
-/// count as the denominator.
+/// Word error rate between two transcript strings — the real edit-distance WER
+/// (`conformance::word_error_rate`), not a positional token compare.
+///
+/// The former positional implementation (word[i] vs word[i], mismatches ÷
+/// longer length) cascaded a single mid-sequence insertion/deletion into a
+/// mismatch on EVERY following word, so a near-perfect transcript that merely
+/// dropped one early word scored WER ≈ 1.0. Since the native-rollout gate is
+/// defined against true WER ≤ 0.10 (DISC-003), that mis-measured the gate.
+/// This now delegates to the crate's normalized word-Levenshtein WER (edits ÷
+/// reference words); it agrees with the old counter on same-length,
+/// non-reordered inputs (all this fn's unit tests) but is correct under
+/// realignment.
 fn word_error_rate_approx(reference: &str, candidate: &str) -> f64 {
-    let ref_words: Vec<&str> = reference.split_whitespace().collect();
-    let cand_words: Vec<&str> = candidate.split_whitespace().collect();
-
-    let max_len = ref_words.len().max(cand_words.len());
-    if max_len == 0 {
-        return 0.0;
-    }
-
-    let mut mismatches = 0_usize;
-    for i in 0..max_len {
-        let r = ref_words.get(i).copied().unwrap_or("");
-        let c = cand_words.get(i).copied().unwrap_or("");
-        if r != c {
-            mismatches += 1;
-        }
-    }
-
-    mismatches as f64 / max_len as f64
+    franken_whisper::conformance::word_error_rate(reference, candidate).wer
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1178,18 @@ fn word_error_rate_approx_different_lengths() {
     // "hello world foo" vs "hello world" => 3 words max, 1 mismatch (missing "foo").
     let wer = word_error_rate_approx("hello world foo", "hello world");
     assert!((wer - 1.0 / 3.0).abs() < 1e-10);
+}
+
+#[test]
+fn word_error_rate_approx_realigns_after_deletion() {
+    // Regression pin for the positional-cascade fix: dropping ONE early word
+    // must cost ~1 edit, not mis-score every following word. The old positional
+    // counter scored a/b/c/d/e/f vs a/c/d/e/f as ~0.83 (5 of 6 positions differ
+    // after the shift); the real edit-distance WER is 1 deletion / 6 ref = 0.167.
+    let wer = word_error_rate_approx("a b c d e f", "a c d e f");
+    assert!((wer - 1.0 / 6.0).abs() < 1e-10, "got {wer}");
+    // Case/punctuation are normalized away (not counted as errors).
+    assert_eq!(word_error_rate_approx("Hello, World.", "hello world"), 0.0);
 }
 
 #[test]
