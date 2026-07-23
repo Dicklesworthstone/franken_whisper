@@ -3755,6 +3755,31 @@ mod tests {
                         }
                     }
                 });
+                // The last unmimicked suite workload: a CONCURRENT full
+                // transcribe with word timestamps — the real suite runs the
+                // other gated e2e transcribes (and their DTW-recording batched
+                // forwards) alongside this test. Own model instance, exactly
+                // like sibling tests' load_tiny_en().
+                let stopr2 = &stop;
+                let samplesr = &samples;
+                scope.spawn(move || {
+                    let Ok(g) = GgmlModel::load(path) else { return };
+                    let Ok(m2) = LoadedModel::from_ggml(g) else {
+                        return;
+                    };
+                    let p2 = DecodeParams {
+                        language: None,
+                        translate: false,
+                        timestamps: true,
+                        n_threads: 4,
+                        max_text_ctx: None,
+                        word_timestamps: true,
+                        model_hint: Some("tiny.en".to_owned()),
+                    };
+                    while !stopr2.load(Ordering::Relaxed) {
+                        let _ = transcribe_samples(&m2, samplesr, &p2, &noop);
+                    }
+                });
             }
             for it in 0..3 {
                 let mel_a = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();

@@ -4,6 +4,36 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **bd-0ivd SYNTHETIC-REPRO CONVERGED (stop digging, tripwire armed) — 14/14 probe iterations bit-stable across FOUR sibling configs; the concurrent-`transcribe_samples` sibling (the last recorded ingredient) is ALSO bit-stable. The flake reproduces ONLY inside the real libtest full suite; no direct/synthetic reproduction exists, and no production-reachable nondeterminism has been demonstrated.**
+
+**Fourth probe config (concurrent full transcribe WITH word timestamps — its own
+`LoadedModel`, DTW-recording batched forward, looping alongside 2 encoder-forward +
+1 model-load-churn siblings, taskset 0-3, 1067 s run): 3/3 bit-stable.** Running
+total: **14/14** probe iterations bit-stable (busywork · real encoder forwards ·
+model-load churn · concurrent transcribe). Meanwhile the REAL suite reproduces
+~50-100% under the identical core mask, tie-break 6/6 `a==c, b≠c` (transient middle
+run), MXCSR default on every worker.
+
+**VERDICT: the trigger is a property of the libtest harness itself, not any workload
+the probe can spawn** — candidates the probe structurally cannot mimic: (a) libtest's
+own thread pool interleaving THIS test's two `transcribe_samples` calls with dozens of
+OTHER `#[test]` fns that first touched the global rayon pool / allocator arenas in a
+different order; (b) first-touch page/arena state from the 1.5 GB large-v3-turbo load
+tests that run in the same process; (c) a genuinely benign scheduler-shaped effect in
+a denormal tail that only manifests under real N-way test contention. All are
+**diagnostic-only** — the divergence is ≤0.04 s of DTW word-boundary drift, TEXT is
+always identical, and every DIRECT (non-libtest) invocation is bit-stable.
+
+**DISPOSITION: investigation PARKED, not a code defect.** The self-diagnosing CI test
+(tie-break outlier side + max |Δt| + per-worker MXCSR) is the permanent tripwire — the
+next NATURAL suite failure emits full diagnostics for free. **Retry predicate:** re-open
+ONLY if (1) a tripwire capture shows a non-default MXCSR or a |Δt| > 0.1 s (would
+upgrade to a real defect), or (2) the drift is ever observed in a SINGLE-transcribe
+production run (`fw transcribe`, not the test harness). Until then: do NOT spend more
+cycles on synthetic reproduction — it is exhausted (4 configs, 14/14). See the
+2026-07-22 narrowing entry below for the MXCSR/tie-break evidence.
+
+---
 ## 2026-07-22 - WhiteCreek: **bd-0ivd MAJOR NARROWING — tripwire verdicts 6/6: run *b* is ALWAYS the outlier and the tie-break `c` ALWAYS matches `a` (max |Δt| 0.02-0.04 s); MXCSR/FTZ-leak class EXONERATED BY DIRECT MEASUREMENT (control bits default at every snapshot).**
 
 **Tie-break pattern (6 divergences captured across two instrument generations):**
