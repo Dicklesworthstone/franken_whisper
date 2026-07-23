@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP (byte-exact, strictly-less-work) — beam now Arc-SHARES the window-constant cross-K/V instead of deep-cloning it per hypothesis fork. Eliminates ~18 MB of memcpy per fork (immutable data); transcript BYTE-IDENTICAL; greedy path untouched. Wall-clock directionally faster on the keynote (Arc ~171–249 s vs pre-Arc 298 s) but shared-box-noisy, so the exact factor is NOT pinned.**
+
+**Change (decoder.rs).** `DecoderState`'s 7 window-constant cross-K/V fields
+(`cross_kh_t`/`cross_vh`/`cross_kh_f16`/`cross_vh_f16`/`cross_kh_i8`/`cross_vh_i8`/
+`cross_vh_i8_block`) are now `Arc<Vec<…>>`. They are immutable after `new`
+(built once; only read in `forward_step`), so a beam fork's `DecoderState::clone`
+bumps 7 refcounts instead of deep-copying ~18 MB of cross-K/V (tiny.en:
+enc_frames 1500 × n_state 384 × n_layer 4 × {K,V} × 4 B). At beam=5 × ~200
+tokens × 27 windows that removed on the order of **hundreds of GB of memcpy** on
+data that never changes. Only the growing self-attention `KvCache` is still
+deep-cloned per fork (inherent to beam; whisper.cpp does the same).
+
+**Byte-exact + validated.** `Arc<Vec<T>>` derefs to `[T]` exactly like `Vec`, and
+the greedy path never clones a `DecoderState`, so its behavior is unchanged:
+`gated_e2e_jfk_tiny_en_matches_reference` byte-exact, `clone_forwards_identically`
++ decoder suite 13/0. The keynote `retry+beam5` transcript is **byte-identical to
+the pre-Arc output** (`cmp -s`), confirming zero output change.
+
+**Perf — honest.** This is a byte-exact change that STRICTLY reduces work (Arc
+bump ≪ 18 MB memcpy), so it cannot regress — only remove copies. Wall-clock is
+directionally faster (two Arc runs 171 s / 249 s vs the pre-Arc single 298 s on
+the 840 s keynote) but the shared box has high variance, so I do NOT claim a
+precise factor (would need a quiet-box min-of-N, CV<5%). The KEEP rests on
+byte-exactness + provable work elimination, not the noisy wall number.
+
+**Residual gap + next lever.** Native retry+beam is still slower than
+`whisper-cli -bs 5` (RTF 0.044). The remaining per-fork cost is the self-attn
+`KvCache` clone, which copies the FULL `capacity_tokens` buffer even though only
+`len` tokens are populated — cloning only the populated prefix is the next
+byte-exact beam-perf lever.
+
+---
 ## 2026-07-23 - WhiteCreek: **COMPETITIVE MEASUREMENT (honest, bounds the "native dominates" claim) — at MATCHED quality on long-form, native is 8× SLOWER than whisper.cpp: native `retry+beam5` RTF 0.355 (298 s wall) vs `whisper-cli -bs 5` RTF 0.044 (37 s wall) on the 840 s keynote (tiny.en). The README "2.33× faster" holds for GREEDY short clips only; native's quality-matched long-form path is not competitive.**
 
 **Measured (same host, tiny.en, Steve Jobs keynote 840.5 s):**

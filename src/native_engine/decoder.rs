@@ -57,6 +57,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use ft_core::Float16;
@@ -821,10 +823,11 @@ impl DecoderWeights {
 /// beam that expands into several children needs its self-attention KV state
 /// duplicated. A clone is a faithful fork — a cloned state forwards the same
 /// token to bit-identical logits (pinned by `clone_forwards_identically`).
-/// NOTE: cloning also duplicates the window-constant cross-K/V (~`enc_frames ×
-/// n_state × n_layer` per copy); a future beam decoder should share that via a
-/// reference/Arc rather than clone it per hypothesis. Not cloned anywhere on the
-/// greedy production path (byte-exact unaffected).
+/// The window-constant cross-K/V fields are `Arc`-shared (immutable after
+/// `new`), so a beam fork bumps a refcount instead of deep-copying ~18 MB of
+/// cross-K/V per hypothesis — only the growing self-attention `kv` is deep-cloned
+/// (bd-6goy beam perf; NEGATIVE_EVIDENCE 2026-07-23). Greedy never clones, so its
+/// behavior is byte-identical (`Arc<Vec<T>>` derefs to `[T]` exactly like `Vec`).
 #[derive(Debug, Clone)]
 pub struct DecoderState {
     /// One self-attention KV cache per layer.
@@ -835,10 +838,10 @@ pub struct DecoderState {
     /// gather are hoisted here once at construction instead of being rebuilt
     /// every decode step (a large per-step scatter on wide models — `enc_frames`
     /// is ~1500). Byte-for-byte the per-step gather the old path produced.
-    cross_kh_t: Vec<Mat>,
+    cross_kh_t: Arc<Vec<Mat>>,
     /// Per-`(layer, head)` gathered cross-value head `[enc_frames, d_head]`
     /// (in `layer * n_head + head` order). See [`Self::cross_kh_t`].
-    cross_vh: Vec<Mat>,
+    cross_vh: Arc<Vec<Mat>>,
     /// f16 cross-attention K/V (bd-b4hp): natural cross-key `[enc_frames, d_head]`
     /// and transposed cross-value `[d_head, enc_frames]`, per `(layer, head)`.
     /// These layouts let the per-step cross path run the existing `nn::gemv_f16`
@@ -846,18 +849,18 @@ pub struct DecoderState {
     /// f32 `nn::matmul` path AND no dead scores zero-init (the f32 m=1 matmul
     /// `vec![0.0; enc_frames]`s a ~1500-elt buffer per head/token). Default path;
     /// `FW_CROSS_F16=0` falls back to the f32 `cross_kh_t`/`cross_vh` above.
-    cross_kh_f16: Vec<Vec<Float16>>,
-    cross_vh_f16: Vec<Vec<Float16>>,
+    cross_kh_f16: Arc<Vec<Vec<Float16>>>,
+    cross_vh_f16: Arc<Vec<Vec<Float16>>>,
     /// int8/Q8 copies of `cross_kh_f16`/`cross_vh_f16` (same layout, per head),
     /// built when [`int8_cross_kv_enabled`] is on. Empty ⇒ f16 path. Halves the
     /// per-token DRAM read of the encoder K/V. See [`int8_cross_kv_enabled`].
-    cross_kh_i8: Vec<nn::I8Mat>,
-    cross_vh_i8: Vec<nn::I8Mat>,
+    cross_kh_i8: Arc<Vec<nn::I8Mat>>,
+    cross_vh_i8: Arc<Vec<nn::I8Mat>>,
     /// BLOCK-WISE int8 copy of `cross_vh_f16` (per head), built when
     /// [`cross_v_block_enabled`] is on. Empty ⇒ the per-row `cross_vh_i8` (or f16)
     /// V path runs. Finer enc-frames scales than `cross_vh_i8` + f32 activation via
     /// [`nn::gemv_i8w_f32a_blocked`]. See [`cross_v_block_enabled`].
-    cross_vh_i8_block: Vec<nn::I8BlockMat>,
+    cross_vh_i8_block: Arc<Vec<nn::I8BlockMat>>,
     /// Number of tokens currently in the self-attention cache.
     len: usize,
     /// Number of encoder frames (cross-attention key/value length).
@@ -1111,13 +1114,15 @@ impl DecoderState {
 
         Ok(Self {
             kv,
-            cross_kh_t,
-            cross_vh,
-            cross_kh_f16,
-            cross_vh_f16,
-            cross_kh_i8,
-            cross_vh_i8,
-            cross_vh_i8_block,
+            // Window-constant + immutable after construction ⇒ Arc-shared so beam
+            // forks bump a refcount instead of deep-copying the cross-K/V.
+            cross_kh_t: Arc::new(cross_kh_t),
+            cross_vh: Arc::new(cross_vh),
+            cross_kh_f16: Arc::new(cross_kh_f16),
+            cross_vh_f16: Arc::new(cross_vh_f16),
+            cross_kh_i8: Arc::new(cross_kh_i8),
+            cross_vh_i8: Arc::new(cross_vh_i8),
+            cross_vh_i8_block: Arc::new(cross_vh_i8_block),
             len: 0,
             enc_frames,
             n_state: w.n_state,
