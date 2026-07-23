@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **COMPETITIVE MEASUREMENT (honest, bounds the "native dominates" claim) — at MATCHED quality on long-form, native is 8× SLOWER than whisper.cpp: native `retry+beam5` RTF 0.355 (298 s wall) vs `whisper-cli -bs 5` RTF 0.044 (37 s wall) on the 840 s keynote (tiny.en). The README "2.33× faster" holds for GREEDY short clips only; native's quality-matched long-form path is not competitive.**
+
+**Measured (same host, tiny.en, Steve Jobs keynote 840.5 s):**
+| engine / config | wall | RTF | quality (WER vs itself/oracle) |
+|-----------------|------|-----|-------------------------------|
+| `whisper-cli -bs 5` (its default) | **36.75 s** | **0.044** | reference |
+| native greedy (default) | ~8–10 s | ~0.01 | drops ~half (WER 0.56) |
+| native `FW_RETRY_FAILED_WINDOW=1 FW_BEAM_SIZE=5` | **298.4 s** | **0.355** | WER 0.098 (matches wc) |
+
+- Native's **quality-matched** config is **~8× slower** than whisper.cpp beam=5. The
+  fast native path (greedy) is low-quality on hard long-form (drops half); the
+  quality path (retry+beam) is slow. whisper.cpp gets BOTH in its default.
+- **Likely dominant cause — beam clones the full `DecoderState` per hypothesis fork,
+  INCLUDING the window-constant cross-K/V** (~18 MB/clone for tiny.en: enc_frames
+  1500 × n_state 384 × n_layer 4 × {K,V} × 4 B). At beam=5 that is up to ~90 MB of
+  cross-K/V copy per token, ~200 tokens/window, 27 windows — pure allocator/memcpy
+  churn on immutable data. whisper.cpp shares its cross-K/V across the beam. This is
+  the `DecoderState::Clone` doc's flagged follow-up.
+- **THE mission lever (dominate realistic long-form):** make beam share the
+  window-constant cross-K/V (wrap the cross-K/V fields in `Arc`, or thread them
+  separately from the per-beam self-attn KV) so a fork is an `Arc` bump + a real
+  clone of only the growing self-attn `KvCache`. **Byte-exact by construction**
+  (cross-K/V is immutable during decode; sharing changes no values), greedy path
+  untouched (it never clones). Expected to remove most of the ~3.6× beam overhead
+  beyond the inherent 5× MACs, bringing native beam toward whisper.cpp's RTF.
+
+**Retry predicate / next step:** implement the cross-K/V `Arc`-share, re-measure
+native retry+beam RTF on the keynote vs the 0.355 baseline here (target: approach
+whisper.cpp's 0.044), golden byte-exact throughout.
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP — CORRECTION/PROOF (supersedes the "hypothesis refuted" entry below): beam search IS a demonstrated WER win on HARD audio — `FW_BEAM_SIZE=5` cuts tiny.en WER 0.1044 → 0.0984 on the Steve Jobs iPhone keynote (810 s, drop-removed), crossing BELOW the 0.10 native-rollout gate that greedy fails. Deterministic. My earlier "refuted" was a wrong-clip artifact.**
 
 **Why the earlier entry was wrong.** The 2026-07-23 "hypothesis refuted" conclusion
