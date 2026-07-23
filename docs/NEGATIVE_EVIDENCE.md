@@ -4,6 +4,38 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP (bd-4slu / bd-frp7 gap fill, byte-safe pure addition) — first-class `word_error_rate` in `src/conformance.rs`; the WER gate the whole epic is defined against previously had NO in-tree implementation. Validated to reproduce the 2026-07-23 long-form verdict EXACTLY (0.528 / 0.164 / 0.192).**
+
+**Gap.** bd-frp7's success criterion and `docs/native_engine_contract.md` §2.2 are
+stated as "WER ≤ 0.10", but `compare_shadow_run` only compared segment TIMESTAMPS +
+replay hashes — grep confirmed **zero** `wer`/`word_error`/`levenshtein` in
+`src/conformance.rs`. The 2026-07-23 quality verdict had to compute WER in
+out-of-tree scratchpad Python.
+
+**Landed.** `pub fn word_error_rate(reference, hypothesis) -> WerReport` +
+`WerReport { reference_words, hypothesis_words, edits, wer, within(max) }`. Standard
+ASR normalization (lowercase, keep ASCII-alphanumeric + intra-word apostrophe,
+collapse whitespace) then unit-cost word Levenshtein (O(min(n,m)) rolling row).
+Pure addition — no existing path calls it, so behavior is byte-unchanged; 6 unit
+tests (identity, normalization, ins/del/sub, empty-reference edges, >1.0 overflow,
+and a long-form-verdict direction/gating fixture); conformance suite 91/0; fleet
+clippy clean.
+
+**Validation (the important part).** A standalone Rust reimplementation of the exact
+in-tree algorithm, run on the REAL captured transcripts from the 2026-07-23 verdict,
+reproduces the scratchpad-Python numbers **to 4 decimals**: greedy 0.5280, retry
+0.1640, temp-fallback 0.1920 — so the in-tree metric and the hand verdict agree by
+construction, not just in the compact fixture.
+
+**Deliberately NOT done (scope discipline):** wiring WER into `ShadowRunReport` /
+`passes_gate`. That changes gate semantics (the shadow gate is currently
+`require_text_exact`; a WER gate is the LOOSER native-rollout tolerance profile) and
+touches shared callers + their tests — a separate, larger change. Natural follow-up:
+add a `text_wer` field + a `max_wer` knob to the native-rollout tolerance profile so
+the DISC-003 "WER ≤ 0.10 / timestamps ≤ 0.3 s" gate is enforced in code, not just
+documented.
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP-EVIDENCE (bd-r0qd / bd-6goy quality verdict) — `FW_TEMP_FALLBACK` is a REAL 2.75× WER improvement, not char-count hallucination: vs whisper.cpp (tiny.en, beam=5) on the long-form drop clip, native greedy = WER 0.528, native temp-fallback = WER 0.192. This is the quantified case for the owner's default-on flip.**
 
 **Method (honest, reproducible).** whisper.cpp is the reference oracle:
