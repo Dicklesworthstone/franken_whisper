@@ -608,6 +608,230 @@ struct WindowCandidate {
     no_speech_prob: f64,
 }
 
+/// `FW_BEAM_SIZE` (default `1` = greedy): whisper.cpp's `beam_search.beam_size`
+/// (`whisper-cli -bs`, default 5). Values `> 1` decode each temp-0 window with
+/// beam search — keep the `n` highest cumulative-logprob hypotheses per step,
+/// select the best length-normalized [`sequence_score`] at the end — instead of
+/// argmax. This is the DISC-003 revisit lever: beam closes the greedy-vs-beam
+/// WER gap (measured residual ~0.06 on the long-form clip, 2026-07-23). `1`
+/// restores the exact greedy path ⇒ byte-identical by construction. Clamped to
+/// `[1, 8]`. Read once; consulted only when a window decodes at temperature 0
+/// (the ladder's `t > 0` rungs stay on the sampling path).
+fn beam_size() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_BEAM_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |n| n.clamp(1, 8))
+    })
+}
+
+/// A window's decode result — `(decoded, plogs, has_ts, seek_delta_cs,
+/// result_len)` — the tuple both the greedy loop and [`beam_decode_window`]
+/// produce for the shared downstream (segment build, DTW, prompt carry).
+type WindowDecode = (Vec<i32>, Vec<f32>, bool, i64, usize);
+
+/// One beam-search hypothesis: its own self-attention KV state (an independent
+/// [`DecoderState`] fork), the tokens decoded so far, their per-token logprobs,
+/// the running cumulative logprob (the during-search ranking key), and the
+/// window bookkeeping (`has_ts`/`seek_delta_cs`/`result_len`) that mirrors the
+/// greedy loop's per-token state. `next_logits` are the raw logits to
+/// `process_logits` at the next expansion (the prefill logits for the seed).
+struct BeamHyp {
+    state: DecoderState,
+    tokens: Vec<i32>,
+    plogs: Vec<f32>,
+    sum_logprob: f64,
+    has_ts: bool,
+    seek_delta_cs: i64,
+    result_len: usize,
+    next_logits: Vec<f32>,
+}
+
+/// Indices of the `k` largest values in `logprobs`, skipping `-inf` (masked)
+/// lanes, best-first. Partial selection (not a full sort) over the vocab.
+fn top_k_logprob_indices(logprobs: &[f32], k: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..logprobs.len())
+        .filter(|&i| logprobs[i] > f32::NEG_INFINITY)
+        .collect();
+    let k = k.min(idx.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    // select_nth then sort the head: O(n) partition + O(k log k) on the head.
+    idx.select_nth_unstable_by(k - 1, |&a, &b| {
+        logprobs[b]
+            .partial_cmp(&logprobs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.truncate(k);
+    idx.sort_unstable_by(|&a, &b| {
+        logprobs[b]
+            .partial_cmp(&logprobs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    idx
+}
+
+/// Beam-search decode of one window (temperature 0), the `FW_BEAM_SIZE > 1`
+/// replacement for the greedy inner loop. `st` is the prompt-prefilled decoder
+/// state (borrowed — left intact for the caller's DTW re-forward, which shares
+/// the same window-constant cross-K/V); `prefill_logits` are its next-token
+/// logits. Returns the winning hypothesis's `(decoded, plogs, has_ts,
+/// seek_delta_cs, result_len)` — exactly the tuple the greedy loop produces, so
+/// all downstream handling is shared.
+///
+/// The per-token timestamp / EOT / budget / backward-bail rules DUPLICATE the
+/// greedy loop (whisper.cpp 7362-7410) rather than refactor it, so the greedy
+/// path stays byte-identical. During search, hypotheses are ranked by cumulative
+/// logprob (whisper's beam ranking); the final winner is the best
+/// length-normalized [`sequence_score`] over completed hypotheses (falling back
+/// to the best still-active one when none completed — the greedy "accept the
+/// last decode" analog).
+#[allow(clippy::too_many_arguments)]
+fn beam_decode_window(
+    m: &LoadedModel,
+    st: &DecoderState,
+    prefill_logits: Vec<f32>,
+    tk: &Tokenizer,
+    cfg: &FilterConfig,
+    params: &DecodeParams,
+    seek_cs: i64,
+    seek_end_cs: i64,
+    n_max_tokens: usize,
+    user_max_tokens: Option<usize>,
+    beam: usize,
+    checkpoint: &dyn Fn() -> FwResult<()>,
+) -> FwResult<WindowDecode> {
+    let mut active: Vec<BeamHyp> = vec![BeamHyp {
+        state: st.clone(),
+        tokens: Vec::new(),
+        plogs: Vec::new(),
+        sum_logprob: 0.0,
+        has_ts: false,
+        seek_delta_cs: CHUNK_CS,
+        result_len: 0,
+        next_logits: prefill_logits,
+    }];
+    // Completed hypotheses as lightweight [`WindowDecode`] tuples — no decoder
+    // state (a terminated hypothesis is never forwarded again), so completing a
+    // beam costs no cross-K/V clone.
+    let mut finished: Vec<WindowDecode> = Vec::new();
+
+    for i in 0..n_max_tokens {
+        if active.is_empty() {
+            break;
+        }
+        checkpoint()?;
+
+        // Expand every active hypothesis by its top-`beam` next tokens (ranked by
+        // logprob); collect (parent index, token, plog, cumulative score).
+        let mut cands: Vec<(usize, i32, f32, f64)> = Vec::new();
+        for (hi, hyp) in active.iter_mut().enumerate() {
+            let raw = std::mem::take(&mut hyp.next_logits);
+            let (_filtered, logprobs) =
+                process_logits(tk, cfg, raw, &hyp.tokens, hyp.has_ts, hyp.seek_delta_cs, i);
+            for tok_idx in top_k_logprob_indices(&logprobs, beam) {
+                let lp = logprobs[tok_idx];
+                let tok = i32::try_from(tok_idx).unwrap_or(0);
+                cands.push((hi, tok, lp, hyp.sum_logprob + f64::from(lp)));
+            }
+        }
+        if cands.is_empty() {
+            break;
+        }
+        // Keep the top-`beam` expansions by cumulative logprob (ties: lower parent
+        // then lower token, for determinism).
+        cands.sort_by(|a, b| {
+            b.3.partial_cmp(&a.3)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.cmp(&b.1))
+        });
+        cands.truncate(beam);
+
+        let mut next_active: Vec<BeamHyp> = Vec::with_capacity(beam);
+        for (hi, tok, plog, new_sum) in cands {
+            let parent = &active[hi];
+            let mut tokens = parent.tokens.clone();
+            tokens.push(tok);
+            let mut plogs = parent.plogs.clone();
+            plogs.push(plog);
+            let mut has_ts = parent.has_ts;
+            let mut seek_delta_cs = parent.seek_delta_cs;
+            let mut result_len = parent.result_len;
+
+            // Timestamp update (mirrors greedy, whisper.cpp 7362-7375).
+            let mut bail = false;
+            if tok > tk.timestamp_begin {
+                let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
+                if has_ts && seek_delta_cs > new_delta && result_len < i {
+                    bail = true; // going back in time: terminate this hypothesis
+                } else {
+                    seek_delta_cs = new_delta;
+                    result_len = i + 1;
+                    has_ts = true;
+                }
+            }
+
+            let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
+            let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+            let terminate = bail || tok == tk.eot || budget_reached || reached_end;
+
+            if terminate {
+                if !bail {
+                    if result_len == 0 && params.timestamps && reached_end {
+                        result_len = i + 1;
+                    }
+                    if !params.timestamps {
+                        result_len = i + 1;
+                        seek_delta_cs = CHUNK_CS;
+                    }
+                }
+                finished.push((tokens, plogs, has_ts, seek_delta_cs, result_len));
+            } else {
+                let mut state = parent.state.clone();
+                let next_logits =
+                    decoder::forward_step(&m.decoder, &mut state, &[tok], checkpoint)?;
+                next_active.push(BeamHyp {
+                    state,
+                    tokens,
+                    plogs,
+                    sum_logprob: new_sum,
+                    has_ts,
+                    seek_delta_cs,
+                    result_len,
+                    next_logits,
+                });
+            }
+        }
+        active = next_active;
+    }
+
+    // Winner: best length-normalized sequence score among completed hypotheses;
+    // if none completed (ran to the token cap), the best still-active hypothesis.
+    let pool: Vec<WindowDecode> = if finished.is_empty() {
+        active
+            .into_iter()
+            .map(|h| (h.tokens, h.plogs, h.has_ts, h.seek_delta_cs, h.result_len))
+            .collect()
+    } else {
+        finished
+    };
+    let best = pool
+        .into_iter()
+        .max_by(|a, b| {
+            sequence_score(&a.1, a.4)
+                .partial_cmp(&sequence_score(&b.1, b.4))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("beam pool is non-empty (seed hypothesis always present)");
+    Ok(best)
+}
+
 /// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
 /// (matching the scalar `l > -inf` guard). AVX2 degree-5 poly exp: range-reduce
 /// `x = k·ln2 + r`, `exp(r)` via Horner, `2^k` by float-bit construction. Numerics-
@@ -1612,83 +1836,113 @@ pub fn transcribe_samples(
                     })
             };
 
-            // Greedy decode loop.
+            // Decode loop. `FW_BEAM_SIZE > 1` runs beam search for the
+            // temperature-0 pass; the `t > 0` fallback rungs (`window_temp > 0`)
+            // stay on the greedy sampling path. `beam_size() == 1` (default) ⇒ the
+            // greedy branch always runs ⇒ byte-identical to the pre-beam engine.
             let t_loop = std::time::Instant::now();
-            let mut decoded: Vec<i32> = Vec::new();
-            let mut plogs: Vec<f32> = Vec::new();
-            let mut has_ts = false;
-            let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
-            let mut result_len = 0usize;
-            let mut step_logits = prefill_logits;
-            // Deterministic per-(window, rung, candidate) sampling stream
-            // (FW_TEMP_FALLBACK): only ever drawn from when `window_temp > 0.0`.
-            // Candidate 0 of every rung matches the pre-best_of stream exactly,
-            // so `FW_TEMP_BEST_OF=1` reproduces the single-candidate ladder
-            // byte-for-byte.
-            let mut sample_rng: u64 = 0x5851_F42D_4C95_7F2D
-                ^ (seek_cs as u64)
-                ^ ((temp_attempt as u64) << 48)
-                ^ ((cand_idx as u64) << 40);
-
-            for i in 0..n_max_tokens {
-                let (filtered, logprobs) = process_logits(
+            let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if beam_size() > 1
+                && window_temp == 0.0
+            {
+                // `st` is left intact (beam clones per hypothesis) for the DTW
+                // re-forward below, which shares this window's cross-K/V.
+                beam_decode_window(
+                    m,
+                    &st,
+                    prefill_logits,
                     tk,
                     &cfg,
-                    step_logits,
-                    &decoded,
-                    has_ts,
-                    seek_delta_cs,
-                    decoded.len(),
-                );
-                let (tok, plog) = if window_temp > 0.0 {
-                    sample_token_at_temperature(&filtered, &logprobs, window_temp, &mut sample_rng)
-                } else {
-                    argmax(&filtered, &logprobs)
-                };
-                decoded.push(tok);
-                plogs.push(plog);
+                    params,
+                    seek_cs,
+                    seek_end_cs,
+                    n_max_tokens,
+                    user_max_tokens,
+                    beam_size(),
+                    checkpoint,
+                )?
+            } else {
+                let mut decoded: Vec<i32> = Vec::new();
+                let mut plogs: Vec<f32> = Vec::new();
+                let mut has_ts = false;
+                let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
+                let mut result_len = 0usize;
+                let mut step_logits = prefill_logits;
+                // Deterministic per-(window, rung, candidate) sampling stream
+                // (FW_TEMP_FALLBACK): only ever drawn from when `window_temp > 0.0`.
+                // Candidate 0 of every rung matches the pre-best_of stream exactly,
+                // so `FW_TEMP_BEST_OF=1` reproduces the single-candidate ladder
+                // byte-for-byte.
+                let mut sample_rng: u64 = 0x5851_F42D_4C95_7F2D
+                    ^ (seek_cs as u64)
+                    ^ ((temp_attempt as u64) << 48)
+                    ^ ((cand_idx as u64) << 40);
 
-                // Update sliding window from a timestamp token (whisper.cpp 7362-7375).
-                if tok > tk.timestamp_begin {
-                    let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
-                    if has_ts && seek_delta_cs > new_delta && result_len < i {
-                        // Going back in time: bail out of this window (whisper.cpp 7366-7369).
-                        break;
-                    }
-                    seek_delta_cs = new_delta;
-                    result_len = i + 1;
-                    has_ts = true;
-                }
+                for i in 0..n_max_tokens {
+                    let (filtered, logprobs) = process_logits(
+                        tk,
+                        &cfg,
+                        step_logits,
+                        &decoded,
+                        has_ts,
+                        seek_delta_cs,
+                        decoded.len(),
+                    );
+                    let (tok, plog) = if window_temp > 0.0 {
+                        sample_token_at_temperature(
+                            &filtered,
+                            &logprobs,
+                            window_temp,
+                            &mut sample_rng,
+                        )
+                    } else {
+                        argmax(&filtered, &logprobs)
+                    };
+                    decoded.push(tok);
+                    plogs.push(plog);
 
-                // End of segment (whisper.cpp 7387-7410). `budget_reached` is the
-                // `params.max_tokens > 0 && i >= params.max_tokens` clause: the
-                // EOT-forcing filter masked text from sampled-token index `mt`
-                // onward, so the token at index `i == mt` is the forced closer and
-                // the window completes here with `decoded.len() == mt + 1`.
-                let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-                let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
-                if tok == tk.eot || budget_reached || reached_end {
-                    if result_len == 0 && params.timestamps {
-                        if reached_end {
-                            result_len = i + 1;
-                        } else {
-                            // Decoder failed with no timestamps closed.
+                    // Update sliding window from a timestamp token (whisper.cpp 7362-7375).
+                    if tok > tk.timestamp_begin {
+                        let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
+                        if has_ts && seek_delta_cs > new_delta && result_len < i {
+                            // Going back in time: bail out of this window (whisper.cpp 7366-7369).
                             break;
                         }
-                    }
-                    if !params.timestamps {
+                        seek_delta_cs = new_delta;
                         result_len = i + 1;
-                        seek_delta_cs = CHUNK_CS;
+                        has_ts = true;
                     }
-                    break;
+
+                    // End of segment (whisper.cpp 7387-7410). `budget_reached` is the
+                    // `params.max_tokens > 0 && i >= params.max_tokens` clause: the
+                    // EOT-forcing filter masked text from sampled-token index `mt`
+                    // onward, so the token at index `i == mt` is the forced closer and
+                    // the window completes here with `decoded.len() == mt + 1`.
+                    let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
+                    let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+                    if tok == tk.eot || budget_reached || reached_end {
+                        if result_len == 0 && params.timestamps {
+                            if reached_end {
+                                result_len = i + 1;
+                            } else {
+                                // Decoder failed with no timestamps closed.
+                                break;
+                            }
+                        }
+                        if !params.timestamps {
+                            result_len = i + 1;
+                            seek_delta_cs = CHUNK_CS;
+                        }
+                        break;
+                    }
+
+                    // Cancellation between every decoder step (the project contract).
+                    checkpoint()?;
+
+                    // Forward the just-chosen token to get the next logits.
+                    step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
                 }
-
-                // Cancellation between every decoder step (the project contract).
-                checkpoint()?;
-
-                // Forward the just-chosen token to get the next logits.
-                step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
-            }
+                (decoded, plogs, has_ts, seek_delta_cs, result_len)
+            };
 
             // avg_logprob over result tokens (whisper.cpp 6602-6617).
             let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
@@ -2624,6 +2878,32 @@ mod tests {
             sequence_score(&[f32::NEG_INFINITY, -1.0], 2),
             EMPTY_WINDOW_AVG_LOGPROB
         );
+    }
+
+    #[test]
+    fn top_k_logprob_indices_selects_best_first_skipping_masked() {
+        // The beam-expansion primitive: the k largest logprobs, best-first,
+        // masked (-inf) lanes excluded. Ties break by lower index (determinism).
+        let lp = vec![-3.0f32, -0.5, f32::NEG_INFINITY, -1.0, -0.5, -9.0];
+        assert_eq!(top_k_logprob_indices(&lp, 3), vec![1, 4, 3]); // -0.5(i1), -0.5(i4), -1.0(i3)
+        assert_eq!(top_k_logprob_indices(&lp, 1), vec![1]);
+        // k larger than the finite lane count clamps to the available lanes
+        // (the -inf lane at index 2 is never returned).
+        assert_eq!(top_k_logprob_indices(&lp, 10), vec![1, 4, 3, 0, 5]);
+        // All-masked and k=0 both yield nothing.
+        assert!(top_k_logprob_indices(&[f32::NEG_INFINITY; 4], 3).is_empty());
+        assert!(top_k_logprob_indices(&lp, 0).is_empty());
+        assert!(top_k_logprob_indices(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn beam_size_default_is_one() {
+        // Default (unset) must be 1 so the greedy path runs unless FW_BEAM_SIZE
+        // is explicitly set — the byte-exact-by-construction guarantee. (The
+        // OnceLock reads the env once; in a clean test process it is unset.)
+        if std::env::var_os("FW_BEAM_SIZE").is_none() {
+            assert_eq!(beam_size(), 1);
+        }
     }
 
     #[test]

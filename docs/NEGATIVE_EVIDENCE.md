@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP as CAPABILITY (bd-6goy last residual, gated default-off, byte-exact default) + HYPOTHESIS REFUTED — `FW_BEAM_SIZE` beam search is correct and whisper.cpp-faithful (jfk beam=5 == greedy == whisper.cpp, deterministic), BUT it does NOT close the long-form WER gap: my 2026-07-23 "beam closes 0.16→0.10" hypothesis is WRONG on the available clip.**
+
+**What landed (decode.rs only).** `FW_BEAM_SIZE` (default 1 = greedy; `> 1`
+clamped to ≤8) runs whisper.cpp-style beam search on the temperature-0 pass:
+keep the `n` highest cumulative-logprob hypotheses per step (each an independent
+`DecoderState` fork via the [`clone_forwards_identically`]-proven Clone
+primitive, sharing the window-constant cross-K/V), pick the best
+length-normalized [`sequence_score`] at the end. The per-token
+timestamp/EOT/budget/backward-bail rules DUPLICATE the greedy loop (greedy path
+untouched). The `t > 0` temp-fallback rungs stay on the sampling path (beam gates
+on `window_temp == 0.0`). Helpers: `top_k_logprob_indices` (partial-select),
+`WindowDecode` tuple alias, `BeamHyp`.
+
+**Correctness PROVEN.** (a) `beam_size()` default 1 ⇒ greedy branch ⇒
+**jfk golden byte-exact** (`gated_e2e_jfk_tiny_en_matches_reference` green);
+decode suite 50/0 + `top_k_logprob_indices` / `beam_size_default_is_one` unit
+tests. (b) On EASY audio beam CONVERGES to the reference: `FW_BEAM_SIZE=5` on jfk
+produces output **identical to greedy AND to whisper.cpp** (md5 `be4284a9…`).
+(c) Deterministic (beam=5 jfk md5-identical across runs). Fleet clippy: my region
+clean (the gate is externally blocked — see the toolchain entry below).
+
+**HYPOTHESIS REFUTED (the honest negative).** The 2026-07-23 WER verdict
+speculated beam closes the track01 residual (`FW_RETRY_FAILED_WINDOW` 0.164 vs
+the 0.10 gate). **MEASURED (whisper.cpp beam=5 oracle, tiny.en, track01 TS):**
+| arm | WER | words | note |
+|-----|-----|-------|------|
+| greedy | 0.528 | 125/250 | drops ~half |
+| `FW_BEAM_SIZE=5` | **0.528** | 136/250 | **NO improvement** |
+| `FW_RETRY_FAILED_WINDOW` | 0.164 | 246/250 | prompt-reset recovery |
+| `FW_BEAM_SIZE=5` + retry | **0.164** | 254/250 | same WER as retry alone |
+The reason: track01's error is content-DROP (the carried-prompt × int8 early-EOT,
+a prompt-*conditioning* failure), which beam AT TEMP 0 WITH THE PROMPT also
+suffers — every hypothesis early-EOTs, so beam picks the least-bad drop. beam
+does NOT address prompt-conditioning; only the prompt reset does. On the
+recovered content beam and greedy pick near-identical words (beam+retry adds a
+few words at the same edit distance). **So beam's word-choice benefit is real in
+principle (that is what beam search does, and it converges to wc on jfk) but is
+NOT demonstrable on the on-box clips** — jfk is too easy (identical), track01 is
+drop-dominated. Demonstrating a WER *win* needs a harder-audio corpus where
+greedy makes word-choice errors.
+
+**Perf.** ~`beam_size`× slower (track01 RTF 0.135 at beam=5 vs 0.008 greedy) —
+inherent, gated default-off.
+
+**Disposition.** LANDED as a correct, gated, whisper.cpp-faithful CAPABILITY that
+closes the DISC-003 beam-search gap and completes bd-6goy's decode surface
+(temp-fallback + best_of + entropy + beam). It is NOT a demonstrated WER win on
+available data; do not claim one. **Retry predicate for a WER-win claim:** a
+harder-audio clip (or corpus) where greedy word-choice WER > 0 and beam reduces
+it — then re-measure vs the whisper.cpp oracle.
+
+---
 ## 2026-07-23 - WhiteCreek: **BLOCKER (fleet-wide, toolchain churn) — `cargo clippy -D warnings` is RED across the codebase after the floating nightly advanced (~2026-07-21+); ~34 NEWLY-promoted lints on PRE-EXISTING code, spanning multiple agents' files. My own increments are clippy-clean (verified per-file on the fleet); the gate cannot go green without a coordinated sweep or a toolchain pin.**
 
 **What.** The fleet workers (and the local nightly) now run a rustc/clippy where
