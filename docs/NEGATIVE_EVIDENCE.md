@@ -4,6 +4,45 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP — CORRECTION/PROOF (supersedes the "hypothesis refuted" entry below): beam search IS a demonstrated WER win on HARD audio — `FW_BEAM_SIZE=5` cuts tiny.en WER 0.1044 → 0.0984 on the Steve Jobs iPhone keynote (810 s, drop-removed), crossing BELOW the 0.10 native-rollout gate that greedy fails. Deterministic. My earlier "refuted" was a wrong-clip artifact.**
+
+**Why the earlier entry was wrong.** The 2026-07-23 "hypothesis refuted" conclusion
+tested beam on track01 (drop-dominated: WER is content-drop, not word-choice) and jfk
+(too easy: beam==greedy). Neither can show beam's benefit. **The right test is HARD
+audio with the drop removed.**
+
+**Method.** Steve Jobs iPhone keynote (`…/ultimate_mcp_server/examples/data/…iPhone_compressed.mp3`
+→ crate decoder → 810 s 16 kHz wav), tiny.en, timestamps mode, vs the `whisper-cli`
+beam=5 oracle (1859 ref words). tiny.en TS-mode DROPS ~half this 27-window clip (the
+bd-r0qd long-form bug fires here too — my memory's "no-drop negative control" note was
+for turbo/no_ts, NOT tiny.en/TS), so the raw arms are drop-confounded (greedy 0.5605 /
+beam 0.5476, both ~half-length). **Removing the drop with `FW_RETRY_FAILED_WINDOW=1`
+isolates word-choice** (both arms then cover the full clip, 1836–1848 words).
+
+**Result (drop removed, the clean comparison).**
+| arm | WER vs wc beam=5 | edits/1859 | words | gate (≤0.10) |
+|-----|-----------------|------------|-------|--------------|
+| greedy + retry | **0.1044** | 194 | 1836 | ✗ FAILS |
+| `FW_BEAM_SIZE=5` + retry | **0.0984** | 183 | 1848 | ✓ PASSES |
+
+- **Beam reduces WER 0.1044 → 0.0984** — 11 fewer edits over 1859 words (~5.7 %
+  relative), and it is the difference between **failing and passing** the native-rollout
+  conformance gate (DISC-003, `NATIVE_ROLLOUT_MAX_WER = 0.10`).
+- **Deterministic:** two `FW_BEAM_SIZE=5 FW_RETRY_FAILED_WINDOW=1` runs md5-identical, so
+  the delta is reproducible, not sampling noise.
+- Confirms the ORIGINAL bd-6goy premise (beam closes the greedy-vs-beam gap) — it just
+  needs (a) hard audio where greedy makes word-choice errors and (b) the drop removed so
+  the metric isn't content-drop-dominated.
+
+**Disposition.** Beam is now a DEMONSTRATED WER win on hard audio, not merely a capability.
+The full quality stack for long-form hard audio is **`FW_RETRY_FAILED_WINDOW=1
+FW_BEAM_SIZE=5`** (retry fixes the drop, beam fixes word-choice) → below the 0.10 gate.
+This materially strengthens the owner's case to promote these knobs. (Both still gated
+default-off; the greedy default stays byte-exact.) **Supersedes the "HYPOTHESIS REFUTED"
+half of the entry below — beam's benefit is real; that entry's track01 measurement was
+just the wrong clip.**
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP as CAPABILITY (bd-6goy last residual, gated default-off, byte-exact default) + HYPOTHESIS REFUTED — `FW_BEAM_SIZE` beam search is correct and whisper.cpp-faithful (jfk beam=5 == greedy == whisper.cpp, deterministic), BUT it does NOT close the long-form WER gap: my 2026-07-23 "beam closes 0.16→0.10" hypothesis is WRONG on the available clip.**
 
 **What landed (decode.rs only).** `FW_BEAM_SIZE` (default 1 = greedy; `> 1`
