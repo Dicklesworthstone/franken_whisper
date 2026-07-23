@@ -23,12 +23,20 @@ denormal-range math runs on these workers (why tiny order differences are
 VISIBLE at all), and the before-a "pristine" pattern is just ft's wholesale
 0x1f80 restore wiping sticky bits after GEMMs — an artifact, not a cause.
 
-**Probe upgrade in flight:** sibling model-LOAD churn (GgmlModel parse +
-from_ggml scoped-pool quantization + hundreds-of-MB transient allocations) —
-the last full-suite ingredient the in-probe siblings didn't mimic. Result to
-follow. Remaining live hypotheses: allocator/page-churn-coupled effect on a
-split boundary somewhere outside the swept kernels, or a shared scoped-pool
-interaction during concurrent loads.
+**Probe with model-LOAD churn siblings (GgmlModel parse + from_ggml
+scoped-pool quantization + large transient allocations, 2 encoder-forward
+siblings, taskset 0-3, 902 s run): 3/3 iterations bit-stable — mel, encoder,
+and full transcribe all bit-identical under the heaviest synthetic contention
+yet.** Running total: 11/11 probe iterations bit-stable across three sibling
+configurations (busywork / real encoder forwards / + load churn), while the
+REAL full suite reproduces at ~50-100% under the same core mask. The trigger
+is something the actual suite does that none of these mimic. **RECORDED NEXT
+INGREDIENT: a concurrent `transcribe_samples` sibling loop** (the suite runs
+the OTHER gated e2e transcribes concurrently — the one workload class the
+probe still lacks); then, if that reproduces, stage attribution is immediate.
+Until then the tripwire (outlier side + max |Δt| + per-worker MXCSR) arms
+every CI run, and the engine has passed every DIRECT determinism challenge —
+no production-reachable nondeterminism has been demonstrated.
 
 ## 2026-07-22 - cod: **KEEP (bd-oazu) — streamed router Brier diagnostics removes the temporary Vec, 3.882x median, 21/21 wins, 1.544% CV, byte-identical JSON.**
 
