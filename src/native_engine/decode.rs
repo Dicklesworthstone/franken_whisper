@@ -3609,7 +3609,35 @@ mod tests {
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
         };
+        // bd-0ivd MXCSR diagnostics: matrixmultiply's micro-kernel sets the x86
+        // FTZ/DAZ flush bits and does not restore them (documented + wrapped in
+        // ft-kernel-cpu after the frankentorch-ft-api-fullsuite-flake). If the
+        // shared rayon pool carries MIXED flush state across workers, identical
+        // decodes can land on differently-flushed threads and drift in the
+        // denormal tails (softmax underflow) — the exact transient shape this
+        // flake shows. Snapshot every pool worker's MXCSR around each run; a
+        // non-0x1f80 value (FTZ = 0x8000, DAZ = 0x40) is the smoking gun.
+        // Read-only register read, x86-gated — no memory access.
+        #[cfg(target_arch = "x86_64")]
+        #[allow(unsafe_code)]
+        fn mxcsr_now() -> u32 {
+            // SAFETY: `_mm_getcsr` reads the thread's MXCSR register; it
+            // touches no memory and has no side effects.
+            unsafe { core::arch::x86_64::_mm_getcsr() }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        fn mxcsr_now() -> u32 {
+            0x1f80
+        }
+        let pool_mxcsr = || -> Vec<u32> {
+            let mut v: Vec<u32> = rayon::broadcast(|_| mxcsr_now());
+            v.push(mxcsr_now()); // the calling (test) thread, last
+            v
+        };
+
+        let mx_a = pool_mxcsr();
         let a = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+        let mx_b = pool_mxcsr();
         let b = transcribe_samples(&model, &samples, &params, &noop).unwrap();
         if a.word_timings != b.word_timings {
             // bd-0ivd self-diagnosis: this flakes ONLY inside a full parallel
@@ -3632,12 +3660,31 @@ mod tests {
                     })
                     .fold(0.0f64, f64::max)
             };
+            let mx_c = pool_mxcsr();
+            let fmt_mx = |v: &[u32]| -> String {
+                // Compact: list only non-default entries as idx:hex, else "all-1f80".
+                let odd: Vec<String> = v
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &m)| m != 0x1f80)
+                    .map(|(i, &m)| format!("{i}:{m:#06x}"))
+                    .collect();
+                if odd.is_empty() {
+                    format!("all-1f80({})", v.len())
+                } else {
+                    odd.join(",")
+                }
+            };
             eprintln!(
-                "bd-0ivd DIVERGENCE: a==c {} | b==c {} | max|Δt| a-vs-b {:.4}s \
-                 (run the tie-break verdict + delta into the bd-0ivd ledger entry)",
+                "bd-0ivd DIVERGENCE: a==c {} | b==c {} | max|Δt| a-vs-b {:.4}s | \
+                 pool MXCSR before-a [{}] before-b [{}] after-c [{}] \
+                 (FTZ=0x8000 DAZ=0x40; non-1f80 = flush-state leak on that worker)",
                 a.word_timings == c.word_timings,
                 b.word_timings == c.word_timings,
                 max_delta(&a, &b),
+                fmt_mx(&mx_a),
+                fmt_mx(&mx_b),
+                fmt_mx(&mx_c),
             );
         }
         assert_eq!(a.word_timings, b.word_timings);
@@ -3675,6 +3722,7 @@ mod tests {
         // insufficient (5/5 bit-stable, 2026-07-22), matching the finding that
         // only the full suite's heavy sibling mix triggers the flake.
         let sibling_mel = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
+        let model_path = super::super::find_model_file("tiny.en");
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 let stopr = &stop;
@@ -3691,6 +3739,20 @@ mod tests {
                             4,
                             &noop,
                         );
+                    }
+                });
+            }
+            // Full-suite ingredient the encoder siblings don't cover: repeated
+            // MODEL LOADS (GgmlModel parse + from_ggml weight quantization on a
+            // SCOPED worker pool + ~hundreds of MB of transient allocations) —
+            // the allocator/page churn every real suite run has.
+            if let Some(path) = model_path.as_deref() {
+                let stopr = &stop;
+                scope.spawn(move || {
+                    while !stopr.load(Ordering::Relaxed) {
+                        if let Ok(g) = GgmlModel::load(path) {
+                            let _ = LoadedModel::from_ggml(g);
+                        }
                     }
                 });
             }

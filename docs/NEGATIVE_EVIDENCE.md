@@ -4,6 +4,32 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-22 - WhiteCreek: **bd-0ivd MAJOR NARROWING — tripwire verdicts 6/6: run *b* is ALWAYS the outlier and the tie-break `c` ALWAYS matches `a` (max |Δt| 0.02-0.04 s); MXCSR/FTZ-leak class EXONERATED BY DIRECT MEASUREMENT (control bits default at every snapshot).**
+
+**Tie-break pattern (6 divergences captured across two instrument generations):**
+`a==c true | b==c false` in EVERY case — there is a CANONICAL result; the
+second transcribe deviates transiently and the third returns to canonical.
+P(6/6 one-sided | random outlier) < 2 % ⇒ the mechanism is tied to the test's
+mid-life instant, not symmetric scheduling noise.
+
+**MXCSR instrumentation (rayon::broadcast snapshot of every pool worker before
+run a / before run b / after tie-break c, landed in the tripwire):** control
+bits (FTZ 0x8000 / DAZ 0x40 / rounding) are **0x1f80-default on every worker at
+every snapshot** ⇒ the matrixmultiply FTZ-leak class — documented + wrapped in
+ft-kernel-cpu after their own `frankentorch-ft-api-fullsuite-flake` — is NOT
+our mechanism (their `sgemm_mm`/`dgemm_mm` per-call restore holds). Only STICKY
+flags differ (0x20/0x30 = inexact/underflow history): proof that
+denormal-range math runs on these workers (why tiny order differences are
+VISIBLE at all), and the before-a "pristine" pattern is just ft's wholesale
+0x1f80 restore wiping sticky bits after GEMMs — an artifact, not a cause.
+
+**Probe upgrade in flight:** sibling model-LOAD churn (GgmlModel parse +
+from_ggml scoped-pool quantization + hundreds-of-MB transient allocations) —
+the last full-suite ingredient the in-probe siblings didn't mimic. Result to
+follow. Remaining live hypotheses: allocator/page-churn-coupled effect on a
+split boundary somewhere outside the swept kernels, or a shared scoped-pool
+interaction during concurrent loads.
+
 ## 2026-07-22 - cod: **KEEP (bd-oazu) — streamed router Brier diagnostics removes the temporary Vec, 3.882x median, 21/21 wins, 1.544% CV, byte-identical JSON.**
 
 This is the admissible retry of the earlier `bd-kdg7.3` RCH blocker. Before
