@@ -29,11 +29,16 @@ the 840 s keynote) but the shared box has high variance, so I do NOT claim a
 precise factor (would need a quiet-box min-of-N, CV<5%). The KEEP rests on
 byte-exactness + provable work elimination, not the noisy wall number.
 
-**Residual gap + next lever.** Native retry+beam is still slower than
-`whisper-cli -bs 5` (RTF 0.044). The remaining per-fork cost is the self-attn
-`KvCache` clone, which copies the FULL `capacity_tokens` buffer even though only
-`len` tokens are populated — cloning only the populated prefix is the next
-byte-exact beam-perf lever.
+**Residual gap.** Native retry+beam is still ~4.6× slower than `whisper-cli -bs 5`
+(RTF 0.044). The remaining per-fork cost is the self-attn `KvCache` clone (full
+`capacity_tokens` buffer). **A "clone only the [..len] prefix" lever is NOT a
+clean win and should not be chased:** the child still needs a capacity-sized
+buffer for future appends, and `#![deny(unsafe_code)]` rules out uninit capacity,
+so a prefix fork is `memset(capacity) + memcpy(len)` which does not beat the
+derived `clone`'s `memcpy(capacity)` (equal for small `len`, WORSE for large).
+The real remaining gap is native's beam being a straightforward per-hypothesis
+re-forward vs whisper.cpp's tuned batched beam — an owner/architecture-scoped
+kernel-batching effort, not a quick lever.
 
 ---
 ## 2026-07-23 - WhiteCreek: **COMPETITIVE MEASUREMENT (honest, bounds the "native dominates" claim) — at MATCHED quality on long-form, native is 8× SLOWER than whisper.cpp: native `retry+beam5` RTF 0.355 (298 s wall) vs `whisper-cli -bs 5` RTF 0.044 (37 s wall) on the 840 s keynote (tiny.en). The README "2.33× faster" holds for GREEDY short clips only; native's quality-matched long-form path is not competitive.**
