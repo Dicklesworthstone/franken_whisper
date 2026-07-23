@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP (byte-exact, strictly-less-work) — beam now BATCHES the tied-output logits projection across all surviving hypotheses (one `logits_all` GEMM reads the ~n_vocab×n_state weight ONCE instead of once per hypothesis). Transcript byte-identical (jfk beam=5 md5 `be4284a9`, keynote retry+beam5 `cmp -s` identical); keynote wall ~140 s vs the Arc-only ~171–249 s (cumulative ~2.1× from pre-Arc 298 s), shared-box-noisy so no precise factor.**
+
+**Change (decoder.rs + decode.rs).** `forward_step` was split: the new
+`forward_step_hidden` runs the transformer forward and returns the final-LN'd
+last-position hidden `[1, n_state]` (+ the default-off draft-accept probe);
+`forward_step` is now the thin wrapper `forward_step_hidden` + `logits_last` +
+draft-accept (byte-identical — jfk golden + decoder suite 13/0 pin it). In
+`beam_decode_window`, each surviving hypothesis forwards its token via
+`forward_step_hidden` (per-hypothesis self-attn/MLP — can't batch across
+differing KV), then ALL survivors' hidden rows are stacked `[n_survivors,
+n_state]` and projected in ONE `decoder::logits_all` GEMM. The logits GEMV is
+bandwidth-bound on the tied-output weight (~80 MB f32 / ~20 MB int8), so reading
+it once per step instead of `n_survivors×` cuts that traffic by up to beam_size.
+
+**Byte-exact + validated.** `logits_all` is byte-identical to per-row
+`logits_last` (its existing unit test pins that), so each hypothesis's logits —
+and thus the beam's top-k decisions — are unchanged. Confirmed end-to-end: jfk
+beam=5 md5 `be4284a9…` (== the pre-batching / greedy / whisper.cpp hash), keynote
+`retry+beam5` transcript identical to the pre-batching output (`cmp -s`), decode
+suite 50/0, decoder 13/0, jfk golden byte-exact. Greedy default untouched (it
+calls the wrapper). Fleet clippy: my regions clean.
+
+**Perf — honest.** Strictly-less-work (one weight read vs `n_survivors`), so it
+cannot regress. Keynote `retry+beam5`: two batched runs 136.6 s / 145.1 s vs the
+Arc-only 171 s / 249 s vs pre-Arc 298 s — directionally faster and monotone
+across the two beam optimizations, but the shared box is noisy so no CV<5%
+factor is claimed. Native retry+beam is now ~3.7× slower than `whisper-cli -bs 5`
+(RTF 0.044), down from 8×. The remaining gap is native's per-hypothesis
+self-attn/MLP forward vs whisper.cpp's fully-batched beam (architecture-scale).
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP (byte-exact, strictly-less-work) — beam now Arc-SHARES the window-constant cross-K/V instead of deep-cloning it per hypothesis fork. Eliminates ~18 MB of memcpy per fork (immutable data); transcript BYTE-IDENTICAL; greedy path untouched. Wall-clock directionally faster on the keynote (Arc ~171–249 s vs pre-Arc 298 s) but shared-box-noisy, so the exact factor is NOT pinned.**
 
 **Change (decoder.rs).** `DecoderState`'s 7 window-constant cross-K/V fields

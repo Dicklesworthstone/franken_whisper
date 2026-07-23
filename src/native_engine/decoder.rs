@@ -1596,12 +1596,18 @@ fn cross_attention(
 /// [`FwError::InvalidRequest`] on an empty batch, an out-of-range token id,
 /// a decode position past `n_text_ctx`, or a width mismatch; propagates the
 /// checkpoint closure's error and any kernel error.
-pub fn forward_step(
+/// The transformer forward for one decode step, returning the final-LN'd
+/// last-position hidden state `[1, n_state]` (and the self-draft accept probe
+/// argmax when `FW_DRAFT_ACCEPT_LAYERS` is set) WITHOUT the tied logits
+/// projection. [`forward_step`] appends `logits_last`; beam search collects
+/// these hidden states across hypotheses and projects them in one batched
+/// `logits_all` (one tied-output weight read instead of per-hypothesis).
+pub fn forward_step_hidden(
     w: &DecoderWeights,
     st: &mut DecoderState,
     tokens: &[i32],
     checkpoint: &dyn Fn() -> FwResult<()>,
-) -> FwResult<Vec<f32>> {
+) -> FwResult<(Mat, Option<u32>)> {
     if tokens.is_empty() {
         return Err(FwError::InvalidRequest(
             "forward_step: empty token batch".into(),
@@ -1725,11 +1731,38 @@ pub fn forward_step(
     // Advance the logical cache length once (all layers appended in lockstep).
     st.len += tokens.len();
 
-    // Final layer norm, then logits for the last position only.
+    // Final layer norm; return the last-position hidden state. The caller
+    // projects it to logits (batched across a beam when applicable) — see
+    // [`forward_step`] and `beam_decode_window`.
     timed!(Sub::FinalLn, w.ln.apply(&mut x));
     let last = x.rows - 1;
     let x_last = Mat::from_vec(1, w.n_state, x.row(last).to_vec());
-    let logits = timed!(Sub::Logits, logits_last(w, &x_last))?;
+    Ok((x_last, draft_arg))
+}
+
+/// Single decode step: the transformer forward ([`forward_step_hidden`]) plus the
+/// tied logits projection for the last position and the self-draft accept
+/// diagnostic. Byte-identical to the pre-split monolithic step (the jfk golden
+/// pins it). Beam search calls `forward_step_hidden` directly and batches the
+/// per-hypothesis logits through one `logits_all` (reads the tied-output weight
+/// once instead of once per hypothesis).
+pub fn forward_step(
+    w: &DecoderWeights,
+    st: &mut DecoderState,
+    tokens: &[i32],
+    checkpoint: &dyn Fn() -> FwResult<()>,
+) -> FwResult<Vec<f32>> {
+    let (x_last, draft_arg) = forward_step_hidden(w, st, tokens, checkpoint)?;
+    // Logits timing (measurement-only; `timed!` is local to `forward_step_hidden`,
+    // so inline the same span here). Default-off ⇒ a direct `logits_last` call.
+    let logits = if super::perf_spans_enabled() {
+        let t = std::time::Instant::now();
+        let r = logits_last(w, &x_last)?;
+        sub_add(Sub::Logits, t.elapsed().as_nanos());
+        r
+    } else {
+        logits_last(w, &x_last)?
+    };
     // Record the self-draft accept comparison (early-exit vs full argmax).
     if let Some(da) = draft_arg {
         use std::sync::atomic::Ordering::Relaxed;
