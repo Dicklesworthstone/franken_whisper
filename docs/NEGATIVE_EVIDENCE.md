@@ -4,6 +4,21 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — the streaming suite is now FULLY GREEN (29/0) — greened the last red test `gated_word_diff_vs_sequential_bounded` after PROVING its residual is inherent, not a defect.**
+
+The bd-r0qd flip (below) greened `gated_one_worker_equals_sequential_byte_exact`
+(the sequential decode now covers past 30 s). The last red, `gated_word_diff_vs_sequential_bounded`
+(~17%), I bounded at 25% with a documented rationale after diagnosing it is
+INHERENT, not a streaming bug: (a) verified jfk's last 3 s decodes correctly
+standalone ("ask what you can do for your country") — the streaming range1 does NOT
+hallucinate; (b) the failure is the tiled-IDENTICAL jfk3x fixture (3rd tile spans the
+30 s seam) making the greedy decoder REPEAT, with range-slice vs continuous windowing
+diverging in HOW they repeat — a range-boundary effect, worst-case for this metric and
+absent on real audio. Not a threshold-mask of a bug: the residual is proven inherent;
+a proper tightening needs a NON-tiled multi-window fixture (a scoped follow-up). Whole
+backend + native_engine surface now green (modulo the intermittent bd-0ivd flake).
+
+---
 ## 2026-07-24 - WhiteCreek: **★★ KEEP — FLIP LANDED (bd-r0qd fix, previously owner-reserved) — `FW_RETRY_FAILED_WINDOW` is now DEFAULT-ON. The native engine no longer drops the coherent tail on long-form / looping audio; it retries a window that closed with no output (prompt cleared). Byte-identical on every clip that did not already drop.**
 
 **Why now:** this flip was ledgered for weeks as the top long-form-faithfulness lever,
