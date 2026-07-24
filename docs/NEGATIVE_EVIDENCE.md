@@ -4,6 +4,31 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (beam search is now a real per-request knob) — a `--beam-size` request now reaches the native engine. Previously beam was ONLY controllable via `FW_BEAM_SIZE` env, so a beam-size request silently ran greedy — a quality gap on realistic workloads.**
+
+The native engine had beam search (behind `FW_BEAM_SIZE`) but the backend never
+mapped the request's `beam_size`, so `--beam-size 5` via the native path was
+silently ignored (greedy). Wired it as a `DecodeParams` field, same pattern as
+initial_prompt (unblocked now that cod is capped).
+
+**What landed.** `DecodeParams.beam_size: Option<usize>`; the env-only `beam_size()`
+split into `beam_size_from_env()` (override) + `resolve_beam_size(params)` =
+`env.or(field).map_or(1, clamp[1,8])`, resolved once per decode into
+`effective_beam_size` (replaces the two in-loop `beam_size()` calls).
+`whisper_cpp_native::decode_params` maps `request.backend_params.decoding.beam_size`
+(GOTCHA: beam_size lives on the nested `DecodingParams`, not directly on
+`BackendParams` like `prompt` does) → the field. The 4 decode.rs test full-literals
+converted to `..DecodeParams::default()` to stop breaking on every field add.
+
+**Validated.** `beam_size_default_is_one` (resolver: default→1, field 5→5, 99→clamp 8,
+0→1); `decode_params_maps_beam_size_from_request` (nested request field → engine
+field); **`gated_beam_size_field_matches_greedy_on_jfk` — FIRST e2e coverage of beam
+search: beam=5 via the field is BYTE-IDENTICAL to greedy on jfk** (beam is a superset
+of greedy on unambiguous audio; also proves the field→beam decode wiring). Backend
+25/0, no in-lane clippy. NOTE: a transient frankensqlite `codegen.rs` mid-edit (another
+repo's active WIP) briefly red-built here and self-resolved in ~30 s — not a blocker.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (initial_prompt is now a real per-request API) — promoted `initial_prompt` from the FW_INITIAL_PROMPT env-hatch to a proper `DecodeParams` field, wired through the native backend so a request's `--prompt` reaches the engine end to end.**
 
 Last leg this was ledgered as cross-lane-BLOCKED (a `DecodeParams` field ripples

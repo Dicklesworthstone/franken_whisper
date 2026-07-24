@@ -197,6 +197,11 @@ pub struct DecodeParams {
     /// `FW_INITIAL_PROMPT` env var overrides this field when set (a dev/testing
     /// hatch, mirroring the other `FW_*` gates).
     pub initial_prompt: Option<String>,
+    /// Beam width for temperature-0 decoding (whisper `--beam-size`). `None` or
+    /// `Some(1)` = greedy (byte-identical default); `Some(n)` keeps the `n` best
+    /// hypotheses per step and selects the best length-normalized sequence score.
+    /// Clamped to `[1, 8]`. `FW_BEAM_SIZE` overrides this field when set.
+    pub beam_size: Option<usize>,
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
@@ -650,24 +655,34 @@ struct WindowCandidate {
     no_speech_prob: f64,
 }
 
-/// `FW_BEAM_SIZE` (default `1` = greedy): whisper.cpp's `beam_search.beam_size`
-/// (`whisper-cli -bs`, default 5). Values `> 1` decode each temp-0 window with
-/// beam search — keep the `n` highest cumulative-logprob hypotheses per step,
-/// select the best length-normalized [`sequence_score`] at the end — instead of
-/// argmax. This is the DISC-003 revisit lever: beam closes the greedy-vs-beam
-/// WER gap (measured residual ~0.06 on the long-form clip, 2026-07-23). `1`
-/// restores the exact greedy path ⇒ byte-identical by construction. Clamped to
-/// `[1, 8]`. Read once; consulted only when a window decodes at temperature 0
-/// (the ladder's `t > 0` rungs stay on the sampling path).
-fn beam_size() -> usize {
+/// `FW_BEAM_SIZE` env OVERRIDE of the [`DecodeParams::beam_size`] field (a
+/// dev/testing hatch that wins over the field when set, mirroring the other
+/// `FW_*` gates). Unset → the field is used. Raw parsed value; clamping happens
+/// in [`resolve_beam_size`].
+fn beam_size_from_env() -> Option<usize> {
     use std::sync::OnceLock;
-    static N: OnceLock<usize> = OnceLock::new();
+    static N: OnceLock<Option<usize>> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("FW_BEAM_SIZE")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(1, |n| n.clamp(1, 8))
     })
+}
+
+/// Effective beam width for a decode: the `FW_BEAM_SIZE` env override, else the
+/// [`DecodeParams::beam_size`] field, else `1` (greedy). Clamped to `[1, 8]`.
+///
+/// whisper.cpp's `beam_search.beam_size` (`whisper-cli -bs`, default 5): values
+/// `> 1` decode each temperature-0 window with beam search — keep the `n`
+/// highest cumulative-logprob hypotheses per step, select the best
+/// length-normalized [`sequence_score`] at the end — instead of argmax. `1`
+/// restores the exact greedy path ⇒ byte-identical by construction. Consulted
+/// only when a window decodes at temperature 0 (the ladder's `t > 0` rungs stay
+/// on the sampling path).
+fn resolve_beam_size(params: &DecodeParams) -> usize {
+    beam_size_from_env()
+        .or(params.beam_size)
+        .map_or(1, |n| n.clamp(1, 8))
 }
 
 /// A window's decode result — `(decoded, plogs, has_ts, seek_delta_cs,
@@ -1727,6 +1742,10 @@ pub fn transcribe_samples(
     let prompt = initial_prompt_from_env().or(params.initial_prompt.as_deref());
     let mut prompt_past: Vec<i32> = seeded_prompt_past(prompt, &m.tokenizer);
 
+    // Beam width (whisper `--beam-size`): field or FW_BEAM_SIZE override, resolved
+    // once. 1 = greedy (byte-identical default).
+    let effective_beam_size = resolve_beam_size(params);
+
     // Tail-window encoder-context truncation kill switch, resolved once.
     //
     // Truncation is gated to TIMESTAMP mode. In timestamp mode it is a quality
@@ -1968,7 +1987,7 @@ pub fn transcribe_samples(
             // stay on the greedy sampling path. `beam_size() == 1` (default) ⇒ the
             // greedy branch always runs ⇒ byte-identical to the pre-beam engine.
             let t_loop = std::time::Instant::now();
-            let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if beam_size() > 1
+            let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
                 && window_temp == 0.0
             {
                 // `st` is left intact (beam clones per hypothesis) for the DTW
@@ -1984,7 +2003,7 @@ pub fn transcribe_samples(
                     seek_end_cs,
                     n_max_tokens,
                     user_max_tokens,
-                    beam_size(),
+                    effective_beam_size,
                     checkpoint,
                 )?
             } else {
@@ -3025,11 +3044,18 @@ mod tests {
 
     #[test]
     fn beam_size_default_is_one() {
-        // Default (unset) must be 1 so the greedy path runs unless FW_BEAM_SIZE
-        // is explicitly set — the byte-exact-by-construction guarantee. (The
-        // OnceLock reads the env once; in a clean test process it is unset.)
+        // Default (no field, no env) must be 1 so the greedy path runs — the
+        // byte-exact-by-construction guarantee. Also check the field and the
+        // clamp. (The OnceLock env reader is unset in a clean test process.)
         if std::env::var_os("FW_BEAM_SIZE").is_none() {
-            assert_eq!(beam_size(), 1);
+            assert_eq!(resolve_beam_size(&DecodeParams::default()), 1);
+            let mut p = DecodeParams::default();
+            p.beam_size = Some(5);
+            assert_eq!(resolve_beam_size(&p), 5, "field beam_size drives beam width");
+            p.beam_size = Some(99);
+            assert_eq!(resolve_beam_size(&p), 8, "beam width clamps to 8");
+            p.beam_size = Some(0);
+            assert_eq!(resolve_beam_size(&p), 1, "0 clamps up to greedy");
         }
     }
 
@@ -4015,6 +4041,40 @@ mod tests {
     }
 
     #[test]
+    fn gated_beam_size_field_matches_greedy_on_jfk() {
+        // Beam search via the DecodeParams.beam_size FIELD (whisper --beam-size).
+        // On jfk (clear, unambiguous speech) beam=5 selects the same hypothesis as
+        // greedy, so the transcript is byte-identical — this exercises the
+        // field → beam decode wiring end to end AND pins the "beam is a superset of
+        // greedy" invariant. First e2e coverage of beam search. FW_BEAM_SIZE is
+        // unset under `cargo test`, so the field is the source of truth.
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_beam_size_field: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let join = |o: &DecodeOutput| {
+            o.segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let greedy = join(&transcribe_samples(&model, &samples, &e2e_params(), &noop).unwrap());
+        let mut p = e2e_params();
+        p.beam_size = Some(5);
+        let beam = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
+        eprintln!("greedy: {greedy}\nbeam5:  {beam}");
+        assert_eq!(
+            beam, greedy,
+            "beam=5 must match greedy on jfk (byte-identical superset)"
+        );
+        assert!(
+            greedy.to_lowercase().contains("country"),
+            "baseline should transcribe jfk"
+        );
+    }
+
+    #[test]
     fn gated_seeded_prompt_past_encodes_user_prompt() {
         // The initial-prompt seed (whisper `--prompt`, FW_INITIAL_PROMPT): an
         // absent/empty prompt yields an empty prompt_past (byte-identical default),
@@ -4599,7 +4659,7 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
-            initial_prompt: None,
+            ..DecodeParams::default()
         };
         let out = transcribe_samples(&model, &samples, &params, &noop).unwrap();
 
@@ -4685,7 +4745,7 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
-            initial_prompt: None,
+            ..DecodeParams::default()
         };
         // bd-0ivd MXCSR diagnostics: matrixmultiply's micro-kernel sets the x86
         // FTZ/DAZ flush bits and does not restore them (documented + wrapped in
@@ -4794,7 +4854,7 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
-            initial_prompt: None,
+            ..DecodeParams::default()
         };
         // Sibling load = REAL engine work sharing the global rayon pool,
         // allocator, and kernels — generic par_iter busywork measured
@@ -4854,7 +4914,7 @@ mod tests {
                         max_text_ctx: None,
                         word_timestamps: true,
                         model_hint: Some("tiny.en".to_owned()),
-                        initial_prompt: None,
+                        ..DecodeParams::default()
                     };
                     while !stopr2.load(Ordering::Relaxed) {
                         let _ = transcribe_samples(&m2, samplesr, &p2, &noop);
