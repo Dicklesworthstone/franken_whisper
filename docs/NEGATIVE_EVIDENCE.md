@@ -4,7 +4,7 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
-## 2026-07-23 - BlackThrush: **BLOCKED / NO VERDICT (bd-938v) — fresh router-diagnostics count-scan profile reached strict RCH but not Criterion: the shared frankensqlite closure is currently unbuildable. Zero samples; production untouched.**
+## 2026-07-23 - BlackThrush: **BLOCKED / NO VERDICT (bd-938v) — strict-RCH canonical dependency mirrors remain content-divergent after nominal sync. Two cold release builds on different workers failed before Criterion; zero samples, zero REJECTs, production untouched.**
 
 **Ledger-first continuation after auth restart.** Both evidence ledgers and recent
 Git history were re-read before resuming the existing `bd-938v` harness. The
@@ -16,11 +16,14 @@ lever was already closed. The retained profile-only
 passes with the complete diagnostics caller. Production may be touched only if
 that stage is at least **10%** of the measured caller.
 
-**Strict-remote failure before timing.** No local Cargo fallback ran.
-`RCH_REQUIRE_REMOTE=1`, `RCH_WORKER=vmi1227854`, `RCH_WORKERS=vmi1227854`, and
-`RCH_NO_SELF_HEALING=1` admitted job `j-29944835100114966`. RCH synced all 57
-path-dependency roots for 120.5 seconds, then cold-compiled for 642.4 seconds.
-Compilation stopped in the current shared frankensqlite checkout:
+**The apparent unblock was a cached false signal.** No local Cargo fallback ran.
+Strict-remote dev-profile job `j-29944835100114996` on `vmi1227854` synced all
+57 path-dependency roots, reached `franken_whisper`, and exited zero, so the
+original source-closure blocker was provisionally closed. The immediately
+following cold release-profile job `j-29944835100115005` on that worker synced
+the same closure but exited 101 before Criterion. After all concurrent sibling
+jobs had cleared, an isolated cold release rerun on a second worker,
+`j-29944835100115016` on `vmi1156319`, failed identically:
 
 ```text
 error[E0432]: unresolved import `io_uring`
@@ -29,31 +32,39 @@ error[E0433]: cannot find module or crate `io_uring` in this scope
   --> crates/fsqlite-vfs/src/uring.rs:249:48
 ```
 
-The local sibling was `main...origin/main [ahead 4, behind 6]`. Its
-`fsqlite-vfs/src/uring.rs` directly imports `io_uring`, while its manifest has
-no direct dependency; the current `origin/main` version instead uses
-`asupersync::fs::IoUringFile`. That sibling checkout contains active peer work
-and was not rebased, edited, stashed, or overwritten. Because every one of the
-five requested Criterion targets (`storage_bench`, `normalize_bench`,
-`pipeline_bench`, `tty_bench`, and `sync_bench`) compiles the same
-`franken_whisper` library and non-optional fsqlite path dependency, repeating
-the other four commands cannot reach a benchmark executable in this source
-state.
+The current local sibling is `main...origin/main [ahead 5, behind 6]`. Its
+tracked `crates/fsqlite-vfs/src/uring.rs` uses
+`asupersync::fs::IoUringFile` and has SHA-256
+`3c3411c005345ea320f6ad2e8f425a6ce8e2aee91f26330e9878771ff2436be8`.
+Both release workers nevertheless compiled an older direct-`io_uring` file
+after reporting successful dependency sync. The successful dev check is
+therefore cache evidence, not proof that the release source closure converged.
+RCH's normal transfer uses rsync's metadata quick check; its content-checksum
+path is tied to clean-overlay materialization. A non-destructive
+`rch sync --dry-run` also confirmed that its repair scope is managed cache under
+`/data/tmp/rch`, not the canonical `/data/projects/...` mirrors used by these
+jobs. No destructive cache invalidation, sibling edit, rebase, stash, or
+overwrite was attempted. All five requested Criterion suites compile the same
+non-optional fsqlite path dependency, so the other four cannot produce a
+benchmark executable while that closure is divergent.
 
 **Disposition and retry predicate.** This is infrastructure/source-closure
 evidence, not a performance rejection. There are **zero** profile medians,
 A/B pairs, null pairs, CV values, or conformance exits. No production file was
-edited; the profile-only harness remains recoverable for the retry. `bd-938v`
-now depends on blocker `bd-bsdz`. Reopen only after the frankensqlite owner
-converges the shared checkout to a buildable main and a strict-remote
-`cargo check --bench pipeline_bench -j2` reaches `franken_whisper` itself.
-Then measure `historical_four_passes_200 / full_200`; proceed only at a
-stage share of at least 10%, and require exact serialized diagnostics plus 21
-same-worker order-alternated historical/candidate pairs, 21
-historical/historical null pairs, null median in `[0.95, 1.05]`, candidate CV
-`<5%`, at least 18/21 wins, and candidate p10 above
-`max(null p90, 1.10)`. Do not retry locally and do not modify the sibling
-checkout from this repository.
+edited; the profile-only harness remains recoverable. `bd-bsdz` and dependent
+`bd-938v` are open again. Retry only after canonical dependency-root transfer
+is content-verified/checksummed, or the frankensqlite owner lands a real
+metadata/content change that forces convergence, and an isolated strict-remote
+**release** `cargo bench --profile release --bench pipeline_bench --no-run`
+reaches `franken_whisper`. A dev-profile cache hit is not sufficient. Then
+measure `historical_four_passes_200 / full_200`; proceed only at a stage share
+of at least 10%, and require exact serialized diagnostics plus 21 same-worker
+order-alternated historical/candidate pairs, 21 historical/historical null
+pairs, null median in `[0.95, 1.05]`, candidate CV `<5%`, at least 18/21 wins,
+and candidate p10 above `max(null p90, 1.10)`. The next fresh sibling after
+`bd-938v` is the seven-to-one scan opportunity in
+`CorrectionEvidenceLedger::diagnostics`. Do not retry locally and do not modify
+the sibling checkout from this repository.
 
 ---
 ## 2026-07-23 - WhiteCreek: **KEEP (byte-exact, strictly-less-work) — beam now MOVE-REUSES parent KV state: the last surviving child of each parent MOVES the parent's self-attn `KvCache` (~8 MB) instead of cloning it. When the beam is spread (~1 child/parent) this eliminates nearly all the remaining per-fork clone. Transcript byte-identical (jfk beam=5 md5 `be4284a9`, keynote `cmp -s`); keynote wall min ~113 s vs the batched-logits ~137 s (cumulative ~2.6× from pre-Arc 298 s), shared-box-noisy so no precise factor.**

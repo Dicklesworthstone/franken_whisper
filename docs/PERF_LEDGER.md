@@ -15,32 +15,46 @@ resolved-success count, and calibration sum) against the complete diagnostics
 caller. The predeclared activation threshold is a stage share of at least 10%;
 production remained untouched pending that measurement.
 
-**Strict RCH reached the dependency closure, not Criterion.** With remote
-required and local fallback disabled, job `j-29944835100114966` was pinned to
-`vmi1227854`. RCH synced 57 path-dependency roots in 120.5 seconds and
-cold-compiled for 642.4 seconds before failing in the shared frankensqlite
-checkout. `fsqlite-vfs/src/uring.rs` imports the `io_uring` crate directly, but
-the current sibling manifest does not link it (`E0432` and `E0433`). The sibling
-was `main...origin/main [ahead 4, behind 6]`; its current `origin/main` uses
-`asupersync::fs::IoUringFile`, but the peer-owned shared checkout was not
-altered. All five requested Criterion targets compile this same non-optional
-path dependency, so none can reach its benchmark executable from the present
-source closure.
+**Strict RCH exposed canonical-mirror content divergence.** With remote
+required and local fallback disabled, dev-profile job
+`j-29944835100114996` on `vmi1227854` synced 57 roots, reached
+`franken_whisper`, and exited zero. That apparent unblock was only a cached
+signal: cold release-profile job `j-29944835100115005` on the same worker and
+isolated cold release job `j-29944835100115016` on `vmi1156319` both exited
+101 before Criterion with `E0432`/`E0433` from a direct `io_uring` import in
+`fsqlite-vfs/src/uring.rs`. The current tracked sibling file instead uses
+`asupersync::fs::IoUringFile` and has SHA-256
+`3c3411c005345ea320f6ad2e8f425a6ce8e2aee91f26330e9878771ff2436be8`.
+Thus both release workers compiled stale canonical-mirror content despite
+nominal dependency sync.
+
+RCH's normal rsync path uses metadata quick checks; content checksumming is
+coupled to clean-overlay materialization. A non-destructive `rch sync
+--dry-run` confirmed that repair targets managed `/data/tmp/rch` cache rather
+than the canonical `/data/projects/...` mirrors used here. No destructive
+invalidation or peer-owned sibling mutation was attempted. All five Criterion
+targets compile this same non-optional path dependency, so cycling the other
+four cannot reach a benchmark executable while the closure remains divergent.
 
 **No performance claim.** There are zero Criterion samples, no profile median,
 no A/B or null distribution, no CV, and no conformance result. This is neither
-a KEEP nor a REJECT. `bd-938v` was returned to open and blocked on new issue
-`bd-bsdz`; the profile harness remains recoverable.
+a KEEP nor a REJECT, so the consecutive REJECT count remains **zero**.
+`bd-bsdz` and dependent `bd-938v` are open again; the profile harness remains
+recoverable.
 
-**Retry predicate.** Resume only after the frankensqlite owner converges the
-shared checkout to a buildable main and strict-remote
-`cargo check --bench pipeline_bench -j2` reaches `franken_whisper`. Then require
+**Retry predicate.** Resume only after canonical dependency-root transfer is
+content-verified/checksummed, or the frankensqlite owner lands a real
+metadata/content change that forces convergence, and an isolated strict-remote
+**release** `cargo bench --profile release --bench pipeline_bench --no-run`
+reaches `franken_whisper`. A dev cache hit is insufficient. Then require
 `historical_four_passes_200 / full_200 >= 10%` before a production edit. A
 candidate must preserve complete serialized diagnostics bytes and pass 21
 same-worker alternating A/B pairs plus 21 identity-null pairs with null median
 in `[0.95, 1.05]`, candidate CV `<5%`, at least 18/21 wins, and candidate p10
-above `max(null p90, 1.10)`. No local Cargo fallback and no sibling-checkout
-mutation are admissible.
+above `max(null p90, 1.10)`. The next ledger-clean sibling after `bd-938v` is
+the seven-to-one scan opportunity in
+`CorrectionEvidenceLedger::diagnostics`. No local Cargo fallback and no
+sibling-checkout mutation are admissible.
 
 ## 2026-07-22 — KEEP — stream routing-diagnostics Brier aggregation (bd-oazu)
 
