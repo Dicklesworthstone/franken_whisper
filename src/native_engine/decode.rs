@@ -207,6 +207,12 @@ pub struct DecodeParams {
     /// during decoding for cleaner text. `false` = whisper.cpp default
     /// (byte-identical). Applied by the logit filter (`ProcessLogitsConfig`).
     pub suppress_nst: bool,
+    /// Max carried previous-context tokens (whisper `--max-context` /
+    /// `n_max_text_ctx`). `None` or a negative value = the default `n_text_ctx/2`
+    /// (byte-identical). `Some(0)` disables prompt carrying entirely (per-request
+    /// equivalent of `FW_NO_CONTEXT` — an anti-hallucination / anti-repetition
+    /// escape on hard or looping audio); `Some(n)` caps the carry at `n` tokens.
+    pub max_context: Option<i32>,
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
@@ -1725,7 +1731,12 @@ pub fn transcribe_samples(
         max_tokens: user_max_tokens,
     };
     // Prompt context cap (whisper.cpp 6927): n_text_ctx/2.
-    let max_prompt_ctx = n_text_ctx / 2;
+    // whisper `--max-context` / `n_max_text_ctx`: < 0 (or unset) → default
+    // n_text_ctx/2; 0 → no prompt carried; n → cap at n (whisper.cpp semantics).
+    let max_prompt_ctx = match params.max_context {
+        Some(n) if n >= 0 => usize::try_from(n).unwrap_or(n_text_ctx / 2),
+        _ => n_text_ctx / 2,
+    };
 
     let mut segments: Vec<TranscriptionSegment> = Vec::new();
     let mut windows: Vec<WindowStats> = Vec::new();
@@ -4043,6 +4054,44 @@ mod tests {
             t.to_lowercase().contains("country"),
             "field prompt should still transcribe jfk: {t}"
         );
+    }
+
+    #[test]
+    fn gated_max_context_zero_disables_prompt_carry() {
+        // max_context=0 (whisper --max-context 0) disables carried previous-context
+        // — the per-request equivalent of FW_NO_CONTEXT. On tiled/looping audio the
+        // default carried prompt triggers the bd-r0qd early-EOT drop; max_context=0
+        // avoids it, so it recovers >= the default's content. (See
+        // project_final_window_early_eot_bug.)
+        let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_max_context_zero: tiny.en model or jfk.wav missing");
+            return;
+        };
+        // Tile jfk ×3 (~33 s, multi-window) so carried context is exercised.
+        let mut tiled = jfk.clone();
+        tiled.extend_from_slice(&jfk);
+        tiled.extend_from_slice(&jfk);
+        let count_country = |o: &DecodeOutput| -> usize {
+            o.segments
+                .iter()
+                .map(|s| s.text.to_lowercase().matches("country").count())
+                .sum()
+        };
+        let default_out = transcribe_samples(&model, &tiled, &e2e_params(), &noop).unwrap();
+        let mut p = e2e_params();
+        p.max_context = Some(0);
+        let nocarry_out = transcribe_samples(&model, &tiled, &p, &noop).unwrap();
+        let (d, n) = (count_country(&default_out), count_country(&nocarry_out));
+        eprintln!("tiled-jfk 'country' count: default={d} max_context=0={n}");
+        // max_context=0 never loses content vs the default carried-prompt path
+        // (which drops on looping audio) — the anti-repetition escape works.
+        assert!(
+            n >= d,
+            "max_context=0 must recover >= default content, got {n} vs {d}"
+        );
+        // And it genuinely decodes the tiled speech (jfk×3 has 6 'country' when
+        // fully transcribed; the carry-free path should reach most of them).
+        assert!(n >= 4, "max_context=0 should transcribe the tiled content, got {n}");
     }
 
     #[test]
