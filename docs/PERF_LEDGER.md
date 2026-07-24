@@ -4,6 +4,32 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-24 — REJECT 2/3 — fuse correction-evidence diagnostic scans (bd-34fr)
+
+Fresh ledger/history screening found no prior attempt for this exact seam.
+Strict-RCH release profile job `j-29944835100115169` on `vmi1227854` measured
+the historical six scans at **3.7182 us** median `[3.5193, 3.9800]` inside the
+complete 200-entry diagnostics caller at **3.8641 us**
+`[3.7559, 4.0169]`. Their **96.23%** stage share cleared the 10% activation
+threshold. The candidate fused correction count, fast/quality latency sums, and
+WER sum into one oldest-first traversal. Before timing, every scalar bit and the
+complete serialized diagnostics JSON matched the historical implementation.
+
+Same-worker release job `j-29944835100115200` nevertheless rejected the lever.
+Across 21 order-alternated A/B pairs and 21 historical/historical identity-null
+pairs at 30,000 snapshots per arm, the candidate won only **15/21**.
+Speedup p10/median/p90 was **0.918259x / 1.039417x / 1.108997x** and candidate
+CV was **22.3329%** (gate `<5%`). Null p10/median/p90 was
+**0.901872x / 0.994937x / 1.050396x**; candidate p10 missed both null p90 and
+the 1.10 floor. The production fold and its candidate-only test were manually
+removed; the profile-only harness remains.
+
+**Retry predicate:** do not rerun the mixed-field fold. Retry only after the
+correction-decision normalization itself is made allocation-free with exhaustive
+predicate parity, or after profiling exposes another dominant substage; retain
+the complete JSON oracle and identical 21-pair gates. Consecutive REJECT count:
+**two**.
+
 ## 2026-07-23 — REJECT 1/3 — fuse router diagnostics count/calibration scans (bd-938v)
 
 The retained `pipeline/router_diagnostics_counts_profile` harness first measured
