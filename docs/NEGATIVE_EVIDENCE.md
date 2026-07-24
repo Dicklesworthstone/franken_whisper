@@ -4,6 +4,25 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (--suppress-nst now reaches the engine) — a `--suppress-nst` request now masks non-speech tokens in the native decode. It was a hardcoded `false` in the decode path (the engine supported it but the request was silently ignored).**
+
+The logit filter already supported non-speech suppression (`FilterConfig.suppress_nst`,
+unit-pinned by `non_speech_suppressed_when_enabled`) but the real decode path hardcoded
+`suppress_nst: false` (decode.rs:1715), so `--suppress-nst` was dropped. Wired it as a
+`DecodeParams.suppress_nst: bool` field (default false = whisper.cpp default =
+byte-identical), passed into the `FilterConfig`, and mapped from
+`request.backend_params.suppress_nst` in ALL THREE native backends (whisper_cpp_native,
+diarize, streaming — it's a per-window filter param, safe everywhere).
+
+**Validated.** `decode_params_maps_suppress_nst_from_request` (request bool → field).
+`gated_suppress_nst_field_is_neutral_on_clean_speech`: suppress_nst=true is
+BYTE-IDENTICAL to false on jfk (clean speech never decodes a non-speech token, so
+masking them can't change the argmax) — proving the field reaches the filter without
+perturbing normal transcription. whisper_cpp_native 26/0, diarize 16/0, no in-lane
+clippy. **Native request-param parity progress: --prompt, --beam-size, --suppress-nst
+now honored (were env-only or ignored).**
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (quality knobs now consistent across native backends) — the diarize + streaming backends now honor `--beam-size` too (diarize also honors `--prompt`). Previously ONLY the sequential native backend mapped them. + FINDING: a pre-existing RED streaming test at HEAD, rooted in bd-r0qd.**
 
 Extending the beam_size/initial_prompt wiring into the two backends I now cover

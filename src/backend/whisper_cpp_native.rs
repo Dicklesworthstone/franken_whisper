@@ -439,6 +439,8 @@ fn decode_params(
             .as_ref()
             .and_then(|d| d.beam_size)
             .map(|n| n as usize),
+        // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
+        suppress_nst: request.backend_params.suppress_nst,
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         // No request field maps to whisper's text-context cap today; use the
@@ -1037,6 +1039,16 @@ mod tests {
             decode_params(&request, false, "tiny.en").beam_size,
             Some(5),
         );
+    }
+
+    #[test]
+    fn decode_params_maps_suppress_nst_from_request() {
+        let mut request = native_request();
+        // Default off (whisper.cpp default = byte-identical).
+        assert!(!decode_params(&request, false, "tiny.en").suppress_nst);
+        // A --suppress-nst request reaches the engine's logit filter.
+        request.backend_params.suppress_nst = true;
+        assert!(decode_params(&request, false, "tiny.en").suppress_nst);
     }
 
     /// A real-shaped engine segment (timed, with text), standing in for what
