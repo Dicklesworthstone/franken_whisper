@@ -441,6 +441,8 @@ fn decode_params(
             .map(|n| n as usize),
         // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
         suppress_nst: request.backend_params.suppress_nst,
+        // Max carried context (whisper `--max-context`); 0 disables prompt carry.
+        max_context: request.backend_params.decoding.as_ref().and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         // No request field maps to whisper's text-context cap today; use the
@@ -1049,6 +1051,20 @@ mod tests {
         // A --suppress-nst request reaches the engine's logit filter.
         request.backend_params.suppress_nst = true;
         assert!(decode_params(&request, false, "tiny.en").suppress_nst);
+    }
+
+    #[test]
+    fn decode_params_maps_max_context_from_request() {
+        use crate::model::DecodingParams;
+        let mut request = native_request();
+        // No decoding params → None (engine uses its n_text_ctx/2 default).
+        assert_eq!(decode_params(&request, false, "tiny.en").max_context, None);
+        // --max-context 0 (disable prompt carry) reaches the engine.
+        request.backend_params.decoding = Some(DecodingParams {
+            max_context: Some(0),
+            ..DecodingParams::default()
+        });
+        assert_eq!(decode_params(&request, false, "tiny.en").max_context, Some(0));
     }
 
     /// A real-shaped engine segment (timed, with text), standing in for what

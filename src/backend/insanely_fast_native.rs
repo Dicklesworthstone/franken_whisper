@@ -306,6 +306,8 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
             .map(|n| n as usize),
         // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
         suppress_nst: request.backend_params.suppress_nst,
+        // Max carried context (whisper `--max-context`); 0 disables prompt carry.
+        max_context: request.backend_params.decoding.as_ref().and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads: threads_per_worker,
         max_text_ctx: None,

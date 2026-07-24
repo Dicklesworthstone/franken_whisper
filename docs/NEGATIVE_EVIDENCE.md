@@ -4,6 +4,23 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (--max-context now honored; `0` = per-request anti-repetition escape) — a `--max-context` request now controls the carried-context cap in native decode. `--max-context 0` disables prompt carry entirely — the per-request equivalent of FW_NO_CONTEXT — and MEASURABLY recovers the bd-r0qd tiled-audio drop.**
+
+`max_prompt_ctx` was hardcoded `n_text_ctx/2` (decode.rs:1728), so `--max-context`
+was ignored. Wired `DecodeParams.max_context: Option<i32>` (whisper.cpp semantics:
+`<0`/unset → `n_text_ctx/2`; `0` → no prompt carried; `n` → cap at `n`), mapped from
+`request.backend_params.decoding.max_context` in all three native backends.
+
+**Validated with a MEASURED effect (not just wiring).** `decode_params_maps_max_context_from_request`
+(request → field). `gated_max_context_zero_disables_prompt_carry`: on **tiled jfk×3**,
+the default carried-prompt path drops (bd-r0qd early-EOT — "country" = **4**), while
+`max_context=0` disables the carry and recovers — "country" = **8** (matches the
+known FW_NO_CONTEXT recovery). So users now have a per-request anti-repetition /
+anti-hallucination escape for hard/looping audio, without the env var. whisper_cpp_native
+27/0, diarize 16/0, no in-lane clippy. **Native request-param parity: --prompt,
+--beam-size, --suppress-nst, --max-context now honored.**
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (--suppress-nst now reaches the engine) — a `--suppress-nst` request now masks non-speech tokens in the native decode. It was a hardcoded `false` in the decode path (the engine supported it but the request was silently ignored).**
 
 The logit filter already supported non-speech suppression (`FilterConfig.suppress_nst`,
