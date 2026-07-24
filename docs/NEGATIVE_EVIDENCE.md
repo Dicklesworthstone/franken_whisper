@@ -4,6 +4,21 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP — FEATURE (third quant, same additive pattern) — native now also loads whisper.cpp `q4_0` (4-bit) quantized ggml models. Native covers the three common whisper.cpp download quants: q8_0, q5_0, q4_0.**
+
+**What landed.** `GgmlDType::Q4_0`; per-tensor GGML_TYPE **2** → Q4_0;
+`Q4_0_BLOCK_BYTES = 18` (f16 scale + 16 nibble-bytes); `dequant_q4_0` (exact ggml
+`dequantize_row_q4_0`: element `j` = low nibble, `j+16` = high nibble, each
+`(nibble − 8) * scale`); `ggml_byte_len` + `tensor_f32` arms; model-gate base **2**
+(a q4_0 v2 model reports ftype **2002**). Validated: dequant math unit test; gated
+loader test (real q4_0 tensors within 15 % mean-abs of f16 — 4-bit is the
+coarsest); `gated_e2e_jfk_tiny_en_q4_0_transcribes` builds the engine and produces
+the correct jfk content (segmentation drifts slightly at 4-bit precision, so the
+test asserts the salient words rather than an exact match). ggml 23/0, decode gated
+8/0, no regression. Remaining: q5_1/q4_1 (add a per-block min offset) + k-quants
+(super-blocks) — additive follow-ups.
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP — FEATURE (extends the Q8_0 quant support below) — native now also loads whisper.cpp `q5_0` (5-bit) quantized ggml models, end-to-end. Native transcribes a real q5_0 tiny.en on jfk to the EXACT canonical transcript.**
 
 **What landed (ggml.rs + mod.rs, additive).** `GgmlDType::Q5_0`; per-tensor
