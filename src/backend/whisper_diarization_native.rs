@@ -118,6 +118,24 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
     decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
+        // Same quality knobs as the sequential native backend: a request prompt
+        // (`--prompt`) and beam width (`--beam-size`) reach the engine. Diarization
+        // runs one sequential `transcribe_samples`, so both apply cleanly.
+        initial_prompt: request
+            .backend_params
+            .prompt
+            .clone()
+            .filter(|p| !p.is_empty()),
+        beam_size: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.beam_size)
+            .map(|n| n as usize),
+        // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
+        suppress_nst: request.backend_params.suppress_nst,
+        // Max carried context (whisper `--max-context`); 0 disables prompt carry.
+        max_context: request.backend_params.decoding.as_ref().and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         max_text_ctx: None,
@@ -417,6 +435,26 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn decode_params_maps_prompt_and_beam_size() {
+        use crate::model::DecodingParams;
+        let mut req = request();
+        // Defaults: no prompt, greedy.
+        let dp = decode_params(&req);
+        assert_eq!(dp.initial_prompt, None);
+        assert_eq!(dp.beam_size, None);
+        // Request quality knobs (--prompt, --beam-size) reach the engine — the
+        // diarize backend now honors them like the sequential backend.
+        req.backend_params.prompt = Some("clinical notes".to_owned());
+        req.backend_params.decoding = Some(DecodingParams {
+            beam_size: Some(4),
+            ..DecodingParams::default()
+        });
+        let dp = decode_params(&req);
+        assert_eq!(dp.initial_prompt.as_deref(), Some("clinical notes"));
+        assert_eq!(dp.beam_size, Some(4));
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
@@ -730,7 +768,13 @@ mod tests {
     fn write_samples_wav(dir: &Path, name: &str, samples: &[f32]) -> PathBuf {
         let pcm: Vec<i16> = samples
             .iter()
-            .map(|s| (if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 } * 32767.0) as i16)
+            .map(|s| {
+                (if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                } * 32767.0) as i16
+            })
             .collect();
         let path = dir.join(name);
         write_pcm16_mono_wav(&path, 16_000, &pcm);

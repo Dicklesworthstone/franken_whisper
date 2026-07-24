@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendDiscoveryEntry, BackendsReport, RunEvent, RunReport, TranscriptionSegment,
+    AccelerationReport, BackendDiscoveryEntry, BackendKind, BackendsReport, RunEvent, RunReport,
+    TranscriptionResult, TranscriptionSegment,
 };
 
 pub const ROBOT_SCHEMA_VERSION: &str = "1.0.0";
@@ -137,11 +138,11 @@ pub fn emit_robot_error_from_fw(error: &FwError) -> FwResult<()> {
 }
 
 pub fn emit_robot_stage(run_id: &str, event: &RunEvent) -> FwResult<()> {
-    emit_line(&run_stage_value(run_id, event))
+    emit_line(&BorrowedStage::new(run_id, event))
 }
 
 pub fn emit_robot_complete(report: &RunReport) -> FwResult<()> {
-    emit_line(&run_complete_value(report))
+    emit_line(&BorrowedComplete::new(report))
 }
 
 pub fn emit_robot_report(report: &RunReport) -> FwResult<()> {
@@ -149,6 +150,178 @@ pub fn emit_robot_report(report: &RunReport) -> FwResult<()> {
         emit_robot_stage(&report.run_id, event)?;
     }
     emit_robot_complete(report)
+}
+
+/// Emit the human-facing pretty JSON report while transferring its owned
+/// payloads into the temporary JSON DOM instead of cloning the complete report.
+pub fn emit_pretty_run_report(report: RunReport) -> FwResult<()> {
+    let value = owned_run_report_value(report)?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn owned_run_report_value(report: RunReport) -> serde_json::Result<Value> {
+    let acceleration_context = acceleration_context_ref_from_evidence(&report.evidence).cloned();
+    let RunReport {
+        run_id,
+        trace_id,
+        started_at_rfc3339,
+        finished_at_rfc3339,
+        input_path,
+        normalized_wav_path,
+        request,
+        result,
+        events,
+        warnings,
+        evidence,
+        replay,
+    } = report;
+
+    let mut object = Map::new();
+    object.insert("run_id".to_owned(), Value::String(run_id));
+    object.insert("trace_id".to_owned(), Value::String(trace_id));
+    object.insert(
+        "started_at_rfc3339".to_owned(),
+        Value::String(started_at_rfc3339),
+    );
+    object.insert(
+        "finished_at_rfc3339".to_owned(),
+        Value::String(finished_at_rfc3339),
+    );
+    object.insert("input_path".to_owned(), Value::String(input_path));
+    object.insert(
+        "normalized_wav_path".to_owned(),
+        Value::String(normalized_wav_path),
+    );
+    object.insert("request".to_owned(), serde_json::to_value(request)?);
+    object.insert(
+        "result".to_owned(),
+        owned_transcription_result_value(result)?,
+    );
+    object.insert(
+        "events".to_owned(),
+        Value::Array(events.into_iter().map(owned_run_event_value).collect()),
+    );
+    object.insert("warnings".to_owned(), owned_string_array(warnings));
+    object.insert("evidence".to_owned(), Value::Array(evidence));
+    object.insert("replay".to_owned(), owned_replay_value(replay));
+    if let Some(context) = acceleration_context {
+        object.insert("acceleration_context".to_owned(), context);
+    }
+    Ok(Value::Object(object))
+}
+
+fn owned_transcription_result_value(result: TranscriptionResult) -> serde_json::Result<Value> {
+    let TranscriptionResult {
+        backend,
+        transcript,
+        language,
+        segments,
+        acceleration,
+        raw_output,
+        artifact_paths,
+    } = result;
+
+    let mut object = Map::new();
+    object.insert("backend".to_owned(), serde_json::to_value(backend)?);
+    object.insert("transcript".to_owned(), Value::String(transcript));
+    object.insert(
+        "language".to_owned(),
+        language.map_or(Value::Null, Value::String),
+    );
+    object.insert(
+        "segments".to_owned(),
+        Value::Array(
+            segments
+                .into_iter()
+                .map(owned_transcription_segment_value)
+                .collect::<serde_json::Result<Vec<_>>>()?,
+        ),
+    );
+    object.insert(
+        "acceleration".to_owned(),
+        match acceleration {
+            Some(report) => owned_acceleration_value(report)?,
+            None => Value::Null,
+        },
+    );
+    object.insert("raw_output".to_owned(), raw_output);
+    object.insert(
+        "artifact_paths".to_owned(),
+        owned_string_array(artifact_paths),
+    );
+    Ok(Value::Object(object))
+}
+
+fn owned_acceleration_value(report: AccelerationReport) -> serde_json::Result<Value> {
+    let mut object = Map::new();
+    object.insert("backend".to_owned(), serde_json::to_value(report.backend)?);
+    object.insert("input_values".to_owned(), Value::from(report.input_values));
+    object.insert(
+        "normalized_confidences".to_owned(),
+        Value::Bool(report.normalized_confidences),
+    );
+    object.insert(
+        "pre_mass".to_owned(),
+        serde_json::to_value(report.pre_mass)?,
+    );
+    object.insert(
+        "post_mass".to_owned(),
+        serde_json::to_value(report.post_mass)?,
+    );
+    object.insert("notes".to_owned(), owned_string_array(report.notes));
+    Ok(Value::Object(object))
+}
+
+fn owned_transcription_segment_value(segment: TranscriptionSegment) -> serde_json::Result<Value> {
+    let mut object = Map::new();
+    object.insert(
+        "start_sec".to_owned(),
+        serde_json::to_value(segment.start_sec)?,
+    );
+    object.insert("end_sec".to_owned(), serde_json::to_value(segment.end_sec)?);
+    object.insert("text".to_owned(), Value::String(segment.text));
+    object.insert(
+        "speaker".to_owned(),
+        segment.speaker.map_or(Value::Null, Value::String),
+    );
+    object.insert(
+        "confidence".to_owned(),
+        serde_json::to_value(segment.confidence)?,
+    );
+    Ok(Value::Object(object))
+}
+
+fn owned_run_event_value(event: RunEvent) -> Value {
+    let mut object = Map::new();
+    object.insert("seq".to_owned(), Value::from(event.seq));
+    object.insert("ts_rfc3339".to_owned(), Value::String(event.ts_rfc3339));
+    object.insert("stage".to_owned(), Value::String(event.stage));
+    object.insert("code".to_owned(), Value::String(event.code));
+    object.insert("message".to_owned(), Value::String(event.message));
+    object.insert("payload".to_owned(), event.payload);
+    Value::Object(object)
+}
+
+fn owned_replay_value(replay: crate::model::ReplayEnvelope) -> Value {
+    let mut object = Map::new();
+    if let Some(value) = replay.input_content_hash {
+        object.insert("input_content_hash".to_owned(), Value::String(value));
+    }
+    if let Some(value) = replay.backend_identity {
+        object.insert("backend_identity".to_owned(), Value::String(value));
+    }
+    if let Some(value) = replay.backend_version {
+        object.insert("backend_version".to_owned(), Value::String(value));
+    }
+    if let Some(value) = replay.output_payload_hash {
+        object.insert("output_payload_hash".to_owned(), Value::String(value));
+    }
+    Value::Object(object)
+}
+
+fn owned_string_array(values: Vec<String>) -> Value {
+    Value::Array(values.into_iter().map(Value::String).collect())
 }
 
 /// Build a [`BackendsReport`] by probing all registered engines.
@@ -204,6 +377,17 @@ pub fn routing_decision_value(
         "recommended_order": payload.get("recommended_order"),
         "mode": payload.get("mode"),
     })
+}
+
+/// Serialize one `routing_decision` NDJSON line without building an owned JSON
+/// object for values that already live in the stored event payload.
+pub fn routing_decision_line(
+    run_id: &str,
+    ts: &str,
+    code: &str,
+    payload: &Value,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&BorrowedRoutingDecision::new(run_id, ts, code, payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -680,7 +864,11 @@ pub fn emit_health_report(report: &HealthReport) -> FwResult<()> {
 /// Extract acceleration stream ownership/cancellation telemetry from run evidence.
 #[must_use]
 pub fn acceleration_context_from_evidence(evidence: &[Value]) -> Option<Value> {
-    evidence.iter().rev().find_map(|entry| {
+    acceleration_context_ref_from_evidence(evidence).cloned()
+}
+
+fn acceleration_context_ref_from_evidence(evidence: &[Value]) -> Option<&Value> {
+    evidence.iter().rev().find(|entry| {
         let has_stream_owner = entry
             .get("logical_stream_owner_id")
             .and_then(Value::as_str)
@@ -688,11 +876,7 @@ pub fn acceleration_context_from_evidence(evidence: &[Value]) -> Option<Value> {
         let has_fence = entry
             .get("cancellation_fence")
             .is_some_and(Value::is_object);
-        if has_stream_owner && has_fence {
-            Some(entry.clone())
-        } else {
-            None
-        }
+        has_stream_owner && has_fence
     })
 }
 
@@ -946,7 +1130,15 @@ pub fn robot_schema_value() -> serde_json::Value {
 }
 
 fn emit_line<T: Serialize>(value: &T) -> FwResult<()> {
-    println!("{}", serde_json::to_string(value)?);
+    // Stream the JSON straight to a locked stdout instead of allocating an
+    // intermediate `String` (+ UTF-8 validation) via `to_string`. The emitted
+    // bytes are identical (JSON + '\n'), and the newline flushes the line-buffered
+    // handle exactly as `println!` did. ~1.2-1.3x on emission, no per-event
+    // allocation (see benches/robot_emit_perf).
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer(&mut out, value)?;
+    out.write_all(b"\n")?;
     Ok(())
 }
 
@@ -967,6 +1159,111 @@ fn run_error_value(message: &str, code: &str) -> serde_json::Value {
     })
 }
 
+#[derive(Serialize)]
+struct BorrowedStage<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    run_id: &'a str,
+    seq: u64,
+    ts: &'a str,
+    stage: &'a str,
+    code: &'a str,
+    message: &'a str,
+    payload: &'a Value,
+}
+
+#[derive(Serialize)]
+struct BorrowedRoutingDecision<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    run_id: &'a str,
+    ts: &'a str,
+    code: &'a str,
+    decision_id: Option<&'a Value>,
+    chosen_action: Option<&'a Value>,
+    calibration_score: Option<&'a Value>,
+    e_process: Option<&'a Value>,
+    fallback_active: Option<&'a Value>,
+    recommended_order: Option<&'a Value>,
+    mode: Option<&'a Value>,
+}
+
+impl<'a> BorrowedRoutingDecision<'a> {
+    fn new(run_id: &'a str, ts: &'a str, code: &'a str, payload: &'a Value) -> Self {
+        Self {
+            event: "routing_decision",
+            schema_version: ROBOT_SCHEMA_VERSION,
+            run_id,
+            ts,
+            code,
+            decision_id: payload.get("decision_id"),
+            chosen_action: payload.get("chosen_action"),
+            calibration_score: payload.get("calibration_score"),
+            e_process: payload.get("e_process"),
+            fallback_active: payload.get("fallback_active"),
+            recommended_order: payload.get("recommended_order"),
+            mode: payload.get("mode"),
+        }
+    }
+}
+
+impl<'a> BorrowedStage<'a> {
+    fn new(run_id: &'a str, event: &'a RunEvent) -> Self {
+        Self {
+            event: "stage",
+            schema_version: ROBOT_SCHEMA_VERSION,
+            run_id,
+            seq: event.seq,
+            ts: &event.ts_rfc3339,
+            stage: &event.stage,
+            code: &event.code,
+            message: &event.message,
+            payload: &event.payload,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedComplete<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    run_id: &'a str,
+    trace_id: &'a str,
+    started_at: &'a str,
+    finished_at: &'a str,
+    backend: BackendKind,
+    language: Option<&'a str>,
+    transcript: &'a str,
+    segments: &'a [TranscriptionSegment],
+    acceleration: Option<&'a AccelerationReport>,
+    warnings: &'a [String],
+    evidence: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceleration_context: Option<&'a Value>,
+}
+
+impl<'a> BorrowedComplete<'a> {
+    fn new(report: &'a RunReport) -> Self {
+        Self {
+            event: "run_complete",
+            schema_version: ROBOT_SCHEMA_VERSION,
+            run_id: &report.run_id,
+            trace_id: &report.trace_id,
+            started_at: &report.started_at_rfc3339,
+            finished_at: &report.finished_at_rfc3339,
+            backend: report.result.backend,
+            language: report.result.language.as_deref(),
+            transcript: &report.result.transcript,
+            segments: &report.result.segments,
+            acceleration: report.result.acceleration.as_ref(),
+            warnings: &report.warnings,
+            evidence: &report.evidence,
+            acceleration_context: acceleration_context_ref_from_evidence(&report.evidence),
+        }
+    }
+}
+
+#[cfg(test)]
 fn run_stage_value(run_id: &str, event: &RunEvent) -> serde_json::Value {
     json!({
         "event": "stage",
@@ -981,6 +1278,7 @@ fn run_stage_value(run_id: &str, event: &RunEvent) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
 fn run_complete_value(report: &RunReport) -> serde_json::Value {
     let mut value = json!({
         "event": "run_complete",
@@ -1012,10 +1310,12 @@ mod tests {
     use crate::model::RunEvent;
 
     use super::{
-        HEALTH_REPORT_REQUIRED_FIELDS, RUN_COMPLETE_REQUIRED_FIELDS, RUN_ERROR_REQUIRED_FIELDS,
-        RUN_START_REQUIRED_FIELDS, SPECULATION_STATS_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS,
+        BorrowedComplete, BorrowedRoutingDecision, BorrowedStage, HEALTH_REPORT_REQUIRED_FIELDS,
+        RUN_COMPLETE_REQUIRED_FIELDS, RUN_ERROR_REQUIRED_FIELDS, RUN_START_REQUIRED_FIELDS,
+        SPECULATION_STATS_REQUIRED_FIELDS, STAGE_REQUIRED_FIELDS,
         TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
-        TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS, robot_schema_value,
+        TRANSCRIPT_PARTIAL_REQUIRED_FIELDS, TRANSCRIPT_RETRACT_REQUIRED_FIELDS,
+        owned_run_report_value, robot_schema_value, routing_decision_line, routing_decision_value,
         run_complete_value, run_error_value, run_stage_value, run_start_value,
         transcript_partial_value,
     };
@@ -1651,6 +1951,290 @@ mod tests {
         }
     }
 
+    fn historical_pretty_run_report(report: &crate::model::RunReport) -> String {
+        let mut value = serde_json::to_value(report).expect("historical report DOM");
+        if let Some(acceleration_context) =
+            super::acceleration_context_from_evidence(&report.evidence)
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("acceleration_context".to_owned(), acceleration_context);
+        }
+        serde_json::to_string_pretty(&value).expect("historical pretty report")
+    }
+
+    fn owned_pretty_run_report(report: crate::model::RunReport) -> String {
+        let value = owned_run_report_value(report).expect("owned report DOM");
+        serde_json::to_string_pretty(&value).expect("owned pretty report")
+    }
+
+    #[test]
+    fn owned_pretty_run_report_serialization_matches_historical_bytes() {
+        use crate::model::{
+            AccelerationBackend, AccelerationReport, ReplayEnvelope, TranscriptionSegment,
+        };
+
+        let mut empty = test_report(vec![], vec![]);
+        empty.result.language = None;
+        empty.result.transcript.clear();
+        empty.result.raw_output = serde_json::Value::Null;
+        assert_eq!(
+            owned_pretty_run_report(empty.clone()).as_bytes(),
+            historical_pretty_run_report(&empty).as_bytes(),
+            "empty report bytes differ"
+        );
+
+        let mut rich = test_report(
+            vec![RunEvent {
+                seq: u64::MAX,
+                ts_rfc3339: "2026-07-13T23:59:59.999999999-04:00".to_owned(),
+                stage: "backend\nquoted".to_owned(),
+                code: "backend.λ".to_owned(),
+                message: "line one\nline two \"quoted\" 🎧".to_owned(),
+                payload: json!({
+                    "z-last": [null, -0.0, {"nested": "日本語"}],
+                    "a-first": true,
+                }),
+            }],
+            vec![
+                json!({"ordinary": {"z": 1, "a": 2}}),
+                json!({
+                    "logical_stream_owner_id": "owner-last",
+                    "cancellation_fence": {"generation": 17, "closed": false},
+                    "extra": ["kept", null],
+                }),
+            ],
+        );
+        rich.run_id = "run-\"quoted\"\\line\nnext".to_owned();
+        rich.trace_id = "ffffffffffffffffffffffffffffffff".to_owned();
+        rich.input_path = "audio/λ input.wav".to_owned();
+        rich.normalized_wav_path = "tmp/normalized 日本語.wav".to_owned();
+        rich.result.transcript = "hello\nλ 🎧 \\ \"world\"".repeat(16);
+        rich.result.language = Some("zh-Hant".to_owned());
+        rich.result.segments = vec![
+            TranscriptionSegment {
+                start_sec: Some(-0.0),
+                end_sec: Some(1.25),
+                text: "first\nsegment".to_owned(),
+                speaker: Some("SPEAKER_00".to_owned()),
+                confidence: Some(0.9375),
+            },
+            TranscriptionSegment {
+                start_sec: None,
+                end_sec: None,
+                text: "第二段 🚀".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+        rich.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 65_537,
+            normalized_confidences: true,
+            pre_mass: Some(-0.0),
+            post_mass: None,
+            notes: vec!["accelerated\npath".to_owned(), "λ".to_owned()],
+        });
+        rich.result.raw_output = json!({
+            "segments": [{"text": "raw", "tokens": [1, 2, 3]}],
+            "model": "tiny.en",
+        });
+        rich.result.artifact_paths = vec!["one.json".to_owned(), "two.srt".to_owned()];
+        rich.warnings = vec!["warning \"quoted\"".to_owned()];
+        rich.replay = ReplayEnvelope {
+            input_content_hash: Some("input-hash".to_owned()),
+            backend_identity: Some("native:test".to_owned()),
+            backend_version: Some("1.2.3".to_owned()),
+            output_payload_hash: Some("output-hash".to_owned()),
+        };
+
+        let historical = historical_pretty_run_report(&rich);
+        let owned = owned_pretty_run_report(rich);
+        assert_eq!(
+            owned.as_bytes(),
+            historical.as_bytes(),
+            "rich report bytes differ"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&owned).expect("parse owned report"),
+            serde_json::from_str::<serde_json::Value>(&historical)
+                .expect("parse historical report")
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn owned_pretty_run_report_serialization_perf() {
+        use crate::model::{AccelerationBackend, AccelerationReport, TranscriptionSegment};
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 500;
+        const SAMPLES: usize = 21;
+
+        fn time_historical(base: &crate::model::RunReport) -> u128 {
+            let reports = (0..ITERATIONS).map(|_| base.clone()).collect::<Vec<_>>();
+            let started = Instant::now();
+            for report in reports {
+                drop(black_box(historical_pretty_run_report(black_box(&report))));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_owned(base: &crate::model::RunReport) -> u128 {
+            let reports = (0..ITERATIONS).map(|_| base.clone()).collect::<Vec<_>>();
+            let started = Instant::now();
+            for report in reports {
+                drop(black_box(owned_pretty_run_report(black_box(report))));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        let mut report = test_report(vec![], vec![]);
+        report.result.transcript =
+            "The quick brown fox crosses the measured speech pipeline. ".repeat(18);
+        report.result.segments = (0..10)
+            .map(|index| TranscriptionSegment {
+                start_sec: Some(f64::from(index) * 0.75),
+                end_sec: Some(f64::from(index + 1) * 0.75),
+                text: format!("segment {index}: measured pretty JSON output"),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{index:02}")),
+                confidence: Some(0.9 + f64::from(index) / 1_000.0),
+            })
+            .collect();
+        report.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 16_000,
+            normalized_confidences: true,
+            pre_mass: Some(9.75),
+            post_mass: Some(9.5),
+            notes: vec!["native acceleration accepted".to_owned()],
+        });
+        report.result.raw_output = json!({
+            "model": "tiny.en",
+            "text": "raw backend payload with nested token metadata ".repeat(80),
+            "segments": (0..10)
+                .map(|index| json!({
+                    "id": index,
+                    "tokens": [50364 + index, 100, 200, 50365 + index],
+                    "temperature": 0.0,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        report.events = (0..20)
+            .map(|index| RunEvent {
+                seq: index,
+                ts_rfc3339: format!("2026-07-13T21:30:{:02}-04:00", index % 60),
+                stage: format!("stage-{}", index % 5),
+                code: format!("stage.{}.ok", index % 5),
+                message: format!("stage {index} completed with measured metadata"),
+                payload: json!({
+                    "elapsed_ms": 100 + index,
+                    "posterior": {"accepted": index % 2 == 0, "score": 0.9375},
+                    "actions": ["keep", "fallback"],
+                }),
+            })
+            .collect();
+        report.warnings = vec!["normalization used ffmpeg".to_owned()];
+        report.evidence = vec![
+            json!({"contract": "backend_selection", "action": "native"}),
+            json!({"contract": "calibration", "score": 0.93}),
+            json!({
+                "logical_stream_owner_id": "owner-current-like",
+                "cancellation_fence": {"generation": 7, "closed": true},
+            }),
+        ];
+
+        let historical = historical_pretty_run_report(&report);
+        let owned = owned_pretty_run_report(report.clone());
+        assert_eq!(
+            owned.as_bytes(),
+            historical.as_bytes(),
+            "benchmark byte parity"
+        );
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "transcribe_pretty_json_ownership binary_sha256={:x}",
+            Sha256::digest(executable)
+        );
+        eprintln!(
+            "transcribe_pretty_json_ownership shape=current_like iterations={ITERATIONS} output_bytes={} output_sha256={:x}",
+            historical.len(),
+            Sha256::digest(historical.as_bytes())
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&report));
+            black_box(time_owned(&report));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut owned_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&report);
+            let null_second = time_historical(&report);
+            let (null_numerator, null_denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(null_numerator as f64 / null_denominator as f64);
+
+            let (historical, owned) = if sample % 2 == 0 {
+                (time_historical(&report), time_owned(&report))
+            } else {
+                let owned = time_owned(&report);
+                let historical = time_historical(&report);
+                (historical, owned)
+            };
+            historical_times.push(historical);
+            owned_times.push(owned);
+            speedups.push(historical as f64 / owned as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "transcribe_pretty_json_ownership shape=current_like samples={SAMPLES} iterations={ITERATIONS} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} owned_arm_median_ns={} speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&owned_times),
+        );
+        eprintln!(
+            "transcribe_pretty_json_ownership shape=current_like null_ratios={null_ratios:?} speedups={speedups:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90,
+            "candidate p10 {speedup_p10:.6} did not clear null p90 {null_p90:.6}"
+        );
+        assert!(wins >= 17, "candidate won only {wins}/{SAMPLES} pairs");
+    }
+
     fn test_event(seq: u64, stage: &str, code: &str) -> RunEvent {
         RunEvent {
             seq,
@@ -1703,6 +2287,196 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_stage_serialization_matches_owned_value_bytes() {
+        let cases = [
+            (
+                "run",
+                RunEvent {
+                    seq: 7,
+                    ts_rfc3339: "ts".to_owned(),
+                    stage: "stage".to_owned(),
+                    code: "code".to_owned(),
+                    message: "message".to_owned(),
+                    payload: json!(null),
+                },
+            ),
+            (
+                "run-\"quoted\"\\line\nnext",
+                RunEvent {
+                    seq: u64::MAX,
+                    ts_rfc3339: "2026-07-13T21:30:00-04:00".to_owned(),
+                    stage: "backend/λ".to_owned(),
+                    code: "backend.\0ok".to_owned(),
+                    message: "line one\nline two 🚀".to_owned(),
+                    payload: json!({
+                        "ordered_first": [true, false, null],
+                        "ordered_second": {"quote": "\\\"", "emoji": "🎧"},
+                    }),
+                },
+            ),
+            (
+                "",
+                RunEvent {
+                    seq: 0,
+                    ts_rfc3339: String::new(),
+                    stage: String::new(),
+                    code: String::new(),
+                    message: String::new(),
+                    payload: json!([0, "scalar", {"deep": [{"value": 1.25}]}]),
+                },
+            ),
+        ];
+
+        for (run_id, event) in &cases {
+            let owned = serde_json::to_vec(&run_stage_value(run_id, event)).expect("owned stage");
+            let borrowed =
+                serde_json::to_vec(&BorrowedStage::new(run_id, event)).expect("borrowed stage");
+            assert_eq!(borrowed, owned, "stage bytes differ for run_id {run_id:?}");
+        }
+
+        assert_eq!(
+            serde_json::to_string(&BorrowedStage::new(cases[0].0, &cases[0].1))
+                .expect("golden stage"),
+            r#"{"event":"stage","schema_version":"1.0.0","run_id":"run","seq":7,"ts":"ts","stage":"stage","code":"code","message":"message","payload":null}"#,
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn borrowed_stage_serialization_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "robot_stage_serialization binary_sha256={:x}",
+            Sha256::digest(executable)
+        );
+
+        fn time_owned(run_id: &str, event: &RunEvent, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = run_stage_value(black_box(run_id), black_box(event));
+                let encoded = serde_json::to_string(black_box(&value)).expect("owned stage");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_borrowed(run_id: &str, event: &RunEvent, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = BorrowedStage::new(black_box(run_id), black_box(event));
+                let encoded = serde_json::to_string(black_box(&value)).expect("borrowed stage");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn run_shape(name: &str, event: &RunEvent, iterations: usize) {
+            let run_id = "run-perf-0123456789abcdef";
+            let owned_bytes =
+                serde_json::to_vec(&run_stage_value(run_id, event)).expect("owned stage");
+            let borrowed_bytes =
+                serde_json::to_vec(&BorrowedStage::new(run_id, event)).expect("borrowed stage");
+            assert_eq!(borrowed_bytes, owned_bytes, "{name} byte parity");
+
+            for _ in 0..3 {
+                black_box(time_owned(run_id, event, iterations));
+                black_box(time_borrowed(run_id, event, iterations));
+            }
+
+            let mut null_ratios = Vec::with_capacity(SAMPLES);
+            let mut speedups = Vec::with_capacity(SAMPLES);
+            let mut owned_times = Vec::with_capacity(SAMPLES);
+            let mut borrowed_times = Vec::with_capacity(SAMPLES);
+
+            for sample in 0..SAMPLES {
+                let null_first = time_owned(run_id, event, iterations);
+                let null_second = time_owned(run_id, event, iterations);
+                let (null_numerator, null_denominator) = if sample % 2 == 0 {
+                    (null_first, null_second)
+                } else {
+                    (null_second, null_first)
+                };
+                null_ratios.push(null_numerator as f64 / null_denominator as f64);
+
+                let (owned, borrowed) = if sample % 2 == 0 {
+                    (
+                        time_owned(run_id, event, iterations),
+                        time_borrowed(run_id, event, iterations),
+                    )
+                } else {
+                    let borrowed = time_borrowed(run_id, event, iterations);
+                    let owned = time_owned(run_id, event, iterations);
+                    (owned, borrowed)
+                };
+                owned_times.push(owned);
+                borrowed_times.push(borrowed);
+                speedups.push(owned as f64 / borrowed as f64);
+            }
+
+            eprintln!(
+                "robot_stage_serialization shape={name} samples={SAMPLES} iterations={iterations} null_median={:.6} null_p90={:.6} owned_arm_median_ns={} borrowed_arm_median_ns={} speedup_median={:.6} speedup_p10={:.6}",
+                percentile(&null_ratios, 50),
+                percentile(&null_ratios, 90),
+                median_ns(&owned_times),
+                median_ns(&borrowed_times),
+                percentile(&speedups, 50),
+                percentile(&speedups, 10),
+            );
+            eprintln!(
+                "robot_stage_serialization shape={name} null_ratios={null_ratios:?} speedups={speedups:?}"
+            );
+        }
+
+        let current_like = RunEvent {
+            seq: 3,
+            ts_rfc3339: "2026-07-13T21:30:00-04:00".to_owned(),
+            stage: "backend".to_owned(),
+            code: "backend.ok".to_owned(),
+            message: "backend completed".to_owned(),
+            payload: json!({"resolved_backend": "native", "elapsed_ms": 711}),
+        };
+        let nested = RunEvent {
+            seq: 9,
+            ts_rfc3339: "2026-07-13T21:30:00-04:00".to_owned(),
+            stage: "backend".to_owned(),
+            code: "backend.routing.decision_contract".to_owned(),
+            message: "routing evidence ready".to_owned(),
+            payload: json!({
+                "posterior": (0..32)
+                    .map(|index| json!({
+                        "backend": format!("candidate-{index}"),
+                        "probability": f64::from(index) / 32.0,
+                        "available": index % 3 != 0,
+                    }))
+                    .collect::<Vec<_>>(),
+                "fallback_active": false,
+            }),
+        };
+
+        run_shape("current_like", &current_like, 20_000);
+        run_shape("nested", &nested, 2_000);
+    }
+
+    #[test]
     fn ndjson_run_complete_serializes_to_single_line() {
         let report = test_report(vec![], vec![json!({"k": "v"})]);
         let value = run_complete_value(&report);
@@ -1713,6 +2487,262 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("parse back");
         assert_eq!(parsed["event"], "run_complete");
+    }
+
+    #[test]
+    fn borrowed_complete_serialization_matches_owned_value_bytes() {
+        use crate::model::{AccelerationBackend, AccelerationReport, TranscriptionSegment};
+
+        fn assert_byte_parity(report: &crate::model::RunReport) -> Vec<u8> {
+            let owned = serde_json::to_vec(&run_complete_value(report)).expect("owned complete");
+            let borrowed =
+                serde_json::to_vec(&BorrowedComplete::new(report)).expect("borrowed complete");
+            assert_eq!(borrowed, owned, "run_complete bytes differ");
+            borrowed
+        }
+
+        let mut empty = test_report(vec![], vec![]);
+        empty.result.language = None;
+        empty.result.transcript.clear();
+        let empty_bytes = assert_byte_parity(&empty);
+        assert_eq!(
+            String::from_utf8(empty_bytes).expect("empty complete is UTF-8"),
+            r#"{"event":"run_complete","schema_version":"1.0.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"warnings":[],"evidence":[]}"#,
+        );
+
+        let mut rich = test_report(vec![], vec![]);
+        rich.run_id = "run-\"quoted\"\\line\nnext".to_owned();
+        rich.result.transcript = "hello\nλ 🎧 \\ \"world\"".repeat(8);
+        rich.result.segments = vec![
+            TranscriptionSegment {
+                start_sec: Some(-0.0),
+                end_sec: Some(1.25),
+                text: "first\nsegment".to_owned(),
+                speaker: Some("SPEAKER_00".to_owned()),
+                confidence: Some(0.9375),
+            },
+            TranscriptionSegment {
+                start_sec: None,
+                end_sec: None,
+                text: "第二段 🚀".to_owned(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+        rich.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 257,
+            normalized_confidences: true,
+            pre_mass: Some(3.5),
+            post_mass: None,
+            notes: vec!["accelerated\npath".to_owned()],
+        });
+        rich.warnings = vec!["warning \"quoted\"".to_owned()];
+        rich.evidence = vec![
+            json!({
+                "logical_stream_owner_id": "ignored",
+                "cancellation_fence": [],
+            }),
+            json!({
+                "logical_stream_owner_id": "owner-first",
+                "cancellation_fence": {"generation": 1},
+            }),
+            json!({"nested": [{"ordered_first": true}, null]}),
+            json!({
+                "logical_stream_owner_id": "owner-last",
+                "cancellation_fence": {},
+                "extra": "kept",
+            }),
+        ];
+        let rich_line =
+            String::from_utf8(assert_byte_parity(&rich)).expect("rich complete is UTF-8");
+        let evidence_offset = rich_line.find("\"evidence\"").expect("evidence field");
+        let context_offset = rich_line
+            .rfind("\"acceleration_context\"")
+            .expect("acceleration context field");
+        assert!(
+            context_offset > evidence_offset,
+            "context must remain final"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&rich_line).expect("parse rich");
+        assert_eq!(
+            parsed["acceleration_context"]["logical_stream_owner_id"],
+            "owner-last"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn borrowed_complete_serialization_perf() {
+        use crate::model::{AccelerationBackend, AccelerationReport, TranscriptionSegment};
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "robot_complete_serialization binary_sha256={:x}",
+            Sha256::digest(executable)
+        );
+
+        fn time_owned(report: &crate::model::RunReport, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = run_complete_value(black_box(report));
+                let encoded = serde_json::to_string(black_box(&value)).expect("owned complete");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_borrowed(report: &crate::model::RunReport, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = BorrowedComplete::new(black_box(report));
+                let encoded = serde_json::to_string(black_box(&value)).expect("borrowed complete");
+                drop(black_box(encoded));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn run_shape(name: &str, report: &crate::model::RunReport, iterations: usize) {
+            let owned_bytes =
+                serde_json::to_vec(&run_complete_value(report)).expect("owned complete");
+            let borrowed_bytes =
+                serde_json::to_vec(&BorrowedComplete::new(report)).expect("borrowed complete");
+            assert_eq!(borrowed_bytes, owned_bytes, "{name} byte parity");
+            eprintln!(
+                "robot_complete_serialization shape={name} output_bytes={} output_sha256={:x}",
+                owned_bytes.len(),
+                Sha256::digest(&owned_bytes)
+            );
+
+            for _ in 0..3 {
+                black_box(time_owned(report, iterations));
+                black_box(time_borrowed(report, iterations));
+            }
+
+            let mut null_ratios = Vec::with_capacity(SAMPLES);
+            let mut speedups = Vec::with_capacity(SAMPLES);
+            let mut owned_times = Vec::with_capacity(SAMPLES);
+            let mut borrowed_times = Vec::with_capacity(SAMPLES);
+
+            for sample in 0..SAMPLES {
+                let null_first = time_owned(report, iterations);
+                let null_second = time_owned(report, iterations);
+                let (null_numerator, null_denominator) = if sample % 2 == 0 {
+                    (null_first, null_second)
+                } else {
+                    (null_second, null_first)
+                };
+                null_ratios.push(null_numerator as f64 / null_denominator as f64);
+
+                let (owned, borrowed) = if sample % 2 == 0 {
+                    (
+                        time_owned(report, iterations),
+                        time_borrowed(report, iterations),
+                    )
+                } else {
+                    let borrowed = time_borrowed(report, iterations);
+                    let owned = time_owned(report, iterations);
+                    (owned, borrowed)
+                };
+                owned_times.push(owned);
+                borrowed_times.push(borrowed);
+                speedups.push(owned as f64 / borrowed as f64);
+            }
+
+            eprintln!(
+                "robot_complete_serialization shape={name} samples={SAMPLES} iterations={iterations} null_p10={:.6} null_median={:.6} null_p90={:.6} owned_arm_median_ns={} borrowed_arm_median_ns={} speedup_p10={:.6} speedup_median={:.6} speedup_p90={:.6}",
+                percentile(&null_ratios, 10),
+                percentile(&null_ratios, 50),
+                percentile(&null_ratios, 90),
+                median_ns(&owned_times),
+                median_ns(&borrowed_times),
+                percentile(&speedups, 10),
+                percentile(&speedups, 50),
+                percentile(&speedups, 90),
+            );
+            eprintln!(
+                "robot_complete_serialization shape={name} null_ratios={null_ratios:?} speedups={speedups:?}"
+            );
+        }
+
+        let mut current_like = test_report(vec![], vec![]);
+        current_like.result.transcript =
+            "The quick brown fox crosses the low-latency speech pipeline. ".repeat(18);
+        current_like.result.segments = (0..10)
+            .map(|index| TranscriptionSegment {
+                start_sec: Some(f64::from(index) * 0.75),
+                end_sec: Some(f64::from(index + 1) * 0.75),
+                text: format!("segment {index}: measured robot output"),
+                speaker: (index % 3 == 0).then(|| format!("SPEAKER_{index:02}")),
+                confidence: Some(0.9 + f64::from(index) / 1_000.0),
+            })
+            .collect();
+        current_like.warnings = vec!["normalization used ffmpeg".to_owned()];
+        current_like.evidence = vec![
+            json!({"contract": "backend_selection", "action": "native"}),
+            json!({"contract": "calibration", "score": 0.93}),
+            json!({"contract": "checkpoint", "stage": "persist", "result": "ok"}),
+        ];
+
+        let mut heavy = test_report(vec![], vec![]);
+        heavy.result.transcript = "wide transcript payload with Unicode λ and 🎧; ".repeat(700);
+        heavy.result.segments = (0..128)
+            .map(|index| TranscriptionSegment {
+                start_sec: Some(f64::from(index) * 0.5),
+                end_sec: Some(f64::from(index + 1) * 0.5),
+                text: format!(
+                    "segment {index:03}: long nested transcription text with escaped \"quotes\""
+                ),
+                speaker: Some(format!("SPEAKER_{:02}", index % 8)),
+                confidence: Some(0.8 + f64::from(index % 20) / 100.0),
+            })
+            .collect();
+        heavy.result.acceleration = Some(AccelerationReport {
+            backend: AccelerationBackend::Frankentorch,
+            input_values: 65_536,
+            normalized_confidences: true,
+            pre_mass: Some(127.75),
+            post_mass: Some(127.5),
+            notes: (0..8).map(|index| format!("note-{index}")).collect(),
+        });
+        heavy.warnings = (0..16)
+            .map(|index| format!("heavy warning {index}"))
+            .collect();
+        heavy.evidence = (0..32)
+            .map(|index| {
+                json!({
+                    "contract": format!("contract-{index}"),
+                    "posterior": {"accepted": index % 2 == 0, "score": f64::from(index) / 32.0},
+                    "actions": ["keep", "fallback"],
+                })
+            })
+            .collect();
+        heavy.evidence.push(json!({
+            "logical_stream_owner_id": "stream-owner-heavy",
+            "cancellation_fence": {"epoch": 17, "closed": false},
+            "calibration": {"ece": 0.0125},
+        }));
+
+        run_shape("current_like", &current_like, 5_000);
+        run_shape("heavy", &heavy, 100);
     }
 
     // --- emit_robot_report shape tests (value-level, not stdout) ---
@@ -2937,6 +3967,271 @@ mod tests {
                 "routing_decision missing required field `{field}`"
             );
         }
+    }
+
+    #[test]
+    fn borrowed_routing_decision_serialization_matches_owned_value_bytes() {
+        let cases = [
+            json!({
+                "decision_id": "dec-1",
+                "chosen_action": "try_whisper_cpp",
+                "calibration_score": 0.91,
+                "e_process": 1.23,
+                "fallback_active": false,
+                "recommended_order": ["whisper_cpp", "insanely_fast"],
+                "mode": "adaptive",
+            }),
+            json!({}),
+            json!({
+                "decision_id": null,
+                "chosen_action": {"nested": ["λ", "🎧", {"quote": "\""}]},
+                "calibration_score": -0.0,
+                "e_process": 1.0e30,
+                "fallback_active": true,
+                "recommended_order": [{"backend": "native"}, null],
+                "mode": "safe\nmode",
+                "ignored": "must not be emitted",
+            }),
+        ];
+
+        for (index, payload) in cases.iter().enumerate() {
+            let run_id = format!("run-{index}-λ");
+            let ts = format!("2026-07-14T00:00:0{index}Z");
+            let code = format!("backend.routing.case_{index}");
+            let owned = serde_json::to_vec(&routing_decision_value(&run_id, &ts, &code, payload))
+                .expect("owned routing decision");
+            let borrowed =
+                serde_json::to_vec(&BorrowedRoutingDecision::new(&run_id, &ts, &code, payload))
+                    .expect("borrowed routing decision");
+            assert_eq!(borrowed, owned, "case {index} byte parity");
+            assert_eq!(
+                routing_decision_line(&run_id, &ts, &code, payload)
+                    .expect("routing decision line")
+                    .as_bytes(),
+                owned,
+                "case {index} production line parity",
+            );
+        }
+
+        assert_eq!(
+            routing_decision_line(
+                "run-123",
+                "2026-02-22T00:00:00Z",
+                "backend.routing.decision_contract",
+                &cases[0],
+            )
+            .expect("golden routing decision"),
+            r#"{"event":"routing_decision","schema_version":"1.0.0","run_id":"run-123","ts":"2026-02-22T00:00:00Z","code":"backend.routing.decision_contract","decision_id":"dec-1","chosen_action":"try_whisper_cpp","calibration_score":0.91,"e_process":1.23,"fallback_active":false,"recommended_order":["whisper_cpp","insanely_fast"],"mode":"adaptive"}"#,
+        );
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn borrowed_routing_decision_serialization_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 32;
+        const TARGET_ARM_NS: u128 = 40_000_000;
+
+        struct RoutingRow {
+            run_id: String,
+            ts: String,
+            code: String,
+            payload: serde_json::Value,
+        }
+
+        fn fixture_rows() -> Vec<RoutingRow> {
+            (0..20)
+                .map(|index| RoutingRow {
+                    run_id: format!("run-{index:02}-0123456789abcdef"),
+                    ts: format!("2026-07-14T00:00:{index:02}Z"),
+                    code: if index % 3 == 0 {
+                        "backend.routing.safe_mode".to_owned()
+                    } else {
+                        "backend.routing.decision_contract".to_owned()
+                    },
+                    payload: json!({
+                        "decision_id": format!("decision-{index:02}"),
+                        "chosen_action": if index % 2 == 0 { "native" } else { "whisper_cpp" },
+                        "calibration_score": 0.75 + f64::from(index) / 100.0,
+                        "e_process": 1.25 + f64::from(index) / 10.0,
+                        "fallback_active": index % 3 == 0,
+                        "recommended_order": ["native", "whisper_cpp", "insanely_fast"],
+                        "mode": if index % 3 == 0 { "safe" } else { "adaptive" },
+                        "ignored_evidence": {
+                            "posterior": [0.5, 0.3, 0.2],
+                            "note": "stored payload remains borrowed λ 🎧",
+                        },
+                    }),
+                })
+                .collect()
+        }
+
+        fn time_owned(rows: &[RoutingRow], iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                for row in rows {
+                    let value = routing_decision_value(
+                        black_box(&row.run_id),
+                        black_box(&row.ts),
+                        black_box(&row.code),
+                        black_box(&row.payload),
+                    );
+                    let line =
+                        serde_json::to_string(black_box(&value)).expect("owned routing decision");
+                    drop(black_box(line));
+                }
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_borrowed(rows: &[RoutingRow], iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                for row in rows {
+                    let line = routing_decision_line(
+                        black_box(&row.run_id),
+                        black_box(&row.ts),
+                        black_box(&row.code),
+                        black_box(&row.payload),
+                    )
+                    .expect("borrowed routing decision");
+                    drop(black_box(line));
+                }
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let rows = fixture_rows();
+        let owned_lines = rows
+            .iter()
+            .map(|row| {
+                serde_json::to_string(&routing_decision_value(
+                    &row.run_id,
+                    &row.ts,
+                    &row.code,
+                    &row.payload,
+                ))
+                .expect("owned fixture line")
+            })
+            .collect::<Vec<_>>();
+        let borrowed_lines = rows
+            .iter()
+            .map(|row| {
+                routing_decision_line(&row.run_id, &row.ts, &row.code, &row.payload)
+                    .expect("borrowed fixture line")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(borrowed_lines, owned_lines, "fixture byte parity");
+        let output = owned_lines.join("\n");
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "routing_decision_borrowed binary_sha256={:x} rows={} output_bytes={} output_sha256={:x}",
+            Sha256::digest(executable),
+            rows.len(),
+            output.len(),
+            Sha256::digest(output.as_bytes()),
+        );
+
+        let calibration = time_owned(&rows, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration)
+            .clamp(128, 10_000) as usize;
+        eprintln!(
+            "routing_decision_borrowed calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_owned(&rows, iterations));
+            black_box(time_borrowed(&rows, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut owned_times = Vec::with_capacity(SAMPLES);
+        let mut borrowed_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_owned(&rows, iterations);
+            let null_second = time_owned(&rows, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (owned, borrowed) = if sample % 2 == 0 {
+                (
+                    time_owned(&rows, iterations),
+                    time_borrowed(&rows, iterations),
+                )
+            } else {
+                let borrowed = time_borrowed(&rows, iterations);
+                let owned = time_owned(&rows, iterations);
+                (owned, borrowed)
+            };
+            owned_times.push(owned);
+            borrowed_times.push(borrowed);
+            speedups.push(owned as f64 / borrowed as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "routing_decision_borrowed samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} owned_arm_median_ns={} borrowed_arm_median_ns={} borrowed_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&owned_times),
+            median_ns(&borrowed_times),
+            coefficient_of_variation(&borrowed_times) * 100.0,
+        );
+        eprintln!(
+            "routing_decision_borrowed null_ratios={null_ratios:?} speedups={speedups:?} owned_times_ns={owned_times:?} borrowed_times_ns={borrowed_times:?}"
+        );
+
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard",
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.10),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.10)",
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18",
+        );
     }
 
     #[test]

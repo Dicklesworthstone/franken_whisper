@@ -64,14 +64,22 @@ fn main() {
     let mut reused: Vec<f32> = Vec::new();
     for _ in 0..3 {
         ft_kernel_cpu::matmul_tensor_contiguous_f32_into(
-            &mut reused, &a.data, &b.data, &lhs_meta, &rhs_meta,
+            &mut reused,
+            &a.data,
+            &b.data,
+            &lhs_meta,
+            &rhs_meta,
         )
         .expect("into");
     }
     let (into_t, into_cs) = best(&mut || {
         let t0 = Instant::now();
         ft_kernel_cpu::matmul_tensor_contiguous_f32_into(
-            &mut reused, &a.data, &b.data, &lhs_meta, &rhs_meta,
+            &mut reused,
+            &a.data,
+            &b.data,
+            &lhs_meta,
+            &rhs_meta,
         )
         .expect("into");
         let dt = t0.elapsed().as_secs_f64();
@@ -80,9 +88,22 @@ fn main() {
         (dt, c)
     });
 
-    println!("== encoder MLP fc1 [{m},{k}]x[{k},{n}] (output {:.1} MB), best-of-{iters} ==", (m * n * 4) as f64 / 1e6);
-    println!("(a) allocating nn::matmul (zero-init each call): {:.3} ms", alloc_t * 1e3);
-    println!("(b) reused-buffer _into  (no zero-init)        : {:.3} ms", into_t * 1e3);
-    println!("dead-zero-init+malloc per matmul = {:.3} ms  ({:.1}% of the call)", (alloc_t - into_t) * 1e3, 100.0 * (alloc_t - into_t) / alloc_t);
+    println!(
+        "== encoder MLP fc1 [{m},{k}]x[{k},{n}] (output {:.1} MB), best-of-{iters} ==",
+        (m * n * 4) as f64 / 1e6
+    );
+    println!(
+        "(a) allocating nn::matmul (zero-init each call): {:.3} ms",
+        alloc_t * 1e3
+    );
+    println!(
+        "(b) reused-buffer _into  (no zero-init)        : {:.3} ms",
+        into_t * 1e3
+    );
+    println!(
+        "dead-zero-init+malloc per matmul = {:.3} ms  ({:.1}% of the call)",
+        (alloc_t - into_t) * 1e3,
+        100.0 * (alloc_t - into_t) / alloc_t
+    );
     println!("checksums: alloc={alloc_cs:.3} into={into_cs:.3} (equal => bit-identical GEMM)");
 }

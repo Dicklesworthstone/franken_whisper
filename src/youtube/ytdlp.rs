@@ -30,10 +30,12 @@
 //! id only — the descriptive `{date} - {title} [{id}]` naming is the
 //! `naming.rs` module's job at the output layer (separation of concerns).
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{NaiveDate, Utc};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::error::{FwError, FwResult};
 use crate::orchestrator::CancellationToken;
@@ -534,9 +536,9 @@ pub fn expand_playlist(
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(value) => {
-                if let Some(video_ref) = video_ref_from_json(&value) {
+        match parse_flat_playlist_line(line) {
+            Ok(video_ref) => {
+                if let Some(video_ref) = video_ref {
                     refs.push(video_ref);
                 } else {
                     tracing::warn!(
@@ -589,30 +591,201 @@ fn is_capture_truncation_failure(err: &FwError) -> bool {
     }
 }
 
-/// Map a single flat-playlist JSON object into a [`VideoRef`], or `None` if it
-/// lacks a usable id.
-fn video_ref_from_json(value: &serde_json::Value) -> Option<VideoRef> {
-    let id = value.get("id").and_then(serde_json::Value::as_str)?;
-    if id.is_empty() {
-        return None;
-    }
-    let title = string_field(value, "title").unwrap_or_default();
-    let url = string_field(value, "url")
-        .or_else(|| string_field(value, "webpage_url"))
+/// The only fields retained from yt-dlp's much larger flat-playlist objects.
+/// Unknown fields are parsed for validity but skipped without building a full
+/// `serde_json::Value` tree.
+#[derive(serde::Deserialize)]
+struct FlatPlaylistEntry {
+    #[serde(default)]
+    id: serde_json::Value,
+    #[serde(default)]
+    title: serde_json::Value,
+    #[serde(default)]
+    url: serde_json::Value,
+    #[serde(default)]
+    webpage_url: serde_json::Value,
+    #[serde(default)]
+    duration: serde_json::Value,
+}
+
+/// Parse one flat-playlist line and move the retained strings into a
+/// [`VideoRef`]. Missing, empty, or non-string ids remain skippable entries.
+fn parse_flat_playlist_line(line: &str) -> serde_json::Result<Option<VideoRef>> {
+    serde_json::from_str(line).map(video_ref_from_flat_entry)
+}
+
+fn video_ref_from_flat_entry(entry: FlatPlaylistEntry) -> Option<VideoRef> {
+    let id = non_empty_json_string(entry.id)?;
+    let title = non_empty_json_string(entry.title).unwrap_or_default();
+    let url = non_empty_json_string(entry.url)
+        .or_else(|| non_empty_json_string(entry.webpage_url))
         .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
-    let duration_sec = value.get("duration").and_then(serde_json::Value::as_f64);
+    let duration_sec = entry.duration.as_f64();
 
     Some(VideoRef {
-        id: id.to_owned(),
+        id,
         title,
         url,
         duration_sec,
     })
 }
 
+fn non_empty_json_string(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) if !value.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // fetch_metadata
 // ---------------------------------------------------------------------------
+
+/// The fields retained from yt-dlp's much larger full metadata object.
+/// Unknown values are validated and skipped without materializing a complete
+/// `serde_json::Value` tree. Retained values stay as JSON values so wrong-type,
+/// empty-string, numeric, and duplicate-key behavior matches the former DOM
+/// parser exactly.
+struct ProjectedVideoMetadata {
+    id: serde_json::Value,
+    title: serde_json::Value,
+    channel: serde_json::Value,
+    uploader: serde_json::Value,
+    upload_date: serde_json::Value,
+    duration: serde_json::Value,
+    webpage_url: serde_json::Value,
+    description: serde_json::Value,
+    availability: serde_json::Value,
+    live_status: serde_json::Value,
+}
+
+impl Default for ProjectedVideoMetadata {
+    fn default() -> Self {
+        Self {
+            id: serde_json::Value::Null,
+            title: serde_json::Value::Null,
+            channel: serde_json::Value::Null,
+            uploader: serde_json::Value::Null,
+            upload_date: serde_json::Value::Null,
+            duration: serde_json::Value::Null,
+            webpage_url: serde_json::Value::Null,
+            description: serde_json::Value::Null,
+            availability: serde_json::Value::Null,
+            live_status: serde_json::Value::Null,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum VideoMetadataField {
+    Id,
+    Title,
+    Channel,
+    Uploader,
+    UploadDate,
+    Duration,
+    WebpageUrl,
+    Description,
+    Availability,
+    LiveStatus,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for ProjectedVideoMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MetadataVisitor;
+
+        impl<'de> Visitor<'de> for MetadataVisitor {
+            type Value = ProjectedVideoMetadata;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a yt-dlp metadata JSON value")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut metadata = ProjectedVideoMetadata::default();
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        VideoMetadataField::Id => metadata.id = map.next_value()?,
+                        VideoMetadataField::Title => metadata.title = map.next_value()?,
+                        VideoMetadataField::Channel => metadata.channel = map.next_value()?,
+                        VideoMetadataField::Uploader => metadata.uploader = map.next_value()?,
+                        VideoMetadataField::UploadDate => {
+                            metadata.upload_date = map.next_value()?;
+                        }
+                        VideoMetadataField::Duration => metadata.duration = map.next_value()?,
+                        VideoMetadataField::WebpageUrl => {
+                            metadata.webpage_url = map.next_value()?;
+                        }
+                        VideoMetadataField::Description => {
+                            metadata.description = map.next_value()?;
+                        }
+                        VideoMetadataField::Availability => {
+                            metadata.availability = map.next_value()?;
+                        }
+                        VideoMetadataField::LiveStatus => {
+                            metadata.live_status = map.next_value()?;
+                        }
+                        VideoMetadataField::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(metadata)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while sequence.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ProjectedVideoMetadata::default())
+            }
+        }
+
+        deserializer.deserialize_any(MetadataVisitor)
+    }
+}
 
 /// Fetch full metadata for a single video via `yt-dlp -j`.
 ///
@@ -652,8 +825,7 @@ pub fn fetch_metadata(
             FwError::InvalidRequest(format!("yt-dlp returned no metadata for `{url}`"))
         })?;
 
-    let value: serde_json::Value = serde_json::from_str(line)?;
-    let meta = video_meta_from_json(&value)?;
+    let meta = parse_video_meta(line)?;
 
     if let Some(status) = meta.live_status.as_deref()
         && matches!(status, "is_live" | "is_upcoming")
@@ -667,7 +839,31 @@ pub fn fetch_metadata(
     Ok(meta)
 }
 
+fn parse_video_meta(line: &str) -> FwResult<VideoMeta> {
+    let metadata: ProjectedVideoMetadata = serde_json::from_str(line)?;
+    let id = non_empty_json_string(metadata.id).ok_or_else(|| {
+        FwError::InvalidRequest("yt-dlp metadata is missing an `id` field".to_owned())
+    })?;
+    let title = non_empty_json_string(metadata.title).unwrap_or_default();
+    let webpage_url = non_empty_json_string(metadata.webpage_url)
+        .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+
+    Ok(VideoMeta {
+        id,
+        title,
+        channel: non_empty_json_string(metadata.channel),
+        uploader: non_empty_json_string(metadata.uploader),
+        upload_date: non_empty_json_string(metadata.upload_date),
+        duration_sec: metadata.duration.as_f64(),
+        webpage_url,
+        description: non_empty_json_string(metadata.description),
+        availability: non_empty_json_string(metadata.availability),
+        live_status: non_empty_json_string(metadata.live_status),
+    })
+}
+
 /// Build a [`VideoMeta`] from a `yt-dlp -j` JSON object.
+#[cfg(test)]
 fn video_meta_from_json(value: &serde_json::Value) -> FwResult<VideoMeta> {
     let id = string_field(value, "id").ok_or_else(|| {
         FwError::InvalidRequest("yt-dlp metadata is missing an `id` field".to_owned())
@@ -892,6 +1088,7 @@ fn classify_stderr(stderr_lower: &str) -> Option<&'static str> {
 
 /// Extract a non-empty string field from a JSON object, treating JSON `null`
 /// and empty strings as absent.
+#[cfg(test)]
 fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -1505,19 +1702,90 @@ mod tests {
     }
 
     #[test]
-    fn video_ref_from_json_url_fallback_to_synthetic() {
-        let value = serde_json::json!({"id": "xyz", "title": "T"});
-        let r = video_ref_from_json(&value).unwrap();
+    fn projected_video_ref_url_fallback_to_synthetic() {
+        let r = parse_flat_playlist_line(r#"{"id":"xyz","title":"T"}"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.url, "https://www.youtube.com/watch?v=xyz");
         assert_eq!(r.duration_sec, None);
     }
 
     #[test]
-    fn video_ref_from_json_no_id_is_none() {
-        let value = serde_json::json!({"title": "T"});
-        assert!(video_ref_from_json(&value).is_none());
-        let empty_id = serde_json::json!({"id": ""});
-        assert!(video_ref_from_json(&empty_id).is_none());
+    fn projected_video_ref_no_id_is_none() {
+        assert!(
+            parse_flat_playlist_line(r#"{"title":"T"}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_flat_playlist_line(r#"{"id":""}"#).unwrap().is_none());
+    }
+
+    fn legacy_video_ref_from_json(value: &serde_json::Value) -> Option<VideoRef> {
+        let id = value.get("id").and_then(serde_json::Value::as_str)?;
+        if id.is_empty() {
+            return None;
+        }
+        let title = string_field(value, "title").unwrap_or_default();
+        let url = string_field(value, "url")
+            .or_else(|| string_field(value, "webpage_url"))
+            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+        let duration_sec = value.get("duration").and_then(serde_json::Value::as_f64);
+        Some(VideoRef {
+            id: id.to_owned(),
+            title,
+            url,
+            duration_sec,
+        })
+    }
+
+    fn legacy_parse_flat_playlist_line(line: &str) -> serde_json::Result<Option<VideoRef>> {
+        serde_json::from_str(line).map(|value| legacy_video_ref_from_json(&value))
+    }
+
+    fn assert_video_refs_exact(left: &Option<VideoRef>, right: &Option<VideoRef>) {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                assert_eq!(left.id, right.id);
+                assert_eq!(left.title, right.title);
+                assert_eq!(left.url, right.url);
+                assert_eq!(
+                    left.duration_sec.map(f64::to_bits),
+                    right.duration_sec.map(f64::to_bits)
+                );
+            }
+            (None, None) => {}
+            _ => panic!("projected and legacy parsers disagreed: {left:?} != {right:?}"),
+        }
+    }
+
+    #[test]
+    fn projected_playlist_parser_matches_value_dom_reference() {
+        for line in [
+            r#"{"id":"abc","title":"title","url":"https://youtu.be/abc","webpage_url":"ignored","duration":1.25,"description":{"fat":[1,2,3]}}"#,
+            r#"{"id":"escaped\\\"id","title":"snowman ☃","webpage_url":"https://example.test/watch","duration":-0.0}"#,
+            r#"{"id":"abc","title":"","url":"","webpage_url":"","duration":7}"#,
+            r#"{"id":"abc","title":7,"url":false,"webpage_url":"fallback","duration":"9"}"#,
+            r#"{"id":""}"#,
+            r#"{"id":42}"#,
+            r#"{"title":"missing id"}"#,
+            r#"[]"#,
+            r#"null"#,
+            r#"{"id":"unterminated""#,
+        ] {
+            let legacy = legacy_parse_flat_playlist_line(line);
+            let projected = parse_flat_playlist_line(line);
+            match (legacy, projected) {
+                (Ok(legacy), Ok(projected)) => assert_video_refs_exact(&legacy, &projected),
+                (Err(_), Err(_)) => {}
+                // A valid non-object JSON value was historically classified as
+                // an entry without an id; the projected struct rejects it as a
+                // parse mismatch. Both production paths skip the line.
+                (Ok(None), Err(_)) | (Err(_), Ok(None)) => {}
+                (legacy, projected) => {
+                    panic!("parse outcome mismatch for {line:?}: {legacy:?} != {projected:?}")
+                }
+            }
+        }
     }
 
     // ---- fetch_metadata (via stub) ---------------------------------------
@@ -1574,6 +1842,41 @@ mod tests {
         let value = serde_json::json!({"id": "abc", "title": "T"});
         let meta = video_meta_from_json(&value).unwrap();
         assert_eq!(meta.webpage_url, "https://www.youtube.com/watch?v=abc");
+    }
+
+    #[test]
+    fn projected_video_meta_preserves_dom_outcomes() {
+        for line in [
+            r#"{"id":"abc","title":"T","channel":"C","uploader":"U","upload_date":"20260715","duration":-0.0,"webpage_url":"https://youtu.be/abc","description":"D","availability":"public","live_status":"not_live","ignored":{"fat":[1,2,3]}}"#,
+            r#"{"id":"abc","title":"","channel":null,"uploader":7,"duration":"9","webpage_url":""}"#,
+            r#"{"id":"first","id":"last","title":"last duplicate wins"}"#,
+            r#"{"title":"missing id"}"#,
+            r#"[1,{"id":"nested"}]"#,
+            "null",
+            "true",
+            r#"{"id":"unterminated""#,
+        ] {
+            let legacy: FwResult<VideoMeta> = serde_json::from_str(line)
+                .map_err(FwError::from)
+                .and_then(|value| video_meta_from_json(&value));
+            let projected = parse_video_meta(line);
+            match (legacy, projected) {
+                (Ok(legacy), Ok(projected)) => {
+                    assert_eq!(legacy, projected, "metadata mismatch for {line}");
+                    assert_eq!(
+                        legacy.duration_sec.map(f64::to_bits),
+                        projected.duration_sec.map(f64::to_bits),
+                        "duration bits mismatch for {line}"
+                    );
+                }
+                (Err(legacy), Err(projected)) => {
+                    assert_eq!(legacy.error_code(), projected.error_code(), "{line}");
+                }
+                (legacy, projected) => {
+                    panic!("parse outcome mismatch for {line}: {legacy:?} != {projected:?}");
+                }
+            }
+        }
     }
 
     // ---- download_audio (via stub) ---------------------------------------

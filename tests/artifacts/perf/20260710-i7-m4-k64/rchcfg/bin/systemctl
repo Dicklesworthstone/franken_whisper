@@ -1,0 +1,4 @@
+#!/bin/sh
+# Isolated-daemon harness: report no systemd-managed rchd so this session can
+# bind its dedicated socket without stopping or reloading the shared daemon.
+exit 1

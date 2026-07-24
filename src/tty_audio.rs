@@ -6,10 +6,9 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use flate2::Compression;
-use flate2::read::ZlibDecoder;
+use flate2::bufread::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::audio;
@@ -243,6 +242,20 @@ pub fn emit_control_frame_to_writer<W: Write>(
     write_control_frame(writer, frame)
 }
 
+/// Serialize one audio frame into a reusable contiguous NDJSON line buffer.
+#[doc(hidden)]
+pub fn write_audio_frame_line<W: Write>(
+    writer: &mut W,
+    frame: &TtyAudioFrame,
+    line_buffer: &mut Vec<u8>,
+) -> FwResult<()> {
+    line_buffer.clear();
+    serde_json::to_writer(&mut *line_buffer, frame)?;
+    line_buffer.push(b'\n');
+    writer.write_all(line_buffer)?;
+    Ok(())
+}
+
 pub fn encode_to_writer<W: Write>(
     input_audio: &Path,
     chunk_ms: u32,
@@ -261,6 +274,7 @@ pub fn encode_to_writer<W: Write>(
         supported_codecs: vec![CODEC_MULAW_ZLIB_B64.to_owned()],
     };
     write_control_frame(writer, &handshake)?;
+    let mut frame_line = Vec::new();
 
     for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
         let crc = crc32_of(chunk);
@@ -275,7 +289,7 @@ pub fn encode_to_writer<W: Write>(
             crc32: Some(crc),
             payload_sha256: Some(sha256_hex(chunk)),
         };
-        writeln!(writer, "{}", serde_json::to_string(&frame)?)?;
+        write_audio_frame_line(writer, &frame, &mut frame_line)?;
     }
 
     Ok(())
@@ -406,8 +420,8 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                 continue;
             }
         };
-        let decoded = match decompress_chunk(&compressed) {
-            Ok(value) => value,
+        let decoded_start = match decompress_chunk_into(&compressed, &mut raw) {
+            Ok(start) => start,
             Err(error) => {
                 integrity_failures.push(frame.seq);
                 dropped_frames.push(frame.seq);
@@ -423,7 +437,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
 
         // CRC32 integrity check.
         if let Some(expected_crc) = frame.crc32 {
-            let actual_crc = crc32_of(&decoded);
+            let actual_crc = crc32_of(&raw[decoded_start..]);
             if actual_crc != expected_crc {
                 integrity_failures.push(frame.seq);
                 dropped_frames.push(frame.seq);
@@ -433,6 +447,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                         frame.seq, expected_crc, actual_crc
                     )));
                 }
+                raw.truncate(decoded_start);
                 contiguous_prefix_intact = false;
                 expected_seq = frame.seq + 1;
                 seen.insert(frame.seq);
@@ -440,7 +455,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
             }
         }
         if let Some(expected_sha) = frame.payload_sha256.as_deref() {
-            let actual_sha = sha256_hex(&decoded);
+            let actual_sha = sha256_hex(&raw[decoded_start..]);
             if !actual_sha.eq_ignore_ascii_case(expected_sha) {
                 integrity_failures.push(frame.seq);
                 dropped_frames.push(frame.seq);
@@ -450,6 +465,7 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
                         frame.seq, expected_sha, actual_sha
                     )));
                 }
+                raw.truncate(decoded_start);
                 contiguous_prefix_intact = false;
                 expected_seq = frame.seq + 1;
                 seen.insert(frame.seq);
@@ -457,7 +473,6 @@ pub fn decode_frames_to_raw_with_policy<R: Read>(
             }
         }
 
-        raw.extend_from_slice(&decoded);
         seen.insert(frame.seq);
         frames_decoded += 1;
         if contiguous_prefix_intact {
@@ -781,18 +796,73 @@ fn parse_frame_lines<R: Read>(reader: &mut R) -> FwResult<Vec<FrameLine>> {
 }
 
 fn parse_frame_line(line: &str) -> FwResult<FrameLine> {
-    let value: Value = serde_json::from_str(line)?;
-    if value.get("frame_type").is_some() {
-        let control: TtyControlFrame = serde_json::from_value(value)?;
+    if line.contains("\"frame_type\"") {
+        let control: TtyControlFrame = serde_json::from_str(line)?;
         Ok(FrameLine::Control(control))
     } else {
-        let frame: TtyAudioFrame = serde_json::from_value(value)?;
+        let frame: TtyAudioFrame = serde_json::from_str(line)?;
         Ok(FrameLine::Audio(frame))
     }
 }
 
 fn write_control_frame<W: Write>(writer: &mut W, frame: &TtyControlFrame) -> FwResult<()> {
-    writeln!(writer, "{}", serde_json::to_string(frame)?)?;
+    match frame {
+        TtyControlFrame::Handshake {
+            min_version,
+            max_version,
+            supported_codecs,
+        } => {
+            write!(
+                writer,
+                "{{\"frame_type\":\"handshake\",\"min_version\":{min_version},\"max_version\":{max_version},\"supported_codecs\":"
+            )?;
+            write_json_string_array(writer, supported_codecs)?;
+            writer.write_all(b"}\n")?;
+        }
+        TtyControlFrame::HandshakeAck {
+            negotiated_version,
+            negotiated_codec,
+        } => {
+            write!(
+                writer,
+                "{{\"frame_type\":\"handshake_ack\",\"negotiated_version\":{negotiated_version},\"negotiated_codec\":"
+            )?;
+            serde_json::to_writer(&mut *writer, negotiated_codec)?;
+            writer.write_all(b"}\n")?;
+        }
+        TtyControlFrame::Ack { up_to_seq } => {
+            writeln!(
+                writer,
+                "{{\"frame_type\":\"ack\",\"up_to_seq\":{up_to_seq}}}"
+            )?;
+        }
+        TtyControlFrame::Backpressure { remaining_capacity } => {
+            writeln!(
+                writer,
+                "{{\"frame_type\":\"backpressure\",\"remaining_capacity\":{remaining_capacity}}}"
+            )?;
+        }
+        TtyControlFrame::RetransmitRequest { .. }
+        | TtyControlFrame::RetransmitResponse { .. }
+        | TtyControlFrame::SessionClose { .. }
+        | TtyControlFrame::TranscriptPartial { .. }
+        | TtyControlFrame::TranscriptRetract { .. }
+        | TtyControlFrame::TranscriptCorrect { .. } => {
+            writeln!(writer, "{}", serde_json::to_string(frame)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_json_string_array<W: Write>(writer: &mut W, values: &[String]) -> FwResult<()> {
+    writer.write_all(b"[")?;
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            writer.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut *writer, value)?;
+    }
+    writer.write_all(b"]")?;
     Ok(())
 }
 
@@ -871,23 +941,45 @@ fn compress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
 const MAX_DECOMPRESSED_FRAME_BYTES: usize = 80_000;
 
 fn decompress_chunk(input: &[u8]) -> FwResult<Vec<u8>> {
-    let mut decoder = ZlibDecoder::new(input);
     let mut out = Vec::new();
+    decompress_chunk_into(input, &mut out)?;
+    Ok(out)
+}
+
+/// Append one decompressed frame directly to `out`, returning its start offset.
+///
+/// On failure, `out` is restored to its original length so recovery-mode callers
+/// never retain bytes from a corrupt or oversized frame.
+fn decompress_chunk_into(input: &[u8], out: &mut Vec<u8>) -> FwResult<usize> {
+    // `input` is already a fully-buffered `&[u8]` (which implements `BufRead`), so
+    // feed it straight to the `bufread` decoder. `flate2::read::ZlibDecoder` would
+    // wrap it in an *additional* 32 KiB read-ahead `BufReader`, allocating + memmoving
+    // a scratch buffer for every frame; `flate2::bufread::ZlibDecoder` reads directly
+    // from the slice. Output is byte-identical — same inflate, no extra copy.
+    let mut decoder = ZlibDecoder::new(input);
+    let start = out.len();
     let mut buf = [0u8; 8192];
     loop {
-        let n = decoder.read(&mut buf)?;
+        let n = match decoder.read(&mut buf) {
+            Ok(n) => n,
+            Err(error) => {
+                out.truncate(start);
+                return Err(error.into());
+            }
+        };
         if n == 0 {
             break;
         }
         out.extend_from_slice(&buf[..n]);
-        if out.len() > MAX_DECOMPRESSED_FRAME_BYTES {
+        if out.len() - start > MAX_DECOMPRESSED_FRAME_BYTES {
+            out.truncate(start);
             return Err(FwError::InvalidRequest(format!(
                 "decompressed frame exceeds {MAX_DECOMPRESSED_FRAME_BYTES} byte limit \
                  (possible decompression bomb)"
             )));
         }
     }
-    Ok(out)
+    Ok(start)
 }
 
 fn crc32_of(data: &[u8]) -> u32 {
@@ -972,6 +1064,13 @@ pub struct MicStreamEvent {
     pub frame: TtyAudioFrame,
 }
 
+#[derive(Serialize)]
+struct BorrowedMicStreamEvent<'a> {
+    event: &'static str,
+    schema_version: &'static str,
+    frame: &'a TtyAudioFrame,
+}
+
 /// Required NDJSON fields for `mic_audio_chunk` events.
 pub const MIC_AUDIO_CHUNK_REQUIRED_FIELDS: &[&str] = &["event", "schema_version", "frame"];
 
@@ -983,6 +1082,28 @@ pub fn mic_stream_event_value(frame: &TtyAudioFrame) -> MicStreamEvent {
         schema_version: crate::robot::ROBOT_SCHEMA_VERSION.to_owned(),
         frame: frame.clone(),
     }
+}
+
+/// Serialize one mic event without cloning its payload-bearing audio frame.
+///
+/// The caller-owned scratch buffer is reused across a stream, while the final
+/// writer still receives one contiguous NDJSON line per frame.
+#[doc(hidden)]
+pub fn write_mic_stream_event_line<W: Write>(
+    writer: &mut W,
+    frame: &TtyAudioFrame,
+    line_buffer: &mut Vec<u8>,
+) -> FwResult<()> {
+    let event = BorrowedMicStreamEvent {
+        event: "mic_audio_chunk",
+        schema_version: crate::robot::ROBOT_SCHEMA_VERSION,
+        frame,
+    };
+    line_buffer.clear();
+    serde_json::to_writer(&mut *line_buffer, &event)?;
+    line_buffer.push(b'\n');
+    writer.write_all(line_buffer)?;
+    Ok(())
 }
 
 /// Trait abstracting the raw audio source for mic streaming.
@@ -1027,6 +1148,7 @@ pub fn stream_mic_to_ndjson<S: MicAudioSource, W: Write>(
     write_control_frame(writer, &handshake)?;
 
     let mut seq: u64 = 0;
+    let mut event_line = Vec::new();
 
     loop {
         let chunk = match source.read_chunk(chunk_size) {
@@ -1054,8 +1176,7 @@ pub fn stream_mic_to_ndjson<S: MicAudioSource, W: Write>(
             payload_sha256: Some(sha),
         };
 
-        let event = mic_stream_event_value(&frame);
-        writeln!(writer, "{}", serde_json::to_string(&event)?)?;
+        write_mic_stream_event_line(writer, &frame, &mut event_line)?;
 
         seq += 1;
     }
@@ -1764,6 +1885,7 @@ pub fn emit_tty_transcript_correct(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::path::Path;
 
     use crate::error::{FwError, FwResult};
@@ -1777,7 +1899,7 @@ mod tests {
         decompress_chunk, emit_control_frame_to_writer, emit_retransmit_loop_from_reader,
         emit_tty_transcript_partial, emit_tty_transcript_retract, ensure_parent_dir,
         mulaw_chunk_size, parse_audio_frames_for_decode, parse_frame_line, parse_frames,
-        retransmit_plan_from_reader, sha256_hex,
+        retransmit_plan_from_reader, sha256_hex, write_audio_frame_line,
     };
 
     fn make_frame(seq: u64, data: &[u8]) -> TtyAudioFrame {
@@ -1816,6 +1938,75 @@ mod tests {
         let compressed = compress_chunk(data).expect("compression should work");
         let decompressed = decompress_chunk(&compressed).expect("decompression should work");
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn decompress_chunk_into_appends_and_rolls_back_on_error() {
+        let prefix = b"already-decoded";
+        let frame = b"next frame bytes";
+        let compressed = compress_chunk(frame).expect("compression should work");
+        let mut output = prefix.to_vec();
+
+        let start =
+            super::decompress_chunk_into(&compressed, &mut output).expect("append inflate");
+        assert_eq!(start, prefix.len());
+        assert_eq!(&output[..start], prefix);
+        assert_eq!(&output[start..], frame);
+
+        let before_error = output.clone();
+        assert!(super::decompress_chunk_into(b"not zlib", &mut output).is_err());
+        assert_eq!(output, before_error, "failed frame must not alter output");
+
+        let oversized = vec![0u8; super::MAX_DECOMPRESSED_FRAME_BYTES + 1];
+        let compressed = compress_chunk(&oversized).expect("compress oversized fixture");
+        assert!(super::decompress_chunk_into(&compressed, &mut output).is_err());
+        assert_eq!(
+            output, before_error,
+            "oversized frame must roll back bytes appended before the cap"
+        );
+    }
+
+    /// Byte-exactness certification for the `read::ZlibDecoder` ->
+    /// `bufread::ZlibDecoder` swap in [`decompress_chunk`]. Both decoders run the
+    /// identical inflate algorithm; only the input buffering differs (the `read`
+    /// variant wraps the slice in an extra 32 KiB `BufReader`). This asserts the
+    /// production `bufread` output is byte-identical to the legacy `read` reference
+    /// across empty, small, boundary, and near-limit frame sizes and several
+    /// content patterns, so the allocation-removal lever cannot alter any output.
+    #[test]
+    fn decompress_bufread_matches_read_reference_byte_exact() {
+        use std::io::Read as _;
+
+        fn decompress_read_reference(input: &[u8]) -> Vec<u8> {
+            let mut decoder = flate2::read::ZlibDecoder::new(input);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).expect("reference inflate");
+            out
+        }
+
+        // Sizes span 0, 1, byte/kib boundaries, a mulaw chunk, and just under the
+        // 80 000-byte decompression-bomb limit.
+        let sizes = [0usize, 1, 15, 16, 17, 160, 1600, 8192, 8193, 40_000, 79_999];
+        for &n in &sizes {
+            for pattern in 0u8..4 {
+                let data: Vec<u8> = (0..n)
+                    .map(|i| match pattern {
+                        0 => 0,                                // all-zero (highly compressible)
+                        1 => 0xAB,                             // constant
+                        2 => (i % 251) as u8,                  // strided
+                        _ => (i.wrapping_mul(2654435761)) as u8, // pseudo-random
+                    })
+                    .collect();
+                let compressed = compress_chunk(&data).expect("compress");
+                let production = decompress_chunk(&compressed).expect("bufread decompress");
+                let reference = decompress_read_reference(&compressed);
+                assert_eq!(
+                    production, reference,
+                    "bufread != read reference at size {n}, pattern {pattern}"
+                );
+                assert_eq!(production, data, "roundtrip failed at size {n}, pattern {pattern}");
+            }
+        }
     }
 
     #[test]
@@ -1862,6 +2053,96 @@ mod tests {
         assert!(parsed.crc32.is_some());
         assert_eq!(parsed.payload_sha256, frame.payload_sha256);
         assert!(parsed.payload_sha256.is_some());
+    }
+
+    #[test]
+    fn buffered_audio_frame_writer_matches_owned_serde_lines_byte_exact() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            max_write: usize,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let count = buf.len().min(self.max_write);
+                self.bytes.extend_from_slice(&buf[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct FailAfterWriter {
+            written: usize,
+            limit: usize,
+        }
+
+        impl Write for FailAfterWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.written >= self.limit {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let count = buf.len().min(self.limit - self.written);
+                self.written += count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut first = make_frame(u64::MAX, &[0x5a; 4_096]);
+        first.codec = "mu\"law\\codec\n雪".to_owned();
+        let mut second = make_frame(0, b"");
+        second.crc32 = None;
+        second.payload_sha256 = None;
+        let mut third = first.clone();
+        third.seq = 42;
+
+        let mut expected = Vec::new();
+        for frame in [&first, &second, &third] {
+            writeln!(
+                expected,
+                "{}",
+                serde_json::to_string(frame).expect("serialize owned frame")
+            )
+            .expect("write expected line");
+        }
+
+        let mut actual = Vec::new();
+        let mut line_buffer = Vec::new();
+        for frame in [&first, &second, &third] {
+            write_audio_frame_line(&mut actual, frame, &mut line_buffer)
+                .expect("write buffered frame");
+        }
+
+        assert_eq!(actual, expected);
+
+        let mut short = ShortWriter {
+            bytes: Vec::new(),
+            max_write: 3,
+        };
+        let mut short_line = Vec::new();
+        for frame in [&first, &second, &third] {
+            write_audio_frame_line(&mut short, frame, &mut short_line)
+                .expect("complete short writes");
+        }
+        assert_eq!(short.bytes, expected);
+
+        let first_line_len = serde_json::to_string(&first)
+            .expect("serialize first frame")
+            .len()
+            + 1;
+        for limit in [first_line_len / 2, first_line_len - 1] {
+            let mut failing = FailAfterWriter { written: 0, limit };
+            let mut failing_line = Vec::new();
+            let error = write_audio_frame_line(&mut failing, &first, &mut failing_line)
+                .expect_err("injected write failure should propagate");
+            assert!(matches!(error, FwError::Io(_)));
+        }
     }
 
     #[test]
@@ -2453,6 +2734,48 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
         assert_eq!(parsed["frame_type"], "ack");
         assert_eq!(parsed["up_to_seq"], 9);
+    }
+
+    #[test]
+    fn emit_control_frame_to_writer_matches_serde_json_line() {
+        let frames = [
+            TtyControlFrame::Handshake {
+                min_version: MIN_PROTOCOL_VERSION,
+                max_version: SUPPORTED_PROTOCOL_VERSION,
+                supported_codecs: vec![CODEC_MULAW_ZLIB_B64.to_owned(), "pcm16".to_owned()],
+            },
+            TtyControlFrame::Ack { up_to_seq: 9 },
+            TtyControlFrame::Backpressure {
+                remaining_capacity: 50,
+            },
+            TtyControlFrame::HandshakeAck {
+                negotiated_version: 1,
+                negotiated_codec: CODEC_MULAW_ZLIB_B64.to_owned(),
+            },
+            TtyControlFrame::RetransmitRequest {
+                sequences: vec![2, 5, 8],
+            },
+            TtyControlFrame::RetransmitResponse {
+                sequences: vec![13, 21],
+            },
+            TtyControlFrame::SessionClose {
+                reason: SessionCloseReason::PeerRequested,
+                last_data_seq: None,
+            },
+            TtyControlFrame::SessionClose {
+                reason: SessionCloseReason::Normal,
+                last_data_seq: Some(34),
+            },
+        ];
+
+        for frame in frames {
+            let mut out = Vec::new();
+            emit_control_frame_to_writer(&mut out, &frame).expect("emit");
+
+            let mut expected = serde_json::to_string(&frame).expect("serialize");
+            expected.push('\n');
+            assert_eq!(out, expected.into_bytes());
+        }
     }
 
     #[test]
@@ -3274,7 +3597,7 @@ mod tests {
     use super::{
         FixedCountMicSource, MIC_AUDIO_CHUNK_REQUIRED_FIELDS, MicAudioSource, MicStreamConfig,
         MicStreamEvent, SliceMicSource, UnavailableMicSource, mic_stream_event_value,
-        stream_mic_to_ndjson,
+        stream_mic_to_ndjson, write_mic_stream_event_line,
     };
 
     // -- MicStreamConfig tests --
@@ -3396,6 +3719,35 @@ mod tests {
             !line.contains('\n'),
             "NDJSON event must not contain newlines"
         );
+    }
+
+    #[test]
+    fn borrowed_mic_event_writer_matches_owned_serde_lines_byte_exact() {
+        let mut first = make_frame(7, b"first payload");
+        first.codec = "mu\"law\\codec\n雪".to_owned();
+        let mut second = make_frame(8, b"second payload");
+        second.crc32 = None;
+        second.payload_sha256 = None;
+
+        let mut expected = Vec::new();
+        for frame in [&first, &second] {
+            let event = mic_stream_event_value(frame);
+            writeln!(
+                expected,
+                "{}",
+                serde_json::to_string(&event).expect("serialize owned event")
+            )
+            .expect("write expected line");
+        }
+
+        let mut actual = Vec::new();
+        let mut line_buffer = Vec::new();
+        write_mic_stream_event_line(&mut actual, &first, &mut line_buffer)
+            .expect("write first borrowed event");
+        write_mic_stream_event_line(&mut actual, &second, &mut line_buffer)
+            .expect("write second borrowed event");
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

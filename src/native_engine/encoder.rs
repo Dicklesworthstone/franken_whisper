@@ -99,6 +99,20 @@ struct EncoderLayer {
     /// MLP down projection `[4*n_state, n_state]` (`[in, out]`) + bias.
     mlp_proj_w: Mat,
     mlp_proj_b: Vec<f32>,
+    /// Optional 7-bit int8 (maddubs) copies of the six linear weights, built ONCE
+    /// at load iff [`super::enc_int8_enabled`]. `None` = f32 path = byte-identical.
+    attn_q_i7: Option<nn::I7Mat>,
+    attn_k_i7: Option<nn::I7Mat>,
+    attn_v_i7: Option<nn::I7Mat>,
+    attn_out_i7: Option<nn::I7Mat>,
+    mlp_fc_i7: Option<nn::I7Mat>,
+    mlp_proj_i7: Option<nn::I7Mat>,
+    /// Optional cached **i8** (full 8-bit) `attn.out` weight, built ONCE at load
+    /// iff [`super::enc_attn_out_i8i32`]. Routes `attn.out` through the i8×i8
+    /// i32-accumulate GEMM ([`matmul_bias_i8`]) instead of the i7 maddubs — the
+    /// extra weight bit preserves proper nouns on this residual-feeding path.
+    /// `None` = f32/i7 path.
+    attn_out_i8: Option<EncI8Mat>,
 }
 
 /// Fully loaded, pre-transposed encoder weights for one whisper model.
@@ -207,7 +221,7 @@ fn load_linear_transposed(
         return Ok(Mat::from_vec(
             in_dim,
             out_dim,
-            dequant_transpose_f16_bytes(raw, out_dim, in_dim),
+            dequant_transpose_f16_bytes(&raw, out_dim, in_dim),
         ));
     }
 
@@ -220,6 +234,81 @@ fn load_linear_transposed(
         out_dim,
         nn::transpose_serial(&data, out_dim, in_dim),
     ))
+}
+
+/// Weight-quant mode for the encoder `attn.out` linear (the residual-feeding one):
+/// f32 sgemm, i7 maddubs, or the full-i8 i32-accumulate GEMM.
+#[derive(Clone, Copy)]
+enum OutQuant {
+    F32,
+    I7,
+    I8,
+}
+
+/// Per-linear encoder weight-quant plan, derived ONCE from the `FW_*` flags +
+/// hparams before the parallel layer load, so each linear can be quantized the
+/// instant it is loaded (fusing the former separate post-load quant pass). Its f32
+/// is then a per-linear transient (freed immediately when `free`) instead of the
+/// whole f32 weight set being resident until a post-load quant — which is what lets
+/// PEAK RSS drop below the full f32 floor. See [`load_linear_maybe_i7`].
+#[derive(Clone, Copy)]
+struct EncQuantPlan {
+    q: bool,
+    k: bool,
+    v: bool,
+    out: OutQuant,
+    fc: bool,
+    proj: bool,
+}
+
+/// Load a linear's `[in, out]` weight and, when `to_i7`, quantize it to i7. When
+/// `free`, the f32 is never handed back (an empty `Mat` is returned), bounding the
+/// transient f32 to ~one linear per rayon worker during the parallel layer load.
+///
+/// The `to_i7 && free` case — the FW_ENC_FREE_F32 peak path — quantizes STRAIGHT from
+/// the resident ggml f16 bytes via [`nn::quantize_f16_bytes_to_i7`], never building
+/// the transposed f32 `Mat` at all: this skips both the transpose and the f32
+/// round-trip (a load-time win) and leaves zero per-linear f32 transient (a further
+/// peak win beyond the load-quant fusion). Bit-identical to
+/// `quantize_mat_to_i7(&load_linear_transposed(..))`. f32-stored tensors (no f16
+/// bytes) fall back to materialize→quantize→free. When `!free` (flag off / macOS /
+/// roundtrip harness) the f32 is retained exactly as before ⇒ shipping default
+/// unchanged.
+fn load_linear_maybe_i7(
+    model: &GgmlModel,
+    name: &str,
+    out_dim: usize,
+    in_dim: usize,
+    to_i7: bool,
+    free: bool,
+) -> FwResult<(Mat, Option<nn::I7Mat>)> {
+    if to_i7 && free {
+        if let Ok((shape, raw)) = model.tensor_f16_bytes(name) {
+            if shape != [out_dim, in_dim] {
+                return Err(FwError::InvalidRequest(format!(
+                    "encoder tensor '{name}' has shape {shape:?}, expected {:?}",
+                    [out_dim, in_dim]
+                )));
+            }
+            return Ok((
+                Mat::from_vec(0, 0, Vec::new()),
+                Some(nn::quantize_f16_bytes_to_i7(&raw, out_dim, in_dim)),
+            ));
+        }
+        // f32-stored fallback (no f16 bytes): materialize, quantize, drop.
+        let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+        return Ok((
+            Mat::from_vec(0, 0, Vec::new()),
+            Some(nn::quantize_mat_to_i7(&w)),
+        ));
+    }
+    let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+    if !to_i7 {
+        return Ok((w, None));
+    }
+    // to_i7 && !free: retain the f32 (shipping default / macOS / roundtrip harness).
+    let i7 = nn::quantize_mat_to_i7(&w);
+    Ok((w, Some(i7)))
 }
 
 /// Fused dequant-transpose reading raw little-endian f16 bytes (`raw`,
@@ -377,11 +466,19 @@ impl EncoderWeights {
         // `transpose_serial([Cout, Cin*K])` is bit-identical to conv1d's inline transpose.
         let conv1_patch = n_mels * CONV_K;
         let conv1_raw = load_shaped(model, "encoder.conv1.weight", &[n_state, n_mels, CONV_K])?;
-        let conv1_wt = Mat::from_vec(conv1_patch, n_state, nn::transpose_serial(&conv1_raw, n_state, conv1_patch));
+        let conv1_wt = Mat::from_vec(
+            conv1_patch,
+            n_state,
+            nn::transpose_serial(&conv1_raw, n_state, conv1_patch),
+        );
         let conv1_b = load_vec(model, "encoder.conv1.bias", n_state)?;
         let conv2_patch = n_state * CONV_K;
         let conv2_raw = load_shaped(model, "encoder.conv2.weight", &[n_state, n_state, CONV_K])?;
-        let conv2_wt = Mat::from_vec(conv2_patch, n_state, nn::transpose_serial(&conv2_raw, n_state, conv2_patch));
+        let conv2_wt = Mat::from_vec(
+            conv2_patch,
+            n_state,
+            nn::transpose_serial(&conv2_raw, n_state, conv2_patch),
+        );
         let conv2_b = load_vec(model, "encoder.conv2.bias", n_state)?;
 
         // Positional embedding: file tensor [n_ctx, n_state], used verbatim.
@@ -395,60 +492,209 @@ impl EncoderWeights {
         // `model`, and now transposes SERIALLY, so this fans the 32 layers across
         // cores with no nested spawn. Order is preserved (`map`+`collect`), so the
         // assembled weights are byte-identical to the serial loop.
-        let layers = (0..n_layer)
+        // FW_ENC_FREE_F32 (default OFF): fuse the encoder weight quant INTO the
+        // parallel layer load. Each linear is quantized the instant it is loaded and
+        // its f32 dropped in place (`free_f32_now`), so at most ~one f32 linear per
+        // rayon worker is transient — instead of the FULL f32 weight set (~2.5 GB
+        // turbo) staying resident until a separate post-load quant pass. That drops
+        // PEAK RSS below the f32 floor the earlier interleaved post-load free
+        // (2ac1257) could not touch. Byte-exact: identical load + identical quantize
+        // funcs. Retaining the f32 (flag off / macOS / weight-roundtrip harness)
+        // reproduces the previous behavior exactly, so the shipping default (flag off)
+        // is unchanged — the f32 is only dropped early under the opt-in flag.
+        #[cfg(target_os = "macos")]
+        let free_f32_now = false;
+        #[cfg(not(target_os = "macos"))]
+        let free_f32_now = super::enc_free_f32() && super::enc_weight_roundtrip().is_none();
+        // Which linears get which quant — the EXACT per-branch policy the former
+        // post-load pass applied (see the flag docs at each `enc_linear` call site).
+        let plan = if super::enc_int8_enabled() {
+            // FRANKEN_WHISPER_ENC_INT8: every linear i7.
+            EncQuantPlan {
+                q: true,
+                k: true,
+                v: true,
+                out: OutQuant::I7,
+                fc: true,
+                proj: true,
+            }
+        } else if super::enc_int8_attn_in() {
+            // FW_ENC_INT8_ATTN_IN: q/k/v/fc1 i7, attn_out + fc2 stay f32.
+            EncQuantPlan {
+                q: true,
+                k: true,
+                v: true,
+                out: OutQuant::F32,
+                fc: true,
+                proj: false,
+            }
+        } else if super::enc_attn_out_i8i32_for(&model.hparams) {
+            // Default quality-safe int8 for calibrated models: q/k/v/fc1/fc2 i7,
+            // residual-feeding attn_out through the full-i8 i32-accumulate GEMM.
+            EncQuantPlan {
+                q: true,
+                k: true,
+                v: true,
+                out: OutQuant::I8,
+                fc: true,
+                proj: true,
+            }
+        } else if super::enc_int8_fc1_only() {
+            // FW_ENC_INT8_FC1: fc1 only (GELU absorbs the quant error).
+            EncQuantPlan {
+                q: false,
+                k: false,
+                v: false,
+                out: OutQuant::F32,
+                fc: true,
+                proj: false,
+            }
+        } else {
+            // No int8: all f32, byte-identical to the pre-lever encoder.
+            EncQuantPlan {
+                q: false,
+                k: false,
+                v: false,
+                out: OutQuant::F32,
+                fc: false,
+                proj: false,
+            }
+        };
+
+        // Fan the per-layer weight build across the ambient rayon pool. The load
+        // concurrency (and thus the transient per-tensor load-buffer footprint,
+        // esp. the owned pread buffers under FW_STREAM_LOAD) is bounded ONE level
+        // up, at the encoder∥decoder `rayon::join` in `decode::LoadedModel::
+        // from_ggml`, so both builds share a single FW_LOAD_WORKERS cap.
+        let mut layers = (0..n_layer)
             .into_par_iter()
             .map(|i| -> FwResult<EncoderLayer> {
                 let p = |suffix: &str| format!("encoder.blocks.{i}.{suffix}");
+                let (attn_q_w, attn_q_i7) = load_linear_maybe_i7(
+                    model,
+                    &p("attn.query.weight"),
+                    n_state,
+                    n_state,
+                    plan.q,
+                    free_f32_now,
+                )?;
+                // whisper key projection has NO bias.
+                let (attn_k_w, attn_k_i7) = load_linear_maybe_i7(
+                    model,
+                    &p("attn.key.weight"),
+                    n_state,
+                    n_state,
+                    plan.k,
+                    free_f32_now,
+                )?;
+                let (attn_v_w, attn_v_i7) = load_linear_maybe_i7(
+                    model,
+                    &p("attn.value.weight"),
+                    n_state,
+                    n_state,
+                    plan.v,
+                    free_f32_now,
+                )?;
+                let (attn_out_w, attn_out_i7, attn_out_i8) = match plan.out {
+                    OutQuant::F32 => (
+                        load_linear_transposed(model, &p("attn.out.weight"), n_state, n_state)?,
+                        None,
+                        None,
+                    ),
+                    OutQuant::I7 => {
+                        let (w, i7) = load_linear_maybe_i7(
+                            model,
+                            &p("attn.out.weight"),
+                            n_state,
+                            n_state,
+                            true,
+                            free_f32_now,
+                        )?;
+                        (w, i7, None)
+                    }
+                    OutQuant::I8 => {
+                        let (w, i8) = load_linear_i8_direct(
+                            model,
+                            &p("attn.out.weight"),
+                            n_state,
+                            n_state,
+                            free_f32_now,
+                        )?;
+                        (w, None, Some(i8))
+                    }
+                };
+                let (mlp_fc_w, mlp_fc_i7) = load_linear_maybe_i7(
+                    model,
+                    &p("mlp.0.weight"),
+                    mlp_hidden,
+                    n_state,
+                    plan.fc,
+                    free_f32_now,
+                )?;
+                let (mlp_proj_w, mlp_proj_i7) = load_linear_maybe_i7(
+                    model,
+                    &p("mlp.2.weight"),
+                    n_state,
+                    mlp_hidden,
+                    plan.proj,
+                    free_f32_now,
+                )?;
                 Ok(EncoderLayer {
                     attn_ln_w: load_vec(model, &p("attn_ln.weight"), n_state)?,
                     attn_ln_b: load_vec(model, &p("attn_ln.bias"), n_state)?,
-                    attn_q_w: load_linear_transposed(
-                        model,
-                        &p("attn.query.weight"),
-                        n_state,
-                        n_state,
-                    )?,
+                    attn_q_w,
                     attn_q_b: load_vec(model, &p("attn.query.bias"), n_state)?,
-                    // whisper key projection has NO bias.
-                    attn_k_w: load_linear_transposed(
-                        model,
-                        &p("attn.key.weight"),
-                        n_state,
-                        n_state,
-                    )?,
-                    attn_v_w: load_linear_transposed(
-                        model,
-                        &p("attn.value.weight"),
-                        n_state,
-                        n_state,
-                    )?,
+                    attn_k_w,
+                    attn_v_w,
                     attn_v_b: load_vec(model, &p("attn.value.bias"), n_state)?,
-                    attn_out_w: load_linear_transposed(
-                        model,
-                        &p("attn.out.weight"),
-                        n_state,
-                        n_state,
-                    )?,
+                    attn_out_w,
                     attn_out_b: load_vec(model, &p("attn.out.bias"), n_state)?,
                     mlp_ln_w: load_vec(model, &p("mlp_ln.weight"), n_state)?,
                     mlp_ln_b: load_vec(model, &p("mlp_ln.bias"), n_state)?,
-                    mlp_fc_w: load_linear_transposed(
-                        model,
-                        &p("mlp.0.weight"),
-                        mlp_hidden,
-                        n_state,
-                    )?,
+                    mlp_fc_w,
                     mlp_fc_b: load_vec(model, &p("mlp.0.bias"), mlp_hidden)?,
-                    mlp_proj_w: load_linear_transposed(
-                        model,
-                        &p("mlp.2.weight"),
-                        n_state,
-                        mlp_hidden,
-                    )?,
+                    mlp_proj_w,
                     mlp_proj_b: load_vec(model, &p("mlp.2.bias"), n_state)?,
+                    attn_q_i7,
+                    attn_k_i7,
+                    attn_v_i7,
+                    attn_out_i7,
+                    mlp_fc_i7,
+                    mlp_proj_i7,
+                    attn_out_i8,
                 })
             })
             .collect::<FwResult<Vec<_>>>()?;
+
+        // (Weight quant is now FUSED into the parallel layer load above — see the
+        // `EncQuantPlan` / `load_linear_maybe_i7` block — so the former separate
+        // post-load `par_iter_mut` quant pass, and the interleaved post-load free it
+        // grew into, are gone. Fusing lets FW_ENC_FREE_F32 free each f32 while only
+        // ~one linear per worker is transient, dropping PEAK below the f32 floor.)
+
+        // bd-bcm7: enable ft_kernel_cpu's poly softmax for large-v3-turbo (proven WER-neutral:
+        // byte-identical transcript, WER Δ 0.000, 1.0722× e2e). tiny.en stays off (uncertified).
+        // Kill-switch FW_SDPA_POLY_EXP=0; operator force FT_SDPA_POLY_EXP=1.
+        super::configure_sdpa_poly_exp(&model.hparams);
+
+        // FEASIBILITY HARNESS (off by default): `FW_ENC_WEIGHT_ROUNDTRIP=row|<N>` replaces
+        // every f32 GEMM weight with its i7 quantize→dequantize roundtrip, so the EXISTING
+        // f32 encoder measures the WEIGHT-quant-granularity effect on the transcript.
+        // `row` = per-output-column scale (current int8 encoder granularity); `<N>` = block
+        // size along the contraction dim (e.g. `32` = the proposed block-wise scheme). Lets a
+        // track01 A/B answer "does block-wise recover the int8 encoder's proper-noun errors?"
+        // WITHOUT the block-wise maddubs kernel. Run with FRANKEN_WHISPER_ENC_INT8 unset.
+        if let Some(mode) = super::enc_weight_roundtrip() {
+            let block = mode; // None => per-column, Some(n) => n-block
+            layers.par_iter_mut().for_each(|l| {
+                l.attn_q_w = nn::i7_roundtrip(&l.attn_q_w, block);
+                l.attn_k_w = nn::i7_roundtrip(&l.attn_k_w, block);
+                l.attn_v_w = nn::i7_roundtrip(&l.attn_v_w, block);
+                l.attn_out_w = nn::i7_roundtrip(&l.attn_out_w, block);
+                l.mlp_fc_w = nn::i7_roundtrip(&l.mlp_fc_w, block);
+                l.mlp_proj_w = nn::i7_roundtrip(&l.mlp_proj_w, block);
+            });
+        }
 
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;
@@ -560,11 +806,154 @@ thread_local! {
     static ENC_PROF: std::cell::RefCell<[u128; 12]> = const { std::cell::RefCell::new([0; 12]) };
 }
 const ENC_PROF_LABELS: [&str; 12] = [
-    "conv_stem", "pos_emb", "attn_ln", "qkv_proj", "attn_sdpa", "attn_out",
-    "attn_resid", "mlp_ln", "mlp_fc", "gelu", "mlp_proj", "mlp_resid",
+    "conv_stem",
+    "pos_emb",
+    "attn_ln",
+    "qkv_proj",
+    "attn_sdpa",
+    "attn_out",
+    "attn_resid",
+    "mlp_ln",
+    "mlp_fc",
+    "gelu",
+    "mlp_proj",
+    "mlp_resid",
 ];
 fn enc_prof_add(i: usize, ns: u128) {
     ENC_PROF.with(|p| p.borrow_mut()[i] += ns);
+}
+
+/// `FW_TOME_R` — ToMe token-merge count (bipartite soft matching). Default 0 (OFF,
+/// byte-identical). When >0, `r` encoder tokens are merged after layer `FW_TOME_LAYER`,
+/// so the remaining layers run at a shorter sequence — a STRUCTURAL FLOP reduction that
+/// shrinks BOTH the int8 GEMMs and the SDPA. NON-byte-exact (merged tokens lose detail)
+/// ⇒ WER-gated owner candidate; measured for drift before any flip.
+fn tome_r() -> usize {
+    use std::sync::OnceLock;
+    static R: OnceLock<usize> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("FW_TOME_R")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// 0-based encoder layer index after which the ToMe merge happens (default 3).
+fn tome_after_layer() -> usize {
+    use std::sync::OnceLock;
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("FW_TOME_LAYER")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(3)
+    })
+}
+
+/// Bipartite soft matching token merge (ToMe, Bolya et al. 2023). Partition tokens
+/// alternately into A (even positions) and B (odd); each A token draws one edge to its
+/// most-cosine-similar B token; the `r` highest-similarity A tokens merge (count-weighted
+/// average) into their B partner. Returns `[seq-r, d]` merged activations + an
+/// `unmerge_map` (original position → merged row) for [`tome_unmerge`].
+fn tome_merge(x: &Mat, r: usize) -> (Mat, Vec<usize>) {
+    let seq = x.rows;
+    let d = x.cols;
+    let n_a = seq.div_ceil(2); // even rows 0,2,4,...
+    let n_b = seq / 2; // odd rows 1,3,5,...
+    let r = r.min(n_a).min(seq.saturating_sub(1));
+    let mut a_data = vec![0f32; n_a * d];
+    let mut b_data = vec![0f32; n_b * d];
+    for a in 0..n_a {
+        a_data[a * d..(a + 1) * d].copy_from_slice(x.row(2 * a));
+    }
+    for b in 0..n_b {
+        b_data[b * d..(b + 1) * d].copy_from_slice(x.row(2 * b + 1));
+    }
+    // sim[a,b] = A[a]·B[b] via the (parallel) sgemm; cosine = sim / (|A||B|).
+    let a_mat = Mat::from_vec(n_a, d, a_data.clone());
+    let b_t = transpose(&b_data, n_b, d); // [d, n_b]
+    let sim = nn::matmul(&a_mat, &b_t)
+        .unwrap_or_else(|_| Mat::from_vec(n_a, n_b.max(1), vec![0.0; n_a * n_b.max(1)]));
+    let norm = |data: &[f32], i: usize| -> f32 {
+        data[i * d..(i + 1) * d]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+            .max(1e-9)
+    };
+    let a_norm: Vec<f32> = (0..n_a).map(|a| norm(&a_data, a)).collect();
+    let b_norm: Vec<f32> = (0..n_b).map(|b| norm(&b_data, b)).collect();
+    let mut best_b = vec![0usize; n_a];
+    let mut best_sim = vec![f32::NEG_INFINITY; n_a];
+    for a in 0..n_a {
+        let row = sim.row(a);
+        for (b, &s) in row.iter().enumerate().take(n_b) {
+            let cos = s / (a_norm[a] * b_norm[b]);
+            if cos > best_sim[a] {
+                best_sim[a] = cos;
+                best_b[a] = b;
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..n_a).collect();
+    order.sort_by(|&i, &j| {
+        best_sim[j]
+            .partial_cmp(&best_sim[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut do_merge = vec![false; n_a];
+    for &a in order.iter().take(r) {
+        do_merge[a] = true;
+    }
+    // merged = B rows (with merged A count-weighted-averaged in), then the kept A rows.
+    let mut merged = b_data.clone();
+    let mut counts = vec![1usize; n_b];
+    for a in 0..n_a {
+        if do_merge[a] {
+            let b = best_b[a];
+            let arow = &a_data[a * d..(a + 1) * d];
+            for (k, &av) in arow.iter().enumerate() {
+                merged[b * d + k] += av;
+            }
+            counts[b] += 1;
+        }
+    }
+    for b in 0..n_b {
+        if counts[b] > 1 {
+            let c = counts[b] as f32;
+            for k in 0..d {
+                merged[b * d + k] /= c;
+            }
+        }
+    }
+    let mut umap = vec![0usize; seq];
+    for b in 0..n_b {
+        umap[2 * b + 1] = b;
+    }
+    let mut slot = n_b;
+    for a in 0..n_a {
+        if do_merge[a] {
+            umap[2 * a] = best_b[a];
+        } else {
+            merged.extend_from_slice(&a_data[a * d..(a + 1) * d]);
+            umap[2 * a] = slot;
+            slot += 1;
+        }
+    }
+    (Mat::from_vec(seq - r, d, merged), umap)
+}
+
+/// Expand a ToMe-merged `[seq-r, d]` activation back to `[orig_seq, d]` by broadcasting
+/// each merged row to all original positions that mapped into it (via `unmerge_map`).
+fn tome_unmerge(merged: &Mat, umap: &[usize], orig_seq: usize) -> Mat {
+    let d = merged.cols;
+    let mut out = vec![0f32; orig_seq * d];
+    for (pos, &m) in umap.iter().enumerate().take(orig_seq) {
+        out[pos * d..(pos + 1) * d].copy_from_slice(merged.row(m));
+    }
+    Mat::from_vec(orig_seq, d, out)
 }
 
 fn forward_time_major(
@@ -586,19 +975,15 @@ fn forward_time_major(
         }};
     }
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
-    let mut x = et!(0, {
-        let mut x = nn::conv1d_wt(
-            &x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD,
-        )?;
+    let x = et!(0, {
+        let mut x = nn::conv1d_wt(&x, &w.conv1_wt, w.n_mels, CONV_K, &w.conv1_b, 1, CONV_PAD)?;
         nn::gelu(&mut x);
         x
     });
 
     // conv2 (stride 2): [3000, n_state] -> [1500, n_state], +gelu.
     let mut x = et!(0, {
-        let mut x = nn::conv1d_wt(
-            &x, &w.conv2_wt, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD,
-        )?;
+        let mut x = nn::conv1d_wt(&x, &w.conv2_wt, w.n_state, CONV_K, &w.conv2_b, 2, CONV_PAD)?;
         nn::gelu(&mut x);
         x
     });
@@ -619,9 +1004,33 @@ fn forward_time_major(
     // per layer instead of per-op CPU<->GPU ping-pong); every other case uses the
     // CPU blocks. `FRANKEN_WHISPER_GPU=0` forces the CPU path.
     if !gpu_encode_stack(&mut x, w) {
-        for layer in &w.layers {
+        // Optional depth truncation (`FW_ENCODER_LAYERS=N`): run only the first N
+        // of the model's encoder transformer blocks. NON-byte-exact (fewer
+        // refinements → different encoder output) — a VIABILITY PROBE for encoder
+        // layer-pruning, default = all layers (byte-identical). If a truncated
+        // depth keeps the transcript within conformance it is a direct encoder
+        // FLOP win (≈ pruned_layers / n_layers of the block stack).
+        let n_run = encoder_layer_limit()
+            .unwrap_or(w.layers.len())
+            .min(w.layers.len());
+        // ToMe structural token merge (FW_TOME_R>0, default off): after layer
+        // `tome_after_layer`, merge `r` tokens so the remaining blocks run at a
+        // shorter sequence, then unmerge before ln_post. NON-byte-exact.
+        let tome = tome_r();
+        let tome_after = tome_after_layer();
+        let mut tome_state: Option<(Vec<usize>, usize)> = None;
+        for (li, layer) in w.layers.iter().take(n_run).enumerate() {
             encoder_block(&mut x, layer, w.n_head)?;
+            if tome > 0 && tome_state.is_none() && li == tome_after && x.rows > tome + 2 {
+                let orig_seq = x.rows;
+                let (merged, umap) = tome_merge(&x, tome);
+                x = merged;
+                tome_state = Some((umap, orig_seq));
+            }
             checkpoint()?;
+        }
+        if let Some((umap, orig_seq)) = tome_state {
+            x = tome_unmerge(&x, &umap, orig_seq);
         }
     }
 
@@ -636,11 +1045,19 @@ fn forward_time_major(
             for (i, lbl) in ENC_PROF_LABELS.iter().enumerate() {
                 if a[i] > 0 {
                     let ms = a[i] as f64 / 1e6;
-                    let pct = if total > 0 { a[i] as f64 / total as f64 * 100.0 } else { 0.0 };
+                    let pct = if total > 0 {
+                        a[i] as f64 / total as f64 * 100.0
+                    } else {
+                        0.0
+                    };
                     eprintln!("  {lbl:<12} {ms:>8.1} ms  {pct:>5.1}%");
                 }
             }
-            eprintln!("  {:<12} {:>8.1} ms (encoder sub-op total)", "SUM", total as f64 / 1e6);
+            eprintln!(
+                "  {:<12} {:>8.1} ms (encoder sub-op total)",
+                "SUM",
+                total as f64 / 1e6
+            );
         });
         ENC_PROF.with(|p| *p.borrow_mut() = [0; 12]);
         // Split attn_sdpa into gather / kernel / scatter (sum over layers).
@@ -756,12 +1173,8 @@ fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
                     b2: &l.mlp_proj_b,
                 })
                 .collect();
-            match ft_kernel_metal::fused::EncoderGpu::new(
-                w.n_state,
-                w.n_head,
-                w.n_state * 4,
-                &refs,
-            ) {
+            match ft_kernel_metal::fused::EncoderGpu::new(w.n_state, w.n_head, w.n_state * 4, &refs)
+            {
                 Ok(enc) => {
                     guard.insert(key, Arc::new(enc));
                 }
@@ -805,6 +1218,29 @@ fn gpu_encoder_enabled() -> bool {
     })
 }
 
+/// Whether a real GPU encoder path exists in this build, on this machine, right
+/// now: the Metal kernels are compiled in, the device reports a usable queue,
+/// and `FRANKEN_WHISPER_GPU=0` has not disabled it.
+///
+/// Model-independent: the per-model [`GPU_ENCODER_MIN_N_STATE`] width gate is a
+/// performance policy applied inside [`gpu_encode_stack`], not a statement about
+/// whether the engine *can* reach a GPU. Off Apple Silicon this is always
+/// `false` — the native engine is CPU-only there, with no CUDA/Vulkan path.
+///
+/// This is the ground truth behind the native engines' reported
+/// `supports_gpu` capability flag.
+#[must_use]
+pub fn gpu_encoder_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        gpu_encoder_enabled()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// One residual encoder block, mutating `x` (`[n_ctx, n_state]`) in place.
 ///
 /// `x = x + attn_out(attn(ln_attn(x)))` then `x = x + mlp(ln_mlp(x))`. The
@@ -816,6 +1252,50 @@ fn fused_ln_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("FW_ENCODER_FUSED_LN").as_deref() != Ok("0"))
+}
+
+/// Default-ON gate (`FW_ENC_FC_BIAS_GELU_FUSED=0` kill-switch) for folding the
+/// **f32-path** `mlp_fc` bias-add into the subsequent GELU pass
+/// ([`nn::gelu_add_bias`]). `matmul_bias` applies the fc1 bias as a SEPARATE
+/// single-threaded RMW over the whole `[n_ctx, mlp_hidden]` output (`[1500,5120]`
+/// = ~30 MiB, L3-borderline/DRAM), immediately before the parallel GELU pass over
+/// the same buffer; the fold removes that serial pass. BYTE-IDENTICAL. Fires only
+/// on the f32 fc1 path (`mlp_fc_i7 == None`) with the separate-GELU branch — the
+/// int8 `matmul_bias_i7_gelu` path already folds GELU into fc2's quant and needs
+/// the bias resident in `h`, so it is excluded.
+fn fc_bias_gelu_fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENC_FC_BIAS_GELU_FUSED").as_deref() != Ok("0"))
+}
+
+/// Default-ON gate (`FW_ENC_PROJ_BIAS_RESID_FUSED=0` kill-switch) for folding the
+/// **f32-path** `mlp.proj` (fc2) bias-add into the residual add
+/// ([`nn::add_bias_residual`]). `matmul_bias` applies the fc2 bias as a SEPARATE
+/// single-threaded RMW over the `[n_ctx, n_state]` output; unlike qkv/attn_out
+/// (whose sgemm working sets fit L3 ⇒ output cache-warm), fc2's sgemm streams a
+/// ~56 MiB working set (`[1500,5120]`+`[5120,1280]`) that evicts its own 7.68 MiB
+/// output, so that serial bias pass reads partly-DRAM. Folding it into the
+/// residual removes the pass (and the h write-back) and parallelizes it.
+/// BYTE-IDENTICAL. Fires only on the f32 fc2 path (`mlp_proj_i7 == None`).
+fn proj_bias_resid_fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENC_PROJ_BIAS_RESID_FUSED").as_deref() != Ok("0"))
+}
+
+/// Optional encoder-depth cap `FW_ENCODER_LAYERS=N` (viability probe for encoder
+/// layer-pruning). `None` (unset / unparsable / `0`) ⇒ run all layers
+/// (byte-identical default). Resolved once.
+fn encoder_layer_limit() -> Option<usize> {
+    use std::sync::OnceLock;
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_ENCODER_LAYERS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
 }
 
 /// `layer_norm(x)` returning a fresh `[rows, cols]` `Mat`. Fused path writes the
@@ -832,6 +1312,411 @@ fn ln_into(x: &Mat, w: &[f32], b: &[f32]) -> Mat {
         nn::layer_norm(&mut h, w, b, LN_EPS);
         h
     }
+}
+
+/// Dispatch a linear layer to the maddubs 7-bit int8 GEMM when an [`nn::I7Mat`]
+/// was built at load (`FRANKEN_WHISPER_ENC_INT8=1`), else the f32 sgemm. The
+/// default (no i7) path is byte-identical to the pre-lever encoder.
+#[inline]
+fn enc_linear(x: &Mat, w_t: &Mat, w_i7: &Option<nn::I7Mat>, bias: Option<&[f32]>) -> FwResult<Mat> {
+    match w_i7 {
+        Some(w) => nn::matmul_bias_i7(x, w, bias),
+        None => match super::enc_act_roundtrip() {
+            // Feasibility harness: roundtrip the ACTIVATION through the int8 path's u8 quant
+            // (per-row or block-wise) before the f32 GEMM, isolating the activation-quant
+            // effect on the transcript. Default (None) = the true f32 path, byte-identical.
+            Some(block) => nn::matmul_bias(&nn::u8_act_roundtrip(x, block), w_t, bias),
+            None => nn::matmul_bias(x, w_t, bias),
+        },
+    }
+}
+
+/// Cached per-output-channel **i8** weight for the encoder `attn.out` GEMM
+/// (gated by [`super::enc_attn_out_i8i32`]). `data` is `[out, inp]` row-major i8
+/// (per-output-channel amax/127, FULL 8 bits — the extra bit vs franken's i7
+/// maddubs is what preserves proper nouns on the residual-feeding `attn.out`;
+/// see the flag doc), transposed once at load from franken's `[inp, out]` `w_t`.
+#[derive(Debug, Clone)]
+struct EncI8Mat {
+    data: Vec<i8>,
+    scale: Vec<f32>,
+    inp: usize,
+    out: usize,
+}
+
+/// Shared inner for [`EncI8Mat`]: for output channel `o`, `weight(o, i)` yields the
+/// f32 weight at contraction index `i` (`0..inp`). Parallel over channels; identical
+/// amax/scale arithmetic for every caller — the ONLY thing that varies is WHERE the
+/// f32 comes from (a pre-transposed `[in, out]` `Mat`, or the raw ggml `[out, in]`
+/// f16 bytes read directly). `weight` is monomorphized ⇒ inlined. Single source of
+/// the i8 quant math (mirrors [`nn::quantize_rows_to_i7`]).
+fn quantize_enc_i8_rows(
+    out: usize,
+    inp: usize,
+    weight: impl Fn(usize, usize) -> f32 + Sync,
+) -> EncI8Mat {
+    let mut data = vec![0i8; out * inp];
+    let mut scale = vec![0.0f32; out];
+    data.par_chunks_mut(inp)
+        .zip(scale.par_iter_mut())
+        .enumerate()
+        .for_each(|(o, (drow, s))| {
+            let mut amax = 1e-9f32;
+            for i in 0..inp {
+                amax = amax.max(weight(o, i).abs());
+            }
+            let sc = amax / 127.0;
+            *s = sc;
+            let inv = 1.0 / sc;
+            for (i, d) in drow.iter_mut().enumerate() {
+                *d = (weight(o, i) * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        });
+    EncI8Mat {
+        data,
+        scale,
+        inp,
+        out,
+    }
+}
+
+/// Quantize franken's `[inp, out]` weight (element `[i*out + o]`) to a cached
+/// `[out, inp]` i8 matrix, per-output-channel symmetric (amax/127). One-time load
+/// cost, parallel over output channels (disjoint rows ⇒ order-invariant).
+fn quantize_enc_i8(w_t: &Mat) -> EncI8Mat {
+    let inp = w_t.rows;
+    let out = w_t.cols;
+    quantize_enc_i8_rows(out, inp, |o, i| w_t.data[i * out + o])
+}
+
+/// Quantize DIRECTLY from ggml's raw `[out, in]` f16 bytes (borrowed from the resident
+/// blob) to an [`EncI8Mat`], WITHOUT materializing the transposed f32 `Mat`.
+/// Bit-identical to `quantize_enc_i8(&load_linear_transposed(..))` — output channel `o`
+/// reads ggml row `o` (`raw[(o*inp + i)*2]`), the same value sequence the transposed
+/// path gathers for column `o` (same `Float16::from_bits`). See
+/// [`nn::quantize_f16_bytes_to_i7`] for the i7 twin. `raw.len()` must be `out*inp*2`.
+fn quantize_enc_i8_f16_bytes(raw: &[u8], out: usize, inp: usize) -> EncI8Mat {
+    debug_assert_eq!(raw.len(), out * inp * 2, "f16 byte length != out*inp*2");
+    quantize_enc_i8_rows(out, inp, |o, i| {
+        let off = (o * inp + i) * 2;
+        Float16::from_bits(u16::from_le_bytes([raw[off], raw[off + 1]])).to_f32()
+    })
+}
+
+/// Load the `attn.out` linear and quantize it to i8. When `free`, quantize STRAIGHT
+/// from the resident ggml f16 bytes (no transposed f32 `Mat`, no transpose) and return
+/// an empty `Mat`; f32-stored tensors fall back to materialize→quantize→free; `!free`
+/// retains the f32 (shipping default unchanged). Mirrors [`load_linear_maybe_i7`].
+fn load_linear_i8_direct(
+    model: &GgmlModel,
+    name: &str,
+    out_dim: usize,
+    in_dim: usize,
+    free: bool,
+) -> FwResult<(Mat, EncI8Mat)> {
+    if free {
+        if let Ok((shape, raw)) = model.tensor_f16_bytes(name) {
+            if shape != [out_dim, in_dim] {
+                return Err(FwError::InvalidRequest(format!(
+                    "encoder tensor '{name}' has shape {shape:?}, expected {:?}",
+                    [out_dim, in_dim]
+                )));
+            }
+            return Ok((
+                Mat::from_vec(0, 0, Vec::new()),
+                quantize_enc_i8_f16_bytes(&raw, out_dim, in_dim),
+            ));
+        }
+        let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+        return Ok((Mat::from_vec(0, 0, Vec::new()), quantize_enc_i8(&w)));
+    }
+    let w = load_linear_transposed(model, name, out_dim, in_dim)?;
+    let i8 = quantize_enc_i8(&w);
+    Ok((w, i8))
+}
+
+/// AVX2 i8×i8 → i32 dot (vpmovsxbw + vpmaddwd, 2 accumulators; sign-extend both
+/// operands so there is NO `_mm256_maddubs_epi16` i16-saturation constraint —
+/// this is why the weight can be full i8, unlike franken's i7 maddubs). A private
+/// copy of `nn::dot_i8` (which is not `pub`), kept self-contained in encoder.rs to
+/// avoid touching the shared-tree `nn.rs`. Integer-exact.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+fn dot_i8_enc(w: &[i8], x: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    let n = w.len();
+    let (wp, xp) = (w.as_ptr(), x.as_ptr());
+    // SAFETY: avx2 is a base target feature; every 128-bit load is bounded by the
+    // `i+32<=n` / `i+16<=n` guards; the `<16` tail runs scalar. Bit-identical to
+    // the scalar reduction (integer add is order-independent).
+    unsafe {
+        let mut a0 = _mm256_setzero_si256();
+        let mut a1 = _mm256_setzero_si256();
+        let mut i = 0;
+        while i + 32 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+            let x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i + 16) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(w1, x1));
+            i += 32;
+        }
+        while i + 16 <= n {
+            let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+            let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+            i += 16;
+        }
+        let s = _mm256_add_epi32(a0, a1);
+        let lo = _mm256_castsi256_si128(s);
+        let hi = _mm256_extracti128_si256::<1>(s);
+        let q = _mm_add_epi32(lo, hi);
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+        let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+        let mut acc = _mm_cvtsi128_si32(q);
+        while i < n {
+            acc += (*w.get_unchecked(i) as i32) * (*x.get_unchecked(i) as i32);
+            i += 1;
+        }
+        acc
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_i8_enc(w: &[i8], x: &[i8]) -> i32 {
+    w.iter().zip(x).map(|(&a, &b)| a as i32 * b as i32).sum()
+}
+
+/// M4×N2 register-blocked i8×i8 → i32: 4 activation rows × 2 weight rows = 8 dots,
+/// each 16-i8 chunk sign-extended ONCE and reused across all 8 dots (8 accumulators
+/// + 4 act + 2 weight = 14 ymm, fits Zen3's 16). This amortizes the vpmovsxbw
+/// sign-extend + the loads that make the per-call [`dot_i8_enc`] effectively M1
+/// (it re-loads+re-extends the weight row for every activation row). Mirrors the
+/// maddubs `dot_maddubs_i7_m4n2`; integer-EXACT (associative i32 add ⇒ bit-identical
+/// to per-element order). Returns `[x0·w0,x1·w0,x2·w0,x3·w0, x0·w1,x1·w1,x2·w1,x3·w1]`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code, clippy::too_many_arguments)]
+fn dot_i8_m4n2(x0: &[i8], x1: &[i8], x2: &[i8], x3: &[i8], w0: &[i8], w1: &[i8]) -> [i32; 8] {
+    use core::arch::x86_64::*;
+    let k = w0.len();
+    let (p0, p1, p2, p3) = (x0.as_ptr(), x1.as_ptr(), x2.as_ptr(), x3.as_ptr());
+    let (q0, q1) = (w0.as_ptr(), w1.as_ptr());
+    // SAFETY: avx2 base feature; all six slices have length k; 16-lane steps guarded
+    // by `i+16<=k`, scalar tail after. vpmaddwd accumulates i16→i32 (no saturation).
+    unsafe {
+        let mut acc = [_mm256_setzero_si256(); 8];
+        let mut i = 0;
+        while i + 16 <= k {
+            let a0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p0.add(i) as *const __m128i));
+            let a1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p1.add(i) as *const __m128i));
+            let a2 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p2.add(i) as *const __m128i));
+            let a3 = _mm256_cvtepi8_epi16(_mm_loadu_si128(p3.add(i) as *const __m128i));
+            let b0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(q0.add(i) as *const __m128i));
+            let b1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(q1.add(i) as *const __m128i));
+            acc[0] = _mm256_add_epi32(acc[0], _mm256_madd_epi16(a0, b0));
+            acc[1] = _mm256_add_epi32(acc[1], _mm256_madd_epi16(a1, b0));
+            acc[2] = _mm256_add_epi32(acc[2], _mm256_madd_epi16(a2, b0));
+            acc[3] = _mm256_add_epi32(acc[3], _mm256_madd_epi16(a3, b0));
+            acc[4] = _mm256_add_epi32(acc[4], _mm256_madd_epi16(a0, b1));
+            acc[5] = _mm256_add_epi32(acc[5], _mm256_madd_epi16(a1, b1));
+            acc[6] = _mm256_add_epi32(acc[6], _mm256_madd_epi16(a2, b1));
+            acc[7] = _mm256_add_epi32(acc[7], _mm256_madd_epi16(a3, b1));
+            i += 16;
+        }
+        let hsum = |v: __m256i| -> i32 {
+            let lo = _mm256_castsi256_si128(v);
+            let hi = _mm256_extracti128_si256::<1>(v);
+            let q = _mm_add_epi32(lo, hi);
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b01_00_11_10>(q));
+            let q = _mm_add_epi32(q, _mm_shuffle_epi32::<0b00_00_00_01>(q));
+            _mm_cvtsi128_si32(q)
+        };
+        let mut r = [0i32; 8];
+        for (j, a) in acc.iter().enumerate() {
+            r[j] = hsum(*a);
+        }
+        while i < k {
+            let (wx0, wx1) = (w0[i] as i32, w1[i] as i32);
+            r[0] += x0[i] as i32 * wx0;
+            r[1] += x1[i] as i32 * wx0;
+            r[2] += x2[i] as i32 * wx0;
+            r[3] += x3[i] as i32 * wx0;
+            r[4] += x0[i] as i32 * wx1;
+            r[5] += x1[i] as i32 * wx1;
+            r[6] += x2[i] as i32 * wx1;
+            r[7] += x3[i] as i32 * wx1;
+            i += 1;
+        }
+        r
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn dot_i8_m4n2(x0: &[i8], x1: &[i8], x2: &[i8], x3: &[i8], w0: &[i8], w1: &[i8]) -> [i32; 8] {
+    [
+        dot_i8_enc(w0, x0),
+        dot_i8_enc(w0, x1),
+        dot_i8_enc(w0, x2),
+        dot_i8_enc(w0, x3),
+        dot_i8_enc(w1, x0),
+        dot_i8_enc(w1, x1),
+        dot_i8_enc(w1, x2),
+        dot_i8_enc(w1, x3),
+    ]
+}
+
+/// Byte-exact AVX2 symmetric-i8 activation quant `(v*inv).round().clamp(-127,127) as i8`.
+/// `f32::round` has no AVX rounding mode (LLVM scalarizes to a per-element `roundf`), so the
+/// AVX2 path emulates round-half-away via `+ copysign(0.5, v)` + round-to-zero, then clamps
+/// and order-preserving-packs. (Unlike the common `trunc(v+0.5)` emulation — e.g. the one in
+/// `nn::quantize_act_i8_into` — this is byte-EXACT: that shortcut mis-rounds `v` just below 0.5.)
+/// MEASURED ~2.2–2.7× on the m=1500 encoder shape (`examples/enc_i8quant_probe`), and
+/// unit-tested byte-identical to the scalar map over the ±127 clamp / half-away edges.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+fn quant_row_i8(xr: &[f32], inv: f32, out: &mut [i8]) {
+    use core::arch::x86_64::*;
+    let n = xr.len().min(out.len());
+    let xp = xr.as_ptr();
+    // SAFETY: avx2 guaranteed by cfg; every load/store is bounded by the `i+8<=n` guard,
+    // and the `< 8` remainder runs the scalar map.
+    unsafe {
+        let vinv = _mm256_set1_ps(inv);
+        let half = _mm256_set1_ps(0.5);
+        let one = _mm256_set1_ps(1.0);
+        let signmask = _mm256_set1_ps(-0.0); // 0x80000000
+        let c127 = _mm256_set1_ps(127.0);
+        let cm127 = _mm256_set1_ps(-127.0);
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_mul_ps(_mm256_loadu_ps(xp.add(i)), vinv);
+            // Round half away from zero, byte-identical to `f32::round`: `trunc(v) +
+            // (|v-trunc(v)| >= 0.5 ? copysign(1,v) : 0)`. `trunc` and `v-trunc(v)` are
+            // EXACT for |v| <= 127, so this avoids the `trunc(v+0.5)` sub-0.5 add-rounding
+            // bug (x=0.4999… would wrongly round to 1). NaN/huge fall through to the clamp.
+            let tr = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(v);
+            let frac = _mm256_sub_ps(v, tr);
+            let ge = _mm256_cmp_ps::<_CMP_GE_OQ>(_mm256_andnot_ps(signmask, frac), half);
+            let sign1 = _mm256_or_ps(one, _mm256_and_ps(v, signmask)); // copysign(1, v)
+            let r = _mm256_add_ps(tr, _mm256_and_ps(ge, sign1));
+            let r = _mm256_min_ps(_mm256_max_ps(r, cm127), c127);
+            let ri = _mm256_cvtps_epi32(r);
+            let lo = _mm256_castsi256_si128(ri);
+            let hi = _mm256_extracti128_si256::<1>(ri);
+            let i16s = _mm_packs_epi32(lo, hi); // order-preserving: [lo0..3, hi0..3]
+            let i8s = _mm_packs_epi16(i16s, i16s); // low 8 bytes = elems 0..7
+            _mm_storel_epi64(out.as_mut_ptr().add(i) as *mut __m128i, i8s);
+            i += 8;
+        }
+        while i < n {
+            *out.get_unchecked_mut(i) =
+                (*xr.get_unchecked(i) * inv).round().clamp(-127.0, 127.0) as i8;
+            i += 1;
+        }
+    }
+}
+
+/// Scalar fallback (non-avx2): the exact reference the AVX2 path reproduces.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+fn quant_row_i8(xr: &[f32], inv: f32, out: &mut [i8]) {
+    for (d, &v) in out.iter_mut().zip(xr) {
+        *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+}
+
+/// Affine projection `x @ w^T (+ bias)` via an i8×i8 i32-accumulate GEMM (the fast
+/// path for the quality-safe `attn.out` int8 — see [`EncI8Mat`]). Activation is
+/// per-row i8-symmetric-quantized (amax/127) inline; the GEMM is M4-register-
+/// blocked (each weight row streamed once per 4 activation rows) and parallel over
+/// row-blocks. NON-byte-exact vs f32 (int8 quantization) but quality-safe on
+/// proper nouns (validated on track01).
+fn matmul_bias_i8(x: &Mat, w: &EncI8Mat, bias: Option<&[f32]>) -> FwResult<Mat> {
+    let m = x.rows;
+    let inp = x.cols;
+    let out = w.out;
+    if inp != w.inp {
+        return Err(FwError::InvalidRequest(format!(
+            "matmul_bias_i8: x.cols {inp} != w.inp {}",
+            w.inp
+        )));
+    }
+    // Per-row i8 symmetric activation quant.
+    let mut xq = vec![0i8; m * inp];
+    let mut sa = vec![0.0f32; m];
+    xq.par_chunks_mut(inp)
+        .zip(sa.par_iter_mut())
+        .enumerate()
+        .for_each(|(r, (xr_i8, s))| {
+            let xr = &x.data[r * inp..(r + 1) * inp];
+            let amax = xr.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+            let rs = amax / 127.0;
+            *s = rs;
+            let inv = 1.0 / rs;
+            // Byte-exact AVX2 quant (f32::round doesn't vectorize → per-element roundf);
+            // MEASURED ~2.2–2.7× on the m=1500 shape, byte-identical (enc_i8quant_probe + test).
+            quant_row_i8(xr, inv, xr_i8);
+        });
+    // M4×N2 register-blocked GEMM: a full 4-row block streams each weight-row PAIR
+    // once, computing 8 dots (4 act × 2 weight) with the sign-extend amortized
+    // (dot_i8_m4n2). Partial row-blocks / the odd final weight row fall back to the
+    // per-element dot_i8_enc. Bit-identical to the per-element order (assoc. i32 add).
+    let mut c = vec![0.0f32; m * out];
+    c.par_chunks_mut(4 * out)
+        .enumerate()
+        .for_each(|(blk, cblk)| {
+            let r0 = blk * 4;
+            let rows = (m - r0).min(4);
+            if rows == 4 {
+                let x0 = &xq[r0 * inp..(r0 + 1) * inp];
+                let x1 = &xq[(r0 + 1) * inp..(r0 + 2) * inp];
+                let x2 = &xq[(r0 + 2) * inp..(r0 + 3) * inp];
+                let x3 = &xq[(r0 + 3) * inp..(r0 + 4) * inp];
+                let (s0, s1, s2, s3) = (sa[r0], sa[r0 + 1], sa[r0 + 2], sa[r0 + 3]);
+                let mut o = 0;
+                while o + 2 <= out {
+                    let w0 = &w.data[o * inp..(o + 1) * inp];
+                    let w1 = &w.data[(o + 1) * inp..(o + 2) * inp];
+                    let raw = dot_i8_m4n2(x0, x1, x2, x3, w0, w1);
+                    let (sc0, sc1) = (w.scale[o], w.scale[o + 1]);
+                    let (bo0, bo1) = bias.map_or((0.0, 0.0), |b| (b[o], b[o + 1]));
+                    cblk[o] = raw[0] as f32 * s0 * sc0 + bo0;
+                    cblk[out + o] = raw[1] as f32 * s1 * sc0 + bo0;
+                    cblk[2 * out + o] = raw[2] as f32 * s2 * sc0 + bo0;
+                    cblk[3 * out + o] = raw[3] as f32 * s3 * sc0 + bo0;
+                    cblk[o + 1] = raw[4] as f32 * s0 * sc1 + bo1;
+                    cblk[out + o + 1] = raw[5] as f32 * s1 * sc1 + bo1;
+                    cblk[2 * out + o + 1] = raw[6] as f32 * s2 * sc1 + bo1;
+                    cblk[3 * out + o + 1] = raw[7] as f32 * s3 * sc1 + bo1;
+                    o += 2;
+                }
+                while o < out {
+                    let wr = &w.data[o * inp..(o + 1) * inp];
+                    let (sc, bo) = (w.scale[o], bias.map_or(0.0, |b| b[o]));
+                    cblk[o] = dot_i8_enc(wr, x0) as f32 * s0 * sc + bo;
+                    cblk[out + o] = dot_i8_enc(wr, x1) as f32 * s1 * sc + bo;
+                    cblk[2 * out + o] = dot_i8_enc(wr, x2) as f32 * s2 * sc + bo;
+                    cblk[3 * out + o] = dot_i8_enc(wr, x3) as f32 * s3 * sc + bo;
+                    o += 1;
+                }
+            } else {
+                for o in 0..out {
+                    let wr = &w.data[o * inp..(o + 1) * inp];
+                    let sc = w.scale[o];
+                    let bo = bias.map_or(0.0, |b| b[o]);
+                    for j in 0..rows {
+                        let r = r0 + j;
+                        let xr = &xq[r * inp..(r + 1) * inp];
+                        cblk[j * out + o] = dot_i8_enc(wr, xr) as f32 * sa[r] * sc + bo;
+                    }
+                }
+            }
+        });
+    Ok(Mat::from_vec(m, out, c))
 }
 
 fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<()> {
@@ -855,50 +1740,196 @@ fn encoder_block(x: &mut Mat, layer: &EncoderLayer, n_head: usize) -> FwResult<(
     // Kill switch FW_ENCODER_FUSED_LN=0 restores the clone path (A/B + escape).
     let h = et!(2, ln_into(x, &layer.attn_ln_w, &layer.attn_ln_b));
 
-    let (q, k, v) = et!(3, {
-        let q = nn::matmul_bias(&h, &layer.attn_q_w, Some(&layer.attn_q_b))?;
-        let k = nn::matmul_bias(&h, &layer.attn_k_w, None)?; // no key bias
-        let v = nn::matmul_bias(&h, &layer.attn_v_w, Some(&layer.attn_v_b))?;
-        (q, k, v)
-    });
-
     // Bidirectional self-attention: causal_offset = None.
-    let attn = et!(4, nn::attention(&q, &k, &v, n_head, None)?);
-    let attn = et!(5, nn::matmul_bias(&attn, &layer.attn_out_w, Some(&layer.attn_out_b))?);
+    let attn = if let (Some(qw), Some(kw), Some(vw)) =
+        (&layer.attn_q_i7, &layer.attn_k_i7, &layer.attn_v_i7)
+    {
+        let hq = nn::quantize_act_i7(&h);
+        if super::enc_qkv_fused() {
+            // Fused: q/k/v written head-major inside the maddubs GEMM → external
+            // SDPA → scatter, skipping the standalone gather. Byte-identical.
+            et!(
+                4,
+                nn::attention_from_i7_qkv(
+                    &hq,
+                    qw,
+                    Some(&layer.attn_q_b),
+                    kw,
+                    None,
+                    vw,
+                    Some(&layer.attn_v_b),
+                    n_head,
+                )?
+            )
+        } else {
+            let (q, k, v) = et!(3, {
+                let q = nn::matmul_bias_i7_quantized(&hq, qw, Some(&layer.attn_q_b))?;
+                let k = nn::matmul_bias_i7_quantized(&hq, kw, None)?; // no key bias
+                let v = nn::matmul_bias_i7_quantized(&hq, vw, Some(&layer.attn_v_b))?;
+                (q, k, v)
+            });
+            et!(4, nn::attention(&q, &k, &v, n_head, None)?)
+        }
+    } else {
+        let (q, k, v) = et!(3, {
+            let q = enc_linear(&h, &layer.attn_q_w, &layer.attn_q_i7, Some(&layer.attn_q_b))?;
+            let k = enc_linear(&h, &layer.attn_k_w, &layer.attn_k_i7, None)?; // no key bias
+            let v = enc_linear(&h, &layer.attn_v_w, &layer.attn_v_i7, Some(&layer.attn_v_b))?;
+            (q, k, v)
+        });
+        et!(4, nn::attention(&q, &k, &v, n_head, None)?)
+    };
+    let attn = et!(
+        5,
+        if let Some(w8) = &layer.attn_out_i8 {
+            matmul_bias_i8(&attn, w8, Some(&layer.attn_out_b))?
+        } else {
+            enc_linear(
+                &attn,
+                &layer.attn_out_w,
+                &layer.attn_out_i7,
+                Some(&layer.attn_out_b),
+            )?
+        }
+    );
     et!(6, add_in_place(x, &attn));
 
     // ── MLP residual ── (same fused layer_norm-into-uninit, no clone memcpy)
     let h = et!(7, ln_into(x, &layer.mlp_ln_w, &layer.mlp_ln_b));
-    let mut h = et!(8, nn::matmul_bias(&h, &layer.mlp_fc_w, Some(&layer.mlp_fc_b))?);
-    et!(9, nn::gelu(&mut h));
-    let h = et!(10, nn::matmul_bias(&h, &layer.mlp_proj_w, Some(&layer.mlp_proj_b))?);
-    et!(11, add_in_place(x, &h));
+    // f32-path fc1 bias→GELU fusion (see `fc_bias_gelu_fused_enabled`): fold the
+    // separate serial 30 MiB bias RMW into the GELU pass. Only when fc1 is f32
+    // (`mlp_fc_i7 == None`) AND the separate-GELU branch runs — the int8
+    // `matmul_bias_i7_gelu` path folds GELU into fc2's quant and needs the bias
+    // already in `h`, so it is excluded. Byte-identical.
+    let int8_gelu_path = super::enc_gelu_fused() && layer.mlp_proj_i7.is_some();
+    let fuse_fc_bias = !int8_gelu_path && layer.mlp_fc_i7.is_none() && fc_bias_gelu_fused_enabled();
+    let fc_bias: Option<&[f32]> = if fuse_fc_bias {
+        None
+    } else {
+        Some(&layer.mlp_fc_b)
+    };
+    let mut h = et!(
+        8,
+        enc_linear(&h, &layer.mlp_fc_w, &layer.mlp_fc_i7, fc_bias)?
+    );
+    // GELU-into-fc2-quant fusion: when fc2 is the int8 maddubs path, fold the
+    // GELU into the activation quant so the big `[1500, 5120]` GELU'd buffer is
+    // never materialized (byte-identical; see `super::enc_gelu_fused`). Otherwise
+    // the classic separate GELU (label 9) + fc2 (label 10), with the f32 fc1 bias
+    // folded into GELU when `fuse_fc_bias`.
+    // f32-path fc2 bias→residual fusion (see `proj_bias_resid_fused_enabled`):
+    // fold the separate serial bias RMW into the residual add. Only on the f32
+    // fc2 path (`mlp_proj_i7 == None`); the int8 `matmul_bias_i7_gelu` path keeps
+    // its own bias. Byte-identical.
+    let fuse_proj_bias = layer.mlp_proj_i7.is_none() && proj_bias_resid_fused_enabled();
+    let h = if super::enc_gelu_fused()
+        && let Some(w) = layer.mlp_proj_i7.as_ref()
+    {
+        et!(10, nn::matmul_bias_i7_gelu(&h, w, Some(&layer.mlp_proj_b))?)
+    } else {
+        if fuse_fc_bias {
+            et!(9, nn::gelu_add_bias(&mut h, &layer.mlp_fc_b));
+        } else {
+            et!(9, nn::gelu(&mut h));
+        }
+        let proj_bias: Option<&[f32]> = if fuse_proj_bias {
+            None
+        } else {
+            Some(&layer.mlp_proj_b)
+        };
+        et!(
+            10,
+            enc_linear(&h, &layer.mlp_proj_w, &layer.mlp_proj_i7, proj_bias)?
+        )
+    };
+    if fuse_proj_bias {
+        et!(11, nn::add_bias_residual(x, &h, &layer.mlp_proj_b));
+    } else {
+        et!(11, add_in_place(x, &h));
+    }
 
     Ok(())
 }
 
 /// In-place element-wise `x += y` for matrices of identical shape.
 ///
-/// Kept SERIAL deliberately: parallelizing this was MEASURED a wash/slight-loss
-/// (2026-07-02, BlackThrush) — the residual operands are cache-warm from the
-/// matmul that just produced them and LLVM auto-vectorizes the loop, so rayon
-/// dispatch overhead outweighs any bandwidth gain (unlike the fused-LN clone,
-/// which was a *cold* memcpy pass). Do not re-parallelize.
+/// Element-wise, so ANY chunking is bit-identical to the serial loop.
+///
+/// SERIAL below `PAR_THRESHOLD`, parallel at/above it. The 2026-07-02 measurement
+/// that found parallelizing "a wash/slight-loss" was on tiny.en, whose residual
+/// operand `[1500, 384]` = 576 K elts (~2.3 MB) is L2-warm from the matmul that
+/// just produced it — there a single AVX2-vectorized pass already saturates the
+/// (warm) bandwidth and rayon dispatch is pure overhead. At turbo scale the operand
+/// `[1500, 1280]` = 1.92 M elts (~7.6 MB) spills L2 into L3/DRAM, where one core is
+/// far below aggregate bandwidth, so fanning the add across `worker_count` cores
+/// wins. The threshold (`1 << 20`) sits ABOVE tiny.en's 576 K (stays serial,
+/// preserving that measurement) and BELOW turbo's 1.92 M. Kill: `FW_ENC_RESID_PAR=0`.
 fn add_in_place(x: &mut Mat, y: &Mat) {
     debug_assert_eq!(
         (x.rows, x.cols),
         (y.rows, y.cols),
         "add_in_place shape mismatch"
     );
-    for (a, b) in x.data.iter_mut().zip(&y.data) {
-        *a += b;
+    const PAR_THRESHOLD: usize = 1 << 20;
+    let n = x.data.len();
+    let workers = nn::worker_count();
+    if n < PAR_THRESHOLD || workers < 2 || !enc_resid_par_enabled() {
+        for (a, b) in x.data.iter_mut().zip(&y.data) {
+            *a += b;
+        }
+        return;
     }
+    let band = n.div_ceil(workers).max(1);
+    x.data
+        .par_chunks_mut(band)
+        .zip(y.data.par_chunks(band))
+        .for_each(|(a, b)| {
+            for (av, bv) in a.iter_mut().zip(b) {
+                *av += bv;
+            }
+        });
+}
+
+/// Kill-switch for the turbo-scale parallel residual add (default ON). Set
+/// `FW_ENC_RESID_PAR=0` to force the serial `x += y` byte-for-byte.
+fn enc_resid_par_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_ENC_RESID_PAR").as_deref() != Ok("0"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native_engine::{find_model_file, mel};
+
+    /// `quant_row_i8` (the AVX2 activation quant in `matmul_bias_i8`) must be
+    /// byte-identical to the scalar `(v*inv).round().clamp(-127,127) as i8` map it
+    /// replaces — including the ±127 clamp edges and round-half-away boundaries.
+    #[test]
+    fn quant_row_i8_is_byte_identical_to_scalar_round() {
+        let scalar = |xr: &[f32], inv: f32, out: &mut [i8]| {
+            for (d, &v) in out.iter_mut().zip(xr) {
+                *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        };
+        for &inv in &[0.5f32, 1.0, 3.7, 42.0] {
+            let mut xs: Vec<f32> = Vec::new();
+            // Dense sweep across the clamp region + exact half-way / integer boundaries,
+            // plus over-range values that must saturate identically.
+            for k in -400..=400 {
+                xs.push(k as f32 / inv * 0.5);
+                xs.push((k as f32 + 0.5) / inv);
+            }
+            xs.extend_from_slice(&[0.0, -0.0, 1e30, -1e30, 127.4999 / inv, -127.5 / inv]);
+            let n = xs.len();
+            let mut a = vec![0i8; n];
+            let mut b = vec![0i8; n];
+            quant_row_i8(&xs, inv, &mut a);
+            scalar(&xs, inv, &mut b);
+            assert_eq!(a, b, "AVX2 quant_row_i8 != scalar round at inv={inv}");
+        }
+    }
 
     /// Deterministic LCG (Numerical Recipes constants) -> f32 in [-1, 1).
     struct Lcg(u64);
@@ -957,6 +1988,13 @@ mod tests {
                 mlp_fc_b: rng.vec(mlp_hidden, s),
                 mlp_proj_w: rng.mat(mlp_hidden, n_state, s),
                 mlp_proj_b: rng.vec(n_state, s),
+                attn_q_i7: None,
+                attn_k_i7: None,
+                attn_v_i7: None,
+                attn_out_i7: None,
+                attn_out_i8: None,
+                mlp_fc_i7: None,
+                mlp_proj_i7: None,
             });
         }
 
@@ -1191,6 +2229,237 @@ mod tests {
             .map(|s| s as f32 / max)
             .collect();
         Some(samples)
+    }
+
+    fn dequant_i8_for_test(w: &EncI8Mat) -> Mat {
+        let mut data = vec![0.0f32; w.inp * w.out];
+        for o in 0..w.out {
+            let row = &w.data[o * w.inp..(o + 1) * w.inp];
+            for (i, &q) in row.iter().enumerate() {
+                data[i * w.out + o] = f32::from(q) * w.scale[o];
+            }
+        }
+        Mat::from_vec(w.inp, w.out, data)
+    }
+
+    /// The f16-direct attn.out i8 quant (`quantize_enc_i8_f16_bytes`, `ae5f618`) MUST
+    /// produce a bit-identical [`EncI8Mat`] to the two-phase
+    /// `quantize_enc_i8(transpose(f16→f32))` — the byte-exact basis of the attn.out
+    /// half of the f16-direct win (twin of the i7 guard in `nn.rs`). The live path runs
+    /// only under `FW_ENC_FREE_F32=1`, so this locks it into the DEFAULT suite. ggml row
+    /// `o` of the `[out, inp]` bytes IS column `o` of the transposed `[inp, out]` Mat,
+    /// both feeding the same `quantize_enc_i8_rows`.
+    #[test]
+    fn quantize_enc_i8_f16_bytes_matches_transposed_f32_path_byte_exact() {
+        let mut rng = Lcg::new(0x18D1_2EC7);
+        for &(out, inp) in &[(40usize, 24usize), (17, 31), (64, 16), (1, 8), (8, 1)] {
+            // Synthetic ggml [out, inp] f16 raw bytes (finite, varied).
+            let mut raw = vec![0u8; out * inp * 2];
+            for b2 in raw.chunks_exact_mut(2) {
+                let v = rng.next_f32() * 4.0;
+                b2.copy_from_slice(&Float16::from_f32(v).to_bits().to_le_bytes());
+            }
+            // Two-phase reference: transpose f16→f32 into [inp, out], then quantize.
+            let mut f32t = vec![0.0f32; inp * out];
+            for o in 0..out {
+                for i in 0..inp {
+                    let off = (o * inp + i) * 2;
+                    let v =
+                        Float16::from_bits(u16::from_le_bytes([raw[off], raw[off + 1]])).to_f32();
+                    f32t[i * out + o] = v;
+                }
+            }
+            let a = quantize_enc_i8(&Mat::from_vec(inp, out, f32t));
+            let b = quantize_enc_i8_f16_bytes(&raw, out, inp);
+            assert_eq!(a.data, b.data, "i8 data mismatch at {out}x{inp}");
+            assert_eq!(a.scale, b.scale, "i8 scale mismatch at {out}x{inp}");
+            assert_eq!(
+                (a.out, a.inp),
+                (b.out, b.inp),
+                "i8 dims mismatch at {out}x{inp}"
+            );
+        }
+    }
+
+    fn quant_error(original: &Mat, dequant: &Mat) -> (f64, f64) {
+        assert_eq!(original.rows, dequant.rows);
+        assert_eq!(original.cols, dequant.cols);
+        let mut sum_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        let mut max_abs = 0.0f64;
+        let mut ref_amax = 0.0f64;
+        for (&a, &b) in original.data.iter().zip(&dequant.data) {
+            let a = f64::from(a);
+            let b = f64::from(b);
+            let d = (a - b).abs();
+            sum_sq += d * d;
+            ref_sq += a * a;
+            max_abs = max_abs.max(d);
+            ref_amax = ref_amax.max(a.abs());
+        }
+        let rel_rmse = (sum_sq / ref_sq.max(1e-24)).sqrt();
+        let max_abs_over_amax = max_abs / ref_amax.max(1e-12);
+        (rel_rmse, max_abs_over_amax)
+    }
+
+    fn assert_quant_budget(
+        model: &str,
+        layer: usize,
+        matrix: &str,
+        original: &Mat,
+        dequant: &Mat,
+        max_rel_rmse: f64,
+        max_abs_over_amax: f64,
+    ) {
+        let (rel_rmse, max_abs) = quant_error(original, dequant);
+        eprintln!(
+            "{model} layer={layer:02} {matrix:<12} rel_rmse={rel_rmse:.6} max_abs/amax={max_abs:.6}"
+        );
+        assert!(
+            rel_rmse <= max_rel_rmse,
+            "{model} layer {layer} {matrix} rel_rmse {rel_rmse:.6} exceeds {max_rel_rmse:.6}"
+        );
+        assert!(
+            max_abs <= max_abs_over_amax,
+            "{model} layer {layer} {matrix} max_abs/amax {max_abs:.6} exceeds {max_abs_over_amax:.6}"
+        );
+    }
+
+    fn assert_quality_safe_int8_error_budget(model_name: &str) {
+        let Some(path) = find_model_file(model_name) else {
+            eprintln!("SKIP {model_name} encoder-int8 budget: model missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load model");
+        let decision = crate::native_engine::encoder_int8_policy_decision(&model.hparams);
+        if !decision.enabled() {
+            eprintln!(
+                "SKIP {model_name} encoder-int8 budget: policy reason={}",
+                decision.reason
+            );
+            return;
+        }
+
+        let weights = EncoderWeights::from_ggml(&model).expect("encoder weights");
+        assert_eq!(
+            weights.layers.len(),
+            model.hparams.n_audio_layer as usize,
+            "loaded all encoder layers"
+        );
+
+        for (idx, layer) in weights.layers.iter().enumerate() {
+            let attn_q =
+                nn::dequant_i7_for_test(layer.attn_q_i7.as_ref().expect("quality-safe q i7"));
+            let attn_k =
+                nn::dequant_i7_for_test(layer.attn_k_i7.as_ref().expect("quality-safe k i7"));
+            let attn_v =
+                nn::dequant_i7_for_test(layer.attn_v_i7.as_ref().expect("quality-safe v i7"));
+            let mlp_fc =
+                nn::dequant_i7_for_test(layer.mlp_fc_i7.as_ref().expect("quality-safe fc1 i7"));
+            let mlp_proj =
+                nn::dequant_i7_for_test(layer.mlp_proj_i7.as_ref().expect("quality-safe fc2 i7"));
+            let attn_out = dequant_i8_for_test(
+                layer
+                    .attn_out_i8
+                    .as_ref()
+                    .expect("quality-safe attn.out i8"),
+            );
+            assert!(
+                layer.attn_out_i7.is_none(),
+                "quality-safe policy must not use the rejected all-i7 attn.out path"
+            );
+
+            // FW_ENC_FREE_F32 free-safety: re-derive the reference f32 weights from
+            // `model` (byte-identical to `load_linear_transposed` at load) instead of
+            // reading `layer.*_w`, which the runtime FREES under `FW_ENC_FREE_F32=1`
+            // (leaving an empty `Mat` that panics `quant_error`'s shape assert). This
+            // makes the budget assert independent of the free flag — the ONLY blocker
+            // to flipping FW_ENC_FREE_F32 default-ON. The dequant Mats carry the
+            // `[inp, out]` dims (rows=inp, cols=out) ⇒ `load_linear_transposed`
+            // wants `(out, in) = (d.cols, d.rows)`.
+            let ref_f32 = |suffix: &str, d: &Mat| -> Mat {
+                load_linear_transposed(
+                    &model,
+                    &format!("encoder.blocks.{idx}.{suffix}"),
+                    d.cols,
+                    d.rows,
+                )
+                .expect("re-derive reference f32 weight")
+            };
+            let attn_q_w = ref_f32("attn.query.weight", &attn_q);
+            let attn_k_w = ref_f32("attn.key.weight", &attn_k);
+            let attn_v_w = ref_f32("attn.value.weight", &attn_v);
+            let mlp_fc_w = ref_f32("mlp.0.weight", &mlp_fc);
+            let mlp_proj_w = ref_f32("mlp.2.weight", &mlp_proj);
+            let attn_out_w = ref_f32("attn.out.weight", &attn_out);
+
+            let max_i7_abs = 0.035;
+            let max_i8_abs = 0.012;
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_q_i7",
+                &attn_q_w,
+                &attn_q,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_k_i7",
+                &attn_k_w,
+                &attn_k,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_v_i7",
+                &attn_v_w,
+                &attn_v,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "mlp_fc_i7",
+                &mlp_fc_w,
+                &mlp_fc,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "mlp_proj_i7",
+                &mlp_proj_w,
+                &mlp_proj,
+                decision.quant_rel_rmse_budget,
+                max_i7_abs,
+            );
+            assert_quant_budget(
+                model_name,
+                idx,
+                "attn_out_i8",
+                &attn_out_w,
+                &attn_out,
+                decision.quant_rel_rmse_budget * 0.55,
+                max_i8_abs,
+            );
+        }
+    }
+
+    #[test]
+    fn real_tiny_en_quality_safe_int8_per_layer_error_budget() {
+        assert_quality_safe_int8_error_budget("tiny.en");
+    }
+
+    #[test]
+    fn real_large_v3_turbo_quality_safe_int8_per_layer_error_budget() {
+        assert_quality_safe_int8_error_budget("large-v3-turbo");
     }
 
     // ── gated real-model test (skips when tiny.en is absent) ──

@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.2.1"
+version = "0.5.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Agent-first Rust ASR orchestration stack with ffmpeg normalization and frankensqlite-backed persistence"
@@ -14,6 +14,13 @@ gpu-frankenjax = ["dep:fj-api", "dep:fj-core"]
 # Two binaries from the same entry point: the full name and the short `fw`
 # alias agents and humans actually type. Listing them explicitly disables the
 # implicit package-named bin, so both are declared here.
+#
+# NOTE: cargo emits `warning: src/main.rs found to be present in multiple build
+# targets` — this is EXPECTED and INTENTIONAL (one 518-line entry point, two
+# installable names). Do NOT "fix" it by dropping a bin (breaks the `fw`/
+# `franken_whisper` dual name that installers + docs rely on) or by refactoring
+# main into the lib behind thin per-bin wrappers (a large, CLI-risky change for a
+# cosmetic warning). Accept the warning.
 [[bin]]
 name = "franken_whisper"
 path = "src/main.rs"
@@ -94,6 +101,9 @@ ft-kernel-metal = { path = "../frankentorch/crates/ft-kernel-metal" }
 criterion = { version = "0.5", features = ["html_reports"] }
 # For the f16_gemv_dequant bench to construct `Float16` weights directly.
 ft-core = { path = "../frankentorch/crates/ft-core" }
+# For the hugepage_gemv_probe (madvise(MADV_HUGEPAGE) A/B on weight streaming).
+# Already a transitive dependency; dev-only, does not affect the shipped binary.
+libc = "0.2"
 
 [[bench]]
 name = "storage_bench"

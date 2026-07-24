@@ -130,21 +130,47 @@ impl LoadedModel {
     /// Propagates [`EncoderWeights::from_ggml`] / [`DecoderWeights::from_ggml`]
     /// shape-validation errors.
     pub fn from_ggml(model: GgmlModel) -> FwResult<Self> {
-        let hparams = model.hparams;
-        let filters = model.filters.clone();
-        let tokenizer = Tokenizer::from_vocab(&hparams, model.vocab_tokens.clone());
+        let hparams = model.hparams; // `Copy`, so `model` stays whole for the borrows below.
         // The encoder (~180 ms) and decoder (~102 ms) weight builds are independent
         // and neither saturates RAM bandwidth (~14 GB/s vs ~100+ aggregate), so run
         // them concurrently — the decoder hides behind the encoder (MEASURED ~1.2×
         // on the weights build). Bit-identical (disjoint tensors → separate
         // structs); `rayon::join` runs serially on a 1-thread pool, so it is safe
         // everywhere.
-        let (encoder, decoder) = rayon::join(
-            || EncoderWeights::from_ggml(&model),
-            || DecoderWeights::from_ggml(&model),
-        );
+        // FW_LOAD_WORKERS: bound the TOTAL concurrency of the encoder∥decoder
+        // weight build — both builds' internal layer `into_par_iter`s run inside
+        // this pool, so a single cap covers the whole load (incl. the decoder's
+        // ~133 MB token embedding). Defaults to host∧32 (the all-core freq-throttle
+        // knee; ~11% faster model_weights than the uncapped 64-way ambient pool
+        // on the 64-core box). A smaller N further caps the live per-tensor load
+        // buffers — under FW_STREAM_LOAD each in-flight tensor is an owned pread
+        // buffer, so fewer concurrent loaders cut peak RSS, traded against a
+        // longer load. `FW_LOAD_WORKERS=0` restores the uncapped ambient join.
+        // Byte-exact for any cap (thread count never changes the built weights).
+        let build_weights = || {
+            rayon::join(
+                || EncoderWeights::from_ggml(&model),
+                || DecoderWeights::from_ggml(&model),
+            )
+        };
+        let (encoder, decoder) = match super::load_worker_cap() {
+            Some(cap) => rayon::ThreadPoolBuilder::new()
+                .num_threads(cap)
+                .build()
+                .map_err(|e| FwError::Io(std::io::Error::other(format!("load worker pool: {e}"))))?
+                .install(build_weights),
+            None => build_weights(),
+        };
         let encoder = encoder?;
         let decoder = decoder?;
+        // Build the tokenizer and take the filterbank AFTER the borrowing weight
+        // builds, so both are MOVED out of the now-finished-with `model` (dropped at
+        // return) instead of cloned. The vocab move alone drops ~`n_vocab` (~51 865 on
+        // turbo) `Vec<u8>` clones + copies from the load critical path — the tokenizer
+        // build previously ran serial-before-`join` purely to clone what it could move.
+        // Byte-identical (same vocab/filters bytes, only the ownership changes).
+        let filters = model.filters;
+        let tokenizer = Tokenizer::from_vocab(&hparams, model.vocab_tokens);
         Ok(Self {
             hparams,
             filters,
@@ -163,6 +189,30 @@ pub struct DecodeParams {
     pub language: Option<String>,
     /// Translate to English instead of transcribing in the source language.
     pub translate: bool,
+    /// Optional text prompt to bias the transcription (whisper `--prompt` /
+    /// `initial_prompt`): tokenized via [`Tokenizer::encode`](super::tokenizer)
+    /// and carried as the previous-context prompt on the first window (then aged
+    /// out as decoded text accumulates, like whisper.cpp's `prompt_past`). `None`
+    /// or an empty string is a no-op (byte-identical to no prompt). The
+    /// `FW_INITIAL_PROMPT` env var overrides this field when set (a dev/testing
+    /// hatch, mirroring the other `FW_*` gates).
+    pub initial_prompt: Option<String>,
+    /// Beam width for temperature-0 decoding (whisper `--beam-size`). `None` or
+    /// `Some(1)` = greedy (byte-identical default); `Some(n)` keeps the `n` best
+    /// hypotheses per step and selects the best length-normalized sequence score.
+    /// Clamped to `[1, 8]`. `FW_BEAM_SIZE` overrides this field when set.
+    pub beam_size: Option<usize>,
+    /// Suppress non-speech tokens (whisper `--suppress-nst` /
+    /// `suppress_non_speech_tokens`): masks the vocab's symbol/non-speech tokens
+    /// during decoding for cleaner text. `false` = whisper.cpp default
+    /// (byte-identical). Applied by the logit filter (`ProcessLogitsConfig`).
+    pub suppress_nst: bool,
+    /// Max carried previous-context tokens (whisper `--max-context` /
+    /// `n_max_text_ctx`). `None` or a negative value = the default `n_text_ctx/2`
+    /// (byte-identical). `Some(0)` disables prompt carrying entirely (per-request
+    /// equivalent of `FW_NO_CONTEXT` — an anti-hallucination / anti-repetition
+    /// escape on hard or looping audio); `Some(n)` caps the carry at `n` tokens.
+    pub max_context: Option<i32>,
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
@@ -425,12 +475,533 @@ fn simd_exp_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_SIMD_EXP").is_some())
 }
 
+/// Disable conditioning the decode on previously-decoded text (`FW_NO_CONTEXT=1`,
+/// default OFF). The port of whisper.cpp's `params.no_context` / whisper-cli
+/// `--no-context` (`condition_on_previous_text = false`). By default each
+/// non-first window prepends the prior windows' text as a `[sot_prev, …past…]`
+/// prompt (the prompt build below) to improve cross-window coherence; when this
+/// is set that carried prompt is suppressed and every window starts from a clean
+/// `sot_sequence`. Default OFF = conditioning ON = whisper.cpp's own default =
+/// **byte-identical** to prior behaviour — and single-window clips (jfk×1) carry
+/// no prompt at all, so it is a proven no-op there regardless.
+///
+/// This is the **bd-r0qd escape hatch** (owner-confirmed faithfulness bug): the
+/// accumulated previous-window prompt can bias the greedy / temperature-0
+/// (fallback-free) native decoder toward an early `eot` on a *final full* window
+/// and drop ~40 words of coherent tail (the sole differing input vs the same
+/// audio decoded standalone is `prompt_past`; whisper.cpp recovers via
+/// temperature fallback + prompt reset, native — the deliberate temp-0 port —
+/// cannot). Setting `FW_NO_CONTEXT=1` drops the carry and restores the tail on
+/// affected clips, matching whisper-cli `--no-context`. Mirrors the established
+/// gated-lever idiom ([`simd_exp_enabled`]); the *proper* fix (per-window
+/// temperature fallback) remains owner-scoped.
+fn condition_on_prev_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FW_NO_CONTEXT").is_some())
+}
+
+/// Optional user initial prompt (whisper `--prompt` / `initial_prompt`), read
+/// from `FW_INITIAL_PROMPT`. Its text is tokenized with [`Tokenizer::encode`]
+/// and seeds `prompt_past` so it is carried as previous context on the first
+/// window (then ages out via the `max_prompt_ctx` truncation as decoded text
+/// accumulates — whisper.cpp's `prompt_past` behaviour). Unset or empty → no
+/// prompt (byte-identical default).
+///
+/// A dev/testing OVERRIDE of the [`DecodeParams::initial_prompt`] field
+/// (mirroring [`condition_on_prev_disabled`]): when `FW_INITIAL_PROMPT` is set it
+/// wins over the field, so a prompt can be injected without constructing params.
+/// Unset → the field is used.
+fn initial_prompt_from_env() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static PROMPT: OnceLock<Option<String>> = OnceLock::new();
+    PROMPT
+        .get_or_init(|| {
+            std::env::var("FW_INITIAL_PROMPT")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+/// Build the initial `prompt_past` from an optional user prompt: its BPE token
+/// ids, or empty when there is no (non-empty) prompt. Split out from
+/// [`transcribe_samples`] so the encode-and-seed step is unit-testable without
+/// the `FW_INITIAL_PROMPT` env-gate (which caches once per process).
+fn seeded_prompt_past(prompt: Option<&str>, tokenizer: &Tokenizer) -> Vec<i32> {
+    match prompt {
+        Some(p) if !p.is_empty() => tokenizer.encode(p),
+        _ => Vec::new(),
+    }
+}
+
+/// Default-OFF: on a window that fails to close any timestamp (`result_len == 0`,
+/// the "decoder failed with no timestamps closed" break) while carrying a
+/// previous-window prompt, RETRY that same seek ONCE with the prompt cleared before
+/// accepting the drop. The carried-prompt × int8 interaction is the confirmed cause
+/// of the long-form content-drop (bd-r0qd): `FW_NO_CONTEXT=1` recovers it globally;
+/// this recovers it targeted (only the failed window resets its prompt, so good
+/// windows keep whisper.cpp-faithful conditioning).
+///
+/// **DEFAULT-ON (2026-07-24, bd-r0qd fix):** the retry only fires on a window that
+/// closes with NO timestamp while carrying a prompt (`result_len == 0 && !is_no_speech
+/// && seek_cs > 0`) — a strict "this window produced nothing" condition. Non-failed
+/// windows never enter it, so the recovery is **byte-identical on every clip that did
+/// not already drop** (single-window clips — jfk golden, quant/turbo e2e — are
+/// unaffected BY CONSTRUCTION: no carried prompt on window 0). On the clips that DID
+/// drop (long-form / looping), it recovers the lost tail (WER 0.164 vs greedy 0.528 on
+/// track01). Verified: full native_engine lib suite 299/0 with the retry on; jfk golden
+/// byte-identical. Disable with `FW_RETRY_FAILED_WINDOW=0` (or `false`/`off`).
+/// See NEGATIVE_EVIDENCE 2026-07-12 / 2026-07-24 / project_final_window_early_eot_bug.
+fn retry_failed_window_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FW_RETRY_FAILED_WINDOW")
+            .map_or(true, |v| !matches!(v.trim(), "0" | "false" | "off"))
+    })
+}
+
+/// whisper.cpp's temperature-fallback ladder (initial greedy pass at 0.0, then
+/// `temperature_inc = 0.2` per retry): the retry temperatures, in order.
+const TEMP_FALLBACK_LADDER: [f64; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
+
+/// Above this retry temperature the carried prior-window prompt is dropped for the
+/// attempt (whisper.cpp conditions on no previous text once `t > 0.5`) — which is
+/// exactly the recovery that fixes the bd-r0qd carried-prompt × int8 early-EOT drop.
+const TEMP_PROMPT_RESET: f64 = 0.5;
+
+/// whisper.cpp `entropy_thold` (default 2.4, "similar to OpenAI's
+/// compression_ratio_threshold"): a window whose result-token tail is this
+/// repetitive is a degenerate loop and fails the quality gate.
+const ENTROPY_THRESHOLD: f64 = 2.4;
+
+/// The entropy tail length (whisper.cpp 6599: the last 32 result tokens). The
+/// check only fires when `result_len > ENTROPY_WINDOW` (whisper.cpp 7540 uses
+/// strict `>`), so short windows — naturally low-entropy — are never judged.
+const ENTROPY_WINDOW: usize = 32;
+
+/// Shannon entropy (nats) of the token-id distribution over the last
+/// [`ENTROPY_WINDOW`] entries of `tokens` — a faithful port of the whisper.cpp
+/// sequence-entropy block (whisper.cpp 6597-6617): count each distinct id in the
+/// tail (timestamp tokens included, exactly as upstream), then `-Σ p·ln p`. A
+/// uniformly repeated tail scores 0.0; 32 distinct tokens score `ln 32 ≈ 3.47`.
+fn token_tail_entropy(tokens: &[i32]) -> f64 {
+    let tail = &tokens[tokens.len().saturating_sub(ENTROPY_WINDOW)..];
+    if tail.is_empty() {
+        return 0.0;
+    }
+    let mut counts: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+    for &t in tail {
+        *counts.entry(t).or_insert(0) += 1;
+    }
+    let n = tail.len() as f64;
+    counts
+        .values()
+        .map(|&c| {
+            let p = f64::from(c) / n;
+            -p * p.ln()
+        })
+        .sum()
+}
+
+/// `FW_TEMP_FALLBACK` (default-OFF): whisper.cpp-faithful temperature fallback —
+/// the bd-r0qd fix-spec's "proper fix" (#3) and the fallback half of bd-6goy. A
+/// non-silent window that closes no timestamp (`result_len == 0`, the confirmed
+/// long-form drop), averages below [`LOGPROB_THRESHOLD`] (whisper.cpp
+/// `logprob_thold`), or loops into a low-entropy repetitive tail
+/// ([`ENTROPY_THRESHOLD`], whisper.cpp `entropy_thold`, checked only when
+/// `result_len > `[`ENTROPY_WINDOW`]) is re-decoded at the
+/// [`TEMP_FALLBACK_LADDER`] temperatures —
+/// multinomial sampling instead of argmax, deterministic per-(window, rung,
+/// candidate) seed, prompt dropped above [`TEMP_PROMPT_RESET`] — reusing the
+/// window's encode. Each rung decodes [`temp_best_of`] independent candidates
+/// and adopts the best [`sequence_score`] (whisper.cpp `greedy.best_of`). The
+/// first rung whose winner clears the gate ends the ladder; the final rung's
+/// winner is accepted as-is (whisper.cpp keeps its last decode too). Unset ⇒ the ladder never fires and
+/// token selection stays the argmax path ⇒ byte-identical by construction.
+/// Supersedes `FW_RETRY_FAILED_WINDOW` when both are set (the ladder's `t > 0.5`
+/// rungs contain that retry's prompt reset).
+fn temp_fallback_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FW_TEMP_FALLBACK").is_some())
+}
+
+/// whisper.cpp `greedy.best_of` (default 5): how many independent sampling
+/// candidates each `t > 0` ladder rung decodes before the best
+/// [`sequence_score`] wins. `FW_TEMP_BEST_OF` overrides (clamped to [1, 32]);
+/// `1` restores the single-candidate ladder byte-for-byte (first candidate of
+/// every rung draws from the identical seed stream). Only read under
+/// [`temp_fallback_enabled`], so the default path never consults it.
+fn temp_best_of() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_TEMP_BEST_OF")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(5, |n| n.clamp(1, 32))
+    })
+}
+
+/// whisper.cpp `whisper_sequence_score` under the default `length_penalty =
+/// -1.0` (penalty = `result_len`): `sum(plogs[..result_len]) / result_len`,
+/// i.e. the result slice's average logprob. A candidate that closed no result
+/// (`result_len == 0` — whisper.cpp leaves its score unset and fails the
+/// decoder) scores the [`EMPTY_WINDOW_AVG_LOGPROB`] sentinel so it never beats
+/// a candidate that produced tokens.
+fn sequence_score(plogs: &[f32], result_len: usize) -> f64 {
+    let take = result_len.min(plogs.len());
+    if take == 0 {
+        return EMPTY_WINDOW_AVG_LOGPROB;
+    }
+    let s = plogs[..take].iter().map(|&p| f64::from(p)).sum::<f64>() / take as f64;
+    if s.is_finite() {
+        s
+    } else {
+        EMPTY_WINDOW_AVG_LOGPROB
+    }
+}
+
+/// One completed decode attempt of a window at a `t > 0` ladder rung — the
+/// state the post-selection code (segment emission, DTW, prompt carry, seek
+/// advance) consumes. The rung's best-scoring candidate is adopted back into
+/// the window locals; the encode (and thus `DecoderState`'s cross-K/V) is
+/// identical across candidates, so adoption is sound for the DTW re-forward.
+struct WindowCandidate {
+    score: f64,
+    decoded: Vec<i32>,
+    plogs: Vec<f32>,
+    result_len: usize,
+    seek_delta_cs: i64,
+    avg_logprob: f64,
+    no_speech_prob: f64,
+}
+
+/// `FW_BEAM_SIZE` env OVERRIDE of the [`DecodeParams::beam_size`] field (a
+/// dev/testing hatch that wins over the field when set, mirroring the other
+/// `FW_*` gates). Unset → the field is used. Raw parsed value; clamping happens
+/// in [`resolve_beam_size`].
+fn beam_size_from_env() -> Option<usize> {
+    use std::sync::OnceLock;
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_BEAM_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    })
+}
+
+/// Effective beam width for a decode: the `FW_BEAM_SIZE` env override, else the
+/// [`DecodeParams::beam_size`] field, else `1` (greedy). Clamped to `[1, 8]`.
+///
+/// whisper.cpp's `beam_search.beam_size` (`whisper-cli -bs`, default 5): values
+/// `> 1` decode each temperature-0 window with beam search — keep the `n`
+/// highest cumulative-logprob hypotheses per step, select the best
+/// length-normalized [`sequence_score`] at the end — instead of argmax. `1`
+/// restores the exact greedy path ⇒ byte-identical by construction. Consulted
+/// only when a window decodes at temperature 0 (the ladder's `t > 0` rungs stay
+/// on the sampling path).
+fn resolve_beam_size(params: &DecodeParams) -> usize {
+    beam_size_from_env()
+        .or(params.beam_size)
+        .map_or(1, |n| n.clamp(1, 8))
+}
+
+/// A window's decode result — `(decoded, plogs, has_ts, seek_delta_cs,
+/// result_len)` — the tuple both the greedy loop and [`beam_decode_window`]
+/// produce for the shared downstream (segment build, DTW, prompt carry).
+type WindowDecode = (Vec<i32>, Vec<f32>, bool, i64, usize);
+
+/// One beam-search hypothesis: its own self-attention KV state (an independent
+/// [`DecoderState`] fork), the tokens decoded so far, their per-token logprobs,
+/// the running cumulative logprob (the during-search ranking key), and the
+/// window bookkeeping (`has_ts`/`seek_delta_cs`/`result_len`) that mirrors the
+/// greedy loop's per-token state. `next_logits` are the raw logits to
+/// `process_logits` at the next expansion (the prefill logits for the seed).
+struct BeamHyp {
+    state: DecoderState,
+    tokens: Vec<i32>,
+    plogs: Vec<f32>,
+    sum_logprob: f64,
+    has_ts: bool,
+    seek_delta_cs: i64,
+    result_len: usize,
+    next_logits: Vec<f32>,
+}
+
+/// A surviving (non-terminated) beam expansion decided in the candidate loop's
+/// first pass — before the parent KV states are moved/cloned in the fork pass.
+/// `parent` indexes the current `active` beam.
+struct BeamExpand {
+    parent: usize,
+    tok: i32,
+    tokens: Vec<i32>,
+    plogs: Vec<f32>,
+    has_ts: bool,
+    seek_delta_cs: i64,
+    result_len: usize,
+    sum_logprob: f64,
+}
+
+/// Indices of the `k` largest values in `logprobs`, skipping `-inf` (masked)
+/// lanes, best-first. Partial selection (not a full sort) over the vocab.
+fn top_k_logprob_indices(logprobs: &[f32], k: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..logprobs.len())
+        .filter(|&i| logprobs[i] > f32::NEG_INFINITY)
+        .collect();
+    let k = k.min(idx.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    // select_nth then sort the head: O(n) partition + O(k log k) on the head.
+    idx.select_nth_unstable_by(k - 1, |&a, &b| {
+        logprobs[b]
+            .partial_cmp(&logprobs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.truncate(k);
+    idx.sort_unstable_by(|&a, &b| {
+        logprobs[b]
+            .partial_cmp(&logprobs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    idx
+}
+
+/// Beam-search decode of one window (temperature 0), the `FW_BEAM_SIZE > 1`
+/// replacement for the greedy inner loop. `st` is the prompt-prefilled decoder
+/// state (borrowed — left intact for the caller's DTW re-forward, which shares
+/// the same window-constant cross-K/V); `prefill_logits` are its next-token
+/// logits. Returns the winning hypothesis's `(decoded, plogs, has_ts,
+/// seek_delta_cs, result_len)` — exactly the tuple the greedy loop produces, so
+/// all downstream handling is shared.
+///
+/// The per-token timestamp / EOT / budget / backward-bail rules DUPLICATE the
+/// greedy loop (whisper.cpp 7362-7410) rather than refactor it, so the greedy
+/// path stays byte-identical. During search, hypotheses are ranked by cumulative
+/// logprob (whisper's beam ranking); the final winner is the best
+/// length-normalized [`sequence_score`] over completed hypotheses (falling back
+/// to the best still-active one when none completed — the greedy "accept the
+/// last decode" analog).
+#[allow(clippy::too_many_arguments)]
+fn beam_decode_window(
+    m: &LoadedModel,
+    st: &DecoderState,
+    prefill_logits: Vec<f32>,
+    tk: &Tokenizer,
+    cfg: &FilterConfig,
+    params: &DecodeParams,
+    seek_cs: i64,
+    seek_end_cs: i64,
+    n_max_tokens: usize,
+    user_max_tokens: Option<usize>,
+    beam: usize,
+    checkpoint: &dyn Fn() -> FwResult<()>,
+) -> FwResult<WindowDecode> {
+    let mut active: Vec<BeamHyp> = vec![BeamHyp {
+        state: st.clone(),
+        tokens: Vec::new(),
+        plogs: Vec::new(),
+        sum_logprob: 0.0,
+        has_ts: false,
+        seek_delta_cs: CHUNK_CS,
+        result_len: 0,
+        next_logits: prefill_logits,
+    }];
+    // Completed hypotheses as lightweight [`WindowDecode`] tuples — no decoder
+    // state (a terminated hypothesis is never forwarded again), so completing a
+    // beam costs no cross-K/V clone.
+    let mut finished: Vec<WindowDecode> = Vec::new();
+
+    for i in 0..n_max_tokens {
+        if active.is_empty() {
+            break;
+        }
+        checkpoint()?;
+
+        // Expand every active hypothesis by its top-`beam` next tokens (ranked by
+        // logprob); collect (parent index, token, plog, cumulative score).
+        let mut cands: Vec<(usize, i32, f32, f64)> = Vec::new();
+        for (hi, hyp) in active.iter_mut().enumerate() {
+            let raw = std::mem::take(&mut hyp.next_logits);
+            let (_filtered, logprobs) =
+                process_logits(tk, cfg, raw, &hyp.tokens, hyp.has_ts, hyp.seek_delta_cs, i);
+            for tok_idx in top_k_logprob_indices(&logprobs, beam) {
+                let lp = logprobs[tok_idx];
+                let tok = i32::try_from(tok_idx).unwrap_or(0);
+                cands.push((hi, tok, lp, hyp.sum_logprob + f64::from(lp)));
+            }
+        }
+        if cands.is_empty() {
+            break;
+        }
+        // Keep the top-`beam` expansions by cumulative logprob (ties: lower parent
+        // then lower token, for determinism).
+        cands.sort_by(|a, b| {
+            b.3.partial_cmp(&a.3)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.cmp(&b.1))
+        });
+        cands.truncate(beam);
+
+        // PASS 1 — decide each candidate: terminated hypotheses go to `finished`;
+        // survivors are collected (with their per-token bookkeeping) so the KV
+        // states can then be moved/cloned without a borrow conflict.
+        let mut expands: Vec<BeamExpand> = Vec::with_capacity(beam);
+        for (hi, tok, plog, new_sum) in cands {
+            let parent = &active[hi];
+            let mut tokens = parent.tokens.clone();
+            tokens.push(tok);
+            let mut plogs = parent.plogs.clone();
+            plogs.push(plog);
+            let mut has_ts = parent.has_ts;
+            let mut seek_delta_cs = parent.seek_delta_cs;
+            let mut result_len = parent.result_len;
+
+            // Timestamp update (mirrors greedy, whisper.cpp 7362-7375).
+            let mut bail = false;
+            if tok > tk.timestamp_begin {
+                let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
+                if has_ts && seek_delta_cs > new_delta && result_len < i {
+                    bail = true; // going back in time: terminate this hypothesis
+                } else {
+                    seek_delta_cs = new_delta;
+                    result_len = i + 1;
+                    has_ts = true;
+                }
+            }
+
+            let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
+            let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+            let terminate = bail || tok == tk.eot || budget_reached || reached_end;
+
+            if terminate {
+                if !bail {
+                    if result_len == 0 && params.timestamps && reached_end {
+                        result_len = i + 1;
+                    }
+                    if !params.timestamps {
+                        result_len = i + 1;
+                        seek_delta_cs = CHUNK_CS;
+                    }
+                }
+                finished.push((tokens, plogs, has_ts, seek_delta_cs, result_len));
+            } else {
+                expands.push(BeamExpand {
+                    parent: hi,
+                    tok,
+                    tokens,
+                    plogs,
+                    has_ts,
+                    seek_delta_cs,
+                    result_len,
+                    sum_logprob: new_sum,
+                });
+            }
+        }
+
+        // Move the parent KV states out of `active` (replaced below). Each
+        // parent's state is deep-cloned for all but its LAST surviving child,
+        // which MOVES it — move == clone in content, so byte-exact, but it
+        // eliminates ~one self-attn `KvCache` copy (~8 MB) per parent per step
+        // (most of the remaining fork cost when the beam is spread ~1 child each).
+        let mut child_count = vec![0usize; active.len()];
+        for e in &expands {
+            child_count[e.parent] += 1;
+        }
+        let mut parent_states: Vec<Option<DecoderState>> = std::mem::take(&mut active)
+            .into_iter()
+            .map(|h| Some(h.state))
+            .collect();
+
+        // PASS 2 — fork + forward each survivor to its hidden state (per-hypothesis
+        // self-attn/MLP; can't batch across differing KV). The tied-output logits
+        // ARE batched below.
+        let mut next_active: Vec<BeamHyp> = Vec::with_capacity(expands.len());
+        let mut hidden_rows: Vec<f32> = Vec::new();
+        let mut used = vec![0usize; child_count.len()];
+        for e in expands {
+            used[e.parent] += 1;
+            let mut state = if used[e.parent] == child_count[e.parent] {
+                parent_states[e.parent]
+                    .take()
+                    .expect("last surviving child moves the parent state")
+            } else {
+                parent_states[e.parent]
+                    .as_ref()
+                    .expect("earlier surviving child clones the parent state")
+                    .clone()
+            };
+            let (x_last, _draft) =
+                decoder::forward_step_hidden(&m.decoder, &mut state, &[e.tok], checkpoint)?;
+            hidden_rows.extend_from_slice(&x_last.data);
+            next_active.push(BeamHyp {
+                state,
+                tokens: e.tokens,
+                plogs: e.plogs,
+                sum_logprob: e.sum_logprob,
+                has_ts: e.has_ts,
+                seek_delta_cs: e.seek_delta_cs,
+                result_len: e.result_len,
+                next_logits: Vec::new(), // filled by the batched logits below
+            });
+        }
+        // Batched tied-output projection: one `logits_all` over all survivors'
+        // hidden states reads the [n_vocab, n_state] weight ONCE instead of once
+        // per hypothesis (the logits GEMV is bandwidth-bound on that weight).
+        // Byte-identical to per-hypothesis `logits_last` (the `logits_all` test
+        // pins that), so the beam's decisions are unchanged.
+        if !next_active.is_empty() {
+            let hidden = super::Mat::from_vec(next_active.len(), m.decoder.n_state(), hidden_rows);
+            let all_logits = decoder::logits_all(&m.decoder, &hidden)?;
+            let n_vocab = all_logits.len() / next_active.len();
+            for (h, hyp) in next_active.iter_mut().enumerate() {
+                hyp.next_logits = all_logits[h * n_vocab..(h + 1) * n_vocab].to_vec();
+            }
+        }
+        active = next_active;
+    }
+
+    // Winner: best length-normalized sequence score among completed hypotheses;
+    // if none completed (ran to the token cap), the best still-active hypothesis.
+    let pool: Vec<WindowDecode> = if finished.is_empty() {
+        active
+            .into_iter()
+            .map(|h| (h.tokens, h.plogs, h.has_ts, h.seek_delta_cs, h.result_len))
+            .collect()
+    } else {
+        finished
+    };
+    let best = pool
+        .into_iter()
+        .max_by(|a, b| {
+            sequence_score(&a.1, a.4)
+                .partial_cmp(&sequence_score(&b.1, b.4))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("beam pool is non-empty (seed hypothesis always present)");
+    Ok(best)
+}
+
 /// `Σ exp(l − max)` over `logits`, masked lanes (`l == -inf`) contributing exactly 0
 /// (matching the scalar `l > -inf` guard). AVX2 degree-5 poly exp: range-reduce
 /// `x = k·ln2 + r`, `exp(r)` via Horner, `2^k` by float-bit construction. Numerics-
 /// affecting (~2.5e-5 vs libm) — only reached under [`simd_exp_enabled`].
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[allow(unsafe_code)]
+// The `log2e`/`ln2` range-reduction literals are part of this poly-exp's tuned,
+// WER-certified coefficient set — NOT free-standing math constants. "Correcting"
+// them to `f32::consts::{LOG2_E, LN_2}` would perturb the certified kernel's
+// numerics, so `approx_constant` is suppressed deliberately here.
+#[allow(clippy::approx_constant)]
 fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
     use core::arch::x86_64::*;
     let n = logits.len();
@@ -475,7 +1046,8 @@ fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
         }
         let mut tmp = [0.0f32; 8];
         _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
-        let mut s = ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
+        let mut s =
+            ((tmp[0] + tmp[1]) + (tmp[2] + tmp[3])) + ((tmp[4] + tmp[5]) + (tmp[6] + tmp[7]));
         while i < n {
             let l = logits[i];
             if l > f32::NEG_INFINITY {
@@ -488,7 +1060,11 @@ fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
 }
 
 /// Scalar fallback (non-avx2): identical to the default libm loop.
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+)))]
 fn logsumexp_sum_simd(logits: &[f32], max: f32) -> f32 {
     let mut s = 0.0f32;
     for &l in logits {
@@ -625,6 +1201,71 @@ fn argmax(logits: &[f32], logprobs: &[f32]) -> (i32, f32) {
     )
 }
 
+/// SplitMix64 step — the deterministic PRNG behind temperature sampling. One `u64`
+/// of state, platform-independent: the same (window, attempt) always draws the same
+/// tokens, so a `FW_TEMP_FALLBACK` transcript is exactly replayable.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Multinomial draw from `softmax(logits / temperature)` — the non-greedy arm of
+/// whisper.cpp's `whisper_sample_token` (logits are divided by the temperature
+/// before the softmax). Masked lanes (`-inf`; NaN treated as masked) carry zero
+/// mass and are never drawn. The returned `plog` is the drawn id's TEMPERATURE-1
+/// log-softmax from `logprobs`, so the window's `avg_logprob` quality gate keeps
+/// measuring true model confidence, not the flattened sampling distribution.
+/// Degenerate inputs (no finite lane / underflowed mass) fall back to [`argmax`].
+fn sample_token_at_temperature(
+    logits: &[f32],
+    logprobs: &[f32],
+    temperature: f64,
+    rng: &mut u64,
+) -> (i32, f32) {
+    let inv_t = 1.0 / temperature.max(1e-6);
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|l| l.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return argmax(logits, logprobs);
+    }
+    let weight = |l: f32| -> f64 {
+        if l.is_finite() {
+            (f64::from(l - max) * inv_t).exp()
+        } else {
+            0.0
+        }
+    };
+    let total: f64 = logits.iter().map(|&l| weight(l)).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return argmax(logits, logprobs);
+    }
+    // 53-bit uniform in [0, 1), then walk the (un-normalized) cumulative mass. The
+    // walk re-derives each weight so `acc` sums the exact terms `total` summed.
+    let target = (splitmix64(rng) >> 11) as f64 / (1u64 << 53) as f64 * total;
+    let mut acc = 0.0f64;
+    for (i, &l) in logits.iter().enumerate() {
+        acc += weight(l);
+        if acc > target {
+            return (
+                i32::try_from(i).unwrap_or(0),
+                logprobs.get(i).copied().unwrap_or(0.0),
+            );
+        }
+    }
+    // FP rounding pushed the walk past the end (target ≈ total): last unmasked lane.
+    let last = logits.iter().rposition(|l| l.is_finite()).unwrap_or(0);
+    (
+        i32::try_from(last).unwrap_or(0),
+        logprobs.get(last).copied().unwrap_or(0.0),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Segment building (port of whisper.cpp 7624-7730)
 // ---------------------------------------------------------------------------
@@ -700,10 +1341,17 @@ fn build_segments(
                 segments.push(make_segment(t0, t1, text, conf));
             }
             t0 = t1;
-            // Skip a run of consecutive timestamp tokens (whisper.cpp 7684-7690).
+            // Skip a run of consecutive timestamp tokens WITHOUT recomputing t0:
+            // whisper.cpp (7675-7679) advances the index past the run but keeps
+            // `t0 = t1` — the FIRST (closing) timestamp of the run. Recomputing t0
+            // to the LAST timestamp of the run (as this loop previously did)
+            // inserts a spurious gap at any within-window consecutive-timestamp
+            // segment boundary: for `text <|10.38|> <|10.80|> text` the next
+            // segment opened at 10.80 instead of whisper.cpp's 10.38 (+420 ms on
+            // jfk×3 seg 1). This now matches both whisper.cpp and the sibling
+            // consecutive-timestamp skip in the word-timing path below.
             while i + 1 < tokens.len() && tokens[i + 1] > beg {
                 i += 1;
-                t0 = clamp(seek_cs + 2 * i64::from(tokens[i] - beg));
             }
             i0 = i + 1;
         }
@@ -768,7 +1416,11 @@ fn confidence(plogs: &[f32]) -> Option<f64> {
     let mean = plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / plogs.len() as f64;
     // `clamp` panics on NaN under the current nightly; guard the exp result.
     let c = mean.exp();
-    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
+    Some(if c.is_finite() {
+        c.clamp(0.0, 1.0)
+    } else {
+        0.0
+    })
 }
 
 /// Per-segment **text** confidence (fix #8): `exp(mean text-token logprob)`
@@ -799,7 +1451,11 @@ fn text_confidence(tk: &Tokenizer, tokens: &[i32], plogs: &[f32]) -> Option<f64>
     let mean = sum / count as f64;
     // `clamp` panics on NaN under the current nightly; guard the exp result.
     let c = mean.exp();
-    Some(if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 })
+    Some(if c.is_finite() {
+        c.clamp(0.0, 1.0)
+    } else {
+        0.0
+    })
 }
 
 /// Construct a [`TranscriptionSegment`] from centisecond bounds + text.
@@ -840,6 +1496,49 @@ fn tail_truncate_enabled() -> bool {
     })
 }
 
+/// First-window encoder-context truncation margin (experimental, default OFF).
+///
+/// [`tail_enc_ctx`] leaves the **first** window full by default because that is
+/// how the golden references were produced (whisper.cpp with no `-ac`), so a
+/// truncated first window is NON-byte-exact against the golden — that, not a
+/// quality regression, is why it is an opt-in. This escape hatch lets a partial
+/// FIRST window (a single sub-30 s clip — the streaming / short-utterance case)
+/// truncate to `real/2 + margin` encoder frames, killing the wasted encoder pass
+/// (and decode) over the zero-padding. `FW_FIRST_WINDOW_MARGIN` = the margin in
+/// **encoder frames** (e.g. 100 ≈ 2 s of trailing context); unset ⇒ `None` ⇒
+/// first window stays full (byte-identical default).
+///
+/// MEASURED on large-v3-turbo (jfk, 2026-07-03): `margin=0` is a **~1.9× e2e win
+/// on an 11 s single-window clip** (enc ctx 1500→~550), transcript preserved. It
+/// is now PURELY a speed lever — the anti-hallucination benefit it once carried
+/// (the full-pad first window emitting a spurious `a.` segment) is now handled by
+/// DEFAULT via the [`single_timestamp_ending`] fix (commit 53e4fb6), so a clip
+/// does NOT need this opt-in to be clean.
+///
+/// ⚠ SAFE-REGIME FLOOR (measured 2026-07-03, CORRECTS an earlier "needs NO margin"
+/// overclaim): first-window truncation is transcript-safe only when the clip has
+/// enough real audio that `base = real/2` stays well above `MIN_ENC_CTX` — i.e.
+/// moderate single-window clips (≈5–25 s). On VERY SHORT clips (≲5 s) it is
+/// UNSTABLE at every margin below full: jfk truncated to 0.5 s / 1 s collapse to
+/// "." and 2 s (base=100) is non-monotonic across margins (enc_ctx 100→"And so my",
+/// 200→EMPTY, 300→"…Americans,", 500→"…Americans…") — none reproduce the full-window
+/// transcript. The 30 s encoder is trained/positional-embedded for long context;
+/// truncating below ~a few-hundred frames degrades it. So this knob is for
+/// moderate-length single-window / streaming clips, NOT sub-5 s ones.
+///
+/// Kept an owner opt-in because it is non-byte-exact vs the full-pad golden and
+/// must be validated per-model AND per-clip-length by A/B — whisper.cpp's `-ac`
+/// applied to the first window, with the same short-clip caveat.
+fn first_window_margin() -> Option<usize> {
+    use std::sync::OnceLock;
+    static M: OnceLock<Option<usize>> = OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("FW_FIRST_WINDOW_MARGIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    })
+}
+
 /// Cross-window ENCODE/DECODE pipelining (default ON; kill switch `FW_PIPELINE_WINDOWS=0`).
 ///
 /// In `no_timestamps` mode the seek advance is always a full `CHUNK_CS` (timestamp
@@ -857,8 +1556,9 @@ fn pipeline_windows_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("FW_PIPELINE_WINDOWS")
-            .map_or(true, |v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+        std::env::var("FW_PIPELINE_WINDOWS").map_or(true, |v| {
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        })
     })
 }
 
@@ -892,17 +1592,33 @@ fn pipeline_windows_enabled() -> bool {
 /// contract.
 ///
 /// Returns `FULL_ENC_CTX` (1500) whenever truncation is disabled, the window is
-/// the first window, or the window is full (`real_frames >= FRAMES_PER_CHUNK`),
-/// so the caller's behavior is byte-identical to the pre-optimization path in
-/// those cases. Pure / hermetic — unit-tested without a model.
+/// full (`real_frames >= FRAMES_PER_CHUNK`), or the window is the first window
+/// **and** the experimental [`first_window_margin`] escape hatch is unset (the
+/// default), so the caller's behavior is byte-identical to the pre-optimization
+/// path in those cases. Hermetic apart from that one cached env read (unset in
+/// tests ⇒ first window full), so the unit tests need no model.
 fn tail_enc_ctx(real_frames: usize, is_first: bool, enabled: bool) -> usize {
-    if !enabled || is_first || real_frames >= FRAMES_PER_CHUNK {
+    if !enabled || real_frames >= FRAMES_PER_CHUNK {
         return FULL_ENC_CTX;
     }
     // `enc_ctx = ceil(real_frames / 2)` = `(real_frames + 1) / 2`: round up so
     // the truncated ctx still covers an odd final mel frame (the conv stem maps
     // 2 mel frames → 1 encoder frame), then clamp to the [MIN, FULL] band.
-    real_frames.div_ceil(2).clamp(MIN_ENC_CTX, FULL_ENC_CTX)
+    let base = real_frames.div_ceil(2);
+    if is_first {
+        // The first window stays FULL by default: the golden was produced full-pad,
+        // so a truncated first window is non-byte-exact against it (see
+        // [`first_window_margin`] for the measured turbo speed+quality win). The
+        // experimental `FW_FIRST_WINDOW_MARGIN` escape hatch truncates it to
+        // `base + margin`, keeping `margin` encoder frames of trailing context.
+        // Unset ⇒ `None` ⇒ full first window (byte-identical default). Env read
+        // once (cached); tests leave it unset.
+        return match first_window_margin() {
+            Some(m) => (base + m).clamp(MIN_ENC_CTX, FULL_ENC_CTX),
+            None => FULL_ENC_CTX,
+        };
+    }
+    base.clamp(MIN_ENC_CTX, FULL_ENC_CTX)
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,7 +1736,7 @@ pub fn transcribe_samples(
     let cfg = FilterConfig {
         suppress_blank: true,
         space_token,
-        suppress_nst: false, // whisper.cpp default (5970).
+        suppress_nst: params.suppress_nst, // whisper.cpp default false (5970); honor --suppress-nst.
         no_timestamps: !params.timestamps,
         max_initial_tid,
         // EOT-forcing budget (fix #6): the user budget, off when unset —
@@ -1028,7 +1744,12 @@ pub fn transcribe_samples(
         max_tokens: user_max_tokens,
     };
     // Prompt context cap (whisper.cpp 6927): n_text_ctx/2.
-    let max_prompt_ctx = n_text_ctx / 2;
+    // whisper `--max-context` / `n_max_text_ctx`: < 0 (or unset) → default
+    // n_text_ctx/2; 0 → no prompt carried; n → cap at n (whisper.cpp semantics).
+    let max_prompt_ctx = match params.max_context {
+        Some(n) if n >= 0 => usize::try_from(n).unwrap_or(n_text_ctx / 2),
+        _ => n_text_ctx / 2,
+    };
 
     let mut segments: Vec<TranscriptionSegment> = Vec::new();
     let mut windows: Vec<WindowStats> = Vec::new();
@@ -1042,10 +1763,37 @@ pub fn transcribe_samples(
         Vec::new()
     };
     // Rolling text context from prior windows (whisper.cpp prompt_past1).
-    let mut prompt_past: Vec<i32> = Vec::new();
+    // Seed it with the optional user prompt (whisper `--prompt`): the
+    // `DecodeParams.initial_prompt` field is the API; `FW_INITIAL_PROMPT` overrides
+    // it when set (dev/testing hatch). Its tokens are carried as previous context
+    // on the first window and age out via the max_prompt_ctx truncation as decoded
+    // text accumulates. Unset → no-op (byte-identical default).
+    let prompt = initial_prompt_from_env().or(params.initial_prompt.as_deref());
+    let mut prompt_past: Vec<i32> = seeded_prompt_past(prompt, &m.tokenizer);
+
+    // Beam width (whisper `--beam-size`): field or FW_BEAM_SIZE override, resolved
+    // once. 1 = greedy (byte-identical default).
+    let effective_beam_size = resolve_beam_size(params);
 
     // Tail-window encoder-context truncation kill switch, resolved once.
-    let tail_truncate = tail_truncate_enabled();
+    //
+    // Truncation is gated to TIMESTAMP mode. In timestamp mode it is a quality
+    // *and* speed win (whisper.cpp `-ac`): timestamp tokens give the decode
+    // structure/stopping, and truncating the trailing zero-padding stops the
+    // classic silence-hallucination across the padded tail (measured: jfk×3
+    // 1.90×, ×5 1.39×, both cleaner). In no_timestamps mode the effect INVERTS
+    // and truncation becomes a content-loss bug: with timestamp tokens
+    // suppressed, the trailing silence is the greedy decoder's only end-of-speech
+    // cue, so truncating a partial tail window to real-audio length removes that
+    // cue and the (temperature-fallback-free) greedy loop repetition-loops over
+    // the short truncated context to the token cap — the garbage window is then
+    // gated out, DROPPING the real tail (jfk×3: window 2 decodes 220 tokens →
+    // dropped → "…ask what you can do for your country." lost; ×5: a spurious 6th
+    // sentence). whisper.cpp does NOT apply `-ac` by default, so full-pad is the
+    // faithful no_ts behavior AND the correct one (franken truncate-off matches
+    // whisper.cpp `-nt` on jfk×3/×5; truncate-on diverges). Timestamp-mode golden
+    // is unchanged (params.timestamps == true ⇒ identical to before).
+    let tail_truncate = tail_truncate_enabled() && params.timestamps;
 
     // Cross-window pipelining (no_timestamps only; default off): a persistent
     // scoped encoder thread computes the NEXT window's encode while THIS window
@@ -1068,7 +1816,12 @@ pub fn transcribe_samples(
                 let noop = || Ok(());
                 while let Ok((off, mf)) = req_rx.recv() {
                     let r = encoder::forward_from_full_mel_window(
-                        enc_w, mel_ref, off, mf, enc_n_threads, &noop,
+                        enc_w,
+                        mel_ref,
+                        off,
+                        mf,
+                        enc_n_threads,
+                        &noop,
                     );
                     if res_tx.send(r).is_err() {
                         break;
@@ -1082,304 +1835,584 @@ pub fn transcribe_samples(
         // in flight / waiting on `res_rx`), or None when nothing is prefetched.
         let mut prefetched: Option<usize> = None;
 
-    let mut seek_cs: i64 = 0;
-    while seek_cs + DELTA_MIN < seek_end_cs {
-        checkpoint()?;
-
-        // Encode this window's mel chunk. A full window is 3000 mel frames
-        // (1500 encoder ctx); a tail window with under 30 s of real audio left
-        // is truncated to `2*enc_ctx` mel frames (`enc_ctx` encoder rows),
-        // mirroring whisper.cpp's audio_ctx (-ac) feature — a near-empty final
-        // window otherwise pays a full encode for a fraction of a second of
-        // audio (perf hotspot #1). Timestamp/precision semantics are unaffected
-        // (`max_initial_tid` is tied to the full model `n_audio_ctx`, not this
-        // window's ctx — whisper.cpp 6322).
-        let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
-        // Real (unpadded) audio remaining in this window, in mel frames
-        // (1 mel frame = 1 cs); capped at the full window, as whisper.cpp does.
-        let real_frames = usize::try_from((seek_end_cs - seek_cs).max(0))
-            .unwrap_or(0)
-            .min(FRAMES_PER_CHUNK);
-        let enc_ctx = tail_enc_ctx(real_frames, seek_cs == 0, tail_truncate);
-        let mel_frames = enc_ctx * 2;
-        if mel_frames < FRAMES_PER_CHUNK {
-            tracing::debug!(
-                target: "franken_whisper::native_engine::decode",
-                seek_cs,
-                real_frames,
-                enc_ctx,
-                mel_frames,
-                "tail-window encoder-context truncation engaged"
-            );
-        }
-        let t_enc = std::time::Instant::now();
-        // Take the prefetched encode if the pipeline already computed THIS window
-        // (overlapped with the previous window's decode); otherwise encode inline.
-        let enc = if pipeline && prefetched == Some(frame_offset) {
-            match res_rx.recv() {
-                Ok(r) => r?,
-                Err(_) => encoder::forward_from_full_mel_window(
-                    &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
-                )?,
-            }
-        } else {
-            encoder::forward_from_full_mel_window(
-                &m.encoder, &full_mel, frame_offset, mel_frames, params.n_threads, checkpoint,
-            )?
-        };
-        // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
-        // no_timestamps advance is always CHUNK_CS, so the next offset is known and
-        // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
-        prefetched = None;
-        if pipeline {
-            let next_seek = seek_cs + CHUNK_CS;
-            if next_seek + DELTA_MIN < seek_end_cs {
-                let next_off = frame_offset + CHUNK_CS as usize;
-                let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
-                    .unwrap_or(0)
-                    .min(FRAMES_PER_CHUNK);
-                let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
-                if req_tx.send((next_off, next_ctx * 2)).is_ok() {
-                    prefetched = Some(next_off);
-                }
-            }
-        }
-        super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
-        let t_xkv = std::time::Instant::now();
-        let mut st = DecoderState::new(&m.decoder, &enc)?;
-        super::perf_span("cross_kv", t_xkv.elapsed().as_secs_f64() * 1e3, "");
-
-        // First-window language auto-detect (multilingual, no explicit
-        // language): reuses this window's encode + this state's cross K/V.
-        if used_language.is_none() {
-            used_language = detect_language_from_enc(m, &mut st, checkpoint)?;
-        }
-
-        // Short-tail prompt clearing (fix #2 — whisper.cpp 7046-7051): a
-        // non-first window with under 5 s of audio left drops the carried prompt
-        // to avoid repetition/hallucination on the tail.
-        if should_clear_short_tail_prompt(seek_cs, seek_end_cs) {
-            prompt_past.clear();
-        }
-
-        // Build the prompt: [sot_prev, ...past...] + sot_sequence (whisper.cpp
-        // 7106-7133). prompt_init is the sot sequence for this language/task.
-        let sot_seq = tk.sot_sequence(
-            used_language.as_deref(),
-            params.translate,
-            params.timestamps,
-        );
-        let mut prompt: Vec<i32> = Vec::new();
-        if !prompt_past.is_empty() && max_prompt_ctx > 1 {
-            prompt.push(tk.sot_prev);
-            let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
-            prompt.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
-        }
-        prompt.extend_from_slice(&sot_seq);
-
-        // Prefill the prompt; the first forward's softmax gives no_speech_prob
-        // (whisper.cpp 7165-7182). Compute it BEFORE filtering.
-        let t_prefill = std::time::Instant::now();
-        let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
-        super::perf_span(
-            "decoder_prefill",
-            t_prefill.elapsed().as_secs_f64() * 1e3,
-            &format!("\"prompt_tokens\":{}", prompt.len()),
-        );
-        let no_speech_prob = {
-            let lp = compute_logprobs(&prefill_logits);
-            usize::try_from(tk.no_speech)
-                .ok()
-                .and_then(|i| lp.get(i).copied())
-                .map_or(0.0, |x| {
-                    // Defense-in-depth: a non-finite logprob must not export a
-                    // NaN no_speech_prob into the silence gate / routing snapshot.
-                    let p = f64::from(x.exp());
-                    if p.is_finite() { p } else { 0.0 }
-                })
-        };
-
-        // Greedy decode loop.
-        let t_loop = std::time::Instant::now();
-        let mut decoded: Vec<i32> = Vec::new();
-        let mut plogs: Vec<f32> = Vec::new();
-        let mut has_ts = false;
-        let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
-        let mut result_len = 0usize;
-        let mut step_logits = prefill_logits;
-
-        for i in 0..n_max_tokens {
-            let (filtered, logprobs) = process_logits(
-                tk,
-                &cfg,
-                step_logits,
-                &decoded,
-                has_ts,
-                seek_delta_cs,
-                decoded.len(),
-            );
-            let (tok, plog) = argmax(&filtered, &logprobs);
-            decoded.push(tok);
-            plogs.push(plog);
-
-            // Update sliding window from a timestamp token (whisper.cpp 7362-7375).
-            if tok > tk.timestamp_begin {
-                let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
-                if has_ts && seek_delta_cs > new_delta && result_len < i {
-                    // Going back in time: bail out of this window (whisper.cpp 7366-7369).
-                    break;
-                }
-                seek_delta_cs = new_delta;
-                result_len = i + 1;
-                has_ts = true;
-            }
-
-            // End of segment (whisper.cpp 7387-7410). `budget_reached` is the
-            // `params.max_tokens > 0 && i >= params.max_tokens` clause: the
-            // EOT-forcing filter masked text from sampled-token index `mt`
-            // onward, so the token at index `i == mt` is the forced closer and
-            // the window completes here with `decoded.len() == mt + 1`.
-            let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-            let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
-            if tok == tk.eot || budget_reached || reached_end {
-                if result_len == 0 && params.timestamps {
-                    if reached_end {
-                        result_len = i + 1;
-                    } else {
-                        // Decoder failed with no timestamps closed.
-                        break;
-                    }
-                }
-                if !params.timestamps {
-                    result_len = i + 1;
-                    seek_delta_cs = CHUNK_CS;
-                }
-                break;
-            }
-
-            // Cancellation between every decoder step (the project contract).
+        let mut seek_cs: i64 = 0;
+        // Set for one iteration when retrying a failed window with the carried prompt
+        // cleared (FW_RETRY_FAILED_WINDOW). Reset once the window completes.
+        let mut force_empty_prompt = false;
+        // FW_TEMP_FALLBACK ladder position for the CURRENT seek: 0 = the normal
+        // greedy pass; k > 0 = re-decoding at TEMP_FALLBACK_LADDER[k - 1]. Reset to 0
+        // once a window is accepted, so every window starts greedy.
+        let mut temp_attempt: usize = 0;
+        // The temperature the current attempt decodes at (0.0 = argmax/greedy path).
+        let mut window_temp: f64 = 0.0;
+        // best_of state within the current t > 0 rung: candidate index and the
+        // best-scoring candidate so far (whisper.cpp ranks its `best_of`
+        // decoders by sequence score and keeps the winner).
+        let mut cand_idx: usize = 0;
+        let mut rung_best: Option<WindowCandidate> = None;
+        // Holds `(frame_offset, enc)` from a window's first attempt so a
+        // FW_RETRY_FAILED_WINDOW retry (same seek) reuses the identical encode instead
+        // of paying a full re-encode. Only ever populated when the flag is on.
+        let mut retry_enc_cache = None;
+        while seek_cs + DELTA_MIN < seek_end_cs {
             checkpoint()?;
 
-            // Forward the just-chosen token to get the next logits.
-            step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
-        }
-
-        // avg_logprob over result tokens (whisper.cpp 6602-6617).
-        let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
-            &plogs[..result_len]
-        } else {
-            &plogs[..]
-        };
-        let avg_logprob = if result_plogs.is_empty() {
-            EMPTY_WINDOW_AVG_LOGPROB
-        } else {
-            result_plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / result_plogs.len() as f64
-        };
-        // A non-finite mean (a NaN/inf plog escaping the decoder) degrades to the
-        // finite empty-window sentinel so the silence gate and routing snapshot
-        // never see NaN (a NaN would silently read as "not silence").
-        let avg_logprob = if avg_logprob.is_finite() {
-            avg_logprob
-        } else {
-            EMPTY_WINDOW_AVG_LOGPROB
-        };
-
-        // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
-        // silence, emit nothing, advance the full window.
-        let is_no_speech = no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
-
-        // single-timestamp-ending: skip the rest of the chunk (whisper.cpp
-        // 7753-7760). Ordering fix #5: upstream emits segments (7624-7730) and
-        // records DTW word timings with the ORIGINAL `seek_delta`, then applies
-        // this whole-chunk skip ONLY to the seek advance (7753-7760). So we keep
-        // `seek_delta_cs` untouched for build_segments/window_word_timings below
-        super::perf_span(
-            "decode_loop",
-            t_loop.elapsed().as_secs_f64() * 1e3,
-            &format!("\"tokens\":{}", decoded.len()),
-        );
-        // and compute a separate `seek_advance_cs` for the window step.
-        let single_ts_ending = single_timestamp_ending(
-            &decoded,
-            tk.timestamp_begin,
-            params.timestamps,
-            user_max_tokens,
-        );
-        let seek_advance_cs = if single_ts_ending {
-            (seek_end_cs - seek_cs).min(CHUNK_CS)
-        } else {
-            seek_delta_cs
-        };
-
-        windows.push(WindowStats {
-            avg_logprob,
-            no_speech_prob,
-            tokens: result_len,
-            window_offset_sec: seek_cs as f64 / 100.0,
-        });
-
-        if !is_no_speech && !decoded.is_empty() {
-            // Use only the result_len tokens for emission (drop a trailing eot).
-            let take = result_len.min(decoded.len());
-            let result_tokens = &decoded[..take];
-            let result_token_plogs = &plogs[..take];
-            let win_segments = build_segments(
-                tk,
-                result_tokens,
-                result_token_plogs,
-                seek_cs,
-                seek_delta_cs,
-                seek_end_cs,
-                params.timestamps,
-            );
-
-            // DTW word timestamps (bd-rjsx): record cross-attention over this
-            // window's result tokens and align them to audio frames. Computed
-            // before `win_segments` is moved so we stay 1:1 with it. When
-            // requested we always push one (possibly empty) word vec per emitted
-            // segment so `word_timings` stays aligned with `segments`.
-            if params.word_timestamps {
-                let win_words = if align_heads.is_empty() {
-                    vec![Vec::new(); win_segments.len()]
-                } else {
-                    window_word_timings(
-                        m,
-                        &mut st,
-                        used_language.as_deref(),
-                        params,
-                        &align_heads,
-                        result_tokens,
-                        &win_segments,
-                        seek_cs,
-                        seek_delta_cs,
-                        checkpoint,
-                    )?
-                };
-                word_timings.extend(win_words);
+            // Encode this window's mel chunk. A full window is 3000 mel frames
+            // (1500 encoder ctx); a tail window with under 30 s of real audio left
+            // is truncated to `2*enc_ctx` mel frames (`enc_ctx` encoder rows),
+            // mirroring whisper.cpp's audio_ctx (-ac) feature — a near-empty final
+            // window otherwise pays a full encode for a fraction of a second of
+            // audio (perf hotspot #1). Timestamp/precision semantics are unaffected
+            // (`max_initial_tid` is tied to the full model `n_audio_ctx`, not this
+            // window's ctx — whisper.cpp 6322).
+            let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
+            // Real (unpadded) audio remaining in this window, in mel frames
+            // (1 mel frame = 1 cs); capped at the full window, as whisper.cpp does.
+            let real_frames = usize::try_from((seek_end_cs - seek_cs).max(0))
+                .unwrap_or(0)
+                .min(FRAMES_PER_CHUNK);
+            let enc_ctx = tail_enc_ctx(real_frames, seek_cs == 0, tail_truncate);
+            let mel_frames = enc_ctx * 2;
+            if mel_frames < FRAMES_PER_CHUNK {
+                tracing::debug!(
+                    target: "franken_whisper::native_engine::decode",
+                    seek_cs,
+                    real_frames,
+                    enc_ctx,
+                    mel_frames,
+                    "tail-window encoder-context truncation engaged"
+                );
             }
-
-            segments.extend(win_segments);
-
-            // Update rolling context: the decoded text tokens (whisper.cpp
-            // 7617-7622), capped to the prompt budget.
-            prompt_past.clear();
-            for &t in result_tokens {
-                if !tk.is_special(t) {
-                    prompt_past.push(t);
+            let t_enc = std::time::Instant::now();
+            // Reuse the encode from THIS seek's failed first attempt on a
+            // FW_RETRY_FAILED_WINDOW retry — same audio/window ⇒ byte-identical enc, so
+            // the retry skips a full re-encode. Only hit when the flag is on and a retry
+            // is in flight; otherwise falls through to prefetch/inline exactly as before.
+            // SAFE vs the pipeline prefetch below: the retry only fires on `result_len == 0`,
+            // which is a TS-mode-only failure (no_ts sets result_len = i+1 at its break), while
+            // `pipeline` is `… && cfg.no_timestamps` (no_ts only). Retry and pipeline are thus
+            // mutually exclusive, so the `if pipeline` dispatch is a no-op on any retry re-entry —
+            // no double-send / res_rx desync. (Verified: retry-on track01 transcript is coherent.)
+            let enc = if retry_enc_cache
+                .as_ref()
+                .is_some_and(|(off, _): &(usize, _)| *off == frame_offset)
+            {
+                retry_enc_cache.take().expect("checked is_some_and above").1
+            } else if pipeline && prefetched == Some(frame_offset) {
+                match res_rx.recv() {
+                    Ok(r) => r?,
+                    Err(_) => encoder::forward_from_full_mel_window(
+                        &m.encoder,
+                        &full_mel,
+                        frame_offset,
+                        mel_frames,
+                        params.n_threads,
+                        checkpoint,
+                    )?,
+                }
+            } else {
+                encoder::forward_from_full_mel_window(
+                    &m.encoder,
+                    &full_mel,
+                    frame_offset,
+                    mel_frames,
+                    params.n_threads,
+                    checkpoint,
+                )?
+            };
+            // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
+            // no_timestamps advance is always CHUNK_CS, so the next offset is known and
+            // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
+            //
+            // A same-seek re-entry (FW_TEMP_FALLBACK / FW_RETRY_FAILED_WINDOW) arrives
+            // here with the next window's encode ALREADY dispatched and unconsumed
+            // (`prefetched == Some(next_off)`); re-sending would queue a duplicate
+            // result and desync every later window's recv by one. Keep the in-flight
+            // one instead. Outside a retry this predicate is impossible (a fresh
+            // window has consumed or never set it), so the default path is untouched.
+            let next_off = frame_offset + CHUNK_CS as usize;
+            if prefetched != Some(next_off) {
+                prefetched = None;
+                if pipeline {
+                    let next_seek = seek_cs + CHUNK_CS;
+                    if next_seek + DELTA_MIN < seek_end_cs {
+                        let next_real = usize::try_from((seek_end_cs - next_seek).max(0))
+                            .unwrap_or(0)
+                            .min(FRAMES_PER_CHUNK);
+                        let next_ctx = tail_enc_ctx(next_real, false, tail_truncate);
+                        if req_tx.send((next_off, next_ctx * 2)).is_ok() {
+                            prefetched = Some(next_off);
+                        }
+                    }
                 }
             }
-            if prompt_past.len() > max_prompt_ctx {
-                let drop = prompt_past.len() - max_prompt_ctx;
-                prompt_past.drain(0..drop);
+            super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
+            let t_xkv = std::time::Instant::now();
+            let mut st = DecoderState::new(&m.decoder, &enc)?;
+            super::perf_span("cross_kv", t_xkv.elapsed().as_secs_f64() * 1e3, "");
+
+            // First-window language auto-detect (multilingual, no explicit
+            // language): reuses this window's encode + this state's cross K/V.
+            if used_language.is_none() {
+                used_language = detect_language_from_enc(m, &mut st, checkpoint)?;
             }
-        } else if is_no_speech {
-            prompt_past.clear();
+
+            // Short-tail prompt clearing (fix #2 — whisper.cpp 7046-7051): a
+            // non-first window with under 5 s of audio left drops the carried prompt
+            // to avoid repetition/hallucination on the tail.
+            if should_clear_short_tail_prompt(seek_cs, seek_end_cs) {
+                prompt_past.clear();
+            }
+
+            // Build the prompt: [sot_prev, ...past...] + sot_sequence (whisper.cpp
+            // 7106-7133). prompt_init is the sot sequence for this language/task.
+            let sot_seq = tk.sot_sequence(
+                used_language.as_deref(),
+                params.translate,
+                params.timestamps,
+            );
+            let mut prompt: Vec<i32> = Vec::new();
+            // Carry the prior-window text prompt unless conditioning is disabled
+            // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
+            // `FW_NO_CONTEXT=1`), this is a failed-window retry (`force_empty_prompt`,
+            // FW_RETRY_FAILED_WINDOW), or a FW_TEMP_FALLBACK attempt above the prompt-
+            // reset temperature. Default (unset) keeps the carry ⇒ byte-identical.
+            let prompt_carried = !condition_on_prev_disabled()
+                && !force_empty_prompt
+                && window_temp <= TEMP_PROMPT_RESET
+                && !prompt_past.is_empty()
+                && max_prompt_ctx > 1;
+            if prompt_carried {
+                prompt.push(tk.sot_prev);
+                let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
+                prompt.extend_from_slice(&prompt_past[prompt_past.len() - take..]);
+            }
+            prompt.extend_from_slice(&sot_seq);
+
+            // Prefill the prompt; the first forward's softmax gives no_speech_prob
+            // (whisper.cpp 7165-7182). Compute it BEFORE filtering.
+            let t_prefill = std::time::Instant::now();
+            let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
+            super::perf_span(
+                "decoder_prefill",
+                t_prefill.elapsed().as_secs_f64() * 1e3,
+                &format!("\"prompt_tokens\":{}", prompt.len()),
+            );
+            let no_speech_prob = {
+                let lp = compute_logprobs(&prefill_logits);
+                usize::try_from(tk.no_speech)
+                    .ok()
+                    .and_then(|i| lp.get(i).copied())
+                    .map_or(0.0, |x| {
+                        // Defense-in-depth: a non-finite logprob must not export a
+                        // NaN no_speech_prob into the silence gate / routing snapshot.
+                        let p = f64::from(x.exp());
+                        if p.is_finite() { p } else { 0.0 }
+                    })
+            };
+
+            // Decode loop. `FW_BEAM_SIZE > 1` runs beam search for the
+            // temperature-0 pass; the `t > 0` fallback rungs (`window_temp > 0`)
+            // stay on the greedy sampling path. `beam_size() == 1` (default) ⇒ the
+            // greedy branch always runs ⇒ byte-identical to the pre-beam engine.
+            let t_loop = std::time::Instant::now();
+            let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = if effective_beam_size > 1
+                && window_temp == 0.0
+            {
+                // `st` is left intact (beam clones per hypothesis) for the DTW
+                // re-forward below, which shares this window's cross-K/V.
+                beam_decode_window(
+                    m,
+                    &st,
+                    prefill_logits,
+                    tk,
+                    &cfg,
+                    params,
+                    seek_cs,
+                    seek_end_cs,
+                    n_max_tokens,
+                    user_max_tokens,
+                    effective_beam_size,
+                    checkpoint,
+                )?
+            } else {
+                let mut decoded: Vec<i32> = Vec::new();
+                let mut plogs: Vec<f32> = Vec::new();
+                let mut has_ts = false;
+                let mut seek_delta_cs = CHUNK_CS; // default: advance full window.
+                let mut result_len = 0usize;
+                let mut step_logits = prefill_logits;
+                // Deterministic per-(window, rung, candidate) sampling stream
+                // (FW_TEMP_FALLBACK): only ever drawn from when `window_temp > 0.0`.
+                // Candidate 0 of every rung matches the pre-best_of stream exactly,
+                // so `FW_TEMP_BEST_OF=1` reproduces the single-candidate ladder
+                // byte-for-byte.
+                let mut sample_rng: u64 = 0x5851_F42D_4C95_7F2D
+                    ^ (seek_cs as u64)
+                    ^ ((temp_attempt as u64) << 48)
+                    ^ ((cand_idx as u64) << 40);
+
+                for i in 0..n_max_tokens {
+                    let (filtered, logprobs) = process_logits(
+                        tk,
+                        &cfg,
+                        step_logits,
+                        &decoded,
+                        has_ts,
+                        seek_delta_cs,
+                        decoded.len(),
+                    );
+                    let (tok, plog) = if window_temp > 0.0 {
+                        sample_token_at_temperature(
+                            &filtered,
+                            &logprobs,
+                            window_temp,
+                            &mut sample_rng,
+                        )
+                    } else {
+                        argmax(&filtered, &logprobs)
+                    };
+                    decoded.push(tok);
+                    plogs.push(plog);
+
+                    // Update sliding window from a timestamp token (whisper.cpp 7362-7375).
+                    if tok > tk.timestamp_begin {
+                        let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
+                        if has_ts && seek_delta_cs > new_delta && result_len < i {
+                            // Going back in time: bail out of this window (whisper.cpp 7366-7369).
+                            break;
+                        }
+                        seek_delta_cs = new_delta;
+                        result_len = i + 1;
+                        has_ts = true;
+                    }
+
+                    // End of segment (whisper.cpp 7387-7410). `budget_reached` is the
+                    // `params.max_tokens > 0 && i >= params.max_tokens` clause: the
+                    // EOT-forcing filter masked text from sampled-token index `mt`
+                    // onward, so the token at index `i == mt` is the forced closer and
+                    // the window completes here with `decoded.len() == mt + 1`.
+                    let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
+                    let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+                    if tok == tk.eot || budget_reached || reached_end {
+                        if result_len == 0 && params.timestamps {
+                            if reached_end {
+                                result_len = i + 1;
+                            } else {
+                                // Decoder failed with no timestamps closed.
+                                break;
+                            }
+                        }
+                        if !params.timestamps {
+                            result_len = i + 1;
+                            seek_delta_cs = CHUNK_CS;
+                        }
+                        break;
+                    }
+
+                    // Cancellation between every decoder step (the project contract).
+                    checkpoint()?;
+
+                    // Forward the just-chosen token to get the next logits.
+                    step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
+                }
+                (decoded, plogs, has_ts, seek_delta_cs, result_len)
+            };
+
+            // avg_logprob over result tokens (whisper.cpp 6602-6617).
+            let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
+                &plogs[..result_len]
+            } else {
+                &plogs[..]
+            };
+            let avg_logprob = if result_plogs.is_empty() {
+                EMPTY_WINDOW_AVG_LOGPROB
+            } else {
+                result_plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / result_plogs.len() as f64
+            };
+            // A non-finite mean (a NaN/inf plog escaping the decoder) degrades to the
+            // finite empty-window sentinel so the silence gate and routing snapshot
+            // never see NaN (a NaN would silently read as "not silence").
+            let avg_logprob = if avg_logprob.is_finite() {
+                avg_logprob
+            } else {
+                EMPTY_WINDOW_AVG_LOGPROB
+            };
+
+            // FW_TEMP_FALLBACK best_of (whisper.cpp greedy.best_of = 5): at a
+            // t > 0 rung each loop re-entry decodes ONE independent sampling
+            // candidate; the rung's best sequence_score is adopted into the
+            // window locals here, and everything downstream (quality gate,
+            // emission, DTW, prompt carry, seek advance) sees only the winner.
+            // Never entered at window_temp == 0.0, so the greedy pass and the
+            // whole default path are untouched.
+            let (decoded, plogs, result_len, seek_delta_cs, avg_logprob, no_speech_prob) =
+                if temp_fallback_enabled() && window_temp > 0.0 {
+                    let cand = WindowCandidate {
+                        score: sequence_score(&plogs, result_len),
+                        decoded,
+                        plogs,
+                        result_len,
+                        seek_delta_cs,
+                        avg_logprob,
+                        no_speech_prob,
+                    };
+                    // Ties keep the EARLIER candidate (whisper.cpp's ranking
+                    // scans decoders in order and replaces only on a strictly
+                    // better score).
+                    let best = match rung_best.take() {
+                        Some(b) if b.score >= cand.score => b,
+                        _ => cand,
+                    };
+                    if cand_idx + 1 < temp_best_of() {
+                        rung_best = Some(best);
+                        cand_idx += 1;
+                        retry_enc_cache = Some((frame_offset, enc));
+                        continue; // decode this rung's next candidate
+                    }
+                    // (cand_idx is reset by both downstream paths — the rung
+                    // advance and the window-accept block — before any next read.)
+                    (
+                        best.decoded,
+                        best.plogs,
+                        best.result_len,
+                        best.seek_delta_cs,
+                        best.avg_logprob,
+                        best.no_speech_prob,
+                    )
+                } else {
+                    (
+                        decoded,
+                        plogs,
+                        result_len,
+                        seek_delta_cs,
+                        avg_logprob,
+                        no_speech_prob,
+                    )
+                };
+
+            // no-speech / failed-window gate (whisper.cpp 7606-7607): treat as
+            // silence, emit nothing, advance the full window. At a completed
+            // t > 0 rung this evaluates the ADOPTED best candidate.
+            let is_no_speech =
+                no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
+
+            // FW_TEMP_FALLBACK (default-off, bd-6goy / bd-r0qd fix-spec #3): the
+            // whisper.cpp fallback ladder. A non-silent window that closed no
+            // timestamp, averaged below the logprob threshold, or looped into a
+            // low-entropy repetitive tail (whisper.cpp entropy_thold, 7540)
+            // re-decodes this SAME seek at the next ladder temperature, reusing the
+            // stashed encode. The ladder is finite, so this cannot loop; the final
+            // rung's decode is accepted as-is below (whisper.cpp keeps its last
+            // decode too). Unset ⇒ never fires ⇒ byte-exact.
+            //
+            // The entropy tail is taken over the result slice like upstream
+            // (`sequence.tokens.resize(result_len)` precedes the score). Minor
+            // divergence: in no_ts our result_len includes the terminal EOT; one
+            // unique id in a 33+-token tail moves the entropy negligibly.
+            let tail_entropy = {
+                let take = result_len.min(decoded.len());
+                // Only priced when the gate is on: the default path never counts.
+                if temp_fallback_enabled() && take > ENTROPY_WINDOW {
+                    Some(token_tail_entropy(&decoded[..take]))
+                } else {
+                    None
+                }
+            };
+            let quality_failed = !is_no_speech
+                && (result_len == 0
+                    || avg_logprob < LOGPROB_THRESHOLD
+                    || tail_entropy.is_some_and(|e| e < ENTROPY_THRESHOLD));
+            if temp_fallback_enabled()
+                && quality_failed
+                && temp_attempt < TEMP_FALLBACK_LADDER.len()
+            {
+                window_temp = TEMP_FALLBACK_LADDER[temp_attempt];
+                temp_attempt += 1;
+                cand_idx = 0;
+                rung_best = None;
+                tracing::debug!(
+                    target: "franken_whisper::native_engine::decode",
+                    seek_sec = seek_cs as f64 / 100.0,
+                    avg_logprob,
+                    result_len,
+                    tail_entropy = tail_entropy.unwrap_or(f64::NAN),
+                    retry_temperature = window_temp,
+                    "window failed the quality gate — temperature-fallback retry"
+                );
+                retry_enc_cache = Some((frame_offset, enc));
+                continue; // re-decode this window at the raised temperature
+            }
+            // Window accepted (or the ladder is exhausted): next window starts greedy.
+            temp_attempt = 0;
+            window_temp = 0.0;
+            cand_idx = 0;
+            rung_best = None;
+
+            // FW_RETRY_FAILED_WINDOW (default-off): a window that closed NO timestamp
+            // (`result_len == 0`, not silence) while carrying a prior-window prompt is
+            // the bd-r0qd long-form drop — the carried prompt × int8 numerics made the
+            // decoder emit `eot` early. Retry this SAME seek ONCE with the prompt
+            // cleared (fresh `st` next iteration; `FW_NO_CONTEXT`-style recovery, but
+            // targeted) before accepting the drop. `force_empty_prompt` makes it fire at
+            // most once per seek, so no infinite loop; unset ⇒ never fires ⇒ byte-exact.
+            if retry_failed_window_enabled()
+                && !temp_fallback_enabled()
+                && result_len == 0
+                && !is_no_speech
+                && !force_empty_prompt
+                && prompt_carried
+            {
+                force_empty_prompt = true;
+                // Stash this window's encode so the retry (same seek) reuses it instead
+                // of re-encoding. `st` owns its cross-KV copy (no borrow of `enc`), so
+                // this move is sound; `enc` is otherwise unused past DecoderState::new.
+                retry_enc_cache = Some((frame_offset, enc));
+                continue; // re-decode this window with no carried prompt (reusing this encode)
+            }
+            force_empty_prompt = false;
+
+            // Surface the otherwise-SILENT content drop (bd-r0qd): a non-first window
+            // that closed no timestamp and isn't silence emits nothing yet advances a
+            // full chunk, so ~30 s of speech vanishes with no signal to the caller.
+            // Transcript-unchanged (a log only) ⇒ byte-exact. Points at the recovery flag.
+            if result_len == 0 && !is_no_speech && seek_cs > 0 {
+                tracing::warn!(
+                    target: "franken_whisper::native_engine::decode",
+                    seek_sec = seek_cs as f64 / 100.0,
+                    no_speech_prob,
+                    avg_logprob,
+                    "long-form window closed no timestamp — ~30 s of audio dropped \
+                     (set FW_RETRY_FAILED_WINDOW=1 to attempt prompt-reset recovery; see bd-r0qd)"
+                );
+            }
+
+            // single-timestamp-ending: skip the rest of the chunk (whisper.cpp
+            // 7753-7760). Ordering fix #5: upstream emits segments (7624-7730) and
+            // records DTW word timings with the ORIGINAL `seek_delta`, then applies
+            // this whole-chunk skip ONLY to the seek advance (7753-7760). So we keep
+            // `seek_delta_cs` untouched for build_segments/window_word_timings below
+            super::perf_span(
+                "decode_loop",
+                t_loop.elapsed().as_secs_f64() * 1e3,
+                &format!("\"tokens\":{}", decoded.len()),
+            );
+            // and compute a separate `seek_advance_cs` for the window step.
+            //
+            // whisper.cpp resizes the sequence to `result_len` (dropping the
+            // loop-terminating EOT and anything past the last closed timestamp)
+            // BEFORE this test (whisper.cpp 7534, `sequence.tokens.resize(result_len)`).
+            // Testing the full `decoded` — which still holds the EOT the loop pushed
+            // at line ~1270 before breaking — makes an EOT-closed window that ends
+            // "…text <|ts|> <eot>" read as "(ts, eot)" instead of "(text, ts)", so the
+            // skip-rest-of-chunk NEVER fires on EOT-terminated windows. That spawns a
+            // spurious extra window over the post-speech zero-padding (jfk: a
+            // hallucinated "a." second window that whisper.cpp does not emit). Match
+            // upstream exactly: run the test on the `result_len`-truncated slice.
+            let result_decoded: &[i32] = &decoded[..result_len.min(decoded.len())];
+            let single_ts_ending = single_timestamp_ending(
+                result_decoded,
+                tk.timestamp_begin,
+                params.timestamps,
+                user_max_tokens,
+            );
+            let seek_advance_cs = if single_ts_ending {
+                (seek_end_cs - seek_cs).min(CHUNK_CS)
+            } else {
+                seek_delta_cs
+            };
+
+            windows.push(WindowStats {
+                avg_logprob,
+                no_speech_prob,
+                tokens: result_len,
+                window_offset_sec: seek_cs as f64 / 100.0,
+            });
+
+            if !is_no_speech && !decoded.is_empty() {
+                // Use only the result_len tokens for emission (drop a trailing eot).
+                let take = result_len.min(decoded.len());
+                let result_tokens = &decoded[..take];
+                // Debug hook (`PROBE_DUMP_TOKENS=1`): emit this window's raw token ids
+                // to stderr for offline analysis (e.g. prompt-lookup/n-gram speculation
+                // accept-rate simulation). Off by default, zero cost when unset.
+                if std::env::var_os("PROBE_DUMP_TOKENS").is_some() {
+                    use std::fmt::Write as _;
+                    let mut line = String::from("TOKENS>>>");
+                    for (i, &t) in result_tokens.iter().enumerate() {
+                        if i > 0 {
+                            line.push(',');
+                        }
+                        let _ = write!(line, "{t}");
+                    }
+                    line.push_str("<<<");
+                    eprintln!("{line}");
+                }
+                let result_token_plogs = &plogs[..take];
+                let win_segments = build_segments(
+                    tk,
+                    result_tokens,
+                    result_token_plogs,
+                    seek_cs,
+                    seek_delta_cs,
+                    seek_end_cs,
+                    params.timestamps,
+                );
+
+                // DTW word timestamps (bd-rjsx): record cross-attention over this
+                // window's result tokens and align them to audio frames. Computed
+                // before `win_segments` is moved so we stay 1:1 with it. When
+                // requested we always push one (possibly empty) word vec per emitted
+                // segment so `word_timings` stays aligned with `segments`.
+                if params.word_timestamps {
+                    let win_words = if align_heads.is_empty() {
+                        vec![Vec::new(); win_segments.len()]
+                    } else {
+                        window_word_timings(
+                            m,
+                            &mut st,
+                            used_language.as_deref(),
+                            params,
+                            &align_heads,
+                            result_tokens,
+                            &win_segments,
+                            seek_cs,
+                            seek_delta_cs,
+                            checkpoint,
+                        )?
+                    };
+                    word_timings.extend(win_words);
+                }
+
+                segments.extend(win_segments);
+
+                // Update rolling context: the decoded text tokens (whisper.cpp
+                // 7617-7622), capped to the prompt budget.
+                prompt_past.clear();
+                for &t in result_tokens {
+                    if !tk.is_special(t) {
+                        prompt_past.push(t);
+                    }
+                }
+                if prompt_past.len() > max_prompt_ctx {
+                    let drop = prompt_past.len() - max_prompt_ctx;
+                    prompt_past.drain(0..drop);
+                }
+            } else if is_no_speech {
+                prompt_past.clear();
+            }
+
+            // Advance the window (whisper.cpp 7763) with the (possibly chunk-skip
+            // adjusted) advance, NOT the emission delta (fix #5).
+            seek_cs += seek_advance_cs.max(DELTA_MIN);
         }
 
-        // Advance the window (whisper.cpp 7763) with the (possibly chunk-skip
-        // adjusted) advance, NOT the emission delta (fix #5).
-        seek_cs += seek_advance_cs.max(DELTA_MIN);
-    }
+        // Close the encoder-thread channel so the scoped worker exits; `scope`
+        // then joins it before returning.
+        drop(req_tx);
+        Ok(())
+    });
+    pipe_result?;
 
         // Close the encoder-thread channel so the scoped worker exits; `scope`
         // then joins it before returning.
@@ -1761,14 +2794,27 @@ pub(crate) fn read_wav_16k_mono(bytes: &[u8]) -> FwResult<Vec<f32>> {
     let data = data.ok_or_else(|| bad("no data chunk"))?;
     let n_frames = data.len() / (2 * channels);
     let mut out = Vec::with_capacity(n_frames);
-    for f in 0..n_frames {
-        let mut acc = 0i32;
-        for c in 0..channels {
-            let o = (f * channels + c) * 2;
-            let s = i16::from_le_bytes([data[o], data[o + 1]]);
-            acc += i32::from(s);
+    if channels == 1 {
+        // Mono fast path (the whisper input format, so the common case): a plain
+        // i16→f32 map — `s as f32 / 32768.0` — that LLVM autovectorizes (vcvt + mul
+        // by 2⁻¹⁵). The general per-channel accumulation loop below inhibits autovec.
+        // BYTE-IDENTICAL to that loop with `channels == 1`: `acc == i32(s)`, and both
+        // `i32(s) as f32` and `i16 s as f32` give the exact integer (i16 ⊂ f32
+        // mantissa), while `/1.0` is the identity and `/32768.0` (÷2¹⁵) is exact.
+        out.extend(
+            data.chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+        );
+    } else {
+        for f in 0..n_frames {
+            let mut acc = 0i32;
+            for c in 0..channels {
+                let o = (f * channels + c) * 2;
+                let s = i16::from_le_bytes([data[o], data[o + 1]]);
+                acc += i32::from(s);
+            }
+            out.push((acc as f32 / channels as f32) / 32768.0);
         }
-        out.push((acc as f32 / channels as f32) / 32768.0);
     }
     Ok(out)
 }
@@ -1874,7 +2920,11 @@ mod tests {
             let mut v: Vec<f32> = (0..n)
                 .map(|_| {
                     let u = nf();
-                    if u < 0.1 { f32::NEG_INFINITY } else { -30.0 * nf() }
+                    if u < 0.1 {
+                        f32::NEG_INFINITY
+                    } else {
+                        -30.0 * nf()
+                    }
                 })
                 .collect();
             if n > 0 {
@@ -1884,10 +2934,16 @@ mod tests {
             let got = logsumexp_sum_simd(&v, max);
             let want = scalar(&v, max);
             let rel = (got - want).abs() / want.abs().max(1e-30);
-            assert!(rel < 1e-3, "n={n}: simd {got} vs scalar {want} rel {rel:.2e}");
+            assert!(
+                rel < 1e-3,
+                "n={n}: simd {got} vs scalar {want} rel {rel:.2e}"
+            );
         }
         // All-masked (-inf, max=-inf) → sum exactly 0 (mask zeroes the NaN lanes).
-        assert_eq!(logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY), 0.0);
+        assert_eq!(
+            logsumexp_sum_simd(&vec![f32::NEG_INFINITY; 32], f32::NEG_INFINITY),
+            0.0
+        );
     }
 
     #[test]
@@ -1934,6 +2990,159 @@ mod tests {
         // Empty and all-masked → 0 (matches scalar initial best_i).
         assert_eq!(argmax_idx(&[]), 0);
         assert_eq!(argmax_idx(&vec![f32::NEG_INFINITY; 20]), 0);
+    }
+
+    #[test]
+    fn sample_token_deterministic_and_respects_masks() {
+        // FW_TEMP_FALLBACK sampler: identical seeds must replay identical draws
+        // bit-for-bit (transcript replayability), and masked (`-inf`) / NaN lanes
+        // must carry zero mass. plog is the id's temperature-1 log-softmax.
+        let logits = vec![f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY, 0.5, f32::NAN];
+        let logprobs = vec![
+            f32::NEG_INFINITY,
+            -0.3,
+            f32::NEG_INFINITY,
+            -0.8,
+            f32::NEG_INFINITY,
+        ];
+        let (mut r1, mut r2) = (42u64, 42u64);
+        let mut drew = [false; 5];
+        for _ in 0..64 {
+            let (t1, p1) = sample_token_at_temperature(&logits, &logprobs, 0.8, &mut r1);
+            let (t2, p2) = sample_token_at_temperature(&logits, &logprobs, 0.8, &mut r2);
+            assert_eq!(
+                (t1, p1.to_bits()),
+                (t2, p2.to_bits()),
+                "same seed, same draw"
+            );
+            assert!(t1 == 1 || t1 == 3, "masked/NaN lane drawn: {t1}");
+            let expected_plog = if t1 == 1 { -0.3 } else { -0.8 };
+            assert_eq!(p1, expected_plog, "plog must come from `logprobs`");
+            drew[usize::try_from(t1).unwrap()] = true;
+        }
+        // At t = 0.8 with a 0.5-nat gap both live lanes appear within 64 draws
+        // (P(all-one-lane) < 1e-9): the draw is genuinely multinomial, not argmax.
+        assert!(
+            drew[1] && drew[3],
+            "sampler collapsed to a single lane: {drew:?}"
+        );
+    }
+
+    #[test]
+    fn sample_token_low_temperature_recovers_argmax() {
+        // t → 0 sharpens softmax(logits/t) onto the max lane: an 6-nat gap at
+        // t = 0.05 is a 120-nat gap, so every draw must equal the argmax choice.
+        let logits = vec![0.0, 8.0, 1.0, 2.0];
+        let logprobs = compute_logprobs(&logits);
+        let mut rng = 99u64;
+        for _ in 0..64 {
+            let (tok, plog) = sample_token_at_temperature(&logits, &logprobs, 0.05, &mut rng);
+            let (best, best_plog) = argmax(&logits, &logprobs);
+            assert_eq!(tok, best);
+            assert_eq!(plog.to_bits(), best_plog.to_bits());
+        }
+    }
+
+    #[test]
+    fn sequence_score_matches_whisper_cpp_defaults() {
+        // whisper.cpp `whisper_sequence_score` with length_penalty = -1.0 (the
+        // default): penalty = result_len ⇒ score = avg logprob of the result.
+        assert_eq!(sequence_score(&[-0.5, -1.5], 2), -1.0);
+        // Only the result slice counts (a trailing eot plog is excluded).
+        assert_eq!(sequence_score(&[-0.5, -1.5, -9.0], 2), -1.0);
+        // No result ⇒ sentinel: never beats a token-producing candidate.
+        assert_eq!(sequence_score(&[], 0), EMPTY_WINDOW_AVG_LOGPROB);
+        assert_eq!(sequence_score(&[-0.5], 0), EMPTY_WINDOW_AVG_LOGPROB);
+        // result_len beyond plogs clamps defensively.
+        assert_eq!(sequence_score(&[-2.0], 5), -2.0);
+        // Non-finite input degrades to the sentinel, mirroring avg_logprob.
+        assert_eq!(
+            sequence_score(&[f32::NEG_INFINITY, -1.0], 2),
+            EMPTY_WINDOW_AVG_LOGPROB
+        );
+    }
+
+    #[test]
+    fn top_k_logprob_indices_selects_best_first_skipping_masked() {
+        // The beam-expansion primitive: the k largest logprobs, best-first,
+        // masked (-inf) lanes excluded. Ties break by lower index (determinism).
+        let lp = vec![-3.0f32, -0.5, f32::NEG_INFINITY, -1.0, -0.5, -9.0];
+        assert_eq!(top_k_logprob_indices(&lp, 3), vec![1, 4, 3]); // -0.5(i1), -0.5(i4), -1.0(i3)
+        assert_eq!(top_k_logprob_indices(&lp, 1), vec![1]);
+        // k larger than the finite lane count clamps to the available lanes
+        // (the -inf lane at index 2 is never returned).
+        assert_eq!(top_k_logprob_indices(&lp, 10), vec![1, 4, 3, 0, 5]);
+        // All-masked and k=0 both yield nothing.
+        assert!(top_k_logprob_indices(&[f32::NEG_INFINITY; 4], 3).is_empty());
+        assert!(top_k_logprob_indices(&lp, 0).is_empty());
+        assert!(top_k_logprob_indices(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn beam_size_default_is_one() {
+        // Default (no field, no env) must be 1 so the greedy path runs — the
+        // byte-exact-by-construction guarantee. Also check the field and the
+        // clamp. (The OnceLock env reader is unset in a clean test process.)
+        if std::env::var_os("FW_BEAM_SIZE").is_none() {
+            assert_eq!(resolve_beam_size(&DecodeParams::default()), 1);
+            let mut p = DecodeParams::default();
+            p.beam_size = Some(5);
+            assert_eq!(resolve_beam_size(&p), 5, "field beam_size drives beam width");
+            p.beam_size = Some(99);
+            assert_eq!(resolve_beam_size(&p), 8, "beam width clamps to 8");
+            p.beam_size = Some(0);
+            assert_eq!(resolve_beam_size(&p), 1, "0 clamps up to greedy");
+        }
+    }
+
+    #[test]
+    fn token_tail_entropy_matches_whisper_cpp_reference() {
+        // Faithful to whisper.cpp 6597-6617: Shannon entropy (nats) over the
+        // token-id counts of the LAST 32 entries only.
+        // Uniformly repeated tail → 0.0 (degenerate loop, the entropy_thold case).
+        assert_eq!(token_tail_entropy(&vec![7i32; 40]), 0.0);
+        // 32 distinct ids → ln 32 (maximum for the window).
+        let distinct: Vec<i32> = (0..32).collect();
+        assert!((token_tail_entropy(&distinct) - 32f64.ln()).abs() < 1e-12);
+        // Two ids at 16/16 in the tail → ln 2, and the prefix must be IGNORED:
+        // 100 leading distinct ids change nothing.
+        let mut two_id: Vec<i32> = (1000..1100).collect();
+        two_id.extend(std::iter::repeat_n(1, 16));
+        two_id.extend(std::iter::repeat_n(2, 16));
+        assert!((token_tail_entropy(&two_id) - 2f64.ln()).abs() < 1e-12);
+        // Hand-computed mixed case: tail of 24×A + 8×B over 32 →
+        // -(0.75 ln 0.75 + 0.25 ln 0.25).
+        let mut mixed = vec![5i32; 24];
+        mixed.extend(std::iter::repeat_n(9, 8));
+        let expect = -(0.75f64 * 0.75f64.ln() + 0.25f64 * 0.25f64.ln());
+        assert!((token_tail_entropy(&mixed) - expect).abs() < 1e-12);
+        // Threshold calibration sanity (wc defaults): a fully repetitive tail is
+        // far below 2.4; a fully diverse tail is above it.
+        assert!(token_tail_entropy(&vec![7i32; 33]) < ENTROPY_THRESHOLD);
+        assert!(token_tail_entropy(&distinct) > ENTROPY_THRESHOLD);
+        // Empty input is defined (0.0), matching "no evidence of a loop".
+        assert_eq!(token_tail_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn sample_token_degenerate_inputs_fall_back_to_argmax() {
+        // All-masked (no finite lane) and empty inputs must not panic or draw a
+        // masked id — they defer to argmax's established conventions.
+        let masked = vec![f32::NEG_INFINITY; 4];
+        let masked_lp = vec![f32::NEG_INFINITY; 4];
+        let mut rng = 1u64;
+        let (tok, _) = sample_token_at_temperature(&masked, &masked_lp, 0.4, &mut rng);
+        assert_eq!(tok, argmax(&masked, &masked_lp).0);
+        let (tok_empty, _) = sample_token_at_temperature(&[], &[], 0.4, &mut rng);
+        assert_eq!(tok_empty, argmax(&[], &[]).0);
+        // A single unmasked lane always wins regardless of the draw.
+        let one = vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 2.0];
+        let one_lp = vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0];
+        for _ in 0..32 {
+            let (tok, plog) = sample_token_at_temperature(&one, &one_lp, 1.0, &mut rng);
+            assert_eq!(tok, 2);
+            assert_eq!(plog, 0.0);
+        }
     }
 
     #[test]
@@ -2275,8 +3484,14 @@ mod tests {
         let plogs = vec![0.0f32, f32::NAN];
         let conf = text_confidence(&tk, &tokens, &plogs).expect("finite text token present");
         assert!(conf.is_finite(), "confidence must be finite, got {conf}");
-        assert!((0.0..=1.0).contains(&conf), "confidence in [0,1], got {conf}");
-        assert!((conf - 1.0).abs() < 1e-9, "only the finite plog (0.0) counts → exp(0)=1");
+        assert!(
+            (0.0..=1.0).contains(&conf),
+            "confidence in [0,1], got {conf}"
+        );
+        assert!(
+            (conf - 1.0).abs() < 1e-9,
+            "only the finite plog (0.0) counts → exp(0)=1"
+        );
 
         // Every text-token plog non-finite → all skipped → None (no NaN mean, no
         // clamp panic).
@@ -2290,14 +3505,25 @@ mod tests {
         // (`-inf`) lane; the finite lanes must still yield finite logprobs
         // instead of a NaN-poisoned whole vector.
         let lp = compute_logprobs(&[f32::INFINITY, 0.0, -1.0]);
-        assert!(lp[1].is_finite(), "logprob for finite logit 0.0 must be finite, got {}", lp[1]);
-        assert!(lp[2].is_finite(), "logprob for finite logit -1.0 must be finite, got {}", lp[2]);
+        assert!(
+            lp[1].is_finite(),
+            "logprob for finite logit 0.0 must be finite, got {}",
+            lp[1]
+        );
+        assert!(
+            lp[2].is_finite(),
+            "logprob for finite logit -1.0 must be finite, got {}",
+            lp[2]
+        );
         assert!(!lp[1].is_nan() && !lp[2].is_nan(), "no NaN logprobs");
 
         // A NaN logit is likewise neutralized (mapped to a masked lane) rather
         // than poisoning the finite lanes.
         let lp2 = compute_logprobs(&[f32::NAN, 0.0, -1.0]);
-        assert!(lp2[1].is_finite() && lp2[2].is_finite(), "NaN logit must not poison finite lanes");
+        assert!(
+            lp2[1].is_finite() && lp2[2].is_finite(),
+            "NaN logit must not poison finite lanes"
+        );
     }
 
     #[test]
@@ -2513,7 +3739,10 @@ mod tests {
         // A NaN plog makes the mean NaN; the guarded clamp must not panic on the
         // current nightly and must degrade to a finite 0.0.
         let c = confidence(&[f32::NAN, 0.0]).expect("non-empty plogs → Some");
-        assert!(c.is_finite(), "confidence must be finite on NaN input, got {c}");
+        assert!(
+            c.is_finite(),
+            "confidence must be finite on NaN input, got {c}"
+        );
         assert_eq!(c, 0.0);
     }
 
@@ -2546,6 +3775,52 @@ mod tests {
         assert_eq!(out.len(), 8);
         assert!((out[0] - 0.0).abs() < 1e-9);
         assert!((out[1] - 1000.0 / 32768.0).abs() < 1e-6);
+    }
+
+    /// The `channels == 1` fast path in `read_wav_16k_mono` (`87556b4`) must be
+    /// BIT-IDENTICAL to the general per-channel accumulation loop it replaced, and
+    /// materially faster (the old path did TWO runtime f32 divisions per sample plus
+    /// `push`, inhibiting autovec; the fast path is one vectorized `×2⁻¹⁵`). This
+    /// guards the byte-exactness of the opt forever and records the speedup as a
+    /// foreground micro-bench (~4 M samples, both paths timed back-to-back).
+    #[test]
+    fn read_wav_mono_fast_path_byte_exact_and_faster() {
+        use std::time::Instant;
+        let n = 4_000_000usize; // ~4.2 min of 16 kHz audio; cycles the full i16 range 61×.
+        let mut data = vec![0u8; n * 2];
+        for (i, chunk) in data.chunks_exact_mut(2).enumerate() {
+            // Deterministic fill covering the full i16 range (incl. ±edge values).
+            chunk.copy_from_slice(&(i as i16).to_le_bytes());
+        }
+        // NEW: the mono fast path (what `read_wav_16k_mono` uses at channels == 1).
+        let t = Instant::now();
+        let fast: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        let t_fast = t.elapsed();
+        // OLD: the general per-channel accumulation loop with channels == 1.
+        let channels = 1usize;
+        let n_frames = data.len() / (2 * channels);
+        let t = Instant::now();
+        let mut general = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            let mut acc = 0i32;
+            for c in 0..channels {
+                let o = (f * channels + c) * 2;
+                acc += i32::from(i16::from_le_bytes([data[o], data[o + 1]]));
+            }
+            general.push((acc as f32 / channels as f32) / 32768.0);
+        }
+        let t_old = t.elapsed();
+        assert_eq!(
+            fast, general,
+            "mono fast path must be byte-identical to the general per-channel loop"
+        );
+        eprintln!(
+            "read_wav mono i16→f32 ({n} samples): fast={t_fast:?} old={t_old:?} speedup={:.2}×",
+            t_old.as_secs_f64() / t_fast.as_secs_f64().max(1e-12)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2581,6 +3856,882 @@ mod tests {
             max_text_ctx: None,
             ..DecodeParams::default()
         }
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q8_0_transcribes() {
+        // End-to-end proof that the engine RUNS a whisper.cpp q8_0-quantized
+        // model: its Q8_0 tensors dequantize to f32 on load (ggml.rs), route
+        // through the f32 weight path, build the engine, and produce a correct
+        // jfk transcript. Requires ggml-tiny.en-q8_0.bin alongside the f16 model
+        // (`whisper-quantize <f16-model> <out> q8_0`).
+        let Some(path) = super::super::find_model_file("tiny.en-q8_0") else {
+            eprintln!("SKIP gated_e2e_jfk_q8_0: ggml-tiny.en-q8_0.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q8_0: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q8_0 model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q8_0");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q8_0");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q8_0 PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q8_0 produced no segments");
+        // High-precision quant → the salient jfk content (content-checked, not a
+        // byte match: q8_0 weights differ slightly from f16 so tokens may drift).
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans"),
+            "q8_0 transcript missing 'fellow americans': {joined}"
+        );
+        assert!(
+            low.contains("country"),
+            "q8_0 transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q4_1_q5_1_transcribe() {
+        // The engine runs the "_1" (scale+min) legacy quants end-to-end.
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q4_1_q5_1: jfk.wav missing");
+            return;
+        };
+        for name in ["tiny.en-q4_1", "tiny.en-q5_1"] {
+            let Some(path) = super::super::find_model_file(name) else {
+                eprintln!("SKIP {name}: model not found");
+                continue;
+            };
+            let model = GgmlModel::load(&path).unwrap_or_else(|e| panic!("load {name}: {e}"));
+            let loaded =
+                LoadedModel::from_ggml(model).unwrap_or_else(|e| panic!("engine {name}: {e}"));
+            let out = transcribe_samples(&loaded, &samples, &e2e_params(), &noop)
+                .unwrap_or_else(|e| panic!("transcribe {name}: {e}"));
+            let joined: String = out
+                .segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("{name} PRODUCED: {joined}");
+            assert!(!out.segments.is_empty(), "{name} produced no segments");
+            assert!(
+                joined.to_lowercase().contains("country"),
+                "{name} transcript missing 'country': {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q4_0_transcribes() {
+        // Engine runs a whisper.cpp q4_0-quantized model end-to-end (4-bit).
+        let Some(path) = super::super::find_model_file("tiny.en-q4_0") else {
+            eprintln!("SKIP gated_e2e_jfk_q4_0: ggml-tiny.en-q4_0.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q4_0: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q4_0 model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q4_0");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q4_0");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q4_0 PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q4_0 produced no segments");
+        // 4-bit is coarse; assert the engine runs + produces the salient content
+        // ("country" is robust; the fuller phrase can drift at 4-bit precision).
+        assert!(
+            joined.to_lowercase().contains("country"),
+            "q4_0 transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q5_0_transcribes() {
+        // Engine runs a whisper.cpp q5_0-quantized model end-to-end (5-bit quant,
+        // dequantized to f32 on load). Requires ggml-tiny.en-q5_0.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q5_0") else {
+            eprintln!("SKIP gated_e2e_jfk_q5_0: ggml-tiny.en-q5_0.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q5_0: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q5_0 model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q5_0");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q5_0");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q5_0 PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q5_0 produced no segments");
+        // 5-bit quant is coarser; assert the salient jfk content (not byte match).
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans"),
+            "q5_0 transcript missing 'fellow americans': {joined}"
+        );
+        assert!(
+            low.contains("country"),
+            "q5_0 transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q6_k_transcribes() {
+        // Engine runs a whisper.cpp q6_k-quantized model end-to-end. Q6_K is a
+        // k-quant super-block format (256-value blocks, 6-bit + per-16 int8
+        // sub-scales); its tensors dequantize to f32 on load (ggml.rs) and route
+        // through the f32 weight path. Requires ggml-tiny.en-q6_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q6_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q6_k: ggml-tiny.en-q6_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q6_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q6_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q6_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q6_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q6_k PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q6_k produced no segments");
+        // Q6_K is high-precision (near-f16); assert the salient jfk content.
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans"),
+            "q6_k transcript missing 'fellow americans': {joined}"
+        );
+        assert!(
+            low.contains("country"),
+            "q6_k transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_initial_prompt_field_wired_and_neutral_when_empty() {
+        // End-to-end through the DecodeParams.initial_prompt FIELD (the real
+        // per-request API, distinct from the FW_INITIAL_PROMPT dev override which
+        // an OnceLock makes hard to test per-case). FW_INITIAL_PROMPT is unset
+        // under `cargo test`, so the field is the source of truth here.
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_initial_prompt_field: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let join = |o: &DecodeOutput| {
+            o.segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // None vs Some("") must be identical (an empty prompt is a no-op).
+        let mut p_none = e2e_params();
+        p_none.initial_prompt = None;
+        let mut p_empty = e2e_params();
+        p_empty.initial_prompt = Some(String::new());
+        let t_none = join(&transcribe_samples(&model, &samples, &p_none, &noop).unwrap());
+        let t_empty = join(&transcribe_samples(&model, &samples, &p_empty, &noop).unwrap());
+        assert_eq!(t_none, t_empty, "empty initial_prompt field must be a no-op");
+        assert!(
+            t_none.to_lowercase().contains("country"),
+            "baseline should transcribe jfk: {t_none}"
+        );
+        // A benign prompt via the field is accepted and still transcribes jfk
+        // (proving the field flows into the decoder's prompt_past seeding).
+        let mut p = e2e_params();
+        p.initial_prompt = Some("Hello there.".to_owned());
+        let t = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
+        eprintln!("field-prompted: {t}");
+        assert!(
+            t.to_lowercase().contains("country"),
+            "field prompt should still transcribe jfk: {t}"
+        );
+    }
+
+    #[test]
+    fn gated_max_context_zero_disables_prompt_carry() {
+        // max_context=0 (whisper --max-context 0) disables carried previous-context
+        // — the per-request equivalent of FW_NO_CONTEXT. On tiled/looping audio the
+        // default carried prompt triggers the bd-r0qd early-EOT drop; max_context=0
+        // avoids it, so it recovers >= the default's content. (See
+        // project_final_window_early_eot_bug.)
+        let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_max_context_zero: tiny.en model or jfk.wav missing");
+            return;
+        };
+        // Tile jfk ×3 (~33 s, multi-window) so carried context is exercised.
+        let mut tiled = jfk.clone();
+        tiled.extend_from_slice(&jfk);
+        tiled.extend_from_slice(&jfk);
+        let count_country = |o: &DecodeOutput| -> usize {
+            o.segments
+                .iter()
+                .map(|s| s.text.to_lowercase().matches("country").count())
+                .sum()
+        };
+        let default_out = transcribe_samples(&model, &tiled, &e2e_params(), &noop).unwrap();
+        let mut p = e2e_params();
+        p.max_context = Some(0);
+        let nocarry_out = transcribe_samples(&model, &tiled, &p, &noop).unwrap();
+        let (d, n) = (count_country(&default_out), count_country(&nocarry_out));
+        eprintln!("tiled-jfk 'country' count: default={d} max_context=0={n}");
+        // max_context=0 disables prompt carry, so the looping tiles decode fully
+        // (jfk×3 = 6 'country' when fully transcribed). This holds regardless of
+        // the default path: the FW_RETRY_FAILED_WINDOW retry is now default-ON, so
+        // the default ALSO recovers the tail — max_context=0 stays >= it.
+        assert!(
+            n >= 6,
+            "max_context=0 should fully transcribe the tiled content, got {n}"
+        );
+        assert!(
+            n >= d,
+            "max_context=0 must not lose content vs the default path, got {n} vs {d}"
+        );
+    }
+
+    #[test]
+    fn gated_suppress_nst_field_is_neutral_on_clean_speech() {
+        // suppress_nst (whisper --suppress-nst) masks non-speech/symbol tokens.
+        // jfk is clean speech that never decodes a non-speech token, so masking
+        // them cannot change the argmax → suppress_nst=true is BYTE-IDENTICAL to
+        // false here. This proves the field reaches the logit filter (via
+        // FilterConfig.suppress_nst) without perturbing normal transcription. The
+        // masking behavior itself is unit-pinned by `non_speech_suppressed_when_enabled`.
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_suppress_nst: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let join = |o: &DecodeOutput| {
+            o.segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let off = join(&transcribe_samples(&model, &samples, &e2e_params(), &noop).unwrap());
+        let mut p = e2e_params();
+        p.suppress_nst = true;
+        let on = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
+        assert_eq!(on, off, "suppress_nst must be a no-op on clean speech (jfk)");
+        assert!(off.to_lowercase().contains("country"), "baseline transcribes jfk");
+    }
+
+    #[test]
+    fn gated_beam_size_field_matches_greedy_on_jfk() {
+        // Beam search via the DecodeParams.beam_size FIELD (whisper --beam-size).
+        // On jfk (clear, unambiguous speech) beam=5 selects the same hypothesis as
+        // greedy, so the transcript is byte-identical — this exercises the
+        // field → beam decode wiring end to end AND pins the "beam is a superset of
+        // greedy" invariant. First e2e coverage of beam search. FW_BEAM_SIZE is
+        // unset under `cargo test`, so the field is the source of truth.
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_beam_size_field: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let join = |o: &DecodeOutput| {
+            o.segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let greedy = join(&transcribe_samples(&model, &samples, &e2e_params(), &noop).unwrap());
+        let mut p = e2e_params();
+        p.beam_size = Some(5);
+        let beam = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
+        eprintln!("greedy: {greedy}\nbeam5:  {beam}");
+        assert_eq!(
+            beam, greedy,
+            "beam=5 must match greedy on jfk (byte-identical superset)"
+        );
+        assert!(
+            greedy.to_lowercase().contains("country"),
+            "baseline should transcribe jfk"
+        );
+    }
+
+    #[test]
+    fn gated_seeded_prompt_past_encodes_user_prompt() {
+        // The initial-prompt seed (whisper `--prompt`, FW_INITIAL_PROMPT): an
+        // absent/empty prompt yields an empty prompt_past (byte-identical default),
+        // and a real prompt is BPE-encoded to its exact whisper.cpp token ids and
+        // becomes the first window's carried context.
+        let Some(model) = load_tiny_en() else {
+            eprintln!("SKIP gated_seeded_prompt: tiny.en model missing");
+            return;
+        };
+        let tk = &model.tokenizer;
+        assert_eq!(seeded_prompt_past(None, tk), Vec::<i32>::new());
+        assert_eq!(seeded_prompt_past(Some(""), tk), Vec::<i32>::new());
+        assert_eq!(seeded_prompt_past(Some(" country"), tk), vec![1499]);
+        assert_eq!(seeded_prompt_past(Some("the country"), tk), vec![1169, 1499]);
+    }
+
+    #[test]
+    fn gated_truncated_model_errors_cleanly() {
+        // A corrupt / partially-downloaded model (valid start, cut before all
+        // tensors are present) must fail with a clean Err from load()/from_ggml —
+        // NEVER a panic or a silent load of garbage weights. Only the header +
+        // early sections parse; a later tensor is missing or its payload is short.
+        let Some(path) = super::super::find_model_file("tiny.en") else {
+            eprintln!("SKIP gated_truncated_model: tiny.en model missing");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read tiny.en");
+        // Cut to half — past the header/mel/vocab, mid tensor directory/data.
+        let cut = bytes.len() / 2;
+        let tmp = std::env::temp_dir().join(format!("fw_truncated_{cut}.bin"));
+        std::fs::write(&tmp, &bytes[..cut]).expect("write truncated");
+        // load() then from_ggml() — the whole path must return Err, not panic.
+        let result = GgmlModel::load(&tmp).and_then(LoadedModel::from_ggml);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            result.is_err(),
+            "a truncated model must error, not load garbage weights"
+        );
+    }
+
+    #[test]
+    fn gated_degenerate_audio_inputs_are_handled_gracefully() {
+        // A production ASR receives arbitrary clips: empty, pure silence, a tone,
+        // and sub-window lengths. None must panic or error — mel's build_padded
+        // always pads to a full 30 s window (so `padded.len() - N_FFT` can't
+        // underflow) and the decode must degrade to no/near-no speech, not crash
+        // or run away. This is the only coverage of the degenerate-input path.
+        let Some(model) = load_tiny_en() else {
+            eprintln!("SKIP gated_degenerate_audio: tiny.en model missing");
+            return;
+        };
+        let params = e2e_params();
+
+        // Empty audio is rejected with a clean error (never a panic).
+        match transcribe_samples(&model, &[], &params, &noop) {
+            Err(FwError::InvalidRequest(msg)) => {
+                assert!(msg.contains("empty"), "unexpected empty-audio error: {msg}");
+            }
+            Err(other) => panic!("empty audio: expected InvalidRequest, got {other:?}"),
+            Ok(_) => panic!("empty audio should be rejected, not transcribed"),
+        }
+
+        // Non-empty but degenerate inputs must transcribe without panicking, with
+        // bounded, finite output (silence/tone degrade to no/near-no speech).
+        let cases: [(&str, Vec<f32>); 4] = [
+            ("one_sample", vec![0.1]),
+            ("half_second_silence", vec![0.0; SAMPLE_RATE / 2]),
+            (
+                "half_second_tone",
+                (0..SAMPLE_RATE / 2)
+                    .map(|i| (i as f32 * 0.20).sin() * 0.3)
+                    .collect(),
+            ),
+            ("two_second_silence", vec![0.0; SAMPLE_RATE * 2]),
+        ];
+        for (name, samples) in cases {
+            let out = transcribe_samples(&model, &samples, &params, &noop)
+                .unwrap_or_else(|e| panic!("{name}: transcribe errored: {e}"));
+            let joined: String = out
+                .segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("{name}: {} segs, text={joined:?}", out.segments.len());
+            // No runaway output (a repetition loop on non-speech would balloon the
+            // segment count) and every timestamp stays finite/ordered.
+            assert!(
+                out.segments.len() < 50,
+                "{name}: runaway segment count {}",
+                out.segments.len()
+            );
+            for seg in &out.segments {
+                if let (Some(s), Some(e)) = (seg.start_sec, seg.end_sec) {
+                    assert!(
+                        s.is_finite() && e.is_finite() && e >= s,
+                        "{name}: bad segment span [{s}, {e}]"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gated_language_detect_jfk_turbo_matches_oracle() {
+        // The ONLY coverage of the multilingual language-auto-detect path
+        // (detect_language_from_enc, a port of whisper.cpp whisper_lang_auto_detect).
+        // Every other on-box test uses English-only tiny.en, which skips detection
+        // entirely. Oracle: `whisper-cli -dl` on jfk + f16 large-v3-turbo reports
+        // "auto-detected language: en (p = 0.960230)". Requires the multilingual
+        // ggml-large-v3-turbo.bin + jfk.wav.
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_language_detect: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_language_detect: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let m = LoadedModel::from_ggml(model).expect("build turbo engine");
+        assert!(
+            m.tokenizer.num_languages() >= 99,
+            "turbo must be multilingual, got {} languages",
+            m.tokenizer.num_languages()
+        );
+
+        // Encode jfk's first 30 s window and build the decoder state — exactly the
+        // inputs detect_language_from_enc consumes in production.
+        let mel_threads = super::super::host_parallelism().min(16);
+        let mel = mel::log_mel(&samples, &m.filters, mel_threads).expect("mel");
+        let frames = FRAMES_PER_CHUNK.min(mel.n_frames);
+        let enc = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
+            .expect("encode window 0");
+        let mut st = DecoderState::new(&m.decoder, &enc).expect("decoder state");
+
+        // (a) The real production function returns the detected code.
+        let detected = detect_language_from_enc(&m, &mut st, &noop)
+            .expect("detect")
+            .expect("some language");
+        assert_eq!(
+            detected, "en",
+            "detect_language_from_enc must match the whisper-cli oracle (en)"
+        );
+
+        // (b) False-pass guard: a bug that always returns the default "en" (e.g.
+        // all-NEG_INFINITY logits → uniform 1/99 softmax) would pass (a). Recompute
+        // the full language distribution and require "en" to be the DOMINANT
+        // outcome (~0.96 per the oracle), which no degenerate path can produce.
+        // detect_language_from_enc reset `st`, so this re-forward reproduces its logits.
+        let logits = decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], &noop)
+            .expect("forward sot");
+        let mut lang_logits: Vec<(&str, f32)> = Vec::new();
+        for &(code, lang_id, _) in LANGUAGES {
+            if lang_id >= m.tokenizer.num_languages() {
+                continue;
+            }
+            let tok = m.tokenizer.sot + 1 + lang_id;
+            if let Ok(idx) = usize::try_from(tok)
+                && let Some(&l) = logits.get(idx)
+            {
+                lang_logits.push((code, l));
+            }
+        }
+        let max_l = lang_logits
+            .iter()
+            .map(|(_, l)| *l)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f32 = lang_logits.iter().map(|(_, l)| (l - max_l).exp()).sum();
+        let mut ranked: Vec<(&str, f32)> = lang_logits
+            .iter()
+            .map(|(c, l)| (*c, (l - max_l).exp() / sum_exp))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("finite probs"));
+        eprintln!(
+            "language detect top-3: {:?}",
+            &ranked[..3.min(ranked.len())]
+        );
+        assert_eq!(ranked[0].0, "en", "top detected language must be en");
+        assert!(
+            ranked[0].1 > 0.9,
+            "p(en) must be dominant (~0.96 oracle), got {:.4}",
+            ranked[0].1
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_large_v3_turbo_no_ts_matches_oracle() {
+        // Faithfulness has a MODE axis (ts / no_ts / word-ts); the flagship was
+        // only proven in TS mode. no_ts uses a different SOT (`sot, <|en|>,
+        // <|transcribe|>, <|notimestamps|>`) and suppresses ALL timestamp logits —
+        // historically the buggiest mode (tail-truncation, single-ts fixes). Diff
+        // it against the oracle. whisper-cli (`-l auto -nt`): "And so, my fellow
+        // Americans, ask not what your country can do for you, ask what you can do
+        // for your country." Requires ggml-large-v3-turbo.bin + jfk.wav.
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_e2e_turbo_no_ts: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_turbo_no_ts: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build turbo engine");
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: false, // no_ts mode
+            n_threads: 4,
+            max_text_ctx: None,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on turbo (no_ts)");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("turbo no_ts PRODUCED: {joined}");
+        let oracle = "And so, my fellow Americans, ask not what your country can \
+                      do for you, ask what you can do for your country.";
+        assert_eq!(
+            joined, oracle,
+            "turbo no_ts must byte-match the whisper-cli oracle"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_distil_large_v3_transcribes() {
+        // distil-whisper is a popular FAST variant: large-v3's 32-layer encoder +
+        // a DISTILLED 2-layer decoder (n_text_layer=2, vs large-v3's 32 / turbo's
+        // 4). The engine reads n_text_layer from the header, so the 2-layer decoder
+        // must build and decode correctly. This is the only coverage of a distilled
+        // (shallow-decoder) model. Requires ggml-distil-large-v3.bin.
+        let Some(path) = super::super::find_model_file("distil-large-v3") else {
+            eprintln!("SKIP gated_e2e_distil: ggml-distil-large-v3.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_distil: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load distil-large-v3");
+        assert_eq!(model.hparams.n_text_layer, 2, "distil has a 2-layer decoder");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from distil");
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on distil");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("distil PRODUCED: [{:?}] {joined}", out.language);
+        assert!(!out.segments.is_empty(), "distil produced no segments");
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans") && low.contains("country"),
+            "distil transcript missing salient jfk content: {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_large_v3_turbo_autodetect_transcribes() {
+        // The full multilingual pipeline end to end on the FLAGSHIP: encode →
+        // auto-detect language → build the multilingual SOT (sot, <|en|>,
+        // <|transcribe|>) → decode. Every other e2e test uses English-only tiny.en
+        // whose SOT is bare `[sot]` — this is the only coverage of turbo's 32-layer
+        // encoder + 51866-token multilingual decode + the language-token SOT path.
+        // Oracle (whisper-cli, f16 turbo, -l auto): "And so, my fellow Americans,
+        // ask not what your country can do for you, ask what you can do for your
+        // country." Requires the multilingual ggml-large-v3-turbo.bin + jfk.wav.
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_e2e_turbo_autodetect: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_turbo_autodetect: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build turbo engine");
+        // language: None → exercises the auto-detect path in transcribe_samples.
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            max_text_ctx: None,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on turbo");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("turbo autodetect PRODUCED: [{:?}] {joined}", out.language);
+        // Auto-detection ran and picked English (matches the whisper-cli oracle).
+        assert_eq!(
+            out.language.as_deref(),
+            Some("en"),
+            "turbo should auto-detect English"
+        );
+        // The multilingual decode produced the salient jfk content.
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans"),
+            "turbo transcript missing 'fellow americans': {joined}"
+        );
+        assert!(
+            low.contains("country"),
+            "turbo transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_q5_k_large_v3_turbo_transcribes() {
+        // The quantized FLAGSHIP end to end: a q5_k large-v3-turbo (k-quant, 233
+        // Q5_K tensors dequantized to f32 on load) must not just build but DECODE
+        // correctly. The load-only test proves dequant+build; this proves the full
+        // dequant → 32-layer encode → multilingual decode path produces a correct
+        // transcript. Requires ggml-large-v3-turbo-q5_k.bin.
+        let Some(path) = super::super::find_model_file("large-v3-turbo-q5_k") else {
+            eprintln!("SKIP gated_e2e_q5_k_turbo: ggml-large-v3-turbo-q5_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_q5_k_turbo: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q5_k turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q5_k turbo");
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on q5_k turbo");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q5_k turbo PRODUCED: [{:?}] {joined}", out.language);
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans") && low.contains("country"),
+            "q5_k turbo transcript missing salient jfk content: {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_q5_k_large_v3_turbo_loads_and_builds_engine() {
+        // Flagship-model proof: the quant path is size-agnostic, so a q5_k
+        // large-v3-turbo (51866 vocab, 1280 audio-state, 32 enc / 4 dec layers,
+        // multilingual) must load, dequantize EVERY tensor, and build the engine
+        // exactly like tiny.en. All prior quant e2e used tiny.en; this closes the
+        // "does it work on the model people actually run" question. Building the
+        // engine forces tensor_f32/tensor_f16 over the whole q5_k tensor set.
+        // Requires ggml-large-v3-turbo-q5_k.bin (`whisper-quantize <turbo> <out> q5_k`).
+        let Some(path) = super::super::find_model_file("large-v3-turbo-q5_k") else {
+            eprintln!("SKIP gated_q5_k_turbo: ggml-large-v3-turbo-q5_k.bin not found");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q5_k turbo model");
+        assert_eq!(
+            model.hparams.ftype.rem_euclid(1000),
+            13,
+            "turbo q5_k base ftype must be 13"
+        );
+        // Turbo hparams ground truth (from the bd-frp7 epic).
+        assert_eq!(model.hparams.n_vocab, 51866, "turbo n_vocab");
+        assert_eq!(model.hparams.n_audio_state, 1280, "turbo n_audio_state");
+        assert_eq!(model.hparams.n_audio_layer, 32, "turbo n_audio_layer");
+        assert_eq!(model.hparams.n_text_layer, 4, "turbo n_text_layer");
+        // The 2D weight tensors are actually stored as Q5_K.
+        let n_q5k = model
+            .tensor_names()
+            .filter(|n| {
+                model
+                    .tensor(n)
+                    .is_some_and(|e| e.dtype == super::super::GgmlDType::Q5_K)
+            })
+            .count();
+        assert!(
+            n_q5k > 100,
+            "expected the bulk of turbo's tensors to be Q5_K, got {n_q5k}"
+        );
+        // Build the engine — dequantizes the full q5_k tensor set into the
+        // engine's own int8/f16 runtime. Succeeding here proves the flagship
+        // quant load path end to end (a bad shape/type/byte-length on ANY of
+        // turbo's tensors would surface as an Err right here).
+        let _loaded = LoadedModel::from_ggml(model).expect("build engine from q5_k turbo");
+        eprintln!("q5_k turbo: loaded + built engine, {n_q5k} Q5_K tensors");
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q2_k_transcribes() {
+        // Engine runs a whisper.cpp q2_k-quantized model end-to-end. Q2_K is the
+        // coarsest quant native decodes (2-bit); dequantized to f32 on load.
+        // Requires ggml-tiny.en-q2_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q2_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q2_k: ggml-tiny.en-q2_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q2_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q2_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q2_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q2_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q2_k PRODUCED: {joined}");
+        // The q2_k load→dequant→build→run path completes without error (proven by
+        // reaching here). 2-bit tiny.en is so coarse it collapses to an EMPTY
+        // transcript — whisper.cpp's own CLI can't even load these k-quant tiny
+        // models, and the per-element dequant is byte-verified against an
+        // independent reference. So accept either the correct jfk content (a
+        // larger q2_k model would produce it) or an empty collapse; reject only
+        // garbage (non-empty AND wrong).
+        let low = joined.to_lowercase();
+        assert!(
+            low.is_empty() || low.contains("country"),
+            "q2_k should collapse to empty or contain jfk content, got: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q3_k_transcribes() {
+        // Engine runs a whisper.cpp q3_k-quantized model end-to-end. Q3_K is the
+        // coarsest k-quant supported (3-bit, no per-block min); dequantized to f32
+        // on load. Requires ggml-tiny.en-q3_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q3_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q3_k: ggml-tiny.en-q3_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q3_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q3_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q3_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q3_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q3_k PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q3_k produced no segments");
+        // 3-bit is the coarsest supported quant; assert the engine runs and
+        // produces the salient jfk content ("country" is the most robust token).
+        assert!(
+            joined.to_lowercase().contains("country"),
+            "q3_k transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q5_k_transcribes() {
+        // Engine runs a whisper.cpp q5_k-quantized model end-to-end. Q5_K is a
+        // 5-bit k-quant (256-value super-block, 6-bit scale+min + a high-bit
+        // plane); dequantized to f32 on load. Requires ggml-tiny.en-q5_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q5_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q5_k: ggml-tiny.en-q5_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q5_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q5_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q5_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q5_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q5_k PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q5_k produced no segments");
+        // 5-bit k-quant is high-precision; assert the salient jfk content.
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans"),
+            "q5_k transcript missing 'fellow americans': {joined}"
+        );
+        assert!(
+            low.contains("country"),
+            "q5_k transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
+    fn gated_e2e_jfk_tiny_en_q4_k_transcribes() {
+        // Engine runs a whisper.cpp q4_k-quantized model end-to-end. Q4_K is a
+        // 4-bit k-quant (256-value super-block, per-sub-block 6-bit scale+min);
+        // its tensors dequantize to f32 on load and route through the f32 path.
+        // Requires ggml-tiny.en-q4_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q4_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q4_k: ggml-tiny.en-q4_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q4_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q4_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q4_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q4_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q4_k PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q4_k produced no segments");
+        // 4-bit is coarse; assert the salient jfk content ("country" is robust;
+        // the fuller phrase can drift at 4-bit precision).
+        assert!(
+            joined.to_lowercase().contains("country"),
+            "q4_k transcript missing 'country': {joined}"
+        );
     }
 
     #[test]
@@ -2718,6 +4869,7 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
+            ..DecodeParams::default()
         };
         let out = transcribe_samples(&model, &samples, &params, &noop).unwrap();
 
@@ -2803,9 +4955,223 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
+            ..DecodeParams::default()
         };
+        // bd-0ivd MXCSR diagnostics: matrixmultiply's micro-kernel sets the x86
+        // FTZ/DAZ flush bits and does not restore them (documented + wrapped in
+        // ft-kernel-cpu after the frankentorch-ft-api-fullsuite-flake). If the
+        // shared rayon pool carries MIXED flush state across workers, identical
+        // decodes can land on differently-flushed threads and drift in the
+        // denormal tails (softmax underflow) — the exact transient shape this
+        // flake shows. Snapshot every pool worker's MXCSR around each run; a
+        // non-0x1f80 value (FTZ = 0x8000, DAZ = 0x40) is the smoking gun.
+        // Read-only register read, x86-gated — no memory access.
+        #[cfg(target_arch = "x86_64")]
+        #[allow(unsafe_code)]
+        fn mxcsr_now() -> u32 {
+            // SAFETY: `_mm_getcsr` reads the thread's MXCSR register; it
+            // touches no memory and has no side effects.
+            unsafe { core::arch::x86_64::_mm_getcsr() }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        fn mxcsr_now() -> u32 {
+            0x1f80
+        }
+        let pool_mxcsr = || -> Vec<u32> {
+            let mut v: Vec<u32> = rayon::broadcast(|_| mxcsr_now());
+            v.push(mxcsr_now()); // the calling (test) thread, last
+            v
+        };
+
+        let mx_a = pool_mxcsr();
         let a = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+        let mx_b = pool_mxcsr();
         let b = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+        if a.word_timings != b.word_timings {
+            // bd-0ivd self-diagnosis: this flakes ONLY inside a full parallel
+            // suite run (isolated + synthetic-load repro attempts all bit-stable,
+            // NEGATIVE_EVIDENCE 2026-07-22). Turn the failure into evidence: a
+            // tie-break run says which side was the outlier, and the max timing
+            // delta bounds the perturbation.
+            let c = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+            let max_delta = |x: &DecodeOutput, y: &DecodeOutput| -> f64 {
+                let (Some(xw), Some(yw)) = (&x.word_timings, &y.word_timings) else {
+                    return f64::NAN;
+                };
+                xw.iter()
+                    .flatten()
+                    .zip(yw.iter().flatten())
+                    .map(|(p, q)| {
+                        (p.start_sec - q.start_sec)
+                            .abs()
+                            .max((p.end_sec - q.end_sec).abs())
+                    })
+                    .fold(0.0f64, f64::max)
+            };
+            let mx_c = pool_mxcsr();
+            let fmt_mx = |v: &[u32]| -> String {
+                // Compact: list only non-default entries as idx:hex, else "all-1f80".
+                let odd: Vec<String> = v
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &m)| m != 0x1f80)
+                    .map(|(i, &m)| format!("{i}:{m:#06x}"))
+                    .collect();
+                if odd.is_empty() {
+                    format!("all-1f80({})", v.len())
+                } else {
+                    odd.join(",")
+                }
+            };
+            eprintln!(
+                "bd-0ivd DIVERGENCE: a==c {} | b==c {} | max|Δt| a-vs-b {:.4}s | \
+                 pool MXCSR before-a [{}] before-b [{}] after-c [{}] \
+                 (FTZ=0x8000 DAZ=0x40; non-1f80 = flush-state leak on that worker)",
+                a.word_timings == c.word_timings,
+                b.word_timings == c.word_timings,
+                max_delta(&a, &b),
+                fmt_mx(&mx_a),
+                fmt_mx(&mx_b),
+                fmt_mx(&mx_c),
+            );
+        }
         assert_eq!(a.word_timings, b.word_timings);
+    }
+
+    /// bd-0ivd bisection tool, NOT a CI test: pins the word-timestamp
+    /// nondeterminism to a stage (mel / encoder / decode+record+DTW) under
+    /// self-generated rayon-pool contention. Run under the canonical reproducer
+    /// conditions: `taskset -c 0-3 <test-bin> --ignored --exact
+    /// native_engine::decode::tests::bd_0ivd_stage_determinism_probe`.
+    /// The sibling threads mimic the full suite's in-process pool pressure
+    /// (cross-process load measured insufficient; see NEGATIVE_EVIDENCE
+    /// 2026-07-22). An assert failure NAMES the first divergent stage.
+    #[test]
+    #[ignore = "bd-0ivd diagnosis tool — run manually under taskset oversubscription"]
+    fn bd_0ivd_stage_determinism_probe() {
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP bd_0ivd_stage_determinism_probe: tiny.en model or jfk.wav missing");
+            return;
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        let mel_threads = super::super::host_parallelism().min(16);
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            max_text_ctx: None,
+            word_timestamps: true,
+            model_hint: Some("tiny.en".to_owned()),
+            ..DecodeParams::default()
+        };
+        // Sibling load = REAL engine work sharing the global rayon pool,
+        // allocator, and kernels — generic par_iter busywork measured
+        // insufficient (5/5 bit-stable, 2026-07-22), matching the finding that
+        // only the full suite's heavy sibling mix triggers the flake.
+        let sibling_mel = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
+        let model_path = super::super::find_model_file("tiny.en");
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let stopr = &stop;
+                let modelr = &model;
+                let melr = &sibling_mel;
+                scope.spawn(move || {
+                    while !stopr.load(Ordering::Relaxed) {
+                        let frames = FRAMES_PER_CHUNK.min(melr.n_frames);
+                        let _ = encoder::forward_from_full_mel_window(
+                            &modelr.encoder,
+                            melr,
+                            0,
+                            frames,
+                            4,
+                            &noop,
+                        );
+                    }
+                });
+            }
+            // Full-suite ingredient the encoder siblings don't cover: repeated
+            // MODEL LOADS (GgmlModel parse + from_ggml weight quantization on a
+            // SCOPED worker pool + ~hundreds of MB of transient allocations) —
+            // the allocator/page churn every real suite run has.
+            if let Some(path) = model_path.as_deref() {
+                let stopr = &stop;
+                scope.spawn(move || {
+                    while !stopr.load(Ordering::Relaxed) {
+                        if let Ok(g) = GgmlModel::load(path) {
+                            let _ = LoadedModel::from_ggml(g);
+                        }
+                    }
+                });
+                // The last unmimicked suite workload: a CONCURRENT full
+                // transcribe with word timestamps — the real suite runs the
+                // other gated e2e transcribes (and their DTW-recording batched
+                // forwards) alongside this test. Own model instance, exactly
+                // like sibling tests' load_tiny_en().
+                let stopr2 = &stop;
+                let samplesr = &samples;
+                scope.spawn(move || {
+                    let Ok(g) = GgmlModel::load(path) else { return };
+                    let Ok(m2) = LoadedModel::from_ggml(g) else {
+                        return;
+                    };
+                    let p2 = DecodeParams {
+                        language: None,
+                        translate: false,
+                        timestamps: true,
+                        n_threads: 4,
+                        max_text_ctx: None,
+                        word_timestamps: true,
+                        model_hint: Some("tiny.en".to_owned()),
+                        ..DecodeParams::default()
+                    };
+                    while !stopr2.load(Ordering::Relaxed) {
+                        let _ = transcribe_samples(&m2, samplesr, &p2, &noop);
+                    }
+                });
+            }
+            for it in 0..3 {
+                let mel_a = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
+                let mel_b = mel::log_mel(&samples, &model.filters, mel_threads).unwrap();
+                assert_eq!(
+                    mel_a.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    mel_b.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "STAGE=mel diverged (iteration {it})"
+                );
+                let frames = FRAMES_PER_CHUNK.min(mel_a.n_frames);
+                let enc_a = encoder::forward_from_full_mel_window(
+                    &model.encoder,
+                    &mel_a,
+                    0,
+                    frames,
+                    4,
+                    &noop,
+                )
+                .unwrap();
+                let enc_b = encoder::forward_from_full_mel_window(
+                    &model.encoder,
+                    &mel_a,
+                    0,
+                    frames,
+                    4,
+                    &noop,
+                )
+                .unwrap();
+                assert_eq!(
+                    enc_a.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    enc_b.data.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    "STAGE=encoder diverged (iteration {it})"
+                );
+                let a = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+                let b = transcribe_samples(&model, &samples, &params, &noop).unwrap();
+                assert_eq!(
+                    a.word_timings, b.word_timings,
+                    "STAGE=decode+record+dtw diverged (mel+encoder were bit-stable; iteration {it})"
+                );
+                eprintln!("probe iteration {it}: all stages bit-stable");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
     }
 }

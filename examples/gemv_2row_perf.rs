@@ -18,8 +18,8 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20000);
     let (out, inp) = match shape.as_str() {
-        "attn" => (384usize, 384usize),   // Q/K/V/out proj  (2-row path, L2-resident)
-        "mlp" => (1536usize, 384usize),   // MLP up-proj     (2-row path)
+        "attn" => (384usize, 384usize), // Q/K/V/out proj  (2-row path, L2-resident)
+        "mlp" => (1536usize, 384usize), // MLP up-proj     (2-row path)
         "logits" => (51864usize, 384usize), // tied output   (single-row path, mem-bound)
         other => panic!("unknown shape {other}"),
     };

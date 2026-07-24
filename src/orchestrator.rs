@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
@@ -35,7 +36,9 @@ pub enum PipelineStage {
     Normalize,
     /// Voice activity detection pre-filtering (bd-qla.1).
     Vad,
-    /// Source separation / vocal isolation (bd-qla.2, Demucs-inspired placeholder).
+    /// Source separation / vocal isolation (bd-qla.2): energy-based vocal-confidence
+    /// heuristic (RMS + active-speech-coverage analysis, not a neural separator;
+    /// bd-mmx3 tracks a real mask-model replacement).
     Separate,
     /// Execute the transcription backend (whisper-cpp, insanely-fast-whisper, etc.).
     Backend,
@@ -45,7 +48,9 @@ pub enum PipelineStage {
     Align,
     /// Punctuation restoration (bd-qla.4).
     Punctuate,
-    /// Speaker diarization (bd-qla.5, TitaNet-inspired placeholder).
+    /// Speaker diarization (bd-qla.5): heuristic clustering of segments by 6-D
+    /// temporal/lexical features (position, pacing, verbosity — NOT acoustic speaker
+    /// embeddings; bd-ohex tracks a real neural ECAPA-TDNN diarizer).
     Diarize,
     /// Persist the run report to frankensqlite.
     Persist,
@@ -65,6 +70,36 @@ impl PipelineStage {
             Self::Punctuate => "punctuate",
             Self::Diarize => "diarize",
             Self::Persist => "persist",
+        }
+    }
+
+    const fn mask_bit(self) -> u16 {
+        match self {
+            Self::Ingest => 1 << 0,
+            Self::Normalize => 1 << 1,
+            Self::Vad => 1 << 2,
+            Self::Separate => 1 << 3,
+            Self::Backend => 1 << 4,
+            Self::Accelerate => 1 << 5,
+            Self::Align => 1 << 6,
+            Self::Punctuate => 1 << 7,
+            Self::Diarize => 1 << 8,
+            Self::Persist => 1 << 9,
+        }
+    }
+
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::Ingest => 0,
+            Self::Normalize => 1,
+            Self::Vad => 2,
+            Self::Separate => 3,
+            Self::Backend => 4,
+            Self::Accelerate => 5,
+            Self::Align => 6,
+            Self::Punctuate => 7,
+            Self::Diarize => 8,
+            Self::Persist => 9,
         }
     }
 }
@@ -99,12 +134,16 @@ const DEFAULT_STAGES: [PipelineStage; 10] = [
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     stages: Vec<PipelineStage>,
+    stage_mask: u16,
 }
 
 impl PipelineConfig {
     /// Create a config with the given stages executed in order.
     pub fn new(stages: Vec<PipelineStage>) -> Self {
-        Self { stages }
+        let stage_mask = stages
+            .iter()
+            .fold(0u16, |mask, stage| mask | stage.mask_bit());
+        Self { stages, stage_mask }
     }
 
     /// The ordered list of stages that will be executed.
@@ -114,7 +153,7 @@ impl PipelineConfig {
 
     /// Returns `true` if the given stage is present in this config.
     pub fn has_stage(&self, stage: PipelineStage) -> bool {
-        self.stages.contains(&stage)
+        self.stage_mask & stage.mask_bit() != 0
     }
 
     /// Validate the configuration for structural soundness.
@@ -124,10 +163,14 @@ impl PipelineConfig {
     /// - `Backend` requires `Normalize` before it (which itself requires `Ingest`).
     /// - No duplicate stages.
     pub fn validate(&self) -> FwResult<()> {
-        // Check for duplicates.
-        let mut seen = std::collections::HashSet::new();
-        for stage in &self.stages {
-            if !seen.insert(stage) {
+        let mut positions = [None; DEFAULT_STAGES.len()];
+        for (idx, &stage) in self.stages.iter().enumerate() {
+            let Some(slot) = positions.get_mut(stage.ordinal()) else {
+                return Err(FwError::InvalidRequest(format!(
+                    "unknown pipeline stage: {stage}"
+                )));
+            };
+            if slot.replace(idx).is_some() {
                 return Err(FwError::InvalidRequest(format!(
                     "duplicate pipeline stage: {stage}"
                 )));
@@ -135,7 +178,7 @@ impl PipelineConfig {
         }
 
         // Check ordering constraints.
-        let pos = |s: PipelineStage| self.stages.iter().position(|x| *x == s);
+        let pos = |s: PipelineStage| positions.get(s.ordinal()).copied().flatten();
 
         if let Some(norm_pos) = pos(PipelineStage::Normalize) {
             match pos(PipelineStage::Ingest) {
@@ -235,9 +278,7 @@ impl PipelineConfig {
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self {
-            stages: DEFAULT_STAGES.to_vec(),
-        }
+        Self::new(DEFAULT_STAGES.to_vec())
     }
 }
 
@@ -1304,6 +1345,8 @@ struct PipelineIntermediate {
     normalized_input_sha256: Option<String>,
     backend_output_sha256: Option<String>,
     backend_runtime: Option<backend::BackendRuntimeMetadata>,
+    /// Native waveform analysis produced by VAD for later audio stages.
+    native_audio_analysis: Option<Arc<backend::native_audio::NativeAudioAnalysis>>,
     /// VAD result: regions of voice activity as (start_sec, end_sec) pairs.
     vad_regions: Option<Vec<(f64, f64)>>,
     /// Whether VAD determined the audio is silence-only (skip transcription).
@@ -1323,6 +1366,7 @@ impl PipelineIntermediate {
             normalized_input_sha256: None,
             backend_output_sha256: None,
             backend_runtime: None,
+            native_audio_analysis: None,
             vad_regions: None,
             vad_silence_only: false,
             vocal_isolated: false,
@@ -1621,7 +1665,11 @@ async fn run_pipeline_body(
         normalized_wav_path: normalized_wav_str,
         request: request.clone(),
         result,
-        events: log.events.clone(),
+        events: if has_persist {
+            Vec::new()
+        } else {
+            log.events.clone()
+        },
         warnings: std::mem::take(&mut inter.warnings),
         evidence: pcx.evidence().to_vec(),
         replay: crate::model::ReplayEnvelope {
@@ -1866,9 +1914,10 @@ async fn execute_backend(
         // Capture the adaptive prediction BEFORE deciding whether to use it.
         // This allows calibration tracking even when we fall back to static order.
         let top_backend = selection.recommended_order[0];
-        let predicted_success = backend::router_state_snapshot()
-            .map(|state| state.metrics_for(top_backend).success_rate)
-            .unwrap_or(0.5);
+        // Read just this backend's success_rate under the router lock instead of
+        // cloning the entire RouterState (byte-identical; see
+        // `router_success_rate_for`).
+        let predicted_success = backend::router_success_rate_for(top_backend).unwrap_or(0.5);
         let prediction = (top_backend, predicted_success);
 
         if selection.calibration_score < min_calibration {
@@ -2210,9 +2259,11 @@ async fn execute_backend_speculative(
             // Always carry partial events + stats + merged segments out, so
             // the outer handler can forward speculation events to the NDJSON
             // log regardless of whether the pipeline succeeded or failed.
-            let emitted = pipeline.events().to_vec();
             let stats = pipeline.stats();
             let merged = pipeline.merged_transcript();
+            // Move the event vector out last (consuming the terminal pipeline)
+            // instead of cloning it via `events().to_vec()`.
+            let emitted = pipeline.into_events();
             Ok((inner_result, emitted, stats, merged))
         });
 
@@ -2841,6 +2892,17 @@ fn vad_energy_detect(
     config: &VadConfig,
     token: &CancellationToken,
 ) -> FwResult<VadReport> {
+    vad_energy_detect_with_analysis(normalized_wav, config, token).map(|(report, _)| report)
+}
+
+fn vad_energy_detect_with_analysis(
+    normalized_wav: &Path,
+    config: &VadConfig,
+    token: &CancellationToken,
+) -> FwResult<(
+    VadReport,
+    Option<backend::native_audio::NativeAudioAnalysis>,
+)> {
     token.checkpoint()?;
 
     let analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
@@ -2851,7 +2913,7 @@ fn vad_energy_detect(
             fallback_report.notes.push(format!(
                 "native_audio parse failed; deterministic legacy fallback activated: {error}"
             ));
-            return Ok(fallback_report);
+            return Ok((fallback_report, None));
         }
     };
 
@@ -2921,17 +2983,20 @@ fn vad_energy_detect(
         })
         .collect();
 
-    Ok(VadReport {
-        frames_total,
-        frames_voiced,
-        voice_ratio,
-        silence_only,
-        regions,
-        detector: "native_audio_waveform",
-        fallback_triggered: false,
-        activity_threshold: config.rms_threshold,
-        notes: Vec::new(),
-    })
+    Ok((
+        VadReport {
+            frames_total,
+            frames_voiced,
+            voice_ratio,
+            silence_only,
+            regions,
+            detector: "native_audio_waveform",
+            fallback_triggered: false,
+            activity_threshold: config.rms_threshold,
+            notes: Vec::new(),
+        },
+        Some(analysis),
+    ))
 }
 
 fn merge_regions_by_gap(regions: &mut Vec<VadRegionMs>, max_gap_ms: u64) {
@@ -3129,8 +3194,8 @@ async fn execute_vad(
     let vad_token = pcx.stage_token(vad_budget_ms); // ubs:ignore — cancellation token is not a secret
     let config_for_run = vad_config.clone();
 
-    let report = match run_stage_with_budget("vad", vad_budget_ms, move || {
-        vad_energy_detect(&vad_wav, &config_for_run, &vad_token)
+    let (report, analysis) = match run_stage_with_budget("vad", vad_budget_ms, move || {
+        vad_energy_detect_with_analysis(&vad_wav, &config_for_run, &vad_token)
     }) {
         Ok(report) => report,
         Err(error) => {
@@ -3145,6 +3210,7 @@ async fn execute_vad(
         }
     };
 
+    inter.native_audio_analysis = analysis.map(Arc::new);
     let vad_code = if report.silence_only {
         inter.vad_silence_only = true;
         // Provide an empty result for silence-only audio.
@@ -3225,23 +3291,37 @@ struct SeparateReport {
 /// fraction exceeds the minimum threshold, indicating the audio has
 /// sufficient vocal content for downstream transcription.
 fn source_separate(normalized_wav: &Path, token: &CancellationToken) -> FwResult<SeparateReport> {
+    source_separate_with_analysis(normalized_wav, None, token)
+}
+
+fn source_separate_with_analysis(
+    normalized_wav: &Path,
+    cached_analysis: Option<&backend::native_audio::NativeAudioAnalysis>,
+    token: &CancellationToken,
+) -> FwResult<SeparateReport> {
     token.checkpoint()?;
 
     // Attempt native audio analysis.  If the file cannot be parsed
     // (e.g. not a valid PCM16 mono WAV), fall back gracefully.
-    let analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
-        Ok(a) => a,
-        Err(reason) => {
-            return Ok(SeparateReport {
-                vocal_isolated: true,
-                speech_coverage: 0.0,
-                avg_rms: 0.0,
-                active_region_count: 0,
-                notes: vec![format!(
-                    "analysis unavailable ({reason}); assuming vocal content present"
-                )],
-            });
-        }
+    let recomputed_analysis;
+    let analysis = if let Some(analysis) = cached_analysis {
+        analysis
+    } else {
+        recomputed_analysis = match backend::native_audio::analyze_wav(normalized_wav, None) {
+            Ok(analysis) => analysis,
+            Err(reason) => {
+                return Ok(SeparateReport {
+                    vocal_isolated: true,
+                    speech_coverage: 0.0,
+                    avg_rms: 0.0,
+                    active_region_count: 0,
+                    notes: vec![format!(
+                        "analysis unavailable ({reason}); assuming vocal content present"
+                    )],
+                });
+            }
+        };
+        &recomputed_analysis
     };
 
     token.checkpoint()?;
@@ -3304,11 +3384,12 @@ async fn execute_separate(
     );
 
     let sep_wav = normalized_wav.clone();
+    let cached_analysis = inter.native_audio_analysis.clone();
     let sep_budget_ms = stage_budgets.separate_ms;
     let sep_token = pcx.stage_token(sep_budget_ms); // ubs:ignore — cancellation token is not a secret
 
     let report = match run_stage_with_budget("separate", sep_budget_ms, move || {
-        source_separate(&sep_wav, &sep_token)
+        source_separate_with_analysis(&sep_wav, cached_analysis.as_deref(), &sep_token)
     }) {
         Ok(report) => report,
         Err(error) => {
@@ -3611,7 +3692,7 @@ async fn execute_punctuate(
 }
 
 // ---------------------------------------------------------------------------
-// Speaker diarization (bd-qla.5, TitaNet-inspired placeholder)
+// Speaker diarization (bd-qla.5): heuristic 6-D temporal/lexical segment clustering
 // ---------------------------------------------------------------------------
 
 /// Report produced by the speaker diarization stage.
@@ -3635,7 +3716,7 @@ pub(crate) struct DiarizeReport {
     pub(crate) notes: Vec<String>,
 }
 
-/// Acoustic-heuristic feature vector for a segment.
+/// Temporal/lexical-heuristic feature vector for a segment.
 ///
 /// In a real TitaNet-inspired system, this would be a high-dimensional
 /// embedding from a neural speaker encoder.  Here we use an expanded set
@@ -3721,22 +3802,40 @@ fn silhouette_score(
     }
 
     let n = embeddings.len();
-    let mut sum = 0.0_f64;
 
+    // The pairwise distance matrix is symmetric — `euclidean_distance(i,j)` ==
+    // `euclidean_distance(j,i)` bit-for-bit, because `(a-b)*(a-b)` == `(b-a)*(b-a)`
+    // in IEEE-754 (negation flips only the sign, squaring clears it) and the sum is
+    // over the same fixed order. So compute each unordered pair's distance ONCE
+    // (n(n-1)/2 sqrt instead of n(n-1)) and fold it into per-point per-cluster
+    // running sums for BOTH endpoints. Each `cluster_sum[i][c]` still accumulates
+    // `d(i,k)` over `k` in strictly increasing index order (the `k<i` terms arrive
+    // from earlier outer iterations, the `k>i` terms from `i`'s own), so a(i)/b(i)
+    // — and thus every s(i) and the mean — are byte-identical to the naive
+    // double-scan below-superseded form. ~2.9x faster (see benches/silhouette_perf).
+    let mut cluster_sum = vec![0.0_f64; n * num_clusters];
+    let mut cluster_count = vec![0u64; n * num_clusters];
     for i in 0..n {
         let ci = assignments[i];
+        for j in (i + 1)..n {
+            let d = embeddings[i].euclidean_distance(&embeddings[j]);
+            let cj = assignments[j];
+            cluster_sum[i * num_clusters + cj] += d;
+            cluster_count[i * num_clusters + cj] += 1;
+            cluster_sum[j * num_clusters + ci] += d;
+            cluster_count[j * num_clusters + ci] += 1;
+        }
+    }
+
+    let mut sum = 0.0_f64;
+    for i in 0..n {
+        let ci = assignments[i];
+        let base = i * num_clusters;
 
         // a(i): mean distance to other points in same cluster.
-        let mut a_sum = 0.0_f64;
-        let mut a_count = 0u64;
-        for (j, emb_j) in embeddings.iter().enumerate() {
-            if j != i && assignments[j] == ci {
-                a_sum += embeddings[i].euclidean_distance(emb_j);
-                a_count += 1;
-            }
-        }
+        let a_count = cluster_count[base + ci];
         let a_i = if a_count > 0 {
-            a_sum / a_count as f64
+            cluster_sum[base + ci] / a_count as f64
         } else {
             0.0
         };
@@ -3747,16 +3846,9 @@ fn silhouette_score(
             if cj == ci {
                 continue;
             }
-            let mut b_sum = 0.0_f64;
-            let mut b_count = 0u64;
-            for (j, emb_j) in embeddings.iter().enumerate() {
-                if assignments[j] == cj {
-                    b_sum += embeddings[i].euclidean_distance(emb_j);
-                    b_count += 1;
-                }
-            }
+            let b_count = cluster_count[base + cj];
             if b_count > 0 {
-                let mean_dist = b_sum / b_count as f64;
+                let mean_dist = cluster_sum[base + cj] / b_count as f64;
                 if mean_dist < b_i {
                     b_i = mean_dist;
                 }
@@ -3792,7 +3884,7 @@ fn resolve_speaker_target(constraints: Option<&crate::model::SpeakerConstraints>
     None
 }
 
-/// Assign speaker labels to segments using acoustic-heuristic feature
+/// Assign speaker labels to segments using temporal/lexical-heuristic feature
 /// clustering.
 ///
 /// Algorithm:
@@ -3815,8 +3907,9 @@ pub(crate) fn diarize_segments(
     token: &CancellationToken,
 ) -> FwResult<DiarizeReport> {
     let total = segments.len();
-    let mut notes: Vec<String> =
-        vec!["heuristic: acoustic-feature clustering without neural speaker encoder".to_owned()];
+    let mut notes: Vec<String> = vec![
+        "heuristic: temporal/lexical-feature clustering without neural speaker encoder".to_owned(),
+    ];
 
     if segments.is_empty() {
         return Ok(DiarizeReport {
@@ -3835,26 +3928,34 @@ pub(crate) fn diarize_segments(
         .unwrap_or(1.0)
         .max(1e-6);
 
-    // Precompute normalization denominators across the segment set.
-    let max_seg_duration = segments
-        .iter()
-        .map(|s| {
-            let start = s.start_sec.unwrap_or(0.0);
-            let end = s.end_sec.unwrap_or(start);
-            (end - start).max(0.0)
-        })
-        .fold(0.0_f64, f64::max)
-        .max(1e-6);
-
-    let max_word_count = segments
-        .iter()
-        .map(|s| s.text.split_whitespace().count() as f64)
-        .fold(1.0_f64, f64::max);
-
-    let max_text_len = segments
-        .iter()
-        .map(|s| s.text.len() as f64)
-        .fold(1.0_f64, f64::max);
+    // Precompute normalization denominators AND per-segment word/char counts in a
+    // SINGLE pass, so the embedding map below can reuse the counts instead of
+    // re-splitting each segment's text. The original made four passes over the set
+    // and called `split_whitespace()` twice per segment (once for max_word_count,
+    // once in the map). Byte-identical: each max folds over the same values in the
+    // same order (same init), and the stored counts equal the re-split counts —
+    // ~2x faster (see benches/diarize_extract_perf).
+    let mut word_counts: Vec<usize> = Vec::with_capacity(total);
+    let mut char_counts: Vec<usize> = Vec::with_capacity(total);
+    let mut max_seg_duration = 0.0_f64;
+    let mut max_word_count = 1.0_f64;
+    let mut max_text_len = 1.0_f64;
+    for s in segments.iter() {
+        let start = s.start_sec.unwrap_or(0.0);
+        let end = s.end_sec.unwrap_or(start);
+        max_seg_duration = max_seg_duration.max((end - start).max(0.0));
+        let mut word_count = 0usize;
+        let mut total_chars = 0usize;
+        for word in s.text.split_whitespace() {
+            word_count += 1;
+            total_chars += word.len();
+        }
+        word_counts.push(word_count);
+        char_counts.push(total_chars);
+        max_word_count = max_word_count.max(word_count as f64);
+        max_text_len = max_text_len.max(s.text.len() as f64);
+    }
+    let max_seg_duration = max_seg_duration.max(1e-6);
 
     // Step 1: Compute embeddings with inter-segment gap analysis.
     let embeddings: Vec<SpeakerEmbedding> = segments
@@ -3877,12 +3978,8 @@ pub(crate) fn diarize_segments(
                 0.0
             };
 
-            let mut word_count = 0usize;
-            let mut total_chars = 0usize;
-            for word in seg.text.split_whitespace() {
-                word_count += 1;
-                total_chars += word.len();
-            }
+            let word_count = word_counts[i];
+            let total_chars = char_counts[i];
             let word_count_norm = word_count as f64 / max_word_count;
             let avg_word_len = if word_count == 0 {
                 0.0
@@ -3908,6 +4005,15 @@ pub(crate) fn diarize_segments(
     let similarity_threshold = 0.92;
     let mut cluster_members: Vec<Vec<SpeakerEmbedding>> = Vec::new();
     let mut centroids: Vec<SpeakerEmbedding> = Vec::new();
+    // Running per-cluster feature sums, so an assignment updates the centroid in
+    // O(1) (add + divide) instead of recomputing `centroid()` over every member
+    // (O(cluster_size) per assignment == O(n^2) for a dominant speaker). Each sum
+    // accumulates members in the same push order `centroid()` re-sums them, so the
+    // stored centroid — and thus every subsequent cosine decision and the whole
+    // assignment sequence — is BYTE-IDENTICAL to the recompute form (verified by
+    // benches/diarize_cluster_perf + the equivalence test). `cluster_members` is
+    // still maintained for the Step-2b constraint merge, which is left untouched.
+    let mut cluster_sums: Vec<[f64; 6]> = Vec::new();
     let mut assignments: Vec<usize> = Vec::with_capacity(total);
 
     for (idx, emb) in embeddings.iter().enumerate() {
@@ -3930,18 +4036,26 @@ pub(crate) fn diarize_segments(
             if let Some(cid) = best_cluster {
                 assignments.push(cid);
                 cluster_members[cid].push(emb.clone());
-                centroids[cid] = SpeakerEmbedding::centroid(&cluster_members[cid]);
+                for k in 0..6 {
+                    cluster_sums[cid][k] += emb.features[k];
+                }
+                let count = cluster_members[cid].len() as f64;
+                centroids[cid] = SpeakerEmbedding {
+                    features: std::array::from_fn(|k| cluster_sums[cid][k] / count),
+                };
             } else {
                 // Defensive fallback: should not happen unless centroids bookkeeping diverges.
                 let new_id = centroids.len();
                 centroids.push(emb.clone());
                 cluster_members.push(vec![emb.clone()]);
+                cluster_sums.push(emb.features);
                 assignments.push(new_id);
             }
         } else {
             let new_id = centroids.len();
             centroids.push(emb.clone());
             cluster_members.push(vec![emb.clone()]);
+            cluster_sums.push(emb.features);
             assignments.push(new_id);
         }
     }
@@ -4191,25 +4305,28 @@ impl EventLog {
             payload,
         };
 
-        self.events.push(event.clone());
-
         if let Some(tx) = &self.event_tx {
+            self.events.push(event.clone());
             let _ = tx.send(StreamedRunEvent {
                 run_id: self.run_id.clone(),
                 event,
             });
+        } else {
+            self.events.push(event);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
     use std::path::PathBuf;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
 
     use asupersync::runtime::RuntimeBuilder;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use crate::error::FwError;
@@ -4231,9 +4348,336 @@ mod tests {
         optional_stage_skip, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
         recommended_budget, resolve_speaker_target, run_pipeline, run_stage_with_budget,
         sanitize_process_pid, sha256_bytes_hex, sha256_file, sha256_json_value, silhouette_score,
-        source_separate, split_long_regions, stage_budget_ms, stage_failure_code,
-        stage_failure_message, stage_latency_profile, state_root, vad_energy_detect,
+        source_separate, source_separate_with_analysis, split_long_regions, stage_budget_ms,
+        stage_failure_code, stage_failure_message, stage_latency_profile, state_root,
+        vad_energy_detect, vad_energy_detect_with_analysis,
     };
+
+    #[test]
+    fn report_event_snapshot_elision_preserves_pipeline_tail_events() {
+        fn request(root: &std::path::Path, db_name: &str, persist: bool) -> TranscribeRequest {
+            TranscribeRequest {
+                input: InputSource::File {
+                    path: root.join("unused.wav"),
+                },
+                backend: BackendKind::Auto,
+                model: None,
+                language: None,
+                translate: false,
+                diarize: false,
+                persist,
+                db_path: root.join(db_name),
+                timeout_ms: None,
+                backend_params: BackendParams::default(),
+            }
+        }
+
+        fn codes(report: &RunReport) -> Vec<&str> {
+            report
+                .events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect()
+        }
+
+        fn assert_contiguous_events(events: &[RunEvent]) {
+            assert!(
+                events
+                    .iter()
+                    .enumerate()
+                    .all(|(index, event)| event.seq == index as u64 + 1),
+                "event sequence must remain contiguous"
+            );
+        }
+
+        let dir = tempdir().expect("tempdir should be available");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let persist_config = PipelineConfig::new(vec![PipelineStage::Persist]);
+
+        let persisted = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "persist.sqlite3", true),
+                dir.path(),
+                None,
+                &persist_config,
+            ))
+            .expect("persist-only pipeline should succeed");
+        assert_eq!(
+            codes(&persisted),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.start",
+                "persist.ok",
+            ]
+        );
+        assert_contiguous_events(&persisted.events);
+
+        let stored = RunStore::open(&dir.path().join("persist.sqlite3"))
+            .expect("store should open")
+            .load_run_details(&persisted.run_id)
+            .expect("stored report should load")
+            .expect("stored report should exist");
+        assert_eq!(
+            stored
+                .events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.start",
+            ]
+        );
+        assert_contiguous_events(&stored.events);
+
+        let skipped = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "skip.sqlite3", false),
+                dir.path(),
+                None,
+                &persist_config,
+            ))
+            .expect("disabled persistence should return a report");
+        assert_eq!(
+            codes(&skipped),
+            vec![
+                "orchestration.budgets",
+                "orchestration.latency_profile",
+                "persist.skip",
+            ]
+        );
+        assert_contiguous_events(&skipped.events);
+
+        let no_persist = runtime
+            .block_on(run_pipeline(
+                request(dir.path(), "absent.sqlite3", true),
+                dir.path(),
+                None,
+                &PipelineConfig::new(Vec::new()),
+            ))
+            .expect("empty pipeline should return a report");
+        assert_eq!(
+            codes(&no_persist),
+            vec!["orchestration.budgets", "orchestration.latency_profile"]
+        );
+        assert_contiguous_events(&no_persist.events);
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness gate"]
+    fn report_event_snapshot_elision_perf() {
+        use sha2::{Digest as _, Sha256};
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 21;
+        const CALIBRATION_ITERATIONS: usize = 128;
+        const TARGET_ARM_NS: u128 = 50_000_000;
+
+        struct ReportShell {
+            events: Vec<RunEvent>,
+        }
+
+        fn fixture_log() -> EventLog {
+            let trace_id = "0123456789abcdef0123456789abcdef";
+            let events = (0..20)
+                .map(|index| RunEvent {
+                    seq: index + 1,
+                    ts_rfc3339: format!("2026-07-14T00:00:{index:02}Z"),
+                    stage: format!("stage_{}", index % 6),
+                    code: format!("stage.{}.ok", index % 6),
+                    message: format!(
+                        "current-like pipeline event {index:02}: {}",
+                        "measured payload with quotes \"text\", Unicode λ and 🎧 ".repeat(2)
+                    ),
+                    payload: json!({
+                        "index": index,
+                        "trace_id": trace_id,
+                        "nested": {
+                            "label": format!("payload-{index:02}"),
+                            "values": [index, index + 1, index + 2],
+                            "detail": "structured event payload ".repeat(4),
+                        },
+                    }),
+                })
+                .collect();
+
+            EventLog {
+                run_id: "perf-run".to_owned(),
+                trace_id: trace_id.to_owned(),
+                seq: 20,
+                events,
+                event_tx: None,
+                stage_start: None,
+            }
+        }
+
+        fn restore_log(log: &mut EventLog) {
+            let removed = log.events.pop().expect("remove persist.start");
+            assert_eq!(removed.code, "persist.start");
+            log.seq -= 1;
+            log.clear_stage_start();
+        }
+
+        fn time_historical(log: &mut EventLog, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let mut report = ReportShell {
+                    events: log.events.clone(),
+                };
+                log.mark_stage_start();
+                log.push(
+                    "persist",
+                    "persist.start",
+                    "writing run report to frankensqlite",
+                    json!({"db_path": "current-like.sqlite3", "budget_ms": 20_000}),
+                );
+                report.events = log.events.clone();
+                restore_log(log);
+                drop(black_box(report));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn time_candidate(log: &mut EventLog, iterations: usize) -> u128 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let mut report = ReportShell { events: Vec::new() };
+                log.mark_stage_start();
+                log.push(
+                    "persist",
+                    "persist.start",
+                    "writing run report to frankensqlite",
+                    json!({"db_path": "current-like.sqlite3", "budget_ms": 20_000}),
+                );
+                report.events = log.events.clone();
+                restore_log(log);
+                drop(black_box(report));
+            }
+            started.elapsed().as_nanos()
+        }
+
+        fn percentile(values: &[f64], percentile: usize) -> f64 {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(sorted.len() - 1) * percentile / 100]
+        }
+
+        fn median_ns(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        fn coefficient_of_variation(values: &[u128]) -> f64 {
+            let mean = values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64;
+            let variance = values
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            variance.sqrt() / mean
+        }
+
+        let mut historical_log = fixture_log();
+        let mut candidate_log = fixture_log();
+        let fixture_bytes = serde_json::to_vec(&historical_log.events)
+            .expect("serialize current-like event fixture");
+        assert_eq!(
+            fixture_bytes,
+            serde_json::to_vec(&candidate_log.events).expect("serialize candidate fixture")
+        );
+
+        let executable = std::fs::read(std::env::current_exe().expect("test executable path"))
+            .expect("read test executable");
+        eprintln!(
+            "report_event_snapshot_elision binary_sha256={:x} events={} fixture_bytes={} fixture_sha256={:x}",
+            Sha256::digest(executable),
+            historical_log.events.len(),
+            fixture_bytes.len(),
+            Sha256::digest(&fixture_bytes)
+        );
+
+        let calibration = time_historical(&mut historical_log, CALIBRATION_ITERATIONS);
+        let iterations = ((TARGET_ARM_NS * CALIBRATION_ITERATIONS as u128) / calibration)
+            .clamp(512, 20_000) as usize;
+        eprintln!(
+            "report_event_snapshot_elision calibration_iterations={CALIBRATION_ITERATIONS} calibration_ns={calibration} iterations={iterations}"
+        );
+
+        for _ in 0..3 {
+            black_box(time_historical(&mut historical_log, iterations));
+            black_box(time_candidate(&mut candidate_log, iterations));
+        }
+
+        let mut null_ratios = Vec::with_capacity(SAMPLES);
+        let mut speedups = Vec::with_capacity(SAMPLES);
+        let mut historical_times = Vec::with_capacity(SAMPLES);
+        let mut candidate_times = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let null_first = time_historical(&mut historical_log, iterations);
+            let null_second = time_historical(&mut historical_log, iterations);
+            let (numerator, denominator) = if sample % 2 == 0 {
+                (null_first, null_second)
+            } else {
+                (null_second, null_first)
+            };
+            null_ratios.push(numerator as f64 / denominator as f64);
+
+            let (historical, candidate) = if sample % 2 == 0 {
+                (
+                    time_historical(&mut historical_log, iterations),
+                    time_candidate(&mut candidate_log, iterations),
+                )
+            } else {
+                let candidate = time_candidate(&mut candidate_log, iterations);
+                let historical = time_historical(&mut historical_log, iterations);
+                (historical, candidate)
+            };
+            historical_times.push(historical);
+            candidate_times.push(candidate);
+            speedups.push(historical as f64 / candidate as f64);
+        }
+
+        let null_p10 = percentile(&null_ratios, 10);
+        let null_median = percentile(&null_ratios, 50);
+        let null_p90 = percentile(&null_ratios, 90);
+        let speedup_p10 = percentile(&speedups, 10);
+        let speedup_median = percentile(&speedups, 50);
+        let speedup_p90 = percentile(&speedups, 90);
+        let wins = speedups.iter().filter(|ratio| **ratio > 1.0).count();
+        eprintln!(
+            "report_event_snapshot_elision samples={SAMPLES} iterations={iterations} null_p10={null_p10:.6} null_median={null_median:.6} null_p90={null_p90:.6} historical_arm_median_ns={} candidate_arm_median_ns={} candidate_cv={:.4}% speedup_p10={speedup_p10:.6} speedup_median={speedup_median:.6} speedup_p90={speedup_p90:.6} wins={wins}/{SAMPLES}",
+            median_ns(&historical_times),
+            median_ns(&candidate_times),
+            coefficient_of_variation(&candidate_times) * 100.0
+        );
+        eprintln!(
+            "report_event_snapshot_elision null_ratios={null_ratios:?} speedups={speedups:?} historical_times_ns={historical_times:?} candidate_times_ns={candidate_times:?}"
+        );
+
+        assert_eq!(historical_log.events.len(), 20);
+        assert_eq!(candidate_log.events.len(), 20);
+        assert!(
+            (0.95..=1.05).contains(&null_median),
+            "null median {null_median:.6} outside predeclared guard"
+        );
+        assert!(
+            speedup_p10 > null_p90.max(1.05),
+            "candidate p10 {speedup_p10:.6} did not clear max(null p90 {null_p90:.6}, 1.05)"
+        );
+        assert!(
+            wins >= 18,
+            "candidate won {wins}/{SAMPLES}; predeclared gate requires at least 18"
+        );
+    }
 
     #[test]
     fn event_log_streams_and_accumulates_with_monotonic_sequence() {
@@ -4259,6 +4703,12 @@ mod tests {
         assert_eq!(streamed[0].event.code, "ingest.start");
         assert_eq!(streamed[1].event.code, "ingest.ok");
         assert_eq!(streamed[2].event.code, "backend.ok");
+        for (retained, streamed) in log.events.iter().zip(&streamed) {
+            assert_eq!(
+                serde_json::to_vec(retained).expect("retained event should serialize"),
+                serde_json::to_vec(&streamed.event).expect("streamed event should serialize")
+            );
+        }
     }
 
     #[test]
@@ -8858,6 +9308,271 @@ mod tests {
         assert!(result.notes[0].contains("analysis unavailable"));
     }
 
+    fn assert_vad_reports_equal(actual: &VadReport, expected: &VadReport) {
+        assert_eq!(actual.frames_total, expected.frames_total);
+        assert_eq!(actual.frames_voiced, expected.frames_voiced);
+        assert_eq!(actual.voice_ratio.to_bits(), expected.voice_ratio.to_bits());
+        assert_eq!(actual.silence_only, expected.silence_only);
+        assert_eq!(
+            actual
+                .regions
+                .iter()
+                .map(|(start, end)| (start.to_bits(), end.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .regions
+                .iter()
+                .map(|(start, end)| (start.to_bits(), end.to_bits()))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(actual.detector, expected.detector);
+        assert_eq!(actual.fallback_triggered, expected.fallback_triggered);
+        assert_eq!(
+            actual.activity_threshold.to_bits(),
+            expected.activity_threshold.to_bits()
+        );
+        assert_eq!(actual.notes, expected.notes);
+    }
+
+    fn assert_separate_reports_equal(actual: &SeparateReport, expected: &SeparateReport) {
+        assert_eq!(actual.vocal_isolated, expected.vocal_isolated);
+        assert_eq!(
+            actual.speech_coverage.to_bits(),
+            expected.speech_coverage.to_bits()
+        );
+        assert_eq!(actual.avg_rms.to_bits(), expected.avg_rms.to_bits());
+        assert_eq!(actual.active_region_count, expected.active_region_count);
+        assert_eq!(actual.notes, expected.notes);
+    }
+
+    fn representative_vad_samples(sample_rate: u32, seconds: usize) -> Vec<i16> {
+        let sample_rate = sample_rate as usize;
+        (0..sample_rate * seconds)
+            .map(|index| {
+                if (index / (sample_rate / 2)) % 4 == 0 {
+                    0
+                } else {
+                    let phase = index as f64 * 330.0 * std::f64::consts::TAU / sample_rate as f64;
+                    (phase.sin() * 9_000.0) as i16
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cached_vad_analysis_preserves_vad_and_separation_reports() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cached-analysis.wav");
+        write_pcm16_mono_wav_for_vad(&path, 16_000, &representative_vad_samples(16_000, 4));
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let config = VadConfig::default();
+
+        let historical_vad = vad_energy_detect(&path, &config, &token).unwrap();
+        let (candidate_vad, analysis) =
+            vad_energy_detect_with_analysis(&path, &config, &token).unwrap();
+        assert_vad_reports_equal(&candidate_vad, &historical_vad);
+        let analysis = analysis.expect("valid WAV analysis should be reusable");
+
+        let historical_separation = source_separate(&path, &token).unwrap();
+        let cached_separation =
+            source_separate_with_analysis(&path, Some(&analysis), &token).unwrap();
+        assert_separate_reports_equal(&cached_separation, &historical_separation);
+    }
+
+    #[derive(Debug)]
+    struct SourceSeparationPerfStats {
+        median: f64,
+        p10: f64,
+        p90: f64,
+        wins: usize,
+    }
+
+    fn source_separation_perf_stats(ratios: &[f64]) -> SourceSeparationPerfStats {
+        let mut sorted = ratios.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let last = sorted.len() - 1;
+        SourceSeparationPerfStats {
+            median: sorted[sorted.len() / 2],
+            p10: sorted[last / 10],
+            p90: sorted[last * 9 / 10],
+            wins: ratios.iter().filter(|ratio| **ratio > 1.0).count(),
+        }
+    }
+
+    fn source_separation_ratios_text(ratios: &[f64]) -> String {
+        ratios
+            .iter()
+            .map(|ratio| format!("{ratio:.6}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn separate_report_signature(report: &SeparateReport) -> String {
+        use std::fmt::Write as _;
+
+        let mut signature = format!(
+            "{}|{:016x}|{:016x}|{}",
+            report.vocal_isolated,
+            report.speech_coverage.to_bits(),
+            report.avg_rms.to_bits(),
+            report.active_region_count,
+        );
+        for note in &report.notes {
+            write!(signature, "|{}:{note}", note.len()).expect("writing to a String cannot fail");
+        }
+        signature
+    }
+
+    fn measure_source_separation<const CACHED: bool>(
+        path: &std::path::Path,
+        analysis: &Arc<crate::backend::native_audio::NativeAudioAnalysis>,
+        iterations: usize,
+    ) -> Duration {
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..iterations {
+            let report = if CACHED {
+                let analysis = Arc::clone(analysis);
+                source_separate_with_analysis(path, Some(analysis.as_ref()), &token)
+            } else {
+                source_separate(path, &token)
+            }
+            .expect("timed source separation should succeed");
+            checksum ^= report.speech_coverage.to_bits();
+            checksum = checksum.wrapping_add(report.avg_rms.to_bits());
+            checksum = checksum.wrapping_add(report.active_region_count as u64);
+            black_box(&report);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn paired_source_separation_ratios<const BASE_CACHED: bool, const TEST_CACHED: bool>(
+        path: &std::path::Path,
+        analysis: &Arc<crate::backend::native_audio::NativeAudioAnalysis>,
+        iterations: usize,
+        repetitions: usize,
+    ) -> Vec<f64> {
+        let mut ratios = Vec::with_capacity(repetitions);
+        for repetition in 0..repetitions {
+            let (baseline, test) = if repetition % 2 == 0 {
+                (
+                    measure_source_separation::<BASE_CACHED>(path, analysis, iterations),
+                    measure_source_separation::<TEST_CACHED>(path, analysis, iterations),
+                )
+            } else {
+                let test = measure_source_separation::<TEST_CACHED>(path, analysis, iterations);
+                let baseline = measure_source_separation::<BASE_CACHED>(path, analysis, iterations);
+                (baseline, test)
+            };
+            ratios.push(baseline.as_secs_f64() / test.as_secs_f64());
+        }
+        ratios
+    }
+
+    #[test]
+    #[ignore = "strict-remote release performance A/B"]
+    fn source_separate_cached_analysis_perf() {
+        const TARGET_ARM_SECS: f64 = 0.100;
+        const WARMUP_REPETITIONS: usize = 3;
+        const PAIRED_REPETITIONS: usize = 15;
+        const NULL_MEDIAN_MIN: f64 = 0.97;
+        const NULL_MEDIAN_MAX: f64 = 1.03;
+        const MIN_CANDIDATE_MEDIAN: f64 = 2.0;
+        const REQUIRED_WINS: usize = 15;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("source-separation-perf.wav");
+        let samples = representative_vad_samples(16_000, 10);
+        write_pcm16_mono_wav_for_vad(&path, 16_000, &samples);
+        let analysis = Arc::new(
+            crate::backend::native_audio::analyze_wav(&path, None)
+                .expect("performance fixture should analyze"),
+        );
+        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
+        let historical = source_separate(&path, &token).unwrap();
+        let candidate =
+            source_separate_with_analysis(&path, Some(analysis.as_ref()), &token).unwrap();
+        assert_separate_reports_equal(&candidate, &historical);
+        let historical_signature = separate_report_signature(&historical);
+        let candidate_signature = separate_report_signature(&candidate);
+        assert_eq!(candidate_signature, historical_signature);
+        let output_sha256 = format!("{:x}", Sha256::digest(candidate_signature.as_bytes()));
+
+        let calibration = measure_source_separation::<false>(&path, &analysis, 1);
+        let iterations = (TARGET_ARM_SECS / calibration.as_secs_f64()).ceil() as usize;
+        let iterations = iterations.clamp(1, 4_096);
+
+        black_box(paired_source_separation_ratios::<false, false>(
+            &path,
+            &analysis,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let null_ratios = paired_source_separation_ratios::<false, false>(
+            &path,
+            &analysis,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let null = source_separation_perf_stats(&null_ratios);
+
+        black_box(paired_source_separation_ratios::<false, true>(
+            &path,
+            &analysis,
+            iterations,
+            WARMUP_REPETITIONS,
+        ));
+        let candidate_ratios = paired_source_separation_ratios::<false, true>(
+            &path,
+            &analysis,
+            iterations,
+            PAIRED_REPETITIONS,
+        );
+        let candidate_stats = source_separation_perf_stats(&candidate_ratios);
+        let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null.median);
+        let keep_eligible = null_valid
+            && candidate_stats.median >= MIN_CANDIDATE_MEDIAN
+            && candidate_stats.p10 > null.p90
+            && candidate_stats.wins >= REQUIRED_WINS;
+
+        eprintln!(
+            "VAD_SEPARATE_CALIBRATION duration_sec=10 samples={} wav_bytes={} signature_bytes={} output_sha256={} baseline_ns={:.3} iterations={} target_arm_ms={:.1}",
+            samples.len(),
+            44 + samples.len() * 2,
+            candidate_signature.len(),
+            output_sha256,
+            calibration.as_secs_f64() * 1_000_000_000.0,
+            iterations,
+            TARGET_ARM_SECS * 1_000.0,
+        );
+        eprintln!(
+            "VAD_SEPARATE_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+            source_separation_ratios_text(&null_ratios),
+            null.median,
+            null.p10,
+            null.p90,
+            null.wins,
+            PAIRED_REPETITIONS,
+        );
+        eprintln!(
+            "VAD_SEPARATE_AB ratios=[{}] median={:.6} p10={:.6} p90={:.6} wins={}/{} null_valid={} keep_eligible={} min_median={MIN_CANDIDATE_MEDIAN:.2} required_wins={REQUIRED_WINS}",
+            source_separation_ratios_text(&candidate_ratios),
+            candidate_stats.median,
+            candidate_stats.p10,
+            candidate_stats.p90,
+            candidate_stats.wins,
+            PAIRED_REPETITIONS,
+            null_valid,
+            keep_eligible,
+        );
+        assert!(
+            keep_eligible,
+            "candidate did not clear the declared keep gate"
+        );
+    }
+
     #[test]
     fn validate_separate_without_normalize_fails() {
         let config = PipelineConfig::new(vec![PipelineStage::Ingest, PipelineStage::Separate]);
@@ -10589,6 +11304,85 @@ mod tests {
             score > 0.9,
             "well-separated clusters should have silhouette > 0.9, got {score}"
         );
+    }
+
+    #[test]
+    fn silhouette_score_matches_naive_double_scan_bit_for_bit() {
+        // The symmetric single-distance-per-pair form must reproduce the naive
+        // double-scan silhouette bit-for-bit (byte-exact restructure, ~2.9x; see
+        // benches/silhouette_perf). Reference = the pre-optimization structure.
+        fn naive(
+            embeddings: &[SpeakerEmbedding],
+            assignments: &[usize],
+            num_clusters: usize,
+        ) -> Option<f64> {
+            if num_clusters < 2 || embeddings.len() < 2 {
+                return None;
+            }
+            let n = embeddings.len();
+            let mut sum = 0.0_f64;
+            for i in 0..n {
+                let ci = assignments[i];
+                let mut a_sum = 0.0_f64;
+                let mut a_count = 0u64;
+                for (j, emb_j) in embeddings.iter().enumerate() {
+                    if j != i && assignments[j] == ci {
+                        a_sum += embeddings[i].euclidean_distance(emb_j);
+                        a_count += 1;
+                    }
+                }
+                let a_i = if a_count > 0 { a_sum / a_count as f64 } else { 0.0 };
+                let mut b_i = f64::INFINITY;
+                for cj in 0..num_clusters {
+                    if cj == ci {
+                        continue;
+                    }
+                    let mut b_sum = 0.0_f64;
+                    let mut b_count = 0u64;
+                    for (j, emb_j) in embeddings.iter().enumerate() {
+                        if assignments[j] == cj {
+                            b_sum += embeddings[i].euclidean_distance(emb_j);
+                            b_count += 1;
+                        }
+                    }
+                    if b_count > 0 {
+                        let mean_dist = b_sum / b_count as f64;
+                        if mean_dist < b_i {
+                            b_i = mean_dist;
+                        }
+                    }
+                }
+                let denom = a_i.max(b_i);
+                sum += if denom < 1e-15 { 0.0 } else { (b_i - a_i) / denom };
+            }
+            Some(sum / n as f64)
+        }
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 8.0 - 4.0
+        };
+        for &(n, k) in &[(2usize, 2usize), (5, 2), (17, 3), (64, 4), (129, 5), (200, 6)] {
+            let embeddings: Vec<SpeakerEmbedding> = (0..n)
+                .map(|_| SpeakerEmbedding {
+                    features: std::array::from_fn(|_| next()),
+                })
+                .collect();
+            // Include a deliberately empty cluster id and a singleton cluster to
+            // exercise the a_count==0 / b_count==0 branches.
+            let assignments: Vec<usize> =
+                (0..n).map(|i| if i == 0 { k - 1 } else { i % (k - 1).max(1) }).collect();
+            let got = silhouette_score(&embeddings, &assignments, k);
+            let want = naive(&embeddings, &assignments, k);
+            assert_eq!(
+                got.map(f64::to_bits),
+                want.map(f64::to_bits),
+                "silhouette mismatch at n={n}, k={k}"
+            );
+        }
     }
 
     #[test]
