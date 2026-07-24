@@ -4,6 +4,35 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-23 — REJECT 1/3 — fuse router diagnostics count/calibration scans (bd-938v)
+
+The retained `pipeline/router_diagnostics_counts_profile` harness first measured
+the four historical count/calibration passes at **240.14 ns** median
+`[232.65, 245.39]` inside a **1.1103 us** complete 200-entry caller
+`[1.0826, 1.1468]` on pinned strict-RCH worker `vmi1227854` (job
+`j-29944835100115093`). Their **21.63%** stage share cleared the predeclared 10%
+activation threshold. The candidate then fused fallback, resolved,
+resolved-success, and calibration accumulation into one oldest-first fold while
+leaving the streamed Brier pass unchanged. A complete serialized-JSON oracle
+against the historical five-pass implementation passed before timing.
+
+The candidate is nevertheless rejected. Same-worker release job
+`j-29944835100115128` ran 21 order-alternated A/B pairs and 21 historical/
+historical null pairs at 200,000 complete snapshots per arm. It won **19/21**,
+with speedup p10/median/p90
+**1.020906x / 1.184682x / 1.282482x**, but candidate CV was
+**6.9070%** (gate `<5%`). Null p10/median/p90 was
+**0.943009x / 1.006305x / 1.107993x**, so candidate p10 did not clear
+`max(null p90, 1.10)` either. The release harness exited 101 on the declared
+gate. The production fold and its candidate-only test were manually removed;
+the evidence harness remains reproducible.
+
+**Retry predicate:** do not rerun this four-pass fusion. Retry only a materially
+stronger byte-identical design that folds the remaining Brier aggregation into
+the same traversal, or after profiling identifies a different dominant substage;
+retain the same 21-pair null/CV/win/p10 criteria. Consecutive REJECT count:
+**one**.
+
 ## 2026-07-23 — BLOCKED / NO VERDICT — router diagnostics count-scan fusion (bd-938v)
 
 **Profile contract.** This auth-restart continuation began by re-reading both

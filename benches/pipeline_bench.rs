@@ -561,6 +561,12 @@ fn bench_router_loss_hoist(c: &mut Criterion) {
 /// Same-worker A/B for streaming the optional-Brier sum and count instead of
 /// materializing a temporary `Vec` during every diagnostics snapshot.
 fn bench_router_diagnostics_profile(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("router_diagnostics_profile")
+    }) {
+        return;
+    }
+
     fn historical_brier_average(ledger: &RoutingEvidenceLedger) -> Option<f64> {
         let brier_values: Vec<f64> = ledger
             .entries()
@@ -732,6 +738,228 @@ fn bench_router_diagnostics_profile(c: &mut Criterion) {
     group.finish();
 }
 
+/// Profile the four independent count/calibration passes in a realistic
+/// routing-diagnostics snapshot before considering a fused traversal.
+fn bench_router_diagnostics_counts_profile(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("router_diagnostics_counts")
+    }) {
+        return;
+    }
+
+    fn historical_counts(ledger: &RoutingEvidenceLedger) -> (usize, usize, usize, f64) {
+        let fallback_count = ledger
+            .entries()
+            .iter()
+            .filter(|entry| entry.fallback_active)
+            .count();
+        let resolved_count = ledger
+            .entries()
+            .iter()
+            .filter(|entry| entry.actual_outcome.is_some())
+            .count();
+        let resolved_success_count = ledger
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.actual_outcome.as_ref())
+            .filter(|outcome| outcome.success)
+            .count();
+        let calibration_sum = ledger
+            .entries()
+            .iter()
+            .map(|entry| entry.calibration_score)
+            .sum::<f64>();
+        (
+            fallback_count,
+            resolved_count,
+            resolved_success_count,
+            calibration_sum,
+        )
+    }
+
+    fn historical_diagnostics(ledger: &RoutingEvidenceLedger) -> Value {
+        let total = ledger.entries().len();
+        let (fallback_count, resolved, resolved_success, calibration_sum) =
+            historical_counts(ledger);
+        let avg_calibration = if total > 0 {
+            calibration_sum / total as f64
+        } else {
+            0.0
+        };
+        let (brier_sum, brier_count) = ledger
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.brier_score)
+            .fold((0.0, 0_usize), |(sum, count), score| {
+                (sum + score, count + 1)
+            });
+        let avg_brier = (brier_count != 0).then(|| brier_sum / brier_count as f64);
+
+        serde_json::json!({
+            "total_entries": total,
+            "total_ever_recorded": ledger.total_recorded(),
+            "capacity": ledger.capacity(),
+            "fallback_count": fallback_count,
+            "fallback_rate": if total > 0 { fallback_count as f64 / total as f64 } else { 0.0 },
+            "resolved_count": resolved,
+            "resolved_success_count": resolved_success,
+            "resolved_success_rate": if resolved > 0 { resolved_success as f64 / resolved as f64 } else { 0.0 },
+            "avg_calibration_score": avg_calibration,
+            "avg_brier_score": avg_brier,
+        })
+    }
+
+    fn measure<F>(inner_steps: usize, mut diagnostics: F) -> Duration
+    where
+        F: FnMut() -> Value,
+    {
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..inner_steps {
+            let value = black_box(diagnostics());
+            checksum = checksum.rotate_left(1)
+                ^ value["fallback_count"].as_u64().unwrap_or_default()
+                ^ value["resolved_success_count"].as_u64().unwrap_or_default();
+            black_box(value);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut ledger = RoutingEvidenceLedger::new(200);
+    for sample in 0..200_u64 {
+        ledger.record(RoutingEvidenceLedgerEntry {
+            decision_id: format!("count-decision-{sample}"),
+            trace_id: format!("count-trace-{}", sample / 4),
+            timestamp_rfc3339: format!("2026-07-22T13:{:02}:{:02}Z", sample / 60, sample % 60),
+            observed_state: "all_available".to_owned(),
+            chosen_action: "whisper_cpp".to_owned(),
+            recommended_order: vec!["whisper_cpp".to_owned(), "insanely_fast".to_owned()],
+            fallback_active: sample % 10 == 0,
+            fallback_reason: (sample % 10 == 0).then(|| "calibration".to_owned()),
+            posterior_snapshot: vec![0.6, 0.3, 0.1],
+            calibration_score: 0.75 + (sample % 20) as f64 * 0.005,
+            brier_score: (sample % 5 != 0).then_some(0.08 + (sample % 17) as f64 * 0.01),
+            e_process: 1.0 + sample as f64 * 0.01,
+            ci_width: 0.2,
+            adaptive_mode: true,
+            policy_id: "router-policy-v1".to_owned(),
+            loss_matrix_hash: format!("count-loss-{sample:016x}"),
+            availability: vec![("whisper_cpp".to_owned(), true)],
+            duration_bucket: "medium".to_owned(),
+            diarize: sample % 3 == 0,
+            actual_outcome: (sample % 4 != 0).then(|| RoutingOutcomeRecord {
+                backend: BackendKind::WhisperCpp,
+                success: sample % 5 != 0,
+                latency_ms: 300 + sample,
+                error_message: (sample % 5 == 0).then(|| format!("failure-{sample}")),
+                recorded_at_rfc3339: format!("2026-07-22T13:{:02}:30Z", sample / 60),
+            }),
+        });
+    }
+
+    let diagnostics = ledger.diagnostics();
+    let historical = historical_counts(&ledger);
+    assert_eq!(diagnostics["fallback_count"], historical.0);
+    assert_eq!(diagnostics["resolved_count"], historical.1);
+    assert_eq!(diagnostics["resolved_success_count"], historical.2);
+    assert_eq!(
+        diagnostics["avg_calibration_score"]
+            .as_f64()
+            .expect("calibration average")
+            .to_bits(),
+        (historical.3 / ledger.entries().len() as f64).to_bits()
+    );
+
+    let historical_json = historical_diagnostics(&ledger);
+    let candidate_json = ledger.diagnostics();
+    assert_eq!(
+        serde_json::to_vec(&candidate_json).expect("serialize candidate diagnostics"),
+        serde_json::to_vec(&historical_json).expect("serialize historical diagnostics")
+    );
+
+    let inner_steps = 200_000;
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure(inner_steps, || historical_diagnostics(&ledger));
+            let null_b = measure(inner_steps, || historical_diagnostics(&ledger));
+            let baseline = measure(inner_steps, || historical_diagnostics(&ledger));
+            let candidate = measure(inner_steps, || ledger.diagnostics());
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate = measure(inner_steps, || ledger.diagnostics());
+            let baseline = measure(inner_steps, || historical_diagnostics(&ledger));
+            let null_b = measure(inner_steps, || historical_diagnostics(&ledger));
+            let null_a = measure(inner_steps, || historical_diagnostics(&ledger));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let null_median = median(&null_ratios);
+    let null_p90 = percentile(&sorted_null, 0.9);
+    let speedup_p10 = percentile(&sorted_speedups, 0.1);
+    let candidate_cv = cv(&candidate_ns);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "ROUTER_COUNTS_FUSION_AB inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={null_median:.6} null_p90={null_p90:.6} speedup_p10={speedup_p10:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={candidate_cv:.6} wins={wins}/21",
+        percentile(&sorted_null, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+    );
+
+    assert!((0.95..=1.05).contains(&null_median));
+    assert!(candidate_cv < 0.05);
+    assert!(wins >= 18);
+    assert!(speedup_p10 > null_p90.max(1.10));
+
+    let mut group = c.benchmark_group("pipeline/router_diagnostics_counts_profile");
+    group.bench_function("candidate_full_200", |b| {
+        b.iter(|| black_box(&ledger).diagnostics());
+    });
+    group.bench_function("historical_full_200", |b| {
+        b.iter(|| historical_diagnostics(black_box(&ledger)));
+    });
+    group.bench_function("historical_four_passes_200", |b| {
+        b.iter(|| historical_counts(black_box(&ledger)));
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -800,6 +1028,7 @@ criterion_group!(
     bench_router_metrics,
     bench_router_loss_hoist,
     bench_router_diagnostics_profile,
+    bench_router_diagnostics_counts_profile,
     bench_export_srt_buffering,
 );
 criterion_main!(benches);
