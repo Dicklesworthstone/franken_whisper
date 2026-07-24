@@ -4,6 +4,25 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **DIG (diagnosis, no code landed) — the pre-existing RED `gated_word_diff_vs_sequential_bounded` decomposes into TWO factors; a fair no-carry baseline only gets it 30.1%→17.3%, so it is NOT cleanly autofixable.**
+
+Now that `--max-context` is wired (b3e1c2c) I could swap the streaming test's
+SEQUENTIAL baseline to a no-carry decode (`max_context=0`) — the fair reference,
+since the streaming path carries no prompt across range seams. Result: word-diff
+**30.1% → 17.3%**. So the failure is two confounded factors: **(1) ~13 pts** = the
+full-carry sequential baseline dropping its tail (bd-r0qd early-EOT, owner-gated —
+removed by the no-carry baseline); **(2) residual ~17%** = an INHERENT STREAMING
+SEAM artifact — the jfk3x fixture's 3rd tile SPANS the 30 s window boundary, so the
+streaming range-slice decode duplicates/handles it differently than a full-clip
+windowed decode (range-slice mel padding at seams ≠ continuous mel; no cross-seam
+seek continuation). So even the correct no-carry baseline can't reach <10% on this
+seam-spanning fixture. **Not force-passed:** reverted the no-carry test edit (won't
+leave a half-fix), and did NOT loosen the threshold (could mask factor (2), which may
+be a fixable merge dedup bug, not merely an inherent tradeoff). Proper fix = streaming
+seam-dedup at merge, OR a non-seam-spanning fixture, OR the retry-default flip
+(owner) — a scoped streaming follow-up. AGENT_NAME=WhiteCreek.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (--max-context now honored; `0` = per-request anti-repetition escape) — a `--max-context` request now controls the carried-context cap in native decode. `--max-context 0` disables prompt carry entirely — the per-request equivalent of FW_NO_CONTEXT — and MEASURABLY recovers the bd-r0qd tiled-audio drop.**
 
 `max_prompt_ctx` was hardcoded `n_text_ctx/2` (decode.rs:1728), so `--max-context`
