@@ -4,6 +4,21 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (distilled shallow-decoder variant) — the native engine runs `distil-large-v3` (large-v3's 32-layer encoder + a DISTILLED 2-layer decoder) and transcribes jfk correctly. First coverage of a distil-whisper model.**
+
+distil-whisper is a popular fast variant: `n_text_layer=2` (vs large-v3's 32,
+turbo's 4). The engine reads the decoder depth from the header, so a 2-layer
+decoder is a distinct build/decode path never exercised. Added
+`gated_e2e_jfk_distil_large_v3_transcribes` (decode.rs): loads
+`ggml-distil-large-v3.bin` (1.4 GB f16, 51866 vocab, multilingual), asserts the
+2-layer decoder, builds the engine, auto-detects language, and transcribes jfk to
+"And so, my fellow Americans, ask not what your country can do for you. Ask what
+you can do for your country." (`en`) — content-exact vs whisper.cpp. So native
+model coverage now spans tiny.en, large-v3-turbo, distil-large-v3, and all 10
+quant formats — arbitrary decoder depths (2/4/32) all decode. 84 s (large encoder,
+debug); gated on the 1.4 GB fixture. Test-only.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — the streaming suite is now FULLY GREEN (29/0) — greened the last red test `gated_word_diff_vs_sequential_bounded` after PROVING its residual is inherent, not a defect.**
 
 The bd-r0qd flip (below) greened `gated_one_worker_equals_sequential_byte_exact`

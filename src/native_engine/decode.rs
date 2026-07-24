@@ -4379,6 +4379,48 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_distil_large_v3_transcribes() {
+        // distil-whisper is a popular FAST variant: large-v3's 32-layer encoder +
+        // a DISTILLED 2-layer decoder (n_text_layer=2, vs large-v3's 32 / turbo's
+        // 4). The engine reads n_text_layer from the header, so the 2-layer decoder
+        // must build and decode correctly. This is the only coverage of a distilled
+        // (shallow-decoder) model. Requires ggml-distil-large-v3.bin.
+        let Some(path) = super::super::find_model_file("distil-large-v3") else {
+            eprintln!("SKIP gated_e2e_distil: ggml-distil-large-v3.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_distil: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load distil-large-v3");
+        assert_eq!(model.hparams.n_text_layer, 2, "distil has a 2-layer decoder");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from distil");
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on distil");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("distil PRODUCED: [{:?}] {joined}", out.language);
+        assert!(!out.segments.is_empty(), "distil produced no segments");
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans") && low.contains("country"),
+            "distil transcript missing salient jfk content: {joined}"
+        );
+    }
+
+    #[test]
     fn gated_e2e_jfk_large_v3_turbo_autodetect_transcribes() {
         // The full multilingual pipeline end to end on the FLAGSHIP: encode →
         // auto-detect language → build the multilingual SOT (sot, <|en|>,
