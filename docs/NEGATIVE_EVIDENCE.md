@@ -4,6 +4,16 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — ROBUSTNESS (corrupt/truncated model) — a partially-downloaded ggml model errors CLEANLY from load()/from_ggml, never a panic or silent garbage-weight load.**
+
+A production engine gets corrupt/partial model downloads. The header parser already
+rejects bad magic/ftype/truncated-header; this covers a VALID header + early sections
+but a later tensor missing or its payload short. `gated_truncated_model_errors_cleanly`
+(decode.rs): truncates tiny.en to 50% and asserts `GgmlModel::load(..).and_then(LoadedModel::from_ggml)`
+returns `Err` (the weight loader's `model.tensor_f32(name)?` propagates the short-read /
+missing-tensor error). No panic, no out-of-bounds slice. Test-only.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (quantized FLAGSHIP decodes, not just loads) — a q5_k large-v3-turbo transcribes jfk, and the transcript is BYTE-IDENTICAL to the f16 turbo (q5_k is transcript-exact on the flagship).**
 
 The load-only `gated_q5_k_large_v3_turbo_loads_and_builds_engine` proved dequant +

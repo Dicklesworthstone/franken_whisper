@@ -4189,6 +4189,30 @@ mod tests {
     }
 
     #[test]
+    fn gated_truncated_model_errors_cleanly() {
+        // A corrupt / partially-downloaded model (valid start, cut before all
+        // tensors are present) must fail with a clean Err from load()/from_ggml —
+        // NEVER a panic or a silent load of garbage weights. Only the header +
+        // early sections parse; a later tensor is missing or its payload is short.
+        let Some(path) = super::super::find_model_file("tiny.en") else {
+            eprintln!("SKIP gated_truncated_model: tiny.en model missing");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read tiny.en");
+        // Cut to half — past the header/mel/vocab, mid tensor directory/data.
+        let cut = bytes.len() / 2;
+        let tmp = std::env::temp_dir().join(format!("fw_truncated_{cut}.bin"));
+        std::fs::write(&tmp, &bytes[..cut]).expect("write truncated");
+        // load() then from_ggml() — the whole path must return Err, not panic.
+        let result = GgmlModel::load(&tmp).and_then(LoadedModel::from_ggml);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            result.is_err(),
+            "a truncated model must error, not load garbage weights"
+        );
+    }
+
+    #[test]
     fn gated_degenerate_audio_inputs_are_handled_gracefully() {
         // A production ASR receives arbitrary clips: empty, pure silence, a tone,
         // and sub-window lengths. None must panic or error — mel's build_padded
