@@ -84,6 +84,11 @@ pub enum GgmlDType {
     /// load — lets the engine run whisper.cpp-quantized `q8_0` models on the
     /// existing f32 path.
     Q8_0,
+    /// ggml `Q5_0` (per-tensor GGML_TYPE 6): blocks of 32 5-bit quants with one
+    /// `f16` scale each (22 bytes/block: scale + 4-byte high-bit field + 16-byte
+    /// nibbles; `x = ((nibble | hi<<4) - 16) * scale`). Dequantized to f32 at
+    /// load, like [`Self::Q8_0`].
+    Q5_0,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,
