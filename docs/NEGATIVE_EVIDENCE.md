@@ -4,6 +4,58 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - BlackThrush: **BLOCKED / NO VERDICT (bd-938v) — fresh router-diagnostics count-scan profile reached strict RCH but not Criterion: the shared frankensqlite closure is currently unbuildable. Zero samples; production untouched.**
+
+**Ledger-first continuation after auth restart.** Both evidence ledgers and recent
+Git history were re-read before resuming the existing `bd-938v` harness. The
+candidate remains fresh and narrowly scoped: `RoutingEvidenceLedger::diagnostics`
+walks the same realistic 200-entry ledger four times for fallback count, resolved
+count, resolved-success count, and calibration sum after the Brier materialization
+lever was already closed. The retained profile-only
+`pipeline/router_diagnostics_counts_profile` row compares those four historical
+passes with the complete diagnostics caller. Production may be touched only if
+that stage is at least **10%** of the measured caller.
+
+**Strict-remote failure before timing.** No local Cargo fallback ran.
+`RCH_REQUIRE_REMOTE=1`, `RCH_WORKER=vmi1227854`, `RCH_WORKERS=vmi1227854`, and
+`RCH_NO_SELF_HEALING=1` admitted job `j-29944835100114966`. RCH synced all 57
+path-dependency roots for 120.5 seconds, then cold-compiled for 642.4 seconds.
+Compilation stopped in the current shared frankensqlite checkout:
+
+```text
+error[E0432]: unresolved import `io_uring`
+  --> crates/fsqlite-vfs/src/uring.rs:25:5
+error[E0433]: cannot find module or crate `io_uring` in this scope
+  --> crates/fsqlite-vfs/src/uring.rs:249:48
+```
+
+The local sibling was `main...origin/main [ahead 4, behind 6]`. Its
+`fsqlite-vfs/src/uring.rs` directly imports `io_uring`, while its manifest has
+no direct dependency; the current `origin/main` version instead uses
+`asupersync::fs::IoUringFile`. That sibling checkout contains active peer work
+and was not rebased, edited, stashed, or overwritten. Because every one of the
+five requested Criterion targets (`storage_bench`, `normalize_bench`,
+`pipeline_bench`, `tty_bench`, and `sync_bench`) compiles the same
+`franken_whisper` library and non-optional fsqlite path dependency, repeating
+the other four commands cannot reach a benchmark executable in this source
+state.
+
+**Disposition and retry predicate.** This is infrastructure/source-closure
+evidence, not a performance rejection. There are **zero** profile medians,
+A/B pairs, null pairs, CV values, or conformance exits. No production file was
+edited; the profile-only harness remains recoverable for the retry. `bd-938v`
+now depends on blocker `bd-bsdz`. Reopen only after the frankensqlite owner
+converges the shared checkout to a buildable main and a strict-remote
+`cargo check --bench pipeline_bench -j2` reaches `franken_whisper` itself.
+Then measure `historical_four_passes_200 / full_200`; proceed only at a
+stage share of at least 10%, and require exact serialized diagnostics plus 21
+same-worker order-alternated historical/candidate pairs, 21
+historical/historical null pairs, null median in `[0.95, 1.05]`, candidate CV
+`<5%`, at least 18/21 wins, and candidate p10 above
+`max(null p90, 1.10)`. Do not retry locally and do not modify the sibling
+checkout from this repository.
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP (byte-exact, strictly-less-work) — beam now MOVE-REUSES parent KV state: the last surviving child of each parent MOVES the parent's self-attn `KvCache` (~8 MB) instead of cloning it. When the beam is spread (~1 child/parent) this eliminates nearly all the remaining per-fork clone. Transcript byte-identical (jfk beam=5 md5 `be4284a9`, keynote `cmp -s`); keynote wall min ~113 s vs the batched-logits ~137 s (cumulative ~2.6× from pre-Arc 298 s), shared-box-noisy so no precise factor.**
 
 **Change (decode.rs).** `beam_decode_window`'s candidate loop is now two-pass: pass 1
