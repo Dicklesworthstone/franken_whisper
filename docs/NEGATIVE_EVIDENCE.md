@@ -4,6 +4,33 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (fourth k-quant; the odd one out) — native now loads whisper.cpp `q3_k` models. q3_k has its OWN scale packing (the `aux[]` u32 reshape, no `dmin`) + a 2-bit-quant/high-bit-plane layout; still transcribes jfk to the EXACT canonical transcript at 3-bit.**
+
+**What landed.** `GgmlDType::Q3_K` (per-tensor GGML_TYPE **11**, model base ftype
+**11**). Q3_K = 256-value super-block, 110 bytes = `[hmask[32] (high bit), qs[64]
+(2-bit), scales[12] (bit-shuffled 6-bit), f16 d]` — NO `dmin` (q3_k has no per-block
+min; `x = d*(scale−32)*(2bit − (hmask-bit?0:4))`). The 16 signed 6-bit scales do
+NOT use `get_scale_min_k4`; they need whisper.cpp's `aux[]` u32 reshape
+(`kmask1=0x03030303`, `kmask2=0x0f0f0f0f`) that splices 4 low bits from two words
+with 2 bits from a third — ported as `u32::from_le_bytes` + `to_le_bytes` (no
+`unsafe` transmute). The 2-bit quants extract via a per-`j` shift (0/2/4/6) with the
+high bit from a per-group `1<<(nblk*4+j)` mask — I compute the mask by index to
+dodge C's `uint8_t m <<= 1` wrap (would panic in debug Rust at m=128).
+
+**Validated.** `q3_k_byte_len_and_dequant_math` pins the full chain on a
+hand-computed block: the scale reshape (`scales[0]=34, [1]=19, [2]=34`), BOTH hmask
+branches (bit set → sub 0, clear → sub 4), the shift extraction (`0b11>>2=0`), and
+both inner loops. `gated_q3_k_model_loads_and_dequants_close_to_f16` — real q3_k
+tensors within **25 %** mean-abs of f16 (coarsest quant). `gated_e2e_jfk_tiny_en_q3_k_transcribes`
+builds the engine and — remarkably at 3-bit — produces the **exact canonical jfk
+transcript**. ggml **33/0**, decode gated q3_k **1/0**, no new in-lane clippy.
+
+**Quant support now: full legacy family + q3_k + q4_k + q5_k + q6_k (4 of 5
+k-quants).** Only q2_k (GGML_TYPE 10) remains — 2-bit, `[scales[16] (4-bit
+scale+4-bit min packed), qs[64] (2-bit), f16 d, f16 dmin]`, its own third scale
+layout — to COMPLETE every whisper.cpp ggml quant format.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (third k-quant; the get_scale_min_k4 machinery pays off) — native now loads whisper.cpp `q5_k` models. Reuses q4_k's `get_scale_min_k4` verbatim + adds a high-bit plane; q5_k transcribes jfk to the EXACT canonical transcript.**
 
 **What landed.** `GgmlDType::Q5_K` (per-tensor GGML_TYPE **13**, model base ftype

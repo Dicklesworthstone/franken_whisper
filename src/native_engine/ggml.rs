@@ -103,6 +103,9 @@ const Q4_K_BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 2;
 /// `Q5_K` on-disk block size: like `Q4_K` plus a 32-byte high-bit plane
 /// (`f16 d` + `f16 dmin` + scales (12) + `qh` (32) + 4-bit quants (128)).
 const Q5_K_BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 2;
+/// `Q3_K` on-disk block size: `hmask` (32) + 2-bit quants (64) + packed 6-bit
+/// scales (12) + `f16 d` (2). No `dmin` — `Q3_K` has no per-block min.
+const Q3_K_BLOCK_BYTES: usize = QK_K / 8 + QK_K / 4 + 12 + 2;
 
 /// whisper.cpp `get_scale_min_k4`: unpack the 6-bit scale and 6-bit min for
 /// sub-block `j` (0..8) from a k-quant super-block's packed 12-byte `scales`
@@ -182,6 +185,73 @@ fn dequant_q5_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
                 out[y + l + 32] = d2 * f32::from((ql[ql_off + l] >> 4) + hi2) - m2;
             }
             y += 64;
+        }
+    }
+    out
+}
+
+/// Dequantize a `Q3_K` payload to `f32`. Each 110-byte super-block is `[hmask[32],
+/// qs[64] (2-bit), scales[12] (bit-shuffled 6-bit), f16 d]`; there is no per-block
+/// min. The 16 signed 6-bit scales unpack via whisper.cpp's `aux[]` reshape, then
+/// `x = d*(scale−32)*(2bit − (hmask-bit ? 0 : 4))`. Exact port of ggml
+/// `dequantize_row_q3_K`.
+fn dequant_q3_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let n_blocks = n_elements / QK_K;
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let base = b * Q3_K_BLOCK_BYTES;
+        let hmask = &raw[base..base + QK_K / 8];
+        let qs = &raw[base + QK_K / 8..base + QK_K / 8 + QK_K / 4];
+        let sc = &raw[base + QK_K / 8 + QK_K / 4..base + QK_K / 8 + QK_K / 4 + 12];
+        let d_all = f16_at(raw, base + QK_K / 8 + QK_K / 4 + 12);
+
+        // Reshape the 12 packed bytes into 16 signed 6-bit scales (each byte =
+        // 4 low bits from aux[0..2] spliced with 2 bits from the third word).
+        let a0 = u32::from_le_bytes([sc[0], sc[1], sc[2], sc[3]]);
+        let a1 = u32::from_le_bytes([sc[4], sc[5], sc[6], sc[7]]);
+        let tmp = u32::from_le_bytes([sc[8], sc[9], sc[10], sc[11]]);
+        let aux = [
+            (a0 & KMASK2) | ((tmp & KMASK1) << 4),
+            (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4),
+            ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4),
+            ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4),
+        ];
+        let mut scales = [0i8; 16];
+        for (i, w) in aux.iter().enumerate() {
+            let by = w.to_le_bytes();
+            scales[i * 4] = by[0] as i8;
+            scales[i * 4 + 1] = by[1] as i8;
+            scales[i * 4 + 2] = by[2] as i8;
+            scales[i * 4 + 3] = by[3] as i8;
+        }
+
+        let mut y = b * QK_K;
+        let mut is = 0;
+        // Two 128-value halves; qs advances 32 bytes between them.
+        for nblk in 0..2 {
+            let qoff = nblk * 32;
+            for j in 0..4 {
+                let shift = (j * 2) as u32;
+                let m = 1u8 << (nblk * 4 + j); // high-bit selector, bit 0..7
+                let dl = (i32::from(scales[is]) - 32) as f32 * d_all;
+                is += 1;
+                for l in 0..16 {
+                    let q2 = i32::from((qs[qoff + l] >> shift) & 3);
+                    let sub = if hmask[l] & m != 0 { 0 } else { 4 };
+                    out[y] = dl * (q2 - sub) as f32;
+                    y += 1;
+                }
+                let dl = (i32::from(scales[is]) - 32) as f32 * d_all;
+                is += 1;
+                for l in 0..16 {
+                    let q2 = i32::from((qs[qoff + l + 16] >> shift) & 3);
+                    let sub = if hmask[l + 16] & m != 0 { 0 } else { 4 };
+                    out[y] = dl * (q2 - sub) as f32;
+                    y += 1;
+                }
+            }
         }
     }
     out
@@ -336,6 +406,14 @@ fn ggml_byte_len(dtype: GgmlDType, n_elements: usize, name: &str) -> FwResult<us
                 )));
             }
             (n_elements / QK_K).checked_mul(Q5_K_BLOCK_BYTES)
+        }
+        GgmlDType::Q3_K => {
+            if !n_elements.is_multiple_of(QK_K) {
+                return Err(FwError::InvalidRequest(format!(
+                    "tensor '{name}' q3_k element count {n_elements} is not a multiple of {QK_K}"
+                )));
+            }
+            (n_elements / QK_K).checked_mul(Q3_K_BLOCK_BYTES)
         }
     };
     len.ok_or_else(|| FwError::InvalidRequest(format!("tensor '{name}' byte length overflow")))
@@ -552,11 +630,11 @@ impl GgmlModel {
         // base is a format we don't decode yet; the per-tensor parse is the real
         // gate (it rejects unsupported GGML_TYPEs).
         let base_ftype = hparams.ftype.rem_euclid(GGML_QNT_VERSION_FACTOR);
-        if !matches!(base_ftype, 0 | 1 | 2 | 3 | 7 | 8 | 9 | 12 | 13 | 14) {
+        if !matches!(base_ftype, 0 | 1 | 2 | 3 | 7 | 8 | 9 | 11 | 12 | 13 | 14) {
             return Err(FwError::Unsupported(format!(
                 "quantized ggml ftype {} (base {base_ftype}) is not supported \
                  (only base 0=f32, 1=f16, 2=q4_0, 3=q4_1, 7=q8_0, 8=q5_0, 9=q5_1, \
-                 12=q4_k, 13=q5_k, 14=q6_k)",
+                 11=q3_k, 12=q4_k, 13=q5_k, 14=q6_k)",
                 hparams.ftype
             )));
         }
@@ -626,6 +704,7 @@ impl GgmlModel {
                 6 => GgmlDType::Q5_0,
                 7 => GgmlDType::Q5_1,
                 8 => GgmlDType::Q8_0,
+                11 => GgmlDType::Q3_K,
                 12 => GgmlDType::Q4_K,
                 13 => GgmlDType::Q5_K,
                 14 => GgmlDType::Q6_K,
@@ -633,7 +712,7 @@ impl GgmlModel {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
                          (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0, \
-                         12=q4_k, 13=q5_k, 14=q6_k)"
+                         11=q3_k, 12=q4_k, 13=q5_k, 14=q6_k)"
                     )));
                 }
             };
@@ -790,6 +869,7 @@ impl GgmlModel {
                 6 => GgmlDType::Q5_0,
                 7 => GgmlDType::Q5_1,
                 8 => GgmlDType::Q8_0,
+                11 => GgmlDType::Q3_K,
                 12 => GgmlDType::Q4_K,
                 13 => GgmlDType::Q5_K,
                 14 => GgmlDType::Q6_K,
@@ -797,7 +877,7 @@ impl GgmlModel {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
                          (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0, \
-                         12=q4_k, 13=q5_k, 14=q6_k)"
+                         11=q3_k, 12=q4_k, 13=q5_k, 14=q6_k)"
                     )));
                 }
             };
@@ -1028,6 +1108,16 @@ impl GgmlModel {
                     )));
                 }
                 dequant_q5_k(&raw, n_elements)
+            }
+            GgmlDType::Q3_K => {
+                let expect = ggml_byte_len(GgmlDType::Q3_K, n_elements, name)?;
+                if raw.len() != expect {
+                    return Err(FwError::InvalidRequest(format!(
+                        "tensor '{name}' q3_k byte length {} != {expect}",
+                        raw.len()
+                    )));
+                }
+                dequant_q3_k(&raw, n_elements)
             }
         };
 
@@ -1734,6 +1824,95 @@ mod tests {
         assert_eq!(out[128], 5.0 * 20.0 - 1.0); // 99.0
         // out[160]: nibble 2 + high(bit5=0)*16 = 2.
         assert_eq!(out[160], 1.0 * 2.0 - 1.5); // 0.5
+    }
+
+    #[test]
+    fn q3_k_byte_len_and_dequant_math() {
+        // Q3_K super-block: 110 bytes / 256 values = [hmask[32], qs[64] (2-bit),
+        // scales[12] (bit-shuffled 6-bit), f16 d].
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q3_K, 256, "t").unwrap(),
+            Q3_K_BLOCK_BYTES
+        );
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q3_K, 512, "t").unwrap(),
+            2 * Q3_K_BLOCK_BYTES
+        );
+        assert!(ggml_byte_len(GgmlDType::Q3_K, 200, "t").is_err());
+
+        // Hand-computed block. d = 1.0. Scale reshape: scales[i] byte from aux[0]
+        // = (sc[i] & 0x0f) | ((sc[8+i] & 3) << 4). Pick:
+        //   scales[0] = 2 | (2<<4) = 34 → dl = 34-32 = 2
+        //   scales[1] = 3 | (1<<4) = 19 → dl = 19-32 = -13
+        //   scales[2] = 2 | (2<<4) = 34 → dl = 2
+        let mut raw = vec![0u8; Q3_K_BLOCK_BYTES];
+        // hmask[32] at offset 0.
+        raw[0] = 1; // hmask[0]: bit0 set  → value 0 keeps its 2 bits (sub 0)
+        raw[1] = 0; // hmask[1]: bit0 clear → value 1 gets sub 4
+        raw[16] = 1; // hmask[16]: bit0 set → 2nd-inner value keeps its bits
+        // qs[64] at offset 32 (2-bit quants).
+        raw[32] = 3; // qs[0]  = 0b11
+        raw[33] = 1; // qs[1]  = 0b01
+        raw[48] = 2; // qs[16] = 0b10
+        // scales[12] at offset 96.
+        raw[96] = 2; // sc[0]
+        raw[97] = 3; // sc[1]
+        raw[98] = 2; // sc[2]
+        raw[104] = 2; // sc[8]  → scales[0] high bits
+        raw[105] = 1; // sc[9]  → scales[1] high bits
+        raw[106] = 2; // sc[10] → scales[2] high bits
+        // f16 d = 1.0 at offset 108.
+        raw[108..110].copy_from_slice(&Float16::from_f32(1.0).to_bits().to_le_bytes());
+
+        let out = dequant_q3_k(&raw, QK_K);
+        assert_eq!(out.len(), QK_K);
+        // is=0, shift=0, m=1: dl=2, qs[0]&3=3, hmask[0]&1 set → sub 0.
+        assert_eq!(out[0], 2.0 * (3.0 - 0.0)); // 6.0
+        // l=1: qs[1]&3=1, hmask[1]&1 clear → sub 4.
+        assert_eq!(out[1], 2.0 * (1.0 - 4.0)); // -6.0
+        // is=1 (2nd inner loop), dl=-13, qs[16]&3=2, hmask[16]&1 set → sub 0.
+        assert_eq!(out[16], -13.0 * (2.0 - 0.0)); // -26.0
+        // is=2 (j=1, shift=2, m=2): dl=2, qs[0]>>2&3=0, hmask[0]&2 clear → sub 4.
+        assert_eq!(out[32], 2.0 * (0.0 - 4.0)); // -8.0
+    }
+
+    #[test]
+    fn gated_q3_k_model_loads_and_dequants_close_to_f16() {
+        // Requires ggml-tiny.en-q3_k.bin (`whisper-quantize <f16> <out> q3_k`).
+        let (Some(q3_path), Some(f16_path)) =
+            (find_model_file("tiny.en-q3_k"), find_model_file("tiny.en"))
+        else {
+            eprintln!("SKIP gated_q3_k: ggml-tiny.en-q3_k.bin or ggml-tiny.en.bin not found");
+            return;
+        };
+        let q3 = GgmlModel::load(&q3_path).expect("load q3_k model");
+        let f16 = GgmlModel::load(&f16_path).expect("load f16 model");
+        assert_eq!(
+            q3.hparams.ftype.rem_euclid(1000),
+            11,
+            "q3_k model base ftype must be 11"
+        );
+        let q3_name = q3
+            .tensor_names()
+            .find(|n| q3.tensor(n).is_some_and(|e| e.dtype == GgmlDType::Q3_K))
+            .expect("q3_k model has at least one Q3_K tensor")
+            .to_owned();
+        let (qshape, qvals) = q3.tensor_f32(&q3_name).expect("q3_k dequant");
+        let (fshape, fvals) = f16.tensor_f32(&q3_name).expect("f16 dequant");
+        assert_eq!(qshape, fshape, "shape mismatch for '{q3_name}'");
+        assert!(
+            qvals.iter().all(|v| v.is_finite()),
+            "q3_k dequant produced non-finite values"
+        );
+        let n = fvals.len() as f32;
+        let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 =
+            qvals.iter().zip(&fvals).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+        // q3_k is a coarse 3-bit k-quant: within ~25% of f16.
+        assert!(
+            mean_abs_diff < 0.25 * mean_abs,
+            "q3_k vs f16 mean|Δ| {mean_abs_diff} exceeds 25% of mean|w| {mean_abs} for '{q3_name}'"
+        );
     }
 
     #[test]
