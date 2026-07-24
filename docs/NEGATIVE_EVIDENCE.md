@@ -4,6 +4,31 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (completes initial_prompt) — the native engine now accepts a user prompt (`FW_INITIAL_PROMPT`, whisper `--prompt`): its BPE tokens seed `prompt_past` and bias the first window, faithfully to whisper.cpp. Wired end to end on top of the new `encode`.**
+
+Uses the [`encode`] capability. `seeded_prompt_past(prompt, tokenizer)` (decode.rs)
+turns the prompt into `prompt_past` (BPE tokens, or empty for none/empty), carried
+as previous context on the first window and aged out via the `max_prompt_ctx`
+truncation as decoded text accumulates — exactly whisper.cpp's `prompt_past` model.
+
+**Exposed via an env-gate `FW_INITIAL_PROMPT` confined to decode.rs, NOT a
+`DecodeParams` field** — a field ripples through the `src/backend/*` constructors
+(incl. cod's diarize/streaming backends), and bd-r0qd set the precedent of using an
+env-gate (`FW_NO_CONTEXT`) for exactly this reason. A proper per-request
+`DecodeParams.initial_prompt` + backend plumbing is a coordinated follow-up.
+
+**Validated.** `gated_seeded_prompt_past_encodes_user_prompt`: None/empty → empty
+seed (byte-identical default — confirmed the no-env jfk reference stays byte-exact),
+`" country"`→`[1499]`, `"the country"`→`[1169,1499]` (exact whisper.cpp ids). End to
+end (tiny.en q8_0, jfk): a benign prompt ("Hello there.") transcribes correctly; the
+prompt DOES bias decoding (proving it's wired). **A strongly off-topic prompt
+("President Kennedy speaks.") drives the first window to EMPTY — this is the KNOWN
+bd-r0qd carried-prompt × int8-greedy early-EOT, NOT a seeding bug: `FW_RETRY_FAILED_WINDOW=1`
+AND `FW_NO_CONTEXT=1` both recover the full transcript, exactly as whisper.cpp
+recovers via temperature fallback.** So initial_prompt is faithful to whisper.cpp
+including its failure/recovery modes. decode + tokenizer suites green; no in-lane clippy.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (new capability) — the native tokenizer gained BPE `encode` (text → token ids), a faithful port of whisper.cpp's `tokenize`. The engine previously could only DECODE; this is the foundation for `initial_prompt` (whisper `--prompt`) support.**
 
 The native tokenizer had `decode` (ids → text) but NO encode — so the engine could
