@@ -79,6 +79,11 @@ impl WhisperHParams {
 pub enum GgmlDType {
     F32,
     F16,
+    /// ggml `Q8_0` (per-tensor GGML_TYPE 8): blocks of 32 `int8` quants with one
+    /// `f16` scale each (34 bytes/block, `x = q * scale`). Dequantized to f32 at
+    /// load — lets the engine run whisper.cpp-quantized `q8_0` models on the
+    /// existing f32 path.
+    Q8_0,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,
