@@ -4,6 +4,33 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (quality knobs now consistent across native backends) — the diarize + streaming backends now honor `--beam-size` too (diarize also honors `--prompt`). Previously ONLY the sequential native backend mapped them. + FINDING: a pre-existing RED streaming test at HEAD, rooted in bd-r0qd.**
+
+Extending the beam_size/initial_prompt wiring into the two backends I now cover
+(cod capped). The diarize + streaming `decode_params` builders used
+`..DecodeParams::default()`, silently dropping the request's `--beam-size` and
+`--prompt`. Now: **diarize** maps both (one sequential `transcribe_samples` → both
+apply cleanly); **streaming** maps `beam_size` only — `initial_prompt` is
+deliberately NOT wired there because it shares one `params` across all ranges, so a
+prompt would re-seed EVERY range's first window (per-range bd-r0qd risk + divergence
+from whisper.cpp's once-at-start). Faithful streaming prompt = first-range-only,
+which needs per-range params (follow-up). Tests: `decode_params_maps_prompt_and_beam_size`
+(diarize), `decode_params_maps_beam_size_but_not_prompt` (streaming). Diarize 17/0.
+
+**⚠ FINDING — PRE-EXISTING RED TEST at HEAD (NOT my regression):
+`insanely_fast_native::gated_word_diff_vs_sequential_bounded` FAILS (2-worker
+word-diff vs sequential 30.1% > 10% bound). PROVEN pre-existing: `git stash` my
+uncommitted diff → the test fails IDENTICALLY (same 30.1%, same output) at clean
+HEAD 369e95f. Root cause: on tiled jfk×3 the SEQUENTIAL baseline drops its tail (the
+known bd-r0qd carried-prompt × int8 early-EOT — seq ends "…ask not"), while the
+STREAMING path drops the prompt at seams and stays complete — so streaming is
+actually MORE faithful here and the "par ≈ seq" premise is invalid on this
+pathological repetitive input.** My beam wiring is inert to this test (no beam set →
+identical params). The fix is owner-gated (the FW_RETRY_FAILED_WINDOW default-on flip
+would stop the seq drop) OR the test should use non-tiled audio / a retry-enabled seq
+baseline — a streaming-test-design change I'm surfacing rather than force-passing.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (beam search is now a real per-request knob) — a `--beam-size` request now reaches the native engine. Previously beam was ONLY controllable via `FW_BEAM_SIZE` env, so a beam-size request silently ran greedy — a quality gap on realistic workloads.**
 
 The native engine had beam search (behind `FW_BEAM_SIZE`) but the backend never

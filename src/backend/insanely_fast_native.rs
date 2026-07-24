@@ -292,6 +292,18 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
     decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
+        // Beam width (`--beam-size`) is a per-window decode param, so it applies
+        // correctly within every range. NOTE: `initial_prompt` is deliberately NOT
+        // wired here — this backend shares one `params` across all ranges, so a
+        // prompt would re-seed EVERY range's first window (per-range bd-r0qd risk +
+        // divergence from whisper.cpp's once-at-start prompt). Faithful streaming
+        // prompt = first-range-only, which needs per-range params (follow-up).
+        beam_size: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.beam_size)
+            .map(|n| n as usize),
         timestamps: !request.backend_params.no_timestamps,
         n_threads: threads_per_worker,
         max_text_ctx: None,
@@ -720,6 +732,23 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn decode_params_maps_beam_size_but_not_prompt() {
+        use crate::model::DecodingParams;
+        let mut req = request();
+        assert_eq!(decode_params(&req, 4).beam_size, None);
+        // Beam width reaches the engine (a per-window param, correct per range).
+        req.backend_params.decoding = Some(DecodingParams {
+            beam_size: Some(3),
+            ..DecodingParams::default()
+        });
+        assert_eq!(decode_params(&req, 4).beam_size, Some(3));
+        // initial_prompt is deliberately NOT wired here (shared params re-seed
+        // every range); it stays None even when the request carries a prompt.
+        req.backend_params.prompt = Some("domain terms".to_owned());
+        assert_eq!(decode_params(&req, 4).initial_prompt, None);
     }
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
