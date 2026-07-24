@@ -1,0 +1,17 @@
+[package]
+name = "rollout-stage-parse-perf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bench]]
+name = "rollout_stage_parse_perf"
+path = "bench.rs"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1

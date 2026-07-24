@@ -8,9 +8,9 @@ use franken_whisper::cli::{
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
-    acceleration_context_from_evidence, backends_discovery_value, build_backends_report,
-    build_health_report, emit_health_report, emit_robot_complete, emit_robot_error,
-    emit_robot_stage, emit_robot_start, robot_schema_value, routing_decision_value,
+    backends_discovery_value, build_backends_report, build_health_report, emit_health_report,
+    emit_pretty_run_report, emit_robot_complete, emit_robot_error, emit_robot_stage,
+    emit_robot_start, robot_schema_value, routing_decision_line,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
@@ -51,19 +51,13 @@ fn main() {
 fn run(cli: Cli) -> FwResult<()> {
     match cli.command {
         Command::Transcribe(args) => {
-            let request = args.to_request()?;
+            let json = args.json;
+            let request = (*args).into_request()?;
             let engine = FrankenWhisperEngine::new()?;
             let report = engine.transcribe(request)?;
 
-            if args.json {
-                let mut value = serde_json::to_value(&report)?;
-                if let Some(acceleration_context) =
-                    acceleration_context_from_evidence(&report.evidence)
-                    && let Some(object) = value.as_object_mut()
-                {
-                    object.insert("acceleration_context".to_owned(), acceleration_context);
-                }
-                println!("{}", serde_json::to_string_pretty(&value)?);
+            if json {
+                emit_pretty_run_report(report)?;
             } else {
                 println!("{}", report.result.transcript);
             }
@@ -72,7 +66,7 @@ fn run(cli: Cli) -> FwResult<()> {
         Command::Robot { command } => match command {
             RobotCommand::Run(args) => {
                 emit_robot_start(args.robot_summary())?;
-                let request = match args.to_request() {
+                let request = match (*args).into_request() {
                     Ok(request) => request,
                     Err(error) => {
                         emit_robot_error(&error.to_string(), error.robot_error_code())?;
@@ -130,13 +124,15 @@ fn run(cli: Cli) -> FwResult<()> {
                             || event.code == "backend.routing.safe_mode"
                             || event.code == "backend.routing.calibration_guardrail"
                         {
-                            let entry = routing_decision_value(
-                                &details.run_id,
-                                &event.ts_rfc3339,
-                                &event.code,
-                                &event.payload,
+                            println!(
+                                "{}",
+                                routing_decision_line(
+                                    &details.run_id,
+                                    &event.ts_rfc3339,
+                                    &event.code,
+                                    &event.payload,
+                                )?
                             );
-                            println!("{}", serde_json::to_string(&entry)?);
                         }
                     }
                 }
@@ -348,17 +344,23 @@ fn load_routing_history_details(
     }
 
     let summaries = store.list_recent_runs(limit)?;
-    summaries
-        .iter()
-        .map(|summary| {
-            store.load_run_details(&summary.run_id)?.ok_or_else(|| {
-                FwError::Storage(format!(
-                    "run `{}` disappeared while loading routing history",
-                    summary.run_id
-                ))
-            })
-        })
-        .collect()
+    let run_ids: Vec<String> = summaries.iter().map(|s| s.run_id.clone()).collect();
+    // Two batched queries instead of the per-run N+1 (`load_run_details` × N).
+    let details = store.load_run_details_batch(&run_ids)?;
+    if details.len() != run_ids.len() {
+        // Preserve the per-run error for any run that vanished between the list and
+        // the batched load.
+        let found: std::collections::HashSet<&str> =
+            details.iter().map(|d| d.run_id.as_str()).collect();
+        for id in &run_ids {
+            if !found.contains(id.as_str()) {
+                return Err(FwError::Storage(format!(
+                    "run `{id}` disappeared while loading routing history"
+                )));
+            }
+        }
+    }
+    Ok(details)
 }
 
 fn backends_command_output() -> FwResult<String> {

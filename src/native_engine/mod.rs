@@ -75,10 +75,63 @@ impl WhisperHParams {
 }
 
 /// Tensor element type found in a ggml tensor directory entry.
+// Variant names mirror ggml's `GGML_TYPE_*` C enum verbatim (Q8_0, Q6_K, ...).
+// `non_camel_case_types` accepts `_` only between two digits (so `Q8_0` is fine)
+// but rejects the k-quant `_K` suffix; keep the canonical ggml spelling.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlDType {
     F32,
     F16,
+    /// ggml `Q8_0` (per-tensor GGML_TYPE 8): blocks of 32 `int8` quants with one
+    /// `f16` scale each (34 bytes/block, `x = q * scale`). Dequantized to f32 at
+    /// load — lets the engine run whisper.cpp-quantized `q8_0` models on the
+    /// existing f32 path.
+    Q8_0,
+    /// ggml `Q5_0` (per-tensor GGML_TYPE 6): blocks of 32 5-bit quants with one
+    /// `f16` scale each (22 bytes/block: scale + 4-byte high-bit field + 16-byte
+    /// nibbles; `x = ((nibble | hi<<4) - 16) * scale`). Dequantized to f32 at
+    /// load, like [`Self::Q8_0`].
+    Q5_0,
+    /// ggml `Q4_0` (per-tensor GGML_TYPE 2): blocks of 32 4-bit quants with one
+    /// `f16` scale each (18 bytes/block: scale + 16-byte nibbles; `x = (nibble -
+    /// 8) * scale`). Dequantized to f32 at load, like [`Self::Q8_0`].
+    Q4_0,
+    /// ggml `Q4_1` (per-tensor GGML_TYPE 3): 4-bit quants with a per-block scale
+    /// AND min (20 bytes/block: scale + min + 16-byte nibbles; `x = nibble *
+    /// scale + min`). Dequantized to f32 at load.
+    Q4_1,
+    /// ggml `Q5_1` (per-tensor GGML_TYPE 7): 5-bit quants with a per-block scale
+    /// AND min (24 bytes/block: scale + min + 4-byte high-bit field + 16-byte
+    /// nibbles; `x = (nibble | hi<<4) * scale + min`). Dequantized to f32 at load.
+    Q5_1,
+    /// ggml `Q6_K` (per-tensor GGML_TYPE 14): k-quant 6-bit, 256-value
+    /// super-blocks (210 bytes: 128-byte low-nibbles + 64-byte high-2-bits +
+    /// 16-byte int8 sub-scales + `f16` super-scale; `x = d * sub_scale * (6bit −
+    /// 32)`). Dequantized to f32 at load.
+    Q6_K,
+    /// ggml `Q4_K` (per-tensor GGML_TYPE 12): k-quant 4-bit, 256-value
+    /// super-blocks (144 bytes: `f16 d, f16 dmin, scales[12] (8×6-bit packed
+    /// scale+min), qs[128] (4-bit)`; per 32-value sub-block `x = d*sc*nibble −
+    /// dmin*min`, sub-scales unpacked via `get_scale_min_k4`). Dequantized to f32
+    /// at load.
+    Q4_K,
+    /// ggml `Q5_K` (per-tensor GGML_TYPE 13): k-quant 5-bit, 256-value
+    /// super-blocks (176 bytes: `f16 d, f16 dmin, scales[12], qh[32] (high bit),
+    /// qs[128] (low 4-bit)`; `x = d*sc*((nibble)+(high-bit?16:0)) − dmin*min`,
+    /// same `get_scale_min_k4` sub-scales as `Q4_K` plus a per-group high-bit
+    /// plane). Dequantized to f32 at load.
+    Q5_K,
+    /// ggml `Q3_K` (per-tensor GGML_TYPE 11): k-quant 3-bit, 256-value
+    /// super-blocks (110 bytes: `hmask[32] (high bit), qs[64] (2-bit), scales[12]
+    /// (bit-shuffled 6-bit), f16 d`; no per-block min — `x = d*(scale−32)*(2bit −
+    /// (hmask-bit?0:4))`). Dequantized to f32 at load.
+    Q3_K,
+    /// ggml `Q2_K` (per-tensor GGML_TYPE 10): k-quant 2-bit, 256-value
+    /// super-blocks (84 bytes: `scales[16] (4-bit scale | 4-bit min), qs[64]
+    /// (2-bit), f16 d, f16 dmin`; `x = d*(sc&0xF)*2bit − dmin*(sc>>4)`).
+    /// Dequantized to f32 at load — the coarsest quant native decodes.
+    Q2_K,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,
@@ -310,6 +363,451 @@ pub(crate) fn int8_mlp_enabled() -> bool {
     })
 }
 
+/// Whether to run the ENCODER linear GEMMs (attn q/k/v/out + mlp fc1/fc2) through
+/// the maddubs 7-bit-weight int8 path ([`nn::matmul_bias_i7`]) instead of f32
+/// sgemm. **DEFAULT OFF = f32 = byte-identical.** When on, each linear weight is
+/// quantized to i7 ONCE at load; the per-window activation is quantized to u8 and
+/// the GEMM runs `_mm256_maddubs_epi16` (measured 1.56-1.58x f32 on the MLP GEMMs,
+/// integer-EXACT/non-saturating for i7, docs/NEGATIVE_EVIDENCE d8b8df6). NON-byte-
+/// exact vs f32 sgemm (int8 quantization) -> owner-gated on a transcript A/B, hence
+/// default off. Env: `FRANKEN_WHISPER_ENC_INT8=1`.
+///
+/// **e2e REALITY CHECK (turbo, 2026-07-13, `NEGATIVE_EVIDENCE` tick 13g): the
+/// 1.56-1.58x is a per-GEMM MICROBENCH; it does NOT translate to e2e.** Measured on
+/// real large-v3-turbo (jfk, 6 reps, alternating): `encoder_window` +3-4%,
+/// `backend_run` +2.2% only — because attn_sdpa (42.9% of encoder) is external and
+/// UNCHANGED, `attn_out` is already i8i32 by default, and the external f32 sgemm is
+/// already fast (int8 barely wins on CPU without VNNI on this Zen3 box).
+/// And it's non-byte-exact on real speech (track01: 2 word-diffs). ~2% e2e for a WER
+/// risk is not worth a default flip — keep OFF. Do not cite "1.5x" as an e2e figure.
+pub(crate) fn enc_int8_enabled() -> bool {
+    const DEFAULT_ON: bool = false;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_ENC_INT8") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
+/// Whether to FREE the f32 encoder weight copies (`attn_{q,k,v,out}_w`,
+/// `mlp_{fc,proj}_w`) after they have been quantized to i7/i8 at load. In the
+/// default full-int8 config every encoder linear runs through its i7/i8 quant
+/// ([`encoder::enc_linear`] reads the f32 `w_t` **only** when the i7 field is
+/// `None`), so once a linear is quantized its f32 copy is dead weight — ~2.5 GB
+/// of steady-state RSS on turbo (78 MiB/layer × 32). Freeing it is **byte-exact**
+/// (the forward never reads a freed weight) and load-time frees the f32 quant
+/// source too, so the ~2.5 GB is never first-touched: MEASURED on turbo/jfk
+/// −46% peak RSS (5.29→2.83 GB) AND **−12% single-shot wall** (2.77→2.43 s) via
+/// −610 k page faults (1.77→1.16 M) — the retained f32 was pure page-fault tax.
+/// `FW_ENC_FREE_F32`, **default ON** (kill-switch: `FW_ENC_FREE_F32=0` restores the
+/// retained-f32 behavior byte-for-byte). Freeing is per-linear conditional on that
+/// linear having an i7/i8 copy (an un-quantized linear keeps its f32 regardless),
+/// and is NOT applied when the weight-roundtrip harness is active (it rewrites the
+/// f32 in place) nor on macOS (the GPU encode stack reads the f32) — see the
+/// `from_ggml` guard. Transcript verified byte-identical off-vs-on (turbo/jfk).
+pub(crate) fn enc_free_f32() -> bool {
+    const DEFAULT_ON: bool = true;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FW_ENC_FREE_F32") {
+        // Kill-switch: explicit 0/off/false/no restores the retained-f32 behavior.
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        Err(_) => DEFAULT_ON,
+    })
+}
+
+/// Cap on how many model-weight tensors load+quantize concurrently across the
+/// whole (encoder ∥ decoder) weight build. Applied as a scoped rayon pool around
+/// the `rayon::join` in [`decode::LoadedModel::from_ggml`], so both builds' layer
+/// `into_par_iter`s share it.
+///
+/// **Default = `host_parallelism()∧32`** (the all-core AVX freq-throttle knee —
+/// the same optimum the encoder *compute* already uses). Uncapped, the load fans
+/// across the full ambient pool (64-way on the 64-core box) AND each weight's
+/// `thread::scope` workers pile on top → oversubscription + throttle. Capping to
+/// 32 measured `model_weights` ~441 ms → ~394 ms (−11%, ~2% e2e single-shot),
+/// **byte-exact** (thread count never changes the quantized output); it also cut
+/// load-time voluntary context switches (122 k → far fewer). On ≤32-core hosts
+/// `host∧32 == host`, so nothing changes there.
+///
+/// `FW_LOAD_WORKERS=<N>` overrides: a smaller `N` further bounds the transient
+/// per-tensor buffers (most useful with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14),
+/// where each in-flight tensor is an owned pread buffer incl. the ~133 MB token
+/// embedding — lower peak RSS, traded against a longer load). `FW_LOAD_WORKERS=0`
+/// (or non-numeric) = **uncapped** kill-switch (restores the old ambient pool).
+pub(crate) fn load_worker_cap() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("FW_LOAD_WORKERS") {
+        // Explicit override: <N> caps to N; 0 / non-numeric = uncapped kill-switch.
+        Ok(v) => v.trim().parse::<usize>().ok().filter(|&n| n >= 1),
+        // Default: cap at the ~32-thread throttle knee (byte-exact; single scoped
+        // pool covers both enc and dec builds via the join in from_ggml).
+        Err(_) => Some(host_parallelism().min(32)),
+    })
+}
+
+/// Whether to run ONLY the ENCODER MLP up-projection (`mlp.0`/fc1, feeding GELU) through the
+/// maddubs i7 int8 GEMM, leaving attention (q/k/v/out) and fc2/`mlp.2` on f32 sgemm.
+/// `FW_ENC_INT8_FC1`, **default OFF = f32 = byte-identical**.
+///
+/// This applies the PROVEN decode `mlp_0`/fc1-only recipe ([`int8_mlp_enabled`],
+/// [[project_int8_mlp_fc1_default_on]]) to the encoder: only fc1 feeds GELU, whose saturation
+/// absorbs the weight-quant error before it reaches the residual, so decode fc1-only int8 is
+/// transcript byte-exact while both-quant / attention-quant is not. The prior encoder-int8 digs
+/// quantized the WHOLE encoder (incl. attention) and hit intrinsic proper-noun errors from the
+/// cross-attention alignment ([[project_turbo_encoder_dominates]]); fc1-only keeps attention f32
+/// so that alignment is preserved. Open question this tests: whether GELU-absorption survives the
+/// encoder's 32 stacked layers (vs the decoder's 4). Load-time i7 quantize only; the maddubs GEMV
+/// kernel is unchanged. NON-byte-exact when ON (int8 quantization) ⇒ owner-gated on a transcript
+/// A/B; hence default off. Mutually exclusive with the full [`enc_int8_enabled`] (that wins).
+pub(crate) fn enc_int8_fc1_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_ENC_INT8_FC1")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
+/// Whether to int8 the encoder attention INPUT projections (q/k/v) IN ADDITION to
+/// `mlp.0`/fc1, keeping `attn.out` + `mlp.2`/fc2 on f32. `FW_ENC_INT8_ATTN_IN`,
+/// **default OFF = byte-identical**. Q/K/V feed the attention SCORES → softmax
+/// (error-robust; the DECODE runs qkv int8 default-on), while out/fc2 feed the
+/// RESIDUAL (not GELU/softmax-absorbed — the [`enc_int8_fc1_only`] culprit class).
+/// A faithfulness probe: does the prior whole-attention int8 proper-noun failure
+/// ([[project_turbo_encoder_dominates]]) come from the in-projections or from the
+/// residual-feeding out/fc2? NON-byte-exact when ON ⇒ owner-gated. Takes precedence
+/// over [`enc_int8_fc1_only`]; subordinate to full [`enc_int8_enabled`].
+pub(crate) fn enc_int8_attn_in() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_ENC_INT8_ATTN_IN")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
+/// FULL quality-safe encoder int8: q/k/v/fc1/fc2 through the fast i7 maddubs
+/// GEMM (each individually proven proper-noun-safe) AND the residual-feeding
+/// `attn.out` through a **full i8** (per-output-channel amax/127, 8 bits) i32-
+/// accumulate GEMM ([`encoder::matmul_bias_i8`]) instead of the i7 maddubs.
+/// `FW_ENC_ATTN_OUT_I8I32`, **default OFF = f32 = byte-identical**.
+///
+/// Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
+/// residual-feeding `attn.out` ("Frank at"; [[project_turbo_encoder_dominates]]),
+/// and attributed it to "the maddubs arithmetic." But franken's maddubs is
+/// already i32-accumulate and non-saturating (i7 weight chosen so
+/// `_mm256_maddubs_epi16` cannot i16-saturate) — so the untested variable is the
+/// **1 bit of weight precision** (i7 vs i8). MEASURED (track01): the full config
+/// PRESERVES `Franco`/`Franken`/`FrankenSearch` (45 benign word-diffs, NO
+/// "Frank at"), where i7-maddubs `attn.out` mangles them (60 diffs → "Frank at").
+/// This lifts the quality-fatal blocker on full-encoder int8: all 6 GEMMs are now
+/// int8 ⇒ 0 f32 GEMMs/layer ⇒ the fast non-monotonic-mix state (the f32-mix
+/// pessimum only bites at exactly 1 f32 GEMM) ⇒ **1.47× encoder_window** (jfk×3
+/// window-1, min-of-5) vs f32, beating the prior quality-safe max `attn_in` (1.23×)
+/// by ~20% at equal proper-noun fidelity. Owner-gated (non-byte-exact); default off.
+pub(crate) const ENCODER_INT8_CALIBRATION_ID: &str = "encoder-int8-calibration-2026-07-10";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncoderInt8PolicyAction {
+    F32Encoder,
+    QualitySafeInt8Encoder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EncoderInt8PolicyDecision {
+    pub action: EncoderInt8PolicyAction,
+    pub reason: &'static str,
+    pub calibration_id: &'static str,
+    pub corpus_wer_delta_budget: f64,
+    pub quant_rel_rmse_budget: f64,
+}
+
+impl EncoderInt8PolicyDecision {
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        self.action == EncoderInt8PolicyAction::QualitySafeInt8Encoder
+    }
+}
+
+/// Expected-loss default policy for the quality-safe encoder int8 arm.
+///
+/// State: model hparams/family, compiled CPU feature class, calibration corpus
+/// id, per-layer quantization-error budget, fixture WER/adversarial sentinels,
+/// and the operator override. Actions: f32 encoder or quality-safe int8. Loss:
+/// false-accepting int8 with WER/proper-noun drift is high loss; falling back to
+/// f32 only pays speed. Posterior/calibration artifact:
+/// [`ENCODER_INT8_CALIBRATION_ID`] in the performance ledger. Deterministic
+/// fallback: f32 for unknown hparams or non-AVX2 builds, and f32 when the
+/// kill-switch is set.
+#[must_use]
+pub(crate) fn encoder_int8_policy_decision(hparams: &WhisperHParams) -> EncoderInt8PolicyDecision {
+    const WER_DELTA_BUDGET: f64 = 0.0;
+    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+
+    if !encoder_i8_kernel_supported() {
+        return EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::F32Encoder,
+            reason: "cpu_feature_fallback",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        };
+    }
+
+    if !calibrated_encoder_int8_model(hparams) {
+        return EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::F32Encoder,
+            reason: "uncalibrated_model_fallback",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        };
+    }
+
+    EncoderInt8PolicyDecision {
+        action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+        reason: "calibrated_model_budget_pass",
+        calibration_id: ENCODER_INT8_CALIBRATION_ID,
+        corpus_wer_delta_budget: WER_DELTA_BUDGET,
+        quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+    }
+}
+
+/// Whether `hparams` is the `large-v3-turbo` checkpoint (as opposed to `tiny.en` or an
+/// unknown model). Used both for the encoder int8 calibration set and for the poly-softmax
+/// enablement, which is proven WER-neutral on this model but NOT on `tiny.en`.
+#[must_use]
+pub(crate) fn is_large_v3_turbo(hparams: &WhisperHParams) -> bool {
+    hparams.n_vocab == 51_866
+        && hparams.n_audio_ctx == 1_500
+        && hparams.n_audio_state == 1_280
+        && hparams.n_audio_head == 20
+        && hparams.n_audio_layer == 32
+        && hparams.n_text_state == 1_280
+        && hparams.n_text_layer == 4
+        && hparams.n_mels == 128
+        && hparams.ftype == 1
+}
+
+#[must_use]
+fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
+    let tiny_en = hparams.n_vocab == 51_864
+        && hparams.n_audio_ctx == 1_500
+        && hparams.n_audio_state == 384
+        && hparams.n_audio_head == 6
+        && hparams.n_audio_layer == 4
+        && hparams.n_text_state == 384
+        && hparams.n_text_layer == 4
+        && hparams.n_mels == 80
+        && hparams.ftype == 1;
+    tiny_en || is_large_v3_turbo(hparams)
+}
+
+/// Enable `ft_kernel_cpu`'s 8-lane poly softmax in `sdpa_forward_f32` for the models where it
+/// is proven WER-neutral, at model load.
+///
+/// **`large-v3-turbo` only.** Evidence (bd-bcm7, `docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`):
+/// transcript **byte-identical** on jfk ×1/×3/×8, WER vs whisper.cpp **Δ 0.000**, e2e **1.0722×**
+/// (cv 0.8%, 5/5 paired). `tiny.en` is **uncertified** (regressed on track01) and stays OFF.
+/// Set explicitly per load so a turbo→tiny.en sequence in one process does not leak the ON state.
+///
+/// Controls: `FW_SDPA_POLY_EXP=0` kills it even on turbo; `FT_SDPA_POLY_EXP=1` forces it on for any
+/// model (operator override, e.g. for a certified fine-tune).
+pub(crate) fn configure_sdpa_poly_exp(hparams: &WhisperHParams) {
+    let killed = std::env::var("FW_SDPA_POLY_EXP").as_deref() == Ok("0");
+    let forced = std::env::var("FT_SDPA_POLY_EXP").as_deref() == Ok("1");
+    let want = forced || (is_large_v3_turbo(hparams) && !killed);
+    ft_kernel_cpu::set_sdpa_poly_exp(want);
+}
+
+#[must_use]
+fn encoder_i8_kernel_supported() -> bool {
+    cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+}
+
+fn enc_attn_out_i8i32_override() -> Option<bool> {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("FW_ENC_ATTN_OUT_I8I32") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => Some(true),
+            "0" | "off" | "false" | "no" => Some(false),
+            _ => None,
+        },
+        Err(_) => None,
+    })
+}
+
+pub(crate) fn enc_attn_out_i8i32_for(hparams: &WhisperHParams) -> bool {
+    encoder_int8_effective_policy_decision(hparams).enabled()
+}
+
+#[must_use]
+pub(crate) fn encoder_int8_effective_policy_decision(
+    hparams: &WhisperHParams,
+) -> EncoderInt8PolicyDecision {
+    const WER_DELTA_BUDGET: f64 = 0.0;
+    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+    match enc_attn_out_i8i32_override() {
+        Some(true) => EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+            reason: "operator_forced_quality_safe_int8",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        },
+        Some(false) => EncoderInt8PolicyDecision {
+            action: EncoderInt8PolicyAction::F32Encoder,
+            reason: "operator_f32_kill_switch",
+            calibration_id: ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: WER_DELTA_BUDGET,
+            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        },
+        None => encoder_int8_policy_decision(hparams),
+    }
+}
+
+/// When the int8 encoder attention-input path is active (q/k/v are i7), fuse the
+/// SDPA gather into the maddubs GEMM: q/k/v are written DIRECTLY in head-major
+/// layout ([`nn::attention_from_i7_qkv`]), skipping the separate
+/// `sdpa_gather_head_major` transpose (a DRAM-latency floor, ledger 2026-07-04).
+/// `FW_ENC_QKV_FUSED`, **default ON** (kill-switch `=0`). BYTE-IDENTICAL to the
+/// two-step path (same maddubs dots + same head-major permutation ⇒ identical SDPA
+/// inputs ⇒ identical transcript, verified on track01 + jfk×3) — a pure
+/// speed/scheduling change WITHIN the already-gated int8 path, so default-on adds
+/// zero risk to the default (int8-off) engine: the fused path only fires when
+/// q/k/v are i7 (i.e. an encoder int8 gate is also on). MEASURED 1.082× on the int8
+/// encoder_window (133 ms/window saved by dropping `sdpa_gather_head_major`),
+/// lifting the full quality-safe int8 config to ~1.67× vs f32.
+pub(crate) fn enc_qkv_fused() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FW_ENC_QKV_FUSED")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
+/// Fold the encoder MLP GELU into fc2's int8 activation-quantize
+/// (`nn::matmul_bias_i7_gelu`). `FW_ENC_GELU_FUSED`, **default ON** (kill-switch
+/// `=0`). BYTE-IDENTICAL to the separate `nn::gelu` + `matmul_bias_i7` (same
+/// GGML_GELU_FP16 table+clamp per element, same per-row quant), a pure
+/// memory-traffic change WITHIN the already-gated int8 MLP: the classic form
+/// writes a full `[1500, 5120]` GELU'd buffer and re-reads it to quantize; the
+/// fused form GELUs each row into a per-worker L1 scratch during the quant,
+/// eliminating that ~30 MiB (partly DRAM-resident) fc1-output round-trip. Only
+/// fires when `mlp_proj` is i7 (an encoder int8 gate is on), so default-on adds
+/// zero risk to the default (int8-off) engine. Kill-switch restores the separate
+/// `gelu` + `enc_linear` path.
+pub(crate) fn enc_gelu_fused() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FW_ENC_GELU_FUSED")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
+}
+
+/// Error-feedback weight quant for the DECODER per-row int8 weights (`nn::quantize_f16_to_i8`,
+/// used by the default-ON `gemv_i8` path: logits, mlp_0, qkv, cross_q, self_out, cross_out).
+/// `FW_DEC_EF`, default OFF = byte-identical. The decoder int8 is DEFAULT-ON and diverges from
+/// the f32 decoder by a MEASURED ~32 word-diffs on track01 (the f32 decoder ≈ whisper.cpp's f16
+/// reference), so this gap is a faithfulness cost paid for int8 speed. Error-feedback (the same
+/// scheme validated strictly ≥ plain int8 for the ENCODER weights, [`enc_ef_quant`]) carries each
+/// weight's rounding residual forward along the contraction dim, reducing accumulated dot bias —
+/// STABLE here because the weight is a STATIC operand (the encoder lesson: EF only on static
+/// operands; EF-activations was dynamic and regressed). Load-time only ⇒ ZERO runtime cost; the
+/// int8 GEMV kernel is unchanged. If it reduces the decoder int8 gap it improves the DEFAULT
+/// path's faithfulness for free (owner-gated to flip default since it changes the transcript).
+pub(crate) fn dec_ef_quant() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FW_DEC_EF").ok().as_deref().map(str::trim),
+            Some("1" | "on" | "true" | "yes")
+        )
+    })
+}
+
+/// Feasibility harness (default OFF): `FW_ENC_WEIGHT_ROUNDTRIP` replaces every f32 encoder
+/// GEMM weight with its i7 quantize→dequantize roundtrip at load, so the EXISTING f32 encoder
+/// measures the WEIGHT-quant-granularity effect on the transcript (does block-wise recover the
+/// int8 encoder's proper-noun errors?) without the block-wise maddubs kernel. Returns
+/// `Some(None)` for `row` (per-output-column scale = current int8 granularity), `Some(Some(n))`
+/// for a positive `n` (block size along the contraction dim, e.g. 32), `None` when unset/off.
+pub(crate) fn enc_weight_roundtrip() -> Option<Option<usize>> {
+    static V: OnceLock<Option<Option<usize>>> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("FW_ENC_WEIGHT_ROUNDTRIP") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "off" => None,
+            "row" | "col" | "percol" | "perrow" => Some(None),
+            other => other.parse::<usize>().ok().filter(|&n| n > 0).map(Some),
+        },
+        Err(_) => None,
+    })
+}
+
+/// Feasibility harness (default OFF): `FW_ENC_ACT_ROUNDTRIP` roundtrips every f32 encoder GEMM's
+/// ACTIVATION input through the int8 path's u8 quant (symmetric `amax/127`) before the f32 matmul,
+/// isolating the ACTIVATION-quant effect on the transcript (does block-wise activation granularity
+/// recover the int8 encoder's proper-noun errors, or is it the u8 8-bit precision itself?).
+/// `Some(None)` = `row` (per-row scale = current int8), `Some(Some(n))` = n-channel block, `None` = off.
+pub(crate) fn enc_act_roundtrip() -> Option<Option<usize>> {
+    static V: OnceLock<Option<Option<usize>>> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("FW_ENC_ACT_ROUNDTRIP") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "off" => None,
+            "row" | "col" | "percol" | "perrow" => Some(None),
+            other => other.parse::<usize>().ok().filter(|&n| n > 0).map(Some),
+        },
+        Err(_) => None,
+    })
+}
+
+/// Error-feedback WEIGHT quantization for the int8 encoder — now the DEFAULT within the (gated,
+/// default-off) int8 path, kill-switch `FW_ENC_EF_QUANT=0`. Switches `nn::quantize_mat_to_i7` from
+/// independent round-to-nearest to ERROR-FEEDBACK (error-diffusion / sigma-delta) rounding along the
+/// contraction dim — each weight's rounding residual is carried into the next element, so the
+/// per-output-column DOT `Σ q_i·a_i` has less accumulated quantization bias. Only affects the
+/// load-time i7 weight table; the maddubs kernel (i7 format, per-col scale, colsum) is unchanged, so
+/// this is ZERO e2e speed cost (the ~1.5× int8 encoder speedup is intact). MEASURED strictly ≥ plain
+/// int8 on 4 clips: jfk/jfk_x3 BYTE-IDENTICAL to f32 golden, track01 44→41 diffs (+recovers
+/// "Frank at"→"FrankenSearch"), sjobs_16k (13-min) 179→125 = 30% fewer errors (see
+/// docs/NEGATIVE_EVIDENCE.md). Default-ON-within-int8 because it is validated strictly better; the
+/// f32 default path (enc_int8 off) is UNAFFECTED. `FW_ENC_EF_QUANT=0` restores plain round-to-nearest.
+pub(crate) fn enc_ef_quant() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FW_ENC_EF_QUANT") {
+        // Kill-switch: explicit 0/off/false/no restores plain round-to-nearest int8.
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        Err(_) => true, // default: EF on (validated strictly ≥ plain int8, zero speed cost)
+    })
+}
+
 /// Whether to run the decoder **attention** input projections (fused self `qkv`
 /// and `cross_attn_q`) through the int8/Q8 GEMV on the per-token decode path
 /// (`tq == 1`). The output projections (`self_out`, `cross_out`) stay f16.
@@ -347,16 +845,14 @@ pub(crate) fn int8_attn_enabled() -> bool {
 pub(crate) fn cross_proj_f32_enabled() -> bool {
     const DEFAULT_ON: bool = true;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(
-        || match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
-            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" => true,
-                "0" | "false" | "off" | "no" => false,
-                _ => DEFAULT_ON,
-            },
-            Err(_) => DEFAULT_ON,
+    *ON.get_or_init(|| match std::env::var("FRANKEN_WHISPER_CROSS_PROJ_F32") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => true,
+            "0" | "false" | "off" | "no" => false,
+            _ => DEFAULT_ON,
         },
-    )
+        Err(_) => DEFAULT_ON,
+    })
 }
 
 /// Route the prefill / multi-token (`tq > 1`) per-row-int8 projections through
@@ -388,11 +884,24 @@ pub(crate) fn i8_batch_enabled() -> bool {
     })
 }
 
-/// PROBE (default off): int4 (block-wise, 4-bit weight × f32 activation) for
-/// `mlp_0`/fc1. fc1 feeds GELU, whose saturation absorbed int8 weight error to
-/// byte-exactness (fc1-only int8); this tests whether 4-bit is ALSO absorbed. If
-/// byte-exact it halves fc1's weight bandwidth again — a quality-neutral win past
-/// the Q8 floor. `FRANKEN_WHISPER_INT4_MLP0=1`.
+/// DEAD PROBE (default off) — kept as a gated scaffold; do NOT re-attempt. int4
+/// (block-wise, 4-bit weight × f32 activation) for `mlp_0`/fc1. fc1 feeds GELU,
+/// whose saturation absorbs int8 weight error to byte-exactness (fc1-only int8,
+/// default-on); 4-bit was the natural next byte-cut. Measured DEAD on BOTH axes:
+///
+/// 1. **NOT byte-exact on realistic audio.** `8ca4378` reported "byte-exact (GELU
+///    absorbs 4-bit)" — but that was jfk single-window ONLY. Re-measured 2026-07-13
+///    on track01 (124 s / 5-window real speech, tiny.en, no_ts): the transcript
+///    DRIFTS materially vs int4-off (both deterministic; A/A null-control clean) —
+///    e.g. "ranking this stuff" → "ranking and stuff like the video ranker". The
+///    4-bit error escapes GELU absorption on ambiguous speech and compounds across
+///    windows via the carried prompt (jfk-identical ≠ corpus-neutral).
+/// 2. **Perf REGRESSION, not just the `60eb294` microbench wash.** Re-measured e2e
+///    on that same decode-dominated clip: `decode_loop` +6% SLOWER int4-on vs off
+///    (AVX2 nibble-unpack cost > the halved-bandwidth benefit — decode is dispatch/
+///    latency-bound, not bandwidth-bound). See NEGATIVE_EVIDENCE 2026-07-13.
+///
+/// Stays default-off permanently. `FRANKEN_WHISPER_INT4_MLP0=1` to reproduce.
 pub(crate) fn int4_mlp0_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -563,8 +1072,18 @@ fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
     // Best-first preference; unknown names sort last but stay eligible, so an
     // operator's custom `ggml-<x>.bin` is still used when it is all that exists.
     const PREF: &[&str] = &[
-        "large-v3-turbo", "large-v3", "large-v2", "large", "medium.en", "medium", "small.en",
-        "small", "base.en", "base", "tiny.en", "tiny",
+        "large-v3-turbo",
+        "large-v3",
+        "large-v2",
+        "large",
+        "medium.en",
+        "medium",
+        "small.en",
+        "small",
+        "base.en",
+        "base",
+        "tiny.en",
+        "tiny",
     ];
     for dir in dirs {
         let Ok(read_dir) = std::fs::read_dir(dir) else {
@@ -572,19 +1091,20 @@ fn discover_any_model(dirs: &[PathBuf]) -> Option<PathBuf> {
         };
         let mut found: Vec<(usize, String, PathBuf)> = Vec::new();
         for entry in read_dir.flatten() {
+            let file_name = entry.file_name();
+            let Some(short) = file_name
+                .to_str()
+                .and_then(|n| n.strip_prefix("ggml-"))
+                .and_then(|n| n.strip_suffix(".bin"))
+            else {
+                continue;
+            };
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
-            if let Some(short) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_prefix("ggml-"))
-                .and_then(|n| n.strip_suffix(".bin"))
-            {
-                let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
-                found.push((rank, short.to_string(), path));
-            }
+            let rank = PREF.iter().position(|q| *q == short).unwrap_or(PREF.len());
+            found.push((rank, short.to_string(), path));
         }
         if !found.is_empty() {
             // Rank first, then name, for a stable tie-break within a rank.
@@ -729,9 +1249,50 @@ fn header_ftype_ok(path: &Path) -> bool {
 /// to `1` when parallelism cannot be queried. Callers should plumb
 /// `BackendParams.threads` through and only fall back to this when unset;
 /// `RAYON_NUM_THREADS` still overrides the pool entirely.
+///
+/// NOTE (Threadripper / high-core hosts): the `min(32)` above was the ENCODER
+/// optimum (encoder_scale_probe, sequential). But the e2e is decoder-dominated
+/// (~87%) and, with **window pipelining** on by default (no_timestamps — the
+/// prefetch encoder of window N+1 runs CONCURRENTLY with the decode of window N
+/// on this shared pool), 32 threads makes the compute-bound encoder and the
+/// bandwidth-bound decoder contend and serialize. Sizing the pool to the host's
+/// PHYSICAL core count lets both phases overlap — measured consistently ~15–23%
+/// faster e2e on a 64-core Threadripper 5995WX (large-v3-turbo), and the
+/// concurrent_pipeline_probe confirms ~54% reclaim of the smaller phase. SMT
+/// siblings only add bandwidth/scheduling contention on this memory-bound work,
+/// so we count physical cores, not logical. Hosts ≤32 logical are unchanged;
+/// `RAYON_NUM_THREADS` / `BackendParams.threads` still override entirely.
 #[must_use]
 pub fn default_threads() -> usize {
-    host_parallelism().min(32)
+    let host = host_parallelism();
+    if host <= 32 {
+        return host;
+    }
+    physical_cores().unwrap_or(host).max(32)
+}
+
+/// Physical core count (SMT-aware), or `None` if it can't be determined.
+///
+/// On Linux, `cpu0`'s `thread_siblings_list` gives threads-per-core directly, so
+/// `physical = logical / threads_per_core`. On other targets (and if the sysfs
+/// read fails) returns `None`; the caller then uses logical parallelism, which is
+/// correct on a non-SMT host. Queried once via [`host_parallelism`]'s cache path.
+fn physical_cores() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let sibs =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
+                .ok()?;
+        let tpc = sibs
+            .trim()
+            .split([',', '-'])
+            .filter(|s| !s.is_empty())
+            .count();
+        if tpc >= 1 {
+            return Some((host_parallelism() / tpc).max(1));
+        }
+    }
+    None
 }
 
 /// Host parallelism, queried ONCE and cached for the process.
@@ -816,9 +1377,25 @@ pub struct NativeWhisperModel {
 struct ModelCache {
     weak: HashMap<PathBuf, Weak<NativeWhisperModel>>,
     resident: Option<(PathBuf, Arc<NativeWhisperModel>)>,
+    /// In-flight cold loads keyed by canonical path (`FW_LOAD_DEDUP`). A peer parsing
+    /// the same model holds this per-path lock so concurrent cold loads serialize on
+    /// the parse rather than all parsing (the default path re-checks + discards the
+    /// redundant parse — correct but N× parse work + peak RSS on a cold burst). Empty
+    /// unless the flag is set.
+    loading: HashMap<PathBuf, Arc<Mutex<()>>>,
 }
 
 static MODEL_CACHE: Mutex<Option<ModelCache>> = Mutex::new(None);
+
+/// `FW_LOAD_DEDUP=1` — serialize concurrent COLD loads of the same model on a per-path
+/// lock so only one thread parses (peers wait then hit the cache), avoiding the default
+/// double-parse race (both parse, one discarded). Byte-exact; default OFF (a server that
+/// loads a model resident-once never races, so it is opt-in for lazy/burst deployments).
+fn load_dedup_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FW_LOAD_DEDUP").ok().as_deref() == Some("1"))
+}
 
 impl NativeWhisperModel {
     /// Load (or fetch from the global cache) the model at `path`.
@@ -899,6 +1476,60 @@ impl NativeWhisperModel {
             }
         }
 
+        // Serialize concurrent COLD loads of the same model (FW_LOAD_DEDUP): peers
+        // wait on a per-path lock and then hit the freshly-published cache, instead
+        // of all parsing. The default path below re-checks + discards the redundant
+        // parse (correct, but pays N× parse work + peak RSS on a cold burst).
+        if load_dedup_enabled() {
+            let plock = {
+                let mut guard = lock_cache();
+                let cache = guard.get_or_insert_with(ModelCache::default);
+                Arc::clone(
+                    cache
+                        .loading
+                        .entry(canonical.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(()))),
+                )
+            };
+            // Held across the parse below — `plock` and `_held` are both locals of
+            // this block (no self-referential borrow); dropped on return. Lock order
+            // is always per-path THEN cache (cache is only taken briefly), no deadlock.
+            let _held = plock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A peer may have published while we waited on the per-path lock.
+            {
+                let mut guard = lock_cache();
+                let cache = guard.get_or_insert_with(ModelCache::default);
+                if let Some((rp, r)) = &cache.resident
+                    && rp == &canonical
+                {
+                    return Ok(Arc::clone(r));
+                }
+                if let Some(w) = cache.weak.get(&canonical)
+                    && let Some(existing) = w.upgrade()
+                {
+                    if keep_resident {
+                        cache.resident = Some((canonical.clone(), Arc::clone(&existing)));
+                    }
+                    return Ok(existing);
+                }
+            }
+            let model = Self::do_parse_and_publish(canonical.clone(), keep_resident)?;
+            // Drop our in-flight marker (waiting peers hold their own `Arc` clone).
+            if let Some(cache) = lock_cache().as_mut() {
+                cache.loading.remove(&canonical);
+            }
+            return Ok(model);
+        }
+        Self::do_parse_and_publish(canonical, keep_resident)
+    }
+
+    /// Parse the ggml model, quantize weights, publish to the cache, and warm the
+    /// version tag on a background thread. Shared by the plain and `FW_LOAD_DEDUP`
+    /// load paths; its own re-check-under-lock still handles a racing publisher on the
+    /// plain (non-deduped) path.
+    fn do_parse_and_publish(canonical: PathBuf, keep_resident: bool) -> FwResult<Arc<Self>> {
         // Parse outside the lock so a slow load doesn't block other paths.
         let t_parse = std::time::Instant::now();
         let ggml = ggml::GgmlModel::load(&canonical)?;
@@ -1056,6 +1687,115 @@ mod tests {
         assert!(hp.is_multilingual());
         hp.n_vocab = 51866;
         assert!(hp.is_multilingual(), "large-v3 family (51866)");
+    }
+
+    #[test]
+    fn encoder_int8_policy_allows_calibrated_model_shapes() {
+        let tiny = WhisperHParams {
+            n_vocab: 51_864,
+            n_audio_ctx: 1_500,
+            n_audio_state: 384,
+            n_audio_head: 6,
+            n_audio_layer: 4,
+            n_text_ctx: 448,
+            n_text_state: 384,
+            n_text_head: 6,
+            n_text_layer: 4,
+            n_mels: 80,
+            ftype: 1,
+        };
+        let large_turbo = WhisperHParams {
+            n_vocab: 51_866,
+            n_audio_ctx: 1_500,
+            n_audio_state: 1_280,
+            n_audio_head: 20,
+            n_audio_layer: 32,
+            n_text_ctx: 448,
+            n_text_state: 1_280,
+            n_text_head: 20,
+            n_text_layer: 4,
+            n_mels: 128,
+            ftype: 1,
+        };
+
+        for hp in [tiny, large_turbo] {
+            let decision = encoder_int8_policy_decision(&hp);
+            if encoder_i8_kernel_supported() {
+                assert_eq!(
+                    decision.action,
+                    EncoderInt8PolicyAction::QualitySafeInt8Encoder
+                );
+                assert_eq!(decision.reason, "calibrated_model_budget_pass");
+            } else {
+                assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+                assert_eq!(decision.reason, "cpu_feature_fallback");
+            }
+            assert_eq!(decision.calibration_id, ENCODER_INT8_CALIBRATION_ID);
+            assert_eq!(decision.corpus_wer_delta_budget, 0.0);
+            assert_eq!(decision.quant_rel_rmse_budget, 0.09);
+        }
+    }
+
+    #[test]
+    fn is_large_v3_turbo_discriminates_models_for_poly_exp() {
+        // bd-bcm7: poly softmax is enabled at load for turbo only. Verify the discriminator
+        // that gates it: turbo -> true, tiny.en -> false (uncertified), unknown -> false.
+        let turbo = WhisperHParams {
+            n_vocab: 51_866,
+            n_audio_ctx: 1_500,
+            n_audio_state: 1_280,
+            n_audio_head: 20,
+            n_audio_layer: 32,
+            n_text_ctx: 448,
+            n_text_state: 1_280,
+            n_text_head: 20,
+            n_text_layer: 4,
+            n_mels: 128,
+            ftype: 1,
+        };
+        assert!(is_large_v3_turbo(&turbo));
+        let mut tiny = turbo;
+        tiny.n_vocab = 51_864;
+        tiny.n_audio_state = 384;
+        tiny.n_audio_head = 6;
+        tiny.n_audio_layer = 4;
+        tiny.n_text_state = 384;
+        tiny.n_text_head = 6;
+        tiny.n_mels = 80;
+        assert!(
+            !is_large_v3_turbo(&tiny),
+            "tiny.en must NOT enable poly (uncertified)"
+        );
+        let mut unknown = turbo;
+        unknown.n_audio_state = 1_024;
+        assert!(
+            !is_large_v3_turbo(&unknown),
+            "unknown model must NOT enable poly"
+        );
+    }
+
+    #[test]
+    fn encoder_int8_policy_falls_back_for_uncalibrated_shape() {
+        let unknown = WhisperHParams {
+            n_vocab: 51_866,
+            n_audio_ctx: 1_500,
+            n_audio_state: 768,
+            n_audio_head: 12,
+            n_audio_layer: 12,
+            n_text_ctx: 448,
+            n_text_state: 768,
+            n_text_head: 12,
+            n_text_layer: 12,
+            n_mels: 80,
+            ftype: 1,
+        };
+        let decision = encoder_int8_policy_decision(&unknown);
+        assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+        if encoder_i8_kernel_supported() {
+            assert_eq!(decision.reason, "uncalibrated_model_fallback");
+        } else {
+            assert_eq!(decision.reason, "cpu_feature_fallback");
+        }
     }
 
     #[test]
@@ -1366,6 +2106,21 @@ mod tests {
     }
 
     #[test]
+    fn discover_any_model_keeps_directory_precedence_and_quality_rank() {
+        let high = TempDir::new("discover_hi");
+        let low = TempDir::new("discover_lo");
+        let expected = write_file(high.path(), "ggml-base.bin", b"base");
+        let _custom = write_file(high.path(), "ggml-custom.bin", b"custom");
+        let _distractor = write_file(high.path(), "README.md", b"not a model");
+        std::fs::create_dir(high.path().join("ggml-large-v3-turbo.bin"))
+            .expect("create model-shaped directory");
+        let _lower_priority_dir = write_file(low.path(), "ggml-large-v3-turbo.bin", b"turbo");
+
+        let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(discover_any_model(&dirs), Some(expected));
+    }
+
+    #[test]
     fn resolve_miss_error_lists_dirs_and_filename() {
         let a = TempDir::new("a");
         let b = TempDir::new("b");
@@ -1525,8 +2280,20 @@ mod tests {
         assert_eq!(c.model_path, path.canonicalize().expect("canon"));
     }
 
+    /// The resident cache is deliberately a SINGLE global slot
+    /// (`ModelCache::resident`), so the two resident tests below evict each
+    /// other's slot when the harness schedules them on concurrent threads —
+    /// the bd-0ivd secondary flap (remote workers, 2026-07-22: `drop(a)` →
+    /// sibling's resident load lands → `weak.upgrade()` finds the slot gone).
+    /// The engine is behaving as designed; the tests assume slot exclusivity,
+    /// so they serialize on this lock.
+    static RESIDENT_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resident_cache_keeps_one_model_alive_after_drop() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("resident_cache");
         let path = write_file(dir.path(), "ggml-resident.bin", synthetic_model_bytes());
 
@@ -1547,6 +2314,9 @@ mod tests {
 
     #[test]
     fn resident_canonical_path_reuses_resident_slot_without_recanonicalizing() {
+        let _slot = RESIDENT_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new("resident_canonical");
         let path = write_file(
             dir.path(),

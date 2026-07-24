@@ -7,9 +7,9 @@
 //!   repeat:      tile the audio N times to synthesize long-form
 //!   wordts:      pass the literal "wordts" to enable DTW word timestamps
 
-use franken_whisper::native_engine::decode::{transcribe_samples, DecodeParams, LoadedModel};
-use franken_whisper::native_engine::ggml::GgmlModel;
+use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel, transcribe_samples};
 use franken_whisper::native_engine::find_model_file;
+use franken_whisper::native_engine::ggml::GgmlModel;
 use std::time::Instant;
 
 /// Minimal robust WAV reader: locate the `data` chunk, parse PCM16 mono/stereo,
@@ -25,8 +25,12 @@ fn read_wav_mono16k(path: &str) -> (Vec<f32>, u32, u16) {
     let mut data: &[u8] = &[];
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let sz = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
-            as usize;
+        let sz = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let body = pos + 8;
         if id == b"fmt " {
             channels = u16::from_le_bytes([bytes[body + 2], bytes[body + 3]]);
@@ -87,7 +91,7 @@ fn main() {
     let params = DecodeParams {
         language: Some("en".to_string()),
         translate: false,
-        timestamps: true,
+        timestamps: std::env::var("PROBE_NO_TS").as_deref() != Ok("1"),
         n_threads: 0,
         max_text_ctx: None,
         word_timestamps: wordts,
@@ -102,7 +106,7 @@ fn main() {
     // Per-sub-part decode attribution (only populated under
     // FRANKEN_WHISPER_PERF_SPANS=1; thread-local on this calling thread).
     if std::env::var("FRANKEN_WHISPER_PERF_SPANS").as_deref() == Ok("1") {
-        use franken_whisper::native_engine::decoder::{take_sub_ns, SUB_LABELS};
+        use franken_whisper::native_engine::decoder::{SUB_LABELS, take_sub_ns};
         let ns = take_sub_ns();
         let total: u128 = ns.iter().sum();
         eprintln!("--- forward_step sub-part breakdown (sum over all tokens) ---");
@@ -110,13 +114,60 @@ fn main() {
         idx.sort_by(|&a, &b| ns[b].cmp(&ns[a]));
         for i in idx {
             let ms = ns[i] as f64 / 1e6;
-            let pct = if total > 0 { ns[i] as f64 / total as f64 * 100.0 } else { 0.0 };
+            let pct = if total > 0 {
+                ns[i] as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
             eprintln!("  {:<18} {:>8.1} ms  {:>5.1}%", SUB_LABELS[i], ms, pct);
         }
-        eprintln!("  {:<18} {:>8.1} ms (forward_step total)", "SUM", total as f64 / 1e6);
+        eprintln!(
+            "  {:<18} {:>8.1} ms (forward_step total)",
+            "SUM",
+            total as f64 / 1e6
+        );
+    }
+
+    // Layer-skip self-draft accept rate (only when FW_DRAFT_ACCEPT_LAYERS is set).
+    if let Ok(k) = std::env::var("FW_DRAFT_ACCEPT_LAYERS") {
+        let (m, tot) = franken_whisper::native_engine::decoder::drain_draft_accept();
+        let pct = if tot > 0 { 100.0 * m as f64 / tot as f64 } else { 0.0 };
+        eprintln!(
+            "DRAFT_ACCEPT k={k} layers: {m}/{tot} decode steps matched full argmax = {pct:.1}% accept"
+        );
     }
 
     let chars: usize = out.segments.iter().map(|s| s.text.len()).sum();
+    if std::env::var("PROBE_DUMP_TEXT").as_deref() == Ok("1") {
+        let full: String = out.segments.iter().map(|s| s.text.as_str()).collect();
+        eprintln!("TRANSCRIPT>>>{full}<<<");
+    }
+    // Segment-level timestamp dump (PROBE_DUMP_SEGS=1): one line per segment as
+    // `SEG i [t0 -> t1] text`, matching whisper.cpp's `[HH:MM:SS.mmm -->
+    // HH:MM:SS.mmm]` layout for a franken-vs-whisper.cpp timestamp diff.
+    if std::env::var("PROBE_DUMP_SEGS").as_deref() == Ok("1") {
+        for (i, s) in out.segments.iter().enumerate() {
+            eprintln!(
+                "SEG {i} [{:.3} -> {:.3}] {}",
+                s.start_sec.unwrap_or(f64::NAN),
+                s.end_sec.unwrap_or(f64::NAN),
+                s.text.trim()
+            );
+        }
+    }
+    // Word-level DTW timestamp dump (PROBE_DUMP_WORDS=1, needs the `wordts` arg):
+    // one line per word as `WORD [t0 -> t1] text`, for a franken-vs-whisper.cpp
+    // (`-dtw <model> -ml 1`) word-timestamp diff.
+    if std::env::var("PROBE_DUMP_WORDS").as_deref() == Ok("1") {
+        match out.word_timings.as_ref() {
+            Some(wt) => {
+                for w in wt.iter().flatten() {
+                    eprintln!("WORD [{:.3} -> {:.3}] {}", w.start_sec, w.end_sec, w.text);
+                }
+            }
+            None => eprintln!("WORD (none — word_timestamps not enabled; pass `wordts`)"),
+        }
+    }
     let rtf = dt / audio_sec;
     println!(
         "model={model_short} wav={wav} repeat={repeat} wordts={wordts} ch={ch} | audio={audio_sec:.1}s load={load_ms:.0}ms | transcribe={:.3}s RTF={rtf:.4} | segs={} chars={chars}",

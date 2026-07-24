@@ -1,6 +1,7 @@
 # Build artifacts
 /target
 /target_local
+/.rch-targets
 
 # Legacy upstream repos (reference only, not shipped)
 /legacy_whispercpp/

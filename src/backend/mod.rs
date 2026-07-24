@@ -354,12 +354,17 @@ impl RoutingEvidenceLedger {
         };
 
         let avg_brier: Option<f64> = {
-            let brier_values: Vec<f64> =
-                self.entries.iter().filter_map(|e| e.brier_score).collect();
-            if brier_values.is_empty() {
+            let (sum, count) = self
+                .entries
+                .iter()
+                .filter_map(|entry| entry.brier_score)
+                .fold((0.0, 0_usize), |(sum, count), score| {
+                    (sum + score, count + 1)
+                });
+            if count == 0 {
                 None
             } else {
-                Some(brier_values.iter().sum::<f64>() / brier_values.len() as f64)
+                Some(sum / count as f64)
             }
         };
 
@@ -546,15 +551,15 @@ impl RouterState {
         let success_count = history.iter().filter(|r| r.success).count();
         let success_rate = success_count as f64 / sample_count as f64;
 
-        let successful_latencies: Vec<f64> = history
+        let successful_latency_sum = history
             .iter()
             .filter(|r| r.success)
             .map(|r| r.latency_ms as f64)
-            .collect();
-        let avg_latency_ms = if successful_latencies.is_empty() {
+            .sum::<f64>();
+        let avg_latency_ms = if success_count == 0 {
             0.0
         } else {
-            successful_latencies.iter().sum::<f64>() / successful_latencies.len() as f64
+            successful_latency_sum / success_count as f64
         };
 
         let last_error = history.iter().rev().find_map(|r| r.error_message.clone());
@@ -695,13 +700,9 @@ pub fn update_router_state(
     latency_ms: u64,
     error_message: Option<String>,
 ) {
-    let record = RoutingOutcomeRecord {
-        backend,
-        success,
-        latency_ms,
-        error_message: error_message.clone(),
-        recorded_at_rfc3339: Utc::now().to_rfc3339(),
-    };
+    // Preserve the historical timestamp-before-trace ordering while retaining
+    // ownership of the error string until the trace subscriber has borrowed it.
+    let recorded_at_rfc3339 = Utc::now().to_rfc3339();
 
     // Emit the evidence ledger entry via tracing.
     tracing::info!(
@@ -713,6 +714,14 @@ pub fn update_router_state(
         error_message = error_message.as_deref().unwrap_or(""),
         "routing outcome recorded"
     );
+
+    let record = RoutingOutcomeRecord {
+        backend,
+        success,
+        latency_ms,
+        error_message,
+        recorded_at_rfc3339,
+    };
 
     if let Ok(mut guard) = ROUTER_STATE.lock() {
         let state = guard.get_or_insert_with(RouterState::new);
@@ -733,6 +742,21 @@ pub fn record_adaptive_prediction(top_ranked_succeeded: bool) {
 #[must_use]
 pub fn router_state_snapshot() -> Option<RouterState> {
     ROUTER_STATE.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// Read a single backend's empirical `success_rate` from the global router
+/// state under its lock, without cloning the whole state. Byte-identical to
+/// `router_state_snapshot().map(|s| s.metrics_for(kind).success_rate)` — the
+/// same `metrics_for` computation, evaluated on the live state instead of a
+/// bit-perfect clone — but avoids the ~105 µs allocation-heavy `RouterState`
+/// clone (3×50 histories + 50 calibrations + 200-entry evidence ledger) when
+/// only the one scalar is needed.
+#[must_use]
+pub fn router_success_rate_for(kind: BackendKind) -> Option<f64> {
+    ROUTER_STATE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|state| state.metrics_for(kind).success_rate))
 }
 
 /// Record a calibration observation into the global router state (bd-efr.2).
@@ -904,13 +928,18 @@ impl Engine for WhisperCppNativeEngine {
     fn kind(&self) -> BackendKind {
         BackendKind::WhisperCpp
     }
+    /// Probed, not declared (bd-0522). Translation needs a multilingual vocab;
+    /// word timestamps need resolvable DTW alignment heads; GPU needs the Metal
+    /// encoder compiled in and enabled. This engine never diarizes, and its
+    /// `run_streaming` is batch-then-replay rather than incremental delivery.
     fn capabilities(&self) -> EngineCapabilities {
+        let probe = whisper_cpp_native::capability_probe();
         EngineCapabilities {
             supports_diarization: false,
-            supports_translation: true,
-            supports_word_timestamps: true,
-            supports_gpu: true,
-            supports_streaming: true,
+            supports_translation: probe.multilingual,
+            supports_word_timestamps: probe.word_timestamps,
+            supports_gpu: probe.gpu,
+            supports_streaming: false,
         }
     }
     fn is_available(&self) -> bool {
@@ -1002,12 +1031,19 @@ impl Engine for InsanelyFastNativeEngine {
     fn kind(&self) -> BackendKind {
         BackendKind::InsanelyFast
     }
+    /// Probed, not declared (bd-0522). Unlike the bridge engine — which shells
+    /// out to a pyannote diarizer — this engine performs **no** diarization of
+    /// its own: it emits segments with no speaker labels, and speakers are
+    /// assigned downstream by the pipeline's `Diarize` stage. Reporting
+    /// `supports_diarization: true` here claimed a capability the engine does
+    /// not have.
     fn capabilities(&self) -> EngineCapabilities {
+        let probe = whisper_cpp_native::capability_probe();
         EngineCapabilities {
-            supports_diarization: true,
-            supports_translation: true,
-            supports_word_timestamps: true,
-            supports_gpu: true,
+            supports_diarization: false,
+            supports_translation: probe.multilingual,
+            supports_word_timestamps: probe.word_timestamps,
+            supports_gpu: probe.gpu,
             supports_streaming: false,
         }
     }
@@ -1084,12 +1120,18 @@ impl Engine for WhisperDiarizationNativeEngine {
     fn kind(&self) -> BackendKind {
         BackendKind::WhisperDiarization
     }
+    /// Probed, not declared (bd-0522). This engine does own its diarization —
+    /// it calls the orchestrator's local heuristic diarizer in-process, which is
+    /// always present and needs no HuggingFace token — so the flag is a true
+    /// constant rather than a probe. It does not expose the translate task, and
+    /// emits segment- rather than word-level timings.
     fn capabilities(&self) -> EngineCapabilities {
+        let probe = whisper_cpp_native::capability_probe();
         EngineCapabilities {
             supports_diarization: true,
             supports_translation: false,
             supports_word_timestamps: false,
-            supports_gpu: true,
+            supports_gpu: probe.gpu,
             supports_streaming: false,
         }
     }
@@ -1377,7 +1419,7 @@ pub fn diagnostics() -> Vec<serde_json::Value> {
             "env_override": "FRANKEN_WHISPER_INSANELY_FAST_BIN",
             "hf_token_set": insanely_fast::hf_token_present(),
             "hf_token_env_overrides": ["FRANKEN_WHISPER_HF_TOKEN", "HF_TOKEN"],
-            "requires_hf_token_for_diarization": true,
+            "requires_hf_token_for_diarization": insanely_fast_bridge_diarizes(native_execution_mode(native_rollout_stage())),
             "unsupported_options": [
                 "--output-txt/--output-vtt/--output-srt/--output-csv/--output-json-full/--output-lrc",
                 "--no-timestamps",
@@ -1576,6 +1618,21 @@ fn available_for_mode(kind: BackendKind, mode: NativeExecutionMode) -> bool {
         }
         NativeExecutionMode::NativePreferred => native_available(kind) || bridge_available(kind),
         NativeExecutionMode::NativeOnly => native_available(kind),
+    }
+}
+
+/// Whether an InsanelyFast diarization request in `mode` will be served by the
+/// external **bridge** (`insanely-fast-whisper`, which runs pyannote via
+/// HuggingFace) rather than the **native** path. The native engine transcribes and
+/// leaves speaker labelling to the orchestrator's local heuristic `Diarize` stage,
+/// which never contacts HuggingFace — so the HF-token requirement is real only when
+/// the bridge is what actually runs. `NativePreferred` uses the bridge only when the
+/// native engine is unavailable; `NativeOnly` never touches the bridge.
+fn insanely_fast_bridge_diarizes(mode: NativeExecutionMode) -> bool {
+    match mode {
+        NativeExecutionMode::BridgeOnly => true,
+        NativeExecutionMode::NativePreferred => !native_available(BackendKind::InsanelyFast),
+        NativeExecutionMode::NativeOnly => false,
     }
 }
 
@@ -1859,14 +1916,19 @@ fn readiness_for(kind: BackendKind, request: &TranscribeRequest) -> BackendReadi
         };
     }
 
+    // The HF-token requirement applies ONLY when the insanely-fast *bridge* will run
+    // the diarization (pyannote via HuggingFace). The native path diarizes through the
+    // orchestrator's local heuristic and needs no token, so gating the native path on a
+    // token was a false requirement (bd-0522). Fire only when the bridge will diarize.
     if kind == BackendKind::InsanelyFast
         && request.diarize
+        && insanely_fast_bridge_diarizes(mode)
         && !insanely_fast::hf_token_present_for_request(request)
     {
         return BackendReadiness {
             available: false,
             reason: Some(
-                "diarization requires HF token (`--hf-token` or env `FRANKEN_WHISPER_HF_TOKEN` / `HF_TOKEN`)"
+                "diarization via the insanely-fast bridge requires an HF token (`--hf-token` or env `FRANKEN_WHISPER_HF_TOKEN` / `HF_TOKEN`)"
                     .to_owned(),
             ),
         };
@@ -2076,12 +2138,14 @@ fn probe_system_health_uncached() -> SystemHealthReport {
             None
         };
 
-        // Check diarization-specific requirements.
-        if (kind == BackendKind::InsanelyFast || kind == BackendKind::WhisperDiarization)
-            && !is_hf_token_set()
-        {
+        // Diarization's HF requirement is engine-specific: InsanelyFast runs an HF
+        // (pyannote) diarizer and needs a token; WhisperDiarization uses the local
+        // heuristic diarizer (`orchestrator::diarize_segments`) and needs no HF, so
+        // flagging it here was a false requirement (bd-0522 honesty).
+        if kind == BackendKind::InsanelyFast && !is_hf_token_set() {
             issues.push(
-                "FRANKEN_WHISPER_HF_TOKEN / HF_TOKEN not set (required for diarization)".to_owned(),
+                "FRANKEN_WHISPER_HF_TOKEN / HF_TOKEN not set (required for InsanelyFast diarization)"
+                    .to_owned(),
             );
         }
 
@@ -2098,10 +2162,14 @@ fn probe_system_health_uncached() -> SystemHealthReport {
     }
 
     let hf_token_set = is_hf_token_set();
-    let diarization_ready = backends
-        .iter()
-        .any(|b| b.available && b.capabilities.supports_diarization)
-        && hf_token_set;
+    // A diarization-capable backend is ready if it is available and its own
+    // requirement is met: InsanelyFast needs an HF token; WhisperDiarization's
+    // local heuristic diarizer needs nothing extra.
+    let diarization_ready = backends.iter().any(|b| {
+        b.available
+            && b.capabilities.supports_diarization
+            && (b.backend != BackendKind::InsanelyFast || hf_token_set)
+    });
     let recommended_backend = backends.iter().find(|b| b.available).map(|b| b.backend);
 
     SystemHealthReport {
@@ -2222,9 +2290,17 @@ impl BackendSelectionContract {
         // Loss matrix: 3 states × 4 actions (row-major).
         let n_actions = actions.len();
         let mut values = Vec::with_capacity(3 * n_actions);
+        let backend_base_losses: [f64; 3] = std::array::from_fn(|action_idx| {
+            Self::backend_base_loss_adaptive(
+                action_backends[action_idx],
+                request,
+                duration_secs,
+                router_state,
+            )
+        });
         for state_idx in 0..3 {
             for action_idx in 0..n_actions {
-                if action_idx >= action_backends.len() {
+                let Some(base) = backend_base_losses.get(action_idx).copied() else {
                     // fallback_error: correct when nothing available, wasteful otherwise.
                     values.push(match state_idx {
                         0 => 1000.0,
@@ -2232,27 +2308,20 @@ impl BackendSelectionContract {
                         2 => 5.0,
                         _ => 1000.0,
                     });
+                    continue;
+                };
+                let availability_penalty = match state_idx {
+                    0 => 0.0,
+                    1 => 333.0,
+                    2 => 1000.0,
+                    _ => 1000.0,
+                };
+                let v = base + availability_penalty;
+                values.push(if v.is_finite() {
+                    v.max(0.0)
                 } else {
-                    let backend = action_backends[action_idx];
-                    let base = Self::backend_base_loss_adaptive(
-                        backend,
-                        request,
-                        duration_secs,
-                        router_state,
-                    );
-                    let availability_penalty = match state_idx {
-                        0 => 0.0,
-                        1 => 333.0,
-                        2 => 1000.0,
-                        _ => 1000.0,
-                    };
-                    let v = base + availability_penalty;
-                    values.push(if v.is_finite() {
-                        v.max(0.0)
-                    } else {
-                        LARGE_FINITE_PENALTY
-                    });
-                }
+                    LARGE_FINITE_PENALTY
+                });
             }
         }
 
@@ -2630,10 +2699,20 @@ pub fn evaluate_backend_selection(
 
     let duration = normalized_duration_seconds.unwrap_or(30.0);
 
-    // Snapshot the global router state (if any) for use in the contract.
-    let rs_snapshot = router_state_snapshot();
-    let contract =
-        BackendSelectionContract::with_router_state(request, duration, rs_snapshot.as_ref());
+    // Borrow the global router state under its lock for the eager loss/matrix
+    // build AND the evidence reads below (calibration / evidence-JSON / brier /
+    // fallback), instead of cloning the entire state (3×50 histories + 50
+    // calibration observations + a 200-entry string-heavy evidence ledger, a
+    // ~105 µs allocation-heavy clone per `Auto` routing decision). The contract
+    // retains no reference (`with_router_state` returns an owned `Self`), every
+    // read is `&self`, and nothing between here and the last read re-locks
+    // `ROUTER_STATE` — so the guard is dropped after `fallback_reason` below,
+    // before the post-decision update at the tail. Byte-identical by
+    // construction: a read of the live state equals a read of a bit-perfect
+    // clone.
+    let rs_guard = ROUTER_STATE.lock().ok();
+    let rs_ref: Option<&RouterState> = rs_guard.as_ref().and_then(|state| state.as_ref());
+    let contract = BackendSelectionContract::with_router_state(request, duration, rs_ref);
 
     let availability = [
         (
@@ -2681,10 +2760,7 @@ pub fn evaluate_backend_selection(
     sorted_probs.sort_by(|a, b| b.total_cmp(a));
     let max_prob = sorted_probs.first().copied().unwrap_or(0.0);
     let second_prob = sorted_probs.get(1).copied().unwrap_or(0.0);
-    let calibration_score = rs_snapshot
-        .as_ref()
-        .map(|rs| rs.calibration_score())
-        .unwrap_or(0.5);
+    let calibration_score = rs_ref.map(|rs| rs.calibration_score()).unwrap_or(0.5);
 
     let ts_ms = Utc::now().timestamp_millis() as u64;
     let decision_random = (uuid::Uuid::new_v4().as_u128()) & 0xFFFF_FFFF_FFFF_FFFF_FFFF;
@@ -2716,7 +2792,11 @@ pub fn evaluate_backend_selection(
     // evidence for any state.  This feeds into FallbackPolicy::should_fallback
     // which triggers fallback when e_process > breach_threshold.
     let diff = max_prob - second_prob;
-    let margin = if diff.is_finite() { diff.max(1e-6) } else { 1e-6 };
+    let margin = if diff.is_finite() {
+        diff.max(1e-6)
+    } else {
+        1e-6
+    };
     let e_process = (1.0 / margin).clamp(1.0, 100.0);
 
     let ctx = EvalContext {
@@ -2784,8 +2864,8 @@ pub fn evaluate_backend_selection(
     // Either way we degrade to no evidence entry (the serde-failure default that
     // already existed here) and record the anomaly.
     let posterior_sum: f64 = outcome.audit_entry.posterior_snapshot.iter().sum();
-    let audit_convertible = !outcome.audit_entry.posterior_snapshot.is_empty()
-        && (posterior_sum - 1.0).abs() <= 1e-6;
+    let audit_convertible =
+        !outcome.audit_entry.posterior_snapshot.is_empty() && (posterior_sum - 1.0).abs() <= 1e-6;
     // Sanitize the posterior snapshot that is logged/persisted: a degenerate
     // (empty / unnormalized / subnormal) audit snapshot must not leak into the
     // routing log or evidence ledger. Fall back to the locally-built,
@@ -2820,14 +2900,16 @@ pub fn evaluate_backend_selection(
     let loss_matrix_hash = loss_matrix_content_hash(&contract.losses);
 
     // Build the adaptive router state snapshot for the routing log.
-    let router_state_json = rs_snapshot
-        .as_ref()
+    let router_state_json = rs_ref
         .map(RouterState::to_evidence_json)
         .unwrap_or(serde_json::json!(null));
 
     // bd-efr.2: Include Brier score from calibration state.
-    let brier_score = rs_snapshot.as_ref().and_then(|rs| rs.brier_score());
-    let router_state_fallback_reason = rs_snapshot.as_ref().and_then(|rs| rs.fallback_reason());
+    let brier_score = rs_ref.and_then(|rs| rs.brier_score());
+    let router_state_fallback_reason = rs_ref.and_then(|rs| rs.fallback_reason());
+    // Last use of the borrowed state; release the lock before the post-decision
+    // `ROUTER_STATE` update at the tail (std `Mutex` is not reentrant).
+    drop(rs_guard);
     let fallback_active = outcome.fallback_active || rollout_forced_static;
     let fallback_reason = effective_fallback_reason(
         router_state_fallback_reason,
@@ -3084,13 +3166,13 @@ fn extract_word_level_segments(chunks: &[Value]) -> Vec<TranscriptionSegment> {
                 let start = sanitize_timestamp(
                     word_node
                         .get("start")
-                        .or_else(|| word_node.pointer("/timestamp/0"))
+                        .or_else(|| timestamp_index_value(word_node, 0, "0"))
                         .and_then(number_to_secs),
                 );
                 let end = sanitize_timestamp(
                     word_node
                         .get("end")
-                        .or_else(|| word_node.pointer("/timestamp/1"))
+                        .or_else(|| timestamp_index_value(word_node, 1, "1"))
                         .and_then(number_to_secs),
                 );
                 let text = word_node
@@ -3124,9 +3206,10 @@ fn extract_word_level_segments(chunks: &[Value]) -> Vec<TranscriptionSegment> {
             }
         } else {
             // Fallback: treat chunk as a regular segment.
+            let (start_sec, end_sec) = segment_times(chunk);
             segments.push(TranscriptionSegment {
-                start_sec: segment_start(chunk),
-                end_sec: segment_end(chunk),
+                start_sec,
+                end_sec,
                 text: chunk
                     .get("text")
                     .and_then(Value::as_str)
@@ -3160,8 +3243,7 @@ fn segments_from_nodes(nodes: &[Value]) -> Vec<TranscriptionSegment> {
     nodes
         .iter()
         .map(|node| {
-            let start = segment_start(node);
-            let end = segment_end(node);
+            let (start, end) = segment_times(node);
 
             let text = node
                 .get("text")
@@ -3195,30 +3277,72 @@ fn segments_from_nodes(nodes: &[Value]) -> Vec<TranscriptionSegment> {
         .collect()
 }
 
-fn segment_start(node: &Value) -> Option<f64> {
-    let raw = if let Some(value) = node.pointer("/offsets/from") {
+fn segment_times(node: &Value) -> (Option<f64>, Option<f64>) {
+    let offsets = node.get("offsets");
+    let start_offset = offsets.and_then(|offsets| offsets.get("from"));
+    let end_offset = offsets.and_then(|offsets| offsets.get("to"));
+
+    let start_direct = if start_offset.is_none() {
+        node.get("start").or_else(|| node.get("start_sec"))
+    } else {
+        None
+    };
+    let end_direct = if end_offset.is_none() {
+        node.get("end").or_else(|| node.get("end_sec"))
+    } else {
+        None
+    };
+
+    let timestamp = if (start_offset.is_none() && start_direct.is_none())
+        || (end_offset.is_none() && end_direct.is_none())
+    {
+        node.get("timestamp")
+    } else {
+        None
+    };
+
+    let start = if let Some(value) = start_offset {
         number_millis_to_secs(value)
     } else {
-        node.get("start")
-            .or_else(|| node.get("start_sec"))
-            .or_else(|| node.pointer("/timestamp/0"))
-            .or_else(|| node.pointer("/timestamp/start"))
+        start_direct
+            .or_else(|| {
+                timestamp.and_then(|timestamp| {
+                    timestamp.get(0).or_else(|| timestamp.get("0"))
+                })
+            })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("start")))
             .and_then(number_to_secs)
     };
-    sanitize_timestamp(raw)
+    let end = if let Some(value) = end_offset {
+        number_millis_to_secs(value)
+    } else {
+        end_direct
+            .or_else(|| {
+                timestamp.and_then(|timestamp| {
+                    timestamp.get(1).or_else(|| timestamp.get("1"))
+                })
+            })
+            .or_else(|| timestamp.and_then(|timestamp| timestamp.get("end")))
+            .and_then(number_to_secs)
+    };
+
+    (sanitize_timestamp(start), sanitize_timestamp(end))
 }
 
+#[cfg(test)]
+fn segment_start(node: &Value) -> Option<f64> {
+    segment_times(node).0
+}
+
+#[cfg(test)]
 fn segment_end(node: &Value) -> Option<f64> {
-    let raw = if let Some(value) = node.pointer("/offsets/to") {
-        number_millis_to_secs(value)
-    } else {
-        node.get("end")
-            .or_else(|| node.get("end_sec"))
-            .or_else(|| node.pointer("/timestamp/1"))
-            .or_else(|| node.pointer("/timestamp/end"))
-            .and_then(number_to_secs)
-    };
-    sanitize_timestamp(raw)
+    segment_times(node).1
+}
+
+#[inline]
+fn timestamp_index_value<'a>(node: &'a Value, index: usize, key: &str) -> Option<&'a Value> {
+    let timestamp = node.get("timestamp")?;
+    timestamp.get(index).or_else(|| timestamp.get(key))
 }
 
 fn number_to_secs(value: &Value) -> Option<f64> {
@@ -4022,20 +4146,21 @@ impl ConcurrentTwoLaneExecutor {
 mod tests {
     use super::{
         ADAPTIVE_FALLBACK_CALIBRATION_THRESHOLD, ADAPTIVE_MIN_SAMPLES, BackendHealthReport,
-        BackendImplementation, BackendSelectionContract, CANONICAL_SEGMENT_TOLERANCE_MS,
-        CalibrationState, Engine, InsanelyFastEngine, NativeEngineContract, QualitySelector,
-        ROUTER_HISTORY_WINDOW, RouterState, RoutingEvidenceLedger, RoutingEvidenceLedgerEntry,
-        RoutingOutcomeRecord, SegmentConformanceReport, SegmentConformanceViolation,
-        SegmentViolationKind, ShadowDivergenceKind, ShadowRunConfig, ShadowRunDivergence,
-        ShadowRunReport, TranscriptSegment, TwoLaneExecutor, WhisperCppEngine,
-        WhisperDiarizationEngine, auto_priority, bridge_error_recoverable,
-        bridge_native_recovery_from_raw, check_segment_conformance, compare_shadow_results,
-        duration_bucket, evaluate_backend_selection, extract_segments_from_json, is_hf_token_set,
-        latency_proxy, native_runtime_metadata, number_millis_to_secs, number_to_secs,
+        BackendImplementation, BackendMetrics, BackendSelectionContract,
+        CANONICAL_SEGMENT_TOLERANCE_MS, CalibrationState, Engine, InsanelyFastEngine,
+        NativeEngineContract, QualitySelector, ROUTER_HISTORY_WINDOW, RouterState,
+        RoutingEvidenceLedger, RoutingEvidenceLedgerEntry, RoutingOutcomeRecord,
+        SegmentConformanceReport, SegmentConformanceViolation, SegmentViolationKind,
+        ShadowDivergenceKind, ShadowRunConfig, ShadowRunDivergence, ShadowRunReport,
+        TranscriptSegment, TwoLaneExecutor, WhisperCppEngine, WhisperDiarizationEngine,
+        auto_priority, bridge_error_recoverable, bridge_native_recovery_from_raw,
+        check_segment_conformance, compare_shadow_results, duration_bucket,
+        evaluate_backend_selection, extract_segments_from_json, is_hf_token_set, latency_proxy,
+        native_runtime_metadata, number_millis_to_secs, number_to_secs,
         posterior_success_probability, prior_for, probe_system_health,
         probe_system_health_uncached, quality_proxy, runtime_metadata,
         runtime_metadata_with_implementation, sanitize_timestamp, segment_end, segment_start,
-        static_fallback_selection_outcome, transcript_from_segments,
+        static_fallback_selection_outcome, transcript_from_segments, update_router_state,
     };
     use crate::conformance::NativeEngineRolloutStage;
     use crate::model::{
@@ -4045,6 +4170,7 @@ mod tests {
     use franken_decision::DecisionContract;
     use franken_kernel::DecisionId;
     use franken_kernel::TraceId;
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
@@ -4435,7 +4561,9 @@ mod tests {
         assert_eq!(segments.len(), 3);
         assert_eq!(segments[0].confidence, Some(1.0));
         assert_eq!(segments[1].confidence, Some(0.0));
-        let denormal = segments[2].confidence.expect("denormal confidence retained");
+        let denormal = segments[2]
+            .confidence
+            .expect("denormal confidence retained");
         assert!(
             denormal.is_finite() && (0.0..=1.0).contains(&denormal),
             "denormal confidence should stay finite and in range: {denormal}"
@@ -4982,11 +5110,16 @@ mod tests {
         assert_eq!(engine.name(), "whisper.cpp-native");
         assert_eq!(engine.kind(), BackendKind::WhisperCpp);
         let caps = engine.capabilities();
+        // Constants: this engine never diarizes, and `run_streaming` replays a
+        // completed batch rather than delivering segments incrementally.
         assert!(!caps.supports_diarization);
-        assert!(caps.supports_translation);
-        assert!(caps.supports_word_timestamps);
-        assert!(caps.supports_gpu);
-        assert!(caps.supports_streaming);
+        assert!(!caps.supports_streaming);
+        // Probed: agree with the probe rather than pinning a machine-dependent
+        // constant (a model may or may not be installed on the test host).
+        let probe = super::whisper_cpp_native::capability_probe();
+        assert_eq!(caps.supports_translation, probe.multilingual);
+        assert_eq!(caps.supports_word_timestamps, probe.word_timestamps);
+        assert_eq!(caps.supports_gpu, probe.gpu);
     }
 
     #[test]
@@ -4995,11 +5128,15 @@ mod tests {
         assert_eq!(engine.name(), "insanely-fast-native");
         assert_eq!(engine.kind(), BackendKind::InsanelyFast);
         let caps = engine.capabilities();
-        assert!(caps.supports_diarization);
-        assert!(caps.supports_translation);
-        assert!(caps.supports_word_timestamps);
-        assert!(caps.supports_gpu);
+        // The native engine emits no speaker labels of its own (the bridge's
+        // pyannote diarizer has no native counterpart); speakers come from the
+        // pipeline's Diarize stage.
+        assert!(!caps.supports_diarization);
         assert!(!caps.supports_streaming);
+        let probe = super::whisper_cpp_native::capability_probe();
+        assert_eq!(caps.supports_translation, probe.multilingual);
+        assert_eq!(caps.supports_word_timestamps, probe.word_timestamps);
+        assert_eq!(caps.supports_gpu, probe.gpu);
     }
 
     #[test]
@@ -5008,11 +5145,35 @@ mod tests {
         assert_eq!(engine.name(), "whisper-diarization-native");
         assert_eq!(engine.kind(), BackendKind::WhisperDiarization);
         let caps = engine.capabilities();
+        // This engine does own its diarization: the local heuristic diarizer is
+        // compiled in and needs no HuggingFace token.
         assert!(caps.supports_diarization);
         assert!(!caps.supports_translation);
         assert!(!caps.supports_word_timestamps);
-        assert!(caps.supports_gpu);
         assert!(!caps.supports_streaming);
+        assert_eq!(
+            caps.supports_gpu,
+            super::whisper_cpp_native::capability_probe().gpu
+        );
+    }
+
+    /// Honesty regression guard (bd-0522): the native engine reaches a GPU only
+    /// through the Apple-Silicon Metal encoder. On every other platform there is
+    /// no CUDA/Vulkan path, so a native engine must never advertise GPU support.
+    /// A future GPU backend must flip `gpu_encoder_available()`, not this test.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn native_engines_never_claim_gpu_off_apple_silicon() {
+        for engine in super::all_engines() {
+            if !engine.name().contains("native") {
+                continue;
+            }
+            assert!(
+                !engine.capabilities().supports_gpu,
+                "native engine `{}` claims GPU support with no GPU path compiled in",
+                engine.name()
+            );
+        }
     }
 
     #[test]
@@ -5561,10 +5722,30 @@ mod tests {
             fast["hf_token_env_overrides"].is_array(),
             "hf_token_env_overrides should be array"
         );
+        // bd-0522: this is now DYNAMIC — true only when the insanely-fast BRIDGE will run
+        // the diarization. The native path uses the orchestrator's local heuristic and needs
+        // no token. Assert the descriptor reflects that honest condition, not a stale `true`.
+        let mode = super::native_execution_mode(super::native_rollout_stage());
         assert_eq!(
             fast["requires_hf_token_for_diarization"].as_bool(),
-            Some(true)
+            Some(super::insanely_fast_bridge_diarizes(mode)),
+            "descriptor must track whether the bridge will diarize in the current mode"
         );
+    }
+
+    #[test]
+    fn insanely_fast_bridge_diarizes_reflects_execution_mode() {
+        // bd-0522: HF token is required for diarization ONLY when the external bridge runs it.
+        assert!(
+            super::insanely_fast_bridge_diarizes(super::NativeExecutionMode::BridgeOnly),
+            "bridge-only mode diarizes via the external tool -> HF token required"
+        );
+        assert!(
+            !super::insanely_fast_bridge_diarizes(super::NativeExecutionMode::NativeOnly),
+            "native-only mode never touches the bridge -> no HF token"
+        );
+        // NativePreferred is availability-dependent; just exercise it (must not panic).
+        let _ = super::insanely_fast_bridge_diarizes(super::NativeExecutionMode::NativePreferred);
     }
 
     #[test]
@@ -5631,8 +5812,7 @@ mod tests {
                 BackendKind::InsanelyFast,
                 BackendKind::WhisperDiarization,
             ] {
-                let loss =
-                    BackendSelectionContract::backend_base_loss(backend, &request, duration);
+                let loss = BackendSelectionContract::backend_base_loss(backend, &request, duration);
                 assert!(
                     loss.is_finite() && loss >= 0.0,
                     "loss for {backend:?} at duration {duration} not finite/non-negative: {loss}"
@@ -5863,13 +6043,23 @@ mod tests {
         );
     }
 
+    /// The untrusted-router fallback degrades to the TOP static-priority backend
+    /// (index 0), never to `fallback_error` (the last action), which emits no
+    /// transcription. Asserting "fallback is the last action" encoded the old
+    /// behavior that returned 0 utterances whenever the posterior was merely
+    /// uncertain; see `fallback_action`'s note.
     #[test]
-    fn fallback_action_is_last_action() {
+    fn fallback_action_is_top_priority_backend_not_error() {
         let contract = BackendSelectionContract::new(&test_request(false), 30.0);
         assert_eq!(
             contract.fallback_action(),
+            0,
+            "fallback should be try_whisper_cpp"
+        );
+        assert_ne!(
+            contract.fallback_action(),
             contract.action_set().len() - 1,
-            "fallback should be last action"
+            "fallback must not be the transcription-free fallback_error action"
         );
     }
 
@@ -6223,6 +6413,20 @@ mod tests {
         assert_eq!(segments[1].end_sec, Some(2.5));
         // "text" field used as fallback for "word"
         assert_eq!(segments[1].text, "world");
+    }
+
+    #[test]
+    fn timestamp_numeric_object_keys_match_json_pointer_semantics() {
+        let input = serde_json::json!({
+            "segments": [
+                {"text": "hello", "timestamp": {"0": 1.25, "1": 2.5}}
+            ]
+        });
+
+        let segments = extract_segments_from_json(&input);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_sec, Some(1.25));
+        assert_eq!(segments[0].end_sec, Some(2.5));
     }
 
     #[test]
@@ -6854,6 +7058,60 @@ mod tests {
         assert_eq!(m.success_rate, 0.0);
     }
 
+    #[test]
+    fn metrics_for_streamed_latency_sum_matches_materialized_reference_bytes() {
+        fn historical_metrics(history: &VecDeque<RoutingOutcomeRecord>) -> BackendMetrics {
+            let sample_count = history.len();
+            let success_count = history.iter().filter(|record| record.success).count();
+            let successful_latencies: Vec<f64> = history
+                .iter()
+                .filter(|record| record.success)
+                .map(|record| record.latency_ms as f64)
+                .collect();
+            let avg_latency_ms = if successful_latencies.is_empty() {
+                0.0
+            } else {
+                successful_latencies.iter().sum::<f64>() / successful_latencies.len() as f64
+            };
+            BackendMetrics {
+                success_rate: success_count as f64 / sample_count as f64,
+                avg_latency_ms,
+                last_error: history
+                    .iter()
+                    .rev()
+                    .find_map(|record| record.error_message.clone()),
+                sample_count,
+                success_count,
+            }
+        }
+
+        for success_period in [1_usize, 2, 4, usize::MAX] {
+            let mut state = RouterState::new();
+            for i in 0..ROUTER_HISTORY_WINDOW {
+                let success = success_period != usize::MAX && i % success_period == 0;
+                let mut outcome =
+                    make_outcome(BackendKind::WhisperCpp, success, 350 + (i as u64 * 17));
+                if !success {
+                    outcome.error_message = Some(format!("failure-{i}"));
+                }
+                state.record_outcome(outcome);
+            }
+
+            let historical = historical_metrics(&state.histories[0]);
+            let streamed = state.metrics_for(BackendKind::WhisperCpp);
+            assert_eq!(
+                serde_json::to_vec(&streamed).expect("serialize streamed metrics"),
+                serde_json::to_vec(&historical).expect("serialize historical metrics"),
+                "metrics bytes diverged for success period {success_period}"
+            );
+            assert_eq!(
+                streamed.avg_latency_ms.to_bits(),
+                historical.avg_latency_ms.to_bits(),
+                "average latency bits diverged for success period {success_period}"
+            );
+        }
+    }
+
     // -- calibration_score --
 
     #[test]
@@ -7132,6 +7390,71 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_loss_hoist_matches_per_row_reference_bits() {
+        let mut state = RouterState::new();
+        for backend in [
+            BackendKind::WhisperCpp,
+            BackendKind::InsanelyFast,
+            BackendKind::WhisperDiarization,
+        ] {
+            for sample in 0..20_u64 {
+                state.record_outcome(make_outcome(backend, sample % 4 != 0, 250 + sample * 17));
+            }
+        }
+        for _ in 0..10 {
+            state.record_prediction_outcome(true);
+        }
+
+        for diarize in [false, true] {
+            let request = test_request(diarize);
+            for duration_secs in [0.0, 30.0, 600.0] {
+                let contract = BackendSelectionContract::with_router_state(
+                    &request,
+                    duration_secs,
+                    Some(&state),
+                );
+                let matrix = contract.loss_matrix();
+                for state_idx in 0..3 {
+                    for action_idx in 0..matrix.n_actions() {
+                        let expected = if action_idx >= contract.action_backends.len() {
+                            match state_idx {
+                                0 => 1000.0,
+                                1 => 500.0,
+                                2 => 5.0,
+                                _ => 1000.0,
+                            }
+                        } else {
+                            let base = BackendSelectionContract::backend_base_loss_adaptive(
+                                contract.action_backends[action_idx],
+                                &request,
+                                duration_secs,
+                                Some(&state),
+                            );
+                            let availability_penalty = match state_idx {
+                                0 => 0.0,
+                                1 => 333.0,
+                                2 => 1000.0,
+                                _ => 1000.0,
+                            };
+                            let value = base + availability_penalty;
+                            if value.is_finite() {
+                                value.max(0.0)
+                            } else {
+                                super::LARGE_FINITE_PENALTY
+                            }
+                        };
+                        assert_eq!(
+                            matrix.get(state_idx, action_idx).to_bits(),
+                            expected.to_bits(),
+                            "loss[{state_idx},{action_idx}] changed for diarize={diarize}, duration={duration_secs}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn contract_with_poor_calibration_is_not_adaptive() {
         let request = test_request(false);
         let mut state = RouterState::new();
@@ -7198,6 +7521,35 @@ mod tests {
         assert!(!parsed.success);
         assert_eq!(parsed.latency_ms, 500);
         assert!(parsed.error_message.is_some());
+    }
+
+    #[test]
+    fn update_router_state_retains_failure_message_after_trace_borrow() {
+        let _guard = ROUTER_STATE_TEST_MUTEX
+            .lock()
+            .expect("router state test lock");
+        if let Ok(mut state) = super::ROUTER_STATE.lock() {
+            *state = None;
+        }
+
+        let expected = "backend failed after emitting structured trace";
+        update_router_state(
+            BackendKind::WhisperDiarization,
+            false,
+            1_234,
+            Some(expected.to_owned()),
+        );
+
+        let state = super::router_state_snapshot().expect("router state should exist");
+        let metrics = state.metrics_for(BackendKind::WhisperDiarization);
+        assert_eq!(metrics.sample_count, 1);
+        assert_eq!(metrics.success_count, 0);
+        assert_eq!(metrics.avg_latency_ms.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(metrics.last_error.as_deref(), Some(expected));
+
+        if let Ok(mut state) = super::ROUTER_STATE.lock() {
+            *state = None;
+        }
     }
 
     // -- RouterState serialization --
@@ -8473,6 +8825,40 @@ mod tests {
             (avg_brier - 0.2).abs() < 1e-10,
             "avg brier should be 0.2, got {avg_brier}"
         );
+    }
+
+    #[test]
+    fn routing_evidence_ledger_streamed_brier_is_json_identical() {
+        fn historical_brier_average(ledger: &RoutingEvidenceLedger) -> Option<f64> {
+            let values: Vec<f64> = ledger
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.brier_score)
+                .collect();
+            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+        }
+
+        for scores in [
+            vec![],
+            vec![None, None],
+            vec![Some(0.1), None, Some(0.2), Some(0.3)],
+            (0..200)
+                .map(|sample| (sample % 5 != 0).then_some(0.08 + f64::from(sample % 17) * 0.01))
+                .collect(),
+        ] {
+            let mut ledger = RoutingEvidenceLedger::new(scores.len().max(1));
+            for (index, score) in scores.into_iter().enumerate() {
+                ledger.record(make_ledger_entry(&format!("d{index}"), false, score));
+            }
+
+            let streamed = ledger.diagnostics();
+            let mut historical = streamed.clone();
+            historical["avg_brier_score"] = serde_json::json!(historical_brier_average(&ledger));
+            assert_eq!(
+                serde_json::to_vec(&streamed).expect("serialize streamed diagnostics"),
+                serde_json::to_vec(&historical).expect("serialize historical diagnostics")
+            );
+        }
     }
 
     #[test]

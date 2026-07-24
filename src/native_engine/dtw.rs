@@ -375,6 +375,17 @@ pub fn median_filter(row: &mut [f32], width: usize) {
     } else {
         width
     };
+    // Width 7 is whisper.cpp's fixed median-filter width (`DEFAULT_MEDFILT_WIDTH`,
+    // 8936) and the only width the token-alignment path ever uses. Specialize it
+    // with a branch-light 13-comparison stable median network instead of sorting
+    // a fresh 7-element `Vec` per output sample: ~1.43x faster on the real
+    // 384-row × 1500-frame pass (valid-null A/B, `benches/dtw_median_perf`) and
+    // BYTE-EXACT vs the general stable-sort path below (proven bit-for-bit by the
+    // bench's `to_bits` assert and by `median_filter_width7_matches_sort_reference`).
+    if w == 7 {
+        median_filter_width7(row);
+        return;
+    }
     let half = (w / 2) as i64;
     let len = n as i64;
 
@@ -395,6 +406,76 @@ pub fn median_filter(row: &mut [f32], width: usize) {
         }
         window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         *out = window[window.len() / 2];
+    }
+}
+
+/// One conditional compare-exchange for the width-7 median network, over
+/// `(value, original_slot)` pairs. Ordering is by value first (with the same
+/// `partial_cmp(...).unwrap_or(Equal)` total-preorder the general path uses),
+/// then by the original window slot so equal finite values keep input order —
+/// which is exactly what a *stable* sort of the window does. Slots are unique
+/// (0..7), so this comparator is a strict total order on any all-finite window.
+#[inline(always)]
+fn median7_compare_swap(values: &mut [(f32, u8); 7], left: usize, right: usize) {
+    let order = values[right]
+        .0
+        .partial_cmp(&values[left].0)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| values[right].1.cmp(&values[left].1));
+    if order.is_lt() {
+        values.swap(left, right);
+    }
+}
+
+/// Median of a 7-element tagged window via a 13-comparison selection network.
+/// Because the comparator breaks value ties by original slot, `values[3]` after
+/// the network equals `window[3]` after the general path's stable `sort_by`,
+/// bit-for-bit, for any all-finite window.
+#[inline(always)]
+fn median7_stable(mut values: [(f32, u8); 7]) -> f32 {
+    median7_compare_swap(&mut values, 0, 5);
+    median7_compare_swap(&mut values, 0, 3);
+    median7_compare_swap(&mut values, 1, 6);
+    median7_compare_swap(&mut values, 2, 4);
+    median7_compare_swap(&mut values, 0, 1);
+    median7_compare_swap(&mut values, 3, 5);
+    median7_compare_swap(&mut values, 2, 6);
+    median7_compare_swap(&mut values, 2, 3);
+    median7_compare_swap(&mut values, 3, 6);
+    median7_compare_swap(&mut values, 4, 5);
+    median7_compare_swap(&mut values, 1, 4);
+    median7_compare_swap(&mut values, 1, 3);
+    median7_compare_swap(&mut values, 3, 4);
+    values[3].0
+}
+
+/// Width-7 specialization of [`median_filter`]. Uses the identical reflect
+/// (edge-mirroring) padding and clamp as the general path, then selects the
+/// median with the branch-light [`median7_stable`] network for the common
+/// all-finite window and falls back to the *exact same* `sort_by` the general
+/// path uses when any window sample is non-finite — so the output is byte-exact
+/// vs `median_filter(row, 7)`'s general branch for every input.
+fn median_filter_width7(row: &mut [f32]) {
+    let len = row.len() as i64;
+    let src: Vec<f32> = row.to_vec();
+    for (k, out) in row.iter_mut().enumerate() {
+        let window: [(f32, u8); 7] = std::array::from_fn(|slot| {
+            let mut idx = k as i64 + slot as i64 - 3;
+            if idx < 0 {
+                idx = -idx;
+            } else if idx >= len {
+                idx = 2 * (len - 1) - idx;
+            }
+            let idx = idx.clamp(0, len - 1) as usize;
+            (src[idx], slot as u8)
+        });
+        *out = if window.iter().all(|&(value, _)| value.is_finite()) {
+            median7_stable(window)
+        } else {
+            let mut fallback = window.map(|(value, _)| value);
+            fallback.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            fallback[3]
+        };
     }
 }
 
@@ -898,6 +979,125 @@ mod tests {
         median_filter(&mut a, 4);
         median_filter(&mut b, 3);
         assert_eq!(a, b);
+    }
+
+    /// Reference width-7 median: the general stable-sort path exactly as it was
+    /// before the `median7_stable` network specialization (reflect padding,
+    /// `partial_cmp().unwrap_or(Equal)` sort, middle element). Kept independent
+    /// in the test so a divergence in the fast path is caught bit-for-bit.
+    fn reference_median7(row: &[f32]) -> Vec<f32> {
+        let n = row.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let len = n as i64;
+        let src = row.to_vec();
+        let mut out = vec![0.0f32; n];
+        let mut window = Vec::with_capacity(7);
+        for (k, o) in out.iter_mut().enumerate() {
+            window.clear();
+            for off in -3i64..=3 {
+                let mut idx = k as i64 + off;
+                if idx < 0 {
+                    idx = -idx;
+                } else if idx >= len {
+                    idx = 2 * (len - 1) - idx;
+                }
+                let idx = idx.clamp(0, len - 1) as usize;
+                window.push(src[idx]);
+            }
+            window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            *o = window[3];
+        }
+        out
+    }
+
+    #[test]
+    fn median_filter_width7_matches_sort_reference() {
+        // Deterministic LCG (same generator family as benches/dtw_median_perf).
+        let mut state = 0x1234_5678u64;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345) & 0x7fff_ffff;
+            (state as f32 / (1u32 << 30) as f32) - 1.0
+        };
+
+        // Cover degenerate lengths (reflect can land out of range and clamp),
+        // the exact window width, and a realistic frame-axis row.
+        for len in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 33, 1500] {
+            // Random row.
+            let mut row: Vec<f32> = (0..len).map(|_| next()).collect();
+            let expected = reference_median7(&row);
+            median_filter(&mut row, 7);
+            assert_eq!(
+                row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "random width-7 mismatch at len {len}"
+            );
+
+            if len == 0 {
+                continue;
+            }
+
+            // Rows with heavy duplicates (exercise stable tie-breaking) and one
+            // with interspersed non-finite values (exercise the sort fallback).
+            let mut dup: Vec<f32> = (0..len).map(|i| ((i % 3) as f32) - 1.0).collect();
+            let dup_expected = reference_median7(&dup);
+            median_filter(&mut dup, 7);
+            assert_eq!(
+                dup.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                dup_expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "duplicate width-7 mismatch at len {len}"
+            );
+
+            let mut nan: Vec<f32> = (0..len)
+                .map(|i| match i % 4 {
+                    0 => f32::NAN,
+                    1 => f32::INFINITY,
+                    2 => f32::NEG_INFINITY,
+                    _ => next(),
+                })
+                .collect();
+            let nan_expected = reference_median7(&nan);
+            median_filter(&mut nan, 7);
+            assert_eq!(
+                nan.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                nan_expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "non-finite width-7 mismatch at len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn median_filter_width7_preserves_signed_zero_like_sort() {
+        // -0.0 and +0.0 compare Equal, so both the network's slot tie-break and
+        // the general path's stable sort keep input order and select the same
+        // sign bit. Bit-for-bit agreement here pins the signed-zero handling.
+        let row = vec![
+            -0.0f32, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, 0.0,
+        ];
+        let expected = reference_median7(&row);
+        let mut got = row.clone();
+        median_filter(&mut got, 7);
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn median7_network_selects_true_median_for_all_binary_inputs() {
+        // 0-1 principle: a comparison network that selects the correct median for
+        // all 2^7 binary inputs selects it for every real input, so this proves
+        // `median7_stable` is a valid median-of-7 selector, not merely that it
+        // agrees with the sort on the sampled floats above.
+        for bits in 0u32..128 {
+            let vals: [f32; 7] = std::array::from_fn(|i| ((bits >> i) & 1) as f32);
+            let tagged: [(f32, u8); 7] = std::array::from_fn(|i| (vals[i], i as u8));
+            let network = median7_stable(tagged);
+            let mut sorted = vals;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(network, sorted[3], "median mismatch for bits {bits:07b}");
+        }
     }
 
     // ── dtw_path ─────────────────────────────────────────────────────────

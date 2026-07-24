@@ -8,11 +8,77 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
+## [0.5.0] - 2026-07-11
+
+### CPU int8 encoder + SDPA poly-exp — a measured, quality-gated CPU speedup on x86-64
+
+This is a performance release for the **CPU** native engine (x86-64 AVX2/FMA — AMD Zen/Threadripper, Intel Haswell and newer). Where v0.4.0 moved the encoder onto the GPU for Apple Silicon, v0.5.0 makes the *CPU* encoder substantially faster while holding output quality to a measured zero-WER-Δ budget. Every lever below was kept only on a measured win — verified **byte-identical** where it is byte-exact, and **WER-neutral** where it changes numerics — and gated on the candidate **median** against a **paired null (A/A) control**, not a single before/after pair. Rejected levers are recorded with their null-control and a retry-condition in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
+
+#### Quality-safe int8 encoder (calibrated, policy-gated)
+
+- **The encoder attention-output GEMM now runs int8×int32 under a calibrated per-model quality policy** ([`035e83b`](https://github.com/Dicklesworthstone/franken_whisper/commit/035e83b), [`a997f37`](https://github.com/Dicklesworthstone/franken_whisper/commit/a997f37)) — engaged when the model's calibration certifies it within a **WER-Δ budget of 0.0** and a quantization rel-RMSE budget of 0.09; `FW_ENC_ATTN_OUT_I8I32=0` is the kill switch, `=1` forces it. Measured **1.47× encoder** vs the f32 path, WER-neutral.
+- **Fusing the SDPA gather into the int8 QKV GEMM** ([`3293b47`](https://github.com/Dicklesworthstone/franken_whisper/commit/3293b47)) writes q/k/v head-major straight out of the maddubs GEMM, skipping the standalone gather → **1.47→1.67× vs f32, byte-exact**.
+- **Register-blocked int8 microkernels**: M4×N2 attn.out i8 GEMM ([`b6c3028`](https://github.com/Dicklesworthstone/franken_whisper/commit/b6c3028), 165→129 ms), the M2×N4 maddubs tile ([`40fc09d`](https://github.com/Dicklesworthstone/franken_whisper/commit/40fc09d)), a 2-token column tile `dot_i8_2col` ([`85776f4`](https://github.com/Dicklesworthstone/franken_whisper/commit/85776f4), 1.15–1.19× @tq=64), AVX2 round-half-away activation-quantize ([`0ce9f64`](https://github.com/Dicklesworthstone/franken_whisper/commit/0ce9f64)), and eliding the i7 output zero-fill ([`db3272f`](https://github.com/Dicklesworthstone/franken_whisper/commit/db3272f)).
+- **More aggressive full-int8 paths stay opt-in**: q/k/v+fc1 int8 (`FW_ENC_INT8_ATTN_IN`, ~1.23× encoder, proper-noun-safe, [`e36fec2`](https://github.com/Dicklesworthstone/franken_whisper/commit/e36fec2)) and fc1-only int8 (`FW_ENC_INT8_FC1`, ~1.10×, byte-identical, [`5481d46`](https://github.com/Dicklesworthstone/franken_whisper/commit/5481d46)).
+- The quality-safe policy is WER-gated by a conformance test ([`9fcedac`](https://github.com/Dicklesworthstone/franken_whisper/commit/9fcedac)).
+
+#### SDPA softmax poly-exp (large-v3-turbo)
+
+- **A degree-5 AVX2/FMA polynomial `exp` replaces libm in the fused SDPA softmax for `large-v3-turbo`** ([`94714c1`](https://github.com/Dicklesworthstone/franken_whisper/commit/94714c1), [`5935d68`](https://github.com/Dicklesworthstone/franken_whisper/commit/5935d68)) — **default-on for turbo only** (`tiny.en` is uncertified and stays off; `FW_SDPA_POLY_EXP=0` kills it, `FT_SDPA_POLY_EXP=1` forces it for a certified fine-tune). Measured **1.0722× e2e** (cv 0.8%, 5/5 paired), transcript **byte-identical** on jfk ×1/×3/×8, **WER Δ 0.000** vs whisper.cpp. Evidence: [`docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`](docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md).
+
+#### Byte-exact encoder fusions
+
+- Fuse the f32 `mlp_fc` bias into the GELU pass ([`f06543d`](https://github.com/Dicklesworthstone/franken_whisper/commit/f06543d), 1.04–1.06× encoder), fold the f32 `mlp_proj` bias into the residual add ([`5cb3cac`](https://github.com/Dicklesworthstone/franken_whisper/commit/5cb3cac), ~1.01×), fuse MLP GELU into the fc2 int8 activation-quantize ([`ede9f15`](https://github.com/Dicklesworthstone/franken_whisper/commit/ede9f15)), an M2 activation-column tile for the row-morsel f16 batch GEMV ([`ce43019`](https://github.com/Dicklesworthstone/franken_whisper/commit/ce43019), **byte-exact 1.26×**), and head-major i7 QKV row scheduling ([`50cbd65`](https://github.com/Dicklesworthstone/franken_whisper/commit/50cbd65)). All byte-identical to the prior output.
+
+#### Honesty & correctness
+
+- **Native engines now report *probed* capabilities, not *declared* ones** ([`e782733`](https://github.com/Dicklesworthstone/franken_whisper/commit/e782733)) — reported feature availability reflects what the running binary actually supports.
+- **The HuggingFace-token requirement now fires only when the insanely-fast bridge actually diarizes** ([`84afe64`](https://github.com/Dicklesworthstone/franken_whisper/commit/84afe64), bd-0522) — the native path no longer demands a token it never uses.
+
+#### Measurement methodology (why these numbers are trustworthy)
+
+- **Median-vs-paired-null gate** — every ratio is the candidate median compared against a same-binary A/A null control (ABBA-interleaved), so host contention and order bias cannot masquerade as a win.
+- **Byte/ULP-exact verification** — byte-exact levers are asserted bit-identical against the reference path; the one numerics-affecting lever (poly-exp) is held to a measured WER-Δ of 0.000 vs whisper.cpp.
+- **Negative-evidence ledger** — rejected levers are logged in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md) with a reject-id, the null-control, and a retry-condition, so a dead end stays dead.
+
+**Evidence sources:** [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md), [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md), [`docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md`](docs/PROPOSAL_ft_sdpa_poly_exp_default_on.md), [`docs/cc_lane_finalization.md`](docs/cc_lane_finalization.md), and the per-lever commit messages linked above. CPU measurements on an AMD Threadripper PRO 5975WX (32 physical cores, `release-perf`, `target-cpu=x86-64-v3`) unless noted; Apple-Silicon GPU figures are in the v0.4.0 entry.
+
+Compare: [`v0.4.0...v0.5.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.4.0...v0.5.0)
+
+## [0.4.0] - 2026-07-03
+
+### Fused GPU encoder — the whole transformer stack on the GPU (Apple Silicon)
+
+- **On Apple Silicon with a large model the entire encoder now runs on the GPU**, replacing v0.3.0's per-matmul offload. A new `ft-kernel-metal::fused` module keeps activations **resident on the GPU** (`GpuTensor`) and encodes each layer's ops — layernorm, q/k/v projections, multi-head attention, output projection, residual, MLP (fc → GELU → proj), residual — into **one command buffer with a single CPU↔GPU sync per layer**, instead of the CPU running layernorm/attention/GELU and blocking on the GPU for every matmul. Weights are uploaded once and cached per model. Enabled by default for `n_state ≥ 1024` (medium/large; `tiny/base/small` keep the CPU path); `FRANKEN_WHISPER_GPU=0` forces CPU, `FRANKEN_WHISPER_FUSED_ENC=0` falls back to the v0.3.0 GEMM-only offload.
+- **Measured (M4 Pro, 120s clip, large-v3-turbo):** fused encoder **29.5s vs 35.7s GEMM-only vs 57.0s CPU** — **48% faster than CPU and 17% faster than the v0.3.0 GEMM-only path**. Killing the per-op ping-pong is the win.
+- **Correctness:** the GPU encoder tracks the CPU encoder closely (jfk transcript identical; on long audio the transcript is valid-but-not-bit-identical, like any GPU backend). A subtle bug was fixed along the way: MSL `tanh` overflows to NaN for large arguments, so the GPU GELU now uses ggml's `GGML_GELU_FP16` clamp (`x≥10→x`, `x≤−10→0`), matching the CPU exactly. All Metal `unsafe` stays in `ft-kernel-metal`, so franken_whisper keeps `#![deny(unsafe_code)]`; non-macOS builds are unaffected.
+- Follow-up: the attention kernels are still naive (un-tiled); a tiled/flash-attention kernel would widen the win further.
+
+## [0.3.0] - 2026-07-02
+
+### GPU acceleration — automatic, hardware-selected (Apple Silicon)
+
+- **The native engine now auto-offloads its large matmuls to the Metal GPU on Apple Silicon, enabled by default.** A new `ft-kernel-metal` crate (sibling to `ft-kernel-cpu`) provides a shared-memory + register-blocked tiled f32 Metal GEMM (~1.5–1.9 TFLOP/s on an M4 Pro, ~5–8× the naive kernel); all `unsafe` Metal FFI is contained there so `franken_whisper` keeps `#![deny(unsafe_code)]`. At runtime `nn::matmul_bias` routes a GEMM to the GPU when (1) the target is macOS, (2) a Metal device is present, and (3) the matmul is large enough (`m·k·n ≥ 2e9`) that the compute win beats the launch/sync overhead — otherwise it stays on the already-fast multi-threaded CPU kernel. **Auto-selection by hardware + workload:** Apple Silicon large models → Metal GPU; x86-64-v3 (incl. AMD Threadripper) → the optimized AVX2/FMA CPU path; everything else → portable CPU. No config required. Override with `FRANKEN_WHISPER_GPU=0` to force CPU.
+- **Measured (M4 Pro):** `large-v3-turbo` transcribe ~34% faster wall-clock (offloading ~3× the CPU compute), output byte-identical to the CPU path (transcription-level conformance holds). Small models (e.g. `tiny.en`) are unchanged — their GEMMs stay on the CPU, so there is no regression, and non-macOS builds are entirely unaffected (the Metal dep is target-gated out). This is a GEMM-only first cut; a batched/overlapped GPU pipeline (and an f16 path) would widen the win.
+
+Everything in v0.2.1 (native-default engine, NaN-hardening, the aarch64 `target-cpu` codegen fix, the routing fallback fix, and the CPU int8/GELU perf work) is included.
+
 ## [Unreleased] (since v0.1.0)
 
 152 commits since v0.1.0
 
 Compare: [`v0.1.0...main`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.1.0...main)
+
+### Native decode-quality surface — whisper.cpp-faithful fallback + beam (post-2026-07-11)
+
+The native engine's greedy/temperature-0 decoder gains whisper.cpp's full decode-quality toolset, **all gated and default-off** (the greedy path stays byte-identical; opt-in is an explicit quality-over-speed/reproducibility choice). Each knob is a faithful port of the corresponding whisper.cpp mechanism, unit-tested against its reference math, and measured against a `whisper-cli` beam=5 oracle.
+
+- **Temperature-fallback ladder** (`FW_TEMP_FALLBACK`) — a window that closes no timestamp, averages below `logprob_thold` (−1.0), or loops into a low-entropy repetitive tail (`entropy_thold` 2.4) is re-decoded up the whisper.cpp temperature ladder `[0.2 … 1.0]` with deterministic seeded multinomial sampling (prompt dropped above t=0.5), `greedy.best_of=5` candidates per rung selected by length-normalized sequence score (`FW_TEMP_BEST_OF`). Recovers the long-form content-drop (bd-r0qd): on `example_audio_track_01` (tiny.en, timestamps) it lifts WER **0.528 → 0.192** vs the whisper.cpp oracle, deterministically.
+- **Targeted prompt-reset retry** (`FW_RETRY_FAILED_WINDOW`) — the minimal, deterministic recovery for the carried-prompt × int8 early-EOT drop: retry a failed window once with the prompt cleared, byte-exact on every non-failed window. **The best-measured recovery: WER 0.164** (246/250 words) on the same clip — lower than the full sampling ladder.
+- **Beam search** (`FW_BEAM_SIZE`, default 1 = greedy) — whisper.cpp-style beam over the temperature-0 pass, per-hypothesis KV forking via a proven `DecoderState` clone primitive that shares the window-constant cross-K/V. Verified to converge to `whisper-cli` output on jfk (beam=5 == greedy == whisper.cpp, deterministic), and **measured to reduce WER on hard audio**: on the Steve Jobs iPhone keynote (tiny.en, drop removed via `FW_RETRY_FAILED_WINDOW`) `FW_BEAM_SIZE=5` cuts WER **0.1044 → 0.0984**, crossing below the 0.10 native-rollout gate that greedy fails. The full long-form quality stack is `FW_RETRY_FAILED_WINDOW=1 FW_BEAM_SIZE=5`.
+- **First-class WER in conformance** — `conformance::word_error_rate` (edit-distance, ASR-normalized) now implements the "WER ≤ 0.10" gate the epic is defined against, and the native-vs-bridge comparator's WER metric was corrected from a positional counter (which cascaded a single word deletion to ~1.0) to real edit distance.
+
+Default-on decisions for these knobs are deliberately reserved (they change golden transcripts on repetitive/tiled audio); the measured WER evidence for that call lives in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
 
 ### Backend routing reliability (post-2026-07-01)
 

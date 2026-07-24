@@ -172,22 +172,46 @@ impl RunStore {
             tok.checkpoint()?;
         }
 
-        // Use SQL ORDER BY and LIMIT for efficient and memory-safe queries.
-        let sql = if limit > 0 {
-            format!(
-                "SELECT id, started_at, finished_at, backend, transcript FROM runs \
-                 ORDER BY started_at DESC, id DESC LIMIT {limit}"
-            )
-        } else {
-            "SELECT id, started_at, finished_at, backend, transcript FROM runs \
-             ORDER BY started_at DESC, id DESC"
-                .to_owned()
+        // Project only the 140-char preview in SQL (fsqlite's `ColumnSubstrPrefix`
+        // fast path) so a large transcript is never materialized or transferred
+        // just to be truncated. `substr(transcript, 1, 140)` returns the first 140
+        // characters, byte-identical to the historical `.chars().take(140)` for
+        // TEXT (and coerced numeric) values. A BLOB value renders differently under
+        // projection (`<blob:<=140>` vs the full `<blob:N>`), so if the projected
+        // result contains any BLOB transcript we re-run with the full column and
+        // fall back to the historical rendering — byte-exact for every DB state.
+        let build_sql = |expr: &str| {
+            if limit > 0 {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     ORDER BY started_at DESC, id DESC LIMIT {limit}"
+                )
+            } else {
+                format!(
+                    "SELECT id, started_at, finished_at, backend, {expr} FROM runs \
+                     ORDER BY started_at DESC, id DESC"
+                )
+            }
         };
 
         let rows = self
             .connection
-            .query(&sql)
+            .query(&build_sql("substr(transcript, 1, 140)"))
             .map_err(|error| FwError::Storage(error.to_string()))?;
+
+        // BLOB transcripts render by byte length, which the projection would
+        // shorten; re-run with the full column so the preview matches the
+        // historical `<blob:N>` marker exactly.
+        let rows = if rows
+            .iter()
+            .any(|row| matches!(row.get(4), Some(SqliteValue::Blob(_))))
+        {
+            self.connection
+                .query(&build_sql("transcript"))
+                .map_err(|error| FwError::Storage(error.to_string()))?
+        } else {
+            rows
+        };
 
         rows.into_iter()
             .map(|row| {
@@ -353,6 +377,88 @@ impl RunStore {
             acceleration: acceleration_override.or(result.acceleration),
             replay,
         }))
+    }
+
+    /// Load full details for many runs with two batched `WHERE id/run_id IN (…)`
+    /// queries instead of the per-run N+1 (`load_run_details` × N, each 2 queries +
+    /// 2 schema scans). Returns details for the run_ids that exist, in input order.
+    /// Output is byte-identical to per-run `load_run_details` (asserted by
+    /// `load_run_details_batch_matches_per_run`). `FW_STORAGE_BATCH_HISTORY=0` falls
+    /// back to the per-run path (kill-switch + A/B arm).
+    pub fn load_run_details_batch(&self, run_ids: &[String]) -> FwResult<Vec<StoredRunDetails>> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !batch_history_enabled() {
+            let mut out = Vec::with_capacity(run_ids.len());
+            for id in run_ids {
+                if let Some(details) = self.load_run_details(id)? {
+                    out.push(details);
+                }
+            }
+            return Ok(out);
+        }
+
+        // Optional-column exprs computed ONCE (not once per run) — see load_run_details.
+        let replay_expr = if self.table_has_column("runs", "replay_json")? {
+            "replay_json"
+        } else {
+            "'{}' AS replay_json"
+        };
+        let acceleration_expr = if self.table_has_column("runs", "acceleration_json")? {
+            "acceleration_json"
+        } else {
+            "'{}' AS acceleration_json"
+        };
+        let placeholders = (1..=run_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params: Vec<SqliteValue> = run_ids
+            .iter()
+            .map(|id| SqliteValue::Text(id.clone().into()))
+            .collect();
+
+        let run_sql = format!(
+            "SELECT id, started_at, finished_at, backend, result_json, warnings_json, transcript, {replay_expr}, {acceleration_expr} \
+             FROM runs WHERE id IN ({placeholders})"
+        );
+        let run_rows = self
+            .connection
+            .query_with_params(&run_sql, &params)
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let mut run_by_id: std::collections::HashMap<String, fsqlite::Row> =
+            std::collections::HashMap::with_capacity(run_rows.len());
+        for row in run_rows {
+            run_by_id.insert(value_to_string(row.get(0)), row);
+        }
+
+        let evt_sql = format!(
+            "SELECT run_id, seq, ts_rfc3339, stage, code, message, payload_json \
+             FROM events WHERE run_id IN ({placeholders}) ORDER BY run_id ASC, seq ASC"
+        );
+        let evt_rows = self
+            .connection
+            .query_with_params(&evt_sql, &params)
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let mut events_by_run: std::collections::HashMap<String, Vec<fsqlite::Row>> =
+            std::collections::HashMap::new();
+        for row in evt_rows {
+            events_by_run
+                .entry(value_to_string(row.get(0)))
+                .or_default()
+                .push(row);
+        }
+
+        let mut out = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            let Some(run_row) = run_by_id.get(run_id) else {
+                continue;
+            };
+            let events = events_by_run.remove(run_id).unwrap_or_default();
+            out.push(assemble_run_details_batched(run_row, &events)?);
+        }
+        Ok(out)
     }
 
     /// Current schema version. Bump when adding migrations.
@@ -1049,11 +1155,31 @@ CREATE TABLE IF NOT EXISTS _meta (
         rebuild_result
     }
 
+    /// Execute one INSERT for [`persist_report_inner`]. When `skip_sp` is set the
+    /// fsqlite per-statement savepoint is skipped (the caller's enclosing
+    /// `SAVEPOINT` is the rollback boundary); otherwise the legacy path runs. The
+    /// persisted row is identical in both cases.
+    fn persist_insert(&self, skip_sp: bool, sql: &str, params: &[SqliteValue]) -> FwResult<()> {
+        let result = if skip_sp {
+            self.connection
+                .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params)
+        } else {
+            self.connection.execute_with_params(sql, params)
+        };
+        result
+            .map(|_| ())
+            .map_err(|error| FwError::Storage(error.to_string()))
+    }
+
     fn persist_report_inner(
         &self,
         report: &RunReport,
         token: Option<&crate::orchestrator::CancellationToken>,
     ) -> FwResult<()> {
+        // All inserts below run inside `persist_report_once`'s SAVEPOINT, which
+        // rolls back on any Err — so the redundant per-statement savepoints can be
+        // skipped (byte-identical persisted rows). See [`persist_skip_stmt_sp_enabled`].
+        let skip_sp = persist_skip_stmt_sp_enabled();
         let request_json = serde_json::to_string(&report.request)?;
         let result_json = serde_json::to_string(&report.result)?;
         let warnings_json = serde_json::to_string(&report.warnings)?;
@@ -1066,43 +1192,41 @@ CREATE TABLE IF NOT EXISTS _meta (
 
         if has_replay {
             let replay_json = serde_json::to_string(&report.replay)?;
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        text_value(report.started_at_rfc3339.clone()),
-                        text_value(report.finished_at_rfc3339.clone()),
-                        text_value(report.result.backend.as_str().to_owned()),
-                        text_value(report.input_path.clone()),
-                        text_value(report.normalized_wav_path.clone()),
-                        text_value(request_json),
-                        text_value(result_json),
-                        text_value(warnings_json),
-                        text_value(report.result.transcript.clone()),
-                        text_value(replay_json),
-                        text_value(acceleration_json),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                &[
+                    text_value(report.run_id.clone()),
+                    text_value(report.started_at_rfc3339.clone()),
+                    text_value(report.finished_at_rfc3339.clone()),
+                    text_value(report.result.backend.as_str().to_owned()),
+                    text_value(report.input_path.clone()),
+                    text_value(report.normalized_wav_path.clone()),
+                    text_value(request_json),
+                    text_value(result_json),
+                    text_value(warnings_json),
+                    text_value(report.result.transcript.clone()),
+                    text_value(replay_json),
+                    text_value(acceleration_json),
+                ],
+            )?;
         } else {
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        text_value(report.started_at_rfc3339.clone()),
-                        text_value(report.finished_at_rfc3339.clone()),
-                        text_value(report.result.backend.as_str().to_owned()),
-                        text_value(report.input_path.clone()),
-                        text_value(report.normalized_wav_path.clone()),
-                        text_value(request_json),
-                        text_value(result_json),
-                        text_value(warnings_json),
-                        text_value(report.result.transcript.clone()),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    text_value(report.run_id.clone()),
+                    text_value(report.started_at_rfc3339.clone()),
+                    text_value(report.finished_at_rfc3339.clone()),
+                    text_value(report.result.backend.as_str().to_owned()),
+                    text_value(report.input_path.clone()),
+                    text_value(report.normalized_wav_path.clone()),
+                    text_value(request_json),
+                    text_value(result_json),
+                    text_value(warnings_json),
+                    text_value(report.result.transcript.clone()),
+                ],
+            )?;
         }
 
         // Checkpoint before segments batch.
@@ -1111,20 +1235,19 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         for (index, segment) in report.result.segments.iter().enumerate() {
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        SqliteValue::Integer(index as i64),
-                        optional_float(segment.start_sec),
-                        optional_float(segment.end_sec),
-                        optional_text(segment.speaker.as_deref()),
-                        text_value(segment.text.clone()),
-                        optional_float(segment.confidence),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text_value(report.run_id.clone()),
+                    SqliteValue::Integer(index as i64),
+                    optional_float(segment.start_sec),
+                    optional_float(segment.end_sec),
+                    optional_text(segment.speaker.as_deref()),
+                    text_value(segment.text.clone()),
+                    optional_float(segment.confidence),
+                ],
+            )?;
         }
 
         // Checkpoint before events batch.
@@ -1133,20 +1256,19 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         for event in &report.events {
-            self.connection
-                .execute_with_params(
-                    "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    &[
-                        text_value(report.run_id.clone()),
-                        SqliteValue::Integer(event.seq as i64),
-                        text_value(event.ts_rfc3339.clone()),
-                        text_value(event.stage.clone()),
-                        text_value(event.code.clone()),
-                        text_value(event.message.clone()),
-                        text_value(serde_json::to_string(&event.payload)?),
-                    ],
-                )
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text_value(report.run_id.clone()),
+                    SqliteValue::Integer(event.seq as i64),
+                    text_value(event.ts_rfc3339.clone()),
+                    text_value(event.stage.clone()),
+                    text_value(event.code.clone()),
+                    text_value(event.message.clone()),
+                    text_value(serde_json::to_string(&event.payload)?),
+                ],
+            )?;
         }
 
         Ok(())
@@ -1362,6 +1484,103 @@ impl Drop for ConcurrentPersistSession<'_> {
             let _ = self.connection.execute(&release);
         }
     }
+}
+
+/// Whether `persist_report_inner` writes its `runs`/`segments`/`events` rows with
+/// the fsqlite "skip statement savepoint in explicit txn" escape hatch (default).
+/// Those inserts always run inside `persist_report_once`'s enclosing `SAVEPOINT`,
+/// which is the rollback boundary (it rolls back on any `Err`), so the per-INSERT
+/// statement savepoint is redundant bookkeeping. Read live so an external-env A/B
+/// can toggle it (cold write path). `FW_PERSIST_SKIP_STMT_SP=0` restores the
+/// per-statement-savepoint path. Persisted rows are byte-identical either way.
+fn persist_skip_stmt_sp_enabled() -> bool {
+    std::env::var("FW_PERSIST_SKIP_STMT_SP").ok().as_deref() != Some("0")
+}
+
+/// Whether [`RunStore::load_run_details_batch`] loads many runs with two batched
+/// `WHERE id/run_id IN (…)` queries (default) instead of one `load_run_details`
+/// (two queries + two schema scans) per run — the app-level N+1 in the routing-
+/// history command. Output is identical either way (asserted by a batch-vs-per-run
+/// test). `FW_STORAGE_BATCH_HISTORY=0` restores the per-run path (kill-switch + A/B).
+fn batch_history_enabled() -> bool {
+    std::env::var("FW_STORAGE_BATCH_HISTORY").ok().as_deref() != Some("0")
+}
+
+/// Assemble a [`StoredRunDetails`] from a batched `runs` row (9 cols: id,
+/// started_at, finished_at, backend, result_json, warnings_json, transcript,
+/// replay_json, acceleration_json) and its batched `events` rows (7 cols: run_id,
+/// seq, ts_rfc3339, stage, code, message, payload_json). Mirrors the per-run
+/// assembly in `load_run_details_cancellable` exactly — the only difference is the
+/// events carry `run_id` at column 0 (so seq…payload shift +1) to allow grouping.
+fn assemble_run_details_batched(
+    run_row: &fsqlite::Row,
+    event_rows: &[fsqlite::Row],
+) -> FwResult<StoredRunDetails> {
+    let run_id = value_to_string(run_row.get(0));
+    let started_at_rfc3339 = value_to_string(run_row.get(1));
+    let finished_at_rfc3339 = value_to_string(run_row.get(2));
+    let backend = parse_backend(&value_to_string(run_row.get(3)));
+    let result_json = value_to_string(run_row.get(4));
+    let warnings_json = value_to_string(run_row.get(5));
+    let transcript_fallback = value_to_string(run_row.get(6));
+    let replay_json = value_to_string(run_row.get(7));
+    let acceleration_json = value_to_string(run_row.get(8));
+
+    let result: TranscriptionResult = serde_json::from_str(&result_json).map_err(|error| {
+        FwError::Storage(format!("invalid result_json for run {run_id}: {error}"))
+    })?;
+    let warnings =
+        parse_required_json_field::<Vec<String>>("warnings_json", &run_id, &warnings_json)?;
+    let replay = parse_required_json_field::<ReplayEnvelope>("replay_json", &run_id, &replay_json)?;
+    let acceleration_override = parse_optional_acceleration_json(&run_id, &acceleration_json)?;
+    let transcript = if result.transcript.trim().is_empty() {
+        transcript_fallback
+    } else {
+        result.transcript.clone()
+    };
+
+    let events = event_rows
+        .iter()
+        .map(|event_row| {
+            let payload_json = value_to_string(event_row.get(6));
+            let payload = serde_json::from_str(&payload_json).map_err(|error| {
+                FwError::Storage(format!(
+                    "invalid event payload for run {} seq {}: {}",
+                    run_id,
+                    value_to_string(event_row.get(1)),
+                    error
+                ))
+            })?;
+            let seq_text = value_to_string(event_row.get(1));
+            let seq = seq_text.parse::<u64>().map_err(|error| {
+                FwError::Storage(format!(
+                    "invalid event sequence `{}` for run {}: {}",
+                    seq_text, run_id, error
+                ))
+            })?;
+            Ok(RunEvent {
+                seq,
+                ts_rfc3339: value_to_string(event_row.get(2)),
+                stage: value_to_string(event_row.get(3)),
+                code: value_to_string(event_row.get(4)),
+                message: value_to_string(event_row.get(5)),
+                payload,
+            })
+        })
+        .collect::<FwResult<Vec<_>>>()?;
+
+    Ok(StoredRunDetails {
+        run_id,
+        started_at_rfc3339,
+        finished_at_rfc3339,
+        backend,
+        transcript,
+        segments: result.segments,
+        events,
+        warnings,
+        acceleration: acceleration_override.or(result.acceleration),
+        replay,
+    })
 }
 
 /// Convert an optional `SqliteValue` to an `i64`, returning 0 for non-integer
@@ -1936,6 +2155,65 @@ mod tests {
             .expect("should exist");
         assert_eq!(details.run_id, "run-alpha");
         assert_eq!(details.transcript, "alpha text");
+    }
+
+    #[test]
+    fn load_run_details_batch_matches_per_run() {
+        // Byte-exactness guard for FW_STORAGE_BATCH_HISTORY: the batched two-query
+        // loader must produce StoredRunDetails identical to per-run `load_run_details`
+        // for every run (incl. multi-event grouping + the run_id-shifted event layout).
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("batch_hist.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        let ids = ["batch-a", "batch-b", "batch-c"];
+        for (i, id) in ids.iter().enumerate() {
+            let mut report = minimal_report(id, &db_path);
+            report.result.transcript = format!("transcript {i}");
+            report.result.segments = vec![TranscriptionSegment {
+                start_sec: Some(i as f64),
+                end_sec: Some(i as f64 + 1.0),
+                text: format!("segment for {id}"),
+                speaker: None,
+                confidence: Some(0.9),
+            }];
+            report.events = vec![
+                RunEvent {
+                    seq: 1,
+                    ts_rfc3339: "2026-01-01T00:00:00Z".to_owned(),
+                    stage: "ingest".to_owned(),
+                    code: "ok".to_owned(),
+                    message: format!("first for {id}"),
+                    payload: serde_json::json!({"i": i}),
+                },
+                RunEvent {
+                    seq: 2,
+                    ts_rfc3339: "2026-01-01T00:00:01Z".to_owned(),
+                    stage: "backend".to_owned(),
+                    code: "ok".to_owned(),
+                    message: format!("second for {id}"),
+                    payload: serde_json::json!({}),
+                },
+            ];
+            store.persist_report(&report).expect("persist");
+        }
+
+        let run_ids: Vec<String> = ids.iter().map(|s| (*s).to_owned()).collect();
+        let batched = store.load_run_details_batch(&run_ids).expect("batch load");
+        assert_eq!(batched.len(), 3);
+        for (i, id) in ids.iter().enumerate() {
+            let per_run = store
+                .load_run_details(id)
+                .expect("per-run load")
+                .expect("run exists");
+            // Compare serialized form (StoredRunDetails is Serialize, not PartialEq) —
+            // a direct byte-exact check of the loader output.
+            assert_eq!(
+                serde_json::to_string(&batched[i]).expect("ser batched"),
+                serde_json::to_string(&per_run).expect("ser per-run"),
+                "batched run `{id}` must byte-match the per-run loader"
+            );
+        }
     }
 
     #[test]

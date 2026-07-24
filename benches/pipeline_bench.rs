@@ -4,12 +4,23 @@
 //! primitives used by the orchestrator's replay envelope), and stage budget
 //! calculation via `PipelineConfig` construction and validation.
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use franken_whisper::model::{RunEvent, StreamedRunEvent};
+use franken_whisper::backend::{
+    BackendMetrics, RouterState, RoutingEvidenceLedger, RoutingEvidenceLedgerEntry,
+    RoutingOutcomeRecord,
+};
+use franken_whisper::model::{BackendKind, RunEvent, StreamedRunEvent};
 use franken_whisper::orchestrator::{PipelineBuilder, PipelineConfig, PipelineStage};
+use franken_whisper::speculation::{
+    CorrectionDecision, CorrectionDrift, CorrectionEvent, CorrectionEvidenceEntry,
+    CorrectionEvidenceLedger, SpeculationWindowController,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -219,19 +230,1063 @@ fn bench_pipeline_has_stage(c: &mut Criterion) {
 
     c.bench_function("pipeline/has_stage_lookup", |b| {
         b.iter(|| {
-            let _ = config.has_stage(PipelineStage::Ingest);
-            let _ = config.has_stage(PipelineStage::Normalize);
-            let _ = config.has_stage(PipelineStage::Backend);
-            let _ = config.has_stage(PipelineStage::Accelerate);
-            let _ = config.has_stage(PipelineStage::Align);
-            let _ = config.has_stage(PipelineStage::Persist);
+            let config = black_box(&config);
+            black_box([
+                config.has_stage(black_box(PipelineStage::Ingest)),
+                config.has_stage(black_box(PipelineStage::Normalize)),
+                config.has_stage(black_box(PipelineStage::Backend)),
+                config.has_stage(black_box(PipelineStage::Accelerate)),
+                config.has_stage(black_box(PipelineStage::Align)),
+                config.has_stage(black_box(PipelineStage::Persist)),
+            ]);
         });
     });
+}
+
+/// Profile the adaptive router's per-backend aggregate over its full retained
+/// history window. `evaluate_backend_selection` invokes this aggregate for
+/// every backend while building the loss matrix and again while constructing
+/// the evidence snapshot.
+fn bench_router_metrics(c: &mut Criterion) {
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|filter| !filter.starts_with('-') && !filter.contains("router_metrics"))
+    {
+        return;
+    }
+
+    fn historical_metrics(history: &[RoutingOutcomeRecord]) -> BackendMetrics {
+        let sample_count = history.len();
+        let success_count = history.iter().filter(|record| record.success).count();
+        let success_rate = success_count as f64 / sample_count as f64;
+        let successful_latencies: Vec<f64> = history
+            .iter()
+            .filter(|record| record.success)
+            .map(|record| record.latency_ms as f64)
+            .collect();
+        let avg_latency_ms = if successful_latencies.is_empty() {
+            0.0
+        } else {
+            successful_latencies.iter().sum::<f64>() / successful_latencies.len() as f64
+        };
+        let last_error = history
+            .iter()
+            .rev()
+            .find_map(|record| record.error_message.clone());
+        BackendMetrics {
+            success_rate,
+            avg_latency_ms,
+            last_error,
+            sample_count,
+            success_count,
+        }
+    }
+
+    fn measure_metrics<F>(inner_steps: usize, mut metrics: F) -> Duration
+    where
+        F: FnMut() -> BackendMetrics,
+    {
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..inner_steps {
+            let result = black_box(metrics());
+            checksum ^= result.avg_latency_ms.to_bits();
+            checksum = checksum.rotate_left(1) ^ result.success_rate.to_bits();
+            black_box(&result);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut state = RouterState::new();
+    let mut history = Vec::with_capacity(50);
+    for i in 0..50_u64 {
+        let record = RoutingOutcomeRecord {
+            backend: BackendKind::WhisperCpp,
+            success: i % 4 != 0,
+            latency_ms: 350 + i * 17,
+            error_message: (i % 4 == 0).then(|| format!("backend failure {i}")),
+            recorded_at_rfc3339: format!("2026-07-22T12:{i:02}:00Z"),
+        };
+        state.record_outcome(record.clone());
+        history.push(record);
+    }
+
+    let historical = historical_metrics(&history);
+    let streamed = state.metrics_for(BackendKind::WhisperCpp);
+    assert_eq!(
+        serde_json::to_vec(&streamed).expect("serialize streamed metrics"),
+        serde_json::to_vec(&historical).expect("serialize historical metrics")
+    );
+    assert_eq!(
+        streamed.avg_latency_ms.to_bits(),
+        historical.avg_latency_ms.to_bits()
+    );
+
+    // One remote executable performs the null and candidate comparisons in an
+    // order-alternated sequence. Each historical arm runs for about 200 ms at
+    // the profiled 200 ns/call baseline, smoothing shared-worker scheduling.
+    let inner_steps = 1_000_000;
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure_metrics(inner_steps, || historical_metrics(&history));
+            let null_b = measure_metrics(inner_steps, || historical_metrics(&history));
+            let baseline = measure_metrics(inner_steps, || historical_metrics(&history));
+            let candidate =
+                measure_metrics(inner_steps, || state.metrics_for(BackendKind::WhisperCpp));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate =
+                measure_metrics(inner_steps, || state.metrics_for(BackendKind::WhisperCpp));
+            let baseline = measure_metrics(inner_steps, || historical_metrics(&history));
+            let null_b = measure_metrics(inner_steps, || historical_metrics(&history));
+            let null_a = measure_metrics(inner_steps, || historical_metrics(&history));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "ROUTER_METRICS_AB inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={:.6} null_p90={:.6} speedup_p10={:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={:.6} wins={wins}/21",
+        percentile(&sorted_null, 0.1),
+        median(&null_ratios),
+        percentile(&sorted_null, 0.9),
+        percentile(&sorted_speedups, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+        cv(&candidate_ns),
+    );
+
+    c.bench_function("pipeline/router_metrics/history_50", |b| {
+        b.iter(|| state.metrics_for(black_box(BackendKind::WhisperCpp)));
+    });
+}
+
+/// Same-worker A/B for hoisting the three state-invariant backend aggregates
+/// out of the adaptive loss matrix's three availability rows.
+fn bench_router_loss_hoist(c: &mut Criterion) {
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|filter| !filter.starts_with('-') && !filter.contains("router_loss_hoist"))
+    {
+        return;
+    }
+
+    const BACKENDS: [BackendKind; 3] = [
+        BackendKind::WhisperCpp,
+        BackendKind::InsanelyFast,
+        BackendKind::WhisperDiarization,
+    ];
+
+    fn checksum(metrics: &BackendMetrics) -> u64 {
+        metrics.success_rate.to_bits()
+            ^ metrics.avg_latency_ms.to_bits().rotate_left(7)
+            ^ (metrics.sample_count as u64).rotate_left(13)
+            ^ (metrics.success_count as u64).rotate_left(19)
+            ^ metrics
+                .last_error
+                .as_ref()
+                .map_or(0, |error| error.len() as u64)
+    }
+
+    fn historical_loss_inputs(state: &RouterState) -> u64 {
+        let mut result = 0_u64;
+        for state_idx in 0..3_u32 {
+            for backend in BACKENDS {
+                let metrics = black_box(state.metrics_for(backend));
+                result = result.rotate_left(state_idx + 1) ^ checksum(&metrics);
+            }
+        }
+        result
+    }
+
+    fn hoisted_loss_inputs(state: &RouterState) -> u64 {
+        let metrics: [BackendMetrics; 3] =
+            std::array::from_fn(|index| black_box(state.metrics_for(BACKENDS[index])));
+        let mut result = 0_u64;
+        for state_idx in 0..3_u32 {
+            for backend_metrics in &metrics {
+                result = result.rotate_left(state_idx + 1) ^ checksum(backend_metrics);
+            }
+        }
+        result
+    }
+
+    fn measure<F>(inner_steps: usize, mut operation: F) -> Duration
+    where
+        F: FnMut() -> u64,
+    {
+        let started = Instant::now();
+        let mut aggregate = 0_u64;
+        for _ in 0..inner_steps {
+            aggregate ^= black_box(operation());
+        }
+        black_box(aggregate);
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut state = RouterState::new();
+    for backend in BACKENDS {
+        for sample in 0..50_u64 {
+            state.record_outcome(RoutingOutcomeRecord {
+                backend,
+                success: sample % 4 != 0,
+                latency_ms: 350 + sample * 17,
+                error_message: (sample % 4 == 0).then(|| format!("{backend:?} failure {sample}")),
+                recorded_at_rfc3339: format!("2026-07-22T12:{sample:02}:00Z"),
+            });
+        }
+    }
+
+    let historical_metrics: Vec<BackendMetrics> = (0..3)
+        .flat_map(|_| BACKENDS.map(|backend| state.metrics_for(backend)))
+        .collect();
+    let cached_metrics: [BackendMetrics; 3] =
+        std::array::from_fn(|index| state.metrics_for(BACKENDS[index]));
+    let mut candidate_metrics = Vec::with_capacity(9);
+    for _ in 0..3 {
+        candidate_metrics.extend(cached_metrics.iter());
+    }
+    assert_eq!(
+        serde_json::to_vec(&historical_metrics).expect("serialize historical loss inputs"),
+        serde_json::to_vec(&candidate_metrics).expect("serialize hoisted loss inputs")
+    );
+    assert_eq!(historical_loss_inputs(&state), hoisted_loss_inputs(&state));
+
+    let inner_steps = 200_000;
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure(inner_steps, || historical_loss_inputs(&state));
+            let null_b = measure(inner_steps, || historical_loss_inputs(&state));
+            let baseline = measure(inner_steps, || historical_loss_inputs(&state));
+            let candidate = measure(inner_steps, || hoisted_loss_inputs(&state));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate = measure(inner_steps, || hoisted_loss_inputs(&state));
+            let baseline = measure(inner_steps, || historical_loss_inputs(&state));
+            let null_b = measure(inner_steps, || historical_loss_inputs(&state));
+            let null_a = measure(inner_steps, || historical_loss_inputs(&state));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let null_median = median(&null_ratios);
+    let null_p90 = percentile(&sorted_null, 0.9);
+    let speedup_p10 = percentile(&sorted_speedups, 0.1);
+    let candidate_cv = cv(&candidate_ns);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "ROUTER_LOSS_HOIST_AB inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={null_median:.6} null_p90={null_p90:.6} speedup_p10={speedup_p10:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={candidate_cv:.6} wins={wins}/21",
+        percentile(&sorted_null, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+    );
+
+    assert!((0.95..=1.05).contains(&null_median));
+    assert!(candidate_cv < 0.05);
+    assert!(wins >= 18);
+    assert!(speedup_p10 > null_p90.max(1.10));
+
+    c.bench_function("pipeline/router_loss_hoist/history_50", |b| {
+        b.iter(|| hoisted_loss_inputs(black_box(&state)));
+    });
+}
+
+/// Same-worker A/B for streaming the optional-Brier sum and count instead of
+/// materializing a temporary `Vec` during every diagnostics snapshot.
+fn bench_router_diagnostics_profile(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("router_diagnostics_profile")
+    }) {
+        return;
+    }
+
+    fn historical_brier_average(ledger: &RoutingEvidenceLedger) -> Option<f64> {
+        let brier_values: Vec<f64> = ledger
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.brier_score)
+            .collect();
+        if brier_values.is_empty() {
+            None
+        } else {
+            Some(brier_values.iter().sum::<f64>() / brier_values.len() as f64)
+        }
+    }
+
+    fn streamed_brier_average(ledger: &RoutingEvidenceLedger) -> Option<f64> {
+        let (sum, count) = ledger
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.brier_score)
+            .fold((0.0, 0_usize), |(sum, count), score| {
+                (sum + score, count + 1)
+            });
+        (count != 0).then(|| sum / count as f64)
+    }
+
+    fn measure<F>(inner_steps: usize, mut operation: F) -> Duration
+    where
+        F: FnMut() -> Option<f64>,
+    {
+        let started = Instant::now();
+        let mut aggregate = 0_u64;
+        for _ in 0..inner_steps {
+            aggregate = aggregate.rotate_left(1) ^ black_box(operation()).map_or(0, f64::to_bits);
+        }
+        black_box(aggregate);
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut ledger = RoutingEvidenceLedger::new(200);
+    for sample in 0..200_u64 {
+        ledger.record(RoutingEvidenceLedgerEntry {
+            decision_id: format!("decision-{sample}"),
+            trace_id: format!("trace-{}", sample / 4),
+            timestamp_rfc3339: format!("2026-07-22T12:{:02}:{:02}Z", sample / 60, sample % 60),
+            observed_state: "all_available".to_owned(),
+            chosen_action: "whisper_cpp".to_owned(),
+            recommended_order: vec![
+                "whisper_cpp".to_owned(),
+                "insanely_fast".to_owned(),
+                "whisper_diarization".to_owned(),
+            ],
+            fallback_active: sample % 10 == 0,
+            fallback_reason: (sample % 10 == 0).then(|| "calibration".to_owned()),
+            posterior_snapshot: vec![0.6, 0.3, 0.1],
+            calibration_score: 0.75 + (sample % 20) as f64 * 0.005,
+            brier_score: (sample % 5 != 0).then_some(0.08 + (sample % 17) as f64 * 0.01),
+            e_process: 1.0 + sample as f64 * 0.01,
+            ci_width: 0.2,
+            adaptive_mode: true,
+            policy_id: "router-policy-v1".to_owned(),
+            loss_matrix_hash: format!("loss-{sample:016x}"),
+            availability: vec![
+                ("whisper_cpp".to_owned(), true),
+                ("insanely_fast".to_owned(), true),
+                ("whisper_diarization".to_owned(), true),
+            ],
+            duration_bucket: "medium".to_owned(),
+            diarize: sample % 3 == 0,
+            actual_outcome: None,
+        });
+    }
+
+    let expected = historical_brier_average(&ledger).expect("profile has Brier values");
+    assert_eq!(
+        streamed_brier_average(&ledger).map(f64::to_bits),
+        Some(expected.to_bits())
+    );
+    let diagnostics = ledger.diagnostics();
+    assert_eq!(
+        diagnostics["avg_brier_score"]
+            .as_f64()
+            .expect("diagnostics Brier average")
+            .to_bits(),
+        expected.to_bits()
+    );
+
+    let mut historical_diagnostics = diagnostics.clone();
+    historical_diagnostics["avg_brier_score"] = serde_json::json!(expected);
+    assert_eq!(
+        serde_json::to_vec(&diagnostics).expect("serialize streamed diagnostics"),
+        serde_json::to_vec(&historical_diagnostics).expect("serialize historical diagnostics")
+    );
+
+    let inner_steps = 250_000;
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure(inner_steps, || historical_brier_average(&ledger));
+            let null_b = measure(inner_steps, || historical_brier_average(&ledger));
+            let baseline = measure(inner_steps, || historical_brier_average(&ledger));
+            let candidate = measure(inner_steps, || streamed_brier_average(&ledger));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate = measure(inner_steps, || streamed_brier_average(&ledger));
+            let baseline = measure(inner_steps, || historical_brier_average(&ledger));
+            let null_b = measure(inner_steps, || historical_brier_average(&ledger));
+            let null_a = measure(inner_steps, || historical_brier_average(&ledger));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let null_median = median(&null_ratios);
+    let null_p90 = percentile(&sorted_null, 0.9);
+    let speedup_p10 = percentile(&sorted_speedups, 0.1);
+    let candidate_cv = cv(&candidate_ns);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "ROUTER_BRIER_STREAM_AB inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={null_median:.6} null_p90={null_p90:.6} speedup_p10={speedup_p10:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={candidate_cv:.6} wins={wins}/21",
+        percentile(&sorted_null, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+    );
+
+    assert!((0.95..=1.05).contains(&null_median));
+    assert!(candidate_cv < 0.05);
+    assert!(wins >= 18);
+    assert!(speedup_p10 > null_p90.max(1.10));
+
+    let mut group = c.benchmark_group("pipeline/router_diagnostics_profile");
+    group.bench_function("full_200", |b| {
+        b.iter(|| black_box(&ledger).diagnostics());
+    });
+    group.bench_function("brier_stream_200", |b| {
+        b.iter(|| streamed_brier_average(black_box(&ledger)));
+    });
+    group.finish();
+}
+
+/// Profile the four independent count/calibration passes in a realistic
+/// routing-diagnostics snapshot before considering a fused traversal.
+fn bench_router_diagnostics_counts_profile(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("router_diagnostics_counts")
+    }) {
+        return;
+    }
+
+    fn historical_counts(ledger: &RoutingEvidenceLedger) -> (usize, usize, usize, f64) {
+        let fallback_count = ledger
+            .entries()
+            .iter()
+            .filter(|entry| entry.fallback_active)
+            .count();
+        let resolved_count = ledger
+            .entries()
+            .iter()
+            .filter(|entry| entry.actual_outcome.is_some())
+            .count();
+        let resolved_success_count = ledger
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.actual_outcome.as_ref())
+            .filter(|outcome| outcome.success)
+            .count();
+        let calibration_sum = ledger
+            .entries()
+            .iter()
+            .map(|entry| entry.calibration_score)
+            .sum::<f64>();
+        (
+            fallback_count,
+            resolved_count,
+            resolved_success_count,
+            calibration_sum,
+        )
+    }
+
+    fn historical_diagnostics(ledger: &RoutingEvidenceLedger) -> Value {
+        let total = ledger.entries().len();
+        let (fallback_count, resolved, resolved_success, calibration_sum) =
+            historical_counts(ledger);
+        let avg_calibration = if total > 0 {
+            calibration_sum / total as f64
+        } else {
+            0.0
+        };
+        let (brier_sum, brier_count) = ledger
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.brier_score)
+            .fold((0.0, 0_usize), |(sum, count), score| {
+                (sum + score, count + 1)
+            });
+        let avg_brier = (brier_count != 0).then(|| brier_sum / brier_count as f64);
+
+        serde_json::json!({
+            "total_entries": total,
+            "total_ever_recorded": ledger.total_recorded(),
+            "capacity": ledger.capacity(),
+            "fallback_count": fallback_count,
+            "fallback_rate": if total > 0 { fallback_count as f64 / total as f64 } else { 0.0 },
+            "resolved_count": resolved,
+            "resolved_success_count": resolved_success,
+            "resolved_success_rate": if resolved > 0 { resolved_success as f64 / resolved as f64 } else { 0.0 },
+            "avg_calibration_score": avg_calibration,
+            "avg_brier_score": avg_brier,
+        })
+    }
+
+    fn measure<F>(inner_steps: usize, mut diagnostics: F) -> Duration
+    where
+        F: FnMut() -> Value,
+    {
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..inner_steps {
+            let value = black_box(diagnostics());
+            checksum = checksum.rotate_left(1)
+                ^ value["fallback_count"].as_u64().unwrap_or_default()
+                ^ value["resolved_success_count"].as_u64().unwrap_or_default();
+            black_box(value);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut ledger = RoutingEvidenceLedger::new(200);
+    for sample in 0..200_u64 {
+        ledger.record(RoutingEvidenceLedgerEntry {
+            decision_id: format!("count-decision-{sample}"),
+            trace_id: format!("count-trace-{}", sample / 4),
+            timestamp_rfc3339: format!("2026-07-22T13:{:02}:{:02}Z", sample / 60, sample % 60),
+            observed_state: "all_available".to_owned(),
+            chosen_action: "whisper_cpp".to_owned(),
+            recommended_order: vec!["whisper_cpp".to_owned(), "insanely_fast".to_owned()],
+            fallback_active: sample % 10 == 0,
+            fallback_reason: (sample % 10 == 0).then(|| "calibration".to_owned()),
+            posterior_snapshot: vec![0.6, 0.3, 0.1],
+            calibration_score: 0.75 + (sample % 20) as f64 * 0.005,
+            brier_score: (sample % 5 != 0).then_some(0.08 + (sample % 17) as f64 * 0.01),
+            e_process: 1.0 + sample as f64 * 0.01,
+            ci_width: 0.2,
+            adaptive_mode: true,
+            policy_id: "router-policy-v1".to_owned(),
+            loss_matrix_hash: format!("count-loss-{sample:016x}"),
+            availability: vec![("whisper_cpp".to_owned(), true)],
+            duration_bucket: "medium".to_owned(),
+            diarize: sample % 3 == 0,
+            actual_outcome: (sample % 4 != 0).then(|| RoutingOutcomeRecord {
+                backend: BackendKind::WhisperCpp,
+                success: sample % 5 != 0,
+                latency_ms: 300 + sample,
+                error_message: (sample % 5 == 0).then(|| format!("failure-{sample}")),
+                recorded_at_rfc3339: format!("2026-07-22T13:{:02}:30Z", sample / 60),
+            }),
+        });
+    }
+
+    let diagnostics = ledger.diagnostics();
+    let historical = historical_counts(&ledger);
+    assert_eq!(diagnostics["fallback_count"], historical.0);
+    assert_eq!(diagnostics["resolved_count"], historical.1);
+    assert_eq!(diagnostics["resolved_success_count"], historical.2);
+    assert_eq!(
+        diagnostics["avg_calibration_score"]
+            .as_f64()
+            .expect("calibration average")
+            .to_bits(),
+        (historical.3 / ledger.entries().len() as f64).to_bits()
+    );
+
+    let historical_json = historical_diagnostics(&ledger);
+    let candidate_json = ledger.diagnostics();
+    assert_eq!(
+        serde_json::to_vec(&candidate_json).expect("serialize candidate diagnostics"),
+        serde_json::to_vec(&historical_json).expect("serialize historical diagnostics")
+    );
+
+    let inner_steps = 200_000;
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure(inner_steps, || historical_diagnostics(&ledger));
+            let null_b = measure(inner_steps, || historical_diagnostics(&ledger));
+            let baseline = measure(inner_steps, || historical_diagnostics(&ledger));
+            let candidate = measure(inner_steps, || ledger.diagnostics());
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate = measure(inner_steps, || ledger.diagnostics());
+            let baseline = measure(inner_steps, || historical_diagnostics(&ledger));
+            let null_b = measure(inner_steps, || historical_diagnostics(&ledger));
+            let null_a = measure(inner_steps, || historical_diagnostics(&ledger));
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let null_median = median(&null_ratios);
+    let null_p90 = percentile(&sorted_null, 0.9);
+    let speedup_p10 = percentile(&sorted_speedups, 0.1);
+    let candidate_cv = cv(&candidate_ns);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "ROUTER_COUNTS_FUSION_AB inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={null_median:.6} null_p90={null_p90:.6} speedup_p10={speedup_p10:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={candidate_cv:.6} wins={wins}/21",
+        percentile(&sorted_null, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+    );
+
+    assert!((0.95..=1.05).contains(&null_median));
+    assert!(candidate_cv < 0.05);
+    assert!(wins >= 18);
+    assert!(speedup_p10 > null_p90.max(1.10));
+
+    let mut group = c.benchmark_group("pipeline/router_diagnostics_counts_profile");
+    group.bench_function("candidate_full_200", |b| {
+        b.iter(|| black_box(&ledger).diagnostics());
+    });
+    group.bench_function("historical_full_200", |b| {
+        b.iter(|| historical_diagnostics(black_box(&ledger)));
+    });
+    group.bench_function("historical_four_passes_200", |b| {
+        b.iter(|| historical_counts(black_box(&ledger)));
+    });
+    group.finish();
+}
+
+/// Profile the six historical scans performed by correction diagnostics before
+/// considering a fused traversal.
+fn bench_speculation_diagnostics_profile(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("speculation_diagnostics_profile")
+    }) {
+        return;
+    }
+
+    fn historical_six_passes(ledger: &CorrectionEvidenceLedger) -> [f64; 5] {
+        [
+            ledger.correction_rate(),
+            ledger.mean_fast_latency(),
+            ledger.mean_quality_latency(),
+            ledger.mean_wer(),
+            ledger.latency_savings_pct(),
+        ]
+    }
+
+    let mut ledger = CorrectionEvidenceLedger::new(200);
+    for sample in 0..200_u64 {
+        ledger.record(CorrectionEvidenceEntry {
+            entry_id: sample,
+            window_id: sample,
+            run_id: format!("speculation-run-{}", sample / 20),
+            timestamp_rfc3339: format!("2026-07-23T14:{:02}:{:02}Z", sample / 60, sample % 60),
+            fast_model_id: "tiny.en".to_owned(),
+            fast_latency_ms: 80 + sample % 41,
+            fast_confidence_mean: 0.77 + (sample % 13) as f64 * 0.01,
+            fast_segment_count: 1 + sample as usize % 4,
+            quality_model_id: "large-v3-turbo".to_owned(),
+            quality_latency_ms: 360 + sample % 97,
+            quality_confidence_mean: 0.88 + (sample % 9) as f64 * 0.01,
+            quality_segment_count: 1 + sample as usize % 5,
+            drift: CorrectionDrift {
+                wer_approx: (sample % 17) as f64 * 0.01,
+                confidence_delta: (sample % 11) as f64 * 0.005,
+                segment_count_delta: sample as i32 % 5 - 2,
+                text_edit_distance: sample as usize % 12,
+            },
+            decision: match sample % 8 {
+                0 => "correct".to_owned(),
+                1 => " corrected ".to_owned(),
+                2 => "CORRECTION".to_owned(),
+                _ => "confirm".to_owned(),
+            },
+            window_size_ms: 2_000 + sample % 5 * 500,
+            correction_rate_at_decision: (sample % 20) as f64 / 20.0,
+            controller_confidence: (sample.min(20)) as f64 / 20.0,
+            fallback_active: sample % 19 == 0,
+            fallback_reason: (sample % 19 == 0).then(|| "calibration".to_owned()),
+        });
+    }
+
+    let diagnostics = ledger.diagnostics();
+    let historical = historical_six_passes(&ledger);
+    for (field, expected) in [
+        ("correction_rate", historical[0]),
+        ("mean_fast_latency_ms", historical[1]),
+        ("mean_quality_latency_ms", historical[2]),
+        ("mean_wer", historical[3]),
+        ("latency_savings_pct", historical[4]),
+    ] {
+        assert_eq!(
+            diagnostics[field]
+                .as_f64()
+                .expect("diagnostic field")
+                .to_bits(),
+            expected.to_bits(),
+            "field={field}"
+        );
+    }
+
+    let mut group = c.benchmark_group("pipeline/speculation_diagnostics_profile");
+    group.bench_function("full_200", |b| {
+        b.iter(|| black_box(&ledger).diagnostics());
+    });
+    group.bench_function("historical_six_passes_200", |b| {
+        b.iter(|| historical_six_passes(black_box(&ledger)));
+    });
+    group.finish();
+}
+
+/// Retry the previously blocked controller Brier-score reuse with one pinned
+/// binary, exact evidence parity, alternating A/B order, and an identity null.
+fn bench_speculation_controller_brier_reuse(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("speculation_controller_brier_reuse")
+    }) {
+        return;
+    }
+
+    fn controller_fixture() -> SpeculationWindowController {
+        let mut controller = SpeculationWindowController::new(5_000, 1_000, 30_000, 500);
+        let drift = CorrectionDrift {
+            wer_approx: 0.05,
+            confidence_delta: 0.01,
+            segment_count_delta: 0,
+            text_edit_distance: 1,
+        };
+        for index in 0..15_u64 {
+            let correction = CorrectionEvent::new(
+                index,
+                index,
+                index,
+                "quality".to_owned(),
+                vec![],
+                100,
+                "2026-07-24T00:00:00Z".to_owned(),
+                &[],
+            );
+            controller.observe(&CorrectionDecision::Correct { correction }, &drift);
+        }
+        for index in 0..10_u64 {
+            controller.observe(
+                &CorrectionDecision::Confirm {
+                    seq: index,
+                    drift: drift.clone(),
+                },
+                &drift,
+            );
+        }
+        controller
+    }
+
+    fn measure<const HISTORICAL: bool>(inner_steps: usize) -> Duration {
+        let mut controller = controller_fixture();
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..inner_steps {
+            if HISTORICAL {
+                black_box(controller.recommend());
+            }
+            checksum ^= black_box(controller.apply());
+        }
+        black_box((checksum, controller.evidence().len()));
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut historical_oracle = controller_fixture();
+    let mut candidate_oracle = controller_fixture();
+    let historical_action = historical_oracle.recommend();
+    let historical_size = historical_oracle.apply();
+    let candidate_size = candidate_oracle.apply();
+    assert_eq!(candidate_size, historical_size);
+    assert_eq!(
+        candidate_oracle.is_fallback_active(),
+        historical_oracle.is_fallback_active()
+    );
+    assert_eq!(
+        candidate_oracle
+            .evidence()
+            .last()
+            .map(|entry| &entry.action_taken),
+        Some(&historical_action)
+    );
+    assert_eq!(
+        serde_json::to_vec(
+            candidate_oracle
+                .evidence()
+                .last()
+                .expect("candidate evidence"),
+        )
+        .expect("serialize candidate evidence"),
+        serde_json::to_vec(
+            historical_oracle
+                .evidence()
+                .last()
+                .expect("historical evidence"),
+        )
+        .expect("serialize historical evidence")
+    );
+
+    let calibration_steps = 10_000;
+    let calibration = measure::<true>(calibration_steps);
+    let inner_steps = ((0.05 / calibration.as_secs_f64()) * calibration_steps as f64) as usize;
+    let inner_steps = inner_steps.clamp(20_000, 200_000);
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure::<true>(inner_steps);
+            let null_b = measure::<true>(inner_steps);
+            let baseline = measure::<true>(inner_steps);
+            let candidate = measure::<false>(inner_steps);
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate = measure::<false>(inner_steps);
+            let baseline = measure::<true>(inner_steps);
+            let null_b = measure::<true>(inner_steps);
+            let null_a = measure::<true>(inner_steps);
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let null_median = median(&null_ratios);
+    let null_p90 = percentile(&sorted_null, 0.9);
+    let speedup_p10 = percentile(&sorted_speedups, 0.1);
+    let candidate_cv = cv(&candidate_ns);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "SPECULATION_CONTROLLER_BRIER_REUSE_AB calibration_steps={calibration_steps} calibration_ns={} inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={null_median:.6} null_p90={null_p90:.6} speedup_p10={speedup_p10:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={candidate_cv:.6} wins={wins}/21",
+        calibration.as_nanos(),
+        percentile(&sorted_null, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+    );
+
+    assert!((0.95..=1.05).contains(&null_median));
+    assert!(candidate_cv < 0.05);
+    assert!(wins >= 18);
+    assert!(speedup_p10 > null_p90.max(1.10));
+
+    let mut group = c.benchmark_group("pipeline/speculation_controller_brier_reuse");
+    group.bench_function("candidate_apply_window_20", |b| {
+        b.iter_batched(
+            controller_fixture,
+            |mut controller| black_box(controller.apply()),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("historical_apply_window_20", |b| {
+        b.iter_batched(
+            controller_fixture,
+            |mut controller| {
+                black_box(controller.recommend());
+                black_box(controller.apply())
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
+
+/// Isolated same-binary A/B for the export-writer `BufWriter` change (see
+/// `src/export.rs`): writing an SRT-shaped transcript to a real file per-segment
+/// through a raw `File` (one `write()` syscall per line) vs a `BufWriter`
+/// (batched ~8 KiB writes). Both arms emit byte-identical file content; only the
+/// syscall count differs. Interleaved unbuffered/buffered/unbuffered/buffered.
+fn bench_export_srt_buffering(c: &mut Criterion) {
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let n = 5_000usize;
+    let segs: Vec<(f64, f64, String)> = (0..n)
+        .map(|i| {
+            (
+                i as f64,
+                i as f64 + 0.9,
+                format!("segment number {i} with a handful of transcribed words"),
+            )
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("export/srt_write");
+
+    for arm in ["unbuffered_r1", "buffered_r1", "unbuffered_r2", "buffered_r2"] {
+        let buffered = arm.starts_with("buffered");
+        let path = dir.path().join(format!("{arm}.srt"));
+        group.bench_function(arm, |b| {
+            if buffered {
+                b.iter(|| {
+                    let mut file = BufWriter::new(File::create(&path).expect("create"));
+                    for (i, (start, end, text)) in segs.iter().enumerate() {
+                        writeln!(file, "{}", i + 1).unwrap();
+                        writeln!(file, "{start:.3} --> {end:.3}").unwrap();
+                        writeln!(file, "{text}\n").unwrap();
+                    }
+                    file.flush().unwrap();
+                });
+            } else {
+                b.iter(|| {
+                    let mut file = File::create(&path).expect("create");
+                    for (i, (start, end, text)) in segs.iter().enumerate() {
+                        writeln!(file, "{}", i + 1).unwrap();
+                        writeln!(file, "{start:.3} --> {end:.3}").unwrap();
+                        writeln!(file, "{text}\n").unwrap();
+                    }
+                });
+            }
+        });
+    }
+
+    group.finish();
+}
 
 criterion_group!(
     benches,
@@ -241,5 +1296,12 @@ criterion_group!(
     bench_sha256_json_value,
     bench_pipeline_config_validation,
     bench_pipeline_has_stage,
+    bench_router_metrics,
+    bench_router_loss_hoist,
+    bench_router_diagnostics_profile,
+    bench_router_diagnostics_counts_profile,
+    bench_speculation_diagnostics_profile,
+    bench_speculation_controller_brier_reuse,
+    bench_export_srt_buffering,
 );
 criterion_main!(benches);

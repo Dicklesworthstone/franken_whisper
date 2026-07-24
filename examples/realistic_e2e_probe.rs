@@ -56,10 +56,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // 3. Multi-window transcribe.
+    // FW_PROBE_TIMESTAMPS=1 flips to timestamp mode (exercises speculative pipelining).
+    let use_ts = std::env::var("FW_PROBE_TIMESTAMPS").as_deref() == Ok("1");
     let params = DecodeParams {
         language: None,
         translate: false,
-        timestamps: false,
+        timestamps: use_ts,
         n_threads: 8,
         ..DecodeParams::default()
     };

@@ -47,7 +47,7 @@ use crate::model::{
     BackendKind, TranscribeRequest, TranscriptionResult, TranscriptionSegment, WordTimestampParams,
 };
 use crate::native_engine::dtw::WordTiming;
-use crate::native_engine::{self, NativeWhisperModel, decode};
+use crate::native_engine::{self, NativeWhisperModel, WhisperHParams, decode};
 
 use super::native_audio::analyze_wav;
 
@@ -229,6 +229,15 @@ fn model_search_dirs() -> Vec<std::path::PathBuf> {
 /// dispatch gate — while still keeping availability honest (zero usable model
 /// files => `false`).
 fn any_model_in_search_dirs() -> bool {
+    first_model_in_search_dirs().is_some()
+}
+
+/// The first `ggml-*.bin` with a valid header found by scanning the search dirs
+/// in [`model_search_dirs`] precedence order. Directory iteration order within a
+/// single dir is filesystem-defined, so this is only a "some usable model
+/// exists, here is one of them" answer — exactly what the availability probe and
+/// the capability probe need when no default model is configured.
+fn first_model_in_search_dirs() -> Option<std::path::PathBuf> {
     for dir in model_search_dirs() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -240,30 +249,132 @@ fn any_model_in_search_dirs() -> bool {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("ggml-") && n.ends_with(".bin"));
             if is_ggml && header_ftype_ok(&path) {
-                return true;
+                return Some(path);
             }
         }
     }
-    false
+    None
 }
 
 /// Read the first 48 bytes of `path` and validate the ggml magic + a supported
 /// dense `ftype` (`0` = f32, `1` = f16). Any failure yields `false`.
 fn header_ftype_ok(path: &Path) -> bool {
+    header_hparams(path).is_some()
+}
+
+/// Sniff `path`'s 48-byte ggml header into [`WhisperHParams`], or `None` when the
+/// file is unreadable, too short, carries the wrong magic, or declares an
+/// unsupported (non-dense) `ftype`.
+///
+/// Header-only: 48 bytes, no weight load, no network, never panics. The eleven
+/// `i32` hparams follow the magic in declaration order.
+fn header_hparams(path: &Path) -> Option<WhisperHParams> {
     use std::io::Read as _;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
+    let mut file = std::fs::File::open(path).ok()?;
     let mut buf = [0u8; HEADER_SNIFF_LEN];
-    if file.read_exact(&mut buf).is_err() {
-        return false;
+    file.read_exact(&mut buf).ok()?;
+    if u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) != GGML_MAGIC {
+        return None;
     }
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != GGML_MAGIC {
-        return false;
+    let field = |i: usize| -> i32 {
+        let o = 4 + i * 4;
+        i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+    };
+    let ftype = field(10);
+    if ftype != 0 && ftype != 1 {
+        return None;
     }
-    let ftype = i32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]);
-    ftype == 0 || ftype == 1
+    Some(WhisperHParams {
+        n_vocab: field(0),
+        n_audio_ctx: field(1),
+        n_audio_state: field(2),
+        n_audio_head: field(3),
+        n_audio_layer: field(4),
+        n_text_ctx: field(5),
+        n_text_state: field(6),
+        n_text_head: field(7),
+        n_text_layer: field(8),
+        n_mels: field(9),
+        ftype,
+    })
+}
+
+/// Machine-checked answers to "what can the native engine actually do right
+/// now?" — the ground truth behind the three native engines' reported
+/// [`EngineCapabilities`](crate::model::EngineCapabilities) (bd-0522).
+///
+/// Every field is a probe of this build, this machine, and the model the engine
+/// would load if asked, rather than a hand-maintained constant that drifts from
+/// reality. Cheap enough to call per health check: one 48-byte header read, no
+/// weight load, no network, never panics.
+///
+/// Model *presence* is deliberately absent here: [`is_available`] already
+/// answers it, and a capability probe that disagreed with it would be the very
+/// drift this type exists to prevent. With no model both model-derived fields
+/// are `false`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeProbe {
+    /// The resolved model carries the multilingual vocabulary, so the decoder's
+    /// `translate` task token exists. English-only models (`*.en`) cannot
+    /// translate, whatever the CLI accepts.
+    pub multilingual: bool,
+    /// DTW alignment heads resolve for the resolved model, so word timestamps
+    /// come from real cross-attention alignment.
+    pub word_timestamps: bool,
+    /// A real GPU encoder path is compiled in and enabled on this machine.
+    pub gpu: bool,
+}
+
+impl NativeProbe {
+    /// The honest capability set when no model resolves: nothing model-derived
+    /// is supported. `gpu` still reflects the build and machine.
+    fn without_model(gpu: bool) -> Self {
+        Self {
+            multilingual: false,
+            word_timestamps: false,
+            gpu,
+        }
+    }
+}
+
+/// Probe what the native engine can actually do (see [`NativeProbe`]).
+///
+/// Resolves the same model [`run`] would: `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`
+/// first, else any usable `ggml-*.bin` in a search dir — mirroring
+/// [`is_available`]'s policy so capabilities never contradict availability.
+pub(crate) fn capability_probe() -> NativeProbe {
+    let gpu = native_engine::encoder::gpu_encoder_available();
+
+    // The spec doubles as the alignment-head preset hint (e.g. "large-v3-turbo"),
+    // exactly as `decode_params` passes it to the engine.
+    let spec = native_engine::default_model_spec();
+    let path = match spec.as_deref() {
+        Some(spec) => native_engine::resolve_model(spec).ok(),
+        None => None,
+    }
+    .or_else(first_model_in_search_dirs);
+
+    let Some(path) = path else {
+        return NativeProbe::without_model(gpu);
+    };
+    let Some(hparams) = header_hparams(&path) else {
+        return NativeProbe::without_model(gpu);
+    };
+
+    // Fall back to the file stem as the preset hint when no spec was configured;
+    // `alignment_heads` normalizes it and drops back to the openai "top half of
+    // layers" rule for anything it does not recognize.
+    let hint = spec.or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim_start_matches("ggml-").to_owned())
+    });
+
+    NativeProbe {
+        multilingual: hparams.is_multilingual(),
+        word_timestamps: !native_engine::dtw::alignment_heads(&hparams, hint.as_deref()).is_empty(),
+        gpu,
+    }
 }
 
 /// Resolve the effective model spec for a request, or a [`FwError`] explaining
@@ -313,6 +424,25 @@ fn decode_params(
     decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
+        // Initial prompt (whisper `--prompt`): the engine tokenizes it and seeds
+        // the first window's carried context. Empty → no-op.
+        initial_prompt: request
+            .backend_params
+            .prompt
+            .clone()
+            .filter(|p| !p.is_empty()),
+        // Beam width (whisper `--beam-size`): the engine beam-searches temp-0
+        // windows when > 1; the decoder clamps to [1, 8]. None → greedy.
+        beam_size: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.beam_size)
+            .map(|n| n as usize),
+        // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
+        suppress_nst: request.backend_params.suppress_nst,
+        // Max carried context (whisper `--max-context`); 0 disables prompt carry.
+        max_context: request.backend_params.decoding.as_ref().and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         // No request field maps to whisper's text-context cap today; use the
@@ -437,6 +567,7 @@ pub fn run(
         &spec,
         &model_path,
         version_tag,
+        native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
         &output.windows,
         word_mode,
         request.backend_params.split_on_word,
@@ -736,9 +867,13 @@ fn finalize_segments(
             end_sec: if no_timestamps { None } else { seg.end_sec },
             text: seg.text.trim().to_owned(),
             speaker: None,
-            confidence: seg
-                .confidence
-                .map(|c| if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 }),
+            confidence: seg.confidence.map(|c| {
+                if c.is_finite() {
+                    c.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }),
         });
     }
     Ok(out)
@@ -760,6 +895,7 @@ fn raw_output_json(
     spec: &str,
     model_path: &Path,
     version_tag: String,
+    encoder_policy: native_engine::EncoderInt8PolicyDecision,
     windows: &[decode::WindowStats],
     word_mode: WordTimestampMode,
     split_on_word: bool,
@@ -794,6 +930,16 @@ fn raw_output_json(
         "model": spec,
         "model_path": model_path.display().to_string(),
         "model_version_tag": version_tag,
+        "encoder_int8_policy": {
+            "action": match encoder_policy.action {
+                native_engine::EncoderInt8PolicyAction::F32Encoder => "f32",
+                native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
+            },
+            "reason": encoder_policy.reason,
+            "calibration_id": encoder_policy.calibration_id,
+            "corpus_wer_delta_budget": encoder_policy.corpus_wer_delta_budget,
+            "quant_rel_rmse_budget": encoder_policy.quant_rel_rmse_budget,
+        },
         "windows": windows_json,
         "word_timestamps": word_timestamps,
     })
@@ -859,6 +1005,66 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn decode_params_maps_initial_prompt_from_request() {
+        let mut request = native_request();
+        // No prompt → the engine gets no initial prompt.
+        assert_eq!(decode_params(&request, false, "tiny.en").initial_prompt, None);
+        // A request prompt (whisper `--prompt`) flows through to the engine's
+        // initial_prompt field, which the decoder tokenizes and seeds.
+        request.backend_params.prompt = Some("medical terminology".to_owned());
+        assert_eq!(
+            decode_params(&request, false, "tiny.en")
+                .initial_prompt
+                .as_deref(),
+            Some("medical terminology"),
+        );
+        // An empty prompt is treated as no prompt (byte-identical default).
+        request.backend_params.prompt = Some(String::new());
+        assert_eq!(decode_params(&request, false, "tiny.en").initial_prompt, None);
+    }
+
+    #[test]
+    fn decode_params_maps_beam_size_from_request() {
+        use crate::model::DecodingParams;
+        let mut request = native_request();
+        // No decoding params → None (the engine runs greedy = byte-identical).
+        assert_eq!(decode_params(&request, false, "tiny.en").beam_size, None);
+        // A request beam size (whisper `--beam-size`) flows to the engine.
+        request.backend_params.decoding = Some(DecodingParams {
+            beam_size: Some(5),
+            ..DecodingParams::default()
+        });
+        assert_eq!(
+            decode_params(&request, false, "tiny.en").beam_size,
+            Some(5),
+        );
+    }
+
+    #[test]
+    fn decode_params_maps_suppress_nst_from_request() {
+        let mut request = native_request();
+        // Default off (whisper.cpp default = byte-identical).
+        assert!(!decode_params(&request, false, "tiny.en").suppress_nst);
+        // A --suppress-nst request reaches the engine's logit filter.
+        request.backend_params.suppress_nst = true;
+        assert!(decode_params(&request, false, "tiny.en").suppress_nst);
+    }
+
+    #[test]
+    fn decode_params_maps_max_context_from_request() {
+        use crate::model::DecodingParams;
+        let mut request = native_request();
+        // No decoding params → None (engine uses its n_text_ctx/2 default).
+        assert_eq!(decode_params(&request, false, "tiny.en").max_context, None);
+        // --max-context 0 (disable prompt carry) reaches the engine.
+        request.backend_params.decoding = Some(DecodingParams {
+            max_context: Some(0),
+            ..DecodingParams::default()
+        });
+        assert_eq!(decode_params(&request, false, "tiny.en").max_context, Some(0));
     }
 
     /// A real-shaped engine segment (timed, with text), standing in for what
@@ -1139,7 +1345,10 @@ mod tests {
         let grouped = group_word_segments_by_len(&words, 100, None).expect("group");
         assert_eq!(grouped.len(), 1);
         let conf = grouped[0].confidence.expect("finite confidence");
-        assert!(conf.is_finite(), "grouped confidence must be finite: {conf}");
+        assert!(
+            conf.is_finite(),
+            "grouped confidence must be finite: {conf}"
+        );
         // Mean of the two finite confidences (0.8, 0.6), NaN excluded.
         assert!((conf - 0.7).abs() < 1e-9, "unexpected mean: {conf}");
     }
@@ -1240,12 +1449,23 @@ mod tests {
         );
     }
 
+    fn f32_encoder_policy_fixture() -> native_engine::EncoderInt8PolicyDecision {
+        native_engine::EncoderInt8PolicyDecision {
+            action: native_engine::EncoderInt8PolicyAction::F32Encoder,
+            reason: "unit_test_fixture",
+            calibration_id: native_engine::ENCODER_INT8_CALIBRATION_ID,
+            corpus_wer_delta_budget: 0.0,
+            quant_rel_rmse_budget: 0.09,
+        }
+    }
+
     #[test]
     fn raw_output_word_flag_is_interpolated_when_requested() {
         let json = raw_output_json(
             "tiny.en",
             Path::new("/models/ggml-tiny.en.bin"),
             "fw-native-v1+sha256:abc".to_owned(),
+            f32_encoder_policy_fixture(),
             &[],
             WordTimestampMode::Word,
             false,
@@ -1264,6 +1484,7 @@ mod tests {
             "tiny.en",
             Path::new("/models/ggml-tiny.en.bin"),
             "fw-native-v1+sha256:abc".to_owned(),
+            f32_encoder_policy_fixture(),
             &[],
             WordTimestampMode::Word,
             false,

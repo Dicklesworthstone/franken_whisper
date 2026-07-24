@@ -2567,6 +2567,27 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 
 ## Performance Characteristics
 
+### Native Engine Speed (measured)
+
+The in-process Rust native engine is faster than realtime on both `tiny.en` and `large-v3-turbo`, and beats the reference implementations at matched greedy decoding. These are measured numbers, not projections; each is gated on a candidate **median** against a **paired null (A/A) control**, with byte-exact levers asserted bit-identical and numerics-affecting levers held to a measured **WER-Δ of 0.000** vs `whisper.cpp`.
+
+| Comparison | Model | Result | Conditions |
+|---|---|---|---|
+| vs `whisper.cpp` (CPU) | `tiny.en` | **~2.3× faster** | Apple M4 Pro, interleaved hyperfine, greedy |
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | **parity → faster** | parity on M4 Pro at lower CPU; **~1.5× on a 32-core x86 quiet box**, and the lead **grows with audio length** as the encoder advantage compounds |
+| int8 encoder (v0.5.0) | `large-v3-turbo` | **1.47–1.67× encoder** | quality-safe, calibrated, WER-neutral |
+| SDPA poly-exp (v0.5.0) | `large-v3-turbo` | **1.0722× e2e** | byte-identical transcript, WER Δ 0.000 |
+
+Because OpenAI's reference Whisper (Python/PyTorch) is itself slower than `whisper.cpp` on CPU, the margin versus the original OpenAI implementation is at least as large as the `whisper.cpp` figures above.
+
+**Honesty methodology.** Levers are kept only on a measured win, and the bar is deliberately conservative:
+
+- **Median vs paired-null control** — the candidate median is compared against a same-binary A/A null (ABBA-interleaved), so host contention and run-order bias cannot masquerade as a speedup.
+- **Byte/ULP-exact where claimed** — byte-exact levers are asserted bit-identical to the reference path; the sole numerics-affecting default (poly-exp) is held to WER-Δ 0.000 vs `whisper.cpp`.
+- **Negative-evidence ledger** — rejected levers are recorded with a reject-id, their null-control, and a retry-condition, so a dead end stays dead.
+
+**Honest scope.** These are **greedy / temperature-0** comparisons (the native fast path does not yet implement beam search or temperature fallback), measured on a **quiet host** — the head-to-head ratio degrades under host contention, and `tiny.en` long-form carries a known per-window fixed-overhead regression on very long audio. The full measured record, including every rejected lever, lives in [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
+
 ### Audio Normalization
 
 | Input Format | Duration | Normalization Time | Method |

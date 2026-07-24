@@ -1018,7 +1018,9 @@ fn compute_frame_column(
         fft_in[j] = hann[j] * padded[offset + j];
     }
 
-    let mut fft_out = vec![0.0f32; 2 * N_FFT];
+    // The FFT always writes the complete fixed-size output; keep this scratch
+    // on the stack to avoid a heap allocation for every scalar frame.
+    let mut fft_out = [0.0f32; 2 * N_FFT];
     if rfft_enabled() {
         fft_twoforone(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
     } else {
