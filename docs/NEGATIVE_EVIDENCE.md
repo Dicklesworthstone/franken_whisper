@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP (byte-exact, strictly-less-work) — beam now MOVE-REUSES parent KV state: the last surviving child of each parent MOVES the parent's self-attn `KvCache` (~8 MB) instead of cloning it. When the beam is spread (~1 child/parent) this eliminates nearly all the remaining per-fork clone. Transcript byte-identical (jfk beam=5 md5 `be4284a9`, keynote `cmp -s`); keynote wall min ~113 s vs the batched-logits ~137 s (cumulative ~2.6× from pre-Arc 298 s), shared-box-noisy so no precise factor.**
+
+**Change (decode.rs).** `beam_decode_window`'s candidate loop is now two-pass: pass 1
+decides each candidate (terminated → `finished`; survivors → `BeamExpand`), pass 2
+forks. Since a parent expands to ≥1 surviving children each needing the parent's KV
+state forwarded with a DIFFERENT token, the earlier children deep-clone the parent
+state and the LAST child MOVES it (`std::mem::take` the states out of `active`, then
+`Option::take` for the last child per parent). Move == clone in content, so the
+forked state — and the whole decode — is byte-identical; but a parent that continues
+as a single hypothesis (the common spread-beam case) now costs 0 KvCache clones
+instead of 1. This targets the clone left after the cross-K/V Arc-share
+(the ~8 MB self-attn KvCache was the dominant remaining fork copy).
+
+**Byte-exact + validated.** jfk beam=5 md5 `be4284a9…` (unchanged), keynote
+`retry+beam5` transcript identical to the pre-move-reuse output (`cmp -s`), decode
+suite 50/0, jfk golden byte-exact, greedy default untouched, fleet clippy my regions
+clean. (`KvCache` prefix-clone stays the ledgered memset-bound dead-end — move-reuse
+is the byte-safe way to cut that clone instead.)
+
+**Perf — honest.** Strictly-less-work (fewer KvCache deep-copies), cannot regress.
+Keynote `retry+beam5` two runs 112.7 s / 141.4 s vs the batched-logits 136.6 s /
+145.1 s vs pre-Arc 298 s — the min steps down monotonically across the THREE
+byte-exact beam-perf wins (Arc cross-K/V → batched logits → move-reuse), but the
+shared box is noisy (112–141 s spread within this config alone) so no CV<5% factor
+is claimed. Native retry+beam min ~113 s is now ~3× `whisper-cli -bs 5`'s 37 s (was
+8×). The residual is native's per-hypothesis self-attn/MLP forward vs whisper.cpp's
+fully-batched beam (architecture-scale).
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP (byte-exact, strictly-less-work) — beam now BATCHES the tied-output logits projection across all surviving hypotheses (one `logits_all` GEMM reads the ~n_vocab×n_state weight ONCE instead of once per hypothesis). Transcript byte-identical (jfk beam=5 md5 `be4284a9`, keynote retry+beam5 `cmp -s` identical); keynote wall ~140 s vs the Arc-only ~171–249 s (cumulative ~2.1× from pre-Arc 298 s), shared-box-noisy so no precise factor.**
 
 **Change (decoder.rs + decode.rs).** `forward_step` was split: the new
