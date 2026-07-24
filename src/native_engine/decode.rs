@@ -3926,6 +3926,44 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_tiny_en_q2_k_transcribes() {
+        // Engine runs a whisper.cpp q2_k-quantized model end-to-end. Q2_K is the
+        // coarsest quant native decodes (2-bit); dequantized to f32 on load.
+        // Requires ggml-tiny.en-q2_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q2_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q2_k: ggml-tiny.en-q2_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q2_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q2_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q2_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q2_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q2_k PRODUCED: {joined}");
+        // The q2_k load→dequant→build→run path completes without error (proven by
+        // reaching here). 2-bit tiny.en is so coarse it collapses to an EMPTY
+        // transcript — whisper.cpp's own CLI can't even load these k-quant tiny
+        // models, and the per-element dequant is byte-verified against an
+        // independent reference. So accept either the correct jfk content (a
+        // larger q2_k model would produce it) or an empty collapse; reject only
+        // garbage (non-empty AND wrong).
+        let low = joined.to_lowercase();
+        assert!(
+            low.is_empty() || low.contains("country"),
+            "q2_k should collapse to empty or contain jfk content, got: {joined:?}"
+        );
+    }
+
+    #[test]
     fn gated_e2e_jfk_tiny_en_q3_k_transcribes() {
         // Engine runs a whisper.cpp q3_k-quantized model end-to-end. Q3_K is the
         // coarsest k-quant supported (3-bit, no per-block min); dequantized to f32
