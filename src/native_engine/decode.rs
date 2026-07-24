@@ -650,6 +650,20 @@ struct BeamHyp {
     next_logits: Vec<f32>,
 }
 
+/// A surviving (non-terminated) beam expansion decided in the candidate loop's
+/// first pass — before the parent KV states are moved/cloned in the fork pass.
+/// `parent` indexes the current `active` beam.
+struct BeamExpand {
+    parent: usize,
+    tok: i32,
+    tokens: Vec<i32>,
+    plogs: Vec<f32>,
+    has_ts: bool,
+    seek_delta_cs: i64,
+    result_len: usize,
+    sum_logprob: f64,
+}
+
 /// Indices of the `k` largest values in `logprobs`, skipping `-inf` (masked)
 /// lanes, best-first. Partial selection (not a full sort) over the vocab.
 fn top_k_logprob_indices(logprobs: &[f32], k: usize) -> Vec<usize> {
@@ -753,10 +767,10 @@ fn beam_decode_window(
         });
         cands.truncate(beam);
 
-        let mut next_active: Vec<BeamHyp> = Vec::with_capacity(beam);
-        // Survivors' final hidden states, row-major `[n_survivors, n_state]`, for
-        // the single batched logits projection after the candidate loop.
-        let mut hidden_rows: Vec<f32> = Vec::new();
+        // PASS 1 — decide each candidate: terminated hypotheses go to `finished`;
+        // survivors are collected (with their per-token bookkeeping) so the KV
+        // states can then be moved/cloned without a borrow conflict.
+        let mut expands: Vec<BeamExpand> = Vec::with_capacity(beam);
         for (hi, tok, plog, new_sum) in cands {
             let parent = &active[hi];
             let mut tokens = parent.tokens.clone();
@@ -796,25 +810,64 @@ fn beam_decode_window(
                 }
                 finished.push((tokens, plogs, has_ts, seek_delta_cs, result_len));
             } else {
-                // Forward the token through THIS hypothesis's KV to its final
-                // hidden state (per-hypothesis; the self-attn/MLP can't batch
-                // across differing KV caches). The tied-output LOGITS projection
-                // IS batched below — one weight read for the whole surviving beam.
-                let mut state = parent.state.clone();
-                let (x_last, _draft) =
-                    decoder::forward_step_hidden(&m.decoder, &mut state, &[tok], checkpoint)?;
-                hidden_rows.extend_from_slice(&x_last.data);
-                next_active.push(BeamHyp {
-                    state,
+                expands.push(BeamExpand {
+                    parent: hi,
+                    tok,
                     tokens,
                     plogs,
-                    sum_logprob: new_sum,
                     has_ts,
                     seek_delta_cs,
                     result_len,
-                    next_logits: Vec::new(), // filled by the batched logits below
+                    sum_logprob: new_sum,
                 });
             }
+        }
+
+        // Move the parent KV states out of `active` (replaced below). Each
+        // parent's state is deep-cloned for all but its LAST surviving child,
+        // which MOVES it — move == clone in content, so byte-exact, but it
+        // eliminates ~one self-attn `KvCache` copy (~8 MB) per parent per step
+        // (most of the remaining fork cost when the beam is spread ~1 child each).
+        let mut child_count = vec![0usize; active.len()];
+        for e in &expands {
+            child_count[e.parent] += 1;
+        }
+        let mut parent_states: Vec<Option<DecoderState>> = std::mem::take(&mut active)
+            .into_iter()
+            .map(|h| Some(h.state))
+            .collect();
+
+        // PASS 2 — fork + forward each survivor to its hidden state (per-hypothesis
+        // self-attn/MLP; can't batch across differing KV). The tied-output logits
+        // ARE batched below.
+        let mut next_active: Vec<BeamHyp> = Vec::with_capacity(expands.len());
+        let mut hidden_rows: Vec<f32> = Vec::new();
+        let mut used = vec![0usize; child_count.len()];
+        for e in expands {
+            used[e.parent] += 1;
+            let mut state = if used[e.parent] == child_count[e.parent] {
+                parent_states[e.parent]
+                    .take()
+                    .expect("last surviving child moves the parent state")
+            } else {
+                parent_states[e.parent]
+                    .as_ref()
+                    .expect("earlier surviving child clones the parent state")
+                    .clone()
+            };
+            let (x_last, _draft) =
+                decoder::forward_step_hidden(&m.decoder, &mut state, &[e.tok], checkpoint)?;
+            hidden_rows.extend_from_slice(&x_last.data);
+            next_active.push(BeamHyp {
+                state,
+                tokens: e.tokens,
+                plogs: e.plogs,
+                sum_logprob: e.sum_logprob,
+                has_ts: e.has_ts,
+                seek_delta_cs: e.seek_delta_cs,
+                result_len: e.result_len,
+                next_logits: Vec::new(), // filled by the batched logits below
+            });
         }
         // Batched tied-output projection: one `logits_all` over all survivors'
         // hidden states reads the [n_vocab, n_state] weight ONCE instead of once
