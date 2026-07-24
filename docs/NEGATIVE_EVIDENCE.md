@@ -4,6 +4,17 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (quantized FLAGSHIP decodes, not just loads) — a q5_k large-v3-turbo transcribes jfk, and the transcript is BYTE-IDENTICAL to the f16 turbo (q5_k is transcript-exact on the flagship).**
+
+The load-only `gated_q5_k_large_v3_turbo_loads_and_builds_engine` proved dequant +
+build; this closes the decode gap. `gated_e2e_jfk_q5_k_large_v3_turbo_transcribes`:
+q5_k turbo (233 Q5_K tensors) auto-detects `en` and produces "And so, my fellow
+Americans, ask not what your country can do for you, ask what you can do for your
+country." — CHARACTER-IDENTICAL to the f16 turbo transcript (3124038). So the full
+k-quant dequant → 32-layer encode → multilingual decode path is correct, and q5_k
+loses nothing vs f16 on this clip. 106 s (debug); gated on the 548 MB fixture. Test-only.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (distilled shallow-decoder variant) — the native engine runs `distil-large-v3` (large-v3's 32-layer encoder + a DISTILLED 2-layer decoder) and transcribes jfk correctly. First coverage of a distil-whisper model.**
 
 distil-whisper is a popular fast variant: `n_text_layer=2` (vs large-v3's 32,
