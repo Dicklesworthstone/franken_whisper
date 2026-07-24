@@ -3888,6 +3888,44 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_tiny_en_q6_k_transcribes() {
+        // Engine runs a whisper.cpp q6_k-quantized model end-to-end. Q6_K is a
+        // k-quant super-block format (256-value blocks, 6-bit + per-16 int8
+        // sub-scales); its tensors dequantize to f32 on load (ggml.rs) and route
+        // through the f32 weight path. Requires ggml-tiny.en-q6_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q6_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q6_k: ggml-tiny.en-q6_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q6_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q6_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q6_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q6_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q6_k PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q6_k produced no segments");
+        // Q6_K is high-precision (near-f16); assert the salient jfk content.
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans"),
+            "q6_k transcript missing 'fellow americans': {joined}"
+        );
+        assert!(
+            low.contains("country"),
+            "q6_k transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
     fn gated_e2e_jfk_tiny_en_matches_reference() {
         let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_e2e_jfk_tiny_en: tiny.en model or jfk.wav missing");
