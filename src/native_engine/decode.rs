@@ -3926,6 +3926,89 @@ mod tests {
     }
 
     #[test]
+    fn gated_language_detect_jfk_turbo_matches_oracle() {
+        // The ONLY coverage of the multilingual language-auto-detect path
+        // (detect_language_from_enc, a port of whisper.cpp whisper_lang_auto_detect).
+        // Every other on-box test uses English-only tiny.en, which skips detection
+        // entirely. Oracle: `whisper-cli -dl` on jfk + f16 large-v3-turbo reports
+        // "auto-detected language: en (p = 0.960230)". Requires the multilingual
+        // ggml-large-v3-turbo.bin + jfk.wav.
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_language_detect: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_language_detect: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let m = LoadedModel::from_ggml(model).expect("build turbo engine");
+        assert!(
+            m.tokenizer.num_languages() >= 99,
+            "turbo must be multilingual, got {} languages",
+            m.tokenizer.num_languages()
+        );
+
+        // Encode jfk's first 30 s window and build the decoder state — exactly the
+        // inputs detect_language_from_enc consumes in production.
+        let mel_threads = super::super::host_parallelism().min(16);
+        let mel = mel::log_mel(&samples, &m.filters, mel_threads).expect("mel");
+        let frames = FRAMES_PER_CHUNK.min(mel.n_frames);
+        let enc = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
+            .expect("encode window 0");
+        let mut st = DecoderState::new(&m.decoder, &enc).expect("decoder state");
+
+        // (a) The real production function returns the detected code.
+        let detected = detect_language_from_enc(&m, &mut st, &noop)
+            .expect("detect")
+            .expect("some language");
+        assert_eq!(
+            detected, "en",
+            "detect_language_from_enc must match the whisper-cli oracle (en)"
+        );
+
+        // (b) False-pass guard: a bug that always returns the default "en" (e.g.
+        // all-NEG_INFINITY logits → uniform 1/99 softmax) would pass (a). Recompute
+        // the full language distribution and require "en" to be the DOMINANT
+        // outcome (~0.96 per the oracle), which no degenerate path can produce.
+        // detect_language_from_enc reset `st`, so this re-forward reproduces its logits.
+        let logits = decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], &noop)
+            .expect("forward sot");
+        let mut lang_logits: Vec<(&str, f32)> = Vec::new();
+        for &(code, lang_id, _) in LANGUAGES {
+            if lang_id >= m.tokenizer.num_languages() {
+                continue;
+            }
+            let tok = m.tokenizer.sot + 1 + lang_id;
+            if let Ok(idx) = usize::try_from(tok)
+                && let Some(&l) = logits.get(idx)
+            {
+                lang_logits.push((code, l));
+            }
+        }
+        let max_l = lang_logits
+            .iter()
+            .map(|(_, l)| *l)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f32 = lang_logits.iter().map(|(_, l)| (l - max_l).exp()).sum();
+        let mut ranked: Vec<(&str, f32)> = lang_logits
+            .iter()
+            .map(|(c, l)| (*c, (l - max_l).exp() / sum_exp))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("finite probs"));
+        eprintln!(
+            "language detect top-3: {:?}",
+            &ranked[..3.min(ranked.len())]
+        );
+        assert_eq!(ranked[0].0, "en", "top detected language must be en");
+        assert!(
+            ranked[0].1 > 0.9,
+            "p(en) must be dominant (~0.96 oracle), got {:.4}",
+            ranked[0].1
+        );
+    }
+
+    #[test]
     fn gated_q5_k_large_v3_turbo_loads_and_builds_engine() {
         // Flagship-model proof: the quant path is size-agnostic, so a q5_k
         // large-v3-turbo (51866 vocab, 1280 audio-state, 32 enc / 4 dec layers,
