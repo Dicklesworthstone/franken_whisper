@@ -37,6 +37,44 @@ more tensor shapes than tiny.en and confirms none regress. Test-only (no product
 code touched). Skips cleanly when the 547 MB fixture is absent.
 
 ---
+## 2026-07-23 - BlackThrush: **REJECT 1/3 — router diagnostics four-pass count/calibration fusion is directionally faster but does not clear the same-worker null/CV gate**
+
+**Profile first.** After the previously ledgered RCH retry predicate became true,
+strict-release `pipeline_bench` job `j-29944835100115093` on pinned worker
+`vmi1227854` measured the complete 200-entry diagnostics caller at **1.1103 us**
+median `[1.0826, 1.1468]` and the historical fallback/resolved/success/calibration
+passes at **240.14 ns** median `[232.65, 245.39]`. The stage share was therefore
+**21.63%**, clearing the predeclared 10% threshold before the production edit.
+
+**Candidate and conformance.** The candidate fused those four oldest-first scans
+into one fold while leaving the already-streamed Brier pass unchanged. Before
+timing, the release harness compared the complete serialized diagnostics JSON
+against the five-pass historical implementation byte for byte; that oracle
+passed. Floating-point calibration and Brier addition order, empty behavior,
+rates, counts, and JSON fields were unchanged.
+
+**Why REJECT.** Strict same-worker release job `j-29944835100115128` ran 21
+order-alternated candidate/historical pairs and 21 historical/historical identity
+null pairs with 200,000 complete diagnostics snapshots per arm. The candidate
+won **19/21**, and speedup p10/median/p90 was
+**1.020906x / 1.184682x / 1.282482x**, but candidate latency CV was
+**6.9070%**, above the predeclared `<5%` ceiling. Null
+p10/median/p90 was **0.943009x / 1.006305x / 1.107993x**, so candidate p10 also
+failed to clear both null p90 and the 1.10 floor. The benchmark correctly exited
+101 on its CV assertion. This is not admissible evidence despite the favorable
+median. The production change and its candidate-only unit test were manually
+removed; only the recoverable profile/A/B harness and this evidence remain.
+
+**Retry predicate.** Do not retry the same four-pass fusion. Revisit only with a
+materially stronger one-traversal design that also incorporates the remaining
+Brier aggregation while preserving each metric's oldest-first floating addition
+order and byte-identical complete JSON, or with caller profiling that demonstrates
+a different dominant substage. Require the same 21 alternating A/B and identity
+null pairs, null median in `[0.95, 1.05]`, candidate CV `<5%`, at least 18/21
+wins, and candidate p10 above `max(null p90, 1.10)`. No local Cargo evidence is
+admissible. Consecutive REJECT count is now **one**.
+
+---
 ## 2026-07-24 - WhiteCreek: **★ KEEP — FEATURE COMPLETE (EVERY whisper.cpp ggml quant) — native now loads `q2_k`, the last format. The engine decodes ALL 10 ggml quant types: q4_0/q4_1/q5_0/q5_1/q8_0 (legacy) + q2_k/q3_k/q4_k/q5_k/q6_k (k-quants).**
 
 **What landed.** `GgmlDType::Q2_K` (per-tensor GGML_TYPE **10**, model base ftype
