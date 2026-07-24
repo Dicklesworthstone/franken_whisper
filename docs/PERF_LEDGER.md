@@ -4,6 +4,44 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-23 — BLOCKED / NO VERDICT — router diagnostics count-scan fusion (bd-938v)
+
+**Profile contract.** This auth-restart continuation began by re-reading both
+ledgers and recent Git history. The retained profile-only
+`pipeline/router_diagnostics_counts_profile` harness is a fresh sibling of the
+closed Brier-streaming keep: it prices the four remaining passes over a
+realistic 200-entry `RoutingEvidenceLedger` (fallback count, resolved count,
+resolved-success count, and calibration sum) against the complete diagnostics
+caller. The predeclared activation threshold is a stage share of at least 10%;
+production remained untouched pending that measurement.
+
+**Strict RCH reached the dependency closure, not Criterion.** With remote
+required and local fallback disabled, job `j-29944835100114966` was pinned to
+`vmi1227854`. RCH synced 57 path-dependency roots in 120.5 seconds and
+cold-compiled for 642.4 seconds before failing in the shared frankensqlite
+checkout. `fsqlite-vfs/src/uring.rs` imports the `io_uring` crate directly, but
+the current sibling manifest does not link it (`E0432` and `E0433`). The sibling
+was `main...origin/main [ahead 4, behind 6]`; its current `origin/main` uses
+`asupersync::fs::IoUringFile`, but the peer-owned shared checkout was not
+altered. All five requested Criterion targets compile this same non-optional
+path dependency, so none can reach its benchmark executable from the present
+source closure.
+
+**No performance claim.** There are zero Criterion samples, no profile median,
+no A/B or null distribution, no CV, and no conformance result. This is neither
+a KEEP nor a REJECT. `bd-938v` was returned to open and blocked on new issue
+`bd-bsdz`; the profile harness remains recoverable.
+
+**Retry predicate.** Resume only after the frankensqlite owner converges the
+shared checkout to a buildable main and strict-remote
+`cargo check --bench pipeline_bench -j2` reaches `franken_whisper`. Then require
+`historical_four_passes_200 / full_200 >= 10%` before a production edit. A
+candidate must preserve complete serialized diagnostics bytes and pass 21
+same-worker alternating A/B pairs plus 21 identity-null pairs with null median
+in `[0.95, 1.05]`, candidate CV `<5%`, at least 18/21 wins, and candidate p10
+above `max(null p90, 1.10)`. No local Cargo fallback and no sibling-checkout
+mutation are admissible.
+
 ## 2026-07-22 — KEEP — stream routing-diagnostics Brier aggregation (bd-oazu)
 
 **Closed-lever retry predicate and profile first.** Before touching the
