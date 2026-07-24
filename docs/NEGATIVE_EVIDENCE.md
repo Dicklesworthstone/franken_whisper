@@ -4,6 +4,25 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (the ONLY multilingual coverage) — native language auto-detection is proven correct against the whisper-cli oracle: on jfk + f16 large-v3-turbo native detects `en` at p=0.942, matching the oracle's `en` p=0.960.**
+
+`detect_language_from_enc` (a port of whisper.cpp `whisper_lang_auto_detect`) had
+ZERO test coverage — every on-box test uses English-only tiny.en, which skips the
+detect path entirely. Multilingual is a headline capability; this closes the gap.
+Added `gated_language_detect_jfk_turbo_matches_oracle` (decode.rs): encodes jfk's
+first window with the multilingual turbo model, forwards `[sot]`, and (a) asserts
+the real `detect_language_from_enc` returns "en", (b) — false-pass guard — recomputes
+the full language softmax and requires "en" to be the DOMINANT outcome (p>0.9), which
+a degenerate/default path (uniform 1/99 ≈ 0.01) could never produce. Native's
+distribution: **en 0.942, es 0.012, de 0.009** — a real ranking dominated by en,
+tracking the oracle's high-confidence detection (whisper-cli `-dl`: "auto-detected
+language: en (p = 0.960230)"). The ~0.02 gap is native's int8-decode numerics vs
+whisper.cpp's ggml/f16, same as the rest of the engine. Runs in 68 s (one turbo
+encoder pass, debug) only when the 1.5 GB f16 turbo is present; skips otherwise.
+Test-only (no production code touched). **Multilingual language detection is now
+proven real, not just implemented.**
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (flagship, not just tiny.en) — the quant path is proven production-real on `large-v3-turbo`: a q5_k turbo model (547 MB, 51866 vocab, 1280 audio-state, 32/4 layers, multilingual) loads, dequantizes all 233 Q5_K tensors, and builds the engine.**
 
 All prior quant e2e used tiny.en; the epic's production target is "large-v3-turbo
