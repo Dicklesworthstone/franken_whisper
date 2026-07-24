@@ -4477,6 +4477,46 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_q5_k_large_v3_turbo_transcribes() {
+        // The quantized FLAGSHIP end to end: a q5_k large-v3-turbo (k-quant, 233
+        // Q5_K tensors dequantized to f32 on load) must not just build but DECODE
+        // correctly. The load-only test proves dequant+build; this proves the full
+        // dequant → 32-layer encode → multilingual decode path produces a correct
+        // transcript. Requires ggml-large-v3-turbo-q5_k.bin.
+        let Some(path) = super::super::find_model_file("large-v3-turbo-q5_k") else {
+            eprintln!("SKIP gated_e2e_q5_k_turbo: ggml-large-v3-turbo-q5_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_q5_k_turbo: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q5_k turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q5_k turbo");
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on q5_k turbo");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q5_k turbo PRODUCED: [{:?}] {joined}", out.language);
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans") && low.contains("country"),
+            "q5_k turbo transcript missing salient jfk content: {joined}"
+        );
+    }
+
+    #[test]
     fn gated_q5_k_large_v3_turbo_loads_and_builds_engine() {
         // Flagship-model proof: the quant path is size-agnostic, so a q5_k
         // large-v3-turbo (51866 vocab, 1280 audio-state, 32 enc / 4 dec layers,
