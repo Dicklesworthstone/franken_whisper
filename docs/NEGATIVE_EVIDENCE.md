@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (first k-quant) — native now loads whisper.cpp `q6_k` models. Breaks into the k-quant super-block family (previously legacy-quant-only); q6_k transcribes jfk to the EXACT canonical transcript.**
+
+**What landed.** `GgmlDType::Q6_K` (per-tensor GGML_TYPE **14**, model base ftype
+**14** → v2 model reports **2014**). Q6_K is the first *k-quant*: a 256-value
+super-block, 210 bytes = `[ql[128] low-nibbles, qh[64] high-2-bits, int8
+scales[16], f16 super-scale d]`. Each 6-bit quant `q = (low-nibble | high-2-bits<<4)
+− 32`, dequantized `x = d * scales[sub] * q` (16-value sub-blocks pick one of the
+16 int8 scales). Exact port of ggml `dequantize_row_q6_K` — the two-128-chunk /
+`is = l/16` sub-scale indexing. Added `QK_K=256`, `Q6_K_BLOCK_BYTES=210`,
+`dequant_q6_k`, the `ggml_byte_len` arm (multiple-of-256), the `tensor_f32` arm,
+the parse arms (ttype 14, both resident + streamed directory parsers), and the
+model-gate base `| 14`. Routes through the existing f32 weight path (dequant on
+load) — engine unchanged. `#[allow(non_camel_case_types)]` on `GgmlDType`: the
+lint accepts `_` only between two digits (`Q8_0` ok) but rejects the k-quant `_K`
+suffix, and the variants mirror ggml's `GGML_TYPE_*` spelling verbatim.
+
+**Validated.** `q6_k_byte_len_and_dequant_math` pins the super-block layout with a
+hand-computed block (sub-scale indexing, the 6-bit `−32` bias, the two-chunk
+strides). `gated_q6_k_model_loads_and_dequants_close_to_f16` — real q6_k tensors
+within **5 %** mean-abs of f16 (k-quant is high-precision; tighter than the legacy
+q4/q5 15 %/10 % bounds). `gated_e2e_jfk_tiny_en_q6_k_transcribes` builds the engine
+and produces the **exact canonical jfk transcript** ("And so my fellow Americans
+ask not what your country can do for you…"). ggml **27/0**, decode gated q6_k
+**1/0**, no new clippy in-lane. The q6_k fixture has only Q6_K + f32/f16 tensors —
+no unsupported companion k-quant surfaced.
+
+**Quant support now: full legacy family (q4_0/q4_1/q5_0/q5_1/q8_0) + the first
+k-quant (q6_k).** Remaining k-quants q2_k/q3_k/q4_k/q5_k (GGML_TYPE 10-13, base
+ftype 10-13) still rejected with a clear error; each is the same additive
+`GgmlDType`+`dequant_*`+`ggml_byte_len`+parse+gate+fixture pattern. Note q2_k..q5_k
+super-blocks pack scales differently (per-block 6-bit scales/mins, not q6_k's flat
+int8 scales) — each needs its own `dequant_*` port.
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP — FEATURE COMPLETE (the LEGACY quant family) — native now loads ALL FIVE legacy whisper.cpp ggml quants: q4_0, q4_1, q5_0, q5_1, q8_0. Added the two `_1` scale+min variants; q4_1 & q5_1 both transcribe jfk to the EXACT canonical transcript.**
 
 **What landed.** `GgmlDType::Q4_1` (GGML_TYPE 3, 20 B/block: `f16 d, f16 m, 16

@@ -75,6 +75,10 @@ impl WhisperHParams {
 }
 
 /// Tensor element type found in a ggml tensor directory entry.
+// Variant names mirror ggml's `GGML_TYPE_*` C enum verbatim (Q8_0, Q6_K, ...).
+// `non_camel_case_types` accepts `_` only between two digits (so `Q8_0` is fine)
+// but rejects the k-quant `_K` suffix; keep the canonical ggml spelling.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlDType {
     F32,
@@ -101,6 +105,11 @@ pub enum GgmlDType {
     /// AND min (24 bytes/block: scale + min + 4-byte high-bit field + 16-byte
     /// nibbles; `x = (nibble | hi<<4) * scale + min`). Dequantized to f32 at load.
     Q5_1,
+    /// ggml `Q6_K` (per-tensor GGML_TYPE 14): k-quant 6-bit, 256-value
+    /// super-blocks (210 bytes: 128-byte low-nibbles + 64-byte high-2-bits +
+    /// 16-byte int8 sub-scales + `f16` super-scale; `x = d * sub_scale * (6bit −
+    /// 32)`). Dequantized to f32 at load.
+    Q6_K,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,
