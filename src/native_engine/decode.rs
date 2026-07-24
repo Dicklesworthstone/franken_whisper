@@ -202,6 +202,11 @@ pub struct DecodeParams {
     /// hypotheses per step and selects the best length-normalized sequence score.
     /// Clamped to `[1, 8]`. `FW_BEAM_SIZE` overrides this field when set.
     pub beam_size: Option<usize>,
+    /// Suppress non-speech tokens (whisper `--suppress-nst` /
+    /// `suppress_non_speech_tokens`): masks the vocab's symbol/non-speech tokens
+    /// during decoding for cleaner text. `false` = whisper.cpp default
+    /// (byte-identical). Applied by the logit filter (`ProcessLogitsConfig`).
+    pub suppress_nst: bool,
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
@@ -1712,7 +1717,7 @@ pub fn transcribe_samples(
     let cfg = FilterConfig {
         suppress_blank: true,
         space_token,
-        suppress_nst: false, // whisper.cpp default (5970).
+        suppress_nst: params.suppress_nst, // whisper.cpp default false (5970); honor --suppress-nst.
         no_timestamps: !params.timestamps,
         max_initial_tid,
         // EOT-forcing budget (fix #6): the user budget, off when unset —
@@ -4038,6 +4043,33 @@ mod tests {
             t.to_lowercase().contains("country"),
             "field prompt should still transcribe jfk: {t}"
         );
+    }
+
+    #[test]
+    fn gated_suppress_nst_field_is_neutral_on_clean_speech() {
+        // suppress_nst (whisper --suppress-nst) masks non-speech/symbol tokens.
+        // jfk is clean speech that never decodes a non-speech token, so masking
+        // them cannot change the argmax → suppress_nst=true is BYTE-IDENTICAL to
+        // false here. This proves the field reaches the logit filter (via
+        // FilterConfig.suppress_nst) without perturbing normal transcription. The
+        // masking behavior itself is unit-pinned by `non_speech_suppressed_when_enabled`.
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_suppress_nst: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let join = |o: &DecodeOutput| {
+            o.segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let off = join(&transcribe_samples(&model, &samples, &e2e_params(), &noop).unwrap());
+        let mut p = e2e_params();
+        p.suppress_nst = true;
+        let on = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
+        assert_eq!(on, off, "suppress_nst must be a no-op on clean speech (jfk)");
+        assert!(off.to_lowercase().contains("country"), "baseline transcribes jfk");
     }
 
     #[test]

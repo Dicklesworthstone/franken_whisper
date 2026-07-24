@@ -132,6 +132,8 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
             .as_ref()
             .and_then(|d| d.beam_size)
             .map(|n| n as usize),
+        // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
+        suppress_nst: request.backend_params.suppress_nst,
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         max_text_ctx: None,
