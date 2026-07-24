@@ -3789,6 +3789,38 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_tiny_en_q4_1_q5_1_transcribe() {
+        // The engine runs the "_1" (scale+min) legacy quants end-to-end.
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q4_1_q5_1: jfk.wav missing");
+            return;
+        };
+        for name in ["tiny.en-q4_1", "tiny.en-q5_1"] {
+            let Some(path) = super::super::find_model_file(name) else {
+                eprintln!("SKIP {name}: model not found");
+                continue;
+            };
+            let model = GgmlModel::load(&path).unwrap_or_else(|e| panic!("load {name}: {e}"));
+            let loaded =
+                LoadedModel::from_ggml(model).unwrap_or_else(|e| panic!("engine {name}: {e}"));
+            let out = transcribe_samples(&loaded, &samples, &e2e_params(), &noop)
+                .unwrap_or_else(|e| panic!("transcribe {name}: {e}"));
+            let joined: String = out
+                .segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("{name} PRODUCED: {joined}");
+            assert!(!out.segments.is_empty(), "{name} produced no segments");
+            assert!(
+                joined.to_lowercase().contains("country"),
+                "{name} transcript missing 'country': {joined}"
+            );
+        }
+    }
+
+    #[test]
     fn gated_e2e_jfk_tiny_en_q4_0_transcribes() {
         // Engine runs a whisper.cpp q4_0-quantized model end-to-end (4-bit).
         let Some(path) = super::super::find_model_file("tiny.en-q4_0") else {

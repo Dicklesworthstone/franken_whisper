@@ -93,6 +93,14 @@ pub enum GgmlDType {
     /// `f16` scale each (18 bytes/block: scale + 16-byte nibbles; `x = (nibble -
     /// 8) * scale`). Dequantized to f32 at load, like [`Self::Q8_0`].
     Q4_0,
+    /// ggml `Q4_1` (per-tensor GGML_TYPE 3): 4-bit quants with a per-block scale
+    /// AND min (20 bytes/block: scale + min + 16-byte nibbles; `x = nibble *
+    /// scale + min`). Dequantized to f32 at load.
+    Q4_1,
+    /// ggml `Q5_1` (per-tensor GGML_TYPE 7): 5-bit quants with a per-block scale
+    /// AND min (24 bytes/block: scale + min + 4-byte high-bit field + 16-byte
+    /// nibbles; `x = (nibble | hi<<4) * scale + min`). Dequantized to f32 at load.
+    Q5_1,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,

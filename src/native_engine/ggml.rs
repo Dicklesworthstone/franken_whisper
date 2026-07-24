@@ -75,6 +75,61 @@ const Q5_0_BLOCK_BYTES: usize = 2 + 4 + QK5_0 / 2;
 const QK4_0: usize = 32;
 /// `Q4_0` on-disk block size: `f16` scale (2) + nibbles (16).
 const Q4_0_BLOCK_BYTES: usize = 2 + QK4_0 / 2;
+/// ggml `Q4_1` block: 32 values. `f16` scale + `f16` min + nibbles (16).
+const QK4_1: usize = 32;
+const Q4_1_BLOCK_BYTES: usize = 2 + 2 + QK4_1 / 2;
+/// ggml `Q5_1` block: 32 values. `f16` scale + `f16` min + high-bits (4) + nibbles.
+const QK5_1: usize = 32;
+const Q5_1_BLOCK_BYTES: usize = 2 + 2 + 4 + QK5_1 / 2;
+
+/// Read a little-endian `f16` at `raw[off..off+2]` as `f32`.
+fn f16_at(raw: &[u8], off: usize) -> f32 {
+    f32::from(Float16::from_bits(u16::from_le_bytes([
+        raw[off],
+        raw[off + 1],
+    ])))
+}
+
+/// Dequantize a `Q4_1` payload: 20-byte block `[f16 d, f16 m, 16 nibbles]`;
+/// `x = nibble * d + m` (ggml `dequantize_row_q4_1`).
+fn dequant_q4_1(raw: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / QK4_1;
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let base = b * Q4_1_BLOCK_BYTES;
+        let d = f16_at(raw, base);
+        let m = f16_at(raw, base + 2);
+        let qs = &raw[base + 4..base + 4 + QK4_1 / 2];
+        for j in 0..QK4_1 / 2 {
+            out[b * QK4_1 + j] = f32::from(qs[j] & 0x0F) * d + m;
+            out[b * QK4_1 + j + QK4_1 / 2] = f32::from(qs[j] >> 4) * d + m;
+        }
+    }
+    out
+}
+
+/// Dequantize a `Q5_1` payload: 24-byte block `[f16 d, f16 m, u32 qh, 16
+/// nibbles]`; `x = ((nibble | hi<<4)) * d + m` (ggml `dequantize_row_q5_1`).
+fn dequant_q5_1(raw: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / QK5_1;
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let base = b * Q5_1_BLOCK_BYTES;
+        let d = f16_at(raw, base);
+        let m = f16_at(raw, base + 2);
+        let qh = u32::from_le_bytes([raw[base + 4], raw[base + 5], raw[base + 6], raw[base + 7]]);
+        let qs = &raw[base + 8..base + 8 + QK5_1 / 2];
+        for j in 0..QK5_1 / 2 {
+            let xh0 = ((qh >> j) << 4) & 0x10;
+            let xh1 = (qh >> (j + 12)) & 0x10;
+            let x0 = u32::from(qs[j] & 0x0F) | xh0;
+            let x1 = u32::from(qs[j] >> 4) | xh1;
+            out[b * QK5_1 + j] = x0 as f32 * d + m;
+            out[b * QK5_1 + j + QK5_1 / 2] = x1 as f32 * d + m;
+        }
+    }
+    out
+}
 
 /// On-disk byte length of a tensor payload for `dtype` × `n_elements`. `Q8_0`
 /// is block-based (34 bytes per 32 values) and requires a multiple-of-32 count.
@@ -105,6 +160,22 @@ fn ggml_byte_len(dtype: GgmlDType, n_elements: usize, name: &str) -> FwResult<us
                 )));
             }
             (n_elements / QK4_0).checked_mul(Q4_0_BLOCK_BYTES)
+        }
+        GgmlDType::Q4_1 => {
+            if !n_elements.is_multiple_of(QK4_1) {
+                return Err(FwError::InvalidRequest(format!(
+                    "tensor '{name}' q4_1 element count {n_elements} is not a multiple of {QK4_1}"
+                )));
+            }
+            (n_elements / QK4_1).checked_mul(Q4_1_BLOCK_BYTES)
+        }
+        GgmlDType::Q5_1 => {
+            if !n_elements.is_multiple_of(QK5_1) {
+                return Err(FwError::InvalidRequest(format!(
+                    "tensor '{name}' q5_1 element count {n_elements} is not a multiple of {QK5_1}"
+                )));
+            }
+            (n_elements / QK5_1).checked_mul(Q5_1_BLOCK_BYTES)
         }
     };
     len.ok_or_else(|| FwError::InvalidRequest(format!("tensor '{name}' byte length overflow")))
@@ -321,10 +392,10 @@ impl GgmlModel {
         // base is a format we don't decode yet; the per-tensor parse is the real
         // gate (it rejects unsupported GGML_TYPEs).
         let base_ftype = hparams.ftype.rem_euclid(GGML_QNT_VERSION_FACTOR);
-        if !matches!(base_ftype, 0 | 1 | 2 | 7 | 8) {
+        if !matches!(base_ftype, 0 | 1 | 2 | 3 | 7 | 8 | 9) {
             return Err(FwError::Unsupported(format!(
                 "quantized ggml ftype {} (base {base_ftype}) is not supported \
-                 (only base 0=f32, 1=f16, 2=q4_0, 7=q8_0, 8=q5_0)",
+                 (only base 0=f32, 1=f16, 2=q4_0, 3=q4_1, 7=q8_0, 8=q5_0, 9=q5_1)",
                 hparams.ftype
             )));
         }
@@ -390,12 +461,14 @@ impl GgmlModel {
                 0 => GgmlDType::F32,
                 1 => GgmlDType::F16,
                 2 => GgmlDType::Q4_0,
+                3 => GgmlDType::Q4_1,
                 6 => GgmlDType::Q5_0,
+                7 => GgmlDType::Q5_1,
                 8 => GgmlDType::Q8_0,
                 other => {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
-                         (only 0=f32, 1=f16, 2=q4_0, 6=q5_0, 8=q8_0)"
+                         (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0)"
                     )));
                 }
             };
@@ -548,12 +621,14 @@ impl GgmlModel {
                 0 => GgmlDType::F32,
                 1 => GgmlDType::F16,
                 2 => GgmlDType::Q4_0,
+                3 => GgmlDType::Q4_1,
                 6 => GgmlDType::Q5_0,
+                7 => GgmlDType::Q5_1,
                 8 => GgmlDType::Q8_0,
                 other => {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
-                         (only 0=f32, 1=f16, 2=q4_0, 6=q5_0, 8=q8_0)"
+                         (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0)"
                     )));
                 }
             };
@@ -734,6 +809,26 @@ impl GgmlModel {
                     )));
                 }
                 dequant_q4_0(&raw, n_elements)
+            }
+            GgmlDType::Q4_1 => {
+                let expect = ggml_byte_len(GgmlDType::Q4_1, n_elements, name)?;
+                if raw.len() != expect {
+                    return Err(FwError::InvalidRequest(format!(
+                        "tensor '{name}' q4_1 byte length {} != {expect}",
+                        raw.len()
+                    )));
+                }
+                dequant_q4_1(&raw, n_elements)
+            }
+            GgmlDType::Q5_1 => {
+                let expect = ggml_byte_len(GgmlDType::Q5_1, n_elements, name)?;
+                if raw.len() != expect {
+                    return Err(FwError::InvalidRequest(format!(
+                        "tensor '{name}' q5_1 byte length {} != {expect}",
+                        raw.len()
+                    )));
+                }
+                dequant_q5_1(&raw, n_elements)
             }
         };
 
@@ -1282,6 +1377,73 @@ mod tests {
     }
 
     #[test]
+    fn q4_1_and_q5_1_dequant_math() {
+        // Q4_1: 20 bytes/block (f16 d, f16 m, 16 nibbles). x = nibble*d + m.
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q4_1, 32, "t").unwrap(),
+            Q4_1_BLOCK_BYTES
+        );
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&Float16::from_f32(2.0).to_bits().to_le_bytes()); // d
+        raw.extend_from_slice(&Float16::from_f32(-1.0).to_bits().to_le_bytes()); // m
+        let mut qs = [0u8; QK4_1 / 2];
+        qs[0] = 0x30; // elem0 nibble 0 -> 0*2-1 = -1; elem16 nibble 3 -> 3*2-1 = 5
+        raw.extend_from_slice(&qs);
+        let out = dequant_q4_1(&raw, QK4_1);
+        assert_eq!(out[0], -1.0);
+        assert_eq!(out[16], 5.0);
+
+        // Q5_1: 24 bytes/block (f16 d, f16 m, u32 qh, 16 nibbles).
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q5_1, 32, "t").unwrap(),
+            Q5_1_BLOCK_BYTES
+        );
+        let mut r2 = Vec::new();
+        r2.extend_from_slice(&Float16::from_f32(1.0).to_bits().to_le_bytes()); // d
+        r2.extend_from_slice(&Float16::from_f32(0.5).to_bits().to_le_bytes()); // m
+        let qh: u32 = 1 << 0; // high bit of elem0
+        r2.extend_from_slice(&qh.to_le_bytes());
+        let mut qs2 = [0u8; QK5_1 / 2];
+        qs2[0] = 0x0F; // elem0 nibble 15 + high bit -> 31; elem16 nibble 0 -> 0
+        r2.extend_from_slice(&qs2);
+        let out2 = dequant_q5_1(&r2, QK5_1);
+        assert_eq!(out2[0], 31.0 * 1.0 + 0.5); // 31.5
+        assert_eq!(out2[16], 0.0 * 1.0 + 0.5); // 0.5
+    }
+
+    #[test]
+    fn gated_q4_1_and_q5_1_models_load_and_dequant_close_to_f16() {
+        for (name, dtype, tol) in [
+            ("tiny.en-q4_1", GgmlDType::Q4_1, 0.15f32),
+            ("tiny.en-q5_1", GgmlDType::Q5_1, 0.10f32),
+        ] {
+            let (Some(qpath), Some(f16_path)) = (find_model_file(name), find_model_file("tiny.en"))
+            else {
+                eprintln!("SKIP gated {name}: model not found");
+                continue;
+            };
+            let q = GgmlModel::load(&qpath).unwrap_or_else(|e| panic!("load {name}: {e}"));
+            let f16 = GgmlModel::load(&f16_path).expect("load f16");
+            let tname = q
+                .tensor_names()
+                .find(|n| q.tensor(n).is_some_and(|e| e.dtype == dtype))
+                .unwrap_or_else(|| panic!("{name} has no {dtype:?} tensor"))
+                .to_owned();
+            let (qs, qv) = q.tensor_f32(&tname).expect("q dequant");
+            let (fs, fv) = f16.tensor_f32(&tname).expect("f16 dequant");
+            assert_eq!(qs, fs, "shape mismatch {tname}");
+            assert!(qv.iter().all(|v| v.is_finite()), "{name} non-finite");
+            let n = fv.len() as f32;
+            let ma: f32 = fv.iter().map(|v| v.abs()).sum::<f32>() / n;
+            let md: f32 = qv.iter().zip(&fv).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+            assert!(
+                md < tol * ma,
+                "{name} mean|Δ| {md} exceeds {tol} of {ma} ({tname})"
+            );
+        }
+    }
+
+    #[test]
     fn gated_q4_0_model_loads_and_dequants_close_to_f16() {
         // Requires ggml-tiny.en-q4_0.bin (`whisper-quantize <f16> <out> q4_0`).
         let (Some(q4_path), Some(f16_path)) =
@@ -1738,16 +1900,19 @@ mod tests {
     fn unsupported_ftype_is_rejected() {
         let mut b = SyntheticModel { bytes: Vec::new() };
         b.push_u32(GGML_MAGIC);
-        // ftype = 1009 in the 11th hparam slot: quant version 1, base 9 (q5_1),
-        // a quantized format we don't decode yet. Also exercises the version
-        // strip (1009 % 1000 == 9) — f32/f16/q8_0/q5_0 (base 0/1/7/8) would pass.
-        for v in [5i32, 1500, 384, 6, 4, 448, 384, 6, 4, 80, 1009] {
+        // ftype = 1010: quant version 1, base 10 (q2_k, a k-quant we don't decode
+        // yet). Exercises the version strip (1010 % 1000 == 10) — the supported
+        // legacy quants (base 0/1/2/3/7/8/9) would pass.
+        for v in [5i32, 1500, 384, 6, 4, 448, 384, 6, 4, 80, 1010] {
             b.push_i32(v);
         }
         let err = GgmlModel::parse(b.bytes).expect_err("must reject quantized ftype");
         match err {
             FwError::Unsupported(msg) => {
-                assert!(msg.contains("base 9"), "base ftype should be listed: {msg}");
+                assert!(
+                    msg.contains("base 10"),
+                    "base ftype should be listed: {msg}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }

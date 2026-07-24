@@ -4,6 +4,29 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP — FEATURE COMPLETE (the LEGACY quant family) — native now loads ALL FIVE legacy whisper.cpp ggml quants: q4_0, q4_1, q5_0, q5_1, q8_0. Added the two `_1` scale+min variants; q4_1 & q5_1 both transcribe jfk to the EXACT canonical transcript.**
+
+**What landed.** `GgmlDType::Q4_1` (GGML_TYPE 3, 20 B/block: `f16 d, f16 m, 16
+nibbles`; `x = nibble*d + m`) and `GgmlDType::Q5_1` (GGML_TYPE 7, 24 B/block: `+
+u32 high-bits`; `x = (nibble|hi<<4)*d + m`) — exact ports of ggml
+`dequantize_row_q4_1`/`_q5_1`, with a shared `f16_at` reader. Parse arms (ttype
+3/7), `ggml_byte_len` + `tensor_f32` arms, model-gate bases 3 & 9 (q4_1 v2 = ftype
+2003, q5_1 v2 = 2009). The `unsupported_ftype` test now uses base 10 (q2_k, a
+k-quant) as its still-unsupported example.
+
+**Validated.** `q4_1_and_q5_1_dequant_math` pins both (incl. the min offset + the
+q5_1 high-bit). `gated_q4_1_and_q5_1_models_load_and_dequant_close_to_f16` — real
+models' tensors within 15 %/10 % mean-abs of f16. `gated_e2e_jfk_tiny_en_q4_1_q5_1_transcribe`
+builds the engine for BOTH and produces the **exact canonical jfk transcript**.
+ggml 25/0, decode gated 9/0, no regression.
+
+**Quant support now: the full legacy family (q4_0/q4_1/q5_0/q5_1/q8_0), each an
+additive `GgmlDType`+`dequant_*`+`ggml_byte_len` arm, all end-to-end validated
+against a whisper.cpp fixture.** Remaining: the k-quants (q2_k…q6_k, GGML_TYPE
+10-15) — super-block format with per-sub-block scales, materially more complex;
+the per-tensor parse rejects them with a clear error until added.
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP — FEATURE (third quant, same additive pattern) — native now also loads whisper.cpp `q4_0` (4-bit) quantized ggml models. Native covers the three common whisper.cpp download quants: q8_0, q5_0, q4_0.**
 
 **What landed.** `GgmlDType::Q4_0`; per-tensor GGML_TYPE **2** → Q4_0;
