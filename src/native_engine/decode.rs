@@ -3926,6 +3926,51 @@ mod tests {
     }
 
     #[test]
+    fn gated_q5_k_large_v3_turbo_loads_and_builds_engine() {
+        // Flagship-model proof: the quant path is size-agnostic, so a q5_k
+        // large-v3-turbo (51866 vocab, 1280 audio-state, 32 enc / 4 dec layers,
+        // multilingual) must load, dequantize EVERY tensor, and build the engine
+        // exactly like tiny.en. All prior quant e2e used tiny.en; this closes the
+        // "does it work on the model people actually run" question. Building the
+        // engine forces tensor_f32/tensor_f16 over the whole q5_k tensor set.
+        // Requires ggml-large-v3-turbo-q5_k.bin (`whisper-quantize <turbo> <out> q5_k`).
+        let Some(path) = super::super::find_model_file("large-v3-turbo-q5_k") else {
+            eprintln!("SKIP gated_q5_k_turbo: ggml-large-v3-turbo-q5_k.bin not found");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q5_k turbo model");
+        assert_eq!(
+            model.hparams.ftype.rem_euclid(1000),
+            13,
+            "turbo q5_k base ftype must be 13"
+        );
+        // Turbo hparams ground truth (from the bd-frp7 epic).
+        assert_eq!(model.hparams.n_vocab, 51866, "turbo n_vocab");
+        assert_eq!(model.hparams.n_audio_state, 1280, "turbo n_audio_state");
+        assert_eq!(model.hparams.n_audio_layer, 32, "turbo n_audio_layer");
+        assert_eq!(model.hparams.n_text_layer, 4, "turbo n_text_layer");
+        // The 2D weight tensors are actually stored as Q5_K.
+        let n_q5k = model
+            .tensor_names()
+            .filter(|n| {
+                model
+                    .tensor(n)
+                    .is_some_and(|e| e.dtype == super::super::GgmlDType::Q5_K)
+            })
+            .count();
+        assert!(
+            n_q5k > 100,
+            "expected the bulk of turbo's tensors to be Q5_K, got {n_q5k}"
+        );
+        // Build the engine — dequantizes the full q5_k tensor set into the
+        // engine's own int8/f16 runtime. Succeeding here proves the flagship
+        // quant load path end to end (a bad shape/type/byte-length on ANY of
+        // turbo's tensors would surface as an Err right here).
+        let _loaded = LoadedModel::from_ggml(model).expect("build engine from q5_k turbo");
+        eprintln!("q5_k turbo: loaded + built engine, {n_q5k} Q5_K tensors");
+    }
+
+    #[test]
     fn gated_e2e_jfk_tiny_en_q2_k_transcribes() {
         // Engine runs a whisper.cpp q2_k-quantized model end-to-end. Q2_K is the
         // coarsest quant native decodes (2-bit); dequantized to f32 on load.

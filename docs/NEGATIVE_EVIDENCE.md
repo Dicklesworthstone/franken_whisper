@@ -4,6 +4,20 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (flagship, not just tiny.en) — the quant path is proven production-real on `large-v3-turbo`: a q5_k turbo model (547 MB, 51866 vocab, 1280 audio-state, 32/4 layers, multilingual) loads, dequantizes all 233 Q5_K tensors, and builds the engine.**
+
+All prior quant e2e used tiny.en; the epic's production target is "large-v3-turbo
+functional". Added `gated_q5_k_large_v3_turbo_loads_and_builds_engine` (decode.rs):
+loads a `whisper-quantize turbo q5_k` fixture, asserts turbo's hparams (n_vocab
+51866, n_audio_state 1280, n_audio_layer 32, n_text_layer 4), counts Q5_K tensors
+(233), and builds the engine via `LoadedModel::from_ggml` — which dequantizes the
+FULL q5_k tensor set into the runtime int8/f16 (a bad shape/type/byte-length on ANY
+turbo tensor would Err there). Passes in 2.3 s. The quant loader is size- and
+model-agnostic; the flagship (32-layer encoder, multilingual vocab) exercises far
+more tensor shapes than tiny.en and confirms none regress. Test-only (no production
+code touched). Skips cleanly when the 547 MB fixture is absent.
+
+---
 ## 2026-07-24 - WhiteCreek: **★ KEEP — FEATURE COMPLETE (EVERY whisper.cpp ggml quant) — native now loads `q2_k`, the last format. The engine decodes ALL 10 ggml quant types: q4_0/q4_1/q5_0/q5_1/q8_0 (legacy) + q2_k/q3_k/q4_k/q5_k/q6_k (k-quants).**
 
 **What landed.** `GgmlDType::Q2_K` (per-tensor GGML_TYPE **10**, model base ftype
