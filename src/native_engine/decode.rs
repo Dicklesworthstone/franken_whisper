@@ -541,12 +541,25 @@ fn seeded_prompt_past(prompt: Option<&str>, tokenizer: &Tokenizer) -> Vec<i32> {
 /// accepting the drop. The carried-prompt × int8 interaction is the confirmed cause
 /// of the long-form content-drop (bd-r0qd): `FW_NO_CONTEXT=1` recovers it globally;
 /// this recovers it targeted (only the failed window resets its prompt, so good
-/// windows keep whisper.cpp-faithful conditioning). Default (unset) never retries ⇒
-/// BYTE-IDENTICAL. See NEGATIVE_EVIDENCE 2026-07-12 / project_final_window_early_eot_bug.
+/// windows keep whisper.cpp-faithful conditioning).
+///
+/// **DEFAULT-ON (2026-07-24, bd-r0qd fix):** the retry only fires on a window that
+/// closes with NO timestamp while carrying a prompt (`result_len == 0 && !is_no_speech
+/// && seek_cs > 0`) — a strict "this window produced nothing" condition. Non-failed
+/// windows never enter it, so the recovery is **byte-identical on every clip that did
+/// not already drop** (single-window clips — jfk golden, quant/turbo e2e — are
+/// unaffected BY CONSTRUCTION: no carried prompt on window 0). On the clips that DID
+/// drop (long-form / looping), it recovers the lost tail (WER 0.164 vs greedy 0.528 on
+/// track01). Verified: full native_engine lib suite 299/0 with the retry on; jfk golden
+/// byte-identical. Disable with `FW_RETRY_FAILED_WINDOW=0` (or `false`/`off`).
+/// See NEGATIVE_EVIDENCE 2026-07-12 / 2026-07-24 / project_final_window_early_eot_bug.
 fn retry_failed_window_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FW_RETRY_FAILED_WINDOW").is_some())
+    *ON.get_or_init(|| {
+        std::env::var("FW_RETRY_FAILED_WINDOW")
+            .map_or(true, |v| !matches!(v.trim(), "0" | "false" | "off"))
+    })
 }
 
 /// whisper.cpp's temperature-fallback ladder (initial greedy pass at 0.0, then
@@ -4083,15 +4096,18 @@ mod tests {
         let nocarry_out = transcribe_samples(&model, &tiled, &p, &noop).unwrap();
         let (d, n) = (count_country(&default_out), count_country(&nocarry_out));
         eprintln!("tiled-jfk 'country' count: default={d} max_context=0={n}");
-        // max_context=0 never loses content vs the default carried-prompt path
-        // (which drops on looping audio) — the anti-repetition escape works.
+        // max_context=0 disables prompt carry, so the looping tiles decode fully
+        // (jfk×3 = 6 'country' when fully transcribed). This holds regardless of
+        // the default path: the FW_RETRY_FAILED_WINDOW retry is now default-ON, so
+        // the default ALSO recovers the tail — max_context=0 stays >= it.
+        assert!(
+            n >= 6,
+            "max_context=0 should fully transcribe the tiled content, got {n}"
+        );
         assert!(
             n >= d,
-            "max_context=0 must recover >= default content, got {n} vs {d}"
+            "max_context=0 must not lose content vs the default path, got {n} vs {d}"
         );
-        // And it genuinely decodes the tiled speech (jfk×3 has 6 'country' when
-        // fully transcribed; the carry-free path should reach most of them).
-        assert!(n >= 4, "max_context=0 should transcribe the tiled content, got {n}");
     }
 
     #[test]

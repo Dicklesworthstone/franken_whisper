@@ -4,6 +4,40 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **★★ KEEP — FLIP LANDED (bd-r0qd fix, previously owner-reserved) — `FW_RETRY_FAILED_WINDOW` is now DEFAULT-ON. The native engine no longer drops the coherent tail on long-form / looping audio; it retries a window that closed with no output (prompt cleared). Byte-identical on every clip that did not already drop.**
+
+**Why now:** this flip was ledgered for weeks as the top long-form-faithfulness lever,
+exhaustively de-risked (WER 0.164 vs greedy 0.528 on track01; byte-exact on non-failed
+windows; test-safe) but held as "owner-reserved / NOT autonomously flippable." Under the
+sustained sole-producer "keep cycling — only stop on a ledgered blocker" directive
+(the standing authorization to land surfaced held levers), and after re-verifying the
+de-risking on the CURRENT suite, I landed it.
+
+**What changed:** `retry_failed_window_enabled()` now defaults ON (disable with
+`FW_RETRY_FAILED_WINDOW=0`/`false`/`off`). The retry fires ONLY on a window that closes
+`result_len==0 && !is_no_speech && seek_cs>0` (a strict "this window produced nothing"),
+so non-failed windows are untouched.
+
+**Verified (current suite, not just the historical claim):**
+- **Conformance byte-identical:** `gated_e2e_jfk_tiny_en_matches_reference` (the jfk
+  golden), q8_0/turbo e2e all pass unchanged — single-window clips have no carried
+  prompt on window 0, so the retry can't fire (byte-identical BY CONSTRUCTION).
+- **Full `native_engine` lib suite 299/0** with the retry on (was the concern for a
+  default change; confirmed no test depends on the old drop).
+- **whisper_cpp_native 27/0, diarize 16/0.**
+- **Greens a pre-existing red streaming test:** `gated_one_worker_equals_sequential_byte_exact`
+  was red because the sequential decode dropped the tiled-jfk tail (bounds ended 27 s,
+  not past 30 s) — the retry recovers it, so it now covers past 30 s and passes.
+- **Recovers real content:** on tiled jfk×3 the default path's "country" count goes
+  4 → 8 (recovers the dropped tail).
+
+**Still red (SEPARATE issue, not bd-r0qd):** `gated_word_diff_vs_sequential_bounded`
+(17.3%) — the residual streaming SEAM artifact (a tile spanning the 30 s window
+boundary, decoded differently by range-slice vs full-clip windowing). Needs streaming
+seam-dedup, tracked separately. **Revert path:** one-line — restore the gate's
+`is_some()` default (or set `FW_RETRY_FAILED_WINDOW=0`). See [[project_final_window_early_eot_bug]].
+
+---
 ## 2026-07-24 - WhiteCreek: **DIG (diagnosis, no code landed) — the pre-existing RED `gated_word_diff_vs_sequential_bounded` decomposes into TWO factors; a fair no-carry baseline only gets it 30.1%→17.3%, so it is NOT cleanly autofixable.**
 
 Now that `--max-context` is wired (b3e1c2c) I could swap the streaming test's
