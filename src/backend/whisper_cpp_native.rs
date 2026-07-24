@@ -431,6 +431,14 @@ fn decode_params(
             .prompt
             .clone()
             .filter(|p| !p.is_empty()),
+        // Beam width (whisper `--beam-size`): the engine beam-searches temp-0
+        // windows when > 1; the decoder clamps to [1, 8]. None → greedy.
+        beam_size: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.beam_size)
+            .map(|n| n as usize),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         // No request field maps to whisper's text-context cap today; use the
@@ -1012,6 +1020,23 @@ mod tests {
         // An empty prompt is treated as no prompt (byte-identical default).
         request.backend_params.prompt = Some(String::new());
         assert_eq!(decode_params(&request, false, "tiny.en").initial_prompt, None);
+    }
+
+    #[test]
+    fn decode_params_maps_beam_size_from_request() {
+        use crate::model::DecodingParams;
+        let mut request = native_request();
+        // No decoding params → None (the engine runs greedy = byte-identical).
+        assert_eq!(decode_params(&request, false, "tiny.en").beam_size, None);
+        // A request beam size (whisper `--beam-size`) flows to the engine.
+        request.backend_params.decoding = Some(DecodingParams {
+            beam_size: Some(5),
+            ..DecodingParams::default()
+        });
+        assert_eq!(
+            decode_params(&request, false, "tiny.en").beam_size,
+            Some(5),
+        );
     }
 
     /// A real-shaped engine segment (timed, with text), standing in for what
