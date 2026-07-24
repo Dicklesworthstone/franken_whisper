@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (third k-quant; the get_scale_min_k4 machinery pays off) — native now loads whisper.cpp `q5_k` models. Reuses q4_k's `get_scale_min_k4` verbatim + adds a high-bit plane; q5_k transcribes jfk to the EXACT canonical transcript.**
+
+**What landed.** `GgmlDType::Q5_K` (per-tensor GGML_TYPE **13**, model base ftype
+**13**). Q5_K = 256-value super-block, 176 bytes = `[f16 d, f16 dmin, scales[12],
+qh[32] (high bit), qs[128] (low 4-bit)]` — q4_k's 144 bytes plus a 32-byte high-bit
+plane. Same 6-bit packed scales/mins via the SHARED `get_scale_min_k4`, plus each
+value gains a 5th bit: `x = d*sc*((nibble)+(qh-bit?16:0)) − dmin*min`. The high-bit
+selector `u1/u2` shifts left 2 bits per 64-value group (bit `2*group` → low half,
+`2*group+1` → high half), so one `qh[l]` byte serves 8 output positions. Exact port
+of ggml `dequantize_row_q5_K`. Added `Q5_K_BLOCK_BYTES=176`, `dequant_q5_k`, the
+`ggml_byte_len`/`tensor_f32` arms, parse arms (ttype 13, both parsers), model-gate
+base `| 13`. Additive — engine unchanged.
+
+**Validated.** `q5_k_byte_len_and_dequant_math` pins the NEW high-bit plane (bit
+`2*group` lights the low half, `2*group+1` the high half; `qh[0]=0x11` lights group
+0 + group 2's low halves) — scale unpacking already pinned by the q4_k test.
+`gated_q5_k_model_loads_and_dequants_close_to_f16` — real q5_k tensors within **10 %**
+mean-abs of f16 (between q6_k's 5 % and q4_k's 15 %). `gated_e2e_jfk_tiny_en_q5_k_transcribes`
+builds the engine and produces the **exact canonical jfk transcript**. ggml **31/0**,
+decode gated q5_k **1/0**, no new in-lane clippy.
+
+**Quant support now: full legacy family + q4_k + q5_k + q6_k (3 of 5 k-quants).**
+Remaining: q2_k (GGML_TYPE 10) & q3_k (GGML_TYPE 11) — these pack scales
+DIFFERENTLY (q2_k: 16×(4-bit scale, 4-bit min) + 2-bit quants; q3_k: 12-byte 6-bit
+scales + a 32-byte high-bit plane + 2-bit quants + a sign/`hmask`), each a distinct
+`dequant_*`. They're the coarsest quants (rare for ASR) — lower priority than the
+now-complete q4/q5/q6 high-fidelity k-quants.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (second k-quant, the popular one) — native now loads whisper.cpp `q4_k` models. q4_k is the most common k-quant in the GGUF ecosystem; introduces the `get_scale_min_k4` packed-scale machinery that q5_k/q3_k/q2_k also need.**
 
 **What landed.** `GgmlDType::Q4_K` (per-tensor GGML_TYPE **12**, model base ftype
