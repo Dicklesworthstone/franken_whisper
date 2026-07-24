@@ -4,6 +4,29 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (new capability) — the native tokenizer gained BPE `encode` (text → token ids), a faithful port of whisper.cpp's `tokenize`. The engine previously could only DECODE; this is the foundation for `initial_prompt` (whisper `--prompt`) support.**
+
+The native tokenizer had `decode` (ids → text) but NO encode — so the engine could
+not accept a user text prompt to bias transcription (a whisper.cpp feature; the
+native `DecodeParams` had no such field). Added `Tokenizer::encode` (tokenizer.rs):
+a port of whisper.cpp `tokenize` (whisper.cpp 3272) — split into GPT-2 words
+(`gpt2_split_words`: contractions, then optional-space-prefixed alpha/digit/symbol
+runs, then whitespace, ported byte-wise to match std::regex's C-locale ASCII
+classes) then greedy longest-prefix match against the vocab. Confirmed the whisper
+ggml vocab is RAW bytes (a leading space is `0x20`, verified: " the"=`[20,74,68,65]`,
+so the match runs directly on UTF-8 text — no GPT-2 `Ġ` byte-encoding). Reverse
+`token_to_id` map built once at load (first-id-wins).
+
+**Validated exactly vs the real tiny.en vocab** (not just self-consistency):
+`encode("the")==[1169]`, `" the"==[262]`, `" Americans"==[3399]`, `" country"==[1499]`,
+`"the country"==[1169,1499]` — the exact ids whisper.cpp produces (hand-verified
+against the vocab). Plus `encode→decode` round-trips a full sentence, only base-vocab
+ids are emitted, and `gpt2_split_words` unit-pins the GPT-2 semantics (contraction
+split, space-attaches-to-next-word, multi-space runs, trailing-ws). tokenizer 13/0,
+no in-lane clippy. Next: wire `DecodeParams.initial_prompt` to seed the first
+window's prompt via `encode` (whisper `--prompt` parity).
+
+---
 ## 2026-07-24 - WhiteCreek: **★ KEEP — VALIDATION (flagship multilingual e2e, BYTE-IDENTICAL to whisper.cpp) — native transcribes jfk on f16 large-v3-turbo through the full auto-detect→transcribe pipeline and produces the EXACT whisper-cli transcript, character for character.**
 
 The complete multilingual pipeline — encode → auto-detect language → build the

@@ -23,7 +23,7 @@
 //! (`time = (id - timestamp_begin) * 0.02`).
 
 use super::WhisperHParams;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Language list ported verbatim from whisper.cpp's `g_lang` map
 /// (`whisper.cpp` lines 280-381). Each entry is `(code, id, english_name)`.
@@ -140,6 +140,91 @@ pub struct Tokenizer {
 
     /// Suppress set: ids of non-speech symbol tokens present in this vocab.
     non_speech: Vec<i32>,
+
+    /// Reverse map (raw token bytes → id) for BPE `encode`. First id wins on the
+    /// (vocab-absent) chance of a duplicate byte string, matching `decode`'s
+    /// first-id semantics. Only the base vocab is indexed — special tokens are
+    /// never produced by text encoding.
+    token_to_id: HashMap<Vec<u8>, i32>,
+}
+
+/// Split raw text into GPT-2 pre-tokenization "words", a faithful port of the
+/// byte-wise semantics of whisper.cpp's tokenizer regex
+/// `'s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]]+| ?[[:digit:]]+| ?[^\s[:alpha:][:digit:]]+|\s+(?!\S)|\s+`.
+/// whisper.cpp runs `std::regex` over the narrow (byte) string in the C locale,
+/// so the character classes are ASCII; this scans bytes with the same classes.
+/// Non-ASCII bytes fall into the `[^\s…]` "other" class, exactly as they do
+/// byte-wise there. Returned slices borrow `text` and, concatenated in order,
+/// reconstruct it.
+fn gpt2_split_words(text: &str) -> Vec<&[u8]> {
+    let b = text.as_bytes();
+    let n = b.len();
+    let is_space = |x: u8| matches!(x, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    let is_alpha = |x: u8| x.is_ascii_alphabetic();
+    let is_digit = |x: u8| x.is_ascii_digit();
+    let is_other = |x: u8| !is_space(x) && !is_alpha(x) && !is_digit(x);
+    // 1=alpha, 2=digit, 3=other, 0=whitespace (handled separately).
+    let class = |x: u8| {
+        if is_alpha(x) {
+            1
+        } else if is_digit(x) {
+            2
+        } else if is_other(x) {
+            3
+        } else {
+            0
+        }
+    };
+    const CONTRACTIONS: [&[u8]; 7] = [b"'s", b"'t", b"'re", b"'ve", b"'m", b"'ll", b"'d"];
+
+    let mut words: Vec<&[u8]> = Vec::new();
+    let mut p = 0;
+    while p < n {
+        // 1. Contractions: '<s|t|re|ve|m|ll|d> (longest wins).
+        if b[p] == b'\''
+            && let Some(ct) = CONTRACTIONS
+                .iter()
+                .copied()
+                .filter(|ct| b[p..].starts_with(ct))
+                .max_by_key(|ct| ct.len())
+        {
+            words.push(&b[p..p + ct.len()]);
+            p += ct.len();
+            continue;
+        }
+
+        // 2-4. Optional single leading space (0x20), then a run of one class.
+        let has_space = b[p] == b' ';
+        let q = if has_space { p + 1 } else { p };
+        if q < n {
+            let cls = class(b[q]);
+            if cls != 0 {
+                let mut r = q + 1;
+                while r < n && class(b[r]) == cls {
+                    r += 1;
+                }
+                words.push(&b[p..r]);
+                p = r;
+                continue;
+            }
+        }
+
+        // 5-6. Whitespace run. `\s+(?!\S)` matches a run only up to the last
+        // space before a non-space, leaving that space for the next word's ` ?`
+        // prefix; `\s+` (or the trailing-to-EOS case) takes the whole run.
+        let mut r = p;
+        while r < n && is_space(b[r]) {
+            r += 1;
+        }
+        if r < n && r - p >= 2 {
+            words.push(&b[p..r - 1]);
+            p = r - 1;
+        } else {
+            words.push(&b[p..r]);
+            p = r;
+        }
+    }
+    words
 }
 
 impl Tokenizer {
@@ -230,8 +315,17 @@ impl Tokenizer {
             no_timestamps,
             timestamp_begin,
             non_speech: Vec::new(),
+            token_to_id: HashMap::new(),
         };
         tk.non_speech = tk.build_non_speech();
+        // Reverse index for encode(); first id wins on duplicates.
+        let mut token_to_id = HashMap::with_capacity(tk.tokens.len());
+        for (id, token) in tk.tokens.iter().enumerate() {
+            if let Ok(id) = i32::try_from(id) {
+                token_to_id.entry(token.clone()).or_insert(id);
+            }
+        }
+        tk.token_to_id = token_to_id;
         tk
     }
 
@@ -406,6 +500,46 @@ impl Tokenizer {
         seq
     }
 
+    /// Byte-level BPE **encode** (text → token ids): a faithful port of
+    /// whisper.cpp's `tokenize` (whisper.cpp 3272). The text is split into GPT-2
+    /// "words" (contractions, then optional-space-prefixed alpha / digit / symbol
+    /// runs, then whitespace) and each word is greedily matched against the vocab,
+    /// taking the LONGEST token at each position. The whisper ggml vocabulary is
+    /// raw bytes (a leading space is `0x20`, not the GPT-2 `Ġ`), so the match runs
+    /// directly over the UTF-8 text. Bytes with no covering token are skipped
+    /// (whisper.cpp logs "unknown token" and advances one byte). Only base-vocab
+    /// ids are produced — never special/timestamp tokens.
+    ///
+    /// This powers an optional initial decode prompt (whisper `--prompt`); the
+    /// decode path is unchanged.
+    #[must_use]
+    pub fn encode(&self, text: &str) -> Vec<i32> {
+        let mut out = Vec::new();
+        for wb in gpt2_split_words(text) {
+            let n = wb.len();
+            let mut i = 0;
+            while i < n {
+                // Greedy longest-prefix match: try [i, n), [i, n-1), … [i, i+1).
+                let mut j = n;
+                let mut matched = false;
+                while j > i {
+                    if let Some(&id) = self.token_to_id.get(&wb[i..j]) {
+                        out.push(id);
+                        i = j;
+                        matched = true;
+                        break;
+                    }
+                    j -= 1;
+                }
+                if !matched {
+                    // No token covers this byte (whisper.cpp: "unknown token").
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
     /// Decode token ids to text by concatenating their raw bytes and applying a
     /// single lossy UTF-8 conversion at the end. Special tokens (`>= eot`)
     /// contribute no text. This matches whisper.cpp, where text tokens hold raw
@@ -507,6 +641,60 @@ impl Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpt2_split_words_matches_reference_semantics() {
+        let split = |s: &str| {
+            gpt2_split_words(s)
+                .iter()
+                .map(|w| std::str::from_utf8(w).unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        // Space attaches to the FOLLOWING word (GPT-2 pre-tokenization).
+        assert_eq!(split("the country"), vec!["the", " country"]);
+        assert_eq!(split(" the"), vec![" the"]);
+        // Contractions split off.
+        assert_eq!(split("don't"), vec!["don", "'t"]);
+        // Runs of spaces: all but the last are their own word; the last attaches.
+        assert_eq!(split("a  b"), vec!["a", " ", " b"]);
+        // Digits and symbols are their own classes.
+        assert_eq!(split("123 abc"), vec!["123", " abc"]);
+        assert_eq!(split("hello!"), vec!["hello", "!"]);
+        // Trailing whitespace to end-of-string stays whole.
+        assert_eq!(split("hi  "), vec!["hi", "  "]);
+        assert_eq!(split(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn gated_encode_matches_whisper_cpp_token_ids() {
+        // Exact ids verified against the real tiny.en vocab (raw-byte greedy
+        // longest-match, whisper.cpp `tokenize`). Needs ggml-tiny.en.bin.
+        let Some(model) = crate::native_engine::find_model_file("tiny.en") else {
+            eprintln!("SKIP gated_encode: ggml-tiny.en.bin not found");
+            return;
+        };
+        let g = crate::native_engine::ggml::GgmlModel::load(&model).expect("load tiny.en");
+        let tk = Tokenizer::from_vocab(&g.hparams, g.vocab_tokens.clone());
+
+        assert_eq!(tk.encode("the"), vec![1169]);
+        assert_eq!(tk.encode(" the"), vec![262]);
+        assert_eq!(tk.encode(" Americans"), vec![3399]);
+        assert_eq!(tk.encode(" country"), vec![1499]);
+        // Two whole-word tokens, split on the word boundary.
+        assert_eq!(tk.encode("the country"), vec![1169, 1499]);
+
+        // A full sentence encodes and decodes back to itself (all bytes covered),
+        // and never emits a special/timestamp id.
+        let text = "And so my fellow Americans ask not what your country can do for you";
+        let ids = tk.encode(text);
+        assert_eq!(tk.decode(&ids), text, "encode -> decode must round-trip");
+        assert!(
+            ids.iter().all(|&id| id >= 0 && id < tk.eot),
+            "encode must only produce base-vocab ids"
+        );
+        // Greedy really tokenizes (a sentence is many tokens, not one).
+        assert!(ids.len() > 10, "sentence should be many tokens, got {}", ids.len());
+    }
     use std::io::Read;
 
     fn hp(n_vocab: i32, n_audio_layer: i32) -> WhisperHParams {
