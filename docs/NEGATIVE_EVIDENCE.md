@@ -119,6 +119,44 @@ more tensor shapes than tiny.en and confirms none regress. Test-only (no product
 code touched). Skips cleanly when the 547 MB fixture is absent.
 
 ---
+## 2026-07-24 - BlackThrush: **REJECT 2/3 — correction-evidence diagnostics six-to-one scan fusion fails the same-worker null/CV gate and is not reliably faster**
+
+**Profile first.** Ledger and recent-history screening found no prior
+`CorrectionEvidenceLedger::diagnostics` scan-fusion attempt. Strict-release
+`pipeline_bench` job `j-29944835100115169` on pinned worker `vmi1227854`
+measured the historical six metric scans at **3.7182 us** median
+`[3.5193, 3.9800]` inside a **3.8641 us** complete 200-entry diagnostics caller
+`[3.7559, 4.0169]`. The **96.23%** stage share cleared the predeclared 10%
+activation threshold before production was touched.
+
+**Candidate and exactness.** The candidate accumulated correction count, both
+`u64` latency sums, and WER sum in one oldest-first traversal, then derived the
+same means and latency-savings value. The release harness compared every scalar
+bit and the complete serialized diagnostics JSON against the six-scan historical
+implementation before timing; both oracles passed for the realistic 200-entry
+fixture.
+
+**Why REJECT.** Strict same-worker release job `j-29944835100115200` ran 21
+order-alternated candidate/historical pairs and 21 historical/historical identity
+null pairs with 30,000 complete snapshots per arm. The candidate won only
+**15/21**. Speedup p10/median/p90 was
+**0.918259x / 1.039417x / 1.108997x**, while candidate latency CV was
+**22.3329%**, far above the `<5%` gate. Null p10/median/p90 was
+**0.901872x / 0.994937x / 1.050396x**; the null median was valid, but candidate
+p10 did not clear either null p90 or the 1.10 floor. The harness correctly exited
+101 on its CV assertion. The mixed-field fold does not beat the compiler's
+simple independent typed reductions reliably; the decision-normalization scan
+remains in both implementations. Production and the candidate-only test were
+manually restored to HEAD. The profile-only harness remains.
+
+**Retry predicate.** Do not retry the same mixed-field fold. Revisit only after
+the per-entry correction-decision normalization itself becomes allocation-free
+with exhaustive predicate parity, or profiling identifies a materially different
+dominant substage. Then repeat the complete JSON-bit oracle and the same 21-pair
+null/CV/win/p10 criteria. No local Cargo evidence is admissible. Consecutive
+REJECT count is now **two**.
+
+---
 ## 2026-07-23 - BlackThrush: **REJECT 1/3 — router diagnostics four-pass count/calibration fusion is directionally faster but does not clear the same-worker null/CV gate**
 
 **Profile first.** After the previously ledgered RCH retry predicate became true,

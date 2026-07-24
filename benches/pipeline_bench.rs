@@ -17,6 +17,9 @@ use franken_whisper::backend::{
 };
 use franken_whisper::model::{BackendKind, RunEvent, StreamedRunEvent};
 use franken_whisper::orchestrator::{PipelineBuilder, PipelineConfig, PipelineStage};
+use franken_whisper::speculation::{
+    CorrectionDrift, CorrectionEvidenceEntry, CorrectionEvidenceLedger,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -960,6 +963,89 @@ fn bench_router_diagnostics_counts_profile(c: &mut Criterion) {
     group.finish();
 }
 
+/// Profile the six historical scans performed by correction diagnostics before
+/// considering a fused traversal.
+fn bench_speculation_diagnostics_profile(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("speculation_diagnostics_profile")
+    }) {
+        return;
+    }
+
+    fn historical_six_passes(ledger: &CorrectionEvidenceLedger) -> [f64; 5] {
+        [
+            ledger.correction_rate(),
+            ledger.mean_fast_latency(),
+            ledger.mean_quality_latency(),
+            ledger.mean_wer(),
+            ledger.latency_savings_pct(),
+        ]
+    }
+
+    let mut ledger = CorrectionEvidenceLedger::new(200);
+    for sample in 0..200_u64 {
+        ledger.record(CorrectionEvidenceEntry {
+            entry_id: sample,
+            window_id: sample,
+            run_id: format!("speculation-run-{}", sample / 20),
+            timestamp_rfc3339: format!("2026-07-23T14:{:02}:{:02}Z", sample / 60, sample % 60),
+            fast_model_id: "tiny.en".to_owned(),
+            fast_latency_ms: 80 + sample % 41,
+            fast_confidence_mean: 0.77 + (sample % 13) as f64 * 0.01,
+            fast_segment_count: 1 + sample as usize % 4,
+            quality_model_id: "large-v3-turbo".to_owned(),
+            quality_latency_ms: 360 + sample % 97,
+            quality_confidence_mean: 0.88 + (sample % 9) as f64 * 0.01,
+            quality_segment_count: 1 + sample as usize % 5,
+            drift: CorrectionDrift {
+                wer_approx: (sample % 17) as f64 * 0.01,
+                confidence_delta: (sample % 11) as f64 * 0.005,
+                segment_count_delta: sample as i32 % 5 - 2,
+                text_edit_distance: sample as usize % 12,
+            },
+            decision: match sample % 8 {
+                0 => "correct".to_owned(),
+                1 => " corrected ".to_owned(),
+                2 => "CORRECTION".to_owned(),
+                _ => "confirm".to_owned(),
+            },
+            window_size_ms: 2_000 + sample % 5 * 500,
+            correction_rate_at_decision: (sample % 20) as f64 / 20.0,
+            controller_confidence: (sample.min(20)) as f64 / 20.0,
+            fallback_active: sample % 19 == 0,
+            fallback_reason: (sample % 19 == 0).then(|| "calibration".to_owned()),
+        });
+    }
+
+    let diagnostics = ledger.diagnostics();
+    let historical = historical_six_passes(&ledger);
+    for (field, expected) in [
+        ("correction_rate", historical[0]),
+        ("mean_fast_latency_ms", historical[1]),
+        ("mean_quality_latency_ms", historical[2]),
+        ("mean_wer", historical[3]),
+        ("latency_savings_pct", historical[4]),
+    ] {
+        assert_eq!(
+            diagnostics[field]
+                .as_f64()
+                .expect("diagnostic field")
+                .to_bits(),
+            expected.to_bits(),
+            "field={field}"
+        );
+    }
+
+    let mut group = c.benchmark_group("pipeline/speculation_diagnostics_profile");
+    group.bench_function("full_200", |b| {
+        b.iter(|| black_box(&ledger).diagnostics());
+    });
+    group.bench_function("historical_six_passes_200", |b| {
+        b.iter(|| historical_six_passes(black_box(&ledger)));
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -1029,6 +1115,7 @@ criterion_group!(
     bench_router_loss_hoist,
     bench_router_diagnostics_profile,
     bench_router_diagnostics_counts_profile,
+    bench_speculation_diagnostics_profile,
     bench_export_srt_buffering,
 );
 criterion_main!(benches);
