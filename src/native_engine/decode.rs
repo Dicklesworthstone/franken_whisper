@@ -477,6 +477,41 @@ fn condition_on_prev_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("FW_NO_CONTEXT").is_some())
 }
 
+/// Optional user initial prompt (whisper `--prompt` / `initial_prompt`), read
+/// from `FW_INITIAL_PROMPT`. Its text is tokenized with [`Tokenizer::encode`]
+/// and seeds `prompt_past` so it is carried as previous context on the first
+/// window (then ages out via the `max_prompt_ctx` truncation as decoded text
+/// accumulates — whisper.cpp's `prompt_past` behaviour). Unset or empty → no
+/// prompt (byte-identical default).
+///
+/// Exposed as an env-gate confined to `decode.rs` (mirroring
+/// [`condition_on_prev_disabled`]) rather than a `DecodeParams` field, to avoid
+/// rippling a new field through the `src/backend/*` constructors (bd-r0qd used
+/// the same idiom for `FW_NO_CONTEXT`). A proper per-request `DecodeParams`
+/// field + backend plumbing is a coordinated follow-up.
+fn initial_prompt_from_env() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static PROMPT: OnceLock<Option<String>> = OnceLock::new();
+    PROMPT
+        .get_or_init(|| {
+            std::env::var("FW_INITIAL_PROMPT")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+/// Build the initial `prompt_past` from an optional user prompt: its BPE token
+/// ids, or empty when there is no (non-empty) prompt. Split out from
+/// [`transcribe_samples`] so the encode-and-seed step is unit-testable without
+/// the `FW_INITIAL_PROMPT` env-gate (which caches once per process).
+fn seeded_prompt_past(prompt: Option<&str>, tokenizer: &Tokenizer) -> Vec<i32> {
+    match prompt {
+        Some(p) if !p.is_empty() => tokenizer.encode(p),
+        _ => Vec::new(),
+    }
+}
+
 /// Default-OFF: on a window that fails to close any timestamp (`result_len == 0`,
 /// the "decoder failed with no timestamps closed" break) while carrying a
 /// previous-window prompt, RETRY that same seek ONCE with the prompt cleared before
@@ -1677,7 +1712,10 @@ pub fn transcribe_samples(
         Vec::new()
     };
     // Rolling text context from prior windows (whisper.cpp prompt_past1).
-    let mut prompt_past: Vec<i32> = Vec::new();
+    // Seed it with the optional user prompt (whisper `--prompt`, FW_INITIAL_PROMPT):
+    // its tokens are carried as previous context on the first window and age out
+    // via the max_prompt_ctx truncation as decoded text accumulates. Unset → no-op.
+    let mut prompt_past: Vec<i32> = seeded_prompt_past(initial_prompt_from_env(), &m.tokenizer);
 
     // Tail-window encoder-context truncation kill switch, resolved once.
     //
@@ -3923,6 +3961,23 @@ mod tests {
             low.contains("country"),
             "q6_k transcript missing 'country': {joined}"
         );
+    }
+
+    #[test]
+    fn gated_seeded_prompt_past_encodes_user_prompt() {
+        // The initial-prompt seed (whisper `--prompt`, FW_INITIAL_PROMPT): an
+        // absent/empty prompt yields an empty prompt_past (byte-identical default),
+        // and a real prompt is BPE-encoded to its exact whisper.cpp token ids and
+        // becomes the first window's carried context.
+        let Some(model) = load_tiny_en() else {
+            eprintln!("SKIP gated_seeded_prompt: tiny.en model missing");
+            return;
+        };
+        let tk = &model.tokenizer;
+        assert_eq!(seeded_prompt_past(None, tk), Vec::<i32>::new());
+        assert_eq!(seeded_prompt_past(Some(""), tk), Vec::<i32>::new());
+        assert_eq!(seeded_prompt_past(Some(" country"), tk), vec![1499]);
+        assert_eq!(seeded_prompt_past(Some("the country"), tk), vec![1169, 1499]);
     }
 
     #[test]
