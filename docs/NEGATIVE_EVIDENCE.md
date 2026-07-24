@@ -4,6 +4,24 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **★ KEEP — VALIDATION (flagship multilingual e2e, BYTE-IDENTICAL to whisper.cpp) — native transcribes jfk on f16 large-v3-turbo through the full auto-detect→transcribe pipeline and produces the EXACT whisper-cli transcript, character for character.**
+
+The complete multilingual pipeline — encode → auto-detect language → build the
+multilingual SOT (`sot, <|en|>, <|transcribe|>`) → decode over the 51866-token
+vocab — had no e2e coverage; every other e2e uses English-only tiny.en whose SOT is
+bare `[sot]` (a different decode path). Added
+`gated_e2e_jfk_large_v3_turbo_autodetect_transcribes` (decode.rs): `language: None`
+→ auto-detect. Result: **`out.language == "en"` and the transcript is "And so, my
+fellow Americans, ask not what your country can do for you, ask what you can do for
+your country." — BYTE-IDENTICAL (commas included) to the whisper-cli oracle**
+(`whisper-cli -m ggml-large-v3-turbo.bin -f jfk.wav -l auto -nt`). So native is
+byte-faithful to whisper.cpp on the FLAGSHIP model, not only tiny.en, and the
+32-layer encoder + multilingual language-token SOT decode path is proven correct
+end to end. Runs 98 s (turbo encode + full decode, debug); gated on the 1.5 GB f16
+turbo, skips otherwise. Test-only. Complements the load-only q5_k turbo test (quant
+path) and the language-detect test (detection alone).
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — ROBUSTNESS (degenerate-input coverage) — the native engine handles empty / single-sample / silence / tone / sub-window audio gracefully: empty → clean `InvalidRequest`, everything else → bounded finite output, no panics, no runaway.**
 
 A production ASR receives arbitrary clips; the degenerate-input path had zero
