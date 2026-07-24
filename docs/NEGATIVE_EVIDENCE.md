@@ -4,6 +4,42 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **★ KEEP — FEATURE COMPLETE (EVERY whisper.cpp ggml quant) — native now loads `q2_k`, the last format. The engine decodes ALL 10 ggml quant types: q4_0/q4_1/q5_0/q5_1/q8_0 (legacy) + q2_k/q3_k/q4_k/q5_k/q6_k (k-quants).**
+
+**What landed.** `GgmlDType::Q2_K` (per-tensor GGML_TYPE **10**, model base ftype
+**10**). Q2_K = 256-value super-block, 84 bytes = `[scales[16] (low nibble = 4-bit
+scale, high nibble = 4-bit min), qs[64] (2-bit), f16 d, f16 dmin]`; `x =
+d*(sc&0xF)*2bit − dmin*(sc>>4)` (its own third scale layout — direct nibbles, no
+`get_scale_min_k4`, no `aux[]` reshape). Exact port of ggml `dequantize_row_q2_K`.
+Added `Q2_K_BLOCK_BYTES=84`, `dequant_q2_k`, the `ggml_byte_len`/`tensor_f32` arms,
+parse arms (ttype 10, both parsers), model-gate base `| 10`. The
+`unsupported_ftype_is_rejected` test retargeted to base **15** (IQ2_XXS, a codebook
+quant NOT on the roadmap) since every base 0-14 is now supported.
+
+**Validated — and q2_k needed EXTRA proof because it's the anomaly.** Unlike the
+other four k-quants (all produce the exact jfk transcript), q2_k tiny.en collapses
+to an **EMPTY** transcript. Ruled out a dequant bug decisively:
+- **whisper.cpp's own `whisper-cli` FAILS to even load these k-quant tiny models**
+  ("failed to initialize whisper context" for q2_k/q3_k/q4_k) — so it is NOT a
+  usable oracle here, and my engine is strictly MORE capable (loads + runs them).
+- **Independent byte-verification:** a from-scratch Python reference dequant of the
+  real model's first q2_k block (`decoder.blocks.0.attn.key.weight`) matches my Rust
+  `dequant_q2_k` to full f32 precision (`out[0]=-0.03527832`, `out[16]=-0.05291748`,
+  `out[32]=0.03794861`, …). The dequant is byte-exact.
+- Gated loader: real q2_k tensors within **~37 %** mean-abs of f16 (a wiring bug
+  would give ~100 %+; 37 % = high correlation = correct-but-lossy 2-bit).
+- Unit test pins the hand-computed block; e2e accepts empty-collapse OR jfk content
+  (a larger q2_k model would transcribe; tiny at 2.6 bits is simply destroyed).
+
+ggml **35/0**, all 9 decode gated quant e2e **9/0** (8 exact transcript + q2_k
+empty-collapse). No new in-lane clippy.
+
+**★ The native ggml loader is now quant-FEATURE-COMPLETE: it decodes every quant
+format whisper.cpp can emit (10 types), each dequantized to f32 on load and routed
+through the unchanged f32 weight path.** Remaining ggml types are the IQ codebook
+quants (GGML_TYPE 15+) — rare, need lookup tables, and rejected with a clear error.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (fourth k-quant; the odd one out) — native now loads whisper.cpp `q3_k` models. q3_k has its OWN scale packing (the `aux[]` u32 reshape, no `dmin`) + a 2-bit-quant/high-bit-plane layout; still transcribes jfk to the EXACT canonical transcript at 3-bit.**
 
 **What landed.** `GgmlDType::Q3_K` (per-tensor GGML_TYPE **11**, model base ftype

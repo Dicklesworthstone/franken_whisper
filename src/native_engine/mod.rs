@@ -127,6 +127,11 @@ pub enum GgmlDType {
     /// (bit-shuffled 6-bit), f16 d`; no per-block min — `x = d*(scale−32)*(2bit −
     /// (hmask-bit?0:4))`). Dequantized to f32 at load.
     Q3_K,
+    /// ggml `Q2_K` (per-tensor GGML_TYPE 10): k-quant 2-bit, 256-value
+    /// super-blocks (84 bytes: `scales[16] (4-bit scale | 4-bit min), qs[64]
+    /// (2-bit), f16 d, f16 dmin`; `x = d*(sc&0xF)*2bit − dmin*(sc>>4)`).
+    /// Dequantized to f32 at load — the coarsest quant native decodes.
+    Q2_K,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,
