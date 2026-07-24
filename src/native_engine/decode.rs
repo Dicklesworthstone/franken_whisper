@@ -4127,6 +4127,50 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_large_v3_turbo_no_ts_matches_oracle() {
+        // Faithfulness has a MODE axis (ts / no_ts / word-ts); the flagship was
+        // only proven in TS mode. no_ts uses a different SOT (`sot, <|en|>,
+        // <|transcribe|>, <|notimestamps|>`) and suppresses ALL timestamp logits —
+        // historically the buggiest mode (tail-truncation, single-ts fixes). Diff
+        // it against the oracle. whisper-cli (`-l auto -nt`): "And so, my fellow
+        // Americans, ask not what your country can do for you, ask what you can do
+        // for your country." Requires ggml-large-v3-turbo.bin + jfk.wav.
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_e2e_turbo_no_ts: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_turbo_no_ts: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build turbo engine");
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: false, // no_ts mode
+            n_threads: 4,
+            max_text_ctx: None,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on turbo (no_ts)");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("turbo no_ts PRODUCED: {joined}");
+        let oracle = "And so, my fellow Americans, ask not what your country can \
+                      do for you, ask what you can do for your country.";
+        assert_eq!(
+            joined, oracle,
+            "turbo no_ts must byte-match the whisper-cli oracle"
+        );
+    }
+
+    #[test]
     fn gated_e2e_jfk_large_v3_turbo_autodetect_transcribes() {
         // The full multilingual pipeline end to end on the FLAGSHIP: encode →
         // auto-detect language → build the multilingual SOT (sot, <|en|>,

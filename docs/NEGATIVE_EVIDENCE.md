@@ -4,6 +4,20 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (flagship no_ts mode, BYTE-IDENTICAL) — turbo jfk in NO_TIMESTAMPS mode also byte-matches whisper.cpp. The flagship faithfulness proof now spans BOTH output modes (ts + no_ts).**
+
+Faithfulness has a MODE axis (ts / no_ts / word-ts — [[project_no_ts_tail_truncation_fix]]);
+the flagship was only proven in TS mode (3124038). no_ts is a distinct, historically-
+buggiest path: a different SOT (`sot, <|en|>, <|transcribe|>, <|notimestamps|>`) and
+ALL timestamp logits suppressed (the tail-truncation + single-timestamp-ending bugs
+both lived here). Added `gated_e2e_jfk_large_v3_turbo_no_ts_matches_oracle`
+(decode.rs): `timestamps: false` on turbo jfk produces "And so, my fellow Americans,
+ask not what your country can do for you, ask what you can do for your country." —
+**byte-identical to `whisper-cli -l auto -nt`**. So the mode-specific no_ts fixes
+generalize to the flagship multilingual model; no turbo-specific no_ts divergence.
+95 s (turbo, debug), gated on the 1.5 GB f16 turbo. Test-only.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (completes initial_prompt) — the native engine now accepts a user prompt (`FW_INITIAL_PROMPT`, whisper `--prompt`): its BPE tokens seed `prompt_past` and bias the first window, faithfully to whisper.cpp. Wired end to end on top of the new `encode`.**
 
 Uses the [`encode`] capability. `seeded_prompt_past(prompt, tokenizer)` (decode.rs)
