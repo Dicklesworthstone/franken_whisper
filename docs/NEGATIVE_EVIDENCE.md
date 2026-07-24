@@ -4,6 +4,35 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (second k-quant, the popular one) — native now loads whisper.cpp `q4_k` models. q4_k is the most common k-quant in the GGUF ecosystem; introduces the `get_scale_min_k4` packed-scale machinery that q5_k/q3_k/q2_k also need.**
+
+**What landed.** `GgmlDType::Q4_K` (per-tensor GGML_TYPE **12**, model base ftype
+**12**). Q4_K = 256-value super-block, 144 bytes = `[f16 d, f16 dmin, scales[12]
+(8×6-bit packed scale+min), qs[128] (4-bit)]`. Unlike q6_k's flat int8 scales, the
+8 sub-block scales/mins are 6-bit values BIT-PACKED into 12 bytes, unpacked by
+`get_scale_min_k4(j)` (`j<4`: `scales[j]&63`, `scales[j+4]&63`; `j>=4`: splice the
+high-2-bits of earlier bytes into bits 4-5). Per 32-value sub-block `x = d*sc*nibble
+− dmin*min`. Exact port of ggml `dequantize_row_q4_K` + `get_scale_min_k4`. Added
+`K_SCALE_SIZE=12`, `Q4_K_BLOCK_BYTES=144`, `get_scale_min_k4`, `dequant_q4_k`, the
+`ggml_byte_len`/`tensor_f32` arms, parse arms (ttype 12, both parsers), model-gate
+base `| 12`. Additive — engine unchanged (dequant on load → f32 path).
+
+**Validated.** `q4_k_byte_len_and_dequant_math` pins `get_scale_min_k4` in
+isolation (BOTH the `j<4` and the trickier `j>=4` high-bit-splice branch) plus a
+hand-computed super-block reading groups 0 and 2. `gated_q4_k_model_loads_and_dequants_close_to_f16`
+— real q4_k tensors within **15 %** mean-abs of f16 (4-bit). `gated_e2e_jfk_tiny_en_q4_k_transcribes`
+builds the engine and produces the near-exact canonical jfk transcript ("And so my
+fellow Americans ask not what your country can do for you. Ask what you can do for
+your country." — one sentence-split drift at 4-bit, content exact). ggml **29/0**,
+decode gated q4_k **1/0**, no new in-lane clippy.
+
+**Quant support now: full legacy family + q6_k + q4_k (2 of 5 k-quants).**
+Remaining k-quants: q5_k (GGML_TYPE 13) reuses `get_scale_min_k4` + adds a qh
+high-bit plane like q5_0 (176 B/block) — now the cheapest next add. q2_k/q3_k
+(GGML_TYPE 10/11) pack scales differently again (per-block 4-bit/6-bit with their
+own layouts); each needs its own `dequant_*` port.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (first k-quant) — native now loads whisper.cpp `q6_k` models. Breaks into the k-quant super-block family (previously legacy-quant-only); q6_k transcribes jfk to the EXACT canonical transcript.**
 
 **What landed.** `GgmlDType::Q6_K` (per-tensor GGML_TYPE **14**, model base ftype
