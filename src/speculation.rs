@@ -1182,9 +1182,15 @@ impl SpeculationWindowController {
             return ControllerAction::Hold;
         }
 
-        if self.calibration.brier_score() > Self::BRIER_FALLBACK_THRESHOLD
-            && self.calibration.sample_count() >= 10
-        {
+        self.recommend_with_brier(self.calibration.brier_score())
+    }
+
+    fn recommend_with_brier(&self, brier: f64) -> ControllerAction {
+        if self.state.window_count < Self::MIN_WINDOWS_FOR_ADAPT {
+            return ControllerAction::Hold;
+        }
+
+        if brier > Self::BRIER_FALLBACK_THRESHOLD && self.calibration.sample_count() >= 10 {
             return ControllerAction::Hold;
         }
 
@@ -1224,9 +1230,8 @@ impl SpeculationWindowController {
 
     /// Apply the recommended action and return the new window size.
     pub fn apply(&mut self) -> u64 {
-        let action = self.recommend();
-
         let brier = self.calibration.brier_score();
+        let action = self.recommend_with_brier(brier);
         if brier > Self::BRIER_FALLBACK_THRESHOLD && self.calibration.sample_count() >= 10 {
             self.fallback_active = true;
             self.fallback_reason = Some(format!("Brier score {brier:.3} > threshold"));
@@ -3448,6 +3453,71 @@ mod tests {
             new_size, initial_ms,
             "Brier fallback should reset to initial window size"
         );
+    }
+
+    #[test]
+    fn speculation_controller_reused_brier_preserves_action_and_evidence() {
+        fn controller_with_history(
+            correction_count: usize,
+            confirmation_count: usize,
+        ) -> SpeculationWindowController {
+            let mut controller = SpeculationWindowController::new(5_000, 1_000, 30_000, 500);
+            let drift = CorrectionDrift {
+                wer_approx: 0.2,
+                confidence_delta: 0.1,
+                segment_count_delta: 0,
+                text_edit_distance: 2,
+            };
+            for index in 0..correction_count {
+                let correction = CorrectionEvent::new(
+                    index as u64,
+                    index as u64,
+                    index as u64,
+                    "quality".to_owned(),
+                    vec![],
+                    100,
+                    "2026-07-24T00:00:00Z".to_owned(),
+                    &[],
+                );
+                controller.observe(&CorrectionDecision::Correct { correction }, &drift);
+            }
+            for index in 0..confirmation_count {
+                controller.observe(
+                    &CorrectionDecision::Confirm {
+                        seq: index as u64,
+                        drift: drift.clone(),
+                    },
+                    &drift,
+                );
+            }
+            controller
+        }
+
+        for (corrections, confirmations) in [(0, 0), (2, 0), (0, 20), (15, 10), (20, 0)] {
+            let mut historical = controller_with_history(corrections, confirmations);
+            let mut candidate = controller_with_history(corrections, confirmations);
+
+            let historical_action = historical.recommend();
+            let historical_size = historical.apply();
+            let candidate_size = candidate.apply();
+
+            assert_eq!(candidate_size, historical_size);
+            assert_eq!(
+                candidate.is_fallback_active(),
+                historical.is_fallback_active()
+            );
+            assert_eq!(
+                candidate.evidence().last().map(|entry| &entry.action_taken),
+                Some(&historical_action)
+            );
+            assert_eq!(
+                serde_json::to_vec(candidate.evidence().last().expect("candidate evidence"))
+                    .expect("serialize candidate evidence"),
+                serde_json::to_vec(historical.evidence().last().expect("historical evidence"))
+                    .expect("serialize historical evidence"),
+                "corrections={corrections} confirmations={confirmations}"
+            );
+        }
     }
 
     // ── Task #219 — speculation pass 4 edge-case tests ───────────────

@@ -7,7 +7,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -18,7 +18,8 @@ use franken_whisper::backend::{
 use franken_whisper::model::{BackendKind, RunEvent, StreamedRunEvent};
 use franken_whisper::orchestrator::{PipelineBuilder, PipelineConfig, PipelineStage};
 use franken_whisper::speculation::{
-    CorrectionDrift, CorrectionEvidenceEntry, CorrectionEvidenceLedger,
+    CorrectionDecision, CorrectionDrift, CorrectionEvent, CorrectionEvidenceEntry,
+    CorrectionEvidenceLedger, SpeculationWindowController,
 };
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1047,190 @@ fn bench_speculation_diagnostics_profile(c: &mut Criterion) {
     group.finish();
 }
 
+/// Retry the previously blocked controller Brier-score reuse with one pinned
+/// binary, exact evidence parity, alternating A/B order, and an identity null.
+fn bench_speculation_controller_brier_reuse(c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("speculation_controller_brier_reuse")
+    }) {
+        return;
+    }
+
+    fn controller_fixture() -> SpeculationWindowController {
+        let mut controller = SpeculationWindowController::new(5_000, 1_000, 30_000, 500);
+        let drift = CorrectionDrift {
+            wer_approx: 0.05,
+            confidence_delta: 0.01,
+            segment_count_delta: 0,
+            text_edit_distance: 1,
+        };
+        for index in 0..15_u64 {
+            let correction = CorrectionEvent::new(
+                index,
+                index,
+                index,
+                "quality".to_owned(),
+                vec![],
+                100,
+                "2026-07-24T00:00:00Z".to_owned(),
+                &[],
+            );
+            controller.observe(&CorrectionDecision::Correct { correction }, &drift);
+        }
+        for index in 0..10_u64 {
+            controller.observe(
+                &CorrectionDecision::Confirm {
+                    seq: index,
+                    drift: drift.clone(),
+                },
+                &drift,
+            );
+        }
+        controller
+    }
+
+    fn measure<const HISTORICAL: bool>(inner_steps: usize) -> Duration {
+        let mut controller = controller_fixture();
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..inner_steps {
+            if HISTORICAL {
+                black_box(controller.recommend());
+            }
+            checksum ^= black_box(controller.apply());
+        }
+        black_box((checksum, controller.evidence().len()));
+        started.elapsed()
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+        sorted[index]
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        percentile(&sorted, 0.5)
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = value - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        variance.sqrt() / mean
+    }
+
+    let mut historical_oracle = controller_fixture();
+    let mut candidate_oracle = controller_fixture();
+    let historical_action = historical_oracle.recommend();
+    let historical_size = historical_oracle.apply();
+    let candidate_size = candidate_oracle.apply();
+    assert_eq!(candidate_size, historical_size);
+    assert_eq!(
+        candidate_oracle.is_fallback_active(),
+        historical_oracle.is_fallback_active()
+    );
+    assert_eq!(
+        candidate_oracle
+            .evidence()
+            .last()
+            .map(|entry| &entry.action_taken),
+        Some(&historical_action)
+    );
+    assert_eq!(
+        serde_json::to_vec(
+            candidate_oracle
+                .evidence()
+                .last()
+                .expect("candidate evidence"),
+        )
+        .expect("serialize candidate evidence"),
+        serde_json::to_vec(
+            historical_oracle
+                .evidence()
+                .last()
+                .expect("historical evidence"),
+        )
+        .expect("serialize historical evidence")
+    );
+
+    let calibration_steps = 10_000;
+    let calibration = measure::<true>(calibration_steps);
+    let inner_steps = ((0.05 / calibration.as_secs_f64()) * calibration_steps as f64) as usize;
+    let inner_steps = inner_steps.clamp(20_000, 200_000);
+    let mut null_ratios = Vec::with_capacity(21);
+    let mut speedups = Vec::with_capacity(21);
+    let mut candidate_ns = Vec::with_capacity(21);
+    for pair in 0..21 {
+        if pair % 2 == 0 {
+            let null_a = measure::<true>(inner_steps);
+            let null_b = measure::<true>(inner_steps);
+            let baseline = measure::<true>(inner_steps);
+            let candidate = measure::<false>(inner_steps);
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        } else {
+            let candidate = measure::<false>(inner_steps);
+            let baseline = measure::<true>(inner_steps);
+            let null_b = measure::<true>(inner_steps);
+            let null_a = measure::<true>(inner_steps);
+            null_ratios.push(null_a.as_secs_f64() / null_b.as_secs_f64());
+            speedups.push(baseline.as_secs_f64() / candidate.as_secs_f64());
+            candidate_ns.push(candidate.as_secs_f64() * 1e9 / inner_steps as f64);
+        }
+    }
+
+    let mut sorted_null = null_ratios.clone();
+    sorted_null.sort_by(f64::total_cmp);
+    let mut sorted_speedups = speedups.clone();
+    sorted_speedups.sort_by(f64::total_cmp);
+    let null_median = median(&null_ratios);
+    let null_p90 = percentile(&sorted_null, 0.9);
+    let speedup_p10 = percentile(&sorted_speedups, 0.1);
+    let candidate_cv = cv(&candidate_ns);
+    let wins = speedups.iter().filter(|speedup| **speedup > 1.0).count();
+    eprintln!(
+        "SPECULATION_CONTROLLER_BRIER_REUSE_AB calibration_steps={calibration_steps} calibration_ns={} inner_steps={inner_steps} null={null_ratios:?} speedup={speedups:?} candidate_ns={candidate_ns:?} null_p10={:.6} null_median={null_median:.6} null_p90={null_p90:.6} speedup_p10={speedup_p10:.6} speedup_median={:.6} speedup_p90={:.6} candidate_cv={candidate_cv:.6} wins={wins}/21",
+        calibration.as_nanos(),
+        percentile(&sorted_null, 0.1),
+        median(&speedups),
+        percentile(&sorted_speedups, 0.9),
+    );
+
+    assert!((0.95..=1.05).contains(&null_median));
+    assert!(candidate_cv < 0.05);
+    assert!(wins >= 18);
+    assert!(speedup_p10 > null_p90.max(1.10));
+
+    let mut group = c.benchmark_group("pipeline/speculation_controller_brier_reuse");
+    group.bench_function("candidate_apply_window_20", |b| {
+        b.iter_batched(
+            controller_fixture,
+            |mut controller| black_box(controller.apply()),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("historical_apply_window_20", |b| {
+        b.iter_batched(
+            controller_fixture,
+            |mut controller| {
+                black_box(controller.recommend());
+                black_box(controller.apply())
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -1116,6 +1301,7 @@ criterion_group!(
     bench_router_diagnostics_profile,
     bench_router_diagnostics_counts_profile,
     bench_speculation_diagnostics_profile,
+    bench_speculation_controller_brier_reuse,
     bench_export_srt_buffering,
 );
 criterion_main!(benches);
