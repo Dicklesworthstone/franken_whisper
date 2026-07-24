@@ -4,6 +4,22 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — ROBUSTNESS (degenerate-input coverage) — the native engine handles empty / single-sample / silence / tone / sub-window audio gracefully: empty → clean `InvalidRequest`, everything else → bounded finite output, no panics, no runaway.**
+
+A production ASR receives arbitrary clips; the degenerate-input path had zero
+coverage. Confirmed by reading `mel::build_padded` that it always pads to a full
+30 s window (`n_samples + N_SAMPLES_30S + 2*(N_FFT/2)`), so `padded.len() − N_FFT`
+can't underflow even at 0 samples, and the leading reflection is `saturating_sub`-
+clamped for tiny inputs — no bug, but untested. Added
+`gated_degenerate_audio_inputs_are_handled_gracefully` (decode.rs): empty audio
+returns `Err(InvalidRequest "empty audio")` (asserted, never a panic); one-sample /
+half-second silence / half-second tone / two-second silence all transcribe without
+panicking, ≤50 segments (no repetition-loop runaway), every segment span finite and
+ordered. Observed: one-sample → 0 segs; silence → `[BLANK_AUDIO]`; tone → one
+bounded `(bell dings)` hallucination. Locks in the graceful behavior against future
+mel/decode refactors. Test-only.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (the ONLY multilingual coverage) — native language auto-detection is proven correct against the whisper-cli oracle: on jfk + f16 large-v3-turbo native detects `en` at p=0.942, matching the oracle's `en` p=0.960.**
 
 `detect_language_from_enc` (a port of whisper.cpp `whisper_lang_auto_detect`) had
