@@ -4,6 +4,27 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP — FEATURE (extends the Q8_0 quant support below) — native now also loads whisper.cpp `q5_0` (5-bit) quantized ggml models, end-to-end. Native transcribes a real q5_0 tiny.en on jfk to the EXACT canonical transcript.**
+
+**What landed (ggml.rs + mod.rs, additive).** `GgmlDType::Q5_0`; per-tensor
+GGML_TYPE **6** → Q5_0; `Q5_0_BLOCK_BYTES = 22` (f16 scale + u32 high-bit field +
+16 nibble-bytes); `dequant_q5_0` — an exact port of ggml `dequantize_row_q5_0`
+(element `j` from `qs[j]` low nibble + high-bit `j`, element `j+16` from the high
+nibble + high-bit `j+16`, each `(5-bit − 16) * scale`); `ggml_byte_len` + a
+`tensor_f32` arm; model-gate base **8** admitted (a q5_0 v2 model reports ftype
+**2008**). The `unsupported_ftype` test now uses base 9 (q5_1) as its
+still-unsupported example.
+
+**Validation (whisper.cpp oracle).** `q5_0_byte_len_and_dequant_math` pins the
+bit-unpacking to a hand-computed block (qh high-bits + interleaved j / j+16
+nibbles). `gated_q5_0_model_loads_and_dequants_close_to_f16` — the real q5_0 model's
+Q5_0 tensors dequant within 10 % mean-abs of the f16 weights (5-bit is coarser
+than Q8_0's 8-bit). `gated_e2e_jfk_tiny_en_q5_0_transcribes` builds the engine and
+produces the **exact canonical jfk transcript**. ggml 21/0, decode gated 7/0, no
+regression. Native now covers the two most common whisper.cpp download quants
+(q8_0, q5_0); q5_1/q4_0/k-quants remain the additive follow-ups.
+
+---
 ## 2026-07-23 - WhiteCreek: **KEEP — FEATURE (bd-frp7 architectural gap, additive) — native now LOADS whisper.cpp `q8_0`-quantized ggml models. End-to-end proven: native transcribes a real q8_0 tiny.en on jfk to the EXACT canonical transcript ("And so my fellow Americans…"). The epic's explicit "quantized = follow-up" gap for Q8_0 is closed.**
 
 **What landed (ggml.rs + mod.rs, purely additive — the f32/f16 path is untouched).**

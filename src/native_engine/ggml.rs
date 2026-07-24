@@ -67,6 +67,10 @@ const GGML_QNT_VERSION_FACTOR: i32 = 1000;
 const QK8_0: usize = 32;
 /// `Q8_0` on-disk block size: one `f16` scale (2 bytes) + 32 `int8` quants.
 const Q8_0_BLOCK_BYTES: usize = 2 + QK8_0;
+/// ggml `Q5_0` block: 32 quantized values per block.
+const QK5_0: usize = 32;
+/// `Q5_0` on-disk block size: `f16` scale (2) + high-bit field (4) + nibbles (16).
+const Q5_0_BLOCK_BYTES: usize = 2 + 4 + QK5_0 / 2;
 
 /// On-disk byte length of a tensor payload for `dtype` × `n_elements`. `Q8_0`
 /// is block-based (34 bytes per 32 values) and requires a multiple-of-32 count.
@@ -82,8 +86,43 @@ fn ggml_byte_len(dtype: GgmlDType, n_elements: usize, name: &str) -> FwResult<us
             }
             (n_elements / QK8_0).checked_mul(Q8_0_BLOCK_BYTES)
         }
+        GgmlDType::Q5_0 => {
+            if !n_elements.is_multiple_of(QK5_0) {
+                return Err(FwError::InvalidRequest(format!(
+                    "tensor '{name}' q5_0 element count {n_elements} is not a multiple of {QK5_0}"
+                )));
+            }
+            (n_elements / QK5_0).checked_mul(Q5_0_BLOCK_BYTES)
+        }
     };
     len.ok_or_else(|| FwError::InvalidRequest(format!("tensor '{name}' byte length overflow")))
+}
+
+/// Dequantize a `Q5_0` tensor payload to `f32`. Each 22-byte block is `[f16
+/// scale, u32 high-bits, 16×(two 4-bit nibbles)]`; element `j` takes `qs[j]`'s
+/// low nibble + high-bit `j`, element `j+16` the high nibble + high-bit `j+16`,
+/// each mapped `(5-bit − 16) * scale`. Exact port of ggml `dequantize_row_q5_0`.
+fn dequant_q5_0(raw: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / QK5_0;
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let base = b * Q5_0_BLOCK_BYTES;
+        let d = f32::from(Float16::from_bits(u16::from_le_bytes([
+            raw[base],
+            raw[base + 1],
+        ])));
+        let qh = u32::from_le_bytes([raw[base + 2], raw[base + 3], raw[base + 4], raw[base + 5]]);
+        let qs = &raw[base + 6..base + 6 + QK5_0 / 2];
+        for j in 0..QK5_0 / 2 {
+            let xh0 = ((qh >> j) << 4) & 0x10;
+            let xh1 = (qh >> (j + 12)) & 0x10;
+            let x0 = (u32::from(qs[j] & 0x0F) | xh0) as i32 - 16;
+            let x1 = (u32::from(qs[j] >> 4) | xh1) as i32 - 16;
+            out[b * QK5_0 + j] = x0 as f32 * d;
+            out[b * QK5_0 + j + QK5_0 / 2] = x1 as f32 * d;
+        }
+    }
+    out
 }
 
 /// Dequantize a `Q8_0` tensor payload (`n_elements` values, `n_elements / 32`
@@ -240,15 +279,16 @@ impl GgmlModel {
 
         // ftype gates the "big tensor" storage type. whisper.cpp packs a
         // quantization VERSION into ftype as `version * GGML_QNT_VERSION_FACTOR +
-        // base` (e.g. a q8_0 v2 model reports 2007), so strip the version before
-        // mapping. Base WHISPER_FTYPE: 0=f32, 1=f16, 7=q8_0 (dequantized to f32 on
-        // load). Any other base is a quantized format we don't decode yet; the
-        // per-tensor parse is the real gate (it rejects unsupported GGML_TYPEs).
+        // base` (e.g. a q8_0 v2 model reports 2007, q5_0 v2 reports 2008), so
+        // strip the version before mapping. Base WHISPER_FTYPE: 0=f32, 1=f16,
+        // 7=q8_0, 8=q5_0 (quantized types dequantized to f32 on load). Any other
+        // base is a format we don't decode yet; the per-tensor parse is the real
+        // gate (it rejects unsupported GGML_TYPEs).
         let base_ftype = hparams.ftype.rem_euclid(GGML_QNT_VERSION_FACTOR);
-        if !matches!(base_ftype, 0 | 1 | 7) {
+        if !matches!(base_ftype, 0 | 1 | 7 | 8) {
             return Err(FwError::Unsupported(format!(
                 "quantized ggml ftype {} (base {base_ftype}) is not supported \
-                 (only base 0=f32, 1=f16, 7=q8_0)",
+                 (only base 0=f32, 1=f16, 7=q8_0, 8=q5_0)",
                 hparams.ftype
             )));
         }
@@ -313,11 +353,12 @@ impl GgmlModel {
             let dtype = match ttype {
                 0 => GgmlDType::F32,
                 1 => GgmlDType::F16,
+                6 => GgmlDType::Q5_0,
                 8 => GgmlDType::Q8_0,
                 other => {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
-                         (only 0=f32, 1=f16, 8=q8_0)"
+                         (only 0=f32, 1=f16, 6=q5_0, 8=q8_0)"
                     )));
                 }
             };
@@ -469,11 +510,12 @@ impl GgmlModel {
             let dtype = match ttype {
                 0 => GgmlDType::F32,
                 1 => GgmlDType::F16,
+                6 => GgmlDType::Q5_0,
                 8 => GgmlDType::Q8_0,
                 other => {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
-                         (only 0=f32, 1=f16, 8=q8_0)"
+                         (only 0=f32, 1=f16, 6=q5_0, 8=q8_0)"
                     )));
                 }
             };
@@ -634,6 +676,16 @@ impl GgmlModel {
                     )));
                 }
                 dequant_q8_0(&raw, n_elements)
+            }
+            GgmlDType::Q5_0 => {
+                let expect = ggml_byte_len(GgmlDType::Q5_0, n_elements, name)?;
+                if raw.len() != expect {
+                    return Err(FwError::InvalidRequest(format!(
+                        "tensor '{name}' q5_0 byte length {} != {expect}",
+                        raw.len()
+                    )));
+                }
+                dequant_q5_0(&raw, n_elements)
             }
         };
 
@@ -1125,6 +1177,81 @@ mod tests {
     }
 
     #[test]
+    fn q5_0_byte_len_and_dequant_math() {
+        // Q5_0: 22 bytes/block (f16 scale + u32 high-bits + 16 nibble-bytes).
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q5_0, 64, "t").unwrap(),
+            2 * Q5_0_BLOCK_BYTES
+        );
+        assert!(ggml_byte_len(GgmlDType::Q5_0, 48, "t").is_err());
+
+        // One block, scale = 1.0. qh sets the 5th bit of elements 0 and 16.
+        // qs[0] = 0x0F (elem0 low nibble 15, elem16 high nibble 0);
+        // qh bit0 = 1 → elem0 5-bit = 31 → 31-16 = 15; qh bit16 = 1 → elem16 = 16 → 0.
+        let scale = Float16::from_f32(1.0);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&scale.to_bits().to_le_bytes());
+        let qh: u32 = (1 << 0) | (1 << 16);
+        raw.extend_from_slice(&qh.to_le_bytes());
+        let mut qs = [0u8; QK5_0 / 2];
+        qs[0] = 0x0F; // elem0 nibble 15, elem16 nibble 0
+        qs[1] = 0xF0; // elem1 nibble 0, elem17 nibble 15
+        raw.extend_from_slice(&qs);
+        let out = dequant_q5_0(&raw, QK5_0);
+        assert_eq!(out.len(), QK5_0);
+        assert_eq!(out[0], 15.0); // (15 | 16) - 16 = 15
+        assert_eq!(out[16], 0.0); // (0 | 16) - 16 = 0
+        assert_eq!(out[1], -16.0); // (0 | 0) - 16 = -16
+        assert_eq!(out[17], -1.0); // (15 | 0) - 16 = -1
+        // Untouched elements: nibble 0, no high bit → -16.
+        assert_eq!(out[2], -16.0);
+        assert_eq!(out[18], -16.0);
+    }
+
+    #[test]
+    fn gated_q5_0_model_loads_and_dequants_close_to_f16() {
+        // Requires ggml-tiny.en-q5_0.bin (`whisper-quantize <f16> <out> q5_0`).
+        let (Some(q5_path), Some(f16_path)) =
+            (find_model_file("tiny.en-q5_0"), find_model_file("tiny.en"))
+        else {
+            eprintln!("SKIP gated_q5_0: ggml-tiny.en-q5_0.bin or ggml-tiny.en.bin not found");
+            return;
+        };
+        let q5 = GgmlModel::load(&q5_path).expect("load q5_0 model");
+        let f16 = GgmlModel::load(&f16_path).expect("load f16 model");
+        assert_eq!(
+            q5.hparams.ftype.rem_euclid(1000),
+            8,
+            "q5_0 model base ftype must be 8"
+        );
+        let q5_name = q5
+            .tensor_names()
+            .find(|n| q5.tensor(n).is_some_and(|e| e.dtype == GgmlDType::Q5_0))
+            .expect("q5_0 model has at least one Q5_0 tensor")
+            .to_owned();
+        let (qshape, qvals) = q5.tensor_f32(&q5_name).expect("q5_0 dequant");
+        let (fshape, fvals) = f16.tensor_f32(&q5_name).expect("f16 dequant");
+        assert_eq!(qshape, fshape, "shape mismatch for '{q5_name}'");
+        assert!(
+            qvals.iter().all(|v| v.is_finite()),
+            "q5_0 dequant produced non-finite values"
+        );
+        let n = fvals.len() as f32;
+        let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 = qvals
+            .iter()
+            .zip(&fvals)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / n;
+        // Q5_0 is coarser than Q8_0 (5-bit) but still tracks f16 within ~10%.
+        assert!(
+            mean_abs_diff < 0.10 * mean_abs,
+            "q5_0 vs f16 mean|Δ| {mean_abs_diff} exceeds 10% of mean|w| {mean_abs} for '{q5_name}'"
+        );
+    }
+
+    #[test]
     fn gated_q8_0_model_loads_and_dequants_close_to_f16() {
         // Requires a q8_0-quantized tiny.en next to the f16 one (produce it with
         // whisper.cpp's `whisper-quantize <f16> <out> q8_0`). Validates that a
@@ -1495,16 +1622,16 @@ mod tests {
     fn unsupported_ftype_is_rejected() {
         let mut b = SyntheticModel { bytes: Vec::new() };
         b.push_u32(GGML_MAGIC);
-        // ftype = 1008 in the 11th hparam slot: quant version 1, base 8 (q5_0),
+        // ftype = 1009 in the 11th hparam slot: quant version 1, base 9 (q5_1),
         // a quantized format we don't decode yet. Also exercises the version
-        // strip (1008 % 1000 == 8) — an f32/f16/q8_0 (base 0/1/7) would pass.
-        for v in [5i32, 1500, 384, 6, 4, 448, 384, 6, 4, 80, 1008] {
+        // strip (1009 % 1000 == 9) — f32/f16/q8_0/q5_0 (base 0/1/7/8) would pass.
+        for v in [5i32, 1500, 384, 6, 4, 448, 384, 6, 4, 80, 1009] {
             b.push_i32(v);
         }
         let err = GgmlModel::parse(b.bytes).expect_err("must reject quantized ftype");
         match err {
             FwError::Unsupported(msg) => {
-                assert!(msg.contains("base 8"), "base ftype should be listed: {msg}");
+                assert!(msg.contains("base 9"), "base ftype should be listed: {msg}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
