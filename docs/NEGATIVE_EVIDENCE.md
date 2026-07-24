@@ -4,6 +4,37 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-23 - WhiteCreek: **KEEP — FEATURE (bd-frp7 architectural gap, additive) — native now LOADS whisper.cpp `q8_0`-quantized ggml models. End-to-end proven: native transcribes a real q8_0 tiny.en on jfk to the EXACT canonical transcript ("And so my fellow Americans…"). The epic's explicit "quantized = follow-up" gap for Q8_0 is closed.**
+
+**What landed (ggml.rs + mod.rs, purely additive — the f32/f16 path is untouched).**
+`GgmlDType::Q8_0`; per-tensor GGML_TYPE 8 → Q8_0 in both directory parsers, with
+block-based byte length (`ggml_byte_len`: 34 bytes / 32 values, rejects
+non-multiples of 32); `dequant_q8_0` (`x = int8 × f16-scale`, mirrors ggml's
+`dequantize_row_q8_0`); `tensor_f32` dequantizes Q8_0. The model-level ftype gate
+now strips whisper.cpp's quantization-VERSION factor (`ftype = qnt_version *
+GGML_QNT_VERSION_FACTOR(1000) + base`; a q8_0 v2 model reports **2007**, base 7)
+and admits base 0/1/7. The engine needs NO change: it routes non-F16 tensors to
+`tensor_f32`, so Q8_0 weights dequant to f32 then re-quantize into the engine's
+own format — a valid path (Q8_0 is high precision).
+
+**Validation (fully end-to-end — created the fixture, whisper.cpp is the oracle).**
+Built whisper.cpp's `whisper-quantize` and produced `ggml-tiny.en-q8_0.bin` (42 MB,
+model ftype 2007). (1) `q8_0_byte_len_and_dequant_math` pins the dequant to
+hand-computed blocks (scale 0.5 × {0,1,2,−1,−128,127} → {0,0.5,1,−0.5,−64,63.5}).
+(2) `gated_q8_0_model_loads_and_dequants_close_to_f16` loads the REAL model, finds
+a Q8_0-stored tensor, and asserts its dequant tracks the f16 model's same weights
+to < 5 % mean-abs (Q8_0 is int8×f16-scale). (3) `gated_e2e_jfk_tiny_en_q8_0_transcribes`
+builds the ENGINE from the q8_0 model and transcribes jfk → **exact canonical
+transcript**. ggml 19/0, decode gated 6/0, no regression; my regions fleet-clippy-clean
+(the remaining ggml.rs doc-indent lints are pre-existing toolchain-churn, shifted).
+
+**Scope / next.** Q8_0 only. Q5_0/Q5_1/Q4_0/Q4_1 (bit-packed) and the k-quants
+(super-blocks) are the natural follow-ups — each is an additive `GgmlDType` +
+`dequant_*` + `ggml_byte_len` arm, validatable the same way (`whisper-quantize
+<model> <out> q5_0`). The per-tensor parse already rejects unsupported GGML_TYPEs
+with a clear error, so partial coverage is safe.
+
+---
 ## 2026-07-23 - BlackThrush: **BLOCKED / NO VERDICT (bd-938v) — strict-RCH canonical dependency mirrors remain content-divergent after nominal sync. Two cold release builds on different workers failed before Criterion; zero samples, zero REJECTs, production untouched.**
 
 **Ledger-first continuation after auth restart.** Both evidence ledgers and recent
