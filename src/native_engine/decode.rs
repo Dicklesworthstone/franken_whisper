@@ -3926,6 +3926,69 @@ mod tests {
     }
 
     #[test]
+    fn gated_degenerate_audio_inputs_are_handled_gracefully() {
+        // A production ASR receives arbitrary clips: empty, pure silence, a tone,
+        // and sub-window lengths. None must panic or error — mel's build_padded
+        // always pads to a full 30 s window (so `padded.len() - N_FFT` can't
+        // underflow) and the decode must degrade to no/near-no speech, not crash
+        // or run away. This is the only coverage of the degenerate-input path.
+        let Some(model) = load_tiny_en() else {
+            eprintln!("SKIP gated_degenerate_audio: tiny.en model missing");
+            return;
+        };
+        let params = e2e_params();
+
+        // Empty audio is rejected with a clean error (never a panic).
+        match transcribe_samples(&model, &[], &params, &noop) {
+            Err(FwError::InvalidRequest(msg)) => {
+                assert!(msg.contains("empty"), "unexpected empty-audio error: {msg}");
+            }
+            Err(other) => panic!("empty audio: expected InvalidRequest, got {other:?}"),
+            Ok(_) => panic!("empty audio should be rejected, not transcribed"),
+        }
+
+        // Non-empty but degenerate inputs must transcribe without panicking, with
+        // bounded, finite output (silence/tone degrade to no/near-no speech).
+        let cases: [(&str, Vec<f32>); 4] = [
+            ("one_sample", vec![0.1]),
+            ("half_second_silence", vec![0.0; SAMPLE_RATE / 2]),
+            (
+                "half_second_tone",
+                (0..SAMPLE_RATE / 2)
+                    .map(|i| (i as f32 * 0.20).sin() * 0.3)
+                    .collect(),
+            ),
+            ("two_second_silence", vec![0.0; SAMPLE_RATE * 2]),
+        ];
+        for (name, samples) in cases {
+            let out = transcribe_samples(&model, &samples, &params, &noop)
+                .unwrap_or_else(|e| panic!("{name}: transcribe errored: {e}"));
+            let joined: String = out
+                .segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("{name}: {} segs, text={joined:?}", out.segments.len());
+            // No runaway output (a repetition loop on non-speech would balloon the
+            // segment count) and every timestamp stays finite/ordered.
+            assert!(
+                out.segments.len() < 50,
+                "{name}: runaway segment count {}",
+                out.segments.len()
+            );
+            for seg in &out.segments {
+                if let (Some(s), Some(e)) = (seg.start_sec, seg.end_sec) {
+                    assert!(
+                        s.is_finite() && e.is_finite() && e >= s,
+                        "{name}: bad segment span [{s}, {e}]"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gated_language_detect_jfk_turbo_matches_oracle() {
         // The ONLY coverage of the multilingual language-auto-detect path
         // (detect_language_from_enc, a port of whisper.cpp whisper_lang_auto_detect).
