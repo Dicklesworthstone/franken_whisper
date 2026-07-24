@@ -4072,6 +4072,62 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_large_v3_turbo_autodetect_transcribes() {
+        // The full multilingual pipeline end to end on the FLAGSHIP: encode →
+        // auto-detect language → build the multilingual SOT (sot, <|en|>,
+        // <|transcribe|>) → decode. Every other e2e test uses English-only tiny.en
+        // whose SOT is bare `[sot]` — this is the only coverage of turbo's 32-layer
+        // encoder + 51866-token multilingual decode + the language-token SOT path.
+        // Oracle (whisper-cli, f16 turbo, -l auto): "And so, my fellow Americans,
+        // ask not what your country can do for you, ask what you can do for your
+        // country." Requires the multilingual ggml-large-v3-turbo.bin + jfk.wav.
+        let Some(path) = super::super::find_model_file("large-v3-turbo") else {
+            eprintln!("SKIP gated_e2e_turbo_autodetect: ggml-large-v3-turbo.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_turbo_autodetect: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load turbo");
+        let loaded = LoadedModel::from_ggml(model).expect("build turbo engine");
+        // language: None → exercises the auto-detect path in transcribe_samples.
+        let params = DecodeParams {
+            language: None,
+            translate: false,
+            timestamps: true,
+            n_threads: 4,
+            max_text_ctx: None,
+            ..DecodeParams::default()
+        };
+        let out = transcribe_samples(&loaded, &samples, &params, &noop)
+            .expect("transcribe jfk on turbo");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("turbo autodetect PRODUCED: [{:?}] {joined}", out.language);
+        // Auto-detection ran and picked English (matches the whisper-cli oracle).
+        assert_eq!(
+            out.language.as_deref(),
+            Some("en"),
+            "turbo should auto-detect English"
+        );
+        // The multilingual decode produced the salient jfk content.
+        let low = joined.to_lowercase();
+        assert!(
+            low.contains("fellow americans"),
+            "turbo transcript missing 'fellow americans': {joined}"
+        );
+        assert!(
+            low.contains("country"),
+            "turbo transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
     fn gated_q5_k_large_v3_turbo_loads_and_builds_engine() {
         // Flagship-model proof: the quant path is size-agnostic, so a q5_k
         // large-v3-turbo (51866 vocab, 1280 audio-state, 32 enc / 4 dec layers,
