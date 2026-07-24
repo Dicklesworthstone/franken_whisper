@@ -424,6 +424,13 @@ fn decode_params(
     decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
+        // Initial prompt (whisper `--prompt`): the engine tokenizes it and seeds
+        // the first window's carried context. Empty → no-op.
+        initial_prompt: request
+            .backend_params
+            .prompt
+            .clone()
+            .filter(|p| !p.is_empty()),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         // No request field maps to whisper's text-context cap today; use the
@@ -986,6 +993,25 @@ mod tests {
             timeout_ms: None,
             backend_params: BackendParams::default(),
         }
+    }
+
+    #[test]
+    fn decode_params_maps_initial_prompt_from_request() {
+        let mut request = native_request();
+        // No prompt → the engine gets no initial prompt.
+        assert_eq!(decode_params(&request, false, "tiny.en").initial_prompt, None);
+        // A request prompt (whisper `--prompt`) flows through to the engine's
+        // initial_prompt field, which the decoder tokenizes and seeds.
+        request.backend_params.prompt = Some("medical terminology".to_owned());
+        assert_eq!(
+            decode_params(&request, false, "tiny.en")
+                .initial_prompt
+                .as_deref(),
+            Some("medical terminology"),
+        );
+        // An empty prompt is treated as no prompt (byte-identical default).
+        request.backend_params.prompt = Some(String::new());
+        assert_eq!(decode_params(&request, false, "tiny.en").initial_prompt, None);
     }
 
     /// A real-shaped engine segment (timed, with text), standing in for what

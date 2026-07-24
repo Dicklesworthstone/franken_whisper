@@ -4,6 +4,30 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-24 - WhiteCreek: **KEEP — FEATURE (initial_prompt is now a real per-request API) — promoted `initial_prompt` from the FW_INITIAL_PROMPT env-hatch to a proper `DecodeParams` field, wired through the native backend so a request's `--prompt` reaches the engine end to end.**
+
+Last leg this was ledgered as cross-lane-BLOCKED (a `DecodeParams` field ripples
+through `src/backend/*` constructors incl. cod's diarize/streaming); with cod
+weekly-capped until Jul 29 (I'm sole producer) the backend edits are unblocked, so I
+completed the follow-up. The ripple was smaller than feared: the diarize + streaming
+`decode_params` builders already use `..DecodeParams::default()` (a new field defaults
+to `None`, no edit needed); only `whisper_cpp_native.rs` (native rewire, my lane) is a
+full literal + is where the mapping belongs.
+
+**What landed.** `DecodeParams.initial_prompt: Option<String>`; `whisper_cpp_native::decode_params`
+maps `request.backend_params.prompt` (whisper `--prompt`) → the field (empty filtered
+to `None`); `transcribe_samples` seeds `prompt_past` from
+`initial_prompt_from_env().or(params.initial_prompt)` — the field is the API, the env
+var stays a dev OVERRIDE (wins when set). 4 decode.rs test full-literals updated.
+
+**Validated (all deterministic — the field, unlike the OnceLock env-gate, is
+per-case testable).** `decode_params_maps_initial_prompt_from_request`
+(whisper_cpp_native): request prompt → field, empty → `None`. `gated_initial_prompt_field_wired_and_neutral_when_empty`
+(decode.rs): `None` == `Some("")` byte-identical (empty is a no-op), and a benign
+field prompt still transcribes jfk correctly (field flows into seeding). Backend suite
+24/0, no in-lane clippy. Users now get `--prompt` biasing through the native engine.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — VALIDATION (flagship no_ts mode, BYTE-IDENTICAL) — turbo jfk in NO_TIMESTAMPS mode also byte-matches whisper.cpp. The flagship faithfulness proof now spans BOTH output modes (ts + no_ts).**
 
 Faithfulness has a MODE axis (ts / no_ts / word-ts — [[project_no_ts_tail_truncation_fix]]);

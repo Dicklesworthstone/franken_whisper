@@ -189,6 +189,14 @@ pub struct DecodeParams {
     pub language: Option<String>,
     /// Translate to English instead of transcribing in the source language.
     pub translate: bool,
+    /// Optional text prompt to bias the transcription (whisper `--prompt` /
+    /// `initial_prompt`): tokenized via [`Tokenizer::encode`](super::tokenizer)
+    /// and carried as the previous-context prompt on the first window (then aged
+    /// out as decoded text accumulates, like whisper.cpp's `prompt_past`). `None`
+    /// or an empty string is a no-op (byte-identical to no prompt). The
+    /// `FW_INITIAL_PROMPT` env var overrides this field when set (a dev/testing
+    /// hatch, mirroring the other `FW_*` gates).
+    pub initial_prompt: Option<String>,
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
@@ -484,11 +492,10 @@ fn condition_on_prev_disabled() -> bool {
 /// accumulates — whisper.cpp's `prompt_past` behaviour). Unset or empty → no
 /// prompt (byte-identical default).
 ///
-/// Exposed as an env-gate confined to `decode.rs` (mirroring
-/// [`condition_on_prev_disabled`]) rather than a `DecodeParams` field, to avoid
-/// rippling a new field through the `src/backend/*` constructors (bd-r0qd used
-/// the same idiom for `FW_NO_CONTEXT`). A proper per-request `DecodeParams`
-/// field + backend plumbing is a coordinated follow-up.
+/// A dev/testing OVERRIDE of the [`DecodeParams::initial_prompt`] field
+/// (mirroring [`condition_on_prev_disabled`]): when `FW_INITIAL_PROMPT` is set it
+/// wins over the field, so a prompt can be injected without constructing params.
+/// Unset → the field is used.
 fn initial_prompt_from_env() -> Option<&'static str> {
     use std::sync::OnceLock;
     static PROMPT: OnceLock<Option<String>> = OnceLock::new();
@@ -1712,10 +1719,13 @@ pub fn transcribe_samples(
         Vec::new()
     };
     // Rolling text context from prior windows (whisper.cpp prompt_past1).
-    // Seed it with the optional user prompt (whisper `--prompt`, FW_INITIAL_PROMPT):
-    // its tokens are carried as previous context on the first window and age out
-    // via the max_prompt_ctx truncation as decoded text accumulates. Unset → no-op.
-    let mut prompt_past: Vec<i32> = seeded_prompt_past(initial_prompt_from_env(), &m.tokenizer);
+    // Seed it with the optional user prompt (whisper `--prompt`): the
+    // `DecodeParams.initial_prompt` field is the API; `FW_INITIAL_PROMPT` overrides
+    // it when set (dev/testing hatch). Its tokens are carried as previous context
+    // on the first window and age out via the max_prompt_ctx truncation as decoded
+    // text accumulates. Unset → no-op (byte-identical default).
+    let prompt = initial_prompt_from_env().or(params.initial_prompt.as_deref());
+    let mut prompt_past: Vec<i32> = seeded_prompt_past(prompt, &m.tokenizer);
 
     // Tail-window encoder-context truncation kill switch, resolved once.
     //
@@ -3964,6 +3974,47 @@ mod tests {
     }
 
     #[test]
+    fn gated_initial_prompt_field_wired_and_neutral_when_empty() {
+        // End-to-end through the DecodeParams.initial_prompt FIELD (the real
+        // per-request API, distinct from the FW_INITIAL_PROMPT dev override which
+        // an OnceLock makes hard to test per-case). FW_INITIAL_PROMPT is unset
+        // under `cargo test`, so the field is the source of truth here.
+        let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
+            eprintln!("SKIP gated_initial_prompt_field: tiny.en model or jfk.wav missing");
+            return;
+        };
+        let join = |o: &DecodeOutput| {
+            o.segments
+                .iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // None vs Some("") must be identical (an empty prompt is a no-op).
+        let mut p_none = e2e_params();
+        p_none.initial_prompt = None;
+        let mut p_empty = e2e_params();
+        p_empty.initial_prompt = Some(String::new());
+        let t_none = join(&transcribe_samples(&model, &samples, &p_none, &noop).unwrap());
+        let t_empty = join(&transcribe_samples(&model, &samples, &p_empty, &noop).unwrap());
+        assert_eq!(t_none, t_empty, "empty initial_prompt field must be a no-op");
+        assert!(
+            t_none.to_lowercase().contains("country"),
+            "baseline should transcribe jfk: {t_none}"
+        );
+        // A benign prompt via the field is accepted and still transcribes jfk
+        // (proving the field flows into the decoder's prompt_past seeding).
+        let mut p = e2e_params();
+        p.initial_prompt = Some("Hello there.".to_owned());
+        let t = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
+        eprintln!("field-prompted: {t}");
+        assert!(
+            t.to_lowercase().contains("country"),
+            "field prompt should still transcribe jfk: {t}"
+        );
+    }
+
+    #[test]
     fn gated_seeded_prompt_past_encodes_user_prompt() {
         // The initial-prompt seed (whisper `--prompt`, FW_INITIAL_PROMPT): an
         // absent/empty prompt yields an empty prompt_past (byte-identical default),
@@ -4548,6 +4599,7 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
+            initial_prompt: None,
         };
         let out = transcribe_samples(&model, &samples, &params, &noop).unwrap();
 
@@ -4633,6 +4685,7 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
+            initial_prompt: None,
         };
         // bd-0ivd MXCSR diagnostics: matrixmultiply's micro-kernel sets the x86
         // FTZ/DAZ flush bits and does not restore them (documented + wrapped in
@@ -4741,6 +4794,7 @@ mod tests {
             max_text_ctx: None,
             word_timestamps: true,
             model_hint: Some("tiny.en".to_owned()),
+            initial_prompt: None,
         };
         // Sibling load = REAL engine work sharing the global rayon pool,
         // allocator, and kernels — generic par_iter busywork measured
@@ -4800,6 +4854,7 @@ mod tests {
                         max_text_ctx: None,
                         word_timestamps: true,
                         model_hint: Some("tiny.en".to_owned()),
+                        initial_prompt: None,
                     };
                     while !stopr2.load(Ordering::Relaxed) {
                         let _ = transcribe_samples(&m2, samplesr, &p2, &noop);
