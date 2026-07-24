@@ -2414,13 +2414,6 @@ pub fn transcribe_samples(
     });
     pipe_result?;
 
-        // Close the encoder-thread channel so the scoped worker exits; `scope`
-        // then joins it before returning.
-        drop(req_tx);
-        Ok(())
-    });
-    pipe_result?;
-
     // English-only models never report a language; multilingual report the used
     // (possibly auto-detected) one.
     if !tk.is_multilingual() {
