@@ -3926,6 +3926,40 @@ mod tests {
     }
 
     #[test]
+    fn gated_e2e_jfk_tiny_en_q4_k_transcribes() {
+        // Engine runs a whisper.cpp q4_k-quantized model end-to-end. Q4_K is a
+        // 4-bit k-quant (256-value super-block, per-sub-block 6-bit scale+min);
+        // its tensors dequantize to f32 on load and route through the f32 path.
+        // Requires ggml-tiny.en-q4_k.bin.
+        let Some(path) = super::super::find_model_file("tiny.en-q4_k") else {
+            eprintln!("SKIP gated_e2e_jfk_q4_k: ggml-tiny.en-q4_k.bin not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_e2e_jfk_q4_k: jfk.wav missing");
+            return;
+        };
+        let model = GgmlModel::load(&path).expect("load q4_k model");
+        let loaded = LoadedModel::from_ggml(model).expect("build engine from q4_k");
+        let out =
+            transcribe_samples(&loaded, &samples, &e2e_params(), &noop).expect("transcribe q4_k");
+        let joined: String = out
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("q4_k PRODUCED: {joined}");
+        assert!(!out.segments.is_empty(), "q4_k produced no segments");
+        // 4-bit is coarse; assert the salient jfk content ("country" is robust;
+        // the fuller phrase can drift at 4-bit precision).
+        assert!(
+            joined.to_lowercase().contains("country"),
+            "q4_k transcript missing 'country': {joined}"
+        );
+    }
+
+    #[test]
     fn gated_e2e_jfk_tiny_en_matches_reference() {
         let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_e2e_jfk_tiny_en: tiny.en model or jfk.wav missing");

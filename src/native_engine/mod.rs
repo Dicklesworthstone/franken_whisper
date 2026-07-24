@@ -110,6 +110,12 @@ pub enum GgmlDType {
     /// 16-byte int8 sub-scales + `f16` super-scale; `x = d * sub_scale * (6bit −
     /// 32)`). Dequantized to f32 at load.
     Q6_K,
+    /// ggml `Q4_K` (per-tensor GGML_TYPE 12): k-quant 4-bit, 256-value
+    /// super-blocks (144 bytes: `f16 d, f16 dmin, scales[12] (8×6-bit packed
+    /// scale+min), qs[128] (4-bit)`; per 32-value sub-block `x = d*sc*nibble −
+    /// dmin*min`, sub-scales unpacked via `get_scale_min_k4`). Dequantized to f32
+    /// at load.
+    Q4_K,
 }
 
 /// Mel filterbank embedded in the ggml model file (`n_mel x n_fft_bins`,

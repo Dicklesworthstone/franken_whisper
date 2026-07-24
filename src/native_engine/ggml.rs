@@ -90,11 +90,62 @@ fn f16_at(raw: &[u8], off: usize) -> f32 {
     ])))
 }
 
-/// ggml `Q6_K` super-block: 256 quantized values.
+/// ggml k-quant super-block: 256 quantized values.
 const QK_K: usize = 256;
 /// `Q6_K` on-disk block size: low-nibbles (128) + high-2-bits (64) + int8
 /// sub-scales (16) + `f16` super-scale (2).
 const Q6_K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+/// Packed 6-bit scale+min bytes per k-quant super-block (`Q4_K`/`Q5_K`).
+const K_SCALE_SIZE: usize = 12;
+/// `Q4_K` on-disk block size: `f16 d` (2) + `f16 dmin` (2) + packed 6-bit
+/// scales (12) + 4-bit quants (128).
+const Q4_K_BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 2;
+
+/// whisper.cpp `get_scale_min_k4`: unpack the 6-bit scale and 6-bit min for
+/// sub-block `j` (0..8) from a k-quant super-block's packed 12-byte `scales`
+/// array. Exact port (used by `Q4_K` and `Q5_K`).
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        let d = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (d, m)
+    }
+}
+
+/// Dequantize a `Q4_K` payload to `f32`. Each 144-byte super-block is `[f16 d,
+/// f16 dmin, scales[12], qs[128]]`; the 8 sub-scales/mins unpack via
+/// `get_scale_min_k4` and each 32-value sub-block is `x = d*sc*nibble −
+/// dmin*min`. Exact port of ggml `dequantize_row_q4_K`.
+fn dequant_q4_k(raw: &[u8], n_elements: usize) -> Vec<f32> {
+    let n_blocks = n_elements / QK_K;
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let base = b * Q4_K_BLOCK_BYTES;
+        let d = f16_at(raw, base);
+        let dmin = f16_at(raw, base + 2);
+        let scales = &raw[base + 4..base + 4 + K_SCALE_SIZE];
+        let qs = &raw[base + 4 + K_SCALE_SIZE..base + Q4_K_BLOCK_BYTES];
+        let mut y = b * QK_K;
+        let mut q = 0; // running offset into qs (+32 per 64-value group)
+        // Four 64-value groups; each consumes two 6-bit sub-scale/min pairs.
+        for group in 0..4 {
+            let is = group * 2;
+            let (sc, m) = get_scale_min_k4(is, scales);
+            let (d1, m1) = (d * f32::from(sc), dmin * f32::from(m));
+            let (sc, m) = get_scale_min_k4(is + 1, scales);
+            let (d2, m2) = (d * f32::from(sc), dmin * f32::from(m));
+            for l in 0..32 {
+                out[y + l] = d1 * f32::from(qs[q + l] & 0x0F) - m1;
+                out[y + l + 32] = d2 * f32::from(qs[q + l] >> 4) - m2;
+            }
+            y += 64;
+            q += 32;
+        }
+    }
+    out
+}
 
 /// Dequantize a `Q6_K` payload to `f32`. Each 210-byte super-block is `[ql[128],
 /// qh[64], int8 scales[16], f16 d]`; a 6-bit quant `(low-nibble | high-2-bits<<4)
@@ -229,6 +280,14 @@ fn ggml_byte_len(dtype: GgmlDType, n_elements: usize, name: &str) -> FwResult<us
                 )));
             }
             (n_elements / QK_K).checked_mul(Q6_K_BLOCK_BYTES)
+        }
+        GgmlDType::Q4_K => {
+            if !n_elements.is_multiple_of(QK_K) {
+                return Err(FwError::InvalidRequest(format!(
+                    "tensor '{name}' q4_k element count {n_elements} is not a multiple of {QK_K}"
+                )));
+            }
+            (n_elements / QK_K).checked_mul(Q4_K_BLOCK_BYTES)
         }
     };
     len.ok_or_else(|| FwError::InvalidRequest(format!("tensor '{name}' byte length overflow")))
@@ -445,10 +504,11 @@ impl GgmlModel {
         // base is a format we don't decode yet; the per-tensor parse is the real
         // gate (it rejects unsupported GGML_TYPEs).
         let base_ftype = hparams.ftype.rem_euclid(GGML_QNT_VERSION_FACTOR);
-        if !matches!(base_ftype, 0 | 1 | 2 | 3 | 7 | 8 | 9 | 14) {
+        if !matches!(base_ftype, 0 | 1 | 2 | 3 | 7 | 8 | 9 | 12 | 14) {
             return Err(FwError::Unsupported(format!(
                 "quantized ggml ftype {} (base {base_ftype}) is not supported \
-                 (only base 0=f32, 1=f16, 2=q4_0, 3=q4_1, 7=q8_0, 8=q5_0, 9=q5_1, 14=q6_k)",
+                 (only base 0=f32, 1=f16, 2=q4_0, 3=q4_1, 7=q8_0, 8=q5_0, 9=q5_1, \
+                 12=q4_k, 14=q6_k)",
                 hparams.ftype
             )));
         }
@@ -518,11 +578,13 @@ impl GgmlModel {
                 6 => GgmlDType::Q5_0,
                 7 => GgmlDType::Q5_1,
                 8 => GgmlDType::Q8_0,
+                12 => GgmlDType::Q4_K,
                 14 => GgmlDType::Q6_K,
                 other => {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
-                         (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0, 14=q6_k)"
+                         (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0, \
+                         12=q4_k, 14=q6_k)"
                     )));
                 }
             };
@@ -679,11 +741,13 @@ impl GgmlModel {
                 6 => GgmlDType::Q5_0,
                 7 => GgmlDType::Q5_1,
                 8 => GgmlDType::Q8_0,
+                12 => GgmlDType::Q4_K,
                 14 => GgmlDType::Q6_K,
                 other => {
                     return Err(FwError::Unsupported(format!(
                         "tensor element type {other} is not supported \
-                         (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0, 14=q6_k)"
+                         (only 0=f32, 1=f16, 2=q4_0, 3=q4_1, 6=q5_0, 7=q5_1, 8=q8_0, \
+                         12=q4_k, 14=q6_k)"
                     )));
                 }
             };
@@ -894,6 +958,16 @@ impl GgmlModel {
                     )));
                 }
                 dequant_q6_k(&raw, n_elements)
+            }
+            GgmlDType::Q4_K => {
+                let expect = ggml_byte_len(GgmlDType::Q4_K, n_elements, name)?;
+                if raw.len() != expect {
+                    return Err(FwError::InvalidRequest(format!(
+                        "tensor '{name}' q4_k byte length {} != {expect}",
+                        raw.len()
+                    )));
+                }
+                dequant_q4_k(&raw, n_elements)
             }
         };
 
@@ -1517,6 +1591,89 @@ mod tests {
         assert_eq!(out[64], -1.0);
         // q4 = (5 | 3<<4) - 32 =  21 → 0.5 * 4  *  21 =  42.0
         assert_eq!(out[96], 42.0);
+    }
+
+    #[test]
+    fn q4_k_byte_len_and_dequant_math() {
+        // Q4_K super-block: 144 bytes / 256 values = [f16 d, f16 dmin,
+        // scales[12] (6-bit packed), qs[128] (4-bit)]. 256 values = 1 block.
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q4_K, 256, "t").unwrap(),
+            Q4_K_BLOCK_BYTES
+        );
+        assert_eq!(
+            ggml_byte_len(GgmlDType::Q4_K, 512, "t").unwrap(),
+            2 * Q4_K_BLOCK_BYTES
+        );
+        assert!(ggml_byte_len(GgmlDType::Q4_K, 200, "t").is_err());
+
+        // get_scale_min_k4 in isolation: j<4 reads scales[j] & scales[j+4] (low
+        // 6 bits); j>=4 splices the high 2 bits of earlier bytes into bits 4-5.
+        let sc = [2u8, 3, 0, 0, 1, 4, 0, 0, 0x25, 0x31, 0, 0];
+        assert_eq!(get_scale_min_k4(0, &sc), (2, 1)); // scales[0]&63, scales[4]&63
+        assert_eq!(get_scale_min_k4(1, &sc), (3, 4)); // scales[1]&63, scales[5]&63
+        // j=4: d=(scales[8]&0xF)|((scales[0]>>6)<<4)=5|0, m=(scales[8]>>4)|((scales[4]>>6)<<4)=2|0
+        assert_eq!(get_scale_min_k4(4, &sc), (5, 2));
+        // j=5: d=(scales[9]&0xF)|((scales[1]>>6)<<4)=1|0, m=(scales[9]>>4)|((scales[5]>>6)<<4)=3|0
+        assert_eq!(get_scale_min_k4(5, &sc), (1, 3));
+
+        // Full super-block. d=1.0, dmin=0.5; the scales above; two 4-bit quants.
+        let mut raw = vec![0u8; Q4_K_BLOCK_BYTES];
+        raw[0..2].copy_from_slice(&Float16::from_f32(1.0).to_bits().to_le_bytes()); // d
+        raw[2..4].copy_from_slice(&Float16::from_f32(0.5).to_bits().to_le_bytes()); // dmin
+        raw[4..16].copy_from_slice(&sc); // scales[12]
+        // qs[0] at offset 16: low nibble 5 → out[0], high nibble 0xA=10 → out[32].
+        raw[16] = 0xA5;
+        // qs[64] at offset 16+64=80 (group 2, is=4/5): low 4 → out[128], high 2 → out[160].
+        raw[80] = 0x24;
+
+        let out = dequant_q4_k(&raw, QK_K);
+        assert_eq!(out.len(), QK_K);
+        // Group 0: d1 = 1*2 = 2, m1 = 0.5*1 = 0.5; d2 = 1*3 = 3, m2 = 0.5*4 = 2.
+        assert_eq!(out[0], 2.0 * 5.0 - 0.5); // 9.5
+        assert_eq!(out[32], 3.0 * 10.0 - 2.0); // 28.0
+        // Group 2: d1 = 1*5 = 5, m1 = 0.5*2 = 1; d2 = 1*1 = 1, m2 = 0.5*3 = 1.5.
+        assert_eq!(out[128], 5.0 * 4.0 - 1.0); // 19.0
+        assert_eq!(out[160], 1.0 * 2.0 - 1.5); // 0.5
+    }
+
+    #[test]
+    fn gated_q4_k_model_loads_and_dequants_close_to_f16() {
+        // Requires ggml-tiny.en-q4_k.bin (`whisper-quantize <f16> <out> q4_k`).
+        let (Some(q4_path), Some(f16_path)) =
+            (find_model_file("tiny.en-q4_k"), find_model_file("tiny.en"))
+        else {
+            eprintln!("SKIP gated_q4_k: ggml-tiny.en-q4_k.bin or ggml-tiny.en.bin not found");
+            return;
+        };
+        let q4 = GgmlModel::load(&q4_path).expect("load q4_k model");
+        let f16 = GgmlModel::load(&f16_path).expect("load f16 model");
+        assert_eq!(
+            q4.hparams.ftype.rem_euclid(1000),
+            12,
+            "q4_k model base ftype must be 12"
+        );
+        let q4_name = q4
+            .tensor_names()
+            .find(|n| q4.tensor(n).is_some_and(|e| e.dtype == GgmlDType::Q4_K))
+            .expect("q4_k model has at least one Q4_K tensor")
+            .to_owned();
+        let (qshape, qvals) = q4.tensor_f32(&q4_name).expect("q4_k dequant");
+        let (fshape, fvals) = f16.tensor_f32(&q4_name).expect("f16 dequant");
+        assert_eq!(qshape, fshape, "shape mismatch for '{q4_name}'");
+        assert!(
+            qvals.iter().all(|v| v.is_finite()),
+            "q4_k dequant produced non-finite values"
+        );
+        let n = fvals.len() as f32;
+        let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 =
+            qvals.iter().zip(&fvals).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+        // q4_k is a 4-bit k-quant (block scale+min, per-sub-block): within ~15%.
+        assert!(
+            mean_abs_diff < 0.15 * mean_abs,
+            "q4_k vs f16 mean|Δ| {mean_abs_diff} exceeds 15% of mean|w| {mean_abs} for '{q4_name}'"
+        );
     }
 
     #[test]
