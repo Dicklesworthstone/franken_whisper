@@ -52,6 +52,11 @@ storage.sqlite3-shm
 # Cargo lock is committed (binary crate)
 # Cargo.lock
 
+# ...but NOT for the standalone bench crates under benches/. Each is its own
+# throwaway workspace whose lock is regenerated on first build, and none of the
+# ~20 already in the tree has ever had one committed.
+benches/*/Cargo.lock
+
 # Temporary files
 *.tmp
 *.bak
