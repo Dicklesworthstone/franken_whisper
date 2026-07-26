@@ -49,16 +49,80 @@ for the retry (rather than optimising the retry) was the correct fix.
 **What this does NOT establish — the README cell stays as it is.** This is a
 **fw-vs-fw** ratio on **tiled jfk**. The published 0.78× is **fw-vs-whisper.cpp**
 on **track01**. Different comparison *and* different clip, so it cannot replace
-that cell. **`track01.wav` is not present anywhere on this host** (`find /`,
-2026-07-26), so the head-to-head cannot be reproduced here at all. Directionally
-a 2.2× reduction in tiny.en seg-TS wall time should move that cell from 0.78×
-toward or past parity, but that number must be measured, not inferred.
+that cell. Directionally a 2.2× reduction in tiny.en seg-TS wall time should move
+that cell from 0.78× toward or past parity, but that number must be measured, not
+inferred.
 
-**Retry predicate.** Re-run the head-to-head only when (1) `track01.wav` is
-restored to this host, and (2) `whisper-cli` is run matched-greedy (`-bs 1 -bo 1`)
-on the same host in the same session. Then replace the README/PERF_FRONTIER
-tiny.en seg-TS cell with the measured value and retire the "replacement pending"
-note. Until then the 0.78× row stands.
+> **CORRECTION (same day, before anyone relies on it).** The first version of
+> this row stated that **`track01.wav` is not present anywhere on this host** and
+> set a retry predicate of "restore the clip". **That was false.** I read the
+> `find /` task output while the search was still running, saw an empty file, and
+> mistook it for a completed search with no hits. The clip is present, twice, and
+> both copies are 3,983,660 bytes = **124.5 s @ 16 kHz mono**, matching the
+> frontier's "track01 124.5 s / 5 windows" exactly:
+>
+> ```text
+> /tmp/fw-cod-fw-track01-20260710/track01.wav
+> /data/tmp/claude-1000/-data-projects-franken-whisper/b2d67ecc-…/scratchpad/track01_16k.wav
+> ```
+>
+> The same false claim went into commit `e01ef81`'s message and the `bd-c9uv`
+> bead comment; both are corrected by this row. **Lesson for the fleet: an empty
+> background-task output file means "no output yet", not "no results" — check
+> that the job actually exited before drawing a conclusion from its silence.**
+
+**Retry predicate (corrected, then SATISFIED — see below).** The head-to-head was
+runnable here after all, and was run the same session.
+
+---
+
+### 2026-07-26 — the head-to-head, on the real clip: **0.78× → 1.35× (the losing cell flips)**
+
+Same host and session, tiny.en, real `track01.wav` (124.5 s / 5 windows,
+3,983,660 B @ 16 kHz), `probe_elf_sha256=21baa3ea…`.
+
+**A. Lever on the real clip (fw-vs-fw, §2 contract, 11 order-alternating pairs):**
+
+| arm | median | CI95 | cv | wins |
+|---|---|---|---|---|
+| A/A null | **1.039606×** | [1.004882, 1.123049] | 9.22% | — |
+| candidate | **1.634025×** | [1.504062, 1.775700] | 9.20% | **11/11** |
+
+1910.638 ms → 1229.593 ms. Gate `median_vs_null_ci95_2x_margin`: null half-width
+0.123049 ⇒ required 1.246098; candidate 1.634025 clears it. **KEEP.**
+`segments_exact=true`, 21 segments, **1,301 characters** both arms, oracle sha256
+`590ae52879a3306425b9781778e1c80639b45cbd3b67bc7d522dd00f034500b0` identical.
+The 1,301 independently confirms `b885ad8`'s own correctness claim.
+
+**Note the null median is 1.0396, not 1.0** — a ~4% skew on a contended host. It
+is not ignored: the gate derives its threshold from that null's half-width, which
+is why the bar was 1.246 rather than 1.10.
+
+**B. Head-to-head vs whisper.cpp, matched-greedy** (`whisper-cli -bs 1 -bo 1 -t 16`,
+tiny.en, same clip, same session):
+
+| engine | median total wall | reps |
+|---|---|---|
+| whisper.cpp greedy | **1740.7 ms** (load ~74 ms) | 4 (1745.4 / 1762.3 / 1731.2 / 1736.1 — ±2%) |
+| **fw, shipped no-carry** | **1290.6 ms** (A/B candidate median 1229.6 + measured load 61) | 11 pairs |
+
+**⇒ 1740.7 / 1290.6 = 1.35× — fw is now FASTER.** Three standalone fw reps
+(load 60/68/61 ms, transcribe 1.286/1.107/1.030 s, all 21 segs / 1,301 chars)
+put it as high as ~1.49×; the conservative 1.35× uses the interleaved A/B median,
+which is measured under contention and has a null control, so that is the number
+to quote.
+
+**Both arms of the old cell reproduce, which is what makes the flip credible.**
+whisper.cpp greedy measured 1740.7 ms here against the frontier's published
+**1.76 s**; the *historical* fw arm measured 1910.6 ms + 61 ms load ≈ 1.97 s
+against the published **2.24 s** (same order, remaining gap is host/session).
+The published ratio was 2.24/1.76 = 0.78×; the same comparison today is 1.35×.
+
+**Honest limits.** fw and whisper.cpp were run in the same session but **not
+interleaved with each other**, so this head-to-head has no cross-tool A/A null —
+only the fw-vs-fw arm does. whisper.cpp's spread was ±2% across 4 reps, so the
+comparison is not fragile, but it is a weaker instrument than part A. Anyone
+tightening this should interleave the two binaries within one harness.
 
 ## 2026-07-25 — HARNESS CONTRACT + 8 KEEPs — corrected resurrection and frontier pass (bd-2qqw)
 
