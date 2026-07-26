@@ -27,8 +27,9 @@ use crate::model::{
 /// stack; it measurably reduces the depth but does **not** on its own make a
 /// debug build fit in libtest's default 8 MiB thread stack — that needs the
 /// `RUST_MIN_STACK` set in `.cargo/config.toml`, which is where the full
-/// rationale lives. One allocation per statement is negligible against the
-/// statement itself.
+/// rationale lives. This is debug-only: a release build clears the same 202
+/// tests on the default stack with `RUST_MIN_STACK` unset. One allocation per
+/// statement is negligible against the statement itself.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     thread_local! {
         static RUNTIME: asupersync::runtime::Runtime =

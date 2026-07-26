@@ -45,9 +45,13 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 # The same 202 tests pass 202/0 with this set. Boxing the outermost future
 # (which `block_on` does) reduces the depth but does not by itself fix it.
 #
-# This is a test/dev ergonomics setting, not a correctness crutch for shipped
-# code: the value only sizes threads, is lazily mapped (an unused large stack
-# costs no resident memory), and does not affect codegen or timing.
+# DEBUG-ONLY, and that is measured, not assumed: the release test binary run
+# directly (bypassing cargo and this file, with RUST_MIN_STACK unset) passes the
+# same 202 tests on the default 8 MiB stack. So this is a test/dev ergonomics
+# setting, not a correctness crutch for shipped code — an installed `fw` binary,
+# which never sees this file, is unaffected. The value only sizes threads, is
+# lazily mapped (an unused large stack costs no resident memory), and does not
+# affect codegen or timing.
 #
 # REVERT: drop this block once the storage layer no longer drives async fsqlite
 # from a synchronous caller (e.g. if the sync surface is made async end to end).

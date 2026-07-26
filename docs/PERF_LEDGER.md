@@ -50,17 +50,27 @@ with the rationale, so every agent and CI run inherits it without knowing this
 story. The value only sizes threads, is lazily mapped, and does not affect
 codegen or timing.
 
-**Open question, stated rather than assumed:** the overflow was reproduced in a
-**debug** build, where frames are far larger (no inlining, every temporary
-materialized). Whether a **release** build also exceeds the default 8 MiB is
-**not yet measured** — `cargo test --release --lib storage::` at default stack
-was still compiling when this entry was written. It matters because an installed
-`fw` binary run outside cargo does not inherit `.cargo/config.toml`'s `[env]`.
-**Predicate:** if that release run overflows at default stack, the facade needs a
-dedicated big-stack worker thread owning the runtime (the shape `fsqlite`'s own
-`AsyncConnection` already uses internally) and this entry must be revised; if it
-passes, `RUST_MIN_STACK` is purely dev/test ergonomics and the shipped path is
-unaffected.
+**Scope of that overflow — measured, not assumed. It is debug-only.** The
+concern was that an installed `fw` binary run outside cargo does not inherit
+`.cargo/config.toml`'s `[env]`, so a release-mode overflow would have been a
+shipped bug requiring a different design. It is not: the **release** test binary
+was executed **directly**, bypassing cargo and its config entirely, with
+`RUST_MIN_STACK` explicitly unset —
+
+```
+env -u RUST_MIN_STACK target/release/deps/franken_whisper-<hash> storage::
+test result: ok. 202 passed; 0 failed  (0.49s)
+```
+
+Release frames are small enough that the poll chain fits the default 8 MiB with
+room to spare. So `RUST_MIN_STACK` is **purely a debug/test ergonomics setting**,
+the shipped path is unaffected, and the facade does **not** need the dedicated
+big-stack worker thread that `fsqlite`'s own `AsyncConnection` uses internally.
+
+**Retry predicate:** revisit only if a *release* run overflows (i.e. the fsqlite
+statement-future nesting grows materially deeper), or if the storage surface is
+ever driven from inside an executor — at which point `block_on` becomes a
+re-entrancy bug, not just a stack-depth one.
 
 **No nesting hazard.** `RunStore` is reachable only from the synchronous CLI
 (`main.rs` has no `async fn`, no runtime) and from its own tests;
