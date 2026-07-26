@@ -18,6 +18,7 @@ Audited by: cc / STRUCTURAL lane. Date: 2026-07-25.
 | REJECTs hand-audited this pass | 16 (the CV-gated subset — the class §2.3 predicts is void) |
 | Confirmed **VOID** | 4 |
 | Confirmed **SOUND** (decision survives the corrected gate) | 5 |
+| Re-run executed / re-won | 1 / 0 (see §4 — the re-run found a *third* defect class) |
 | Reclassified: not a REJECT at all (self-labelled blocker/surface row) | 2 |
 | Open/unmeasured half of a live row over the top owned frame | 1 |
 
@@ -142,8 +143,38 @@ This is exactly why §1 ranks by self-time rather than by claimed ratio.
 
 - Audited: 16 hand / 138 screened.
 - Void: 4.
-- Re-run: 0 completed this pass — **blocked, and the blocker is named in §5.**
-- Re-won: 0.
+- **Re-run: 1** — queue item #2 (`bd-7rxo`, speculation-controller Brier reuse),
+  its first execution ever. 3 runs × 21 order-alternated pairs, local, one
+  binary.
+- **Re-won: 0** — and the reason validates this whole exercise. See below.
+
+### The re-run found the same defect class this audit was written to catch
+
+`bd-7rxo` measured **1.186–1.193× median across three runs, 60/63 paired wins,
+against three *valid* A/A nulls** (median 0.9902–0.9997). A tempting KEEP. It is
+not one: the bench times its "historical" arm as `recommend() + apply()`, but
+`apply()` is *already the candidate* — it computes the Brier score once and
+threads it into `recommend_with_brier`. The baseline therefore does **2 folds +
+2 decision bodies** where the true historical `apply()` did **2 folds + 1**. It
+performs work the lever never removed, so the ratio is an **upper bound, not an
+estimate**, and no amount of extra sampling repairs it.
+
+That is the *same failure mode* as frankenmermaid's 0.000%-self-time rows and
+franken_networkx's StackCanon row — a bench that does not execute the code under
+test — except caught **before** a claim was banked rather than months after.
+Filed as `bd-203u` (runtime double-fold toggle so both arms are the real
+`apply()`), which now blocks `bd-7rxo`. Full row in `docs/NEGATIVE_EVIDENCE.md`.
+
+### It also confirmed §1's thesis on live measurements
+
+Candidate `cv` was **7.06 / 8.07 / 8.74%** across three runs of a demonstrably
+calibrated harness (null median within 1% of unity every time). The `cv < 0.05`
+assertion is what exited 101 on all three runs. **`cv < 5%` is not reachable on
+this hardware**, so `bd-7rxo`'s own acceptance criterion was unsatisfiable as
+written — exactly the pattern this audit found by reading, now reproduced by
+running. The null floor is also unstable under contention (null p90 moved
+1.0805 → 1.1990 → 1.0975), which is why a quiet host is part of the retry
+predicate.
 
 Honest statement: this repo does **not** have frankenlibc's 39-of-93 void rate.
 Its recent ledger discipline is genuinely good — every 2026-07-2x row carries a
@@ -160,9 +191,10 @@ sizeable effect thrown away by the gate (#3).
 
 ---
 
-## 5. Blocker that stopped the re-runs (fixed this session, but see the residue)
+## 5. Blocker that stopped the *other* re-runs (fixed this session, but see the residue)
 
-Both re-run candidates need a working bench. At the start of this session
+Queue item #2 ran (see §4). Items #1 and #3–#6 did not, and every one of them
+needs a working bench. At the start of this session
 **the crate did not compile at all**: the `frankensqlite` async migration
 (`54020c68`, `a0ab400a`, 2026-07-25) turned `fsqlite::Connection`'s `open` /
 `query` / `execute` / `*_with_params` into `async fn`, and this repo's fully
