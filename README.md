@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In matched-greedy CPU comparisons, the native engine is ~2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription and 1.10× faster on tiny.en no-timestamp transcription — and 0.78× (slower) on tiny.en segment-timestamp transcription, a known correctness-workaround cost.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In matched-greedy CPU comparisons, the native engine is ~2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription and 1.10× faster on tiny.en no-timestamp transcription. The last admitted tiny.en segment-timestamp result is 0.78× (slower); its targeted no-context fix is pending an allocated remeasurement.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -34,7 +34,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 > | large-v3-turbo, 124.5 s / 5 windows | no timestamps | **2.07× faster** |
 > | large-v3-turbo, isolated encoder | mode-independent | **2.29× faster** |
 > | tiny.en, 124.5 s / 5 windows | no timestamps | **1.10× faster** |
-> | tiny.en, 124.5 s / 5 windows | segment timestamps + full-coverage retry | **0.78× speed (slower)** |
+> | tiny.en, 124.5 s / 5 windows | segment timestamps, historical full-coverage retry | **0.78× speed (slower; replacement pending)** |
 
 ---
 
@@ -2585,7 +2585,7 @@ The in-process Rust native engine is faster than realtime on both `tiny.en` and 
 | int8 encoder (v0.5.0) | `large-v3-turbo` | fw-vs-fw lever | **1.47–1.67× encoder** (quality-safe, calibrated, WER-neutral) |
 | SDPA poly-exp (v0.5.0) | `large-v3-turbo` | fw-vs-fw lever | **1.0722× e2e** (byte-identical transcript, WER Δ 0.000) |
 
-**The `tiny.en` segment-timestamp cell is a real loss, and it is a correctness cost, not a compute deficit.** In timestamp mode on `tiny.en`, a carried prior-window prompt can make the decoder emit `eot` immediately, dropping the window (`bd-r0qd`). The default `FW_RETRY_FAILED_WINDOW` recovers the content by re-decoding that window once with the prompt cleared, which restores full coverage but **re-decodes ~2 windows** (fw 2.24 s vs whisper.cpp-greedy 1.76 s). Removing the loss means removing the *need* for the retry — the retry itself already reuses the first attempt's encode and only fires when a prompt was actually carried. Tracked in [the performance frontier](docs/PERF_FRONTIER.md).
+**The `tiny.en` segment-timestamp cell is the last admitted result, and it is a correctness cost, not a compute deficit.** In timestamp mode on `tiny.en`, a carried prior-window prompt can make the decoder emit `eot` immediately, dropping the window (`bd-r0qd`). The default `FW_RETRY_FAILED_WINDOW` recovers the content by re-decoding that window once with the prompt cleared, which restores full coverage but **re-decodes ~2 windows** (fw 2.24 s vs whisper.cpp-greedy 1.76 s). The native engine now suppresses cross-window prompt carry for this exact model/mode by default, matching `whisper.cpp`'s `no_context` policy; the historical behavior remains available through an explicit context request or `FW_TINY_EN_TS_CONTEXT=1`. Lane L has not been allocated a measurement window, so the table deliberately keeps the old 0.78× result until the new same-ELF A/A-first gate can replace it.
 
 **Withdrawn claim.** Earlier revisions of this section reported **~2.3× faster on `tiny.en`** (Apple M4 Pro) and **~1.5×** on `large-v3-turbo`. Those runs compared franken's greedy decode against `whisper.cpp`'s **default** beam-5/best-of-5 — roughly 5× the decode work, at higher quality — so they credited franken for work the reference was doing and franken was not. They are withdrawn and replaced by the matched-greedy table above. The correction is recorded in full at `docs/PERF_FRONTIER.md` ("CORRECTION 2026-07-13").
 
@@ -2596,9 +2596,9 @@ Because OpenAI's reference Whisper (Python/PyTorch) is itself slower than `whisp
 - **Paired null (A/A) control, same binary** — every A/B ships alongside an identity null (candidate vs candidate) run in the same invocation with arms ABBA-interleaved, so host contention and run-order bias cannot masquerade as a speedup. A run whose null is not centred on 1.0 is thrown away, not reported.
 - **Byte/ULP-exact where claimed** — byte-exact levers are asserted bit-identical to the reference path; the sole numerics-affecting default (poly-exp) is held to WER-Δ 0.000 vs `whisper.cpp`.
 - **Negative-evidence ledger** — rejected levers are recorded with a reject-id, their null control, and a concrete retry predicate, so a dead end stays dead. See [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md) and the void audit in [`docs/LEDGER_RESURRECTION.md`](docs/LEDGER_RESURRECTION.md).
-- **Known gate defect (2026-07-25).** Several benches additionally assert `cv < 5%` and `candidate p10 > null p90`. Both are stricter than the null floor this hardware can deliver — measured A/A nulls here span roughly ±10–20%, and a calibrated harness still reports `cv` of 7–9%. Those two gates have rejected effects that were real, so results decided by them are being re-adjudicated on the median-vs-null-CI rule. Treat any row citing a `cv` gate as unresolved rather than settled.
+- **Known gate defect (2026-07-25).** Several legacy benches additionally asserted `cv < 5%` and `candidate p10 > null p90`. Both are stricter than the null floor this hardware can deliver — measured A/A nulls here span roughly ±10–20%, and a calibrated harness still reports `cv` of 7–9%. Those two gates rejected effects that were real, so verdicts decided by either gate are being re-adjudicated on the median-vs-null-CI rule. Modern rows may still report CV as provenance; CV never decides their verdict.
 
-**Honest scope.** These are **greedy / temperature-0** comparisons — the native fast path does not yet implement beam search or temperature fallback, so this is not a quality-matched comparison against `whisper.cpp`'s defaults, which decode better. Measured on a **quiet host**; the head-to-head ratio degrades under contention, and whole-pipeline rows on a shared box are load-sensitive (the isolated-encoder 2.29× is the confound-free anchor). The full measured record lives in [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
+**Honest scope.** These are **greedy / temperature-0** comparisons: the native engine's beam search and temperature fallback are not enabled in these rows, and the reference is explicitly forced to the same greedy decoding mode (`-bs 1 -bo 1`). They are therefore matched-greedy speed comparisons, not comparisons against `whisper.cpp`'s higher-quality default beam-5/best-of-5 decode. Measured on a **quiet host**; the head-to-head ratio degrades under contention, and whole-pipeline rows on a shared box are load-sensitive (the isolated-encoder 2.29× is the confound-free anchor). The full measured record lives in [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
 
 ### Audio Normalization
 
