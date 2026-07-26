@@ -2571,7 +2571,7 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 
 ### Native Engine Speed (measured)
 
-The in-process Rust native engine is faster than realtime on both `tiny.en` and `large-v3-turbo`. Against `whisper.cpp` it wins clearly on encoder-heavy work, wins modestly on decode-heavy work, and **loses one cell** — all figures below are **matched-greedy** (both engines forced to greedy: `whisper-cli -bs 1 -bo 1`), measured 2026-07-12 on a 32-core x86 box at each engine's best thread count.
+The in-process Rust native engine is faster than realtime on both `tiny.en` and `large-v3-turbo`. Against `whisper.cpp` it now wins every head-to-head cell listed below—clearly on encoder-heavy work and modestly on decode-heavy work. Every comparison is **matched-greedy** (both engines forced to greedy: `whisper-cli -bs 1 -bo 1`): the original table was measured 2026-07-12 on a 32-core x86 box at each engine's best thread count, and the corrected `tiny.en` segment-timestamp cell was remeasured 2026-07-26 on the same clip.
 
 | Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|
