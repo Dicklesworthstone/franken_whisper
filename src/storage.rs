@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fsqlite::Connection;
+use fsqlite::{Connection, FrankenError, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::de::DeserializeOwned;
 
@@ -13,8 +13,99 @@ use crate::model::{
     TranscriptionResult,
 };
 
+/// Drive `future` to completion on this thread's runtime.
+///
+/// The runtime is built once per thread rather than once per statement: a
+/// single `persist_report` issues many statements, and the concurrency tests
+/// drive several threads at once.
+///
+/// The future is boxed before it is polled. `fsqlite`'s statement futures nest
+/// deeply (statement dispatch → DML → triggers → nested statement execution —
+/// deep enough that `fsqlite` raises its own `recursion_limit` to type-check
+/// them), so both their state machines and the synchronous poll chain that
+/// drives them are large. Boxing moves the outermost state machine off the
+/// stack; it measurably reduces the depth but does **not** on its own make a
+/// debug build fit in libtest's default 8 MiB thread stack — that needs the
+/// `RUST_MIN_STACK` set in `.cargo/config.toml`, which is where the full
+/// rationale lives. One allocation per statement is negligible against the
+/// statement itself.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    thread_local! {
+        static RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build franken_whisper storage runtime");
+    }
+    RUNTIME.with(|runtime| runtime.block_on(Box::pin(future)))
+}
+
+/// Synchronous facade over the now-`async` [`fsqlite::Connection`].
+///
+/// The frankensqlite async migration turned every statement entry point —
+/// `open`, `query`, `execute`, and the `*_with_params` variants — into
+/// `async fn`. Every consumer of the run store (the CLI in `main.rs`, robot
+/// mode, and the JSONL sync) is synchronous and is never itself driven by an
+/// executor, so propagating `async` across the whole storage surface would buy
+/// no concurrency and would force a runtime into `main`. Instead the bridge
+/// lives here, mirroring the `block_on` bridge frankensqlite added for its own
+/// synchronous harnesses.
+///
+/// Method names, argument types, and error types are deliberately identical to
+/// the `Connection` inherent methods they wrap, so the call sites in this
+/// module and in [`crate::sync`] keep their existing shape and error mapping.
+pub struct BlockingConnection {
+    inner: Connection,
+}
+
+impl std::fmt::Debug for BlockingConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingConnection").finish_non_exhaustive()
+    }
+}
+
+impl BlockingConnection {
+    pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
+        block_on(Connection::open(path)).map(|inner| Self { inner })
+    }
+
+    pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
+        block_on(self.inner.query(sql))
+    }
+
+    pub fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<Vec<Row>, FrankenError> {
+        block_on(self.inner.query_with_params(sql, params))
+    }
+
+    pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
+        block_on(self.inner.execute(sql))
+    }
+
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        block_on(self.inner.execute_with_params(sql, params))
+    }
+
+    pub fn execute_with_params_skip_statement_savepoint_in_explicit_txn(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        block_on(
+            self.inner
+                .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params),
+        )
+    }
+}
+
 pub struct RunStore {
-    connection: Connection,
+    connection: BlockingConnection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +152,7 @@ impl RunStore {
         }
 
         for attempt in 0..=PERSIST_BUSY_RETRY_ATTEMPTS {
-            let connection_result = Connection::open(db_path.display().to_string());
+            let connection_result = BlockingConnection::open(db_path.display().to_string());
             match connection_result {
                 Ok(connection) => {
                     let store = Self { connection };
@@ -1421,7 +1512,7 @@ pub struct WalCheckpointInfo {
 /// transaction state.
 #[derive(Debug)]
 pub struct ConcurrentPersistSession<'conn> {
-    connection: &'conn Connection,
+    connection: &'conn BlockingConnection,
     savepoint_name: String,
     finished: bool,
 }
@@ -1667,7 +1758,7 @@ fn next_persist_savepoint_name() -> String {
     format!("fw_persist_{id}")
 }
 
-fn rollback_savepoint(connection: &Connection, savepoint_name: &str) -> FwResult<()> {
+fn rollback_savepoint(connection: &BlockingConnection, savepoint_name: &str) -> FwResult<()> {
     let rollback_sql = format!("ROLLBACK TO SAVEPOINT {savepoint_name};");
     connection
         .execute(&rollback_sql)
@@ -1736,7 +1827,7 @@ mod tests {
         RunReport, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
 
-    use super::{RunStore, value_to_string};
+    use super::{BlockingConnection, RunStore, value_to_string};
 
     #[test]
     fn persists_and_lists_runs() {
@@ -3004,7 +3095,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Corrupt result_json directly in the database.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE runs SET result_json = ?1 WHERE id = ?2",
             &[
@@ -3042,7 +3133,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Corrupt an event's payload_json.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE events SET payload_json = ?1 WHERE run_id = ?2 AND seq = ?3",
             &[
@@ -3134,7 +3225,7 @@ mod tests {
         report.warnings = vec!["a real warning".to_owned()];
         store.persist_report(&report).expect("persist");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE runs SET warnings_json = ?1 WHERE id = ?2",
             &[
@@ -3159,7 +3250,7 @@ mod tests {
         let report = minimal_report("run-bad-replay", &db_path);
         store.persist_report(&report).expect("persist");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "UPDATE runs SET replay_json = ?1 WHERE id = ?2",
             &[
@@ -3181,7 +3272,7 @@ mod tests {
         let db_path = dir.path().join("legacy.sqlite3");
 
         // Create a DB manually WITHOUT replay_json (simulating older schema).
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -3460,7 +3551,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Insert a corrupt event directly via raw SQL.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             &[
@@ -3513,7 +3604,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Overwrite result_json with an empty string.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "UPDATE runs SET result_json = ?1 WHERE id = ?2",
             &[
@@ -3546,7 +3637,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Update the denormalized transcript column with a meaningful value.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "UPDATE runs SET transcript = ?1 WHERE id = ?2",
             &[
@@ -3814,7 +3905,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Delete all rows from the segments table for this run.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute_with_params(
             "DELETE FROM segments WHERE run_id = ?1",
             &[SqliteValue::Text("run-segsrc".to_owned().into())],
@@ -3918,7 +4009,7 @@ mod tests {
         store.persist_report(&report).expect("persist");
 
         // Overwrite the denormalized transcript column with a different value.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         conn.execute_with_params(
             "UPDATE runs SET transcript = ?1 WHERE id = ?2",
             &[
@@ -4039,7 +4130,7 @@ mod tests {
         let db_path = dir.path().join("preserve.sqlite3");
 
         // Create a DB manually (without _meta) that already has modern columns.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -4109,7 +4200,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("future.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
         conn.execute_with_params(
@@ -4204,7 +4295,7 @@ mod tests {
         let db_path = dir.path().join("no_version_key.sqlite3");
 
         // Create a bare DB with _meta table but no schema_version row.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
 
@@ -4247,7 +4338,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("bad_version.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
         conn.execute_with_params(
@@ -5765,7 +5856,7 @@ mod tests {
         let db_path = dir.path().join("v2_to_v3.sqlite3");
 
         // Manually create a v2 database.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -6742,7 +6833,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("idx_preserve.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("open");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("open");
         // Create v1 schema (no replay_json, no acceleration_json).
         conn.execute(
             "CREATE TABLE runs (\
@@ -6957,7 +7048,7 @@ mod tests {
 
         // Create a "fresh shape" DB at version 0: tables with both columns
         // present but no schema_version key in _meta.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -7071,7 +7162,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("v1_data.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         // Create v1 schema.
         conn.execute(
             "CREATE TABLE runs (\
@@ -7160,7 +7251,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("partial_v1.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -7261,7 +7352,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("rollback_failpoint.sqlite3");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (\
                 id TEXT PRIMARY KEY, \
@@ -7375,7 +7466,7 @@ mod tests {
         let db_path = dir.path().join("ver_insert.sqlite3");
 
         // Create a bare DB with _meta but no schema_version row.
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = BlockingConnection::open(db_path.display().to_string()).expect("conn");
         conn.execute("CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .expect("create _meta");
         // Also create required tables so RunStore operations work.

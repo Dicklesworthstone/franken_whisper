@@ -31,3 +31,25 @@
 # default codegen while x86_64 (linux/windows/intel-mac) keeps the AVX2/FMA win.
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# Stack size for threads cargo spawns (tests, benches, `cargo run`).
+#
+# WHY: `fsqlite`'s statement API is `async fn`, and `RunStore` drives it
+# synchronously through `storage::block_on` (see the `BlockingConnection` doc
+# comment). Those futures nest deeply — statement dispatch -> DML -> triggers ->
+# nested statement execution, deep enough that `fsqlite` raises its own
+# `recursion_limit` just to type-check them — so the synchronous poll chain is
+# stack-hungry. In a DEBUG build (no inlining, every temporary materialized) that
+# chain overflows libtest's default 8 MiB thread stack: `cargo test --lib storage::`
+# aborted with SIGABRT ("has overflowed its stack") after only 3 of 202 tests.
+# The same 202 tests pass 202/0 with this set. Boxing the outermost future
+# (which `block_on` does) reduces the depth but does not by itself fix it.
+#
+# This is a test/dev ergonomics setting, not a correctness crutch for shipped
+# code: the value only sizes threads, is lazily mapped (an unused large stack
+# costs no resident memory), and does not affect codegen or timing.
+#
+# REVERT: drop this block once the storage layer no longer drives async fsqlite
+# from a synchronous caller (e.g. if the sync surface is made async end to end).
+[env]
+RUST_MIN_STACK = "67108864"

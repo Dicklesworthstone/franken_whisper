@@ -96,6 +96,7 @@ fn main() {
         max_text_ctx: None,
         word_timestamps: wordts,
         model_hint: Some(model_short.to_string()),
+        ..DecodeParams::default()
     };
 
     // warm (mmap/page-in) then timed
@@ -131,7 +132,11 @@ fn main() {
     // Layer-skip self-draft accept rate (only when FW_DRAFT_ACCEPT_LAYERS is set).
     if let Ok(k) = std::env::var("FW_DRAFT_ACCEPT_LAYERS") {
         let (m, tot) = franken_whisper::native_engine::decoder::drain_draft_accept();
-        let pct = if tot > 0 { 100.0 * m as f64 / tot as f64 } else { 0.0 };
+        let pct = if tot > 0 {
+            100.0 * m as f64 / tot as f64
+        } else {
+            0.0
+        };
         eprintln!(
             "DRAFT_ACCEPT k={k} layers: {m}/{tot} decode steps matched full argmax = {pct:.1}% accept"
         );

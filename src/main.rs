@@ -493,7 +493,9 @@ mod tests {
         store.persist_report(&older).expect("persist good");
         store.persist_report(&newer).expect("persist bad");
 
-        let connection = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let connection =
+            franken_whisper::storage::BlockingConnection::open(db_path.display().to_string())
+                .expect("conn");
         connection
             .execute_with_params(
                 "UPDATE runs SET result_json = ?1 WHERE id = ?2",
