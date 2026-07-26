@@ -1,5 +1,10 @@
 //! Self-attention SCORE-DOT lever (BlackThrush, 2026-07-04).
 //!
+//! Measurement probe only — never linked into the library. It hand-writes the
+//! AVX2 intrinsics it is timing, so it opts out of the workspace
+//! `unsafe_code = "deny"` lint the same way `native_engine::nn` does for its
+//! own kernels.
+//!
 //! `attention_decode_step` (nn.rs:3205-3212) computes the per-token self-attn
 //! scores with a SCALAR sequential f32 reduction:
 //!   for j in 0..tk { let mut acc=0; for d in 0..d_head { acc += qh[d]*(k[j,d]*scale) } scores[j]=acc }
@@ -18,6 +23,8 @@
 //!      — measures whether even a mild reorder helps and by how much its |Δ|.
 //! Reports per-token score-dot µs (20 heads × tk keys), ratio, and max|Δ| vs scalar.
 //! Usage: `self_attn_score_dot_probe [iters]`  (turbo shapes: n_head=20, d_head=64).
+#![allow(unsafe_code)]
+
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::hint::black_box;
@@ -43,7 +50,14 @@ fn scalar_scores(qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out:
 /// NON-byte-exact: 4 partial sums reduced at the end (reordered).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn avx2_scores_4acc(qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out: &mut [f32]) {
+unsafe fn avx2_scores_4acc(
+    qh: &[f32],
+    k: &[f32],
+    scale: f32,
+    base: usize,
+    tk: usize,
+    out: &mut [f32],
+) {
     let vscale = _mm256_set1_ps(scale);
     let qp = qh.as_ptr();
     for j in 0..tk {
@@ -81,21 +95,31 @@ unsafe fn avx2_scores_4acc(qh: &[f32], k: &[f32], scale: f32, base: usize, tk: u
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
     let scale = (D_HEAD as f32).powf(-0.25);
     // deterministic synthetic q (one token) + K cache
     let mut st = 0x9E37_79B9_7F4A_7C15u64;
     let mut nf = || {
-        st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
         ((st >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
     };
     let qfull: Vec<f32> = (0..N_STATE).map(|_| nf()).collect();
 
-    println!("self-attn score dot: scalar vs AVX2 4-accum (turbo n_head={N_HEAD}, d_head={D_HEAD})");
+    println!(
+        "self-attn score dot: scalar vs AVX2 4-accum (turbo n_head={N_HEAD}, d_head={D_HEAD})"
+    );
     for &tk in &[32usize, 64, 128, 224] {
         let k: Vec<f32> = (0..tk * N_STATE).map(|_| nf()).collect();
         let mut sc_scalar = vec![0.0f32; N_HEAD * tk];
@@ -104,9 +128,25 @@ fn main() {
         // correctness + warm
         for h in 0..N_HEAD {
             let base = h * D_HEAD;
-            scalar_scores(&qfull[base..base + D_HEAD], &k, scale, base, tk, &mut sc_scalar[h * tk..(h + 1) * tk]);
+            scalar_scores(
+                &qfull[base..base + D_HEAD],
+                &k,
+                scale,
+                base,
+                tk,
+                &mut sc_scalar[h * tk..(h + 1) * tk],
+            );
             #[cfg(target_arch = "x86_64")]
-            unsafe { avx2_scores_4acc(&qfull[base..base + D_HEAD], &k, scale, base, tk, &mut sc_avx[h * tk..(h + 1) * tk]); }
+            unsafe {
+                avx2_scores_4acc(
+                    &qfull[base..base + D_HEAD],
+                    &k,
+                    scale,
+                    base,
+                    tk,
+                    &mut sc_avx[h * tk..(h + 1) * tk],
+                );
+            }
         }
         let mad = max_abs_diff(&sc_scalar, &sc_avx);
 
@@ -114,7 +154,14 @@ fn main() {
         for _ in 0..iters {
             for h in 0..N_HEAD {
                 let base = h * D_HEAD;
-                scalar_scores(&qfull[base..base + D_HEAD], black_box(&k), scale, base, tk, &mut sc_scalar[h * tk..(h + 1) * tk]);
+                scalar_scores(
+                    &qfull[base..base + D_HEAD],
+                    black_box(&k),
+                    scale,
+                    base,
+                    tk,
+                    &mut sc_scalar[h * tk..(h + 1) * tk],
+                );
             }
             black_box(sc_scalar[0]);
         }
@@ -125,7 +172,16 @@ fn main() {
             for h in 0..N_HEAD {
                 let base = h * D_HEAD;
                 #[cfg(target_arch = "x86_64")]
-                unsafe { avx2_scores_4acc(&qfull[base..base + D_HEAD], black_box(&k), scale, base, tk, &mut sc_avx[h * tk..(h + 1) * tk]); }
+                unsafe {
+                    avx2_scores_4acc(
+                        &qfull[base..base + D_HEAD],
+                        black_box(&k),
+                        scale,
+                        base,
+                        tk,
+                        &mut sc_avx[h * tk..(h + 1) * tk],
+                    );
+                }
             }
             black_box(sc_avx[0]);
         }
@@ -133,8 +189,15 @@ fn main() {
 
         println!(
             "  tk={tk:>3}: scalar {:>7.2} µs  avx4 {:>7.2} µs  = {:>4.2}×   max|Δ|={:.2e} ({})",
-            t_scalar * 1e6, t_avx * 1e6, t_scalar / t_avx, mad,
-            if mad == 0.0 { "BYTE-EXACT" } else { "non-byte-exact (reordered sum)" }
+            t_scalar * 1e6,
+            t_avx * 1e6,
+            t_scalar / t_avx,
+            mad,
+            if mad == 0.0 {
+                "BYTE-EXACT"
+            } else {
+                "non-byte-exact (reordered sum)"
+            }
         );
     }
     println!(

@@ -3097,7 +3097,7 @@ fn sync_overwrite_policy_replaces_conflicting_run() {
 
 #[test]
 fn sync_overwrite_strict_policy_replaces_conflicting_segment_row() {
-    use fsqlite::Connection;
+    use franken_whisper::storage::BlockingConnection as Connection;
     use fsqlite_types::SqliteValue;
 
     let dir = tempdir().expect("tempdir");

@@ -8,7 +8,11 @@ use chrono::Utc;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use fsqlite::Connection;
+// The JSONL sync drives the database synchronously from the CLI. `fsqlite`'s
+// own `Connection` is async as of the frankensqlite async migration, so this
+// module speaks to it through the crate's blocking facade; every `Connection`
+// below is that facade, with the same statement methods and error type.
+use crate::storage::BlockingConnection as Connection;
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1322,7 +1326,9 @@ fn apply_run_row(
             ConflictPolicy::Overwrite | ConflictPolicy::OverwriteStrict => {
                 let existing_segment_idxs =
                     query_segment_idxs_for_run(connection, id).map_err(|error| {
-                        FwError::Storage(format!("overwrite capture segments `{id}` failed: {error}"))
+                        FwError::Storage(format!(
+                            "overwrite capture segments `{id}` failed: {error}"
+                        ))
                     })?;
                 tracking
                     .overwritten_segment_idxs_before
@@ -1346,7 +1352,9 @@ fn apply_run_row(
                         &[SqliteValue::Text(id.to_owned().into())],
                     )
                     .map_err(|error| {
-                        FwError::Storage(format!("overwrite delete segments `{id}` failed: {error}"))
+                        FwError::Storage(format!(
+                            "overwrite delete segments `{id}` failed: {error}"
+                        ))
                     })?;
                 connection
                     .import_exec(
@@ -1489,7 +1497,13 @@ fn record_segment_pre(
     overwritten_run_ids: &HashSet<String>,
     state: &mut SegmentImportState,
 ) -> FwResult<()> {
-    ensure_run_reference_exists(connection, run_id, "segments", key, &mut state.known_run_ids)?;
+    ensure_run_reference_exists(
+        connection,
+        run_id,
+        "segments",
+        key,
+        &mut state.known_run_ids,
+    )?;
     if conflict_policy == ConflictPolicy::Overwrite && overwritten_run_ids.contains(run_id) {
         state
             .imported_idx_by_overwritten_run
@@ -1528,7 +1542,8 @@ fn apply_segment_row(
         ) && optional_floats_equal(
             sqlite_to_optional_f64(existing.get(3)),
             json_to_optional_f64(row, "end_sec"),
-        ) && sqlite_to_optional_text(existing.get(4)) == json_to_optional_text(row, "speaker")
+        ) && sqlite_to_optional_text(existing.get(4))
+            == json_to_optional_text(row, "speaker")
             && value_to_string_sqlite(existing.get(5)) == json_str(row, "text")?
             && optional_floats_equal(
                 sqlite_to_optional_f64(existing.get(6)),
@@ -1633,7 +1648,9 @@ fn flush_segment_chunk(
         .collect();
     let rows = connection
         .query_with_params(&sql, &params)
-        .map_err(|error| FwError::Storage(format!("batch query segments existing failed: {error}")))?;
+        .map_err(|error| {
+            FwError::Storage(format!("batch query segments existing failed: {error}"))
+        })?;
 
     let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
     for r in &rows {
@@ -1954,7 +1971,9 @@ fn flush_event_chunk(
         .collect();
     let rows = connection
         .query_with_params(&sql, &params)
-        .map_err(|error| FwError::Storage(format!("batch query events existing failed: {error}")))?;
+        .map_err(|error| {
+            FwError::Storage(format!("batch query events existing failed: {error}"))
+        })?;
 
     let mut existing_map: HashMap<(String, i64), Vec<SqliteValue>> = HashMap::new();
     for r in &rows {
@@ -5844,7 +5863,7 @@ mod tests {
         let export_dir = dir.path().join("export");
         let state_root = dir.path().join("state");
 
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = Connection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, \
              finished_at TEXT NOT NULL, backend TEXT NOT NULL, input_path TEXT NOT NULL, \
@@ -6410,7 +6429,7 @@ mod tests {
         // DB has runs + events tables but NO segments → should fail on iteration 2.
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("no_segments.sqlite3");
-        let conn = fsqlite::Connection::open(db_path.display().to_string()).expect("conn");
+        let conn = Connection::open(db_path.display().to_string()).expect("conn");
         conn.execute(
             "CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, \
              finished_at TEXT NOT NULL, backend TEXT NOT NULL, input_path TEXT NOT NULL, \
@@ -8304,8 +8323,7 @@ mod tests {
         assert_eq!(manifest.row_counts.events, 6); // 3 runs × 2 events
 
         let import_db = dir.path().join("import.sqlite3");
-        let result =
-            import_inner(&import_db, &export_dir, ConflictPolicy::Reject).expect("import");
+        let result = import_inner(&import_db, &export_dir, ConflictPolicy::Reject).expect("import");
         assert_eq!(result.runs_imported, 3);
 
         let imported = RunStore::open(&import_db).expect("open imported");
@@ -8781,8 +8799,7 @@ mod tests {
         let store = RunStore::open(&db_path).expect("open");
         // Access the raw connection via the store's public API indirectly:
         // Open a separate connection for this test.
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // No runs -> no export position.
         let result = max_export_position(&conn, None).expect("should succeed");
@@ -8798,8 +8815,7 @@ mod tests {
         let report = fixture_report("ts-run", &db_path);
         store.persist_report(&report).expect("persist");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // With cursor far in the future, no runs match -> None.
         let far_future = test_cursor("2099-12-31T23:59:59Z", Some("zzzzzz"));
@@ -8818,8 +8834,7 @@ mod tests {
         let store = RunStore::open(&db_path).expect("open");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         ensure_schema(&conn).expect("schema");
 
         let mut known_run_ids = HashSet::new();
@@ -8849,8 +8864,7 @@ mod tests {
         let report = fixture_report("has-segments", &db_path);
         store.persist_report(&report).expect("persist");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let output_path = dir.path().join("segments.jsonl");
         let (count, _sha256) =
             export_table_segments_for_runs(&conn, &output_path, &[]).expect("should succeed");
@@ -9481,8 +9495,7 @@ mod tests {
         late.finished_at_rfc3339 = "2026-06-15T12:00:05Z".to_owned();
         store.persist_report(&late).expect("persist late");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // Cursor positioned at early should return late's tuple.
         let after_early = test_cursor("2026-01-01T00:00:05Z", Some("run-early"));
@@ -9508,8 +9521,7 @@ mod tests {
             .persist_report(&fixture_report("evt-run", &db_path))
             .expect("persist");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         let out_path = dir.path().join("events_empty.jsonl");
         let (count, _sha256) = export_table_events_for_runs(&conn, &out_path, &[]).expect("export");
@@ -9536,8 +9548,7 @@ mod tests {
         r3.finished_at_rfc3339 = "2026-06-01T00:00:05Z".to_owned();
         store.persist_report(&r3).expect("persist r3");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // None filter → all 3 IDs
         let all = collect_exported_run_ids(&conn, None).expect("all");
@@ -9599,8 +9610,7 @@ mod tests {
         r2.finished_at_rfc3339 = "2026-05-20T00:00:05Z".to_owned();
         store.persist_report(&r2).expect("persist r2");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // No filter → both runs exported.
         let all_path = dir.path().join("all_runs.jsonl");
@@ -10258,8 +10268,7 @@ mod tests {
         late.started_at_rfc3339 = "2026-06-15T12:00:00Z".to_owned();
         store.persist_report(&late).expect("persist late");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // No filter → returns the overall maximum.
         let result = max_started_at(&conn, None).expect("query");
@@ -10956,8 +10965,7 @@ mod tests {
         let export_dir = dir.path().join("export");
 
         // Create a bare SQLite file with no tables.
-        let _conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("create bare db");
+        let _conn = Connection::open(db_path.display().to_string()).expect("create bare db");
 
         // Create empty JSONL files so validate_sync doesn't fail on missing files.
         fs::create_dir_all(&export_dir).expect("mkdir");
@@ -11047,8 +11055,7 @@ mod tests {
         store
             .persist_report(&fixture_report("run-b", &db_path))
             .expect("persist run-b");
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         conn.execute_with_params(
             "DELETE FROM runs WHERE id = ?1",
             &[SqliteValue::Text("run-a".to_owned().into())],
@@ -11106,8 +11113,7 @@ mod tests {
         r2.finished_at_rfc3339 = "2026-06-01T00:00:05Z".to_owned();
         store.persist_report(&r2).expect("persist r2");
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         // Cursor with None run_id → unwrap_or_default() = "".
         // Both runs have finished_at == cursor ts, and id > "" for any real id.
@@ -11262,8 +11268,7 @@ mod tests {
         fs::write(&runs_path, serde_json::to_string(&parsed).unwrap()).expect("write");
 
         // Update the DB to have default "{}" for both columns.
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         conn.execute_with_params(
             "UPDATE runs SET replay_json = '{}', acceleration_json = '{}' WHERE id = ?1",
             &[SqliteValue::Text("legacy-1".to_owned().into())],
@@ -11306,8 +11311,7 @@ mod tests {
             .expect("persist");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
 
         let mut known = HashSet::new();
         // First call: queries DB, inserts into known_run_ids.
@@ -11339,8 +11343,7 @@ mod tests {
         store.persist_report(&r2).expect("persist r2");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let run_count = count_table(&conn, "runs").expect("count runs");
         assert_eq!(run_count, 2, "should count 2 runs");
 
@@ -11361,8 +11364,7 @@ mod tests {
         store.persist_report(&r).expect("persist");
         drop(store);
 
-        let conn =
-            fsqlite::Connection::open(db_path.display().to_string()).expect("open connection");
+        let conn = Connection::open(db_path.display().to_string()).expect("open connection");
         let output_path = dir.path().join("runs.jsonl");
 
         // Cursor with a future timestamp — no runs should match.
@@ -12584,8 +12586,7 @@ mod tests {
         // the 1st's insert via the seen-map, exactly as the per-line SELECT would).
         let dir = tempdir().expect("tempdir");
         let mk = |name: &str| {
-            let c = Connection::open(dir.path().join(name).display().to_string())
-                .expect("open");
+            let c = Connection::open(dir.path().join(name).display().to_string()).expect("open");
             ensure_schema(&c).expect("schema");
             c
         };
@@ -12677,7 +12678,11 @@ mod tests {
 
         let d = dump(&cbat);
         assert_eq!(d, dump(&cref), "batched import diverged from per-line");
-        assert_eq!(d.len(), 3, "x,y,z — the intra-chunk dup must not double-insert y");
+        assert_eq!(
+            d.len(),
+            3,
+            "x,y,z — the intra-chunk dup must not double-insert y"
+        );
         assert_eq!(d[0][3], "gpu", "x overwritten to gpu");
     }
 
@@ -12689,8 +12694,7 @@ mod tests {
         // intra-chunk DUPLICATE (run_id, idx) that must see the earlier insert.
         let dir = tempdir().expect("tempdir");
         let mk = |name: &str| {
-            let c = Connection::open(dir.path().join(name).display().to_string())
-                .expect("open");
+            let c = Connection::open(dir.path().join(name).display().to_string()).expect("open");
             ensure_schema(&c).expect("schema");
             c
         };
@@ -12764,8 +12768,14 @@ mod tests {
             for (run_id, idx, row) in &import_rows {
                 let key = format!("{run_id}/{idx}");
                 record_segment_pre(
-                    &cref, run_id, *idx, &key,
-                    ConflictPolicy::OverwriteStrict, &imp, &ovr, &mut st,
+                    &cref,
+                    run_id,
+                    *idx,
+                    &key,
+                    ConflictPolicy::OverwriteStrict,
+                    &imp,
+                    &ovr,
+                    &mut st,
                 )
                 .expect("pre");
                 let existing_rows = cref
@@ -12776,8 +12786,14 @@ mod tests {
                     .expect("select");
                 let existing = existing_rows.first().map(segment_row_to_cols);
                 apply_segment_row(
-                    &cref, run_id, *idx, &key, row, existing.as_deref(),
-                    ConflictPolicy::OverwriteStrict, &mut cf,
+                    &cref,
+                    run_id,
+                    *idx,
+                    &key,
+                    row,
+                    existing.as_deref(),
+                    ConflictPolicy::OverwriteStrict,
+                    &mut cf,
                 )
                 .expect("apply");
             }
@@ -12789,8 +12805,13 @@ mod tests {
             let (imp, ovr) = (HashSet::new(), HashSet::new());
             let mut chunk = import_rows.clone();
             let n = flush_segment_chunk(
-                &cbat, &mut chunk, ConflictPolicy::OverwriteStrict,
-                &mut Vec::new(), &mut st, &imp, &ovr,
+                &cbat,
+                &mut chunk,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut st,
+                &imp,
+                &ovr,
             )
             .expect("flush");
             assert_eq!(n, 3);
@@ -12798,8 +12819,16 @@ mod tests {
         }
 
         let d = dump(&cbat);
-        assert_eq!(d, dump(&cref), "batched segment import diverged from per-line");
-        assert_eq!(d.len(), 2, "(r1,0)+(r1,1); intra-chunk dup must not double-insert");
+        assert_eq!(
+            d,
+            dump(&cref),
+            "batched segment import diverged from per-line"
+        );
+        assert_eq!(
+            d.len(),
+            2,
+            "(r1,0)+(r1,1); intra-chunk dup must not double-insert"
+        );
         assert_eq!(d[0][5], "new", "(r1,0) overwritten to 'new'");
     }
 
@@ -12810,8 +12839,7 @@ mod tests {
         // fresh insert, intra-chunk duplicate (run_id, seq) → seen-map).
         let dir = tempdir().expect("tempdir");
         let mk = |name: &str| {
-            let c = Connection::open(dir.path().join(name).display().to_string())
-                .expect("open");
+            let c = Connection::open(dir.path().join(name).display().to_string()).expect("open");
             ensure_schema(&c).expect("schema");
             c
         };
@@ -12882,8 +12910,14 @@ mod tests {
             for (run_id, seq, row) in &import_rows {
                 let key = format!("{run_id}/{seq}");
                 record_event_pre(
-                    &cref, run_id, *seq, &key,
-                    ConflictPolicy::OverwriteStrict, &imp, &ovr, &mut st,
+                    &cref,
+                    run_id,
+                    *seq,
+                    &key,
+                    ConflictPolicy::OverwriteStrict,
+                    &imp,
+                    &ovr,
+                    &mut st,
                 )
                 .expect("pre");
                 let existing_rows = cref
@@ -12894,8 +12928,14 @@ mod tests {
                     .expect("select");
                 let existing = existing_rows.first().map(event_row_to_cols);
                 apply_event_row(
-                    &cref, run_id, *seq, &key, row, existing.as_deref(),
-                    ConflictPolicy::OverwriteStrict, &mut cf,
+                    &cref,
+                    run_id,
+                    *seq,
+                    &key,
+                    row,
+                    existing.as_deref(),
+                    ConflictPolicy::OverwriteStrict,
+                    &mut cf,
                 )
                 .expect("apply");
             }
@@ -12906,8 +12946,13 @@ mod tests {
             let (imp, ovr) = (HashSet::new(), HashSet::new());
             let mut chunk = import_rows.clone();
             let n = flush_event_chunk(
-                &cbat, &mut chunk, ConflictPolicy::OverwriteStrict,
-                &mut Vec::new(), &mut st, &imp, &ovr,
+                &cbat,
+                &mut chunk,
+                ConflictPolicy::OverwriteStrict,
+                &mut Vec::new(),
+                &mut st,
+                &imp,
+                &ovr,
             )
             .expect("flush");
             assert_eq!(n, 3);
@@ -12915,8 +12960,16 @@ mod tests {
         }
 
         let d = dump(&cbat);
-        assert_eq!(d, dump(&cref), "batched event import diverged from per-line");
-        assert_eq!(d.len(), 2, "(r1,0)+(r1,1); intra-chunk dup must not double-insert");
+        assert_eq!(
+            d,
+            dump(&cref),
+            "batched event import diverged from per-line"
+        );
+        assert_eq!(
+            d.len(),
+            2,
+            "(r1,0)+(r1,1); intra-chunk dup must not double-insert"
+        );
         assert_eq!(d[0][5], "new", "(r1,0) message overwritten to 'new'");
     }
 

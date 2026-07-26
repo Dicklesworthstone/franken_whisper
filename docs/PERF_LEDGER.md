@@ -4,6 +4,105 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-25 — LANDED / INSTRUMENT UNBLOCK — synchronous facade over the now-async fsqlite `Connection` (bd-30yg)
+
+**Not a perf lever — the precondition for every perf lever.** This entry is here
+because the repo's measurement instrument was dead, and a ledger with no
+runnable bench is a ledger that cannot be added to.
+
+**What broke.** The frankensqlite async migration (`54020c68`, `a0ab400a`,
+2026-07-25) turned `fsqlite::Connection::{open, query, execute,
+query_with_params, execute_with_params,
+execute_with_params_skip_statement_savepoint_in_explicit_txn}` into `async fn`.
+`franken_whisper`'s storage/sync surface is entirely synchronous and called them
+directly, so HEAD did not compile: **235 errors** across `src/storage.rs` and
+`src/sync.rs` (`cargo check --all-targets`). No test, bench, gate, or
+conformance run in this repo was executable, for either campaign lane.
+
+**The fix, and why this shape.** A `BlockingConnection` facade in
+`src/storage.rs` — a thread-local `asupersync` current-thread `Runtime` plus
+`block_on`. This is not an invention: it is the same bridge the owner added to
+frankensqlite's own synchronous harnesses in `a0ab400a`, for the same reason
+(sync trait/CLI surfaces that cannot simply `.await`, and where making them
+async would rewrite the callers for no concurrency gain). Propagating `async`
+here would have reached `main.rs` and the whole CLI.
+
+The facade's method names, argument types, and error types are **identical** to
+the `Connection` methods they wrap, which is what keeps the change small: all
+~235 call sites are untouched. `src/sync.rs` needed one import
+(`use crate::storage::BlockingConnection as Connection;`) plus 18
+fully-qualified `fsqlite::Connection::open` renames — no signature churn in that
+12,800-line file. Net diff **+156 / −64** across 7 files.
+
+**One non-obvious consequence: driving these futures synchronously is
+stack-hungry.** `fsqlite`'s statement futures nest deeply enough that `fsqlite`
+raises its own `recursion_limit` to type-check them, so both the state machines
+and the poll chain that drives them are large. In a **debug** build this
+overflows libtest's default 8 MiB thread stack: `cargo test --lib storage::`
+aborted with SIGABRT ("has overflowed its stack") after only **3 of 202** tests.
+
+Two things were needed, and the distinction matters for anyone rewriting this:
+`block_on` boxes the outermost future (`Box::pin`), which reduces the depth but
+is **not sufficient on its own** — the suite still aborted with the box in
+place, just in a different test. The fix that actually clears it is
+`RUST_MIN_STACK = "67108864"`, now set declaratively in `.cargo/config.toml`
+with the rationale, so every agent and CI run inherits it without knowing this
+story. The value only sizes threads, is lazily mapped, and does not affect
+codegen or timing.
+
+**Open question, stated rather than assumed:** the overflow was reproduced in a
+**debug** build, where frames are far larger (no inlining, every temporary
+materialized). Whether a **release** build also exceeds the default 8 MiB is
+**not yet measured** — `cargo test --release --lib storage::` at default stack
+was still compiling when this entry was written. It matters because an installed
+`fw` binary run outside cargo does not inherit `.cargo/config.toml`'s `[env]`.
+**Predicate:** if that release run overflows at default stack, the facade needs a
+dedicated big-stack worker thread owning the runtime (the shape `fsqlite`'s own
+`AsyncConnection` already uses internally) and this entry must be revised; if it
+passes, `RUST_MIN_STACK` is purely dev/test ergonomics and the shipped path is
+unaffected.
+
+**No nesting hazard.** `RunStore` is reachable only from the synchronous CLI
+(`main.rs` has no `async fn`, no runtime) and from its own tests;
+`orchestrator.rs` — which does own an `asupersync` runtime — references only the
+`FwError::Storage` variant, not the struct. So no `block_on` is ever entered
+from inside a running executor.
+
+**Also fixed, same gate:** `examples/e2e_probe.rs` was missing the newer
+`DecodeParams` fields (`beam_size` / `initial_prompt` / `max_context` /
+`suppress_nst`), and two archived AVX2 probe examples violated the workspace
+`unsafe_code = "deny"` lint. Both were pre-existing and unrelated to the async
+migration; both were failing `--all-targets`.
+
+**Verification.** `cargo check --all-targets` **green** (235 → 0).
+`cargo test --lib storage::` **202 passed / 0 failed** (debug, with the
+`RUST_MIN_STACK` below), including `concurrent_persist_10_threads_with_segments_and_events`,
+which exercises the per-thread runtime across 10 threads.
+
+On formatting: neutrality was checked rather than assumed. Before the editor's
+formatter ran, per-file rustfmt diff-hunk counts were **identical to HEAD** for
+every file touched (`src/sync.rs` 19 → 19, the three examples 1/8/9 unchanged,
+`src/storage.rs` clean) — i.e. these edits introduced **zero** new drift. The
+files were subsequently auto-formatted, so all five now report **0** drift
+hunks; that is why their diffs are larger than the semantic change (`src/sync.rs`
+58 → 185 lines). The incidental hunks are pre-existing nightly-churn drift being
+paid down, not behaviour. The repo's remaining ~43-file rustfmt drift and its red
+`clippy -D warnings` are the same pre-existing churn, out of scope here.
+
+**Residual blocker (NOT fixed here): `bd-dd90`.** Remote benching remains
+unavailable. `rch` refuses this workspace with **RCH-E410** (missing remote
+entrypoint `crates/fsqlite/tests/zz_aggincomposite_bench.rs`), and when it does
+dispatch, worker `ovh-a` fails to compile `fsqlite-pager` (exit 101) — the same
+crate builds fine locally, so the remote checkout is stale. Force local with
+`env RCH_MIN_LOCAL_TIME_MS=999999999 …`; note an inline `VAR=x cargo …` prefix
+gets mangled by the PreToolUse hook into `sh -c` and fails with `not found`.
+
+**Retry predicate for the remote path:** re-attempt strict-remote benches only
+after `bd-dd90` clears *both* failure modes — (1) the E410 entrypoint exists on
+the worker, AND (2) `cargo build -p fsqlite-pager` succeeds on the assigned
+worker. Until then, single-binary paired micro-benches run local (admissible per
+the campaign harness contract §2.2); 32-thread encoder gates do not.
+
 ## 2026-07-24 — REJECT 2/3 — fuse correction-evidence diagnostic scans (bd-34fr)
 
 Fresh ledger/history screening found no prior attempt for this exact seam.

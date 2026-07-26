@@ -18,13 +18,19 @@
 //     gather 1->428ms, 8->98ms, 16->80ms, 24->79.6, 32->85, 64->79.3 => FLAT past 16.
 // The gather is cold/DRAM-latency-bound at ~80ms/window, parallelism-saturated at the
 // default 16 chunks. Do not "optimize" it based on its low apparent GB/s.
-use std::time::Instant;
+//
+// Measurement probe only — never linked into the library. It hand-writes the AVX2
+// intrinsics it is timing, so it opts out of the workspace `unsafe_code = "deny"`
+// lint the same way `native_engine::nn` does for its own kernels.
+#![allow(unsafe_code)]
+
 use std::thread;
+use std::time::Instant;
 
 const HH: usize = 20;
 const T: usize = 1500;
-const D: usize = 64;      // d_head
-const NS: usize = 1280;   // n_state = HH*D
+const D: usize = 64; // d_head
+const NS: usize = 1280; // n_state = HH*D
 
 // V0: current impl — dest-order, strided READ, contiguous WRITE.
 fn gather_v0(dst: &mut [f32], src: &[f32]) {
@@ -97,7 +103,9 @@ fn gather_v1_mt(dst: &mut [f32], src: &[f32], nt: usize) {
     thread::scope(|s| {
         for c in 0..nt {
             let i0 = c * per;
-            if i0 >= T { break; }
+            if i0 >= T {
+                break;
+            }
             let i1 = (i0 + per).min(T);
             let src = &src;
             s.spawn(move || {
@@ -117,18 +125,28 @@ fn gather_v1_mt(dst: &mut [f32], src: &[f32], nt: usize) {
     });
 }
 
-fn bench<F: FnMut(&mut [f32], &[f32])>(name: &str, src: &[f32], reps: usize, truth: &[f32], mut f: F) {
+fn bench<F: FnMut(&mut [f32], &[f32])>(
+    name: &str,
+    src: &[f32],
+    reps: usize,
+    truth: &[f32],
+    mut f: F,
+) {
     let mut dst = vec![0f32; HH * T * D];
     // warm
     f(&mut dst, src);
     assert_eq!(&dst[..], truth, "{name} not byte-identical!");
     let mut best = f64::MAX;
     for _ in 0..reps {
-        for v in dst.iter_mut() { *v = 0.0; }
+        for v in dst.iter_mut() {
+            *v = 0.0;
+        }
         let t = Instant::now();
         f(&mut dst, src);
         let e = t.elapsed().as_secs_f64() * 1e3;
-        if e < best { best = e; }
+        if e < best {
+            best = e;
+        }
     }
     // bytes moved: read 7.68MB + write 7.68MB = 15.36MB
     let gbps = (2.0 * (HH * T * D) as f64 * 4.0) / (best / 1e3) / 1e9;
@@ -137,14 +155,22 @@ fn bench<F: FnMut(&mut [f32], &[f32])>(name: &str, src: &[f32], reps: usize, tru
 
 // COLD bench: evict caches with a >L3 sweep before each timed rep (latency-bound,
 // mimics the in-engine gather whose src was just written by the QKV GEMM & evicted).
-fn bench_cold<F: FnMut(&mut [f32], &[f32])>(name: &str, src: &[f32], reps: usize, truth: &[f32], mut f: F) {
+fn bench_cold<F: FnMut(&mut [f32], &[f32])>(
+    name: &str,
+    src: &[f32],
+    reps: usize,
+    truth: &[f32],
+    mut f: F,
+) {
     let mut dst = vec![0f32; HH * T * D];
     let mut evict = vec![0u8; 256 * 1024 * 1024]; // 256MB >> 128MB L3
     f(&mut dst, src);
     assert_eq!(&dst[..], truth, "{name} not byte-identical!");
     let mut times = Vec::new();
     for _ in 0..reps {
-        for (j, v) in evict.iter_mut().enumerate() { *v = (j & 0xff) as u8; }
+        for (j, v) in evict.iter_mut().enumerate() {
+            *v = (j & 0xff) as u8;
+        }
         std::hint::black_box(&evict);
         let t = Instant::now();
         f(&mut dst, src);
