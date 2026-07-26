@@ -4,6 +4,76 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-25 - YellowKite: **NO ADMISSIBLE VERDICT (bd-7rxo) — the speculation-controller Brier reuse measures 1.186–1.193× median, 60/63 paired wins, against three VALID A/A nulls — but the harness's "historical" arm is not the historical code, so the number is an upper bound and cannot be banked.**
+
+**This is the first execution of bd-7rxo's A/B.** The production change and harness
+landed at `fd3bdd5`; the retry predicate (a worker able to finish under RCH's
+1,800 s limit) was recorded as satisfied, but no arm had ever run. The blocker
+was more basic than scheduling: the crate did not compile at all until `d92b511`
+(see `docs/PERF_LEDGER.md`). Run local, single binary, `pipeline_bench`
+sha256 `92e139feea6db4dbb9d6e424104e539bce3ab88c4f50edf4ec484799d15db241`,
+`inner_steps=200000`, 21 order-alternated pairs per run, 3 independent runs.
+Host: 64 cores, load 8.8–10.8, **contended** (another repo's `redis-benchmark`
+pinned at 100%). Note per the campaign harness contract §2.1 that a shell-computed
+sha next to the run is weaker evidence than a self-reporting ELF hash; this bench
+does not self-report, which is a harness gap worth closing.
+
+| run | null p10 / **median** / p90 | candidate p10 / **median** / p90 | wins | cand cv |
+|---|---|---|---|---|
+| 1 | 0.8944 / **0.9928** / 1.0805 | 1.0247 / **1.1857** / 1.2880 | 20/21 | 7.06% |
+| 2 | — / **0.9902** / **1.1990** | 1.0892 / **1.1916** / — | 20/21 | 8.07% |
+| 3 | 0.9550 / **0.9997** / 1.0975 | 1.0925 / **1.1925** / 1.3034 | 20/21 | 8.74% |
+
+**What is established.** The A/A identity null is *valid* in all three runs
+(median 0.9902–0.9997, inside the declared 0.95–1.05 band), so the harness is
+calibrated. The direction is unambiguous and tightly reproducible: candidate
+median 1.186–1.193 (0.7% spread across runs) and **60/63** paired wins.
+Byte-exactness is not in question — it holds by construction (the Brier score is
+a pure function of calibration state that is not mutated between the two
+historical reads) and is asserted before any timing by the bench's oracle over
+five calibration regimes, plus the landed test
+`speculation_controller_reused_brier_preserves_action_and_evidence`.
+
+**Why it is nevertheless not bankable — the historical arm is a proxy, and it
+overstates.** The bench times `HISTORICAL = recommend() + apply()`. But `apply()`
+is *already the candidate*: it computes the Brier score once and threads it into
+`recommend_with_brier`. So the measured baseline is **2 folds + 2 decision
+bodies**, whereas the true historical `apply()` was **2 folds + 1 decision body**
+(one fold inside `recommend()`, a second for the fallback latch). The baseline
+therefore performs one extra `recommend_with_brier` pass that the real lever
+never removed, and the measured ratio is an **upper bound** on the lever's
+effect, not an estimate of it. No amount of extra sampling fixes this; it is a
+construction defect, and it is exactly the "the bench does not execute the code
+under test" failure class the campaign's §1 was written to catch — caught here
+before a KEEP was claimed rather than after.
+
+**Second, weaker problem: the null floor is unstable on a contended host.** Under
+the median-CI gate (candidate median outside the A/A null envelope with a 2×
+margin) this passes run 1 (margin 2.31×), fails run 2 outright (null p90 1.1990
+swallows the candidate median 1.1916), and lands just under on run 3 (1.97×).
+One noisy run moved null p90 by 11 points.
+
+**Third, a finding that outlives this row: `cv < 5%` is unreachable here.**
+Candidate CV was 7.06 / 8.07 / 8.74% across three runs of a *calibrated* harness
+whose null median sat within 1% of unity. bd-7rxo's own acceptance criterion
+("21-pair same-worker A/B/null with CV<5%") is therefore unsatisfiable as
+written, and the bench's `assert!(candidate_cv < 0.05)` is what exited 101 on all
+three runs — together with `speedup_p10 > max(null_p90, 1.10)`, which demands
+near-total distribution non-overlap. Both gates should be replaced by the
+median-CI gate. This independently confirms, on live measurements, the
+`docs/LEDGER_RESURRECTION.md` finding that this repo's rejections are being
+driven by decision rules the hardware cannot satisfy.
+
+**Retry predicate (concrete).** Re-run only after BOTH: (1) `SpeculationWindowController`
+gains a runtime toggle that forces the historical double-fold *inside* `apply()`
+— mirroring `set_sdpa_poly_exp` / `set_sgemm_tile_balanced`, since an env
+`OnceLock` cannot flip between arms in one binary — so both arms are the REAL
+`apply()` differing only by that flag; AND (2) the host is quiet (load < 2, no
+competing benchmark process), verified before the run. Then decide on the
+median-CI gate with a 2× margin and report `cv` as provenance only. Until then
+the lever stays landed and byte-identical, with **no** speed claim attached.
+
+---
 ## 2026-07-24 - WhiteCreek: **KEEP — ROBUSTNESS (corrupt/truncated model) — a partially-downloaded ggml model errors CLEANLY from load()/from_ggml, never a panic or silent garbage-weight load.**
 
 A production engine gets corrupt/partial model downloads. The header parser already
