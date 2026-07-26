@@ -4,6 +4,62 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > release measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
+## 2026-07-26 — KEEP — tiny.en segment-TS no-carry policy measured: **2.218×**, byte-identical (bd-c9uv)
+
+**This is the measurement `b885ad8` shipped without.** That commit landed the
+tiny.en segment-timestamp no-carry policy and — correctly — did *not* bank a
+speed claim, leaving the README's 0.78× cell in place as "replacement pending"
+because Lane L had no measurement window. The window opened with the disk
+all-clear; this row supplies the number.
+
+**Result.** `e2e_probe` `PROBE_CONTEXT_AB=1`, 11 order-alternating pairs,
+tiny.en, `jfk.wav` tiled ×12 (≈132 s ≈ 5 windows — the multi-window shape the
+bug needs), local `release-perf`, self-reported
+`probe_elf_sha256=21baa3eaa69f7347ea8455b45160912f4f56c10f1dfe01f34e14256f9b9a513d`
+(11,486,272 bytes).
+
+| arm | median | CI95 | cv | wins |
+|---|---|---|---|---|
+| **A/A null** (identity) | **1.001443×** | [0.925608, 1.082653] | 6.71% | — |
+| **candidate vs historical** | **2.217776×** | [2.133651, 2.316621] | 5.84% | **11/11** |
+
+Historical median **2524.670 ms** → candidate **1140.043 ms**.
+
+**Gate.** `median_vs_null_ci95_2x_margin`: null half-width 0.082653 ⇒ required
+speedup 1.165305; candidate median 2.217776 clears it by ~13×. **`cv` is
+provenance only and decided nothing** — note it is 5.84%, i.e. this lever would
+have been *rejected* by the old `cv < 5%` gate despite a 2.2× effect against a
+valid null. That is the campaign's §2.3 thesis reproduced on a live measurement.
+
+**Behaviour proof, before timing.** `segments_exact=true`, 25 segments and 1,246
+characters in both arms, `sha256` of the full segment oracle (count, per-segment
+start/end/length/bytes) **identical**:
+`608b357976428428e9372c4251665ca9644b27f0ae859fc55f0bae63de29efda`. The policy
+changes *when a window needs re-decoding*, not what it produces.
+
+**Mechanism confirmed, not assumed.** The historical arm carries the prior-window
+prompt, a window closes with no timestamp (`result_len == 0`), and the default-on
+`FW_RETRY_FAILED_WINDOW` re-decodes it. Output is therefore *identical* by design
+— the retry recovers the content — and the entire cost shows up as wall time.
+2524.670 ms vs 1140.043 ms is that retry. This also answers the open question
+filed in `bd-c9uv`: a failed attempt is **not** a cheap early `eot`; it is
+expensive enough to more than double the run, which is why removing the *need*
+for the retry (rather than optimising the retry) was the correct fix.
+
+**What this does NOT establish — the README cell stays as it is.** This is a
+**fw-vs-fw** ratio on **tiled jfk**. The published 0.78× is **fw-vs-whisper.cpp**
+on **track01**. Different comparison *and* different clip, so it cannot replace
+that cell. **`track01.wav` is not present anywhere on this host** (`find /`,
+2026-07-26), so the head-to-head cannot be reproduced here at all. Directionally
+a 2.2× reduction in tiny.en seg-TS wall time should move that cell from 0.78×
+toward or past parity, but that number must be measured, not inferred.
+
+**Retry predicate.** Re-run the head-to-head only when (1) `track01.wav` is
+restored to this host, and (2) `whisper-cli` is run matched-greedy (`-bs 1 -bo 1`)
+on the same host in the same session. Then replace the README/PERF_FRONTIER
+tiny.en seg-TS cell with the measured value and retire the "replacement pending"
+note. Until then the 0.78× row stands.
+
 ## 2026-07-25 — HARNESS CONTRACT + 8 KEEPs — corrected resurrection and frontier pass (bd-2qqw)
 
 **Harness contract first.** The active `pipeline_bench` and
