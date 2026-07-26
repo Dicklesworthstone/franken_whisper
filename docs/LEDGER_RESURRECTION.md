@@ -11,6 +11,46 @@ opposed to detecting it and finding it absent.
 
 ---
 
+## 0a. Correction to revision 2 — the population was half its true size
+
+Building the enforcement guard (broadcast 2) exposed a counting error in this
+document. Revision 2 audited **139 rows whose header contains "REJECT"**. But
+this repo does not have a verdict *column* — rejections live in prose titles, and
+a large fraction never use the word. The `int4 mlp_0` family, for instance, is
+closed under *DEAD*, *CLOSED*, *FALSIFIED* and *NEGATIVE* and says "REJECT"
+nowhere.
+
+Counting the vocabulary this repo actually uses
+(`REJECT|DEAD|CLOSED|FALSIFIED|NO-SHIP|DO-NOT-RETRY|NEGATIVE`, dated rows only):
+
+| | revision 2 | **corrected** |
+|---|---:|---:|
+| rejection-verdict rows | 139 | **277** |
+| rows recording no decidability evidence | 82 | **99** |
+| void rate | 59% | **36%** |
+
+The corrected rate is *lower* because the widened population brings in many rows
+that do record evidence — not because the standard was relaxed. It is measured
+with the calibrated marker set now enforced by `tests/ledger_integrity.rs`
+(word-boundary matched, with the false-positive traps in §0b removed), which is
+stricter than revision 2's hand-rescue pass. **Treat 277 / 99 / 36% as this
+repo's figures.**
+
+## 0b. Two false-positive traps, in case other repos screen the same way
+
+Both were caught while calibrating the guard, and both would have silently
+inflated a "clean ledger" claim:
+
+- **`"wer"` matches inside *were*, *lower*, *answer*.** Substring matching made
+  the first draft of the guard pass **96%** of historical rows. Word-boundary
+  matching is mandatory.
+- **`"byte-identical"` is a claim of exactness, not an accuracy refutation.** A
+  row reading *"byte-identical but 1.02×, rejected"* would have passed on it
+  while recording no null at all. Only `non-byte-exact` — an actual refutation —
+  counts. Likewise bare `"slower"` (54 of 169 rows, nearly all prose) and bare
+  `"allocation"` were dropped in favour of a numeric `≤ 0.90×` test and specific
+  phrases like `"allocations unchanged"`.
+
 ## 0. Correction to revision 1 — I audited the wrong class
 
 Revision 1 of this document concluded that *"this repo does **not** have frankenlibc's
@@ -168,6 +208,44 @@ is unreachable here, so `bd-7rxo`'s own acceptance criterion was unsatisfiable a
 written. Note this does *not* make CV the epidemic — only 3 rows died on it.
 
 ---
+
+## 4b. Institutionalization (broadcast 2) — the audit is now enforced, not documented
+
+frankensqlite sits at **1.7% void** having audited months ago and then made the
+check mechanical; every repo that audited once and stopped drifted to 25–91%.
+**Ledger integrity decays.** So this audit ships with enforcement:
+
+**`tests/ledger_integrity.rs`** — runs under the mandatory `cargo test` gate,
+modelled on this repo's existing `tests/no_canned_phrases.rs` honesty guard. A
+rejection row dated on or after `2026-07-26` must record at least one reason it
+was *decidable*: an A/A null, a counted mechanism, an accuracy/faithfulness
+refutation, a `≤ 0.90×` loss, or a profile-first self-time/Amdahl rejection.
+Otherwise the build fails, naming the row and the remedy. Writing a
+non-provable rejection is now impossible rather than discouraged.
+
+- History is **grandfathered and pinned**: `LEGACY_NONCOMPLIANT_BUDGET = 99`.
+  Failing on legacy rows would make the test permanently red, and a permanently
+  red test gets deleted — which is exactly how the discipline decays. The budget
+  may only shrink, so backdating a row to dodge the cutoff trips it instead.
+- The guard is **validated in both directions**, because a guard that only ever
+  passes is worse than none: a synthetic row *"REJECT — measured 1.02x and we
+  moved on"* fails it with a file:line citation, and the same row with an A/A
+  null recorded passes. A third test asserts the parser still sees >500 entries
+  and >200 rejection rows, so a ledger format change makes it fail loudly rather
+  than pass vacuously.
+
+**`examples/ledger_preflight.rs`** — the frankensqlite `sql_pipeline_candidate_preflight`
+analogue, run *before* touching source:
+
+```text
+cargo run --example ledger_preflight -- int4 mlp_0
+BLOCKED — 1 binding prior rejection(s):  (exit 2)
+```
+
+It distinguishes the two cases this campaign showed are different: **BLOCKED
+(exit 2)** when a matching prior rejection records why it was decidable, and
+**VOID PRIOR (exit 0)** when it records none — the latter is *not* binding and
+the lever is live, which is the whole point of the resurrection audit.
 
 ## 5. Blockers
 
