@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In matched-greedy CPU comparisons, the native engine is ~2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription and 1.10× faster on tiny.en no-timestamp transcription. The last admitted tiny.en segment-timestamp result is 0.78× (slower); its targeted no-context fix is pending an allocated remeasurement.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In matched-greedy CPU comparisons, the native engine is ~2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription and 1.10× faster on tiny.en no-timestamp transcription. The tiny.en segment-timestamp cell, previously a 0.78× loss, is now **1.35× faster** after the no-context fix — remeasured 2026-07-26 on the same clip.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -34,7 +34,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 > | large-v3-turbo, 124.5 s / 5 windows | no timestamps | **2.07× faster** |
 > | large-v3-turbo, isolated encoder | mode-independent | **2.29× faster** |
 > | tiny.en, 124.5 s / 5 windows | no timestamps | **1.10× faster** |
-> | tiny.en, 124.5 s / 5 windows | segment timestamps, historical full-coverage retry | **0.78× speed (slower; replacement pending)** |
+> | tiny.en, 124.5 s / 5 windows | segment timestamps | **1.35× faster** (was 0.78× before the no-context fix) |
 
 ---
 
@@ -2581,11 +2581,18 @@ The in-process Rust native engine is faster than realtime on both `tiny.en` and 
 | vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, word timestamps (DTW) | **~1.71× faster** |
 | vs `whisper.cpp` (CPU) | `tiny.en` | 840 s, no timestamps | **1.47× faster** |
 | vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, no timestamps | **1.10× faster** |
-| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, segment timestamps | **0.78× — SLOWER** (see below) |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, segment timestamps | **1.35× faster** (was **0.78× — slower**; see below) |
 | int8 encoder (v0.5.0) | `large-v3-turbo` | fw-vs-fw lever | **1.47–1.67× encoder** (quality-safe, calibrated, WER-neutral) |
 | SDPA poly-exp (v0.5.0) | `large-v3-turbo` | fw-vs-fw lever | **1.0722× e2e** (byte-identical transcript, WER Δ 0.000) |
 
-**The `tiny.en` segment-timestamp cell is the last admitted result, and it is a correctness cost, not a compute deficit.** In timestamp mode on `tiny.en`, a carried prior-window prompt can make the decoder emit `eot` immediately, dropping the window (`bd-r0qd`). The default `FW_RETRY_FAILED_WINDOW` recovers the content by re-decoding that window once with the prompt cleared, which restores full coverage but **re-decodes ~2 windows** (fw 2.24 s vs whisper.cpp-greedy 1.76 s). The native engine now suppresses cross-window prompt carry for this exact model/mode by default, matching `whisper.cpp`'s `no_context` policy; the historical behavior remains available through an explicit context request or `FW_TINY_EN_TS_CONTEXT=1`. Lane L has not been allocated a measurement window, so the table deliberately keeps the old 0.78× result until the new same-ELF A/A-first gate can replace it.
+**The `tiny.en` segment-timestamp cell was the one loss, and it has been fixed and remeasured.** In timestamp mode on `tiny.en`, a carried prior-window prompt could make the decoder emit `eot` immediately, dropping the window (`bd-r0qd`). The default `FW_RETRY_FAILED_WINDOW` recovered the content by re-decoding that window, which restored full coverage but **re-decoded ~2 windows** — the published **0.78×** (fw 2.24 s vs whisper.cpp-greedy 1.76 s). The engine now suppresses cross-window prompt carry for this exact model/mode by default, matching `whisper.cpp`'s own `no_context` policy; the historical behaviour remains available via an explicit context request or `FW_TINY_EN_TS_CONTEXT=1`.
+
+Remeasured 2026-07-26 on the same `track01.wav` (124.5 s / 5 windows), same host and session:
+
+- **fw-vs-fw, under the full harness contract** — 11 order-alternating pairs, self-reported ELF sha, byte-identity asserted *before* timing (`segments_exact=true`, 21 segments, 1,301 characters, identical oracle sha256): **1.634×** (1910.6 → 1229.6 ms), 11/11 wins, against an A/A null of 1.0396 [1.0049, 1.1230]. Gated on median-vs-null-CI with a 2× margin (required 1.2461), `cv` recorded as provenance only.
+- **Head-to-head vs `whisper-cli -bs 1 -bo 1 -t 16`**: whisper.cpp **1740.7 ms** median total wall (4 reps, ±2%) vs fw **1290.6 ms** ⇒ **1.35× faster**. Standalone fw reps put it near 1.49×; the table quotes the conservative interleaved figure.
+
+Both arms of the old cell reproduce (whisper.cpp 1740.7 ms vs the published 1.76 s; the historical fw path ≈1.97 s vs the published 2.24 s), which is what makes the flip credible rather than a re-baselining artifact. Caveat: fw and whisper.cpp were run in the same session but **not interleaved with each other**, so only the fw-vs-fw arm carries a null control. Full evidence in [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md).
 
 **Withdrawn claim.** Earlier revisions of this section reported **~2.3× faster on `tiny.en`** (Apple M4 Pro) and **~1.5×** on `large-v3-turbo`. Those runs compared franken's greedy decode against `whisper.cpp`'s **default** beam-5/best-of-5 — roughly 5× the decode work, at higher quality — so they credited franken for work the reference was doing and franken was not. They are withdrawn and replaced by the matched-greedy table above. The correction is recorded in full at `docs/PERF_FRONTIER.md` ("CORRECTION 2026-07-13").
 
