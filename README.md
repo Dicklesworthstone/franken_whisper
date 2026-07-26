@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess — and on CPU it beats whisper.cpp 2.33× on tiny.en, at parity on large-v3-turbo), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In matched-greedy CPU comparisons, the native engine is ~2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription and 1.10× faster on tiny.en no-timestamp transcription — and 0.78× (slower) on tiny.en segment-timestamp transcription, a known correctness-workaround cost.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -27,12 +27,14 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 
 </div>
 
-> **v0.2.0 — the native engine is real, and it is fast.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) now transcribes **2.33× faster than whisper.cpp on tiny.en and at parity on large-v3-turbo** — CPU vs CPU, same machine (Apple M4 Pro, interleaved runs), while using about 18% less user CPU on the large model (53.8 s vs 65.4 s). Native-vs-whisper.cpp conformance on the reference fixture: **WER 0.0000**.
+> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against whisper.cpp with both engines using greedy decode. Native-vs-whisper.cpp conformance on the reference fixture remains **WER 0.0000**. The full methodology, coverage checks, and caveats are in [the performance frontier](docs/PERF_FRONTIER.md).
 >
-> | Model | franken_whisper native (CPU) | whisper.cpp (CPU) | |
-> |---|---|---|---|
-> | tiny.en (11 s clip) | **475 ms** | 1,105 ms | **2.33× faster** |
-> | large-v3-turbo (11 s clip) | **9.73 s** | 9.59 s | parity |
+> | Model / workload | Mode | Matched-greedy result |
+> |---|---|---|
+> | large-v3-turbo, 124.5 s / 5 windows | no timestamps | **2.07× faster** |
+> | large-v3-turbo, isolated encoder | mode-independent | **2.29× faster** |
+> | tiny.en, 124.5 s / 5 windows | no timestamps | **1.10× faster** |
+> | tiny.en, 124.5 s / 5 windows | segment timestamps + full-coverage retry | **0.78× speed (slower)** |
 
 ---
 
@@ -2569,24 +2571,34 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 
 ### Native Engine Speed (measured)
 
-The in-process Rust native engine is faster than realtime on both `tiny.en` and `large-v3-turbo`, and beats the reference implementations at matched greedy decoding. These are measured numbers, not projections; each is gated on a candidate **median** against a **paired null (A/A) control**, with byte-exact levers asserted bit-identical and numerics-affecting levers held to a measured **WER-Δ of 0.000** vs `whisper.cpp`.
+The in-process Rust native engine is faster than realtime on both `tiny.en` and `large-v3-turbo`. Against `whisper.cpp` it wins clearly on encoder-heavy work, wins modestly on decode-heavy work, and **loses one cell** — all figures below are **matched-greedy** (both engines forced to greedy: `whisper-cli -bs 1 -bo 1`), measured 2026-07-12 on a 32-core x86 box at each engine's best thread count.
 
-| Comparison | Model | Result | Conditions |
+| Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|
-| vs `whisper.cpp` (CPU) | `tiny.en` | **~2.3× faster** | Apple M4 Pro, interleaved hyperfine, greedy |
-| vs `whisper.cpp` (CPU) | `large-v3-turbo` | **parity → faster** | parity on M4 Pro at lower CPU; **~1.5× on a 32-core x86 quiet box**, and the lead **grows with audio length** as the encoder advantage compounds |
-| int8 encoder (v0.5.0) | `large-v3-turbo` | **1.47–1.67× encoder** | quality-safe, calibrated, WER-neutral |
-| SDPA poly-exp (v0.5.0) | `large-v3-turbo` | **1.0722× e2e** | byte-identical transcript, WER Δ 0.000 |
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | isolated encoder | **2.29× faster** (framing-independent) |
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, no timestamps | **2.07× faster** |
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, segment timestamps | **~1.79× faster** |
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, word timestamps (DTW) | **~1.71× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 840 s, no timestamps | **1.47× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, no timestamps | **1.10× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, segment timestamps | **0.78× — SLOWER** (see below) |
+| int8 encoder (v0.5.0) | `large-v3-turbo` | fw-vs-fw lever | **1.47–1.67× encoder** (quality-safe, calibrated, WER-neutral) |
+| SDPA poly-exp (v0.5.0) | `large-v3-turbo` | fw-vs-fw lever | **1.0722× e2e** (byte-identical transcript, WER Δ 0.000) |
+
+**The `tiny.en` segment-timestamp cell is a real loss, and it is a correctness cost, not a compute deficit.** In timestamp mode on `tiny.en`, a carried prior-window prompt can make the decoder emit `eot` immediately, dropping the window (`bd-r0qd`). The default `FW_RETRY_FAILED_WINDOW` recovers the content by re-decoding that window once with the prompt cleared, which restores full coverage but **re-decodes ~2 windows** (fw 2.24 s vs whisper.cpp-greedy 1.76 s). Removing the loss means removing the *need* for the retry — the retry itself already reuses the first attempt's encode and only fires when a prompt was actually carried. Tracked in [the performance frontier](docs/PERF_FRONTIER.md).
+
+**Withdrawn claim.** Earlier revisions of this section reported **~2.3× faster on `tiny.en`** (Apple M4 Pro) and **~1.5×** on `large-v3-turbo`. Those runs compared franken's greedy decode against `whisper.cpp`'s **default** beam-5/best-of-5 — roughly 5× the decode work, at higher quality — so they credited franken for work the reference was doing and franken was not. They are withdrawn and replaced by the matched-greedy table above. The correction is recorded in full at `docs/PERF_FRONTIER.md` ("CORRECTION 2026-07-13").
 
 Because OpenAI's reference Whisper (Python/PyTorch) is itself slower than `whisper.cpp` on CPU, the margin versus the original OpenAI implementation is at least as large as the `whisper.cpp` figures above.
 
-**Honesty methodology.** Levers are kept only on a measured win, and the bar is deliberately conservative:
+**Honesty methodology.** Levers are kept only on a measured win, and rejected levers are recorded rather than discarded:
 
-- **Median vs paired-null control** — the candidate median is compared against a same-binary A/A null (ABBA-interleaved), so host contention and run-order bias cannot masquerade as a speedup.
+- **Paired null (A/A) control, same binary** — every A/B ships alongside an identity null (candidate vs candidate) run in the same invocation with arms ABBA-interleaved, so host contention and run-order bias cannot masquerade as a speedup. A run whose null is not centred on 1.0 is thrown away, not reported.
 - **Byte/ULP-exact where claimed** — byte-exact levers are asserted bit-identical to the reference path; the sole numerics-affecting default (poly-exp) is held to WER-Δ 0.000 vs `whisper.cpp`.
-- **Negative-evidence ledger** — rejected levers are recorded with a reject-id, their null-control, and a retry-condition, so a dead end stays dead.
+- **Negative-evidence ledger** — rejected levers are recorded with a reject-id, their null control, and a concrete retry predicate, so a dead end stays dead. See [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md) and the void audit in [`docs/LEDGER_RESURRECTION.md`](docs/LEDGER_RESURRECTION.md).
+- **Known gate defect (2026-07-25).** Several benches additionally assert `cv < 5%` and `candidate p10 > null p90`. Both are stricter than the null floor this hardware can deliver — measured A/A nulls here span roughly ±10–20%, and a calibrated harness still reports `cv` of 7–9%. Those two gates have rejected effects that were real, so results decided by them are being re-adjudicated on the median-vs-null-CI rule. Treat any row citing a `cv` gate as unresolved rather than settled.
 
-**Honest scope.** These are **greedy / temperature-0** comparisons (the native fast path does not yet implement beam search or temperature fallback), measured on a **quiet host** — the head-to-head ratio degrades under host contention, and `tiny.en` long-form carries a known per-window fixed-overhead regression on very long audio. The full measured record, including every rejected lever, lives in [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
+**Honest scope.** These are **greedy / temperature-0** comparisons — the native fast path does not yet implement beam search or temperature fallback, so this is not a quality-matched comparison against `whisper.cpp`'s defaults, which decode better. Measured on a **quiet host**; the head-to-head ratio degrades under contention, and whole-pipeline rows on a shared box are load-sensitive (the isolated-encoder 2.29× is the confound-free anchor). The full measured record lives in [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
 
 ### Audio Normalization
 
