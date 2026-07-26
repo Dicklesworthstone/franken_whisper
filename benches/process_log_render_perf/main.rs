@@ -1,10 +1,31 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use sha2::{Digest, Sha256};
+
 const SAMPLES: usize = 11;
 const TARGET_SAMPLE_NS: u64 = 80_000_000;
-const AB_PAIRS: usize = 21;
-const AB_TARGET_NS: u64 = 75_000_000;
+const AB_PAIRS: usize = 41;
+const AB_TARGET_NS: u64 = 2_000_000;
+const MIN_OF: usize = 3;
+const BOOTSTRAP_RESAMPLES: usize = 20_000;
+
+fn self_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!(
+        "{:x} ({} bytes) {}",
+        hasher.finalize(),
+        bytes.len(),
+        path.display()
+    )
+}
 
 struct BenchCase {
     program: &'static str,
@@ -379,20 +400,32 @@ fn calibrate_renderer(cases: &[BenchCase], arm: RenderArm) -> usize {
     scaled.clamp(1, 10_000_000)
 }
 
-fn measure_ratios(cases: &[BenchCase], contender: RenderArm, inner: usize) -> Vec<f64> {
+fn min_ns_per_round(cases: &[BenchCase], arm: RenderArm, inner: usize) -> f64 {
+    (0..MIN_OF)
+        .map(|_| time_renderer(cases, arm, inner) as f64)
+        .fold(f64::INFINITY, f64::min)
+        / inner as f64
+}
+
+fn measure_ratios(
+    cases: &[BenchCase],
+    contender: RenderArm,
+    historical_inner: usize,
+    contender_inner: usize,
+) -> Vec<f64> {
     let mut ratios = Vec::with_capacity(AB_PAIRS);
     for pair in 0..AB_PAIRS {
         let (historical_ns, contender_ns) = if pair % 2 == 0 {
             (
-                time_renderer(cases, RenderArm::Historical, inner),
-                time_renderer(cases, contender, inner),
+                min_ns_per_round(cases, RenderArm::Historical, historical_inner),
+                min_ns_per_round(cases, contender, contender_inner),
             )
         } else {
-            let contender_ns = time_renderer(cases, contender, inner);
-            let historical_ns = time_renderer(cases, RenderArm::Historical, inner);
+            let contender_ns = min_ns_per_round(cases, contender, contender_inner);
+            let historical_ns = min_ns_per_round(cases, RenderArm::Historical, historical_inner);
             (historical_ns, contender_ns)
         };
-        ratios.push(historical_ns as f64 / contender_ns as f64);
+        ratios.push(historical_ns / contender_ns.max(f64::MIN_POSITIVE));
     }
     ratios
 }
@@ -418,12 +451,34 @@ fn ratio_stats(ratios: &[f64]) -> RatioStats {
         .sum::<f64>()
         / ratios.len() as f64;
     RatioStats {
-        p10: sorted[2],
+        p10: sorted[(sorted.len() - 1) / 10],
         median: sorted[AB_PAIRS / 2],
-        p90: sorted[18],
+        p90: sorted[(sorted.len() - 1) * 9 / 10],
         cv: variance.sqrt() / mean,
         wins: ratios.iter().filter(|ratio| **ratio > 1.0).count(),
     }
+}
+
+fn bootstrap_median_ci(ratios: &[f64]) -> (f64, f64) {
+    let mut state = 0xbb67_ae85_84ca_a73b_u64 ^ ratios.len() as u64;
+    let mut sample = Vec::with_capacity(ratios.len());
+    let mut medians = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..ratios.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            sample.push(ratios[state as usize % ratios.len()]);
+        }
+        sample.sort_by(f64::total_cmp);
+        medians.push(sample[sample.len() / 2]);
+    }
+    medians.sort_by(f64::total_cmp);
+    (
+        medians[BOOTSTRAP_RESAMPLES * 25 / 1_000],
+        medians[BOOTSTRAP_RESAMPLES * 975 / 1_000],
+    )
 }
 
 fn print_ratios(label: &str, ratios: &[f64], stats: &RatioStats) {
@@ -433,8 +488,9 @@ fn print_ratios(label: &str, ratios: &[f64], stats: &RatioStats) {
         .collect::<Vec<_>>()
         .join(",");
     println!("{label}_ratios={values}");
+    let (ci_low, ci_high) = bootstrap_median_ci(ratios);
     println!(
-        "{label}_p10={:.6} {label}_median={:.6} {label}_p90={:.6} {label}_cv={:.6} {label}_wins={}/{}",
+        "{label}_p10={:.6} {label}_median={:.6} {label}_p90={:.6} {label}_median_ci95=[{ci_low:.6},{ci_high:.6}] {label}_cv={:.6} {label}_wins={}/{}",
         stats.p10, stats.median, stats.p90, stats.cv, stats.wins, AB_PAIRS
     );
 }
@@ -531,42 +587,38 @@ fn run_ab() {
     let parity_cases = verify_parity(&cases);
     let historical_inner = calibrate_renderer(&cases, RenderArm::Historical);
     let direct_inner = calibrate_renderer(&cases, RenderArm::Direct);
-    let inner = historical_inner.max(direct_inner);
 
-    let null_ratios = measure_ratios(&cases, RenderArm::Historical, inner);
-    let candidate_ratios = measure_ratios(&cases, RenderArm::Direct, inner);
+    let null_ratios = measure_ratios(
+        &cases,
+        RenderArm::Historical,
+        historical_inner,
+        historical_inner,
+    );
+    let candidate_ratios =
+        measure_ratios(&cases, RenderArm::Direct, historical_inner, direct_inner);
     let null = ratio_stats(&null_ratios);
     let candidate = ratio_stats(&candidate_ratios);
-    let keep = (0.98..=1.02).contains(&null.median)
-        && null.cv <= 0.03
-        && candidate.median >= 1.10
-        && candidate.p10 > null.p90
-        && candidate.wins >= 19;
+    let (null_ci_low, null_ci_high) = bootstrap_median_ci(&null_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
+    let keep = candidate.median >= required_speedup;
 
     println!(
-        "AB worker_pid={} pairs={AB_PAIRS} target_ns={AB_TARGET_NS} parity_cases={parity_cases}",
+        "AB worker_pid={} pairs={AB_PAIRS} target_ns={AB_TARGET_NS} min_of={MIN_OF} parity_cases={parity_cases}",
         std::process::id()
     );
-    println!(
-        "inners historical_calibrated={historical_inner} direct_calibrated={direct_inner} used={inner}"
-    );
+    println!("inners historical_calibrated={historical_inner} direct_calibrated={direct_inner}");
     print_ratios("null", &null_ratios, &null);
     print_ratios("candidate", &candidate_ratios, &candidate);
     println!(
-        "gate_null_median_0.98_1.02={}",
-        (0.98..=1.02).contains(&null.median)
+        "gate=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} required_speedup={required_speedup:.6} candidate_median={:.6} cv_is_provenance_only=true verdict={}",
+        candidate.median,
+        if keep { "KEEP" } else { "REJECT" }
     );
-    println!("gate_null_cv_le_0.03={}", null.cv <= 0.03);
-    println!("gate_candidate_median_ge_1.10={}", candidate.median >= 1.10);
-    println!(
-        "gate_candidate_p10_gt_null_p90={}",
-        candidate.p10 > null.p90
-    );
-    println!("gate_candidate_wins_ge_19={}", candidate.wins >= 19);
-    println!("verdict={}", if keep { "KEEP" } else { "REJECT" });
 }
 
 fn main() {
+    println!("bench_elf_sha256={}", self_identity());
     if std::env::args().any(|arg| arg.eq("profile")) {
         run_profile();
     } else {

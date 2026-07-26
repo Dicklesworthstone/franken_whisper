@@ -3,10 +3,31 @@ use std::hint::black_box;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 const PROFILE_SAMPLES: usize = 11;
-const PAIRS: usize = 21;
+const PAIRS: usize = 41;
 const PROFILE_ARM_NS: u128 = 30_000_000;
-const MEASURE_ARM_NS: u128 = 100_000_000;
+const MEASURE_ARM_NS: u128 = 2_000_000;
+const MIN_OF: usize = 3;
+const BOOTSTRAP_RESAMPLES: usize = 20_000;
+
+fn self_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!(
+        "{:x} ({} bytes) {}",
+        hasher.finalize(),
+        bytes.len(),
+        path.display()
+    )
+}
 
 #[derive(Clone, Copy, Debug)]
 enum BackendKind {
@@ -324,9 +345,13 @@ fn measure(
     started.elapsed()
 }
 
-fn calibrated_repetitions(state: &Mutex<Option<RouterState>>, target_ns: u128) -> usize {
+fn calibrated_repetitions(
+    state: &Mutex<Option<RouterState>>,
+    implementation: MetricFn,
+    target_ns: u128,
+) -> usize {
     let probe_repetitions = 25_usize;
-    let probe_ns = measure(state, historical, probe_repetitions)
+    let probe_ns = measure(state, implementation, probe_repetitions)
         .as_nanos()
         .max(1);
     let scaled = target_ns
@@ -358,8 +383,39 @@ fn coefficient_of_variation(values: &[f64]) -> f64 {
     variance.sqrt() / mean
 }
 
+fn median_sorted(values: &[f64]) -> f64 {
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
+fn bootstrap_median_ci(values: &[f64]) -> (f64, f64) {
+    let mut state = 0x6a09_e667_f3bc_c909_u64 ^ values.len() as u64;
+    let mut sample = Vec::with_capacity(values.len());
+    let mut medians = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..values.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            sample.push(values[state as usize % values.len()]);
+        }
+        sample.sort_by(f64::total_cmp);
+        medians.push(median_sorted(&sample));
+    }
+    medians.sort_by(f64::total_cmp);
+    (
+        medians[BOOTSTRAP_RESAMPLES * 25 / 1_000],
+        medians[BOOTSTRAP_RESAMPLES * 975 / 1_000],
+    )
+}
+
 fn run_profile(state: &Mutex<Option<RouterState>>, oracle_cases: usize) {
-    let repetitions = calibrated_repetitions(state, PROFILE_ARM_NS);
+    let repetitions = calibrated_repetitions(state, historical, PROFILE_ARM_NS);
     let implementations: [(&str, MetricFn); 5] = [
         ("lock_only", lock_only),
         ("snapshot_clone", clone_only),
@@ -390,54 +446,60 @@ fn run_profile(state: &Mutex<Option<RouterState>>, oracle_cases: usize) {
 
 struct PairedResults {
     ratios: Vec<f64>,
-    numerator_ns: Vec<u128>,
-    denominator_ns: Vec<u128>,
+    baseline_ns_per_call: Vec<f64>,
+    contender_ns_per_call: Vec<f64>,
+}
+
+fn min_ns_per_call(
+    state: &Mutex<Option<RouterState>>,
+    implementation: MetricFn,
+    repetitions: usize,
+) -> f64 {
+    (0..MIN_OF)
+        .map(|_| measure(state, implementation, repetitions).as_nanos() as f64)
+        .fold(f64::INFINITY, f64::min)
+        / repetitions as f64
 }
 
 fn paired_ratios(
     state: &Mutex<Option<RouterState>>,
-    numerator: MetricFn,
-    denominator: MetricFn,
-    repetitions: usize,
+    baseline: MetricFn,
+    contender: MetricFn,
+    baseline_repetitions: usize,
+    contender_repetitions: usize,
 ) -> PairedResults {
-    let mut ratios = Vec::with_capacity(PAIRS * 2);
-    let mut numerator_ns = Vec::with_capacity(PAIRS * 2);
-    let mut denominator_ns = Vec::with_capacity(PAIRS * 2);
+    let mut ratios = Vec::with_capacity(PAIRS);
+    let mut baseline_ns_per_call = Vec::with_capacity(PAIRS);
+    let mut contender_ns_per_call = Vec::with_capacity(PAIRS);
     for pair in 0..PAIRS {
-        let (first_n, first_d, second_d, second_n) = if pair % 2 == 0 {
+        let (baseline_ns, contender_ns) = if pair.is_multiple_of(2) {
             (
-                measure(state, numerator, repetitions).as_nanos(),
-                measure(state, denominator, repetitions).as_nanos(),
-                measure(state, denominator, repetitions).as_nanos(),
-                measure(state, numerator, repetitions).as_nanos(),
+                min_ns_per_call(state, baseline, baseline_repetitions),
+                min_ns_per_call(state, contender, contender_repetitions),
             )
         } else {
-            let first_d = measure(state, denominator, repetitions).as_nanos();
-            let first_n = measure(state, numerator, repetitions).as_nanos();
-            let second_n = measure(state, numerator, repetitions).as_nanos();
-            let second_d = measure(state, denominator, repetitions).as_nanos();
-            (first_n, first_d, second_d, second_n)
+            let contender_ns = min_ns_per_call(state, contender, contender_repetitions);
+            let baseline_ns = min_ns_per_call(state, baseline, baseline_repetitions);
+            (baseline_ns, contender_ns)
         };
-        numerator_ns.extend([first_n, second_n]);
-        denominator_ns.extend([first_d, second_d]);
-        ratios.extend([
-            first_n as f64 / first_d.max(1) as f64,
-            second_n as f64 / second_d.max(1) as f64,
-        ]);
+        baseline_ns_per_call.push(baseline_ns);
+        contender_ns_per_call.push(contender_ns);
+        ratios.push(baseline_ns / contender_ns.max(f64::MIN_POSITIVE));
     }
     PairedResults {
         ratios,
-        numerator_ns,
-        denominator_ns,
+        baseline_ns_per_call,
+        contender_ns_per_call,
     }
 }
 
-fn print_results(label: &str, results: &PairedResults, repetitions: usize) {
-    let wins = results.ratios.iter().filter(|ratio| **ratio < 1.0).count();
-    let numerator_ns = median_u128(&results.numerator_ns) as f64 / repetitions as f64;
-    let denominator_ns = median_u128(&results.denominator_ns) as f64 / repetitions as f64;
+fn print_results(label: &str, results: &PairedResults) {
+    let wins = results.ratios.iter().filter(|ratio| **ratio > 1.0).count();
+    let baseline_ns = percentile(&results.baseline_ns_per_call, 50);
+    let contender_ns = percentile(&results.contender_ns_per_call, 50);
+    let (ci_low, ci_high) = bootstrap_median_ci(&results.ratios);
     println!(
-        "{label} p10={:.6}x median={:.6}x p90={:.6}x cv={:.4}% wins={wins}/{} numerator_ns_per_call={numerator_ns:.3} denominator_ns_per_call={denominator_ns:.3}",
+        "{label} p10={:.6}x median={:.6}x p90={:.6}x median_ci95=[{ci_low:.6},{ci_high:.6}] cv={:.4}% wins={wins}/{} baseline_ns_per_call={baseline_ns:.3} contender_ns_per_call={contender_ns:.3}",
         percentile(&results.ratios, 10),
         percentile(&results.ratios, 50),
         percentile(&results.ratios, 90),
@@ -447,45 +509,46 @@ fn print_results(label: &str, results: &PairedResults, repetitions: usize) {
 }
 
 fn run_measure(state: &Mutex<Option<RouterState>>, oracle_cases: usize) {
-    let repetitions = calibrated_repetitions(state, MEASURE_ARM_NS);
+    let baseline_repetitions = calibrated_repetitions(state, borrowed_metrics, MEASURE_ARM_NS);
+    let candidate_repetitions = calibrated_repetitions(state, candidate, MEASURE_ARM_NS);
     for _ in 0..5 {
-        black_box(measure(state, historical, repetitions));
-        black_box(measure(state, candidate, repetitions));
+        black_box(measure(state, borrowed_metrics, baseline_repetitions));
+        black_box(measure(state, candidate, candidate_repetitions));
     }
 
-    let null = paired_ratios(state, historical, historical, repetitions);
-    let comparison = paired_ratios(state, candidate, historical, repetitions);
-    println!(
-        "measure oracle_cases={oracle_cases} repetitions={repetitions} pairs={PAIRS} ratios_per_comparison={} histories=3x50 calibration=50 evidence=200 ratio=candidate_over_historical lto=false",
-        PAIRS * 2
+    let null = paired_ratios(
+        state,
+        borrowed_metrics,
+        borrowed_metrics,
+        baseline_repetitions,
+        baseline_repetitions,
     );
-    print_results("null", &null, repetitions);
-    print_results("candidate", &comparison, repetitions);
-
-    let null_median = percentile(&null.ratios, 50);
-    let null_cv = coefficient_of_variation(&null.ratios);
-    let candidate_median = percentile(&comparison.ratios, 50);
-    let candidate_p90 = percentile(&comparison.ratios, 90);
-    let candidate_wins = comparison
-        .ratios
-        .iter()
-        .filter(|ratio| **ratio < 1.0)
-        .count();
-    let keep = (0.97..=1.03).contains(&null_median)
-        && null_cv <= 0.03
-        && candidate_p90 < percentile(&null.ratios, 10)
-        && candidate_wins == comparison.ratios.len()
-        && candidate_median < 0.25;
+    let comparison = paired_ratios(
+        state,
+        borrowed_metrics,
+        candidate,
+        baseline_repetitions,
+        candidate_repetitions,
+    );
     println!(
-        "gate=null_median_0.97_1.03+null_cv_le_3pct+candidate_p90_lt_null_p10+all_wins+candidate_median_lt_0.25 verdict={}",
+        "measure oracle_cases={oracle_cases} baseline_repetitions={baseline_repetitions} candidate_repetitions={candidate_repetitions} pairs={PAIRS} min_of={MIN_OF} histories=3x50 calibration=50 evidence=200 ratio=borrowed_full_metrics_over_scalar_candidate lto=false"
+    );
+    print_results("null", &null);
+    print_results("candidate", &comparison);
+
+    let (null_ci_low, null_ci_high) = bootstrap_median_ci(&null.ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let candidate_median = percentile(&comparison.ratios, 50);
+    let required_speedup = 1.0 + 2.0 * null_half_width;
+    let keep = candidate_median >= required_speedup;
+    println!(
+        "gate=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} required_speedup={required_speedup:.6} candidate_median={candidate_median:.6} cv_is_provenance_only=true verdict={}",
         if keep { "KEEP" } else { "REJECT" }
     );
-    if !keep {
-        std::process::exit(2);
-    }
 }
 
 fn main() {
+    println!("bench_elf_sha256={}", self_identity());
     let oracle_cases = assert_oracle();
     let state = Mutex::new(Some(router_state(50, 50, 200)));
     match std::env::args().nth(1).as_deref() {

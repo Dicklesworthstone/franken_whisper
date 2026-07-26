@@ -6,6 +6,9 @@ publish = false
 
 [workspace]
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [profile.release]
 opt-level = 3
 lto = false

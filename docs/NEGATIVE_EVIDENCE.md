@@ -4,6 +4,66 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-25 - MistyGate: **REJECT — resurrected FrankenTorch SDPA BR=128 is flat against BR=64 under the corrected same-ELF A/A + median-CI gate.**
+
+This closes Meta-Lever #1 queue item #5 without reusing the invalid 2026-07-10
+evidence. RCH job `j-29946774143631719` ran the real
+`ft_kernel_cpu::sdpa_forward_f32` kernel at the production-shaped
+`20 heads × 1500 sequence × 64 depth`, switching the real runtime BR selector
+between 64 and 128. The release-perf executable self-reported SHA-256
+`3ba35b4a7d7ba48d48fb0c8ed2ffdd3a83454f8e69047702134e573e58c789cb`
+(27,965,208 bytes) before its parity oracle and timing phases.
+
+Correctness is exact: all 1,920,000 f32 outputs matched bit-for-bit; the
+baseline-output oracle SHA-256 was
+`89a93acf42f289d61e4ee9db8b6bda09b50922ef30a5269d404ad20d3fc528da`.
+The same invocation then ran 41 min-of-3 A/A pairs followed by 41
+order-alternated A/B pairs:
+
+| phase | median paired ratio | deterministic bootstrap 95% median CI | CV / wins |
+|---|---:|---:|---:|
+| BR=64 / BR=64 null | `1.011038` | `[0.965832, 1.039802]` | 11.76% |
+| BR=64 / BR=128 candidate | `1.011137` | `[0.979652, 1.044951]` | 12.48%; 21/41 |
+
+The null-CI 2x-margin rule required `1.079604`; the candidate median was
+`1.011137`. **REJECT.** CV is recorded only as provenance and did not decide
+the verdict. No production SDPA source changed.
+
+**Concrete retry predicate:** retry only if at least one mechanism changes:
+`sdpa_forward_f32` kernel/codegen, the target CPU's cache geometry, or the
+production sequence/head shape away from 20×1500×64. Re-run the exact
+bit-parity oracle and same-invocation A/A-first median-CI gate. Additional
+samples on the unchanged kernel/shape are not a valid retry trigger.
+
+---
+## 2026-07-25 - MistyGate: **VOID / BLOCKED — resurrection queue #1 names i7 bias specialization, but the candidate source no longer exists and the audit's stated runtime-toggle prerequisite belongs to a different, already-rejected rowblock lever.**
+
+The Meta-Lever #1 audit correctly identified the original i7 bias-specialization
+measurement as inadmissible: it compared separate RCH invocations and had no
+same-ELF A/A floor. The row under audit was specifically the const-generic
+split between `matmul_bias_i7_quantized_impl::<true>` and
+`matmul_bias_i7_quantized_impl::<false>`, specializing the presence of the
+optional bias slice. Its old directional result was only `0.999x`.
+
+That exact candidate was reverted and is absent from the current tree. The
+resurrection queue's hard prerequisite instead names
+`FW_I7_ROWBLOCK_MIN_LEN`, which controls **rowblock coarsening**, not bias
+specialization. Substituting that toggle would not rerun the VOID entry; it
+would rerun a different lever whose corrected same-binary closeout already
+measured `0.879877x` and is SOUND as a loss. No proxy measurement was invented,
+no production source was changed, and this blocker does not increment the
+consecutive-REJECT count. Exact reconstruction is tracked as `bd-p5ku`.
+
+**Concrete retry predicate:** retry only after either (a) the exact archived
+bias/no-bias specialization patch is recovered, or (b) a faithful same-binary
+runtime selector is added around the two real const-specialized production
+arms. Before timing, a turbo-shaped profile must attribute at least 5% self-time
+to that exact dispatch and all output floats must match bit-for-bit. Then run
+BASE/BASE followed by BASE/candidate in one self-hashing ELF and decide only on
+the 95% bootstrap median-CI 2x-margin gate. Do not use the rowblock toggle as a
+surrogate.
+
+---
 ## 2026-07-25 - YellowKite: **NO ADMISSIBLE VERDICT (bd-7rxo) — the speculation-controller Brier reuse measures 1.186–1.193× median, 60/63 paired wins, against three VALID A/A nulls — but the harness's "historical" arm is not the historical code, so the number is an upper bound and cannot be banked.**
 
 **This is the first execution of bd-7rxo's A/B.** The production change and harness

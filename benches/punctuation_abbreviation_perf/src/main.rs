@@ -3,6 +3,30 @@ use std::hint::black_box;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
+const PAIRS: usize = 41;
+const MIN_OF: usize = 3;
+const MEASURE_TARGET: Duration = Duration::from_millis(2);
+const BOOTSTRAP_RESAMPLES: usize = 20_000;
+
+fn self_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!(
+        "{:x} ({} bytes) {}",
+        hasher.finalize(),
+        bytes.len(),
+        path.display()
+    )
+}
+
 const ABBREVIATIONS: &[&str] = &[
     "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "st.", "ave.", "blvd.", "vs.", "etc.",
     "approx.", "dept.", "est.", "govt.", "inc.", "ltd.", "no.", "vol.", "rev.", "gen.", "sgt.",
@@ -154,10 +178,10 @@ fn elapsed_lowercase(fixture: &Fixture, rounds: u64) -> Duration {
     start.elapsed()
 }
 
-fn calibrated_rounds(fixture: &Fixture, target: Duration) -> u64 {
+fn calibrated_rounds(fixture: &Fixture, helper: fn(&str, usize) -> bool, target: Duration) -> u64 {
     let mut rounds = 1_u64;
     loop {
-        let elapsed = elapsed_helper(fixture, rounds, historical);
+        let elapsed = elapsed_helper(fixture, rounds, helper);
         if elapsed >= Duration::from_millis(5) {
             let scaled = (rounds as u128 * target.as_nanos() / elapsed.as_nanos().max(1)) as u64;
             return scaled.max(rounds).max(1);
@@ -323,35 +347,59 @@ fn cv(samples: &[f64]) -> f64 {
     variance.sqrt() / mean
 }
 
-fn ratios(fixture: &Fixture, rounds: u64, candidate_arm: bool) -> Vec<f64> {
-    let mut ratios = Vec::with_capacity(21);
+fn bootstrap_median_ci(samples: &[f64]) -> (f64, f64) {
+    let mut state = 0x3c6e_f372_fe94_f82b_u64 ^ samples.len() as u64;
+    let mut sample = Vec::with_capacity(samples.len());
+    let mut medians = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..samples.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            sample.push(samples[state as usize % samples.len()]);
+        }
+        sample.sort_by(f64::total_cmp);
+        medians.push(median(&sample));
+    }
+    medians.sort_by(f64::total_cmp);
+    (
+        medians[BOOTSTRAP_RESAMPLES * 25 / 1_000],
+        medians[BOOTSTRAP_RESAMPLES * 975 / 1_000],
+    )
+}
+
+fn min_ns_per_round(fixture: &Fixture, rounds: u64, helper: fn(&str, usize) -> bool) -> f64 {
+    (0..MIN_OF)
+        .map(|_| elapsed_helper(fixture, rounds, helper).as_nanos() as f64)
+        .fold(f64::INFINITY, f64::min)
+        / rounds as f64
+}
+
+fn ratios(
+    fixture: &Fixture,
+    historical_rounds: u64,
+    other_rounds: u64,
+    candidate_arm: bool,
+) -> Vec<f64> {
+    let mut ratios = Vec::with_capacity(PAIRS);
     let other = if candidate_arm { candidate } else { historical };
     for _ in 0..3 {
-        black_box(run_helper(fixture, rounds, historical));
-        black_box(run_helper(fixture, rounds, other));
+        black_box(run_helper(fixture, historical_rounds, historical));
+        black_box(run_helper(fixture, other_rounds, other));
     }
-    for sample in 0..21 {
-        let elapsed_ns = |helper| elapsed_helper(fixture, rounds, helper).as_nanos() as f64;
+    for sample in 0..PAIRS {
         let (historical_ns, other_ns) = if sample % 2 == 0 {
-            let historical_first = elapsed_ns(historical);
-            let other_first = elapsed_ns(other);
-            let other_second = elapsed_ns(other);
-            let historical_second = elapsed_ns(historical);
             (
-                historical_first + historical_second,
-                other_first + other_second,
+                min_ns_per_round(fixture, historical_rounds, historical),
+                min_ns_per_round(fixture, other_rounds, other),
             )
         } else {
-            let other_first = elapsed_ns(other);
-            let historical_first = elapsed_ns(historical);
-            let historical_second = elapsed_ns(historical);
-            let other_second = elapsed_ns(other);
-            (
-                historical_first + historical_second,
-                other_first + other_second,
-            )
+            let other_ns = min_ns_per_round(fixture, other_rounds, other);
+            let historical_ns = min_ns_per_round(fixture, historical_rounds, historical);
+            (historical_ns, other_ns)
         };
-        ratios.push(other_ns / historical_ns);
+        ratios.push(historical_ns / other_ns.max(f64::MIN_POSITIVE));
     }
     sorted(ratios)
 }
@@ -362,8 +410,9 @@ fn print_samples(name: &str, samples: &[f64]) {
         .map(|sample| format!("{sample:.6}"))
         .collect::<Vec<_>>()
         .join(",");
+    let (ci_low, ci_high) = bootstrap_median_ci(samples);
     println!(
-        "{name}=[{body}] median={:.6} p10={:.6} p90={:.6} cv={:.4}%",
+        "{name}=[{body}] median={:.6} p10={:.6} p90={:.6} median_ci95=[{ci_low:.6},{ci_high:.6}] cv={:.4}%",
         median(samples),
         percentile(samples, 0.10),
         percentile(samples, 0.90),
@@ -374,7 +423,7 @@ fn print_samples(name: &str, samples: &[f64]) {
 fn profile() -> ExitCode {
     let (cases, output_bytes, output_hash) = verify_parity();
     let fixture = fixture(Shape::Medium);
-    let rounds = calibrated_rounds(&fixture, Duration::from_millis(100));
+    let rounds = calibrated_rounds(&fixture, historical, Duration::from_millis(100));
     let historical_ns = elapsed_helper(&fixture, rounds, historical).as_nanos() as f64;
     let lowercase_ns = elapsed_lowercase(&fixture, rounds).as_nanos() as f64;
     let candidate_ns = elapsed_helper(&fixture, rounds, candidate).as_nanos() as f64;
@@ -410,15 +459,16 @@ fn measure() -> ExitCode {
     println!(
         "parity predicate_cases={cases} full_output_bytes={output_bytes} full_output_fnv64={output_hash:016x}"
     );
-    let mut passed = true;
+    let mut kept_shapes = 0;
     for shape in [Shape::Short, Shape::Medium, Shape::Stress] {
         let fixture = fixture(shape);
-        let rounds = calibrated_rounds(&fixture, Duration::from_millis(160));
-        let null = ratios(&fixture, rounds, false);
-        let ab = ratios(&fixture, rounds, true);
+        let historical_rounds = calibrated_rounds(&fixture, historical, MEASURE_TARGET);
+        let candidate_rounds = calibrated_rounds(&fixture, candidate, MEASURE_TARGET);
+        let null = ratios(&fixture, historical_rounds, historical_rounds, false);
+        let ab = ratios(&fixture, historical_rounds, candidate_rounds, true);
         let period_count: usize = fixture.periods.iter().map(Vec::len).sum();
         println!(
-            "measure shape={} segments={} periods_per_round={} rounds={rounds}",
+            "measure shape={} segments={} periods_per_round={} historical_rounds={historical_rounds} candidate_rounds={candidate_rounds} pairs={PAIRS} min_of={MIN_OF}",
             shape.name(),
             fixture.segments.len(),
             period_count
@@ -426,27 +476,24 @@ fn measure() -> ExitCode {
         print_samples("historical_over_historical", &null);
         print_samples("candidate_over_historical", &ab);
 
-        let null_ok = (0.97..=1.03).contains(&median(&null)) && cv(&null) <= 0.03;
-        let separation_ok = percentile(&ab, 0.90) < percentile(&null, 0.10);
-        let shape_ok = match shape {
-            Shape::Short => median(&ab) <= 1.03,
-            Shape::Medium => median(&ab) <= 0.80 && ab.iter().all(|ratio| *ratio < 1.0),
-            Shape::Stress => true,
-        };
+        let (null_ci_low, null_ci_high) = bootstrap_median_ci(&null);
+        let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+        let required_speedup = 1.0 + 2.0 * null_half_width;
+        let candidate_median = median(&ab);
+        let keep = candidate_median >= required_speedup;
+        kept_shapes += usize::from(keep);
         println!(
-            "gates shape={} null_ok={null_ok} separation_ok={separation_ok} shape_ok={shape_ok}",
-            shape.name()
+            "gate shape={} method=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} required_speedup={required_speedup:.6} candidate_median={candidate_median:.6} cv_is_provenance_only=true verdict={}",
+            shape.name(),
+            if keep { "KEEP" } else { "REJECT" }
         );
-        passed &= null_ok && separation_ok && shape_ok;
     }
-    if passed {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(2)
-    }
+    println!("overall kept_shapes={kept_shapes}/3");
+    ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
+    println!("bench_elf_sha256={}", self_identity());
     match env::args().nth(1).as_deref() {
         Some("profile") => profile(),
         Some("measure") => measure(),

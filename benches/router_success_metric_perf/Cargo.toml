@@ -6,6 +6,9 @@ publish = false
 
 [workspace]
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [[bench]]
 name = "router_success_metric_perf"
 path = "bench.rs"

@@ -7,6 +7,9 @@ autobins = false
 
 [workspace]
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [[bench]]
 name = "punctuation_abbreviation_perf"
 path = "src/main.rs"

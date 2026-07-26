@@ -45,8 +45,10 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
+use ft_kernel_cpu::{sdpa_forward_f32, set_sdpa_br, set_sdpa_br_auto};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel};
 use franken_whisper::native_engine::decoder::{self, DecoderState};
@@ -90,6 +92,65 @@ fn synthetic_audio(n: usize, seed: u64) -> Vec<f32> {
         out.push(0.9 * tone + 0.05 * lcg.next_f32());
     }
     out
+}
+
+const SDPA_HARNESS_PAIRS: usize = 41;
+const SDPA_HARNESS_MIN_OF: usize = 3;
+const SDPA_BOOTSTRAP_RESAMPLES: usize = 20_000;
+
+fn native_bench_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!(
+        "{:x} ({} bytes) {}",
+        hasher.finalize(),
+        bytes.len(),
+        path.display()
+    )
+}
+
+fn sdpa_harness_percentile(values: &[f64], percentile: usize) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[(sorted.len() - 1) * percentile / 100]
+}
+
+fn sdpa_bootstrap_median_ci(values: &[f64]) -> (f64, f64) {
+    let mut state = 0x1f83_d9ab_fb41_bd6b_u64 ^ values.len() as u64;
+    let mut sample = Vec::with_capacity(values.len());
+    let mut medians = Vec::with_capacity(SDPA_BOOTSTRAP_RESAMPLES);
+    for _ in 0..SDPA_BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..values.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            sample.push(values[state as usize % values.len()]);
+        }
+        sample.sort_by(f64::total_cmp);
+        medians.push(sample[sample.len() / 2]);
+    }
+    medians.sort_by(f64::total_cmp);
+    (
+        medians[SDPA_BOOTSTRAP_RESAMPLES * 25 / 1_000],
+        medians[SDPA_BOOTSTRAP_RESAMPLES * 975 / 1_000],
+    )
+}
+
+fn sdpa_harness_cv(values: &[f64]) -> f64 {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt() / mean
 }
 
 /// A synthetic `[n_mel, N_FREQ_BINS]` filterbank. The mel-frontend cost is
@@ -639,8 +700,6 @@ fn bench_self_attn_column_keys(c: &mut Criterion) {
     const INNER_STEPS: usize = 16;
     const WARMUP_REPS: usize = 3;
     const PAIRED_REPS: usize = 31;
-    const NULL_MEDIAN_MIN: f64 = 0.98;
-    const NULL_MEDIAN_MAX: f64 = 1.02;
 
     let mut lcg = Lcg::new(0xc011_0a7e);
     let prefill_k = Mat::from_vec(
@@ -712,9 +771,13 @@ fn bench_self_attn_column_keys(c: &mut Criterion) {
         PAIRED_REPS,
     );
     let null_stats = paired_ratio_stats(&null_ratios);
+    let (null_ci_low, null_ci_high) = sdpa_bootstrap_median_ci(&null_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
     eprintln!(
         "SELF_K_NULL ratios=[{}] median={:.6} p10={:.6} p90={:.6} min={:.6} \
-         max={:.6} cv_pct={:.3} wins={}/{} acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}]",
+         max={:.6} median_ci95=[{null_ci_low:.6},{null_ci_high:.6}] cv_pct={:.3} \
+         wins={}/{} cv_is_provenance_only=true",
         format_ratios(&null_ratios),
         null_stats.median,
         null_stats.p10,
@@ -725,7 +788,6 @@ fn bench_self_attn_column_keys(c: &mut Criterion) {
         null_stats.wins,
         PAIRED_REPS,
     );
-    let null_valid = (NULL_MEDIAN_MIN..=NULL_MEDIAN_MAX).contains(&null_stats.median);
 
     // Correctness is checked through the real public path before candidate
     // timing. Both complete 1280-float outputs must match bit-for-bit.
@@ -763,61 +825,51 @@ fn bench_self_attn_column_keys(c: &mut Criterion) {
     black_box(original_out.data.as_slice());
     black_box(candidate_out.data.as_slice());
 
-    if null_valid {
-        black_box(paired_self_attn_ratios(
-            &mut original,
-            &mut candidate,
-            &q,
-            &k_new,
-            &v_new,
-            N_HEAD,
-            PREFILL,
-            INNER_STEPS,
-            WARMUP_REPS,
-        ));
-        let candidate_ratios = paired_self_attn_ratios(
-            &mut original,
-            &mut candidate,
-            &q,
-            &k_new,
-            &v_new,
-            N_HEAD,
-            PREFILL,
-            INNER_STEPS,
-            PAIRED_REPS,
-        );
-        let candidate_stats = paired_ratio_stats(&candidate_ratios);
-        let verdict = if candidate_stats.median > null_stats.p90 {
-            "WIN_ABOVE_NULL_P90"
-        } else if candidate_stats.median < null_stats.p10 {
-            "REJECT_BELOW_NULL_P10"
-        } else {
-            "SURFACE_INSIDE_NULL"
-        };
-        eprintln!(
-            "SELF_K_CANDIDATE reach=attention_with_cache parity=bit_exact ratios=[{}] \
-             median={:.6} p10={:.6} p90={:.6} min={:.6} max={:.6} cv_pct={:.3} \
-             wins={}/{} null_median={:.6} null_floor=[{:.6},{:.6}] verdict={verdict}",
-            format_ratios(&candidate_ratios),
-            candidate_stats.median,
-            candidate_stats.p10,
-            candidate_stats.p90,
-            candidate_stats.min,
-            candidate_stats.max,
-            candidate_stats.cv_pct,
-            candidate_stats.wins,
-            PAIRED_REPS,
-            null_stats.median,
-            null_stats.p10,
-            null_stats.p90,
-        );
+    black_box(paired_self_attn_ratios(
+        &mut original,
+        &mut candidate,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        WARMUP_REPS,
+    ));
+    let candidate_ratios = paired_self_attn_ratios(
+        &mut original,
+        &mut candidate,
+        &q,
+        &k_new,
+        &v_new,
+        N_HEAD,
+        PREFILL,
+        INNER_STEPS,
+        PAIRED_REPS,
+    );
+    let candidate_stats = paired_ratio_stats(&candidate_ratios);
+    let (candidate_ci_low, candidate_ci_high) = sdpa_bootstrap_median_ci(&candidate_ratios);
+    let verdict = if candidate_stats.median >= required_speedup {
+        "KEEP"
     } else {
-        eprintln!(
-            "SELF_K_CANDIDATE verdict=BLOCKED_NULL_MEDIAN null_median={:.6} \
-             acceptance=[{NULL_MEDIAN_MIN:.2},{NULL_MEDIAN_MAX:.2}] candidate_not_timed=true",
-            null_stats.median,
-        );
-    }
+        "REJECT"
+    };
+    eprintln!(
+        "SELF_K_CANDIDATE reach=attention_with_cache parity=bit_exact ratios=[{}] \
+         median={:.6} p10={:.6} p90={:.6} min={:.6} max={:.6} \
+         median_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] cv_pct={:.3} \
+         wins={}/{} gate=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} \
+         required_speedup={required_speedup:.6} cv_is_provenance_only=true verdict={verdict}",
+        format_ratios(&candidate_ratios),
+        candidate_stats.median,
+        candidate_stats.p10,
+        candidate_stats.p90,
+        candidate_stats.min,
+        candidate_stats.max,
+        candidate_stats.cv_pct,
+        candidate_stats.wins,
+        PAIRED_REPS,
+    );
 
     // These are profiler-reachability loops only, not A/B evidence. The valid
     // comparison above is interleaved in one routine; these two labels merely
@@ -828,29 +880,15 @@ fn bench_self_attn_column_keys(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
     group.bench_function("profile_only_orig_row_major", |b| {
         b.iter(|| {
-            let elapsed = measure_self_attn_arm(
-                &mut original,
-                &q,
-                &k_new,
-                &v_new,
-                N_HEAD,
-                PREFILL,
-                1,
-            );
+            let elapsed =
+                measure_self_attn_arm(&mut original, &q, &k_new, &v_new, N_HEAD, PREFILL, 1);
             black_box(elapsed);
         });
     });
     group.bench_function("profile_only_candidate_column_major", |b| {
         b.iter(|| {
-            let elapsed = measure_self_attn_arm(
-                &mut candidate,
-                &q,
-                &k_new,
-                &v_new,
-                N_HEAD,
-                PREFILL,
-                1,
-            );
+            let elapsed =
+                measure_self_attn_arm(&mut candidate, &q, &k_new, &v_new, N_HEAD, PREFILL, 1);
             black_box(elapsed);
         });
     });
@@ -1719,6 +1757,175 @@ fn bench_timestamp_lookup_ab(c: &mut Criterion) {
     group.finish();
 }
 
+/// Re-run the VOID SDPA `BR` sweep under the fleet harness contract: one ELF,
+/// A/A before A/B, 41 order-alternated ratios, min-of-3 timing, and a
+/// bootstrap-median CI gate. `cv` is emitted only as provenance.
+fn bench_sdpa_br_resurrection(_c: &mut Criterion) {
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|filter| !filter.starts_with('-') && !filter.contains("sdpa_br_resurrection"))
+    {
+        return;
+    }
+
+    fn fill(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / 16_777_216.0) - 0.5
+            })
+            .collect()
+    }
+
+    fn run(
+        br: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        nbh: usize,
+        seq: usize,
+        d: usize,
+    ) -> Vec<f32> {
+        set_sdpa_br(br);
+        sdpa_forward_f32(
+            black_box(q),
+            black_box(k),
+            black_box(v),
+            nbh,
+            seq,
+            seq,
+            d,
+            d,
+            1.0 / (d as f32).sqrt(),
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn min_ns_per_call(
+        br: usize,
+        repetitions: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        nbh: usize,
+        seq: usize,
+        d: usize,
+    ) -> f64 {
+        (0..SDPA_HARNESS_MIN_OF)
+            .map(|_| {
+                let started = Instant::now();
+                let mut checksum = 0_u64;
+                for _ in 0..repetitions {
+                    let output = run(br, q, k, v, nbh, seq, d);
+                    checksum ^= output
+                        .chunks(97)
+                        .map(|chunk| u64::from(chunk[0].to_bits()))
+                        .fold(0_u64, u64::wrapping_add);
+                    black_box(output);
+                }
+                black_box(checksum);
+                started.elapsed().as_nanos() as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+            / repetitions as f64
+    }
+
+    let (nbh, seq, d) = (20_usize, 1_500_usize, 64_usize);
+    let q = fill(1, nbh * seq * d);
+    let k = fill(7, nbh * seq * d);
+    let v = fill(13, nbh * seq * d);
+    let baseline_output = run(64, &q, &k, &v, nbh, seq, d);
+    let candidate_output = run(128, &q, &k, &v, nbh, seq, d);
+    assert!(
+        baseline_output
+            .iter()
+            .zip(&candidate_output)
+            .all(|(baseline, candidate)| baseline.to_bits() == candidate.to_bits()),
+        "BR=128 must preserve every output bit"
+    );
+    let mut parity_hasher = Sha256::new();
+    for value in &baseline_output {
+        parity_hasher.update(value.to_bits().to_le_bytes());
+    }
+    println!(
+        "SDPA_BR_PARITY shape={nbh}x{seq}x{d} outputs={} sha256={:x}",
+        baseline_output.len(),
+        parity_hasher.finalize()
+    );
+
+    let probe_started = Instant::now();
+    black_box(run(64, &q, &k, &v, nbh, seq, d));
+    let probe_ns = probe_started.elapsed().as_nanos().max(1);
+    let repetitions =
+        usize::try_from((2_000_000_u128 / probe_ns).clamp(1, 8)).expect("bounded repetitions");
+
+    let mut null_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (left, right) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d),
+                min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d),
+            )
+        } else {
+            let right = min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d);
+            let left = min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d);
+            (left, right)
+        };
+        null_ratios.push(left / right.max(f64::MIN_POSITIVE));
+    }
+
+    let mut candidate_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (baseline, candidate) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d),
+                min_ns_per_call(128, repetitions, &q, &k, &v, nbh, seq, d),
+            )
+        } else {
+            let candidate = min_ns_per_call(128, repetitions, &q, &k, &v, nbh, seq, d);
+            let baseline = min_ns_per_call(64, repetitions, &q, &k, &v, nbh, seq, d);
+            (baseline, candidate)
+        };
+        candidate_ratios.push(baseline / candidate.max(f64::MIN_POSITIVE));
+    }
+
+    let (null_ci_low, null_ci_high) = sdpa_bootstrap_median_ci(&null_ratios);
+    let (candidate_ci_low, candidate_ci_high) = sdpa_bootstrap_median_ci(&candidate_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
+    let candidate_median = sdpa_harness_percentile(&candidate_ratios, 50);
+    println!(
+        "SDPA_BR_AB br=64/128 repetitions={repetitions} pairs={SDPA_HARNESS_PAIRS} min_of={SDPA_HARNESS_MIN_OF}"
+    );
+    println!(
+        "SDPA_BR_NULL ratios={null_ratios:?} median={:.6} median_ci95=[{null_ci_low:.6},{null_ci_high:.6}] cv={:.6}",
+        sdpa_harness_percentile(&null_ratios, 50),
+        sdpa_harness_cv(&null_ratios)
+    );
+    println!(
+        "SDPA_BR_CANDIDATE ratios={candidate_ratios:?} median={candidate_median:.6} median_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] cv={:.6} wins={}/{}",
+        sdpa_harness_cv(&candidate_ratios),
+        candidate_ratios
+            .iter()
+            .filter(|ratio| **ratio > 1.0)
+            .count(),
+        SDPA_HARNESS_PAIRS
+    );
+    println!(
+        "SDPA_BR_GATE method=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} required_speedup={required_speedup:.6} candidate_median={candidate_median:.6} cv_is_provenance_only=true verdict={}",
+        if candidate_median >= required_speedup {
+            "KEEP"
+        } else {
+            "REJECT"
+        }
+    );
+    set_sdpa_br_auto();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
@@ -1747,8 +1954,14 @@ criterion_group!(
     bench_tokenizer_suppress_prefilter,
     bench_tokenizer_decode_utf8,
     bench_timestamp_lookup_ab,
+    bench_sdpa_br_resurrection,
     bench_e2e_tiny_jfk,
     bench_e2e_tiny_jfk_no_timestamps,
     bench_e2e_large_jfk,
 );
-criterion_main!(benches);
+
+fn main() {
+    println!("bench_elf_sha256={}", native_bench_identity());
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

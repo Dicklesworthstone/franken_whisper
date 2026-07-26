@@ -1,73 +1,46 @@
 # Ledger Resurrection Audit — franken_whisper
 
 **Campaign:** `perf-campaign-20260725`, Fleet-Wide Meta-Lever #1.
-**Lane:** cc / STRUCTURAL (YellowKite), Lane L under the 2026-07-25 allocation addendum.
-**Source audited:** `docs/NEGATIVE_EVIDENCE.md` (709 entries, 25,780 lines).
-**Revision 2 (2026-07-25):** rewritten to adopt **frankenfs's taxonomy verbatim**
-(`/data/projects/frankenfs/docs/LEDGER_RESURRECTION.md`) per the fleet broadcast.
+**Lane:** cod / HARNESS+FRONTIER, Lane L under the 2026-07-25 allocation addendum.
+**Source audited:** `docs/NEGATIVE_EVIDENCE.md` (713 `##` entries; 25,910 lines
+in the audit worktree).
+**Method source:** `/data/projects/frankenfs/docs/LEDGER_RESURRECTION.md`, read
+in full before this audit.
 
 A REJECT row is **VOID** when the measurement *could not have detected the lever* — as
 opposed to detecting it and finding it absent.
 
 ---
 
-## 0a. Correction to revision 2 — the population was half its true size
+## 0. Population correction and hand-adjudication
 
-Building the enforcement guard (broadcast 2) exposed a counting error in this
-document. Revision 2 audited **139 rows whose header contains "REJECT"**. But
-this repo does not have a verdict *column* — rejections live in prose titles, and
-a large fraction never use the word. The `int4 mlp_0` family, for instance, is
-closed under *DEAD*, *CLOSED*, *FALSIFIED* and *NEGATIVE* and says "REJECT"
-nowhere.
+The mechanical header screen used this repository's actual verdict vocabulary:
 
-Counting the vocabulary this repo actually uses
-(`REJECT|DEAD|CLOSED|FALSIFIED|NO-SHIP|DO-NOT-RETRY|NEGATIVE`, dated rows only):
+```text
+REJECT | DEAD | CLOSED | FALSIFIED | NO-SHIP | DO-NOT-RETRY | NEGATIVE
+```
 
-| | revision 2 | **corrected** |
-|---|---:|---:|
-| rejection-verdict rows | 139 | **277** |
-| rows recording no decidability evidence | 82 | **99** |
-| void rate | 59% | **36%** |
+It produced **277 candidates**. That number is a queue, not a denominator.
+Reading every candidate exposed **89 false positives**: KEEP rows that discuss a
+prior rejection, infrastructure blockers, superseding corrections, surveys, and
+specification closures whose prose happens to contain one of the words above.
+Those rows are excluded rather than silently counted as valid evidence.
 
-The corrected rate is *lower* because the widened population brings in many rows
-that do record evidence — not because the standard was relaxed. It is measured
-with the calibrated marker set now enforced by `tests/ledger_integrity.rs`
-(word-boundary matched, with the false-positive traps in §0b removed), which is
-stricter than revision 2's hand-rescue pass. **Treat 277 / 99 / 36% as this
-repo's figures.**
+The remaining **188 performance-rejection rows were each hand-adjudicated**.
+The regex never assigned a verdict. Nested `###` evidence stayed attached to its
+parent `##` row; this avoids the over-splitting defect documented by frankenfs.
+For ambiguous rows, the decision followed the evidence that actually killed the
+lever:
 
-## 0b. Two false-positive traps, in case other repos screen the same way
+- a bare wall ratio, even a large regression, is not a counted mechanism;
+- a recorded count can be broader than one spelling (for example bytes moved,
+  accepted tokens, FLOPs, or a quantified output mismatch), but it must make the
+  rejected premise impossible rather than merely restate wall time;
+- correctness-only KEEP/survey prose is excluded; a quantified correctness
+  mechanism inside a performance rejection is `VALID-MECHANISM`;
+- `cv` may be reported as provenance but never makes a row valid.
 
-Both were caught while calibrating the guard, and both would have silently
-inflated a "clean ledger" claim:
-
-- **`"wer"` matches inside *were*, *lower*, *answer*.** Substring matching made
-  the first draft of the guard pass **96%** of historical rows. Word-boundary
-  matching is mandatory.
-- **`"byte-identical"` is a claim of exactness, not an accuracy refutation.** A
-  row reading *"byte-identical but 1.02×, rejected"* would have passed on it
-  while recording no null at all. Only `non-byte-exact` — an actual refutation —
-  counts. Likewise bare `"slower"` (54 of 169 rows, nearly all prose) and bare
-  `"allocation"` were dropped in favour of a numeric `≤ 0.90×` test and specific
-  phrases like `"allocations unchanged"`.
-
-## 0. Correction to revision 1 — I audited the wrong class
-
-Revision 1 of this document concluded that *"this repo does **not** have frankenlibc's
-39-of-93 void rate; the void vein is narrow, old, and concentrated in one week"* and
-reported **4 VOID**. That conclusion was wrong, in two compounding ways:
-
-1. **I hand-audited only the 16 CV-gated rows** — because the campaign doc predicted the
-   CV gate would be the dominant void class. The fleet broadcast has since corrected
-   that prediction: CV is *rare* (frankenfs 4 of 219; **3 of 82 here**). By aiming the
-   hand-audit at the rare class I sampled ~11% of the REJECT population and missed the
-   epidemic entirely.
-2. **I generalised "recent rows are rigorous" from the rows that have nulls.** Twenty
-   rows record an A/A null and they are genuinely good. There are **139** REJECT rows.
-   Inferring the ledger's health from its best 14% was a selection error on my part.
-
-Corrected headline: **~82 of 139 REJECT rows (59%) are VOID**, and — exactly as the
-broadcast says — the epidemic is **VOID-NONULL**, not VOID-CV.
+This supersedes the earlier 139-row and 277-row-as-denominator drafts.
 
 ---
 
@@ -82,61 +55,70 @@ broadcast says — the epidemic is **VOID-NONULL**, not VOID-CV.
 | `VOID-ZEROSELF` | The target frame had ~0% self-time in the profile the bench actually exercised. | ❌ |
 | `VOID-NONULL` | An A/B ran, was rejected on a near-1.0 wall ratio, and recorded **no** A/A null control and no counted mechanism. Cannot distinguish lever from harness. | ❌ |
 
-### Proposed 7th class — `VALID-ACCURACY` (franken_whisper-specific; offered to the fleet)
-
-This repo's contract is **transcript exactness**, not throughput. A large share of its
-REJECTs never made a speed claim at all: they were refuted on WER, faithfulness,
-byte-exactness, or numerical safety. **A speed null control is meaningless for those
-rows**, in exactly the way `VALID-MECHANISM` describes — the refutation does not rest on
-a wall ratio, so the absence of a null cannot void it.
-
-Examples adjudicated by hand: *"REJECTED on ACCURACY — Nyström low-rank encoder
-self-attention"* (L8382); *"encoder `attn.out` int8 is NOT safe"* (L8331); the three
-2026-07-04 quantisation rows rejected because they *"help track01 but REGRESS"* another
-clip (L9170/9204/9234).
-
-Two adjacent shapes were rescued on the same logic — a null cannot rescue them either:
-
-- **Large-magnitude regression.** L8265 fused-wide encoder int8 QKV at **0.439×**
-  (2.3–2.7× *slower*); L8474 product-quantised GEMM at **0.40×**. No plausible null floor
-  spans a 2.5× loss.
-- **Self-caught harness defect.** L8402 int8 GEMV register-row-blocking, rejected by its
-  own author as a *"warm-bench trap"* — the row identified its measurement as invalid,
-  which is the audit conclusion, not a defect in it.
-
-If the fleet accepts this class, other repos with correctness-first contracts
-(frankensqlite, frankenlibc) should re-screen for it before publishing a void rate.
+There is deliberately **no seventh class**. Quantified WER/token/output failures
+are adjudicated under `VALID-MECHANISM` only when the count itself refutes the
+lever; otherwise the row is excluded from the performance-rejection population.
 
 ---
 
 ## 2. Counts
 
-Screen = `awk` pass over all 709 entries (script inputs in the session scratchpad).
-**The screen is triage, not a verdict** — see §4 for exactly how far hand-adjudication got.
+The mechanical screen was followed by a row-by-row read. The denominator below
+is the 188 actual performance rejections, not the 277 regex hits.
 
 | Metric | Count |
 |---|---:|
-| Ledger entries parsed | 709 |
-| **REJECT verdict — audited** | **139** |
-| `VALID-AB` | 20 |
-| `VALID-MECHANISM` | 21 |
-| `VALID-PROFILE` | 1 |
-| `VALID-ACCURACY` + magnitude/self-caught (hand-rescued from the screen's void pile) | 19 |
-| **`VOID-NONULL`** | **79** |
-| **`VOID-CV`** | **3** |
+| `##` ledger entries parsed | 713 |
+| Mechanical header-screen candidates | 277 |
+| False-positive/non-performance candidates excluded by hand | 89 |
+| **Performance rejections hand-adjudicated** | **188** |
+| `VALID-AB` | 19 |
+| `VALID-MECHANISM` | 96 |
+| `VALID-PROFILE` | 13 |
+| **`VOID-NONULL`** | **56** |
+| **`VOID-CV`** | **4** |
 | `VOID-ZEROSELF` | 0 observed |
-| **VOID total** | **82 / 139 = 59%** |
-| Rows carrying a binary sha256 | **12 / 139 = 8.6%** |
+| **VOID total** | **60 / 188 = 31.9%** |
+| Rows carrying a benchmark-binary/ELF sha256 | **12 / 188 = 6.4%** |
 
-Comparison with frankenfs: VOID 59% vs 79.3%; sha256 coverage 8.6% vs 10.9%; and the
-same dominance pattern — **VOID-NONULL 79 of 82 void here, 214 of 219 there; VOID-CV 3
-here, 4 there.** Two independent repos, same epidemic, same rare class. The broadcast's
-correction reproduces cleanly.
+The same fleet pattern survives the corrected denominator:
+**VOID-NONULL is 56 of 60 void rows (93.3%)**, while only four rows died solely
+on CV. The campaign prediction that CV would dominate was wrong here too.
 
-**Read this honestly, per frankenfs's warning.** 82 void rows are *not* 82 buried wins.
+**Read this honestly, per frankenfs's warning.** Sixty void rows are not sixty buried wins.
 `VOID-NONULL` overwhelmingly means "the row measured ~1.0× and never wrote down what
 ~1.0× means on that bench". Most of those levers are genuinely dead; the class exists
 because the row cannot *prove* it. The actionable yield is a small head (§3).
+
+### Audit trail
+
+Line numbers below refer to the 25,910-line audit worktree snapshot. They make
+the hand decisions reviewable without pretending the screen was the verdict.
+
+- `VALID-AB` (19): 7, 482, 2094, 2279, 2529, 2591, 2654, 2713, 2771,
+  2865, 2922, 3006, 3085, 3124, 3209, 3269, 4835, 4951, 5993.
+- `VALID-PROFILE` (13): 6723, 7027, 7192, 7943, 8325, 9728, 11414,
+  11472, 11531, 11724, 15594, 16454, 16485.
+- `VOID-CV` (4): 520, 5585, 6434, 25686.
+- `VOID-ZEROSELF` (0): none.
+- `VOID-NONULL` (56): 2132, 7548, 7584, 7635, 7642, 7798, 7952,
+  7958, 8084, 8087, 9296, 9998, 11921, 12127, 12141, 12159, 12189,
+  12303, 12600, 12647, 13269, 13304, 13592, 13890, 15631, 16117,
+  16150, 16682, 17558, 17714, 18254, 18339, 18419, 18485, 18863,
+  19214, 19656, 19736, 19875, 20097, 20156, 20201, 20571, 20854,
+  21181, 21256, 21433, 21537, 22926, 23010, 23176, 24772, 25221,
+  25274, 25318, 25435.
+- `VALID-MECHANISM` (96): 1402, 3508, 4157, 4190, 4293, 4547,
+  6889, 7537, 7762, 7946, 7949, 7994, 8081, 8151, 8265, 8328,
+  8331, 8365, 8382, 8402, 8442, 8459, 8474, 8562, 8720, 9062,
+  9170, 9204, 9234, 9263, 9358, 9496, 9690, 9760, 9832, 9869,
+  9935, 10141, 10613, 10724, 10995, 11030, 11358, 11396, 11449,
+  11573, 11616, 11679, 11695, 11704, 11750, 11844, 11862, 11880,
+  11890, 11958, 12007, 12021, 12083, 12091, 12315, 12341, 12420,
+  12456, 12570, 12944, 13082, 13336, 13383, 13621, 14491, 14934,
+  15411, 15461, 15477, 15725, 15855, 15934, 16086, 16526, 17364,
+  17833, 18561, 18650, 20374, 20404, 20451, 21103, 21142, 23847,
+  24698, 24729, 25247, 25507, 25716, 25735.
 
 ---
 
@@ -151,24 +133,24 @@ int8 (17)** — i.e. the i7 int8 encoder GEMM, which the `bd-i7-…-o0bu` profil
 code in the engine.
 
 1. **i7 bias specialization** (`bd-i7-rows-gated-and-substrate-invalid-o0bu`) —
-   **~28.2% self-time.** Never validly measured: the original A/B flipped
-   `FW_I7_ROWBLOCK_MIN_LEN` across *two* rch invocations and rch ratios are not
-   worker-invariant. **Prerequisite:** the flag is a `OnceLock` env read, so it needs a
-   runtime setter before both arms can live in one binary. Do **not** re-mine the
-   rowblock half — it is an honest `VALID-AB` REJECT (median 0.880, 4/21 wins).
-2. **Router diagnostics four-pass fusion** (L390) — `VOID-CV`, and the cheapest to close.
-   Candidate **median 1.1847× against null p90 1.1080×**, byte-exactness oracle already
-   run before timing, profile-only harness retained. Killed by a `cv` assertion plus a
-   `p10 > null p90` test no effect of that size can pass at this noise floor.
-3. **Speculation-controller Brier reuse** (`bd-7rxo`) — 18.026% of its caller. **Re-run
-   this pass; see §4.** Result: not bankable, harness defect found.
-4. **Direct transcript concatenation** (L2641) — `VOID-NONULL`, 1.0748× with a
-   byte-identical SHA256 already recorded. Needs its null floor established.
-5. **SDPA `BR` tile sweep** (L5455) — `VOID-CV`; its own A/A null read **1.1163× at cv
-   29.0%**, so the harness decided nothing. Ceiling capped: target frame is 4.05% of e2e.
-6. **`tile_shape`** (L6304) — `VOID-CV`; a **1.689×** mechanism with 23–24/25 paired wins
-   killed only by `cv 16.8–24.2%`. Lowest expected e2e yield despite the biggest ratio,
-   because per `bd-4hc0` the f32 2D tiler is off the default hot path.
+   **~28.2% self-time.** The exact const-generic bias/no-bias candidate was
+   reverted and is no longer reconstructable. The available
+   `FW_I7_ROWBLOCK_MIN_LEN` selector controls a different, already-validly
+   rejected rowblock lever and cannot serve as a proxy.
+2. **Router diagnostics four-pass fusion** (audit line 520) — `VOID-CV`,
+   **21.63%** of its caller. Its old 1.1847× result was killed by CV despite a
+   valid null median.
+3. **Speculation-controller Brier reuse** (`bd-7rxo`) — `VOID-NONULL`,
+   **18.026%** of `apply()`.
+4. **SDPA `BR` tile sweep** (audit line 5585) — `VOID-CV`; target packing
+   frame **4.05% of e2e**.
+5. **`tile_shape`** (audit line 6434) — `VOID-CV`; the historical T=14
+   mechanism read **1.689×** with 23–24/25 wins but was killed by CV. It has
+   the lowest expected e2e yield because the f32 2-D tiler is off the default
+   hot path.
+
+The hand pass removed **direct transcript concatenation** from the queue. Its
+row records a same-binary A/A null, so it is `VALID-AB`, not resurrectable.
 
 ---
 
@@ -176,36 +158,39 @@ code in the engine.
 
 | Metric | Count |
 |---|---:|
-| Entries screened (six-class) | 139 / 139 |
-| Queue head read in full and hand-adjudicated | ~25 |
-| Residual `VOID-NONULL` rows **not** individually hand-read | **79** |
-| Re-run under a corrected harness | **1** (`bd-7rxo`) |
-| Re-won | **0** |
+| Mechanical candidates read and adjudicated | **277 / 277** |
+| Actual performance rejections classified | **188 / 188** |
+| Queue rows closed under corrected evidence | **4 / 5** |
+| Resurrected KEEP | **2** |
+| Corrected REJECT | **1** |
+| Faithful rerun blocked before timing | **1** |
+| Awaiting Lane-L measurement window | **1** |
 
-**Honesty about method.** The broadcast asks for every row to be hand-adjudicated. That
-is done for the queue head and for the encoder/int8 population that dominates the void
-pile. The 19 rescues in §1 came from a **second screen pass** (accuracy / magnitude /
-self-caught keywords), spot-checked by hand but **not** individually adjudicated for all
-19; and the residual 79 are screen output only. Full hand adjudication of those 79 is
-the outstanding work on this document. I am not claiming it is done.
+The top-five outcomes are:
 
-**The one re-run, and why it produced no win.** `bd-7rxo` measured **1.186–1.193× median
-across 3 runs, 60/63 paired wins, against three *valid* A/A nulls** (median 0.9902–0.9997)
-— and is still not bankable. Its bench times the "historical" arm as
-`recommend() + apply()`, but `apply()` *is already the candidate*: it computes the Brier
-score once and threads it into `recommend_with_brier`. The baseline therefore does
-**2 folds + 2 decision bodies** where true historical did **2 + 1**. It performs work the
-lever never removed, so the ratio is an **upper bound, not an estimate**, and more
-sampling cannot repair a construction defect. Filed as `bd-203u`, which now blocks
-`bd-7rxo`. Full row in `docs/NEGATIVE_EVIDENCE.md`.
+1. **i7 bias specialization — BLOCKED, no proxy verdict.** The original
+   candidate source is absent. `bd-p5ku` records the exact reconstruction
+   predicate; rowblock coarsening is not the same lever.
+2. **Router diagnostics — KEEP, 1.120094×.** Null median
+   `0.994045`, candidate bootstrap median CI `[1.091145, 1.149635]`,
+   complete serialized diagnostics JSON identical.
+3. **Brier reuse — KEEP, 1.217822×.** The first rerun found that its
+   "historical" arm performed an extra decision body and was inadmissible.
+   A faithful runtime selector then put the true historical and current
+   `apply()` paths in the same binary: null `1.000247`, candidate median CI
+   `[1.212472, 1.232171]`, action/fallback/evidence JSON identical.
+4. **SDPA BR=128 — REJECT, 1.011137×.** Self-reporting ELF
+   `3ba35b4a7d7ba48d48fb0c8ed2ffdd3a83454f8e69047702134e573e58c789cb`;
+   A/A median CI `[0.965832, 1.039802]`; corrected 2× null-CI floor
+   `1.079604`; 1,920,000 f32 outputs bit-identical. CV was provenance only.
+5. **`tile_shape` — pending.** Lane L has no worker allocation. The campaign
+   thread contains the requested measurement-window handoff; taking a worker
+   without a grant would violate the superseding addendum.
 
-That is a `VOID-ZEROSELF`-adjacent defect — the bench did not exercise the code the row
-was about — caught *before* a KEEP was banked rather than months after.
-
-**The gate finding, confirmed by measurement rather than by reading.** Candidate `cv` was
-**7.06 / 8.07 / 8.74%** across three runs of a demonstrably calibrated harness. `cv < 5%`
-is unreachable here, so `bd-7rxo`'s own acceptance criterion was unsatisfiable as
-written. Note this does *not* make CV the epidemic — only 3 rows died on it.
+The first Brier attempt is retained as an important harness result, not counted
+as a fifth verdict: candidate medians 1.186–1.193× and valid A/A medians
+0.9902–0.9997 could not rescue a baseline that executed work historical
+production never did. More sampling cannot repair arm construction.
 
 ---
 
@@ -215,55 +200,58 @@ frankensqlite sits at **1.7% void** having audited months ago and then made the
 check mechanical; every repo that audited once and stopped drifted to 25–91%.
 **Ledger integrity decays.** So this audit ships with enforcement:
 
-**`tests/ledger_integrity.rs`** — runs under the mandatory `cargo test` gate,
-modelled on this repo's existing `tests/no_canned_phrases.rs` honesty guard. A
-rejection row dated on or after `2026-07-26` must record at least one reason it
-was *decidable*: an A/A null, a counted mechanism, an accuracy/faithfulness
-refutation, a `≤ 0.90×` loss, or a profile-first self-time/Amdahl rejection.
-Otherwise the build fails, naming the row and the remedy. Writing a
-non-provable rejection is now impossible rather than discouraged.
-
-- History is **grandfathered and pinned**: `LEGACY_NONCOMPLIANT_BUDGET = 99`.
-  Failing on legacy rows would make the test permanently red, and a permanently
-  red test gets deleted — which is exactly how the discipline decays. The budget
-  may only shrink, so backdating a row to dodge the cutoff trips it instead.
-- The guard is **validated in both directions**, because a guard that only ever
-  passes is worse than none: a synthetic row *"REJECT — measured 1.02x and we
-  moved on"* fails it with a file:line citation, and the same row with an A/A
-  null recorded passes. A third test asserts the parser still sees >500 entries
-  and >200 rejection rows, so a ledger format change makes it fail loudly rather
-  than pass vacuously.
-
-**`examples/ledger_preflight.rs`** — the frankensqlite `sql_pipeline_candidate_preflight`
-analogue, run *before* touching source:
+**`examples/ledger_preflight.rs`** is the self-contained frankensqlite-style
+gate. It has two responsibilities:
 
 ```text
-cargo run --example ledger_preflight -- int4 mlp_0
-BLOCKED — 1 binding prior rejection(s):  (exit 2)
+cargo run --example ledger_preflight -- surface int4 mlp_0
+cargo run --example ledger_preflight -- validate-staged
 ```
 
-It distinguishes the two cases this campaign showed are different: **BLOCKED
-(exit 2)** when a matching prior rejection records why it was decidable, and
-**VOID PRIOR (exit 0)** when it records none — the latter is *not* binding and
-the lever is live, which is the whole point of the resurrection audit.
+`surface` searches `docs/NEGATIVE_EVIDENCE.md`, prints every matching prior row,
+and prints its concrete retry predicate verbatim when present. A sound prior
+KEEP/REJECT blocks with exit 2; a void prior is explicitly non-binding.
+
+`validate-staged` compares the staged ledgers with HEAD. Any new or modified
+REJECT/DEAD/CLOSED/FALSIFIED/NO-SHIP/DO-NOT-RETRY/NEGATIVE row is rejected
+unless it records either:
+
+1. a **same-invocation A/A null** with a numerical median/CI; or
+2. a **counted mechanism** showing instructions, cycles, syscalls,
+   allocations, bytes, or faults unchanged.
+
+There are no accuracy, large-regression, profile, or bare-CV exceptions in the
+write gate. A new KEEP is rejected unless it carries a 64-hex benchmark
+binary/ELF sha256. Exit 0 means clear; **exit 2 means blocked**.
+
+**`tests/ledger_integrity.rs`** exercises the same positive and negative
+contracts, including false-positive phrases such as "no null control" and an
+output-oracle SHA that is not a binary SHA.
+
+**`.githooks/pre-commit`** compiles the std-only Rust preflight directly and
+runs `validate-staged`. Repository-local `core.hooksPath=.githooks` activates
+it. The hook reads the Git index rather than the worktree, so an unstaged
+explanation cannot launder an invalid staged row.
 
 ## 5. Blockers
 
-**Ranks 1 and 4–6 are not re-runnable from this lane.** franken_whisper is **Lane L**
-(throttled, no worker) under the 2026-07-25 allocation addendum; the standing rule is to
-request a window rather than take one. Requested on the campaign thread.
+**Rank 5 and the tiny.en segment-timestamp gate are not runnable from this
+lane.** franken_whisper is **Lane L** (throttled, no worker) under the
+2026-07-25 allocation addendum; the standing rule is to request a window rather
+than take one. A measurement window was requested on the campaign thread.
 
 Rank 1 additionally needs a code prerequisite before any measurement is meaningful: a
-runtime setter for `FW_I7_ROWBLOCK_MIN_LEN`, since an env `OnceLock` cannot flip between
-arms inside one binary — the exact defect that made the original A/B inadmissible.
+faithful reconstruction of the removed bias/no-bias const-specialization or a
+runtime selector around those exact production arms. The available rowblock
+setter is not a substitute.
 
 **Remote benching is separately dead** (`bd-dd90`): `rch` refuses this workspace with
 `RCH-E410` (missing remote entrypoint `crates/fsqlite/tests/zz_aggincomposite_bench.rs`),
 and when it does dispatch, worker `ovh-a` fails to compile `fsqlite-pager` — which builds
 fine locally, so the remote checkout is stale.
 
-**Retry predicate for this document:** re-run the §3 queue when (1) a measurement window
-is granted, (2) for rank 1 specifically the runtime setter exists, and (3) the host is
-quiet (load < 2, no competing benchmark). Decide every re-run on the median-CI gate —
+**Retry predicate for this document:** finish rank 5 when (1) a measurement
+window is granted and (2) the host is quiet (load < 2, no competing benchmark).
+Reopen rank 1 only when its exact source exists. Decide every re-run on the median-CI gate —
 **decidable iff the claimed ratio lies outside the arm's A/A null 95% CI with a 2×
 margin** — and record `cv` as provenance only.

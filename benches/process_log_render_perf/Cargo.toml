@@ -6,6 +6,9 @@ publish = false
 
 [workspace]
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [[bench]]
 name = "process_log_render_perf"
 path = "main.rs"
