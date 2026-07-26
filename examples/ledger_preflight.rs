@@ -1,77 +1,21 @@
-//! Candidate preflight — grep the ledger *before* you touch source.
+//! Ledger preflight and staged-result gate.
 //!
 //! Fleet campaign `perf-campaign-20260725`, Meta-Lever #1, broadcast 2.
-//! Modelled on frankensqlite's `sql_pipeline_candidate_preflight` (exit 2 =
-//! BLOCKED), the mechanism credited with holding that repo at a **1.7%** void
-//! rate while every repo that audited once and stopped drifted to 25–91%.
+//! Modelled on frankensqlite's `sql_pipeline_candidate_preflight`.
 //!
-//! ## What it answers
+//! `surface` searches the negative-evidence ledger before source is touched,
+//! prints matching retry predicates, and exits 2 for a binding prior result.
+//! `validate-staged` compares the Git index with HEAD and exits 2 if a changed
+//! rejection has neither a same-invocation A/A null nor a counted mechanism,
+//! or if a changed KEEP lacks a benchmark-binary/ELF SHA-256.
 //!
-//! "Has this lever already been tried, and if so, is that rejection binding?"
-//! Those are two different questions, and conflating them is expensive in both
-//! directions — this repo's own ledger records agents re-deriving already-closed
-//! levers, *and* records genuinely-live levers being treated as closed because a
-//! void row said no.
-//!
-//! - **BLOCKED (exit 2)** — a prior REJECT row matches *and* records why it was
-//!   decidable (A/A null, counted mechanism, accuracy refutation, or a
-//!   large-magnitude loss). That rejection stands. Do not re-derive it.
-//! - **VOID PRIOR (exit 0)** — a prior REJECT row matches but records none of
-//!   those, so it could not distinguish the lever from the harness. It is *not*
-//!   binding. Proceed — and record an A/A null this time.
-//! - **CLEAR (exit 0)** — no prior row matches.
-//!
-//! ## Usage
-//!
-//! ```text
-//! cargo run --example ledger_preflight -- <term> [more terms...]
-//! cargo run --example ledger_preflight -- sdpa tile
-//! ```
-//!
-//! All terms must appear in the row (AND), case-insensitive.
-//!
-//! The evidence markers here intentionally mirror `tests/ledger_integrity.rs`,
-//! which enforces the same rule on *new* rows. This tool advises before the
-//! work; that test blocks the bad row afterwards.
+//! Exit 0 means clear. Exit 2 means BLOCKED. Other non-zero exits are usage or
+//! infrastructure failures.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-const EVIDENCE_MARKERS: &[&str] = &[
-    "null control",
-    "a/a",
-    "null median",
-    "null_p90",
-    "null p90",
-    "null p10",
-    "identity null",
-    "base/base",
-    "null floor",
-    "null pair",
-    "instructions",
-    "cycles",
-    "syscall",
-    "allocation",
-    "page fault",
-    "perf stat",
-    "retired",
-    "wer",
-    "accuracy",
-    "faithful",
-    "not safe",
-    "byte-exact",
-    "byte-identical",
-    "non-byte-exact",
-    "slower",
-    "self-time",
-    "self time",
-    "amdahl",
-];
-
-/// Verdict words this repo actually uses to close a lever. Matching only
-/// `REJECT` misses half the population: the `int4 mlp_0` family is closed under
-/// *DEAD* / *CLOSED* / *FALSIFIED* / *NEGATIVE* and never says "REJECT", so a
-/// narrower preflight reports CLEAR on a genuinely dead lever — the expensive
-/// direction of the error. Kept in sync with `tests/ledger_integrity.rs`.
 const REJECTION_VERDICTS: &[&str] = &[
     "REJECT",
     "DEAD",
@@ -82,34 +26,82 @@ const REJECTION_VERDICTS: &[&str] = &[
     "NEGATIVE",
 ];
 
-struct Row {
-    line: usize,
-    header: String,
-    body: String,
+const NULL_MARKERS: &[&str] = &["a/a", "null control", "identity null", "base/base"];
+const SAME_INVOCATION_MARKERS: &[&str] = &[
+    "same invocation",
+    "same-invocation",
+    "same binary",
+    "same-binary",
+    "same elf",
+    "same-elf",
+];
+const NULL_STATISTIC_MARKERS: &[&str] = &[
+    "median",
+    "ci95",
+    "ci 95",
+    "confidence interval",
+    "bootstrap",
+];
+const NEGATED_NULL_MARKERS: &[&str] = &[
+    "no a/a",
+    "without a/a",
+    "no null control",
+    "without a null control",
+    "null control unavailable",
+    "null control not recorded",
+    "missing null control",
+];
+const COUNTED_NOUNS: &[&str] = &[
+    "instructions",
+    "instruction count",
+    "cycles",
+    "cycle count",
+    "syscalls",
+    "syscall count",
+    "allocations",
+    "allocation count",
+    "page faults",
+    "fault count",
+    "bytes moved",
+    "bytes read",
+    "bytes written",
+];
+const UNCHANGED_MARKERS: &[&str] = &[
+    "unchanged",
+    "same count",
+    "identical count",
+    "zero delta",
+    "did not change",
+    "no change",
+    "equal count",
+];
+const BINARY_SHA_MARKERS: &[&str] = &[
+    "benchmark binary sha",
+    "benchmark-binary sha",
+    "binary sha",
+    "elf sha",
+    "executable sha",
+    "probe_elf_sha256",
+];
+const LEDGER_PATHS: &[&str] = &["docs/NEGATIVE_EVIDENCE.md", "docs/PERF_LEDGER.md"];
+
+#[derive(Clone, Debug)]
+pub(crate) struct Row {
+    pub(crate) line: usize,
+    pub(crate) header: String,
+    pub(crate) body: String,
 }
 
-fn main() {
-    let terms: Vec<String> = std::env::args().skip(1).map(|a| a.to_lowercase()).collect();
-    if terms.is_empty() {
-        eprintln!(
-            "usage: cargo run --example ledger_preflight -- <term> [more terms...]\n\
-             all terms must appear in a row (AND), case-insensitive"
-        );
-        std::process::exit(64);
+impl Row {
+    fn text(&self) -> String {
+        format!("{}\n{}", self.header, self.body)
     }
+}
 
-    let ledger = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/NEGATIVE_EVIDENCE.md");
-    let text = match std::fs::read_to_string(&ledger) {
-        Ok(text) => text,
-        Err(error) => {
-            eprintln!("cannot read {}: {error}", ledger.display());
-            std::process::exit(70);
-        }
-    };
-
-    let mut rows: Vec<Row> = Vec::new();
+pub(crate) fn parse_rows(text: &str) -> Vec<Row> {
+    let mut rows = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
-        if let Some(_rest) = raw.strip_prefix("## ") {
+        if raw.starts_with("## ") {
             rows.push(Row {
                 line: idx + 1,
                 header: raw.to_owned(),
@@ -120,77 +112,321 @@ fn main() {
             current.body.push('\n');
         }
     }
+    rows
+}
 
-    let mut binding = Vec::new();
-    let mut void_prior = Vec::new();
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
 
-    for row in &rows {
-        let upper = row.header.to_uppercase();
-        if !REJECTION_VERDICTS
+pub(crate) fn has_same_invocation_aa(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let explicit_positive = SAME_INVOCATION_MARKERS.iter().any(|same| {
+        NULL_MARKERS
             .iter()
-            .any(|verdict| upper.contains(verdict))
+            .any(|null| lower.contains(&format!("{same} {null}")))
+    });
+    let negated = contains_any(&lower, NEGATED_NULL_MARKERS);
+    if negated && !explicit_positive {
+        return false;
+    }
+
+    contains_any(&lower, NULL_MARKERS)
+        && contains_any(&lower, SAME_INVOCATION_MARKERS)
+        && contains_any(&lower, NULL_STATISTIC_MARKERS)
+        && lower.bytes().any(|byte| byte.is_ascii_digit())
+}
+
+pub(crate) fn has_counted_mechanism(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    contains_any(&lower, COUNTED_NOUNS) && contains_any(&lower, UNCHANGED_MARKERS)
+}
+
+fn contains_real_sha256(bytes: &[u8]) -> bool {
+    if bytes.len() < 64 {
+        return false;
+    }
+    for start in 0..=bytes.len() - 64 {
+        let candidate = &bytes[start..start + 64];
+        if !candidate.iter().all(u8::is_ascii_hexdigit) {
+            continue;
+        }
+        let left_ok = start == 0 || !bytes[start - 1].is_ascii_hexdigit();
+        let right_ok = start + 64 == bytes.len() || !bytes[start + 64].is_ascii_hexdigit();
+        let non_placeholder = candidate.iter().any(|byte| *byte != candidate[0]);
+        if left_ok && right_ok && non_placeholder {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn has_binary_sha256(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let bytes = lower.as_bytes();
+    BINARY_SHA_MARKERS.iter().any(|marker| {
+        lower.match_indices(marker).any(|(offset, _)| {
+            let start = offset.saturating_sub(32);
+            let end = (offset + marker.len() + 384).min(bytes.len());
+            contains_real_sha256(&bytes[start..end])
+        })
+    })
+}
+
+fn has_profile_evidence(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    (lower.contains("self-time") || lower.contains("self time"))
+        && (lower.contains("amdahl") || lower.contains("ceiling"))
+        && lower.contains('%')
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Verdict {
+    Keep,
+    Reject,
+    Other,
+}
+
+fn verdict(header: &str) -> Verdict {
+    let upper = header.to_uppercase();
+    let keep_at = upper.find("KEEP");
+    let reject_at = REJECTION_VERDICTS
+        .iter()
+        .filter_map(|word| upper.find(word))
+        .min();
+    match (keep_at, reject_at) {
+        (Some(keep), Some(reject)) if keep < reject => Verdict::Keep,
+        (_, Some(_)) => Verdict::Reject,
+        (Some(_), None) => Verdict::Keep,
+        (None, None) => Verdict::Other,
+    }
+}
+
+fn row_violation(row: &Row, path: &str) -> Option<String> {
+    match verdict(&row.header) {
+        Verdict::Reject
+            if !has_same_invocation_aa(&row.text()) && !has_counted_mechanism(&row.text()) =>
         {
-            continue;
+            Some(format!(
+                "{path}:{} — changed rejection lacks BOTH a numerical same-invocation A/A \
+                 null and a counted unchanged-work mechanism: {}",
+                row.line, row.header
+            ))
         }
-        let haystack = format!("{}\n{}", row.header, row.body).to_lowercase();
-        if !terms.iter().all(|term| haystack.contains(term)) {
-            continue;
-        }
-        let decidable = EVIDENCE_MARKERS
-            .iter()
-            .any(|marker| haystack.contains(marker));
-        let summary = format!(
-            "docs/NEGATIVE_EVIDENCE.md:{} — {}",
-            row.line,
-            row.header.chars().take(140).collect::<String>()
-        );
-        if decidable {
-            binding.push(summary);
-        } else {
-            void_prior.push(summary);
-        }
+        Verdict::Keep if !has_binary_sha256(&row.text()) => Some(format!(
+            "{path}:{} — changed KEEP lacks a 64-hex benchmark-binary/ELF SHA-256: {}",
+            row.line, row.header
+        )),
+        _ => None,
     }
+}
 
-    if !binding.is_empty() {
-        println!("BLOCKED — {} binding prior rejection(s):", binding.len());
-        for row in &binding {
-            println!("  {row}");
+pub(crate) fn validate_changed_text(head: &str, staged: &str, path: &str) -> Vec<String> {
+    let old_rows: HashSet<String> = parse_rows(head).into_iter().map(|row| row.text()).collect();
+    parse_rows(staged)
+        .into_iter()
+        .filter(|row| !old_rows.contains(&row.text()))
+        .filter_map(|row| row_violation(&row, path))
+        .collect()
+}
+
+fn retry_predicate(row: &Row) -> String {
+    let markers = [
+        "retry predicate",
+        "retry condition",
+        "retry-condition",
+        "retry only",
+        "do not retry",
+        "reopen only",
+    ];
+    let lines: Vec<&str> = row.body.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        if !markers.iter().any(|marker| lower.contains(marker)) {
+            continue;
         }
-        println!(
-            "\nEach records why it was decidable (A/A null, counted mechanism, accuracy \
-             refutation, or a large-magnitude loss). Do not re-derive these. If you believe one \
-             is wrong, reopen it explicitly in the ledger with new evidence rather than silently \
-             retrying it."
-        );
-        if !void_prior.is_empty() {
-            println!("\nAlso {} VOID prior row(s) — not binding:", void_prior.len());
-            for row in &void_prior {
-                println!("  {row}");
+        let mut paragraph = Vec::new();
+        for candidate in &lines[index..] {
+            if candidate.trim().is_empty() && !paragraph.is_empty() {
+                break;
             }
+            if candidate.starts_with('#') || candidate.trim() == "---" {
+                break;
+            }
+            paragraph.push(candidate.trim());
         }
-        std::process::exit(2);
+        let joined = paragraph.join(" ");
+        return joined.chars().take(900).collect();
+    }
+    "(none recorded)".to_owned()
+}
+
+fn root() -> PathBuf {
+    Path::new(option_env!("CARGO_MANIFEST_DIR").unwrap_or(".")).to_path_buf()
+}
+
+fn read_file(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+}
+
+fn run_surface(terms: &[String]) -> Result<i32, String> {
+    if terms.is_empty() {
+        return Err("surface requires at least one search term".to_owned());
+    }
+    let ledger = root().join("docs/NEGATIVE_EVIDENCE.md");
+    let rows = parse_rows(&read_file(&ledger)?);
+    let terms: Vec<String> = terms.iter().map(|term| term.to_lowercase()).collect();
+    let mut matched = 0usize;
+    let mut binding = 0usize;
+    let mut void = 0usize;
+
+    for row in rows {
+        let text = row.text();
+        let lower = text.to_lowercase();
+        if !terms.iter().all(|term| lower.contains(term)) {
+            continue;
+        }
+        matched += 1;
+        let label = match verdict(&row.header) {
+            Verdict::Keep => {
+                binding += 1;
+                "BINDING KEEP"
+            }
+            Verdict::Reject
+                if has_same_invocation_aa(&text)
+                    || has_counted_mechanism(&text)
+                    || has_profile_evidence(&text) =>
+            {
+                binding += 1;
+                "BINDING REJECT"
+            }
+            Verdict::Reject => {
+                void += 1;
+                "VOID PRIOR"
+            }
+            Verdict::Other => "PRIOR INFO",
+        };
+        println!(
+            "{label}: docs/NEGATIVE_EVIDENCE.md:{} — {}",
+            row.line, row.header
+        );
+        println!("  retry predicate: {}", retry_predicate(&row));
     }
 
-    if !void_prior.is_empty() {
+    if binding > 0 {
         println!(
-            "VOID PRIOR — {} matching rejection(s), none of them binding:",
-            void_prior.len()
+            "BLOCKED — {binding} binding prior result(s), {void} void prior(s), \
+             {matched} total match(es)."
         );
-        for row in &void_prior {
-            println!("  {row}");
-        }
-        println!(
-            "\nThese rows record no A/A null, no counted mechanism, and no accuracy or \
-             large-magnitude refutation, so they could not distinguish the lever from the \
-             harness. They do NOT close this lever. Proceed — and record an A/A null control \
-             this time, or tests/ledger_integrity.rs will reject your new row."
-        );
-        std::process::exit(0);
+        return Ok(2);
     }
+    if void > 0 {
+        println!(
+            "VOID PRIOR — {void} undecidable rejection(s) are non-binding; \
+             {matched} total match(es)."
+        );
+        return Ok(0);
+    }
+    println!("CLEAR — {matched} informational match(es), no binding prior result.");
+    Ok(0)
+}
 
-    println!(
-        "CLEAR — no prior REJECT row matches {:?}. Record an A/A null control when you write \
-         your result.",
-        terms
+fn git_blob(spec: &str) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .current_dir(root())
+        .args(["show", spec])
+        .output()
+        .map_err(|error| format!("cannot run git show {spec}: {error}"))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map(Some)
+            .map_err(|error| format!("git blob {spec} is not UTF-8: {error}"));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("does not exist")
+        || stderr.contains("exists on disk, but not in")
+        || stderr.contains("Path '")
+    {
+        return Ok(None);
+    }
+    Err(format!("git show {spec} failed: {}", stderr.trim()))
+}
+
+fn run_validate_staged() -> Result<i32, String> {
+    let mut violations = Vec::new();
+    for path in LEDGER_PATHS {
+        let staged = git_blob(&format!(":{path}"))?.unwrap_or_default();
+        let head = git_blob(&format!("HEAD:{path}"))?.unwrap_or_default();
+        violations.extend(validate_changed_text(&head, &staged, path));
+    }
+    if violations.is_empty() {
+        println!(
+            "CLEAR — staged ledger rows satisfy A/A-or-counted-mechanism REJECT and \
+             binary-SHA KEEP contracts."
+        );
+        return Ok(0);
+    }
+    eprintln!("BLOCKED — staged ledger integrity violations:");
+    for violation in violations {
+        eprintln!("  {violation}");
+    }
+    Ok(2)
+}
+
+fn run_validate_entry(path: &str, line: usize) -> Result<i32, String> {
+    let full_path = root().join(path);
+    let rows = parse_rows(&read_file(&full_path)?);
+    let row = rows
+        .iter()
+        .find(|row| row.line == line)
+        .ok_or_else(|| format!("{path}:{line} is not the start of a `## ` ledger row"))?;
+    if let Some(violation) = row_violation(row, path) {
+        eprintln!("BLOCKED — {violation}");
+        return Ok(2);
+    }
+    println!("CLEAR — {path}:{line} satisfies the ledger contract.");
+    Ok(0)
+}
+
+fn usage() {
+    eprintln!(
+        "usage:\n  ledger_preflight surface <term> [more terms...]\n  \
+         ledger_preflight validate-staged\n  \
+         ledger_preflight validate-entry <ledger-path> <row-start-line>\n\n\
+         `surface` also remains the default when the subcommand is omitted."
     );
+}
+
+fn run() -> Result<i32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(command) = args.first() else {
+        usage();
+        return Ok(64);
+    };
+    match command.as_str() {
+        "surface" => run_surface(&args[1..]),
+        "validate-staged" if args.len() == 1 => run_validate_staged(),
+        "validate-entry" if args.len() == 3 => {
+            let line = args[2]
+                .parse()
+                .map_err(|error| format!("invalid row-start-line `{}`: {error}", args[2]))?;
+            run_validate_entry(&args[1], line)
+        }
+        "validate-staged" | "validate-entry" => {
+            usage();
+            Ok(64)
+        }
+        _ => run_surface(&args),
+    }
+}
+
+fn main() {
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("ledger_preflight: {error}");
+            std::process::exit(70);
+        }
+    }
 }

@@ -2,126 +2,22 @@
 //!
 //! Fleet campaign `perf-campaign-20260725`, Meta-Lever #1, broadcast 2.
 //!
-//! ## Why this test exists
-//!
-//! The fleet-wide ledger-resurrection audit found that a REJECT row is usually
-//! void not because the lever was wrongly judged, but because **the row cannot
-//! prove anything either way**: an A/B ran, the row was rejected on a near-1.0
-//! wall ratio, and no A/A null control and no counted mechanism were written
-//! down. Across the fleet that class (`VOID-NONULL`) is the epidemic —
-//! frankenfs 214 of 219 void rows, franken_whisper 79 of 82
-//! (`docs/LEDGER_RESURRECTION.md`).
-//!
-//! The decisive data point is frankensqlite: **1.7% void**, not because it
-//! audited leniently but because it ran this audit months ago and then
-//! *institutionalized* it with a mechanically enforced preflight. Every repo
-//! that audited once and stopped sits at 25–91%. **Ledger integrity decays.**
-//! A convention that is merely documented is a convention that erodes; this
-//! test is the enforcement, so the discipline survives the agents who wrote it.
-//!
-//! ## What a REJECT row must carry
-//!
-//! At least one of the following, mirroring the fleet taxonomy in
-//! `docs/LEDGER_RESURRECTION.md` §1 — each is a reason the rejection is
-//! *decidable*:
-//!
-//! - **A/A null control** — the effect is compared against the harness's own
-//!   noise floor. The only thing that makes a near-1.0 ratio meaningful.
-//! - **Counted mechanism** — instructions / cycles / syscalls / allocations /
-//!   faults unchanged. A null cannot change the fact that no work was removed,
-//!   so this refutes without one (`VALID-MECHANISM`).
-//! - **Accuracy / faithfulness refutation** — WER, byte-exactness, or numerical
-//!   safety. This repo's contract is transcript exactness, so many levers die
-//!   here and never make a speed claim at all; a speed null is meaningless for
-//!   them (`VALID-ACCURACY`, franken_whisper's proposed 7th class).
-//! - **Large-magnitude refutation** — a stated ratio at or below 0.90×. No
-//!   plausible null floor on this hardware spans a >10% loss. (Detected
-//!   numerically; the bare word "slower" is *not* accepted, because it occurs
-//!   in ordinary prose in a third of these rows.)
-//! - **Profile-first rejection** — killed on a named frame's self-time or an
-//!   Amdahl ceiling before any source was edited (`VALID-PROFILE`).
-//!
-//! ## Why the cutoff, and why the legacy debt is pinned rather than fixed
-//!
-//! 99 pre-existing rows do not comply. Failing on those would make this test
-//! permanently red, and a permanently red test gets deleted or `#[ignore]`d —
-//! which is how the discipline erodes in the first place. So history is
-//! grandfathered and **counted**: [`LEGACY_NONCOMPLIANT_BUDGET`] pins that debt
-//! so it can only shrink. Backdating a new row past the cutoff to dodge the
-//! check trips the budget assertion instead.
+//! A changed rejection must carry either a numerical same-invocation A/A null
+//! or a counted unchanged-work mechanism. Accuracy prose, a large regression,
+//! a profile, and CV alone are not write-gate exceptions. A changed KEEP must
+//! carry a 64-hex benchmark-binary/ELF SHA-256. The pre-commit hook applies
+//! these rules to the staged index, including backdated rows; this test pins the
+//! parser and both sides of the contract.
 
 use std::path::{Path, PathBuf};
+
+#[allow(dead_code)]
+#[path = "../examples/ledger_preflight.rs"]
+mod ledger_preflight;
 
 /// Rows dated on or after this must be provable. Chosen as the date the guard
 /// landed, so it constrains the future without rewriting the past.
 const ENFORCED_FROM: &str = "2026-07-26";
-
-/// Pre-cutoff REJECT rows that carry no decidability evidence, as measured when
-/// this guard landed. It may only shrink. Lowering it as rows are rehabilitated
-/// is encouraged; raising it means a non-provable row was backdated.
-const LEGACY_NONCOMPLIANT_BUDGET: usize = 99;
-
-/// Evidence that a rejection was decidable. See the module docs for why each
-/// one independently suffices.
-///
-/// These are deliberately *specific phrases*, not keywords. An earlier draft
-/// used bare `"instructions"`, `"allocation"`, `"slower"` and `"byte-identical"`
-/// and was nearly vacuous — it passed 96% of historical REJECT rows, because
-/// those words occur incidentally in ordinary prose. Two traps in particular:
-///
-/// - `"wer"` matched inside *were*, *lower*, *answer*. Substring matching is
-///   not enough; [`contains_word`] requires non-alphanumeric boundaries.
-/// - `"byte-identical"` is normally a *claim of exactness*, not an accuracy
-///   refutation. A row reading "byte-identical but 1.02×, rejected" would have
-///   passed on it while recording no null at all — the exact hole this guard
-///   exists to close. Only `non-byte-exact` (a refutation) counts.
-///
-/// A guard that passes everything is worse than no guard: it manufactures
-/// confidence. The current set fails ~36% of historical rows.
-const EVIDENCE_MARKERS: &[&str] = &[
-    // A/A null control — the effect was compared against the harness noise floor
-    "null control",
-    "a/a",
-    "null median",
-    "null_p90",
-    "null p90",
-    "null p10",
-    "identity null",
-    "base/base",
-    "null floor",
-    "null pair",
-    // counted mechanism — "no work was removed", which a null cannot overturn
-    "instructions retired",
-    "instruction count",
-    "retired instructions",
-    "cycle count",
-    "cycles unchanged",
-    "perf stat",
-    "syscall count",
-    "syscalls unchanged",
-    "allocations unchanged",
-    "alloc count",
-    "allocation count",
-    "page fault",
-    "zero allocations",
-    "no allocations",
-    // accuracy / faithfulness / safety refutation (VALID-ACCURACY)
-    "wer",
-    "accuracy",
-    "faithful",
-    "not safe",
-    "non-byte-exact",
-    "transcript-unsafe",
-    "quality gate",
-    "regresses",
-    "regression on",
-    "drifts",
-    // profile-first rejection (VALID-PROFILE)
-    "self-time",
-    "self time",
-    "amdahl",
-    "% of e2e",
-];
 
 fn ledger_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/NEGATIVE_EVIDENCE.md")
@@ -183,39 +79,11 @@ fn is_reject(header: &str) -> bool {
         .any(|verdict| upper.contains(verdict))
 }
 
-/// Substring match that requires non-alphanumeric boundaries, so `"wer"` does
-/// not match inside *were* / *lower* / *answer*.
-fn contains_word(haystack: &str, needle: &str) -> bool {
-    let mut from = 0usize;
-    while let Some(rel) = haystack[from..].find(needle) {
-        let start = from + rel;
-        let end = start + needle.len();
-        let left_ok = start == 0
-            || !haystack[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric());
-        let right_ok = end == haystack.len()
-            || !haystack[end..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_alphanumeric());
-        if left_ok && right_ok {
-            return true;
-        }
-        from = start + needle.len().max(1);
-    }
-    false
-}
-
 /// Does the row record anything that makes its rejection decidable?
 fn has_evidence(entry: &Entry) -> bool {
-    let haystack = format!("{}\n{}", entry.header.to_lowercase(), entry.body_lower);
-    EVIDENCE_MARKERS
-        .iter()
-        .any(|marker| contains_word(&haystack, marker))
-        // A ratio at or below 0.90x is a large-magnitude refutation on its own.
-        || contains_large_regression(&haystack)
+    let text = format!("{}\n{}", entry.header, entry.body_lower);
+    ledger_preflight::has_same_invocation_aa(&text)
+        || ledger_preflight::has_counted_mechanism(&text)
 }
 
 /// Is this header dated `YYYY-MM-DD`? Section dividers and prose headers are not
@@ -232,42 +100,12 @@ fn is_dated(date: &str) -> bool {
         && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
-/// True when the text states a ratio of 0.90x or worse — a loss no null floor
-/// on this hardware spans.
-fn contains_large_regression(haystack: &str) -> bool {
-    let bytes = haystack.as_bytes();
-    for (i, window) in bytes.windows(2).enumerate() {
-        if window != b"0." {
-            continue;
-        }
-        let tail = &haystack[i + 2..];
-        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-        if digits.is_empty() {
-            continue;
-        }
-        let suffix = &tail[digits.len()..];
-        if !(suffix.starts_with('x') || suffix.starts_with('×')) {
-            continue;
-        }
-        // "0.90" -> 90, "0.4" -> 4 (scaled to 40) — compare on the first two digits.
-        let scaled: u32 = match digits.len() {
-            1 => digits.parse::<u32>().unwrap_or(99) * 10,
-            _ => digits[..2].parse::<u32>().unwrap_or(99),
-        };
-        if scaled <= 90 {
-            return true;
-        }
-    }
-    false
-}
-
 #[test]
 fn every_new_reject_row_records_why_it_is_decidable() {
     let text = std::fs::read_to_string(ledger_path()).expect("read docs/NEGATIVE_EVIDENCE.md");
     let entries = parse_entries(&text);
 
     let mut offenders = Vec::new();
-    let mut legacy_noncompliant = 0usize;
 
     // Only dated `## YYYY-MM-DD …` headers are ledger rows. Prose headers and
     // section dividers are skipped outright — one of them reads
@@ -277,38 +115,24 @@ fn every_new_reject_row_records_why_it_is_decidable() {
         .iter()
         .filter(|e| is_reject(&e.header) && is_dated(&e.date))
     {
-        if has_evidence(entry) {
+        if entry.date.as_str() < ENFORCED_FROM || has_evidence(entry) {
             continue;
         }
-        if entry.date.as_str() >= ENFORCED_FROM {
-            offenders.push(format!(
-                "  docs/NEGATIVE_EVIDENCE.md:{} — {}",
-                entry.line,
-                entry.header.chars().take(120).collect::<String>()
-            ));
-        } else {
-            legacy_noncompliant += 1;
-        }
+        offenders.push(format!(
+            "  docs/NEGATIVE_EVIDENCE.md:{} — {}",
+            entry.line,
+            entry.header.chars().take(120).collect::<String>()
+        ));
     }
 
     assert!(
         offenders.is_empty(),
         "REJECT rows dated on/after {ENFORCED_FROM} record no evidence that the rejection was \
-         decidable.\n\nA rejection needs at least ONE of: an A/A null control; a counted \
-         mechanism (instructions/cycles/syscalls/allocations/faults unchanged); an \
-         accuracy/faithfulness/byte-exactness refutation; a large-magnitude loss (<=0.90x or \
-         'SLOWER'); or a profile-first self-time/Amdahl rejection.\n\nWithout one of those the \
-         row cannot distinguish the lever from the harness, which is the VOID-NONULL class that \
-         made {LEGACY_NONCOMPLIANT_BUDGET} of this ledger's rows unusable. See \
+         decidable.\n\nA rejection needs either (1) a numerical same-invocation A/A null \
+         control or (2) a counted unchanged-work mechanism. Accuracy prose, a large \
+         regression, profile evidence, and CV alone do not satisfy the write gate. See \
          docs/LEDGER_RESURRECTION.md.\n\nOffending rows:\n{}",
         offenders.join("\n")
-    );
-
-    assert!(
-        legacy_noncompliant <= LEGACY_NONCOMPLIANT_BUDGET,
-        "pre-{ENFORCED_FROM} rows without decidability evidence rose to {legacy_noncompliant}, \
-         above the pinned budget of {LEGACY_NONCOMPLIANT_BUDGET}. Legacy debt may only shrink — \
-         a new REJECT row must not be dated before the cutoff to bypass this guard."
     );
 }
 
@@ -335,11 +159,82 @@ fn the_ledger_is_parseable_and_non_trivial() {
 }
 
 #[test]
-fn large_regression_detection_is_sound() {
-    assert!(contains_large_regression("measured 0.439x versus baseline"));
-    assert!(contains_large_regression("came in at 0.40×"));
-    assert!(contains_large_regression("0.90x exactly at the boundary"));
-    assert!(!contains_large_regression("0.91x is inside the floor"));
-    assert!(!contains_large_regression("1.024879x, inside the null envelope"));
-    assert!(!contains_large_regression("no ratio here at all"));
+fn staged_reject_contract_is_strict_and_two_sided() {
+    let invalid = "## 2026-07-26 - test: **REJECT — 0.40x and accuracy drift.**\n\
+                   Profile self-time 20%; Amdahl ceiling 1.25x; CV 1%.\n";
+    let violations =
+        ledger_preflight::validate_changed_text("", invalid, "docs/NEGATIVE_EVIDENCE.md");
+    assert_eq!(
+        violations.len(),
+        1,
+        "magnitude, accuracy, profile, and CV must not bypass the write gate"
+    );
+
+    let negated = "## 2026-07-26 - test: **REJECT — flat.**\n\
+                   No A/A null control was recorded; candidate median 1.001.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text("", negated, "docs/NEGATIVE_EVIDENCE.md").len(),
+        1,
+        "mentioning a missing null must not count as a null"
+    );
+
+    let valid_null = "## 2026-07-26 - test: **REJECT — flat.**\n\
+                      Same-invocation A/A null control median 1.001, bootstrap CI95 \
+                      [0.992, 1.009]. Candidate median 1.002.\n";
+    assert!(
+        ledger_preflight::validate_changed_text("", valid_null, "docs/NEGATIVE_EVIDENCE.md")
+            .is_empty()
+    );
+
+    let valid_mechanism = "## 2026-07-26 - test: **REJECT — mechanism unchanged.**\n\
+                           Instructions unchanged at 41024 in both arms; allocation count \
+                           unchanged at 3.\n";
+    assert!(
+        ledger_preflight::validate_changed_text("", valid_mechanism, "docs/NEGATIVE_EVIDENCE.md")
+            .is_empty()
+    );
+}
+
+#[test]
+fn staged_keep_requires_binary_or_elf_sha_not_an_output_oracle() {
+    let oracle_only = "## 2026-07-26 - test: **KEEP — candidate wins.**\n\
+                       Output oracle SHA-256 \
+                       0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text("", oracle_only, "docs/NEGATIVE_EVIDENCE.md").len(),
+        1
+    );
+
+    let binary = "## 2026-07-26 - test: **KEEP — candidate wins.**\n\
+                  The executable ELF SHA-256 self-report is \
+                  0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n";
+    assert!(
+        ledger_preflight::validate_changed_text("", binary, "docs/NEGATIVE_EVIDENCE.md").is_empty()
+    );
+}
+
+#[test]
+fn unchanged_legacy_rows_are_grandfathered_but_modified_rows_are_checked() {
+    let legacy = "## 2026-06-01 - test: **REJECT — 1.00x.**\nNo null.\n";
+    assert!(
+        ledger_preflight::validate_changed_text(legacy, legacy, "docs/NEGATIVE_EVIDENCE.md")
+            .is_empty()
+    );
+    let modified = "## 2026-06-01 - test: **REJECT — 1.01x after retry.**\nStill no null.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text(legacy, modified, "docs/NEGATIVE_EVIDENCE.md")
+            .len(),
+        1,
+        "the staged comparison must prevent backdating"
+    );
+}
+
+#[test]
+fn nested_subsections_remain_inside_their_parent_row() {
+    let rows = ledger_preflight::parse_rows(
+        "## 2026-07-26 - test: **REJECT — sample.**\n### A/A evidence\nbody\n\
+         ## 2026-07-26 - test: **KEEP — next.**\nbody\n",
+    );
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].body.contains("### A/A evidence"));
 }
