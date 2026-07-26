@@ -334,21 +334,20 @@ impl RoutingEvidenceLedger {
     #[must_use]
     pub fn diagnostics(&self) -> Value {
         let total = self.entries.len();
-        let fallback_count = self.entries.iter().filter(|e| e.fallback_active).count();
-        let resolved = self.resolved_count();
-        let resolved_success = self
-            .entries
-            .iter()
-            .filter_map(|e| e.actual_outcome.as_ref())
-            .filter(|o| o.success)
-            .count();
-
+        let mut fallback_count = 0_usize;
+        let mut resolved = 0_usize;
+        let mut resolved_success = 0_usize;
+        let mut calibration_sum = 0.0_f64;
+        for entry in &self.entries {
+            fallback_count += usize::from(entry.fallback_active);
+            calibration_sum += entry.calibration_score;
+            if let Some(outcome) = &entry.actual_outcome {
+                resolved += 1;
+                resolved_success += usize::from(outcome.success);
+            }
+        }
         let avg_calibration = if total > 0 {
-            self.entries
-                .iter()
-                .map(|e| e.calibration_score)
-                .sum::<f64>()
-                / total as f64
+            calibration_sum / total as f64
         } else {
             0.0
         };
@@ -573,6 +572,23 @@ impl RouterState {
         }
     }
 
+    /// Compute only the empirical success rate for a backend.
+    ///
+    /// This is the scalar-only counterpart to [`Self::metrics_for`]. It
+    /// preserves the same empty-history and `Auto` semantics without scanning
+    /// successful latencies or cloning the last error.
+    #[must_use]
+    fn success_rate_for(&self, kind: BackendKind) -> f64 {
+        let Some(idx) = Self::slot(kind) else {
+            return 0.0;
+        };
+        let history = &self.histories[idx];
+        if history.is_empty() {
+            return 0.5;
+        }
+        history.iter().filter(|record| record.success).count() as f64 / history.len() as f64
+    }
+
     /// Overall calibration score: fraction of correct adaptive predictions.
     /// Returns `0.5` (uninformative) if no predictions have been made.
     #[must_use]
@@ -746,17 +762,15 @@ pub fn router_state_snapshot() -> Option<RouterState> {
 
 /// Read a single backend's empirical `success_rate` from the global router
 /// state under its lock, without cloning the whole state. Byte-identical to
-/// `router_state_snapshot().map(|s| s.metrics_for(kind).success_rate)` — the
-/// same `metrics_for` computation, evaluated on the live state instead of a
-/// bit-perfect clone — but avoids the ~105 µs allocation-heavy `RouterState`
-/// clone (3×50 histories + 50 calibrations + 200-entry evidence ledger) when
-/// only the one scalar is needed.
+/// `router_state_snapshot().map(|s| s.metrics_for(kind).success_rate)`, but
+/// avoids both the ~105 µs allocation-heavy `RouterState` clone and the
+/// latency/error work in `metrics_for` when only the scalar is needed.
 #[must_use]
 pub fn router_success_rate_for(kind: BackendKind) -> Option<f64> {
     ROUTER_STATE
         .lock()
         .ok()
-        .and_then(|guard| guard.as_ref().map(|state| state.metrics_for(kind).success_rate))
+        .and_then(|guard| guard.as_ref().map(|state| state.success_rate_for(kind)))
 }
 
 /// Record a calibration observation into the global router state (bd-efr.2).
@@ -7037,6 +7051,37 @@ mod tests {
     }
 
     #[test]
+    fn scalar_success_rate_matches_full_metrics_bits() {
+        let mut state = RouterState::new();
+        assert_eq!(
+            state.success_rate_for(BackendKind::WhisperCpp).to_bits(),
+            state
+                .metrics_for(BackendKind::WhisperCpp)
+                .success_rate
+                .to_bits()
+        );
+        assert_eq!(
+            state.success_rate_for(BackendKind::Auto).to_bits(),
+            state.metrics_for(BackendKind::Auto).success_rate.to_bits()
+        );
+
+        for index in 0..ROUTER_HISTORY_WINDOW {
+            state.record_outcome(make_outcome(
+                BackendKind::WhisperCpp,
+                index % 5 != 0,
+                100 + index as u64,
+            ));
+        }
+        assert_eq!(
+            state.success_rate_for(BackendKind::WhisperCpp).to_bits(),
+            state
+                .metrics_for(BackendKind::WhisperCpp)
+                .success_rate
+                .to_bits()
+        );
+    }
+
+    #[test]
     fn metrics_for_computes_avg_latency_only_from_successes() {
         let mut state = RouterState::new();
         state.record_outcome(make_outcome(BackendKind::WhisperCpp, true, 200));
@@ -8857,6 +8902,87 @@ mod tests {
             assert_eq!(
                 serde_json::to_vec(&streamed).expect("serialize streamed diagnostics"),
                 serde_json::to_vec(&historical).expect("serialize historical diagnostics")
+            );
+        }
+    }
+
+    #[test]
+    fn routing_evidence_ledger_fused_counts_are_json_identical() {
+        fn historical_diagnostics(ledger: &RoutingEvidenceLedger) -> serde_json::Value {
+            let total = ledger.entries().len();
+            let fallback_count = ledger
+                .entries()
+                .iter()
+                .filter(|entry| entry.fallback_active)
+                .count();
+            let resolved_count = ledger
+                .entries()
+                .iter()
+                .filter(|entry| entry.actual_outcome.is_some())
+                .count();
+            let resolved_success_count = ledger
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.actual_outcome.as_ref())
+                .filter(|outcome| outcome.success)
+                .count();
+            let calibration_sum = ledger
+                .entries()
+                .iter()
+                .map(|entry| entry.calibration_score)
+                .sum::<f64>();
+            let (brier_sum, brier_count) = ledger
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.brier_score)
+                .fold((0.0, 0_usize), |(sum, count), score| {
+                    (sum + score, count + 1)
+                });
+            let avg_brier = (brier_count != 0).then(|| brier_sum / brier_count as f64);
+
+            serde_json::json!({
+                "total_entries": total,
+                "total_ever_recorded": ledger.total_recorded(),
+                "capacity": ledger.capacity(),
+                "fallback_count": fallback_count,
+                "fallback_rate": if total > 0 { fallback_count as f64 / total as f64 } else { 0.0 },
+                "resolved_count": resolved_count,
+                "resolved_success_count": resolved_success_count,
+                "resolved_success_rate": if resolved_count > 0 { resolved_success_count as f64 / resolved_count as f64 } else { 0.0 },
+                "avg_calibration_score": if total > 0 { calibration_sum / total as f64 } else { 0.0 },
+                "avg_brier_score": avg_brier,
+            })
+        }
+
+        for entry_count in [0_usize, 1, 17, 200] {
+            let mut ledger = RoutingEvidenceLedger::new(entry_count.max(1));
+            for index in 0..entry_count {
+                let mut entry = make_ledger_entry(
+                    &format!("fused-{index}"),
+                    index % 7 == 0,
+                    (index % 5 != 0).then_some(0.08 + (index % 17) as f64 * 0.01),
+                );
+                entry.calibration_score = 0.6 + (index % 13) as f64 * 0.01;
+                ledger.record(entry);
+                if index % 4 != 0 {
+                    ledger.resolve_outcome(
+                        &format!("fused-{index}"),
+                        RoutingOutcomeRecord {
+                            backend: BackendKind::WhisperCpp,
+                            success: index % 3 != 0,
+                            latency_ms: 300 + index as u64,
+                            error_message: (index % 3 == 0).then(|| format!("failure-{index}")),
+                            recorded_at_rfc3339: "2026-07-25T00:00:00Z".to_owned(),
+                        },
+                    );
+                }
+            }
+
+            assert_eq!(
+                serde_json::to_vec(&ledger.diagnostics()).expect("serialize fused diagnostics"),
+                serde_json::to_vec(&historical_diagnostics(&ledger))
+                    .expect("serialize historical diagnostics"),
+                "entry_count={entry_count}"
             );
         }
     }

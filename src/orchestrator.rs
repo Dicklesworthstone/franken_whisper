@@ -3452,22 +3452,17 @@ const ABBREVIATIONS: &[&str] = &[
 /// to a known abbreviation rather than ending a sentence.
 fn is_abbreviation_period(text: &str, period_byte_pos: usize) -> bool {
     let before = &text[..period_byte_pos + 1]; // includes the period
-    let lower = before.to_ascii_lowercase();
+    let before_bytes = before.as_bytes();
     for abbr in ABBREVIATIONS {
-        if lower.ends_with(abbr) {
-            // Make sure the abbreviation is word-aligned (preceded by start or
-            // whitespace).
-            let prefix_len = before.len() - abbr.len();
-            if prefix_len == 0 {
-                return true;
-            }
-            if before
-                .as_bytes()
-                .get(prefix_len.wrapping_sub(1))
-                .is_some_and(|b| b.is_ascii_whitespace())
-            {
-                return true;
-            }
+        let abbr_bytes = abbr.as_bytes();
+        if before_bytes.len() < abbr_bytes.len() {
+            continue;
+        }
+        let prefix_len = before_bytes.len() - abbr_bytes.len();
+        if before_bytes[prefix_len..].eq_ignore_ascii_case(abbr_bytes)
+            && (prefix_len == 0 || before_bytes[prefix_len - 1].is_ascii_whitespace())
+        {
+            return true;
         }
     }
     false
@@ -12137,12 +12132,14 @@ mod tests {
         assert!(is_abbreviation_period("Dr. Smith", 2));
         assert!(is_abbreviation_period("talk to mr. jones", 10));
         assert!(is_abbreviation_period("Mrs. Williams", 3));
+        assert!(is_abbreviation_period("PROF. Ada", 4));
     }
 
     #[test]
     fn is_abbreviation_period_rejects_non_abbrevs() {
         assert!(!is_abbreviation_period("done.", 4));
         assert!(!is_abbreviation_period("hello world.", 11));
+        assert!(!is_abbreviation_period("notdr.", 5));
     }
 
     #[test]

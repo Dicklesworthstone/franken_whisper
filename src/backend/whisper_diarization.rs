@@ -231,35 +231,38 @@ fn script_path() -> PathBuf {
 
 fn parse_srt_segments(content: &str) -> Vec<TranscriptionSegment> {
     let mut segments = Vec::new();
-    let mut block_lines: Vec<String> = Vec::new();
+    let mut block_lines = Vec::new();
 
     for raw_line in content.lines() {
         let line = raw_line.trim_end_matches('\r');
         if line.trim().is_empty() {
             if !block_lines.is_empty() {
-                let block = block_lines.join("\n");
-                if let Some(segment) = parse_srt_block(block.trim()) {
+                if let Some(segment) = parse_srt_lines(&block_lines) {
                     segments.push(segment);
                 }
                 block_lines.clear();
             }
             continue;
         }
-        block_lines.push(line.to_owned());
+        block_lines.push(line);
     }
 
-    if !block_lines.is_empty() {
-        let block = block_lines.join("\n");
-        if let Some(segment) = parse_srt_block(block.trim()) {
-            segments.push(segment);
-        }
+    if !block_lines.is_empty()
+        && let Some(segment) = parse_srt_lines(&block_lines)
+    {
+        segments.push(segment);
     }
 
     segments
 }
 
+#[cfg(test)]
 fn parse_srt_block(block: &str) -> Option<TranscriptionSegment> {
     let lines: Vec<&str> = block.lines().collect();
+    parse_srt_lines(&lines)
+}
+
+fn parse_srt_lines(lines: &[&str]) -> Option<TranscriptionSegment> {
     if lines.is_empty() {
         return None;
     }

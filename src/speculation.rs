@@ -333,11 +333,18 @@ fn mean_confidence(segments: &[TranscriptionSegment]) -> f64 {
 
 /// Concatenate all segment texts separated by a single space.
 fn concat_segment_text(segments: &[TranscriptionSegment]) -> String {
-    segments
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
+    let separator_bytes = segments.len().saturating_sub(1);
+    let capacity = segments.iter().fold(separator_bytes, |bytes, segment| {
+        bytes.saturating_add(segment.text.len())
+    });
+    let mut text = String::with_capacity(capacity);
+    for (index, segment) in segments.iter().enumerate() {
+        if index != 0 {
+            text.push(' ');
+        }
+        text.push_str(&segment.text);
+    }
+    text
 }
 
 /// Character-level Levenshtein distance.
@@ -1111,6 +1118,7 @@ pub struct SpeculationWindowController {
     fallback_reason: Option<String>,
     next_decision_id: u64,
     consecutive_zero_corrections: u64,
+    historical_double_brier_fold: bool,
 }
 
 impl SpeculationWindowController {
@@ -1144,7 +1152,15 @@ impl SpeculationWindowController {
             fallback_reason: None,
             next_decision_id: 0,
             consecutive_zero_corrections: 0,
+            historical_double_brier_fold: false,
         }
+    }
+
+    /// Select the historical two-fold `apply()` path for same-binary A/B
+    /// measurement. The default remains the single-fold production path.
+    #[doc(hidden)]
+    pub fn set_historical_double_brier_fold(&mut self, enabled: bool) {
+        self.historical_double_brier_fold = enabled;
     }
 
     /// Observe a correction decision and update internal state.
@@ -1232,9 +1248,15 @@ impl SpeculationWindowController {
     pub fn apply(&mut self) -> u64 {
         let brier = self.calibration.brier_score();
         let action = self.recommend_with_brier(brier);
-        if brier > Self::BRIER_FALLBACK_THRESHOLD && self.calibration.sample_count() >= 10 {
+        let fallback_brier = if self.historical_double_brier_fold {
+            self.calibration.brier_score()
+        } else {
+            brier
+        };
+        if fallback_brier > Self::BRIER_FALLBACK_THRESHOLD && self.calibration.sample_count() >= 10
+        {
             self.fallback_active = true;
-            self.fallback_reason = Some(format!("Brier score {brier:.3} > threshold"));
+            self.fallback_reason = Some(format!("Brier score {fallback_brier:.3} > threshold"));
             self.current_window_ms = self.initial_window_ms;
         } else if self.state.correction_rate > Self::RUNAWAY_CORRECTION_RATE {
             self.fallback_active = true;
@@ -1399,12 +1421,51 @@ impl CorrectionEvidenceLedger {
     /// Summary diagnostics as JSON.
     #[must_use]
     pub fn diagnostics(&self) -> serde_json::Value {
+        let mut corrections = 0_usize;
+        let mut fast_latency_sum = 0_u64;
+        let mut quality_latency_sum = 0_u64;
+        let mut wer_sum = 0.0_f64;
+        for entry in &self.entries {
+            corrections += usize::from(is_correction_decision(&entry.decision));
+            fast_latency_sum += entry.fast_latency_ms;
+            quality_latency_sum += entry.quality_latency_ms;
+            wer_sum += entry.drift.wer_approx;
+        }
+
+        let count = self.entries.len();
+        let denominator = count as f64;
+        let correction_rate = if count == 0 {
+            0.0
+        } else {
+            corrections as f64 / denominator
+        };
+        let mean_fast_latency = if count == 0 {
+            0.0
+        } else {
+            fast_latency_sum as f64 / denominator
+        };
+        let mean_quality_latency = if count == 0 {
+            0.0
+        } else {
+            quality_latency_sum as f64 / denominator
+        };
+        let mean_wer = if count == 0 {
+            0.0
+        } else {
+            wer_sum / denominator
+        };
+        let latency_savings_pct = if mean_quality_latency == 0.0 {
+            0.0
+        } else {
+            (mean_quality_latency - mean_fast_latency) / mean_quality_latency * 100.0
+        };
+
         serde_json::json!({
-            "correction_rate": self.correction_rate(),
-            "mean_fast_latency_ms": self.mean_fast_latency(),
-            "mean_quality_latency_ms": self.mean_quality_latency(),
-            "mean_wer": self.mean_wer(),
-            "latency_savings_pct": self.latency_savings_pct(),
+            "correction_rate": correction_rate,
+            "mean_fast_latency_ms": mean_fast_latency,
+            "mean_quality_latency_ms": mean_quality_latency,
+            "mean_wer": mean_wer,
+            "latency_savings_pct": latency_savings_pct,
         })
     }
 
@@ -3496,8 +3557,8 @@ mod tests {
         for (corrections, confirmations) in [(0, 0), (2, 0), (0, 20), (15, 10), (20, 0)] {
             let mut historical = controller_with_history(corrections, confirmations);
             let mut candidate = controller_with_history(corrections, confirmations);
+            historical.set_historical_double_brier_fold(true);
 
-            let historical_action = historical.recommend();
             let historical_size = historical.apply();
             let candidate_size = candidate.apply();
 
@@ -3508,7 +3569,10 @@ mod tests {
             );
             assert_eq!(
                 candidate.evidence().last().map(|entry| &entry.action_taken),
-                Some(&historical_action)
+                historical
+                    .evidence()
+                    .last()
+                    .map(|entry| &entry.action_taken)
             );
             assert_eq!(
                 serde_json::to_vec(candidate.evidence().last().expect("candidate evidence"))
@@ -5504,6 +5568,10 @@ mod tests {
         assert_eq!(concat_segment_text(&[seg("solo", None)]), "solo");
         // Empty segments.
         assert_eq!(concat_segment_text(&[]), "");
+        assert_eq!(
+            concat_segment_text(&[seg("", None), seg("naïve café", None), seg("", None),]),
+            " naïve café "
+        );
     }
 
     #[test]

@@ -2,7 +2,97 @@
 
 > Head-to-head, MEASURED optimization log for the native Rust engine. Owned by
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
-> criterion measurement; ~0-gain or regressing levers are REVERTED, not kept.
+> release measurement; ~0-gain or regressing levers are REVERTED, not kept.
+
+## 2026-07-25 — HARNESS CONTRACT + 8 KEEPs — corrected resurrection and frontier pass (bd-2qqw)
+
+**Harness contract first.** The active `pipeline_bench` and
+`native_engine_bench` entrypoints, plus the standalone router-success,
+process-log, abbreviation, and SRT harnesses touched in this pass, now print the
+SHA-256 of `env::current_exe()` as line 1. Their decision loops run a BASE/BASE
+identity null before BASE/candidate in the same invocation, alternate arm order,
+and report deterministic 20,000-resample bootstrap 95% CIs for the median of
+paired ratios. The default new-loop shape is 41 pairs, min-of-3 inner timings,
+and a calibrated 2 ms arm. The only decision rule is
+`candidate_median >= 1 + 2 * max(abs(null_ci_low - 1), abs(null_ci_high - 1))`.
+CV and win count remain visible as provenance and never gate a verdict. Two
+legacy `pipeline_bench` A/B paths that still asserted `candidate_cv < 0.05`
+were converted to the same median-CI decision, and their A/A phase now
+completes before A/B.
+
+The corrected resurrection runs below came from one remote invocation on
+RCH worker `vmi1167313`. Its first output line self-reported
+`pipeline_bench` ELF SHA-256
+`6c226d72bfb16ae4b0d121bef92ad6c23c2e46a8d2cdba7cb6c8ae96eaa8b24c`
+(19,321,152 bytes), identical to an independent hash of the executed artifact.
+RCH job `j-29946774143631620` built that release-perf ELF before its control
+connection reached the 1,800 s limit; the already-built artifact was then
+invoked directly on that same remote worker. There was no local Cargo fallback.
+Every parity oracle ran before timing.
+
+| Resurrected lever | A/A null median, 95% CI (CV) | Candidate median, 95% CI (CV) | CI floor / wins | Verdict and concrete retry predicate |
+|---|---|---|---|---|
+| Faithful speculation-controller Brier reuse | `1.000247 [0.980468, 1.007971]` (4.79%) | **`1.217822 [1.212472, 1.232171]`** (4.64%) | `1.039063`; 40/41 | **KEEP.** Both arms execute the real `apply()`: a runtime-only historical selector restores the second Brier fold, and action, fallback state, and complete evidence JSON are byte-identical. Retry only if calibration mutation is introduced between the two historical reads or `apply()` stops spending at least 5% in Brier aggregation. |
+| Router diagnostics four-pass count/calibration fusion | `0.994045 [0.979644, 1.007061]` (9.89%) | **`1.120094 [1.091145, 1.149635]`** (15.53%) | `1.040713`; 37/41 | **KEEP.** The full serialized diagnostics JSON matches for 0/1/17/200-entry histories. Retry only if a new diagnostic requires different traversal order or profiling puts these fields below 5% of the caller. |
+| Direct transcript concatenation | `1.004365 [0.993303, 1.016665]` (27.01%) | **`1.583840 [1.540668, 1.620905]`** (13.18%) | `1.033330`; 41/41 | **KEEP.** Empty, singleton, empty-text, and UTF-8 cases are byte-identical. This row is also the live proof that high CV is not a rejection: the null median CI is narrow enough to decide despite 27% CV. Retry only if segment joining semantics change away from exactly one ASCII space or profiling shows concatenation below 5% of `CorrectionDrift::compute`. |
+
+The ledger audit's queue item #1, i7 **bias specialization**, could not be
+faithfully reconstructed: the actual `matmul_bias_i7_quantized_impl::<true /
+false>` candidate source was reverted, while the audit prerequisite names the
+different rowblock environment toggle whose corrected same-binary rerun is
+already a measured `0.879877x` loss. It is recorded as VOID/BLOCKED in
+`docs/NEGATIVE_EVIDENCE.md`, rather than silently substituting the rowblock
+lever.
+
+Queue item #5, the real FrankenTorch SDPA BR=64/128 sweep, completed in RCH job
+`j-29946774143631719` on worker `vmi1264463`. The executed release-perf ELF
+self-reported SHA-256
+`3ba35b4a7d7ba48d48fb0c8ed2ffdd3a83454f8e69047702134e573e58c789cb`
+(27,965,208 bytes), and all 1,920,000 output floats matched bit-for-bit (oracle
+SHA-256 `89a93acf42f289d61e4ee9db8b6bda09b50922ef30a5269d404ad20d3fc528da`).
+Its A/A null was `1.011038 [0.965832, 1.039802]` (CV 11.76%); BR=128 versus
+BR=64 was `1.011137 [0.979652, 1.044951]` (CV 12.48%, 21/41 wins), below the
+CI-derived `1.079604` floor. **REJECT.** CV is provenance only and did not
+decide this row. Retry only after the SDPA kernel/codegen, target CPU cache
+geometry, or production sequence/head shape changes; more samples of this
+unchanged 20×1500×64 kernel are not a retry predicate. Full detail is in
+`docs/NEGATIVE_EVIDENCE.md`.
+
+After the resurrection queue, five ledger-clean, allocation-attributed frontier
+cuts were measured under the same contract. Each standalone executable
+self-reported the SHA below before its parity oracle and A/A phase.
+
+These were not ratio-first guesses. The retained activation profiles in the
+negative ledger attribute 96.23% of correction diagnostics to the historical
+six scans, 64.13% of process-log rendering to intermediate owned-token churn,
+39.32% of the abbreviation workload to whole-prefix lowercasing, and 25.80% of
+SRT parsing to line ownership/block assembly. The router profile measured the
+current borrowed full-metrics read at about 671 ns versus about 46 ns for the
+scalar design; the corrected foreground run below re-measures that exact
+current-production boundary. Brier reuse and router count fusion enter from the
+audit's 18.026%-of-`apply` and 21.63%-of-caller profiles. Direct concatenation
+executes on every speculative confirmation/correction and was the next
+allocation in the already-profiled `CorrectionDrift::compute` seam.
+
+| Frontier lever | ELF SHA-256 | A/A null median, 95% CI (CV) | Candidate median, 95% CI | CI floor | Verdict and concrete retry predicate |
+|---|---|---|---|---|---|
+| Scalar-only `RouterState::success_rate_for` instead of borrowed full `metrics_for` when the caller needs one scalar | `7eaf09f87a2ffeaa98c89bc832d82883b069bae47182eea3b941c04289566de4` | `0.991902 [0.980888, 1.015220]` (11.20%) | **`11.883410 [11.539456, 12.276469]`** | `1.038225` | **KEEP.** All 13 parity regimes match `f64::to_bits()`; median component cost is 518.485 ns versus 44.369 ns. The harness deliberately uses the current borrowed-full-metrics production baseline, not the already-eliminated whole-state clone. This is a micro-call ratio, not an end-to-end claim. Retry only if the caller begins consuming latency/error fields too, or the history window representation changes. |
+| Correction diagnostics six scans fused into one traversal | `8d275e69f20f24439541ded296dbbe71b0aa2f46b57237c61794e47895ee67bc` | `1.001411 [0.992878, 1.004540]` (2.78%) | **`1.075613 [1.069838, 1.081497]`** | `1.014245` | **KEEP.** Every scalar bit and the complete JSON encoding match. Retry only if entry order or floating-point accumulation order changes, or the diagnostics path falls below 5% self-time. |
+| Direct capacity-sized process command-log rendering | `e0f0c79f446dd77da39e5fdd5f340e16ba70a25a3e0a8d78404796d03f651312` | `1.001669 [0.997914, 1.007896]` (10.80%) | **`1.692940 [1.661378, 1.701537]`** | `1.015791` | **KEEP.** Forty generated argument/redaction fixtures are byte-identical, including `--secret value`, `--secret=value`, and lookalike flags. Retry only if quoting/escaping is added to the log contract or typical commands shrink below two arguments. |
+| Allocation-free ASCII abbreviation suffix check | `2f29006b9b634b27516d92ea76d766656a184f0f798b8bb89c59af9fbe4e39ee` | 256×256 B: `0.969106 [0.913310, 0.976935]`; 16×4 KiB: `0.980262 [0.959359, 0.985278]`; 1×64 KiB: `0.997129 [0.994723, 1.002429]` | **`2.160024 [2.147263, 2.163125]`**, **`3.868393 [3.817991, 3.907404]`**, **`23.573340 [23.512804, 23.611945]`** | `1.173379`, `1.081283`, `1.010554` | **KEEP.** 3,637 predicates and 196,881 output bytes match; FNV oracle `ab008b2394605bcf`. Retry only if the abbreviation set gains non-ASCII entries or word-boundary semantics change. |
+| Borrowed SRT block lines instead of `String` per line plus joined block | `129ace9a86d7fced8eff8d4343fac582ad88e626888c811f6d13b90726a97bf2` | `0.996690 [0.992402, 1.002915]` (15.93%) | **`1.425161 [1.420276, 1.429256]`** | `1.015195` | **KEEP.** Complete parsed segments match over valid, CRLF, missing-index, bad-timestamp, empty-text, and trailing-block fixtures. Retry only if SRT blocks must outlive the input buffer or multi-line text normalization changes. |
+
+**README correction.** The public table now uses matched-greedy comparisons:
+large-v3-turbo is 2.07x end-to-end / 2.29x isolated encoder, tiny.en no-TS is
+1.10x, and tiny.en segment timestamps with full-coverage retry is honestly
+shown as `0.78x` (slower). The native-vs-whisper.cpp reference WER remains
+0.0000. The removed 2.33x headline compared greedy native decode with
+whisper.cpp's default beam/best-of decode and was not a matched claim.
+
+**Pass-wide retry predicate:** rerun a row only when its explicit predicate
+above holds, on the same source and same worker with the executable's line-1
+SHA recorded. A future harness change must retain A/A-first same-invocation
+measurement and the median-CI 2x-margin gate; CV must remain provenance only.
 
 ## 2026-07-25 — LANDED / INSTRUMENT UNBLOCK — synchronous facade over the now-async fsqlite `Connection` (bd-30yg)
 

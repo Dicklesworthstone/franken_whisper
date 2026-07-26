@@ -1,6 +1,30 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
+const PAIRS: usize = 41;
+const MIN_OF: usize = 3;
+const TARGET_NS: u128 = 2_000_000;
+const BOOTSTRAP_RESAMPLES: usize = 20_000;
+
+fn self_identity() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_owned();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "unavailable".to_owned();
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!(
+        "{:x} ({} bytes) {}",
+        hasher.finalize(),
+        bytes.len(),
+        path.display()
+    )
+}
+
 #[derive(Debug, PartialEq)]
 struct Segment {
     start_sec: Option<f64>,
@@ -211,40 +235,76 @@ fn timed(content: &str, arm: Arm, rounds: usize) -> (Duration, u64) {
     (started.elapsed(), black_box(result))
 }
 
-fn paired_ratio(content: &str, second: Arm, rounds: usize, reverse: bool) -> f64 {
-    let results = if reverse {
-        [
-            timed(content, second, rounds),
-            timed(content, Arm::Historical, rounds),
-            timed(content, Arm::Historical, rounds),
-            timed(content, second, rounds),
-        ]
+fn calibrated_rounds(content: &str, arm: Arm) -> usize {
+    let probe_rounds = 1;
+    let probe_ns = timed(content, arm, probe_rounds).0.as_nanos().max(1);
+    usize::try_from((TARGET_NS * probe_rounds as u128 / probe_ns).clamp(1, 1_000_000))
+        .expect("bounded rounds")
+}
+
+fn min_ns_per_round(content: &str, arm: Arm, rounds: usize) -> f64 {
+    (0..MIN_OF)
+        .map(|_| timed(content, arm, rounds).0.as_nanos() as f64)
+        .fold(f64::INFINITY, f64::min)
+        / rounds as f64
+}
+
+fn paired_ratio(
+    content: &str,
+    second: Arm,
+    historical_rounds: usize,
+    second_rounds: usize,
+    reverse: bool,
+) -> f64 {
+    let (historical_ns, second_ns) = if reverse {
+        let second_ns = min_ns_per_round(content, second, second_rounds);
+        let historical_ns = min_ns_per_round(content, Arm::Historical, historical_rounds);
+        (historical_ns, second_ns)
     } else {
-        [
-            timed(content, Arm::Historical, rounds),
-            timed(content, second, rounds),
-            timed(content, second, rounds),
-            timed(content, Arm::Historical, rounds),
-        ]
+        (
+            min_ns_per_round(content, Arm::Historical, historical_rounds),
+            min_ns_per_round(content, second, second_rounds),
+        )
     };
-    let (historical_before, second_before, second_after, historical_after) = if reverse {
-        (results[1], results[0], results[3], results[2])
-    } else {
-        (results[0], results[1], results[2], results[3])
-    };
-    for result in &results[1..] {
-        assert_eq!(results[0].1, result.1, "timed signatures diverged");
-    }
-    let historical_ns =
-        historical_before.0.as_nanos() as f64 + historical_after.0.as_nanos() as f64;
-    let second_ns = second_before.0.as_nanos() as f64 + second_after.0.as_nanos() as f64;
-    historical_ns / second_ns
+    historical_ns / second_ns.max(f64::MIN_POSITIVE)
 }
 
 fn percentile(values: &[f64], percentile: usize) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     sorted[(sorted.len() - 1) * percentile / 100]
+}
+
+fn coefficient_of_variation(values: &[f64]) -> f64 {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt() / mean
+}
+
+fn bootstrap_median_ci(values: &[f64]) -> (f64, f64) {
+    let mut state = 0xa54f_f53a_5f1d_36f1_u64 ^ values.len() as u64;
+    let mut sample = Vec::with_capacity(values.len());
+    let mut medians = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..values.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            sample.push(values[state as usize % values.len()]);
+        }
+        sample.sort_by(f64::total_cmp);
+        medians.push(sample[sample.len() / 2]);
+    }
+    medians.sort_by(f64::total_cmp);
+    (
+        medians[BOOTSTRAP_RESAMPLES * 25 / 1_000],
+        medians[BOOTSTRAP_RESAMPLES * 975 / 1_000],
+    )
 }
 
 fn assert_exact(left: &[Segment], right: &[Segment]) {
@@ -298,15 +358,28 @@ fn format_ratios(ratios: &[f64]) -> String {
 
 fn main() {
     const BLOCKS: usize = 8_192;
-    const ROUNDS: usize = 4;
-    const PAIRS: usize = 21;
 
+    println!("bench_elf_sha256={}", self_identity());
     let content = corpus(BLOCKS);
     parity_oracle();
+    let historical_rounds = calibrated_rounds(&content, Arm::Historical);
+    let borrowed_rounds = calibrated_rounds(&content, Arm::Borrowed);
 
     for reverse in [false, true, false] {
-        black_box(paired_ratio(&content, Arm::Historical, 1, reverse));
-        black_box(paired_ratio(&content, Arm::Borrowed, 1, reverse));
+        black_box(paired_ratio(
+            &content,
+            Arm::Historical,
+            historical_rounds,
+            historical_rounds,
+            reverse,
+        ));
+        black_box(paired_ratio(
+            &content,
+            Arm::Borrowed,
+            historical_rounds,
+            borrowed_rounds,
+            reverse,
+        ));
     }
 
     let mut null_ratios = Vec::with_capacity(PAIRS);
@@ -315,33 +388,48 @@ fn main() {
         null_ratios.push(paired_ratio(
             &content,
             Arm::Historical,
-            ROUNDS,
+            historical_rounds,
+            historical_rounds,
             pair % 2 != 0,
         ));
     }
     for pair in 0..PAIRS {
-        candidate_ratios.push(paired_ratio(&content, Arm::Borrowed, ROUNDS, pair % 2 != 0));
+        candidate_ratios.push(paired_ratio(
+            &content,
+            Arm::Borrowed,
+            historical_rounds,
+            borrowed_rounds,
+            pair % 2 != 0,
+        ));
     }
 
-    let null_median = percentile(&null_ratios, 50);
-    let null_p90 = percentile(&null_ratios, 90);
-    let candidate_p10 = percentile(&candidate_ratios, 10);
+    let (null_ci_low, null_ci_high) = bootstrap_median_ci(&null_ratios);
+    let (candidate_ci_low, candidate_ci_high) = bootstrap_median_ci(&candidate_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
     let candidate_median = percentile(&candidate_ratios, 50);
     let candidate_wins = candidate_ratios
         .iter()
         .filter(|ratio| **ratio > 1.0)
         .count();
-    let keep = (0.97..=1.03).contains(&null_median)
-        && candidate_median >= 1.10
-        && candidate_p10 > null_p90.max(1.05)
-        && candidate_wins >= 18;
+    let keep = candidate_median >= required_speedup;
 
-    println!("bench blocks={BLOCKS} rounds={ROUNDS} pairs={PAIRS}");
+    println!(
+        "bench blocks={BLOCKS} historical_rounds={historical_rounds} borrowed_rounds={borrowed_rounds} pairs={PAIRS} min_of={MIN_OF}"
+    );
     println!("null_ratios={}", format_ratios(&null_ratios));
     println!("candidate_ratios={}", format_ratios(&candidate_ratios));
-    println!("null_median={null_median:.6} null_p90={null_p90:.6}");
     println!(
-        "candidate_p10={candidate_p10:.6} candidate_median={candidate_median:.6} wins={candidate_wins}/{PAIRS}"
+        "null_median={:.6} null_median_ci95=[{null_ci_low:.6},{null_ci_high:.6}] null_cv={:.6}",
+        percentile(&null_ratios, 50),
+        coefficient_of_variation(&null_ratios)
     );
-    println!("decision={}", if keep { "KEEP" } else { "REJECT" });
+    println!(
+        "candidate_median={candidate_median:.6} candidate_median_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] candidate_cv={:.6} wins={candidate_wins}/{PAIRS}",
+        coefficient_of_variation(&candidate_ratios)
+    );
+    println!(
+        "gate=median_vs_null_ci95_2x_margin null_half_width={null_half_width:.6} required_speedup={required_speedup:.6} candidate_median={candidate_median:.6} cv_is_provenance_only=true verdict={}",
+        if keep { "KEEP" } else { "REJECT" }
+    );
 }

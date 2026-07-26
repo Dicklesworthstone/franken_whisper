@@ -20,13 +20,11 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
         return program.to_owned();
     }
 
-    let mut rendered = Vec::with_capacity(args.len() + 1);
-    rendered.push(program.to_owned());
-
+    let mut capacity = program.len().saturating_add(args.len());
     let mut redact_next = false;
     for arg in args {
         if redact_next {
-            rendered.push("***".to_owned());
+            capacity = capacity.saturating_add(3);
             redact_next = false;
             continue;
         }
@@ -34,20 +32,42 @@ fn render_command_for_log(program: &str, args: &[String]) -> String {
         if let Some((flag, _value)) = arg.split_once('=')
             && is_sensitive_flag(flag)
         {
-            rendered.push(format!("{flag}=***"));
+            capacity = capacity.saturating_add(flag.len().saturating_add(4));
             continue;
         }
 
+        capacity = capacity.saturating_add(arg.len());
         if is_sensitive_flag(arg) {
-            rendered.push(arg.clone());
             redact_next = true;
-            continue;
         }
-
-        rendered.push(arg.clone());
     }
 
-    rendered.join(" ")
+    let mut rendered = String::with_capacity(capacity);
+    rendered.push_str(program);
+    let mut redact_next = false;
+    for arg in args {
+        rendered.push(' ');
+        if redact_next {
+            rendered.push_str("***");
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((flag, _value)) = arg.split_once('=')
+            && is_sensitive_flag(flag)
+        {
+            rendered.push_str(flag);
+            rendered.push_str("=***");
+            continue;
+        }
+
+        rendered.push_str(arg);
+        if is_sensitive_flag(arg) {
+            redact_next = true;
+        }
+    }
+
+    rendered
 }
 
 fn is_sensitive_flag(flag: &str) -> bool {
@@ -512,6 +532,11 @@ mod tests {
             !rendered.contains("secret_api_key"),
             "api key should be redacted"
         );
+        assert_eq!(
+            rendered,
+            "prog --hf-token *** --api-key=*** --token-threshold 0.1 positional"
+        );
+        assert_eq!(render_command_for_log("prog", &[]), "prog");
     }
 
     #[test]
