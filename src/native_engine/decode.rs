@@ -208,10 +208,12 @@ pub struct DecodeParams {
     /// (byte-identical). Applied by the logit filter (`ProcessLogitsConfig`).
     pub suppress_nst: bool,
     /// Max carried previous-context tokens (whisper `--max-context` /
-    /// `n_max_text_ctx`). `None` or a negative value = the default `n_text_ctx/2`
-    /// (byte-identical). `Some(0)` disables prompt carrying entirely (per-request
-    /// equivalent of `FW_NO_CONTEXT` — an anti-hallucination / anti-repetition
-    /// escape on hard or looping audio); `Some(n)` caps the carry at `n` tokens.
+    /// `n_max_text_ctx`). `None` uses the model policy: normally `n_text_ctx/2`,
+    /// while tiny.en segment-timestamp decoding suppresses cross-window carry to
+    /// avoid its measured failed-window re-decode. An explicit negative value
+    /// restores the original `n_text_ctx/2` carry policy; `Some(0)` disables
+    /// carrying entirely (per-request equivalent of `FW_NO_CONTEXT`), and
+    /// `Some(n)` caps the carry at `n` tokens.
     pub max_context: Option<i32>,
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
@@ -481,9 +483,12 @@ fn simd_exp_enabled() -> bool {
 /// non-first window prepends the prior windows' text as a `[sot_prev, …past…]`
 /// prompt (the prompt build below) to improve cross-window coherence; when this
 /// is set that carried prompt is suppressed and every window starts from a clean
-/// `sot_sequence`. Default OFF = conditioning ON = whisper.cpp's own default =
-/// **byte-identical** to prior behaviour — and single-window clips (jfk×1) carry
-/// no prompt at all, so it is a proven no-op there regardless.
+/// `sot_sequence`. Default OFF preserves the native engine's historical
+/// conditioning behavior. The bundled whisper.cpp currently defaults
+/// `whisper_full_params.no_context` to true; the tiny.en segment-timestamp policy
+/// below aligns that one losing comparator cell without changing other
+/// model/mode combinations. Single-window clips (jfk×1) carry no prior-window
+/// prompt at all, so this flag is a proven no-op there regardless.
 ///
 /// This is the **bd-r0qd escape hatch** (owner-confirmed faithfulness bug): the
 /// accumulated previous-window prompt can bias the greedy / temperature-0
@@ -499,6 +504,59 @@ fn condition_on_prev_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FW_NO_CONTEXT").is_some())
+}
+
+/// Preserve the historical carried-context policy for tiny.en segment timestamps.
+///
+/// Default tiny.en segment-timestamp decoding suppresses only text carried from a
+/// prior window. The user's initial prompt on window zero is still honored. Set
+/// `FW_TINY_EN_TS_CONTEXT=1` to restore the old carry-then-retry behavior; an
+/// explicit [`DecodeParams::max_context`] also overrides the model policy.
+fn tiny_en_segment_ts_context_forced() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FW_TINY_EN_TS_CONTEXT").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on"
+            )
+        })
+    })
+}
+
+/// Decide whether to suppress tiny.en's cross-window segment-timestamp prompt.
+///
+/// This is a deterministic model policy, not an online adaptive controller:
+///
+/// - State: exact tiny.en architecture, segment timestamps, explicit user
+///   context override, and the operator fallback flag.
+/// - Actions: carry prior-window text, or start window 2+ from the normal SOT
+///   sequence without that carry.
+/// - Loss: the measured carried-prompt failure silently drops two track01
+///   windows unless it pays for a second decode; no-carry restores all 1,301
+///   characters in one attempt. The counter-loss is reduced cross-window style
+///   conditioning, so the policy is deliberately model/mode-specific.
+/// - Calibration/fallback: track01 full coverage and WER against whisper.cpp,
+///   whose bundled default is also `no_context`; explicit `max_context` or
+///   `FW_TINY_EN_TS_CONTEXT=1` restores the historical action. The default-on
+///   failed-window retry remains as a conservative guard.
+fn suppress_tiny_en_segment_ts_context(
+    hparams: &WhisperHParams,
+    params: &DecodeParams,
+    force_context: bool,
+) -> bool {
+    let is_tiny_en = hparams.n_vocab == 51_864
+        && hparams.n_audio_ctx == 1_500
+        && hparams.n_audio_state == 384
+        && hparams.n_audio_head == 6
+        && hparams.n_audio_layer == 4
+        && hparams.n_text_ctx == 448
+        && hparams.n_text_state == 384
+        && hparams.n_text_head == 6
+        && hparams.n_text_layer == 4
+        && hparams.n_mels == 80;
+    is_tiny_en && params.timestamps && params.max_context.is_none() && !force_context
 }
 
 /// Optional user initial prompt (whisper `--prompt` / `initial_prompt`), read
@@ -1750,6 +1808,14 @@ pub fn transcribe_samples(
         Some(n) if n >= 0 => usize::try_from(n).unwrap_or(n_text_ctx / 2),
         _ => n_text_ctx / 2,
     };
+    // tiny.en's carried prompt is the proven cause of its segment-timestamp
+    // failed-window retry. Suppress only cross-window carry by default; an
+    // explicit request or operator override retains the historical behavior.
+    let suppress_tiny_en_ts_context = suppress_tiny_en_segment_ts_context(
+        &m.hparams,
+        params,
+        tiny_en_segment_ts_context_forced(),
+    );
 
     let mut segments: Vec<TranscriptionSegment> = Vec::new();
     let mut windows: Vec<WindowStats> = Vec::new();
@@ -1974,14 +2040,15 @@ pub fn transcribe_samples(
             let mut prompt: Vec<i32> = Vec::new();
             // Carry the prior-window text prompt unless conditioning is disabled
             // (whisper.cpp `no_context` / `--no-context`; bd-r0qd escape hatch,
-            // `FW_NO_CONTEXT=1`), this is a failed-window retry (`force_empty_prompt`,
-            // FW_RETRY_FAILED_WINDOW), or a FW_TEMP_FALLBACK attempt above the prompt-
-            // reset temperature. Default (unset) keeps the carry ⇒ byte-identical.
+            // `FW_NO_CONTEXT=1`), the tiny.en segment-TS policy suppresses window
+            // 2+ carry, this is a failed-window retry (`force_empty_prompt`), or a
+            // FW_TEMP_FALLBACK attempt above the prompt-reset temperature.
             let prompt_carried = !condition_on_prev_disabled()
                 && !force_empty_prompt
                 && window_temp <= TEMP_PROMPT_RESET
                 && !prompt_past.is_empty()
-                && max_prompt_ctx > 1;
+                && max_prompt_ctx > 1
+                && !(suppress_tiny_en_ts_context && seek_cs > 0);
             if prompt_carried {
                 prompt.push(tk.sot_prev);
                 let take = prompt_past.len().min(max_prompt_ctx.saturating_sub(1));
@@ -2249,13 +2316,15 @@ pub fn transcribe_samples(
             cand_idx = 0;
             rung_best = None;
 
-            // FW_RETRY_FAILED_WINDOW (default-off): a window that closed NO timestamp
+            // FW_RETRY_FAILED_WINDOW (default-on guard): a window that closed NO timestamp
             // (`result_len == 0`, not silence) while carrying a prior-window prompt is
             // the bd-r0qd long-form drop — the carried prompt × int8 numerics made the
             // decoder emit `eot` early. Retry this SAME seek ONCE with the prompt
             // cleared (fresh `st` next iteration; `FW_NO_CONTEXT`-style recovery, but
             // targeted) before accepting the drop. `force_empty_prompt` makes it fire at
-            // most once per seek, so no infinite loop; unset ⇒ never fires ⇒ byte-exact.
+            // most once per seek, so no infinite loop. The tiny.en segment-TS policy
+            // should avoid this path; it remains a conservative fallback and supports
+            // the explicit historical-context overrides above.
             if retry_failed_window_enabled()
                 && !temp_fallback_enabled()
                 && result_len == 0
@@ -2834,6 +2903,54 @@ mod tests {
             n_mels: 80,
             ftype: 1,
         }
+    }
+
+    #[test]
+    fn tiny_en_segment_ts_context_policy_is_narrow_and_overridable() {
+        let tiny = hp(51_864);
+        let mut params = DecodeParams {
+            timestamps: true,
+            ..DecodeParams::default()
+        };
+
+        assert!(suppress_tiny_en_segment_ts_context(&tiny, &params, false));
+        assert!(
+            !suppress_tiny_en_segment_ts_context(&tiny, &params, true),
+            "the operator fallback must restore historical context"
+        );
+
+        params.max_context = Some(-1);
+        assert!(
+            !suppress_tiny_en_segment_ts_context(&tiny, &params, false),
+            "an explicit max-context request must override the model policy"
+        );
+        params.max_context = None;
+        params.timestamps = false;
+        assert!(
+            !suppress_tiny_en_segment_ts_context(&tiny, &params, false),
+            "tiny.en no-timestamp decoding keeps its historical context"
+        );
+
+        params.timestamps = true;
+        let mut quantized_tiny = tiny;
+        quantized_tiny.ftype = 7;
+        assert!(
+            suppress_tiny_en_segment_ts_context(&quantized_tiny, &params, false),
+            "the policy follows the tiny.en architecture across quant formats"
+        );
+
+        let mut turbo = tiny;
+        turbo.n_vocab = 51_866;
+        turbo.n_audio_state = 1_280;
+        turbo.n_audio_head = 20;
+        turbo.n_audio_layer = 32;
+        turbo.n_text_state = 1_280;
+        turbo.n_text_head = 20;
+        turbo.n_mels = 128;
+        assert!(
+            !suppress_tiny_en_segment_ts_context(&turbo, &params, false),
+            "large-v3-turbo must remain on the historical context policy"
+        );
     }
 
     /// English-only synthetic vocab (51864) with known special ids:
