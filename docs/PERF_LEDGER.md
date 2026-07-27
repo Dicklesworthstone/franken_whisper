@@ -248,7 +248,7 @@ fully-qualified `fsqlite::Connection::open` renames — no signature churn in th
 stack-hungry.** `fsqlite`'s statement futures nest deeply enough that `fsqlite`
 raises its own `recursion_limit` to type-check them, so both the state machines
 and the poll chain that drives them are large. In a **debug** build this
-overflows libtest's default 8 MiB thread stack: `cargo test --lib storage::`
+overflows libtest's ordinary worker stack: `cargo test --lib storage::`
 aborted with SIGABRT ("has overflowed its stack") after only **3 of 202** tests.
 
 Two things were needed, and the distinction matters for anyone rewriting this:
@@ -272,10 +272,11 @@ env -u RUST_MIN_STACK target/release/deps/franken_whisper-<hash> storage::
 test result: ok. 202 passed; 0 failed  (0.49s)
 ```
 
-Release frames are small enough that the poll chain fits the default 8 MiB with
-room to spare. So `RUST_MIN_STACK` is **purely a debug/test ergonomics setting**,
-the shipped path is unaffected, and the facade does **not** need the dedicated
-big-stack worker thread that `fsqlite`'s own `AsyncConnection` uses internally.
+The exact release suite completes on the ordinary stack with no override. That
+supports keeping `RUST_MIN_STACK` as a debug/test ergonomics setting for the
+currently exercised storage shapes, and it rules out a dedicated big-stack
+worker solely for those shapes. It does **not** measure spare stack headroom or
+prove that every future, more deeply nested statement shape will fit.
 
 **Retry predicate:** revisit only if a *release* run overflows (i.e. the fsqlite
 statement-future nesting grows materially deeper), or if the storage surface is

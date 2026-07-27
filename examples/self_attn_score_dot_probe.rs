@@ -1,9 +1,8 @@
 //! Self-attention SCORE-DOT lever (BlackThrush, 2026-07-04).
 //!
-//! Measurement probe only — never linked into the library. It hand-writes the
-//! AVX2 intrinsics it is timing, so it opts out of the workspace
-//! `unsafe_code = "deny"` lint the same way `native_engine::nn` does for its
-//! own kernels.
+//! Measurement probe only — never linked into the library. Its AVX2/FMA kernel
+//! is isolated behind one runtime-checked capability token; the rest of the
+//! probe remains under the workspace `unsafe_code = "deny"` lint.
 //!
 //! `attention_decode_step` (nn.rs:3205-3212) computes the per-token self-attn
 //! scores with a SCALAR sequential f32 reduction:
@@ -23,8 +22,6 @@
 //!      — measures whether even a mild reorder helps and by how much its |Δ|.
 //! Reports per-token score-dot µs (20 heads × tk keys), ratio, and max|Δ| vs scalar.
 //! Usage: `self_attn_score_dot_probe [iters]`  (turbo shapes: n_head=20, d_head=64).
-#![allow(unsafe_code)]
-
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::hint::black_box;
@@ -36,6 +33,9 @@ const D_HEAD: usize = N_STATE / N_HEAD; // 64
 
 /// Current engine code: scalar sequential dot (byte-exact reference).
 fn scalar_scores(qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out: &mut [f32]) {
+    debug_assert_eq!(qh.len(), D_HEAD);
+    debug_assert!(k.len() >= tk * N_STATE);
+    debug_assert_eq!(out.len(), tk);
     for (j, sj) in out.iter_mut().enumerate() {
         let krow = &k[j * N_STATE + base..j * N_STATE + base + D_HEAD];
         let mut acc = 0.0f32;
@@ -48,8 +48,15 @@ fn scalar_scores(qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out:
 
 /// A) 4-accumulator AVX2 dot over contiguous d_head (D_HEAD=64 = 8×f32x8).
 /// NON-byte-exact: 4 partial sums reduced at the end (reordered).
+///
+/// # Safety
+///
+/// The caller must verify AVX2 and FMA support and provide `qh`, `k`, and
+/// `out` slices large enough for `D_HEAD`, `tk * N_STATE`, and `tk`; `base`
+/// through `base + D_HEAD` must stay inside each `N_STATE` row.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code)]
 unsafe fn avx2_scores_4acc(
     qh: &[f32],
     k: &[f32],
@@ -58,39 +65,71 @@ unsafe fn avx2_scores_4acc(
     tk: usize,
     out: &mut [f32],
 ) {
-    let vscale = _mm256_set1_ps(scale);
-    let qp = qh.as_ptr();
-    for j in 0..tk {
-        let kp = k.as_ptr().add(j * N_STATE + base);
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        let mut a2 = _mm256_setzero_ps();
-        let mut a3 = _mm256_setzero_ps();
-        // D_HEAD=64 => 8 vectors; unroll 4 accumulators × 2 rounds.
-        let mut d = 0;
-        while d + 32 <= D_HEAD {
-            let q0 = _mm256_loadu_ps(qp.add(d));
-            let q1 = _mm256_loadu_ps(qp.add(d + 8));
-            let q2 = _mm256_loadu_ps(qp.add(d + 16));
-            let q3 = _mm256_loadu_ps(qp.add(d + 24));
-            let k0 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d)), vscale);
-            let k1 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d + 8)), vscale);
-            let k2 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d + 16)), vscale);
-            let k3 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d + 24)), vscale);
-            a0 = _mm256_fmadd_ps(q0, k0, a0);
-            a1 = _mm256_fmadd_ps(q1, k1, a1);
-            a2 = _mm256_fmadd_ps(q2, k2, a2);
-            a3 = _mm256_fmadd_ps(q3, k3, a3);
-            d += 32;
+    // SAFETY: the function's contract establishes the ISA features and every
+    // pointer range used below. Unaligned loads are intentional; all offsets
+    // stay inside the validated slice lengths.
+    unsafe {
+        let vscale = _mm256_set1_ps(scale);
+        let qp = qh.as_ptr();
+        for j in 0..tk {
+            let kp = k.as_ptr().add(j * N_STATE + base);
+            let mut a0 = _mm256_setzero_ps();
+            let mut a1 = _mm256_setzero_ps();
+            let mut a2 = _mm256_setzero_ps();
+            let mut a3 = _mm256_setzero_ps();
+            // D_HEAD=64 => 8 vectors; unroll 4 accumulators × 2 rounds.
+            let mut d = 0;
+            while d + 32 <= D_HEAD {
+                let q0 = _mm256_loadu_ps(qp.add(d));
+                let q1 = _mm256_loadu_ps(qp.add(d + 8));
+                let q2 = _mm256_loadu_ps(qp.add(d + 16));
+                let q3 = _mm256_loadu_ps(qp.add(d + 24));
+                let k0 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d)), vscale);
+                let k1 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d + 8)), vscale);
+                let k2 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d + 16)), vscale);
+                let k3 = _mm256_mul_ps(_mm256_loadu_ps(kp.add(d + 24)), vscale);
+                a0 = _mm256_fmadd_ps(q0, k0, a0);
+                a1 = _mm256_fmadd_ps(q1, k1, a1);
+                a2 = _mm256_fmadd_ps(q2, k2, a2);
+                a3 = _mm256_fmadd_ps(q3, k3, a3);
+                d += 32;
+            }
+            let s = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+            // horizontal sum of the 8 lanes
+            let hi = _mm256_extractf128_ps(s, 1);
+            let lo = _mm256_castps256_ps128(s);
+            let mut sum128 = _mm_add_ps(hi, lo);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            sum128 = _mm_hadd_ps(sum128, sum128);
+            out[j] = _mm_cvtss_f32(sum128);
         }
-        let s = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
-        // horizontal sum of the 8 lanes
-        let hi = _mm256_extractf128_ps(s, 1);
-        let lo = _mm256_castps256_ps128(s);
-        let mut sum128 = _mm_add_ps(hi, lo);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        sum128 = _mm_hadd_ps(sum128, sum128);
-        out[j] = _mm_cvtss_f32(sum128);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct Avx2Fma;
+
+#[cfg(target_arch = "x86_64")]
+impl Avx2Fma {
+    fn detect() -> Option<Self> {
+        (std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"))
+            .then_some(Self)
+    }
+
+    #[inline]
+    #[allow(unsafe_code)]
+    fn scores(self, qh: &[f32], k: &[f32], scale: f32, base: usize, tk: usize, out: &mut [f32]) {
+        let required_k = tk
+            .checked_mul(N_STATE)
+            .expect("self-attention key-cache length overflow");
+        assert_eq!(qh.len(), D_HEAD);
+        assert!(base <= N_STATE - D_HEAD);
+        assert!(k.len() >= required_k);
+        assert!(out.len() >= tk);
+        // SAFETY: `detect` proved the required ISA features, and the slice
+        // and row bounds required by the kernel are checked above.
+        unsafe { avx2_scores_4acc(qh, k, scale, base, tk, out) }
     }
 }
 
@@ -101,7 +140,16 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn main() {
+    eprintln!("self_attn_score_dot_probe requires x86_64 with AVX2 and FMA");
+    std::process::exit(2);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn main() {
+    let avx2 =
+        Avx2Fma::detect().expect("self_attn_score_dot_probe requires CPU support for AVX2 and FMA");
     let iters: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -136,17 +184,14 @@ fn main() {
                 tk,
                 &mut sc_scalar[h * tk..(h + 1) * tk],
             );
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                avx2_scores_4acc(
-                    &qfull[base..base + D_HEAD],
-                    &k,
-                    scale,
-                    base,
-                    tk,
-                    &mut sc_avx[h * tk..(h + 1) * tk],
-                );
-            }
+            avx2.scores(
+                &qfull[base..base + D_HEAD],
+                &k,
+                scale,
+                base,
+                tk,
+                &mut sc_avx[h * tk..(h + 1) * tk],
+            );
         }
         let mad = max_abs_diff(&sc_scalar, &sc_avx);
 
@@ -171,17 +216,14 @@ fn main() {
         for _ in 0..iters {
             for h in 0..N_HEAD {
                 let base = h * D_HEAD;
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    avx2_scores_4acc(
-                        &qfull[base..base + D_HEAD],
-                        black_box(&k),
-                        scale,
-                        base,
-                        tk,
-                        &mut sc_avx[h * tk..(h + 1) * tk],
-                    );
-                }
+                avx2.scores(
+                    &qfull[base..base + D_HEAD],
+                    black_box(&k),
+                    scale,
+                    base,
+                    tk,
+                    &mut sc_avx[h * tk..(h + 1) * tk],
+                );
             }
             black_box(sc_avx[0]);
         }

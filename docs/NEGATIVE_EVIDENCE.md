@@ -113,16 +113,15 @@ margin) this passes run 1 (margin 2.31×), fails run 2 outright (null p90 1.1990
 swallows the candidate median 1.1916), and lands just under on run 3 (1.97×).
 One noisy run moved null p90 by 11 points.
 
-**Third, a finding that outlives this row: `cv < 5%` is unreachable here.**
-Candidate CV was 7.06 / 8.07 / 8.74% across three runs of a *calibrated* harness
-whose null median sat within 1% of unity. bd-7rxo's own acceptance criterion
-("21-pair same-worker A/B/null with CV<5%") is therefore unsatisfiable as
-written, and the bench's `assert!(candidate_cv < 0.05)` is what exited 101 on all
-three runs — together with `speedup_p10 > max(null_p90, 1.10)`, which demands
-near-total distribution non-overlap. Both gates should be replaced by the
-median-CI gate. This independently confirms, on live measurements, the
-`docs/LEDGER_RESURRECTION.md` finding that this repo's rejections are being
-driven by decision rules the hardware cannot satisfy.
+**Third, the `cv < 5%` clause was an invalid decision gate for these runs.**
+Candidate CV was 7.06 / 8.07 / 8.74% across three runs whose null median sat
+within 1% of unity. The bench's `assert!(candidate_cv < 0.05)` therefore exited
+101 on all three runs, together with `speedup_p10 > max(null_p90, 1.10)`, which
+demands near-total distribution non-overlap. That establishes that the old
+rules discarded this observed effect; it does **not** establish that a quiet
+run on this hardware can never report CV below 5%. The durable conclusion is
+the campaign contract: CV is provenance only, never a verdict gate; decide on
+the median-CI rule.
 
 **Retry predicate (concrete).** Re-run only after BOTH: (1) `SpeculationWindowController`
 gains a runtime toggle that forces the historical double-fold *inside* `apply()`
