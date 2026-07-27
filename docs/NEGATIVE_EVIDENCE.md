@@ -123,14 +123,18 @@ run on this hardware can never report CV below 5%. The durable conclusion is
 the campaign contract: CV is provenance only, never a verdict gate; decide on
 the median-CI rule.
 
-**Retry predicate (concrete).** Re-run only after BOTH: (1) `SpeculationWindowController`
-gains a runtime toggle that forces the historical double-fold *inside* `apply()`
-— mirroring `set_sdpa_poly_exp` / `set_sgemm_tile_balanced`, since an env
-`OnceLock` cannot flip between arms in one binary — so both arms are the REAL
-`apply()` differing only by that flag; AND (2) the host is quiet (load < 2, no
-competing benchmark process), verified before the run. Then decide on the
-median-CI gate with a 2× margin and report `cv` as provenance only. Until then
-the lever stays landed and byte-identical, with **no** speed claim attached.
+**Retry predicate (concrete).** Re-run only after BOTH: (1)
+`SpeculationWindowController` gains a runtime toggle that forces the historical
+double-fold *inside* `apply()` — mirroring `set_sdpa_poly_exp` /
+`set_sgemm_tile_balanced`, since an env `OnceLock` cannot flip between arms in
+one binary — so both arms are the REAL `apply()` differing only by that flag;
+AND (2) the host is quiet (load < 2, no competing benchmark process), verified
+before the run. Use a self-reporting ELF, prove exact action/fallback/evidence
+and Brier `to_bits()` equality before timing, and run order-interleaved A/A
+before A/B in the same invocation. Decide only on the candidate median against
+the A/A bootstrap 95% CI with the campaign margin; report `cv` and wins as
+provenance only. Until then the lever stays landed and byte-identical, with
+**no** speed claim attached.
 
 ---
 ## 2026-07-24 - WhiteCreek: **KEEP — ROBUSTNESS (corrupt/truncated model) — a partially-downloaded ggml model errors CLEANLY from load()/from_ggml, never a panic or silent garbage-weight load.**
@@ -4647,8 +4651,8 @@ remains gated, so no future agent re-surveys the vein.
 
 Self-corrections logged (integrity): the "SDPA not exp-bound" closure (falsified — exp is 23.7% of
 the kernel), the i7 "0% self-time" mis-audit (`44833c2` — it's ~28%, default-on), the "9.91% dequant
-epilogue" mislabel (`3910c9c` — it's rayon dispatch), the cv<5 gate (`bbe6ed0` — unreachable; median
-gate adopted), and the BR overclaim withdrawal.
+epilogue" mislabel (`3910c9c` — it's rayon dispatch), the cv<5 gate (`bbe6ed0` — invalid for those
+contended runs; median gate adopted), and the BR overclaim withdrawal.
 
 ### GATED — the only remaining cc-relevant levers (NOT one-cycle byte-exact; require owner/cod/hardware)
 1. **SDPA-sgemm `gemm`-crate swap** — ~1.12× on the SDPA frame (~3% e2e), WER-neutral (rel 3.8e-7)
@@ -5352,12 +5356,14 @@ stashed or deleted. `nn.rs`/`benches` untouched — cod_fw's.
 ---
 ## 2026-07-10 - cc_fw: **GATE CORRECTED (median vs null spread, not cv<5) — and it FALSIFIES MY OWN CLAIMS.** BR is **not decidable** on any worker I have had; the "`BR=128` regresses 0.9414× at `nbh=4`" number is **WITHDRAWN** — it was decided **inside that shape's own null floor**. Self-audit of every ratio I have published this session, against the null floor and the provenance rules.
 
-**Rule adopted** (frankenmermaid harness calibration + frankenlibc per-function floor): `cv < 5` is
-**unreachable on this hardware** and is no longer a gate. Run `paired(base, base)` as an **A/A null
-control**, take the **median** of the null ratio and its **observed spread**, and call a candidate
-**decidable only when its median lies outside the null's [p10, p90]**. Report null median, null
-spread, and candidate median together. **The floor is PER-FUNCTION and PER-SHAPE** — calibrate it
-for the thing you are actually measuring. cv stays as information, never as a gate.
+**Rule adopted** (frankenmermaid harness calibration + frankenlibc per-function floor): `cv < 5`
+was **not an admissible verdict gate for these contended runs** and is no longer a gate. Run
+`paired(base, base)` as an **A/A null control**, take the **median** of the null ratio and its
+**observed spread**, and call a candidate **decidable only when its median lies outside the null's
+[p10, p90]**. Report null median, null spread, and candidate median together. **The floor is
+PER-FUNCTION and PER-SHAPE** — calibrate it for the thing you are actually measuring. cv stays as
+information, never as a gate. This wording corrects the original universal claim: three noisy
+runs do not prove that a quiet run can never report CV below 5%.
 Harness updated: frankentorch `2ba080ba`.
 
 ### The accepted run (pre-declared rule: accept first run with null median ∈ [0.98, 1.02]; report discards)
@@ -25898,12 +25904,15 @@ KEEP/REJECT basis. The speculative source and benchmark edits were manually
 restored and `git diff --exit-code -- src/speculation.rs benches/pipeline_bench.rs`
 returned **0**.
 
-**Concrete retry predicate:** retry only when an admissible worker has the
-release-test artifact genuinely warm enough for the focused test to start below
-RCH's 1,800-second limit, or when the remote command timeout exceeds the observed
-cold build. On one pinned worker, require the exact action/fallback/evidence
-oracle plus Brier `to_bits` equality, then 21 order-alternated historical/
-candidate pairs and historical/historical null pairs with null median
-`0.95..=1.05`, candidate CV `<5%`, at least `18/21` wins, and candidate p10
-`> max(null p90, 1.10)`. Until that predicate holds, **do not ship and do not
+**Concrete retry predicate (corrected 2026-07-27):** the remote-build
+precondition was later satisfied, but the first timed harness exposed a more
+important blocker: its baseline performed an extra decision body that the
+historical production path never ran. Retry only after a runtime toggle forces
+the faithful historical double Brier fold *inside* `apply()`, so both arms call
+the real production method and differ only by that toggle. On one pinned
+worker, use a self-reporting ELF, prove exact action/fallback/evidence and Brier
+`to_bits()` equality before timing, then run order-interleaved A/A before A/B
+in the same invocation. Decide only on the candidate median against the A/A
+bootstrap 95% CI with the campaign margin; report CV and wins as provenance,
+never as verdict gates. Until that predicate holds, **do not ship and do not
 record this as a rejection**; the measured hotspot remains open.

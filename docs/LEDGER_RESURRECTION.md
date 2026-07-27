@@ -33,6 +33,47 @@ routing, proof soundness, numerical justification, and ungated code quality.
 No speed KEEP from this window is retracted. The only timed candidate in the
 window (`efb42b7`) deliberately carried **no admissible speed verdict**.
 
+### Final remediation reconciliation — 2026-07-27
+
+All five `CORRECTED` verdicts now map to landed fixes:
+
+- `d92b511`: `d78f7f3` replaces the sampled resurrection draft with the full
+  hand audit; `d0b4a8e` propagates runtime-construction failure and narrows the
+  standalone probes' unsafe exemptions.
+- `aa5ab8b`: `d0b4a8e` limits the release-stack conclusion to the exact
+  202-test path and explicitly disclaims spare-headroom and future-shape proof.
+- `b17945c`: `d0b4a8e` scopes the CV finding to the three observed contended
+  runs. This closeout also removes the stale CV ratchet from live beads
+  `bd-pjl6`, `bd-7rxo`, and `bd-203u`, appends an immutable correction to
+  `bd-7rxo`'s old comment, and corrects the two surviving universal-CV
+  references plus the stale Brier retry predicate in
+  `NEGATIVE_EVIDENCE.md`.
+- `a9c58e6`: `d78f7f3` applies the exact six-class taxonomy to all 188
+  hand-adjudicated performance rejections; `d0b4a8e` records the model audit.
+- `76901c4`: `bd6243a` replaces the permissive prototype with the staged
+  pre-commit contract; `d0b4a8e` binds nulls, counted mechanisms, and binary
+  digests to the evidence they purport to prove and compiles the staged gate
+  source.
+
+There are no `RETRACTED` verdicts and therefore no retraction-dependent speed
+claims to withdraw. The dependent scan covered `NEGATIVE_EVIDENCE.md`,
+`PERF_LEDGER.md`, `README.md`, every scorecard-named path (none exist), and all
+current bead descriptions, notes, and comments. Historical measurements remain
+as audit records; superseding corrections are explicit rather than silent.
+
+The hardened gate was then run against this repository's real ledger via
+`RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo test --test
+ledger_integrity` on `vmi1149989`: **7 passed, 0 failed**. The real-ledger test
+found no undecidable post-enforcement rejection. The adversarial tests confirmed
+that accuracy/profile/CV/magnitude prose cannot bypass the REJECT contract, a
+candidate statistic cannot launder a missing numerical null, an unchanged
+output cannot launder changed allocation counts, and an output-oracle digest
+cannot launder a missing binary/ELF digest. This is the judgment defect class
+that escaped the first `76901c4` prototype. A live `surface speculation brier`
+self-check also caught and corrected a stale retry predicate, then led to
+parser hardening: an explicit retry heading now outranks an earlier historical
+mention of the words “retry predicate.”
+
 ---
 
 ## 0. Population correction and hand-adjudication
@@ -74,7 +115,7 @@ This supersedes the earlier 139-row and 277-row-as-denominator drafts.
 | `VALID-PROFILE` | Rejected before any source edit, on a named profile frame with non-zero self-time and a computed Amdahl ceiling. | ✅ |
 | `VALID-MECHANISM` | No A/A null recorded, but refuted on a *counted* mechanism — instructions/cycles/syscalls/allocations/faults unchanged. A null control cannot change "no work was removed". | ✅ |
 | `VALID-AB` | A/B run with a recorded A/A null; the claimed effect sits inside that null. | ✅ |
-| `VOID-CV` | An A/B ran, and the row was killed **only** by a `cv < 5%` gate — unreachable on this hardware. | ❌ |
+| `VOID-CV` | An A/B ran, and the row was killed **only** by a `cv < 5%` gate. CV alone is not an admissible verdict gate. | ❌ |
 | `VOID-ZEROSELF` | The target frame had ~0% self-time in the profile the bench actually exercised. | ❌ |
 | `VOID-NONULL` | An A/B ran, was rejected on a near-1.0 wall ratio, and recorded **no** A/A null control and no counted mechanism. Cannot distinguish lever from harness. | ❌ |
 
