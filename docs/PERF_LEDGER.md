@@ -17,9 +17,9 @@ of these literal fields:
 - **Result class: INCUMBENT-WIN / CAMPAIGN WIN.** Use only when the actual
   legacy incumbent ran side-by-side with the candidate in the same harness
   invocation. The row must also record **Legacy incumbent:** with a concrete
-  implementation name, **Comparator execution:** with both `side-by-side` and
-  `same invocation`, and **Measured incumbent ratio:** with the numerical
-  result.
+  implementation name, the incumbent binary's SHA-256, **Comparator
+  execution:** with both `side-by-side` and `same invocation`, and **Measured
+  incumbent ratio:** with the numerical result.
 
 An incumbent measurement that lacks that execution shape is
 **Result class: NON-CAMPAIGN / INFORMATIONAL** and must not use KEEP/WIN
@@ -29,10 +29,20 @@ competitive claims may cite only `INCUMBENT-WIN / CAMPAIGN WIN` rows.
 
 ## 2026-07-27 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — tiny.en seg-TS certified against live whisper.cpp: **1.415×** (bd-c9uv)
 
-**Result class: `vs_incumbent`.** Measured against the actual legacy engine by a
-harness that runs it side by side **in the same invocation**. This supersedes the
-2026-07-26 `NON-CAMPAIGN` 1.35× point estimate for the same cell, which ran both
-tools in one session but not interleaved and carried no cross-tool null.
+**Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
+
+**Legacy incumbent:** whisper.cpp `whisper-cli`
+(`incumbent_bin_sha256=73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`).
+
+**Comparator execution:** the actual legacy incumbent and franken ran
+side-by-side in the same invocation, with order alternated per round.
+
+**Measured incumbent ratio:** `1.415379×` (`whisper.cpp / franken`), CI95
+`[1.185640, 1.866960]`.
+
+This supersedes the 2026-07-26 `NON-CAMPAIGN` 1.35× point estimate for the same
+cell, which ran both tools in one session but not interleaved and carried no
+cross-tool null.
 
 **Harness.** `examples/incumbent_ab.rs` (new). One invocation drives both
 engines, **alternating which runs first each round**, and computes an A/A null
@@ -208,7 +218,7 @@ only the fw-vs-fw arm does. whisper.cpp's spread was ±2% across 4 reps, so the
 comparison is not fragile, but it is a weaker instrument than part A. Anyone
 tightening this should interleave the two binaries within one harness.
 
-**Concrete retry predicate:** extend the live incumbent harness to run tiny.en
+**Concrete retry predicate (satisfied by the 2026-07-27 row above):** extend the live incumbent harness to run tiny.en
 segment timestamps for franken and the actual `whisper-cli -bs 1 -bo 1 -t 16`
 arm side-by-side in the same invocation, record both executable SHA-256 values,
 assert full transcript/segment coverage before timing, and include the

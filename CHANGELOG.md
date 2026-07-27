@@ -10,9 +10,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ## [0.5.0] - 2026-07-11
 
-### CPU int8 encoder + SDPA poly-exp — a measured, quality-gated CPU speedup on x86-64
+### CPU int8 encoder + SDPA poly-exp — measured, quality-gated maintenance self-speedups on x86-64
 
-This is a performance release for the **CPU** native engine (x86-64 AVX2/FMA — AMD Zen/Threadripper, Intel Haswell and newer). Where v0.4.0 moved the encoder onto the GPU for Apple Silicon, v0.5.0 makes the *CPU* encoder substantially faster while holding output quality to a measured zero-WER-Δ budget. Every lever below was kept only on a measured win — verified **byte-identical** where it is byte-exact, and **WER-neutral** where it changes numerics — and gated on the candidate **median** against a **paired null (A/A) control**, not a single before/after pair. Rejected levers are recorded with their null-control and a retry-condition in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
+This is a performance release for the **CPU** native engine (x86-64 AVX2/FMA — AMD Zen/Threadripper, Intel Haswell and newer). Where v0.4.0 moved the encoder onto the GPU for Apple Silicon, v0.5.0 makes the *CPU* encoder substantially faster while holding output quality to a measured zero-WER-Δ budget. Every maintenance lever below was kept only on a measured self-speedup — verified **byte-identical** where it is byte-exact, and **WER-neutral** where it changes numerics — and gated on the candidate **median** against a **paired null (A/A) control**, not a single before/after pair. Rejected levers are recorded with their null-control and a retry-condition in [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
 
 #### Quality-safe int8 encoder (calibrated, policy-gated)
 
@@ -103,7 +103,7 @@ Default-on decisions for these knobs are deliberately reserved (they change gold
 
 ### Native Engine Performance Wave (post-2026-06-05)
 
-- **Profile-driven optimization pass on the in-process Rust whisper engine** (bd-2th6) — six measured levers land a **3.3× speedup on tiny.en (1.57 s → 0.475 s, RTF 0.043)** and **4.6× on large-v3-turbo (44.6 s → 9.73 s, RTF 0.88)** on this host (Apple M4 Pro, 14 cores, `release-perf`). Interleaved same-host hyperfine: native tiny.en is **2.33× faster than whisper-cli CPU** (475 ms ± 13 vs 1105 ms ± 21); native large-v3-turbo reaches **parity** with whisper-cli CPU (9.731 s ± 0.272 vs 9.585 s ± 0.224) at *lower* user CPU (53.8 s vs 65.4 s). Both models are now faster than realtime. Each lever kept only on a measured win; bit-identical except DISC-004's scoped tail truncation.
+- **Profile-driven optimization pass on the in-process Rust whisper engine** (bd-2th6) — six measured maintenance levers produce a **3.3× tiny.en self-speedup (1.57 s → 0.475 s, RTF 0.043)** and **4.6× large-v3-turbo self-speedup (44.6 s → 9.73 s, RTF 0.88)** on an Apple M4 Pro (14 cores, `release-perf`). Current live-incumbent, same-invocation matched-greedy CPU measurements on the 124.5 s / 5-window workload are **1.10× faster than whisper.cpp for tiny.en no-timestamp transcription**, **1.41× faster for tiny.en segment timestamps**, and **2.07× faster for large-v3-turbo no-timestamp transcription**. Both models are faster than realtime. The maintenance levers are bit-identical except DISC-004's scoped tail truncation.
   - [`2ed6471`](https://github.com/Dicklesworthstone/franken_whisper/commit/2ed6471) — version-tag SHA-256 hashed on a background thread at load, moving ~3.0 s off the run's critical path (tag value unchanged).
   - [`0361bb2`](https://github.com/Dicklesworthstone/franken_whisper/commit/0361bb2) — parallel f16→f32 dequant + tiled parallel weight transpose at load (`model_weights` span 2.4 s → 0.47 s).
   - [`bdbdd21`](https://github.com/Dicklesworthstone/franken_whisper/commit/bdbdd21) — language auto-detect reuses window-0's encode instead of a hidden duplicate encoder pass (−8.8 s on large).

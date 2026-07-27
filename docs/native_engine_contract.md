@@ -315,24 +315,24 @@ Each native engine should have:
 
 ## 8. Performance
 
-### 8.1 Measured RTFs (reference hardware: Apple M4 Pro)
+### 8.1 Measured CPU performance
 
 Real-Time Factor (RTF) = wall-clock / audio-duration; **< 1.0 means faster
-than realtime**. Measured on this host (Apple M4 Pro, 14 cores = 10P+4E,
-64 GB, macOS 26.2), `release-perf` profile (opt3 + thin-LTO), sole-stage
-native execution, 8 worker threads, jfk.wav (11 s), warm page cache.
-Final interleaved hyperfine vs `whisper-cli` on the same host:
+than realtime**. Competitive results use the actual `whisper-cli` legacy
+incumbent in the same `scripts/whisper_cpp_ab.sh` or
+`examples/incumbent_ab.rs` invocation, with matched threads and greedy
+decoding on both sides (`-bs 1 -bo 1`).
 
-| Model | Native wall | Native RTF | whisper-cli CPU | Comparison |
-|-------|-------------|------------|-----------------|------------|
-| tiny.en | **475 ms ± 13** | **0.043** | 1105 ms ± 21 | native **2.33× faster** |
-| large-v3-turbo | **9.731 s ± 0.272** | **0.88** | 9.585 s ± 0.224 | **parity** at lower user CPU (53.8 s vs 65.4 s); whisper-cli Metal 2.169 s |
+| Model | Workload | Decode mode | Result vs `whisper.cpp` CPU |
+|-------|----------|-------------|-----------------------------|
+| tiny.en | 124.5 s / 5 windows | no timestamps | native **1.10× faster** |
+| tiny.en | 124.5 s / 5 windows | segment timestamps | native **1.41× faster** |
+| large-v3-turbo | 124.5 s / 5 windows | no timestamps | native **2.07× faster** |
 
-Cumulative speedup over the optimization arc (release profile): tiny.en
-1.57 s → 0.475 s (**3.3×**); large-v3-turbo 44.6 s → 9.73 s (**4.6×**). Full
-lever-by-lever breakdown and evidence-backed abandons:
-`tests/artifacts/perf/20260605T0218Z-native-engine-baseline/RESULTS.md`
-(Round 1: `§1–5`; Round 2 f16 / sgemm / attribution: `§6`).
+Before/after measurements of the native engine are maintenance self-speedups,
+not competitive results. Their lever-by-lever record lives in
+`docs/PERF_LEDGER.md`; rejected and non-comparable measurements live in
+`docs/NEGATIVE_EVIDENCE.md`.
 
 #### Decoder per-token floors (Round 2, f16 compute default ON)
 

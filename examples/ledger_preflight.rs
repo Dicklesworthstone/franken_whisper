@@ -7,7 +7,9 @@
 //! prints matching retry predicates, and exits 2 for a binding prior result.
 //! `validate-staged` compares the Git index with HEAD and exits 2 if a changed
 //! rejection has neither a same-invocation A/A null nor a counted mechanism,
-//! or if a changed KEEP lacks a benchmark-binary/ELF SHA-256.
+//! if a changed KEEP/WIN lacks a benchmark-binary/ELF SHA-256 or result class,
+//! if a campaign win lacks a live same-invocation incumbent arm, or if a
+//! changed public performance document adds retraction narrative.
 //!
 //! Exit 0 means clear. Exit 2 means BLOCKED. Other non-zero exits are usage or
 //! infrastructure failures.
@@ -25,6 +27,7 @@ const REJECTION_VERDICTS: &[&str] = &[
     "DO-NOT-RETRY",
     "NEGATIVE",
 ];
+const POSITIVE_VERDICTS: &[&str] = &["KEEP", "WIN", "LAND", "LANDED", "SHIPPED"];
 
 const NULL_MARKERS: &[&str] = &["a/a", "null control", "identity null", "base/base"];
 const SAME_INVOCATION_MARKERS: &[&str] = &[
@@ -104,7 +107,69 @@ const NEGATED_BINARY_SHA_MARKERS: &[&str] = &[
     "elf sha unavailable",
     "elf sha not recorded",
 ];
+const CANDIDATE_BINARY_SHA_MARKERS: &[&str] = &[
+    "benchmark binary sha",
+    "benchmark-binary sha",
+    "candidate binary sha",
+    "candidate-binary sha",
+    "candidate elf sha",
+    "harness elf sha",
+    "harness_elf_sha256",
+    "probe_elf_sha256",
+    "executable elf sha",
+    "executable sha",
+];
+const INCUMBENT_BINARY_SHA_MARKERS: &[&str] = &[
+    "incumbent binary sha",
+    "incumbent-binary sha",
+    "incumbent_bin_sha256",
+    "incumbent elf sha",
+];
+const NEGATED_INCUMBENT_BINARY_SHA_MARKERS: &[&str] = &[
+    "incumbent binary sha missing",
+    "incumbent binary sha unavailable",
+    "incumbent binary sha not recorded",
+    "no incumbent binary sha",
+    "incumbent elf sha missing",
+    "incumbent elf sha unavailable",
+    "incumbent elf sha not recorded",
+];
 const LEDGER_PATHS: &[&str] = &["docs/NEGATIVE_EVIDENCE.md", "docs/PERF_LEDGER.md"];
+const PUBLIC_DOC_PATHS: &[&str] = &[
+    "README.md",
+    "CHANGELOG.md",
+    "docs/PERF_FRONTIER.md",
+    "docs/native_engine_contract.md",
+    "docs/cc_lane_finalization.md",
+];
+const PUBLIC_RETRACTION_MARKERS: &[&str] = &[
+    "withdrawn claim",
+    "withdrawn and replaced",
+    "earlier revisions",
+    "previously claimed",
+    "previously we claimed",
+    "we previously claimed",
+    "old headline",
+    "stale claim",
+    "known gate defect",
+    "published misinformation",
+    "published 0.78",
+    "was 0.78",
+    "wrong figure",
+    "wrong number",
+];
+const INCUMBENT_SAME_INVOCATION_MARKERS: &[&str] = &["same invocation", "same-invocation"];
+const SIDE_BY_SIDE_MARKERS: &[&str] = &["side-by-side", "side by side", "interleaved"];
+const NEGATED_INCUMBENT_EXECUTION_MARKERS: &[&str] = &[
+    "not same invocation",
+    "not in the same invocation",
+    "separate invocation",
+    "separate-invocation",
+    "same session but",
+    "not side-by-side",
+    "not side by side",
+    "not interleaved",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct Row {
@@ -138,6 +203,128 @@ pub(crate) fn parse_rows(text: &str) -> Vec<Row> {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn find_token(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.match_indices(needle).find_map(|(start, _)| {
+        let bytes = haystack.as_bytes();
+        let end = start + needle.len();
+        let left_ok =
+            start == 0 || (!bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_');
+        let right_ok =
+            end == bytes.len() || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_');
+        (left_ok && right_ok).then_some(start)
+    })
+}
+
+fn contains_ratio_literal(text: &str) -> bool {
+    let mut previous = None;
+    for character in text.chars() {
+        if matches!(character, 'x' | 'X' | '×')
+            && previous.is_some_and(|prior: char| prior.is_ascii_digit())
+        {
+            return true;
+        }
+        previous = Some(character);
+    }
+    false
+}
+
+fn has_performance_claim(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    contains_ratio_literal(&lower)
+        || lower.contains("speedup")
+        || lower.contains("faster")
+        || lower.contains("latency reduction")
+        || lower.contains("throughput gain")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultClass {
+    Missing,
+    SelfSpeedup,
+    IncumbentWin,
+    NonCampaign,
+    Ambiguous,
+}
+
+fn result_class(text: &str) -> ResultClass {
+    let mut classes = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let Some((_, value)) = lower.split_once("result class:") else {
+            continue;
+        };
+        let self_speedup = value.contains("self-speedup") && value.contains("maintenance");
+        let incumbent_win = (value.contains("incumbent-win") || value.contains("incumbent win"))
+            && (value.contains("campaign-win") || value.contains("campaign win"));
+        let non_campaign = value.contains("non-campaign") && value.contains("informational");
+        match (self_speedup, incumbent_win, non_campaign) {
+            (true, false, false) => classes.push(ResultClass::SelfSpeedup),
+            (false, true, false) => classes.push(ResultClass::IncumbentWin),
+            (false, false, true) => classes.push(ResultClass::NonCampaign),
+            _ => classes.push(ResultClass::Ambiguous),
+        }
+    }
+    match classes.as_slice() {
+        [] => ResultClass::Missing,
+        [class] => *class,
+        _ => ResultClass::Ambiguous,
+    }
+}
+
+fn has_named_legacy_incumbent(text: &str) -> bool {
+    text.lines().any(|line| {
+        let lower = line.to_lowercase();
+        let Some((_, value)) = lower.split_once("legacy incumbent:") else {
+            return false;
+        };
+        let value = value.trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '*' | '_' | '`')
+        });
+        !value.is_empty()
+            && value.chars().any(char::is_alphanumeric)
+            && !contains_any(
+                value,
+                &[
+                    "none",
+                    "n/a",
+                    "unknown",
+                    "tbd",
+                    "proxy",
+                    "self",
+                    "candidate",
+                ],
+            )
+    })
+}
+
+fn has_same_invocation_incumbent_arm(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let lines: Vec<&str> = lower.lines().collect();
+    for start in 0..lines.len() {
+        for end in (start + 1)..=(start + 3).min(lines.len()) {
+            let window = lines[start..end].join(" ");
+            if contains_any(&window, NEGATED_INCUMBENT_EXECUTION_MARKERS) {
+                continue;
+            }
+            if window.contains("comparator execution:")
+                && window.contains("incumbent")
+                && contains_any(&window, INCUMBENT_SAME_INVOCATION_MARKERS)
+                && contains_any(&window, SIDE_BY_SIDE_MARKERS)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_measured_incumbent_ratio(text: &str) -> bool {
+    text.lines().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("measured incumbent ratio:") && contains_ratio_literal(&lower)
+    })
 }
 
 pub(crate) fn has_same_invocation_aa(text: &str) -> bool {
@@ -228,7 +415,34 @@ pub(crate) fn has_binary_sha256(text: &str) -> bool {
             if contains_any(&window, NEGATED_BINARY_SHA_MARKERS) {
                 continue;
             }
+            // A campaign row carries two executable identities. The generic
+            // "binary sha" marker must not let the incumbent digest masquerade
+            // as the candidate/harness self-report.
+            if contains_any(&window, INCUMBENT_BINARY_SHA_MARKERS)
+                && !contains_any(&window, CANDIDATE_BINARY_SHA_MARKERS)
+            {
+                continue;
+            }
             if contains_any(&window, BINARY_SHA_MARKERS) && contains_real_sha256(window.as_bytes())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_incumbent_binary_sha256(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let lines: Vec<&str> = lower.lines().collect();
+    for start in 0..lines.len() {
+        for end in (start + 1)..=(start + 2).min(lines.len()) {
+            let window = lines[start..end].join(" ");
+            if contains_any(&window, NEGATED_INCUMBENT_BINARY_SHA_MARKERS) {
+                continue;
+            }
+            if contains_any(&window, INCUMBENT_BINARY_SHA_MARKERS)
+                && contains_real_sha256(window.as_bytes())
             {
                 return true;
             }
@@ -253,10 +467,13 @@ enum Verdict {
 
 fn verdict(header: &str) -> Verdict {
     let upper = header.to_uppercase();
-    let keep_at = upper.find("KEEP");
+    let keep_at = POSITIVE_VERDICTS
+        .iter()
+        .filter_map(|word| find_token(&upper, word))
+        .min();
     let reject_at = REJECTION_VERDICTS
         .iter()
-        .filter_map(|word| upper.find(word))
+        .filter_map(|word| find_token(&upper, word))
         .min();
     match (keep_at, reject_at) {
         (Some(keep), Some(reject)) if keep < reject => Verdict::Keep,
@@ -267,22 +484,96 @@ fn verdict(header: &str) -> Verdict {
 }
 
 fn row_violation(row: &Row, path: &str) -> Option<String> {
-    match verdict(&row.header) {
-        Verdict::Reject
-            if !has_same_invocation_aa(&row.text()) && !has_counted_mechanism(&row.text()) =>
-        {
-            Some(format!(
-                "{path}:{} — changed rejection lacks BOTH a numerical same-invocation A/A \
-                 null and a counted unchanged-work mechanism: {}",
-                row.line, row.header
-            ))
-        }
-        Verdict::Keep if !has_binary_sha256(&row.text()) => Some(format!(
-            "{path}:{} — changed KEEP lacks a 64-hex benchmark-binary/ELF SHA-256: {}",
+    let text = row.text();
+    let class = result_class(&text);
+    let row_verdict = verdict(&row.header);
+    if row_verdict == Verdict::Reject
+        && !has_same_invocation_aa(&text)
+        && !has_counted_mechanism(&text)
+    {
+        return Some(format!(
+            "{path}:{} — changed rejection lacks BOTH a numerical same-invocation A/A \
+             null and a counted unchanged-work mechanism: {}",
             row.line, row.header
-        )),
-        _ => None,
+        ));
     }
+
+    let positive_result = row_verdict == Verdict::Keep
+        || matches!(class, ResultClass::SelfSpeedup | ResultClass::IncumbentWin);
+    if !positive_result {
+        return None;
+    }
+    if !has_binary_sha256(&text) {
+        return Some(format!(
+            "{path}:{} — changed KEEP/WIN lacks a 64-hex benchmark-binary/ELF SHA-256: {}",
+            row.line, row.header
+        ));
+    }
+    if has_performance_claim(&text) && class == ResultClass::Missing {
+        return Some(format!(
+            "{path}:{} — changed performance KEEP/WIN lacks `Result class: \
+             SELF-SPEEDUP / MAINTENANCE` or `Result class: INCUMBENT-WIN / CAMPAIGN WIN`: {}",
+            row.line, row.header
+        ));
+    }
+    if class == ResultClass::Ambiguous {
+        return Some(format!(
+            "{path}:{} — changed KEEP/WIN has an ambiguous or repeated `Result class:` field: {}",
+            row.line, row.header
+        ));
+    }
+    if class == ResultClass::NonCampaign {
+        return Some(format!(
+            "{path}:{} — NON-CAMPAIGN / INFORMATIONAL evidence cannot use a KEEP/WIN verdict: {}",
+            row.line, row.header
+        ));
+    }
+    let lower_header = row.header.to_lowercase();
+    let lower_text = text.to_lowercase();
+    if class == ResultClass::SelfSpeedup
+        && (lower_header.contains("campaign win")
+            || lower_header.contains("incumbent win")
+            || contains_any(
+                &lower_text,
+                &[
+                    "campaign output: yes",
+                    "competitive result: yes",
+                    "competitive claim: yes",
+                ],
+            ))
+    {
+        return Some(format!(
+            "{path}:{} — a SELF-SPEEDUP / MAINTENANCE row cannot claim campaign or \
+             competitive-win status: {}",
+            row.line, row.header
+        ));
+    }
+    if class == ResultClass::IncumbentWin && !has_named_legacy_incumbent(&text) {
+        return Some(format!(
+            "{path}:{} — campaign win lacks a concrete `Legacy incumbent:` name: {}",
+            row.line, row.header
+        ));
+    }
+    if class == ResultClass::IncumbentWin && !has_incumbent_binary_sha256(&text) {
+        return Some(format!(
+            "{path}:{} — campaign win lacks a 64-hex incumbent-binary/ELF SHA-256: {}",
+            row.line, row.header
+        ));
+    }
+    if class == ResultClass::IncumbentWin && !has_same_invocation_incumbent_arm(&text) {
+        return Some(format!(
+            "{path}:{} — campaign win lacks `Comparator execution:` proving the actual \
+             incumbent ran side-by-side in the same invocation: {}",
+            row.line, row.header
+        ));
+    }
+    if class == ResultClass::IncumbentWin && !has_measured_incumbent_ratio(&text) {
+        return Some(format!(
+            "{path}:{} — campaign win lacks a numerical `Measured incumbent ratio:`: {}",
+            row.line, row.header
+        ));
+    }
+    None
 }
 
 pub(crate) fn validate_changed_text(head: &str, staged: &str, path: &str) -> Vec<String> {
@@ -291,6 +582,28 @@ pub(crate) fn validate_changed_text(head: &str, staged: &str, path: &str) -> Vec
         .into_iter()
         .filter(|row| !old_rows.contains(&row.text()))
         .filter_map(|row| row_violation(&row, path))
+        .collect()
+}
+
+pub(crate) fn validate_public_changed_text(head: &str, staged: &str, path: &str) -> Vec<String> {
+    let old_lines: HashSet<&str> = head.lines().collect();
+    staged
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !old_lines.contains(line))
+        .filter_map(|(index, line)| {
+            let lower = line.to_lowercase();
+            PUBLIC_RETRACTION_MARKERS
+                .iter()
+                .find(|marker| lower.contains(**marker))
+                .map(|marker| {
+                    format!(
+                        "{path}:{} — public performance docs state the current admitted claim; \
+                         retraction narrative `{marker}` belongs only in the internal ledgers",
+                        index + 1
+                    )
+                })
+        })
         .collect()
 }
 
@@ -442,10 +755,15 @@ fn run_validate_staged() -> Result<i32, String> {
         let head = git_blob(&format!("HEAD:{path}"))?.unwrap_or_default();
         violations.extend(validate_changed_text(&head, &staged, path));
     }
+    for path in PUBLIC_DOC_PATHS {
+        let staged = git_blob(&format!(":{path}"))?.unwrap_or_default();
+        let head = git_blob(&format!("HEAD:{path}"))?.unwrap_or_default();
+        violations.extend(validate_public_changed_text(&head, &staged, path));
+    }
     if violations.is_empty() {
         println!(
-            "CLEAR — staged ledger rows satisfy A/A-or-counted-mechanism REJECT and \
-             binary-SHA KEEP contracts."
+            "CLEAR — staged rows satisfy decidable-REJECT, binary-SHA, result-class, \
+             live-incumbent campaign-win, and public-claim contracts."
         );
         return Ok(0);
     }

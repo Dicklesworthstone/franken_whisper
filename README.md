@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In live-incumbent, same-invocation matched-greedy CPU comparisons, the native engine is 2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription and 1.10× faster on tiny.en no-timestamp transcription.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In live-incumbent, same-invocation matched-greedy CPU comparisons, the native engine is 2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription, 1.10× faster on tiny.en no-timestamp transcription, and 1.41× faster on tiny.en segment-timestamp transcription.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -2571,10 +2571,11 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 ### Native Engine Speed (measured)
 
 The in-process Rust native engine is faster than realtime on both `tiny.en` and
-`large-v3-turbo`. The competitive rows below come from the live
-`whisper-cli` incumbent arm in `scripts/whisper_cpp_ab.sh`: both binaries run
-side-by-side in the same invocation, at matched thread counts, with greedy
-decode on both sides (`whisper-cli -bs 1 -bo 1`).
+`large-v3-turbo`. The competitive rows below come from live `whisper-cli`
+incumbent arms in `scripts/whisper_cpp_ab.sh` and
+`examples/incumbent_ab.rs`: both binaries run side-by-side in the same
+invocation, at matched thread counts, with greedy decode on both sides
+(`whisper-cli -bs 1 -bo 1`).
 
 | Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|
@@ -2601,9 +2602,11 @@ whisper.cpp 1867.4 ms, against nulls of 1.004 and 0.970.
 - **Gate.** A result is decidable only when its median lies outside the A/A null's 95% CI with a 2× margin. `cv` is recorded as provenance and never decides a verdict.
 
 **Scope.** These are **greedy / temperature-0** comparisons with the reference
-explicitly forced to the same decode mode (`-bs 1 -bo 1`). The measurements use
-a quiet 32-core x86 host at each engine's best matched thread count. The full
-record lives in [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and
+explicitly forced to the same decode mode (`-bs 1 -bo 1`). The no-timestamp
+rows use a quiet 32-core x86 host at each engine's best matched thread count;
+the segment-timestamp row uses order-alternating pairs and per-engine A/A
+controls under fleet load. The full record lives in
+[`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and
 [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
 
 ### Audio Normalization
