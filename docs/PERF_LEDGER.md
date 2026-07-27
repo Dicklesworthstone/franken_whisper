@@ -4,7 +4,87 @@
 > swarm agent **BlackThrush** (franken_whisper-cc). Every entry records a real
 > release measurement; ~0-gain or regressing levers are REVERTED, not kept.
 
-## 2026-07-26 — KEEP — tiny.en segment-TS no-carry policy measured: **2.218×**, byte-identical (bd-c9uv)
+## Result classes (effective 2026-07-27)
+
+A before/after comparison of franken against itself is useful maintenance
+evidence, but it is not campaign output and cannot support a competitive
+claim. Every new or modified performance KEEP/WIN row must carry exactly one
+of these literal fields:
+
+- **Result class: SELF-SPEEDUP / MAINTENANCE.** Use for franken-before versus
+  franken-after, including same-binary feature gates. It may justify landing
+  code, but it does not count as a campaign win.
+- **Result class: INCUMBENT-WIN / CAMPAIGN WIN.** Use only when the actual
+  legacy incumbent ran side-by-side with the candidate in the same harness
+  invocation. The row must also record **Legacy incumbent:** with a concrete
+  implementation name, **Comparator execution:** with both `side-by-side` and
+  `same invocation`, and **Measured incumbent ratio:** with the numerical
+  result.
+
+An incumbent measurement that lacks that execution shape is
+**Result class: NON-CAMPAIGN / INFORMATIONAL** and must not use KEEP/WIN
+language. All historical franken-before/franken-after rows are maintenance
+self-speedups under this convention regardless of older wording. Public
+competitive claims may cite only `INCUMBENT-WIN / CAMPAIGN WIN` rows.
+
+## 2026-07-27 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — tiny.en seg-TS certified against live whisper.cpp: **1.415×** (bd-c9uv)
+
+**Result class: `vs_incumbent`.** Measured against the actual legacy engine by a
+harness that runs it side by side **in the same invocation**. This supersedes the
+2026-07-26 `NON-CAMPAIGN` 1.35× point estimate for the same cell, which ran both
+tools in one session but not interleaved and carried no cross-tool null.
+
+**Harness.** `examples/incumbent_ab.rs` (new). One invocation drives both
+engines, **alternating which runs first each round**, and computes an A/A null
+for *each* engine inside that same invocation. Statistic: median of per-round
+`wc_transcribe / fw_transcribe`.
+
+Provenance — benchmark binary sha256 (harness ELF, self-reported by the run):
+`897993f472378a0fb19081d4ee646a2abdbac8538cbee11f05df59ee9559d371`
+(emitted as `harness_elf_sha256=…`);
+`incumbent_bin_sha256=73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`
+(`whisper-cli`); `model_sha256=921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`
+(`ggml-tiny.en.bin`). `track01.wav` 124.5 s, 11 rounds, `-bs 1 -bo 1 -t 16`.
+
+| arm | median | CI95 | cv |
+|---|---|---|---|
+| A/A null — franken | 1.004055 | [0.951042, 1.070798] | 20.54% |
+| A/A null — whisper.cpp | 0.970392 | [0.956296, 1.040625] | 11.90% |
+| **comparison (wc / fw)** | **1.415379** | **[1.185640, 1.866960]** | 21.99% |
+
+franken **1500.079 ms** vs whisper.cpp **1867.400 ms** (medians).
+
+**Gate.** `median_vs_both_null_ci95_2x_margin`: worse null half-width 0.070798 ⇒
+required 1.141597. The comparison median clears it **and** the comparison's own
+CI95 lower bound (1.185640) sits above 1.0. **WIN.** `cv` is provenance only and
+decided nothing — at 21.99% a cv gate would have discarded a result whose entire
+confidence interval is above unity.
+
+**What is timed, and why.** Transcribe work **excluding one-time model load on
+both sides**: whisper.cpp self-reports `load` and `total`, so its transcribe time
+is `total − load`; franken is timed in-process with the model resident. Comparing
+full process wall would pit `whisper-cli`'s thin inference binary against
+franken's orchestrator (routing, storage, normalization) — not the quantity in
+question, and it would understate franken. Disclosed asymmetry: whisper.cpp's
+`total` still contains process spawn and stdout formatting, milliseconds against
+~1.9 s, not subtracted.
+
+**Conditions.** Run under heavy fleet build load, which is why both absolute
+medians exceed the quiet-host figures recorded elsewhere. The ratio is the
+reported quantity; the paired order-alternating design is what makes it robust to
+that load, and both nulls returned valid.
+
+**Coverage sanity check (not a WER claim).** franken 1,301 characters vs
+whisper.cpp 1,350 — crude counts including formatting. Native-vs-whisper.cpp WER
+on the reference fixture is separately established at 0.0000.
+
+**Retry predicate.** Re-certify if the incumbent binary, the model, or the
+harness ELF sha changes, or on a quiet host to tighten the CI. Do not quote this
+cell from any harness that does not run the incumbent in the same invocation.
+
+## 2026-07-26 — KEEP / MAINTENANCE — tiny.en segment-TS no-carry policy measured: **2.218×**, byte-identical (bd-c9uv)
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.**
 
 **This is the measurement `b885ad8` shipped without.** That commit landed the
 tiny.en segment-timestamp no-carry policy and — correctly — did *not* bank a
@@ -76,7 +156,11 @@ runnable here after all, and was run the same session.
 
 ---
 
-### 2026-07-26 — the head-to-head, on the real clip: **0.78× → 1.35× (the losing cell flips)**
+## 2026-07-26 — NON-CAMPAIGN INCUMBENT COMPARISON — tiny.en segment-TS point estimate: **1.35×**
+
+**Result class: NON-CAMPAIGN / INFORMATIONAL.** The two tools ran in the same
+session, but not side-by-side in one invocation, so this is not a campaign win
+and is not a public competitive claim.
 
 Same host and session, tiny.en, real `track01.wav` (124.5 s / 5 windows,
 3,983,660 B @ 16 kHz), `probe_elf_sha256=21baa3ea…`.
@@ -106,11 +190,11 @@ tiny.en, same clip, same session):
 | whisper.cpp greedy | **1740.7 ms** (load ~74 ms) | 4 (1745.4 / 1762.3 / 1731.2 / 1736.1 — ±2%) |
 | **fw, shipped no-carry** | **1290.6 ms** (A/B candidate median 1229.6 + measured load 61) | 11 pairs |
 
-**⇒ 1740.7 / 1290.6 = 1.35× — fw is now FASTER.** Three standalone fw reps
+**⇒ 1740.7 / 1290.6 = 1.35×.** Three standalone fw reps
 (load 60/68/61 ms, transcribe 1.286/1.107/1.030 s, all 21 segs / 1,301 chars)
-put it as high as ~1.49×; the conservative 1.35× uses the interleaved A/B median,
-which is measured under contention and has a null control, so that is the number
-to quote.
+put it as high as ~1.49×; the 1.35× point estimate uses the interleaved
+fw-vs-fw candidate median. It remains internal until a live incumbent arm
+produces the comparison in the same invocation.
 
 **Both arms of the old cell reproduce, which is what makes the flip credible.**
 whisper.cpp greedy measured 1740.7 ms here against the frontier's published
@@ -123,6 +207,13 @@ interleaved with each other**, so this head-to-head has no cross-tool A/A null �
 only the fw-vs-fw arm does. whisper.cpp's spread was ±2% across 4 reps, so the
 comparison is not fragile, but it is a weaker instrument than part A. Anyone
 tightening this should interleave the two binaries within one harness.
+
+**Concrete retry predicate:** extend the live incumbent harness to run tiny.en
+segment timestamps for franken and the actual `whisper-cli -bs 1 -bo 1 -t 16`
+arm side-by-side in the same invocation, record both executable SHA-256 values,
+assert full transcript/segment coverage before timing, and include the
+same-invocation A/A null. Only that result may be classified as an
+`INCUMBENT-WIN / CAMPAIGN WIN`.
 
 ## 2026-07-25 — HARNESS CONTRACT + 8 KEEPs — corrected resurrection and frontier pass (bd-2qqw)
 
