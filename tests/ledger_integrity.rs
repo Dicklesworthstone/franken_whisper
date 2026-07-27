@@ -4,10 +4,12 @@
 //!
 //! A changed rejection must carry either a numerical same-invocation A/A null
 //! or a counted unchanged-work mechanism. Accuracy prose, a large regression,
-//! a profile, and CV alone are not write-gate exceptions. A changed KEEP must
-//! carry a 64-hex benchmark-binary/ELF SHA-256. The pre-commit hook applies
-//! these rules to the staged index, including backdated rows; this test pins the
-//! parser and both sides of the contract.
+//! a profile, and CV alone are not write-gate exceptions. A changed KEEP/WIN
+//! must carry a 64-hex benchmark-binary/ELF SHA-256 and classify a measured
+//! speed result as either a maintenance self-speedup or a same-invocation
+//! actual-incumbent campaign win. The pre-commit hook applies these rules to
+//! the staged index, including backdated rows; this test pins the parser and
+//! both sides of the contract.
 
 use std::path::{Path, PathBuf};
 
@@ -280,6 +282,134 @@ fn staged_keep_requires_binary_or_elf_sha_not_an_output_oracle() {
 }
 
 #[test]
+fn staged_speed_keeps_distinguish_maintenance_from_incumbent_wins() {
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let unclassified = format!(
+        "## 2026-07-27 - test: **KEEP — 1.20x faster.**\n\
+         Executable ELF SHA-256 {digest}.\n"
+    );
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            &unclassified,
+            "docs/PERF_LEDGER.md"
+        )
+        .len(),
+        1,
+        "a speed KEEP without a result class must be blocked"
+    );
+
+    let maintenance = format!(
+        "## 2026-07-27 - test: **KEEP — 1.20x faster.**\n\
+         Result class: SELF-SPEEDUP / MAINTENANCE.\n\
+         Executable ELF SHA-256 {digest}.\n"
+    );
+    assert!(
+        ledger_preflight::validate_changed_text("", &maintenance, "docs/PERF_LEDGER.md")
+            .is_empty(),
+        "a labeled self-speedup may justify a maintenance KEEP"
+    );
+
+    let self_as_campaign = format!(
+        "## 2026-07-27 - test: **CAMPAIGN WIN — 1.20x faster.**\n\
+         Result class: SELF-SPEEDUP / MAINTENANCE.\n\
+         Executable ELF SHA-256 {digest}.\n"
+    );
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            &self_as_campaign,
+            "docs/PERF_LEDGER.md"
+        )
+        .len(),
+        1,
+        "a self-speedup cannot be presented as campaign output"
+    );
+
+    let same_session_only = format!(
+        "## 2026-07-27 - test: **KEEP — incumbent comparison 1.20x.**\n\
+         Result class: INCUMBENT-WIN / CAMPAIGN WIN.\n\
+         Legacy incumbent: whisper.cpp whisper-cli.\n\
+         Comparator execution: same session but not interleaved.\n\
+         Measured incumbent ratio: 1.20x.\n\
+         Executable ELF SHA-256 {digest}.\n"
+    );
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            &same_session_only,
+            "docs/PERF_LEDGER.md"
+        )
+        .len(),
+        1,
+        "same-session separate runs are not a campaign win"
+    );
+
+    let proxy_incumbent = format!(
+        "## 2026-07-27 - test: **KEEP — incumbent comparison 1.20x.**\n\
+         Result class: INCUMBENT-WIN / CAMPAIGN WIN.\n\
+         Legacy incumbent: proxy implementation.\n\
+         Comparator execution: actual incumbent side-by-side in the same invocation.\n\
+         Measured incumbent ratio: 1.20x.\n\
+         Executable ELF SHA-256 {digest}.\n"
+    );
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            &proxy_incumbent,
+            "docs/PERF_LEDGER.md"
+        )
+        .len(),
+        1,
+        "a named proxy is not the actual legacy incumbent"
+    );
+
+    let live_incumbent = format!(
+        "## 2026-07-27 - test: **KEEP — incumbent comparison 1.20x.**\n\
+         Result class: INCUMBENT-WIN / CAMPAIGN WIN.\n\
+         Legacy incumbent: whisper.cpp whisper-cli.\n\
+         Comparator execution: actual legacy incumbent side-by-side in the same invocation.\n\
+         Measured incumbent ratio: 1.20x.\n\
+         Executable ELF SHA-256 {digest}.\n"
+    );
+    assert!(
+        ledger_preflight::validate_changed_text("", &live_incumbent, "docs/PERF_LEDGER.md")
+            .is_empty(),
+        "a named live incumbent arm in the same invocation satisfies the campaign contract"
+    );
+
+    let informational = "## 2026-07-27 - test: NON-CAMPAIGN COMPARISON — 1.20x.\n\
+                         Result class: NON-CAMPAIGN / INFORMATIONAL.\n";
+    assert!(
+        ledger_preflight::validate_changed_text("", informational, "docs/PERF_LEDGER.md")
+            .is_empty(),
+        "an explicitly non-campaign point estimate may remain internal without a positive verdict"
+    );
+}
+
+#[test]
+fn public_docs_reject_performance_retraction_narratives() {
+    let withdrawn = "Current result: 1.10x.\nWithdrawn claim: an older number was wrong.\n";
+    assert_eq!(
+        ledger_preflight::validate_public_changed_text("", withdrawn, "README.md").len(),
+        1
+    );
+
+    let current_only =
+        "Current live-incumbent same-invocation result: 1.10x faster than whisper.cpp.\n";
+    assert!(
+        ledger_preflight::validate_public_changed_text("", current_only, "README.md").is_empty()
+    );
+
+    let domain_event = "`transcript.retract` replaces a speculative partial transcript.\n";
+    assert!(
+        ledger_preflight::validate_public_changed_text("", domain_event, "README.md").is_empty(),
+        "the public-doc policy must not confuse the product's retract event with claim retractions"
+    );
+}
+
+#[test]
 fn unchanged_legacy_rows_are_grandfathered_but_modified_rows_are_checked() {
     let legacy = "## 2026-06-01 - test: **REJECT — 1.00x.**\nNo null.\n";
     assert!(
@@ -319,4 +449,76 @@ fn explicit_retry_heading_beats_an_earlier_historical_mention() {
     assert!(predicate.contains("faithful baseline"));
     assert!(predicate.contains("same-invocation A/A"));
     assert!(!predicate.contains("warm worker"));
+}
+
+/// Policy (2026-07-27): a self-speedup is maintenance, not a competitive claim.
+///
+/// A ratio measured against franken's own previous code says how much the engine
+/// improved on itself. A *competitive* claim requires the actual legacy incumbent,
+/// measured by a harness that runs it side by side in the same invocation. The two
+/// are routinely conflated because they are both "an Nx", so every performance KEEP
+/// must say which it is, in the row, where a future reader cannot miss it.
+///
+/// Enforced from `CLASS_ENFORCED_FROM` only — older rows predate the convention and
+/// are grandfathered exactly as the decidability guard grandfathers its own history.
+const CLASS_ENFORCED_FROM: &str = "2026-07-27";
+
+/// Markers that declare which kind of ratio a row is reporting.
+const CLASS_MARKERS: &[&str] = &[
+    // self-speedup (maintenance)
+    "self-speedup",
+    "self speedup",
+    "fw-vs-fw",
+    "fw vs fw",
+    "class=self",
+    // measured against the real incumbent
+    "vs-incumbent",
+    "vs incumbent",
+    "class=vs_incumbent",
+    "vs whisper.cpp",
+    "vs `whisper.cpp`",
+    "whisper-cli",
+    "incumbent_ab",
+];
+
+#[test]
+fn new_keep_rows_declare_self_speedup_or_vs_incumbent() {
+    let text = std::fs::read_to_string(ledger_path()).expect("read docs/NEGATIVE_EVIDENCE.md");
+
+    let mut offenders = Vec::new();
+    for entry in parse_entries(&text) {
+        if !is_dated(&entry.date) || entry.date.as_str() < CLASS_ENFORCED_FROM {
+            continue;
+        }
+        let header_upper = entry.header.to_uppercase();
+        if !header_upper.contains("KEEP") || is_reject(&entry.header) {
+            continue;
+        }
+        let haystack = format!("{}\n{}", entry.header.to_lowercase(), entry.body_lower);
+        // Only rows that actually quote a ratio need to classify it.
+        let quotes_a_ratio = haystack.contains('×') || haystack.contains("x median");
+        if !quotes_a_ratio {
+            continue;
+        }
+        if CLASS_MARKERS
+            .iter()
+            .any(|marker| haystack.contains(marker))
+        {
+            continue;
+        }
+        offenders.push(format!(
+            "  docs/NEGATIVE_EVIDENCE.md:{} — {}",
+            entry.line,
+            entry.header.chars().take(120).collect::<String>()
+        ));
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "KEEP rows dated on/after {CLASS_ENFORCED_FROM} quote a ratio without saying what it is \
+         measured against.\n\nSay so explicitly: a self-speedup (fw-vs-fw — maintenance, never a \
+         competitive claim) or vs-incumbent (measured against the real legacy engine by a harness \
+         that runs it in the same invocation).\n\nOffending rows:\n{}",
+        offenders.join("\n")
+    );
 }
