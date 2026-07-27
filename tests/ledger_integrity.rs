@@ -193,6 +193,56 @@ fn staged_reject_contract_is_strict_and_two_sided() {
         ledger_preflight::validate_changed_text("", valid_mechanism, "docs/NEGATIVE_EVIDENCE.md")
             .is_empty()
     );
+
+    let unrelated_unchanged = "## 2026-07-26 - test: **REJECT — mechanism unclear.**\n\
+                               Allocations increased from 3 to 5, while transcript output \
+                               was unchanged.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            unrelated_unchanged,
+            "docs/NEGATIVE_EVIDENCE.md"
+        )
+        .len(),
+        1,
+        "an unchanged output must not launder a changed counter"
+    );
+
+    let unquantified_null = "## 2026-07-26 - test: **REJECT — flat.**\n\
+                             Same-binary A/A null control was mentioned; candidate median \
+                             1.001, but no numerical null statistic was recorded.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text("", unquantified_null, "docs/NEGATIVE_EVIDENCE.md")
+            .len(),
+        1,
+        "a candidate statistic must not masquerade as a numerical null"
+    );
+
+    let candidate_laundering = "## 2026-07-26 - test: **REJECT — flat.**\n\
+                                Same-invocation A/A null control ran; candidate median 1.001.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            candidate_laundering,
+            "docs/NEGATIVE_EVIDENCE.md"
+        )
+        .len(),
+        1,
+        "a candidate ratio in another clause must not count as the null statistic"
+    );
+
+    let duration_laundering = "## 2026-07-26 - test: **REJECT — flat.**\n\
+                               Same-invocation A/A null control median 10.0 ms.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            duration_laundering,
+            "docs/NEGATIVE_EVIDENCE.md"
+        )
+        .len(),
+        1,
+        "a multi-digit duration must not be mistaken for a null ratio"
+    );
 }
 
 #[test]
@@ -210,6 +260,20 @@ fn staged_keep_requires_binary_or_elf_sha_not_an_output_oracle() {
                   0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n";
     assert!(
         ledger_preflight::validate_changed_text("", binary, "docs/NEGATIVE_EVIDENCE.md").is_empty()
+    );
+
+    let missing_binary_with_oracle = "## 2026-07-26 - test: **KEEP — candidate wins.**\n\
+                                      Binary SHA unavailable. Output oracle SHA-256 \
+                                      0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text(
+            "",
+            missing_binary_with_oracle,
+            "docs/NEGATIVE_EVIDENCE.md"
+        )
+        .len(),
+        1,
+        "a nearby output digest must not launder an explicitly missing binary digest"
     );
 }
 

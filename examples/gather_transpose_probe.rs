@@ -19,10 +19,9 @@
 // The gather is cold/DRAM-latency-bound at ~80ms/window, parallelism-saturated at the
 // default 16 chunks. Do not "optimize" it based on its low apparent GB/s.
 //
-// Measurement probe only — never linked into the library. It hand-writes the AVX2
-// intrinsics it is timing, so it opts out of the workspace `unsafe_code = "deny"`
-// lint the same way `native_engine::nn` does for its own kernels.
-#![allow(unsafe_code)]
+// Measurement probe only — never linked into the library. The source-order
+// multi-thread variant uses one narrowly-audited raw-pointer block because its
+// destination bands are disjoint but non-contiguous.
 
 use std::thread;
 use std::time::Instant;
@@ -97,6 +96,7 @@ fn gather_v0_mt(dst: &mut [f32], src: &[f32], nt: usize) {
 // V1-mt: bands over i (source rows). Each thread reads a contiguous src slab,
 // writes strided across heads. dst is written at (h*T+i) — disjoint per i, so
 // we can't take a simple contiguous dst chunk; use raw pointer with disjoint i.
+#[allow(unsafe_code)]
 fn gather_v1_mt(dst: &mut [f32], src: &[f32], nt: usize) {
     let per = (T + nt - 1) / nt;
     let dst_ptr = dst.as_mut_ptr() as usize;
@@ -114,6 +114,10 @@ fn gather_v1_mt(dst: &mut [f32], src: &[f32], nt: usize) {
                     let row = &src[i * NS..i * NS + NS];
                     for h in 0..HH {
                         let o = (h * T + i) * D;
+                        // SAFETY: every scoped thread owns a disjoint `i0..i1`
+                        // band. For each head, `(h*T+i)*D..+D` therefore cannot
+                        // overlap any other thread's destination, and all
+                        // ranges stay within the original `dst` allocation.
                         unsafe {
                             let d = std::slice::from_raw_parts_mut(dp.add(o), D);
                             d.copy_from_slice(&row[h * D..h * D + D]);

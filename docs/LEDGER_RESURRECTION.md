@@ -12,6 +12,29 @@ opposed to detecting it and finding it absent.
 
 ---
 
+## Model-integrity re-audit — 2026-07-27
+
+The provider silently ran this pane on a lower-capacity fallback model between
+2026-07-25 20:40 and 2026-07-26 00:35 EDT. The seven commits authored in that
+window were re-read under the restored model. Existing A/A, ELF-digest, and
+byte-identity artifacts were not rerun wholesale; the review targeted workload
+routing, proof soundness, numerical justification, and ungated code quality.
+
+| Commit | Verdict | Fresh audit |
+|---|---|---|
+| `d92b511` | **CORRECTED** | The synchronous storage route is real and its 202-test proof exercises the bridge, but the same commit's first resurrection audit sampled the wrong class and its facade could panic if runtime construction failed. Current code returns `FrankenError::Internal`, and the audit denominator below supersedes the draft. File-wide unsafe exemptions on two standalone probes were narrowed to their audited blocks. |
+| `aa5ab8b` | **CORRECTED** | Directly running the release storage test binary with `RUST_MIN_STACK` unset proves that exact 202-test release path does not overflow. It did not measure “room to spare” or every future query shape; the ledger and comments now state the narrower result. |
+| `efb42b7` | **SOUND** | It correctly refused a KEEP: the timed “historical” arm executed an extra decision body and therefore did not measure the production lever. The behavior proof is sound because both Brier reads are the same pure fold over state that is not mutated between reads; action, fallback, and serialized evidence were checked before timing. |
+| `b17945c` | **CORRECTED** | The rerun counts and no-verdict judgment are sound, but three contended runs do not prove that CV below 5% is impossible on the hardware. The ledger now states the defensible conclusion: CV was an invalid verdict gate for those runs and remains provenance only. |
+| `ac3b633` | **SOUND** | The README used the matched-greedy rows actually recorded in `PERF_FRONTIER`, explicitly withdrew the beam-5/best-of-5 headline, and disclosed the then-current 0.78× losing cell. Its later 1.35× replacement reflects a subsequent code change, not a defect in this correction. |
+| `a9c58e6` | **CORRECTED** | It claimed a verbatim six-class audit while inventing `VALID-ACCURACY`, used 139 header matches as the population, and left most rows mechanically screened. The current audit uses exactly six classes, excludes 89 false positives, and records hand adjudication of all 188 actual performance rejections. |
+| `76901c4` | **CORRECTED** | The first gate allowed accuracy/profile/large-loss exceptions, ignored KEEP binary digests, inspected the full ledger rather than staged changes, and was not wired into pre-commit. `bd6243a` replaced that design; the re-audit additionally binds counted evidence by clause, rejects missing-binary/output-hash laundering, and makes the hook compile the staged gate source. |
+
+No speed KEEP from this window is retracted. The only timed candidate in the
+window (`efb42b7`) deliberately carried **no admissible speed verdict**.
+
+---
+
 ## 0. Population correction and hand-adjudication
 
 The mechanical header screen used this repository's actual verdict vocabulary:

@@ -25,19 +25,23 @@ use crate::model::{
 /// them), so both their state machines and the synchronous poll chain that
 /// drives them are large. Boxing moves the outermost state machine off the
 /// stack; it measurably reduces the depth but does **not** on its own make a
-/// debug build fit in libtest's default 8 MiB thread stack — that needs the
+/// debug build fit on libtest's ordinary worker stack — that needs the
 /// `RUST_MIN_STACK` set in `.cargo/config.toml`, which is where the full
-/// rationale lives. This is debug-only: a release build clears the same 202
-/// tests on the default stack with `RUST_MIN_STACK` unset. One allocation per
-/// statement is negligible against the statement itself.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+/// rationale lives. This is debug-only for the measured suite: a release build
+/// clears the same 202 tests with `RUST_MIN_STACK` unset.
+fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, FrankenError> {
     thread_local! {
-        static RUNTIME: asupersync::runtime::Runtime =
+        static RUNTIME: Result<asupersync::runtime::Runtime, String> =
             asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
-                .expect("build franken_whisper storage runtime");
+                .map_err(|error| error.to_string());
     }
-    RUNTIME.with(|runtime| runtime.block_on(Box::pin(future)))
+    RUNTIME.with(|runtime| match runtime {
+        Ok(runtime) => Ok(runtime.block_on(Box::pin(future))),
+        Err(error) => Err(FrankenError::Internal(format!(
+            "cannot build franken_whisper storage runtime: {error}"
+        ))),
+    })
 }
 
 /// Synchronous facade over the now-`async` [`fsqlite::Connection`].
@@ -66,11 +70,11 @@ impl std::fmt::Debug for BlockingConnection {
 
 impl BlockingConnection {
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
-        block_on(Connection::open(path)).map(|inner| Self { inner })
+        block_on(Connection::open(path))?.map(|inner| Self { inner })
     }
 
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        block_on(self.inner.query(sql))
+        block_on(self.inner.query(sql))?
     }
 
     pub fn query_with_params(
@@ -78,11 +82,11 @@ impl BlockingConnection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        block_on(self.inner.query_with_params(sql, params))
+        block_on(self.inner.query_with_params(sql, params))?
     }
 
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        block_on(self.inner.execute(sql))
+        block_on(self.inner.execute(sql))?
     }
 
     pub fn execute_with_params(
@@ -90,7 +94,7 @@ impl BlockingConnection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        block_on(self.inner.execute_with_params(sql, params))
+        block_on(self.inner.execute_with_params(sql, params))?
     }
 
     pub fn execute_with_params_skip_statement_savepoint_in_explicit_txn(
@@ -101,7 +105,7 @@ impl BlockingConnection {
         block_on(
             self.inner
                 .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params),
-        )
+        )?
     }
 }
 

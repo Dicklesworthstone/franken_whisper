@@ -2,15 +2,16 @@
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
-source_file="$repo_root/examples/ledger_preflight.rs"
-hook_binary="$repo_root/target/ledger-preflight-hook"
+source_spec=":examples/ledger_preflight.rs"
+source_sha=$(git show "$source_spec" | sha256sum | cut -d ' ' -f 1)
+hook_binary="$repo_root/target/ledger-preflight-hook-$source_sha"
 
 mkdir -p "$repo_root/target"
-if [ ! -x "$hook_binary" ] || [ "$source_file" -nt "$hook_binary" ]; then
-    CARGO_MANIFEST_DIR="$repo_root" rustc \
+if [ ! -x "$hook_binary" ]; then
+    git show "$source_spec" | CARGO_MANIFEST_DIR="$repo_root" rustc \
         --edition=2024 \
         -C opt-level=1 \
-        "$source_file" \
+        - \
         -o "$hook_binary"
 fi
 

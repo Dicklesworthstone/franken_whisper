@@ -50,6 +50,10 @@ const NEGATED_NULL_MARKERS: &[&str] = &[
     "null control unavailable",
     "null control not recorded",
     "missing null control",
+    "no numerical null",
+    "numerical null statistic not recorded",
+    "null statistic not recorded",
+    "missing null statistic",
 ];
 const COUNTED_NOUNS: &[&str] = &[
     "instructions",
@@ -82,6 +86,23 @@ const BINARY_SHA_MARKERS: &[&str] = &[
     "elf sha",
     "executable sha",
     "probe_elf_sha256",
+];
+const NEGATED_BINARY_SHA_MARKERS: &[&str] = &[
+    "no benchmark binary sha",
+    "without a benchmark binary sha",
+    "benchmark binary sha missing",
+    "benchmark binary sha unavailable",
+    "benchmark binary sha not recorded",
+    "no binary sha",
+    "without a binary sha",
+    "binary sha missing",
+    "binary sha unavailable",
+    "binary sha not recorded",
+    "no elf sha",
+    "without an elf sha",
+    "elf sha missing",
+    "elf sha unavailable",
+    "elf sha not recorded",
 ];
 const LEDGER_PATHS: &[&str] = &["docs/NEGATIVE_EVIDENCE.md", "docs/PERF_LEDGER.md"];
 
@@ -121,25 +142,58 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 
 pub(crate) fn has_same_invocation_aa(text: &str) -> bool {
     let lower = text.to_lowercase();
-    let explicit_positive = SAME_INVOCATION_MARKERS.iter().any(|same| {
-        NULL_MARKERS
-            .iter()
-            .any(|null| lower.contains(&format!("{same} {null}")))
-    });
-    let negated = contains_any(&lower, NEGATED_NULL_MARKERS);
-    if negated && !explicit_positive {
-        return false;
-    }
+    let lines: Vec<&str> = lower.lines().collect();
 
-    contains_any(&lower, NULL_MARKERS)
-        && contains_any(&lower, SAME_INVOCATION_MARKERS)
-        && contains_any(&lower, NULL_STATISTIC_MARKERS)
-        && lower.bytes().any(|byte| byte.is_ascii_digit())
+    // Keep the same-invocation marker near the evidence, then require the null
+    // label, statistic label, and ratio in one clause. Without the clause rule,
+    // "A/A ran; candidate median 1.001" launders the candidate statistic into
+    // a numerical null. Three adjacent lines accommodate Markdown wrapping.
+    for start in 0..lines.len() {
+        for end in (start + 1)..=(start + 3).min(lines.len()) {
+            let window = lines[start..end].join("\n");
+            if contains_any(&window, NEGATED_NULL_MARKERS) {
+                continue;
+            }
+            if !contains_any(&window, SAME_INVOCATION_MARKERS) {
+                continue;
+            }
+            if window.split(['\n', ';']).any(|clause| {
+                contains_any(clause, NULL_MARKERS)
+                    && contains_any(clause, NULL_STATISTIC_MARKERS)
+                    && contains_null_ratio_literal(clause)
+            }) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn has_counted_mechanism(text: &str) -> bool {
     let lower = text.to_lowercase();
-    contains_any(&lower, COUNTED_NOUNS) && contains_any(&lower, UNCHANGED_MARKERS)
+    // Require the counter, equality statement, and a concrete number in the
+    // same short clause. Without this locality, prose such as "allocations
+    // increased; transcript unchanged" incorrectly passes by combining two
+    // unrelated claims.
+    lower.split(['\n', ';', '|', ',', '.']).any(|clause| {
+        contains_any(clause, COUNTED_NOUNS)
+            && contains_any(clause, UNCHANGED_MARKERS)
+            && clause.bytes().any(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn contains_null_ratio_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (0..bytes.len().saturating_sub(2)).any(|start| {
+        let left_is_boundary = start == 0
+            || (!bytes[start - 1].is_ascii_digit()
+                && bytes[start - 1] != b'.'
+                && bytes[start - 1] != b'-');
+        left_is_boundary
+            && matches!(bytes[start], b'0' | b'1')
+            && bytes[start + 1] == b'.'
+            && bytes[start + 2].is_ascii_digit()
+    })
 }
 
 fn contains_real_sha256(bytes: &[u8]) -> bool {
@@ -163,14 +217,24 @@ fn contains_real_sha256(bytes: &[u8]) -> bool {
 
 pub(crate) fn has_binary_sha256(text: &str) -> bool {
     let lower = text.to_lowercase();
-    let bytes = lower.as_bytes();
-    BINARY_SHA_MARKERS.iter().any(|marker| {
-        lower.match_indices(marker).any(|(offset, _)| {
-            let start = offset.saturating_sub(32);
-            let end = (offset + marker.len() + 384).min(bytes.len());
-            contains_real_sha256(&bytes[start..end])
-        })
-    })
+    let lines: Vec<&str> = lower.lines().collect();
+
+    // The digest must live on the marker line or its wrapped continuation.
+    // A broad character window allowed "binary SHA unavailable" followed by an
+    // output-oracle digest later in the paragraph to launder a KEEP.
+    for start in 0..lines.len() {
+        for end in (start + 1)..=(start + 2).min(lines.len()) {
+            let window = lines[start..end].join(" ");
+            if contains_any(&window, NEGATED_BINARY_SHA_MARKERS) {
+                continue;
+            }
+            if contains_any(&window, BINARY_SHA_MARKERS) && contains_real_sha256(window.as_bytes())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn has_profile_evidence(text: &str) -> bool {
