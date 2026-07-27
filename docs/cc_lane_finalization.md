@@ -1,4 +1,4 @@
-# cc-lane finalization — shipped wins, reject index, gated remainder
+# cc-lane finalization — maintenance keeps, reject index, gated remainder
 
 Terminal record for the `cc_fw` lane (SDPA / int8-SDPA / encoder-non-GEMM / mel / VAD), 2026-07-10.
 Every rejected lever below carries a **reject ID** (commit), its **null-control / measurement**, and
@@ -6,10 +6,11 @@ a **retry-condition**. The vein is at its byte-exact frontier; this is the map, 
 
 Provenance for all e2e/self-time figures: shipped `e2e_probe` sha256
 `272102fd7cd643bf449eeed18002874cc98241f74290d2937a8d606a10b0c776`, local 5975WX unless a worker is
-named. Null-control discipline: paired A/A control, gate on the candidate **median** vs the null's
-`[p10,p90]` (cv < 5 is unreachable on this fleet — see `bbe6ed0`).
+named. Null-control discipline: paired same-invocation A/A control, with the
+candidate **median** gated against the null's bootstrap 95% CI using a 2×
+margin. CV is provenance only.
 
-## 1. SHIPPED (measured, verified remote-only, WER/output proven neutral)
+## 1. MAINTENANCE KEEPS (self-speedups, not campaign wins)
 
 | lever | commit(s) | result | proof |
 |---|---|---|---|
@@ -32,21 +33,22 @@ named. Null-control discipline: paired A/A control, gate on the candidate **medi
 | SDPA softmax pass-elimination / scale-fold / reciprocal | `91b44b1` | +3.9 ms/window; `sc` is 384 KiB L2-resident so fusion buys nothing | a DRAM-resident, bandwidth-bound softmax scratch (never, at these shapes) |
 | int8-SDPA (scores / out) | ledger 2026-07-04 | **0.14× / 0.77×** — d_head=64 thin dim, quant overhead > tiny f32 time | a fused int8 attention kernel with d_head ≫ 64 (owner/multi-day) |
 | SDPA `sc` / `out` zero-init alloc | ledger (2857 / 55df007) | **0.5%** — glibc recycles the size class; `__memset` below floor | none |
-| encoder **LayerNorm** | `1519` (correction) | compute-bound f64 SoA at 2.5× memory floor **AND a faithfulness feature** (more precise than ggml) | never byte-exact (f64 sum order); don't trade faithfulness |
+| encoder **LayerNorm** | `1519` | compute-bound f64 SoA at 2.5× memory floor **AND a faithfulness feature** (more precise than ggml) | never byte-exact (f64 sum order); don't trade faithfulness |
 | encoder **residual add** parallelization | 2026-07-02 | a measured wash/slight-loss; kept serial (DRAM-floored) | none |
 | encoder **conv** im2col / weight-transpose | `conv_im2col` audit | reshape-audit-complete; weight-pretranspose hoisted to load | a new constant-recompute site (hunt complete, `55df007`) |
 | **mel** (twiddles / hann / FFT / filterbank) | `55df007` | **0.27% of e2e**; twiddles+hann cached, FFT SIMD, cfft arena landed | none — below any median floor regardless of speedup |
 | **VAD** | `9162a27` | **bridge-only**, zero native surface | native VAD ever implemented |
 | `tile_shape` balanced grid at T=32 | `a410602` (parked, `tests/artifacts/perf/20260710-sgemm-tile-shape/`) | T=14 decidable (1.686×) but naive balance regresses fc1; T=32 unmeasurable | a ≥32-core worker AND a B-bytes-aware selector (unbuilt) |
 
-### Integrity self-corrections (measured, logged — kept so they cannot recur)
-| claim corrected | commit | correction |
+### Current measurement invariants
+
+| Surface | Evidence commit | Current state |
 |---|---|---|
-| "SDPA is not exp-bound" (2026-07-07 closure) | `5935d68` (falsification) | exp is **23.7%** of the fused kernel; prior probes measured a proxy the engine never runs |
-| i7 GEMM "0% self-time in default engine" | `44833c2` | it's **~28%** — default-on via `enc_attn_out_i8i32_for`; I read a comment, not the gate |
-| "9.91% reducible dequant epilogue" | `3910c9c` | it's **rayon dispatch** (zero arithmetic), not dequant math |
-| `cv < 5` keep-gate | `bbe6ed0` | unreachable on this fleet → **median-vs-null-spread** gate adopted (from frankenmermaid) |
-| BR "1.02–1.04× win" (ABBA run) | `bbe6ed0` | withdrawn — medians inside the null floor; only the sign-test was suggestive |
+| SDPA exponential | `5935d68` | exponential evaluation is **23.7%** of the fused kernel |
+| i7 GEMM | `44833c2` | about **28% self-time**, default-on through `enc_attn_out_i8i32_for` |
+| Dequant/dispatch attribution | `3910c9c` | the measured **9.91%** is Rayon dispatch, with zero dequant arithmetic |
+| Statistical gate | `bbe6ed0` | candidate median vs same-invocation A/A bootstrap 95% CI with a 2× margin; CV is provenance only |
+| SDPA BR selector | `bbe6ed0` | measured medians remain inside the null floor |
 
 ## 3. GATED remainder (not one-cycle byte-exact; owner / cod / hardware)
 

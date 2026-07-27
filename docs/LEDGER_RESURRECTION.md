@@ -285,12 +285,28 @@ unless it records either:
    allocations, bytes, or faults unchanged.
 
 There are no accuracy, large-regression, profile, or bare-CV exceptions in the
-write gate. A new KEEP is rejected unless it carries a 64-hex benchmark
-binary/ELF sha256. Exit 0 means clear; **exit 2 means blocked**.
+write gate. A new KEEP/WIN is rejected unless it carries a 64-hex benchmark
+binary/ELF sha256.
+
+Performance keeps also have a mandatory result class:
+
+1. `SELF-SPEEDUP / MAINTENANCE` for franken-before versus franken-after. This
+   may justify a code landing but never counts as campaign output.
+2. `INCUMBENT-WIN / CAMPAIGN WIN` only when the row names the actual legacy
+   incumbent and its binary SHA-256, records a numerical incumbent ratio, and
+   states that both tools ran side-by-side in the same invocation.
+
+An incumbent comparison missing that execution shape is
+`NON-CAMPAIGN / INFORMATIONAL` and cannot use a positive verdict. The same
+preflight rejects new public-performance retraction narratives; current public
+docs state the current admitted number while the full history stays in this
+document and the ledgers. Exit 0 means clear; **exit 2 means blocked**.
 
 **`tests/ledger_integrity.rs`** exercises the same positive and negative
-contracts, including false-positive phrases such as "no null control" and an
-output-oracle SHA that is not a binary SHA.
+contracts, including false-positive phrases such as "no null control", an
+output-oracle SHA that is not a binary SHA, a self-speedup presented as a
+campaign win, and a same-session incumbent comparison presented as
+same-invocation evidence.
 
 **`.githooks/pre-commit`** compiles the std-only Rust preflight directly and
 runs `validate-staged`. Repository-local `core.hooksPath=.githooks` activates

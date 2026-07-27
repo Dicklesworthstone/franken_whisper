@@ -9,3 +9,5 @@
 # Temporary
 last-touched
 *.tmp
+beads.base.jsonl
+beads.db-fsqlite-ns-*
