@@ -149,6 +149,7 @@ target_*/
 
 # Nested crate build artifacts
 crates/*/target/
+benches/*/target/
 
 # Compiler crash reports
 rustc-ice-*.txt

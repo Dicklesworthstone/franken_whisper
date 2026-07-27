@@ -294,8 +294,9 @@ pub(crate) fn validate_changed_text(head: &str, staged: &str, path: &str) -> Vec
         .collect()
 }
 
-fn retry_predicate(row: &Row) -> String {
+fn retry_marker_rank(line: &str) -> Option<u8> {
     let markers = [
+        "concrete retry predicate",
         "retry predicate",
         "retry condition",
         "retry-condition",
@@ -303,24 +304,41 @@ fn retry_predicate(row: &Row) -> String {
         "do not retry",
         "reopen only",
     ];
+    let lower = line.to_lowercase();
+    let normalized = lower
+        .trim_start_matches(|character: char| {
+            matches!(character, ' ' | '\t' | '*' | '_' | '#' | '-')
+        })
+        .trim_start();
+    if markers.iter().any(|marker| normalized.starts_with(marker)) {
+        return Some(0);
+    }
+    markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+        .then_some(1)
+}
+
+pub(crate) fn retry_predicate(row: &Row) -> String {
     let lines: Vec<&str> = row.body.lines().collect();
-    for (index, line) in lines.iter().enumerate() {
-        let lower = line.to_lowercase();
-        if !markers.iter().any(|marker| lower.contains(marker)) {
-            continue;
-        }
-        let mut paragraph = Vec::new();
-        for candidate in &lines[index..] {
-            if candidate.trim().is_empty() && !paragraph.is_empty() {
-                break;
+    for wanted_rank in [0, 1] {
+        for (index, line) in lines.iter().enumerate() {
+            if retry_marker_rank(line) != Some(wanted_rank) {
+                continue;
             }
-            if candidate.starts_with('#') || candidate.trim() == "---" {
-                break;
+            let mut paragraph = Vec::new();
+            for candidate in &lines[index..] {
+                if candidate.trim().is_empty() && !paragraph.is_empty() {
+                    break;
+                }
+                if candidate.starts_with('#') || candidate.trim() == "---" {
+                    break;
+                }
+                paragraph.push(candidate.trim());
             }
-            paragraph.push(candidate.trim());
+            let joined = paragraph.join(" ");
+            return joined.chars().take(900).collect();
         }
-        let joined = paragraph.join(" ");
-        return joined.chars().take(900).collect();
     }
     "(none recorded)".to_owned()
 }

@@ -56,11 +56,13 @@ fn parse_entries(text: &str) -> Vec<Entry> {
 
 /// Verdict words this repo actually uses to close a lever.
 ///
-/// Matching only `REJECT` would have missed **half the population** — 139 rows
-/// instead of 277 — because rejections here live in prose titles, not a verdict
-/// column: the `int4 mlp_0` family is closed under *DEAD*, *CLOSED*,
-/// *FALSIFIED* and *NEGATIVE*, never under "REJECT". Anything narrower also
-/// leaves the guard trivially bypassable by writing "DEAD" instead.
+/// Matching only `REJECT` would have missed **half the mechanical screen** —
+/// 139 candidate headers instead of 277 — because closure words here live in
+/// prose titles, not a verdict column: the `int4 mlp_0` family is closed under
+/// *DEAD*, *CLOSED*, *FALSIFIED* and *NEGATIVE*, never under "REJECT".
+/// Hand-adjudication later reduced those 277 candidates to 188 actual
+/// performance rejections. Anything narrower also leaves the guard trivially
+/// bypassable by writing "DEAD" instead.
 const REJECTION_VERDICTS: &[&str] = &[
     "REJECT",
     "DEAD",
@@ -142,7 +144,7 @@ fn the_ledger_is_parseable_and_non_trivial() {
     // test above vacuously green.
     let text = std::fs::read_to_string(ledger_path()).expect("read docs/NEGATIVE_EVIDENCE.md");
     let entries = parse_entries(&text);
-    let rejects = entries.iter().filter(|e| is_reject(&e.header)).count();
+    let reject_candidates = entries.iter().filter(|e| is_reject(&e.header)).count();
 
     assert!(
         entries.len() > 500,
@@ -151,9 +153,9 @@ fn the_ledger_is_parseable_and_non_trivial() {
         entries.len()
     );
     assert!(
-        rejects > 200,
-        "parsed only {rejects} REJECT rows out of {} entries — the verdict format changed and \
-         this guard would pass vacuously",
+        reject_candidates > 200,
+        "parsed only {reject_candidates} candidate verdict headers out of {} entries — the \
+         verdict format changed and this guard would pass vacuously",
         entries.len()
     );
 }
@@ -301,4 +303,20 @@ fn nested_subsections_remain_inside_their_parent_row() {
     );
     assert_eq!(rows.len(), 2);
     assert!(rows[0].body.contains("### A/A evidence"));
+}
+
+#[test]
+fn explicit_retry_heading_beats_an_earlier_historical_mention() {
+    let mut rows = ledger_preflight::parse_rows(
+        "## 2026-07-26 - test: **NO VERDICT.**\n\
+         The old retry predicate required a warm worker, and that condition was satisfied.\n\n\
+         **Concrete retry predicate:** rerun only after the faithful baseline exists.\n\
+         Gate on the same-invocation A/A median CI.\n",
+    );
+    let row = rows.pop().expect("one ledger row");
+    let predicate = ledger_preflight::retry_predicate(&row);
+
+    assert!(predicate.contains("faithful baseline"));
+    assert!(predicate.contains("same-invocation A/A"));
+    assert!(!predicate.contains("warm worker"));
 }
