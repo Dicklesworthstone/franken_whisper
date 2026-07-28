@@ -13,6 +13,7 @@ pub mod audio;
 pub mod backend;
 pub mod cli;
 pub mod conformance;
+pub mod diarization;
 pub mod error;
 pub mod export;
 pub mod logging;

@@ -39,7 +39,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 
 ## The Problem
 
-Speech-to-text pipelines are fragmented. To get production-quality transcription you need `whisper.cpp` for speed, `insanely-fast-whisper` for GPU batching, and `whisper-diarization` for speaker identification. Each has its own CLI, output format, error handling, and deployment story. Orchestrating them from scripts means parsing inconsistent stdout, handling timeouts manually, killing zombie subprocesses, and losing all run history when something crashes.
+Speech-to-text pipelines are fragmented. Existing stacks combine `whisper.cpp` for speed, `insanely-fast-whisper` for GPU batching, and Python diarization systems for speaker attribution. Each has its own CLI, output format, error handling, and deployment story. Orchestrating them from scripts means parsing inconsistent stdout, handling timeouts manually, killing zombie subprocesses, and losing all run history when something crashes.
 
 Agent workflows make the problem worse. Modern LLM agents need **structured**, **streaming**, **machine-readable** output, not human-oriented terminal decorations that break the moment they touch `jq`, pipes, or SSH.
 
@@ -48,6 +48,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 `franken_whisper` is a single Rust binary that wraps every major Whisper backend behind a unified, agent-first interface — and ships its own engine:
 
 - **A real in-process Whisper engine, in pure Rust.** ggml model parsing, log-mel frontend, encoder/decoder transformer inference on FrankenTorch CPU kernels, greedy decoding with whisper.cpp's full timestamp-rule suite, and cross-attention DTW word timestamps. No FFI, no Python, no subprocess — drop a ggml model file in place and transcribe.
+- **Rust-native acoustic speaker diarization.** A bounded-memory waveform path separates voice from channel evidence, detects multiscale regime changes, builds robust within-call profiles, accepts hard or soft known-speaker intervals, and projects an independent turn timeline onto DTW word boundaries. It makes no gender or identity claims.
 - **Adaptive Bayesian backend routing.** Each `auto` request runs a formal decision contract with an explicit loss matrix, per-backend Beta posteriors, Brier-scored calibration, and deterministic fallback when the model is mis-calibrated.
 - **Real-time NDJSON streaming.** Every pipeline stage emits sequenced, timestamped events on stable schema `v1.0.0`. No fragile regex; agents parse JSON.
 - **Durable run history.** Every transcription persists to SQLite with full event logs, replay envelopes, and JSONL export/import, even when the process crashes mid-run.
@@ -65,7 +66,7 @@ Agent workflows make the problem worse. Modern LLM agents need **structured**, *
 | Machine-readable errors | exit code only | exceptions | exceptions | **12 structured `FW-*` error codes** |
 | Adaptive backend selection | — | — | — | **Bayesian decision contract** |
 | Run persistence | — | — | — | **SQLite + JSONL replay packs** |
-| Diarization | — | yes (HF token) | yes | **yes (any backend)** |
+| Diarization | TinyDiarize hints | yes (HF token) | yes | **Rust acoustic + normalized external evidence** |
 | GPU acceleration | CUDA / Metal | CUDA / MPS | CUDA | **`frankentorch` / `frankenjax`** |
 | Cancellation | `SIGKILL` | `KeyboardInterrupt` | `SIGKILL` | **cooperative `CancellationToken`** |
 | TTY audio relay | — | — | — | **mulaw + zlib + base64 NDJSON** |
@@ -90,8 +91,9 @@ franken_whisper robot run --input meeting.mp3 --backend auto
 franken_whisper robot run --input meeting.mp3 --speculative \
   --fast-model tiny.en --quality-model large-v3
 
-# Speaker diarization with pyannote
-franken_whisper transcribe --input meeting.mp3 --diarize --hf-token "$HF_TOKEN" --json
+# Built-in acoustic speaker diarization (no Python or HF token)
+franken_whisper transcribe --input meeting.mp3 --diarize \
+  --diarization-engine acoustic --json
 
 # TinyDiarize: whisper.cpp's built-in speaker-turn detection (no HF token needed)
 franken_whisper transcribe --input meeting.mp3 --tiny-diarize --json
@@ -293,8 +295,8 @@ The release profile is aggressively optimized for distribution: `opt-level = "z"
 - **Bridge backend binaries** (optional alternates; the Bayesian router arbitrates):
   - `whisper-cli` (from whisper.cpp); override via `FRANKEN_WHISPER_WHISPER_CPP_BIN`
   - `insanely-fast-whisper` (Python entry point); override via `FRANKEN_WHISPER_INSANELY_FAST_BIN`
-  - `python3` with `pyannote.audio` installed (for the diarization backend); override via `FRANKEN_WHISPER_PYTHON_BIN`
-- **HuggingFace token** (for diarization only): `--hf-token`, `FRANKEN_WHISPER_HF_TOKEN`, or `HF_TOKEN`
+  - `python3` with `pyannote.audio` installed (only for the optional external diarization backend); override via `FRANKEN_WHISPER_PYTHON_BIN`
+- **HuggingFace token** (external diarization only): `--hf-token`, `FRANKEN_WHISPER_HF_TOKEN`, or `HF_TOKEN`. The built-in acoustic engine needs neither Python nor a token.
 
 ### Sibling Crate Dependencies
 
@@ -354,11 +356,25 @@ Output (one JSON object per line, schema `1.0.0`):
 franken_whisper transcribe \
   --input meeting.mp3 \
   --diarize \
-  --hf-token "$HF_TOKEN" \
+  --diarization-engine acoustic \
   --min-speakers 2 \
   --max-speakers 5 \
   --json
 ```
+
+Known intervals can enroll an opaque speaker reference without copying the
+hint document:
+
+```json
+{"schema_version":"speaker-hints-v1","known_intervals":[
+  {"speaker_ref":"caller_a","start_ms":1200,"end_ms":5400,
+   "confidence":0.98,"policy":"hard_must_link"}
+]}
+```
+
+Pass it with `--speaker-hints /private/path/hints.json`. Hard intervals are
+immutable must-links; soft enrollment can be rejected when acoustically
+contradictory. Labels remain within-run references, not biometric identities.
 
 ### 4. Microphone Capture
 
@@ -522,7 +538,7 @@ franken_whisper transcribe [OPTIONS]
 | `--model <MODEL>` | backend-specific | Model name or path forwarded to backend |
 | `--language <LANG>` | auto-detect | Language hint (ISO 639-1) |
 | `--translate` | `false` | Translate to English |
-| `--diarize` | `false` | Enable speaker diarization |
+| `--diarize` | `false` | Enable the typed speaker-diarization stage |
 
 **Output:**
 
@@ -607,14 +623,20 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 
 **Diarization:**
 
-| Flag | Description |
-|------|-------------|
-| `--num-speakers <N>` | Exact speaker count |
-| `--min-speakers <N>` | Minimum speakers |
-| `--max-speakers <N>` | Maximum speakers |
-| `--no-stem` | Disable vocal isolation (Demucs source separation) |
-| `--suppress-numerals` | Spell out numbers for alignment stability |
-| `--diarization-model <MODEL>` | Override whisper model for the diarization stage |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, or reserved `neural`; explicit `acoustic` selects the Rust waveform engine regardless of rollout stage |
+| `--diarization-fallback <POLICY>` | `unknown` | `unknown`, `external`, or `error` when evidence is insufficient |
+| `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not emitted in robot summaries |
+| `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
+| `--diarization-max-prototypes <N>` | `512` | Bounded global prototype cap (`1..=512`) |
+| `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v4 still stores privacy-safe summaries rather than reusable acoustic vectors |
+| `--num-speakers <N>` | — | Exact speaker count |
+| `--min-speakers <N>` | — | Minimum speakers; insufficient evidence remains unknown rather than inventing a speaker |
+| `--max-speakers <N>` | — | Maximum speakers |
+| `--no-stem` | `false` | Disable external-backend vocal isolation |
+| `--suppress-numerals` | `false` | Spell out numbers for external alignment stability |
+| `--diarization-model <MODEL>` | — | Override the external diarization model |
 
 **Speculative Streaming:**
 
@@ -669,7 +691,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 
-`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
+`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
 
 **Health Report.** `robot health` probes every subsystem and returns a structured diagnostic:
 
@@ -798,6 +820,7 @@ Built on the [FrankenTUI](https://github.com/Dicklesworthstone/frankentui) frame
 | `FRANKEN_WHISPER_HF_TOKEN` | — | HuggingFace token (preferred over `HF_TOKEN`) |
 | `HF_TOKEN` | — | HuggingFace token (fallback) |
 | `FRANKEN_WHISPER_DIARIZATION_DEVICE` | — | GPU device for the diarization backend |
+| `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT` | `shadow` | `auto` admission stage: `shadow`, `validated`, `fallback`, `primary`, or `sole`; invalid values fail closed to `shadow` |
 | `FRANKEN_WHISPER_STATE_DIR` | `.franken_whisper` | State directory root |
 | `FRANKEN_WHISPER_DB` | `.franken_whisper/storage.sqlite3` | SQLite database path |
 | `FRANKEN_WHISPER_FFMPEG_BIN` | auto | Explicit ffmpeg binary path |
@@ -846,6 +869,14 @@ Native Rust engine replacements follow a 5-stage rollout under conformance gatin
 | `sole` | Native only (requires `FRANKEN_WHISPER_NATIVE_EXECUTION=1`) |
 
 The execution-path metadata on every `backend.ok` event and replay envelope records the active stage so post-hoc analysis can correlate output drift with rollout transitions.
+
+Acoustic diarization has an independent, default-off `auto` rollout controlled
+by `FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT`. `shadow` and `validated`
+leave acoustic output unexposed; `fallback` admits it only when verified
+external labels are absent; `primary` prefers it; `sole` admits only it.
+Explicit `--diarization-engine acoustic` bypasses this `auto` gate. Every run
+emits `diarize.rollout` with the requested and resolved engine, stage, config
+validity, and external-evidence presence.
 
 ---
 
@@ -2364,14 +2395,14 @@ This produces the smallest possible binary while retaining full optimization. Th
 |  No network calls during transcription                         |
 |  No telemetry or analytics                                     |
 |  No cloud sync                                                 |
-|  No API keys required (except HuggingFace for diarization)     |
+|  No API keys required for native ASR or acoustic diarization  |
 +----------------------------------------------------------------+
 ```
 
 All processing happens on your hardware using local backend binaries. The only external network access is:
 
 - **ffmpeg auto-provisioning**: one-time download, can be disabled via `FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`
-- **HuggingFace model downloads**: only when using `--diarize` with `pyannote` models
+- **HuggingFace model downloads**: only when explicitly using an external diarization backend with pyannote models
 
 ### Secrets Redaction
 
@@ -2781,14 +2812,19 @@ brew install whisper-cpp                                  # macOS
 export FRANKEN_WHISPER_WHISPER_CPP_BIN=/path/to/whisper-cli
 ```
 
-### `FW-BACKEND-UNAVAILABLE: diarization requires HF token`
+### `FW-BACKEND-UNAVAILABLE: external diarization requires HF token`
 
-Diarization needs a HuggingFace API token for pyannote models:
+The optional pyannote backend needs a HuggingFace API token. The Rust acoustic
+engine does not:
 
 ```bash
 export FRANKEN_WHISPER_HF_TOKEN="hf_your_token_here"
 # or pass directly
 franken_whisper transcribe --input audio.mp3 --diarize --hf-token "hf_..."
+
+# or stay entirely in process
+franken_whisper transcribe --input audio.mp3 --diarize \
+  --diarization-engine acoustic
 ```
 
 The token is automatically redacted from command logs.
@@ -3719,8 +3755,9 @@ The `auto` router will normally pick the right backend, but explicit selection i
 
 ```
 Do you need speaker diarization?
-├─ YES, with high-quality pyannote models      → whisper_diarization
-├─ YES, with built-in fast-only speaker turns  → whisper_cpp + --tiny-diarize
+├─ YES, waveform-derived and dependency-light  → --diarization-engine acoustic
+├─ YES, with an installed pyannote backend     → --diarization-engine external
+├─ YES, turn hints only                        → whisper_cpp + --tiny-diarize
 └─ NO ──┐
         Do you have a CUDA / MPS GPU?
         ├─ YES, batching long audio aggressively  → insanely_fast
@@ -3859,7 +3896,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 
 | Use case | Configuration sketch |
 |----------|----------------------|
-| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --min-speakers 2 --max-speakers 8 --json` |
+| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --diarization-engine acoustic --min-speakers 2 --max-speakers 8 --json` |
 | **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper_cpp --model large-v3 --json; done` |
 | **Live transcription dashboard** | `robot run --mic --mic-seconds 300 --speculative --fast-model tiny.en --quality-model large-v3` piped to a Server-Sent Events translator |
 | **Voicemail archival** | `transcribe --stdin --backend auto --json` invoked from a mail-handler hook |
@@ -3870,7 +3907,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 | **Forensic transcription with audit trail** | `--json --output-srt --output-vtt` plus a snapshot of the replay pack for chain-of-custody |
 | **Karaoke / lyrics alignment** | `transcribe --input song.mp3 --output-lrc --json` then post-process with the word-level timestamps via library API |
 | **Real-time accessibility captioning** | `robot run --mic --speculative` with `transcript.partial` driving a low-latency UI and `transcript.confirm` / `transcript.correct` updating the canonical text |
-| **Air-gapped sensitive recordings** | Disable all network I/O (`FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG=0`, manual model deployment, no diarization), use `--no-persist` if even local storage is forbidden |
+| **Air-gapped sensitive recordings** | Disable auto-provisioning, deploy the Whisper model manually, use `--diarization-engine acoustic` when speaker turns are needed, and add `--no-persist` if local transcript storage is forbidden |
 
 The common theme: `franken_whisper` is the same binary in every use case. The configuration changes; the integration story (NDJSON events, structured errors, deterministic replay) does not.
 
@@ -4335,28 +4372,28 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 
 ---
 
-## TinyDiarize vs Full Diarization
+## Speaker Diarization Paths
 
-`franken_whisper` exposes two paths to speaker labels:
+| Aspect | Rust acoustic | External | TinyDiarize |
+|--------|---------------|----------|-------------|
+| Selection | `--diarization-engine acoustic` | `--diarization-engine external` | `--tiny-diarize` |
+| Evidence | Waveform voice/channel features and multiscale changes | Backend-defined, normalized only after provenance checks | Decoder turn tokens |
+| Dependencies | Built-in Rust + the normalized PCM already used by ASR | Typically Python, model files, and possibly an HF token | whisper-cli |
+| Output | Independent turns plus conservative projection to ASR segments | Timed backend labels normalized to the common report | Inline turn hints |
+| Known intervals | Hard must-link and soft enrollment | Backend-specific | No |
+| Unknown/overlap | Explicit unknown and overlap suspicion | Backend-specific | No calibrated assignment |
+| Accuracy authority | Synthetic invariant proof only; public corpus DER/JER remains `NO-DATA` | Depends on the installed backend and corpus | No project accuracy certification |
 
-| Aspect | `--tiny-diarize` (whisper.cpp built-in) | `--diarize` (whisper-diarization / pyannote) |
-|--------|-----------------------------------------|----------------------------------------------|
-| Dependencies | whisper-cli only | Python + pyannote.audio + HuggingFace token + Demucs (for `--no-stem` off) |
-| Output | Speaker-turn tokens injected inline in the transcript | Explicit per-segment `speaker` field with clusterable IDs |
-| Accuracy on 2 speakers | Decent; misses overlap | High; handles overlap, gender, register |
-| Accuracy on 5+ speakers | Degrades quickly | Stable up to 10+ speakers with constraints |
-| Latency overhead | Minimal | +20–60% wall time (separation + clustering) |
-| HF token required | No | Yes |
-| Works offline (post-model-download) | Yes | Yes (after first download) |
-| Cross-engine compatible | Only whisper.cpp | Any backend (the diarization stage runs separately) |
-
-Decision rule: use `--tiny-diarize` when speakers are clearly turn-taking and you just need a hint; use `--diarize` for anything where mis-attribution matters (interviews, depositions, multi-party meetings).
+Use acoustic diarization for dependency-light waveform evidence and auditable
+known intervals. Use an external engine only when its model/deployment tradeoff
+is deliberate. TinyDiarize is a turn hint, not a speaker-profile substitute.
 
 ---
 
 ## Source Separation Tradeoffs (`--no-stem`)
 
-The diarization backend optionally runs Demucs vocal isolation before clustering. This is on by default; pass `--no-stem` to disable.
+The external diarization backend may run Demucs vocal isolation before
+clustering. The Rust acoustic engine does not invoke Demucs or Python.
 
 **Keep stemming on (default) when:**
 

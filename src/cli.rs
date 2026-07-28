@@ -1,15 +1,77 @@
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, BackendParams, DecodingParams, DiarizationConfig, InputSource, OutputFormat,
+    BackendKind, BackendParams, DecodingParams, DiarizationConfig, DiarizationEngine,
+    DiarizationFallbackPolicy, DiarizationRequest, InputSource, KnownSpeakerInterval, OutputFormat,
     SpeakerConstraints, TimestampLevel, TranscribeRequest, VadParams,
 };
 use crate::sync::ConflictPolicy;
+
+const MAX_SPEAKER_HINTS_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SpeakerHintsFile {
+    Intervals(Vec<KnownSpeakerInterval>),
+    Document {
+        schema_version: String,
+        known_intervals: Vec<KnownSpeakerInterval>,
+    },
+}
+
+fn parse_speaker_hints(bytes: &[u8]) -> FwResult<Vec<KnownSpeakerInterval>> {
+    let parsed: SpeakerHintsFile = serde_json::from_slice(bytes).map_err(|_| {
+        FwError::InvalidRequest(
+            "speaker hints must be valid speaker-hints-v1 JSON without trailing data".to_owned(),
+        )
+    })?;
+    match parsed {
+        SpeakerHintsFile::Intervals(intervals) => Ok(intervals),
+        SpeakerHintsFile::Document {
+            schema_version,
+            known_intervals,
+        } if schema_version == "speaker-hints-v1" => Ok(known_intervals),
+        SpeakerHintsFile::Document { .. } => Err(FwError::InvalidRequest(
+            "speaker hints document must use schema_version speaker-hints-v1".to_owned(),
+        )),
+    }
+}
+
+fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
+    let file = std::fs::File::open(path).map_err(|_| {
+        FwError::InvalidRequest("speaker hints file could not be opened".to_owned())
+    })?;
+    if file
+        .metadata()
+        .map_err(|_| {
+            FwError::InvalidRequest("speaker hints file metadata could not be read".to_owned())
+        })?
+        .len()
+        > MAX_SPEAKER_HINTS_BYTES
+    {
+        return Err(FwError::InvalidRequest(
+            "speaker hints file exceeds the 1 MiB safety limit".to_owned(),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_SPEAKER_HINTS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| FwError::InvalidRequest("speaker hints file could not be read".to_owned()))?;
+    if bytes.len() as u64 > MAX_SPEAKER_HINTS_BYTES {
+        return Err(FwError::InvalidRequest(
+            "speaker hints file exceeds the 1 MiB safety limit".to_owned(),
+        ));
+    }
+    parse_speaker_hints(&bytes)
+}
 
 // ---------------------------------------------------------------------------
 // bd-38c.6: Graceful Ctrl+C shutdown via asupersync cancellation protocol
@@ -330,6 +392,32 @@ pub struct TranscribeArgs {
     /// Request speaker diarization.
     #[arg(long)]
     pub diarize: bool,
+
+    /// Speaker diarization implementation.
+    #[arg(long, value_enum, default_value_t = DiarizationEngine::Auto)]
+    pub diarization_engine: DiarizationEngine,
+
+    /// Conservative action when the requested diarizer lacks evidence.
+    #[arg(long, value_enum, default_value_t = DiarizationFallbackPolicy::Unknown)]
+    pub diarization_fallback: DiarizationFallbackPolicy,
+
+    /// Confidential speaker-hints-v1 JSON array; read in place and never copied.
+    #[arg(long)]
+    pub speaker_hints: Option<PathBuf>,
+
+    /// Remove this many milliseconds from each enrollment interval edge.
+    #[arg(long, default_value_t = 100)]
+    pub enrollment_edge_guard_ms: u32,
+
+    /// Maximum global acoustic prototypes (hard ceiling: 512).
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u16).range(1..=512))]
+    pub diarization_max_prototypes: u16,
+
+    /// Record consent for future reusable-profile persistence.
+    ///
+    /// Schema v4 stores privacy-safe summaries only, never raw acoustic vectors.
+    #[arg(long)]
+    pub persist_speaker_profiles: bool,
 
     /// Path to frankensqlite database file.
     #[arg(long, default_value = ".franken_whisper/storage.sqlite3")]
@@ -784,6 +872,16 @@ impl TranscribeArgs {
                 "--input, --stdin, and --mic are mutually exclusive".to_owned(),
             ));
         }
+        if !self.diarize
+            && (self.speaker_hints.is_some()
+                || self.persist_speaker_profiles
+                || self.diarization_engine != DiarizationEngine::Auto
+                || self.diarization_fallback != DiarizationFallbackPolicy::Unknown)
+        {
+            return Err(FwError::InvalidRequest(
+                "diarization controls require --diarize".to_owned(),
+            ));
+        }
 
         let input = if let Some(path) = self.input.take() {
             InputSource::File { path }
@@ -890,6 +988,22 @@ impl TranscribeArgs {
                 None
             };
 
+        let known_intervals = self
+            .speaker_hints
+            .take()
+            .as_deref()
+            .map(read_speaker_hints)
+            .transpose()?
+            .unwrap_or_default();
+        let acoustic_diarization = self.diarize.then_some(DiarizationRequest {
+            engine: self.diarization_engine,
+            fallback: self.diarization_fallback,
+            known_intervals,
+            enrollment_edge_guard_ms: self.enrollment_edge_guard_ms,
+            max_prototypes: self.diarization_max_prototypes,
+            persist_profiles: self.persist_speaker_profiles,
+        });
+
         let fast_model = self.fast_model.take();
         let quality_model = self.quality_model.take();
         let speculative = self.speculative_request_with_models(fast_model, quality_model);
@@ -901,6 +1015,7 @@ impl TranscribeArgs {
             vad,
             speaker_constraints,
             diarization_config,
+            acoustic_diarization,
             gpu_device: self.gpu_device.take(),
             flash_attention: if self.flash_attention {
                 Some(true)
@@ -956,6 +1071,10 @@ impl TranscribeArgs {
             "language": self.language,
             "translate": self.translate,
             "diarize": self.diarize,
+            "diarization_engine": self.diarization_engine,
+            "diarization_fallback": self.diarization_fallback,
+            "speaker_hints_present": self.speaker_hints.is_some(),
+            "persist_speaker_profiles": self.persist_speaker_profiles,
             "persist": !self.no_persist,
             "db": self.db,
             "speculative": self.speculative,
@@ -1047,6 +1166,12 @@ mod tests {
             language: None,
             translate: false,
             diarize: false,
+            diarization_engine: DiarizationEngine::Auto,
+            diarization_fallback: DiarizationFallbackPolicy::Unknown,
+            speaker_hints: None,
+            enrollment_edge_guard_ms: 100,
+            diarization_max_prototypes: 512,
+            persist_speaker_profiles: false,
             db: PathBuf::from("db.sqlite3"),
             no_persist: false,
             timeout: None,
@@ -1282,6 +1407,97 @@ mod tests {
         assert_eq!(summary["backend"], "auto");
         assert_eq!(summary["translate"], false);
         assert_eq!(summary["persist"], true);
+        assert_eq!(summary["diarization_engine"], "auto");
+        assert_eq!(summary["speaker_hints_present"], false);
+    }
+
+    #[test]
+    fn native_diarization_controls_build_a_typed_request() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.diarization_engine = DiarizationEngine::Acoustic;
+        args.diarization_fallback = DiarizationFallbackPolicy::Error;
+        args.enrollment_edge_guard_ms = 175;
+        args.diarization_max_prototypes = 24;
+        args.persist_speaker_profiles = true;
+
+        let request = args.to_request().expect("valid diarization request");
+        let diarization = request
+            .backend_params
+            .acoustic_diarization
+            .expect("typed request");
+        assert_eq!(diarization.engine, DiarizationEngine::Acoustic);
+        assert_eq!(diarization.fallback, DiarizationFallbackPolicy::Error);
+        assert_eq!(diarization.enrollment_edge_guard_ms, 175);
+        assert_eq!(diarization.max_prototypes, 24);
+        assert!(diarization.persist_profiles);
+        assert!(diarization.known_intervals.is_empty());
+    }
+
+    #[test]
+    fn native_diarization_controls_require_diarize() {
+        let mut args = minimal_args();
+        args.diarization_engine = DiarizationEngine::Acoustic;
+        let error = args
+            .to_request()
+            .expect_err("engine selection without --diarize must fail");
+        assert!(error.to_string().contains("require --diarize"));
+
+        let mut args = minimal_args();
+        args.persist_speaker_profiles = true;
+        assert!(
+            args.to_request()
+                .expect_err("profile persistence without --diarize must fail")
+                .to_string()
+                .contains("require --diarize")
+        );
+    }
+
+    #[test]
+    fn speaker_hints_parser_accepts_v1_document_and_bare_array() {
+        let interval = r#"{
+            "speaker_ref":"near",
+            "start_ms":100,
+            "end_ms":900,
+            "confidence":0.95,
+            "policy":"hard_must_link"
+        }"#;
+        let bare = parse_speaker_hints(format!("[{interval}]").as_bytes()).expect("bare array");
+        let document = parse_speaker_hints(
+            format!("{{\"schema_version\":\"speaker-hints-v1\",\"known_intervals\":[{interval}]}}")
+                .as_bytes(),
+        )
+        .expect("versioned document");
+        assert_eq!(bare, document);
+        assert_eq!(bare[0].speaker_ref, "near");
+    }
+
+    #[test]
+    fn speaker_hints_parser_rejects_unknown_schema_and_malformed_json() {
+        let wrong_schema = br#"{"schema_version":"speaker-hints-v2","known_intervals":[]}"#;
+        assert!(
+            parse_speaker_hints(wrong_schema)
+                .expect_err("future schema must fail closed")
+                .to_string()
+                .contains("speaker-hints-v1")
+        );
+        assert!(parse_speaker_hints(b"not json").is_err());
+    }
+
+    #[test]
+    fn robot_summary_reports_hint_presence_without_disclosing_the_path() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_hints = Some(PathBuf::from(
+            "/private/confidential-corpus/do-not-disclose.json",
+        ));
+        let summary = args.robot_summary();
+        assert_eq!(summary["speaker_hints_present"], true);
+        assert!(
+            !serde_json::to_string(&summary)
+                .expect("serialize summary")
+                .contains("do-not-disclose")
+        );
     }
 
     #[test]
@@ -2044,6 +2260,10 @@ mod tests {
             "language",
             "translate",
             "diarize",
+            "diarization_engine",
+            "diarization_fallback",
+            "speaker_hints_present",
+            "persist_speaker_profiles",
             "persist",
             "db",
             "speculative",

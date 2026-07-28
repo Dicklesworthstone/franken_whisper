@@ -52,6 +52,51 @@ pub const FRAMES_PER_CHUNK: usize = N_SAMPLES_30S / HOP; // 3000
 /// One-sided FFT bin count: `N_FFT/2 + 1`, i.e. bin_0 .. bin_nyquist.
 pub const N_FREQ_BINS: usize = N_FFT / 2 + 1; // 201
 
+/// Compute one Hann-windowed, one-sided power spectrum with the exact FFT
+/// geometry used by the native Whisper frontend.
+///
+/// This crate-private primitive deliberately returns power before mel
+/// projection, logarithms, and whole-clip normalization. Diarization needs
+/// amplitude and channel evidence that Whisper's globally normalized log-mel
+/// representation intentionally discards. Factoring the primitive here keeps
+/// the two consumers on one deterministic FFT implementation without changing
+/// any arithmetic in [`log_mel`].
+pub(crate) fn fixed_frame_power_spectrum(
+    frame: &[f32],
+    out: &mut [f32; N_FREQ_BINS],
+) -> FwResult<()> {
+    if frame.len() != N_FFT {
+        return Err(FwError::InvalidRequest(format!(
+            "fixed spectrum frame must contain exactly {N_FFT} samples, got {}",
+            frame.len()
+        )));
+    }
+    if frame.iter().any(|sample| !sample.is_finite()) {
+        return Err(FwError::InvalidRequest(
+            "fixed spectrum frame contains a non-finite PCM sample".to_owned(),
+        ));
+    }
+
+    let hann = cached_hann_window();
+    let twiddles = cached_fft_twiddles();
+    let mut fft_in = [0.0_f32; N_FFT];
+    for (windowed, (&sample, &weight)) in fft_in.iter_mut().zip(frame.iter().zip(hann.iter())) {
+        *windowed = sample * weight;
+    }
+    let mut fft_out = [0.0_f32; 2 * N_FFT];
+    if rfft_enabled() {
+        fft_twoforone(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    } else {
+        fft(&fft_in, &mut fft_out, &twiddles.levels, &twiddles.base);
+    }
+    for (bin, power) in out.iter_mut().enumerate() {
+        let re = fft_out[2 * bin];
+        let im = fft_out[2 * bin + 1];
+        *power = re * re + im * im;
+    }
+    Ok(())
+}
+
 /// The exact value every "silence" mel sample collapses to.
 ///
 /// Derivation (all bins zero ⇒ every pre-normalization sample equals

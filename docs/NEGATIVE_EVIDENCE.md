@@ -25916,3 +25916,22 @@ in the same invocation. Decide only on the candidate median against the A/A
 bootstrap 95% CI with the campaign margin; report CV and wins as provenance,
 never as verdict gates. Until that predicate holds, **do not ship and do not
 record this as a rejection**; the measured hotspot remains open.
+
+---
+## 2026-07-28 - MistyDog: **NO-SHIP CERTIFICATION / NO-DATA — Rust acoustic diarization has focused synthetic proof, but no admissible public-corpus DER/JER or calibration artifact.**
+
+`bd-odj7` now has a typed waveform implementation, permutation-invariant
+scorers, deterministic replay checks, bounded-memory tests, hard/soft enrollment
+tests, transcript-projection tests, schema-v4 persistence/recovery tests, and a
+fail-closed rollout resolver. These establish implementation invariants only.
+They do not establish real-call accuracy, speaker-count reliability, overlap
+quality, confidence calibration, or production performance.
+
+Private local evaluation material was deliberately excluded from the
+repository, remote workers, logs, issue tracker, and evidence artifacts. It
+cannot be used to mint a public certification. Promotion beyond `shadow`
+therefore requires a redistributable provenance-cleared corpus, retained
+reference/output hashes, exact DER/JER/change/calibration configuration, and a
+same-host performance packet. Until then, public acoustic accuracy and
+performance are **NO-DATA**, while explicit operator-selected acoustic use
+remains available under the conservative unknown/error contract.

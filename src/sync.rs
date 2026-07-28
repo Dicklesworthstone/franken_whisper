@@ -12,7 +12,7 @@ use flate2::write::GzEncoder;
 // own `Connection` is async as of the frankensqlite async migration, so this
 // module speaks to it through the crate's blocking facade; every `Connection`
 // below is that facade, with the same statement methods and error type.
-use crate::storage::BlockingConnection as Connection;
+use crate::storage::{BlockingConnection as Connection, RunStore};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1112,7 +1112,9 @@ fn import_inner(
             connection
                 .execute("COMMIT;")
                 .map_err(|error| FwError::Storage(error.to_string()))?;
-
+            drop(connection);
+            let store = RunStore::open(db_path)?;
+            store.rebuild_diarization_index()?;
             Ok(import_result)
         }
         Err(error) => {
@@ -3164,10 +3166,12 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::model::{
-        BackendKind, BackendParams, InputSource, RunEvent, RunReport, TranscribeRequest,
+        BackendKind, BackendParams, DiarizationEngine, DiarizationFallbackStatus,
+        DiarizationReport, DiarizationRequest, DiarizationTurn, InputSource, KnownSpeakerInterval,
+        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerProfileSummary, TranscribeRequest,
         TranscriptionResult, TranscriptionSegment,
     };
-    use crate::storage::RunStore;
+    use crate::storage::{BlockingConnection, RunStore};
 
     use super::*;
 
@@ -3294,6 +3298,7 @@ mod tests {
                     },
                 ],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({"test": true}),
                 artifact_paths: vec!["out.json".to_owned()],
             },
@@ -3324,6 +3329,51 @@ mod tests {
                 output_payload_hash: Some("sync-output-hash".to_owned()),
             },
         }
+    }
+
+    fn attach_fixture_diarization(report: &mut RunReport) {
+        report.request.diarize = true;
+        report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "speaker_a".to_owned(),
+                start_ms: 0,
+                end_ms: 2_000,
+                confidence: 0.92,
+                policy: KnownSpeakerPolicy::SoftEnrollment,
+                provenance: Some("synthetic_sync_fixture".to_owned()),
+            }],
+            ..DiarizationRequest::default()
+        });
+        report.result.diarization = Some(DiarizationReport {
+            implementation: "native-acoustic-v1".to_owned(),
+            contract_version: "acoustic-diarization-v1".to_owned(),
+            feature_schema: "acoustic-feature-v1".to_owned(),
+            normalized_input_sha256: "cccccccccccccccccccccccccccccccc".to_owned(),
+            hint_document_sha256: Some("dddddddddddddddddddddddddddddddd".to_owned()),
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 2_000,
+                speaker_ref: Some("speaker_a".to_owned()),
+                speaker_confidence: Some(0.9),
+                change_confidence: Some(0.82),
+                overlap_suspected: false,
+                hard_hint_attributed: false,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "speaker_a".to_owned(),
+                frame_count: 180,
+                voiced_duration_ms: 1_800,
+                reliability: 0.88,
+                channel_profile_count: 1,
+                anchored: true,
+                soft_hint_contradiction: Some(0.04),
+            }],
+            detected_speakers: 1,
+            constraints_satisfied: true,
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: vec!["synthetic sync fixture".to_owned()],
+        });
     }
 
     fn test_cursor(ts: &str, run_id: Option<&str>) -> SyncCursor {
@@ -3410,6 +3460,75 @@ mod tests {
         assert_eq!(
             details.replay.output_payload_hash.as_deref(),
             Some("sync-output-hash")
+        );
+    }
+
+    #[test]
+    fn diarization_round_trip_rebuilds_normalized_index() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut report = fixture_report("run-diarization-sync", &source_db);
+        attach_fixture_diarization(&mut report);
+        source_store
+            .persist_report(&report)
+            .expect("diarization report should persist");
+
+        export(&source_db, &export_dir, &state_root).expect("export");
+        import(&target_db, &export_dir, &state_root, ConflictPolicy::Reject).expect("import");
+
+        let target =
+            BlockingConnection::open(target_db.display().to_string()).expect("target connection");
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            let rows = target
+                .query(&format!("SELECT COUNT(*) FROM {table};"))
+                .expect("normalized index count");
+            assert_eq!(
+                value_to_string_sqlite(rows[0].get(0)),
+                "1",
+                "{table} should be rebuilt from canonical runs JSONL"
+            );
+        }
+
+        let canonical = target
+            .query(
+                "SELECT request_json, result_json FROM runs \
+                 WHERE id = 'run-diarization-sync';",
+            )
+            .expect("canonical run row");
+        let request: TranscribeRequest =
+            serde_json::from_str(&value_to_string_sqlite(canonical[0].get(0)))
+                .expect("typed request should survive JSONL");
+        let result: TranscriptionResult =
+            serde_json::from_str(&value_to_string_sqlite(canonical[0].get(1)))
+                .expect("typed result should survive JSONL");
+        assert_eq!(
+            request
+                .backend_params
+                .acoustic_diarization
+                .as_ref()
+                .map(|request| request.engine),
+            Some(DiarizationEngine::Acoustic)
+        );
+        assert_eq!(
+            result
+                .diarization
+                .as_ref()
+                .map(|report| report.implementation.as_str()),
+            Some("native-acoustic-v1")
+        );
+        assert!(
+            !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
+            "canonical JSONL payload must not acquire reusable biometric vectors"
         );
     }
 

@@ -15,11 +15,23 @@ Tables:
 - `runs`
 - `segments`
 - `events`
+- derived native-diarization indexes:
+  - `diarization_reports`
+  - `diarization_turns`
+  - `speaker_hints`
+  - `speaker_profile_summaries`
 
 JSONL channels:
 - `runs.jsonl`
 - `segments.jsonl`
 - `events.jsonl`
+
+The four diarization tables are deterministic indexes, not independent JSONL
+channels. Their canonical typed request/result state lives in
+`runs.request_json` and `runs.result_json`, and therefore in `runs.jsonl`.
+Import rebuilds the indexes from that canonical state after the runs,
+segments, and events transaction commits. This avoids a second source of truth
+and keeps old snapshots forward-migratable.
 
 ## One-Way Operations Only
 
@@ -69,7 +81,9 @@ Rules:
      - conflicting child rows are replaced via delete+insert,
      - stale child rows not present in import are pruned.
 7. Commit transaction.
-8. Release lock.
+8. Rebuild derived native-diarization indexes from canonical run JSON in a
+   rollback-safe savepoint.
+9. Release lock.
 
 ## Conflict Strategy
 
@@ -92,6 +106,20 @@ Integrity checks:
 - per-file SHA-256 checksum in manifest.
 - row-count reconciliation.
 - referential checks: `segments.run_id` and `events.run_id` must reference existing `runs.id`.
+- typed native-diarization request/result decoding during derived-index rebuild.
+
+## Diarization Privacy Boundary
+
+The persisted native-diarization contract includes speaker turns, opaque
+within-run speaker references, hint provenance, fallback/diagnostic metadata,
+and aggregate profile-quality summaries. It does not persist normalized PCM,
+spectra, cepstra, pitch tracks, embeddings, covariance matrices, or reusable
+speaker-profile vectors.
+
+`persist_profiles` is default-off and is recorded as an explicit opt-in bit.
+The v1 acoustic implementation still does not serialize reusable biometric
+vectors when that bit is true; adding such a record requires a separately
+versioned, encrypted, retention-bounded design and new privacy review.
 
 ## Versioning
 

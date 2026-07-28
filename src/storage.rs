@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, ReplayEnvelope, RunEvent, RunReport, RunSummary, StoredRunDetails,
-    TranscriptionResult,
+    TranscribeRequest, TranscriptionResult,
 };
 
 /// Drive `future` to completion on this thread's runtime.
@@ -558,7 +558,7 @@ impl RunStore {
     }
 
     /// Current schema version. Bump when adding migrations.
-    pub const SCHEMA_VERSION: u32 = 3;
+    pub const SCHEMA_VERSION: u32 = 4;
 
     fn initialize_schema(&self) -> FwResult<()> {
         // Enable WAL mode for concurrent read/write support.
@@ -603,6 +603,59 @@ CREATE TABLE IF NOT EXISTS events (
     message TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS diarization_reports (
+    run_id TEXT PRIMARY KEY,
+    implementation TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    feature_schema TEXT NOT NULL,
+    normalized_input_sha256 TEXT NOT NULL,
+    hint_document_sha256 TEXT,
+    detected_speakers INTEGER NOT NULL,
+    constraints_satisfied INTEGER NOT NULL,
+    fallback_status TEXT NOT NULL,
+    diagnostics_json TEXT NOT NULL,
+    profile_persistence_opt_in INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS diarization_turns (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    speaker_ref TEXT,
+    speaker_confidence REAL,
+    change_confidence REAL,
+    overlap_suspected INTEGER NOT NULL,
+    hard_hint_attributed INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS speaker_hints (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    policy TEXT NOT NULL,
+    provenance TEXT,
+    PRIMARY KEY (run_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    frame_count INTEGER NOT NULL,
+    voiced_duration_ms INTEGER NOT NULL,
+    reliability REAL NOT NULL,
+    channel_profile_count INTEGER NOT NULL,
+    anchored INTEGER NOT NULL,
+    soft_hint_contradiction REAL,
+    profile_persistence_opt_in INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
 );
 
 CREATE TABLE IF NOT EXISTS _meta (
@@ -738,10 +791,146 @@ CREATE TABLE IF NOT EXISTS _meta (
                     .map_err(|error| FwError::Storage(error.to_string()))?;
                 Ok(())
             }
+            4 => self.migrate_diarization_schema_v4(),
             _ => Err(FwError::Storage(format!(
                 "unknown migration version: {version}"
             ))),
         }
+    }
+
+    fn migrate_diarization_schema_v4(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_migrate_diarization_v4";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let result = (|| {
+            self.connection
+                .execute(
+                    r#"
+CREATE TABLE IF NOT EXISTS diarization_reports (
+    run_id TEXT PRIMARY KEY,
+    implementation TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    feature_schema TEXT NOT NULL,
+    normalized_input_sha256 TEXT NOT NULL,
+    hint_document_sha256 TEXT,
+    detected_speakers INTEGER NOT NULL,
+    constraints_satisfied INTEGER NOT NULL,
+    fallback_status TEXT NOT NULL,
+    diagnostics_json TEXT NOT NULL,
+    profile_persistence_opt_in INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS diarization_turns (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    speaker_ref TEXT,
+    speaker_confidence REAL,
+    change_confidence REAL,
+    overlap_suspected INTEGER NOT NULL,
+    hard_hint_attributed INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
+);
+CREATE TABLE IF NOT EXISTS speaker_hints (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    policy TEXT NOT NULL,
+    provenance TEXT,
+    PRIMARY KEY (run_id, idx)
+);
+CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
+    run_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    speaker_ref TEXT NOT NULL,
+    frame_count INTEGER NOT NULL,
+    voiced_duration_ms INTEGER NOT NULL,
+    reliability REAL NOT NULL,
+    channel_profile_count INTEGER NOT NULL,
+    anchored INTEGER NOT NULL,
+    soft_hint_contradiction REAL,
+    profile_persistence_opt_in INTEGER NOT NULL,
+    PRIMARY KEY (run_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_diarization_turns_run_id
+    ON diarization_turns(run_id);
+CREATE INDEX IF NOT EXISTS idx_speaker_hints_run_id
+    ON speaker_hints(run_id);
+CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
+    ON speaker_profile_summaries(run_id);
+"#,
+                )
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+
+            self.rebuild_diarization_index_inner()
+        })();
+
+        match result {
+            Ok(()) => {
+                self.connection
+                    .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn rebuild_diarization_index(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_rebuild_diarization_index";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        match self.rebuild_diarization_index_inner() {
+            Ok(()) => {
+                self.connection
+                    .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    fn rebuild_diarization_index_inner(&self) -> FwResult<()> {
+        let rows = self
+            .connection
+            .query("SELECT id, request_json, result_json FROM runs ORDER BY id ASC;")
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        for row in rows {
+            let run_id = value_to_string(row.get(0));
+            let request_json = value_to_string(row.get(1));
+            let result_json = value_to_string(row.get(2));
+            let request: TranscribeRequest =
+                serde_json::from_str(&request_json).map_err(|error| {
+                    FwError::Storage(format!(
+                        "cannot rebuild diarization request for run {run_id}: {error}"
+                    ))
+                })?;
+            let result: TranscriptionResult =
+                serde_json::from_str(&result_json).map_err(|error| {
+                    FwError::Storage(format!(
+                        "cannot rebuild diarization result for run {run_id}: {error}"
+                    ))
+                })?;
+            self.replace_diarization_records(
+                &run_id,
+                &request,
+                result.diarization.as_ref(),
+                persist_skip_stmt_sp_enabled(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Add a column to a table if it doesn't already exist.
@@ -1267,6 +1456,112 @@ CREATE TABLE IF NOT EXISTS _meta (
             .map_err(|error| FwError::Storage(error.to_string()))
     }
 
+    fn replace_diarization_records(
+        &self,
+        run_id: &str,
+        request: &TranscribeRequest,
+        report: Option<&crate::model::DiarizationReport>,
+        skip_sp: bool,
+    ) -> FwResult<()> {
+        let run_id_value = text_value(run_id.to_owned());
+        for table in [
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+            "diarization_reports",
+        ] {
+            self.persist_insert(
+                skip_sp,
+                &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                std::slice::from_ref(&run_id_value),
+            )?;
+        }
+
+        let diarization_request = request.backend_params.acoustic_diarization.as_ref();
+        let profile_persistence_opt_in =
+            diarization_request.is_some_and(|request| request.persist_profiles);
+        if let Some(diarization_request) = diarization_request {
+            for (index, hint) in diarization_request.known_intervals.iter().enumerate() {
+                self.persist_insert(
+                    skip_sp,
+                    "INSERT INTO speaker_hints (run_id, idx, speaker_ref, start_ms, end_ms, confidence, policy, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    &[
+                        run_id_value.clone(),
+                        storage_index(index, "speaker hint index")?,
+                        text_value(hint.speaker_ref.clone()),
+                        storage_u64(hint.start_ms, "speaker hint start_ms")?,
+                        storage_u64(hint.end_ms, "speaker hint end_ms")?,
+                        SqliteValue::Float(hint.confidence),
+                        text_value(serde_enum_name(&hint.policy)?),
+                        optional_text(hint.provenance.as_deref()),
+                    ],
+                )?;
+            }
+        }
+
+        let Some(report) = report else {
+            return Ok(());
+        };
+        self.persist_insert(
+            skip_sp,
+            "INSERT INTO diarization_reports (run_id, implementation, contract_version, feature_schema, normalized_input_sha256, hint_document_sha256, detected_speakers, constraints_satisfied, fallback_status, diagnostics_json, profile_persistence_opt_in) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            &[
+                run_id_value.clone(),
+                text_value(report.implementation.clone()),
+                text_value(report.contract_version.clone()),
+                text_value(report.feature_schema.clone()),
+                text_value(report.normalized_input_sha256.clone()),
+                optional_text(report.hint_document_sha256.as_deref()),
+                SqliteValue::Integer(i64::from(report.detected_speakers)),
+                SqliteValue::Integer(if report.constraints_satisfied { 1 } else { 0 }),
+                text_value(serde_enum_name(&report.fallback_status)?),
+                text_value(serde_json::to_string(&report.diagnostics)?),
+                SqliteValue::Integer(if profile_persistence_opt_in { 1 } else { 0 }),
+            ],
+        )?;
+
+        for (index, turn) in report.turns.iter().enumerate() {
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO diarization_turns (run_id, idx, start_ms, end_ms, speaker_ref, speaker_confidence, change_confidence, overlap_suspected, hard_hint_attributed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                &[
+                    run_id_value.clone(),
+                    storage_index(index, "diarization turn index")?,
+                    storage_u64(turn.start_ms, "diarization turn start_ms")?,
+                    storage_u64(turn.end_ms, "diarization turn end_ms")?,
+                    optional_text(turn.speaker_ref.as_deref()),
+                    optional_float(turn.speaker_confidence),
+                    optional_float(turn.change_confidence),
+                    SqliteValue::Integer(if turn.overlap_suspected { 1 } else { 0 }),
+                    SqliteValue::Integer(if turn.hard_hint_attributed { 1 } else { 0 }),
+                ],
+            )?;
+        }
+
+        for (index, profile) in report.profiles.iter().enumerate() {
+            self.persist_insert(
+                skip_sp,
+                "INSERT INTO speaker_profile_summaries (run_id, idx, speaker_ref, frame_count, voiced_duration_ms, reliability, channel_profile_count, anchored, soft_hint_contradiction, profile_persistence_opt_in) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                &[
+                    run_id_value.clone(),
+                    storage_index(index, "speaker profile summary index")?,
+                    text_value(profile.speaker_ref.clone()),
+                    storage_u64(profile.frame_count, "speaker profile frame_count")?,
+                    storage_u64(
+                        profile.voiced_duration_ms,
+                        "speaker profile voiced_duration_ms",
+                    )?,
+                    SqliteValue::Float(profile.reliability),
+                    SqliteValue::Integer(i64::from(profile.channel_profile_count)),
+                    SqliteValue::Integer(if profile.anchored { 1 } else { 0 }),
+                    optional_float(profile.soft_hint_contradiction),
+                    SqliteValue::Integer(if profile_persistence_opt_in { 1 } else { 0 }),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn persist_report_inner(
         &self,
         report: &RunReport,
@@ -1324,6 +1619,16 @@ CREATE TABLE IF NOT EXISTS _meta (
                 ],
             )?;
         }
+
+        // The typed request/result JSON remains the canonical recovery payload.
+        // These normalized rows make turns and privacy-safe summaries directly
+        // queryable without persisting raw acoustic vectors.
+        self.replace_diarization_records(
+            &report.run_id,
+            &report.request,
+            report.result.diarization.as_ref(),
+            skip_sp,
+        )?;
 
         // Checkpoint before segments batch.
         if let Some(tok) = token {
@@ -1726,6 +2031,25 @@ fn optional_float(value: Option<f64>) -> SqliteValue {
     }
 }
 
+fn storage_u64(value: u64, field: &str) -> FwResult<SqliteValue> {
+    i64::try_from(value)
+        .map(SqliteValue::Integer)
+        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
+}
+
+fn storage_index(value: usize, field: &str) -> FwResult<SqliteValue> {
+    i64::try_from(value)
+        .map(SqliteValue::Integer)
+        .map_err(|_| FwError::Storage(format!("{field} exceeds SQLite INTEGER range")))
+}
+
+fn serde_enum_name<T: serde::Serialize>(value: &T) -> FwResult<String> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| FwError::Storage("expected a string-valued serialized enum".to_owned()))
+}
+
 fn value_to_string(value: Option<&SqliteValue>) -> String {
     match value {
         Some(SqliteValue::Text(text)) => text.to_string(),
@@ -1828,8 +2152,10 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use crate::model::{
-        AccelerationBackend, AccelerationReport, BackendKind, BackendParams, InputSource, RunEvent,
-        RunReport, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+        AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
+        DiarizationFallbackStatus, DiarizationReport, DiarizationRequest, DiarizationTurn,
+        InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent, RunReport,
+        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
 
     use super::{BlockingConnection, RunStore, value_to_string};
@@ -1880,6 +2206,7 @@ mod tests {
                     post_mass: Some(1.0),
                     notes: vec!["normalized with frankentorch".to_owned()],
                 }),
+                diarization: None,
                 raw_output: json!({"ok": true}),
                 artifact_paths: vec!["out.json".to_owned()],
             },
@@ -1982,6 +2309,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -1989,6 +2317,150 @@ mod tests {
             warnings: vec![],
             evidence: vec![],
             replay: crate::model::ReplayEnvelope::default(),
+        }
+    }
+
+    fn attach_synthetic_diarization(report: &mut RunReport, persist_profiles: bool) {
+        report.request.diarize = true;
+        report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "speaker_a".to_owned(),
+                start_ms: 0,
+                end_ms: 1_000,
+                confidence: 0.95,
+                policy: KnownSpeakerPolicy::HardMustLink,
+                provenance: Some("synthetic_context_fixture".to_owned()),
+            }],
+            persist_profiles,
+            ..DiarizationRequest::default()
+        });
+        report.result.diarization = Some(DiarizationReport {
+            implementation: "native-acoustic-v1".to_owned(),
+            contract_version: "acoustic-diarization-v1".to_owned(),
+            feature_schema: "acoustic-feature-v1".to_owned(),
+            normalized_input_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            hint_document_sha256: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 1_000,
+                speaker_ref: Some("speaker_a".to_owned()),
+                speaker_confidence: Some(0.96),
+                change_confidence: Some(0.91),
+                overlap_suspected: false,
+                hard_hint_attributed: true,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "speaker_a".to_owned(),
+                frame_count: 87,
+                voiced_duration_ms: 870,
+                reliability: 0.94,
+                channel_profile_count: 1,
+                anchored: true,
+                soft_hint_contradiction: None,
+            }],
+            detected_speakers: 1,
+            constraints_satisfied: true,
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: vec!["synthetic persistence fixture".to_owned()],
+        });
+    }
+
+    fn table_row_count(store: &RunStore, table: &str) -> usize {
+        let rows = store
+            .connection
+            .query(&format!("SELECT COUNT(*) FROM {table};"))
+            .expect("row count query");
+        value_to_string(rows[0].get(0))
+            .parse()
+            .expect("row count should be an integer")
+    }
+
+    #[test]
+    fn diarization_index_is_privacy_safe_and_rebuildable() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("diarization.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+
+        let mut default_private = minimal_report("run-diarization-default", &db_path);
+        attach_synthetic_diarization(&mut default_private, false);
+        store
+            .persist_report(&default_private)
+            .expect("default-private report should persist");
+
+        let mut opt_in = minimal_report("run-diarization-opt-in", &db_path);
+        attach_synthetic_diarization(&mut opt_in, true);
+        store
+            .persist_report(&opt_in)
+            .expect("opt-in report should persist");
+
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            assert_eq!(table_row_count(&store, table), 2, "{table} row count");
+            let columns = store
+                .connection
+                .query(&format!("PRAGMA table_info({table});"))
+                .expect("table shape");
+            for row in columns {
+                let column = value_to_string(row.get(1)).to_ascii_lowercase();
+                assert!(
+                    ![
+                        "audio",
+                        "pcm",
+                        "spectrum",
+                        "cepstr",
+                        "pitch",
+                        "f0",
+                        "centroid",
+                        "covariance",
+                        "embedding",
+                        "vector",
+                        "voiceprint",
+                    ]
+                    .iter()
+                    .any(|forbidden| column.contains(forbidden)),
+                    "privacy-sensitive column `{column}` must not exist in {table}",
+                );
+            }
+        }
+
+        let report_flags = store
+            .connection
+            .query(
+                "SELECT profile_persistence_opt_in FROM diarization_reports ORDER BY run_id ASC;",
+            )
+            .expect("report flags");
+        assert_eq!(value_to_string(report_flags[0].get(0)), "0");
+        assert_eq!(value_to_string(report_flags[1].get(0)), "1");
+
+        let profile_flags = store
+            .connection
+            .query(
+                "SELECT profile_persistence_opt_in FROM speaker_profile_summaries \
+                 ORDER BY run_id ASC;",
+            )
+            .expect("profile flags");
+        assert_eq!(value_to_string(profile_flags[0].get(0)), "0");
+        assert_eq!(value_to_string(profile_flags[1].get(0)), "1");
+
+        store
+            .rebuild_diarization_index()
+            .expect("rebuild should be deterministic");
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            assert_eq!(
+                table_row_count(&store, table),
+                2,
+                "{table} row count after rebuild"
+            );
         }
     }
 
@@ -4391,7 +4863,7 @@ mod tests {
         let db_path = dir.path().join("overwrite_ver.sqlite3");
         let store = RunStore::open(&db_path).expect("open");
 
-        // After open, version is SCHEMA_VERSION (currently 2).
+        // After open, version is the current SCHEMA_VERSION.
         let v1 = store.current_schema_version().expect("v1");
         assert_eq!(v1, RunStore::SCHEMA_VERSION);
 
@@ -4777,6 +5249,7 @@ mod tests {
                         "calibration applied".to_owned(),
                     ],
                 }),
+                diarization: None,
                 raw_output: json!({"model": "large-v3", "ok": true}),
                 artifact_paths: vec!["/tmp/fw/out.json".to_owned(), "/tmp/fw/out.srt".to_owned()],
             },
@@ -5911,10 +6384,14 @@ mod tests {
             .expect("set version 2");
         drop(conn);
 
-        // Open with RunStore, which should migrate from v2 to v3.
+        // Open with RunStore, which should migrate from v2 to the latest schema.
         let store = RunStore::open(&db_path).expect("open should migrate");
         let version = store.current_schema_version().expect("version");
-        assert_eq!(version, 3, "should have migrated to v3");
+        assert_eq!(
+            version,
+            RunStore::SCHEMA_VERSION,
+            "should have migrated to the latest schema"
+        );
 
         // Verify indexes exist.
         let indexes = store
@@ -5936,11 +6413,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_3() {
+    fn schema_version_is_current() {
         assert_eq!(
             RunStore::SCHEMA_VERSION,
-            3,
-            "SCHEMA_VERSION should be 3 after bd-3i1.5"
+            4,
+            "SCHEMA_VERSION should include the native diarization index"
         );
     }
 
