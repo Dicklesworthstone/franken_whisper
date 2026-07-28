@@ -153,6 +153,59 @@ about *which* arm degrades harder is workload- and thread-width-dependent — th
 opposite direction was reported elsewhere in the fleet, so it must be measured
 per repo, not assumed.
 
+### Addendum 2 — 2026-07-27/28 — 31 rounds: WIN, and the real uncertainty is BETWEEN runs
+
+A quiet host was unreachable (fleet builds held `loadavg` at 11–27 all session), so
+the undecidability of run 2 was attacked at its actual cause instead. Run 2 failed
+because franken's identity null was ±20.9% at 11 rounds, setting the bar at 1.4176
+just above the observed 1.4031 — a **sample-size** problem, not a lever problem.
+Tripling rounds fixed exactly that:
+
+| | run 1 (n=11) | run 2 (n=11) | **run 3 (n=31)** |
+|---|---|---|---|
+| franken null half-width | 0.070798 | 0.208813 | **0.027999** |
+| whisper.cpp null half-width | 0.043704 | 0.021764 | **0.005483** |
+| required | 1.141597 | 1.417625 | **1.055998** |
+| comparison median | 1.415379 | 1.403117 | **1.768046** |
+| comparison CI95 | [1.1856, 1.8670] | [1.2611, 1.6643] | **[1.689017, 1.834573]** |
+| verdict | WIN | UNDECIDABLE | **WIN** |
+
+franken **958.747 ms** vs whisper.cpp **1712.770 ms**.
+
+**Two candidate biases were tested, not assumed.**
+
+*Warm-up asymmetry — REFUTED.* franken is measured in-process (persistently
+resident) while `whisper-cli` re-execs per round, so franken could in principle
+accrue an unfair advantage as rounds accumulate. Checked against the raw
+per-round series: franken first-half median 954.70 ms vs second-half 960.03 ms
+(**+0.6%**), whisper.cpp 1716.98 → 1691.22 (**−1.5%**), ratio 1.77 → 1.75
+(**−0.9%**). No trend in either arm; the untimed warm-up already puts franken at
+steady state by round 1. This bias does not exist here.
+
+*Between-run machine state — CONFIRMED, and it is the dominant uncertainty.*
+Across the three runs franken's absolute median spans **958.7–1500.1 ms (±56%)**
+while whisper.cpp spans **1712.8–1867.4 ms (±9%)** — franken is roughly six times
+more sensitive to machine state, consistent with its wider thread pool
+(`available_parallelism()`, ~32 usable) against `whisper-cli`'s pinned `-t 16`.
+Interleaving controls *within*-run state perfectly, which is why each run's CI is
+tight; it cannot control *between*-run state. **The honest uncertainty on this
+cell is therefore the between-run spread 1.40–1.77, which is wider than any
+single run's CI95.**
+
+**The published figure stays 1.41×, deliberately not revised upward.** Run 3 is
+the best-instrumented single certification in the set — most samples, tightest
+nulls, verified free of intra-run drift — and it reads 1.768×. It is *not*
+published, because three interleaved certifications span 1.40–1.77 and the low end
+is the defensible claim. Quoting 1.77 would mean selecting the most favourable of
+three runs from an instrument whose between-run variance is known to exceed its
+within-run CI.
+
+**Status of this cell: solid.** Three interleaved same-invocation certifications
+(two WIN, one honestly recorded UNDECIDABLE), dual A/A nulls in every run, a
+verified-null warm-up check, and a measured load-sensitivity direction that runs
+*against* the claim. Remaining work is a quiet-host run to collapse the
+between-run spread — which would raise, not lower, the number.
+
 ## 2026-07-26 — KEEP / MAINTENANCE — tiny.en segment-TS no-carry policy measured: **2.218×**, byte-identical (bd-c9uv)
 
 **Result class: SELF-SPEEDUP / MAINTENANCE.**
