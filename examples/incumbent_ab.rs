@@ -40,7 +40,9 @@
 //! Two A/A nulls run in the same invocation and the same alternating shape:
 //! franken against itself, and `whisper.cpp` against itself. A claim is
 //! decidable only when the comparison median lies outside **both** null CI95s
-//! with a 2× margin. `cv` is recorded as provenance and decides nothing.
+//! with a 2× margin, and when the comparison medians from lighter and heavier
+//! rounds differ by at most 0.1×. `cv` is recorded as provenance and decides
+//! nothing.
 //!
 //! ## Usage
 //!
@@ -58,6 +60,8 @@ use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel, transcri
 use franken_whisper::native_engine::find_model_file;
 use franken_whisper::native_engine::ggml::GgmlModel;
 use sha2::{Digest, Sha256};
+
+const MAX_LOAD_SPLIT_GAP: f64 = 0.1;
 
 /// Read a PCM16 WAV into mono f32. Mirrors `e2e_probe`'s reader.
 fn read_wav_mono16k(path: &str) -> Vec<f32> {
@@ -153,6 +157,37 @@ fn cv(values: &[f64]) -> f64 {
     let mean = values.iter().sum::<f64>() / values.len() as f64;
     let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
     var.sqrt() / mean
+}
+
+/// Split rounds at the median total arm cost and return the comparison median
+/// for the lighter and heavier halves plus their absolute gap. For an odd
+/// number of rounds, the single middle-cost round is deliberately excluded.
+fn load_split(fw_ms: &[f64], wc_ms: &[f64], compare: &[f64]) -> Option<(f64, f64, f64)> {
+    if fw_ms.len() != wc_ms.len() || fw_ms.len() != compare.len() || fw_ms.len() < 3 {
+        return None;
+    }
+
+    let mut totals: Vec<(f64, f64)> = fw_ms
+        .iter()
+        .zip(wc_ms)
+        .zip(compare)
+        .map(|((fw, wc), ratio)| (fw + wc, *ratio))
+        .collect();
+    totals.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let half = totals.len() / 2;
+    let light: Vec<f64> = totals[..half].iter().map(|(_, ratio)| *ratio).collect();
+    let heavy: Vec<f64> = totals[totals.len() - half..]
+        .iter()
+        .map(|(_, ratio)| *ratio)
+        .collect();
+    let light_median = median(&light);
+    let heavy_median = median(&heavy);
+    Some((
+        light_median,
+        heavy_median,
+        (light_median - heavy_median).abs(),
+    ))
 }
 
 /// One `whisper.cpp` run. Returns `(transcribe_ms, total_ms, load_ms, chars)`.
@@ -342,33 +377,16 @@ fn main() {
     println!("INCUMBENT_AB_RAW compare={compare:?}");
     println!("INCUMBENT_AB_RAW null_fw={fw_null:?}");
     println!("INCUMBENT_AB_RAW null_wc={wc_null:?}");
-    // Cheap built-in version of that check: split rounds at the median total
-    // round cost and report the comparison median on each side. If the two
-    // halves disagree materially, the ratio is load-dependent and the quiet-host
-    // number is the one to publish.
-    {
-        let mut totals: Vec<(f64, f64)> = fw_ms
-            .iter()
-            .zip(&wc_ms)
-            .zip(&compare)
-            .map(|((fw, wc), ratio)| (fw + wc, *ratio))
-            .collect();
-        totals.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let half = totals.len() / 2;
-        let light: Vec<f64> = totals[..half].iter().map(|(_, r)| *r).collect();
-        let heavy: Vec<f64> = totals[totals.len() - half..]
-            .iter()
-            .map(|(_, r)| *r)
-            .collect();
-        if !light.is_empty() && !heavy.is_empty() {
-            println!(
-                "INCUMBENT_AB_LOAD_SPLIT lighter_rounds_median={:.6} heavier_rounds_median={:.6} \
-                 n_each={half} note=material_gap_means_ratio_is_load_dependent",
-                median(&light),
-                median(&heavy)
-            );
-        }
-    }
+    // This is part of the verdict, not commentary: differential load
+    // sensitivity can survive order alternation and bias the cross-tool ratio.
+    let (light_median, heavy_median, load_split_gap) =
+        load_split(&fw_ms, &wc_ms, &compare).expect("odd rounds >= 3 form a load split");
+    println!(
+        "INCUMBENT_AB_LOAD_SPLIT lighter_rounds_median={light_median:.6} \
+         heavier_rounds_median={heavy_median:.6} n_each={} gap={load_split_gap:.6} \
+         max_gap={MAX_LOAD_SPLIT_GAP:.6}",
+        rounds / 2
+    );
     let (_, fw_lo, fw_hi) = report("INCUMBENT_AB_NULL_FW", &fw_null);
     let (_, wc_lo, wc_hi) = report("INCUMBENT_AB_NULL_WC", &wc_null);
     let (cmp_med, cmp_lo, cmp_hi) = report("INCUMBENT_AB_COMPARE", &compare);
@@ -377,7 +395,10 @@ fn main() {
     let fw_half = (fw_hi - 1.0).abs().max((1.0 - fw_lo).abs());
     let wc_half = (wc_hi - 1.0).abs().max((1.0 - wc_lo).abs());
     let required = 1.0 + 2.0 * fw_half.max(wc_half);
-    let verdict = if cmp_med > required && cmp_lo > 1.0 {
+    let load_split_clear = load_split_gap <= MAX_LOAD_SPLIT_GAP;
+    let verdict = if !load_split_clear {
+        "UNDECIDABLE"
+    } else if cmp_med > required && cmp_lo > 1.0 {
         "WIN"
     } else if cmp_med < 1.0 / required && cmp_hi < 1.0 {
         "LOSS"
@@ -388,6 +409,33 @@ fn main() {
         "INCUMBENT_AB_GATE method=median_vs_both_null_ci95_2x_margin \
          fw_null_half={fw_half:.6} wc_null_half={wc_half:.6} required={required:.6} \
          compare_median={cmp_med:.6} compare_ci95=[{cmp_lo:.6},{cmp_hi:.6}] \
+         load_split_gap={load_split_gap:.6} load_split_max={MAX_LOAD_SPLIT_GAP:.6} \
+         load_split_clear={load_split_clear} \
          cv_is_provenance_only=true class=vs_incumbent verdict={verdict}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_split_excludes_middle_round_and_reports_absolute_gap() {
+        let fw_ms = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let wc_ms = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let compare = [1.1, 1.2, 9.9, 1.3, 1.4];
+
+        let (light, heavy, gap) =
+            load_split(&fw_ms, &wc_ms, &compare).expect("valid equal-length inputs");
+
+        assert!((light - 1.15).abs() < f64::EPSILON);
+        assert!((heavy - 1.35).abs() < f64::EPSILON);
+        assert!((gap - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn load_split_rejects_mismatched_or_too_short_inputs() {
+        assert!(load_split(&[1.0, 2.0], &[1.0, 2.0], &[1.0, 2.0]).is_none());
+        assert!(load_split(&[1.0, 2.0, 3.0], &[1.0, 2.0], &[1.0, 2.0, 3.0]).is_none());
+    }
 }
