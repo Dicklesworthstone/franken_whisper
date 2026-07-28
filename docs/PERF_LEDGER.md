@@ -89,8 +89,62 @@ whisper.cpp 1,350 — crude counts including formatting. Native-vs-whisper.cpp W
 on the reference fixture is separately established at 0.0000.
 
 **Retry predicate.** Re-certify if the incumbent binary, the model, or the
-harness ELF sha changes, or on a quiet host to tighten the CI. Do not quote this
+harness ELF sha changes, **and re-certify on a quiet host** — see the load-sensitivity
+addendum below, which is the binding constraint on this row. Do not quote this
 cell from any harness that does not run the incumbent in the same invocation.
+
+### Addendum 2026-07-27 — load-sensitivity replication: point estimate holds, certification does NOT
+
+Interleaving cancels drift *over time*. It does **not** cancel one engine being
+more load-sensitive than the other: that bias survives alternation and silently
+scales the ratio. The concern raised against this row was that an un-interleaved
+cross-tool number is exactly the shape that flatters us, since the incumbent arm
+may degrade harder under contention. So the harness was extended to emit the raw
+per-round series plus an `INCUMBENT_AB_LOAD_SPLIT` line (rounds split at median
+total round cost), and re-run at roughly **2× the load** of the certification.
+
+| | run 1 (load ≈11) | run 2 (load 21→28) |
+|---|---|---|
+| comparison median | **1.415379** | **1.403117** |
+| comparison CI95 | [1.185640, 1.866960] | [1.261067, 1.664255] |
+| franken A/A null CI95 | [0.951042, 1.070798] | **[0.905504, 1.208813]** |
+| whisper.cpp A/A null CI95 | [0.956296, 1.040625] | [0.978236, 1.020593] |
+| required (2× worse null half) | 1.141597 | **1.417625** |
+| verdict | **WIN** | **UNDECIDABLE** |
+| franken / whisper.cpp median ms | 1500.079 / 1867.400 | 1290.862 / 1837.990 |
+
+**Run 2 is UNDECIDABLE and that is recorded as such.** franken's own identity
+null widened to ±21% under contention, lifting the bar (1.417625) just above the
+observed ratio (1.403117). The lever did not get worse; the instrument did. The
+gate refusing to certify through a noisy null is the gate working.
+
+**The bias direction is measured, and it runs against us, not for us:**
+
+```text
+INCUMBENT_AB_LOAD_SPLIT lighter_rounds_median=1.664255 heavier_rounds_median=1.261067
+```
+
+Within one invocation, lighter rounds read **1.664×** and heavier rounds
+**1.261×**. franken is the more load-sensitive arm, so contention *depresses* this
+ratio. Mechanism is consistent: franken sizes its thread pool from
+`available_parallelism()` (~32 usable here) while `whisper-cli` is pinned at its
+optimum `-t 16`, so franken absorbs proportionally more of the box's competing
+work. Corroborated across harnesses: franken degraded **+22.0%** between the
+quiet and loaded conditions against whisper.cpp's **+12.0%**.
+
+**Consequence for the published number.** The point estimate replicates closely
+across two independent runs at very different loads (1.415 / 1.403), and every
+measurement was taken under contention, so the README's **1.41×** is a floor
+rather than a flattering figure — the light-round median suggests a quiet host
+would read higher. It is *not* revised upward, because no quiet-host run exists.
+
+**Binding retry predicate.** Re-run `examples/incumbent_ab.rs` when
+`loadavg < 2` with no competing rustc, and publish that certification. Reject any
+run whose `INCUMBENT_AB_LOAD_SPLIT` halves differ by more than ~0.1× as
+load-contaminated regardless of its verdict. Note also that a fleet-wide claim
+about *which* arm degrades harder is workload- and thread-width-dependent — the
+opposite direction was reported elsewhere in the fleet, so it must be measured
+per repo, not assumed.
 
 ## 2026-07-26 — KEEP / MAINTENANCE — tiny.en segment-TS no-carry policy measured: **2.218×**, byte-identical (bd-c9uv)
 

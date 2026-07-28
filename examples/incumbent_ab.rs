@@ -232,11 +232,13 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "tests/fixtures/native/jfk.wav".to_string());
     let rounds: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(11);
-    assert!(rounds >= 3 && rounds % 2 == 1, "rounds must be odd and >= 3");
+    assert!(
+        rounds >= 3 && rounds % 2 == 1,
+        "rounds must be odd and >= 3"
+    );
 
-    let incumbent = std::env::var("FW_INCUMBENT_BIN").unwrap_or_else(|_| {
-        "legacy_whispercpp/whisper.cpp/build/bin/whisper-cli".to_string()
-    });
+    let incumbent = std::env::var("FW_INCUMBENT_BIN")
+        .unwrap_or_else(|_| "legacy_whispercpp/whisper.cpp/build/bin/whisper-cli".to_string());
     let incumbent = PathBuf::from(incumbent);
     assert!(
         incumbent.is_file(),
@@ -330,6 +332,43 @@ fn main() {
         median(&fw_ms),
         median(&wc_ms)
     );
+    // Raw per-round series. Interleaving cancels drift *over time*, but it does
+    // NOT cancel one engine being more load-sensitive than the other — that bias
+    // survives alternation and silently scales the ratio. Emitting the raw series
+    // lets a reviewer regress ratio against absolute round cost (a proxy for
+    // instantaneous load) and see whether the ratio moves with it.
+    println!("INCUMBENT_AB_RAW fw_ms={fw_ms:?}");
+    println!("INCUMBENT_AB_RAW wc_ms={wc_ms:?}");
+    println!("INCUMBENT_AB_RAW compare={compare:?}");
+    println!("INCUMBENT_AB_RAW null_fw={fw_null:?}");
+    println!("INCUMBENT_AB_RAW null_wc={wc_null:?}");
+    // Cheap built-in version of that check: split rounds at the median total
+    // round cost and report the comparison median on each side. If the two
+    // halves disagree materially, the ratio is load-dependent and the quiet-host
+    // number is the one to publish.
+    {
+        let mut totals: Vec<(f64, f64)> = fw_ms
+            .iter()
+            .zip(&wc_ms)
+            .zip(&compare)
+            .map(|((fw, wc), ratio)| (fw + wc, *ratio))
+            .collect();
+        totals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let half = totals.len() / 2;
+        let light: Vec<f64> = totals[..half].iter().map(|(_, r)| *r).collect();
+        let heavy: Vec<f64> = totals[totals.len() - half..]
+            .iter()
+            .map(|(_, r)| *r)
+            .collect();
+        if !light.is_empty() && !heavy.is_empty() {
+            println!(
+                "INCUMBENT_AB_LOAD_SPLIT lighter_rounds_median={:.6} heavier_rounds_median={:.6} \
+                 n_each={half} note=material_gap_means_ratio_is_load_dependent",
+                median(&light),
+                median(&heavy)
+            );
+        }
+    }
     let (_, fw_lo, fw_hi) = report("INCUMBENT_AB_NULL_FW", &fw_null);
     let (_, wc_lo, wc_hi) = report("INCUMBENT_AB_NULL_WC", &wc_null);
     let (cmp_med, cmp_lo, cmp_hi) = report("INCUMBENT_AB_COMPARE", &compare);
