@@ -11,6 +11,8 @@
 //!   the direct instrument for the f16-GEMV lever.
 //! - `sanitize_downmix`    — built-in decoder ingestion: sanitize + channel
 //!   average over decoded interleaved PCM.
+//! - `acoustic_diarization` — bounded Rust-native acoustic features and the
+//!   complete one-speaker pipeline at fixed synthetic durations.
 //! - `e2e_tiny_jfk`       — full `transcribe_samples` over the jfk fixture.
 //!
 //! # Model gating
@@ -58,6 +60,13 @@ use franken_whisper::native_engine::mel::{self, FRAMES_PER_CHUNK, N_SAMPLES_30S,
 use franken_whisper::native_engine::tokenizer::Tokenizer;
 use franken_whisper::native_engine::{
     Mat, Mel, MelFilterbank, NativeWhisperModel, WhisperHParams, find_model_file,
+};
+use franken_whisper::{
+    diarization::{
+        AcousticBoundaryHints, AcousticDiarizationInput, diarize_acoustic_pcm,
+        extract_acoustic_features,
+    },
+    model::{DiarizationEngine, DiarizationRequest, SpeakerConstraints},
 };
 
 // ---------------------------------------------------------------------------
@@ -389,6 +398,71 @@ fn bench_mel_30s_realistic(c: &mut Criterion) {
         });
     });
 
+    group.finish();
+}
+
+/// Hermetic performance substrate for the native acoustic diarizer.
+///
+/// These measurements intentionally make no accuracy claim: corpus DER/JER is
+/// a separate evidence gate. The duration-labelled feature benches expose
+/// scaling and RTF, while the complete pipeline bench includes streaming
+/// segmentation, enrollment, bounded clustering, smoothing, and projection.
+fn bench_acoustic_diarization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native_engine/acoustic_diarization");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(250));
+    group.measurement_time(Duration::from_secs(5));
+
+    for seconds in [10_u64, 60] {
+        let samples = synthetic_audio(SAMPLE_RATE * seconds as usize, 0xd1a4_1200 ^ seconds);
+        group.throughput(criterion::Throughput::Elements(samples.len() as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::new("features", format!("{seconds}s")),
+            &samples,
+            |b, audio| {
+                b.iter(|| {
+                    let summary = extract_acoustic_features(black_box(audio), || false, |_| Ok(()))
+                        .expect("acoustic feature extraction");
+                    black_box(summary)
+                });
+            },
+        );
+    }
+
+    let seconds = 10_u64;
+    let samples = synthetic_audio(SAMPLE_RATE * seconds as usize, 0xd1a4_1200);
+    let request = DiarizationRequest {
+        engine: DiarizationEngine::Acoustic,
+        max_prototypes: 64,
+        ..DiarizationRequest::default()
+    };
+    let constraints = SpeakerConstraints {
+        num_speakers: Some(1),
+        ..SpeakerConstraints::default()
+    };
+    let boundaries = AcousticBoundaryHints {
+        speech_regions_ms: vec![(0, seconds * 1_000)],
+        ..AcousticBoundaryHints::default()
+    };
+    group.throughput(criterion::Throughput::Elements(samples.len() as u64));
+    group.bench_function("pipeline_10s_one_speaker", |b| {
+        b.iter(|| {
+            let output = diarize_acoustic_pcm(
+                AcousticDiarizationInput {
+                    samples: black_box(&samples),
+                    normalized_input_sha256: "synthetic-benchmark-input",
+                    segments: &[],
+                    word_aligned: false,
+                    request: black_box(&request),
+                    constraints: Some(black_box(&constraints)),
+                    boundary_hints: black_box(&boundaries),
+                },
+                || false,
+            )
+            .expect("native acoustic diarization");
+            black_box(output)
+        });
+    });
     group.finish();
 }
 
@@ -1687,9 +1761,7 @@ fn shared_parent_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
     } else {
         start_direct
             .or_else(|| {
-                timestamp.and_then(|timestamp| {
-                    timestamp.get(0).or_else(|| timestamp.get("0"))
-                })
+                timestamp.and_then(|timestamp| timestamp.get(0).or_else(|| timestamp.get("0")))
             })
             .or_else(|| timestamp.and_then(|timestamp| timestamp.get("start")))
             .and_then(timestamp_number)
@@ -1699,9 +1771,7 @@ fn shared_parent_timestamp_pair(node: &Value) -> (Option<f64>, Option<f64>) {
     } else {
         end_direct
             .or_else(|| {
-                timestamp.and_then(|timestamp| {
-                    timestamp.get(1).or_else(|| timestamp.get("1"))
-                })
+                timestamp.and_then(|timestamp| timestamp.get(1).or_else(|| timestamp.get("1")))
             })
             .or_else(|| timestamp.and_then(|timestamp| timestamp.get("end")))
             .and_then(timestamp_number)
@@ -1934,6 +2004,7 @@ criterion_group!(
     benches,
     bench_mel_30s,
     bench_mel_30s_realistic,
+    bench_acoustic_diarization,
     bench_model_residency_tiny,
     bench_chunk_frames,
     bench_window_to_time_major,

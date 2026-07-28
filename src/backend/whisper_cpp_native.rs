@@ -44,7 +44,8 @@ use serde_json::{Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, TranscribeRequest, TranscriptionResult, TranscriptionSegment, WordTimestampParams,
+    BackendKind, DiarizationEngine, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+    WordTimestampParams,
 };
 use crate::native_engine::dtw::WordTiming;
 use crate::native_engine::{self, NativeWhisperModel, WhisperHParams, decode};
@@ -442,7 +443,11 @@ fn decode_params(
         // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
         suppress_nst: request.backend_params.suppress_nst,
         // Max carried context (whisper `--max-context`); 0 disables prompt carry.
-        max_context: request.backend_params.decoding.as_ref().and_then(|d| d.max_context),
+        max_context: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         // No request field maps to whisper's text-context cap today; use the
@@ -524,7 +529,10 @@ pub fn run(
     // (a word/maxlen split or `split_on_word`) — the engine then records
     // cross-attention and aligns each word to audio frames (bd-rjsx).
     let word_mode = word_timestamp_mode(request.backend_params.word_timestamps.as_ref());
-    let want_words = word_mode != WordTimestampMode::None || request.backend_params.split_on_word;
+    let native_acoustic_diarization = native_acoustic_diarization_requested(request);
+    let want_words = word_mode != WordTimestampMode::None
+        || request.backend_params.split_on_word
+        || native_acoustic_diarization;
     // DTW is only meaningful when we keep per-segment timestamps.
     let want_dtw = want_words && !request.backend_params.no_timestamps;
 
@@ -581,9 +589,24 @@ pub fn run(
         language,
         segments,
         acceleration: None,
+        diarization: None,
         raw_output,
         artifact_paths: Vec::new(),
     })
+}
+
+fn native_acoustic_diarization_requested(request: &TranscribeRequest) -> bool {
+    request.diarize
+        && request
+            .backend_params
+            .acoustic_diarization
+            .as_ref()
+            .is_none_or(|config| {
+                matches!(
+                    config.engine,
+                    DiarizationEngine::Auto | DiarizationEngine::Acoustic
+                )
+            })
 }
 
 /// Streaming entry point.
@@ -830,11 +853,11 @@ fn group_word_segments_by_len(
         }
         current_text.push_str(word);
         current_end = segment.end_sec;
-        if let Some(conf) = segment.confidence {
-            if conf.is_finite() {
-                confidence_sum += conf;
-                confidence_count += 1;
-            }
+        if let Some(conf) = segment.confidence
+            && conf.is_finite()
+        {
+            confidence_sum += conf;
+            confidence_count += 1;
         }
     }
 
@@ -959,6 +982,7 @@ fn silence_result(
         language: request.language.clone(),
         segments: Vec::new(),
         acceleration: None,
+        diarization: None,
         raw_output: json!({
             "engine": "whisper.cpp-native",
             "schema_version": SCHEMA_VERSION,
@@ -983,8 +1007,8 @@ mod tests {
 
     use crate::backend::Engine;
     use crate::model::{
-        BackendKind, BackendParams, InputSource, TranscribeRequest, TranscriptionSegment,
-        WordTimestampParams,
+        BackendKind, BackendParams, DiarizationEngine, DiarizationRequest, InputSource,
+        TranscribeRequest, TranscriptionSegment, WordTimestampParams,
     };
     use crate::orchestrator::CancellationToken;
 
@@ -1008,10 +1032,39 @@ mod tests {
     }
 
     #[test]
+    fn native_acoustic_diarization_forces_word_alignment_capture() {
+        let mut request = native_request();
+        assert!(!native_acoustic_diarization_requested(&request));
+
+        request.diarize = true;
+        assert!(
+            native_acoustic_diarization_requested(&request),
+            "absent typed config defaults to native acoustic diarization"
+        );
+
+        request.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            ..DiarizationRequest::default()
+        });
+        assert!(native_acoustic_diarization_requested(&request));
+
+        request
+            .backend_params
+            .acoustic_diarization
+            .as_mut()
+            .expect("typed config")
+            .engine = DiarizationEngine::External;
+        assert!(!native_acoustic_diarization_requested(&request));
+    }
+
+    #[test]
     fn decode_params_maps_initial_prompt_from_request() {
         let mut request = native_request();
         // No prompt → the engine gets no initial prompt.
-        assert_eq!(decode_params(&request, false, "tiny.en").initial_prompt, None);
+        assert_eq!(
+            decode_params(&request, false, "tiny.en").initial_prompt,
+            None
+        );
         // A request prompt (whisper `--prompt`) flows through to the engine's
         // initial_prompt field, which the decoder tokenizes and seeds.
         request.backend_params.prompt = Some("medical terminology".to_owned());
@@ -1023,7 +1076,10 @@ mod tests {
         );
         // An empty prompt is treated as no prompt (byte-identical default).
         request.backend_params.prompt = Some(String::new());
-        assert_eq!(decode_params(&request, false, "tiny.en").initial_prompt, None);
+        assert_eq!(
+            decode_params(&request, false, "tiny.en").initial_prompt,
+            None
+        );
     }
 
     #[test]
@@ -1037,10 +1093,7 @@ mod tests {
             beam_size: Some(5),
             ..DecodingParams::default()
         });
-        assert_eq!(
-            decode_params(&request, false, "tiny.en").beam_size,
-            Some(5),
-        );
+        assert_eq!(decode_params(&request, false, "tiny.en").beam_size, Some(5),);
     }
 
     #[test]
@@ -1064,7 +1117,10 @@ mod tests {
             max_context: Some(0),
             ..DecodingParams::default()
         });
-        assert_eq!(decode_params(&request, false, "tiny.en").max_context, Some(0));
+        assert_eq!(
+            decode_params(&request, false, "tiny.en").max_context,
+            Some(0)
+        );
     }
 
     /// A real-shaped engine segment (timed, with text), standing in for what

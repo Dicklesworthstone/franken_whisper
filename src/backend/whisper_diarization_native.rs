@@ -22,13 +22,14 @@
 //!
 //! ## Diarizer honesty — NOT a neural speaker encoder
 //!
-//! The diarization stage is an **acoustic-feature/temporal heuristic**: it
-//! clusters segments on temporal position, pacing, turn-taking gaps, and lexical
-//! features. It does **not** run a neural speaker encoder (ECAPA/TitaNet) and
-//! does not extract per-speaker acoustic embeddings from the waveform. The
-//! `raw_output` states this plainly (`"diarizer": "text-temporal-heuristic"` with
-//! a `"diarizer_note"` spelling out the limitation); the neural ECAPA upgrade is
-//! tracked in bd-ohex. Nothing here implies neural diarization.
+//! The diarization stage is a legacy **text/temporal heuristic**: it clusters
+//! segments on temporal position, pacing, turn-taking gaps, and lexical
+//! features. It does **not** extract acoustic speaker evidence from the waveform
+//! and does not run a neural speaker encoder (ECAPA/TitaNet). Its labels are
+//! explicitly rejected by the orchestrator's external-evidence gate, so they
+//! cannot be promoted as acoustic or externally verified diarization. New code
+//! uses [`crate::diarization`] for Rust-native waveform analysis; the neural
+//! ECAPA upgrade remains tracked in bd-ohex.
 //!
 //! ## Model resolution, silence pre-gate, availability
 //!
@@ -65,8 +66,8 @@ const DIARIZER_TAG: &str = "text-temporal-heuristic";
 
 /// Honest one-line statement of the diarizer's quality limitation, surfaced in
 /// `raw_output` so no consumer mistakes it for neural diarization.
-const DIARIZER_NOTE: &str = "acoustic-feature clustering without neural speaker encoder; \
-     ECAPA upgrade tracked in bd-ohex";
+const DIARIZER_NOTE: &str = "legacy text/temporal heuristic without waveform speaker evidence; \
+     excluded from acoustic and external evidence gates";
 
 /// Honestly report whether the native whisper-diarization engine can run.
 ///
@@ -135,7 +136,11 @@ fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
         // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
         suppress_nst: request.backend_params.suppress_nst,
         // Max carried context (whisper `--max-context`); 0 disables prompt carry.
-        max_context: request.backend_params.decoding.as_ref().and_then(|d| d.max_context),
+        max_context: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads,
         max_text_ctx: None,
@@ -275,6 +280,7 @@ pub fn run(
         language,
         segments,
         acceleration: None,
+        diarization: None,
         raw_output,
         artifact_paths: Vec::new(),
     })
@@ -385,6 +391,7 @@ fn silence_result(
         language: request.language.clone(),
         segments: Vec::new(),
         acceleration: None,
+        diarization: None,
         raw_output: json!({
             "engine": "whisper-diarization-native",
             "schema_version": SCHEMA_VERSION,

@@ -67,6 +67,324 @@ pub struct DiarizationConfig {
     pub batch_size: Option<u32>,
 }
 
+/// Speaker-diarization implementation selected by a library or CLI request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationEngine {
+    /// Select the best admitted implementation, preferring the native acoustic
+    /// engine when its input and evidence requirements are satisfied.
+    Auto,
+    /// Rust-native, waveform-only acoustic diarization.
+    Acoustic,
+    /// User-installed subprocess backend.
+    External,
+    /// Optional in-process neural speaker-embedding engine.
+    Neural,
+}
+
+/// Evidence-gated rollout stage for `auto` acoustic diarization.
+///
+/// Explicit `DiarizationEngine::Acoustic` requests are not changed by this
+/// stage; the gate controls only whether `auto` may select the acoustic engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcousticDiarizationRolloutStage {
+    /// Acoustic output is not user-visible and cannot satisfy an `auto`
+    /// request. Focused development evidence may still be collected directly.
+    #[default]
+    Shadow,
+    /// The implementation contract is validated, but `auto` remains off.
+    Validated,
+    /// `auto` uses verified external output when present, then acoustic.
+    Fallback,
+    /// `auto` prefers acoustic even when external output is present.
+    Primary,
+    /// `auto` admits only acoustic; external output is not selected.
+    Sole,
+}
+
+/// Conservative action when the selected diarizer cannot make a supported
+/// assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationFallbackPolicy {
+    /// Preserve attributable hard-hint regions and emit unknown elsewhere.
+    Unknown,
+    /// Permit an admitted external backend to attempt the request.
+    External,
+    /// Fail the request with a structured error.
+    Error,
+}
+
+/// Strength assigned to a caller-provided known-speaker interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnownSpeakerPolicy {
+    /// Frames from this interval are immutable must-link evidence.
+    HardMustLink,
+    /// Frames may enroll a profile, but contradictory evidence may downweight
+    /// or reject them.
+    SoftEnrollment,
+}
+
+/// One `speaker-hints-v1` interval.
+///
+/// `speaker_ref` is an opaque identifier scoped to this run. It is not a
+/// biometric or legal identity claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnownSpeakerInterval {
+    pub speaker_ref: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub confidence: f64,
+    pub policy: KnownSpeakerPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+}
+
+/// Typed native diarization request (`speaker-hints-v1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizationRequest {
+    pub engine: DiarizationEngine,
+    pub fallback: DiarizationFallbackPolicy,
+    #[serde(default)]
+    pub known_intervals: Vec<KnownSpeakerInterval>,
+    /// Samples removed from each enrollment edge to avoid boundary bleed.
+    pub enrollment_edge_guard_ms: u32,
+    /// Maximum number of global clustering prototypes.
+    pub max_prototypes: u16,
+    /// Record explicit consent for reusable-profile persistence. Default-off.
+    /// Schema v4 deliberately persists only privacy-safe summaries; raw
+    /// acoustic vectors remain excluded until a separately reviewed schema.
+    #[serde(default)]
+    pub persist_profiles: bool,
+}
+
+impl Default for DiarizationRequest {
+    fn default() -> Self {
+        Self {
+            engine: DiarizationEngine::Auto,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            known_intervals: Vec::new(),
+            enrollment_edge_guard_ms: 100,
+            max_prototypes: 512,
+            persist_profiles: false,
+        }
+    }
+}
+
+/// Stable validation code for malformed diarization requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationValidationCode {
+    EmptySpeakerRef,
+    InvalidHintConfidence,
+    ReversedHintInterval,
+    HintOutsideAudio,
+    ContradictoryHardHints,
+    InvalidSpeakerConstraints,
+    InvalidPrototypeCap,
+}
+
+impl DiarizationValidationCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptySpeakerRef => "diarization.empty_speaker_ref",
+            Self::InvalidHintConfidence => "diarization.invalid_hint_confidence",
+            Self::ReversedHintInterval => "diarization.reversed_hint_interval",
+            Self::HintOutsideAudio => "diarization.hint_outside_audio",
+            Self::ContradictoryHardHints => "diarization.contradictory_hard_hints",
+            Self::InvalidSpeakerConstraints => "diarization.invalid_speaker_constraints",
+            Self::InvalidPrototypeCap => "diarization.invalid_prototype_cap",
+        }
+    }
+}
+
+/// Structured validation failure suitable for robot-mode serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiarizationValidationError {
+    pub code: DiarizationValidationCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_index: Option<usize>,
+}
+
+impl std::fmt::Display for DiarizationValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for DiarizationValidationError {}
+
+impl DiarizationRequest {
+    /// Validate speaker hints and count constraints against the canonical
+    /// normalized audio duration.
+    pub fn validate(
+        &self,
+        audio_duration_ms: u64,
+        constraints: Option<&SpeakerConstraints>,
+    ) -> Result<(), DiarizationValidationError> {
+        if self.max_prototypes == 0 || self.max_prototypes > 512 {
+            return Err(DiarizationValidationError {
+                code: DiarizationValidationCode::InvalidPrototypeCap,
+                message: "max_prototypes must be within 1..=512 for acoustic-v1".to_owned(),
+                hint_index: None,
+            });
+        }
+        validate_speaker_constraints(constraints)?;
+
+        for (index, hint) in self.known_intervals.iter().enumerate() {
+            if hint.speaker_ref.trim().is_empty() {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::EmptySpeakerRef,
+                    message: "speaker_ref must not be empty".to_owned(),
+                    hint_index: Some(index),
+                });
+            }
+            if !hint.confidence.is_finite() || !(0.0..=1.0).contains(&hint.confidence) {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::InvalidHintConfidence,
+                    message: "hint confidence must be finite and within [0, 1]".to_owned(),
+                    hint_index: Some(index),
+                });
+            }
+            if hint.end_ms <= hint.start_ms {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::ReversedHintInterval,
+                    message: "hint interval must satisfy start_ms < end_ms".to_owned(),
+                    hint_index: Some(index),
+                });
+            }
+            if hint.end_ms > audio_duration_ms {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::HintOutsideAudio,
+                    message: format!(
+                        "hint end_ms {} exceeds audio duration {audio_duration_ms}",
+                        hint.end_ms
+                    ),
+                    hint_index: Some(index),
+                });
+            }
+        }
+
+        for (left_index, left) in self.known_intervals.iter().enumerate() {
+            if left.policy != KnownSpeakerPolicy::HardMustLink {
+                continue;
+            }
+            for (right_index, right) in self.known_intervals.iter().enumerate().skip(left_index + 1)
+            {
+                if right.policy == KnownSpeakerPolicy::HardMustLink
+                    && left.speaker_ref != right.speaker_ref
+                    && left.start_ms < right.end_ms
+                    && right.start_ms < left.end_ms
+                {
+                    return Err(DiarizationValidationError {
+                        code: DiarizationValidationCode::ContradictoryHardHints,
+                        message: format!(
+                            "hard hints {left_index} and {right_index} overlap with different speaker_ref values"
+                        ),
+                        hint_index: Some(right_index),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_speaker_constraints(
+    constraints: Option<&SpeakerConstraints>,
+) -> Result<(), DiarizationValidationError> {
+    let Some(constraints) = constraints else {
+        return Ok(());
+    };
+    let invalid_zero = constraints.num_speakers == Some(0)
+        || constraints.min_speakers == Some(0)
+        || constraints.max_speakers == Some(0);
+    let invalid_range = constraints
+        .min_speakers
+        .zip(constraints.max_speakers)
+        .is_some_and(|(minimum, maximum)| minimum > maximum);
+    let invalid_exact = constraints.num_speakers.is_some_and(|exact| {
+        constraints
+            .min_speakers
+            .is_some_and(|minimum| exact < minimum)
+            || constraints
+                .max_speakers
+                .is_some_and(|maximum| exact > maximum)
+    });
+    if invalid_zero || invalid_range || invalid_exact {
+        return Err(DiarizationValidationError {
+            code: DiarizationValidationCode::InvalidSpeakerConstraints,
+            message: "speaker constraints must be positive and satisfy min <= exact <= max"
+                .to_owned(),
+            hint_index: None,
+        });
+    }
+    Ok(())
+}
+
+/// Why a diarization result conservatively fell back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiarizationFallbackStatus {
+    NotNeeded,
+    InsufficientEvidence,
+    CalibrationInvalid,
+    ResourceLimit,
+    UnsatisfiedConstraints,
+    ExternalBackend,
+}
+
+/// One acoustic speaker turn, independent of ASR segment boundaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizationTurn {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_confidence: Option<f64>,
+    pub overlap_suspected: bool,
+    pub hard_hint_attributed: bool,
+}
+
+/// Privacy-safe quality summary for one within-run speaker profile.
+///
+/// Raw acoustic vectors and audio are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerProfileSummary {
+    pub speaker_ref: String,
+    pub frame_count: u64,
+    pub voiced_duration_ms: u64,
+    pub reliability: f64,
+    pub channel_profile_count: u32,
+    pub anchored: bool,
+    pub soft_hint_contradiction: Option<f64>,
+}
+
+/// Complete typed diarization result attached to [`TranscriptionResult`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizationReport {
+    pub implementation: String,
+    pub contract_version: String,
+    pub feature_schema: String,
+    pub normalized_input_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_document_sha256: Option<String>,
+    pub turns: Vec<DiarizationTurn>,
+    pub profiles: Vec<SpeakerProfileSummary>,
+    pub detected_speakers: u32,
+    pub constraints_satisfied: bool,
+    pub fallback_status: DiarizationFallbackStatus,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // bd-1rj.2: Word-level timestamp parameters (whisper.cpp)
 // ---------------------------------------------------------------------------
@@ -168,6 +486,9 @@ pub struct BackendParams {
     pub speaker_constraints: Option<SpeakerConstraints>,
     /// Diarization-specific pipeline options.
     pub diarization_config: Option<DiarizationConfig>,
+    /// Backend-independent native acoustic diarization request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acoustic_diarization: Option<DiarizationRequest>,
     /// GPU device identifier (insanely-fast, diarization).
     pub gpu_device: Option<String>,
     /// Enable Flash Attention 2 (insanely-fast).
@@ -379,6 +700,8 @@ pub struct TranscriptionSegment {
     pub end_sec: Option<f64>,
     pub text: String,
     pub speaker: Option<String>,
+    /// ASR token/text confidence. Speaker assignment confidence lives on
+    /// [`DiarizationTurn::speaker_confidence`].
     pub confidence: Option<f64>,
 }
 
@@ -418,6 +741,8 @@ pub struct TranscriptionResult {
     pub language: Option<String>,
     pub segments: Vec<TranscriptionSegment>,
     pub acceleration: Option<AccelerationReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<DiarizationReport>,
     pub raw_output: Value,
     pub artifact_paths: Vec<String>,
 }
@@ -592,6 +917,7 @@ mod tests {
                 confidence: Some(0.95),
             }],
             acceleration: None,
+            diarization: None,
             raw_output: json!({"test": true}),
             artifact_paths: vec!["output.json".to_owned()],
         };
@@ -873,6 +1199,7 @@ mod tests {
             language: None,
             segments: vec![],
             acceleration: None,
+            diarization: None,
             raw_output: json!(null),
             artifact_paths: vec![],
         };
@@ -1153,6 +1480,7 @@ mod tests {
                     confidence: Some(0.97),
                 }],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({"text": "hello world"}),
                 artifact_paths: vec![],
             },
@@ -1690,6 +2018,7 @@ mod tests {
                 post_mass: Some(0.99),
                 notes: vec!["jax".to_owned(), "fast".to_owned()],
             }),
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: vec!["a.json".to_owned(), "b.srt".to_owned()],
         };
@@ -1799,6 +2128,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: payload.clone(),
                 artifact_paths: vec![],
             };
@@ -2514,5 +2844,158 @@ mod tests {
         assert_eq!(parsed.evidence[2], 42);
         assert_eq!(parsed.evidence[3]["nested"]["key"][1], 2);
         assert_eq!(parsed.evidence[4][0], true);
+    }
+
+    fn speaker_hint(
+        speaker_ref: &str,
+        start_ms: u64,
+        end_ms: u64,
+        policy: KnownSpeakerPolicy,
+    ) -> KnownSpeakerInterval {
+        KnownSpeakerInterval {
+            speaker_ref: speaker_ref.to_owned(),
+            start_ms,
+            end_ms,
+            confidence: 0.9,
+            policy,
+            provenance: Some("contextual transcript cue".to_owned()),
+        }
+    }
+
+    #[test]
+    fn acoustic_diarization_request_round_trips_snake_case() {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            fallback: DiarizationFallbackPolicy::Unknown,
+            known_intervals: vec![speaker_hint(
+                "caller",
+                100,
+                900,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            ..DiarizationRequest::default()
+        };
+        let json = serde_json::to_string(&request).expect("serialize request");
+        assert!(json.contains("\"engine\":\"acoustic\""));
+        assert!(json.contains("\"policy\":\"hard_must_link\""));
+        let parsed: DiarizationRequest = serde_json::from_str(&json).expect("deserialize request");
+        assert_eq!(parsed, request);
+        assert!(request.validate(1_000, None).is_ok());
+    }
+
+    #[test]
+    fn contradictory_hard_hints_fail_with_stable_code() {
+        let request = DiarizationRequest {
+            known_intervals: vec![
+                speaker_hint("near", 0, 800, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("remote", 700, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            ..DiarizationRequest::default()
+        };
+        let error = request
+            .validate(1_000, None)
+            .expect_err("overlapping hard identities must fail");
+        assert_eq!(
+            error.code,
+            DiarizationValidationCode::ContradictoryHardHints
+        );
+        assert_eq!(error.code.as_str(), "diarization.contradictory_hard_hints");
+    }
+
+    #[test]
+    fn overlapping_soft_hints_are_advisory() {
+        let request = DiarizationRequest {
+            known_intervals: vec![
+                speaker_hint("near", 0, 800, KnownSpeakerPolicy::SoftEnrollment),
+                speaker_hint("remote", 700, 1_000, KnownSpeakerPolicy::SoftEnrollment),
+            ],
+            ..DiarizationRequest::default()
+        };
+        assert!(request.validate(1_000, None).is_ok());
+    }
+
+    #[test]
+    fn malformed_hint_and_constraint_codes_are_stable() {
+        let mut request = DiarizationRequest {
+            known_intervals: vec![speaker_hint(
+                "",
+                100,
+                200,
+                KnownSpeakerPolicy::SoftEnrollment,
+            )],
+            ..DiarizationRequest::default()
+        };
+        assert_eq!(
+            request.validate(1_000, None).expect_err("empty").code,
+            DiarizationValidationCode::EmptySpeakerRef
+        );
+
+        request.known_intervals[0].speaker_ref = "speaker".to_owned();
+        request.known_intervals[0].confidence = f64::NAN;
+        assert_eq!(
+            request.validate(1_000, None).expect_err("NaN").code,
+            DiarizationValidationCode::InvalidHintConfidence
+        );
+
+        request.known_intervals[0].confidence = 0.8;
+        request.known_intervals[0].end_ms = 1_001;
+        assert_eq!(
+            request.validate(1_000, None).expect_err("bounds").code,
+            DiarizationValidationCode::HintOutsideAudio
+        );
+
+        request.known_intervals.clear();
+        let constraints = SpeakerConstraints {
+            num_speakers: Some(4),
+            min_speakers: Some(1),
+            max_speakers: Some(3),
+        };
+        assert_eq!(
+            request
+                .validate(1_000, Some(&constraints))
+                .expect_err("constraints")
+                .code,
+            DiarizationValidationCode::InvalidSpeakerConstraints
+        );
+    }
+
+    #[test]
+    fn diarization_report_is_typed_and_privacy_safe() {
+        let report = DiarizationReport {
+            implementation: "native_acoustic".to_owned(),
+            contract_version: "acoustic-diarization-v1".to_owned(),
+            feature_schema: "acoustic-feature-v1".to_owned(),
+            normalized_input_sha256: "abc123".to_owned(),
+            hint_document_sha256: Some("def456".to_owned()),
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 1_000,
+                speaker_ref: Some("near".to_owned()),
+                speaker_confidence: Some(0.91),
+                change_confidence: Some(0.84),
+                overlap_suspected: false,
+                hard_hint_attributed: true,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "near".to_owned(),
+                frame_count: 72,
+                voiced_duration_ms: 720,
+                reliability: 0.9,
+                channel_profile_count: 1,
+                anchored: true,
+                soft_hint_contradiction: None,
+            }],
+            detected_speakers: 1,
+            constraints_satisfied: true,
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: Vec::new(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize report");
+        assert!(!json.contains("feature_vector"));
+        assert!(!json.contains("raw_audio"));
+        assert_eq!(
+            serde_json::from_str::<DiarizationReport>(&json).expect("deserialize report"),
+            report
+        );
     }
 }

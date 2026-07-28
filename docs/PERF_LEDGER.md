@@ -4638,3 +4638,21 @@ whisper.cpp conformance contract. Encoder GEMM is FrankenTorch's (external
 crate). So further *bit-exact* native-engine levers are limited; the largest
 remaining honest wins require the local-measurement unblock (item 2) and the
 `whisper.cpp` comparator (item 3).
+
+---
+## 2026-07-28 - Rust acoustic diarization benchmark harness: **NO-DATA / NOT CERTIFIED**
+
+`benches/native_engine_bench.rs` now contains hermetic Criterion coverage for
+10-second and 60-second acoustic feature extraction plus a 10-second
+single-speaker end-to-end acoustic pipeline. The inputs are generated tones and
+noise, contain no private audio or transcript material, and exercise the same
+public Rust API as the orchestrator.
+
+No timing number is recorded yet. A local attempt did not reach benchmark
+execution because the shared Cargo target was occupied; it produced neither an
+A/A control nor an admissible wall-clock sample. Remote workers are acceptable
+for compilation, but private inputs are forbidden from transfer and
+cross-worker timing is not comparable. Certification requires a single
+self-reporting host, order-interleaved A/A then A/B where applicable, exact
+output-hash/determinism proof, RTF, peak-memory or allocation evidence, and the
+corresponding accuracy gate. Current performance state is **NO-DATA**.

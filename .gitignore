@@ -17,13 +17,45 @@ storage.sqlite3-shm
 *.sqlite3-wal
 *.sqlite3-shm
 
-# Audio working files
+# Audio working files and confidential local evaluation media
 *.wav
 *.ulaw
 *.mp3
 *.flac
 *.ogg
 *.m4a
+*.aac
+*.aif
+*.aiff
+*.amr
+*.caf
+*.opus
+*.wma
+*.3gp
+*.mp4
+*.mov
+*.webm
+*.WAV
+*.ULAW
+*.MP3
+*.FLAC
+*.OGG
+*.M4A
+*.AAC
+*.AIF
+*.AIFF
+*.AMR
+*.CAF
+*.OPUS
+*.WMA
+*.3GP
+*.MP4
+*.MOV
+*.WEBM
+
+# Confidential transcript sidecars must remain outside the repository
+*transcript*.md
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[mM][dD]
 
 # Images (keep .webp for README illustration, .png for GitHub social preview)
 *.png

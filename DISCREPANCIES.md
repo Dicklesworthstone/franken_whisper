@@ -47,3 +47,28 @@
 - **Resolution:** **ACCEPTED (default OFF; enabling is a quality-over-reproducibility trade the operator makes explicitly).** The default-ON decision is deliberately reserved (see NEGATIVE_EVIDENCE 2026-07-14: "owner faithfulness call") because it changes golden transcripts on repetitive/tiled audio — toward whisper.cpp, per the measured tiled-jfk comparison. Revisit alongside native beam search (DISC-003's revisit point).
 - **Tests affected:** `src/native_engine/decode.rs` sampler/entropy/score unit tests (`sample_token_*`, `token_tail_entropy_matches_whisper_cpp_reference`, `sequence_score_matches_whisper_cpp_defaults`); gated e2e goldens unaffected (gate off in CI).
 - **Review date:** 2026-07-22
+
+## DISC-006: Acoustic speaker labels are permutation-stable, not identity-stable
+
+- **Reference:** External diarizers expose backend-specific labels and confidence
+  semantics; whisper.cpp byte-exactness does not define a waveform speaker
+  profile or independent turn timeline.
+- **Our impl:** `src/diarization.rs` emits opaque within-run references after
+  deterministic constrained clustering. Anchored caller references sort first;
+  unanchored labels use earliest reliable occurrence plus a stable feature-hash
+  tie-break. ASR text/confidence remain authoritative and unchanged by
+  projection, but cluster numbers need not match an external backend.
+- **Impact:** Cross-engine scoring must use maximum-overlap permutation before
+  DER/JER. Labels cannot be interpreted as name, gender, or legal identity.
+  The historical text/temporal heuristic is rejected by both acoustic and
+  verified-external provenance gates.
+- **Rollout:** `auto` defaults to `shadow`; explicit
+  `--diarization-engine acoustic` is available. Promotion requires retained
+  public-corpus accuracy/calibration and same-host performance evidence. Those
+  certification states are currently `NO-DATA`.
+- **Resolution:** **ACCEPTED as a new typed output contract, not a byte-exact
+  whisper.cpp claim.**
+- **Tests affected:** acoustic contract/scoring, deterministic replay,
+  hard/soft hint, clustering, projection, persistence, and rollout resolver
+  tests.
+- **Review date:** 2026-07-28
