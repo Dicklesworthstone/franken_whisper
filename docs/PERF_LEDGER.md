@@ -103,6 +103,13 @@ may degrade harder under contention. So the harness was extended to emit the raw
 per-round series plus an `INCUMBENT_AB_LOAD_SPLIT` line (rounds split at median
 total round cost), and re-run at roughly **2× the load** of the certification.
 
+Run 2 provenance — harness ELF (self-reported):
+`2a1dfe75c7c41daf05c5cdeea91ce5b479018e3df788ada3af07e3f5d805fd1e`;
+incumbent binary:
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+model:
+`921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`.
+
 | | run 1 (load ≈11) | run 2 (load 21→28) |
 |---|---|---|
 | comparison median | **1.415379** | **1.403117** |
