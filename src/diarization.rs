@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{FwError, FwResult};
@@ -23,15 +24,32 @@ use crate::model::{
 
 /// Stable identifier for the native acoustic diarization contract.
 pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v1";
+/// Frozen implementation identity for retained diarization evaluation results.
+pub const DIARIZATION_SCORER_VERSION: &str = "diarization-scorer-v1";
+/// Schema identity for reference annotations accepted by the frozen scorer.
+pub const DIARIZATION_REFERENCE_SCHEMA_VERSION: &str = "diarization-reference-v1";
+/// Schema identity for system hypotheses accepted by the frozen scorer.
+pub const DIARIZATION_HYPOTHESIS_SCHEMA_VERSION: &str = "diarization-hypothesis-v1";
+/// Schema identity for scorer configuration.
+pub const DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION: &str = "diarization-scorer-config-v1";
+/// Schema identity for retained scorer results.
+pub const DIARIZATION_SCORE_RESULT_SCHEMA_VERSION: &str = "diarization-score-result-v1";
+/// Schema identity for privacy-safe corpus manifests.
+pub const DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION: &str = "diarization-corpus-manifest-v1";
+/// Schema identity for split-leakage audit results.
+pub const DIARIZATION_LEAKAGE_AUDIT_SCHEMA_VERSION: &str = "diarization-leakage-audit-v1";
 
 const SCORE_EPSILON_SEC: f64 = 1e-9;
+const SCORE_HASH_HEX_LEN: usize = 64;
+const MAX_OPAQUE_ID_LEN: usize = 160;
 
 /// One speech turn used by the permutation-invariant scorer.
 ///
 /// The presence of a turn means speech is active. A missing `speaker` is an
 /// honest unknown-speaker hypothesis; reference turns must have a non-empty
 /// speaker label.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScoringTurn {
     pub start_sec: f64,
     pub end_sec: f64,
@@ -64,7 +82,7 @@ impl ScoringTurn {
 }
 
 /// Permutation-invariant diarization metrics in seconds.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiarizationScore {
     /// Total reference speaker-time used as the DER denominator.
     pub reference_speaker_time_sec: f64,
@@ -82,7 +100,7 @@ pub struct DiarizationScore {
 }
 
 /// Change-boundary precision, recall, F1, and timing error.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangePointScore {
     pub reference_count: usize,
     pub hypothesis_count: usize,
@@ -95,14 +113,14 @@ pub struct ChangePointScore {
 }
 
 /// One confidence observation with known correctness.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationObservation {
     pub confidence: f64,
     pub correct: bool,
 }
 
 /// Assignment-confidence calibration and coverage.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationScore {
     pub observed: usize,
     pub opportunities: usize,
@@ -112,11 +130,350 @@ pub struct CalibrationScore {
     pub bins: usize,
 }
 
+/// Whether reference-overlap regions contribute to the headline score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationOverlapPolicy {
+    Include,
+    Exclude,
+}
+
+/// Policy attached to a context-derived speaker hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationHintPolicy {
+    Hard,
+    Soft,
+}
+
+/// Immutable scorer policy. Every retained result embeds this complete value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiarizationScorerConfig {
+    pub schema_version: String,
+    /// Half-width removed around each reference speaker-change boundary.
+    pub speaker_boundary_collar_ms: u64,
+    /// One-to-one change-point matching tolerance.
+    pub change_boundary_collar_ms: u64,
+    pub overlap_policy: EvaluationOverlapPolicy,
+    pub calibration_bins: usize,
+}
+
+impl Default for DiarizationScorerConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION.to_owned(),
+            speaker_boundary_collar_ms: 0,
+            change_boundary_collar_ms: 250,
+            overlap_policy: EvaluationOverlapPolicy::Include,
+            calibration_bins: 10,
+        }
+    }
+}
+
+/// Integer-millisecond interval used by versioned evaluation documents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationRegion {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Stable machine reason such as `annotation_uncertain`.
+    pub reason_code: String,
+}
+
+/// One versioned reference or hypothesis turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationTurn {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub speaker: Option<String>,
+    /// Assignment confidence is meaningful only for a labeled hypothesis.
+    pub speaker_confidence: Option<f64>,
+    pub overlap_suspected: bool,
+}
+
+impl EvaluationTurn {
+    /// Construct a reference or hypothesis turn without a confidence value.
+    #[must_use]
+    pub fn labeled(start_ms: u64, end_ms: u64, speaker: impl Into<String>) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            speaker: Some(speaker.into()),
+            speaker_confidence: None,
+            overlap_suspected: false,
+        }
+    }
+
+    /// Construct an unknown-speaker hypothesis turn.
+    #[must_use]
+    pub const fn unknown(start_ms: u64, end_ms: u64) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            speaker: None,
+            speaker_confidence: None,
+            overlap_suspected: false,
+        }
+    }
+}
+
+/// Context-derived interval known or believed to belong to one speaker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationSpeakerHint {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub speaker_ref: String,
+    pub policy: EvaluationHintPolicy,
+}
+
+/// Frozen ground-truth document. It deliberately has no path or transcript field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiarizationReferenceDocument {
+    pub schema_version: String,
+    pub recording_id: String,
+    pub duration_ms: u64,
+    pub turns: Vec<EvaluationTurn>,
+    pub ignored_regions: Vec<EvaluationRegion>,
+    pub speaker_hints: Vec<EvaluationSpeakerHint>,
+}
+
+/// Runtime resource observation associated with one hypothesis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationPerformanceObservation {
+    pub audio_duration_ms: u64,
+    pub wall_time_ms: u64,
+    pub peak_rss_bytes: u64,
+}
+
+/// Frozen system-output document. It deliberately has no path or transcript field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiarizationHypothesisDocument {
+    pub schema_version: String,
+    pub recording_id: String,
+    pub duration_ms: u64,
+    pub turns: Vec<EvaluationTurn>,
+    pub performance: Option<EvaluationPerformanceObservation>,
+}
+
+/// Union speech-activity metrics, distinct from speaker-time DER components.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeechActivityScore {
+    pub reference_speech_sec: f64,
+    pub hypothesis_speech_sec: f64,
+    pub correct_speech_sec: f64,
+    pub missed_speech_sec: f64,
+    pub false_alarm_sec: f64,
+    pub error_rate: Option<f64>,
+}
+
+/// Speaker attribution quality after the frozen permutation mapping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerAttributionScore {
+    pub attributable_reference_speaker_time_sec: f64,
+    pub correctly_attributed_speaker_time_sec: f64,
+    pub attribution_error_sec: f64,
+    pub accuracy: Option<f64>,
+}
+
+/// Reference/hypothesis speaker-count comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerCountScore {
+    pub reference_speakers: usize,
+    pub hypothesis_speakers: usize,
+    pub signed_error: i64,
+    pub absolute_error: u64,
+}
+
+/// Duration-weighted overlap-region detection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlapDetectionScore {
+    pub reference_overlap_sec: f64,
+    pub hypothesis_overlap_sec: f64,
+    pub true_positive_sec: f64,
+    pub false_positive_sec: f64,
+    pub false_negative_sec: f64,
+    pub precision: Option<f64>,
+    pub recall: Option<f64>,
+    pub f1: Option<f64>,
+}
+
+/// Adherence to hard and soft context hints after speaker permutation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HintAdherenceScore {
+    pub hinted_sec: f64,
+    pub adherent_sec: f64,
+    pub contradictory_sec: f64,
+    pub unknown_sec: f64,
+    pub hard_violation_sec: f64,
+    pub adherence_rate: Option<f64>,
+}
+
+/// Risk conditional on emitting a known speaker, plus abstention coverage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelectiveAttributionScore {
+    pub reference_speaker_time_sec: f64,
+    pub covered_speaker_time_sec: f64,
+    pub correct_covered_speaker_time_sec: f64,
+    pub error_covered_speaker_time_sec: f64,
+    pub unknown_speaker_time_sec: f64,
+    pub coverage: Option<f64>,
+    pub selective_risk: Option<f64>,
+}
+
+/// Duration-weighted assignment-confidence calibration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeightedCalibrationScore {
+    pub observed_duration_sec: f64,
+    pub opportunity_duration_sec: f64,
+    pub coverage: Option<f64>,
+    pub brier_score: Option<f64>,
+    pub expected_calibration_error: Option<f64>,
+    pub bins: usize,
+}
+
+/// Resource score kept separate from accuracy and calibration claims.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizationPerformanceScore {
+    pub audio_duration_sec: f64,
+    pub wall_time_sec: f64,
+    pub real_time_factor: Option<f64>,
+    pub peak_rss_bytes: u64,
+}
+
+/// Complete, reproducible result emitted by the authoritative scorer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthoritativeDiarizationScore {
+    pub schema_version: String,
+    pub scorer_version: String,
+    pub recording_id: String,
+    pub config: DiarizationScorerConfig,
+    pub reference_sha256: String,
+    pub hypothesis_sha256: String,
+    pub config_sha256: String,
+    pub scored_duration_sec: f64,
+    pub ignored_duration_sec: f64,
+    pub diarization: DiarizationScore,
+    pub speech_activity: SpeechActivityScore,
+    pub change_points: ChangePointScore,
+    pub speaker_attribution: SpeakerAttributionScore,
+    pub speaker_count: SpeakerCountScore,
+    pub overlap: OverlapDetectionScore,
+    pub hints: HintAdherenceScore,
+    pub selective_attribution: SelectiveAttributionScore,
+    pub calibration: WeightedCalibrationScore,
+    pub performance: Option<DiarizationPerformanceScore>,
+    /// Hash of the result with this field set to the empty string.
+    pub result_sha256: String,
+}
+
+/// Immutable split identity used by the leakage auditor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationSplit {
+    Train,
+    Development,
+    Test,
+}
+
+/// One privacy-safe corpus recording descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorpusRecordingManifest {
+    pub recording_id: String,
+    pub split: EvaluationSplit,
+    /// Stable source-call identity shared by clips from the same recording.
+    pub origin_recording_id: String,
+    /// Opaque speaker identities when the corpus license permits tracking them.
+    pub speaker_refs: Vec<String>,
+    /// Opaque ancestor recording IDs for derived clips or mixtures.
+    pub derived_from_recording_ids: Vec<String>,
+    /// Opaque group shared by all augmentations of the same source example.
+    pub augmentation_group_id: Option<String>,
+    /// Opaque recordings used to enroll profiles for this example.
+    pub enrollment_recording_ids: Vec<String>,
+}
+
+/// Versioned, path-free corpus manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiarizationCorpusManifest {
+    pub schema_version: String,
+    pub corpus_id: String,
+    pub license_id: String,
+    pub recordings: Vec<CorpusRecordingManifest>,
+}
+
+/// Machine-stable split-leakage category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakageKind {
+    DuplicateRecording,
+    SharedOrigin,
+    SharedSpeaker,
+    SharedDerivedSource,
+    SharedAugmentation,
+    CrossSplitEnrollment,
+}
+
+/// Privacy-safe leakage finding. IDs are validated opaque identifiers, not paths.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LeakageFinding {
+    pub kind: LeakageKind,
+    pub left_split: EvaluationSplit,
+    pub right_split: EvaluationSplit,
+    pub opaque_id: String,
+}
+
+/// Deterministic leakage audit for one corpus manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiarizationLeakageAudit {
+    pub schema_version: String,
+    pub manifest_sha256: String,
+    pub passed: bool,
+    pub findings: Vec<LeakageFinding>,
+    pub audit_sha256: String,
+}
+
 #[derive(Debug, Clone)]
 struct AtomicInterval {
     duration: f64,
     reference: Vec<usize>,
     hypothesis: Vec<Option<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct EvaluationHypothesisState {
+    speaker: Option<String>,
+    confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct EvaluationAtomicInterval {
+    start_ms: u64,
+    end_ms: u64,
+    reference: BTreeSet<String>,
+    hypothesis: Vec<EvaluationHypothesisState>,
+    hypothesis_overlap_suspected: bool,
+    excluded: bool,
+}
+
+impl EvaluationAtomicInterval {
+    fn duration_sec(&self) -> f64 {
+        (self.end_ms - self.start_ms) as f64 / 1_000.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WeightedCalibrationObservation {
+    confidence: f64,
+    correct: bool,
+    duration_sec: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -341,6 +698,1198 @@ pub fn score_calibration(
         expected_calibration_error: Some(expected_calibration_error),
         bins,
     })
+}
+
+/// Parse and validate one frozen reference document.
+pub fn parse_diarization_reference(bytes: &[u8]) -> FwResult<DiarizationReferenceDocument> {
+    let document = serde_json::from_slice(bytes)?;
+    validate_reference_document(&document)?;
+    Ok(document)
+}
+
+/// Parse and validate one frozen hypothesis document.
+pub fn parse_diarization_hypothesis(bytes: &[u8]) -> FwResult<DiarizationHypothesisDocument> {
+    let document = serde_json::from_slice(bytes)?;
+    validate_hypothesis_document(&document)?;
+    Ok(document)
+}
+
+/// Parse and validate one frozen corpus manifest.
+pub fn parse_diarization_corpus_manifest(bytes: &[u8]) -> FwResult<DiarizationCorpusManifest> {
+    let manifest = serde_json::from_slice(bytes)?;
+    validate_corpus_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+/// Score two versioned documents using the complete frozen policy.
+pub fn score_diarization_documents(
+    reference: &DiarizationReferenceDocument,
+    hypothesis: &DiarizationHypothesisDocument,
+    config: &DiarizationScorerConfig,
+) -> FwResult<AuthoritativeDiarizationScore> {
+    validate_reference_document(reference)?;
+    validate_hypothesis_document(hypothesis)?;
+    validate_scorer_config(config)?;
+    if reference.recording_id != hypothesis.recording_id {
+        return Err(score_error(
+            "recording_id_mismatch",
+            "reference and hypothesis recording IDs differ",
+        ));
+    }
+    if reference.duration_ms != hypothesis.duration_ms {
+        return Err(score_error(
+            "duration_mismatch",
+            "reference and hypothesis durations differ",
+        ));
+    }
+    if let Some(performance) = &hypothesis.performance
+        && performance.audio_duration_ms != reference.duration_ms
+    {
+        return Err(score_error(
+            "performance_duration_mismatch",
+            "performance audio duration differs from the scored recording duration",
+        ));
+    }
+
+    let reference_changes =
+        speaker_change_points_ms(&reference.turns, reference.duration_ms, true)?;
+    let hypothesis_changes =
+        speaker_change_points_ms(&hypothesis.turns, hypothesis.duration_ms, false)?;
+    let atoms = evaluation_atomic_intervals(reference, hypothesis, config, &reference_changes);
+    let (scoring_reference, scoring_hypothesis) = scoring_turns_from_atoms(&atoms);
+    let diarization = score_diarization(&scoring_reference, &scoring_hypothesis)?;
+
+    let scored_duration_sec = atoms
+        .iter()
+        .filter(|atom| !atom.excluded)
+        .map(EvaluationAtomicInterval::duration_sec)
+        .sum();
+    let ignored_duration_sec = atoms
+        .iter()
+        .filter(|atom| atom.excluded)
+        .map(EvaluationAtomicInterval::duration_sec)
+        .sum();
+    let speech_activity = score_speech_activity(&atoms);
+    let speaker_attribution = score_speaker_attribution(&diarization);
+    let speaker_count = score_speaker_count(&scoring_reference, &scoring_hypothesis);
+    let overlap = score_overlap_detection(&atoms);
+    let hints = score_hint_adherence(
+        &atoms,
+        &reference.speaker_hints,
+        &diarization.speaker_mapping,
+    );
+    let selective_attribution = score_selective_attribution(&atoms, &diarization.speaker_mapping);
+    let calibration = score_weighted_calibration(
+        &atoms,
+        &diarization.speaker_mapping,
+        config.calibration_bins,
+    );
+    let change_points = score_change_points(
+        &reference_changes
+            .iter()
+            .filter(|point| !millisecond_is_ignored(**point, &reference.ignored_regions))
+            .map(|point| *point as f64 / 1_000.0)
+            .collect::<Vec<_>>(),
+        &hypothesis_changes
+            .iter()
+            .filter(|point| !millisecond_is_ignored(**point, &reference.ignored_regions))
+            .map(|point| *point as f64 / 1_000.0)
+            .collect::<Vec<_>>(),
+        config.change_boundary_collar_ms as f64 / 1_000.0,
+    )?;
+    let performance = hypothesis.performance.as_ref().map(|observation| {
+        let audio_duration_sec = observation.audio_duration_ms as f64 / 1_000.0;
+        let wall_time_sec = observation.wall_time_ms as f64 / 1_000.0;
+        DiarizationPerformanceScore {
+            audio_duration_sec,
+            wall_time_sec,
+            real_time_factor: (audio_duration_sec > 0.0)
+                .then_some(wall_time_sec / audio_duration_sec),
+            peak_rss_bytes: observation.peak_rss_bytes,
+        }
+    });
+
+    let mut result = AuthoritativeDiarizationScore {
+        schema_version: DIARIZATION_SCORE_RESULT_SCHEMA_VERSION.to_owned(),
+        scorer_version: DIARIZATION_SCORER_VERSION.to_owned(),
+        recording_id: reference.recording_id.clone(),
+        config: config.clone(),
+        reference_sha256: canonical_json_sha256(reference)?,
+        hypothesis_sha256: canonical_json_sha256(hypothesis)?,
+        config_sha256: canonical_json_sha256(config)?,
+        scored_duration_sec,
+        ignored_duration_sec,
+        diarization,
+        speech_activity,
+        change_points,
+        speaker_attribution,
+        speaker_count,
+        overlap,
+        hints,
+        selective_attribution,
+        calibration,
+        performance,
+        result_sha256: String::new(),
+    };
+    result.result_sha256 = canonical_json_sha256(&result)?;
+    Ok(result)
+}
+
+/// Verify the self-hash on a retained authoritative score.
+pub fn verify_authoritative_score_hash(result: &AuthoritativeDiarizationScore) -> FwResult<()> {
+    if result.schema_version != DIARIZATION_SCORE_RESULT_SCHEMA_VERSION {
+        return Err(score_error(
+            "result_schema_version",
+            "unsupported diarization score-result schema version",
+        ));
+    }
+    if result.scorer_version != DIARIZATION_SCORER_VERSION {
+        return Err(score_error(
+            "scorer_version",
+            "unsupported diarization scorer version",
+        ));
+    }
+    validate_scorer_config(&result.config)?;
+    for (field, hash) in [
+        ("reference_sha256", &result.reference_sha256),
+        ("hypothesis_sha256", &result.hypothesis_sha256),
+        ("config_sha256", &result.config_sha256),
+    ] {
+        if !is_sha256_hex(hash) {
+            return Err(score_error(
+                "result_hash_format",
+                &format!("{field} must be 64 lowercase hexadecimal characters"),
+            ));
+        }
+    }
+    if canonical_json_sha256(&result.config)? != result.config_sha256 {
+        return Err(score_error(
+            "config_hash_mismatch",
+            "config_sha256 does not match the embedded scorer configuration",
+        ));
+    }
+    if !is_sha256_hex(&result.result_sha256) {
+        return Err(score_error(
+            "result_hash_format",
+            "result_sha256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    let mut unhashed = result.clone();
+    unhashed.result_sha256.clear();
+    let expected = canonical_json_sha256(&unhashed)?;
+    if expected != result.result_sha256 {
+        return Err(score_error(
+            "result_hash_mismatch",
+            "result_sha256 does not match the canonical result",
+        ));
+    }
+    Ok(())
+}
+
+/// Audit a versioned corpus manifest for cross-split contamination.
+pub fn audit_diarization_manifest(
+    manifest: &DiarizationCorpusManifest,
+) -> FwResult<DiarizationLeakageAudit> {
+    validate_corpus_manifest(manifest)?;
+    let mut findings = BTreeSet::new();
+    for (left_index, left) in manifest.recordings.iter().enumerate() {
+        for right in manifest.recordings.iter().skip(left_index + 1) {
+            if left.split == right.split {
+                continue;
+            }
+            let (left_split, right_split) = ordered_splits(left.split, right.split);
+            if left.recording_id == right.recording_id {
+                findings.insert(LeakageFinding {
+                    kind: LeakageKind::DuplicateRecording,
+                    left_split,
+                    right_split,
+                    opaque_id: left.recording_id.clone(),
+                });
+            }
+            if left.origin_recording_id == right.origin_recording_id {
+                findings.insert(LeakageFinding {
+                    kind: LeakageKind::SharedOrigin,
+                    left_split,
+                    right_split,
+                    opaque_id: left.origin_recording_id.clone(),
+                });
+            }
+            for speaker in sorted_intersection(&left.speaker_refs, &right.speaker_refs) {
+                findings.insert(LeakageFinding {
+                    kind: LeakageKind::SharedSpeaker,
+                    left_split,
+                    right_split,
+                    opaque_id: speaker,
+                });
+            }
+            let right_identity = [
+                right.recording_id.clone(),
+                right.origin_recording_id.clone(),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            let left_identity = [left.recording_id.clone(), left.origin_recording_id.clone()]
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let left_sources = lineage_ids(left);
+            let right_sources = lineage_ids(right);
+            for source in sorted_set_intersection(&left_sources, &right_sources)
+                .into_iter()
+                .chain(sorted_set_intersection(&left_sources, &right_identity))
+                .chain(sorted_set_intersection(&right_sources, &left_identity))
+            {
+                findings.insert(LeakageFinding {
+                    kind: LeakageKind::SharedDerivedSource,
+                    left_split,
+                    right_split,
+                    opaque_id: source,
+                });
+            }
+            if let (Some(left_group), Some(right_group)) = (
+                left.augmentation_group_id.as_ref(),
+                right.augmentation_group_id.as_ref(),
+            ) && left_group == right_group
+            {
+                findings.insert(LeakageFinding {
+                    kind: LeakageKind::SharedAugmentation,
+                    left_split,
+                    right_split,
+                    opaque_id: left_group.clone(),
+                });
+            }
+            let left_enrollment = left
+                .enrollment_recording_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let right_enrollment = right
+                .enrollment_recording_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for enrollment in sorted_set_intersection(&left_enrollment, &right_enrollment)
+                .into_iter()
+                .chain(sorted_set_intersection(&left_enrollment, &right_identity))
+                .chain(sorted_set_intersection(&right_enrollment, &left_identity))
+            {
+                findings.insert(LeakageFinding {
+                    kind: LeakageKind::CrossSplitEnrollment,
+                    left_split,
+                    right_split,
+                    opaque_id: enrollment,
+                });
+            }
+        }
+    }
+
+    let findings = findings.into_iter().collect::<Vec<_>>();
+    let mut audit = DiarizationLeakageAudit {
+        schema_version: DIARIZATION_LEAKAGE_AUDIT_SCHEMA_VERSION.to_owned(),
+        manifest_sha256: canonical_json_sha256(manifest)?,
+        passed: findings.is_empty(),
+        findings,
+        audit_sha256: String::new(),
+    };
+    audit.audit_sha256 = canonical_json_sha256(&audit)?;
+    Ok(audit)
+}
+
+/// Verify the self-hash on a retained leakage audit.
+pub fn verify_leakage_audit_hash(audit: &DiarizationLeakageAudit) -> FwResult<()> {
+    if audit.schema_version != DIARIZATION_LEAKAGE_AUDIT_SCHEMA_VERSION {
+        return Err(score_error(
+            "leakage_schema_version",
+            "unsupported leakage-audit schema version",
+        ));
+    }
+    if !is_sha256_hex(&audit.audit_sha256) {
+        return Err(score_error(
+            "leakage_hash_format",
+            "audit_sha256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    if !is_sha256_hex(&audit.manifest_sha256) {
+        return Err(score_error(
+            "leakage_manifest_hash_format",
+            "manifest_sha256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    if audit.passed != audit.findings.is_empty() {
+        return Err(score_error(
+            "leakage_passed_inconsistent",
+            "leakage passed flag must equal findings.is_empty()",
+        ));
+    }
+    if !audit
+        .findings
+        .windows(2)
+        .all(|window| window[0] < window[1])
+    {
+        return Err(score_error(
+            "leakage_finding_order",
+            "leakage findings must be strictly sorted and unique",
+        ));
+    }
+    let mut unhashed = audit.clone();
+    unhashed.audit_sha256.clear();
+    if canonical_json_sha256(&unhashed)? != audit.audit_sha256 {
+        return Err(score_error(
+            "leakage_hash_mismatch",
+            "audit_sha256 does not match the canonical leakage audit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reference_document(document: &DiarizationReferenceDocument) -> FwResult<()> {
+    if document.schema_version != DIARIZATION_REFERENCE_SCHEMA_VERSION {
+        return Err(score_error(
+            "reference_schema_version",
+            "unsupported diarization reference schema version",
+        ));
+    }
+    validate_opaque_id(&document.recording_id, "reference recording_id")?;
+    if document.duration_ms == 0 {
+        return Err(score_error(
+            "reference_duration",
+            "reference duration_ms must be greater than zero",
+        ));
+    }
+    validate_evaluation_turns(&document.turns, document.duration_ms, true, "reference")?;
+    validate_regions(
+        &document.ignored_regions,
+        document.duration_ms,
+        "ignored region",
+    )?;
+    let reference_speakers = document
+        .turns
+        .iter()
+        .filter_map(|turn| turn.speaker.as_ref())
+        .collect::<BTreeSet<_>>();
+    for (index, hint) in document.speaker_hints.iter().enumerate() {
+        validate_ms_interval(
+            hint.start_ms,
+            hint.end_ms,
+            document.duration_ms,
+            &format!("speaker hint {index}"),
+        )?;
+        validate_opaque_id(
+            &hint.speaker_ref,
+            &format!("speaker hint {index} speaker_ref"),
+        )?;
+        if !reference_speakers.contains(&hint.speaker_ref) {
+            return Err(score_error(
+                "hint_speaker_not_in_reference",
+                &format!("speaker hint {index} does not name a reference speaker"),
+            ));
+        }
+    }
+    ensure_canonical_hint_order(&document.speaker_hints)?;
+    for window in document.speaker_hints.windows(2) {
+        if window[0].end_ms > window[1].start_ms {
+            return Err(score_error(
+                "ambiguous_hint_overlap",
+                "overlapping speaker hints are not scoreable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_hypothesis_document(document: &DiarizationHypothesisDocument) -> FwResult<()> {
+    if document.schema_version != DIARIZATION_HYPOTHESIS_SCHEMA_VERSION {
+        return Err(score_error(
+            "hypothesis_schema_version",
+            "unsupported diarization hypothesis schema version",
+        ));
+    }
+    validate_opaque_id(&document.recording_id, "hypothesis recording_id")?;
+    if document.duration_ms == 0 {
+        return Err(score_error(
+            "hypothesis_duration",
+            "hypothesis duration_ms must be greater than zero",
+        ));
+    }
+    validate_evaluation_turns(&document.turns, document.duration_ms, false, "hypothesis")?;
+    if let Some(performance) = &document.performance {
+        if performance.audio_duration_ms == 0 {
+            return Err(score_error(
+                "performance_audio_duration",
+                "performance audio_duration_ms must be greater than zero",
+            ));
+        }
+        if performance.wall_time_ms == 0 {
+            return Err(score_error(
+                "performance_wall_time",
+                "performance wall_time_ms must be greater than zero",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scorer_config(config: &DiarizationScorerConfig) -> FwResult<()> {
+    if config.schema_version != DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION {
+        return Err(score_error(
+            "config_schema_version",
+            "unsupported diarization scorer-config schema version",
+        ));
+    }
+    if config.calibration_bins == 0 || config.calibration_bins > 1_000 {
+        return Err(score_error(
+            "calibration_bins",
+            "calibration_bins must be within 1..=1000",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evaluation_turns(
+    turns: &[EvaluationTurn],
+    duration_ms: u64,
+    reference: bool,
+    kind: &str,
+) -> FwResult<()> {
+    for (index, turn) in turns.iter().enumerate() {
+        validate_ms_interval(
+            turn.start_ms,
+            turn.end_ms,
+            duration_ms,
+            &format!("{kind} turn {index}"),
+        )?;
+        if reference && turn.speaker.is_none() {
+            return Err(score_error(
+                "reference_speaker_missing",
+                &format!("reference turn {index} must have a speaker"),
+            ));
+        }
+        if let Some(speaker) = &turn.speaker {
+            validate_opaque_id(speaker, &format!("{kind} turn {index} speaker"))?;
+        }
+        if reference && turn.speaker_confidence.is_some() {
+            return Err(score_error(
+                "reference_confidence_forbidden",
+                &format!("reference turn {index} must not contain speaker_confidence"),
+            ));
+        }
+        if turn.speaker.is_none() && turn.speaker_confidence.is_some() {
+            return Err(score_error(
+                "unknown_confidence_forbidden",
+                &format!("{kind} turn {index} cannot assign confidence to an unknown speaker"),
+            ));
+        }
+        if let Some(confidence) = turn.speaker_confidence
+            && (!confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
+        {
+            return Err(score_error(
+                "speaker_confidence_range",
+                &format!("{kind} turn {index} speaker_confidence must be finite and within [0, 1]"),
+            ));
+        }
+    }
+    if !turns.windows(2).all(|window| {
+        evaluation_turn_order_key(&window[0]) <= evaluation_turn_order_key(&window[1])
+    }) {
+        return Err(score_error(
+            "turn_order",
+            &format!("{kind} turns must use canonical start/end/speaker order"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_regions(regions: &[EvaluationRegion], duration_ms: u64, kind: &str) -> FwResult<()> {
+    for (index, region) in regions.iter().enumerate() {
+        validate_ms_interval(
+            region.start_ms,
+            region.end_ms,
+            duration_ms,
+            &format!("{kind} {index}"),
+        )?;
+        validate_reason_code(&region.reason_code, &format!("{kind} {index} reason_code"))?;
+    }
+    if !regions.windows(2).all(|window| {
+        (
+            window[0].start_ms,
+            window[0].end_ms,
+            window[0].reason_code.as_str(),
+        ) <= (
+            window[1].start_ms,
+            window[1].end_ms,
+            window[1].reason_code.as_str(),
+        )
+    }) {
+        return Err(score_error(
+            "region_order",
+            "ignored regions must use canonical start/end/reason order",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ms_interval(start_ms: u64, end_ms: u64, duration_ms: u64, field: &str) -> FwResult<()> {
+    if start_ms >= end_ms {
+        return Err(score_error(
+            "interval_geometry",
+            &format!("{field} must satisfy start_ms < end_ms"),
+        ));
+    }
+    if end_ms > duration_ms {
+        return Err(score_error(
+            "interval_bounds",
+            &format!("{field} exceeds duration_ms"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_canonical_hint_order(hints: &[EvaluationSpeakerHint]) -> FwResult<()> {
+    if hints.windows(2).all(|window| {
+        (
+            window[0].start_ms,
+            window[0].end_ms,
+            window[0].speaker_ref.as_str(),
+            window[0].policy,
+        ) <= (
+            window[1].start_ms,
+            window[1].end_ms,
+            window[1].speaker_ref.as_str(),
+            window[1].policy,
+        )
+    }) {
+        Ok(())
+    } else {
+        Err(score_error(
+            "hint_order",
+            "speaker hints must use canonical start/end/speaker/policy order",
+        ))
+    }
+}
+
+fn validate_corpus_manifest(manifest: &DiarizationCorpusManifest) -> FwResult<()> {
+    if manifest.schema_version != DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION {
+        return Err(score_error(
+            "manifest_schema_version",
+            "unsupported diarization corpus-manifest schema version",
+        ));
+    }
+    validate_opaque_id(&manifest.corpus_id, "manifest corpus_id")?;
+    validate_opaque_id(&manifest.license_id, "manifest license_id")?;
+    for (index, recording) in manifest.recordings.iter().enumerate() {
+        validate_opaque_id(
+            &recording.recording_id,
+            &format!("manifest recording {index} recording_id"),
+        )?;
+        validate_opaque_id(
+            &recording.origin_recording_id,
+            &format!("manifest recording {index} origin_recording_id"),
+        )?;
+        validate_sorted_opaque_ids(
+            &recording.speaker_refs,
+            &format!("manifest recording {index} speaker_refs"),
+        )?;
+        validate_sorted_opaque_ids(
+            &recording.derived_from_recording_ids,
+            &format!("manifest recording {index} derived_from_recording_ids"),
+        )?;
+        validate_sorted_opaque_ids(
+            &recording.enrollment_recording_ids,
+            &format!("manifest recording {index} enrollment_recording_ids"),
+        )?;
+        if let Some(group) = &recording.augmentation_group_id {
+            validate_opaque_id(
+                group,
+                &format!("manifest recording {index} augmentation_group_id"),
+            )?;
+        }
+    }
+    if !manifest.recordings.windows(2).all(|window| {
+        (window[0].recording_id.as_str(), window[0].split)
+            < (window[1].recording_id.as_str(), window[1].split)
+    }) {
+        return Err(score_error(
+            "manifest_recording_order",
+            "manifest recordings must use strictly increasing recording_id/split order",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sorted_opaque_ids(values: &[String], field: &str) -> FwResult<()> {
+    for value in values {
+        validate_opaque_id(value, field)?;
+    }
+    if values.windows(2).all(|window| window[0] < window[1]) {
+        Ok(())
+    } else {
+        Err(score_error(
+            "opaque_id_order",
+            &format!("{field} must be strictly sorted and unique"),
+        ))
+    }
+}
+
+fn validate_opaque_id(value: &str, field: &str) -> FwResult<()> {
+    if value.is_empty() || value.len() > MAX_OPAQUE_ID_LEN || value.trim() != value {
+        return Err(score_error(
+            "opaque_id_shape",
+            &format!("{field} must be a non-empty trimmed opaque identifier"),
+        ));
+    }
+    if value.chars().any(char::is_control)
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains("..")
+    {
+        return Err(score_error(
+            "opaque_id_path",
+            &format!("{field} must not contain a path"),
+        ));
+    }
+    let lower = value.to_ascii_lowercase();
+    const PRIVATE_MARKERS: [&str; 12] = [
+        "transcript",
+        "downloads",
+        ".m4a",
+        ".mp3",
+        ".wav",
+        ".flac",
+        ".ogg",
+        ".aac",
+        ".wma",
+        ".mp4",
+        ".srt",
+        ".md",
+    ];
+    if PRIVATE_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return Err(score_error(
+            "opaque_id_sensitive_marker",
+            &format!("{field} contains a forbidden media, transcript, or path marker"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reason_code(value: &str, field: &str) -> FwResult<()> {
+    validate_opaque_id(value, field)?;
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(score_error(
+            "reason_code_shape",
+            &format!("{field} must contain only lowercase ASCII, digits, dot, dash, or underscore"),
+        ))
+    }
+}
+
+fn evaluation_turn_order_key(turn: &EvaluationTurn) -> (u64, u64, Option<&str>, Option<u64>, bool) {
+    (
+        turn.start_ms,
+        turn.end_ms,
+        turn.speaker.as_deref(),
+        turn.speaker_confidence.map(f64::to_bits),
+        turn.overlap_suspected,
+    )
+}
+
+fn score_error(code: &str, message: &str) -> FwError {
+    FwError::InvalidRequest(format!("diarization.scorer.{code}: {message}"))
+}
+
+fn canonical_json_sha256<T: Serialize>(value: &T) -> FwResult<String> {
+    let encoded = serde_json::to_vec(value)?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == SCORE_HASH_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn speaker_change_points_ms(
+    turns: &[EvaluationTurn],
+    duration_ms: u64,
+    reference: bool,
+) -> FwResult<Vec<u64>> {
+    let mut boundaries = turns
+        .iter()
+        .flat_map(|turn| [turn.start_ms, turn.end_ms])
+        .filter(|point| *point > 0 && *point < duration_ms)
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut changes = Vec::new();
+    for boundary in boundaries {
+        let before = active_evaluation_labels(turns, boundary - 1, reference)?;
+        let after = active_evaluation_labels(turns, boundary, reference)?;
+        if !before.is_empty() && !after.is_empty() && before != after {
+            changes.push(boundary);
+        }
+    }
+    Ok(changes)
+}
+
+fn active_evaluation_labels(
+    turns: &[EvaluationTurn],
+    point_ms: u64,
+    reference: bool,
+) -> FwResult<BTreeSet<Option<String>>> {
+    turns
+        .iter()
+        .filter(|turn| turn.start_ms <= point_ms && point_ms < turn.end_ms)
+        .map(|turn| {
+            if reference && turn.speaker.is_none() {
+                Err(score_error(
+                    "reference_speaker_missing",
+                    "reference turn must have a speaker",
+                ))
+            } else {
+                Ok(turn.speaker.clone())
+            }
+        })
+        .collect()
+}
+
+fn evaluation_atomic_intervals(
+    reference: &DiarizationReferenceDocument,
+    hypothesis: &DiarizationHypothesisDocument,
+    config: &DiarizationScorerConfig,
+    reference_changes: &[u64],
+) -> Vec<EvaluationAtomicInterval> {
+    let mut boundaries = vec![0, reference.duration_ms];
+    boundaries.extend(
+        reference
+            .turns
+            .iter()
+            .chain(&hypothesis.turns)
+            .flat_map(|turn| [turn.start_ms, turn.end_ms]),
+    );
+    boundaries.extend(
+        reference
+            .ignored_regions
+            .iter()
+            .flat_map(|region| [region.start_ms, region.end_ms]),
+    );
+    boundaries.extend(
+        reference
+            .speaker_hints
+            .iter()
+            .flat_map(|hint| [hint.start_ms, hint.end_ms]),
+    );
+    if config.speaker_boundary_collar_ms > 0 {
+        for change in reference_changes {
+            boundaries.push(change.saturating_sub(config.speaker_boundary_collar_ms));
+            boundaries.push(
+                change
+                    .saturating_add(config.speaker_boundary_collar_ms)
+                    .min(reference.duration_ms),
+            );
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    boundaries
+        .windows(2)
+        .filter_map(|window| {
+            let start_ms = window[0];
+            let end_ms = window[1];
+            if start_ms >= end_ms {
+                return None;
+            }
+            let point_ms = start_ms + (end_ms - start_ms) / 2;
+            let reference_labels = reference
+                .turns
+                .iter()
+                .filter(|turn| turn.start_ms <= point_ms && point_ms < turn.end_ms)
+                .filter_map(|turn| turn.speaker.clone())
+                .collect::<BTreeSet<_>>();
+
+            let active_hypothesis = hypothesis
+                .turns
+                .iter()
+                .filter(|turn| turn.start_ms <= point_ms && point_ms < turn.end_ms)
+                .collect::<Vec<_>>();
+            let hypothesis_overlap_suspected =
+                active_hypothesis.iter().any(|turn| turn.overlap_suspected);
+            let mut hypothesis_by_speaker = BTreeMap::<Option<String>, Option<f64>>::new();
+            for turn in active_hypothesis {
+                let entry = hypothesis_by_speaker
+                    .entry(turn.speaker.clone())
+                    .or_insert(turn.speaker_confidence);
+                if let Some(confidence) = turn.speaker_confidence
+                    && entry.is_none_or(|current| confidence > current)
+                {
+                    *entry = Some(confidence);
+                }
+            }
+            let hypothesis_states = hypothesis_by_speaker
+                .into_iter()
+                .map(|(speaker, confidence)| EvaluationHypothesisState {
+                    speaker,
+                    confidence,
+                })
+                .collect::<Vec<_>>();
+            let in_ignored_region = millisecond_is_ignored(point_ms, &reference.ignored_regions);
+            let in_collar = config.speaker_boundary_collar_ms > 0
+                && reference_changes.iter().any(|change| {
+                    let lower = change.saturating_sub(config.speaker_boundary_collar_ms);
+                    let upper = change
+                        .saturating_add(config.speaker_boundary_collar_ms)
+                        .min(reference.duration_ms);
+                    lower <= point_ms && point_ms < upper
+                });
+            let excluded_overlap = config.overlap_policy == EvaluationOverlapPolicy::Exclude
+                && reference_labels.len() > 1;
+            Some(EvaluationAtomicInterval {
+                start_ms,
+                end_ms,
+                reference: reference_labels,
+                hypothesis: hypothesis_states,
+                hypothesis_overlap_suspected,
+                excluded: in_ignored_region || in_collar || excluded_overlap,
+            })
+        })
+        .collect()
+}
+
+fn millisecond_is_ignored(point_ms: u64, regions: &[EvaluationRegion]) -> bool {
+    regions
+        .iter()
+        .any(|region| region.start_ms <= point_ms && point_ms < region.end_ms)
+}
+
+fn scoring_turns_from_atoms(
+    atoms: &[EvaluationAtomicInterval],
+) -> (Vec<ScoringTurn>, Vec<ScoringTurn>) {
+    let mut reference = Vec::new();
+    let mut hypothesis = Vec::new();
+    for atom in atoms.iter().filter(|atom| !atom.excluded) {
+        let start_sec = atom.start_ms as f64 / 1_000.0;
+        let end_sec = atom.end_ms as f64 / 1_000.0;
+        reference.extend(
+            atom.reference
+                .iter()
+                .map(|speaker| ScoringTurn::labeled(start_sec, end_sec, speaker)),
+        );
+        hypothesis.extend(atom.hypothesis.iter().map(|state| ScoringTurn {
+            start_sec,
+            end_sec,
+            speaker: state.speaker.clone(),
+            overlap_suspected: atom.hypothesis_overlap_suspected,
+        }));
+    }
+    (reference, hypothesis)
+}
+
+fn score_speech_activity(atoms: &[EvaluationAtomicInterval]) -> SpeechActivityScore {
+    let mut score = SpeechActivityScore {
+        reference_speech_sec: 0.0,
+        hypothesis_speech_sec: 0.0,
+        correct_speech_sec: 0.0,
+        missed_speech_sec: 0.0,
+        false_alarm_sec: 0.0,
+        error_rate: None,
+    };
+    for atom in atoms.iter().filter(|atom| !atom.excluded) {
+        let duration = atom.duration_sec();
+        let reference_active = !atom.reference.is_empty();
+        let hypothesis_active = !atom.hypothesis.is_empty();
+        if reference_active {
+            score.reference_speech_sec += duration;
+        }
+        if hypothesis_active {
+            score.hypothesis_speech_sec += duration;
+        }
+        match (reference_active, hypothesis_active) {
+            (true, true) => score.correct_speech_sec += duration,
+            (true, false) => score.missed_speech_sec += duration,
+            (false, true) => score.false_alarm_sec += duration,
+            (false, false) => {}
+        }
+    }
+    score.error_rate = (score.reference_speech_sec > SCORE_EPSILON_SEC)
+        .then_some((score.missed_speech_sec + score.false_alarm_sec) / score.reference_speech_sec);
+    score
+}
+
+fn score_speaker_attribution(diarization: &DiarizationScore) -> SpeakerAttributionScore {
+    let attributable_reference_speaker_time_sec =
+        (diarization.reference_speaker_time_sec - diarization.missed_speech_sec).max(0.0);
+    let correctly_attributed_speaker_time_sec =
+        (attributable_reference_speaker_time_sec - diarization.speaker_confusion_sec).max(0.0);
+    SpeakerAttributionScore {
+        attributable_reference_speaker_time_sec,
+        correctly_attributed_speaker_time_sec,
+        attribution_error_sec: diarization.speaker_confusion_sec,
+        accuracy: (attributable_reference_speaker_time_sec > SCORE_EPSILON_SEC).then_some(
+            correctly_attributed_speaker_time_sec / attributable_reference_speaker_time_sec,
+        ),
+    }
+}
+
+fn score_speaker_count(reference: &[ScoringTurn], hypothesis: &[ScoringTurn]) -> SpeakerCountScore {
+    let reference_speakers = collect_labels(reference).len();
+    let hypothesis_speakers = collect_labels(hypothesis).len();
+    let signed_error = i64::try_from(hypothesis_speakers)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(i64::try_from(reference_speakers).unwrap_or(i64::MAX));
+    SpeakerCountScore {
+        reference_speakers,
+        hypothesis_speakers,
+        signed_error,
+        absolute_error: signed_error.unsigned_abs(),
+    }
+}
+
+fn score_overlap_detection(atoms: &[EvaluationAtomicInterval]) -> OverlapDetectionScore {
+    let mut reference_overlap_sec = 0.0;
+    let mut hypothesis_overlap_sec = 0.0;
+    let mut true_positive_sec = 0.0;
+    let mut false_positive_sec = 0.0;
+    let mut false_negative_sec = 0.0;
+    for atom in atoms.iter().filter(|atom| !atom.excluded) {
+        let duration = atom.duration_sec();
+        let reference_overlap = atom.reference.len() > 1;
+        let hypothesis_overlap = atom.hypothesis.len() > 1 || atom.hypothesis_overlap_suspected;
+        if reference_overlap {
+            reference_overlap_sec += duration;
+        }
+        if hypothesis_overlap {
+            hypothesis_overlap_sec += duration;
+        }
+        match (reference_overlap, hypothesis_overlap) {
+            (true, true) => true_positive_sec += duration,
+            (false, true) => false_positive_sec += duration,
+            (true, false) => false_negative_sec += duration,
+            (false, false) => {}
+        }
+    }
+    let precision = ratio_or_none(true_positive_sec, true_positive_sec + false_positive_sec);
+    let recall = ratio_or_none(true_positive_sec, true_positive_sec + false_negative_sec);
+    OverlapDetectionScore {
+        reference_overlap_sec,
+        hypothesis_overlap_sec,
+        true_positive_sec,
+        false_positive_sec,
+        false_negative_sec,
+        precision,
+        recall,
+        f1: f1_or_none(precision, recall),
+    }
+}
+
+fn score_hint_adherence(
+    atoms: &[EvaluationAtomicInterval],
+    hints: &[EvaluationSpeakerHint],
+    mapping: &BTreeMap<String, String>,
+) -> HintAdherenceScore {
+    let mut score = HintAdherenceScore {
+        hinted_sec: 0.0,
+        adherent_sec: 0.0,
+        contradictory_sec: 0.0,
+        unknown_sec: 0.0,
+        hard_violation_sec: 0.0,
+        adherence_rate: None,
+    };
+    for hint in hints {
+        for atom in atoms.iter().filter(|atom| {
+            !atom.excluded && atom.start_ms < hint.end_ms && hint.start_ms < atom.end_ms
+        }) {
+            let overlap_start = atom.start_ms.max(hint.start_ms);
+            let overlap_end = atom.end_ms.min(hint.end_ms);
+            let duration = (overlap_end - overlap_start) as f64 / 1_000.0;
+            score.hinted_sec += duration;
+            let mapped = atom
+                .hypothesis
+                .iter()
+                .filter_map(|state| state.speaker.as_ref())
+                .filter_map(|speaker| mapping.get(speaker))
+                .collect::<BTreeSet<_>>();
+            if mapped.contains(&hint.speaker_ref) {
+                score.adherent_sec += duration;
+            } else if mapped.is_empty() {
+                score.unknown_sec += duration;
+                if hint.policy == EvaluationHintPolicy::Hard {
+                    score.hard_violation_sec += duration;
+                }
+            } else {
+                score.contradictory_sec += duration;
+                if hint.policy == EvaluationHintPolicy::Hard {
+                    score.hard_violation_sec += duration;
+                }
+            }
+        }
+    }
+    score.adherence_rate = ratio_or_none(score.adherent_sec, score.hinted_sec);
+    score
+}
+
+fn score_selective_attribution(
+    atoms: &[EvaluationAtomicInterval],
+    mapping: &BTreeMap<String, String>,
+) -> SelectiveAttributionScore {
+    let mut reference_speaker_time_sec = 0.0;
+    let mut covered_speaker_time_sec = 0.0;
+    let mut correct_covered_speaker_time_sec = 0.0;
+    for atom in atoms.iter().filter(|atom| !atom.excluded) {
+        let duration = atom.duration_sec();
+        let reference_count = atom.reference.len();
+        let mapped = atom
+            .hypothesis
+            .iter()
+            .filter_map(|state| state.speaker.as_ref())
+            .filter_map(|speaker| mapping.get(speaker))
+            .collect::<BTreeSet<_>>();
+        let labeled_hypothesis_count = atom
+            .hypothesis
+            .iter()
+            .filter(|state| state.speaker.is_some())
+            .count();
+        let covered_count = reference_count.min(labeled_hypothesis_count);
+        let correct_count = mapped
+            .iter()
+            .filter(|speaker| atom.reference.contains(**speaker))
+            .count()
+            .min(covered_count);
+        reference_speaker_time_sec += duration * reference_count as f64;
+        covered_speaker_time_sec += duration * covered_count as f64;
+        correct_covered_speaker_time_sec += duration * correct_count as f64;
+    }
+    let error_covered_speaker_time_sec =
+        (covered_speaker_time_sec - correct_covered_speaker_time_sec).max(0.0);
+    SelectiveAttributionScore {
+        reference_speaker_time_sec,
+        covered_speaker_time_sec,
+        correct_covered_speaker_time_sec,
+        error_covered_speaker_time_sec,
+        unknown_speaker_time_sec: (reference_speaker_time_sec - covered_speaker_time_sec).max(0.0),
+        coverage: ratio_or_none(covered_speaker_time_sec, reference_speaker_time_sec),
+        selective_risk: ratio_or_none(error_covered_speaker_time_sec, covered_speaker_time_sec),
+    }
+}
+
+fn score_weighted_calibration(
+    atoms: &[EvaluationAtomicInterval],
+    mapping: &BTreeMap<String, String>,
+    bins: usize,
+) -> WeightedCalibrationScore {
+    let mut observations = Vec::new();
+    let mut opportunity_duration_sec = 0.0;
+    for atom in atoms.iter().filter(|atom| !atom.excluded) {
+        let duration = atom.duration_sec();
+        for state in atom
+            .hypothesis
+            .iter()
+            .filter(|state| state.speaker.is_some())
+        {
+            opportunity_duration_sec += duration;
+            if let (Some(speaker), Some(confidence)) = (&state.speaker, state.confidence) {
+                let correct = mapping
+                    .get(speaker)
+                    .is_some_and(|reference| atom.reference.contains(reference));
+                observations.push(WeightedCalibrationObservation {
+                    confidence,
+                    correct,
+                    duration_sec: duration,
+                });
+            }
+        }
+    }
+    let observed_duration_sec = observations
+        .iter()
+        .map(|observation| observation.duration_sec)
+        .sum::<f64>();
+    if observed_duration_sec <= SCORE_EPSILON_SEC {
+        return WeightedCalibrationScore {
+            observed_duration_sec: 0.0,
+            opportunity_duration_sec,
+            coverage: ratio_or_none(0.0, opportunity_duration_sec),
+            brier_score: None,
+            expected_calibration_error: None,
+            bins,
+        };
+    }
+
+    let mut brier_sum = 0.0;
+    let mut bin_weights = vec![0.0_f64; bins];
+    let mut bin_confidence = vec![0.0_f64; bins];
+    let mut bin_correct = vec![0.0_f64; bins];
+    for observation in &observations {
+        let outcome = f64::from(observation.correct);
+        brier_sum += (observation.confidence - outcome).powi(2) * observation.duration_sec;
+        let bin = ((observation.confidence * bins as f64).floor() as usize).min(bins - 1);
+        bin_weights[bin] += observation.duration_sec;
+        bin_confidence[bin] += observation.confidence * observation.duration_sec;
+        bin_correct[bin] += outcome * observation.duration_sec;
+    }
+    let mut expected_calibration_error = 0.0;
+    for bin in 0..bins {
+        if bin_weights[bin] <= SCORE_EPSILON_SEC {
+            continue;
+        }
+        let mean_confidence = bin_confidence[bin] / bin_weights[bin];
+        let accuracy = bin_correct[bin] / bin_weights[bin];
+        expected_calibration_error +=
+            bin_weights[bin] / observed_duration_sec * (accuracy - mean_confidence).abs();
+    }
+    WeightedCalibrationScore {
+        observed_duration_sec,
+        opportunity_duration_sec,
+        coverage: ratio_or_none(observed_duration_sec, opportunity_duration_sec),
+        brier_score: Some(brier_sum / observed_duration_sec),
+        expected_calibration_error: Some(expected_calibration_error),
+        bins,
+    }
+}
+
+fn ratio_or_none(numerator: f64, denominator: f64) -> Option<f64> {
+    (denominator > SCORE_EPSILON_SEC).then_some(numerator / denominator)
+}
+
+fn f1_or_none(precision: Option<f64>, recall: Option<f64>) -> Option<f64> {
+    match (precision, recall) {
+        (Some(precision), Some(recall)) if precision + recall > SCORE_EPSILON_SEC => {
+            Some(2.0 * precision * recall / (precision + recall))
+        }
+        (Some(_), Some(_)) => Some(0.0),
+        _ => None,
+    }
+}
+
+fn ordered_splits(
+    left: EvaluationSplit,
+    right: EvaluationSplit,
+) -> (EvaluationSplit, EvaluationSplit) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn sorted_intersection(left: &[String], right: &[String]) -> Vec<String> {
+    let left = left.iter().cloned().collect::<BTreeSet<_>>();
+    let right = right.iter().cloned().collect::<BTreeSet<_>>();
+    sorted_set_intersection(&left, &right)
+}
+
+fn sorted_set_intersection(left: &BTreeSet<String>, right: &BTreeSet<String>) -> Vec<String> {
+    left.intersection(right).cloned().collect()
+}
+
+fn lineage_ids(recording: &CorpusRecordingManifest) -> BTreeSet<String> {
+    recording
+        .derived_from_recording_ids
+        .iter()
+        .cloned()
+        .collect()
 }
 
 fn validate_turns(turns: &[ScoringTurn], reference: bool) -> FwResult<()> {
@@ -3853,11 +5402,19 @@ mod tests {
         ACOUSTIC_CANCELLATION_INTERVAL_FRAMES, ACOUSTIC_FRAME_SAMPLES, ACOUSTIC_HOP_SAMPLES,
         AcousticBoundaryHints, AcousticDiarizationInput, AcousticFrameFeatures,
         AcousticQualityMask, AcousticSegmenter, AcousticSpeakerAssignment, AcousticTracklet,
-        CalibrationObservation, ChannelFeatureView, ProfileEnrollmentCode, ScoringTurn,
-        VoiceFeatureView, cluster_acoustic_tracklets, diarization_turns_from_assignments,
-        diarize_acoustic_pcm, enroll_known_speaker_profiles, extract_acoustic_features,
-        merge_tracklet_statistics, project_diarization_onto_segments, score_calibration,
-        score_change_points, score_diarization, segment_acoustic_frames,
+        CalibrationObservation, ChannelFeatureView, CorpusRecordingManifest,
+        DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION, DIARIZATION_HYPOTHESIS_SCHEMA_VERSION,
+        DIARIZATION_REFERENCE_SCHEMA_VERSION, DiarizationCorpusManifest,
+        DiarizationHypothesisDocument, DiarizationReferenceDocument, DiarizationScorerConfig,
+        EvaluationHintPolicy, EvaluationOverlapPolicy, EvaluationPerformanceObservation,
+        EvaluationRegion, EvaluationSpeakerHint, EvaluationSplit, EvaluationTurn, LeakageKind,
+        ProfileEnrollmentCode, ScoringTurn, VoiceFeatureView, audit_diarization_manifest,
+        cluster_acoustic_tracklets, diarization_turns_from_assignments, diarize_acoustic_pcm,
+        enroll_known_speaker_profiles, extract_acoustic_features, merge_tracklet_statistics,
+        parse_diarization_corpus_manifest, parse_diarization_reference,
+        project_diarization_onto_segments, score_calibration, score_change_points,
+        score_diarization, score_diarization_documents, segment_acoustic_frames,
+        verify_authoritative_score_hash, verify_leakage_audit_hash,
     };
     use crate::FwError;
     use crate::model::{
@@ -3871,6 +5428,524 @@ mod tests {
             (actual - expected).abs() < 1e-9,
             "expected {expected}, got {actual}"
         );
+    }
+
+    fn evaluation_reference() -> DiarizationReferenceDocument {
+        DiarizationReferenceDocument {
+            schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
+            recording_id: "synthetic-call-001".to_owned(),
+            duration_ms: 6_000,
+            turns: vec![
+                EvaluationTurn::labeled(0, 2_000, "speaker-a"),
+                EvaluationTurn::labeled(2_000, 4_000, "speaker-b"),
+                EvaluationTurn::labeled(4_000, 5_000, "speaker-a"),
+                EvaluationTurn::labeled(4_000, 5_000, "speaker-b"),
+            ],
+            ignored_regions: Vec::new(),
+            speaker_hints: vec![
+                EvaluationSpeakerHint {
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    speaker_ref: "speaker-a".to_owned(),
+                    policy: EvaluationHintPolicy::Hard,
+                },
+                EvaluationSpeakerHint {
+                    start_ms: 3_000,
+                    end_ms: 4_000,
+                    speaker_ref: "speaker-b".to_owned(),
+                    policy: EvaluationHintPolicy::Soft,
+                },
+            ],
+        }
+    }
+
+    fn confident_turn(
+        start_ms: u64,
+        end_ms: u64,
+        speaker: &str,
+        confidence: f64,
+        overlap_suspected: bool,
+    ) -> EvaluationTurn {
+        EvaluationTurn {
+            start_ms,
+            end_ms,
+            speaker: Some(speaker.to_owned()),
+            speaker_confidence: Some(confidence),
+            overlap_suspected,
+        }
+    }
+
+    fn evaluation_hypothesis() -> DiarizationHypothesisDocument {
+        DiarizationHypothesisDocument {
+            schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: "synthetic-call-001".to_owned(),
+            duration_ms: 6_000,
+            turns: vec![
+                confident_turn(0, 2_000, "cluster-x", 0.9, false),
+                confident_turn(2_000, 3_000, "cluster-y", 0.8, false),
+                EvaluationTurn::unknown(3_000, 4_000),
+                confident_turn(4_000, 5_000, "cluster-x", 0.7, true),
+                confident_turn(4_000, 5_000, "cluster-y", 0.6, true),
+                confident_turn(5_000, 5_500, "cluster-x", 0.4, false),
+            ],
+            performance: Some(EvaluationPerformanceObservation {
+                audio_duration_ms: 6_000,
+                wall_time_ms: 120,
+                peak_rss_bytes: 8_388_608,
+            }),
+        }
+    }
+
+    fn manifest_recording(
+        recording_id: &str,
+        split: EvaluationSplit,
+        origin_recording_id: &str,
+        speaker_refs: &[&str],
+    ) -> CorpusRecordingManifest {
+        CorpusRecordingManifest {
+            recording_id: recording_id.to_owned(),
+            split,
+            origin_recording_id: origin_recording_id.to_owned(),
+            speaker_refs: speaker_refs
+                .iter()
+                .map(|speaker| (*speaker).to_owned())
+                .collect(),
+            derived_from_recording_ids: Vec::new(),
+            augmentation_group_id: None,
+            enrollment_recording_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn authoritative_scorer_matches_hand_computed_multi_metric_example() {
+        let result = score_diarization_documents(
+            &evaluation_reference(),
+            &evaluation_hypothesis(),
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("authoritative score");
+
+        assert_close(result.diarization.reference_speaker_time_sec, 6.0);
+        assert_close(result.diarization.missed_speech_sec, 0.0);
+        assert_close(result.diarization.false_alarm_sec, 0.5);
+        assert_close(result.diarization.speaker_confusion_sec, 1.0);
+        assert_close(result.diarization.der.expect("DER"), 0.25);
+        assert_close(result.diarization.jer.expect("JER"), 5.0 / 21.0);
+        assert_eq!(result.diarization.speaker_mapping["cluster-x"], "speaker-a");
+        assert_eq!(result.diarization.speaker_mapping["cluster-y"], "speaker-b");
+
+        assert_close(result.speech_activity.reference_speech_sec, 5.0);
+        assert_close(result.speech_activity.false_alarm_sec, 0.5);
+        assert_close(
+            result.speech_activity.error_rate.expect("speech error"),
+            0.1,
+        );
+        assert_eq!(result.change_points.reference_count, 2);
+        assert_eq!(result.change_points.hypothesis_count, 4);
+        assert_eq!(result.change_points.matched_count, 2);
+        assert_eq!(result.change_points.precision, Some(0.5));
+        assert_eq!(result.change_points.recall, Some(1.0));
+        assert_eq!(result.speaker_count.reference_speakers, 2);
+        assert_eq!(result.speaker_count.hypothesis_speakers, 2);
+
+        assert_close(result.overlap.reference_overlap_sec, 1.0);
+        assert_eq!(result.overlap.f1, Some(1.0));
+        assert_close(result.hints.hinted_sec, 2.0);
+        assert_close(result.hints.adherent_sec, 1.0);
+        assert_close(result.hints.unknown_sec, 1.0);
+        assert_close(result.hints.hard_violation_sec, 0.0);
+        assert_close(
+            result.selective_attribution.coverage.expect("coverage"),
+            5.0 / 6.0,
+        );
+        assert_eq!(result.selective_attribution.selective_risk, Some(0.0));
+        assert_close(
+            result.calibration.brier_score.expect("weighted Brier"),
+            0.39 / 5.5,
+        );
+        assert_eq!(result.calibration.coverage, Some(1.0));
+        assert_close(
+            result
+                .performance
+                .as_ref()
+                .and_then(|score| score.real_time_factor)
+                .expect("RTF"),
+            0.02,
+        );
+        verify_authoritative_score_hash(&result).expect("valid result hash");
+    }
+
+    #[test]
+    fn authoritative_scorer_remains_permutation_invariant() {
+        let reference = DiarizationReferenceDocument {
+            speaker_hints: Vec::new(),
+            turns: vec![
+                EvaluationTurn::labeled(0, 1_000, "ref-a"),
+                EvaluationTurn::labeled(1_000, 2_000, "ref-b"),
+            ],
+            duration_ms: 2_000,
+            ..evaluation_reference()
+        };
+        let hypothesis = DiarizationHypothesisDocument {
+            turns: vec![
+                confident_turn(0, 1_000, "z-cluster", 1.0, false),
+                confident_turn(1_000, 2_000, "a-cluster", 1.0, false),
+            ],
+            duration_ms: 2_000,
+            performance: None,
+            ..evaluation_hypothesis()
+        };
+        let result = score_diarization_documents(
+            &reference,
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("score");
+        assert_eq!(result.diarization.der, Some(0.0));
+        assert_eq!(result.diarization.jer, Some(0.0));
+        assert_eq!(result.diarization.speaker_mapping["z-cluster"], "ref-a");
+        assert_eq!(result.diarization.speaker_mapping["a-cluster"], "ref-b");
+    }
+
+    #[test]
+    fn speaker_boundary_collar_changes_der_but_not_change_point_authority() {
+        let reference = DiarizationReferenceDocument {
+            speaker_hints: Vec::new(),
+            turns: vec![
+                EvaluationTurn::labeled(0, 2_000, "ref-a"),
+                EvaluationTurn::labeled(2_000, 4_000, "ref-b"),
+            ],
+            duration_ms: 4_000,
+            ..evaluation_reference()
+        };
+        let hypothesis = DiarizationHypothesisDocument {
+            turns: vec![
+                confident_turn(0, 2_200, "cluster-x", 0.9, false),
+                confident_turn(2_200, 4_000, "cluster-y", 0.9, false),
+            ],
+            duration_ms: 4_000,
+            performance: None,
+            ..evaluation_hypothesis()
+        };
+        let strict = score_diarization_documents(
+            &reference,
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("strict score");
+        assert_close(strict.diarization.der.expect("strict DER"), 0.05);
+
+        let config = DiarizationScorerConfig {
+            speaker_boundary_collar_ms: 250,
+            ..DiarizationScorerConfig::default()
+        };
+        let collared =
+            score_diarization_documents(&reference, &hypothesis, &config).expect("collared score");
+        assert_eq!(collared.diarization.der, Some(0.0));
+        assert_eq!(collared.change_points.reference_count, 1);
+        assert_eq!(collared.change_points.matched_count, 1);
+        assert_close(collared.ignored_duration_sec, 0.5);
+    }
+
+    #[test]
+    fn overlap_exclusion_policy_is_explicit_and_reproducible() {
+        let reference = DiarizationReferenceDocument {
+            speaker_hints: Vec::new(),
+            turns: vec![
+                EvaluationTurn::labeled(0, 2_000, "ref-a"),
+                EvaluationTurn::labeled(1_000, 2_000, "ref-b"),
+            ],
+            duration_ms: 2_000,
+            ..evaluation_reference()
+        };
+        let hypothesis = DiarizationHypothesisDocument {
+            turns: vec![confident_turn(0, 2_000, "cluster-x", 0.9, false)],
+            duration_ms: 2_000,
+            performance: None,
+            ..evaluation_hypothesis()
+        };
+        let included = score_diarization_documents(
+            &reference,
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("included overlap");
+        assert_close(included.diarization.der.expect("DER"), 1.0 / 3.0);
+
+        let config = DiarizationScorerConfig {
+            overlap_policy: EvaluationOverlapPolicy::Exclude,
+            ..DiarizationScorerConfig::default()
+        };
+        let excluded = score_diarization_documents(&reference, &hypothesis, &config)
+            .expect("excluded overlap");
+        assert_eq!(excluded.diarization.der, Some(0.0));
+        assert_close(excluded.ignored_duration_sec, 1.0);
+    }
+
+    #[test]
+    fn ignored_regions_remove_accuracy_hint_and_calibration_opportunities() {
+        let mut reference = evaluation_reference();
+        reference.ignored_regions = vec![EvaluationRegion {
+            start_ms: 2_000,
+            end_ms: 4_000,
+            reason_code: "annotation_uncertain".to_owned(),
+        }];
+        let result = score_diarization_documents(
+            &reference,
+            &evaluation_hypothesis(),
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("score");
+        assert_close(result.ignored_duration_sec, 2.0);
+        assert_close(result.diarization.reference_speaker_time_sec, 4.0);
+        assert_close(result.diarization.speaker_confusion_sec, 0.0);
+        assert_close(result.hints.hinted_sec, 1.0);
+        assert_close(result.calibration.opportunity_duration_sec, 4.5);
+    }
+
+    #[test]
+    fn empty_speech_and_missing_confidence_have_explicit_undefined_metrics() {
+        let reference = DiarizationReferenceDocument {
+            speaker_hints: Vec::new(),
+            turns: Vec::new(),
+            duration_ms: 1_000,
+            ..evaluation_reference()
+        };
+        let empty_hypothesis = DiarizationHypothesisDocument {
+            turns: Vec::new(),
+            duration_ms: 1_000,
+            performance: None,
+            ..evaluation_hypothesis()
+        };
+        let empty = score_diarization_documents(
+            &reference,
+            &empty_hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("empty score");
+        assert_eq!(empty.diarization.der, None);
+        assert_eq!(empty.diarization.jer, None);
+        assert_eq!(empty.speech_activity.error_rate, None);
+        assert_eq!(empty.selective_attribution.coverage, None);
+        assert_eq!(empty.calibration.coverage, None);
+        assert_eq!(empty.calibration.brier_score, None);
+
+        let labeled_reference = DiarizationReferenceDocument {
+            turns: vec![EvaluationTurn::labeled(0, 1_000, "speaker-a")],
+            ..reference
+        };
+        let no_confidence = DiarizationHypothesisDocument {
+            turns: vec![EvaluationTurn::labeled(0, 1_000, "cluster-x")],
+            ..empty_hypothesis
+        };
+        let score = score_diarization_documents(
+            &labeled_reference,
+            &no_confidence,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("no-confidence score");
+        assert_eq!(score.calibration.coverage, Some(0.0));
+        assert_eq!(score.calibration.brier_score, None);
+    }
+
+    #[test]
+    fn speaker_hint_must_name_a_reference_speaker() {
+        let mut reference = evaluation_reference();
+        reference.speaker_hints[0].speaker_ref = "speaker-not-present".to_owned();
+        let error = score_diarization_documents(
+            &reference,
+            &evaluation_hypothesis(),
+            &DiarizationScorerConfig::default(),
+        )
+        .expect_err("unbound hint");
+        assert!(error.to_string().contains("hint_speaker_not_in_reference"));
+    }
+
+    #[test]
+    fn scorer_serialization_and_hashes_are_deterministic() {
+        let first = score_diarization_documents(
+            &evaluation_reference(),
+            &evaluation_hypothesis(),
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("first");
+        let second = score_diarization_documents(
+            &evaluation_reference(),
+            &evaluation_hypothesis(),
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("second");
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first"),
+            serde_json::to_vec(&second).expect("serialize second")
+        );
+
+        let mut tampered = first;
+        tampered.diarization.false_alarm_sec += 0.001;
+        let error =
+            verify_authoritative_score_hash(&tampered).expect_err("tampering must be detected");
+        assert!(error.to_string().contains("result_hash_mismatch"));
+    }
+
+    #[test]
+    fn parser_rejects_unknown_fields_wrong_versions_and_sensitive_markers() {
+        let mut value = serde_json::to_value(evaluation_reference()).expect("reference JSON");
+        value["unexpected"] = serde_json::json!(true);
+        assert!(
+            parse_diarization_reference(
+                &serde_json::to_vec(&value).expect("serialize malformed reference")
+            )
+            .is_err()
+        );
+
+        let mut wrong_version = evaluation_reference();
+        wrong_version.schema_version = "diarization-reference-v999".to_owned();
+        let error = parse_diarization_reference(
+            &serde_json::to_vec(&wrong_version).expect("serialize wrong version"),
+        )
+        .expect_err("wrong version");
+        assert!(error.to_string().contains("reference_schema_version"));
+
+        let mut sensitive = evaluation_reference();
+        sensitive.recording_id = "Downloads/private-call.m4a".to_owned();
+        let error = score_diarization_documents(
+            &sensitive,
+            &evaluation_hypothesis(),
+            &DiarizationScorerConfig::default(),
+        )
+        .expect_err("sensitive path");
+        assert!(
+            error.to_string().contains("opaque_id_path")
+                || error.to_string().contains("opaque_id_sensitive_marker")
+        );
+    }
+
+    #[test]
+    fn malformed_intervals_confidences_and_order_fail_with_stable_codes() {
+        let mut invalid_interval = evaluation_reference();
+        invalid_interval.turns[0].end_ms = 0;
+        let error = score_diarization_documents(
+            &invalid_interval,
+            &evaluation_hypothesis(),
+            &DiarizationScorerConfig::default(),
+        )
+        .expect_err("invalid interval");
+        assert!(error.to_string().contains("interval_geometry"));
+
+        let mut invalid_confidence = evaluation_hypothesis();
+        invalid_confidence.turns[0].speaker_confidence = Some(f64::NAN);
+        let error = score_diarization_documents(
+            &evaluation_reference(),
+            &invalid_confidence,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect_err("invalid confidence");
+        assert!(error.to_string().contains("speaker_confidence_range"));
+
+        let mut unsorted = evaluation_hypothesis();
+        unsorted.turns.swap(0, 1);
+        let error = score_diarization_documents(
+            &evaluation_reference(),
+            &unsorted,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect_err("unsorted");
+        assert!(error.to_string().contains("turn_order"));
+    }
+
+    #[test]
+    fn leakage_audit_detects_every_cross_split_identity_channel() {
+        let mut train = manifest_recording(
+            "recording-a",
+            EvaluationSplit::Train,
+            "origin-a",
+            &["speaker-a"],
+        );
+        train.derived_from_recording_ids = vec!["source-a".to_owned()];
+        train.augmentation_group_id = Some("augmentation-a".to_owned());
+        train.enrollment_recording_ids = vec!["enrollment-a".to_owned()];
+        let mut test = manifest_recording(
+            "recording-a",
+            EvaluationSplit::Test,
+            "origin-a",
+            &["speaker-a"],
+        );
+        test.derived_from_recording_ids = vec!["source-a".to_owned()];
+        test.augmentation_group_id = Some("augmentation-a".to_owned());
+        test.enrollment_recording_ids = vec!["enrollment-a".to_owned()];
+        let manifest = DiarizationCorpusManifest {
+            schema_version: DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION.to_owned(),
+            corpus_id: "synthetic-corpus".to_owned(),
+            license_id: "synthetic-only".to_owned(),
+            recordings: vec![train, test],
+        };
+        let audit = audit_diarization_manifest(&manifest).expect("audit");
+        assert!(!audit.passed);
+        for kind in [
+            LeakageKind::DuplicateRecording,
+            LeakageKind::SharedOrigin,
+            LeakageKind::SharedSpeaker,
+            LeakageKind::SharedDerivedSource,
+            LeakageKind::SharedAugmentation,
+            LeakageKind::CrossSplitEnrollment,
+        ] {
+            assert!(
+                audit.findings.iter().any(|finding| finding.kind == kind),
+                "missing {kind:?}"
+            );
+        }
+        verify_leakage_audit_hash(&audit).expect("audit hash");
+    }
+
+    #[test]
+    fn clean_manifest_passes_and_remains_path_free() {
+        let manifest = DiarizationCorpusManifest {
+            schema_version: DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION.to_owned(),
+            corpus_id: "public-corpus".to_owned(),
+            license_id: "CC-BY-4.0".to_owned(),
+            recordings: vec![
+                manifest_recording(
+                    "recording-a",
+                    EvaluationSplit::Train,
+                    "origin-a",
+                    &["speaker-a"],
+                ),
+                manifest_recording(
+                    "recording-b",
+                    EvaluationSplit::Test,
+                    "origin-b",
+                    &["speaker-b"],
+                ),
+            ],
+        };
+        let audit = audit_diarization_manifest(&manifest).expect("audit");
+        assert!(audit.passed);
+        assert!(audit.findings.is_empty());
+        let serialized = serde_json::to_string(&manifest).expect("serialize manifest");
+        for forbidden in ["path", "transcript", "audio_file", "source_uri"] {
+            assert!(!serialized.contains(forbidden));
+        }
+        let parsed = parse_diarization_corpus_manifest(serialized.as_bytes()).expect("parse");
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_entries_within_one_split() {
+        let recording = manifest_recording(
+            "recording-a",
+            EvaluationSplit::Train,
+            "origin-a",
+            &["speaker-a"],
+        );
+        let manifest = DiarizationCorpusManifest {
+            schema_version: DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION.to_owned(),
+            corpus_id: "synthetic-corpus".to_owned(),
+            license_id: "synthetic-only".to_owned(),
+            recordings: vec![recording.clone(), recording],
+        };
+        let error = audit_diarization_manifest(&manifest).expect_err("duplicate manifest entry");
+        assert!(error.to_string().contains("manifest_recording_order"));
     }
 
     #[test]
