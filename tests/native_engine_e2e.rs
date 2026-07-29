@@ -26,6 +26,10 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 use serde_json::Value;
 
+use franken_whisper::conformance::compare_replay_envelopes;
+use franken_whisper::storage::RunStore;
+use franken_whisper::sync::{self, ConflictPolicy};
+
 /// The reference transcript whisper-cli produced for `jfk.wav` with `tiny.en`,
 /// read at runtime from `tests/fixtures/native/jfk_tiny_reference.json` (the
 /// `-oj` output committed alongside the audio fixture). We do not hard-code it
@@ -188,6 +192,14 @@ fn run_robot(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) -> Cl
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
+}
+
+fn strict_ndjson_lines(run: &CliRun) -> Vec<Value> {
+    run.stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("each robot line must be JSON"))
+        .collect()
 }
 
 /// Locate the `backend.ok` event's payload in a report, or panic with the
@@ -379,6 +391,10 @@ fn gated_robot_acoustic_diarization_accepts_canonical_dtw_projection() {
     }
     let state = tempfile::tempdir().expect("tempdir");
     let wav = jfk_wav();
+    let source_db = state.path().join("source.sqlite3");
+    let target_db = state.path().join("recovered.sqlite3");
+    let snapshot = state.path().join("snapshot");
+    let sync_state = state.path().join("sync-state");
 
     let mut env = vec![
         ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
@@ -397,7 +413,8 @@ fn gated_robot_acoustic_diarization_accepts_canonical_dtw_projection() {
             "--diarize",
             "--diarization-engine",
             "acoustic",
-            "--no-persist",
+            "--db",
+            source_db.to_str().expect("utf8 source db"),
         ],
         &env,
         state.path(),
@@ -409,11 +426,7 @@ fn gated_robot_acoustic_diarization_accepts_canonical_dtw_projection() {
         run.stdout,
         run.stderr,
     );
-    let lines = run
-        .stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .collect::<Vec<_>>();
+    let lines = strict_ndjson_lines(&run);
     assert!(
         lines
             .iter()
@@ -454,6 +467,130 @@ fn gated_robot_acoustic_diarization_accepts_canonical_dtw_projection() {
         }),
         "every projected transcript unit must retain positive duration"
     );
+
+    let run_id = complete["run_id"].as_str().expect("run_complete run_id");
+    let source_store = RunStore::open(&source_db).expect("source store");
+    let stored = source_store
+        .load_run_details(run_id)
+        .expect("stored run query")
+        .expect("stored run");
+    assert_eq!(
+        stored
+            .projection_timeline
+            .as_ref()
+            .expect("stored projection timeline")["schema_version"],
+        franken_whisper::conformance::DTW_PROJECTION_SCHEMA_VERSION
+    );
+    assert_eq!(
+        stored
+            .projection_timeline
+            .as_ref()
+            .expect("stored projection timeline")["word_aligned_safe"],
+        true
+    );
+    assert_eq!(
+        stored
+            .projection_timeline
+            .as_ref()
+            .expect("stored projection timeline")["fallback_reasons"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        serde_json::to_value(&stored.segments).expect("serialize stored segments"),
+        complete["segments"],
+        "robot output and SQLite-authoritative segments must agree"
+    );
+    assert_eq!(
+        serde_json::to_value(&stored.diarization).expect("serialize stored diarization"),
+        complete["diarization"],
+        "robot output and SQLite-authoritative diarization must agree"
+    );
+
+    let manifest = sync::export(&source_db, &snapshot, &sync_state).expect("JSONL export");
+    assert_eq!(manifest.schema_version, "1.1");
+    assert_eq!(manifest.export_format_version, "1.0");
+    sync::import(&target_db, &snapshot, &sync_state, ConflictPolicy::Reject)
+        .expect("JSONL recovery into a fresh database");
+
+    let recovered = RunStore::open(&target_db)
+        .expect("recovered store")
+        .load_run_details(run_id)
+        .expect("recovered run query")
+        .expect("recovered run");
+    assert_eq!(
+        serde_json::to_value(&recovered.segments).expect("serialize recovered segments"),
+        serde_json::to_value(&stored.segments).expect("serialize stored segments")
+    );
+    assert_eq!(recovered.diarization, stored.diarization);
+    assert_eq!(recovered.projection_timeline, stored.projection_timeline);
+    assert!(
+        compare_replay_envelopes(&stored.replay, &recovered.replay).within_tolerance(),
+        "replay envelope must survive SQLite -> JSONL -> fresh SQLite"
+    );
+
+    let repeat = run_robot(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            "tiny.en",
+            "--diarize",
+            "--diarization-engine",
+            "acoustic",
+            "--no-persist",
+        ],
+        &env,
+        state.path(),
+    );
+    assert!(
+        repeat.status.success(),
+        "deterministic repeat failed: stdout={} stderr={}",
+        repeat.stdout,
+        repeat.stderr
+    );
+    let repeat_lines = strict_ndjson_lines(&repeat);
+    let repeat_complete = repeat_lines
+        .iter()
+        .find(|line| line["event"] == "run_complete")
+        .expect("repeat run_complete");
+    assert_eq!(repeat_complete["segments"], complete["segments"]);
+    assert_eq!(repeat_complete["diarization"], complete["diarization"]);
+
+    let human = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            "tiny.en",
+            "--diarize",
+            "--diarization-engine",
+            "acoustic",
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+    assert!(
+        human.status.success(),
+        "human JSON rendering failed: stdout={} stderr={}",
+        human.stdout,
+        human.stderr
+    );
+    assert!(
+        human.stdout.lines().count() > 1,
+        "human JSON output must remain pretty-printed rather than NDJSON"
+    );
+    let human_report = human.report();
+    assert_eq!(
+        human_report["result"]["raw_output"]["projection_timeline"]["schema_version"],
+        franken_whisper::conformance::DTW_PROJECTION_SCHEMA_VERSION
+    );
+    assert!(human_report["result"]["diarization"].is_object());
 }
 
 // ===========================================================================

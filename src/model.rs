@@ -883,6 +883,17 @@ pub struct StoredRunDetails {
     pub backend: BackendKind,
     pub transcript: String,
     pub segments: Vec<TranscriptionSegment>,
+    /// Complete typed diarization report recovered from the canonical
+    /// `result_json` payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<DiarizationReport>,
+    /// Privacy-safe projection provenance recovered from the canonical
+    /// `result_json` payload.
+    ///
+    /// The rest of backend `raw_output` is deliberately not exposed from run
+    /// history because it may contain internal model paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_timeline: Option<Value>,
     pub events: Vec<RunEvent>,
     pub warnings: Vec<String>,
     pub acceleration: Option<AccelerationReport>,
@@ -1450,6 +1461,11 @@ mod tests {
                     confidence: Some(0.85),
                 },
             ],
+            diarization: None,
+            projection_timeline: Some(json!({
+                "schema_version": "dtw-projection-v2",
+                "word_aligned_safe": true
+            })),
             events: vec![RunEvent {
                 seq: 0,
                 ts_rfc3339: "2026-01-15T10:00:00Z".to_owned(),
@@ -1480,6 +1496,13 @@ mod tests {
         assert_eq!(parsed.backend, BackendKind::WhisperDiarization);
         assert_eq!(parsed.segments.len(), 2);
         assert_eq!(parsed.segments[1].speaker.as_deref(), Some("SPEAKER_01"));
+        assert_eq!(
+            parsed
+                .projection_timeline
+                .as_ref()
+                .expect("projection timeline")["schema_version"],
+            "dtw-projection-v2"
+        );
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.warnings.len(), 1);
         assert!(parsed.acceleration.is_some());
@@ -1498,6 +1521,8 @@ mod tests {
             backend: BackendKind::Auto,
             transcript: String::new(),
             segments: vec![],
+            diarization: None,
+            projection_timeline: None,
             events: vec![],
             warnings: vec![],
             acceleration: None,
@@ -1507,6 +1532,8 @@ mod tests {
         let parsed: StoredRunDetails = serde_json::from_str(&json).unwrap();
         assert!(parsed.transcript.is_empty());
         assert!(parsed.segments.is_empty());
+        assert!(parsed.diarization.is_none());
+        assert!(parsed.projection_timeline.is_none());
         assert!(parsed.events.is_empty());
         assert!(parsed.warnings.is_empty());
         assert!(parsed.acceleration.is_none());

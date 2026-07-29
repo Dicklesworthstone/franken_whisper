@@ -138,7 +138,7 @@ boundaries and cannot invent, drop, duplicate, or reorder text.
 `group_tokens_into_words` quantizes token boundaries to the alignment grid and
 may legitimately emit a terminal `[t, t]` observation. That decoder
 observation is not itself a projection interval. The native backend now owns
-one conversion from raw observations into `dtw-projection-v1` canonical units
+one conversion from raw observations into `dtw-projection-v2` canonical units
 before diarization or persistence can consume them.
 
 A canonical unit has:
@@ -180,11 +180,28 @@ text, recording path, or speaker identity. The orchestrator trusts the typed
 `projection_timeline.word_aligned_safe` field rather than inferring legality
 from the older descriptive `word_timestamps` string.
 
+`fallback_reasons` is an ordered list of stable reason strings. It distinguishes
+missing decoder word timestamps, insufficient parent duration for distinct
+millisecond word units, and timestamp suppression requested by the caller.
+This required field and the durable summary contract are the reason the schema
+identity is v2; consumers must reject v1 rather than silently assuming the new
+fallback semantics.
+
 The simulated proportional CTC alignment stage does not rewrite a timeline
 carrying that proof. Real decoder attention-DTW offsets are authoritative, and
 mixing proportional corrections with per-segment fallbacks can otherwise
 reintroduce overlap at the end of the recording. The align stage records a
 deterministic preservation note and leaves canonical segment bytes unchanged.
+
+SQLite `result_json` is the authoritative durable copy of the typed
+diarization report and the projection timeline. `RunStore` exposes both after
+restart, and JSONL export/import carries the same canonical payload into a
+fresh database before rebuilding its normalized diarization indexes. Robot
+`run_complete` deliberately emits speaker turns and projected segments but not
+the backend raw-output object, which can contain internal model paths; durable
+projection provenance is retrieved through the stored-run surface instead.
+That surface exposes only the privacy-safe `projection_timeline` sub-object,
+not the rest of backend raw output or its internal model paths.
 
 Acoustic v1 confidence currently combines best-versus-second assignment margin
 with profile reliability and reports `heuristic_uncalibrated`. Resampling

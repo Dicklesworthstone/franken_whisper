@@ -28,7 +28,7 @@ pub const CANONICAL_PROJECTION_EPSILON_SEC: f64 = 1e-6;
 pub const CANONICAL_PROJECTION_MIN_DURATION_SEC: f64 = 0.001;
 
 /// Stable schema identity for a normalized decoder-to-diarization timeline.
-pub const DTW_PROJECTION_SCHEMA_VERSION: &str = "dtw-projection-v1";
+pub const DTW_PROJECTION_SCHEMA_VERSION: &str = "dtw-projection-v2";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentConformancePolicy {

@@ -7845,6 +7845,13 @@ mod tests {
             matches!(err, FwError::Cancelled(_)),
             "expected Cancelled error, got: {err:?}"
         );
+        assert!(
+            store
+                .load_run_details("run-cx-test")
+                .expect("query cancelled persistence")
+                .is_none(),
+            "cancelled persistence must roll back the entire run"
+        );
     }
 
     #[test]
@@ -8954,15 +8961,22 @@ mod tests {
         assert!(has_canonical_word_alignment(&json!({
             "word_timestamps": "dtw",
             "projection_timeline": {
-                "schema_version": "dtw-projection-v1",
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
                 "word_aligned_safe": true
             }
         })));
         assert!(!has_canonical_word_alignment(&json!({
             "word_timestamps": "dtw",
             "projection_timeline": {
-                "schema_version": "dtw-projection-v1",
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
                 "word_aligned_safe": false
+            }
+        })));
+        assert!(!has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw",
+            "projection_timeline": {
+                "schema_version": "dtw-projection-v1",
+                "word_aligned_safe": true
             }
         })));
     }
