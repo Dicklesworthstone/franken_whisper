@@ -1302,11 +1302,17 @@ mod tests {
         write_pcm16_mono_wav(&wav, 16_000, &samples);
 
         let req = native_request();
-        let token = CancellationToken::with_deadline_from_now(Duration::from_millis(0));
+        let cancellation = CancellationToken::with_deadline_from_now(Duration::from_millis(0));
         std::thread::sleep(Duration::from_millis(5));
 
         let start = std::time::Instant::now();
-        let result = run(&req, &wav, dir.path(), Duration::from_secs(1), Some(&token));
+        let result = run(
+            &req,
+            &wav,
+            dir.path(),
+            Duration::from_secs(1),
+            Some(&cancellation),
+        );
         assert!(result.is_err(), "expired token must cancel");
         assert!(
             matches!(result.unwrap_err(), FwError::Cancelled(_)),
@@ -1473,9 +1479,9 @@ mod tests {
     #[test]
     fn finalize_segments_cancellation_propagates() {
         let segs = vec![seg(0.0, 1.0, "x")];
-        let token = CancellationToken::with_deadline_from_now(Duration::from_millis(0));
+        let cancellation = CancellationToken::with_deadline_from_now(Duration::from_millis(0));
         std::thread::sleep(Duration::from_millis(5));
-        let result = finalize_segments(&segs, false, Some(&token));
+        let result = finalize_segments(&segs, false, Some(&cancellation));
         assert!(matches!(result.unwrap_err(), FwError::Cancelled(_)));
     }
 
@@ -1581,6 +1587,57 @@ mod tests {
         assert_eq!(out[1].start_sec, Some(0.9));
         // Strictly monotonic, non-overlapping.
         assert!(out[0].end_sec <= out[1].start_sec);
+    }
+
+    #[test]
+    fn dtw_adapter_preserves_zero_width_word_that_acoustic_projection_rejects() {
+        let engine = vec![TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(1.0),
+            text: " alpha beta".to_owned(),
+            speaker: None,
+            confidence: Some(0.9),
+        }];
+        let timings = vec![vec![
+            WordTiming {
+                text: "alpha".to_owned(),
+                start_sec: 0.0,
+                end_sec: 1.0,
+            },
+            WordTiming {
+                text: "beta".to_owned(),
+                start_sec: 1.0,
+                end_sec: 1.0,
+            },
+        ]];
+
+        let adapted = build_segments_dtw(&engine, &timings, WordTimestampMode::Word, false, None)
+            .expect("the current adapter accepts raw DTW geometry");
+        assert_eq!(adapted.len(), 2);
+        assert_eq!(
+            (adapted[1].start_sec, adapted[1].end_sec),
+            (Some(1.0), Some(1.0)),
+            "the adapter must reproduce the unnormalized shape for this diagnosis"
+        );
+
+        let turns = vec![crate::model::DiarizationTurn {
+            start_ms: 0,
+            end_ms: 1_000,
+            speaker_ref: Some("speaker_a".to_owned()),
+            speaker_confidence: Some(0.9),
+            change_confidence: Some(0.8),
+            overlap_suspected: false,
+            hard_hint_attributed: false,
+        }];
+        let error = crate::diarization::project_diarization_onto_segments(&adapted, &turns, true)
+            .expect_err("the strict acoustic projection contract rejects zero-width words");
+        assert!(matches!(error, FwError::InvalidRequest(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("projection segments must have paired finite timestamps"),
+            "unexpected projection error: {error}"
+        );
     }
 
     #[test]

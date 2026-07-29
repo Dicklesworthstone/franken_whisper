@@ -133,6 +133,39 @@ ASR segment `confidence` remains ASR confidence. Speaker confidence is a
 separate field. Transcript projection may split only at legal DTW word
 boundaries and cannot invent, drop, duplicate, or reorder text.
 
+### 6.1 DTW projection diagnosis (`bd-2noc.1`)
+
+The native DTW producer and transcript projection currently disagree about a
+legal word interval. `group_tokens_into_words` quantizes token boundaries to
+the alignment grid and deliberately clamps a word end with
+`end.max(start)`. It can therefore emit `[t, t]` for a terminal word whose
+start lands on its enclosing segment end. The generic segment conformance
+contract accepts that zero-width interval, and `build_segments_dtw` copies it
+unchanged while marking the result as DTW word-aligned. The acoustic projection
+contract then requires `end > start` and rejects the same result.
+
+A minimized typed fixture and a gated robot-mode native run reproduce that
+exact producer -> adapter -> conformance -> diarization failure. The owning
+defect is the DTW adapter boundary: raw quantized observations are not yet a
+canonical projection unit. Globally weakening projection validation would hide
+true reversed or overlapping geometry and is not an admissible repair.
+
+The adjacent-path audit establishes:
+
+- ordinary non-DTW segments are not labeled word-aligned and retain their
+  duration-dominance projection policy;
+- untimed DTW segments already use the explicit interpolation fallback;
+- punctuation tokens are attached to their lexical word by the DTW grouper
+  and do not require independent zero-width projection units;
+- sub-microsecond overlap is accepted by generic segment conformance but
+  rejected by word projection, so the repair needs one shared tolerance;
+- the failure occurs before persistence, so replay cannot create it, but a
+  canonical representation must be what later persistence records.
+
+The dependent repair (`bd-2noc.2`) must normalize raw DTW geometry once at the
+adapter boundary, preserve provenance, and keep strict rejection for
+non-finite, reversed, or materially overlapping intervals.
+
 Acoustic v1 confidence currently combines best-versus-second assignment margin
 with profile reliability and reports `heuristic_uncalibrated`. Resampling
 stability and a named corpus calibration artifact remain promotion gates, not
