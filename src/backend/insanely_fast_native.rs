@@ -307,7 +307,11 @@ fn decode_params(request: &TranscribeRequest, threads_per_worker: usize) -> deco
         // Suppress non-speech tokens (whisper `--suppress-nst`) for cleaner text.
         suppress_nst: request.backend_params.suppress_nst,
         // Max carried context (whisper `--max-context`); 0 disables prompt carry.
-        max_context: request.backend_params.decoding.as_ref().and_then(|d| d.max_context),
+        max_context: request
+            .backend_params
+            .decoding
+            .as_ref()
+            .and_then(|d| d.max_context),
         timestamps: !request.backend_params.no_timestamps,
         n_threads: threads_per_worker,
         max_text_ctx: None,
@@ -438,6 +442,7 @@ pub fn run(
         language,
         segments,
         acceleration: None,
+        diarization: None,
         raw_output,
         artifact_paths: Vec::new(),
     })
@@ -686,6 +691,7 @@ fn silence_result(
         language: request.language.clone(),
         segments: Vec::new(),
         acceleration: None,
+        diarization: None,
         raw_output: json!({
             "engine": "insanely-fast-native",
             "schema_version": SCHEMA_VERSION,

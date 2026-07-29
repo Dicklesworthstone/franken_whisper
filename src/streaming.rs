@@ -221,8 +221,7 @@ impl SpeculativeStreamingPipeline {
             fast_ts,
         );
         self.correction_tracker.register_partial(partial.clone());
-        self.window_manager
-            .record_fast_result(window_id, partial);
+        self.window_manager.record_fast_result(window_id, partial);
 
         // Use captured original model segments (no round-trip conversion).
         let quality_segments = take_stored_segments(quality_holder.as_ref());
@@ -470,6 +469,7 @@ impl SpeculativeStreamingPipeline {
             language: Some("en".to_owned()),
             segments,
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: vec![],
         }
