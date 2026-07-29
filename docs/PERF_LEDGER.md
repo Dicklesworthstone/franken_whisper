@@ -206,6 +206,103 @@ verified-null warm-up check, and a measured load-sensitivity direction that runs
 *against* the claim. Remaining work is a quiet-host run to collapse the
 between-run spread — which would raise, not lower, the number.
 
+## 2026-07-28 — clean-host n=31 retry: UNDECIDABLE because the load split was endogenous
+
+**Result class: NON-CAMPAIGN / INFORMATIONAL. Verdict: UNDECIDABLE.**
+
+The first clean-host retry used harness ELF
+`8c46f675f55bd5cd395f49ac3e85156dd2e96780d4995227cdf0a8f293de1d07`,
+incumbent ELF
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`,
+model
+`921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`,
+and input
+`a21dcd888ae070381189e869e54de39c66fc65f1b9ad50a54a8cf14369930e9e`.
+It ran on a 128-way AMD Ryzen Threadripper PRO 5995WX host, with both arms
+pinned to physical cores 32-63 and `whisper-cli` at the fastest screened
+setting (`-t 27`). Admission was `load1=1.13`, exact `cargo=0` / `rustc=0`,
+no peer performance process, and no external-load monitor event.
+
+| arm | median | CI95 | cv |
+|---|---:|---:|---:|
+| A/A null — franken | 1.006502 | [0.990992, 1.017691] | 5.63% |
+| A/A null — whisper.cpp | 1.040364 | [1.008275, 1.079861] | 14.53% |
+| comparison (`whisper.cpp / franken`) | **1.512829** | **[1.414557, 1.618859]** | 15.29% |
+
+The median-CI/null gate itself cleared: required `1.159722`, with franken at
+`887.217 ms` and whisper.cpp at `1253.940 ms`. The run nevertheless remains
+undecidable because the then-current load check sorted rounds by
+`fw_ms + wc_ms`. That grouping variable contains both the numerator and
+denominator of `wc_ms / fw_ms`, so its apparent lighter/heavier gap
+(`1.414557` versus `1.618859`, gap `0.204302`) is correlated with the ratio by
+construction. It is not an independent load observation and cannot certify or
+refute differential load sensitivity.
+
+**Concrete retry predicate:** sample a host-load covariate before every measured
+round, keep total timed-arm cost diagnostic-only, then re-run the same
+order-alternating n=31 invocation after five stable seconds with `load1 < 2`,
+exact `cargo=0` / `rustc=0`, and no competing performance process. Accept a
+competitive verdict only if both A/A/median-CI gates clear and the comparison
+medians split by that independent covariate differ by at most `0.1×`.
+
+## 2026-07-28 — clean-start, independently split n=31 re-certification: **1.479272× WIN**
+
+**Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
+
+**Legacy incumbent:** whisper.cpp `whisper-cli`
+(`incumbent_bin_sha256=73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`).
+
+**Comparator execution:** the actual legacy incumbent and franken ran
+side-by-side in the same invocation. Each of 31 rounds alternated which engine
+ran first and then ran a second observation in the opposite order, producing an
+A/A null for each engine.
+
+**Measured incumbent ratio:** `1.479272×` (`whisper.cpp / franken`), CI95
+`[1.406951, 1.612307]`.
+
+**Benchmark binary ELF SHA-256:** self-reported harness ELF
+`ca6c9521c3cdf9dbfb4e33941f94b88efbbcdca5822e4f8ba823ff34de4d3511`;
+incumbent ELF
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+model
+`921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`;
+`track01.wav`
+`a21dcd888ae070381189e869e54de39c66fc65f1b9ad50a54a8cf14369930e9e`.
+Both processes inherited affinity to physical cores 32-63 on an AMD Ryzen
+Threadripper PRO 5995WX host. The fastest affinity-matched incumbent setting
+from a final five-point screen was `-t 27`; greedy decode was forced with
+`-bs 1 -bo 1` and segment timestamps remained enabled on both engines.
+
+Admission cleared after five stable seconds at `load1=1.88`, exact `cargo=0` /
+`rustc=0`, and no competing performance process. A concurrent watchdog reported
+no external-load event and ended cleanly (`monitor=0`).
+
+| arm | median | CI95 | cv |
+|---|---:|---:|---:|
+| A/A null — franken | 1.019857 | [0.977351, 1.040668] | 8.63% |
+| A/A null — whisper.cpp | 0.970569 | [0.897510, 1.033127] | 20.54% |
+| **comparison (`whisper.cpp / franken`)** | **1.479272** | **[1.406951, 1.612307]** | 15.85% |
+
+franken measured `873.541 ms`; whisper.cpp measured `1282.890 ms`. The worse
+null half-width was `0.102490`, so the 2×-margin requirement was `1.204980`.
+The comparison median and its complete CI95 clear that bar; `cv` is provenance
+only.
+
+The acceptance split now uses `/proc/loadavg` sampled before each measured
+round, never a quantity computed from the timed arms. Its lighter/heavier
+comparison medians were `1.519836` and `1.479272`, gap `0.040564×`, within the
+predeclared `0.1×` maximum. The old total-cost split remains diagnostic-only
+(`1.476597` versus `1.573537`, gap `0.096940×`) and cannot decide the verdict.
+
+**Verdict: WIN.** The public matched-greedy tiny.en segment-timestamp result is
+reported conservatively as **1.47×**.
+
+**Concrete retry predicate:** re-run this exact contract only if the native
+engine, incumbent, model, or fixture SHA changes; if a newly screened incumbent
+thread setting beats `-t 27` on the certification host; or before publishing a
+claim above `1.47×`. Require the same five-second clean admission, alternating
+order, dual A/A nulls, median-CI gate, and independent-load split `<=0.1×`.
+
 ## 2026-07-26 — KEEP / MAINTENANCE — tiny.en segment-TS no-carry policy measured: **2.218×**, byte-identical (bd-c9uv)
 
 **Result class: SELF-SPEEDUP / MAINTENANCE.**

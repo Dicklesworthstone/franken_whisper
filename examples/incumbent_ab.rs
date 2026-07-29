@@ -9,9 +9,8 @@
 //! otherwise the two engines are measured under different machine states and the
 //! ratio inherits an uncontrolled between-session drift.
 //!
-//! The prior tiny.en segment-timestamp result (1.35×) was measured with both
-//! binaries in the same *session* but not interleaved, and carried no cross-tool
-//! null. This harness closes exactly that gap.
+//! This harness certifies the tiny.en segment-timestamp comparison with the
+//! incumbent interleaved inside one invocation and with a null for each engine.
 //!
 //! ## What is measured, and why it is the fair quantity
 //!
@@ -40,16 +39,16 @@
 //! Two A/A nulls run in the same invocation and the same alternating shape:
 //! franken against itself, and `whisper.cpp` against itself. A claim is
 //! decidable only when the comparison median lies outside **both** null CI95s
-//! with a 2× margin, and when the comparison medians from lighter and heavier
-//! rounds differ by at most 0.1×. `cv` is recorded as provenance and decides
-//! nothing.
+//! with a 2× margin, and when the comparison medians from independently
+//! sampled lighter- and heavier-load rounds differ by at most 0.1×. `cv` is
+//! recorded as provenance and decides nothing.
 //!
 //! ## Usage
 //!
 //! ```text
 //! incumbent_ab <model_short> <wav> [rounds]
 //! FW_INCUMBENT_BIN=/path/to/whisper-cli   (default: legacy_whispercpp/.../whisper-cli)
-//! FW_INCUMBENT_THREADS=16                 (whisper.cpp's best tiny.en thread count)
+//! FW_INCUMBENT_THREADS=27                 (screen the host and use its best setting)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -119,6 +118,18 @@ fn executable_identity() -> String {
     }
 }
 
+/// Independent host-load covariate sampled before each measured round.
+///
+/// This must not be derived from either timed arm. Splitting on `fw_ms + wc_ms`
+/// is endogenous because the grouping variable contains the numerator and
+/// denominator of the comparison ratio, creating correlation by construction.
+fn load_average_1m() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse().ok())
+        .unwrap_or(f64::NAN)
+}
+
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -159,25 +170,29 @@ fn cv(values: &[f64]) -> f64 {
     var.sqrt() / mean
 }
 
-/// Split rounds at the median total arm cost and return the comparison median
-/// for the lighter and heavier halves plus their absolute gap. For an odd
-/// number of rounds, the single middle-cost round is deliberately excluded.
-fn load_split(fw_ms: &[f64], wc_ms: &[f64], compare: &[f64]) -> Option<(f64, f64, f64)> {
-    if fw_ms.len() != wc_ms.len() || fw_ms.len() != compare.len() || fw_ms.len() < 3 {
+/// Split ratios at the median of an independent covariate and return the
+/// comparison median for the lighter and heavier halves plus their absolute
+/// gap. For an odd number of rounds, the single middle-covariate round is
+/// deliberately excluded.
+fn split_by_covariate(covariate: &[f64], compare: &[f64]) -> Option<(f64, f64, f64)> {
+    if covariate.len() != compare.len()
+        || covariate.len() < 3
+        || covariate.iter().any(|value| !value.is_finite())
+        || compare.iter().any(|value| !value.is_finite())
+    {
         return None;
     }
 
-    let mut totals: Vec<(f64, f64)> = fw_ms
+    let mut ranked: Vec<(f64, f64)> = covariate
         .iter()
-        .zip(wc_ms)
         .zip(compare)
-        .map(|((fw, wc), ratio)| (fw + wc, *ratio))
+        .map(|(load, ratio)| (*load, *ratio))
         .collect();
-    totals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    let half = totals.len() / 2;
-    let light: Vec<f64> = totals[..half].iter().map(|(_, ratio)| *ratio).collect();
-    let heavy: Vec<f64> = totals[totals.len() - half..]
+    let half = ranked.len() / 2;
+    let light: Vec<f64> = ranked[..half].iter().map(|(_, ratio)| *ratio).collect();
+    let heavy: Vec<f64> = ranked[ranked.len() - half..]
         .iter()
         .map(|(_, ratio)| *ratio)
         .collect();
@@ -194,20 +209,33 @@ fn load_split(fw_ms: &[f64], wc_ms: &[f64], compare: &[f64]) -> Option<(f64, f64
 ///
 /// `transcribe_ms` is `total − load`, so a one-time model load is excluded on
 /// this side exactly as it is on franken's.
-fn run_incumbent(bin: &Path, model: &Path, wav: &str, threads: usize) -> (f64, f64, f64, usize) {
+fn run_incumbent(
+    bin: &Path,
+    model: &Path,
+    wav: &str,
+    threads: usize,
+    timestamps: bool,
+) -> (f64, f64, f64, usize) {
+    let mut args: Vec<String> = vec![
+        "-m".into(),
+        model.display().to_string(),
+        "-f".into(),
+        wav.into(),
+        "-bs".into(),
+        "1".into(),
+        "-bo".into(),
+        "1".into(),
+        "-t".into(),
+        threads.to_string(),
+    ];
+    // Match franken's mode on the incumbent side too: comparing franken's
+    // no-timestamp decode against whisper.cpp's timestamped decode would charge
+    // the incumbent for timestamp work franken is not doing.
+    if !timestamps {
+        args.push("-nt".into());
+    }
     let output = Command::new(bin)
-        .args([
-            "-m",
-            &model.display().to_string(),
-            "-f",
-            wav,
-            "-bs",
-            "1",
-            "-bo",
-            "1",
-            "-t",
-            &threads.to_string(),
-        ])
+        .args(&args)
         .output()
         .expect("run whisper-cli");
     let text = String::from_utf8_lossy(&output.stderr).into_owned()
@@ -267,6 +295,10 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "tests/fixtures/native/jfk.wav".to_string());
     let rounds: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(11);
+    // 4th positional arg "no_ts" certifies the no-timestamp cell instead. Both
+    // engines switch together; a mismatched pair would charge one side for work
+    // the other is not doing.
+    let timestamps = args.get(4).map(String::as_str) != Some("no_ts");
     assert!(
         rounds >= 3 && rounds % 2 == 1,
         "rounds must be odd and >= 3"
@@ -295,7 +327,7 @@ fn main() {
     let params = DecodeParams {
         language: Some("en".to_string()),
         translate: false,
-        timestamps: true,
+        timestamps,
         n_threads: 0,
         max_text_ctx: None,
         word_timestamps: false,
@@ -316,14 +348,14 @@ fn main() {
     );
     println!(
         "INCUMBENT_AB_CONFIG rounds={rounds} order=alternating wav={wav} \
-         audio_sec={:.1} incumbent_threads={threads} \
+         audio_sec={:.1} incumbent_threads={threads} timestamps={timestamps} \
          measured=transcribe_excluding_model_load",
         samples.len() as f64 / 16000.0
     );
 
     // Warm both engines once; neither warm-up is timed.
     let (_, fw_chars) = run_franken(&model, &samples, &params);
-    let (_, _, _, wc_chars) = run_incumbent(&incumbent, &model_path, &wav, threads);
+    let (_, _, _, wc_chars) = run_incumbent(&incumbent, &model_path, &wav, threads, timestamps);
     println!("INCUMBENT_AB_COVERAGE fw_chars={fw_chars} wc_chars={wc_chars}");
 
     let mut compare = Vec::with_capacity(rounds);
@@ -331,27 +363,29 @@ fn main() {
     let mut wc_null = Vec::with_capacity(rounds);
     let mut fw_ms = Vec::with_capacity(rounds);
     let mut wc_ms = Vec::with_capacity(rounds);
+    let mut pre_round_load1 = Vec::with_capacity(rounds);
 
     for round in 0..rounds {
+        pre_round_load1.push(load_average_1m());
         // Alternate which engine runs first so monotonic drift hits both equally.
         let (fw_a, wc_a) = if round % 2 == 0 {
             let fw = run_franken(&model, &samples, &params).0;
-            let wc = run_incumbent(&incumbent, &model_path, &wav, threads).0;
+            let wc = run_incumbent(&incumbent, &model_path, &wav, threads, timestamps).0;
             (fw, wc)
         } else {
-            let wc = run_incumbent(&incumbent, &model_path, &wav, threads).0;
+            let wc = run_incumbent(&incumbent, &model_path, &wav, threads, timestamps).0;
             let fw = run_franken(&model, &samples, &params).0;
             (fw, wc)
         };
         // Second observation of each engine, opposite order: pairs with the
         // first to form each arm's own A/A null inside this same invocation.
         let (fw_b, wc_b) = if round % 2 == 0 {
-            let wc = run_incumbent(&incumbent, &model_path, &wav, threads).0;
+            let wc = run_incumbent(&incumbent, &model_path, &wav, threads, timestamps).0;
             let fw = run_franken(&model, &samples, &params).0;
             (fw, wc)
         } else {
             let fw = run_franken(&model, &samples, &params).0;
-            let wc = run_incumbent(&incumbent, &model_path, &wav, threads).0;
+            let wc = run_incumbent(&incumbent, &model_path, &wav, threads, timestamps).0;
             (fw, wc)
         };
 
@@ -377,12 +411,26 @@ fn main() {
     println!("INCUMBENT_AB_RAW compare={compare:?}");
     println!("INCUMBENT_AB_RAW null_fw={fw_null:?}");
     println!("INCUMBENT_AB_RAW null_wc={wc_null:?}");
+    println!("INCUMBENT_AB_RAW pre_round_load1={pre_round_load1:?}");
     // This is part of the verdict, not commentary: differential load
     // sensitivity can survive order alternation and bias the cross-tool ratio.
-    let (light_median, heavy_median, load_split_gap) =
-        load_split(&fw_ms, &wc_ms, &compare).expect("odd rounds >= 3 form a load split");
+    // The gate uses the independent pre-round load sample. Total arm cost is
+    // still emitted as a diagnostic, but cannot decide its own ratio.
+    let total_cost: Vec<f64> = fw_ms.iter().zip(&wc_ms).map(|(fw, wc)| fw + wc).collect();
+    let (cost_light, cost_heavy, cost_gap) =
+        split_by_covariate(&total_cost, &compare).expect("odd rounds >= 3 form a cost split");
     println!(
-        "INCUMBENT_AB_LOAD_SPLIT lighter_rounds_median={light_median:.6} \
+        "INCUMBENT_AB_COST_SPLIT diagnostic_only=true \
+         lighter_rounds_median={cost_light:.6} heavier_rounds_median={cost_heavy:.6} \
+         n_each={} gap={cost_gap:.6}",
+        rounds / 2
+    );
+    let (light_median, heavy_median, load_split_gap) =
+        split_by_covariate(&pre_round_load1, &compare)
+            .expect("Linux pre-round load samples form a load split");
+    println!(
+        "INCUMBENT_AB_LOAD_SPLIT covariate=pre_round_load1 \
+         lighter_rounds_median={light_median:.6} \
          heavier_rounds_median={heavy_median:.6} n_each={} gap={load_split_gap:.6} \
          max_gap={MAX_LOAD_SPLIT_GAP:.6}",
         rounds / 2
@@ -420,13 +468,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_split_excludes_middle_round_and_reports_absolute_gap() {
-        let fw_ms = [1.0, 2.0, 3.0, 4.0, 5.0];
-        let wc_ms = [1.0, 2.0, 3.0, 4.0, 5.0];
+    fn covariate_split_excludes_middle_round_and_reports_absolute_gap() {
+        let load = [1.0, 2.0, 3.0, 4.0, 5.0];
         let compare = [1.1, 1.2, 9.9, 1.3, 1.4];
 
         let (light, heavy, gap) =
-            load_split(&fw_ms, &wc_ms, &compare).expect("valid equal-length inputs");
+            split_by_covariate(&load, &compare).expect("valid equal-length inputs");
 
         assert!((light - 1.15).abs() < f64::EPSILON);
         assert!((heavy - 1.35).abs() < f64::EPSILON);
@@ -434,8 +481,9 @@ mod tests {
     }
 
     #[test]
-    fn load_split_rejects_mismatched_or_too_short_inputs() {
-        assert!(load_split(&[1.0, 2.0], &[1.0, 2.0], &[1.0, 2.0]).is_none());
-        assert!(load_split(&[1.0, 2.0, 3.0], &[1.0, 2.0], &[1.0, 2.0, 3.0]).is_none());
+    fn covariate_split_rejects_mismatched_short_or_non_finite_inputs() {
+        assert!(split_by_covariate(&[1.0, 2.0], &[1.0, 2.0]).is_none());
+        assert!(split_by_covariate(&[1.0, 2.0, 3.0], &[1.0, 2.0]).is_none());
+        assert!(split_by_covariate(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]).is_none());
     }
 }
