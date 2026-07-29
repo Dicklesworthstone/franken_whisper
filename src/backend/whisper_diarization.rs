@@ -198,6 +198,7 @@ pub fn run(
         language: request.language.clone(),
         segments,
         acceleration: None,
+        diarization: None,
         raw_output: raw,
         artifact_paths: {
             let mut paths = vec![txt_path.display().to_string()];
