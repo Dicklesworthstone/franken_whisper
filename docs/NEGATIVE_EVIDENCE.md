@@ -4,6 +4,71 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-29 - OliveIsland: **NO ADMISSIBLE VERDICT — a steady competing benchmark survives interleaving, both numerical A/A controls, and the load-split gate; process-level host exclusivity is therefore a binding prerequisite for the Phase 2 whole-job sweep.**
+
+The first `large-v3-turbo`, 124.5-second, text-only whole-job cell printed a
+formal `WIN` at one requested/actual thread: franken **92,224.631 ms** versus
+whisper.cpp **309,835.336 ms**, or `3.359573×` with bootstrap CI95
+`[3.267420, 3.379602]`. Both tools ran inside one invocation, order alternated
+per round, transcript WER was `0.013986`, and actual thread use was exactly one
+on each arm. The benchmark nevertheless is **not evidence** because a
+Frankensearch QG-1 `perf_matrix-a466d5a6 --bench` process was already active on
+the host when this invocation began and remained active throughout it at
+roughly 1.3–2.0 CPU cores.
+
+The numerical controls did not expose the steady competitor:
+
+| control | median | bootstrap CI95 |
+|---|---:|---:|
+| franken A/A null | `0.934837` | `[0.932317, 1.000991]` |
+| whisper.cpp A/A null | `0.994311` | `[0.962561, 1.016836]` |
+| incumbent / franken | `3.359573` | `[3.267420, 3.379602]` |
+
+The independent pre-round load split was also nominally clear:
+`3.267420×` in the lighter half versus `3.359573×` in the heavier half, gap
+`0.092152×` against the `0.100000×` limit. This is not contradictory. A/A
+detects within-arm instability, order alternation cancels temporal drift, and
+the load split detects a ratio that moves with sampled load. None proves that a
+*steady* external workload affects the two engines equally. The external
+process timeline is stronger evidence than the formal verdict:
+
+- Frankensearch sweep parent PID 1759615 started at
+  `2026-07-29T04:25:44-04:00`.
+- This turbo invocation ran from `2026-07-29T04:39:44-04:00` through
+  `2026-07-29T05:26:35-04:00`.
+- Its active Frankensearch child consumed 1.3–2.0 CPU cores while the Whisper
+  arms ran. Recurring one-core Git fsck work was also observed.
+
+Four nominally passing tiny.en reruns began after that same QG-1 sweep and are
+likewise non-admissible: text-only thread 1 (`2.491301×`, CI95
+`[2.455874, 2.531133]`) and segment-timestamp threads 2 (`2.613857×`,
+`[2.499114, 2.698176]`), 8 (`2.057526×`, `[2.019523, 2.066905]`), and 96
+(`1.489721×`, `[1.435489, 1.509835]`). Their numerical null/load gates passing
+does not repair the known host overlap. The earlier uncontaminated cells and
+their own formal verdicts are unaffected.
+
+Provenance: harness commit `eab71bfe6632c99d23db4e6bc33cf12b04614bab`;
+benchmark ELF SHA-256
+`e87b430386bea4b6b2c3570848cc671bf9b56e6cfdff67bbc6fa85fa4ae54bce`;
+incumbent whisper.cpp 1.8.3 commit `21411d81`, binary SHA-256
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+large-v3-turbo model SHA-256
+`1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`;
+audio SHA-256
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+Host `threadripperje`: AMD Threadripper PRO 5995WX, 64 physical cores / 128
+logical threads, affinity and effective cpuset `0-127`, runtime-detected
+SSE4.2/AVX/AVX2/FMA/F16C/BMI1/BMI2/AES.
+
+**Concrete retry predicate:** rerun each named cell only after an explicit
+exclusive `trj` handoff, with no other benchmark/compiler process present in
+the preflight, during the invocation, or in the postflight. Use the same
+matched-greedy settings, exact artifact hashes, order alternation, per-engine
+A/A controls, actual-thread assertion, WER gate, and median-CI/load-split gate.
+If any external workload appears mid-cell, ledger that attempt as
+non-admissible regardless of the numerical verdict.
+
+---
 ## 2026-07-25 - MistyGate: **REJECT — resurrected FrankenTorch SDPA BR=128 is flat against BR=64 under the corrected same-ELF A/A + median-CI gate.**
 
 This closes Meta-Lever #1 queue item #5 without reusing the invalid 2026-07-10
