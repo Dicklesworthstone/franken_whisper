@@ -51,6 +51,11 @@
 //! persistent non-harness processes between every arm: a process consuming more
 //! than 0.1 CPU core makes the result undecidable, because steady cross-tool
 //! load bias can survive both numerical controls.
+//! The harness additionally copies FrankenFS's fail-closed host-wide
+//! quiescence contract: every online logical CPU must be sampled for 300 ms and
+//! remain at or below 20% busy at preflight and immediately before measurement.
+//! A post-measurement sample is part of the verdict, so a competitor arriving
+//! during the final arm cannot leave a bankable result.
 //! Each whole-job row also records host RAM/NUMA topology and distinguishes
 //! requested/configured pool width from threads independently observed
 //! consuming CPU ticks under `/proc/<pid>/task`.
@@ -83,6 +88,8 @@ use sha2::{Digest, Sha256};
 const MAX_LOAD_SPLIT_GAP: f64 = 0.1;
 const MAX_CROSS_ENGINE_WER: f64 = 0.1;
 const MAX_EXTERNAL_CPU_CORE_FRACTION: f64 = 0.1;
+const HOST_CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
+const MAX_HOST_CPU_BUSY_FRACTION: f64 = 0.20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BenchScope {
@@ -141,6 +148,35 @@ struct ExternalCpuActivity {
     command: String,
     checkpoint: String,
     intervals: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuTicks {
+    total: u64,
+    idle: u64,
+}
+
+#[derive(Debug)]
+struct HostWideQuiescence {
+    checkpoint: String,
+    online_cpu_count: usize,
+    sampled_online_cpu_count: usize,
+    allowed_cpu_count: usize,
+    max_busy_fraction: f64,
+    busy_cpus: Vec<(usize, f64)>,
+}
+
+impl HostWideQuiescence {
+    fn is_clear(&self) -> bool {
+        self.sampled_online_cpu_count == self.online_cpu_count && self.busy_cpus.is_empty()
+    }
+
+    fn busy_labels(&self) -> Vec<String> {
+        self.busy_cpus
+            .iter()
+            .map(|(cpu, busy)| format!("cpu{cpu}={:.1}%", busy * 100.0))
+            .collect()
+    }
 }
 
 impl ExternalCpuActivity {
@@ -381,6 +417,196 @@ fn host_provenance() -> Value {
         "cpuset_effective": cpuset_effective,
         "runtime_isa": runtime_isa(),
     })
+}
+
+fn parse_cpu_list(value: &str) -> Result<BTreeSet<usize>, String> {
+    let mut cpus = BTreeSet::new();
+    for range in value.trim().split(',').filter(|part| !part.is_empty()) {
+        if let Some((start, end)) = range.split_once('-') {
+            let start = start
+                .parse::<usize>()
+                .map_err(|error| format!("parse CPU range start {start:?}: {error}"))?;
+            let end = end
+                .parse::<usize>()
+                .map_err(|error| format!("parse CPU range end {end:?}: {error}"))?;
+            if start > end {
+                return Err(format!("descending CPU range: {range}"));
+            }
+            cpus.extend(start..=end);
+        } else {
+            cpus.insert(
+                range
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse CPU index {range:?}: {error}"))?,
+            );
+        }
+    }
+    if cpus.is_empty() {
+        return Err("CPU list is empty".to_owned());
+    }
+    Ok(cpus)
+}
+
+fn online_cpus() -> Result<BTreeSet<usize>, String> {
+    let value = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .map_err(|error| format!("read online CPU list: {error}"))?;
+    parse_cpu_list(&value)
+}
+
+fn self_allowed_cpus() -> Result<BTreeSet<usize>, String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("read /proc/self/status: {error}"))?;
+    let value = status
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name == "Cpus_allowed_list").then_some(value.trim())
+        })
+        .ok_or_else(|| "Cpus_allowed_list missing from /proc/self/status".to_owned())?;
+    parse_cpu_list(value)
+}
+
+fn parse_cpu_ticks(text: &str) -> Result<BTreeMap<usize, CpuTicks>, String> {
+    let mut cpus = BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(label) = fields.next() else {
+            continue;
+        };
+        let Some(suffix) = label.strip_prefix("cpu") else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let cpu = suffix
+            .parse::<usize>()
+            .map_err(|error| format!("parse CPU index {suffix:?}: {error}"))?;
+        let ticks = fields
+            .map(|field| {
+                field
+                    .parse::<u64>()
+                    .map_err(|error| format!("parse /proc/stat tick {field:?}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if ticks.len() < 5 {
+            return Err(format!("cpu{cpu} /proc/stat row is too short"));
+        }
+        cpus.insert(
+            cpu,
+            CpuTicks {
+                total: ticks.iter().copied().sum(),
+                idle: ticks[3].saturating_add(ticks[4]),
+            },
+        );
+    }
+    if cpus.is_empty() {
+        return Err("no per-CPU rows in /proc/stat".to_owned());
+    }
+    Ok(cpus)
+}
+
+fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
+    let text = std::fs::read_to_string("/proc/stat")
+        .map_err(|error| format!("read /proc/stat: {error}"))?;
+    parse_cpu_ticks(&text)
+}
+
+fn cpu_busy_between(
+    before: &BTreeMap<usize, CpuTicks>,
+    after: &BTreeMap<usize, CpuTicks>,
+) -> Result<BTreeMap<usize, f64>, String> {
+    let mut busy = BTreeMap::new();
+    for (cpu, start) in before {
+        let end = after
+            .get(cpu)
+            .ok_or_else(|| format!("cpu{cpu} disappeared during load sample"))?;
+        let total = end.total.saturating_sub(start.total);
+        let idle = end.idle.saturating_sub(start.idle);
+        let fraction = if total == 0 {
+            1.0
+        } else {
+            total.saturating_sub(idle) as f64 / total as f64
+        };
+        busy.insert(*cpu, fraction);
+    }
+    Ok(busy)
+}
+
+fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>, String> {
+    let before = read_cpu_ticks()?;
+    thread::sleep(HOST_CPU_SAMPLE_INTERVAL);
+    let after = read_cpu_ticks()?;
+    cpu_busy_between(&before, &after)
+}
+
+fn sample_host_wide_quiescence(
+    checkpoint: &str,
+    online: &BTreeSet<usize>,
+    allowed: &BTreeSet<usize>,
+) -> HostWideQuiescence {
+    assert!(
+        allowed.is_subset(online),
+        "process CPU allowance includes offline CPUs: allowed={allowed:?} online={online:?}"
+    );
+    let busy = sample_cpu_busy().expect("sample host-wide CPU quiescence");
+    let sampled_online_cpu_count = online.iter().filter(|cpu| busy.contains_key(cpu)).count();
+    let max_busy_fraction = online
+        .iter()
+        .filter_map(|cpu| busy.get(cpu))
+        .copied()
+        .fold(0.0, f64::max);
+    let busy_cpus = online
+        .iter()
+        .filter_map(|cpu| {
+            let fraction = busy.get(cpu).copied()?;
+            (fraction > MAX_HOST_CPU_BUSY_FRACTION).then_some((*cpu, fraction))
+        })
+        .collect();
+    let sample = HostWideQuiescence {
+        checkpoint: checkpoint.to_owned(),
+        online_cpu_count: online.len(),
+        sampled_online_cpu_count,
+        allowed_cpu_count: allowed.len(),
+        max_busy_fraction,
+        busy_cpus,
+    };
+    println!(
+        "INCUMBENT_AB_HOST_WIDE_QUIESCENCE checkpoint={} online_cpu_count={} \
+         sampled_online_cpu_count={} allowed_cpu_count={} sample_ms={} \
+         max_busy_fraction={:.6} max_allowed={MAX_HOST_CPU_BUSY_FRACTION:.6} \
+         busy_cpus={:?} clear={}",
+        sample.checkpoint,
+        sample.online_cpu_count,
+        sample.sampled_online_cpu_count,
+        sample.allowed_cpu_count,
+        HOST_CPU_SAMPLE_INTERVAL.as_millis(),
+        sample.max_busy_fraction,
+        sample.busy_labels(),
+        sample.is_clear(),
+    );
+    sample
+}
+
+fn require_host_wide_quiescence(
+    checkpoint: &str,
+    online: &BTreeSet<usize>,
+    allowed: &BTreeSet<usize>,
+) -> HostWideQuiescence {
+    let sample = sample_host_wide_quiescence(checkpoint, online, allowed);
+    assert!(
+        sample.sampled_online_cpu_count == sample.online_cpu_count,
+        "host-wide quiescence sampled {} of {} online CPUs",
+        sample.sampled_online_cpu_count,
+        sample.online_cpu_count
+    );
+    assert!(
+        sample.busy_cpus.is_empty(),
+        "host-wide benchmark exclusivity requires every online CPU at or below {:.1}% busy; {}",
+        MAX_HOST_CPU_BUSY_FRACTION * 100.0,
+        sample.busy_labels().join(", ")
+    );
+    sample
 }
 
 fn parse_proc_stat(text: &str) -> Option<(u32, u64)> {
@@ -1053,6 +1279,15 @@ fn main() {
         },
     );
 
+    // This is a harness requirement, not a booking convention. Sampling all
+    // online CPUs (rather than only the current affinity mask) prevents
+    // `taskset` or a cpuset cap from hiding a host-wide memory-bandwidth
+    // competitor on CPUs the harness itself cannot schedule on.
+    let host_online_cpus = online_cpus().expect("read host online CPU topology");
+    let host_allowed_cpus = self_allowed_cpus().expect("read harness CPU affinity");
+    let host_preflight =
+        require_host_wide_quiescence("preflight", &host_online_cpus, &host_allowed_cpus);
+
     // Whole-job evidence additionally requires a quiet host. A steady competing
     // workload can bias the two tools differently while still passing both A/A
     // nulls and a load-split check. Sample every persistent process between arms
@@ -1156,6 +1391,9 @@ fn main() {
         observation
     };
 
+    let host_pre_measurement =
+        require_host_wide_quiescence("pre_measurement", &host_online_cpus, &host_allowed_cpus);
+
     let mut compare = Vec::with_capacity(rounds);
     let mut fw_null = Vec::with_capacity(rounds);
     let mut wc_null = Vec::with_capacity(rounds);
@@ -1227,6 +1465,12 @@ fn main() {
     }
     drop(checkpoint);
 
+    let host_post_measurement =
+        sample_host_wide_quiescence("post_measurement", &host_online_cpus, &host_allowed_cpus);
+    let host_wide_clear = host_preflight.is_clear()
+        && host_pre_measurement.is_clear()
+        && host_post_measurement.is_clear();
+
     println!(
         "INCUMBENT_AB_TIMES fw_median_ms={:.3} wc_median_ms={:.3}",
         median(&fw_ms),
@@ -1289,7 +1533,12 @@ fn main() {
     let wc_half = (wc_hi - 1.0).abs().max((1.0 - wc_lo).abs());
     let required = 1.0 + 2.0 * fw_half.max(wc_half);
     let load_split_clear = load_split_gap <= MAX_LOAD_SPLIT_GAP;
-    let verdict = if !quality_clear || !thread_clear || !load_split_clear || !external_host_clear {
+    let verdict = if !quality_clear
+        || !thread_clear
+        || !load_split_clear
+        || !external_host_clear
+        || !host_wide_clear
+    {
         "UNDECIDABLE"
     } else if cmp_med > required && cmp_lo > 1.0 {
         "WIN"
@@ -1305,6 +1554,7 @@ fn main() {
          load_split_gap={load_split_gap:.6} load_split_max={MAX_LOAD_SPLIT_GAP:.6} \
          load_split_clear={load_split_clear} quality_clear={quality_clear} \
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
+         host_wide_clear={host_wide_clear} \
          cv_is_provenance_only=true class=vs_incumbent verdict={verdict}"
     );
 }
@@ -1331,6 +1581,56 @@ mod tests {
         assert!(split_by_covariate(&[1.0, 2.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, 2.0, 3.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]).is_none());
+    }
+
+    #[test]
+    fn cpu_list_parser_expands_ranges_and_rejects_descending_ranges() {
+        assert_eq!(
+            parse_cpu_list("0-2,5,7-8"),
+            Ok(BTreeSet::from([0, 1, 2, 5, 7, 8]))
+        );
+        assert!(parse_cpu_list("3-1").is_err());
+        assert!(parse_cpu_list("").is_err());
+    }
+
+    #[test]
+    fn cpu_busy_fraction_matches_proc_stat_idle_accounting() {
+        let before = BTreeMap::from([
+            (
+                0,
+                CpuTicks {
+                    total: 100,
+                    idle: 80,
+                },
+            ),
+            (
+                1,
+                CpuTicks {
+                    total: 500,
+                    idle: 400,
+                },
+            ),
+        ]);
+        let after = BTreeMap::from([
+            (
+                0,
+                CpuTicks {
+                    total: 200,
+                    idle: 160,
+                },
+            ),
+            (
+                1,
+                CpuTicks {
+                    total: 600,
+                    idle: 470,
+                },
+            ),
+        ]);
+
+        let busy = cpu_busy_between(&before, &after).expect("matching CPU samples");
+        assert!((busy[&0] - 0.2).abs() < f64::EPSILON);
+        assert!((busy[&1] - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]
