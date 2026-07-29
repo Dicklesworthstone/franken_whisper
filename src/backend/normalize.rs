@@ -180,6 +180,7 @@ pub fn to_transcription_result(
         language: normalized.language,
         segments: normalized.segments,
         acceleration: None,
+        diarization: None,
         raw_output: normalized.raw_output,
         artifact_paths: Vec::new(),
     }
