@@ -53,7 +53,8 @@ fn quant_row_avx2(xr: &[f32], inv: f32, out: &mut [i8]) {
             i += 8;
         }
         while i < n {
-            *out.get_unchecked_mut(i) = (*xr.get_unchecked(i) * inv).round().clamp(-127.0, 127.0) as i8;
+            *out.get_unchecked_mut(i) =
+                (*xr.get_unchecked(i) * inv).round().clamp(-127.0, 127.0) as i8;
             i += 1;
         }
     }
@@ -71,26 +72,45 @@ fn quant_all(x: &[f32], m: usize, out: &mut [i8], sa: &mut [f32], avx2: bool) {
             *s = rs;
             let inv = 1.0 / rs;
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            if avx2 { quant_row_avx2(xr, inv, xr_i8); } else { quant_row_scalar(xr, inv, xr_i8); }
+            if avx2 {
+                quant_row_avx2(xr, inv, xr_i8);
+            } else {
+                quant_row_scalar(xr, inv, xr_i8);
+            }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            { let _ = avx2; quant_row_scalar(xr, inv, xr_i8); }
+            {
+                let _ = avx2;
+                quant_row_scalar(xr, inv, xr_i8);
+            }
         });
     let _ = m;
 }
 
-fn ms(t: std::time::Instant) -> f64 { t.elapsed().as_secs_f64() * 1e3 }
+fn ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
 
 fn main() {
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    { eprintln!("needs avx2"); }
+    {
+        eprintln!("needs avx2");
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         let mut s = 0x9E3779B97F4A7C15u64;
-        let mut nf = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); ((s >> 33) as i32 as f32) / 4.0e8 };
-        let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        let mut nf = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((s >> 33) as i32 as f32) / 4.0e8
+        };
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
         println!("# enc i8 activation-quant AVX2-vs-scalar — available_parallelism={avail}");
         for workers in [1usize, avail.min(16)] {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(workers).build().unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
             for m in [1500usize, 200] {
                 let x: Vec<f32> = (0..m * INP).map(|_| nf()).collect();
                 let (mut a, mut b) = (vec![0i8; m * INP], vec![0i8; m * INP]);
@@ -102,16 +122,32 @@ fn main() {
                 let (mut bs, mut bv) = (f64::MAX, f64::MAX);
                 for r in 0..reps {
                     if r % 2 == 0 {
-                        let t = std::time::Instant::now(); pool.install(|| quant_all(&x, m, &mut a, &mut sa, false)); bs = bs.min(ms(t));
-                        let t = std::time::Instant::now(); pool.install(|| quant_all(&x, m, &mut b, &mut sb, true)); bv = bv.min(ms(t));
+                        let t = std::time::Instant::now();
+                        pool.install(|| quant_all(&x, m, &mut a, &mut sa, false));
+                        bs = bs.min(ms(t));
+                        let t = std::time::Instant::now();
+                        pool.install(|| quant_all(&x, m, &mut b, &mut sb, true));
+                        bv = bv.min(ms(t));
                     } else {
-                        let t = std::time::Instant::now(); pool.install(|| quant_all(&x, m, &mut b, &mut sb, true)); bv = bv.min(ms(t));
-                        let t = std::time::Instant::now(); pool.install(|| quant_all(&x, m, &mut a, &mut sa, false)); bs = bs.min(ms(t));
+                        let t = std::time::Instant::now();
+                        pool.install(|| quant_all(&x, m, &mut b, &mut sb, true));
+                        bv = bv.min(ms(t));
+                        let t = std::time::Instant::now();
+                        pool.install(|| quant_all(&x, m, &mut a, &mut sa, false));
+                        bs = bs.min(ms(t));
                     }
                 }
-                std::hint::black_box(&a); std::hint::black_box(&b);
-                let v = if bv < bs { "AVX2 FASTER" } else { "AVX2 slower" };
-                println!("m={m:4} {workers:2}t min-{reps}: scalar={bs:.4} ms  avx2={bv:.4} ms  ({:.2}× {v})  byte-id={ident}", bs / bv);
+                std::hint::black_box(&a);
+                std::hint::black_box(&b);
+                let v = if bv < bs {
+                    "AVX2 FASTER"
+                } else {
+                    "AVX2 slower"
+                };
+                println!(
+                    "m={m:4} {workers:2}t min-{reps}: scalar={bs:.4} ms  avx2={bv:.4} ms  ({:.2}× {v})  byte-id={ident}",
+                    bs / bv
+                );
             }
         }
     }

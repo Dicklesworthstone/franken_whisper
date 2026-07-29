@@ -3320,9 +3320,7 @@ fn segment_times(node: &Value) -> (Option<f64>, Option<f64>) {
     } else {
         start_direct
             .or_else(|| {
-                timestamp.and_then(|timestamp| {
-                    timestamp.get(0).or_else(|| timestamp.get("0"))
-                })
+                timestamp.and_then(|timestamp| timestamp.get(0).or_else(|| timestamp.get("0")))
             })
             .or_else(|| timestamp.and_then(|timestamp| timestamp.get("start")))
             .and_then(number_to_secs)
@@ -3332,9 +3330,7 @@ fn segment_times(node: &Value) -> (Option<f64>, Option<f64>) {
     } else {
         end_direct
             .or_else(|| {
-                timestamp.and_then(|timestamp| {
-                    timestamp.get(1).or_else(|| timestamp.get("1"))
-                })
+                timestamp.and_then(|timestamp| timestamp.get(1).or_else(|| timestamp.get("1")))
             })
             .or_else(|| timestamp.and_then(|timestamp| timestamp.get("end")))
             .and_then(number_to_secs)

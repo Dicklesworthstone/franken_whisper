@@ -1947,8 +1947,7 @@ mod tests {
         let compressed = compress_chunk(frame).expect("compression should work");
         let mut output = prefix.to_vec();
 
-        let start =
-            super::decompress_chunk_into(&compressed, &mut output).expect("append inflate");
+        let start = super::decompress_chunk_into(&compressed, &mut output).expect("append inflate");
         assert_eq!(start, prefix.len());
         assert_eq!(&output[..start], prefix);
         assert_eq!(&output[start..], frame);
@@ -1991,9 +1990,9 @@ mod tests {
             for pattern in 0u8..4 {
                 let data: Vec<u8> = (0..n)
                     .map(|i| match pattern {
-                        0 => 0,                                // all-zero (highly compressible)
-                        1 => 0xAB,                             // constant
-                        2 => (i % 251) as u8,                  // strided
+                        0 => 0,                                  // all-zero (highly compressible)
+                        1 => 0xAB,                               // constant
+                        2 => (i % 251) as u8,                    // strided
                         _ => (i.wrapping_mul(2654435761)) as u8, // pseudo-random
                     })
                     .collect();
@@ -2004,7 +2003,10 @@ mod tests {
                     production, reference,
                     "bufread != read reference at size {n}, pattern {pattern}"
                 );
-                assert_eq!(production, data, "roundtrip failed at size {n}, pattern {pattern}");
+                assert_eq!(
+                    production, data,
+                    "roundtrip failed at size {n}, pattern {pattern}"
+                );
             }
         }
     }

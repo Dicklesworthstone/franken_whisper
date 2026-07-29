@@ -273,7 +273,16 @@ mod tests {
         assert_eq!(format_timestamp_vtt(3661.123).to_string(), "01:01:01.123");
         // The allocation-free Display wrapper must match the format!-based
         // reference bit-for-bit across a range of times (incl. hour rollover).
-        for &sec in &[0.0, 0.4999, 0.5, 1.5, 59.999, 3599.999, 3661.123, 86_399.9995] {
+        for &sec in &[
+            0.0,
+            0.4999,
+            0.5,
+            1.5,
+            59.999,
+            3599.999,
+            3661.123,
+            86_399.9995,
+        ] {
             assert_eq!(
                 format_timestamp_vtt(sec).to_string(),
                 format_timestamp_vtt_owned(sec),

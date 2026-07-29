@@ -3197,7 +3197,11 @@ mod tests {
             assert_eq!(resolve_beam_size(&DecodeParams::default()), 1);
             let mut p = DecodeParams::default();
             p.beam_size = Some(5);
-            assert_eq!(resolve_beam_size(&p), 5, "field beam_size drives beam width");
+            assert_eq!(
+                resolve_beam_size(&p),
+                5,
+                "field beam_size drives beam width"
+            );
             p.beam_size = Some(99);
             assert_eq!(resolve_beam_size(&p), 8, "beam width clamps to 8");
             p.beam_size = Some(0);
@@ -4169,7 +4173,10 @@ mod tests {
         p_empty.initial_prompt = Some(String::new());
         let t_none = join(&transcribe_samples(&model, &samples, &p_none, &noop).unwrap());
         let t_empty = join(&transcribe_samples(&model, &samples, &p_empty, &noop).unwrap());
-        assert_eq!(t_none, t_empty, "empty initial_prompt field must be a no-op");
+        assert_eq!(
+            t_none, t_empty,
+            "empty initial_prompt field must be a no-op"
+        );
         assert!(
             t_none.to_lowercase().contains("country"),
             "baseline should transcribe jfk: {t_none}"
@@ -4250,8 +4257,14 @@ mod tests {
         let mut p = e2e_params();
         p.suppress_nst = true;
         let on = join(&transcribe_samples(&model, &samples, &p, &noop).unwrap());
-        assert_eq!(on, off, "suppress_nst must be a no-op on clean speech (jfk)");
-        assert!(off.to_lowercase().contains("country"), "baseline transcribes jfk");
+        assert_eq!(
+            on, off,
+            "suppress_nst must be a no-op on clean speech (jfk)"
+        );
+        assert!(
+            off.to_lowercase().contains("country"),
+            "baseline transcribes jfk"
+        );
     }
 
     #[test]
@@ -4302,7 +4315,10 @@ mod tests {
         assert_eq!(seeded_prompt_past(None, tk), Vec::<i32>::new());
         assert_eq!(seeded_prompt_past(Some(""), tk), Vec::<i32>::new());
         assert_eq!(seeded_prompt_past(Some(" country"), tk), vec![1499]);
-        assert_eq!(seeded_prompt_past(Some("the country"), tk), vec![1169, 1499]);
+        assert_eq!(
+            seeded_prompt_past(Some("the country"), tk),
+            vec![1169, 1499]
+        );
     }
 
     #[test]
@@ -4535,7 +4551,10 @@ mod tests {
             return;
         };
         let model = GgmlModel::load(&path).expect("load distil-large-v3");
-        assert_eq!(model.hparams.n_text_layer, 2, "distil has a 2-layer decoder");
+        assert_eq!(
+            model.hparams.n_text_layer, 2,
+            "distil has a 2-layer decoder"
+        );
         let loaded = LoadedModel::from_ggml(model).expect("build engine from distil");
         let params = DecodeParams {
             language: None,
@@ -4590,8 +4609,8 @@ mod tests {
             max_text_ctx: None,
             ..DecodeParams::default()
         };
-        let out = transcribe_samples(&loaded, &samples, &params, &noop)
-            .expect("transcribe jfk on turbo");
+        let out =
+            transcribe_samples(&loaded, &samples, &params, &noop).expect("transcribe jfk on turbo");
         let joined: String = out
             .segments
             .iter()

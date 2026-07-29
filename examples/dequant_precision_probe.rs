@@ -6,16 +6,25 @@
 // fundamental (not a fixable dequant bug).  rustc -O -C target-cpu=native --edition 2021
 struct Lcg(u64);
 impl Lcg {
-    fn new(s: u64) -> Self { Self(s) }
+    fn new(s: u64) -> Self {
+        Self(s)
+    }
     fn u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (self.0 >> 32) as u32
     }
-    fn f32(&mut self) -> f32 { (self.u32() as f32 / u32::MAX as f32) * 2.0 - 1.0 }
+    fn f32(&mut self) -> f32 {
+        (self.u32() as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
     // approx gaussian via sum-of-uniforms (central limit), scaled
     fn gauss(&mut self, scale: f32) -> f32 {
         let mut s = 0.0f32;
-        for _ in 0..4 { s += self.f32(); }
+        for _ in 0..4 {
+            s += self.f32();
+        }
         (s / 2.0) * scale
     }
 }
@@ -28,7 +37,9 @@ fn main() {
 
     // Weights [inp,out] row-major as data[i*out+o] (matches Mat layout), gaussian.
     let mut w = vec![0.0f32; inp * out];
-    for v in w.iter_mut() { *v = rng.gauss(0.06); } // typical linear weight magnitude
+    for v in w.iter_mut() {
+        *v = rng.gauss(0.06);
+    } // typical linear weight magnitude
     // occasional outlier weights (real weights have heavy tails)
     for o in 0..out {
         let oi = (rng.u32() as usize) % inp;
@@ -41,7 +52,9 @@ fn main() {
     let mut wcs = vec![0i32; out];
     for o in 0..out {
         let mut amax = 1e-9f32;
-        for i in 0..inp { amax = amax.max(w[i * out + o].abs()); }
+        for i in 0..inp {
+            amax = amax.max(w[i * out + o].abs());
+        }
         let sc = amax / 63.0;
         wsc[o] = sc;
         let inv = 1.0 / sc;
@@ -56,13 +69,17 @@ fn main() {
 
     // Activations [m,inp], gaussian-ish (encoder hidden states after LN/gelu).
     let mut x = vec![0.0f32; m * inp];
-    for v in x.iter_mut() { *v = rng.gauss(1.0); }
+    for v in x.iter_mut() {
+        *v = rng.gauss(1.0);
+    }
     // per-row u8 quant: scale=amax/127, round, clamp; store i8v (a_int).
     let mut xq = vec![0i32; m * inp];
     let mut xsc = vec![0.0f32; m];
     for r in 0..m {
         let mut amax = 1e-9f32;
-        for c in 0..inp { amax = amax.max(x[r * inp + c].abs()); }
+        for c in 0..inp {
+            amax = amax.max(x[r * inp + c].abs());
+        }
         let sc = amax / 127.0;
         xsc[r] = sc;
         let inv = 1.0 / sc;
@@ -104,23 +121,60 @@ fn main() {
                 d += (a as i64) * (wv as i64);
                 rt += (a as f32 * sa) * (wv as f32 * sc);
             }
-            if d.abs() > max_d { max_d = d.abs(); }
+            if d.abs() > max_d {
+                max_d = d.abs();
+            }
             let madd = (d as f32) * sa * sc;
             let truth = (d as f64) * sa64 * sc64;
             let me = (madd as f64 - truth).abs();
             let re = (rt as f64 - truth).abs();
-            sum_madd_err += me; if me > max_madd_err { max_madd_err = me; }
-            sum_rt_err += re; if re > max_rt_err { max_rt_err = re; }
-            if me < re { madd_closer += 1; } else if re < me { rt_closer += 1; }
+            sum_madd_err += me;
+            if me > max_madd_err {
+                max_madd_err = me;
+            }
+            sum_rt_err += re;
+            if re > max_rt_err {
+                max_rt_err = re;
+            }
+            if me < re {
+                madd_closer += 1;
+            } else if re < me {
+                rt_closer += 1;
+            }
             n += 1;
         }
     }
     println!("samples                = {}", n);
-    println!("max |D| (integer dot)  = {}  (2^24 = {})", max_d, 1i64 << 24);
-    println!("maddubs  mean|err|     = {:.3e}   max|err| = {:.3e}", sum_madd_err / n as f64, max_madd_err);
-    println!("roundtrip mean|err|    = {:.3e}   max|err| = {:.3e}", sum_rt_err / n as f64, max_rt_err);
-    println!("maddubs closer to f64  = {} / {}  ({:.1}%)", madd_closer, n, 100.0 * madd_closer as f64 / n as f64);
-    println!("roundtrip closer       = {} / {}  ({:.1}%)", rt_closer, n, 100.0 * rt_closer as f64 / n as f64);
+    println!(
+        "max |D| (integer dot)  = {}  (2^24 = {})",
+        max_d,
+        1i64 << 24
+    );
+    println!(
+        "maddubs  mean|err|     = {:.3e}   max|err| = {:.3e}",
+        sum_madd_err / n as f64,
+        max_madd_err
+    );
+    println!(
+        "roundtrip mean|err|    = {:.3e}   max|err| = {:.3e}",
+        sum_rt_err / n as f64,
+        max_rt_err
+    );
+    println!(
+        "maddubs closer to f64  = {} / {}  ({:.1}%)",
+        madd_closer,
+        n,
+        100.0 * madd_closer as f64 / n as f64
+    );
+    println!(
+        "roundtrip closer       = {} / {}  ({:.1}%)",
+        rt_closer,
+        n,
+        100.0 * rt_closer as f64 / n as f64
+    );
     let ratio = (sum_rt_err / n as f64) / (sum_madd_err / n as f64);
-    println!("roundtrip/maddubs err  = {:.2}x  (>1 => maddubs MORE accurate => 'Frank at' is truer int8)", ratio);
+    println!(
+        "roundtrip/maddubs err  = {:.2}x  (>1 => maddubs MORE accurate => 'Frank at' is truer int8)",
+        ratio
+    );
 }

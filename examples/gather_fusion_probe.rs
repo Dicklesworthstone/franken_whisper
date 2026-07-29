@@ -27,7 +27,9 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as i32 as f32) / (1i64 << 23) as f32 * 0.1
         })
         .collect()
@@ -47,16 +49,18 @@ fn gather(out: &[f32], hm: &mut [f32]) {
     let total_rows = NH * T;
     let chunks = 16usize;
     let chunk_rows = total_rows.div_ceil(chunks).max(1);
-    hm.par_chunks_mut(chunk_rows * DH).enumerate().for_each(|(c, blk)| {
-        let row0 = c * chunk_rows;
-        for (local, out_row) in blk.chunks_mut(DH).enumerate() {
-            let r = row0 + local;
-            let h = r / T;
-            let i = r % T;
-            let base = i * NSTATE + h * DH;
-            out_row.copy_from_slice(&out[base..base + DH]);
-        }
-    });
+    hm.par_chunks_mut(chunk_rows * DH)
+        .enumerate()
+        .for_each(|(c, blk)| {
+            let row0 = c * chunk_rows;
+            for (local, out_row) in blk.chunks_mut(DH).enumerate() {
+                let r = row0 + local;
+                let h = r / T;
+                let i = r % T;
+                let base = i * NSTATE + h * DH;
+                out_row.copy_from_slice(&out[base..base + DH]);
+            }
+        });
 }
 
 /// FUSED head-major write `val[t,nstate] -> hm[nh,t,dh]` (models a head-major GEMM write).
@@ -110,24 +114,43 @@ fn main() {
     println!("byte-identity: hm_a == hm_b ✓\n");
 
     println!("COLD per-op costs (32 threads, {reps} reps, min):");
-    let t_contig = bench_cold("contiguous write (GEMM does this anyway)", reps, &mut evbuf, || {
-        write_contiguous(&val, &mut out);
-    });
+    let t_contig = bench_cold(
+        "contiguous write (GEMM does this anyway)",
+        reps,
+        &mut evbuf,
+        || {
+            write_contiguous(&val, &mut out);
+        },
+    );
     let t_gather = bench_cold("gather (out -> head-major)", reps, &mut evbuf, || {
         gather(&out, &mut hm_a);
     });
-    let t_hm = bench_cold("FUSED head-major write (val -> head-major)", reps, &mut evbuf, || {
-        write_headmajor(&val, &mut hm_b);
-    });
+    let t_hm = bench_cold(
+        "FUSED head-major write (val -> head-major)",
+        reps,
+        &mut evbuf,
+        || {
+            write_headmajor(&val, &mut hm_b);
+        },
+    );
 
     println!("\n--- verdict (per QKV tensor, one layer) ---");
     let path_a = t_contig + t_gather;
-    println!("  path A  = contiguous_write + gather = {t_contig:.4} + {t_gather:.4} = {path_a:.4} ms");
+    println!(
+        "  path A  = contiguous_write + gather = {t_contig:.4} + {t_gather:.4} = {path_a:.4} ms"
+    );
     println!("  path B  = fused head-major write     = {t_hm:.4} ms");
     if t_hm < path_a {
-        println!("  ⇒ FUSION WINS by {:.4} ms ({:.2}×) — wire it (nn.rs head-major GEMM)", path_a - t_hm, path_a / t_hm);
+        println!(
+            "  ⇒ FUSION WINS by {:.4} ms ({:.2}×) — wire it (nn.rs head-major GEMM)",
+            path_a - t_hm,
+            path_a / t_hm
+        );
     } else {
-        println!("  ⇒ FUSION LOSES ({:.2}×) — head-major write ≥ contig+gather; the transpose", path_a / t_hm);
+        println!(
+            "  ⇒ FUSION LOSES ({:.2}×) — head-major write ≥ contig+gather; the transpose",
+            path_a / t_hm
+        );
         println!("     latency is inherent, fusion just moves it. Ledger the rejection.");
     }
     println!("  (×3 tensors ×32 layers scales to the window; gather span was ~74 ms/window)");

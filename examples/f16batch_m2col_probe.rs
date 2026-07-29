@@ -29,7 +29,11 @@ const TQ: usize = 1500;
 
 /// EXACT replica of nn::dot_f16c: 4 f32 accumulators over f16 weight × f32 act,
 /// reduced `((a0+a1)+(a2+a3))` then the 8-lane tree.
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 #[inline]
 #[allow(unsafe_code)]
 fn dot_f16c(w: &[f16], x: &[f32]) -> f32 {
@@ -38,7 +42,10 @@ fn dot_f16c(w: &[f16], x: &[f32]) -> f32 {
     let xp = x.as_ptr();
     unsafe {
         let (mut a0, mut a1, mut a2, mut a3) = (
-            _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
         );
         let mut i = 0usize;
         while i + 32 <= n {
@@ -75,7 +82,11 @@ fn dot_f16c(w: &[f16], x: &[f32]) -> f32 {
 
 /// M2 activation-column tile: one weight row, two activation rows; the 4 weight-chunk
 /// conversions done ONCE and reused across both rows. Byte-identical to two dot_f16c.
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 #[inline]
 #[allow(unsafe_code)]
 fn dot_f16c_2col(w: &[f16], x0: &[f32], x1: &[f32]) -> (f32, f32) {
@@ -84,10 +95,16 @@ fn dot_f16c_2col(w: &[f16], x0: &[f32], x1: &[f32]) -> (f32, f32) {
     let (p0, p1) = (x0.as_ptr(), x1.as_ptr());
     unsafe {
         let (mut a0, mut a1, mut a2, mut a3) = (
-            _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
         );
         let (mut b0, mut b1, mut b2, mut b3) = (
-            _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
         );
         let mut i = 0usize;
         while i + 32 <= n {
@@ -137,7 +154,11 @@ fn dot_f16c_2col(w: &[f16], x0: &[f32], x1: &[f32]) -> (f32, f32) {
 /// 4 converted-weight + 3×4 accumulators = 16 ymm (x loads fold into the fmadd memory
 /// operand). Byte-identical to three dot_f16c. Tests whether 3-way cvtph sharing beats
 /// M2col's 2-way before register pressure bites.
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 #[inline]
 #[allow(unsafe_code)]
 fn dot_f16c_3col(w: &[f16], x0: &[f32], x1: &[f32], x2: &[f32]) -> (f32, f32, f32) {
@@ -145,9 +166,24 @@ fn dot_f16c_3col(w: &[f16], x0: &[f32], x1: &[f32], x2: &[f32]) -> (f32, f32, f3
     let n = w.len().min(x0.len()).min(x1.len()).min(x2.len());
     let (p0, p1, p2) = (x0.as_ptr(), x1.as_ptr(), x2.as_ptr());
     unsafe {
-        let (mut a0, mut a1, mut a2, mut a3) = (_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps());
-        let (mut b0, mut b1, mut b2, mut b3) = (_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps());
-        let (mut c0, mut c1, mut c2, mut c3) = (_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps());
+        let (mut a0, mut a1, mut a2, mut a3) = (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        );
+        let (mut b0, mut b1, mut b2, mut b3) = (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        );
+        let (mut c0, mut c1, mut c2, mut c3) = (
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+        );
         let mut i = 0usize;
         while i + 32 <= n {
             let wc0 = _mm256_cvtph_ps(_mm_loadu_si128(w.as_ptr().add(i).cast()));
@@ -185,7 +221,9 @@ fn dot_f16c_3col(w: &[f16], x0: &[f32], x1: &[f32], x2: &[f32]) -> (f32, f32, f3
         }
         while i < n {
             let wv = w[i].to_f32();
-            s0 += wv * x0[i]; s1 += wv * x1[i]; s2 += wv * x2[i];
+            s0 += wv * x0[i];
+            s1 += wv * x1[i];
+            s2 += wv * x2[i];
             i += 1;
         }
         (s0, s1, s2)
@@ -194,35 +232,44 @@ fn dot_f16c_3col(w: &[f16], x0: &[f32], x1: &[f32], x2: &[f32]) -> (f32, f32, f3
 
 fn gemv_m3col(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
-    out_slice.par_chunks_mut(row_band * OUT).enumerate().for_each(|(band, dst_rows)| {
-        let t0 = band * row_band;
-        let rows = dst_rows.len() / OUT;
-        let mut lt = 0;
-        while lt + 3 <= rows {
-            let t = t0 + lt;
-            let x0 = &x[t * INP..(t + 1) * INP];
-            let x1 = &x[(t + 1) * INP..(t + 2) * INP];
-            let x2 = &x[(t + 2) * INP..(t + 3) * INP];
-            for o in 0..OUT {
-                let (s0, s1, s2) = dot_f16c_3col(&w[o * INP..(o + 1) * INP], x0, x1, x2);
-                dst_rows[lt * OUT + o] = s0;
-                dst_rows[(lt + 1) * OUT + o] = s1;
-                dst_rows[(lt + 2) * OUT + o] = s2;
+    out_slice
+        .par_chunks_mut(row_band * OUT)
+        .enumerate()
+        .for_each(|(band, dst_rows)| {
+            let t0 = band * row_band;
+            let rows = dst_rows.len() / OUT;
+            let mut lt = 0;
+            while lt + 3 <= rows {
+                let t = t0 + lt;
+                let x0 = &x[t * INP..(t + 1) * INP];
+                let x1 = &x[(t + 1) * INP..(t + 2) * INP];
+                let x2 = &x[(t + 2) * INP..(t + 3) * INP];
+                for o in 0..OUT {
+                    let (s0, s1, s2) = dot_f16c_3col(&w[o * INP..(o + 1) * INP], x0, x1, x2);
+                    dst_rows[lt * OUT + o] = s0;
+                    dst_rows[(lt + 1) * OUT + o] = s1;
+                    dst_rows[(lt + 2) * OUT + o] = s2;
+                }
+                lt += 3;
             }
-            lt += 3;
-        }
-        while lt < rows {
-            let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
-            for o in 0..OUT { dst_rows[lt * OUT + o] = dot_f16c(&w[o * INP..(o + 1) * INP], xr); }
-            lt += 1;
-        }
-    });
+            while lt < rows {
+                let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
+                for o in 0..OUT {
+                    dst_rows[lt * OUT + o] = dot_f16c(&w[o * INP..(o + 1) * INP], xr);
+                }
+                lt += 1;
+            }
+        });
 }
 
 /// dot_f16c with the weight ALREADY converted to f32 (skip `vcvtph2ps`): same four
 /// accumulators + same `((a0+a1)+(a2+a3))`/8-lane-tree reduction, so for `wf32 =
 /// convert(w_f16)` (lossless) it is `== dot_f16c(w_f16, x)` bit-for-bit.
-#[cfg(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "f16c",
+    target_feature = "fma"
+))]
 #[inline]
 #[allow(unsafe_code)]
 fn dot_f16corder_f32(w: &[f32], x: &[f32]) -> f32 {
@@ -231,14 +278,29 @@ fn dot_f16corder_f32(w: &[f32], x: &[f32]) -> f32 {
     let (wp, xp) = (w.as_ptr(), x.as_ptr());
     unsafe {
         let (mut a0, mut a1, mut a2, mut a3) = (
-            _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
+            _mm256_setzero_ps(),
         );
         let mut i = 0usize;
         while i + 32 <= n {
             a0 = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(i)), _mm256_loadu_ps(xp.add(i)), a0);
-            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(i + 8)), _mm256_loadu_ps(xp.add(i + 8)), a1);
-            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(i + 16)), _mm256_loadu_ps(xp.add(i + 16)), a2);
-            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(i + 24)), _mm256_loadu_ps(xp.add(i + 24)), a3);
+            a1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(wp.add(i + 8)),
+                _mm256_loadu_ps(xp.add(i + 8)),
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(wp.add(i + 16)),
+                _mm256_loadu_ps(xp.add(i + 16)),
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(wp.add(i + 24)),
+                _mm256_loadu_ps(xp.add(i + 24)),
+                a3,
+            );
             i += 32;
         }
         let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
@@ -265,68 +327,77 @@ fn dot_f16corder_f32(w: &[f32], x: &[f32]) -> f32 {
 /// within the block (strided output writes); byte-identical (scratch = lossless f16→f32).
 fn gemv_mblock(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize, b: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
-    out_slice.par_chunks_mut(row_band * OUT).enumerate().for_each(|(band, dst_rows)| {
-        let t0 = band * row_band;
-        let rows = dst_rows.len() / OUT;
-        let mut scratch = vec![0.0f32; INP];
-        let mut bs = 0;
-        while bs < rows {
-            let be = (bs + b).min(rows);
-            for o in 0..OUT {
-                w[o * INP..(o + 1) * INP].convert_to_f32_slice(&mut scratch);
-                for lt in bs..be {
-                    let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
-                    dst_rows[lt * OUT + o] = dot_f16corder_f32(&scratch, xr);
+    out_slice
+        .par_chunks_mut(row_band * OUT)
+        .enumerate()
+        .for_each(|(band, dst_rows)| {
+            let t0 = band * row_band;
+            let rows = dst_rows.len() / OUT;
+            let mut scratch = vec![0.0f32; INP];
+            let mut bs = 0;
+            while bs < rows {
+                let be = (bs + b).min(rows);
+                for o in 0..OUT {
+                    w[o * INP..(o + 1) * INP].convert_to_f32_slice(&mut scratch);
+                    for lt in bs..be {
+                        let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
+                        dst_rows[lt * OUT + o] = dot_f16corder_f32(&scratch, xr);
+                    }
                 }
+                bs = be;
             }
-            bs = be;
-        }
-    });
+        });
 }
 
 /// M1 kernel: exact replica of gemv_f16_batch_rows (row-morsel, tq-band direct-write).
 fn gemv_m1(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
-    out_slice.par_chunks_mut(row_band * OUT).enumerate().for_each(|(band, dst_rows)| {
-        let t0 = band * row_band;
-        let rows = dst_rows.len() / OUT;
-        for lt in 0..rows {
-            let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
-            let dst = &mut dst_rows[lt * OUT..(lt + 1) * OUT];
-            for o in 0..OUT {
-                dst[o] = dot_f16c(&w[o * INP..(o + 1) * INP], xr);
+    out_slice
+        .par_chunks_mut(row_band * OUT)
+        .enumerate()
+        .for_each(|(band, dst_rows)| {
+            let t0 = band * row_band;
+            let rows = dst_rows.len() / OUT;
+            for lt in 0..rows {
+                let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
+                let dst = &mut dst_rows[lt * OUT..(lt + 1) * OUT];
+                for o in 0..OUT {
+                    dst[o] = dot_f16c(&w[o * INP..(o + 1) * INP], xr);
+                }
             }
-        }
-    });
+        });
 }
 
 /// M2col kernel: pairs of activation rows share each weight-row conversion.
 fn gemv_m2col(w: &[f16], x: &[f32], out_slice: &mut [f32], workers: usize) {
     let row_band = TQ.div_ceil(workers).max(1);
-    out_slice.par_chunks_mut(row_band * OUT).enumerate().for_each(|(band, dst_rows)| {
-        let t0 = band * row_band;
-        let rows = dst_rows.len() / OUT;
-        let mut lt = 0;
-        while lt + 2 <= rows {
-            let t = t0 + lt;
-            let x0 = &x[t * INP..(t + 1) * INP];
-            let x1 = &x[(t + 1) * INP..(t + 2) * INP];
-            let (d0, d1) = dst_rows[lt * OUT..(lt + 2) * OUT].split_at_mut(OUT);
-            for o in 0..OUT {
-                let (s0, s1) = dot_f16c_2col(&w[o * INP..(o + 1) * INP], x0, x1);
-                d0[o] = s0;
-                d1[o] = s1;
+    out_slice
+        .par_chunks_mut(row_band * OUT)
+        .enumerate()
+        .for_each(|(band, dst_rows)| {
+            let t0 = band * row_band;
+            let rows = dst_rows.len() / OUT;
+            let mut lt = 0;
+            while lt + 2 <= rows {
+                let t = t0 + lt;
+                let x0 = &x[t * INP..(t + 1) * INP];
+                let x1 = &x[(t + 1) * INP..(t + 2) * INP];
+                let (d0, d1) = dst_rows[lt * OUT..(lt + 2) * OUT].split_at_mut(OUT);
+                for o in 0..OUT {
+                    let (s0, s1) = dot_f16c_2col(&w[o * INP..(o + 1) * INP], x0, x1);
+                    d0[o] = s0;
+                    d1[o] = s1;
+                }
+                lt += 2;
             }
-            lt += 2;
-        }
-        if lt < rows {
-            let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
-            let dst = &mut dst_rows[lt * OUT..(lt + 1) * OUT];
-            for o in 0..OUT {
-                dst[o] = dot_f16c(&w[o * INP..(o + 1) * INP], xr);
+            if lt < rows {
+                let xr = &x[(t0 + lt) * INP..(t0 + lt + 1) * INP];
+                let dst = &mut dst_rows[lt * OUT..(lt + 1) * OUT];
+                for o in 0..OUT {
+                    dst[o] = dot_f16c(&w[o * INP..(o + 1) * INP], xr);
+                }
             }
-        }
-    });
+        });
 }
 
 /// Tiled dequant f16→f32 (BlackThrush's exact TILE_O/TILE_I blocking) into [inp,out].
@@ -354,10 +425,15 @@ fn dequant_tiled(w: &[f16]) -> Vec<f32> {
 
 /// ft sgemm on a pre-transposed f32 weight [inp,out]: `[tq,inp] @ [inp,out]`.
 fn sgemm_f32(x: &[f32], w_t: &[f32], out_slice: &mut [f32]) -> bool {
-    let lhs = ft_core::TensorMeta::from_shape(vec![TQ, INP], ft_core::DType::F32, ft_core::Device::Cpu);
-    let rhs = ft_core::TensorMeta::from_shape(vec![INP, OUT], ft_core::DType::F32, ft_core::Device::Cpu);
+    let lhs =
+        ft_core::TensorMeta::from_shape(vec![TQ, INP], ft_core::DType::F32, ft_core::Device::Cpu);
+    let rhs =
+        ft_core::TensorMeta::from_shape(vec![INP, OUT], ft_core::DType::F32, ft_core::Device::Cpu);
     match ft_kernel_cpu::matmul_tensor_contiguous_f32(x, w_t, &lhs, &rhs) {
-        Ok(data) => { out_slice.copy_from_slice(&data); true }
+        Ok(data) => {
+            out_slice.copy_from_slice(&data);
+            true
+        }
         Err(_) => false,
     }
 }
@@ -368,20 +444,32 @@ fn gemv_tiled_f32(w: &[f16], x: &[f32], out_slice: &mut [f32]) -> bool {
     sgemm_f32(x, &w_t, out_slice)
 }
 
-fn ms(t: std::time::Instant) -> f64 { t.elapsed().as_secs_f64() * 1e3 }
+fn ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
 
 fn main() {
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "f16c", target_feature = "fma")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "f16c",
+        target_feature = "fma"
+    )))]
     {
         eprintln!("needs f16c+fma (build with RUSTFLAGS=-Ctarget-cpu=native)");
         return;
     }
     let mut s = 0x2545F4914F6CDD1Du64;
-    let mut nf = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (((s >> 40) as u32 as f32) / (1u64 << 24) as f32 - 0.5) * 2.0 };
+    let mut nf = || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (((s >> 40) as u32 as f32) / (1u64 << 24) as f32 - 0.5) * 2.0
+    };
     let w: Vec<f16> = (0..OUT * INP).map(|_| f16::from_f32(nf() * 0.1)).collect();
     let x: Vec<f32> = (0..TQ * INP).map(|_| nf()).collect();
 
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16).min(16);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(16)
+        .min(16);
     let mut a = vec![0.0f32; TQ * OUT];
     let mut b = vec![0.0f32; TQ * OUT];
     let mut c = vec![0.0f32; TQ * OUT];
@@ -399,9 +487,23 @@ fn main() {
     if tiled_ok {
         let mut ndiff = 0usize;
         let mut maxd = 0.0f32;
-        for (p, q) in a.iter().zip(&c) { if p != q { ndiff += 1; maxd = maxd.max((p - q).abs()); } }
-        println!("  tiled_f32 vs M1: {} diffs / {} (max|Δ|={:e})  => {}",
-            ndiff, a.len(), maxd, if ndiff == 0 { "byte-exact" } else { "NON-byte-exact" });
+        for (p, q) in a.iter().zip(&c) {
+            if p != q {
+                ndiff += 1;
+                maxd = maxd.max((p - q).abs());
+            }
+        }
+        println!(
+            "  tiled_f32 vs M1: {} diffs / {} (max|Δ|={:e})  => {}",
+            ndiff,
+            a.len(),
+            maxd,
+            if ndiff == 0 {
+                "byte-exact"
+            } else {
+                "NON-byte-exact"
+            }
+        );
     }
 
     // Pre-dequant ONCE (load-time model): isolates the sgemm from the per-call dequant.
@@ -413,31 +515,95 @@ fn main() {
     let (mut bm1, mut bm2, mut bt, mut bs) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
     let (mut bb4, mut bb8, mut bb16, mut bb3) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
     for _ in 0..reps {
-        for e in evict.iter_mut() { *e *= 1.0000001; }
-        let t = std::time::Instant::now(); gemv_m1(&w, &x, &mut a, workers); bm1 = bm1.min(ms(t));
-        for e in evict.iter_mut() { *e *= 1.0000001; }
-        let t = std::time::Instant::now(); gemv_m2col(&w, &x, &mut b, workers); bm2 = bm2.min(ms(t));
-        for e in evict.iter_mut() { *e *= 1.0000001; }
-        let t = std::time::Instant::now(); gemv_mblock(&w, &x, &mut e, workers, 4); bb4 = bb4.min(ms(t));
-        for ev in evict.iter_mut() { *ev *= 1.0000001; }
-        let t = std::time::Instant::now(); gemv_mblock(&w, &x, &mut e, workers, 8); bb8 = bb8.min(ms(t));
-        for ev in evict.iter_mut() { *ev *= 1.0000001; }
-        let t = std::time::Instant::now(); gemv_mblock(&w, &x, &mut e, workers, 16); bb16 = bb16.min(ms(t));
-        for ev in evict.iter_mut() { *ev *= 1.0000001; }
-        let t = std::time::Instant::now(); gemv_m3col(&w, &x, &mut f, workers); bb3 = bb3.min(ms(t));
-        for ev in evict.iter_mut() { *ev *= 1.0000001; }
-        let t = std::time::Instant::now(); gemv_tiled_f32(&w, &x, &mut c); bt = bt.min(ms(t));
-        for ev in evict.iter_mut() { *ev *= 1.0000001; }
-        let t = std::time::Instant::now(); sgemm_f32(&x, &w_t, &mut d); bs = bs.min(ms(t));
+        for e in evict.iter_mut() {
+            *e *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        gemv_m1(&w, &x, &mut a, workers);
+        bm1 = bm1.min(ms(t));
+        for e in evict.iter_mut() {
+            *e *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        gemv_m2col(&w, &x, &mut b, workers);
+        bm2 = bm2.min(ms(t));
+        for e in evict.iter_mut() {
+            *e *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        gemv_mblock(&w, &x, &mut e, workers, 4);
+        bb4 = bb4.min(ms(t));
+        for ev in evict.iter_mut() {
+            *ev *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        gemv_mblock(&w, &x, &mut e, workers, 8);
+        bb8 = bb8.min(ms(t));
+        for ev in evict.iter_mut() {
+            *ev *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        gemv_mblock(&w, &x, &mut e, workers, 16);
+        bb16 = bb16.min(ms(t));
+        for ev in evict.iter_mut() {
+            *ev *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        gemv_m3col(&w, &x, &mut f, workers);
+        bb3 = bb3.min(ms(t));
+        for ev in evict.iter_mut() {
+            *ev *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        gemv_tiled_f32(&w, &x, &mut c);
+        bt = bt.min(ms(t));
+        for ev in evict.iter_mut() {
+            *ev *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        sgemm_f32(&x, &w_t, &mut d);
+        bs = bs.min(ms(t));
     }
-    std::hint::black_box(&a); std::hint::black_box(&b); std::hint::black_box(&c); std::hint::black_box(&d); std::hint::black_box(&e); std::hint::black_box(&evict);
+    std::hint::black_box(&a);
+    std::hint::black_box(&b);
+    std::hint::black_box(&c);
+    std::hint::black_box(&d);
+    std::hint::black_box(&e);
+    std::hint::black_box(&evict);
     println!("[{TQ},{INP}]x[{INP},{OUT}] {workers}t cold, min-of-{reps}:");
     println!("   M1 (current row-morsel, byte-exact)        = {bm1:.3} ms");
-    println!("   M2col (shared cvtph, BYTE-EXACT)           = {bm2:.3} ms   ({:.3}× vs M1)", bm1 / bm2);
-    println!("   M3col (3-token in-reg, BYTE-EXACT)         = {bb3:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)", bm1 / bb3, bm2 / bb3);
-    println!("   mblock B=4  (convert-once/4tok, BYTE-EXACT)= {bb4:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)", bm1 / bb4, bm2 / bb4);
-    println!("   mblock B=8  (convert-once/8tok, BYTE-EXACT)= {bb8:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)", bm1 / bb8, bm2 / bb8);
-    println!("   mblock B=16 (convert-once/16tk, BYTE-EXACT)= {bb16:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)", bm1 / bb16, bm2 / bb16);
-    println!("   tiled_f32 per-call dequant (NON-exact)     = {bt:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)", bm1 / bt, bm2 / bt);
-    println!("   sgemm-only, load-time dequant (NON-exact)  = {bs:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)", bm1 / bs, bm2 / bs);
+    println!(
+        "   M2col (shared cvtph, BYTE-EXACT)           = {bm2:.3} ms   ({:.3}× vs M1)",
+        bm1 / bm2
+    );
+    println!(
+        "   M3col (3-token in-reg, BYTE-EXACT)         = {bb3:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)",
+        bm1 / bb3,
+        bm2 / bb3
+    );
+    println!(
+        "   mblock B=4  (convert-once/4tok, BYTE-EXACT)= {bb4:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)",
+        bm1 / bb4,
+        bm2 / bb4
+    );
+    println!(
+        "   mblock B=8  (convert-once/8tok, BYTE-EXACT)= {bb8:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)",
+        bm1 / bb8,
+        bm2 / bb8
+    );
+    println!(
+        "   mblock B=16 (convert-once/16tk, BYTE-EXACT)= {bb16:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)",
+        bm1 / bb16,
+        bm2 / bb16
+    );
+    println!(
+        "   tiled_f32 per-call dequant (NON-exact)     = {bt:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)",
+        bm1 / bt,
+        bm2 / bt
+    );
+    println!(
+        "   sgemm-only, load-time dequant (NON-exact)  = {bs:.3} ms   ({:.3}× vs M1, {:.3}× vs M2col)",
+        bm1 / bs,
+        bm2 / bs
+    );
 }

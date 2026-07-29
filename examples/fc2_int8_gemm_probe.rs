@@ -24,7 +24,9 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed | 1;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as i32 as f32) / (1i64 << 23) as f32 * 0.1
         })
         .collect()
@@ -67,10 +69,24 @@ fn probe(name: &str, m: usize, k: usize, n: usize) {
         let _ = nn::matmul_bias_i7(&x, &w_i7, Some(&bias)).unwrap();
     });
     println!("  --------------------------------------------------");
-    println!("  int8-GEMM-only (c) vs f32 (a):  {:.3}×  {}", a / c,
-        if c < a { "int8 GEMM FASTER ✓" } else { "int8 GEMM SLOWER ✗" });
-    println!("  full int8 (d) vs f32 (a):       {:.3}×  {}", a / d,
-        if d < a { "int8 net FASTER ✓" } else { "int8 net SLOWER ✗" });
+    println!(
+        "  int8-GEMM-only (c) vs f32 (a):  {:.3}×  {}",
+        a / c,
+        if c < a {
+            "int8 GEMM FASTER ✓"
+        } else {
+            "int8 GEMM SLOWER ✗"
+        }
+    );
+    println!(
+        "  full int8 (d) vs f32 (a):       {:.3}×  {}",
+        a / d,
+        if d < a {
+            "int8 net FASTER ✓"
+        } else {
+            "int8 net SLOWER ✗"
+        }
+    );
     println!("  quant overhead (b) as % of f32: {:.0}%", b / a * 100.0);
     println!("  best-case (free quant) = (c):   {:.3}× vs f32", a / c);
 }

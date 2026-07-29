@@ -49,7 +49,10 @@ fn load_wt(model: &GgmlModel, name: &str) -> (Mat, usize, usize) {
 }
 
 fn frob(v: &[f32]) -> f64 {
-    v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt()
+    v.iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Extract column `j` (length `rows`) of a row-major [rows,cols] matrix.
@@ -63,7 +66,9 @@ fn range_find(wt: &Mat, wt_t_as_ggml: &Mat, r: usize, seed: u64) -> (Mat, f64) {
     // Omega [out, r] random +-1.
     let mut s = seed | 1;
     let mut nextf = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         if (s >> 40) & 1 == 0 { 1.0f32 } else { -1.0f32 }
     };
     let omega = Mat::from_vec(outd, r, (0..outd * r).map(|_| nextf()).collect());
@@ -107,7 +112,14 @@ fn range_find(wt: &Mat, wt_t_as_ggml: &Mat, r: usize, seed: u64) -> (Mat, f64) {
     (Mat::from_vec(ind, rk, q_rowmajor), captured)
 }
 
-fn bench_weight(model: &GgmlModel, label: &str, name: &str, ranks: &[usize], seq: usize, iters: usize) {
+fn bench_weight(
+    model: &GgmlModel,
+    label: &str,
+    name: &str,
+    ranks: &[usize],
+    seq: usize,
+    iters: usize,
+) {
     let (wt, ind, outd) = load_wt(model, name);
     // W_t^T in [out,in] layout for the power iteration = re-load ggml raw (row-major [out,in]).
     let (shape, data) = model.tensor_f32(name).unwrap();
@@ -117,7 +129,9 @@ fn bench_weight(model: &GgmlModel, label: &str, name: &str, ranks: &[usize], seq
     // Activation x[seq,in] (random, representative for GEMM shape/speed).
     let mut s = 0xBEEFu64;
     let mut af = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     };
     let x = Mat::from_vec(seq, ind, (0..seq * ind).map(|_| af()).collect());
@@ -126,7 +140,9 @@ fn bench_weight(model: &GgmlModel, label: &str, name: &str, ranks: &[usize], seq
 
     // baseline speed.
     let mut bbase = f64::INFINITY;
-    for _ in 0..3 { black_box(nn::matmul(&x, &wt).unwrap()); }
+    for _ in 0..3 {
+        black_box(nn::matmul(&x, &wt).unwrap());
+    }
     for _ in 0..iters {
         let t = Instant::now();
         black_box(nn::matmul(&x, &wt).unwrap());
@@ -134,29 +150,51 @@ fn bench_weight(model: &GgmlModel, label: &str, name: &str, ranks: &[usize], seq
     }
     println!(
         "\n{label}  W_t[{ind},{outd}] seq={seq}  ({base_flop:.2} GFLOP)  baseline {:.3} ms {:.0} GF/s @ {}t",
-        bbase * 1e3, base_flop / bbase, rayon::current_num_threads()
+        bbase * 1e3,
+        base_flop / bbase,
+        rayon::current_num_threads()
     );
     for &r in ranks {
-        if r >= ind.min(outd) { println!("  r={r}: skip (>= min dim)"); continue; }
+        if r >= ind.min(outd) {
+            println!("  r={r}: skip (>= min dim)");
+            continue;
+        }
         let (u, captured) = range_find(&wt, &wt_t, r, 0x51A7 + r as u64);
         let rk = u.cols;
-        let v = nn::matmul(&{
-            // V = U^T W_t = [r,in]@[in,out]; build U^T.
-            let mut ut = vec![0.0f32; rk * ind];
-            for i in 0..ind { for j in 0..rk { ut[j * ind + i] = u.data[i * rk + j]; } }
-            Mat::from_vec(rk, ind, ut)
-        }, &wt).unwrap();
+        let v = nn::matmul(
+            &{
+                // V = U^T W_t = [r,in]@[in,out]; build U^T.
+                let mut ut = vec![0.0f32; rk * ind];
+                for i in 0..ind {
+                    for j in 0..rk {
+                        ut[j * ind + i] = u.data[i * rk + j];
+                    }
+                }
+                Mat::from_vec(rk, ind, ut)
+            },
+            &wt,
+        )
+        .unwrap();
         // applied output accuracy: (x@U)@V vs exact.
         let approx = nn::matmul(&nn::matmul(&x, &u).unwrap(), &v).unwrap();
         let out_relerr = {
-            let d2: f64 = approx.data.iter().zip(&exact.data)
-                .map(|(&a, &e)| { let dd = a as f64 - e as f64; dd * dd }).sum();
+            let d2: f64 = approx
+                .data
+                .iter()
+                .zip(&exact.data)
+                .map(|(&a, &e)| {
+                    let dd = a as f64 - e as f64;
+                    dd * dd
+                })
+                .sum();
             d2.sqrt() / exact_frob
         };
         let w_relerr = (1.0 - captured * captured).max(0.0).sqrt();
         // two-GEMM speed.
         let mut blr = f64::INFINITY;
-        for _ in 0..3 { black_box(nn::matmul(&nn::matmul(&x, &u).unwrap(), &v).unwrap()); }
+        for _ in 0..3 {
+            black_box(nn::matmul(&nn::matmul(&x, &u).unwrap(), &v).unwrap());
+        }
         for _ in 0..iters {
             let t = Instant::now();
             black_box(nn::matmul(&nn::matmul(&x, &u).unwrap(), &v).unwrap());
@@ -165,23 +203,66 @@ fn bench_weight(model: &GgmlModel, label: &str, name: &str, ranks: &[usize], seq
         let flop_cut = (ind as f64 * outd as f64) / (rk as f64 * (ind + outd) as f64);
         println!(
             "  r={rk:<4}: {:.3} ms  {:.2}x speed  (FLOPcut {:.2}x) | captured={:.3}% w_relerr={:.3}% OUT_relerr={:.3}%",
-            blr * 1e3, bbase / blr, flop_cut, captured * 100.0, w_relerr * 100.0, out_relerr * 100.0,
+            blr * 1e3,
+            bbase / blr,
+            flop_cut,
+            captured * 100.0,
+            w_relerr * 100.0,
+            out_relerr * 100.0,
         );
     }
 }
 
 fn main() {
-    let layer: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(15);
-    let iters: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let layer: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let iters: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
     let path = find_model_file("large-v3-turbo").expect("set FRANKEN_WHISPER_MODEL_DIR");
     let model = GgmlModel::load(&path).expect("load large-v3-turbo");
-    println!("=== low-rank WEIGHT factorization, encoder layer {layer}, real turbo weights @ {}t ===",
-             rayon::current_num_threads());
-    println!("captured = rank-r Frobenius energy of REAL weight; OUT_relerr = (x@U)@V vs x@W_t; speed weight-factor load-amortized");
+    println!(
+        "=== low-rank WEIGHT factorization, encoder layer {layer}, real turbo weights @ {}t ===",
+        rayon::current_num_threads()
+    );
+    println!(
+        "captured = rank-r Frobenius energy of REAL weight; OUT_relerr = (x@U)@V vs x@W_t; speed weight-factor load-amortized"
+    );
     let seq = 1500;
     let p = |s: &str| format!("encoder.blocks.{layer}.{s}");
-    bench_weight(&model, "attn.query", &p("attn.query.weight"), &[128, 256, 512, 768], seq, iters);
-    bench_weight(&model, "attn.out  ", &p("attn.out.weight"), &[128, 256, 512, 768], seq, iters);
-    bench_weight(&model, "mlp.0 fc1 ", &p("mlp.0.weight"), &[256, 512, 768, 1024], seq, iters);
-    bench_weight(&model, "mlp.2 fc2 ", &p("mlp.2.weight"), &[256, 512, 768, 1024], seq, iters);
+    bench_weight(
+        &model,
+        "attn.query",
+        &p("attn.query.weight"),
+        &[128, 256, 512, 768],
+        seq,
+        iters,
+    );
+    bench_weight(
+        &model,
+        "attn.out  ",
+        &p("attn.out.weight"),
+        &[128, 256, 512, 768],
+        seq,
+        iters,
+    );
+    bench_weight(
+        &model,
+        "mlp.0 fc1 ",
+        &p("mlp.0.weight"),
+        &[256, 512, 768, 1024],
+        seq,
+        iters,
+    );
+    bench_weight(
+        &model,
+        "mlp.2 fc2 ",
+        &p("mlp.2.weight"),
+        &[256, 512, 768, 1024],
+        seq,
+        iters,
+    );
 }

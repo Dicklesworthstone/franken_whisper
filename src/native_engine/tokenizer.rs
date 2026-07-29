@@ -693,7 +693,11 @@ mod tests {
             "encode must only produce base-vocab ids"
         );
         // Greedy really tokenizes (a sentence is many tokens, not one).
-        assert!(ids.len() > 10, "sentence should be many tokens, got {}", ids.len());
+        assert!(
+            ids.len() > 10,
+            "sentence should be many tokens, got {}",
+            ids.len()
+        );
     }
     use std::io::Read;
 

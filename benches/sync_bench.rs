@@ -260,7 +260,11 @@ fn bench_sha256_buffer(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync/sha256_file");
     group.throughput(Throughput::Bytes(size));
     for arm in ["buf8k_r1", "buf64k_r1", "buf8k_r2", "buf64k_r2"] {
-        let buf_len = if arm.starts_with("buf64k") { 64 * 1024 } else { 8192 };
+        let buf_len = if arm.starts_with("buf64k") {
+            64 * 1024
+        } else {
+            8192
+        };
         group.bench_function(arm, |b| {
             b.iter(|| hash_with_buf(&path, buf_len));
         });

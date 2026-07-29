@@ -4,13 +4,16 @@
 //! so the fused form packs A once instead of 3×.
 //!
 //! Run: cargo run --profile release --example qkv_f32_fusion_probe
-use franken_whisper::native_engine::nn;
 use franken_whisper::native_engine::Mat;
+use franken_whisper::native_engine::nn;
 
 struct Lcg(u64);
 impl Lcg {
     fn next_f32(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     }
     fn mat(&mut self, r: usize, c: usize) -> Mat {
@@ -52,7 +55,11 @@ fn main() {
                 f.data[i * 3 * n + n + j],
                 f.data[i * 3 * n + 2 * n + j],
             );
-            for (a, b) in [(fq, q.data[i * n + j]), (fk, kk_.data[i * n + j]), (fv, v.data[i * n + j])] {
+            for (a, b) in [
+                (fq, q.data[i * n + j]),
+                (fk, kk_.data[i * n + j]),
+                (fv, v.data[i * n + j]),
+            ] {
                 if a.to_bits() != b.to_bits() {
                     diffs += 1;
                     maxabs = maxabs.max((a - b).abs());
@@ -60,10 +67,16 @@ fn main() {
             }
         }
     }
-    println!("byte-exact check: {diffs} differing / {} total  max|Δ|={maxabs:.3e}", m * n * 3);
+    println!(
+        "byte-exact check: {diffs} differing / {} total  max|Δ|={maxabs:.3e}",
+        m * n * 3
+    );
 
     // Timing: min-of-N, interleaved
-    let reps = std::env::var("REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let reps = std::env::var("REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let mut best_sep = f64::MAX;
     let mut best_fus = f64::MAX;
     for _ in 0..reps {
@@ -77,6 +90,11 @@ fn main() {
         let _f = nn::matmul(&h, &wqkv).unwrap();
         best_fus = best_fus.min(t.elapsed().as_secs_f64() * 1e3);
     }
-    println!("min-of-{reps}: 3× separate = {best_sep:.3} ms   fused [1280,3840] = {best_fus:.3} ms   ratio(sep/fus) = {:.4}×", best_sep / best_fus);
-    println!("(fused must ALSO beat sep by more than the downstream Q/K/V split cost to be a net win)");
+    println!(
+        "min-of-{reps}: 3× separate = {best_sep:.3} ms   fused [1280,3840] = {best_fus:.3} ms   ratio(sep/fus) = {:.4}×",
+        best_sep / best_fus
+    );
+    println!(
+        "(fused must ALSO beat sep by more than the downstream Q/K/V split cost to be a net win)"
+    );
 }

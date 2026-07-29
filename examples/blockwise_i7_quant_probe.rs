@@ -21,7 +21,10 @@
 struct Lcg(u64);
 impl Lcg {
     fn next_u32(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 32) as u32
     }
     fn unit(&mut self) -> f32 {
@@ -39,7 +42,9 @@ impl Lcg {
 /// dequant error over the row.
 fn per_row_rms(row: &[f32]) -> f64 {
     let amax = row.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
-    if amax == 0.0 { return 0.0; }
+    if amax == 0.0 {
+        return 0.0;
+    }
     let scale = amax / 63.0;
     let inv = 1.0 / scale;
     let mut se = 0.0f64;
@@ -56,7 +61,9 @@ fn per_block_rms(row: &[f32], blk: usize) -> f64 {
     let mut se = 0.0f64;
     for chunk in row.chunks(blk) {
         let amax = chunk.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
-        if amax == 0.0 { continue; }
+        if amax == 0.0 {
+            continue;
+        }
         let scale = amax / 63.0;
         let inv = 1.0 / scale;
         for &w in chunk {
@@ -71,13 +78,16 @@ fn per_block_rms(row: &[f32], blk: usize) -> f64 {
 fn main() {
     let inp = 1280usize; // encoder contraction dim (n_state)
     let rows = 1280usize; // one projection's output rows
-    let blk = 32usize;    // Q8_0 block size
+    let blk = 32usize; // Q8_0 block size
     let mut rng = Lcg(0x9E3779B97F4A7C15);
 
     // Two regimes: (A) pure Gaussian weights (no outliers), (B) Gaussian + sparse large
     // outliers (~1 per row at 8-15σ), the realistic transformer-projection case that
     // inflates a per-row amax.
-    for (label, outliers) in [("gaussian (no outliers)", false), ("gaussian + sparse outliers", true)] {
+    for (label, outliers) in [
+        ("gaussian (no outliers)", false),
+        ("gaussian + sparse outliers", true),
+    ] {
         let mut sum_row = 0.0f64;
         let mut sum_blk = 0.0f64;
         let mut worst_ratio = 0.0f64;
@@ -93,17 +103,27 @@ fn main() {
             let pb = per_block_rms(&row, blk);
             sum_row += pr;
             sum_blk += pb;
-            if pb > 0.0 { worst_ratio = worst_ratio.max(pr / pb); }
+            if pb > 0.0 {
+                worst_ratio = worst_ratio.max(pr / pb);
+            }
         }
         let mr = sum_row / rows as f64;
         let mb = sum_blk / rows as f64;
         println!("== {label} ==");
         println!("  per-row  RMS dequant err : {:.3e}", mr);
         println!("  per-block RMS dequant err: {:.3e}   (block={blk})", mb);
-        println!("  mean error reduction (per-row / per-block): {:.2}×", mr / mb.max(1e-30));
-        println!("  worst-row error reduction:                  {:.2}×", worst_ratio);
+        println!(
+            "  mean error reduction (per-row / per-block): {:.2}×",
+            mr / mb.max(1e-30)
+        );
+        println!(
+            "  worst-row error reduction:                  {:.2}×",
+            worst_ratio
+        );
     }
     println!("\nInterpretation: a >1× reduction in the OUTLIER regime = block-wise isolates the");
     println!("outlier's inflated amax to its 32-wide block, sparing the rest of the row = the");
-    println!("mechanism that would recover proper-noun accuracy while staying all-int8 (power dodge).");
+    println!(
+        "mechanism that would recover proper-noun accuracy while staying all-int8 (power dodge)."
+    );
 }

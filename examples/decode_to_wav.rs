@@ -23,7 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `normalize_to_wav` writes `normalized_16k_mono.wav` into a work dir, so
     // decode into the output's parent then rename to the requested name.
-    let work_dir = output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let work_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(work_dir)?;
     let produced = normalize_to_wav(input, work_dir)?;
     if produced != output {
