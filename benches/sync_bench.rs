@@ -79,6 +79,7 @@ fn make_report(run_id: &str, db_path: &std::path::Path) -> RunReport {
             language: Some("en".to_owned()),
             segments,
             acceleration: None,
+            diarization: None,
             raw_output: json!({"text":"hello world"}),
             artifact_paths: vec![],
         },

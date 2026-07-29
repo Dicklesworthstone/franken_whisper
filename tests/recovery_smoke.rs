@@ -45,6 +45,7 @@ fn fixture_report(id: &str, db_path: &std::path::Path) -> RunReport {
                 confidence: Some(0.91),
             }],
             acceleration: None,
+            diarization: None,
             raw_output: json!({"test": true}),
             artifact_paths: vec![],
         },

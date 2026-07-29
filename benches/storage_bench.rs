@@ -74,6 +74,7 @@ fn make_report(run_id: &str, num_segments: usize, num_events: usize) -> RunRepor
             language: Some("en".to_owned()),
             segments,
             acceleration: None,
+            diarization: None,
             raw_output: json!({"text": "bench output"}),
             artifact_paths: vec![],
         },

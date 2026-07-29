@@ -122,6 +122,7 @@ fn make_result(segments: Vec<TranscriptionSegment>) -> TranscriptionResult {
         language: Some("en".to_owned()),
         segments,
         acceleration: None,
+        diarization: None,
         raw_output: json!({}),
         artifact_paths: vec![],
     }
