@@ -10,6 +10,26 @@ use crate::model::{ReplayEnvelope, TranscriptionSegment};
 /// Regression tests in this module verify code-docs consistency.
 pub const CANONICAL_TIMESTAMP_TOLERANCE_SEC: f64 = 0.05;
 
+/// Numerical tolerance for canonical projection-timeline adjacency.
+///
+/// This is deliberately much smaller than
+/// [`CANONICAL_TIMESTAMP_TOLERANCE_SEC`]: 50 ms is a cross-engine comparison
+/// budget, while this value only absorbs floating-point noise at a boundary
+/// that is intended to be adjacent.
+pub const CANONICAL_PROJECTION_EPSILON_SEC: f64 = 1e-6;
+
+/// Smallest canonical word-aligned projection-unit duration.
+///
+/// Diarization boundary hints are represented as integer milliseconds, so a
+/// shorter interval cannot retain distinct start and end boundaries when it is
+/// handed to the acoustic pipeline. A conservative segment-level fallback may
+/// retain its shorter authoritative parent interval, but it is never labeled
+/// word-aligned.
+pub const CANONICAL_PROJECTION_MIN_DURATION_SEC: f64 = 0.001;
+
+/// Stable schema identity for a normalized decoder-to-diarization timeline.
+pub const DTW_PROJECTION_SCHEMA_VERSION: &str = "dtw-projection-v1";
+
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentConformancePolicy {
     pub allow_overlap: bool,
@@ -79,7 +99,7 @@ impl Default for SegmentConformancePolicy {
     fn default() -> Self {
         Self {
             allow_overlap: false,
-            timestamp_epsilon_sec: 1e-6,
+            timestamp_epsilon_sec: CANONICAL_PROJECTION_EPSILON_SEC,
         }
     }
 }
