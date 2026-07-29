@@ -163,7 +163,9 @@ fn bench_load_run_details_batch(c: &mut Criterion) {
         for i in 0..run_count {
             let id = format!("hist-{i:04}");
             let report = make_report(&id, 5, 5);
-            store.persist_report(&report).expect("seed persist should succeed");
+            store
+                .persist_report(&report)
+                .expect("seed persist should succeed");
             run_ids.push(id);
         }
 

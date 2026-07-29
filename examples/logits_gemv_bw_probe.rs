@@ -20,7 +20,9 @@ fn fill_i8(n: usize, seed: u64) -> Vec<i8> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((s >> 40) as i32 & 0xff) - 128).clamp(-127, 127) as i8
         })
         .collect()
@@ -138,53 +140,62 @@ fn gemv_pf(w: &I8Mat, xi8: &[i8], xs: f32, out_slice: &mut [f32], ahead: usize) 
     let (out, inp) = (w.out, w.inp);
     let workers = rayon::current_num_threads().max(1);
     let band = out.div_ceil(workers).max(1);
-    out_slice.par_chunks_mut(band).enumerate().for_each(|(wk, bs)| {
-        let base = wk * band;
-        for (i, slot) in bs.iter_mut().enumerate() {
-            let o = base + i;
-            let row = &w.data[o * inp..(o + 1) * inp];
-            #[cfg(target_arch = "x86_64")]
-            let acc = unsafe { dot_i8_pf(row, xi8, ahead) } as f32 * w.scales[o] * xs;
-            #[cfg(not(target_arch = "x86_64"))]
-            let acc = 0.0f32;
-            *slot = acc;
-        }
-    });
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, bs)| {
+            let base = wk * band;
+            for (i, slot) in bs.iter_mut().enumerate() {
+                let o = base + i;
+                let row = &w.data[o * inp..(o + 1) * inp];
+                #[cfg(target_arch = "x86_64")]
+                let acc = unsafe { dot_i8_pf(row, xi8, ahead) } as f32 * w.scales[o] * xs;
+                #[cfg(not(target_arch = "x86_64"))]
+                let acc = 0.0f32;
+                *slot = acc;
+            }
+        });
 }
 
 fn gemv_2row(w: &I8Mat, xi8: &[i8], xs: f32, out_slice: &mut [f32]) {
     let (out, inp) = (w.out, w.inp);
     let workers = rayon::current_num_threads().max(1);
     let band = (out.div_ceil(workers).max(2) + 1) & !1; // even band
-    out_slice.par_chunks_mut(band).enumerate().for_each(|(wk, bs)| {
-        let base = wk * band;
-        let mut i = 0;
-        while i + 2 <= bs.len() {
-            let o = base + i;
-            let r0 = &w.data[o * inp..(o + 1) * inp];
-            let r1 = &w.data[(o + 1) * inp..(o + 2) * inp];
-            #[cfg(target_arch = "x86_64")]
-            {
-                let (d0, d1) = unsafe { dot_i8_2row(r0, r1, xi8) };
-                bs[i] = d0 as f32 * w.scales[o] * xs;
-                bs[i + 1] = d1 as f32 * w.scales[o + 1] * xs;
+    out_slice
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(wk, bs)| {
+            let base = wk * band;
+            let mut i = 0;
+            while i + 2 <= bs.len() {
+                let o = base + i;
+                let r0 = &w.data[o * inp..(o + 1) * inp];
+                let r1 = &w.data[(o + 1) * inp..(o + 2) * inp];
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let (d0, d1) = unsafe { dot_i8_2row(r0, r1, xi8) };
+                    bs[i] = d0 as f32 * w.scales[o] * xs;
+                    bs[i + 1] = d1 as f32 * w.scales[o + 1] * xs;
+                }
+                i += 2;
             }
-            i += 2;
-        }
-        while i < bs.len() {
-            let o = base + i;
-            let row = &w.data[o * inp..(o + 1) * inp];
-            #[cfg(target_arch = "x86_64")]
-            {
-                bs[i] = unsafe { dot_i8(row, xi8) } as f32 * w.scales[o] * xs;
+            while i < bs.len() {
+                let o = base + i;
+                let row = &w.data[o * inp..(o + 1) * inp];
+                #[cfg(target_arch = "x86_64")]
+                {
+                    bs[i] = unsafe { dot_i8(row, xi8) } as f32 * w.scales[o] * xs;
+                }
+                i += 1;
             }
-            i += 1;
-        }
-    });
+        });
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
     let out = 51866usize;
     let inp = 1280usize;
     let bytes = out * inp; // int8 weight bytes streamed/token
@@ -196,14 +207,22 @@ fn main() {
 
     let data = fill_i8(out * inp, 0x1111);
     let scales = vec![0.01f32; out];
-    let w = I8Mat { data, scales, out, inp };
+    let w = I8Mat {
+        data,
+        scales,
+        out,
+        inp,
+    };
     let x: Vec<f32> = (0..inp).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
 
     // pre-quantize activation like gemv_i8 does
     let xamax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
     let xs = xamax / 127.0;
     let xinv = 1.0 / xs;
-    let xi8: Vec<i8> = x.iter().map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8).collect();
+    let xi8: Vec<i8> = x
+        .iter()
+        .map(|v| (v * xinv).round().clamp(-127.0, 127.0) as i8)
+        .collect();
 
     let mut o_ref = vec![0.0f32; out];
     let mut o_pf = vec![0.0f32; out];
@@ -219,7 +238,12 @@ fn main() {
         nn::gemv_i8(&w, &x, None, &mut o_ref);
         best_ref = best_ref.min(t0.elapsed().as_secs_f64());
     }
-    println!("  {:<16} {:.2} ms   {:.1} GB/s (real nn::gemv_i8)", "baseline", best_ref * 1e3, bytes as f64 / best_ref / 1e9);
+    println!(
+        "  {:<16} {:.2} ms   {:.1} GB/s (real nn::gemv_i8)",
+        "baseline",
+        best_ref * 1e3,
+        bytes as f64 / best_ref / 1e9
+    );
 
     // prefetch variants (ahead in bytes/elements)
     for ahead in [256usize, 512, 1024] {
@@ -232,8 +256,16 @@ fn main() {
             gemv_pf(&w, &xi8, xs, &mut o_pf, ahead);
             best = best.min(t0.elapsed().as_secs_f64());
         }
-        let diff = o_pf.iter().zip(&o_ref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        println!("  pf(ahead={ahead:<4})     {:.2} ms   {:.1} GB/s  maxdiff={diff:.2e}", best * 1e3, bytes as f64 / best / 1e9);
+        let diff = o_pf
+            .iter()
+            .zip(&o_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "  pf(ahead={ahead:<4})     {:.2} ms   {:.1} GB/s  maxdiff={diff:.2e}",
+            best * 1e3,
+            bytes as f64 / best / 1e9
+        );
     }
 
     // 2-row (2 concurrent streams)
@@ -246,8 +278,16 @@ fn main() {
         gemv_2row(&w, &xi8, xs, &mut o_2r);
         best_2r = best_2r.min(t0.elapsed().as_secs_f64());
     }
-    let diff2 = o_2r.iter().zip(&o_ref).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    println!("  2row             {:.2} ms   {:.1} GB/s  maxdiff={diff2:.2e}", best_2r * 1e3, bytes as f64 / best_2r / 1e9);
+    let diff2 = o_2r
+        .iter()
+        .zip(&o_ref)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!(
+        "  2row             {:.2} ms   {:.1} GB/s  maxdiff={diff2:.2e}",
+        best_2r * 1e3,
+        bytes as f64 / best_2r / 1e9
+    );
 
     black_box((o_ref, o_pf, o_2r));
 }

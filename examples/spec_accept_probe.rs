@@ -47,10 +47,15 @@ fn read_wav_16k_mono(path: &str) -> Vec<f32> {
 }
 
 /// Greedy-decode ONE window; returns the committed text token ids (stops at eot).
-fn greedy(model: &LoadedModel, enc: &franken_whisper::native_engine::Mat, prompt: &[i32]) -> Vec<i32> {
+fn greedy(
+    model: &LoadedModel,
+    enc: &franken_whisper::native_engine::Mat,
+    prompt: &[i32],
+) -> Vec<i32> {
     let noop = || Ok(());
     let mut st = DecoderState::new(&model.decoder, enc).expect("state");
-    let mut logits = decoder::forward_step(&model.decoder, &mut st, prompt, &noop).expect("prefill");
+    let mut logits =
+        decoder::forward_step(&model.decoder, &mut st, prompt, &noop).expect("prefill");
     let eot = model.tokenizer.eot;
     let mut toks = Vec::new();
     for _ in 0..224 {
@@ -75,7 +80,8 @@ fn teacher_forced_accept(
     let noop = || Ok(());
     let mut st = DecoderState::new(&draft.decoder, enc).expect("draft state");
     // Prime with the same prompt; its last-position logits predict verify_toks[0].
-    let mut logits = decoder::forward_step(&draft.decoder, &mut st, prompt, &noop).expect("draft prefill");
+    let mut logits =
+        decoder::forward_step(&draft.decoder, &mut st, prompt, &noop).expect("draft prefill");
     let (mut accept, mut total) = (0usize, 0usize);
     for &vt in verify_toks {
         if argmax(&logits) == vt {

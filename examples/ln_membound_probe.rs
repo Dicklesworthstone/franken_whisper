@@ -11,7 +11,7 @@
 //!
 //! Run: cargo +nightly run --release --example ln_membound_probe
 #![feature(portable_simd)]
-use std::simd::{num::SimdFloat, Simd, StdFloat};
+use std::simd::{Simd, StdFloat, num::SimdFloat};
 
 const ROWS: usize = 1500;
 const COLS: usize = 1280;
@@ -34,10 +34,15 @@ fn ln_soa(src: &[f32], dst: &mut [f32], w: &[f32], b: &[f32], eps: f64) {
             *s = V::from_array(a);
         }
         let mut sum = V::splat(0.0);
-        for s in &soa { sum += *s; }
+        for s in &soa {
+            sum += *s;
+        }
         let mean = sum / V::splat(n);
         let mut var = V::splat(0.0);
-        for s in &soa { let d = *s - mean; var += d * d; }
+        for s in &soa {
+            let d = *s - mean;
+            var += d * d;
+        }
         var /= V::splat(n);
         let inv = V::splat(1.0) / (var + V::splat(eps)).sqrt();
         for (j, s) in soa.iter().enumerate() {
@@ -53,10 +58,18 @@ fn ln_soa(src: &[f32], dst: &mut [f32], w: &[f32], b: &[f32], eps: f64) {
     for r in nfull..nrows {
         let row = &src[r * COLS..r * COLS + COLS];
         let mean: f64 = row.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
-        let var: f64 = row.iter().map(|&x| { let d = f64::from(x) - mean; d * d }).sum::<f64>() / n;
+        let var: f64 = row
+            .iter()
+            .map(|&x| {
+                let d = f64::from(x) - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
         let inv = 1.0 / (var + eps).sqrt();
         for (j, &x) in row.iter().enumerate() {
-            dst[r * COLS + j] = ((f64::from(x) - mean) * inv * f64::from(w[j]) + f64::from(b[j])) as f32;
+            dst[r * COLS + j] =
+                ((f64::from(x) - mean) * inv * f64::from(w[j]) + f64::from(b[j])) as f32;
         }
     }
 }
@@ -87,10 +100,15 @@ fn ln_soa_transposed(src: &[f32], dst: &mut [f32], w: &[f32], b: &[f32], eps: f6
             *s = V::from_array(a);
         }
         let mut sum = V::splat(0.0);
-        for s in &soa { sum += *s; }
+        for s in &soa {
+            sum += *s;
+        }
         let mean = sum / V::splat(n);
         let mut var = V::splat(0.0);
-        for s in &soa { let d = *s - mean; var += d * d; }
+        for s in &soa {
+            let d = *s - mean;
+            var += d * d;
+        }
         var /= V::splat(n);
         let inv = V::splat(1.0) / (var + V::splat(eps)).sqrt();
         for (j, s) in soa.iter().enumerate() {
@@ -105,10 +123,18 @@ fn ln_soa_transposed(src: &[f32], dst: &mut [f32], w: &[f32], b: &[f32], eps: f6
     for r in nfull..nrows {
         let row = &src[r * COLS..r * COLS + COLS];
         let mean: f64 = row.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
-        let var: f64 = row.iter().map(|&x| { let d = f64::from(x) - mean; d * d }).sum::<f64>() / n;
+        let var: f64 = row
+            .iter()
+            .map(|&x| {
+                let d = f64::from(x) - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
         let inv = 1.0 / (var + eps).sqrt();
         for (j, &x) in row.iter().enumerate() {
-            dst[r * COLS + j] = ((f64::from(x) - mean) * inv * f64::from(w[j]) + f64::from(b[j])) as f32;
+            dst[r * COLS + j] =
+                ((f64::from(x) - mean) * inv * f64::from(w[j]) + f64::from(b[j])) as f32;
         }
     }
 }
@@ -117,11 +143,16 @@ fn memcpy_baseline(src: &[f32], dst: &mut [f32]) {
     dst.copy_from_slice(src); // pure 15 MB read+write floor
 }
 
-fn ms(t: std::time::Instant) -> f64 { t.elapsed().as_secs_f64() * 1e3 }
+fn ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
 
 fn main() {
     let mut s = 0x9e3779b97f4a7c15u64;
-    let mut nx = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (((s >> 33) as u32) as f32 / u32::MAX as f32 - 0.5) * 4.0 };
+    let mut nx = || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (((s >> 33) as u32) as f32 / u32::MAX as f32 - 0.5) * 4.0
+    };
     let src: Vec<f32> = (0..ROWS * COLS).map(|_| nx()).collect();
     let w: Vec<f32> = (0..COLS).map(|_| 1.0 + nx() * 0.1).collect();
     let b: Vec<f32> = (0..COLS).map(|_| nx() * 0.1).collect();
@@ -138,20 +169,43 @@ fn main() {
     let (mut b_soa, mut b_tr, mut b_mc) = (f64::MAX, f64::MAX, f64::MAX);
     let mut dst = vec![0.0f32; ROWS * COLS];
     for _ in 0..reps {
-        for e in evict.iter_mut() { *e *= 1.0000001; }
-        let t = std::time::Instant::now(); ln_soa(&src, &mut dst, &w, &b, eps); b_soa = b_soa.min(ms(t));
-        for e in evict.iter_mut() { *e *= 1.0000001; }
-        let t = std::time::Instant::now(); ln_soa_transposed(&src, &mut dst, &w, &b, eps); b_tr = b_tr.min(ms(t));
-        for e in evict.iter_mut() { *e *= 1.0000001; }
-        let t = std::time::Instant::now(); memcpy_baseline(&src, &mut dst); b_mc = b_mc.min(ms(t));
+        for e in evict.iter_mut() {
+            *e *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        ln_soa(&src, &mut dst, &w, &b, eps);
+        b_soa = b_soa.min(ms(t));
+        for e in evict.iter_mut() {
+            *e *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        ln_soa_transposed(&src, &mut dst, &w, &b, eps);
+        b_tr = b_tr.min(ms(t));
+        for e in evict.iter_mut() {
+            *e *= 1.0000001;
+        }
+        let t = std::time::Instant::now();
+        memcpy_baseline(&src, &mut dst);
+        b_mc = b_mc.min(ms(t));
     }
-    std::hint::black_box(&dst); std::hint::black_box(&evict);
+    std::hint::black_box(&dst);
+    std::hint::black_box(&evict);
     println!("[{ROWS},{COLS}] single-thread cold, min-of-{reps}:");
     println!("   memcpy baseline (15MB r+w floor) = {b_mc:.3} ms");
-    println!("   LN SoA (real, strided gather)     = {b_soa:.3} ms  ({:.2}× memcpy)", b_soa / b_mc);
-    println!("   LN SoA transposed-first           = {b_tr:.3} ms  ({:.2}× vs SoA)", b_tr / b_soa);
+    println!(
+        "   LN SoA (real, strided gather)     = {b_soa:.3} ms  ({:.2}× memcpy)",
+        b_soa / b_mc
+    );
+    println!(
+        "   LN SoA transposed-first           = {b_tr:.3} ms  ({:.2}× vs SoA)",
+        b_tr / b_soa
+    );
     println!(
         "   => LN is {}",
-        if b_soa < b_mc * 1.4 { "MEMORY-bound (fusion could help)" } else { "COMPUTE/SoA-OVERHEAD-bound (fusion dead)" }
+        if b_soa < b_mc * 1.4 {
+            "MEMORY-bound (fusion could help)"
+        } else {
+            "COMPUTE/SoA-OVERHEAD-bound (fusion dead)"
+        }
     );
 }

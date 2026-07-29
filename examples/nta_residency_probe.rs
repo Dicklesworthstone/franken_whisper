@@ -91,12 +91,17 @@ fn best_read_bw(r: &[i8], iters: usize, f: &dyn Fn(&[i8]) -> i64) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let r_mb = 24usize; // resident (decoder-share), < 32 MB CCD L3
     let s_mb = 96usize; // stream (logits + overflow), > L3
     let r: Vec<i8> = (0..r_mb * MB).map(|i| (i as i8).wrapping_mul(3)).collect();
     let s: Vec<i8> = (0..s_mb * MB).map(|i| (i as i8).wrapping_mul(7)).collect();
-    println!("== NTA residency: R={r_mb}MB (resident target) S={s_mb}MB (stream), best-of-{iters}, 1 thread ==");
+    println!(
+        "== NTA residency: R={r_mb}MB (resident target) S={s_mb}MB (stream), best-of-{iters}, 1 thread =="
+    );
 
     // Baseline: R alone, kept warm (repeated reads). Upper bound on R read BW (L3/L2).
     let warm = best_read_bw(&r, iters, &sum_normal);
@@ -111,7 +116,10 @@ fn main() {
         bw_after_normal = bw_after_normal.min(t0.elapsed().as_secs_f64());
     }
     let bw_after_normal = r.len() as f64 / bw_after_normal / 1e9;
-    println!("  R after normal-S read (baseline)  {:6.1} GB/s", bw_after_normal);
+    println!(
+        "  R after normal-S read (baseline)  {:6.1} GB/s",
+        bw_after_normal
+    );
 
     // MOVNTDQA (_mm256_stream_load) needs 32B alignment (Vec<i8> is 1B-aligned => #GP);
     // and on WB memory the NT-load hint is architecturally IGNORED (== normal load), so it
@@ -126,7 +134,15 @@ fn main() {
             bw2 = bw2.min(t0.elapsed().as_secs_f64());
         }
         let bw2 = r.len() as f64 / bw2 / 1e9;
-        println!("  R after PREFETCHNTA-S read        {:6.1} GB/s  ({})", bw2, if bw2 > 1.3 * bw_after_normal { "KEEPS R WARM => LEVER ALIVE" } else { "pollutes => lever dead" });
+        println!(
+            "  R after PREFETCHNTA-S read        {:6.1} GB/s  ({})",
+            bw2,
+            if bw2 > 1.3 * bw_after_normal {
+                "KEEPS R WARM => LEVER ALIVE"
+            } else {
+                "pollutes => lever dead"
+            }
+        );
     }
     black_box((r, s));
 }

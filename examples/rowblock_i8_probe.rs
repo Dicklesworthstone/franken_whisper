@@ -163,38 +163,44 @@ mod bench {
             seed ^= seed << 17;
             ((seed >> 33) as i32 % 255 - 127) as i8
         };
-        println!("=== int8 GEMV 4-row register-blocking vs single-row `dot_i8` (Zen3, single-thread) ===");
-        println!("byte-exact by integer associativity; ratio = single-row / 4-row (>1 = blocking wins)\n");
+        println!(
+            "=== int8 GEMV 4-row register-blocking vs single-row `dot_i8` (Zen3, single-thread) ==="
+        );
+        println!(
+            "byte-exact by integer associativity; ratio = single-row / 4-row (>1 = blocking wins)\n"
+        );
         for &(rname, ws_bytes) in regimes {
             println!("-- {rname} --");
             for &(name, out, inp) in shapes {
                 let one = out * inp;
                 let copies = (ws_bytes / one).clamp(2, 512);
-                let ws: Vec<Vec<i8>> =
-                    (0..copies).map(|_| (0..one).map(|_| rb()).collect()).collect();
+                let ws: Vec<Vec<i8>> = (0..copies)
+                    .map(|_| (0..one).map(|_| rb()).collect())
+                    .collect();
                 let x: Vec<i8> = (0..inp).map(|_| rb()).collect();
                 let mut o1 = vec![0i32; out];
                 let mut o4 = vec![0i32; out];
                 gemv1(&ws[0], out, inp, &x, &mut o1);
                 gemv4(&ws[0], out, inp, &x, &mut o4);
                 let exact = o1 == o4;
-                let bench = |f: &dyn Fn(&[i8], usize, usize, &[i8], &mut [i32]), o: &mut [i32]| -> f64 {
-                    for c in 0..copies.min(4) {
-                        f(&ws[c], out, inp, &x, o);
-                    }
-                    let mut best = f64::INFINITY;
-                    for _ in 0..10 {
-                        let t = Instant::now();
-                        for c in 0..copies {
+                let bench =
+                    |f: &dyn Fn(&[i8], usize, usize, &[i8], &mut [i32]), o: &mut [i32]| -> f64 {
+                        for c in 0..copies.min(4) {
                             f(&ws[c], out, inp, &x, o);
                         }
-                        let us = t.elapsed().as_secs_f64() * 1e6 / copies as f64;
-                        if us < best {
-                            best = us;
+                        let mut best = f64::INFINITY;
+                        for _ in 0..10 {
+                            let t = Instant::now();
+                            for c in 0..copies {
+                                f(&ws[c], out, inp, &x, o);
+                            }
+                            let us = t.elapsed().as_secs_f64() * 1e6 / copies as f64;
+                            if us < best {
+                                best = us;
+                            }
                         }
-                    }
-                    best
-                };
+                        best
+                    };
                 let t1 = bench(&gemv1, &mut o1);
                 let t4 = bench(&gemv4, &mut o4);
                 std::hint::black_box(o4.iter().map(|&v| v as i64).sum::<i64>());
@@ -206,10 +212,14 @@ mod bench {
             println!();
         }
         println!("VERDICT (measured 2026-07-06): warm L1-hot 4row wins ~1.3-1.6x, but that is a");
-        println!("cache-residency artifact — at L3 it is marginal/mixed and DRAM-cold it REGRESSES");
+        println!(
+            "cache-residency artifact — at L3 it is marginal/mixed and DRAM-cold it REGRESSES"
+        );
         println!("to ~0.67x on every weight-streaming shape. The int8 decode GEMVs are memory-");
         println!("bandwidth-bound (weight stream); R concurrent weight streams degrade DRAM/L3");
-        println!("open-row locality. int8 already halved the bytes => MORE bandwidth-bound => blocking");
+        println!(
+            "open-row locality. int8 already halved the bytes => MORE bandwidth-bound => blocking"
+        );
         println!("hurts more than for f16. REJECTED: the lever is bytes, not blocking.");
     }
 }

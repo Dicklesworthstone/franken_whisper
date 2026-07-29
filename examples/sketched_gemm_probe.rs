@@ -84,7 +84,10 @@ fn sketch_act(h: &[f32], m: usize, k: usize, kp: usize, bucket: &[u32], sign: &[
 }
 
 fn frob(a: &[f32]) -> f64 {
-    a.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt()
+    a.iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt()
 }
 
 fn bench(name: &str, k: usize, n: usize, seq: usize, ratios: &[f64], davg: &[usize], iters: usize) {
@@ -130,8 +133,9 @@ fn bench(name: &str, k: usize, n: usize, seq: usize, ratios: &[f64], davg: &[usi
         let kp = ((k as f64 * r).round() as usize).clamp(1, k);
         for &d in davg {
             // Build d independent sketches (weights sketched once = load-time, untimed).
-            let maps: Vec<(Vec<u32>, Vec<f32>)> =
-                (0..d).map(|di| sketch_map(k, kp, 0xA53Fu64 + di as u64 * 2654435761)).collect();
+            let maps: Vec<(Vec<u32>, Vec<f32>)> = (0..d)
+                .map(|di| sketch_map(k, kp, 0xA53Fu64 + di as u64 * 2654435761))
+                .collect();
             let ws_mats: Vec<Mat> = maps
                 .iter()
                 .map(|(b, sg)| sketch_weight(&w, k, n, kp, b, sg))
@@ -195,12 +199,17 @@ fn bench(name: &str, k: usize, n: usize, seq: usize, ratios: &[f64], davg: &[usi
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     println!(
         "=== sketched (CountSketch / compressed) approximate encoder GEMM @ {} threads ===",
         rayon::current_num_threads()
     );
-    println!("speed = baseline / sketched (weight sketch load-amortized, untimed); relerr = Frobenius ||approx-exact||/||exact||");
+    println!(
+        "speed = baseline / sketched (weight sketch load-amortized, untimed); relerr = Frobenius ||approx-exact||/||exact||"
+    );
     let ratios = [0.5, 0.75];
     let davg = [1usize, 2, 4];
     // Real turbo encoder shapes (n_state=1280, n_ctx=1500):

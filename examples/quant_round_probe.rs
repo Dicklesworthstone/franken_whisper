@@ -99,14 +99,19 @@ fn now() -> std::time::Instant {
 }
 
 fn main() {
-    let shapes = [(1500usize, 1280usize, "fc1/qkv [1500,1280]"), (1500, 5120, "fc2 [1500,5120]")];
+    let shapes = [
+        (1500usize, 1280usize, "fc1/qkv [1500,1280]"),
+        (1500, 5120, "fc2 [1500,5120]"),
+    ];
     // deterministic pseudo-random input (no rng dep): a cheap LCG mapped to ~[-6,6]
     for (rows, cols, label) in shapes {
         let n = rows * cols;
         let mut x = vec![0.0f32; n];
         let mut s: u64 = 0x9e3779b97f4a7c15;
         for v in x.iter_mut() {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((s >> 33) as u32) as f32 / (u32::MAX as f32); // [0,1]
             *v = (u - 0.5) * 12.0;
         }
@@ -129,7 +134,9 @@ fn main() {
         for (a, b) in out_s.iter().zip(&out_a) {
             maxdiff = maxdiff.max((*a as i32 - *b as i32).abs());
         }
-        println!("== {label} ==  byte-identical u8: {u8_ok} (max|Δu8|={maxdiff}), scales identical: {sc_ok}");
+        println!(
+            "== {label} ==  byte-identical u8: {u8_ok} (max|Δu8|={maxdiff}), scales identical: {sc_ok}"
+        );
 
         let reps = 30;
         let mut best_s = f64::MAX;

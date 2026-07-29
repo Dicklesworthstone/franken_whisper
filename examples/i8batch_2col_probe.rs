@@ -84,59 +84,90 @@ fn dot_i8_2col(w: &[i8], x0: &[i8], x1: &[i8]) -> (i32, i32) {
 /// M1: exact structure of gemv_i8_batch compute_band, weight-outer over an out-band.
 fn gemv_m1(w: &[i8], xi8: &[i8], out: usize, tq: usize, dst: &mut [f32], workers: usize) {
     let band = out.div_ceil(workers).max(1);
-    let bands: Vec<(usize, usize)> = (0..out).step_by(band).map(|o0| (o0, (o0 + band).min(out))).collect();
-    let parts: Vec<Vec<f32>> = bands.par_iter().map(|&(o0, o1)| {
-        let mut local = vec![0.0f32; (o1 - o0) * tq];
-        for o in o0..o1 {
-            let wrow = &w[o * INP..(o + 1) * INP];
-            for t in 0..tq {
-                local[(o - o0) * tq + t] = dot_i8(wrow, &xi8[t * INP..(t + 1) * INP]) as f32;
+    let bands: Vec<(usize, usize)> = (0..out)
+        .step_by(band)
+        .map(|o0| (o0, (o0 + band).min(out)))
+        .collect();
+    let parts: Vec<Vec<f32>> = bands
+        .par_iter()
+        .map(|&(o0, o1)| {
+            let mut local = vec![0.0f32; (o1 - o0) * tq];
+            for o in o0..o1 {
+                let wrow = &w[o * INP..(o + 1) * INP];
+                for t in 0..tq {
+                    local[(o - o0) * tq + t] = dot_i8(wrow, &xi8[t * INP..(t + 1) * INP]) as f32;
+                }
             }
-        }
-        local
-    }).collect();
+            local
+        })
+        .collect();
     for (bi, &(o0, o1)) in bands.iter().enumerate() {
         for o in o0..o1 {
-            for t in 0..tq { dst[o * tq + t] = parts[bi][(o - o0) * tq + t]; }
+            for t in 0..tq {
+                dst[o * tq + t] = parts[bi][(o - o0) * tq + t];
+            }
         }
     }
 }
 
 fn gemv_m2(w: &[i8], xi8: &[i8], out: usize, tq: usize, dst: &mut [f32], workers: usize) {
     let band = out.div_ceil(workers).max(1);
-    let bands: Vec<(usize, usize)> = (0..out).step_by(band).map(|o0| (o0, (o0 + band).min(out))).collect();
-    let parts: Vec<Vec<f32>> = bands.par_iter().map(|&(o0, o1)| {
-        let mut local = vec![0.0f32; (o1 - o0) * tq];
-        for o in o0..o1 {
-            let wrow = &w[o * INP..(o + 1) * INP];
-            let mut t = 0;
-            while t + 2 <= tq {
-                let (s0, s1) = dot_i8_2col(wrow, &xi8[t * INP..(t + 1) * INP], &xi8[(t + 1) * INP..(t + 2) * INP]);
-                local[(o - o0) * tq + t] = s0 as f32;
-                local[(o - o0) * tq + t + 1] = s1 as f32;
-                t += 2;
+    let bands: Vec<(usize, usize)> = (0..out)
+        .step_by(band)
+        .map(|o0| (o0, (o0 + band).min(out)))
+        .collect();
+    let parts: Vec<Vec<f32>> = bands
+        .par_iter()
+        .map(|&(o0, o1)| {
+            let mut local = vec![0.0f32; (o1 - o0) * tq];
+            for o in o0..o1 {
+                let wrow = &w[o * INP..(o + 1) * INP];
+                let mut t = 0;
+                while t + 2 <= tq {
+                    let (s0, s1) = dot_i8_2col(
+                        wrow,
+                        &xi8[t * INP..(t + 1) * INP],
+                        &xi8[(t + 1) * INP..(t + 2) * INP],
+                    );
+                    local[(o - o0) * tq + t] = s0 as f32;
+                    local[(o - o0) * tq + t + 1] = s1 as f32;
+                    t += 2;
+                }
+                if t < tq {
+                    local[(o - o0) * tq + t] = dot_i8(wrow, &xi8[t * INP..(t + 1) * INP]) as f32;
+                }
             }
-            if t < tq {
-                local[(o - o0) * tq + t] = dot_i8(wrow, &xi8[t * INP..(t + 1) * INP]) as f32;
-            }
-        }
-        local
-    }).collect();
+            local
+        })
+        .collect();
     for (bi, &(o0, o1)) in bands.iter().enumerate() {
         for o in o0..o1 {
-            for t in 0..tq { dst[o * tq + t] = parts[bi][(o - o0) * tq + t]; }
+            for t in 0..tq {
+                dst[o * tq + t] = parts[bi][(o - o0) * tq + t];
+            }
         }
     }
 }
 
-fn ms(t: std::time::Instant) -> f64 { t.elapsed().as_secs_f64() * 1e3 }
+fn ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
 
 fn main() {
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    { eprintln!("needs avx2"); return; }
+    {
+        eprintln!("needs avx2");
+        return;
+    }
     let mut s = 0x2545F4914F6CDD1Du64;
-    let mut ni = || { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); ((s >> 40) as i8) };
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(16).min(16);
+    let mut ni = || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((s >> 40) as i8)
+    };
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(16)
+        .min(16);
     let mut evict = vec![1.0f32; 48 * 1024 * 1024 / 4];
 
     // Representative prefill / draft shapes: mlp_0 [inp,5120], qkv [inp,3840]; tq small.
@@ -152,14 +183,26 @@ fn main() {
             let reps = 60;
             let (mut b1, mut b2) = (f64::MAX, f64::MAX);
             for _ in 0..reps {
-                for e in evict.iter_mut() { *e *= 1.0000001; }
-                let t = std::time::Instant::now(); gemv_m1(&w, &xi8, out, tq, &mut a, workers); b1 = b1.min(ms(t));
-                for e in evict.iter_mut() { *e *= 1.0000001; }
-                let t = std::time::Instant::now(); gemv_m2(&w, &xi8, out, tq, &mut b, workers); b2 = b2.min(ms(t));
+                for e in evict.iter_mut() {
+                    *e *= 1.0000001;
+                }
+                let t = std::time::Instant::now();
+                gemv_m1(&w, &xi8, out, tq, &mut a, workers);
+                b1 = b1.min(ms(t));
+                for e in evict.iter_mut() {
+                    *e *= 1.0000001;
+                }
+                let t = std::time::Instant::now();
+                gemv_m2(&w, &xi8, out, tq, &mut b, workers);
+                b2 = b2.min(ms(t));
             }
-            std::hint::black_box(&a); std::hint::black_box(&b);
-            println!("{label} tq={tq:3} {workers}t cold min-{reps}: M1={b1:.4} ms  M2col={b2:.4} ms  ({:.3}× {})  byte-id={ident}",
-                b1 / b2, if b2 < b1 { "FASTER" } else { "slower" });
+            std::hint::black_box(&a);
+            std::hint::black_box(&b);
+            println!(
+                "{label} tq={tq:3} {workers}t cold min-{reps}: M1={b1:.4} ms  M2col={b2:.4} ms  ({:.3}× {})  byte-id={ident}",
+                b1 / b2,
+                if b2 < b1 { "FASTER" } else { "slower" }
+            );
         }
     }
     std::hint::black_box(&evict);

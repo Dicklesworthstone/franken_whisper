@@ -681,7 +681,10 @@ impl GgmlModel {
         // base is a format we don't decode yet; the per-tensor parse is the real
         // gate (it rejects unsupported GGML_TYPEs).
         let base_ftype = hparams.ftype.rem_euclid(GGML_QNT_VERSION_FACTOR);
-        if !matches!(base_ftype, 0 | 1 | 2 | 3 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14) {
+        if !matches!(
+            base_ftype,
+            0 | 1 | 2 | 3 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14
+        ) {
             return Err(FwError::Unsupported(format!(
                 "quantized ggml ftype {} (base {base_ftype}) is not supported \
                  (only base 0=f32, 1=f16, 2=q4_0, 3=q4_1, 7=q8_0, 8=q5_0, 9=q5_1, \
@@ -2005,8 +2008,12 @@ mod tests {
         );
         let n = fvals.len() as f32;
         let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
-        let mean_abs_diff: f32 =
-            qvals.iter().zip(&fvals).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 = qvals
+            .iter()
+            .zip(&fvals)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / n;
         // q2_k is the coarsest quant (2-bit): the loosest bound, ~40% of f16.
         // (The per-element dequant is byte-verified against an independent
         // reference implementation — this bound just documents 2-bit's lossiness.)
@@ -2046,8 +2053,12 @@ mod tests {
         );
         let n = fvals.len() as f32;
         let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
-        let mean_abs_diff: f32 =
-            qvals.iter().zip(&fvals).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 = qvals
+            .iter()
+            .zip(&fvals)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / n;
         // q3_k is a coarse 3-bit k-quant: within ~25% of f16.
         assert!(
             mean_abs_diff < 0.25 * mean_abs,
@@ -2085,8 +2096,12 @@ mod tests {
         );
         let n = fvals.len() as f32;
         let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
-        let mean_abs_diff: f32 =
-            qvals.iter().zip(&fvals).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 = qvals
+            .iter()
+            .zip(&fvals)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / n;
         // q5_k is a 5-bit k-quant: within ~10% of f16 (between q6_k's 5% and q4_k's 15%).
         assert!(
             mean_abs_diff < 0.10 * mean_abs,
@@ -2124,8 +2139,12 @@ mod tests {
         );
         let n = fvals.len() as f32;
         let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
-        let mean_abs_diff: f32 =
-            qvals.iter().zip(&fvals).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 = qvals
+            .iter()
+            .zip(&fvals)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / n;
         // q4_k is a 4-bit k-quant (block scale+min, per-sub-block): within ~15%.
         assert!(
             mean_abs_diff < 0.15 * mean_abs,
@@ -2164,8 +2183,12 @@ mod tests {
         );
         let n = fvals.len() as f32;
         let mean_abs: f32 = fvals.iter().map(|v| v.abs()).sum::<f32>() / n;
-        let mean_abs_diff: f32 =
-            qvals.iter().zip(&fvals).map(|(a, b)| (a - b).abs()).sum::<f32>() / n;
+        let mean_abs_diff: f32 = qvals
+            .iter()
+            .zip(&fvals)
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / n;
         // q6_k is high-precision (6-bit + per-16 sub-scales): within ~5% of f16.
         assert!(
             mean_abs_diff < 0.05 * mean_abs,

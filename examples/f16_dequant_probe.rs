@@ -50,7 +50,10 @@ fn best_ms(label: &str, src: &[f16], dst: &mut [f32], f: fn(&[f16], &mut [f32]))
         let ms = t.elapsed().as_secs_f64() * 1e3;
         best = best.min(ms);
     }
-    eprintln!("  {label:<20} best {best:.2} ms  ({:.2} GB/s in+out)", (N as f64 * 6.0) / (best / 1e3) / 1e9);
+    eprintln!(
+        "  {label:<20} best {best:.2} ms  ({:.2} GB/s in+out)",
+        (N as f64 * 6.0) / (best / 1e3) / 1e9
+    );
     best
 }
 

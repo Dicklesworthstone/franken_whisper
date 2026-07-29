@@ -24,8 +24,12 @@ use franken_whisper::native_engine::find_model_file;
 use franken_whisper::native_engine::ggml::GgmlModel;
 use franken_whisper::native_engine::nn;
 
-fn dot(a: &[f32], b: &[f32]) -> f64 { a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum() }
-fn nrm(a: &[f32]) -> f64 { dot(a, a).sqrt() }
+fn dot(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum()
+}
+fn nrm(a: &[f32]) -> f64 {
+    dot(a, a).sqrt()
+}
 
 fn main() {
     let path = find_model_file("large-v3-turbo").expect("set FRANKEN_WHISPER_MODEL_DIR");
@@ -42,7 +46,9 @@ fn main() {
     let mut et = vec![0.0f32; n_state * n_vocab];
     for r in 0..n_vocab {
         let row = &e.data[r * n_state..(r + 1) * n_state];
-        for c in 0..n_state { et[c * n_vocab + r] = row[c]; }
+        for c in 0..n_state {
+            et[c * n_vocab + r] = row[c];
+        }
     }
     let et = Mat::from_vec(n_state, n_vocab, et);
     let g = nn::matmul(&et, &e).expect("gram"); // [n_state, n_state], symmetric PSD
@@ -51,10 +57,21 @@ fn main() {
 
     // Randomized range finding on G with 2 power iterations → Qᵣ [ns, r].
     let mut seed = 0x51D5_10AD_BEEF_0001u64;
-    let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); if (seed >> 40) & 1 == 0 { 1.0f32 } else { -1.0f32 } };
+    let mut rnd = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        if (seed >> 40) & 1 == 0 {
+            1.0f32
+        } else {
+            -1.0f32
+        }
+    };
 
     for &r in &[32usize, 64, 128, 256, 512, 768, 1024] {
-        if r >= ns { continue; }
+        if r >= ns {
+            continue;
+        }
         let omega = Mat::from_vec(ns, r, (0..ns * r).map(|_| rnd()).collect());
         // Z = G·G·Ω  (2 power iterations to sharpen the top-r eigenspace)
         let z1 = nn::matmul(&g, &omega).expect("z1"); // [ns, r]
@@ -65,10 +82,18 @@ fn main() {
             let mut v: Vec<f32> = (0..ns).map(|i| z.data[i * r + j]).collect();
             for qc in &q {
                 let d = dot(&v, qc) as f32;
-                for (vi, &qi) in v.iter_mut().zip(qc) { *vi -= d * qi; }
+                for (vi, &qi) in v.iter_mut().zip(qc) {
+                    *vi -= d * qi;
+                }
             }
             let nn_ = nrm(&v);
-            if nn_ > 1e-6 { let inv = (1.0 / nn_) as f32; for vi in v.iter_mut() { *vi *= inv; } q.push(v); }
+            if nn_ > 1e-6 {
+                let inv = (1.0 / nn_) as f32;
+                for vi in v.iter_mut() {
+                    *vi *= inv;
+                }
+                q.push(v);
+            }
         }
         // captured = Σ_i (qᵢᵀ G qᵢ) / trace(G).
         let mut cap = 0.0f64;
@@ -83,8 +108,12 @@ fn main() {
         }
         let pct = cap / trace_g * 100.0;
         let byte_ratio = r as f64 / ns as f64;
-        println!("  rank {r:>4}: captured {pct:6.2}%   (factorized head ≈ {byte_ratio:.2}× the DRAM bytes)");
+        println!(
+            "  rank {r:>4}: captured {pct:6.2}%   (factorized head ≈ {byte_ratio:.2}× the DRAM bytes)"
+        );
     }
-    println!("\nVIABLE iff ≥99% at r≪{ns} (r≤512 ⇒ ≤0.4× bytes on the bandwidth-bound logits head).");
+    println!(
+        "\nVIABLE iff ≥99% at r≪{ns} (r≤512 ⇒ ≤0.4× bytes on the bandwidth-bound logits head)."
+    );
     println!("Near-full-rank ⇒ embedding uses all {ns} dims ⇒ low-rank logits head DEAD.");
 }

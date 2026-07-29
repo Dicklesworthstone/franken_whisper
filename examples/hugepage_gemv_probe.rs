@@ -54,11 +54,15 @@ fn hugepage_copy_i8(src: &[i8]) -> Vec<i8> {
 fn make_i8(out: usize, inp: usize, seed: u64) -> (Vec<i8>, Vec<f32>) {
     let mut s = seed | 1;
     let mut nb = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (s >> 40) as i32
     };
     let data: Vec<i8> = (0..out * inp).map(|_| (nb() % 255 - 127) as i8).collect();
-    let scales: Vec<f32> = (0..out).map(|_| 0.01 + (nb() % 100) as f32 * 1e-4).collect();
+    let scales: Vec<f32> = (0..out)
+        .map(|_| 0.01 + (nb() % 100) as f32 * 1e-4)
+        .collect();
     (data, scales)
 }
 
@@ -67,16 +71,34 @@ fn bench(label: &str, out: usize, inp: usize, iters: usize) {
     // Activation x[inp] (reused; small, cache-resident — isolates the weight stream).
     let mut s = 0x1234u64;
     let x: Vec<f32> = (0..inp)
-        .map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5 })
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        })
         .collect();
 
-    let w_normal = I8Mat { data: data.clone(), scales: scales.clone(), out, inp };
+    let w_normal = I8Mat {
+        data: data.clone(),
+        scales: scales.clone(),
+        out,
+        inp,
+    };
     let hp = hugepage_copy_i8(&data);
-    let w_huge = I8Mat { data: hp, scales: scales.clone(), out, inp };
+    let w_huge = I8Mat {
+        data: hp,
+        scales: scales.clone(),
+        out,
+        inp,
+    };
 
     let mut y = vec![0.0f32; out];
     let mut best = |w: &I8Mat| -> f64 {
-        for _ in 0..3 { nn::gemv_i8(w, &x, None, &mut y); black_box(&y); }
+        for _ in 0..3 {
+            nn::gemv_i8(w, &x, None, &mut y);
+            black_box(&y);
+        }
         let mut b = f64::INFINITY;
         for _ in 0..iters {
             let t = Instant::now();
@@ -96,8 +118,10 @@ fn bench(label: &str, out: usize, inp: usize, iters: usize) {
     let mb = (out * inp) as f64 / 1e6;
     println!(
         "  {label:<14} [{out}x{inp}] {mb:>6.1} MB | normal {:>7.3} ms {:>5.0} GB/s | huge {:>7.3} ms {:>5.0} GB/s | speedup {:.3}x",
-        bn * 1e3, mb / 1e3 / bn,
-        bh * 1e3, mb / 1e3 / bh,
+        bn * 1e3,
+        mb / 1e3 / bn,
+        bh * 1e3,
+        mb / 1e3 / bh,
         bn / bh,
     );
     // Leak the mmap-backed I8Mat (its Vec must never hit the global free).
@@ -105,9 +129,17 @@ fn bench(label: &str, out: usize, inp: usize, iters: usize) {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(60);
-    println!("=== huge-page (2 MB THP) vs normal (4 KB) weight-stream A/B, real turbo decode GEMV shapes @ {}t ===", rayon::current_num_threads());
-    println!("THP=madvise, AnonHugePages baseline 0 → normal Vec gets NO huge pages; huge = mmap+MADV_HUGEPAGE. byte-exact (identical weights).");
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    println!(
+        "=== huge-page (2 MB THP) vs normal (4 KB) weight-stream A/B, real turbo decode GEMV shapes @ {}t ===",
+        rayon::current_num_threads()
+    );
+    println!(
+        "THP=madvise, AnonHugePages baseline 0 → normal Vec gets NO huge pages; huge = mmap+MADV_HUGEPAGE. byte-exact (identical weights)."
+    );
     // Real turbo decode per-token streaming set (n_state=1280, mlp_hidden=5120, vocab=51865):
     bench("mlp_fc/fc1", 5120, 1280, iters);
     bench("mlp_proj/fc2", 1280, 5120, iters);
