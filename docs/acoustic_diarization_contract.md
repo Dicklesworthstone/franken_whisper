@@ -133,38 +133,58 @@ ASR segment `confidence` remains ASR confidence. Speaker confidence is a
 separate field. Transcript projection may split only at legal DTW word
 boundaries and cannot invent, drop, duplicate, or reorder text.
 
-### 6.1 DTW projection diagnosis (`bd-2noc.1`)
+### 6.1 Canonical DTW projection timeline (`bd-2noc.1`, `bd-2noc.2`)
 
-The native DTW producer and transcript projection currently disagree about a
-legal word interval. `group_tokens_into_words` quantizes token boundaries to
-the alignment grid and deliberately clamps a word end with
-`end.max(start)`. It can therefore emit `[t, t]` for a terminal word whose
-start lands on its enclosing segment end. The generic segment conformance
-contract accepts that zero-width interval, and `build_segments_dtw` copies it
-unchanged while marking the result as DTW word-aligned. The acoustic projection
-contract then requires `end > start` and rejects the same result.
+`group_tokens_into_words` quantizes token boundaries to the alignment grid and
+may legitimately emit a terminal `[t, t]` observation. That decoder
+observation is not itself a projection interval. The native backend now owns
+one conversion from raw observations into `dtw-projection-v1` canonical units
+before diarization or persistence can consume them.
 
-A minimized typed fixture and a gated robot-mode native run reproduce that
-exact producer -> adapter -> conformance -> diarization failure. The owning
-defect is the DTW adapter boundary: raw quantized observations are not yet a
-canonical projection unit. Globally weakening projection validation would hide
-true reversed or overlapping geometry and is not an admissible repair.
+A canonical unit has:
 
-The adjacent-path audit establishes:
+- finite `f64` seconds;
+- half-open `[start_sec, end_sec)` semantics;
+- non-negative, strictly positive duration;
+- monotonic, non-overlapping order;
+- a minimum word-aligned duration of 1 ms, because acoustic boundary hints are
+  integer milliseconds;
+- source segment and word indices;
+- boundary provenance and explicit clamp/expansion status.
 
-- ordinary non-DTW segments are not labeled word-aligned and retain their
-  duration-dominance projection policy;
-- untimed DTW segments already use the explicit interpolation fallback;
-- punctuation tokens are attached to their lexical word by the DTW grouper
-  and do not require independent zero-width projection units;
-- sub-microsecond overlap is accepted by generic segment conformance but
-  rejected by word projection, so the repair needs one shared tolerance;
-- the failure occurs before persistence, so replay cannot create it, but a
-  canonical representation must be what later persistence records.
+The adjacency epsilon is 1 microsecond. It exists only to absorb
+floating-point noise around a boundary that is intended to be identical. It
+is not the 50 ms cross-engine comparison budget. A sub-epsilon overlap is
+canonicalized to exact adjacency. Material overlap, reversed time,
+non-finite time, negative time, unpaired parent timestamps, materially
+overlapping parents, and extra timing vectors fail with stable
+`FW-DTW-PROJECTION-*` reasons.
 
-The dependent repair (`bd-2noc.2`) must normalize raw DTW geometry once at the
-adapter boundary, preserve provenance, and keep strict rejection for
-non-finite, reversed, or materially overlapping intervals.
+For valid DTW observations, the adapter reserves 1 ms for each remaining word,
+clamps observations to the enclosing decoder segment, and expands quantized
+zero-width units within that reservation. This repairs a terminal `[t, t]`
+without inventing, dropping, duplicating, or reordering text. Punctuation-only
+content remains legal.
+
+Missing DTW words for a segment use deterministic linear interpolation within
+that parent segment. If a parent is too short to represent every word as a
+distinct millisecond interval, the adapter emits one parent-segment unit. Both
+cases retain fallback provenance and set `word_aligned_safe=false`; acoustic
+projection then uses conservative duration dominance rather than claiming
+legal DTW word boundaries. `no_timestamps` also disables that claim.
+
+The privacy-safe `projection_timeline` raw-output object records the schema,
+units, interval semantics, tolerances, input/output counts, provenance counts,
+adjustment counts, and `word_aligned_safe`. That object contains no transcript
+text, recording path, or speaker identity. The orchestrator trusts the typed
+`projection_timeline.word_aligned_safe` field rather than inferring legality
+from the older descriptive `word_timestamps` string.
+
+The simulated proportional CTC alignment stage does not rewrite a timeline
+carrying that proof. Real decoder attention-DTW offsets are authoritative, and
+mixing proportional corrections with per-segment fallbacks can otherwise
+reintroduce overlap at the end of the recording. The align stage records a
+deterministic preservation note and leaves canonical segment bytes unchanged.
 
 Acoustic v1 confidence currently combines best-versus-second assignment margin
 with profile reliability and reports `heuristic_uncalibrated`. Resampling

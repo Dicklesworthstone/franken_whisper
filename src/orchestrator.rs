@@ -2770,6 +2770,27 @@ fn ctc_forced_align(
     })
 }
 
+fn align_transcription_result(
+    result: &mut crate::model::TranscriptionResult,
+    audio_duration_sec: Option<f64>,
+    config: &AlignConfig,
+    token: &CancellationToken,
+) -> FwResult<AlignmentReport> {
+    if has_canonical_word_alignment(&result.raw_output) {
+        token.checkpoint()?;
+        return Ok(AlignmentReport {
+            segments_total: result.segments.len(),
+            segments_corrected: 0,
+            segments_fallback: result.segments.len(),
+            notes: vec![
+                "preserved authoritative canonical DTW projection timeline; synthetic alignment skipped"
+                    .to_owned(),
+            ],
+        });
+    }
+    ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)
+}
+
 async fn execute_align(
     pcx: &mut PipelineCx,
     log: &mut EventLog,
@@ -2803,7 +2824,7 @@ async fn execute_align(
         match run_stage_with_budget("align", align_budget_ms, move || {
             let config = AlignConfig::default();
             let report =
-                ctc_forced_align(&mut result.segments, audio_duration, &config, &align_token)?;
+                align_transcription_result(&mut result, audio_duration, &config, &align_token)?;
             Ok((result, report))
         }) {
             Ok(output) => output,
@@ -4353,11 +4374,7 @@ async fn execute_diarize(
                     let wav_bytes = std::fs::read(&normalized_wav)?;
                     let normalized_input_sha256 = sha256_bytes_hex(&wav_bytes);
                     let samples = crate::native_engine::decode::read_wav_16k_mono(&wav_bytes)?;
-                    let word_aligned = result
-                        .raw_output
-                        .get("word_timestamps")
-                        .and_then(Value::as_str)
-                        == Some("dtw");
+                    let word_aligned = has_canonical_word_alignment(&result.raw_output);
                     let word_boundaries_ms = if word_aligned {
                         transcript_boundaries_ms(&result.segments)
                     } else {
@@ -4704,6 +4721,17 @@ fn transcript_boundaries_ms(segments: &[crate::model::TranscriptionSegment]) -> 
     boundaries
 }
 
+fn has_canonical_word_alignment(raw_output: &Value) -> bool {
+    raw_output
+        .pointer("/projection_timeline/schema_version")
+        .and_then(Value::as_str)
+        == Some(crate::conformance::DTW_PROJECTION_SCHEMA_VERSION)
+        && raw_output
+            .pointer("/projection_timeline/word_aligned_safe")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
 fn result_has_external_diarization(result: &crate::model::TranscriptionResult) -> bool {
     // The legacy native whisper-diarization adapter labels ASR segments with a
     // text/temporal heuristic.  Those labels are useful only as historical
@@ -4980,10 +5008,11 @@ mod tests {
         FinalizerRegistry, PipelineConfig, PipelineCx, PipelineStage, PunctuateReport,
         SeparateReport, SpeakerEmbedding, StageBudgetPolicy, VadConfig, VadRegionMs, VadReport,
         acceleration_cancellation_fence_payload, acceleration_context_payload,
-        acceleration_stream_owner_id, apply_native_diarization_projection, apply_padding,
-        budget_duration, checkpoint_or_emit, ctc_forced_align, diarize_segments,
-        emit_diarization_report_events, event_elapsed_ms, external_diarization_fallback_admitted,
-        external_diarization_report, finite_seconds_interval_to_ms, is_abbreviation_period,
+        acceleration_stream_owner_id, align_transcription_result,
+        apply_native_diarization_projection, apply_padding, budget_duration, checkpoint_or_emit,
+        ctc_forced_align, diarize_segments, emit_diarization_report_events, event_elapsed_ms,
+        external_diarization_fallback_admitted, external_diarization_report,
+        finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
         is_decimal_period, is_ellipsis_period, merge_regions_by_gap, ms_to_frames,
         optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
         parse_event_ts_ms, punctuate_segments, recommended_budget, resolve_speaker_target,
@@ -8917,6 +8946,27 @@ mod tests {
         assert_eq!(transcript_boundaries_ms(&segments), vec![0, 1_250, 2_000]);
     }
 
+    #[test]
+    fn acoustic_projection_requires_typed_canonical_word_alignment_proof() {
+        assert!(!has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw"
+        })));
+        assert!(has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw",
+            "projection_timeline": {
+                "schema_version": "dtw-projection-v1",
+                "word_aligned_safe": true
+            }
+        })));
+        assert!(!has_canonical_word_alignment(&json!({
+            "word_timestamps": "dtw",
+            "projection_timeline": {
+                "schema_version": "dtw-projection-v1",
+                "word_aligned_safe": false
+            }
+        })));
+    }
+
     fn synthetic_typed_diarization_report() -> DiarizationReport {
         DiarizationReport {
             implementation: "native-acoustic-v1".to_owned(),
@@ -9199,6 +9249,51 @@ mod tests {
             speaker: None,
             confidence: None,
         }
+    }
+
+    #[test]
+    fn alignment_preserves_authoritative_canonical_dtw_units_byte_for_byte() {
+        let original_segments = vec![
+            make_segment(0.0, 0.999, "alpha"),
+            make_segment(0.999, 1.0, "beta"),
+        ];
+        let original_json =
+            serde_json::to_value(&original_segments).expect("serialize original segments");
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "alpha beta".to_owned(),
+            language: Some("en".to_owned()),
+            segments: original_segments,
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({
+                "word_timestamps": "dtw",
+                "projection_timeline": {
+                    "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                    "word_aligned_safe": true
+                }
+            }),
+            artifact_paths: Vec::new(),
+        };
+        let report = align_transcription_result(
+            &mut result,
+            Some(1.0),
+            &AlignConfig::default(),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("canonical alignment preservation");
+        assert_eq!(report.segments_corrected, 0);
+        assert_eq!(report.segments_fallback, 2);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("canonical DTW"))
+        );
+        assert_eq!(
+            serde_json::to_value(&result.segments).expect("serialize preserved segments"),
+            original_json
+        );
     }
 
     #[test]

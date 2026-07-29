@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
@@ -4491,7 +4492,9 @@ fn validate_projection_segments(
                     && start >= 0.0
                     && end > start
                     && (index == 0 || start >= previous_start)
-                    && (!word_aligned || index == 0 || start + 1e-9 >= previous_end) =>
+                    && (!word_aligned
+                        || index == 0
+                        || start + CANONICAL_PROJECTION_EPSILON_SEC >= previous_end) =>
             {
                 previous_start = start;
                 previous_end = end;
@@ -7760,6 +7763,38 @@ mod tests {
         assert!(
             project_diarization_onto_segments(&overlapping_words, &turns, true)
                 .expect_err("overlapping words")
+                .to_string()
+                .contains("projection segments")
+        );
+    }
+
+    #[test]
+    fn projection_accepts_only_sub_epsilon_adjacency_noise() {
+        let turns = vec![turn(0, 2_000, Some("alice"), Some(0.9))];
+        let harmless = vec![
+            transcript_segment(Some(0.0), Some(1.0), "one", None),
+            transcript_segment(
+                Some(1.0 - super::CANONICAL_PROJECTION_EPSILON_SEC / 2.0),
+                Some(2.0),
+                "two",
+                None,
+            ),
+        ];
+        project_diarization_onto_segments(&harmless, &turns, true)
+            .expect("shared projection epsilon must absorb floating-point adjacency noise");
+
+        let material = vec![
+            transcript_segment(Some(0.0), Some(1.0), "one", None),
+            transcript_segment(
+                Some(1.0 - super::CANONICAL_PROJECTION_EPSILON_SEC * 2.0),
+                Some(2.0),
+                "two",
+                None,
+            ),
+        ];
+        assert!(
+            project_diarization_onto_segments(&material, &turns, true)
+                .expect_err("material overlap must remain invalid")
                 .to_string()
                 .contains("projection segments")
         );

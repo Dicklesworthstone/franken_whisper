@@ -370,10 +370,10 @@ fn gated_sole_stage_native_is_only_path() {
 }
 
 #[test]
-fn gated_robot_acoustic_diarization_characterizes_raw_dtw_geometry_failure() {
+fn gated_robot_acoustic_diarization_accepts_canonical_dtw_projection() {
     if !tiny_en_available() {
         eprintln!(
-            "SKIP gated_robot_acoustic_diarization_characterizes_raw_dtw_geometry_failure: tiny.en model missing"
+            "SKIP gated_robot_acoustic_diarization_accepts_canonical_dtw_projection: tiny.en model missing"
         );
         return;
     }
@@ -404,8 +404,10 @@ fn gated_robot_acoustic_diarization_characterizes_raw_dtw_geometry_failure() {
     );
 
     assert!(
-        !run.status.success(),
-        "the pre-normalization adapter must reproduce the diagnosed failure"
+        run.status.success(),
+        "canonical native DTW projection must complete: stdout={} stderr={}",
+        run.stdout,
+        run.stderr,
     );
     let lines = run
         .stdout
@@ -416,23 +418,42 @@ fn gated_robot_acoustic_diarization_characterizes_raw_dtw_geometry_failure() {
         lines
             .iter()
             .any(|line| line["event"] == "stage" && line["code"] == "backend.ok"),
-        "the real native backend must complete before projection fails"
+        "the real native backend must complete before acoustic projection"
     );
-    let diarize_error = lines
-        .iter()
-        .find(|line| line["event"] == "stage" && line["code"] == "diarize.error")
-        .expect("the actual diarize stage must expose the geometry mismatch");
     assert!(
-        diarize_error["payload"]["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("projection segments must have paired finite")),
-        "unexpected diarize error envelope: {diarize_error}"
+        lines
+            .iter()
+            .any(|line| line["event"] == "stage" && line["code"] == "diarize.ok"),
+        "the acoustic diarization stage must accept the canonical timeline"
     );
-    let run_error = lines
+    assert!(
+        !lines.iter().any(|line| line["event"] == "run_error"),
+        "successful robot output must not contain run_error"
+    );
+    let complete = lines
         .iter()
-        .find(|line| line["event"] == "run_error")
-        .expect("robot mode must terminate with a line-isolated error");
-    assert_eq!(run_error["code"], "FW-ROBOT-REQUEST");
+        .find(|line| line["event"] == "run_complete")
+        .expect("robot mode must terminate with run_complete");
+    assert!(
+        complete["diarization"].is_object(),
+        "run_complete must expose the typed diarization report"
+    );
+    let segments = complete["segments"]
+        .as_array()
+        .expect("run_complete segments array");
+    assert!(
+        !segments.is_empty(),
+        "JFK inference must emit transcript units"
+    );
+    assert!(
+        segments.iter().all(|segment| {
+            segment["start_sec"]
+                .as_f64()
+                .zip(segment["end_sec"].as_f64())
+                .is_some_and(|(start, end)| end > start)
+        }),
+        "every projected transcript unit must retain positive duration"
+    );
 }
 
 // ===========================================================================
