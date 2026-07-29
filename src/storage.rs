@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, ReplayEnvelope, RunEvent, RunReport, RunSummary, StoredRunDetails,
-    TranscribeRequest, TranscriptionResult,
+    TranscriptionResult,
 };
 
 /// Drive `future` to completion on this thread's runtime.
@@ -727,15 +727,21 @@ CREATE TABLE IF NOT EXISTS _meta (
         }
 
         // Fresh databases are created with the current table shape in
-        // initialize_schema(). Detect that shape explicitly before shortcutting:
-        // legacy v1 DBs can also report version=0 when `_meta` is absent and must
-        // still flow through v2 migrations to add new columns.
+        // initialize_schema(). A markerless legacy database can also report
+        // version=0, but CREATE TABLE IF NOT EXISTS has already supplied every
+        // table that was absent. When the runs table has the v2 columns, finish
+        // the index-only v3/v4 work directly and rebuild the derived cache. This
+        // avoids replaying v4's table DDL against a brand-new current-shape DB,
+        // which leaves needless freelist pages in fsqlite.
         if current == 0 {
             let has_replay = self.table_has_column("runs", "replay_json")?;
             let has_acceleration = self.table_has_column("runs", "acceleration_json")?;
             if has_replay && has_acceleration {
-                self.set_schema_version(2)?;
-                current = 2;
+                self.apply_migration(3)?;
+                self.ensure_diarization_indexes_v4()?;
+                self.rebuild_diarization_index_inner()?;
+                self.set_schema_version(4)?;
+                current = 4;
             }
         }
 
@@ -856,16 +862,11 @@ CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
     profile_persistence_opt_in INTEGER NOT NULL,
     PRIMARY KEY (run_id, idx)
 );
-CREATE INDEX IF NOT EXISTS idx_diarization_turns_run_id
-    ON diarization_turns(run_id);
-CREATE INDEX IF NOT EXISTS idx_speaker_hints_run_id
-    ON speaker_hints(run_id);
-CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
-    ON speaker_profile_summaries(run_id);
 "#,
                 )
                 .map_err(|error| FwError::Storage(error.to_string()))?;
 
+            self.ensure_diarization_indexes_v4()?;
             self.rebuild_diarization_index_inner()
         })();
 
@@ -881,6 +882,22 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 Err(error)
             }
         }
+    }
+
+    fn ensure_diarization_indexes_v4(&self) -> FwResult<()> {
+        self.connection
+            .execute(
+                r#"
+CREATE INDEX IF NOT EXISTS idx_diarization_turns_run_id
+    ON diarization_turns(run_id);
+CREATE INDEX IF NOT EXISTS idx_speaker_hints_run_id
+    ON speaker_hints(run_id);
+CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
+    ON speaker_profile_summaries(run_id);
+"#,
+            )
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        Ok(())
     }
 
     pub(crate) fn rebuild_diarization_index(&self) -> FwResult<()> {
@@ -907,26 +924,80 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
             .connection
             .query("SELECT id, request_json, result_json FROM runs ORDER BY id ASC;")
             .map_err(|error| FwError::Storage(error.to_string()))?;
+        if rows.is_empty() {
+            let mut has_derived_rows = false;
+            for table in [
+                "diarization_turns",
+                "speaker_hints",
+                "speaker_profile_summaries",
+                "diarization_reports",
+            ] {
+                let present = self
+                    .connection
+                    .query(&format!("SELECT 1 FROM {table} LIMIT 1;"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                has_derived_rows |= !present.is_empty();
+            }
+            if !has_derived_rows {
+                return Ok(());
+            }
+        }
+
+        for table in [
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+            "diarization_reports",
+        ] {
+            self.connection
+                .execute(&format!("DELETE FROM {table};"))
+                .map_err(|error| FwError::Storage(error.to_string()))?;
+        }
         for row in rows {
             let run_id = value_to_string(row.get(0));
             let request_json = value_to_string(row.get(1));
             let result_json = value_to_string(row.get(2));
-            let request: TranscribeRequest =
+            let request_value: serde_json::Value =
                 serde_json::from_str(&request_json).map_err(|error| {
                     FwError::Storage(format!(
                         "cannot rebuild diarization request for run {run_id}: {error}"
                     ))
                 })?;
-            let result: TranscriptionResult =
+            let result_value: serde_json::Value =
                 serde_json::from_str(&result_json).map_err(|error| {
                     FwError::Storage(format!(
                         "cannot rebuild diarization result for run {run_id}: {error}"
                     ))
                 })?;
+
+            let diarization_request = request_value
+                .pointer("/backend_params/acoustic_diarization")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value::<crate::model::DiarizationRequest>(value.clone())
+                        .map_err(|error| {
+                            FwError::Storage(format!(
+                                "cannot rebuild acoustic diarization request for run {run_id}: {error}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            let diarization_report = result_value
+                .get("diarization")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value::<crate::model::DiarizationReport>(value.clone())
+                        .map_err(|error| {
+                            FwError::Storage(format!(
+                                "cannot rebuild diarization report for run {run_id}: {error}"
+                            ))
+                        })
+                })
+                .transpose()?;
             self.replace_diarization_records(
                 &run_id,
-                &request,
-                result.diarization.as_ref(),
+                diarization_request.as_ref(),
+                diarization_report.as_ref(),
                 persist_skip_stmt_sp_enabled(),
             )?;
         }
@@ -1459,7 +1530,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
     fn replace_diarization_records(
         &self,
         run_id: &str,
-        request: &TranscribeRequest,
+        diarization_request: Option<&crate::model::DiarizationRequest>,
         report: Option<&crate::model::DiarizationReport>,
         skip_sp: bool,
     ) -> FwResult<()> {
@@ -1477,7 +1548,6 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
             )?;
         }
 
-        let diarization_request = request.backend_params.acoustic_diarization.as_ref();
         let profile_persistence_opt_in =
             diarization_request.is_some_and(|request| request.persist_profiles);
         if let Some(diarization_request) = diarization_request {
@@ -1625,7 +1695,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         // queryable without persisting raw acoustic vectors.
         self.replace_diarization_records(
             &report.run_id,
-            &report.request,
+            report.request.backend_params.acoustic_diarization.as_ref(),
             report.result.diarization.as_ref(),
             skip_sp,
         )?;
@@ -2339,8 +2409,11 @@ mod tests {
             implementation: "native-acoustic-v1".to_owned(),
             contract_version: "acoustic-diarization-v1".to_owned(),
             feature_schema: "acoustic-feature-v1".to_owned(),
-            normalized_input_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            hint_document_sha256: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+            normalized_input_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            hint_document_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
             turns: vec![DiarizationTurn {
                 start_ms: 0,
                 end_ms: 1_000,
@@ -2460,6 +2533,26 @@ mod tests {
                 table_row_count(&store, table),
                 2,
                 "{table} row count after rebuild"
+            );
+        }
+
+        store
+            .connection
+            .execute("DELETE FROM runs WHERE id = 'run-diarization-default';")
+            .expect("remove canonical fixture row");
+        store
+            .rebuild_diarization_index()
+            .expect("rebuild should remove orphaned derived rows");
+        for table in [
+            "diarization_reports",
+            "diarization_turns",
+            "speaker_hints",
+            "speaker_profile_summaries",
+        ] {
+            assert_eq!(
+                table_row_count(&store, table),
+                1,
+                "{table} must contain only canonical runs after rebuild"
             );
         }
     }

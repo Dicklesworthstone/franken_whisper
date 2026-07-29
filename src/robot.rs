@@ -5,8 +5,8 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    AccelerationReport, BackendDiscoveryEntry, BackendKind, BackendsReport, RunEvent, RunReport,
-    TranscriptionResult, TranscriptionSegment,
+    AccelerationReport, BackendDiscoveryEntry, BackendKind, BackendsReport, DiarizationReport,
+    RunEvent, RunReport, TranscriptionResult, TranscriptionSegment,
 };
 
 pub const ROBOT_SCHEMA_VERSION: &str = "1.0.0";
@@ -36,6 +36,7 @@ pub const RUN_COMPLETE_REQUIRED_FIELDS: &[&str] = &[
     "transcript",
     "segments",
     "acceleration",
+    "diarization",
     "warnings",
     "evidence",
 ];
@@ -218,6 +219,7 @@ fn owned_transcription_result_value(result: TranscriptionResult) -> serde_json::
         language,
         segments,
         acceleration,
+        diarization,
         raw_output,
         artifact_paths,
     } = result;
@@ -245,6 +247,9 @@ fn owned_transcription_result_value(result: TranscriptionResult) -> serde_json::
             None => Value::Null,
         },
     );
+    if let Some(diarization) = diarization {
+        object.insert("diarization".to_owned(), serde_json::to_value(diarization)?);
+    }
     object.insert("raw_output".to_owned(), raw_output);
     object.insert(
         "artifact_paths".to_owned(),
@@ -943,6 +948,7 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "transcript": "hello world",
                     "segments": [],
                     "acceleration": {"backend": "none", "normalized_confidences": true},
+                    "diarization": null,
                     "acceleration_context": {
                         "logical_stream_owner_id": "trace:acceleration:none:cpu",
                         "logical_stream_kind": "cpu_lane",
@@ -1236,6 +1242,7 @@ struct BorrowedComplete<'a> {
     transcript: &'a str,
     segments: &'a [TranscriptionSegment],
     acceleration: Option<&'a AccelerationReport>,
+    diarization: Option<&'a DiarizationReport>,
     warnings: &'a [String],
     evidence: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1256,6 +1263,7 @@ impl<'a> BorrowedComplete<'a> {
             transcript: &report.result.transcript,
             segments: &report.result.segments,
             acceleration: report.result.acceleration.as_ref(),
+            diarization: report.result.diarization.as_ref(),
             warnings: &report.warnings,
             evidence: &report.evidence,
             acceleration_context: acceleration_context_ref_from_evidence(&report.evidence),
@@ -1292,6 +1300,7 @@ fn run_complete_value(report: &RunReport) -> serde_json::Value {
         "transcript": report.result.transcript,
         "segments": report.result.segments,
         "acceleration": report.result.acceleration,
+        "diarization": report.result.diarization,
         "warnings": report.warnings,
         "evidence": report.evidence,
     });
@@ -1424,6 +1433,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -1487,6 +1497,7 @@ mod tests {
                     confidence: Some(0.95),
                 }],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -1628,6 +1639,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -1703,6 +1715,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -1884,6 +1897,7 @@ mod tests {
                 language: None,
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!(null),
                 artifact_paths: vec![],
             },
@@ -1941,6 +1955,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -2507,7 +2522,7 @@ mod tests {
         let empty_bytes = assert_byte_parity(&empty);
         assert_eq!(
             String::from_utf8(empty_bytes).expect("empty complete is UTF-8"),
-            r#"{"event":"run_complete","schema_version":"1.0.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"warnings":[],"evidence":[]}"#,
+            r#"{"event":"run_complete","schema_version":"1.0.0","run_id":"ndjson-test","trace_id":"00000000000000000000000000000000","started_at":"2026-02-22T00:00:00Z","finished_at":"2026-02-22T00:00:01Z","backend":"whisper_cpp","language":null,"transcript":"","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}"#,
         );
 
         let mut rich = test_report(vec![], vec![]);
@@ -3000,6 +3015,7 @@ mod tests {
                     post_mass: Some(0.99),
                     notes: vec!["accelerated".to_owned()],
                 }),
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -3048,6 +3064,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -3126,6 +3143,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments,
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -5498,6 +5516,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },
@@ -5556,6 +5575,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },

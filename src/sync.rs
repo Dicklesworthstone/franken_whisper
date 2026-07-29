@@ -3349,8 +3349,11 @@ mod tests {
             implementation: "native-acoustic-v1".to_owned(),
             contract_version: "acoustic-diarization-v1".to_owned(),
             feature_schema: "acoustic-feature-v1".to_owned(),
-            normalized_input_sha256: "cccccccccccccccccccccccccccccccc".to_owned(),
-            hint_document_sha256: Some("dddddddddddddddddddddddddddddddd".to_owned()),
+            normalized_input_sha256:
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            hint_document_sha256: Some(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            ),
             turns: vec![DiarizationTurn {
                 start_ms: 0,
                 end_ms: 2_000,

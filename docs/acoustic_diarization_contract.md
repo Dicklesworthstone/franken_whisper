@@ -114,6 +114,10 @@ Soft hints contribute capped pseudo-counts and priors. They can be rejected
 when acoustically contradictory. Provenance is audit metadata and cannot
 increase confidence by itself.
 
+Acoustic v1 accepts at most 1,024 known intervals per request, 256 bytes per
+speaker reference, and 4,096 bytes per provenance value. These limits are
+validated before the hard-hint overlap check.
+
 ## 6. Output and confidence
 
 The diarized-turn timeline is the acoustic source of truth. Each turn contains:
@@ -129,16 +133,21 @@ ASR segment `confidence` remains ASR confidence. Speaker confidence is a
 separate field. Transcript projection may split only at legal DTW word
 boundaries and cannot invent, drop, duplicate, or reorder text.
 
-Confidence combines best-versus-second assignment margin, profile reliability,
-resampling stability, and a named calibration artifact. Calibration reports
-Brier score, expected calibration error, and coverage so returning unknown
-everywhere cannot appear successful.
+Acoustic v1 confidence currently combines best-versus-second assignment margin
+with profile reliability and reports `heuristic_uncalibrated`. Resampling
+stability and a named corpus calibration artifact remain promotion gates, not
+inputs the current implementation pretends to possess. The retained scoring
+surface reports Brier score, expected calibration error, and coverage when
+ground-truth observations are available, so returning unknown everywhere
+cannot appear successful.
 
 ## 7. Determinism and resource limits
 
 - Frame cadence is 16 kHz, 400 samples, 160-sample hop for feature schema v1.
-- Cancellation is checked at least every 32 frames and during clustering,
-  smoothing, projection, persistence, and cleanup.
+- Cancellation is checked at least every 32 frames and within clustering and
+  smoothing. Projection is bounded linear work inside the independently
+  budgeted Diarize stage; persistence and cleanup retain their existing
+  pipeline cancellation boundaries.
 - Whole-call raw frame matrices and full raw-audio wavelet transforms are
   forbidden.
 - Acoustic v1 defaults to at most 512 global prototypes. Anchored prototypes
@@ -146,9 +155,10 @@ everywhere cannot appear successful.
 - Exact constrained agglomeration is bounded by the prototype cap, followed by
   linear-in-turns temporal refinement.
 - Stable labels place anchored references first, then unanchored speakers by
-  earliest reliable occurrence and stable feature-hash tie-break.
-- Identical input, request, implementation, feature schema, and calibration
-  artifacts produce identical turn and evidence hashes across thread counts.
+  earliest reliable occurrence and a total-order comparison of the compact
+  feature vector.
+- Identical input, request, implementation, and feature schema produce
+  byte-identical typed output in the deterministic implementation.
 
 ## 8. Conservative fallback
 

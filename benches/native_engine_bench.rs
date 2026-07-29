@@ -450,7 +450,8 @@ fn bench_acoustic_diarization(c: &mut Criterion) {
             let output = diarize_acoustic_pcm(
                 AcousticDiarizationInput {
                     samples: black_box(&samples),
-                    normalized_input_sha256: "synthetic-benchmark-input",
+                    normalized_input_sha256:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     segments: &[],
                     word_aligned: false,
                     request: black_box(&request),

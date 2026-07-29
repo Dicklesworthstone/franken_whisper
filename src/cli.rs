@@ -401,7 +401,10 @@ pub struct TranscribeArgs {
     #[arg(long, value_enum, default_value_t = DiarizationFallbackPolicy::Unknown)]
     pub diarization_fallback: DiarizationFallbackPolicy,
 
-    /// Confidential speaker-hints-v1 JSON array; read in place and never copied.
+    /// Speaker-hints-v1 JSON; its source path is not retained.
+    ///
+    /// Parsed hint fields become part of the request and may be persisted with
+    /// the run unless `--no-persist` is used.
     #[arg(long)]
     pub speaker_hints: Option<PathBuf>,
 
