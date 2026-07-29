@@ -51,6 +51,9 @@
 //! persistent non-harness processes between every arm: a process consuming more
 //! than 0.1 CPU core makes the result undecidable, because steady cross-tool
 //! load bias can survive both numerical controls.
+//! Each whole-job row also records host RAM/NUMA topology and distinguishes
+//! requested/configured pool width from threads independently observed
+//! consuming CPU ticks under `/proc/<pid>/task`.
 //!
 //! ## Usage
 //!
@@ -64,9 +67,11 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use franken_whisper::conformance::word_error_rate;
 use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel, transcribe_samples};
@@ -113,6 +118,8 @@ struct Observation {
     transcript: String,
     transcript_sha256: String,
     actual_threads: usize,
+    observed_active_threads: usize,
+    peak_process_threads: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +300,36 @@ fn physical_cores() -> usize {
     cores.len()
 }
 
+fn ram_bytes() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| {
+            meminfo.lines().find_map(|line| {
+                let kib = line.strip_prefix("MemTotal:")?.split_whitespace().next()?;
+                kib.parse::<u64>().ok()
+            })
+        })
+        .and_then(|kib| kib.checked_mul(1024))
+        .unwrap_or(0)
+}
+
+fn numa_nodes() -> usize {
+    std::fs::read_dir("/sys/devices/system/node").map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("node"))
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+            .count()
+    })
+}
+
 fn runtime_isa() -> Vec<&'static str> {
     let mut features = Vec::new();
     #[cfg(target_arch = "x86_64")]
@@ -337,6 +374,8 @@ fn host_provenance() -> Value {
         "cpu_model": cpu_model(),
         "physical_cores": physical_cores(),
         "logical_threads": logical_threads(),
+        "ram_bytes": ram_bytes(),
+        "numa_nodes": numa_nodes(),
         "available_threads": std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
         "affinity_cpus_allowed": proc_status_value("Cpus_allowed_list"),
         "cpuset_effective": cpuset_effective,
@@ -353,6 +392,115 @@ fn parse_proc_stat(text: &str) -> Option<(u32, u64)> {
     let user_ticks: u64 = fields.get(11)?.parse().ok()?;
     let system_ticks: u64 = fields.get(12)?.parse().ok()?;
     Some((parent_pid, user_ticks.saturating_add(system_ticks)))
+}
+
+#[derive(Debug, Default)]
+struct ChildThreadProbe {
+    previous_ticks: BTreeMap<u32, u64>,
+    active_tids: BTreeSet<u32>,
+    peak_process_threads: usize,
+}
+
+impl ChildThreadProbe {
+    fn sample(&mut self, pid: u32) {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            return;
+        };
+        let mut current_threads = 0usize;
+        for task in tasks.flatten() {
+            let Some(tid) = task
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Some((_, ticks)) = std::fs::read_to_string(task.path().join("stat"))
+                .ok()
+                .and_then(|text| parse_proc_stat(&text))
+            else {
+                continue;
+            };
+            current_threads += 1;
+            let previous = self.previous_ticks.insert(tid, ticks).unwrap_or(0);
+            if ticks > previous {
+                self.active_tids.insert(tid);
+            }
+        }
+        self.peak_process_threads = self.peak_process_threads.max(current_threads);
+    }
+
+    fn observed_active_threads(&self) -> usize {
+        self.active_tids.len()
+    }
+}
+
+/// Run one engine process, optionally observing threads that consume CPU.
+///
+/// Requested/configured pool width is not execution evidence: a runtime may cap
+/// or decline to schedule workers. Sampling `/proc/<pid>/task/*/stat` records
+/// every thread whose CPU ticks advance, while `peak_process_threads` preserves
+/// the process-level high-water mark. Pipe readers live in the parent harness,
+/// so they are not counted as engine workers. Thread observation is used only
+/// for the untimed probe; measured arms take the uninstrumented branch.
+fn run_command(command: &mut Command, observe_threads: bool) -> (Output, f64, ChildThreadProbe) {
+    if !observe_threads {
+        let started = Instant::now();
+        let output = command.output().expect("run benchmark arm");
+        return (
+            output,
+            started.elapsed().as_secs_f64() * 1e3,
+            ChildThreadProbe::default(),
+        );
+    }
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = command.spawn().expect("spawn benchmark arm");
+    let pid = child.id();
+    let mut stdout = child.stdout.take().expect("capture benchmark stdout");
+    let mut stderr = child.stderr.take().expect("capture benchmark stderr");
+
+    let (status, stdout_bytes, stderr_bytes, probe) = thread::scope(|scope| {
+        let stdout_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .expect("read benchmark stdout");
+            bytes
+        });
+        let stderr_reader = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stderr
+                .read_to_end(&mut bytes)
+                .expect("read benchmark stderr");
+            bytes
+        });
+        let mut probe = ChildThreadProbe::default();
+        let status = loop {
+            probe.sample(pid);
+            if let Some(status) = child.try_wait().expect("wait for benchmark arm") {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        (
+            status,
+            stdout_reader.join().expect("join benchmark stdout reader"),
+            stderr_reader.join().expect("join benchmark stderr reader"),
+            probe,
+        )
+    });
+    let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+    (
+        Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        },
+        wall_ms,
+        probe,
+    )
 }
 
 fn process_sample() -> ProcessSample {
@@ -552,6 +700,7 @@ fn run_incumbent(
     threads: usize,
     timestamps: bool,
     scope: BenchScope,
+    observe_threads: bool,
 ) -> Observation {
     let mut args: Vec<String> = vec![
         "-m".into(),
@@ -571,12 +720,9 @@ fn run_incumbent(
     if !timestamps {
         args.push("-nt".into());
     }
-    let started = Instant::now();
-    let output = Command::new(bin)
-        .args(&args)
-        .output()
-        .expect("run whisper-cli");
-    let process_wall_ms = started.elapsed().as_secs_f64() * 1e3;
+    let mut command = Command::new(bin);
+    command.args(&args);
+    let (output, process_wall_ms, thread_probe) = run_command(&mut command, observe_threads);
     assert!(
         output.status.success(),
         "whisper-cli exited with {}",
@@ -619,6 +765,8 @@ fn run_incumbent(
         transcript,
         transcript_sha256,
         actual_threads: incumbent_actual_threads(&text).unwrap_or(0),
+        observed_active_threads: thread_probe.observed_active_threads(),
+        peak_process_threads: thread_probe.peak_process_threads,
     }
 }
 
@@ -646,6 +794,8 @@ fn run_franken_resident(
         transcript_sha256: sha256_bytes(transcript.as_bytes()),
         transcript,
         actual_threads: rayon::current_num_threads(),
+        observed_active_threads: 0,
+        peak_process_threads: 0,
     }
 }
 
@@ -655,10 +805,11 @@ fn run_franken_whole(
     wav: &str,
     threads: usize,
     timestamps: bool,
+    observe_threads: bool,
 ) -> Observation {
     let current_exe = std::env::current_exe().expect("resolve harness executable");
-    let started = Instant::now();
-    let output = Command::new(current_exe)
+    let mut command = Command::new(current_exe);
+    command
         .arg("--franken-worker")
         .arg(model)
         .arg(model_short)
@@ -666,10 +817,8 @@ fn run_franken_whole(
         .arg(if timestamps { "ts" } else { "no_ts" })
         .arg(threads.to_string())
         .env("RAYON_NUM_THREADS", threads.to_string())
-        .env("FW_LOAD_WORKERS", threads.to_string())
-        .output()
-        .expect("run franken whole-job worker");
-    let process_wall_ms = started.elapsed().as_secs_f64() * 1e3;
+        .env("FW_LOAD_WORKERS", threads.to_string());
+    let (output, process_wall_ms, thread_probe) = run_command(&mut command, observe_threads);
     assert!(
         output.status.success(),
         "franken worker exited with {}: {}",
@@ -702,6 +851,8 @@ fn run_franken_whole(
             .to_owned(),
         transcript,
         actual_threads: field_u64("actual_threads"),
+        observed_active_threads: thread_probe.observed_active_threads(),
+        peak_process_threads: thread_probe.peak_process_threads,
     }
 }
 
@@ -840,10 +991,41 @@ fn main() {
             &params,
         ),
         BenchScope::WholeJob => {
-            run_franken_whole(&model_path, model_short, &wav, threads, timestamps)
+            run_franken_whole(&model_path, model_short, &wav, threads, timestamps, false)
         }
     };
-    let run_whisper = || run_incumbent(&incumbent, &model_path, &wav, threads, timestamps, scope);
+    let probe_franken_threads = || match scope {
+        BenchScope::TranscribeOnly => run_franken_resident(
+            resident_model.as_ref().expect("resident model"),
+            &samples,
+            &params,
+        ),
+        BenchScope::WholeJob => {
+            run_franken_whole(&model_path, model_short, &wav, threads, timestamps, true)
+        }
+    };
+    let run_whisper = || {
+        run_incumbent(
+            &incumbent,
+            &model_path,
+            &wav,
+            threads,
+            timestamps,
+            scope,
+            false,
+        )
+    };
+    let probe_whisper_threads = || {
+        run_incumbent(
+            &incumbent,
+            &model_path,
+            &wav,
+            threads,
+            timestamps,
+            scope,
+            true,
+        )
+    };
 
     println!("harness_elf_sha256={}", executable_identity());
     println!(
@@ -891,13 +1073,25 @@ fn main() {
         last_process_sample = current;
     };
 
-    // Warm both engines once; neither warm-up is timed.
-    let fw_warm = run_then_checkpoint(&run_franken, &mut checkpoint, "warm_franken");
-    let wc_warm = run_then_checkpoint(&run_whisper, &mut checkpoint, "warm_incumbent");
+    // Warm both engines once while observing actual CPU-active threads. The
+    // probe is untimed so `/proc` sampling cannot perturb the measured arms.
+    let fw_warm = run_then_checkpoint(
+        &probe_franken_threads,
+        &mut checkpoint,
+        "warm_franken_thread_probe",
+    );
+    let wc_warm = run_then_checkpoint(
+        &probe_whisper_threads,
+        &mut checkpoint,
+        "warm_incumbent_thread_probe",
+    );
     let wer = word_error_rate(&wc_warm.transcript, &fw_warm.transcript);
     let quality_clear = wer.wer <= MAX_CROSS_ENGINE_WER;
-    let thread_clear = !enforce_matched_threads
+    let configured_thread_clear = !enforce_matched_threads
         || (fw_warm.actual_threads == threads && wc_warm.actual_threads == threads);
+    let observed_thread_clear = scope != BenchScope::WholeJob
+        || (fw_warm.observed_active_threads > 0 && wc_warm.observed_active_threads > 0);
+    let thread_clear = configured_thread_clear && observed_thread_clear;
     println!(
         "INCUMBENT_AB_COVERAGE fw_chars={} wc_chars={} fw_words={} wc_words={} \
          fw_segments={} wc_segments={} fw_text_sha256={} wc_text_sha256={} \
@@ -914,12 +1108,19 @@ fn main() {
         wer.edits,
     );
     println!(
-        "INCUMBENT_AB_THREADS requested={threads} franken_actual={} \
-         incumbent_actual={} franken_load_workers_config={} \
+        "INCUMBENT_AB_THREADS requested={threads} franken_configured={} \
+         incumbent_configured={} franken_observed_active={} incumbent_observed_active={} \
+         franken_peak_process={} incumbent_peak_process={} \
+         observed_source=proc_task_cpu_ticks franken_load_workers_config={} \
          affinity={} cpuset_effective={} enforce_matched={enforce_matched_threads} \
-         thread_clear={thread_clear}",
+         configured_thread_clear={configured_thread_clear} \
+         observed_thread_clear={observed_thread_clear} thread_clear={thread_clear}",
         fw_warm.actual_threads,
         wc_warm.actual_threads,
+        fw_warm.observed_active_threads,
+        wc_warm.observed_active_threads,
+        fw_warm.peak_process_threads,
+        wc_warm.peak_process_threads,
         if scope == BenchScope::WholeJob {
             threads.to_string()
         } else {
@@ -938,7 +1139,7 @@ fn main() {
         );
         assert_eq!(
             observation.actual_threads, fw_warm.actual_threads,
-            "franken actual thread count changed within one invocation"
+            "franken configured thread count changed within one invocation"
         );
         observation
     };
@@ -950,7 +1151,7 @@ fn main() {
         );
         assert_eq!(
             observation.actual_threads, wc_warm.actual_threads,
-            "whisper.cpp actual thread count changed within one invocation"
+            "whisper.cpp configured thread count changed within one invocation"
         );
         observation
     };
@@ -1212,6 +1413,37 @@ diagnostic line\n\
         assert_eq!(
             incumbent_segments("\n hello world from whisper\n", false),
             ["hello world from whisper".to_owned()]
+        );
+    }
+
+    #[test]
+    fn child_thread_probe_observes_cpu_active_process_thread() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("i=0; while [ \"$i\" -lt 100000 ]; do i=$((i + 1)); done");
+
+        let (output, wall_ms, probe) = run_command(&mut command, true);
+
+        assert!(output.status.success());
+        assert!(wall_ms > 0.0);
+        assert!(probe.peak_process_threads >= 1);
+        assert!(probe.observed_active_threads() >= 1);
+    }
+
+    #[test]
+    fn host_provenance_includes_ram_and_numa_topology() {
+        let provenance = host_provenance();
+
+        assert!(
+            provenance["ram_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(
+            provenance["numa_nodes"]
+                .as_u64()
+                .is_some_and(|nodes| nodes > 0)
         );
     }
 }
