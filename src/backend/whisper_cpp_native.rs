@@ -140,10 +140,25 @@ struct DtwProjectionReport {
     segment_geometry_fallback_segments: usize,
     clamped_units: usize,
     expanded_units: usize,
+    timestamps_suppressed: bool,
     word_aligned_safe: bool,
 }
 
 impl DtwProjectionReport {
+    fn fallback_reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::with_capacity(3);
+        if self.interpolated_fallback_segments > 0 {
+            reasons.push("missing_decoder_word_timestamps");
+        }
+        if self.segment_geometry_fallback_segments > 0 {
+            reasons.push("insufficient_parent_duration_for_millisecond_word_units");
+        }
+        if self.timestamps_suppressed {
+            reasons.push("timestamps_suppressed_by_request");
+        }
+        reasons
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "schema_version": DTW_PROJECTION_SCHEMA_VERSION,
@@ -162,6 +177,7 @@ impl DtwProjectionReport {
             "segment_geometry_fallback_segments": self.segment_geometry_fallback_segments,
             "clamped_units": self.clamped_units,
             "expanded_units": self.expanded_units,
+            "fallback_reasons": self.fallback_reasons(),
             "word_aligned_safe": self.word_aligned_safe,
             "supported_provenance": ProjectionUnitProvenance::supported_labels(),
         })
@@ -878,6 +894,7 @@ fn build_segments_dtw(
         segment_geometry_fallback_segments: 0,
         clamped_units: 0,
         expanded_units: 0,
+        timestamps_suppressed: no_timestamps,
         word_aligned_safe: !no_timestamps,
     };
     let mut previous_parent_end = None;
@@ -2058,6 +2075,7 @@ mod tests {
             segment_geometry_fallback_segments: 0,
             clamped_units: 1,
             expanded_units: 1,
+            timestamps_suppressed: false,
             word_aligned_safe: true,
         };
         let json = raw_output_json(
@@ -2084,6 +2102,7 @@ mod tests {
             json["projection_timeline"]["word_aligned_safe"].as_bool(),
             Some(true)
         );
+        assert_eq!(json["projection_timeline"]["fallback_reasons"], json!([]));
     }
 
     #[test]
@@ -2219,6 +2238,10 @@ mod tests {
         assert_eq!(out[2].text, "c");
         assert_eq!(out[2].start_sec, Some(1.2));
         assert_eq!(outcome.report.interpolated_fallback_segments, 1);
+        assert_eq!(
+            outcome.report.fallback_reasons(),
+            vec!["missing_decoder_word_timestamps"]
+        );
         assert!(!outcome.report.word_aligned_safe);
     }
 
@@ -2462,6 +2485,10 @@ mod tests {
         assert_eq!(outcome.report.interpolated_fallback_segments, 0);
         assert_eq!(outcome.report.segment_geometry_fallback_segments, 1);
         assert_eq!(outcome.report.clamped_units, 0);
+        assert_eq!(
+            outcome.report.fallback_reasons(),
+            vec!["insufficient_parent_duration_for_millisecond_word_units"]
+        );
         assert!(!outcome.report.word_aligned_safe);
     }
 
@@ -2501,6 +2528,10 @@ mod tests {
                 .segments
                 .iter()
                 .all(|segment| segment.start_sec.is_none() && segment.end_sec.is_none())
+        );
+        assert_eq!(
+            untimed.report.fallback_reasons(),
+            vec!["timestamps_suppressed_by_request"]
         );
         assert!(!untimed.report.word_aligned_safe);
     }
@@ -2557,6 +2588,27 @@ mod tests {
                     .all(|pair| pair[0].end_sec <= pair[1].start_sec)
             );
         }
+    }
+
+    #[test]
+    fn dtw_projection_honors_cancellation_before_normalization() {
+        let engine = vec![seg(0.0, 1.0, "one")];
+        let timings = vec![vec![WordTiming {
+            text: "one".to_owned(),
+            start_sec: 0.0,
+            end_sec: 1.0,
+        }]];
+        let cancellation = CancellationToken::with_deadline_from_now(Duration::from_millis(0));
+        std::thread::sleep(Duration::from_millis(5));
+        let error = build_segments_dtw(
+            &engine,
+            &timings,
+            WordTimestampMode::Word,
+            false,
+            Some(&cancellation),
+        )
+        .expect_err("expired projection token must fail before normalization");
+        assert!(matches!(error, FwError::Cancelled(_)));
     }
 
     // ── Gated end-to-end against the real tiny.en model + jfk.wav ─────────

@@ -465,6 +465,7 @@ impl RunStore {
             })
             .collect::<FwResult<Vec<_>>>()?;
 
+        let projection_timeline = stored_projection_timeline(&result.raw_output, &run_id)?;
         Ok(Some(StoredRunDetails {
             run_id,
             started_at_rfc3339,
@@ -472,6 +473,8 @@ impl RunStore {
             backend,
             transcript,
             segments: result.segments,
+            diarization: result.diarization,
+            projection_timeline,
             events,
             warnings,
             acceleration: acceleration_override.or(result.acceleration),
@@ -2044,6 +2047,7 @@ fn assemble_run_details_batched(
         })
         .collect::<FwResult<Vec<_>>>()?;
 
+    let projection_timeline = stored_projection_timeline(&result.raw_output, &run_id)?;
     Ok(StoredRunDetails {
         run_id,
         started_at_rfc3339,
@@ -2051,11 +2055,200 @@ fn assemble_run_details_batched(
         backend,
         transcript,
         segments: result.segments,
+        diarization: result.diarization,
+        projection_timeline,
         events,
         warnings,
         acceleration: acceleration_override.or(result.acceleration),
         replay,
     })
+}
+
+fn stored_projection_timeline(
+    raw_output: &serde_json::Value,
+    run_id: &str,
+) -> FwResult<Option<serde_json::Value>> {
+    let Some(timeline) = raw_output.get("projection_timeline") else {
+        return Ok(None);
+    };
+    let object = timeline.as_object().ok_or_else(|| {
+        FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: expected an object"
+        ))
+    })?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(crate::conformance::DTW_PROJECTION_SCHEMA_VERSION)
+    {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: unsupported schema"
+        )));
+    }
+
+    const SAFE_FIELDS: &[&str] = &[
+        "schema_version",
+        "unit",
+        "interval_semantics",
+        "timestamp_epsilon_sec",
+        "minimum_duration_sec",
+        "input_engine_segments",
+        "input_timed_segments",
+        "canonical_units",
+        "output_segments",
+        "decoder_word_units",
+        "interpolated_fallback_units",
+        "segment_geometry_fallback_units",
+        "interpolated_fallback_segments",
+        "segment_geometry_fallback_segments",
+        "clamped_units",
+        "expanded_units",
+        "fallback_reasons",
+        "word_aligned_safe",
+        "supported_provenance",
+    ];
+    if object
+        .keys()
+        .any(|key| !SAFE_FIELDS.contains(&key.as_str()))
+    {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: unsupported field"
+        )));
+    }
+    if SAFE_FIELDS.iter().any(|field| !object.contains_key(*field)) {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: missing required field"
+        )));
+    }
+
+    let fixed_strings_valid = object
+        .get("unit")
+        .is_none_or(|value| value.as_str() == Some("seconds"))
+        && object
+            .get("interval_semantics")
+            .is_none_or(|value| value.as_str() == Some("half_open"));
+    let non_negative_float_fields_valid = ["timestamp_epsilon_sec", "minimum_duration_sec"]
+        .iter()
+        .all(|field| {
+            object.get(*field).is_none_or(|value| {
+                value
+                    .as_f64()
+                    .is_some_and(|number| number.is_finite() && number >= 0.0)
+            })
+        });
+    let count_fields_valid = [
+        "input_engine_segments",
+        "input_timed_segments",
+        "canonical_units",
+        "output_segments",
+        "decoder_word_units",
+        "interpolated_fallback_units",
+        "segment_geometry_fallback_units",
+        "interpolated_fallback_segments",
+        "segment_geometry_fallback_segments",
+        "clamped_units",
+        "expanded_units",
+    ]
+    .iter()
+    .all(|field| {
+        object
+            .get(*field)
+            .is_none_or(|value| value.as_u64().is_some())
+    });
+    let word_aligned_safe_valid = object
+        .get("word_aligned_safe")
+        .is_none_or(|value| value.as_bool().is_some());
+    let fallback_reasons = object
+        .get("fallback_reasons")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|reasons| {
+            reasons
+                .iter()
+                .map(serde_json::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+    let provenance_valid = object.get("supported_provenance").is_none_or(|value| {
+        value.as_array().is_some_and(|labels| {
+            labels
+                == &[
+                    serde_json::Value::String("decoder_word_timestamp".to_owned()),
+                    serde_json::Value::String("segment_interpolation_fallback".to_owned()),
+                    serde_json::Value::String("segment_geometry_fallback".to_owned()),
+                ]
+        })
+    });
+    let canonical_counts_valid = count_fields_valid && {
+        let count = |field| {
+            object
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX)
+        };
+        let decoder = count("decoder_word_units");
+        let interpolated = count("interpolated_fallback_units");
+        let geometry = count("segment_geometry_fallback_units");
+        let input_engine_segments = count("input_engine_segments");
+        let interpolated_segments = count("interpolated_fallback_segments");
+        let geometry_segments = count("segment_geometry_fallback_segments");
+        count("input_timed_segments") <= input_engine_segments
+            && interpolated_segments <= input_engine_segments
+            && geometry_segments <= input_engine_segments
+            && decoder
+                .checked_add(interpolated)
+                .and_then(|value| value.checked_add(geometry))
+                == Some(count("canonical_units"))
+            && geometry == geometry_segments
+            && count("output_segments") <= count("canonical_units")
+            && count("clamped_units") <= decoder
+            && count("expanded_units") <= decoder
+    };
+    let fixed_numeric_contract_valid = object
+        .get("timestamp_epsilon_sec")
+        .and_then(serde_json::Value::as_f64)
+        == Some(crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC)
+        && object
+            .get("minimum_duration_sec")
+            .and_then(serde_json::Value::as_f64)
+            == Some(crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC);
+    let fallback_contract_valid = fallback_reasons.as_ref().is_some_and(|reasons| {
+        let interpolated_expected = object
+            .get("interpolated_fallback_segments")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0);
+        let geometry_expected = object
+            .get("segment_geometry_fallback_segments")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0);
+        let word_aligned_safe = object
+            .get("word_aligned_safe")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mut expected = Vec::with_capacity(3);
+        if interpolated_expected {
+            expected.push("missing_decoder_word_timestamps");
+        }
+        if geometry_expected {
+            expected.push("insufficient_parent_duration_for_millisecond_word_units");
+        }
+        if reasons.contains(&"timestamps_suppressed_by_request") {
+            expected.push("timestamps_suppressed_by_request");
+        }
+        reasons == &expected && word_aligned_safe == expected.is_empty()
+    });
+    if !fixed_strings_valid
+        || !non_negative_float_fields_valid
+        || !canonical_counts_valid
+        || !word_aligned_safe_valid
+        || !fixed_numeric_contract_valid
+        || !fallback_contract_valid
+        || !provenance_valid
+    {
+        return Err(FwError::Storage(format!(
+            "invalid projection_timeline for run {run_id}: unsupported field value"
+        )));
+    }
+
+    Ok(Some(timeline.clone()))
 }
 
 /// Convert an optional `SqliteValue` to an `i64`, returning 0 for non-integer
@@ -2225,6 +2418,7 @@ mod tests {
 
     use fsqlite_types::value::SqliteValue;
 
+    use crate::error::FwError;
     use crate::model::{
         AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
         DiarizationFallbackStatus, DiarizationReport, DiarizationRequest, DiarizationTurn,
@@ -2232,7 +2426,7 @@ mod tests {
         SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
 
-    use super::{BlockingConnection, RunStore, value_to_string};
+    use super::{BlockingConnection, RunStore, stored_projection_timeline, value_to_string};
 
     #[test]
     fn persists_and_lists_runs() {
@@ -2822,6 +3016,96 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].transcript_preview.len(), 140);
         assert!(runs[0].transcript_preview.chars().all(|c| c == 'A'));
+    }
+
+    #[test]
+    fn stored_projection_timeline_rejects_unknown_fields_without_echoing_values() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("projection_privacy.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-projection-privacy", &db_path);
+        report.result.raw_output = json!({
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "word_aligned_safe": true,
+                "private_path": "PRIVATE_SENTINEL"
+            }
+        });
+        store
+            .persist_report(&report)
+            .expect("persist canonical result");
+
+        let error = store
+            .load_run_details("run-projection-privacy")
+            .expect_err("unsupported projection metadata must fail closed");
+        assert!(error.to_string().contains("unsupported field"));
+        assert!(
+            !error.to_string().contains("PRIVATE_SENTINEL"),
+            "storage errors must not echo rejected private values"
+        );
+    }
+
+    #[test]
+    fn stored_projection_timeline_requires_canonical_fallback_reason_order() {
+        let mut raw_output = json!({
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "unit": "seconds",
+                "interval_semantics": "half_open",
+                "timestamp_epsilon_sec":
+                    crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC,
+                "minimum_duration_sec":
+                    crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC,
+                "input_engine_segments": 2,
+                "input_timed_segments": 1,
+                "canonical_units": 2,
+                "output_segments": 2,
+                "decoder_word_units": 0,
+                "interpolated_fallback_units": 1,
+                "segment_geometry_fallback_units": 1,
+                "interpolated_fallback_segments": 1,
+                "segment_geometry_fallback_segments": 1,
+                "clamped_units": 0,
+                "expanded_units": 0,
+                "fallback_reasons": [
+                    "missing_decoder_word_timestamps",
+                    "insufficient_parent_duration_for_millisecond_word_units",
+                    "timestamps_suppressed_by_request"
+                ],
+                "word_aligned_safe": false,
+                "supported_provenance": [
+                    "decoder_word_timestamp",
+                    "segment_interpolation_fallback",
+                    "segment_geometry_fallback"
+                ]
+            }
+        });
+        assert!(
+            stored_projection_timeline(&raw_output, "run-projection-order")
+                .expect("canonical fallback order")
+                .is_some()
+        );
+
+        raw_output["projection_timeline"]["fallback_reasons"] = json!([
+            "timestamps_suppressed_by_request",
+            "missing_decoder_word_timestamps",
+            "insufficient_parent_duration_for_millisecond_word_units"
+        ]);
+        assert!(matches!(
+            stored_projection_timeline(&raw_output, "run-projection-order"),
+            Err(FwError::Storage(message)) if message.contains("unsupported field value")
+        ));
+
+        raw_output["projection_timeline"]["fallback_reasons"] = json!([
+            "missing_decoder_word_timestamps",
+            "insufficient_parent_duration_for_millisecond_word_units",
+            "timestamps_suppressed_by_request",
+            "timestamps_suppressed_by_request"
+        ]);
+        assert!(matches!(
+            stored_projection_timeline(&raw_output, "run-projection-order"),
+            Err(FwError::Storage(message)) if message.contains("unsupported field value")
+        ));
     }
 
     #[test]

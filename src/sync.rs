@@ -3387,6 +3387,34 @@ mod tests {
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             diagnostics: vec!["synthetic sync fixture".to_owned()],
         });
+        report.result.raw_output = json!({
+            "engine": "whisper.cpp-native",
+            "projection_timeline": {
+                "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                "unit": "seconds",
+                "interval_semantics": "half_open",
+                "timestamp_epsilon_sec": crate::conformance::CANONICAL_PROJECTION_EPSILON_SEC,
+                "minimum_duration_sec": crate::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC,
+                "input_engine_segments": 2,
+                "input_timed_segments": 2,
+                "canonical_units": 2,
+                "output_segments": 2,
+                "decoder_word_units": 2,
+                "interpolated_fallback_units": 0,
+                "segment_geometry_fallback_units": 0,
+                "interpolated_fallback_segments": 0,
+                "segment_geometry_fallback_segments": 0,
+                "clamped_units": 0,
+                "expanded_units": 0,
+                "fallback_reasons": [],
+                "word_aligned_safe": true,
+                "supported_provenance": [
+                    "decoder_word_timestamp",
+                    "segment_interpolation_fallback",
+                    "segment_geometry_fallback"
+                ]
+            }
+        });
     }
 
     fn test_cursor(ts: &str, run_id: Option<&str>) -> SyncCursor {
@@ -3542,6 +3570,38 @@ mod tests {
         assert!(
             !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
             "canonical JSONL payload must not acquire reusable biometric vectors"
+        );
+
+        let recovered = RunStore::open(&target_db)
+            .expect("recovered store")
+            .load_run_details("run-diarization-sync")
+            .expect("recovered details query")
+            .expect("recovered details");
+        assert_eq!(
+            recovered
+                .diarization
+                .as_ref()
+                .map(|report| report.turns.as_slice()),
+            report
+                .result
+                .diarization
+                .as_ref()
+                .map(|report| report.turns.as_slice()),
+            "typed speaker turns must survive SQLite -> JSONL -> fresh SQLite"
+        );
+        assert_eq!(
+            recovered
+                .projection_timeline
+                .as_ref()
+                .expect("recovered projection timeline"),
+            &report.result.raw_output["projection_timeline"],
+            "projection provenance must survive recovery without drift"
+        );
+        assert!(
+            !serde_json::to_string(&recovered.projection_timeline)
+                .expect("serialize recovered projection timeline")
+                .contains("feature_vector"),
+            "recovered projection metadata must remain privacy-safe"
         );
     }
 

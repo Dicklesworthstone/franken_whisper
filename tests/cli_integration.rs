@@ -401,6 +401,74 @@ fn run_get_by_id_returns_full_details() {
 }
 
 #[test]
+fn runs_json_exposes_only_privacy_safe_projection_provenance() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("storage.sqlite3");
+    let store = RunStore::open(&db_path).expect("store should open");
+    let mut report = fixture_report("integ-projection-1", &db_path);
+    report.result.raw_output = json!({
+        "model_path": "PRIVATE_MODEL_PATH_SENTINEL",
+        "projection_timeline": {
+            "schema_version": franken_whisper::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+            "unit": "seconds",
+            "interval_semantics": "half_open",
+            "timestamp_epsilon_sec":
+                franken_whisper::conformance::CANONICAL_PROJECTION_EPSILON_SEC,
+            "minimum_duration_sec":
+                franken_whisper::conformance::CANONICAL_PROJECTION_MIN_DURATION_SEC,
+            "input_engine_segments": 2,
+            "input_timed_segments": 2,
+            "canonical_units": 2,
+            "output_segments": 2,
+            "decoder_word_units": 2,
+            "interpolated_fallback_units": 0,
+            "segment_geometry_fallback_units": 0,
+            "interpolated_fallback_segments": 0,
+            "segment_geometry_fallback_segments": 0,
+            "clamped_units": 0,
+            "expanded_units": 0,
+            "fallback_reasons": [],
+            "word_aligned_safe": true,
+            "supported_provenance": [
+                "decoder_word_timestamp",
+                "segment_interpolation_fallback",
+                "segment_geometry_fallback"
+            ]
+        }
+    });
+    store.persist_report(&report).expect("persist");
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "runs",
+            "--db",
+            db_path.to_str().expect("utf8 db"),
+            "--id",
+            "integ-projection-1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("runs command");
+    assert!(
+        output.status.success(),
+        "runs command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let details: serde_json::Value = serde_json::from_str(&stdout).expect("runs JSON");
+    assert_eq!(
+        details["projection_timeline"]["schema_version"],
+        franken_whisper::conformance::DTW_PROJECTION_SCHEMA_VERSION
+    );
+    assert!(details.get("raw_output").is_none());
+    assert!(
+        !stdout.contains("PRIVATE_MODEL_PATH_SENTINEL"),
+        "run-history output must not expose unrelated backend raw metadata"
+    );
+}
+
+#[test]
 fn run_get_nonexistent_returns_none() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("storage.sqlite3");
