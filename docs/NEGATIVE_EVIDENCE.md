@@ -26043,3 +26043,35 @@ reference/output hashes, exact DER/JER/change/calibration configuration, and a
 same-host performance packet. Until then, public acoustic accuracy and
 performance are **NO-DATA**, while explicit operator-selected acoustic use
 remains available under the conservative unknown/error contract.
+## 2026-07-29 - OliveIsland: **HARNESS PREFLIGHT / NO MEASUREMENT — whole-job incumbent recertification stopped on a non-performance CPU-frequency policy before either timed arm ran.**
+
+The interleaved whole-job harness now records the scaling driver, scaling
+governor, and energy-performance preference for every online CPU and refuses a
+competitive run unless driver/governor coverage is complete, each is uniform,
+and the governor is exactly `performance`. A validation-only release ELF
+(`sha256=992ce161126f24ef63c11d7d04c3b0d14fe49068e2ea59b240ebc11ea729ca69`)
+was invoked on `thinkstation1` against whisper.cpp
+(`sha256=73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`)
+with the public 124.5-second fixture
+(`sha256=a21dcd888ae070381189e869e54de39c66fc65f1b9ad50a54a8cf14369930e9e`)
+and tiny.en model
+(`sha256=921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`).
+All 64 online CPUs reported the uniform policy
+`amd-pstate-epp` / `powersave` / `balance_performance`. The harness emitted
+identity, host, configuration, and frequency-policy records, then aborted.
+There are no coverage, warmup, per-round timing, median, CI, or verdict records,
+so this probe produces **no performance ratio and no competitive conclusion**.
+The raw log is
+`/data/tmp/fw-realistic-phase2-trj-logs/thinkstation1_governor_preflight_992ce161126f.log`
+(`sha256=7f7166257c9987d1dbfacb40565bae7ea19503a483fdf001cf682e4eb71ce54d`).
+
+**Concrete retry predicate:** after franken_whisper reaches its exclusive trj
+queue position, claim `trj-booking`, verify complete and uniform
+`scaling_driver` coverage plus `scaling_governor=performance` across every
+online CPU, and obtain the host-wide exclusivity lease. Then build the harness
+through strict remote RCH, retain its ELF SHA-256, and rerun tiny.en segment
+timestamps as one alternating-order whole-job invocation with both same-engine
+A/A controls and the live whisper.cpp greedy incumbent. Accept or reject only
+from the bootstrap median-CI gate with the independent-load split and 2x null
+margin; CV remains provenance only. Release trj immediately on success or
+failure.
