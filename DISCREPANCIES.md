@@ -55,9 +55,10 @@
   profile or independent turn timeline.
 - **Our impl:** `src/diarization.rs` emits opaque within-run references after
   deterministic constrained clustering. Anchored caller references sort first;
-  unanchored labels use earliest reliable occurrence plus a stable feature-hash
-  tie-break. ASR text/confidence remain authoritative and unchanged by
-  projection, but cluster numbers need not match an external backend.
+  unanchored labels use earliest reliable occurrence plus a total-order compact
+  feature-vector tie-break. ASR text/confidence remain authoritative and
+  unchanged by projection, but cluster numbers need not match an external
+  backend.
 - **Impact:** Cross-engine scoring must use maximum-overlap permutation before
   DER/JER. Labels cannot be interpreted as name, gender, or legal identity.
   The historical text/temporal heuristic is rejected by both acoustic and

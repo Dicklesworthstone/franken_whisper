@@ -714,12 +714,12 @@ mod tests {
         assert_eq!(json["diarizer"].as_str(), Some(DIARIZER_TAG));
         let note = json["diarizer_note"].as_str().expect("note present");
         assert!(
-            note.contains("without neural speaker encoder"),
+            note.contains("without waveform speaker evidence"),
             "note must state the limitation: {note}"
         );
         assert!(
-            note.contains("bd-ohex"),
-            "note must reference the ECAPA upgrade bead: {note}"
+            note.contains("excluded from acoustic and external evidence gates"),
+            "note must state the evidence boundary: {note}"
         );
         let serialized = json.to_string().to_lowercase();
         assert!(

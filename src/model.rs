@@ -173,11 +173,19 @@ impl Default for DiarizationRequest {
     }
 }
 
+/// Hard request-size limits for the bounded `speaker-hints-v1` surface.
+pub const MAX_KNOWN_SPEAKER_INTERVALS: usize = 1_024;
+pub const MAX_SPEAKER_REF_BYTES: usize = 256;
+pub const MAX_HINT_PROVENANCE_BYTES: usize = 4_096;
+
 /// Stable validation code for malformed diarization requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiarizationValidationCode {
+    TooManyKnownIntervals,
     EmptySpeakerRef,
+    SpeakerRefTooLong,
+    ProvenanceTooLong,
     InvalidHintConfidence,
     ReversedHintInterval,
     HintOutsideAudio,
@@ -190,7 +198,10 @@ impl DiarizationValidationCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::TooManyKnownIntervals => "diarization.too_many_known_intervals",
             Self::EmptySpeakerRef => "diarization.empty_speaker_ref",
+            Self::SpeakerRefTooLong => "diarization.speaker_ref_too_long",
+            Self::ProvenanceTooLong => "diarization.provenance_too_long",
             Self::InvalidHintConfidence => "diarization.invalid_hint_confidence",
             Self::ReversedHintInterval => "diarization.reversed_hint_interval",
             Self::HintOutsideAudio => "diarization.hint_outside_audio",
@@ -233,6 +244,15 @@ impl DiarizationRequest {
                 hint_index: None,
             });
         }
+        if self.known_intervals.len() > MAX_KNOWN_SPEAKER_INTERVALS {
+            return Err(DiarizationValidationError {
+                code: DiarizationValidationCode::TooManyKnownIntervals,
+                message: format!(
+                    "known_intervals exceeds the acoustic-v1 limit of {MAX_KNOWN_SPEAKER_INTERVALS}"
+                ),
+                hint_index: None,
+            });
+        }
         validate_speaker_constraints(constraints)?;
 
         for (index, hint) in self.known_intervals.iter().enumerate() {
@@ -240,6 +260,28 @@ impl DiarizationRequest {
                 return Err(DiarizationValidationError {
                     code: DiarizationValidationCode::EmptySpeakerRef,
                     message: "speaker_ref must not be empty".to_owned(),
+                    hint_index: Some(index),
+                });
+            }
+            if hint.speaker_ref.len() > MAX_SPEAKER_REF_BYTES {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::SpeakerRefTooLong,
+                    message: format!(
+                        "speaker_ref exceeds the {MAX_SPEAKER_REF_BYTES}-byte acoustic-v1 limit"
+                    ),
+                    hint_index: Some(index),
+                });
+            }
+            if hint
+                .provenance
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_HINT_PROVENANCE_BYTES)
+            {
+                return Err(DiarizationValidationError {
+                    code: DiarizationValidationCode::ProvenanceTooLong,
+                    message: format!(
+                        "hint provenance exceeds the {MAX_HINT_PROVENANCE_BYTES}-byte acoustic-v1 limit"
+                    ),
                     hint_index: Some(index),
                 });
             }
@@ -2960,13 +3002,55 @@ mod tests {
     }
 
     #[test]
+    fn acoustic_hint_request_limits_fail_before_quadratic_validation() {
+        let hint = speaker_hint("speaker", 0, 1, KnownSpeakerPolicy::SoftEnrollment);
+        let request = DiarizationRequest {
+            known_intervals: vec![hint.clone(); MAX_KNOWN_SPEAKER_INTERVALS + 1],
+            ..DiarizationRequest::default()
+        };
+        assert_eq!(
+            request
+                .validate(1, None)
+                .expect_err("interval count must be bounded")
+                .code,
+            DiarizationValidationCode::TooManyKnownIntervals
+        );
+
+        let mut request = DiarizationRequest {
+            known_intervals: vec![hint],
+            ..DiarizationRequest::default()
+        };
+        request.known_intervals[0].speaker_ref = "s".repeat(MAX_SPEAKER_REF_BYTES + 1);
+        assert_eq!(
+            request
+                .validate(1, None)
+                .expect_err("speaker reference must be bounded")
+                .code,
+            DiarizationValidationCode::SpeakerRefTooLong
+        );
+
+        request.known_intervals[0].speaker_ref = "speaker".to_owned();
+        request.known_intervals[0].provenance = Some("p".repeat(MAX_HINT_PROVENANCE_BYTES + 1));
+        assert_eq!(
+            request
+                .validate(1, None)
+                .expect_err("provenance must be bounded")
+                .code,
+            DiarizationValidationCode::ProvenanceTooLong
+        );
+    }
+
+    #[test]
     fn diarization_report_is_typed_and_privacy_safe() {
         let report = DiarizationReport {
             implementation: "native_acoustic".to_owned(),
             contract_version: "acoustic-diarization-v1".to_owned(),
             feature_schema: "acoustic-feature-v1".to_owned(),
-            normalized_input_sha256: "abc123".to_owned(),
-            hint_document_sha256: Some("def456".to_owned()),
+            normalized_input_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            hint_document_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
             turns: vec![DiarizationTurn {
                 start_ms: 0,
                 end_ms: 1_000,

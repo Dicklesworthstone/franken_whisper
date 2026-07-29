@@ -362,8 +362,8 @@ franken_whisper transcribe \
   --json
 ```
 
-Known intervals can enroll an opaque speaker reference without copying the
-hint document:
+Known intervals can enroll an opaque speaker reference without retaining the
+hint document's source path or raw source bytes:
 
 ```json
 {"schema_version":"speaker-hints-v1","known_intervals":[
@@ -374,7 +374,9 @@ hint document:
 
 Pass it with `--speaker-hints /private/path/hints.json`. Hard intervals are
 immutable must-links; soft enrollment can be rejected when acoustically
-contradictory. Labels remain within-run references, not biometric identities.
+contradictory. Parsed hint fields are part of the typed request and are
+persisted with the run unless `--no-persist` is used. Labels remain within-run
+references, not biometric identities.
 
 ### 4. Microphone Capture
 
@@ -627,7 +629,7 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 |------|---------|-------------|
 | `--diarization-engine <ENGINE>` | `auto` | `auto`, `acoustic`, `external`, or reserved `neural`; explicit `acoustic` selects the Rust waveform engine regardless of rollout stage |
 | `--diarization-fallback <POLICY>` | `unknown` | `unknown`, `external`, or `error` when evidence is insufficient |
-| `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not emitted in robot summaries |
+| `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not retained, but parsed fields persist with the run unless `--no-persist` is used |
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
 | `--diarization-max-prototypes <N>` | `512` | Bounded global prototype cap (`1..=512`) |
 | `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v4 still stores privacy-safe summaries rather than reusable acoustic vectors |
@@ -1151,7 +1153,9 @@ Set `FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE=1` to bypass the built-in decoder an
 
 ### Storage Internals
 
-The storage layer uses `fsqlite` (from the FrankenSQLite project) with three core tables plus a key-value metadata table. The schema is at version **3** at HEAD.
+The storage layer uses `fsqlite` (from the FrankenSQLite project) with three
+canonical run tables, four derived diarization index tables, and a key-value
+metadata table. The schema is at version **4** at HEAD.
 
 ```sql
 runs     (id PK, started_at, finished_at, backend, input_path,
@@ -1165,16 +1169,24 @@ segments (run_id, idx, start_sec, end_sec, speaker, text, confidence,
 events   (run_id, seq, ts_rfc3339, stage, code, message, payload_json,
           PRIMARY KEY (run_id, seq))
 
+diarization_reports          (run_id PK, implementation, contract_version, ...)
+diarization_turns            (run_id, idx, start_ms, end_ms, speaker_ref, ...)
+speaker_hints                (run_id, idx, speaker_ref, start_ms, end_ms, ...)
+speaker_profile_summaries    (run_id, idx, speaker_ref, reliability, ...)
+          -- deterministic indexes rebuilt from runs.request_json/result_json
+
 _meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL)
-          -- holds 'schema_version' => '3' among other metadata
+          -- holds 'schema_version' => '4' among other metadata
 ```
 
 **Schema Migrations.** When opening older databases, the storage layer walks forward through the migration ladder:
 
 - **v1 → v2:** add `runs.replay_json` and `runs.acceleration_json` (defaulting to `'{}'`).
 - **v2 → v3:** create indexes on hot query paths (recent-runs listing, per-run segment / event lookup) for faster `robot health` and `runs` queries.
+- **v3 → v4:** add privacy-safe normalized diarization indexes and rebuild
+  them from canonical typed request/result JSON.
 
-Migration steps run safely:
+The legacy column-add migration runs safely:
 
 1. Query current journal mode (`PRAGMA journal_mode;`)
 2. Switch from WAL to DELETE for DDL reliability
@@ -2516,11 +2528,13 @@ CREATE TABLE events (
 -- Key-value schema metadata
 CREATE TABLE _meta (
     key   TEXT PRIMARY KEY,                  -- e.g. 'schema_version'
-    value TEXT NOT NULL                      -- 'schema_version' currently '3'
+    value TEXT NOT NULL                      -- 'schema_version' currently '4'
 );
 
 -- v3 migration adds indexes on hot query paths (recent-runs listing,
 -- per-run segment + event lookup).
+-- v4 adds derived diarization reports, turns, hint audits, and privacy-safe
+-- profile summaries rebuilt from canonical runs JSON.
 ```
 
 ### NDJSON Export Format
@@ -4106,7 +4120,7 @@ idx,start_sec,end_sec,speaker,text,confidence
   "database": {                       // SQLite store at --db
     "name": "database", "available": true,
     "path": ".franken_whisper/storage.sqlite3",
-    "version": "schema_v3",
+    "version": "schema_v4",
     "issues": []
     // The full StorageDiagnostics (page_count, page_size, journal_mode,
     // wal_checkpoint{busy, log_frames, checkpointed_frames}, freelist_count,

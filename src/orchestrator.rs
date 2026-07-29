@@ -3769,58 +3769,6 @@ async fn execute_punctuate(
 
     inter.result = Some(updated_result);
     inter.warnings.extend(report.notes.iter().cloned());
-    if let Some(diarization_report) = inter
-        .result
-        .as_ref()
-        .and_then(|result| result.diarization.as_ref())
-    {
-        log.push(
-            "diarize",
-            "diarize.progress",
-            "diarization report assembled",
-            json!({
-                "implementation": diarization_report.implementation,
-                "contract_version": diarization_report.contract_version,
-                "feature_schema": diarization_report.feature_schema,
-                "turns": diarization_report.turns.len(),
-                "profiles": diarization_report.profiles.len(),
-                "fallback_status": diarization_report.fallback_status,
-            }),
-        );
-        for (turn_index, turn) in diarization_report.turns.iter().enumerate() {
-            log.push(
-                "diarize",
-                "diarize.change",
-                "speaker turn boundary",
-                json!({
-                    "turn_index": turn_index,
-                    "start_ms": turn.start_ms,
-                    "end_ms": turn.end_ms,
-                    "speaker_ref": turn.speaker_ref,
-                    "speaker_confidence": turn.speaker_confidence,
-                    "change_confidence": turn.change_confidence,
-                    "overlap_suspected": turn.overlap_suspected,
-                    "hard_hint_attributed": turn.hard_hint_attributed,
-                }),
-            );
-        }
-        for profile in &diarization_report.profiles {
-            log.push(
-                "diarize",
-                "diarize.profile",
-                "privacy-safe speaker profile summary",
-                json!({
-                    "speaker_ref": profile.speaker_ref,
-                    "frame_count": profile.frame_count,
-                    "voiced_duration_ms": profile.voiced_duration_ms,
-                    "reliability": profile.reliability,
-                    "channel_profile_count": profile.channel_profile_count,
-                    "anchored": profile.anchored,
-                    "soft_hint_contradiction": profile.soft_hint_contradiction,
-                }),
-            );
-        }
-    }
 
     tracing::debug!(
         stage = "punctuate",
@@ -4364,6 +4312,10 @@ async fn execute_diarize(
         .clone()
         .unwrap_or_default();
     let fallback_policy = acoustic_request.fallback;
+    let normalized_duration_ms = inter
+        .normalized_duration
+        .and_then(|duration| finite_seconds_interval_to_ms(0.0, duration))
+        .map(|(_, end_ms)| end_ms);
     let speech_regions_ms = inter
         .vad_regions
         .as_ref()
@@ -4378,61 +4330,69 @@ async fn execute_diarize(
     let (updated_result, report) = match run_stage_with_budget(
         "diarize",
         diarize_budget_ms,
-        move || match engine {
-            DiarizationEngine::Auto | DiarizationEngine::Acoustic => {
-                let segments_total = result.segments.len();
-                let wav_bytes = std::fs::read(&normalized_wav)?;
-                let normalized_input_sha256 = sha256_bytes_hex(&wav_bytes);
-                let samples = crate::native_engine::decode::read_wav_16k_mono(&wav_bytes)?;
-                let word_aligned = result
-                    .raw_output
-                    .get("word_timestamps")
-                    .and_then(Value::as_str)
-                    == Some("dtw");
-                let word_boundaries_ms = if word_aligned {
-                    transcript_boundaries_ms(&result.segments)
-                } else {
-                    Vec::new()
-                };
-                let boundary_hints = AcousticBoundaryHints {
-                    speech_regions_ms,
-                    word_boundaries_ms,
-                    tiny_diarize_boundaries_ms: Vec::new(),
-                };
-                let (diarization_report, projection) = diarization::diarize_acoustic_pcm(
-                    diarization::AcousticDiarizationInput {
-                        samples: &samples,
-                        normalized_input_sha256: &normalized_input_sha256,
-                        segments: &result.segments,
-                        word_aligned,
-                        request: &acoustic_request,
-                        constraints: speaker_constraints.as_ref(),
-                        boundary_hints: &boundary_hints,
-                    },
-                    || diarize_token.checkpoint().is_err(),
-                )?;
-                if acoustic_request.fallback == DiarizationFallbackPolicy::External
-                    && diarization_report.fallback_status != DiarizationFallbackStatus::NotNeeded
-                    && result_has_external_diarization(&result)
-                {
-                    let external_report = external_diarization_report(
-                        &result,
-                        &normalized_input_sha256,
-                        speaker_constraints.as_ref(),
+        move || {
+            validate_diarization_execution_request(
+                engine,
+                &acoustic_request,
+                speaker_constraints.as_ref(),
+                normalized_duration_ms,
+            )?;
+            match engine {
+                DiarizationEngine::Auto | DiarizationEngine::Acoustic => {
+                    let segments_total = result.segments.len();
+                    let wav_bytes = std::fs::read(&normalized_wav)?;
+                    let normalized_input_sha256 = sha256_bytes_hex(&wav_bytes);
+                    let samples = crate::native_engine::decode::read_wav_16k_mono(&wav_bytes)?;
+                    let word_aligned = result
+                        .raw_output
+                        .get("word_timestamps")
+                        .and_then(Value::as_str)
+                        == Some("dtw");
+                    let word_boundaries_ms = if word_aligned {
+                        transcript_boundaries_ms(&result.segments)
+                    } else {
+                        Vec::new()
+                    };
+                    let boundary_hints = AcousticBoundaryHints {
+                        speech_regions_ms,
+                        word_boundaries_ms,
+                        tiny_diarize_boundaries_ms: Vec::new(),
+                    };
+                    let (diarization_report, projection) = diarization::diarize_acoustic_pcm(
+                        diarization::AcousticDiarizationInput {
+                            samples: &samples,
+                            normalized_input_sha256: &normalized_input_sha256,
+                            segments: &result.segments,
+                            word_aligned,
+                            request: &acoustic_request,
+                            constraints: speaker_constraints.as_ref(),
+                            boundary_hints: &boundary_hints,
+                        },
+                        || diarize_token.checkpoint().is_err(),
                     )?;
-                    let speakers_detected = usize::try_from(external_report.detected_speakers)
-                        .map_err(|_| {
-                            FwError::InvalidRequest(
-                                "external speaker count does not fit this platform".to_owned(),
-                            )
-                        })?;
-                    let segments_labeled = result
-                        .segments
-                        .iter()
-                        .filter(|segment| segment.speaker.is_some())
-                        .count();
-                    result.diarization = Some(external_report);
-                    Ok((
+                    if acoustic_request.fallback == DiarizationFallbackPolicy::External
+                        && diarization_report.fallback_status
+                            != DiarizationFallbackStatus::NotNeeded
+                        && result_has_external_diarization(&result)
+                    {
+                        let external_report = external_diarization_report(
+                            &result,
+                            &normalized_input_sha256,
+                            speaker_constraints.as_ref(),
+                        )?;
+                        let speakers_detected = usize::try_from(external_report.detected_speakers)
+                            .map_err(|_| {
+                                FwError::InvalidRequest(
+                                    "external speaker count does not fit this platform".to_owned(),
+                                )
+                            })?;
+                        let segments_labeled = result
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.speaker.is_some())
+                            .count();
+                        result.diarization = Some(external_report);
+                        Ok((
                         result,
                         DiarizeReport {
                             segments_total,
@@ -4445,128 +4405,136 @@ async fn execute_diarize(
                             ],
                         },
                     ))
-                } else {
-                    result.segments = projection.segments;
-                    result.transcript = backend::transcript_from_segments(&result.segments);
-                    let notes = diarization_report.diagnostics.clone();
-                    let speakers_detected = usize::try_from(diarization_report.detected_speakers)
-                        .map_err(|_| {
-                        FwError::InvalidRequest(
-                            "diarization speaker count does not fit this platform".to_owned(),
+                    } else {
+                        let notes = diarization_report.diagnostics.clone();
+                        let speakers_detected = usize::try_from(
+                            diarization_report.detected_speakers,
                         )
-                    })?;
-                    let segments_labeled = result
-                        .segments
-                        .iter()
-                        .filter(|segment| segment.speaker.is_some())
-                        .count();
-                    result.diarization = Some(diarization_report);
-                    Ok((
-                        result,
-                        DiarizeReport {
-                            segments_total,
-                            speakers_detected,
-                            segments_labeled,
-                            silhouette_score: None,
-                            notes,
-                        },
-                    ))
-                }
-            }
-            DiarizationEngine::External => {
-                if result_has_external_diarization(&result) {
-                    let segments_total = result.segments.len();
-                    let diarization_report = external_diarization_report(
-                        &result,
-                        &sha256_file(&normalized_wav)?,
-                        speaker_constraints.as_ref(),
-                    )?;
-                    let speakers_detected = usize::try_from(diarization_report.detected_speakers)
                         .map_err(|_| {
-                        FwError::InvalidRequest(
-                            "external speaker count does not fit this platform".to_owned(),
-                        )
-                    })?;
-                    let segments_labeled = result
-                        .segments
-                        .iter()
-                        .filter(|segment| segment.speaker.is_some())
-                        .count();
-                    result.diarization = Some(diarization_report);
-                    Ok((
-                        result,
-                        DiarizeReport {
-                            segments_total,
-                            speakers_detected,
-                            segments_labeled,
-                            silhouette_score: None,
-                            notes: vec![
-                                "accepted runtime-verified external diarization".to_owned(),
-                            ],
-                        },
-                    ))
-                } else if fallback_policy == DiarizationFallbackPolicy::Unknown {
-                    let segments_total = result.segments.len();
-                    for segment in &mut result.segments {
-                        segment.speaker = None;
+                            FwError::InvalidRequest(
+                                "diarization speaker count does not fit this platform".to_owned(),
+                            )
+                        })?;
+                        apply_native_diarization_projection(
+                            &mut result,
+                            projection,
+                            diarization_report,
+                        );
+                        let segments_labeled = result
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.speaker.is_some())
+                            .count();
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected,
+                                segments_labeled,
+                                silhouette_score: None,
+                                notes,
+                            },
+                        ))
                     }
-                    result.diarization = Some(unknown_diarization_report(
-                        sha256_file(&normalized_wav)?,
-                        speaker_constraints.as_ref(),
-                        "external diarization was unavailable; emitted unknown speakers",
-                    ));
-                    Ok((
-                        result,
-                        DiarizeReport {
-                            segments_total,
-                            speakers_detected: 0,
-                            segments_labeled: 0,
-                            silhouette_score: None,
-                            notes: vec![
+                }
+                DiarizationEngine::External => {
+                    if result_has_external_diarization(&result) {
+                        let segments_total = result.segments.len();
+                        let diarization_report = external_diarization_report(
+                            &result,
+                            &sha256_file(&normalized_wav)?,
+                            speaker_constraints.as_ref(),
+                        )?;
+                        let speakers_detected = usize::try_from(
+                            diarization_report.detected_speakers,
+                        )
+                        .map_err(|_| {
+                            FwError::InvalidRequest(
+                                "external speaker count does not fit this platform".to_owned(),
+                            )
+                        })?;
+                        let segments_labeled = result
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.speaker.is_some())
+                            .count();
+                        result.diarization = Some(diarization_report);
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected,
+                                segments_labeled,
+                                silhouette_score: None,
+                                notes: vec![
+                                    "accepted runtime-verified external diarization".to_owned(),
+                                ],
+                            },
+                        ))
+                    } else if fallback_policy == DiarizationFallbackPolicy::Unknown {
+                        let segments_total = result.segments.len();
+                        for segment in &mut result.segments {
+                            segment.speaker = None;
+                        }
+                        result.diarization = Some(unknown_diarization_report(
+                            sha256_file(&normalized_wav)?,
+                            speaker_constraints.as_ref(),
+                            "external diarization was unavailable; emitted unknown speakers",
+                        ));
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected: 0,
+                                segments_labeled: 0,
+                                silhouette_score: None,
+                                notes: vec![
                                 "external diarization was unavailable; emitted unknown speakers"
                                     .to_owned(),
                             ],
-                        },
-                    ))
-                } else {
-                    Err(FwError::InvalidRequest(
+                            },
+                        ))
+                    } else {
+                        Err(FwError::InvalidRequest(
                         "external diarization was requested but no resolved backend supplied valid speaker turns"
                             .to_owned(),
                     ))
-                }
-            }
-            DiarizationEngine::Neural => match acoustic_request.fallback {
-                DiarizationFallbackPolicy::External => Err(FwError::InvalidRequest(
-                    "neural diarization fallback requires the whisper-diarization backend"
-                        .to_owned(),
-                )),
-                DiarizationFallbackPolicy::Unknown => {
-                    let segments_total = result.segments.len();
-                    for segment in &mut result.segments {
-                        segment.speaker = None;
                     }
-                    result.diarization = Some(unknown_diarization_report(
-                        sha256_file(&normalized_wav)?,
-                        speaker_constraints.as_ref(),
-                        "requested neural engine is unavailable; emitted unknown speakers",
-                    ));
-                    Ok((
-                        result,
-                        DiarizeReport {
-                            segments_total,
-                            speakers_detected: 0,
-                            segments_labeled: 0,
-                            silhouette_score: None,
-                            notes: vec![
-                                "neural engine unavailable; emitted unknown speakers".to_owned(),
-                            ],
-                        },
-                    ))
                 }
-                DiarizationFallbackPolicy::Error => Err(FwError::InvalidRequest(
-                    "neural diarization engine is not admitted in this build".to_owned(),
-                )),
-            },
+                DiarizationEngine::Neural => match acoustic_request.fallback {
+                    DiarizationFallbackPolicy::External => Err(FwError::InvalidRequest(
+                        "neural diarization fallback requires the whisper-diarization backend"
+                            .to_owned(),
+                    )),
+                    DiarizationFallbackPolicy::Unknown => {
+                        let segments_total = result.segments.len();
+                        for segment in &mut result.segments {
+                            segment.speaker = None;
+                        }
+                        result.diarization = Some(unknown_diarization_report(
+                            sha256_file(&normalized_wav)?,
+                            speaker_constraints.as_ref(),
+                            "requested neural engine is unavailable; emitted unknown speakers",
+                        ));
+                        Ok((
+                            result,
+                            DiarizeReport {
+                                segments_total,
+                                speakers_detected: 0,
+                                segments_labeled: 0,
+                                silhouette_score: None,
+                                notes: vec![
+                                    "neural engine unavailable; emitted unknown speakers"
+                                        .to_owned(),
+                                ],
+                            },
+                        ))
+                    }
+                    DiarizationFallbackPolicy::Error => Err(FwError::InvalidRequest(
+                        "neural diarization engine is not admitted in this build".to_owned(),
+                    )),
+                },
+            }
         },
     ) {
         Ok(output) => output,
@@ -4584,6 +4552,13 @@ async fn execute_diarize(
 
     inter.result = Some(updated_result);
     inter.warnings.extend(report.notes.iter().cloned());
+    if let Some(diarization_report) = inter
+        .result
+        .as_ref()
+        .and_then(|result| result.diarization.as_ref())
+    {
+        emit_diarization_report_events(log, diarization_report);
+    }
 
     tracing::debug!(
         stage = "diarize",
@@ -4608,6 +4583,89 @@ async fn execute_diarize(
     Ok(())
 }
 
+fn validate_diarization_execution_request(
+    engine: DiarizationEngine,
+    request: &crate::model::DiarizationRequest,
+    constraints: Option<&SpeakerConstraints>,
+    audio_duration_ms: Option<u64>,
+) -> FwResult<()> {
+    request
+        .validate(audio_duration_ms.unwrap_or(u64::MAX), constraints)
+        .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
+    if !request.known_intervals.is_empty()
+        && !matches!(
+            engine,
+            DiarizationEngine::Auto | DiarizationEngine::Acoustic
+        )
+    {
+        return Err(FwError::InvalidRequest(
+            "known speaker intervals require the native acoustic diarization engine".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_native_diarization_projection(
+    result: &mut crate::model::TranscriptionResult,
+    projection: diarization::DiarizationProjection,
+    report: DiarizationReport,
+) {
+    // Speaker projection may alter only the legacy per-segment speaker field.
+    // The backend's top-level transcript remains byte-authoritative even when
+    // its spacing differs from a reconstruction of the segment list.
+    result.segments = projection.segments;
+    result.diarization = Some(report);
+}
+
+fn emit_diarization_report_events(log: &mut EventLog, report: &DiarizationReport) {
+    log.push(
+        "diarize",
+        "diarize.progress",
+        "diarization report assembled",
+        json!({
+            "implementation": report.implementation,
+            "contract_version": report.contract_version,
+            "feature_schema": report.feature_schema,
+            "turns": report.turns.len(),
+            "profiles": report.profiles.len(),
+            "fallback_status": report.fallback_status,
+        }),
+    );
+    for (turn_index, turn) in report.turns.iter().enumerate() {
+        log.push(
+            "diarize",
+            "diarize.change",
+            "speaker turn boundary",
+            json!({
+                "turn_index": turn_index,
+                "start_ms": turn.start_ms,
+                "end_ms": turn.end_ms,
+                "speaker_ref": turn.speaker_ref,
+                "speaker_confidence": turn.speaker_confidence,
+                "change_confidence": turn.change_confidence,
+                "overlap_suspected": turn.overlap_suspected,
+                "hard_hint_attributed": turn.hard_hint_attributed,
+            }),
+        );
+    }
+    for profile in &report.profiles {
+        log.push(
+            "diarize",
+            "diarize.profile",
+            "privacy-safe speaker profile summary",
+            json!({
+                "speaker_ref": profile.speaker_ref,
+                "frame_count": profile.frame_count,
+                "voiced_duration_ms": profile.voiced_duration_ms,
+                "reliability": profile.reliability,
+                "channel_profile_count": profile.channel_profile_count,
+                "anchored": profile.anchored,
+                "soft_hint_contradiction": profile.soft_hint_contradiction,
+            }),
+        );
+    }
+}
+
 fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u64, u64)> {
     if !start_sec.is_finite() || !end_sec.is_finite() || start_sec < 0.0 || end_sec <= start_sec {
         return None;
@@ -4617,7 +4675,9 @@ fn finite_seconds_interval_to_ms(start_sec: f64, end_sec: f64) -> Option<(u64, u
     if start_ms > u64::MAX as f64 || end_ms > u64::MAX as f64 {
         return None;
     }
-    Some((start_ms as u64, end_ms as u64))
+    let start_ms = start_ms as u64;
+    let end_ms = end_ms as u64;
+    (end_ms > start_ms).then_some((start_ms, end_ms))
 }
 
 fn transcript_boundaries_ms(segments: &[crate::model::TranscriptionSegment]) -> Vec<u64> {
@@ -4697,38 +4757,57 @@ fn external_diarization_report(
     normalized_input_sha256: &str,
     constraints: Option<&SpeakerConstraints>,
 ) -> FwResult<DiarizationReport> {
-    let mut turns = Vec::<DiarizationTurn>::new();
-    let mut profile_totals = BTreeMap::<String, (u64, u64)>::new();
+    let mut intervals = Vec::<(u64, u64, String)>::new();
     for segment in &result.segments {
-        let Some(speaker_ref) = segment
-            .speaker
-            .as_ref()
-            .map(|speaker| speaker.trim())
-            .filter(|speaker| !speaker.is_empty())
-        else {
+        let Some(speaker_ref) = segment.speaker.as_ref() else {
             continue;
         };
-        let Some((start_ms, end_ms)) = segment
+        let speaker_ref = speaker_ref.trim();
+        if speaker_ref.is_empty() {
+            return Err(FwError::InvalidRequest(
+                "external diarization supplied an empty speaker reference".to_owned(),
+            ));
+        }
+        let (start_ms, end_ms) = segment
             .start_sec
             .zip(segment.end_sec)
             .and_then(|(start, end)| finite_seconds_interval_to_ms(start, end))
-        else {
-            continue;
-        };
-        let totals = profile_totals.entry(speaker_ref.to_owned()).or_default();
-        totals.0 += 1;
-        totals.1 = totals.1.saturating_add(end_ms - start_ms);
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "external diarization supplied a labeled segment without a positive finite millisecond interval"
+                        .to_owned(),
+                )
+            })?;
+        intervals.push((start_ms, end_ms, speaker_ref.to_owned()));
+    }
+    intervals.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+
+    let mut turns = Vec::<DiarizationTurn>::with_capacity(intervals.len());
+    for (start_ms, end_ms, speaker_ref) in intervals {
         if let Some(previous) = turns.last_mut()
-            && previous.speaker_ref.as_deref() == Some(speaker_ref)
+            && previous.speaker_ref.as_deref() == Some(speaker_ref.as_str())
             && start_ms <= previous.end_ms.saturating_add(20)
         {
             previous.end_ms = previous.end_ms.max(end_ms);
             continue;
         }
+        if turns
+            .last()
+            .is_some_and(|previous| start_ms < previous.end_ms)
+        {
+            return Err(FwError::InvalidRequest(
+                "external diarization supplied overlapping turns for different speakers".to_owned(),
+            ));
+        }
         turns.push(DiarizationTurn {
             start_ms,
             end_ms,
-            speaker_ref: Some(speaker_ref.to_owned()),
+            speaker_ref: Some(speaker_ref),
             speaker_confidence: None,
             change_confidence: None,
             overlap_suspected: false,
@@ -4740,19 +4819,25 @@ fn external_diarization_report(
             "resolved external diarization did not provide valid timed speaker turns".to_owned(),
         ));
     }
+    let mut profile_totals = BTreeMap::<String, u64>::new();
+    for turn in &turns {
+        if let Some(speaker_ref) = &turn.speaker_ref {
+            let duration = turn.end_ms - turn.start_ms;
+            let total = profile_totals.entry(speaker_ref.clone()).or_default();
+            *total = total.saturating_add(duration);
+        }
+    }
     let profiles = profile_totals
         .into_iter()
-        .map(
-            |(speaker_ref, (_segment_count, voiced_duration_ms))| SpeakerProfileSummary {
-                speaker_ref,
-                frame_count: 0,
-                voiced_duration_ms,
-                reliability: 0.0,
-                channel_profile_count: 0,
-                anchored: false,
-                soft_hint_contradiction: None,
-            },
-        )
+        .map(|(speaker_ref, voiced_duration_ms)| SpeakerProfileSummary {
+            speaker_ref,
+            frame_count: 0,
+            voiced_duration_ms,
+            reliability: 0.0,
+            channel_profile_count: 0,
+            anchored: false,
+            soft_hint_contradiction: None,
+        })
         .collect::<Vec<_>>();
     let detected_speakers = u32::try_from(profiles.len()).map_err(|_| {
         FwError::InvalidRequest("external speaker count exceeds report schema".to_owned())
@@ -4871,8 +4956,10 @@ mod tests {
     use crate::error::FwError;
     use crate::model::{
         AcousticDiarizationRolloutStage, BackendKind, BackendParams, DiarizationConfig,
-        DiarizationEngine, DiarizationRequest, InputSource, RunEvent, RunReport, StreamedRunEvent,
-        TranscribeRequest, TranscriptionResult, TranscriptionSegment, VadParams,
+        DiarizationEngine, DiarizationFallbackStatus, DiarizationReport, DiarizationRequest,
+        DiarizationTurn, InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent,
+        RunReport, SpeakerProfileSummary, StreamedRunEvent, TranscribeRequest, TranscriptionResult,
+        TranscriptionSegment, VadParams,
     };
     use crate::storage::RunStore;
 
@@ -4882,17 +4969,19 @@ mod tests {
         FinalizerRegistry, PipelineConfig, PipelineCx, PipelineStage, PunctuateReport,
         SeparateReport, SpeakerEmbedding, StageBudgetPolicy, VadConfig, VadRegionMs, VadReport,
         acceleration_cancellation_fence_payload, acceleration_context_payload,
-        acceleration_stream_owner_id, apply_padding, budget_duration, checkpoint_or_emit,
-        ctc_forced_align, diarize_segments, event_elapsed_ms, is_abbreviation_period,
-        is_decimal_period, is_ellipsis_period, merge_regions_by_gap, ms_to_frames,
-        optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
-        parse_event_ts_ms, punctuate_segments, recommended_budget, resolve_speaker_target,
-        resolved_diarization_engine, resolved_diarization_engine_for_rollout,
-        result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
-        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_json_value,
-        silhouette_score, source_separate, source_separate_with_analysis, split_long_regions,
-        stage_budget_ms, stage_failure_code, stage_failure_message, stage_latency_profile,
-        state_root, transcript_boundaries_ms, vad_energy_detect, vad_energy_detect_with_analysis,
+        acceleration_stream_owner_id, apply_native_diarization_projection, apply_padding,
+        budget_duration, checkpoint_or_emit, ctc_forced_align, diarize_segments,
+        emit_diarization_report_events, event_elapsed_ms, external_diarization_report,
+        finite_seconds_interval_to_ms, is_abbreviation_period, is_decimal_period,
+        is_ellipsis_period, merge_regions_by_gap, ms_to_frames, optional_stage_skip,
+        parse_acoustic_diarization_rollout, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
+        recommended_budget, resolve_speaker_target, resolved_diarization_engine,
+        resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
+        run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
+        sha256_file, sha256_json_value, silhouette_score, source_separate,
+        source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
+        stage_failure_message, stage_latency_profile, state_root, transcript_boundaries_ms,
+        vad_energy_detect, vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
 
     #[test]
@@ -8793,6 +8882,196 @@ mod tests {
             },
         ];
         assert_eq!(transcript_boundaries_ms(&segments), vec![0, 1_250, 2_000]);
+    }
+
+    fn synthetic_typed_diarization_report() -> DiarizationReport {
+        DiarizationReport {
+            implementation: "native-acoustic-v1".to_owned(),
+            contract_version: "acoustic-diarization-v1".to_owned(),
+            feature_schema: "acoustic-feature-v1".to_owned(),
+            normalized_input_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            hint_document_sha256: None,
+            turns: vec![DiarizationTurn {
+                start_ms: 0,
+                end_ms: 1_000,
+                speaker_ref: Some("speaker_a".to_owned()),
+                speaker_confidence: Some(0.8),
+                change_confidence: Some(0.7),
+                overlap_suspected: false,
+                hard_hint_attributed: false,
+            }],
+            profiles: vec![SpeakerProfileSummary {
+                speaker_ref: "speaker_a".to_owned(),
+                frame_count: 80,
+                voiced_duration_ms: 800,
+                reliability: 0.75,
+                channel_profile_count: 1,
+                anchored: false,
+                soft_hint_contradiction: None,
+            }],
+            detected_speakers: 1,
+            constraints_satisfied: true,
+            fallback_status: DiarizationFallbackStatus::NotNeeded,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn native_projection_preserves_the_authoritative_transcript_bytes() {
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "backend spacing  is authoritative\n".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![TranscriptionSegment {
+                start_sec: Some(0.0),
+                end_sec: Some(1.0),
+                text: "backend spacing is authoritative".to_owned(),
+                speaker: None,
+                confidence: Some(0.9),
+            }],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let transcript = result.transcript.clone();
+        let projection = crate::diarization::DiarizationProjection {
+            segments: vec![TranscriptionSegment {
+                speaker: Some("speaker_a".to_owned()),
+                ..result.segments[0].clone()
+            }],
+            mixed_speaker_segment_indices: Vec::new(),
+            overlap_suspected_segment_indices: Vec::new(),
+        };
+
+        apply_native_diarization_projection(
+            &mut result,
+            projection,
+            synthetic_typed_diarization_report(),
+        );
+
+        assert_eq!(result.transcript, transcript);
+        assert_eq!(result.segments[0].speaker.as_deref(), Some("speaker_a"));
+        assert!(result.diarization.is_some());
+    }
+
+    #[test]
+    fn diarization_details_emit_from_the_diarize_stage() {
+        let mut log = EventLog::new("run".to_owned(), "trace".to_owned(), None);
+        emit_diarization_report_events(&mut log, &synthetic_typed_diarization_report());
+        assert_eq!(
+            log.events
+                .iter()
+                .map(|event| event.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["diarize.progress", "diarize.change", "diarize.profile"]
+        );
+        assert!(log.events.iter().all(|event| event.stage == "diarize"));
+    }
+
+    #[test]
+    fn external_diarization_is_sorted_merged_and_validated() {
+        let result = TranscriptionResult {
+            backend: BackendKind::WhisperDiarization,
+            transcript: "synthetic".to_owned(),
+            language: None,
+            segments: vec![
+                TranscriptionSegment {
+                    start_sec: Some(2.0),
+                    end_sec: Some(3.0),
+                    text: "b".to_owned(),
+                    speaker: Some("speaker_b".to_owned()),
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(1.0),
+                    end_sec: Some(2.0),
+                    text: "a2".to_owned(),
+                    speaker: Some("speaker_a".to_owned()),
+                    confidence: None,
+                },
+                TranscriptionSegment {
+                    start_sec: Some(0.0),
+                    end_sec: Some(1.0),
+                    text: "a1".to_owned(),
+                    speaker: Some("speaker_a".to_owned()),
+                    confidence: None,
+                },
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let report = external_diarization_report(
+            &result,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
+        )
+        .expect("valid external report");
+        assert_eq!(report.turns.len(), 2);
+        assert_eq!(
+            (report.turns[0].start_ms, report.turns[0].end_ms),
+            (0, 2_000)
+        );
+        assert_eq!(report.turns[0].speaker_ref.as_deref(), Some("speaker_a"));
+        assert_eq!(report.turns[1].speaker_ref.as_deref(), Some("speaker_b"));
+
+        let mut overlapping = result;
+        overlapping.segments[0].start_sec = Some(0.5);
+        assert!(
+            external_diarization_report(
+                &overlapping,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                None,
+            )
+            .expect_err("different external speakers may not overlap")
+            .to_string()
+            .contains("overlapping turns")
+        );
+    }
+
+    #[test]
+    fn known_intervals_are_rejected_when_the_selected_engine_cannot_enforce_them() {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Auto,
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "speaker_a".to_owned(),
+                start_ms: 0,
+                end_ms: 1_000,
+                confidence: 0.9,
+                policy: KnownSpeakerPolicy::HardMustLink,
+                provenance: None,
+            }],
+            ..DiarizationRequest::default()
+        };
+        let error = validate_diarization_execution_request(
+            DiarizationEngine::External,
+            &request,
+            None,
+            Some(2_000),
+        )
+        .expect_err("external engine would silently ignore known intervals");
+        assert!(error.to_string().contains("require the native acoustic"));
+        assert!(
+            validate_diarization_execution_request(
+                DiarizationEngine::Acoustic,
+                &request,
+                None,
+                Some(2_000),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn second_intervals_must_remain_positive_after_millisecond_quantization() {
+        assert_eq!(finite_seconds_interval_to_ms(1.0, 1.0004), None);
+        assert_eq!(
+            finite_seconds_interval_to_ms(1.0, 1.0006),
+            Some((1_000, 1_001))
+        );
     }
 
     #[test]

@@ -1251,6 +1251,15 @@ impl<'a> AcousticSegmenter<'a> {
             self.tracklets.push(tracklet);
         }
         merge_compatible_adjacent_tracklets(&mut self.tracklets);
+        if !self.hints.speech_regions_ms.is_empty() {
+            self.tracklets.retain(|tracklet| {
+                let midpoint = tracklet.start_ms + (tracklet.end_ms - tracklet.start_ms) / 2;
+                self.hints
+                    .speech_regions_ms
+                    .iter()
+                    .any(|&(start_ms, end_ms)| midpoint >= start_ms && midpoint < end_ms)
+            });
+        }
         for (index, tracklet) in self.tracklets.iter_mut().enumerate() {
             tracklet.tracklet_index = index;
         }
@@ -1627,8 +1636,11 @@ fn consume_segment_frame(
         .remove(&frame.frame_index)
         .or_else(|| detected.remove(&frame.frame_index));
     if let Some(evidence) = evidence {
+        let must_preserve_boundary = evidence.vad_boundary;
         let long_enough = accumulator.frame_count >= MIN_TRACKLET_FRAMES;
-        if long_enough && let Some(tracklet) = accumulator.finish(tracklets.len(), Some(evidence)) {
+        if (must_preserve_boundary || long_enough)
+            && let Some(tracklet) = accumulator.finish(tracklets.len(), Some(evidence))
+        {
             tracklets.push(tracklet);
         }
     }
@@ -1643,7 +1655,11 @@ fn merge_compatible_adjacent_tracklets(tracklets: &mut Vec<AcousticTracklet>) {
     for tracklet in tracklets.drain(..) {
         let compatible = merged.last().is_some_and(|previous: &AcousticTracklet| {
             tracklet.start_ms <= previous.end_ms + 50
-                && tracklet.change_confidence < CHANGE_THRESHOLD
+                && previous.change_confidence < CHANGE_THRESHOLD
+                && !previous
+                    .boundary_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.vad_boundary)
                 && euclidean_distance(&previous.voice_mean, &tracklet.voice_mean) < 0.08
         });
         if compatible {
@@ -1659,19 +1675,30 @@ fn merge_compatible_adjacent_tracklets(tracklets: &mut Vec<AcousticTracklet>) {
 
 fn merge_tracklet_statistics(destination: &mut AcousticTracklet, source: &AcousticTracklet) {
     let total = destination.frame_count + source.frame_count;
-    let left_weight = destination.frame_count as f32 / total as f32;
-    let right_weight = source.frame_count as f32 / total as f32;
+    let left_count = destination.frame_count as f32;
+    let right_count = source.frame_count as f32;
+    let total_count = total as f32;
     for index in 0..VOICE_VECTOR_DIMENSIONS {
-        destination.voice_mean[index] =
-            left_weight * destination.voice_mean[index] + right_weight * source.voice_mean[index];
-        destination.voice_variance[index] = left_weight * destination.voice_variance[index]
-            + right_weight * source.voice_variance[index];
+        let left_mean = destination.voice_mean[index];
+        let right_mean = source.voice_mean[index];
+        let delta = right_mean - left_mean;
+        destination.voice_mean[index] = left_mean + delta * right_count / total_count;
+        let left_m2 = destination.voice_variance[index] * (left_count - 1.0).max(0.0);
+        let right_m2 = source.voice_variance[index] * (right_count - 1.0).max(0.0);
+        destination.voice_variance[index] =
+            (left_m2 + right_m2 + delta * delta * left_count * right_count / total_count)
+                / (total_count - 1.0).max(1.0);
     }
     for index in 0..CHANNEL_VECTOR_DIMENSIONS {
-        destination.channel_mean[index] = left_weight * destination.channel_mean[index]
-            + right_weight * source.channel_mean[index];
-        destination.channel_variance[index] = left_weight * destination.channel_variance[index]
-            + right_weight * source.channel_variance[index];
+        let left_mean = destination.channel_mean[index];
+        let right_mean = source.channel_mean[index];
+        let delta = right_mean - left_mean;
+        destination.channel_mean[index] = left_mean + delta * right_count / total_count;
+        let left_m2 = destination.channel_variance[index] * (left_count - 1.0).max(0.0);
+        let right_m2 = source.channel_variance[index] * (right_count - 1.0).max(0.0);
+        destination.channel_variance[index] =
+            (left_m2 + right_m2 + delta * delta * left_count * right_count / total_count)
+                / (total_count - 1.0).max(1.0);
     }
     destination.end_ms = source.end_ms;
     destination.frame_count = total;
@@ -1785,6 +1812,21 @@ pub fn enroll_known_speaker_profiles(
             message: error.to_string(),
             hint_index: error.hint_index,
         })?;
+    validate_tracklet_timeline(tracklets).map_err(|error| ProfileEnrollmentError {
+        code: ProfileEnrollmentCode::InvalidRequest,
+        message: error.to_string(),
+        hint_index: None,
+    })?;
+    if tracklets
+        .iter()
+        .any(|tracklet| tracklet.end_ms > audio_duration_ms)
+    {
+        return Err(ProfileEnrollmentError {
+            code: ProfileEnrollmentCode::InvalidRequest,
+            message: "tracklet interval exceeds the canonical audio duration".to_owned(),
+            hint_index: None,
+        });
+    }
 
     let hint_document_sha256 = (!request.known_intervals.is_empty())
         .then(|| canonical_hint_document_sha256(&request.known_intervals));
@@ -1801,9 +1843,8 @@ pub fn enroll_known_speaker_profiles(
             tracklets
                 .iter()
                 .filter(|tracklet| {
-                    let midpoint = tracklet.start_ms.saturating_add(tracklet.end_ms) / 2;
-                    midpoint >= guarded_start
-                        && midpoint < guarded_end
+                    tracklet.start_ms >= guarded_start
+                        && tracklet.end_ms <= guarded_end
                         && tracklet.frame_count >= 3
                         && tracklet.voiced_frame_count * 4 >= tracklet.frame_count
                         && !tracklet.overlap_suspected
@@ -1877,13 +1918,15 @@ pub fn enroll_known_speaker_profiles(
 
     let mut profiles = BTreeMap::new();
     for (speaker_ref, observations) in by_speaker {
-        let hard_observations = observations
-            .iter()
-            .filter(|observation| observation.hard)
-            .cloned()
-            .collect::<Vec<_>>();
+        let hard_observations = deduplicate_profile_observations(
+            observations
+                .iter()
+                .filter(|observation| observation.hard)
+                .cloned()
+                .collect(),
+        );
         let provisional_source = if hard_observations.is_empty() {
-            observations.clone()
+            deduplicate_profile_observations(observations.clone())
         } else {
             hard_observations
         };
@@ -1898,10 +1941,10 @@ pub fn enroll_known_speaker_profiles(
                 accepted.push(observation);
             } else if accept {
                 hint_evidence.accepted_tracklet_count += 1;
-                soft_priors.insert(
-                    (observation.tracklet_index, speaker_ref.clone()),
-                    observation.weight.min(20.0),
-                );
+                let prior = soft_priors
+                    .entry((observation.tracklet_index, speaker_ref.clone()))
+                    .or_default();
+                *prior = prior.max(observation.weight.min(20.0));
                 accepted.push(observation);
             } else {
                 hint_evidence.rejected_tracklet_count += 1;
@@ -1918,6 +1961,7 @@ pub fn enroll_known_speaker_profiles(
         if accepted.is_empty() {
             continue;
         }
+        let accepted = deduplicate_profile_observations(accepted);
         let profile = build_speaker_profile(
             speaker_ref.clone(),
             &accepted,
@@ -1937,6 +1981,25 @@ pub fn enroll_known_speaker_profiles(
         soft_priors,
         cannot_links,
     })
+}
+
+fn deduplicate_profile_observations(
+    observations: Vec<EnrollmentObservation>,
+) -> Vec<EnrollmentObservation> {
+    let mut by_tracklet = BTreeMap::<usize, EnrollmentObservation>::new();
+    for observation in observations {
+        by_tracklet
+            .entry(observation.tracklet_index)
+            .and_modify(|current| {
+                if (!current.hard && observation.hard)
+                    || (current.hard == observation.hard && observation.weight > current.weight)
+                {
+                    *current = observation.clone();
+                }
+            })
+            .or_insert(observation);
+    }
+    by_tracklet.into_values().collect()
 }
 
 fn canonical_hint_document_sha256(hints: &[KnownSpeakerInterval]) -> String {
@@ -2227,6 +2290,16 @@ where
             "native acoustic pipeline cannot execute {:?} diarization",
             request.engine
         )));
+    }
+    if normalized_input_sha256.len() != 64
+        || !normalized_input_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(FwError::InvalidRequest(
+            "normalized_input_sha256 must be exactly 64 lowercase hexadecimal characters"
+                .to_owned(),
+        ));
     }
     let audio_duration_ms = samples_to_ms(samples.len());
     request
@@ -2622,7 +2695,7 @@ fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
                 .speaker_ref
                 .as_ref()
                 .is_some_and(|speaker| speaker.trim().is_empty())
-            || turn.speaker_ref.is_some() != turn.speaker_confidence.is_some()
+            || (turn.speaker_ref.is_none() && turn.speaker_confidence.is_some())
             || !valid_confidence(turn.speaker_confidence)
             || !valid_confidence(turn.change_confidence)
         {
@@ -2753,18 +2826,25 @@ fn validate_tracklet_timeline(tracklets: &[AcousticTracklet]) -> FwResult<()> {
     for tracklet in tracklets {
         if tracklet.end_ms <= tracklet.start_ms
             || tracklet.start_ms < previous_end.saturating_sub(25)
+            || tracklet.end_ms < previous_end
             || tracklet.frame_count == 0
+            || tracklet.voiced_frame_count > tracklet.frame_count
             || !indexes.insert(tracklet.tracklet_index)
+            || !tracklet.change_confidence.is_finite()
+            || !(0.0..=1.0).contains(&tracklet.change_confidence)
             || tracklet
                 .voice_mean
                 .iter()
-                .chain(tracklet.voice_variance.iter())
                 .chain(tracklet.channel_mean.iter())
                 .any(|value| !value.is_finite())
+            || tracklet
+                .voice_variance
+                .iter()
+                .chain(tracklet.channel_variance.iter())
+                .any(|value| !value.is_finite() || *value < 0.0)
         {
             return Err(FwError::InvalidRequest(
-                "tracklets must be finite, non-empty, uniquely indexed, and time-ordered"
-                    .to_owned(),
+                "tracklets must have finite non-negative statistics, valid counts and confidence, unique indexes, and ordered positive intervals".to_owned(),
             ));
         }
         previous_end = tracklet.end_ms;
@@ -3530,8 +3610,8 @@ mod tests {
         AcousticSpeakerAssignment, AcousticTracklet, CalibrationObservation, ChannelFeatureView,
         ProfileEnrollmentCode, ScoringTurn, VoiceFeatureView, cluster_acoustic_tracklets,
         diarization_turns_from_assignments, diarize_acoustic_pcm, enroll_known_speaker_profiles,
-        extract_acoustic_features, project_diarization_onto_segments, score_calibration,
-        score_change_points, score_diarization, segment_acoustic_frames,
+        extract_acoustic_features, merge_tracklet_statistics, project_diarization_onto_segments,
+        score_calibration, score_change_points, score_diarization, segment_acoustic_frames,
     };
     use crate::model::{
         DiarizationEngine, DiarizationFallbackStatus, DiarizationRequest, DiarizationTurn,
@@ -3731,6 +3811,8 @@ mod tests {
 
     #[test]
     fn complete_native_pipeline_uses_contextual_hints_without_changing_asr_bytes() {
+        const SYNTHETIC_INPUT_SHA256: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let samples = sine_wave(120.0, 5.0, 0.35);
         let segments = vec![
             TranscriptionSegment {
@@ -3776,7 +3858,7 @@ mod tests {
         let (report, projection) = diarize_acoustic_pcm(
             AcousticDiarizationInput {
                 samples: &samples,
-                normalized_input_sha256: "synthetic-input-hash",
+                normalized_input_sha256: SYNTHETIC_INPUT_SHA256,
                 segments: &segments,
                 word_aligned: true,
                 request: &request,
@@ -3789,7 +3871,7 @@ mod tests {
         let (repeated_report, repeated_projection) = diarize_acoustic_pcm(
             AcousticDiarizationInput {
                 samples: &samples,
-                normalized_input_sha256: "synthetic-input-hash",
+                normalized_input_sha256: SYNTHETIC_INPUT_SHA256,
                 segments: &segments,
                 word_aligned: true,
                 request: &request,
@@ -3835,6 +3917,32 @@ mod tests {
         assert_eq!(projection.segments[1].confidence, Some(0.82));
         assert_eq!(projection.segments[0].speaker.as_deref(), Some("context_a"));
         assert_eq!(projection.segments[1].speaker.as_deref(), Some("context_a"));
+    }
+
+    #[test]
+    fn complete_native_pipeline_rejects_unbound_input_provenance() {
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            ..DiarizationRequest::default()
+        };
+        let error = diarize_acoustic_pcm(
+            AcousticDiarizationInput {
+                samples: &[],
+                normalized_input_sha256: "not-a-sha256",
+                segments: &[],
+                word_aligned: false,
+                request: &request,
+                constraints: None,
+                boundary_hints: &AcousticBoundaryHints::default(),
+            },
+            || false,
+        )
+        .expect_err("unbound provenance must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("64 lowercase hexadecimal characters")
+        );
     }
 
     #[test]
@@ -4059,6 +4167,75 @@ mod tests {
     }
 
     #[test]
+    fn short_vad_regions_remain_structural_boundaries() {
+        let frames = (0..40)
+            .map(|index| synthetic_feature(index, 0.0, false, false))
+            .collect::<Vec<_>>();
+        let hints = AcousticBoundaryHints {
+            speech_regions_ms: vec![(0, 100), (100, 400)],
+            ..AcousticBoundaryHints::default()
+        };
+        let (tracklets, summary) =
+            segment_acoustic_frames(frames, &hints, || false).expect("segment");
+        assert_eq!(tracklets.len(), 2, "{tracklets:#?}");
+        assert_eq!(tracklets[0].frame_count, 10);
+        assert!(
+            tracklets[0]
+                .boundary_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.vad_boundary)
+        );
+        assert_eq!(summary.forced_boundary_count, 3);
+    }
+
+    #[test]
+    fn vad_mask_excludes_non_speech_tracklets_from_clustering() {
+        let frames = (0..40)
+            .map(|index| {
+                let speech = (10..30).contains(&index);
+                synthetic_feature(index, 0.0, !speech, false)
+            })
+            .collect::<Vec<_>>();
+        let hints = AcousticBoundaryHints {
+            speech_regions_ms: vec![(100, 300)],
+            ..AcousticBoundaryHints::default()
+        };
+        let (tracklets, _) = segment_acoustic_frames(frames, &hints, || false).expect("segment");
+        assert_eq!(tracklets.len(), 1, "{tracklets:#?}");
+        assert!(tracklets[0].start_ms >= 100);
+        assert!(tracklets[0].end_ms <= 325);
+        assert_eq!(tracklets[0].voiced_frame_count, tracklets[0].frame_count);
+    }
+
+    #[test]
+    fn adjacent_tracklet_merge_uses_pooled_sample_variance() {
+        let mut destination = profile_tracklet(0, 0, 20, 0.0, 0.0, 2);
+        let mut source = profile_tracklet(1, 20, 40, 2.0, 4.0, 2);
+        destination.voice_variance = [0.0; 8];
+        destination.channel_variance = [0.0; 8];
+        source.voice_variance = [0.0; 8];
+        source.channel_variance = [0.0; 8];
+
+        merge_tracklet_statistics(&mut destination, &source);
+
+        assert_eq!(destination.frame_count, 4);
+        assert!(destination.voice_mean.iter().all(|value| *value == 1.0));
+        assert!(destination.channel_mean.iter().all(|value| *value == 2.0));
+        assert!(
+            destination
+                .voice_variance
+                .iter()
+                .all(|value| (*value - 4.0 / 3.0).abs() < 1e-6)
+        );
+        assert!(
+            destination
+                .channel_variance
+                .iter()
+                .all(|value| (*value - 16.0 / 3.0).abs() < 1e-6)
+        );
+    }
+
+    #[test]
     fn silence_gap_is_change_evidence_not_a_speaker_identity() {
         let frames = (0..700)
             .map(|index| {
@@ -4204,6 +4381,33 @@ mod tests {
     }
 
     #[test]
+    fn edge_guards_require_the_whole_tracklet_to_be_trusted() {
+        let request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "alice",
+                0,
+                1_000,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            enrollment_edge_guard_ms: 100,
+            ..DiarizationRequest::default()
+        };
+        let tracklets = vec![
+            // Its midpoint is inside the guarded interval, but its leading edge is not.
+            profile_tracklet(0, 50, 150, 5.0, 0.0, 10),
+            profile_tracklet(1, 200, 700, 0.0, 0.0, 50),
+        ];
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, None, 1_000).expect("enrollment");
+        assert_eq!(enrollment.summaries[0].frame_count, 50);
+        assert!(!enrollment.hard_assignments.contains_key(&0));
+        assert_eq!(
+            enrollment.hard_assignments.get(&1),
+            Some(&"alice".to_owned())
+        );
+    }
+
+    #[test]
     fn contradictory_soft_enrollment_is_rejected_with_evidence() {
         let request = DiarizationRequest {
             known_intervals: vec![
@@ -4242,6 +4446,32 @@ mod tests {
         let enrollment =
             enroll_known_speaker_profiles(&tracklets, &request, None, 2_000).expect("enrollment");
         assert_eq!(enrollment.summaries[0].channel_profile_count, 2);
+    }
+
+    #[test]
+    fn overlapping_same_speaker_hints_do_not_double_count_a_tracklet() {
+        let request = DiarizationRequest {
+            known_intervals: vec![
+                known_interval("alice", 0, 900, KnownSpeakerPolicy::HardMustLink),
+                known_interval("alice", 100, 800, KnownSpeakerPolicy::HardMustLink),
+            ],
+            enrollment_edge_guard_ms: 50,
+            ..DiarizationRequest::default()
+        };
+        let tracklets = vec![profile_tracklet(0, 200, 700, 0.1, 0.0, 50)];
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, None, 1_000).expect("enrollment");
+        assert_eq!(enrollment.summaries[0].frame_count, 50);
+        assert_eq!(enrollment.summaries[0].voiced_duration_ms, 500);
+        assert_eq!(enrollment.hard_assignments.len(), 1);
+        assert_eq!(
+            enrollment
+                .evidence
+                .iter()
+                .map(|evidence| evidence.accepted_tracklet_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
     }
 
     #[test]
@@ -4595,6 +4825,50 @@ mod tests {
         assert!(error.to_string().contains("clustering cancelled"));
     }
 
+    #[test]
+    fn clustering_rejects_invalid_tracklet_statistics_and_counts() {
+        let request = DiarizationRequest::default();
+        let enrollment =
+            enroll_known_speaker_profiles(&[], &request, None, 100).expect("enrollment");
+        let mut invalid = profile_tracklet(0, 0, 100, 0.0, 0.0, 10);
+        invalid.channel_variance[0] = f32::NAN;
+        assert!(
+            cluster_acoustic_tracklets(&[invalid.clone()], &enrollment, None, 8, || false)
+                .expect_err("non-finite channel variance")
+                .to_string()
+                .contains("finite non-negative statistics")
+        );
+
+        invalid.channel_variance[0] = 0.01;
+        invalid.voice_variance[0] = -0.01;
+        assert!(
+            cluster_acoustic_tracklets(&[invalid.clone()], &enrollment, None, 8, || false)
+                .expect_err("negative sample variance")
+                .to_string()
+                .contains("finite non-negative statistics")
+        );
+
+        invalid.voice_variance[0] = 0.01;
+        invalid.voiced_frame_count = invalid.frame_count + 1;
+        assert!(
+            cluster_acoustic_tracklets(&[invalid], &enrollment, None, 8, || false)
+                .expect_err("voiced count exceeds total")
+                .to_string()
+                .contains("valid counts")
+        );
+
+        let nested = vec![
+            profile_tracklet(0, 0, 100, 0.0, 0.0, 10),
+            profile_tracklet(1, 80, 90, 0.0, 0.0, 1),
+        ];
+        assert!(
+            cluster_acoustic_tracklets(&nested, &enrollment, None, 8, || false)
+                .expect_err("nested tracklet timeline")
+                .to_string()
+                .contains("ordered positive intervals")
+        );
+    }
+
     fn assignment(
         tracklet_index: usize,
         start_ms: u64,
@@ -4660,6 +4934,14 @@ mod tests {
         assert_eq!(turns[0].end_ms, turns[1].start_ms);
         assert_eq!(turns[1].end_ms, 1_500);
         assert!((turns[1].speaker_confidence.expect("confidence") - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn external_style_turn_without_calibration_remains_structurally_valid() {
+        let turns = vec![turn(0, 1_000, Some("external_a"), None)];
+        let projection =
+            project_diarization_onto_segments(&[], &turns, false).expect("valid turn timeline");
+        assert!(projection.segments.is_empty());
     }
 
     #[test]
