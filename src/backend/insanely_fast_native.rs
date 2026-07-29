@@ -438,6 +438,7 @@ pub fn run(
         language,
         segments,
         acceleration: None,
+        diarization: None,
         raw_output,
         artifact_paths: Vec::new(),
     })
@@ -686,6 +687,7 @@ fn silence_result(
         language: request.language.clone(),
         segments: Vec::new(),
         acceleration: None,
+        diarization: None,
         raw_output: json!({
             "engine": "insanely-fast-native",
             "schema_version": SCHEMA_VERSION,

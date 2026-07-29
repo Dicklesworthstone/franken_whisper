@@ -470,6 +470,7 @@ impl SpeculativeStreamingPipeline {
             language: Some("en".to_owned()),
             segments,
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: vec![],
         }

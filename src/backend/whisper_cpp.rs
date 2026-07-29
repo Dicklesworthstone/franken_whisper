@@ -74,6 +74,7 @@ pub fn run(
         language,
         segments,
         acceleration: None,
+        diarization: None,
         raw_output: raw,
         artifact_paths,
     })

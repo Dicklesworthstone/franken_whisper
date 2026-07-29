@@ -218,6 +218,7 @@ fn owned_transcription_result_value(result: TranscriptionResult) -> serde_json::
         language,
         segments,
         acceleration,
+        diarization,
         raw_output,
         artifact_paths,
     } = result;
@@ -245,6 +246,7 @@ fn owned_transcription_result_value(result: TranscriptionResult) -> serde_json::
             None => Value::Null,
         },
     );
+    object.insert("diarization".to_owned(), serde_json::to_value(diarization)?);
     object.insert("raw_output".to_owned(), raw_output);
     object.insert(
         "artifact_paths".to_owned(),
