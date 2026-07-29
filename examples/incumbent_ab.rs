@@ -56,6 +56,11 @@
 //! remain at or below 20% busy at preflight and immediately before measurement.
 //! A post-measurement sample is part of the verdict, so a competitor arriving
 //! during the final arm cannot leave a bankable result.
+//! Cross-engine rows also fail closed unless every online CPU reports one
+//! uniform scaling driver and the `performance` governor. The complete
+//! per-value CPU grouping, including `energy_performance_preference` when the
+//! driver exposes it, is emitted as provenance: boost-on-demand policies can
+//! affect the two engines differently even on an otherwise idle host.
 //! Each whole-job row also records host RAM/NUMA topology and distinguishes
 //! requested/configured pool width from threads independently observed
 //! consuming CPU ticks under `/proc/<pid>/task`.
@@ -177,6 +182,123 @@ impl HostWideQuiescence {
             .map(|(cpu, busy)| format!("cpu{cpu}={:.1}%", busy * 100.0))
             .collect()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CpuPolicyField {
+    by_value: BTreeMap<String, Vec<usize>>,
+    unavailable_cpus: Vec<usize>,
+}
+
+impl CpuPolicyField {
+    fn is_complete_uniform(&self, online_cpu_count: usize) -> bool {
+        self.unavailable_cpus.is_empty()
+            && self.by_value.len() == 1
+            && self
+                .by_value
+                .values()
+                .next()
+                .is_some_and(|cpus| cpus.len() == online_cpu_count)
+    }
+
+    fn uniform_value(&self, online_cpu_count: usize) -> Option<&str> {
+        if self.is_complete_uniform(online_cpu_count) {
+            self.by_value.keys().next().map(String::as_str)
+        } else {
+            None
+        }
+    }
+
+    fn as_json(&self, online_cpu_count: usize) -> Value {
+        json!({
+            "online_cpu_count": online_cpu_count,
+            "observed_cpu_count": online_cpu_count.saturating_sub(self.unavailable_cpus.len()),
+            "uniform": self.is_complete_uniform(online_cpu_count),
+            "by_value": &self.by_value,
+            "unavailable_cpus": &self.unavailable_cpus,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CpuFrequencyPolicy {
+    scaling_driver: CpuPolicyField,
+    scaling_governor: CpuPolicyField,
+    energy_performance_preference: CpuPolicyField,
+}
+
+impl CpuFrequencyPolicy {
+    fn observe(online: &BTreeSet<usize>) -> Self {
+        Self {
+            scaling_driver: read_cpu_policy_field(online, "scaling_driver"),
+            scaling_governor: read_cpu_policy_field(online, "scaling_governor"),
+            energy_performance_preference: read_cpu_policy_field(
+                online,
+                "energy_performance_preference",
+            ),
+        }
+    }
+
+    fn benchmark_clear(&self, online_cpu_count: usize) -> bool {
+        let driver_clear = self.scaling_driver.is_complete_uniform(online_cpu_count);
+        let governor_clear =
+            self.scaling_governor.uniform_value(online_cpu_count) == Some("performance");
+        driver_clear && governor_clear
+    }
+
+    fn as_json(&self, online_cpu_count: usize) -> Value {
+        json!({
+            "required_scaling_governor": "performance",
+            "energy_performance_preference_is_provenance_only": true,
+            "scaling_driver": self.scaling_driver.as_json(online_cpu_count),
+            "scaling_governor": self.scaling_governor.as_json(online_cpu_count),
+            "energy_performance_preference": self
+                .energy_performance_preference
+                .as_json(online_cpu_count),
+            "benchmark_clear": self.benchmark_clear(online_cpu_count),
+        })
+    }
+}
+
+fn group_cpu_policy_field(
+    samples: impl IntoIterator<Item = (usize, Option<String>)>,
+) -> CpuPolicyField {
+    let mut by_value: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut unavailable_cpus = Vec::new();
+    for (cpu, value) in samples {
+        match value.filter(|value| !value.is_empty()) {
+            Some(value) => by_value.entry(value).or_default().push(cpu),
+            None => unavailable_cpus.push(cpu),
+        }
+    }
+    CpuPolicyField {
+        by_value,
+        unavailable_cpus,
+    }
+}
+
+fn read_cpu_policy_field(online: &BTreeSet<usize>, field: &str) -> CpuPolicyField {
+    group_cpu_policy_field(online.iter().map(|cpu| {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/{field}");
+        let value = std::fs::read_to_string(path)
+            .ok()
+            .map(|value| value.trim().to_owned());
+        (*cpu, value)
+    }))
+}
+
+fn require_cpu_frequency_policy(policy: &CpuFrequencyPolicy, online_cpu_count: usize) -> bool {
+    let clear = policy.benchmark_clear(online_cpu_count);
+    println!(
+        "INCUMBENT_AB_CPU_FREQUENCY_POLICY {}",
+        policy.as_json(online_cpu_count)
+    );
+    assert!(
+        clear,
+        "competitive benchmark requires one uniform scaling driver and the performance \
+         governor on every online CPU"
+    );
+    clear
 }
 
 impl ExternalCpuActivity {
@@ -398,7 +520,7 @@ fn runtime_isa() -> Vec<&'static str> {
     features
 }
 
-fn host_provenance() -> Value {
+fn host_provenance(cpu_frequency_policy: &CpuFrequencyPolicy, online_cpu_count: usize) -> Value {
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|value| value.trim().to_owned())
         .unwrap_or_else(|_| "unavailable".to_owned());
@@ -416,6 +538,7 @@ fn host_provenance() -> Value {
         "affinity_cpus_allowed": proc_status_value("Cpus_allowed_list"),
         "cpuset_effective": cpuset_effective,
         "runtime_isa": runtime_isa(),
+        "cpu_frequency_policy": cpu_frequency_policy.as_json(online_cpu_count),
     })
 }
 
@@ -1265,7 +1388,13 @@ fn main() {
         model_path.display()
     );
     println!("audio_sha256={} {}", sha256_file(Path::new(&wav)), wav);
-    println!("INCUMBENT_AB_HOST {}", host_provenance());
+    let host_online_cpus = online_cpus().expect("read host online CPU topology");
+    let host_allowed_cpus = self_allowed_cpus().expect("read harness CPU affinity");
+    let cpu_frequency_policy = CpuFrequencyPolicy::observe(&host_online_cpus);
+    println!(
+        "INCUMBENT_AB_HOST {}",
+        host_provenance(&cpu_frequency_policy, host_online_cpus.len())
+    );
     println!(
         "INCUMBENT_AB_CONFIG workload={workload:?} rounds={rounds} order=alternating \
          wav={wav} audio_sec={:.1} requested_threads={threads} timestamps={timestamps} \
@@ -1278,13 +1407,13 @@ fn main() {
                 "process_wall_including_startup_model_audio_io_inference_serialization_teardown",
         },
     );
+    let cpu_frequency_policy_clear =
+        require_cpu_frequency_policy(&cpu_frequency_policy, host_online_cpus.len());
 
     // This is a harness requirement, not a booking convention. Sampling all
     // online CPUs (rather than only the current affinity mask) prevents
     // `taskset` or a cpuset cap from hiding a host-wide memory-bandwidth
     // competitor on CPUs the harness itself cannot schedule on.
-    let host_online_cpus = online_cpus().expect("read host online CPU topology");
-    let host_allowed_cpus = self_allowed_cpus().expect("read harness CPU affinity");
     let host_preflight =
         require_host_wide_quiescence("preflight", &host_online_cpus, &host_allowed_cpus);
 
@@ -1538,6 +1667,7 @@ fn main() {
         || !load_split_clear
         || !external_host_clear
         || !host_wide_clear
+        || !cpu_frequency_policy_clear
     {
         "UNDECIDABLE"
     } else if cmp_med > required && cmp_lo > 1.0 {
@@ -1555,6 +1685,7 @@ fn main() {
          load_split_clear={load_split_clear} quality_clear={quality_clear} \
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
          host_wide_clear={host_wide_clear} \
+         cpu_frequency_policy_clear={cpu_frequency_policy_clear} \
          cv_is_provenance_only=true class=vs_incumbent verdict={verdict}"
     );
 }
@@ -1581,6 +1712,61 @@ mod tests {
         assert!(split_by_covariate(&[1.0, 2.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, 2.0, 3.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]).is_none());
+    }
+
+    #[test]
+    fn cpu_policy_grouping_requires_complete_uniform_values() {
+        let uniform = group_cpu_policy_field([
+            (0, Some("performance".to_owned())),
+            (1, Some("performance".to_owned())),
+            (2, Some("performance".to_owned())),
+        ]);
+        assert!(uniform.is_complete_uniform(3));
+        assert_eq!(uniform.uniform_value(3), Some("performance"));
+        assert_eq!(
+            uniform.as_json(3)["by_value"]["performance"],
+            json!([0, 1, 2])
+        );
+
+        let mixed = group_cpu_policy_field([
+            (0, Some("performance".to_owned())),
+            (1, Some("powersave".to_owned())),
+        ]);
+        assert!(!mixed.is_complete_uniform(2));
+        assert_eq!(mixed.uniform_value(2), None);
+
+        let missing = group_cpu_policy_field([(0, Some("performance".to_owned())), (1, None)]);
+        assert!(!missing.is_complete_uniform(2));
+        assert_eq!(missing.as_json(2)["unavailable_cpus"], json!([1]));
+    }
+
+    #[test]
+    fn cpu_frequency_policy_requires_performance_and_records_epp_without_gating_it() {
+        let policy = CpuFrequencyPolicy {
+            scaling_driver: group_cpu_policy_field([
+                (0, Some("amd-pstate-epp".to_owned())),
+                (1, Some("amd-pstate-epp".to_owned())),
+            ]),
+            scaling_governor: group_cpu_policy_field([
+                (0, Some("performance".to_owned())),
+                (1, Some("performance".to_owned())),
+            ]),
+            energy_performance_preference: group_cpu_policy_field([
+                (0, Some("balance_performance".to_owned())),
+                (1, Some("balance_performance".to_owned())),
+            ]),
+        };
+        assert!(policy.benchmark_clear(2));
+
+        let powersave = CpuFrequencyPolicy {
+            scaling_driver: policy.scaling_driver,
+            scaling_governor: group_cpu_policy_field([
+                (0, Some("powersave".to_owned())),
+                (1, Some("powersave".to_owned())),
+            ]),
+            energy_performance_preference: policy.energy_performance_preference,
+        };
+        assert!(!powersave.benchmark_clear(2));
     }
 
     #[test]
@@ -1733,7 +1919,9 @@ diagnostic line\n\
 
     #[test]
     fn host_provenance_includes_ram_and_numa_topology() {
-        let provenance = host_provenance();
+        let online = online_cpus().expect("online CPUs");
+        let policy = CpuFrequencyPolicy::observe(&online);
+        let provenance = host_provenance(&policy, online.len());
 
         assert!(
             provenance["ram_bytes"]
@@ -1744,6 +1932,10 @@ diagnostic line\n\
             provenance["numa_nodes"]
                 .as_u64()
                 .is_some_and(|nodes| nodes > 0)
+        );
+        assert_eq!(
+            provenance["cpu_frequency_policy"]["scaling_governor"]["online_cpu_count"],
+            json!(online.len())
         );
     }
 }

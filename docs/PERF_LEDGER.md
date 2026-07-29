@@ -27,6 +27,26 @@ language. All historical franken-before/franken-after rows are maintenance
 self-speedups under this convention regardless of older wording. Public
 competitive claims may cite only `INCUMBENT-WIN / CAMPAIGN WIN` rows.
 
+## Competitive host provenance (effective 2026-07-29)
+
+Every new competitive baseline must record host identity, physical cores,
+logical threads, RAM, NUMA count, runtime ISA, affinity/cpuset, requested
+threads, and actually observed active threads for both engines. On Linux it
+must additionally record the scaling driver, scaling governor, and
+`energy_performance_preference` (when exposed) across **every online CPU**.
+Missing or heterogeneous driver/governor coverage is inadmissible, and an
+absolute cross-engine throughput claim requires a uniform `performance`
+governor. A `powersave` run may support profile attribution or a diagnostic
+paired ratio, but not a campaign win: load-triggered boost can affect the two
+engines differently.
+
+The host must also pass the harness's binding exclusivity checks: every online
+CPU at or below 20% busy in the preflight and immediate pre-measurement
+samples, a clear post-measurement sample, and no persistent external process
+above 0.1 CPU core between arms. These are formal verdict inputs alongside the
+same-invocation dual A/A controls, bootstrap median-CI 2x-null-margin gate, and
+independent load split. `cv` remains provenance only.
+
 ## 2026-07-27 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — tiny.en seg-TS certified against live whisper.cpp: **1.415×** (bd-c9uv)
 
 **Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
