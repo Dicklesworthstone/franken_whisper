@@ -47,7 +47,10 @@
 //! decidable only when the comparison median lies outside **both** null CI95s
 //! with a 2× margin, and when the comparison medians from independently
 //! sampled lighter- and heavier-load rounds differ by at most 0.1×. `cv` is
-//! recorded as provenance and decides nothing.
+//! recorded as provenance and decides nothing. Whole-job runs also census
+//! persistent non-harness processes between every arm: a process consuming more
+//! than 0.1 CPU core makes the result undecidable, because steady cross-tool
+//! load bias can survive both numerical controls.
 //!
 //! ## Usage
 //!
@@ -60,7 +63,7 @@
 //! FW_WORKLOAD_NAME=meeting-text-only       (ledger-facing workload identity)
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -74,6 +77,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_LOAD_SPLIT_GAP: f64 = 0.1;
 const MAX_CROSS_ENGINE_WER: f64 = 0.1;
+const MAX_EXTERNAL_CPU_CORE_FRACTION: f64 = 0.1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BenchScope {
@@ -109,6 +113,67 @@ struct Observation {
     transcript: String,
     transcript_sha256: String,
     actual_threads: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessCpu {
+    ticks: u64,
+    command: String,
+}
+
+#[derive(Debug)]
+struct ProcessSample {
+    captured: Instant,
+    by_pid: BTreeMap<u32, ProcessCpu>,
+}
+
+#[derive(Debug, Default)]
+struct ExternalCpuActivity {
+    max_core_fraction: f64,
+    pid: u32,
+    command: String,
+    checkpoint: String,
+    intervals: usize,
+}
+
+impl ExternalCpuActivity {
+    fn observe(
+        &mut self,
+        previous: &ProcessSample,
+        current: &ProcessSample,
+        excluded_pids: &BTreeSet<u32>,
+        clock_ticks_per_second: f64,
+        checkpoint: &str,
+    ) {
+        self.intervals += 1;
+        let elapsed = current
+            .captured
+            .duration_since(previous.captured)
+            .as_secs_f64();
+        if elapsed <= 0.0 || clock_ticks_per_second <= 0.0 {
+            return;
+        }
+        for (pid, current_cpu) in &current.by_pid {
+            if excluded_pids.contains(pid) {
+                continue;
+            }
+            // A process first observed at this checkpoint started during the
+            // interval (or raced the earlier `/proc` scan). Treating its prior
+            // ticks as zero gives a conservative lower bound on interval CPU
+            // use and prevents a competitor launched during the final arm from
+            // escaping the gate.
+            let previous_ticks = previous.by_pid.get(pid).map_or(0, |cpu| cpu.ticks);
+            let delta_ticks = current_cpu.ticks.saturating_sub(previous_ticks);
+            let core_fraction = delta_ticks as f64 / clock_ticks_per_second / elapsed;
+            if core_fraction > self.max_core_fraction {
+                self.max_core_fraction = core_fraction;
+                self.pid = *pid;
+                self.command.clone_from(&current_cpu.command);
+                self.checkpoint.clear();
+                self.checkpoint.push_str(checkpoint);
+            }
+        }
+    }
 }
 
 /// Read a PCM16 WAV into mono f32. Mirrors `e2e_probe`'s reader.
@@ -277,6 +342,84 @@ fn host_provenance() -> Value {
         "cpuset_effective": cpuset_effective,
         "runtime_isa": runtime_isa(),
     })
+}
+
+fn parse_proc_stat(text: &str) -> Option<(u32, u64)> {
+    // The command is parenthesized and may itself contain spaces or `)`, so the
+    // final `) ` is the only safe boundary before the fixed-position fields.
+    let command_end = text.rfind(") ")?;
+    let fields: Vec<&str> = text[command_end + 2..].split_whitespace().collect();
+    let parent_pid = fields.get(1)?.parse().ok()?;
+    let user_ticks: u64 = fields.get(11)?.parse().ok()?;
+    let system_ticks: u64 = fields.get(12)?.parse().ok()?;
+    Some((parent_pid, user_ticks.saturating_add(system_ticks)))
+}
+
+fn process_sample() -> ProcessSample {
+    let mut by_pid = BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|value| value.parse::<u32>().ok()) else {
+                continue;
+            };
+            let path = entry.path();
+            let Some((_, ticks)) = std::fs::read_to_string(path.join("stat"))
+                .ok()
+                .and_then(|text| parse_proc_stat(&text))
+            else {
+                continue;
+            };
+            let command = std::fs::read_to_string(path.join("comm"))
+                .map(|value| value.trim().to_owned())
+                .unwrap_or_else(|_| "unavailable".to_owned());
+            by_pid.insert(pid, ProcessCpu { ticks, command });
+        }
+    }
+    ProcessSample {
+        captured: Instant::now(),
+        by_pid,
+    }
+}
+
+fn process_ancestry() -> BTreeSet<u32> {
+    let mut excluded = BTreeSet::new();
+    let mut pid = std::process::id();
+    for _ in 0..64 {
+        if pid == 0 || !excluded.insert(pid) {
+            break;
+        }
+        let Some((parent_pid, _)) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|text| parse_proc_stat(&text))
+        else {
+            break;
+        };
+        pid = parent_pid;
+    }
+    excluded
+}
+
+fn clock_ticks_per_second() -> f64 {
+    Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|ticks: &f64| ticks.is_finite() && *ticks > 0.0)
+        .unwrap_or(100.0)
+}
+
+fn run_then_checkpoint<F, G>(run: &F, checkpoint: &mut G, label: &str) -> Observation
+where
+    F: Fn() -> Observation,
+    G: FnMut(&str),
+{
+    let observation = run();
+    checkpoint(label);
+    observation
 }
 
 /// Independent host-load covariate sampled before each measured round.
@@ -728,9 +871,29 @@ fn main() {
         },
     );
 
+    // Whole-job evidence additionally requires a quiet host. A steady competing
+    // workload can bias the two tools differently while still passing both A/A
+    // nulls and a load-split check. Sample every persistent process between arms
+    // and gate on the busiest non-harness process's CPU use.
+    let excluded_pids = process_ancestry();
+    let clock_ticks_per_second = clock_ticks_per_second();
+    let mut external_activity = ExternalCpuActivity::default();
+    let mut last_process_sample = process_sample();
+    let mut checkpoint = |label: &str| {
+        let current = process_sample();
+        external_activity.observe(
+            &last_process_sample,
+            &current,
+            &excluded_pids,
+            clock_ticks_per_second,
+            label,
+        );
+        last_process_sample = current;
+    };
+
     // Warm both engines once; neither warm-up is timed.
-    let fw_warm = run_franken();
-    let wc_warm = run_whisper();
+    let fw_warm = run_then_checkpoint(&run_franken, &mut checkpoint, "warm_franken");
+    let wc_warm = run_then_checkpoint(&run_whisper, &mut checkpoint, "warm_incumbent");
     let wer = word_error_rate(&wc_warm.transcript, &fw_warm.transcript);
     let quality_clear = wer.wer <= MAX_CROSS_ENGINE_WER;
     let thread_clear = !enforce_matched_threads
@@ -803,23 +966,55 @@ fn main() {
         pre_round_load1.push(load_average_1m());
         // Alternate which engine runs first so monotonic drift hits both equally.
         let (fw_a, wc_a) = if round % 2 == 0 {
-            let fw = run_franken_checked();
-            let wc = run_whisper_checked();
+            let fw = run_then_checkpoint(
+                &run_franken_checked,
+                &mut checkpoint,
+                &format!("round_{round}_franken_a"),
+            );
+            let wc = run_then_checkpoint(
+                &run_whisper_checked,
+                &mut checkpoint,
+                &format!("round_{round}_incumbent_a"),
+            );
             (fw, wc)
         } else {
-            let wc = run_whisper_checked();
-            let fw = run_franken_checked();
+            let wc = run_then_checkpoint(
+                &run_whisper_checked,
+                &mut checkpoint,
+                &format!("round_{round}_incumbent_a"),
+            );
+            let fw = run_then_checkpoint(
+                &run_franken_checked,
+                &mut checkpoint,
+                &format!("round_{round}_franken_a"),
+            );
             (fw, wc)
         };
         // Second observation of each engine, opposite order: pairs with the
         // first to form each arm's own A/A null inside this same invocation.
         let (fw_b, wc_b) = if round % 2 == 0 {
-            let wc = run_whisper_checked();
-            let fw = run_franken_checked();
+            let wc = run_then_checkpoint(
+                &run_whisper_checked,
+                &mut checkpoint,
+                &format!("round_{round}_incumbent_b"),
+            );
+            let fw = run_then_checkpoint(
+                &run_franken_checked,
+                &mut checkpoint,
+                &format!("round_{round}_franken_b"),
+            );
             (fw, wc)
         } else {
-            let fw = run_franken_checked();
-            let wc = run_whisper_checked();
+            let fw = run_then_checkpoint(
+                &run_franken_checked,
+                &mut checkpoint,
+                &format!("round_{round}_franken_b"),
+            );
+            let wc = run_then_checkpoint(
+                &run_whisper_checked,
+                &mut checkpoint,
+                &format!("round_{round}_incumbent_b"),
+            );
             (fw, wc)
         };
 
@@ -829,6 +1024,7 @@ fn main() {
         fw_ms.push(fw_a.measured_ms);
         wc_ms.push(wc_a.measured_ms);
     }
+    drop(checkpoint);
 
     println!(
         "INCUMBENT_AB_TIMES fw_median_ms={:.3} wc_median_ms={:.3}",
@@ -846,6 +1042,20 @@ fn main() {
     println!("INCUMBENT_AB_RAW null_fw={fw_null:?}");
     println!("INCUMBENT_AB_RAW null_wc={wc_null:?}");
     println!("INCUMBENT_AB_RAW pre_round_load1={pre_round_load1:?}");
+    let external_host_clear = scope != BenchScope::WholeJob
+        || external_activity.max_core_fraction <= MAX_EXTERNAL_CPU_CORE_FRACTION;
+    println!(
+        "INCUMBENT_AB_EXTERNAL_CPU max_core_fraction={:.6} max_allowed={:.6} \
+         pid={} command={:?} checkpoint={:?} intervals={} \
+         enforced={} external_host_clear={external_host_clear}",
+        external_activity.max_core_fraction,
+        MAX_EXTERNAL_CPU_CORE_FRACTION,
+        external_activity.pid,
+        external_activity.command,
+        external_activity.checkpoint,
+        external_activity.intervals,
+        scope == BenchScope::WholeJob,
+    );
     // This is part of the verdict, not commentary: differential load
     // sensitivity can survive order alternation and bias the cross-tool ratio.
     // The gate uses the independent pre-round load sample. Total arm cost is
@@ -878,7 +1088,7 @@ fn main() {
     let wc_half = (wc_hi - 1.0).abs().max((1.0 - wc_lo).abs());
     let required = 1.0 + 2.0 * fw_half.max(wc_half);
     let load_split_clear = load_split_gap <= MAX_LOAD_SPLIT_GAP;
-    let verdict = if !quality_clear || !thread_clear || !load_split_clear {
+    let verdict = if !quality_clear || !thread_clear || !load_split_clear || !external_host_clear {
         "UNDECIDABLE"
     } else if cmp_med > required && cmp_lo > 1.0 {
         "WIN"
@@ -893,7 +1103,7 @@ fn main() {
          compare_median={cmp_med:.6} compare_ci95=[{cmp_lo:.6},{cmp_hi:.6}] \
          load_split_gap={load_split_gap:.6} load_split_max={MAX_LOAD_SPLIT_GAP:.6} \
          load_split_clear={load_split_clear} quality_clear={quality_clear} \
-         thread_clear={thread_clear} \
+         thread_clear={thread_clear} external_host_clear={external_host_clear} \
          cv_is_provenance_only=true class=vs_incumbent verdict={verdict}"
     );
 }
@@ -920,6 +1130,70 @@ mod tests {
         assert!(split_by_covariate(&[1.0, 2.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, 2.0, 3.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]).is_none());
+    }
+
+    #[test]
+    fn proc_stat_parser_handles_spaces_and_parentheses_in_command() {
+        let stat = "123 (bench worker (phase)) R 42 0 0 0 0 0 0 0 0 0 150 25";
+        assert_eq!(parse_proc_stat(stat), Some((42, 175)));
+        assert_eq!(parse_proc_stat("malformed"), None);
+    }
+
+    #[test]
+    fn external_cpu_activity_reports_busiest_non_ancestor() {
+        let start = Instant::now();
+        let previous = ProcessSample {
+            captured: start,
+            by_pid: BTreeMap::from([
+                (
+                    7,
+                    ProcessCpu {
+                        ticks: 100,
+                        command: "competitor".to_owned(),
+                    },
+                ),
+                (
+                    8,
+                    ProcessCpu {
+                        ticks: 100,
+                        command: "ancestor".to_owned(),
+                    },
+                ),
+            ]),
+        };
+        let current = ProcessSample {
+            captured: start + std::time::Duration::from_secs(2),
+            by_pid: BTreeMap::from([
+                (
+                    7,
+                    ProcessCpu {
+                        ticks: 170,
+                        command: "competitor".to_owned(),
+                    },
+                ),
+                (
+                    8,
+                    ProcessCpu {
+                        ticks: 500,
+                        command: "ancestor".to_owned(),
+                    },
+                ),
+            ]),
+        };
+        let mut activity = ExternalCpuActivity::default();
+        activity.observe(
+            &previous,
+            &current,
+            &BTreeSet::from([8]),
+            100.0,
+            "after_franken",
+        );
+
+        assert!((activity.max_core_fraction - 0.35).abs() < f64::EPSILON);
+        assert_eq!(activity.pid, 7);
+        assert_eq!(activity.command, "competitor");
+        assert_eq!(activity.checkpoint, "after_franken");
+        assert_eq!(activity.intervals, 1);
     }
 
     #[test]
