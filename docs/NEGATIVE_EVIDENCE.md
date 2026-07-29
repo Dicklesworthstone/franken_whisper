@@ -4,6 +4,49 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-29 - OliveIsland: **HARNESS PREFLIGHT / NO MEASUREMENT — host-wide benchmark exclusivity is now binding, and the first live preflight correctly refused a busy host before either arm ran.**
+
+`examples/incumbent_ab.rs` now copies FrankenFS's binding quiescence
+requirement: sample `/proc/stat` for 300 ms and require every online logical CPU
+to remain at or below 20% busy. Franken Whisper deliberately checks **all
+online CPUs**, not only the harness's current affinity mask, so `taskset` or a
+cpuset cannot hide a benchmark, compiler, or memory-bandwidth competitor on
+the rest of the host. The preflight and immediate pre-measurement samples abort
+before timed arms; the post-measurement sample is part of the formal
+`INCUMBENT_AB_GATE`. The existing per-process census remains in force between
+every arm and refuses a persistent external process above 0.1 CPU core.
+
+The release ELF self-reported SHA-256
+`b7ca477459fd3b7f6a6b37b9a66e2fb90bd3c67517a3ee4ec8d46d4202795733`.
+On host `thinkstation1` (32 physical cores / 64 logical threads, affinity and
+effective cpuset `0-63`) a requested 16-thread, whole-job tiny.en
+segment-timestamp re-certification sampled all 64 online CPUs, observed
+`cpu22=90.0%` and `cpu48=100.0%`, printed `clear=false`, and aborted before
+warmup or either measured engine arm. No ratio or performance verdict exists
+for this attempt. The exact audio SHA-256 was
+`a21dcd888ae070381189e869e54de39c66fc65f1b9ad50a54a8cf14369930e9e`;
+the tiny.en model SHA-256 was
+`921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`;
+the whisper.cpp binary SHA-256 was
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`.
+The preserved log is
+`/data/tmp/fw-realistic-phase2-trj-logs/thinkstation1_preflight_b7ca477459fd.log`.
+
+This mechanically enforces the lesson from the invalidated, trj-overlapped
+Phase 2 rows already recorded below: order alternation, two numerical A/A
+controls, and a load-split gate do not prove that a steady competitor degrades
+both engines equally.
+
+**Concrete retry predicate:** re-run only on a host where both fail-closed
+pre-arm samples cover every online CPU and keep each one at or below 20% busy,
+the post-arm sample is also clear, and the between-arm process census sees no
+external process above 0.1 CPU core. On `trj`, additionally require the active
+`trj-booking` claim rather than a queue position. Preserve the same ELF/model/
+audio/incumbent hashes, alternating order, per-engine A/A controls, matched
+configured threads, observed-thread reporting, WER gate, and bootstrap
+median-CI 2x-null-margin decision.
+
+---
 ## 2026-07-29 - OliveIsland: **NO ADMISSIBLE VERDICT — a steady competing benchmark survives interleaving, both numerical A/A controls, and the load-split gate; process-level host exclusivity is therefore a binding prerequisite for the Phase 2 whole-job sweep.**
 
 The first `large-v3-turbo`, 124.5-second, text-only whole-job cell printed a
