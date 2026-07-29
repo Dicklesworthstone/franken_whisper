@@ -144,6 +144,7 @@ fn build_report(run_id: &str, n_segments: usize, n_events: usize) -> RunReport {
             language: Some("en".to_owned()),
             segments,
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({"bench": true}),
             artifact_paths: vec![],
         },

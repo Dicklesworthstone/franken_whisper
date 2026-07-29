@@ -6665,6 +6665,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: self.segments.clone(),
                 acceleration: None,
+                diarization: None,
                 raw_output: serde_json::json!({}),
                 artifact_paths: vec![],
             })
@@ -8018,6 +8019,7 @@ mod tests {
             language: Some("en".to_owned()),
             segments,
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: vec![],
         }
@@ -9553,6 +9555,7 @@ mod tests {
                 confidence: None,
             }],
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: vec![],
         };
@@ -9568,6 +9571,7 @@ mod tests {
                 confidence: None,
             }],
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: vec![],
         };

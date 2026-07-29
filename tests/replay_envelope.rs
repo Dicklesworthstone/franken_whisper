@@ -44,6 +44,7 @@ fn fixture_report(id: &str, db_path: &std::path::Path, replay: ReplayEnvelope) -
                 confidence: Some(0.91),
             }],
             acceleration: None,
+            diarization: None,
             raw_output: json!({"text":"hello"}),
             artifact_paths: vec![],
         },
