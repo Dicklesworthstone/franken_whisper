@@ -1664,6 +1664,7 @@ mod enabled {
                     language: Some("en".to_owned()),
                     segments,
                     acceleration: None,
+                    diarization: None,
                     raw_output: json!({"test": true}),
                     artifact_paths: vec![],
                 },

@@ -320,6 +320,7 @@ mod tests {
                 confidence: None,
             }],
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: vec![],
         };
@@ -360,6 +361,7 @@ mod tests {
                 })
                 .collect(),
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: Vec::new(),
         };
@@ -454,6 +456,7 @@ mod tests {
                 })
                 .collect(),
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: Vec::new(),
         };
@@ -755,6 +758,7 @@ mod tests {
                 },
             ],
             acceleration: None,
+            diarization: None,
             raw_output: serde_json::json!({}),
             artifact_paths: vec![],
         };

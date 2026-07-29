@@ -441,6 +441,7 @@ mod tests {
                 language: Some("en".to_owned()),
                 segments: vec![],
                 acceleration: None,
+                diarization: None,
                 raw_output: json!({}),
                 artifact_paths: vec![],
             },

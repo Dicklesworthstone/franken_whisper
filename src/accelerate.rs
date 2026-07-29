@@ -1422,6 +1422,7 @@ mod tests {
                 },
             ],
             acceleration: None,
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: vec![],
         };
@@ -1450,6 +1451,7 @@ mod tests {
             language: None,
             segments: vec![],
             acceleration: None,
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: vec![],
         };
@@ -1489,6 +1491,7 @@ mod tests {
             language: None,
             segments,
             acceleration: None,
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: vec![],
         }
@@ -4517,6 +4520,7 @@ mod tests {
                 speaker: None,
             }],
             acceleration: None,
+            diarization: None,
             raw_output: json!({}),
             artifact_paths: vec![],
         };
