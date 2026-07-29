@@ -189,6 +189,10 @@ impl RunStore {
         ))
     }
 
+    pub(crate) fn connection(&self) -> &BlockingConnection {
+        &self.connection
+    }
+
     pub fn persist_report(&self, report: &RunReport) -> FwResult<()> {
         self.persist_report_cancellable(report, None)
     }
@@ -739,7 +743,7 @@ CREATE TABLE IF NOT EXISTS _meta (
             if has_replay && has_acceleration {
                 self.apply_migration(3)?;
                 self.ensure_diarization_indexes_v4()?;
-                self.rebuild_diarization_index_inner()?;
+                self.rebuild_diarization_index()?;
                 self.set_schema_version(4)?;
                 current = 4;
             }
@@ -2555,6 +2559,47 @@ mod tests {
                 "{table} must contain only canonical runs after rebuild"
             );
         }
+    }
+
+    #[test]
+    fn markerless_rebuild_failure_preserves_existing_derived_index() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("markerless-rebuild.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-markerless-rebuild", &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        store.persist_report(&report).expect("persist");
+        assert_eq!(table_row_count(&store, "diarization_reports"), 1);
+
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET request_json = 'not-json' \
+                 WHERE id = 'run-markerless-rebuild';",
+            )
+            .expect("corrupt canonical request fixture");
+        store
+            .connection
+            .execute("DELETE FROM _meta WHERE key = 'schema_version';")
+            .expect("remove schema marker");
+        drop(store);
+
+        let error = RunStore::open(&db_path).expect_err("canonical rebuild must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot rebuild diarization request")
+        );
+        let connection =
+            BlockingConnection::open(db_path.display().to_string()).expect("inspect database");
+        let rows = connection
+            .query("SELECT COUNT(*) FROM diarization_reports;")
+            .expect("derived row count");
+        assert_eq!(
+            value_to_string(rows[0].get(0)),
+            "1",
+            "failed markerless migration must roll back derived-index deletion"
+        );
     }
 
     #[test]
