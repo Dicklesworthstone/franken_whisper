@@ -22,7 +22,7 @@ privacy, and bounded-resource contract that the ASR contract lacks.
 ## 2. Canonical data flow
 
 ```text
-normalized 16 kHz mono PCM
+normalized 16 kHz mono PCM with finite samples in the closed [-1.0, 1.0] range
     -> VAD and speech-quality mask
     -> 25 ms frames / 10 ms hop
     -> separate voice and channel features
@@ -156,7 +156,8 @@ cannot appear successful.
   linear-in-turns temporal refinement.
 - Stable labels place anchored references first, then unanchored speakers by
   earliest reliable occurrence and a total-order comparison of the compact
-  feature vector.
+  feature vector. Generated `SPEAKER_NN` labels never collide with an opaque
+  reference supplied by the caller.
 - Identical input, request, implementation, and feature schema produce
   byte-identical typed output in the deterministic implementation.
 
@@ -200,8 +201,8 @@ Every retained decision artifact records:
   parameter, and loss-matrix hashes;
 - change-score components and selected boundaries;
 - profile quality summaries and anchor use;
-- clustering merge trace, speaker-count candidates, cap pressure, and temporal
-  refinement settings;
+- selected-solution clustering merge trace, speaker-count candidates, cap
+  pressure, and temporal refinement settings;
 - assignment margins, confidence, unknown/overlap decisions, and fallback;
 - stage duration, RTF, allocations or peak memory, cancellation, and errors.
 

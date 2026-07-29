@@ -344,10 +344,10 @@ Output (one JSON object per line, schema `1.0.0`):
 
 ```json
 {"event":"run_start","schema_version":"1.0.0","request":{"input":"audio.mp3","backend":"auto"}}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":1,"stage":"ingest","code":"ingest.start","message":"materializing input"}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":2,"stage":"normalize","code":"normalize.ok","message":"audio normalized"}
-{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":3,"stage":"backend","code":"backend.routing.decision_contract","message":"routing decision","payload":{...}}
-{"event":"run_complete","schema_version":"1.0.0","run_id":"...","backend":"whisper_cpp","transcript":"Hello world..."}
+{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":1,"ts":"2026-07-28T00:00:00Z","stage":"ingest","code":"ingest.start","message":"materializing input","payload":{}}
+{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":2,"ts":"2026-07-28T00:00:01Z","stage":"normalize","code":"normalize.ok","message":"audio normalized","payload":{}}
+{"event":"stage","schema_version":"1.0.0","run_id":"...","seq":3,"ts":"2026-07-28T00:00:02Z","stage":"backend","code":"backend.routing.decision_contract","message":"routing decision","payload":{"chosen_action":"try_whisper_cpp"}}
+{"event":"run_complete","schema_version":"1.0.0","run_id":"...","trace_id":"...","started_at":"2026-07-28T00:00:00Z","finished_at":"2026-07-28T00:00:03Z","backend":"whisper_cpp","language":"en","transcript":"Hello world...","segments":[],"acceleration":null,"diarization":null,"warnings":[],"evidence":[]}
 ```
 
 ### 3. Speaker Diarization
@@ -478,7 +478,7 @@ The **JSON** sidecar carries the structured form — `video` metadata, `run` met
 | `--model <M>` | backend-specific | Model name or path forwarded to the engine |
 | `--language <L>` | auto-detect | Language hint (ISO 639-1) |
 | `--backend <B>` | `auto` | `auto`, `whisper-cpp`, `insanely-fast`, `whisper-diarization` |
-| `--diarize` | `false` | Speaker diarization (emits `SPEAKER_NN` labels) |
+| `--diarize` | `false` | Speaker diarization (generated `SPEAKER_NN` labels plus supplied opaque references; uncertain speech stays unlabeled) |
 | `--concurrency <N>` | `3` | Maximum concurrent downloads |
 | `--no-keep-audio` | `false` | Delete each audio file after its transcript is written |
 | `--no-retry` | `false` | Do not retry videos previously marked failed in the manifest |
@@ -706,7 +706,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
     {"name": "whisper.cpp", "available": true, "path": "/usr/local/bin/whisper-cli", "version": "1.7.2", "issues": []}
   ],
   "ffmpeg": {"name": "ffmpeg", "available": true, "path": "/usr/bin/ffmpeg", "version": null, "issues": []},
-  "database": {"name": "database", "available": true, "path": ".franken_whisper/storage.sqlite3", "version": "schema_v2", "issues": []},
+  "database": {"name": "database", "available": true, "path": ".franken_whisper/storage.sqlite3", "version": "schema_v4", "issues": []},
   "resources": {"disk_free_bytes": 12345, "disk_total_bytes": 67890, "memory_available_bytes": 11111, "memory_total_bytes": 22222},
   "overall_status": "ok"
 }
@@ -3938,7 +3938,8 @@ run_start         : event, schema_version, request
 run_error         : event, schema_version, code, message
 stage             : event, schema_version, run_id, seq, ts, stage, code, message, payload
 run_complete      : event, schema_version, run_id, trace_id, started_at, finished_at,
-                    backend, language, transcript, segments, acceleration, warnings, evidence
+                    backend, language, transcript, segments, acceleration, diarization,
+                    warnings, evidence
 backends.discovery: event, schema_version, backends
 routing_decision  : event, schema_version, run_id, ts, code
 transcript.partial: event, schema_version, run_id, seq, ts, text, start_sec, end_sec,
@@ -4468,7 +4469,7 @@ franken_whisper robot schema | jq '.events | keys'
 franken_whisper robot schema | jq '.events["run_complete"].required'
 # ["event", "schema_version", "run_id", "trace_id", "started_at",
 #  "finished_at", "backend", "language", "transcript", "segments",
-#  "acceleration", "warnings", "evidence"]
+#  "acceleration", "diarization", "warnings", "evidence"]
 
 franken_whisper robot schema | jq '.events["routing_decision"].payload'
 # describes the loss_matrix, posterior snapshot, calibration metrics,

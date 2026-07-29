@@ -1085,37 +1085,47 @@ fn import_inner(
     {
         fs::create_dir_all(parent)?;
     }
-    let connection = Connection::open(db_path.display().to_string())
-        .map_err(|error| FwError::Storage(error.to_string()))?;
-    ensure_schema(&connection)?;
+    let store = RunStore::open(db_path)?;
+    let connection = store.connection();
+    ensure_schema(connection)?;
 
     // Begin transaction
     connection
         .execute("BEGIN;")
         .map_err(|error| FwError::Storage(error.to_string()))?;
 
-    let result = import_tables(&connection, input_dir, &manifest, conflict_policy);
+    let result = import_tables(connection, input_dir, &manifest, conflict_policy);
 
     match result {
         Ok(import_result) => {
-            if !import_result.conflicts.is_empty() {
-                write_conflicts_file(input_dir, &import_result.conflicts)?;
-                if conflict_policy == ConflictPolicy::Reject {
+            let finalize = (|| -> FwResult<()> {
+                if !import_result.conflicts.is_empty() {
+                    write_conflicts_file(input_dir, &import_result.conflicts)?;
+                    if conflict_policy == ConflictPolicy::Reject {
+                        return Err(FwError::Storage(format!(
+                            "import rejected due to {} conflict(s); see sync_conflicts.jsonl",
+                            import_result.conflicts.len()
+                        )));
+                    }
+                }
+
+                // The normalized diarization tables are a derived cache, but
+                // they must advance atomically with their canonical run JSON.
+                // Rebuild inside this import transaction so malformed typed
+                // payloads cannot commit only the canonical half.
+                store.rebuild_diarization_index()?;
+                connection
+                    .execute("COMMIT;")
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            })();
+            match finalize {
+                Ok(()) => Ok(import_result),
+                Err(error) => {
                     let _ = connection.execute("ROLLBACK;");
-                    return Err(FwError::Storage(format!(
-                        "import rejected due to {} conflict(s); see sync_conflicts.jsonl",
-                        import_result.conflicts.len()
-                    )));
+                    Err(error)
                 }
             }
-
-            connection
-                .execute("COMMIT;")
-                .map_err(|error| FwError::Storage(error.to_string()))?;
-            drop(connection);
-            let store = RunStore::open(db_path)?;
-            store.rebuild_diarization_index()?;
-            Ok(import_result)
         }
         Err(error) => {
             let _ = connection.execute("ROLLBACK;");
@@ -3532,6 +3542,70 @@ mod tests {
         assert!(
             !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
             "canonical JSONL payload must not acquire reusable biometric vectors"
+        );
+    }
+
+    #[test]
+    fn diarization_rebuild_failure_rolls_back_canonical_import() {
+        let dir = tempdir().expect("tempdir");
+        let source_db = dir.path().join("source.sqlite3");
+        let target_db = dir.path().join("target.sqlite3");
+        let export_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let source_store = RunStore::open(&source_db).expect("source store");
+        let mut report = fixture_report("run-invalid-diarization-import", &source_db);
+        attach_fixture_diarization(&mut report);
+        source_store.persist_report(&report).expect("persist");
+        export(&source_db, &export_dir, &state_root).expect("export");
+
+        let runs_path = export_dir.join("runs.jsonl");
+        let line = fs::read_to_string(&runs_path).expect("runs jsonl");
+        let mut row: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("canonical run row");
+        let mut result: serde_json::Value = serde_json::from_str(
+            row["result_json"]
+                .as_str()
+                .expect("embedded result JSON string"),
+        )
+        .expect("embedded result JSON");
+        result["diarization"] = json!({"invalid": true});
+        row["result_json"] = json!(serde_json::to_string(&result).expect("serialize result"));
+        fs::write(
+            &runs_path,
+            format!("{}\n", serde_json::to_string(&row).expect("serialize row")),
+        )
+        .expect("rewrite runs JSONL");
+
+        let manifest_path = export_dir.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("manifest"))
+                .expect("manifest JSON");
+        manifest["checksums"]["runs_jsonl_sha256"] =
+            json!(sha256_file(&runs_path).expect("runs checksum"));
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("rewrite manifest");
+
+        let error = import(&target_db, &export_dir, &state_root, ConflictPolicy::Reject)
+            .expect_err("invalid derived payload must abort the whole import");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot rebuild diarization report")
+        );
+
+        let target =
+            BlockingConnection::open(target_db.display().to_string()).expect("target connection");
+        let rows = target
+            .query("SELECT COUNT(*) FROM runs;")
+            .expect("canonical run count");
+        assert_eq!(
+            value_to_string_sqlite(rows[0].get(0)),
+            "0",
+            "canonical rows must roll back with the derived-index rebuild"
         );
     }
 

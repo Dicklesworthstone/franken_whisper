@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
@@ -332,11 +333,36 @@ impl DiarizationRequest {
                 }
             }
         }
+
+        let hard_speaker_count = self
+            .known_intervals
+            .iter()
+            .filter(|hint| hint.policy == KnownSpeakerPolicy::HardMustLink)
+            .map(|hint| hint.speaker_ref.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let constrained_maximum = constraints.and_then(|constraints| {
+            constraints
+                .num_speakers
+                .or(constraints.max_speakers)
+                .map(|value| value as usize)
+        });
+        if let Some(maximum) = constrained_maximum
+            && maximum < hard_speaker_count
+        {
+            return Err(DiarizationValidationError {
+                code: DiarizationValidationCode::InvalidSpeakerConstraints,
+                message: format!(
+                    "speaker constraints permit at most {maximum} speakers but hard hints name {hard_speaker_count} distinct speakers"
+                ),
+                hint_index: None,
+            });
+        }
         Ok(())
     }
 }
 
-fn validate_speaker_constraints(
+pub(crate) fn validate_speaker_constraints(
     constraints: Option<&SpeakerConstraints>,
 ) -> Result<(), DiarizationValidationError> {
     let Some(constraints) = constraints else {
@@ -2942,6 +2968,29 @@ mod tests {
             DiarizationValidationCode::ContradictoryHardHints
         );
         assert_eq!(error.code.as_str(), "diarization.contradictory_hard_hints");
+    }
+
+    #[test]
+    fn speaker_constraints_cannot_merge_distinct_hard_references() {
+        let request = DiarizationRequest {
+            known_intervals: vec![
+                speaker_hint("near", 0, 400, KnownSpeakerPolicy::HardMustLink),
+                speaker_hint("remote", 600, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            ..DiarizationRequest::default()
+        };
+        let constraints = SpeakerConstraints {
+            max_speakers: Some(1),
+            ..SpeakerConstraints::default()
+        };
+        let error = request
+            .validate(1_000, Some(&constraints))
+            .expect_err("two immutable hard references cannot fit one speaker");
+        assert_eq!(
+            error.code,
+            DiarizationValidationCode::InvalidSpeakerConstraints
+        );
+        assert!(error.message.contains("2 distinct speakers"));
     }
 
     #[test]

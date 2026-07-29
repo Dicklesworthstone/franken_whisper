@@ -624,6 +624,8 @@ const ENVELOPE_BANDS: usize = 12;
 const CEPSTRAL_COEFFICIENTS: usize = 6;
 const POWER_EPSILON: f32 = 1e-20;
 const PCM_EPSILON: f32 = 1e-12;
+const MAX_ABS_ACOUSTIC_FEATURE: f32 = 1_000_000.0;
+const MAX_ACOUSTIC_VARIANCE: f32 = MAX_ABS_ACOUSTIC_FEATURE * MAX_ABS_ACOUSTIC_FEATURE;
 
 /// Vocal-source and vocal-tract evidence.
 ///
@@ -710,15 +712,23 @@ where
     S: FnMut(AcousticFrameFeatures) -> FwResult<()>,
     C: FnMut() -> bool,
 {
-    if samples.iter().any(|sample| !sample.is_finite()) {
-        return Err(FwError::InvalidRequest(
-            "acoustic feature input contains a non-finite PCM sample".to_owned(),
-        ));
-    }
     if is_cancelled() {
         return Err(FwError::Cancelled(
             "acoustic feature extraction cancelled before frame zero".to_owned(),
         ));
+    }
+    for sample in samples {
+        if !sample.is_finite() {
+            return Err(FwError::InvalidRequest(
+                "acoustic feature input contains a non-finite PCM sample".to_owned(),
+            ));
+        }
+        if !(-1.0..=1.0).contains(sample) {
+            return Err(FwError::InvalidRequest(
+                "acoustic feature input contains a PCM sample outside the normalized [-1, 1] range"
+                    .to_owned(),
+            ));
+        }
     }
 
     let frame_count = if samples.len() < ACOUSTIC_FRAME_SAMPLES {
@@ -1175,6 +1185,7 @@ impl<'a> AcousticSegmenter<'a> {
     }
 
     fn push(&mut self, frame: AcousticFrameFeatures) -> FwResult<()> {
+        validate_acoustic_frame(&frame)?;
         if let Some((previous_index, previous_start_ms)) = self.last_frame
             && (frame.frame_index != previous_index + 1 || frame.start_ms < previous_start_ms)
         {
@@ -1318,6 +1329,109 @@ where
         segmenter.push(frame)?;
     }
     segmenter.finish()
+}
+
+fn validate_acoustic_frame(frame: &AcousticFrameFeatures) -> FwResult<()> {
+    let start_sample = frame
+        .frame_index
+        .checked_mul(ACOUSTIC_HOP_SAMPLES)
+        .ok_or_else(|| {
+            FwError::InvalidRequest("acoustic frame index exceeds the v1 cadence range".to_owned())
+        })?;
+    let end_sample = start_sample
+        .checked_add(ACOUSTIC_FRAME_SAMPLES)
+        .ok_or_else(|| {
+            FwError::InvalidRequest("acoustic frame end exceeds the v1 cadence range".to_owned())
+        })?;
+    let expected_start_ms = checked_samples_to_ms(start_sample).ok_or_else(|| {
+        FwError::InvalidRequest("acoustic frame timestamp exceeds the v1 cadence range".to_owned())
+    })?;
+    let expected_end_ms = checked_samples_to_ms(end_sample).ok_or_else(|| {
+        FwError::InvalidRequest("acoustic frame timestamp exceeds the v1 cadence range".to_owned())
+    })?;
+    let f0_valid = frame
+        .voice
+        .f0_hz
+        .is_none_or(|value| value.is_finite() && (54.0..=401.0).contains(&value));
+    let unit_interval = |value: f32| value.is_finite() && (0.0..=1.0).contains(&value);
+    let bounded_scalar = |value: f32| value.is_finite() && value.abs() <= MAX_ABS_ACOUSTIC_FEATURE;
+    let bounded_voice = frame
+        .voice
+        .cepstral_envelope
+        .iter()
+        .chain(frame.voice.cepstral_delta.iter())
+        .copied()
+        .all(bounded_scalar);
+    let bounded_channel = [
+        frame.channel.rms_dbfs,
+        frame.channel.dynamics_above_noise_db,
+        frame.channel.spectral_centroid_hz,
+        frame.channel.spectral_bandwidth_hz,
+        frame.channel.spectral_rolloff_hz,
+        frame.channel.spectral_flatness,
+        frame.channel.spectral_tilt,
+        frame.channel.low_band_fraction,
+        frame.channel.mid_band_fraction,
+        frame.channel.high_band_fraction,
+        frame.channel.crest_factor,
+        frame.channel.clipping_fraction,
+        frame.channel.noise_floor_dbfs,
+        frame.channel.spectral_flux,
+        frame.channel.distortion_proxy,
+    ]
+    .into_iter()
+    .all(bounded_scalar);
+    let band_fraction_sum = frame.channel.low_band_fraction
+        + frame.channel.mid_band_fraction
+        + frame.channel.high_band_fraction;
+    let channel_domains_valid = (-241.0..=0.001).contains(&frame.channel.rms_dbfs)
+        && (0.0..=241.0).contains(&frame.channel.dynamics_above_noise_db)
+        && (0.0..=8_000.001).contains(&frame.channel.spectral_centroid_hz)
+        && (0.0..=8_000.001).contains(&frame.channel.spectral_bandwidth_hz)
+        && (0.0..=8_000.001).contains(&frame.channel.spectral_rolloff_hz)
+        && (0.0..=1.001).contains(&frame.channel.spectral_flatness)
+        && (0.0..=1.001).contains(&frame.channel.low_band_fraction)
+        && (0.0..=1.001).contains(&frame.channel.mid_band_fraction)
+        && (0.0..=1.001).contains(&frame.channel.high_band_fraction)
+        && (0.0..=1.001).contains(&band_fraction_sum)
+        && (0.0..=20.001).contains(&frame.channel.crest_factor)
+        && (0.0..=1.0).contains(&frame.channel.clipping_fraction)
+        && (-241.0..=0.001).contains(&frame.channel.noise_floor_dbfs)
+        && (0.0..=1.001).contains(&frame.channel.spectral_flux)
+        && (0.0..=1.0).contains(&frame.channel.distortion_proxy);
+    let quality_consistent = frame.quality.voiced == frame.voice.f0_hz.is_some()
+        && frame.quality.reliable_pitch
+            == (frame.quality.voiced
+                && frame.voice.voicing_confidence >= 0.55
+                && frame.channel.rms_dbfs >= -50.0)
+        && frame.quality.low_energy == (frame.channel.rms_dbfs < -55.0)
+        && frame.quality.clipped == (frame.channel.clipping_fraction > 0.005)
+        && frame.quality.transient == (frame.channel.spectral_flux > 0.35);
+
+    if frame.start_ms != expected_start_ms
+        || frame.end_ms != expected_end_ms
+        || !bounded_voice
+        || !bounded_channel
+        || !channel_domains_valid
+        || !f0_valid
+        || !unit_interval(frame.voice.voicing_confidence)
+        || !unit_interval(frame.voice.harmonicity)
+        || !unit_interval(frame.voice.voiced_fraction)
+        || !quality_consistent
+    {
+        return Err(FwError::InvalidRequest(
+            "acoustic frames must use the exact v1 cadence with finite, internally consistent feature values"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_samples_to_ms(samples: usize) -> Option<u64> {
+    u64::try_from(samples)
+        .ok()?
+        .checked_mul(1_000)
+        .map(|milliseconds| milliseconds / crate::native_engine::mel::SAMPLE_RATE as u64)
 }
 
 fn validate_boundary_hints(hints: &AcousticBoundaryHints) -> FwResult<()> {
@@ -1685,9 +1799,9 @@ fn merge_tracklet_statistics(destination: &mut AcousticTracklet, source: &Acoust
         destination.voice_mean[index] = left_mean + delta * right_count / total_count;
         let left_m2 = destination.voice_variance[index] * (left_count - 1.0).max(0.0);
         let right_m2 = source.voice_variance[index] * (right_count - 1.0).max(0.0);
+        let between_m2 = delta * delta * (left_count / total_count) * right_count;
         destination.voice_variance[index] =
-            (left_m2 + right_m2 + delta * delta * left_count * right_count / total_count)
-                / (total_count - 1.0).max(1.0);
+            (left_m2 + right_m2 + between_m2) / (total_count - 1.0).max(1.0);
     }
     for index in 0..CHANNEL_VECTOR_DIMENSIONS {
         let left_mean = destination.channel_mean[index];
@@ -1696,9 +1810,9 @@ fn merge_tracklet_statistics(destination: &mut AcousticTracklet, source: &Acoust
         destination.channel_mean[index] = left_mean + delta * right_count / total_count;
         let left_m2 = destination.channel_variance[index] * (left_count - 1.0).max(0.0);
         let right_m2 = source.channel_variance[index] * (right_count - 1.0).max(0.0);
+        let between_m2 = delta * delta * (left_count / total_count) * right_count;
         destination.channel_variance[index] =
-            (left_m2 + right_m2 + delta * delta * left_count * right_count / total_count)
-                / (total_count - 1.0).max(1.0);
+            (left_m2 + right_m2 + between_m2) / (total_count - 1.0).max(1.0);
     }
     destination.end_ms = source.end_ms;
     destination.frame_count = total;
@@ -1784,6 +1898,7 @@ pub struct SpeakerEnrollment {
     hard_assignments: BTreeMap<usize, String>,
     soft_priors: BTreeMap<(usize, String), f32>,
     cannot_links: BTreeSet<(String, String)>,
+    reserved_speaker_refs: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1830,6 +1945,11 @@ pub fn enroll_known_speaker_profiles(
 
     let hint_document_sha256 = (!request.known_intervals.is_empty())
         .then(|| canonical_hint_document_sha256(&request.known_intervals));
+    let reserved_speaker_refs = request
+        .known_intervals
+        .iter()
+        .map(|hint| hint.speaker_ref.clone())
+        .collect();
     let mut by_speaker = BTreeMap::<String, Vec<EnrollmentObservation>>::new();
     let mut evidence = Vec::with_capacity(request.known_intervals.len());
     let mut hard_assignments = BTreeMap::<usize, String>::new();
@@ -1980,6 +2100,7 @@ pub fn enroll_known_speaker_profiles(
         hard_assignments,
         soft_priors,
         cannot_links,
+        reserved_speaker_refs,
     })
 }
 
@@ -2475,6 +2596,8 @@ where
         ));
     }
     validate_tracklet_timeline(tracklets)?;
+    crate::model::validate_speaker_constraints(constraints)
+        .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
     let (prototypes, cap_pressure) = build_capped_prototypes(
         tracklets,
         &enrollment.hard_assignments,
@@ -2497,16 +2620,28 @@ where
     }
 
     let initial_clusters = initial_clusters(&prototypes, enrollment);
-    let count_policy = resolve_count_policy(constraints, initial_clusters.len())?;
+    let requested_minimum = constraints
+        .and_then(|constraints| constraints.num_speakers.or(constraints.min_speakers))
+        .map_or(1, |value| value as usize);
+    let count_constraints_feasible = requested_minimum <= initial_clusters.len();
+    let count_policy = if count_constraints_feasible {
+        resolve_count_policy(constraints, initial_clusters.len())?
+    } else {
+        SpeakerCountPolicy {
+            min: initial_clusters.len(),
+            max: initial_clusters.len(),
+            exact: Some(initial_clusters.len()),
+        }
+    };
     let (clusters, merge_trace) = agglomerate_clusters(
         initial_clusters,
         &enrollment.cannot_links,
         count_policy,
         &mut is_cancelled,
     )?;
-    let labels = canonical_cluster_labels(&clusters);
-    let require_exact_coverage =
-        constraints.is_some_and(|constraints| constraints.num_speakers.is_some());
+    let labels = canonical_cluster_labels(&clusters, enrollment);
+    let require_exact_coverage = count_constraints_feasible
+        && constraints.is_some_and(|constraints| constraints.num_speakers.is_some());
     let mut assignments = viterbi_assignments(
         tracklets,
         &clusters,
@@ -2515,15 +2650,28 @@ where
         require_exact_coverage,
         &mut is_cancelled,
     )?;
+    let mut exact_coverage_satisfied = true;
     if require_exact_coverage {
-        ensure_cluster_coverage(tracklets, &clusters, &labels, enrollment, &mut assignments)?;
+        let mut covered_assignments = assignments.clone();
+        exact_coverage_satisfied = ensure_cluster_coverage(
+            tracklets,
+            &clusters,
+            &labels,
+            enrollment,
+            &mut covered_assignments,
+        );
+        if exact_coverage_satisfied {
+            assignments = covered_assignments;
+        }
     }
     let detected_speakers = assignments
         .iter()
         .filter_map(|assignment| assignment.speaker_ref.as_ref())
         .collect::<BTreeSet<_>>()
         .len();
-    let constraints_satisfied = speaker_count_satisfies(detected_speakers, constraints);
+    let constraints_satisfied = count_constraints_feasible
+        && exact_coverage_satisfied
+        && speaker_count_satisfies(detected_speakers, constraints);
     let profiles = clustering_profile_summaries(&clusters, &labels, enrollment);
     let bootstrap_stability = clusters
         .iter()
@@ -2823,8 +2971,17 @@ fn distinct_known_speakers(turns: &[DiarizationTurn]) -> usize {
 fn validate_tracklet_timeline(tracklets: &[AcousticTracklet]) -> FwResult<()> {
     let mut previous_end = 0u64;
     let mut indexes = BTreeSet::new();
+    let mut total_frame_count = 0usize;
+    let maximum_total_frames = usize::try_from(u64::MAX / 10).unwrap_or(usize::MAX);
     for tracklet in tracklets {
-        if tracklet.end_ms <= tracklet.start_ms
+        let Some(next_total_frame_count) = total_frame_count.checked_add(tracklet.frame_count)
+        else {
+            return Err(FwError::InvalidRequest(
+                "tracklets must have finite non-negative statistics within acoustic-v1 bounds, valid counts and confidence, unique indexes, and ordered positive intervals".to_owned(),
+            ));
+        };
+        if next_total_frame_count > maximum_total_frames
+            || tracklet.end_ms <= tracklet.start_ms
             || tracklet.start_ms < previous_end.saturating_sub(25)
             || tracklet.end_ms < previous_end
             || tracklet.frame_count == 0
@@ -2836,18 +2993,19 @@ fn validate_tracklet_timeline(tracklets: &[AcousticTracklet]) -> FwResult<()> {
                 .voice_mean
                 .iter()
                 .chain(tracklet.channel_mean.iter())
-                .any(|value| !value.is_finite())
+                .any(|value| !value.is_finite() || value.abs() > MAX_ABS_ACOUSTIC_FEATURE)
             || tracklet
                 .voice_variance
                 .iter()
                 .chain(tracklet.channel_variance.iter())
-                .any(|value| !value.is_finite() || *value < 0.0)
+                .any(|value| !value.is_finite() || *value < 0.0 || *value > MAX_ACOUSTIC_VARIANCE)
         {
             return Err(FwError::InvalidRequest(
-                "tracklets must have finite non-negative statistics, valid counts and confidence, unique indexes, and ordered positive intervals".to_owned(),
+                "tracklets must have finite non-negative statistics within acoustic-v1 bounds, valid counts and confidence, unique indexes, and ordered positive intervals".to_owned(),
             ));
         }
         previous_end = tracklet.end_ms;
+        total_frame_count = next_total_frame_count;
     }
     Ok(())
 }
@@ -3188,22 +3346,20 @@ where
         }
     }
     let mut active = clusters.len();
-    let mut best: Option<(f32, Vec<AcousticCluster>)> = None;
+    let mut best: Option<(f32, Vec<AcousticCluster>, usize)> = None;
     let mut merge_trace = Vec::new();
-    evaluate_cluster_count(&clusters, active, policy, &mut best);
+    evaluate_cluster_count(&clusters, active, policy, merge_trace.len(), &mut best);
     let mut merge_count = 0usize;
-    while active > policy.min {
+    'merging: while active > policy.min {
         if merge_count.is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES) && is_cancelled() {
             return Err(FwError::Cancelled(format!(
                 "acoustic clustering cancelled after {merge_count} merges"
             )));
         }
         let candidate = loop {
-            let candidate = heap.pop().ok_or_else(|| {
-                FwError::InvalidRequest(
-                    "hard cannot-link constraints prevent the requested speaker count".to_owned(),
-                )
-            })?;
+            let Some(candidate) = heap.pop() else {
+                break 'merging;
+            };
             let valid = clusters[candidate.left].is_some()
                 && clusters[candidate.right].is_some()
                 && generations[candidate.left] == candidate.left_generation
@@ -3254,19 +3410,21 @@ where
                 });
             }
         }
-        evaluate_cluster_count(&clusters, active, policy, &mut best);
+        evaluate_cluster_count(&clusters, active, policy, merge_trace.len(), &mut best);
     }
-    best.map(|(_, clusters)| (clusters, merge_trace))
-        .ok_or_else(|| {
-            FwError::InvalidRequest("no feasible speaker-count solution was found".to_owned())
-        })
+    let (_, selected, selected_trace_len) = best.ok_or_else(|| {
+        FwError::InvalidRequest("no feasible speaker-count solution was found".to_owned())
+    })?;
+    merge_trace.truncate(selected_trace_len);
+    Ok((selected, merge_trace))
 }
 
 fn evaluate_cluster_count(
     clusters: &[Option<AcousticCluster>],
     active: usize,
     policy: SpeakerCountPolicy,
-    best: &mut Option<(f32, Vec<AcousticCluster>)>,
+    merge_trace_len: usize,
+    best: &mut Option<(f32, Vec<AcousticCluster>, usize)>,
 ) {
     let allowed = policy
         .exact
@@ -3287,13 +3445,16 @@ fn evaluate_cluster_count(
     let objective = sse + penalty;
     if best
         .as_ref()
-        .is_none_or(|(best_objective, _)| objective < *best_objective)
+        .is_none_or(|(best_objective, _, _)| objective < *best_objective)
     {
-        *best = Some((objective, current));
+        *best = Some((objective, current, merge_trace_len));
     }
 }
 
-fn canonical_cluster_labels(clusters: &[AcousticCluster]) -> Vec<String> {
+fn canonical_cluster_labels(
+    clusters: &[AcousticCluster],
+    enrollment: &SpeakerEnrollment,
+) -> Vec<String> {
     let mut unanchored = clusters
         .iter()
         .enumerate()
@@ -3307,15 +3468,29 @@ fn canonical_cluster_labels(clusters: &[AcousticCluster]) -> Vec<String> {
             .then_with(|| compare_float_vectors(&left.voice, &right.voice))
             .then(left_index.cmp(right_index))
     });
+    let reserved = clusters
+        .iter()
+        .filter_map(|cluster| cluster.hard_anchor.as_ref().or(cluster.label_hint.as_ref()))
+        .cloned()
+        .chain(enrollment.reserved_speaker_refs.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let mut generated = BTreeMap::new();
-    for (position, (cluster_index, cluster)) in unanchored.into_iter().enumerate() {
-        generated.insert(
-            cluster_index,
-            cluster
-                .label_hint
-                .clone()
-                .unwrap_or_else(|| format!("SPEAKER_{position:02}")),
-        );
+    let mut used = reserved.clone();
+    let mut generated_index = 0usize;
+    for (cluster_index, cluster) in unanchored {
+        let label = if let Some(label_hint) = &cluster.label_hint {
+            label_hint.clone()
+        } else {
+            loop {
+                let candidate = format!("SPEAKER_{generated_index:02}");
+                generated_index += 1;
+                if !used.contains(&candidate) {
+                    break candidate;
+                }
+            }
+        };
+        used.insert(label.clone());
+        generated.insert(cluster_index, label);
     }
     clusters
         .iter()
@@ -3501,7 +3676,7 @@ fn ensure_cluster_coverage(
     labels: &[String],
     enrollment: &SpeakerEnrollment,
     assignments: &mut [AcousticSpeakerAssignment],
-) -> FwResult<()> {
+) -> bool {
     let mut counts = BTreeMap::<String, usize>::new();
     for assignment in assignments.iter() {
         if let Some(label) = &assignment.speaker_ref {
@@ -3532,12 +3707,10 @@ fn ensure_cluster_coverage(
                 )
             })
             .min_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)))
-            .map(|(_, index)| index)
-            .ok_or_else(|| {
-                FwError::InvalidRequest(
-                    "exact speaker count has no compatible tracklet for every profile".to_owned(),
-                )
-            })?;
+            .map(|(_, index)| index);
+        let Some(candidate) = candidate else {
+            return false;
+        };
         if let Some(previous) = assignments[candidate].speaker_ref.take()
             && let Some(count) = counts.get_mut(&previous)
         {
@@ -3551,7 +3724,7 @@ fn ensure_cluster_coverage(
             .hard_assignments
             .contains_key(&tracklets[candidate].tracklet_index);
     }
-    Ok(())
+    true
 }
 
 fn constraint_allows_zero(constraints: Option<&SpeakerConstraints>) -> bool {
@@ -3605,14 +3778,16 @@ fn clustering_profile_summaries(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACOUSTIC_CANCELLATION_INTERVAL_FRAMES, ACOUSTIC_FRAME_SAMPLES, AcousticBoundaryHints,
-        AcousticDiarizationInput, AcousticFrameFeatures, AcousticQualityMask, AcousticSegmenter,
-        AcousticSpeakerAssignment, AcousticTracklet, CalibrationObservation, ChannelFeatureView,
-        ProfileEnrollmentCode, ScoringTurn, VoiceFeatureView, cluster_acoustic_tracklets,
-        diarization_turns_from_assignments, diarize_acoustic_pcm, enroll_known_speaker_profiles,
-        extract_acoustic_features, merge_tracklet_statistics, project_diarization_onto_segments,
-        score_calibration, score_change_points, score_diarization, segment_acoustic_frames,
+        ACOUSTIC_CANCELLATION_INTERVAL_FRAMES, ACOUSTIC_FRAME_SAMPLES, ACOUSTIC_HOP_SAMPLES,
+        AcousticBoundaryHints, AcousticDiarizationInput, AcousticFrameFeatures,
+        AcousticQualityMask, AcousticSegmenter, AcousticSpeakerAssignment, AcousticTracklet,
+        CalibrationObservation, ChannelFeatureView, ProfileEnrollmentCode, ScoringTurn,
+        VoiceFeatureView, cluster_acoustic_tracklets, diarization_turns_from_assignments,
+        diarize_acoustic_pcm, enroll_known_speaker_profiles, extract_acoustic_features,
+        merge_tracklet_statistics, project_diarization_onto_segments, score_calibration,
+        score_change_points, score_diarization, segment_acoustic_frames,
     };
+    use crate::FwError;
     use crate::model::{
         DiarizationEngine, DiarizationFallbackStatus, DiarizationRequest, DiarizationTurn,
         KnownSpeakerInterval, KnownSpeakerPolicy, SpeakerConstraints, TranscriptionSegment,
@@ -3985,6 +4160,23 @@ mod tests {
     }
 
     #[test]
+    fn entry_cancellation_precedes_whole_audio_validation() {
+        let samples = [f32::NAN; ACOUSTIC_FRAME_SAMPLES];
+        let error = extract_acoustic_features(&samples, || true, |_| Ok(()))
+            .expect_err("pre-cancelled extraction must stop before inspecting PCM");
+        assert!(matches!(error, FwError::Cancelled(_)));
+    }
+
+    #[test]
+    fn out_of_range_pcm_fails_before_spectral_overflow() {
+        let mut samples = vec![0.0; ACOUSTIC_FRAME_SAMPLES];
+        samples[17] = 1.000_001;
+        let error = extract_acoustic_features(&samples, || false, |_| Ok(()))
+            .expect_err("non-normalized PCM must fail");
+        assert!(error.to_string().contains("normalized [-1, 1] range"));
+    }
+
+    #[test]
     fn cancellation_is_checked_within_thirty_two_frames() {
         let samples = vec![0.0; ACOUSTIC_FRAME_SAMPLES + 100 * crate::native_engine::mel::HOP];
         let mut checks = 0usize;
@@ -4233,6 +4425,21 @@ mod tests {
                 .iter()
                 .all(|value| (*value - 16.0 / 3.0).abs() < 1e-6)
         );
+
+        let large_count = usize::MAX / 4;
+        let mut large_destination = profile_tracklet(0, 0, 20, -1_000_000.0, -1_000_000.0, 0);
+        let mut large_source = profile_tracklet(1, 20, 40, 1_000_000.0, 1_000_000.0, 0);
+        large_destination.frame_count = large_count;
+        large_source.frame_count = large_count;
+        merge_tracklet_statistics(&mut large_destination, &large_source);
+        assert!(
+            large_destination
+                .voice_variance
+                .iter()
+                .chain(large_destination.channel_variance.iter())
+                .all(|value| value.is_finite()),
+            "bounded statistics must not overflow pooled-variance intermediates"
+        );
     }
 
     #[test]
@@ -4294,6 +4501,56 @@ mod tests {
         let error =
             segment_acoustic_frames(Vec::new(), &hints, || false).expect_err("overlapping VAD");
         assert!(error.to_string().contains("ordered, and disjoint"));
+    }
+
+    #[test]
+    fn malformed_acoustic_frames_fail_before_segmentation() {
+        let mut wrong_cadence = synthetic_feature(0, 0.0, false, false);
+        wrong_cadence.start_ms = 1;
+        let error =
+            segment_acoustic_frames([wrong_cadence], &AcousticBoundaryHints::default(), || false)
+                .expect_err("wrong frame cadence must fail");
+        assert!(error.to_string().contains("exact v1 cadence"));
+
+        let mut invalid_pitch = synthetic_feature(0, 0.0, false, false);
+        invalid_pitch.voice.f0_hz = Some(-120.0);
+        let error =
+            segment_acoustic_frames([invalid_pitch], &AcousticBoundaryHints::default(), || false)
+                .expect_err("negative pitch must fail");
+        assert!(error.to_string().contains("internally consistent"));
+
+        let mut overflowing_distance = synthetic_feature(0, 0.0, false, false);
+        overflowing_distance.voice.cepstral_envelope[0] = f32::MAX;
+        let error = segment_acoustic_frames(
+            [overflowing_distance],
+            &AcousticBoundaryHints::default(),
+            || false,
+        )
+        .expect_err("finite values that overflow distance arithmetic must fail");
+        assert!(error.to_string().contains("internally consistent"));
+
+        let mut contradictory_quality = synthetic_feature(0, 0.0, false, false);
+        contradictory_quality.channel.clipping_fraction = 1.0;
+        let error = segment_acoustic_frames(
+            [contradictory_quality],
+            &AcousticBoundaryHints::default(),
+            || false,
+        )
+        .expect_err("feature values and quality flags must agree");
+        assert!(error.to_string().contains("internally consistent"));
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let overflowing_index =
+                usize::try_from((u64::MAX / 1_000 + 1) / ACOUSTIC_HOP_SAMPLES as u64)
+                    .expect("64-bit frame index");
+            let mut overflowing = synthetic_feature(0, 0.0, false, false);
+            overflowing.frame_index = overflowing_index;
+            let error =
+                segment_acoustic_frames([overflowing], &AcousticBoundaryHints::default(), || false)
+                    .expect_err("timestamp conversion overflow must fail");
+            assert!(error.to_string().contains("cadence range"));
+        }
     }
 
     fn profile_tracklet(
@@ -4562,6 +4819,97 @@ mod tests {
     }
 
     #[test]
+    fn generated_labels_never_collide_with_hard_speaker_references() {
+        let request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "SPEAKER_00",
+                0,
+                500,
+                KnownSpeakerPolicy::HardMustLink,
+            )],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let tracklets = vec![
+            profile_tracklet(0, 0, 500, 0.0, 0.0, 50),
+            profile_tracklet(1, 500, 1_000, 3.0, 0.0, 50),
+        ];
+        let constraints = SpeakerConstraints {
+            num_speakers: Some(2),
+            ..SpeakerConstraints::default()
+        };
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, Some(&constraints), 1_000)
+                .expect("enrollment");
+        let result =
+            cluster_acoustic_tracklets(&tracklets, &enrollment, Some(&constraints), 512, || false)
+                .expect("cluster");
+        assert_eq!(
+            result.assignments[0].speaker_ref.as_deref(),
+            Some("SPEAKER_00")
+        );
+        assert_eq!(
+            result.assignments[1].speaker_ref.as_deref(),
+            Some("SPEAKER_01")
+        );
+        assert_eq!(result.detected_speakers, 2);
+        assert!(result.constraints_satisfied);
+    }
+
+    #[test]
+    fn generated_labels_reserve_rejected_soft_speaker_references() {
+        let request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "SPEAKER_00",
+                0,
+                100,
+                KnownSpeakerPolicy::SoftEnrollment,
+            )],
+            enrollment_edge_guard_ms: 50,
+            ..DiarizationRequest::default()
+        };
+        let tracklets = vec![profile_tracklet(0, 200, 700, 0.0, 0.0, 50)];
+        let mut enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, None, 1_000).expect("enrollment");
+        assert_eq!(enrollment.evidence[0].usable_tracklet_count, 0);
+        enrollment.evidence.clear();
+
+        let result = cluster_acoustic_tracklets(&tracklets, &enrollment, None, 512, || false)
+            .expect("cluster");
+        assert_eq!(result.profiles[0].speaker_ref, "SPEAKER_01");
+    }
+
+    #[test]
+    fn compatible_bounded_solution_survives_exhausted_cannot_link_heap() {
+        let request = DiarizationRequest {
+            known_intervals: vec![
+                known_interval("alice", 0, 500, KnownSpeakerPolicy::HardMustLink),
+                known_interval("bob", 500, 1_000, KnownSpeakerPolicy::HardMustLink),
+            ],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let tracklets = vec![
+            profile_tracklet(0, 0, 500, 0.0, 0.0, 50),
+            profile_tracklet(1, 500, 1_000, 1.0, 0.0, 50),
+        ];
+        let constraints = SpeakerConstraints {
+            min_speakers: Some(1),
+            max_speakers: Some(3),
+            ..SpeakerConstraints::default()
+        };
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, Some(&constraints), 1_000)
+                .expect("enrollment");
+        let result =
+            cluster_acoustic_tracklets(&tracklets, &enrollment, Some(&constraints), 512, || false)
+                .expect("the two anchored speakers already satisfy the bounded request");
+        assert_eq!(result.detected_speakers, 2);
+        assert!(result.constraints_satisfied);
+        assert!(result.merge_trace.is_empty());
+    }
+
+    #[test]
     fn soft_enrollment_influences_but_does_not_force_unrelated_speech() {
         let request = DiarizationRequest {
             known_intervals: vec![known_interval(
@@ -4626,6 +4974,91 @@ mod tests {
                 .expect("bounded clustering");
         assert!((1..=2).contains(&bounded_result.detected_speakers));
         assert!(bounded_result.constraints_satisfied);
+    }
+
+    #[test]
+    fn infeasible_speaker_count_reports_unsatisfied_instead_of_aborting() {
+        let request = DiarizationRequest::default();
+        let tracklets = vec![profile_tracklet(0, 0, 500, 0.0, 0.0, 50)];
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, None, 500).expect("enrollment");
+        let impossible = SpeakerConstraints {
+            num_speakers: Some(2),
+            ..SpeakerConstraints::default()
+        };
+        let result =
+            cluster_acoustic_tracklets(&tracklets, &enrollment, Some(&impossible), 512, || false)
+                .expect("insufficient evidence is a fallback state, not a malformed request");
+        assert!(!result.constraints_satisfied);
+        assert!(result.detected_speakers <= 1);
+    }
+
+    #[test]
+    fn malformed_speaker_count_remains_an_error_when_evidence_is_insufficient() {
+        let tracklets = vec![profile_tracklet(0, 0, 500, 0.0, 0.0, 50)];
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &DiarizationRequest::default(), None, 500)
+                .expect("enrollment");
+        let malformed = SpeakerConstraints {
+            min_speakers: Some(3),
+            max_speakers: Some(2),
+            ..SpeakerConstraints::default()
+        };
+        let error =
+            cluster_acoustic_tracklets(&tracklets, &enrollment, Some(&malformed), 512, || false)
+                .expect_err("malformed constraints must not become an evidence fallback");
+        assert!(error.to_string().contains("min <= exact <= max"));
+    }
+
+    #[test]
+    fn impossible_exact_coverage_does_not_leave_partial_forced_assignments() {
+        let request = DiarizationRequest {
+            known_intervals: vec![known_interval(
+                "known",
+                0,
+                500,
+                KnownSpeakerPolicy::SoftEnrollment,
+            )],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let tracklets = vec![profile_tracklet(0, 0, 500, 0.0, 0.0, 50)];
+        let constraints = SpeakerConstraints {
+            num_speakers: Some(2),
+            ..SpeakerConstraints::default()
+        };
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, Some(&constraints), 500)
+                .expect("enrollment");
+        let result =
+            cluster_acoustic_tracklets(&tracklets, &enrollment, Some(&constraints), 512, || false)
+                .expect("coverage failure must remain a typed unsatisfied result");
+        assert!(!result.constraints_satisfied);
+        assert_eq!(result.assignments.len(), 1);
+        assert!(result.detected_speakers <= 1);
+    }
+
+    #[test]
+    fn merge_trace_stops_at_the_selected_cluster_solution() {
+        let request = DiarizationRequest::default();
+        let tracklets = vec![
+            profile_tracklet(0, 0, 500, 0.0, 0.0, 50),
+            profile_tracklet(1, 500, 1_000, 0.01, 0.0, 50),
+            profile_tracklet(2, 1_000, 1_500, 8.0, 0.0, 50),
+        ];
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, None, 1_500).expect("enrollment");
+        let result = cluster_acoustic_tracklets(&tracklets, &enrollment, None, 512, || false)
+            .expect("cluster");
+        assert_eq!(result.profiles.len(), 2, "{result:#?}");
+        assert_eq!(
+            result
+                .merge_trace
+                .last()
+                .map(|step| step.remaining_clusters),
+            Some(result.profiles.len()),
+            "the audit trace must omit exploratory merges past the selected solution"
+        );
     }
 
     #[test]
@@ -4849,10 +5282,38 @@ mod tests {
         );
 
         invalid.voice_variance[0] = 0.01;
+        invalid.voice_mean[0] = f32::MAX;
+        assert!(
+            cluster_acoustic_tracklets(&[invalid.clone()], &enrollment, None, 8, || false)
+                .expect_err("finite tracklet means must not overflow distance arithmetic")
+                .to_string()
+                .contains("within acoustic-v1 bounds")
+        );
+
+        invalid.voice_mean[0] = 0.0;
+        invalid.channel_variance[0] = f32::MAX;
+        assert!(
+            cluster_acoustic_tracklets(&[invalid.clone()], &enrollment, None, 8, || false)
+                .expect_err("finite tracklet variances must not overflow distance arithmetic")
+                .to_string()
+                .contains("within acoustic-v1 bounds")
+        );
+
+        invalid.channel_variance[0] = 0.01;
         invalid.voiced_frame_count = invalid.frame_count + 1;
         assert!(
             cluster_acoustic_tracklets(&[invalid], &enrollment, None, 8, || false)
                 .expect_err("voiced count exceeds total")
+                .to_string()
+                .contains("valid counts")
+        );
+
+        let mut huge = profile_tracklet(0, 0, 100, 0.0, 0.0, 0);
+        huge.frame_count = usize::MAX;
+        let following = profile_tracklet(1, 100, 200, 0.0, 0.0, 1);
+        assert!(
+            cluster_acoustic_tracklets(&[huge, following], &enrollment, None, 8, || false)
+                .expect_err("aggregate frame counts must not overflow")
                 .to_string()
                 .contains("valid counts")
         );

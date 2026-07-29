@@ -1468,6 +1468,14 @@ fn resolved_diarization_engine_for_rollout(
     }
 }
 
+fn external_diarization_fallback_admitted(
+    requested: DiarizationEngine,
+    rollout: crate::model::AcousticDiarizationRolloutStage,
+) -> bool {
+    !(requested == DiarizationEngine::Auto
+        && rollout == crate::model::AcousticDiarizationRolloutStage::Sole)
+}
+
 fn optional_stage_skip(
     stage: PipelineStage,
     request: &TranscribeRequest,
@@ -4312,6 +4320,8 @@ async fn execute_diarize(
         .clone()
         .unwrap_or_default();
     let fallback_policy = acoustic_request.fallback;
+    let external_fallback_admitted =
+        external_diarization_fallback_admitted(selected_diarization_engine(request), rollout_stage);
     let normalized_duration_ms = inter
         .normalized_duration
         .and_then(|duration| finite_seconds_interval_to_ms(0.0, duration))
@@ -4371,6 +4381,7 @@ async fn execute_diarize(
                         || diarize_token.checkpoint().is_err(),
                     )?;
                     if acoustic_request.fallback == DiarizationFallbackPolicy::External
+                        && external_fallback_admitted
                         && diarization_report.fallback_status
                             != DiarizationFallbackStatus::NotNeeded
                         && result_has_external_diarization(&result)
@@ -4971,17 +4982,18 @@ mod tests {
         acceleration_cancellation_fence_payload, acceleration_context_payload,
         acceleration_stream_owner_id, apply_native_diarization_projection, apply_padding,
         budget_duration, checkpoint_or_emit, ctc_forced_align, diarize_segments,
-        emit_diarization_report_events, event_elapsed_ms, external_diarization_report,
-        finite_seconds_interval_to_ms, is_abbreviation_period, is_decimal_period,
-        is_ellipsis_period, merge_regions_by_gap, ms_to_frames, optional_stage_skip,
-        parse_acoustic_diarization_rollout, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
-        recommended_budget, resolve_speaker_target, resolved_diarization_engine,
-        resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
-        run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
-        sha256_file, sha256_json_value, silhouette_score, source_separate,
-        source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
-        stage_failure_message, stage_latency_profile, state_root, transcript_boundaries_ms,
-        vad_energy_detect, vad_energy_detect_with_analysis, validate_diarization_execution_request,
+        emit_diarization_report_events, event_elapsed_ms, external_diarization_fallback_admitted,
+        external_diarization_report, finite_seconds_interval_to_ms, is_abbreviation_period,
+        is_decimal_period, is_ellipsis_period, merge_regions_by_gap, ms_to_frames,
+        optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
+        parse_event_ts_ms, punctuate_segments, recommended_budget, resolve_speaker_target,
+        resolved_diarization_engine, resolved_diarization_engine_for_rollout,
+        result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
+        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_json_value,
+        silhouette_score, source_separate, source_separate_with_analysis, split_long_regions,
+        stage_budget_ms, stage_failure_code, stage_failure_message, stage_latency_profile,
+        state_root, transcript_boundaries_ms, vad_energy_detect, vad_energy_detect_with_analysis,
+        validate_diarization_execution_request,
     };
 
     #[test]
@@ -8839,6 +8851,20 @@ mod tests {
                 "{stage:?} must select acoustic through auto"
             );
         }
+        assert!(
+            !external_diarization_fallback_admitted(
+                DiarizationEngine::Auto,
+                AcousticDiarizationRolloutStage::Sole,
+            ),
+            "sole auto rollout must never select external fallback output"
+        );
+        assert!(
+            external_diarization_fallback_admitted(
+                DiarizationEngine::Auto,
+                AcousticDiarizationRolloutStage::Primary,
+            ),
+            "primary auto rollout may use an explicitly requested external fallback"
+        );
 
         let mut explicit = request;
         explicit.backend_params.acoustic_diarization = Some(DiarizationRequest {
@@ -8853,6 +8879,13 @@ mod tests {
             ),
             DiarizationEngine::Acoustic,
             "explicit acoustic requests bypass only the auto rollout gate"
+        );
+        assert!(
+            external_diarization_fallback_admitted(
+                DiarizationEngine::Acoustic,
+                AcousticDiarizationRolloutStage::Sole,
+            ),
+            "sole limits auto admission, not an explicit acoustic request's fallback policy"
         );
     }
 
