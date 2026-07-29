@@ -161,6 +161,35 @@ fn run_transcribe(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) 
     }
 }
 
+/// Spawn `franken_whisper robot run <args>` so native failures can be
+/// characterized through the line-oriented machine contract.
+fn run_robot(args: &[&str], extra_env: &[(&str, &str)], state_root: &Path) -> CliRun {
+    let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
+    cmd.args(["robot", "run"]);
+    cmd.args(args);
+    cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
+    for key in [
+        "FRANKEN_WHISPER_ENC_INT8",
+        "FW_ENC_ATTN_OUT_I8I32",
+        "FW_ENC_INT8_ATTN_IN",
+        "FW_ENC_INT8_FC1",
+        "FW_ENC_WEIGHT_ROUNDTRIP",
+    ] {
+        cmd.env_remove(key);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let output = cmd.output().expect("spawn franken_whisper robot run");
+    CliRun {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
 /// Locate the `backend.ok` event's payload in a report, or panic with the
 /// event list when it is absent.
 fn backend_ok_payload(report: &Value) -> &Value {
@@ -338,6 +367,72 @@ fn gated_sole_stage_native_is_only_path() {
         report["result"]["raw_output"]["implementation"],
         "real-inference"
     );
+}
+
+#[test]
+fn gated_robot_acoustic_diarization_characterizes_raw_dtw_geometry_failure() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_robot_acoustic_diarization_characterizes_raw_dtw_geometry_failure: tiny.en model missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+    ];
+    env.extend(bridge_bins_missing());
+
+    let run = run_robot(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            "tiny.en",
+            "--diarize",
+            "--diarization-engine",
+            "acoustic",
+            "--no-persist",
+        ],
+        &env,
+        state.path(),
+    );
+
+    assert!(
+        !run.status.success(),
+        "the pre-normalization adapter must reproduce the diagnosed failure"
+    );
+    let lines = run
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["event"] == "stage" && line["code"] == "backend.ok"),
+        "the real native backend must complete before projection fails"
+    );
+    let diarize_error = lines
+        .iter()
+        .find(|line| line["event"] == "stage" && line["code"] == "diarize.error")
+        .expect("the actual diarize stage must expose the geometry mismatch");
+    assert!(
+        diarize_error["payload"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("projection segments must have paired finite")),
+        "unexpected diarize error envelope: {diarize_error}"
+    );
+    let run_error = lines
+        .iter()
+        .find(|line| line["event"] == "run_error")
+        .expect("robot mode must terminate with a line-isolated error");
+    assert_eq!(run_error["code"], "FW-ROBOT-REQUEST");
 }
 
 // ===========================================================================
