@@ -174,7 +174,38 @@ behavior. Every fallback names its source and reason.
 
 ## 9. Scoring
 
-DER is computed after maximum-overlap speaker permutation:
+The retained evaluation authority is `diarization-scorer-v1`. Low-level
+metric helpers are not sufficient evidence by themselves: a retained verdict
+must be produced by `score_diarization_documents` from these exact versioned
+documents:
+
+| Document | Schema identity |
+|---|---|
+| Reference | `diarization-reference-v1` |
+| Hypothesis | `diarization-hypothesis-v1` |
+| Configuration | `diarization-scorer-config-v1` |
+| Result | `diarization-score-result-v1` |
+| Corpus manifest | `diarization-corpus-manifest-v1` |
+| Leakage audit | `diarization-leakage-audit-v1` |
+
+All time geometry in those documents uses integer milliseconds. Documents
+must use canonical interval and identifier order; corpus recording/split keys
+are strictly increasing so duplicate entries within one split fail closed.
+Unknown fields, unsupported versions, zero-duration calls, out-of-bounds
+intervals, missing reference labels, confidence outside `[0, 1]`, confidence
+attached to an unknown label, ambiguous overlapping hints, and non-canonical
+ordering fail closed with `diarization.scorer.*` reason codes.
+
+The reference and hypothesis identify the same opaque recording and exact
+duration. They contain timed speaker turns only: there is deliberately no
+filesystem path, media URI, transcript text, or free-form provenance field.
+Reference turns are labeled; hypothesis turns may use an absent label for an
+honest unknown. Hypothesis assignment confidence and overlap suspicion remain
+separate observations.
+
+### 9.1 Frozen metric policy
+
+DER is computed after maximum-overlap one-to-one speaker permutation:
 
 ```text
 DER = (missed speaker-time + false-alarm speaker-time
@@ -185,9 +216,54 @@ The report keeps all three components separate. Overlapping reference speakers
 contribute speaker-time independently. JER is the mean per-reference-speaker
 Jaccard error after the same mapping.
 
-Change-point scoring is one-to-one and always names its forgiveness collar.
-Confidence calibration is evaluated only where correctness is known and always
-reports coverage.
+`speaker_boundary_collar_ms` is the half-width removed around each reference
+speaker change for DER/JER and associated attribution metrics. It does not
+erase the change from the change-point task. `overlap_policy` explicitly
+includes or excludes reference-overlap regions; no default hidden in a corpus
+adapter may change that policy. Corpus-defined ignored regions are also
+removed and contribute to the reported ignored duration.
+
+The same result separately reports:
+
+- union speech miss, false alarm, and speech-activity error rate;
+- one-to-one change precision, recall, F1, and mean absolute timing error under
+  the named `change_boundary_collar_ms`;
+- conditional speaker-attribution accuracy and speaker-count error;
+- duration-weighted overlap precision, recall, and F1;
+- hard/soft hint adherence, contradiction, unknown duration, and hard
+  violation duration;
+- known-speaker coverage and selective risk, so abstaining everywhere cannot
+  look accurate;
+- duration-weighted Brier score and fixed-bin expected calibration error,
+  always accompanied by confidence coverage;
+- wall time, audio duration, real-time factor, and peak RSS, kept separate from
+  accuracy.
+
+Reference, hypothesis, configuration, and result hashes use canonical compact
+JSON and SHA-256. `result_sha256` hashes the complete result with that one field
+temporarily empty, making tampering independently detectable. Repeated scoring
+of identical canonical inputs must serialize byte-for-byte identically.
+
+### 9.2 Corpus manifests and leakage
+
+`diarization-corpus-manifest-v1` is path-free and contains only opaque corpus,
+license, recording, source-call, speaker, derivation, augmentation, and
+enrollment identities plus `train|development|test`. Identifier validation
+rejects path separators, traversal, control characters, media extensions,
+transcript markers, and common private-download markers.
+
+The deterministic leakage audit checks every pair of different splits for:
+
+- duplicate recordings;
+- clips sharing an origin call;
+- known speakers appearing across splits;
+- shared derived or mixture ancestors;
+- augmentations of the same source;
+- shared or cross-linked enrollment recordings.
+
+Findings expose only validated opaque IDs and machine-stable categories. A
+passing audit and its self-hash are mandatory inputs to any corpus tuning or
+held-out comparison.
 
 Synthetic audio proves arithmetic and invariants only. Corpus accuracy requires
 retained real multi-speaker ground truth, license provenance, exact scorer
