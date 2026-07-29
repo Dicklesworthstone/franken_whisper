@@ -1121,6 +1121,8 @@ pub struct ChangePointEvidence {
     pub snapped_to_word: bool,
     pub tiny_diarize_support: bool,
     pub vad_boundary: bool,
+    /// Boundary forced at the guarded edge of a known-speaker interval.
+    pub supervised_boundary: bool,
 }
 
 /// Compact speaker-homogeneous observation retained after frame segmentation.
@@ -1166,8 +1168,23 @@ struct AcousticSegmenter<'a> {
 
 impl<'a> AcousticSegmenter<'a> {
     fn new(hints: &'a AcousticBoundaryHints) -> FwResult<Self> {
+        Self::new_with_supervised_boundaries(hints, &[])
+    }
+
+    fn new_with_supervised_boundaries(
+        hints: &'a AcousticBoundaryHints,
+        supervised_boundaries_ms: &[u64],
+    ) -> FwResult<Self> {
         validate_boundary_hints(hints)?;
-        let forced_boundaries = forced_boundary_map(hints);
+        if supervised_boundaries_ms
+            .windows(2)
+            .any(|window| window[0] > window[1])
+        {
+            return Err(FwError::InvalidRequest(
+                "supervised boundaries must be ordered".to_owned(),
+            ));
+        }
+        let forced_boundaries = forced_boundary_map(hints, supervised_boundaries_ms);
         let forced_boundary_count = forced_boundaries.len();
         Ok(Self {
             hints,
@@ -1275,16 +1292,15 @@ impl<'a> AcousticSegmenter<'a> {
             tracklet.tracklet_index = index;
         }
 
-        let acoustic_change_count = self
-            .tracklets
-            .iter()
-            .filter(|tracklet| {
-                tracklet
-                    .boundary_evidence
-                    .as_ref()
-                    .is_some_and(|evidence| !evidence.vad_boundary)
-            })
-            .count();
+        let acoustic_change_count =
+            self.tracklets
+                .iter()
+                .filter(|tracklet| {
+                    tracklet.boundary_evidence.as_ref().is_some_and(|evidence| {
+                        !evidence.vad_boundary && !evidence.supervised_boundary
+                    })
+                })
+                .count();
         let summary = AcousticSegmentationSummary {
             input_frame_count: self.input_frame_count,
             tracklet_count: self.tracklets.len(),
@@ -1457,7 +1473,10 @@ fn validate_boundary_hints(hints: &AcousticBoundaryHints) -> FwResult<()> {
     Ok(())
 }
 
-fn forced_boundary_map(hints: &AcousticBoundaryHints) -> BTreeMap<usize, ChangePointEvidence> {
+fn forced_boundary_map(
+    hints: &AcousticBoundaryHints,
+    supervised_boundaries_ms: &[u64],
+) -> BTreeMap<usize, ChangePointEvidence> {
     let mut boundaries = BTreeMap::new();
     for &(start_ms, end_ms) in &hints.speech_regions_ms {
         for boundary_ms in [start_ms, end_ms] {
@@ -1474,14 +1493,62 @@ fn forced_boundary_map(hints: &AcousticBoundaryHints) -> BTreeMap<usize, ChangeP
                     snapped_to_word: false,
                     tiny_diarize_support: false,
                     vad_boundary: true,
+                    supervised_boundary: false,
                 });
         }
+    }
+    for &boundary_ms in supervised_boundaries_ms {
+        let frame_index = ms_to_frame(boundary_ms);
+        boundaries
+            .entry(frame_index)
+            .and_modify(|evidence| evidence.supervised_boundary = true)
+            .or_insert_with(|| ChangePointEvidence {
+                boundary_ms,
+                voice_distance: 0.0,
+                channel_distance: 0.0,
+                multiscale_scores: [0.0; 5],
+                fused_score: 1.0,
+                silence_gap: false,
+                snapped_to_word: false,
+                tiny_diarize_support: false,
+                vad_boundary: false,
+                supervised_boundary: true,
+            });
     }
     boundaries
 }
 
 fn ms_to_frame(milliseconds: u64) -> usize {
     usize::try_from(milliseconds / 10).unwrap_or(usize::MAX)
+}
+
+/// Convert guarded known-speaker intervals into exact frame-split boundaries.
+///
+/// Acoustic frames overlap by 15 ms in v1. The end split therefore moves
+/// inward by that overhang so the final enrollment frame remains fully inside
+/// the guarded interval instead of reintroducing boundary bleed.
+fn supervised_enrollment_boundaries_ms(request: &DiarizationRequest) -> Vec<u64> {
+    let hop_ms = samples_to_ms(ACOUSTIC_HOP_SAMPLES);
+    let frame_overhang_ms = samples_to_ms(ACOUSTIC_FRAME_SAMPLES).saturating_sub(hop_ms);
+    let guard_ms = u64::from(request.enrollment_edge_guard_ms);
+    let mut boundaries = Vec::with_capacity(request.known_intervals.len() * 2);
+    for hint in &request.known_intervals {
+        let guarded_start_ms = hint.start_ms.saturating_add(guard_ms);
+        let guarded_end_ms = hint.end_ms.saturating_sub(guard_ms);
+        if guarded_start_ms >= guarded_end_ms || guarded_end_ms <= frame_overhang_ms {
+            continue;
+        }
+        let start_frame = guarded_start_ms.div_ceil(hop_ms);
+        let end_frame = (guarded_end_ms - frame_overhang_ms) / hop_ms;
+        if end_frame <= start_frame {
+            continue;
+        }
+        boundaries.push(start_frame * hop_ms);
+        boundaries.push(end_frame * hop_ms);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
 }
 
 fn multiscale_change_evidence(
@@ -1532,6 +1599,7 @@ fn multiscale_change_evidence(
         snapped_to_word,
         tiny_diarize_support,
         vad_boundary: false,
+        supervised_boundary: false,
     }
 }
 
@@ -1750,7 +1818,7 @@ fn consume_segment_frame(
         .remove(&frame.frame_index)
         .or_else(|| detected.remove(&frame.frame_index));
     if let Some(evidence) = evidence {
-        let must_preserve_boundary = evidence.vad_boundary;
+        let must_preserve_boundary = evidence.vad_boundary || evidence.supervised_boundary;
         let long_enough = accumulator.frame_count >= MIN_TRACKLET_FRAMES;
         if (must_preserve_boundary || long_enough)
             && let Some(tracklet) = accumulator.finish(tracklets.len(), Some(evidence))
@@ -1773,7 +1841,7 @@ fn merge_compatible_adjacent_tracklets(tracklets: &mut Vec<AcousticTracklet>) {
                 && !previous
                     .boundary_evidence
                     .as_ref()
-                    .is_some_and(|evidence| evidence.vad_boundary)
+                    .is_some_and(|evidence| evidence.vad_boundary || evidence.supervised_boundary)
                 && euclidean_distance(&previous.voice_mean, &tracklet.voice_mean) < 0.08
         });
         if compatible {
@@ -2426,7 +2494,11 @@ where
     request
         .validate(audio_duration_ms, constraints)
         .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
-    let mut segmenter = AcousticSegmenter::new(boundary_hints)?;
+    let supervised_boundaries_ms = supervised_enrollment_boundaries_ms(request);
+    let mut segmenter = AcousticSegmenter::new_with_supervised_boundaries(
+        boundary_hints,
+        &supervised_boundaries_ms,
+    )?;
     let extraction =
         extract_acoustic_features(samples, &mut is_cancelled, |frame| segmenter.push(frame))?;
     if is_cancelled() {
@@ -4092,6 +4164,67 @@ mod tests {
         assert_eq!(projection.segments[1].confidence, Some(0.82));
         assert_eq!(projection.segments[0].speaker.as_deref(), Some("context_a"));
         assert_eq!(projection.segments[1].speaker.as_deref(), Some("context_a"));
+    }
+
+    #[test]
+    fn complete_native_pipeline_splits_stable_tracklet_for_bounded_hard_hint() {
+        const SYNTHETIC_INPUT_SHA256: &str =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let samples = sine_wave(140.0, 12.0, 0.35);
+        let segments = [TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(12.0),
+            text: "bounded synthetic supervision".to_owned(),
+            speaker: None,
+            confidence: Some(0.9),
+        }];
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "bounded_context".to_owned(),
+                start_ms: 4_000,
+                end_ms: 8_000,
+                confidence: 1.0,
+                policy: KnownSpeakerPolicy::HardMustLink,
+                provenance: Some("synthetic-bounded-context".to_owned()),
+            }],
+            enrollment_edge_guard_ms: 100,
+            max_prototypes: 16,
+            ..DiarizationRequest::default()
+        };
+        let constraints = SpeakerConstraints {
+            num_speakers: Some(1),
+            ..SpeakerConstraints::default()
+        };
+
+        let (report, projection) = diarize_acoustic_pcm(
+            AcousticDiarizationInput {
+                samples: &samples,
+                normalized_input_sha256: SYNTHETIC_INPUT_SHA256,
+                segments: &segments,
+                word_aligned: false,
+                request: &request,
+                constraints: Some(&constraints),
+                boundary_hints: &AcousticBoundaryHints::default(),
+            },
+            || false,
+        )
+        .expect("bounded hard hint should create guarded enrollment tracklets");
+
+        assert_eq!(report.detected_speakers, 1);
+        assert!(report.constraints_satisfied);
+        assert_eq!(report.fallback_status, DiarizationFallbackStatus::NotNeeded);
+        assert!(
+            report
+                .profiles
+                .iter()
+                .any(|profile| profile.speaker_ref == "bounded_context" && profile.anchored)
+        );
+        assert!(report.turns.iter().any(|turn| turn.hard_hint_attributed));
+        assert_eq!(
+            projection.segments[0].speaker.as_deref(),
+            Some("bounded_context")
+        );
     }
 
     #[test]
