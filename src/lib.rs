@@ -22,6 +22,7 @@ pub mod model;
 pub mod native_engine;
 pub mod orchestrator;
 pub mod process;
+pub mod public_corpus;
 pub mod replay_pack;
 pub mod robot;
 pub mod speculation;
