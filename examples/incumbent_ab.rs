@@ -128,12 +128,14 @@ use franken_whisper::native_engine::ggml::GgmlModel;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-/// Version contract for the pinned incumbent. Relative to the crate root so the
-/// harness finds it regardless of the cwd it is launched from.
-const INCUMBENT_CONTRACT_PATH: &str = concat!(
+/// Version contract for the pinned incumbent. Embed it so an ELF copied back
+/// from an RCH worker does not retain that worker's scratch checkout path.
+const INCUMBENT_CONTRACT_PATH: &str = "docs/INCUMBENT_CONTRACT.json";
+const INCUMBENT_CONTRACT_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/INCUMBENT_CONTRACT.json"
-);
+));
+#[cfg(test)]
 const CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 const MAX_LOAD_SPLIT_GAP: f64 = 0.1;
@@ -671,17 +673,11 @@ struct IncumbentContract {
 }
 
 impl IncumbentContract {
-    fn load(path: &Path) -> Self {
-        let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+    fn shipped() -> Self {
+        let value: Value = serde_json::from_str(INCUMBENT_CONTRACT_JSON).unwrap_or_else(|error| {
             panic!(
-                "cannot read incumbent version contract {}: {error}",
-                path.display()
-            )
-        });
-        let value: Value = serde_json::from_str(&text).unwrap_or_else(|error| {
-            panic!(
-                "incumbent version contract {} is not valid JSON: {error}",
-                path.display()
+                "embedded incumbent version contract {INCUMBENT_CONTRACT_PATH} is not valid JSON: \
+                 {error}"
             )
         });
         let incumbent = &value["incumbent"];
@@ -724,8 +720,7 @@ impl IncumbentContract {
     /// Check the vendored source against the contract, so the incumbent cannot be
     /// rebuilt from moved source while the ledger keeps citing the pinned version.
     /// Returns the per-file verdicts for provenance.
-    fn source_verdicts(&self) -> Vec<(String, bool, String)> {
-        let root = Path::new(CRATE_ROOT).join(&self.source_root);
+    fn source_verdicts(&self, root: &Path) -> Vec<(String, bool, String)> {
         let mut verdicts = Vec::new();
         for (relative, expected) in &self.source_sha256 {
             let observed = sha256_file(&root.join(relative));
@@ -739,6 +734,16 @@ impl IncumbentContract {
         ));
         verdicts
     }
+}
+
+/// Recover the vendored source root from the incumbent image that actually runs.
+///
+/// The benchmark binary is copied back from an RCH worker, so using its
+/// compile-time crate root would point at the worker's scratch checkout. The
+/// incumbent layout is `<source>/build/bin/whisper-cli`; deriving `<source>` from
+/// that runtime path keeps the source-drift gate portable with the ELF.
+fn incumbent_source_root(incumbent: &Path) -> Option<PathBuf> {
+    incumbent.ancestors().nth(3).map(Path::to_path_buf)
 }
 
 /// Parse `project("whisper.cpp" VERSION 1.8.3)` out of the vendored CMakeLists.
@@ -1764,7 +1769,7 @@ fn main() {
     // The version contract is loaded before anything is measured, and it drives
     // BOTH arms' decoding parameters. A matched-params claim asserted at two
     // separate call sites is a claim that drifts on the next edit.
-    let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+    let contract = IncumbentContract::shipped();
     let params = DecodeParams {
         language: Some(contract.decode.language.clone()),
         translate: contract.decode.translate,
@@ -1855,16 +1860,31 @@ fn main() {
     // was at that path today": source digests plus the declared project version
     // are checked here, and the *running* image is checked against the contract
     // once the identity probe has attested it.
-    let source_verdicts = contract.source_verdicts();
+    let incumbent_source_root = incumbent_source_root(&incumbent);
+    let source_verdicts = incumbent_source_root.as_deref().map_or_else(
+        || {
+            vec![(
+                "source_root".to_owned(),
+                false,
+                "unavailable_from_incumbent_path".to_owned(),
+            )]
+        },
+        |root| contract.source_verdicts(root),
+    );
     let source_clear = source_verdicts.iter().all(|(_, ok, _)| *ok);
     println!(
         "INCUMBENT_AB_CONTRACT path={INCUMBENT_CONTRACT_PATH} project={} version={} \
-         source_root={} contract_binary_sha256={} source_clear={source_clear} \
+         contract_source_root={} runtime_source_root={} \
+         contract_binary_sha256={} source_clear={source_clear} \
          source_verdicts={} build={} decode_source=version_contract {} \
          franken_temp_fallback_env={franken_fallback_on} decode_matched={decode_matched}",
         contract.project,
         contract.version,
         contract.source_root,
+        incumbent_source_root.as_deref().map_or_else(
+            || "unavailable".to_owned(),
+            |root| root.display().to_string()
+        ),
         contract.binary_sha256,
         json!(
             source_verdicts
@@ -2288,25 +2308,26 @@ mod tests {
     /// build workers, so source-drift assertions must skip rather than fail where
     /// the incumbent's source is simply absent. The runtime gate is unaffected:
     /// `identity_clear` still fails closed on drift wherever a ratio is produced.
-    fn vendored_incumbent_source_present(contract: &IncumbentContract) -> bool {
-        let present = Path::new(CRATE_ROOT)
-            .join(&contract.source_root)
-            .join("CMakeLists.txt")
-            .is_file();
+    fn vendored_incumbent_source_root(contract: &IncumbentContract) -> Option<PathBuf> {
+        let root = Path::new(CRATE_ROOT).join(&contract.source_root);
+        let present = root.join("CMakeLists.txt").is_file();
         if !present {
-            println!("SKIP vendored incumbent source absent at {}", contract.source_root);
+            println!(
+                "SKIP vendored incumbent source absent at {}",
+                contract.source_root
+            );
         }
-        present
+        present.then_some(root)
     }
 
     #[test]
     fn shipped_contract_matches_the_vendored_incumbent_source() {
-        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+        let contract = IncumbentContract::shipped();
         assert_eq!(contract.project, "whisper.cpp");
-        if !vendored_incumbent_source_present(&contract) {
+        let Some(source_root) = vendored_incumbent_source_root(&contract) else {
             return;
-        }
-        for (file, matches, observed) in contract.source_verdicts() {
+        };
+        for (file, matches, observed) in contract.source_verdicts(&source_root) {
             assert!(
                 matches,
                 "incumbent contract drifted from the vendored source at {file}: observed \
@@ -2317,7 +2338,7 @@ mod tests {
 
     #[test]
     fn contract_pins_matched_greedy_decode_on_both_arms() {
-        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+        let contract = IncumbentContract::shipped();
         // whisper-cli defaults to -bs 5 -bo 5; a contract that let those stand
         // would compare beam search against franken's greedy path.
         assert_eq!(contract.decode.beam_size, 1);
@@ -2352,7 +2373,7 @@ mod tests {
 
     #[test]
     fn identical_arm_digests_fail_the_distinctness_control() {
-        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+        let contract = IncumbentContract::shipped();
         let same = Some(contract.binary_sha256.clone());
         let distinct = match (&same, &same) {
             (Some(franken), Some(incumbent)) => franken != incumbent,
@@ -2371,16 +2392,29 @@ mod tests {
     #[test]
     fn declared_source_version_parses_the_cmake_project_line() {
         assert_eq!(declared_source_version(Path::new("/nonexistent")), None);
-        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
-        if !vendored_incumbent_source_present(&contract) {
+        let contract = IncumbentContract::shipped();
+        let Some(source_root) = vendored_incumbent_source_root(&contract) else {
             return;
-        }
-        let cmakelists = Path::new(CRATE_ROOT)
-            .join(&contract.source_root)
-            .join("CMakeLists.txt");
+        };
+        let cmakelists = source_root.join("CMakeLists.txt");
         assert_eq!(
             declared_source_version(&cmakelists).as_deref(),
             Some(contract.version.as_str())
+        );
+    }
+
+    #[test]
+    fn runtime_incumbent_path_recovers_the_source_root() {
+        assert_eq!(INCUMBENT_CONTRACT_PATH, "docs/INCUMBENT_CONTRACT.json");
+        assert!(INCUMBENT_CONTRACT_JSON.contains("\"project\": \"whisper.cpp\""));
+        assert_eq!(
+            incumbent_source_root(Path::new(
+                "/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp/build/bin/whisper-cli"
+            ))
+            .as_deref(),
+            Some(Path::new(
+                "/data/projects/franken_whisper/legacy_whispercpp/whisper.cpp"
+            ))
         );
     }
 
