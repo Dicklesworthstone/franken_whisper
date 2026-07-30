@@ -4,6 +4,70 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-29 - OliveIsland: **NO ADMISSIBLE VERDICT — the current-source t32-first live-incumbent sweep failed closed on resident host activity after one mechanically complete but invalid cell.**
+
+The frozen whole-job harness ELF was built from base
+`06d1c9005d4367ab33a78c4b0193b9342ef64fdd` plus only
+`examples/incumbent_ab.rs` at SHA-256
+`e45803de3cab135129b22fb3b237497031dbccef811bd109f3009391f6961249`.
+The ELF self-reported SHA-256
+`f21b76d4e9d3261f55d1c16cb71056170d4d0ab3455f3d508e64372c24dbd0b9`
+and Build ID `2c5594a8e2e1d114f792c18dcad8db634e78724d`; builder identity was
+`local:thinkstation1:release-perf` under the bounded final-artifact policy.
+The actual pinned whisper.cpp 1.8.3 incumbent ran side-by-side in the same
+invocation and attested ELF SHA-256
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`.
+Its source-file, version, build-option, binary-identity, and matched-greedy
+contract gates all passed.
+
+The first cell was `track01` (124.5 s), tiny.en segment timestamps, three
+rounds, requested/configured 32 threads for both arms. It was mechanically
+stable but **inadmissible**:
+
+| observation | result |
+|---|---:|
+| same-invocation franken A/A null | `0.996101`, CI95 `[0.992050, 1.009576]` |
+| same-invocation whisper.cpp A/A null | `0.992396`, CI95 `[0.989281, 1.000801]` |
+| apparent incumbent / franken | `1.429661`, CI95 `[1.429584, 1.447684]` |
+| whole-job medians | franken `811.451 ms`; whisper.cpp `1160.162 ms` |
+| cross-engine WER | `0.058594` (15 edits; 0.10 maximum) |
+| actual active threads | franken `34`; whisper.cpp `45` |
+| comparable work | windows `5/5`; encodes `5/5`; single-token forwards `341/334` |
+
+The work classification was `matched_within_10pct`, so this is not an
+iteration-count-shaped result. Both nulls and the bootstrap median-CI
+2x-widest-null margin cleared, as did the independent load split, CPU-frequency
+policy, identity, thread, and host-wide CPU gates. The binding failure was the
+between-arm process census: the resident system `sbh` daemon reached
+`0.142144` CPU core against the `0.100000` maximum. The formal verdict was
+therefore `UNDECIDABLE`; **1.429661× is not a performance claim**.
+
+The driver then started the t32 tiny.en text-only cell. Its preflight sampled
+`cpu33=35.5%` busy against the 20% per-online-CPU ceiling and aborted before
+warmup or either timed arm. No other workload or thread cell ran. The exclusive
+claim was released immediately, and no benchmark process or tmux session
+survived. Preserved remote artifacts:
+`/data/tmp/fw-realistic-phase3/exclusive_f21b76d4e9d3_t32first_n3` and
+`/data/tmp/fw-realistic-phase3/full-run_f21b76d4e9d3_t32first.log`.
+
+The immediately preceding attempt cannot be combined with this one: it used
+the now-superseded ELF
+`c0c044e3757db928103c431302e406a2f3dce2cc71f2b23ef21e5b6a672bd2d5`.
+That attempt's next t32 cell also aborted before measurement when the
+pre-measurement host-wide sample saw `cpu21=23.3%` and `cpu48=33.3%`. It has no
+ratio and cannot fill a current-source row.
+
+**Concrete retry predicate:** use the same current-source ELF and immutable
+model/audio/incumbent hashes in a fresh unique run root, after every earlier
+`trj-booking` entry formally releases. Require both pre-arm samples and the
+post-arm sample to keep every online CPU at or below 20% busy, and require
+`sbh` plus every other external process to remain at or below 0.1 CPU core for
+the full invocation. Start with all four t32 workloads, then screen the
+remaining thread counts. Retain actual-incumbent same-invocation execution,
+per-arm A/A, exact identity, WER, actual-thread and work-count gates, and decide
+only on the bootstrap median-CI rule; CV remains provenance only.
+
+---
 ## 2026-07-29 - OliveIsland: **HARNESS PREFLIGHT / NO MEASUREMENT — host-wide benchmark exclusivity is now binding, and the first live preflight correctly refused a busy host before either arm ran.**
 
 `examples/incumbent_ab.rs` now copies FrankenFS's binding quiescence
