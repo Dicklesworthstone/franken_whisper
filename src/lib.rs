@@ -12,6 +12,7 @@ pub mod accelerate;
 pub mod audio;
 pub mod backend;
 pub mod cli;
+pub mod confidential_evaluation;
 pub mod conformance;
 pub mod diarization;
 pub mod error;

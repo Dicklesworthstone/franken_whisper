@@ -8,6 +8,15 @@ use franken_whisper::backend;
 use franken_whisper::cli::{
     Cli, Command, RunsOutputFormat, TtyAudioCommand, TtyAudioControlCommand, TtyAudioRecoveryPolicy,
 };
+use franken_whisper::confidential_evaluation::{
+    CONFIDENTIAL_EVALUATION_AGGREGATE_SCHEMA_VERSION,
+    CONFIDENTIAL_EVALUATION_MANIFEST_SCHEMA_VERSION,
+};
+use franken_whisper::diarization::{
+    DIARIZATION_HYPOTHESIS_SCHEMA_VERSION, DIARIZATION_REFERENCE_SCHEMA_VERSION,
+    DiarizationHypothesisDocument, DiarizationReferenceDocument, DiarizationScorerConfig,
+    EvaluationTurn,
+};
 use franken_whisper::model::{
     BackendKind, BackendParams, DecodingParams, DiarizationConfig, DiarizationEngine,
     DiarizationFallbackPolicy, InputSource, OutputFormat, RunEvent, RunReport, SpeakerConstraints,
@@ -466,6 +475,131 @@ fn runs_json_exposes_only_privacy_safe_projection_provenance() {
         !stdout.contains("PRIVATE_MODEL_PATH_SENTINEL"),
         "run-history output must not expose unrelated backend raw metadata"
     );
+}
+
+#[test]
+fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
+    // RCH may set its process-wide temporary directory beneath the synchronized
+    // checkout. Use the platform's external Unix temporary root explicitly so
+    // the fixture exercises the same disjoint-root contract on local and remote
+    // workers.
+    let external_temp_root = if cfg!(unix) {
+        std::path::Path::new("/tmp")
+    } else {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("project parent")
+    };
+    let input = tempfile::Builder::new()
+        .prefix("fw-confidential-input-")
+        .tempdir_in(external_temp_root)
+        .expect("external input");
+    let output = tempfile::Builder::new()
+        .prefix("fw-confidential-output-")
+        .tempdir_in(external_temp_root)
+        .expect("external output");
+    let audio_path = input.path().join("PRIVATE_AUDIO_CLI_SENTINEL.m4a");
+    let reference_path = input.path().join("PRIVATE_REFERENCE_CLI_SENTINEL.json");
+    let hypothesis_path = input.path().join("PRIVATE_HYPOTHESIS_CLI_SENTINEL.json");
+    let manifest_path = input.path().join("PRIVATE_MANIFEST_CLI_SENTINEL.json");
+    let aggregate_path = output.path().join("aggregate.json");
+    std::fs::write(&audio_path, b"synthetic CLI audio bytes").expect("audio");
+    let reference = DiarizationReferenceDocument {
+        schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
+        recording_id: "private-cli-recording".to_owned(),
+        duration_ms: 1_000,
+        turns: vec![EvaluationTurn::labeled(0, 1_000, "private-speaker")],
+        ignored_regions: vec![],
+        speaker_hints: vec![],
+    };
+    let hypothesis = DiarizationHypothesisDocument {
+        schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+        recording_id: "private-cli-recording".to_owned(),
+        duration_ms: 1_000,
+        turns: vec![EvaluationTurn {
+            speaker_confidence: Some(0.75),
+            ..EvaluationTurn::labeled(0, 1_000, "private-cluster")
+        }],
+        performance: None,
+    };
+    std::fs::write(
+        &reference_path,
+        serde_json::to_vec(&reference).expect("reference JSON"),
+    )
+    .expect("reference");
+    std::fs::write(
+        &hypothesis_path,
+        serde_json::to_vec(&hypothesis).expect("hypothesis JSON"),
+    )
+    .expect("hypothesis");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&json!({
+            "schema_version": CONFIDENTIAL_EVALUATION_MANIFEST_SCHEMA_VERSION,
+            "dataset_id": "private-cli-dataset",
+            "config": DiarizationScorerConfig::default(),
+            "recordings": [{
+                "recording_id": "private-cli-recording",
+                "audio_path": audio_path,
+                "reference_path": reference_path,
+                "hypothesis_path": hypothesis_path
+            }]
+        }))
+        .expect("manifest JSON"),
+    )
+    .expect("manifest");
+
+    let runtime_directory = std::env::current_dir().expect("test runtime directory");
+    let test_executable = std::env::current_exe().expect("test executable");
+    let runtime_project_root = runtime_directory
+        .ancestors()
+        .chain(test_executable.ancestors())
+        .find(|ancestor| ancestor.join(".git").exists() && ancestor.join("Cargo.toml").is_file())
+        .expect("runtime project checkout");
+    let result = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .current_dir(runtime_project_root)
+        .args([
+            "diarization-eval",
+            "--input-root",
+            input.path().to_str().expect("UTF-8 input root"),
+            "--manifest",
+            manifest_path.to_str().expect("UTF-8 manifest"),
+            "--output",
+            aggregate_path.to_str().expect("UTF-8 aggregate"),
+        ])
+        .output()
+        .expect("confidential evaluator");
+    assert!(
+        result.status.success(),
+        "confidential evaluator failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).expect("UTF-8 stdout");
+    let retained = std::fs::read_to_string(aggregate_path).expect("aggregate output");
+    let aggregate: serde_json::Value = serde_json::from_str(&stdout).expect("aggregate JSON");
+    assert_eq!(
+        aggregate["schema_version"],
+        CONFIDENTIAL_EVALUATION_AGGREGATE_SCHEMA_VERSION
+    );
+    assert_eq!(aggregate["recording_count"], 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&retained).expect("retained aggregate"),
+        aggregate
+    );
+    for forbidden in [
+        "PRIVATE_",
+        "private-cli-recording",
+        "private-cli-dataset",
+        "private-speaker",
+        "private-cluster",
+        "audio_path",
+        "reference_path",
+        "hypothesis_path",
+        "transcript",
+    ] {
+        assert!(!stdout.contains(forbidden));
+        assert!(!retained.contains(forbidden));
+    }
 }
 
 #[test]

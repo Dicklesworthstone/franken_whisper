@@ -389,3 +389,57 @@ documentation. Its filenames, transcript text, hashes, durations, and derived
 metrics are not admissible public evidence. Only hermetic synthetic fixtures
 may be retained here until a redistributable, provenance-cleared corpus is
 approved.
+
+### 11.1 Local confidential evaluator
+
+`confidential-diarization-evaluation-manifest-v1` is deliberately different
+from the path-free public corpus manifest. It is a local input document that
+contains absolute audio, reference, and hypothesis paths and therefore must
+remain outside the checkout. Its Rust representation supports deserialization
+only: it has no `Debug` or serialization surface.
+
+The `diarization-eval` command:
+
+- discovers the canonical project root from the current checkout;
+- requires a canonical absolute input root disjoint from that project;
+- resolves every manifest source through symlinks and requires it to remain
+  beneath the input root;
+- requires a new absolute `.json` output whose canonical parent is outside the
+  project;
+- caps manifest and scoring-document reads and streams audio hashing with
+  bounded memory;
+- maps every path, parse, and I/O failure to a stable
+  `confidential_evaluation.*` error that never contains a source basename or
+  source value;
+- checkpoints cancellation before the manifest, every recording, every
+  streaming audio-hash block, and the final write, leaving no aggregate when
+  cancelled;
+- writes only
+  `confidential-diarization-evaluation-aggregate-v1`.
+
+The aggregate contains micro/macro accuracy, change, count, overlap,
+calibration, and optional performance summaries plus opaque content/config
+fingerprints. It contains no per-recording row, path, filename, transcript,
+timestamp, speaker/recording identity, feature vector, or excerpt. Repeated
+evaluation of identical content is byte-stable apart from the caller-chosen
+external filename, which is never serialized.
+
+### 11.2 Repository and release guard
+
+Audio/video extensions and transcript sidecars are ignored broadly, including
+case variants and text/JSON/subtitle forms. Raw decoder spans and transcript-
+shaped performance text are also ignored under `tests/artifacts/perf`.
+
+`scripts/check_repository_privacy.rs` is a standalone standard-library-only
+gate. It scans tracked or staged path names first. If any prohibited path is
+present, it emits only path/reason NDJSON and exits before reading file
+contents. Only after the path phase is clean does it inspect magic bytes and
+transcript-shaped content in risky artifact roots, so a misleading filename
+cannot bypass the policy. It never prints matched content.
+
+Both the automatic tag workflow and the distribution workflow compile this
+gate directly with `rustc`. Distribution builds remain allowed to proceed
+after advisory test failures, but never after a privacy failure. A known
+legacy raw-performance artifact set intentionally keeps this release gate red
+until owner-authorized working-tree removal and a separately authorized public
+history rewrite are complete.
