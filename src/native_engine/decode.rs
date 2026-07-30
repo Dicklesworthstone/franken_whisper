@@ -253,6 +253,31 @@ pub struct WindowStats {
     pub window_offset_sec: f64,
 }
 
+/// Aggregate decoder work performed by one [`transcribe_samples`] call.
+///
+/// These counters distinguish an algorithmic/work-count change from a
+/// per-operation speed change. In particular, retries reuse their window
+/// encoding but still pay for another prefill and token-generation attempt.
+/// `sampled_tokens` counts every selected token across all attempts, including
+/// attempts later retried; `accepted_result_tokens` counts only tokens retained
+/// by accepted windows. The single-token forward counter is exact for the
+/// greedy path used by the incumbent harness; beam-search hypothesis expansion
+/// is intentionally not represented by that field. `decoder_prefill_tokens`
+/// counts the prompt tokens submitted across all prefill calls.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecodeWorkStats {
+    pub window_attempts: usize,
+    pub encoder_calls: usize,
+    pub decoder_prefill_calls: usize,
+    pub decoder_prefill_tokens: usize,
+    pub sampled_tokens: usize,
+    pub greedy_single_token_forwards: usize,
+    pub accepted_windows: usize,
+    pub accepted_result_tokens: usize,
+    pub prompt_reset_retries: usize,
+    pub temperature_fallback_retries: usize,
+}
+
 /// Result of [`transcribe_samples`]: timed segments, detected/used language,
 /// and per-window QC statistics.
 #[derive(Debug, Clone)]
@@ -260,6 +285,8 @@ pub struct DecodeOutput {
     pub segments: Vec<TranscriptionSegment>,
     pub language: Option<String>,
     pub windows: Vec<WindowStats>,
+    /// Aggregate work counters for performance provenance.
+    pub work: DecodeWorkStats,
     /// Per-segment word timings, aligned 1:1 with `segments`, populated only
     /// when [`DecodeParams::word_timestamps`] was set (else `None`). Each inner
     /// `Vec<WordTiming>` is the DTW-aligned words of the corresponding segment,
@@ -1819,6 +1846,7 @@ pub fn transcribe_samples(
 
     let mut segments: Vec<TranscriptionSegment> = Vec::new();
     let mut windows: Vec<WindowStats> = Vec::new();
+    let mut work = DecodeWorkStats::default();
     // Per-segment DTW word timings, accumulated 1:1 with `segments` when
     // `params.word_timestamps` is set (bd-rjsx).
     let mut word_timings: Vec<Vec<WordTiming>> = Vec::new();
@@ -1922,6 +1950,7 @@ pub fn transcribe_samples(
         let mut retry_enc_cache = None;
         while seek_cs + DELTA_MIN < seek_end_cs {
             checkpoint()?;
+            work.window_attempts += 1;
 
             // Encode this window's mel chunk. A full window is 3000 mel frames
             // (1500 encoder ctx); a tail window with under 30 s of real audio left
@@ -1959,10 +1988,10 @@ pub fn transcribe_samples(
             // `pipeline` is `… && cfg.no_timestamps` (no_ts only). Retry and pipeline are thus
             // mutually exclusive, so the `if pipeline` dispatch is a no-op on any retry re-entry —
             // no double-send / res_rx desync. (Verified: retry-on track01 transcript is coherent.)
-            let enc = if retry_enc_cache
+            let reuses_cached_encode = retry_enc_cache
                 .as_ref()
-                .is_some_and(|(off, _): &(usize, _)| *off == frame_offset)
-            {
+                .is_some_and(|(off, _): &(usize, _)| *off == frame_offset);
+            let enc = if reuses_cached_encode {
                 retry_enc_cache.take().expect("checked is_some_and above").1
             } else if pipeline && prefetched == Some(frame_offset) {
                 match res_rx.recv() {
@@ -1986,6 +2015,9 @@ pub fn transcribe_samples(
                     checkpoint,
                 )?
             };
+            if !reuses_cached_encode {
+                work.encoder_calls += 1;
+            }
             // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
             // no_timestamps advance is always CHUNK_CS, so the next offset is known and
             // its mel_frames mirror the inline `tail_enc_ctx` computation exactly.
@@ -2060,6 +2092,8 @@ pub fn transcribe_samples(
             // (whisper.cpp 7165-7182). Compute it BEFORE filtering.
             let t_prefill = std::time::Instant::now();
             let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
+            work.decoder_prefill_calls += 1;
+            work.decoder_prefill_tokens += prompt.len();
             super::perf_span(
                 "decoder_prefill",
                 t_prefill.elapsed().as_secs_f64() * 1e3,
@@ -2182,9 +2216,11 @@ pub fn transcribe_samples(
 
                     // Forward the just-chosen token to get the next logits.
                     step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
+                    work.greedy_single_token_forwards += 1;
                 }
                 (decoded, plogs, has_ts, seek_delta_cs, result_len)
             };
+            work.sampled_tokens += decoded.len();
 
             // avg_logprob over result tokens (whisper.cpp 6602-6617).
             let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
@@ -2296,6 +2332,7 @@ pub fn transcribe_samples(
             {
                 window_temp = TEMP_FALLBACK_LADDER[temp_attempt];
                 temp_attempt += 1;
+                work.temperature_fallback_retries += 1;
                 cand_idx = 0;
                 rung_best = None;
                 tracing::debug!(
@@ -2333,6 +2370,7 @@ pub fn transcribe_samples(
                 && prompt_carried
             {
                 force_empty_prompt = true;
+                work.prompt_reset_retries += 1;
                 // Stash this window's encode so the retry (same seek) reuses it instead
                 // of re-encoding. `st` owns its cross-KV copy (no borrow of `enc`), so
                 // this move is sound; `enc` is otherwise unused past DecoderState::new.
@@ -2397,6 +2435,8 @@ pub fn transcribe_samples(
                 tokens: result_len,
                 window_offset_sec: seek_cs as f64 / 100.0,
             });
+            work.accepted_windows += 1;
+            work.accepted_result_tokens += result_len;
 
             if !is_no_speech && !decoded.is_empty() {
                 // Use only the result_len tokens for emission (drop a trailing eot).
@@ -2493,6 +2533,7 @@ pub fn transcribe_samples(
         segments,
         language: used_language,
         windows,
+        work,
         word_timings: if params.word_timestamps {
             Some(word_timings)
         } else {
