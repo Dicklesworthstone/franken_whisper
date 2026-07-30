@@ -739,6 +739,7 @@ mod tests {
             segments: vec![seg(0.0, 9.0, "x")],
             language: Some("en".to_owned()),
             windows: vec![],
+            work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };
         assert_eq!(audio_duration_sec(&req, &output), Some(12.0));
@@ -750,6 +751,7 @@ mod tests {
             segments: vec![],
             language: None,
             windows: vec![],
+            work: decode::DecodeWorkStats::default(),
             word_timings: None,
         };
         assert_eq!(audio_duration_sec(&req, &empty), None);
