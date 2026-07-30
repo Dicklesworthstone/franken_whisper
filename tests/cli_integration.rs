@@ -22,6 +22,9 @@ use franken_whisper::model::{
     DiarizationFallbackPolicy, InputSource, OutputFormat, RunEvent, RunReport, SpeakerConstraints,
     TimestampLevel, TranscribeRequest, TranscriptionResult, TranscriptionSegment, VadParams,
 };
+use franken_whisper::public_corpus::{
+    PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION, PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+};
 use franken_whisper::storage::RunStore;
 use franken_whisper::sync::{self, ConflictPolicy};
 
@@ -595,6 +598,153 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         "audio_path",
         "reference_path",
         "hypothesis_path",
+        "transcript",
+    ] {
+        assert!(!stdout.contains(forbidden));
+        assert!(!retained.contains(forbidden));
+    }
+}
+
+#[test]
+fn public_diarization_corpus_cli_builds_external_path_free_bundle() {
+    use sha2::{Digest, Sha256};
+
+    let external_temp_root = if cfg!(unix) {
+        std::path::Path::new("/tmp")
+    } else {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("project parent")
+    };
+    let input = tempfile::Builder::new()
+        .prefix("fw-public-corpus-input-")
+        .tempdir_in(external_temp_root)
+        .expect("external input");
+    let output = tempfile::Builder::new()
+        .prefix("fw-public-corpus-output-")
+        .tempdir_in(external_temp_root)
+        .expect("external output");
+    let runtime_project = tempfile::Builder::new()
+        .prefix("fw-public-corpus-project-")
+        .tempdir_in(external_temp_root)
+        .expect("runtime project");
+    std::fs::create_dir(runtime_project.path().join(".git")).expect("project marker");
+    std::fs::write(
+        runtime_project.path().join("Cargo.toml"),
+        "[package]\nname = \"public-corpus-e2e-root\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("project manifest");
+    let audio_path = input.path().join("fixture.wav");
+    let annotation_path = input.path().join("fixture.rttm");
+    let descriptor_path = input.path().join("descriptor.json");
+    let bundle_path = output.path().join("bundle.json");
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 8_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&audio_path, spec).expect("WAV");
+    for _ in 0..16_000 {
+        writer.write_sample(0_i16).expect("sample");
+    }
+    writer.finalize().expect("finalize WAV");
+    std::fs::write(
+        &annotation_path,
+        concat!(
+            "SPEAKER public-call 1 0.000 0.600 <NA> <NA> local-a <NA> <NA>\n",
+            "SPEAKER public-call 1 0.400 0.500 <NA> <NA> local-b <NA> <NA>\n",
+        ),
+    )
+    .expect("RTTM");
+    let audio_sha256 = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&audio_path).expect("WAV bytes"))
+    );
+    let annotation_sha256 = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&annotation_path).expect("RTTM bytes"))
+    );
+    std::fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+            "corpus_key": "aishell-4-openslr111-v1",
+            "source_version": "cli-fixture-v1",
+            "recordings": [{
+                "recording_id": "public-cli-recording",
+                "split": "development",
+                "origin_recording_id": "public-cli-origin",
+                "audio_path": "fixture.wav",
+                "audio_sha256": audio_sha256,
+                "expected_sample_rate_hz": 8_000,
+                "expected_channel_count": 2,
+                "selected_channel": 1,
+                "annotation_path": "fixture.rttm",
+                "annotation_sha256": annotation_sha256,
+                "annotation_recording_id": "public-call",
+                "annotation_channel": "1",
+                "speaker_map": {
+                    "local-a": "public-cli-speaker-a",
+                    "local-b": "public-cli-speaker-b"
+                },
+                "ignored_regions": [{
+                    "start_ms": 900,
+                    "end_ms": 950,
+                    "reason_code": "annotation_uncertain"
+                }]
+            }]
+        }))
+        .expect("descriptor JSON"),
+    )
+    .expect("descriptor");
+
+    let result = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .current_dir(runtime_project.path())
+        .args([
+            "diarization-corpus",
+            "build",
+            "--input-root",
+            input.path().to_str().expect("UTF-8 input root"),
+            "--descriptor",
+            descriptor_path.to_str().expect("UTF-8 descriptor"),
+            "--output",
+            bundle_path.to_str().expect("UTF-8 output"),
+            "--license-ack",
+            "accept-aishell-4-cc-by-sa-4.0",
+        ])
+        .output()
+        .expect("public corpus adapter");
+    assert!(
+        result.status.success(),
+        "public corpus adapter failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).expect("UTF-8 stdout");
+    let retained = std::fs::read_to_string(&bundle_path).expect("bundle output");
+    let bundle: serde_json::Value = serde_json::from_str(&stdout).expect("bundle JSON");
+    assert_eq!(
+        bundle["schema_version"],
+        PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        bundle["references"][0]["turns"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(bundle["recordings"][0]["overlap_turn_count"], 2);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&retained).expect("retained bundle"),
+        bundle
+    );
+    for forbidden in [
+        input.path().to_str().expect("input path"),
+        output.path().to_str().expect("output path"),
+        "audio_path",
+        "annotation_path",
+        "fixture.wav",
+        "fixture.rttm",
+        "local-a",
+        "local-b",
         "transcript",
     ] {
         assert!(!stdout.contains(forbidden));

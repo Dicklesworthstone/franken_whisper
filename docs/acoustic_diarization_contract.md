@@ -424,7 +424,60 @@ timestamp, speaker/recording identity, feature vector, or excerpt. Repeated
 evaluation of identical content is byte-stable apart from the caller-chosen
 external filename, which is never serialized.
 
-### 11.2 Repository and release guard
+### 11.2 Public and user-licensed corpus adapter
+
+`diarization-corpus registry` emits
+`public-diarization-corpus-registry-v1`, the frozen acquisition and conversion
+contract. The initial registry spans:
+
+| Key | Conditions | License |
+|---|---|---|
+| `ami-scenario-v1` | English meetings, close/far microphones, overlap | `CC-BY-4.0` |
+| `aishell-4-openslr111-v1` | Mandarin meetings, arrays, noise, short turns, overlap | `CC-BY-SA-4.0` |
+| `voxconverse-v1` | in-the-wild backgrounds, same-gender and overlapping speech | `CC-BY-4.0` with original-video copyright notice |
+| `callhome-american-english-2e-v1` | dyadic 8 kHz telephone/channel mismatch | operator-held LDC user agreement |
+
+The registry records an authoritative source URL, license URL and exact
+acknowledgement ID, expected external layout, conversion contract, integrity
+policy, condition tags, and split policy. A registry entry documents what the
+operator must acquire; it does not download data, accept a license, or confer
+rights. The LDC entry is usable only by an operator who already has lawful
+access.
+
+`diarization-corpus build` consumes
+`public-diarization-corpus-input-v1` from an absolute root outside the checkout.
+Every selected input is a relative path under that canonical root. Symlink
+escapes, traversal, absolute descriptor paths, wrong SHA-256 values, unexpected
+WAV sample rate/channel count, invalid selected channels, malformed RTTM,
+unmapped speakers, and out-of-bounds turns fail closed. RTTM is the deliberately
+small interchange surface: exactly ten `SPEAKER` fields, plain decimal seconds,
+one selected recording/channel, and an explicit source-label to path-free
+speaker-ID map. Concurrent different-speaker turns are preserved and marked as
+overlap. Ignored regions remain explicit scorer inputs.
+
+The generated `public-diarization-corpus-bundle-v1` contains the path-free
+manifest, canonical reference documents, media/annotation/reference SHA-256
+values, checked WAV geometry, and a passing self-hashed leakage audit. It never
+contains local paths, URIs, transcripts, or media bytes. The output is created
+once in a directory outside both the checkout and input root; source media is
+never copied. The path-bearing descriptor type is deserialization-only and has
+no `Debug` or serialization implementation.
+
+The AMI adapter enforces the corpus site's scenario-only training,
+development, and unseen-test meeting-family split. Other corpora use an
+external descriptor whose exact bytes are frozen by SHA-256, followed by the
+same cross-split speaker/origin/derivation/augmentation/enrollment audit. Any
+tuning or comparison must name the bundle hash before looking at held-out
+results. Changing a source file, mapping, ignored region, or split produces a
+different bundle identity.
+
+CI uses only generated WAV/RTTM fixtures to prove adapter arithmetic, malformed
+input handling, overlap, ignored regions, channel/sample-rate checking,
+license acknowledgement, cancellation, and byte-stable replay. Full accuracy
+certification points the same command at externally acquired data and retains
+the resulting bundle and scorer outputs outside the repository.
+
+### 11.3 Repository and release guard
 
 Audio/video extensions and transcript sidecars are ignored broadly, including
 case variants and text/JSON/subtitle forms. Raw decoder spans and transcript-

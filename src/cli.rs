@@ -180,10 +180,57 @@ pub enum Command {
     /// Score external confidential references/hypotheses and emit aggregates only.
     #[command(name = "diarization-eval")]
     DiarizationEval(ConfidentialEvaluationArgs),
+    /// Inspect or build reproducible external public-corpus evidence.
+    #[command(name = "diarization-corpus")]
+    DiarizationCorpus {
+        #[command(subcommand)]
+        command: PublicCorpusCommand,
+    },
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
     /// transcribe each into a markdown + JSON pair.
     Youtube(Box<YoutubeArgs>),
+}
+
+/// Public-corpus registry and preparation commands.
+#[derive(Debug, Subcommand)]
+pub enum PublicCorpusCommand {
+    /// Emit the built-in corpus/license/conversion registry as JSON.
+    Registry,
+    /// Build a path-free, leakage-audited bundle from external WAV/RTTM data.
+    Build(PublicCorpusBuildArgs),
+}
+
+/// Arguments for external public-corpus preparation.
+#[derive(Args)]
+pub struct PublicCorpusBuildArgs {
+    /// Absolute external root containing the selected public or licensed inputs.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the external path-bearing corpus descriptor.
+    #[arg(long)]
+    pub descriptor: PathBuf,
+
+    /// New absolute JSON bundle path outside both the checkout and input root.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+}
+
+impl fmt::Debug for PublicCorpusBuildArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusBuildArgs")
+            .field("input_root", &"<redacted>")
+            .field("descriptor", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .finish()
+    }
 }
 
 /// Arguments for the local-only confidential diarization evaluator.
@@ -2944,5 +2991,45 @@ mod tests {
         assert!(!debug.contains("PRIVATE"));
         assert!(!debug.contains("MANIFEST"));
         assert!(!debug.contains("OUTPUT"));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_build_and_redacts_paths() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "build",
+            "--input-root",
+            "/EXTERNAL/PUBLIC",
+            "--descriptor",
+            "/EXTERNAL/PUBLIC/descriptor.json",
+            "--output",
+            "/EXTERNAL/OUTPUT/bundle.json",
+            "--license-ack",
+            "accept-ami-cc-by-4.0",
+        ])
+        .expect("public corpus command");
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::Build(args),
+        } = cli.command
+        else {
+            panic!("expected public corpus build");
+        };
+        assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("EXTERNAL"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_registry() {
+        let cli = Cli::try_parse_from(["franken_whisper", "diarization-corpus", "registry"])
+            .expect("public corpus registry");
+        assert!(matches!(
+            cli.command,
+            Command::DiarizationCorpus {
+                command: PublicCorpusCommand::Registry
+            }
+        ));
     }
 }

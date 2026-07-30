@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use franken_whisper::cli::{
-    Cli, Command, ControlFrameKind, RobotCommand, RunsOutputFormat, ShutdownController,
-    SyncCommand, TtyAudioCommand, TtyAudioControlCommand,
+    Cli, Command, ControlFrameKind, PublicCorpusCommand, RobotCommand, RunsOutputFormat,
+    ShutdownController, SyncCommand, TtyAudioCommand, TtyAudioControlCommand,
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
@@ -215,6 +215,38 @@ fn run(cli: Cli) -> FwResult<()> {
             println!("{}", serde_json::to_string_pretty(&aggregate)?);
             Ok(())
         }
+        Command::DiarizationCorpus { command } => match command {
+            PublicCorpusCommand::Registry => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &franken_whisper::public_corpus::public_corpus_registry()
+                    )?
+                );
+                Ok(())
+            }
+            PublicCorpusCommand::Build(args) => {
+                let current_dir = std::env::current_dir().map_err(|_| {
+                    FwError::InvalidRequest(
+                        "public_corpus.project_root: current directory could not be resolved"
+                            .to_owned(),
+                    )
+                })?;
+                let project_root =
+                    franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+                let bundle =
+                    franken_whisper::public_corpus::build_public_corpus_bundle_with_cancel(
+                        &project_root,
+                        &args.input_root,
+                        &args.descriptor,
+                        &args.output,
+                        &args.license_ack,
+                        ShutdownController::is_shutting_down,
+                    )?;
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
+                Ok(())
+            }
+        },
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {
                 let manifest =
