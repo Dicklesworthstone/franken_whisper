@@ -47,6 +47,87 @@ above 0.1 CPU core between arms. These are formal verdict inputs alongside the
 same-invocation dual A/A controls, bootstrap median-CI 2x-null-margin gate, and
 independent load split. `cv` remains provenance only.
 
+## 2026-07-30 — KEEP / **CAMPAIGN WINS (vs-incumbent)** — current-source tiny.en text certification: **1.518913×** on 124.5 s and **1.512159×** on 300 s (bd-b4hp)
+
+**Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
+
+**Legacy incumbent:** whisper.cpp 1.8.3 `whisper-cli`
+(`incumbent_bin_sha256=73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`).
+
+**Comparator execution:** the actual legacy incumbent and franken ran
+side-by-side in the same invocation. Three comparison rounds alternated arm
+order, and the same invocation ran an A/A null for each engine.
+
+**Measured incumbent ratio:** `1.518913×` on `track01`; the second certified
+cell measured `1.512159×` on `keynote300`.
+
+- `track01`, 124.5 s / 5 windows, tiny.en text: `1.518913×`
+  (`whisper.cpp / franken`), CI95 `[1.480841, 1.534221]`.
+- `keynote300`, 300 s / 10 windows, tiny.en text: `1.512159×`
+  (`whisper.cpp / franken`), CI95 `[1.468530, 1.526903]`.
+
+The frozen `release-perf` harness was built only through strict remote
+compilation:
+`RCH_WORKER=ovh-a RCH_REQUIRE_REMOTE=1 rch exec --base
+e4b566b985d95d692f3d6d70eff2e85a18c5a36a --clean-overlay
+--overlay-path examples/incumbent_ab.rs -- cargo build --profile release-perf
+--example incumbent_ab`. The source file SHA-256 was
+`ab8ef65d428a21193754c743d8b11fbf32704d91d2dde5b61f19e07a48738f7a`;
+**Benchmark binary ELF SHA-256:**
+`d2fa276c53d306d2930e95cdff4bc560084d00e46878d060fbf5b5e495b4251f`
+(self-reported), with Build ID
+`78c7da194d1f789e2cd5784825075336ffae008d`.
+The frozen runner SHA-256 was
+`4c396baa0208eac6f9dada11bb476ae57aa5bc393b0dc4556719b64948242215`;
+host artifacts on `threadripperje` are under
+`/data/tmp/fw-realistic-phase4/exclusive_d2fa276c53d3_claim6986_t32_n3`.
+The tiny.en model SHA-256 was
+`921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`.
+Audio SHA-256 values were
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`
+for `track01_16k.wav` and
+`af3a4694e3d900c5a577ca08c74b69ef6ef527e133885cff2af54e888af9e4c8`
+for `keynote300_16k.wav`.
+
+**Host and admission.** The exclusive run used `threadripperje`, an AMD Ryzen
+Threadripper PRO 5995WX with 64 physical cores, 128 logical threads,
+536,069,869,568 bytes RAM, one NUMA node, affinity/effective cpuset `0-127`,
+and SSE4.2/AVX/AVX2/FMA/F16C/BMI1/BMI2/AES. All 128 online CPUs reported the
+`amd-pstate-epp` driver, `performance` governor, and `performance`
+energy-performance preference. The five-sample admission was **100.000% idle
+average, 100.000% idle minimum, and 0.000% maximum iowait**, against required
+95%/0%. The terminal post-run vmstat samples were 99–100% idle with 0% iowait.
+
+| cell | franken / whisper.cpp median | comparison median (CI95) | nulls: franken; whisper.cpp | 2×-null floor | WER | work / host |
+|---|---:|---:|---:|---:|---:|---|
+| track01 tiny.en text | 717.245 / 1095.341 ms | **1.518913** `[1.480841, 1.534221]` | `0.999239` `[0.967602, 1.064200]`; `1.005308` `[1.000522, 1.005539]` | `1.128399` | `0.027237` | windows/encodes `5/5`; decode-work ratio `1.024648`; external max `0.080018`; host-wide preflight/pre/post `0.0%/3.23%/3.33%` |
+| keynote300 tiny.en text | 1328.914 / 1964.554 ms | **1.512159** `[1.468530, 1.526903]` | `1.006208` `[0.993322, 1.038432]`; `1.002157` `[0.995695, 1.024547]` | `1.076865` | `0.011236` | windows/encodes `10/10`; decode-work ratio `1.017045`; external max `0.079991`; host-wide preflight/pre/post `3.33%/3.33%/3.33%` |
+
+Both cells requested/configured 32 threads. Observed active-thread peaks were
+35/53 (franken/incumbent) for `track01` and 35/63 for `keynote300`; the thread
+contract passed. Load-split gaps were respectively `0.038072` and `0.043629`
+against the `0.100000` maximum. Identity, source, matched-greedy decode,
+quality, work, frequency-policy, host-wide, external-process, load, and
+statistical gates all passed.
+
+The `track01` whisper.cpp null CI excludes 1.0. That is admissible by the
+comparator's historical rule: a null's widest edge from 1.0 calibrates the 2×
+decision floor; null-CI straddling is not a prerequisite. Re-verification back
+to the comparator's introducing commit found no straddle veto to remove.
+Regression coverage replays the exact seven rows from frankenlibc's second
+`wordexp` run: four contain a non-straddling null, all seven remain `LOSS`, and
+zero become `WIN`. Failed prerequisites, a comparison CI touching 1.0, and a
+comparison inside the 2× floor also remain `UNDECIDABLE`.
+
+The same frozen sweep's segment-timestamp and large-v3-turbo cells are not
+campaign results. Their fail-closed evidence and concrete retry predicates are
+recorded in `NEGATIVE_EVIDENCE.md`.
+
+**Verdict: KEEP the current competitive rows.** These supersede the older
+public tiny.en text number. Re-certify if the harness, native source, incumbent,
+model, audio, decode contract, or host class changes. Do not generalize these
+text-only tiny.en results to timestamps or large-v3-turbo.
+
 ## 2026-07-27 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — tiny.en seg-TS certified against live whisper.cpp: **1.415×** (bd-c9uv)
 
 **Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
