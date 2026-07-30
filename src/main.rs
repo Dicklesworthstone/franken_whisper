@@ -195,6 +195,26 @@ fn run(cli: Cli) -> FwResult<()> {
             }
             Ok(())
         }
+        Command::DiarizationEval(args) => {
+            let current_dir = std::env::current_dir().map_err(|_| {
+                FwError::InvalidRequest(
+                    "confidential_evaluation.project_root: current directory could not be resolved"
+                        .to_owned(),
+                )
+            })?;
+            let project_root =
+                franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+            let aggregate =
+                franken_whisper::confidential_evaluation::run_confidential_evaluation_with_cancel(
+                    &project_root,
+                    &args.input_root,
+                    &args.manifest,
+                    &args.output,
+                    ShutdownController::is_shutting_down,
+                )?;
+            println!("{}", serde_json::to_string_pretty(&aggregate)?);
+            Ok(())
+        }
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {
                 let manifest =

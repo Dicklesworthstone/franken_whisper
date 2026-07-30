@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,10 +177,40 @@ pub enum Command {
         #[command(subcommand)]
         command: TtyAudioCommand,
     },
+    /// Score external confidential references/hypotheses and emit aggregates only.
+    #[command(name = "diarization-eval")]
+    DiarizationEval(ConfidentialEvaluationArgs),
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
     /// transcribe each into a markdown + JSON pair.
     Youtube(Box<YoutubeArgs>),
+}
+
+/// Arguments for the local-only confidential diarization evaluator.
+#[derive(Args)]
+pub struct ConfidentialEvaluationArgs {
+    /// Absolute external root containing every private source file.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the path-bearing local evaluation manifest.
+    #[arg(long)]
+    pub manifest: PathBuf,
+
+    /// New absolute JSON path outside the project tree for aggregate output.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+impl fmt::Debug for ConfidentialEvaluationArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfidentialEvaluationArgs")
+            .field("input_root", &"<redacted>")
+            .field("manifest", &"<redacted>")
+            .field("output", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Arguments for the `youtube` subcommand.
@@ -2899,5 +2930,19 @@ mod tests {
             },
             other => panic!("expected TtyAudio, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn confidential_evaluation_cli_debug_redacts_every_path() {
+        let args = ConfidentialEvaluationArgs {
+            input_root: PathBuf::from("/PRIVATE/INPUT/ROOT"),
+            manifest: PathBuf::from("/PRIVATE/MANIFEST.json"),
+            output: PathBuf::from("/PRIVATE/OUTPUT.json"),
+        };
+        let debug = format!("{args:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("PRIVATE"));
+        assert!(!debug.contains("MANIFEST"));
+        assert!(!debug.contains("OUTPUT"));
     }
 }

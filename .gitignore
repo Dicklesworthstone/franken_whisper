@@ -56,6 +56,22 @@ storage.sqlite3-shm
 # Confidential transcript sidecars must remain outside the repository
 *transcript*.md
 *[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[mM][dD]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[tT][xX][tT]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[jJ][sS][oO][nN]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[jJ][sS][oO][nN][lL]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[sS][rR][tT]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[vV][tT][tT]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[cC][sS][vV]
+*[tT][rR][aA][nN][sS][cC][rR][iI][pP][tT]*.[tT][sS][vV]
+
+# Raw decoder/performance text is never a repository artifact. Retain only
+# aggregate Markdown/JSON evidence; keep spans and decoded text outside Git.
+tests/artifacts/perf/**/*.spans
+tests/artifacts/perf/**/*_if.txt
+tests/artifacts/perf/**/*_seq.txt
+tests/artifacts/perf/**/*sample*.txt
+tests/artifacts/perf/**/*spans*.txt
+tests/artifacts/perf/**/*spans*.jsonl
 
 # Images (keep .webp for README illustration, .png for GitHub social preview)
 *.png
