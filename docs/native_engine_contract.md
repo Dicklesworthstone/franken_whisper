@@ -319,15 +319,13 @@ Each native engine should have:
 
 Real-Time Factor (RTF) = wall-clock / audio-duration; **< 1.0 means faster
 than realtime**. Competitive results use the actual `whisper-cli` legacy
-incumbent in the same `scripts/whisper_cpp_ab.sh` or
-`examples/incumbent_ab.rs` invocation, with matched threads and greedy
-decoding on both sides (`-bs 1 -bo 1`).
+incumbent in the same `examples/incumbent_ab.rs` invocation, with matched
+threads and greedy decoding on both sides (`-bs 1 -bo 1`).
 
 | Model | Workload | Decode mode | Result vs `whisper.cpp` CPU |
 |-------|----------|-------------|-----------------------------|
-| tiny.en | 124.5 s / 5 windows | no timestamps | native **1.10× faster** |
-| tiny.en | 124.5 s / 5 windows | segment timestamps | native **1.41× faster** |
-| large-v3-turbo | 124.5 s / 5 windows | no timestamps | native **2.07× faster** |
+| tiny.en | 124.5 s / 5 windows | no timestamps | native **1.52× faster** |
+| tiny.en | 300 s / 10 windows | no timestamps | native **1.51× faster** |
 
 Before/after measurements of the native engine are maintenance self-speedups,
 not competitive results. Their lever-by-lever record lives in
