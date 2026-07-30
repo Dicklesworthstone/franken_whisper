@@ -199,6 +199,8 @@ pub enum PublicCorpusCommand {
     Registry,
     /// Build a path-free, leakage-audited bundle from external WAV/RTTM data.
     Build(PublicCorpusBuildArgs),
+    /// Run all frozen acoustic feature ablations and emit aggregates only.
+    Ablate(PublicCorpusAblationArgs),
 }
 
 /// Arguments for external public-corpus preparation.
@@ -229,6 +231,51 @@ impl fmt::Debug for PublicCorpusBuildArgs {
             .field("descriptor", &"<redacted>")
             .field("output", &"<redacted>")
             .field("license_ack", &self.license_ack)
+            .finish()
+    }
+}
+
+/// Arguments for an external, aggregate-only public feature ablation.
+#[derive(Args)]
+pub struct PublicCorpusAblationArgs {
+    /// Absolute external root containing selected public inputs.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the external path-bearing corpus descriptor.
+    #[arg(long)]
+    pub descriptor: PathBuf,
+
+    /// New absolute path for the path-free validated corpus bundle.
+    #[arg(long)]
+    pub bundle_output: PathBuf,
+
+    /// New absolute path for aggregate-only ablation evidence.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+
+    /// Deterministically score only each recording prefix of this duration.
+    #[arg(long)]
+    pub maximum_recording_duration_ms: Option<u64>,
+}
+
+impl fmt::Debug for PublicCorpusAblationArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusAblationArgs")
+            .field("input_root", &"<redacted>")
+            .field("descriptor", &"<redacted>")
+            .field("bundle_output", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .field(
+                "maximum_recording_duration_ms",
+                &self.maximum_recording_duration_ms,
+            )
             .finish()
     }
 }
@@ -3031,5 +3078,38 @@ mod tests {
                 command: PublicCorpusCommand::Registry
             }
         ));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_ablation_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "ablate",
+            "--input-root",
+            "/EXTERNAL/PUBLIC",
+            "--descriptor",
+            "/EXTERNAL/PUBLIC/descriptor.json",
+            "--bundle-output",
+            "/EXTERNAL/OUTPUT/bundle.json",
+            "--output",
+            "/EXTERNAL/OUTPUT/ablation.json",
+            "--license-ack",
+            "accept-ami-cc-by-4.0",
+            "--maximum-recording-duration-ms",
+            "300000",
+        ])
+        .expect("public corpus ablation command");
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::Ablate(args),
+        } = cli.command
+        else {
+            panic!("expected public corpus ablation");
+        };
+        assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
+        assert_eq!(args.maximum_recording_duration_ms, Some(300_000));
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("EXTERNAL"));
+        assert!(debug.contains("<redacted>"));
     }
 }

@@ -246,6 +246,31 @@ fn run(cli: Cli) -> FwResult<()> {
                 println!("{}", serde_json::to_string_pretty(&bundle)?);
                 Ok(())
             }
+            PublicCorpusCommand::Ablate(args) => {
+                let current_dir = std::env::current_dir().map_err(|_| {
+                    FwError::InvalidRequest(
+                        "public_corpus.project_root: current directory could not be resolved"
+                            .to_owned(),
+                    )
+                })?;
+                let project_root =
+                    franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+                let evidence =
+                    franken_whisper::public_corpus::run_public_corpus_ablation_with_cancel(
+                        franken_whisper::public_corpus::PublicCorpusAblationRequest {
+                            project_root: &project_root,
+                            input_root: &args.input_root,
+                            descriptor_path: &args.descriptor,
+                            bundle_output_path: &args.bundle_output,
+                            evidence_output_path: &args.output,
+                            license_acknowledgement_id: &args.license_ack,
+                            maximum_recording_duration_ms: args.maximum_recording_duration_ms,
+                        },
+                        ShutdownController::is_shutting_down,
+                    )?;
+                println!("{}", serde_json::to_string_pretty(&evidence)?);
+                Ok(())
+            }
         },
         Command::Sync { command } => match command {
             SyncCommand::Export(args) => {
