@@ -236,6 +236,22 @@ impl fmt::Debug for PublicCorpusBuildArgs {
 }
 
 /// Arguments for an external, aggregate-only public feature ablation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PublicCorpusEvaluationStageArg {
+    Development,
+    Certification,
+}
+
+impl From<PublicCorpusEvaluationStageArg> for crate::public_corpus::PublicCorpusEvaluationStage {
+    fn from(value: PublicCorpusEvaluationStageArg) -> Self {
+        match value {
+            PublicCorpusEvaluationStageArg::Development => Self::Development,
+            PublicCorpusEvaluationStageArg::Certification => Self::Certification,
+        }
+    }
+}
+
+/// Arguments for an external, aggregate-only public feature ablation.
 #[derive(Args)]
 pub struct PublicCorpusAblationArgs {
     /// Absolute external root containing selected public inputs.
@@ -261,6 +277,14 @@ pub struct PublicCorpusAblationArgs {
     /// Deterministically score only each recording prefix of this duration.
     #[arg(long)]
     pub maximum_recording_duration_ms: Option<u64>,
+
+    /// Development tuning or hash-locked unseen certification.
+    #[arg(long, value_enum)]
+    pub stage: PublicCorpusEvaluationStageArg,
+
+    /// Existing development evidence required only for certification.
+    #[arg(long)]
+    pub locked_development_evidence: Option<PathBuf>,
 }
 
 impl fmt::Debug for PublicCorpusAblationArgs {
@@ -276,6 +300,8 @@ impl fmt::Debug for PublicCorpusAblationArgs {
                 "maximum_recording_duration_ms",
                 &self.maximum_recording_duration_ms,
             )
+            .field("stage", &self.stage)
+            .field("locked_development_evidence", &"<redacted>")
             .finish()
     }
 }
@@ -3098,6 +3124,8 @@ mod tests {
             "accept-ami-cc-by-4.0",
             "--maximum-recording-duration-ms",
             "300000",
+            "--stage",
+            "development",
         ])
         .expect("public corpus ablation command");
         let Command::DiarizationCorpus {
@@ -3108,6 +3136,8 @@ mod tests {
         };
         assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
         assert_eq!(args.maximum_recording_duration_ms, Some(300_000));
+        assert_eq!(args.stage, PublicCorpusEvaluationStageArg::Development);
+        assert!(args.locked_development_evidence.is_none());
         let debug = format!("{args:?}");
         assert!(!debug.contains("EXTERNAL"));
         assert!(debug.contains("<redacted>"));
