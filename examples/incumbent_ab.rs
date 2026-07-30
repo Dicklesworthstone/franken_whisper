@@ -71,6 +71,36 @@
 //! requested/configured pool width from threads independently observed
 //! consuming CPU ticks under `/proc/<pid>/task`.
 //!
+//! ## Pinned incumbent, and why both arms attest their own image
+//!
+//! The incumbent is `whisper.cpp` **at a pinned version**, recorded in the
+//! version contract `docs/INCUMBENT_CONTRACT.json`. The contract carries the
+//! declared project version, the digests of the vendored source, the digest of
+//! the built `whisper-cli`, the GGML build switches (so an ISA-hobbled incumbent
+//! cannot be mistaken for the real one), and the matched decoding parameters.
+//! Preflight fails closed when the vendored source or the declared version drifts
+//! from the contract; the reported row carries the pinned version and the digest
+//! that produced it, so a later incumbent bump cannot retroactively re-point an
+//! old claim.
+//!
+//! Both arms report the SHA-256 of the image **their own process is executing**,
+//! via `/proc/self/exe` in-process and `/proc/<pid>/exe` for a spawned arm — the
+//! kernel's record of what actually ran, not a digest of whatever sat at a path.
+//! `whisper-cli` is third-party and cannot be recompiled to print its own digest,
+//! so the kernel is the attester of record for it. The comparison fails closed
+//! unless the two arms are **distinct binaries** and the incumbent's attested
+//! image equals the contract's. Without that check a harness misconfigured to run
+//! one build twice would produce a well-formed competitive ratio that is really
+//! an A/A null, and every other gate here would happily pass it.
+//!
+//! Matched decoding parameters are driven from the contract for both arms rather
+//! than written at each call site. This matters concretely: `whisper-cli` defaults
+//! to `-bs 5 -bo 5`, so leaving its defaults alone would compare beam search
+//! against franken's greedy decode and bank a ~5x decode-work gap as a speedup.
+//! The contract also pins temperature fallback **off** on both sides, matching
+//! franken's default-off ladder, so the incumbent is not charged for retry
+//! windows franken never attempts.
+//!
 //! ## Usage
 //!
 //! ```text
@@ -97,6 +127,14 @@ use franken_whisper::native_engine::find_model_file;
 use franken_whisper::native_engine::ggml::GgmlModel;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+/// Version contract for the pinned incumbent. Relative to the crate root so the
+/// harness finds it regardless of the cwd it is launched from.
+const INCUMBENT_CONTRACT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/INCUMBENT_CONTRACT.json"
+);
+const CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 const MAX_LOAD_SPLIT_GAP: f64 = 0.1;
 const MAX_CROSS_ENGINE_WER: f64 = 0.1;
@@ -140,6 +178,11 @@ struct Observation {
     actual_threads: usize,
     observed_active_threads: usize,
     peak_process_threads: usize,
+    /// SHA-256 of the image the arm actually executed, attested by the arm's own
+    /// process (`/proc/self/exe` in-process, `/proc/<pid>/exe` for a spawned arm).
+    /// `None` outside the untimed identity probe, which is the only run that needs
+    /// it — hashing an ELF inside a timed arm would charge the arm for the hash.
+    exe_sha256: Option<String>,
     work: EngineWork,
 }
 
@@ -494,6 +537,227 @@ fn executable_identity() -> String {
     }
 }
 
+/// SHA-256 of *this* process's own loaded image, read through `/proc/self/exe`.
+///
+/// The point of going through `/proc` rather than hashing an argv-derived path is
+/// that `/proc/self/exe` is the kernel's record of the image this process is
+/// actually executing. It cannot be redirected by a stale path, a symlink swap,
+/// or a rebuild landing elsewhere.
+fn self_exe_sha256() -> String {
+    sha256_file(Path::new("/proc/self/exe"))
+}
+
+/// SHA-256 of a *live child's* loaded image, read through `/proc/<pid>/exe`.
+///
+/// This is the incumbent's own attestation of what it is running, to the extent
+/// obtainable from an unmodified third-party binary: the harness cannot recompile
+/// `whisper-cli` to print its own digest, but it can ask the kernel which image
+/// the spawned process actually mapped. Hashing `FW_INCUMBENT_BIN` instead would
+/// only prove what sat at a path, not what ran.
+fn child_exe_sha256(pid: u32) -> Option<String> {
+    let digest = sha256_file(Path::new(&format!("/proc/{pid}/exe")));
+    (digest != "unreadable").then_some(digest)
+}
+
+/// Decoding parameters applied to *both* arms, sourced from the version contract.
+///
+/// One struct, one source of truth. `whisper-cli` defaults to beam search
+/// (`-bs 5 -bo 5`); comparing that against franken's greedy path would hand
+/// franken a ~5x decode-work advantage and call it a speedup.
+#[derive(Clone, Debug, PartialEq)]
+struct MatchedDecode {
+    beam_size: usize,
+    best_of: usize,
+    temperature: f64,
+    temperature_fallback: bool,
+    language: String,
+    translate: bool,
+    word_timestamps: bool,
+}
+
+impl MatchedDecode {
+    fn from_json(value: &Value) -> Self {
+        let field = |name: &str| -> &Value {
+            let field = &value[name];
+            assert!(
+                !field.is_null(),
+                "incumbent contract matched_decode is missing {name:?}"
+            );
+            field
+        };
+        let usize_field = |name: &str| -> usize {
+            field(name)
+                .as_u64()
+                .unwrap_or_else(|| panic!("contract matched_decode.{name} must be an integer"))
+                as usize
+        };
+        let bool_field = |name: &str| -> bool {
+            field(name)
+                .as_bool()
+                .unwrap_or_else(|| panic!("contract matched_decode.{name} must be a bool"))
+        };
+        Self {
+            beam_size: usize_field("beam_size"),
+            best_of: usize_field("best_of"),
+            temperature: field("temperature")
+                .as_f64()
+                .expect("contract matched_decode.temperature must be a number"),
+            temperature_fallback: bool_field("temperature_fallback"),
+            language: field("language")
+                .as_str()
+                .expect("contract matched_decode.language must be a string")
+                .to_owned(),
+            translate: bool_field("translate"),
+            word_timestamps: bool_field("word_timestamps"),
+        }
+    }
+
+    /// `whisper-cli` flags that pin the incumbent to the contract. Every value is
+    /// passed explicitly, including the ones that match `whisper-cli`'s own
+    /// defaults: a default is a fact about a version, not about the comparison,
+    /// and it can move underneath a pinned digest bump.
+    fn incumbent_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "-bs".to_owned(),
+            self.beam_size.to_string(),
+            "-bo".to_owned(),
+            self.best_of.to_string(),
+            "-tp".to_owned(),
+            format!("{:.2}", self.temperature),
+            "-l".to_owned(),
+            self.language.clone(),
+        ];
+        if !self.temperature_fallback {
+            args.push("-nf".to_owned());
+        }
+        if self.translate {
+            args.push("-tr".to_owned());
+        }
+        args
+    }
+
+    /// The parameters as they must appear on every reported row. A matched-params
+    /// claim that is not printed is not checkable.
+    fn as_row(&self) -> String {
+        format!(
+            "beam_size={} best_of={} temperature={:.2} temperature_fallback={} \
+             language={} translate={} word_timestamps={} decode_mode={}",
+            self.beam_size,
+            self.best_of,
+            self.temperature,
+            self.temperature_fallback,
+            self.language,
+            self.translate,
+            self.word_timestamps,
+            if self.beam_size <= 1 && self.best_of <= 1 {
+                "greedy"
+            } else {
+                "beam"
+            },
+        )
+    }
+}
+
+/// The pinned-incumbent version contract (`docs/INCUMBENT_CONTRACT.json`).
+#[derive(Clone, Debug)]
+struct IncumbentContract {
+    project: String,
+    version: String,
+    source_root: String,
+    binary_sha256: String,
+    source_sha256: BTreeMap<String, String>,
+    build: Value,
+    decode: MatchedDecode,
+}
+
+impl IncumbentContract {
+    fn load(path: &Path) -> Self {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "cannot read incumbent version contract {}: {error}",
+                path.display()
+            )
+        });
+        let value: Value = serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!(
+                "incumbent version contract {} is not valid JSON: {error}",
+                path.display()
+            )
+        });
+        let incumbent = &value["incumbent"];
+        let string_field = |name: &str| -> String {
+            incumbent[name]
+                .as_str()
+                .unwrap_or_else(|| panic!("incumbent contract is missing {name:?}"))
+                .to_owned()
+        };
+        let source_sha256 = incumbent["source_sha256"]
+            .as_object()
+            .expect("incumbent contract is missing source_sha256")
+            .iter()
+            .map(|(name, digest)| {
+                (
+                    name.clone(),
+                    digest
+                        .as_str()
+                        .expect("contract source_sha256 values must be strings")
+                        .to_owned(),
+                )
+            })
+            .collect();
+        Self {
+            project: string_field("project"),
+            version: string_field("version"),
+            source_root: string_field("source_root"),
+            binary_sha256: string_field("binary_sha256"),
+            source_sha256,
+            build: incumbent["build"].clone(),
+            decode: MatchedDecode::from_json(&value["matched_decode"]),
+        }
+    }
+
+    /// Check the *attested* image of the incumbent process against the contract.
+    fn binary_matches(&self, attested_sha256: Option<&str>) -> bool {
+        attested_sha256 == Some(self.binary_sha256.as_str())
+    }
+
+    /// Check the vendored source against the contract, so the incumbent cannot be
+    /// rebuilt from moved source while the ledger keeps citing the pinned version.
+    /// Returns the per-file verdicts for provenance.
+    fn source_verdicts(&self) -> Vec<(String, bool, String)> {
+        let root = Path::new(CRATE_ROOT).join(&self.source_root);
+        let mut verdicts = Vec::new();
+        for (relative, expected) in &self.source_sha256 {
+            let observed = sha256_file(&root.join(relative));
+            verdicts.push((relative.clone(), &observed == expected, observed));
+        }
+        let declared = declared_source_version(&root.join("CMakeLists.txt"));
+        verdicts.push((
+            "CMakeLists.txt:project_version".to_owned(),
+            declared.as_deref() == Some(self.version.as_str()),
+            declared.unwrap_or_else(|| "unavailable".to_owned()),
+        ));
+        verdicts
+    }
+}
+
+/// Parse `project("whisper.cpp" VERSION 1.8.3)` out of the vendored CMakeLists.
+fn declared_source_version(cmakelists: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(cmakelists).ok()?;
+    text.lines()
+        .filter(|line| line.trim_start().starts_with("project("))
+        .find_map(|line| {
+            let tail = line.split_once("VERSION")?.1;
+            Some(
+                tail.trim()
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .next()?
+                    .to_owned(),
+            )
+        })
+}
+
 fn proc_status_value(field: &str) -> String {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -841,10 +1105,17 @@ struct ChildThreadProbe {
     previous_ticks: BTreeMap<u32, u64>,
     active_tids: BTreeSet<u32>,
     peak_process_threads: usize,
+    /// Digest of the child's mapped image, captured once while it is still alive.
+    exe_sha256: Option<String>,
 }
 
 impl ChildThreadProbe {
     fn sample(&mut self, pid: u32) {
+        // Once only: the sample loop runs every millisecond, and re-hashing the
+        // child's ELF on every tick would make the probe itself a competitor.
+        if self.exe_sha256.is_none() {
+            self.exe_sha256 = child_exe_sha256(pid);
+        }
         let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
             return;
         };
@@ -1197,19 +1468,19 @@ fn run_incumbent(
     timestamps: bool,
     scope: BenchScope,
     observe_threads: bool,
+    decode: &MatchedDecode,
 ) -> Observation {
     let mut args: Vec<String> = vec![
         "-m".into(),
         model.display().to_string(),
         "-f".into(),
         wav.into(),
-        "-bs".into(),
-        "1".into(),
-        "-bo".into(),
-        "1".into(),
         "-t".into(),
         threads.to_string(),
     ];
+    // Decoding parameters come from the version contract, not from this call site,
+    // so the two arms cannot drift apart across edits.
+    args.extend(decode.incumbent_args());
     // Match franken's mode on the incumbent side too: comparing franken's
     // no-timestamp decode against whisper.cpp's timestamped decode would charge
     // the incumbent for timestamp work franken is not doing.
@@ -1263,6 +1534,7 @@ fn run_incumbent(
         actual_threads: incumbent_actual_threads(&text).unwrap_or(0),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
+        exe_sha256: thread_probe.exe_sha256,
         work: incumbent_work_counts(&text),
     }
 }
@@ -1272,6 +1544,7 @@ fn run_franken_resident(
     model: &LoadedModel,
     samples: &[f32],
     params: &DecodeParams,
+    attest: bool,
 ) -> Observation {
     let started = Instant::now();
     let out = transcribe_samples(model, samples, params, &(|| Ok(()))).expect("fw transcribe");
@@ -1294,6 +1567,11 @@ fn run_franken_resident(
         actual_threads: rayon::current_num_threads(),
         observed_active_threads: 0,
         peak_process_threads: 0,
+        // Resident franken *is* this process, so its self-attestation is
+        // `/proc/self/exe`. Only on the untimed probe: this ELF carries line
+        // tables, and hashing it inside a timed arm would both add wall and
+        // evict the arm's working set.
+        exe_sha256: attest.then(self_exe_sha256),
         work,
     }
 }
@@ -1352,6 +1630,7 @@ fn run_franken_whole(
         actual_threads: field_u64("actual_threads"),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
+        exe_sha256: thread_probe.exe_sha256,
         work: EngineWork::from_worker_json(&value["work"]),
     }
 }
@@ -1481,16 +1760,32 @@ fn main() {
     let model_path = find_model_file(model_short)
         .unwrap_or_else(|| panic!("model {model_short} not found in search dirs"));
     let samples = read_wav_mono16k(&wav);
+
+    // The version contract is loaded before anything is measured, and it drives
+    // BOTH arms' decoding parameters. A matched-params claim asserted at two
+    // separate call sites is a claim that drifts on the next edit.
+    let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
     let params = DecodeParams {
-        language: Some("en".to_string()),
-        translate: false,
+        language: Some(contract.decode.language.clone()),
+        translate: contract.decode.translate,
+        beam_size: Some(contract.decode.beam_size),
         timestamps,
         n_threads: matched_threads.as_ref().map_or(0, |_| threads),
         max_text_ctx: None,
-        word_timestamps: false,
+        word_timestamps: contract.decode.word_timestamps,
         model_hint: Some(model_short.to_string()),
         ..DecodeParams::default()
     };
+    // franken's fallback ladder is env-gated and default-off. If the contract
+    // pins fallback off, an operator-set `FW_TEMP_FALLBACK` would make franken
+    // do retry work the incumbent's `-nf` forbids — unmatched in franken's
+    // favour or against it, either way not this comparison.
+    let franken_fallback_on = std::env::var_os("FW_TEMP_FALLBACK").is_some();
+    let decode_matched = franken_fallback_on == contract.decode.temperature_fallback
+        && params.beam_size == Some(contract.decode.beam_size)
+        && params.translate == contract.decode.translate
+        && params.word_timestamps == contract.decode.word_timestamps
+        && params.language.as_deref() == Some(contract.decode.language.as_str());
     let resident_model = (scope == BenchScope::TranscribeOnly).then(|| {
         GgmlModel::load(&model_path)
             .and_then(LoadedModel::from_ggml)
@@ -1501,6 +1796,7 @@ fn main() {
             resident_model.as_ref().expect("resident model"),
             &samples,
             &params,
+            false,
         ),
         BenchScope::WholeJob => {
             run_franken_whole(&model_path, model_short, &wav, threads, timestamps, false)
@@ -1511,6 +1807,7 @@ fn main() {
             resident_model.as_ref().expect("resident model"),
             &samples,
             &params,
+            true,
         ),
         BenchScope::WholeJob => {
             run_franken_whole(&model_path, model_short, &wav, threads, timestamps, true)
@@ -1525,6 +1822,7 @@ fn main() {
             timestamps,
             scope,
             false,
+            &contract.decode,
         )
     };
     let probe_whisper_threads = || {
@@ -1536,6 +1834,7 @@ fn main() {
             timestamps,
             scope,
             true,
+            &contract.decode,
         )
     };
 
@@ -1551,6 +1850,35 @@ fn main() {
         model_path.display()
     );
     println!("audio_sha256={} {}", sha256_file(Path::new(&wav)), wav);
+
+    // Version contract. The incumbent is a pinned version, not "whatever binary
+    // was at that path today": source digests plus the declared project version
+    // are checked here, and the *running* image is checked against the contract
+    // once the identity probe has attested it.
+    let source_verdicts = contract.source_verdicts();
+    let source_clear = source_verdicts.iter().all(|(_, ok, _)| *ok);
+    println!(
+        "INCUMBENT_AB_CONTRACT path={INCUMBENT_CONTRACT_PATH} project={} version={} \
+         source_root={} contract_binary_sha256={} source_clear={source_clear} \
+         source_verdicts={} build={} decode_source=version_contract {} \
+         franken_temp_fallback_env={franken_fallback_on} decode_matched={decode_matched}",
+        contract.project,
+        contract.version,
+        contract.source_root,
+        contract.binary_sha256,
+        json!(
+            source_verdicts
+                .iter()
+                .map(|(name, ok, observed)| json!({
+                    "file": name,
+                    "matches": ok,
+                    "observed": observed
+                }))
+                .collect::<Vec<_>>()
+        ),
+        contract.build,
+        contract.decode.as_row(),
+    );
     let host_online_cpus = online_cpus().expect("read host online CPU topology");
     let host_allowed_cpus = self_allowed_cpus().expect("read harness CPU affinity");
     let cpu_frequency_policy = CpuFrequencyPolicy::observe(&host_online_cpus);
@@ -1612,6 +1940,32 @@ fn main() {
         &mut checkpoint,
         "warm_incumbent_thread_probe",
     );
+    // Per-arm binary identity, attested by the arm's own process image. This is
+    // the control that stops the harness from silently comparing a build against
+    // itself: if both arms resolved to the same ELF the ratio would be a null
+    // control wearing a competitive label, and every downstream gate would pass.
+    let franken_exe = fw_warm.exe_sha256.clone();
+    let incumbent_exe = wc_warm.exe_sha256.clone();
+    let distinct_binaries = match (&franken_exe, &incumbent_exe) {
+        (Some(franken), Some(incumbent)) => franken != incumbent,
+        _ => false,
+    };
+    let contract_binary_clear = contract.binary_matches(incumbent_exe.as_deref());
+    let identity_clear = distinct_binaries && contract_binary_clear && source_clear;
+    println!(
+        "INCUMBENT_AB_IDENTITY franken_exe_sha256={} incumbent_exe_sha256={} \
+         attestation=proc_exe_of_running_process franken_source={} \
+         distinct_binaries={distinct_binaries} \
+         contract_binary_clear={contract_binary_clear} source_clear={source_clear} \
+         identity_clear={identity_clear}",
+        franken_exe.as_deref().unwrap_or("unattested"),
+        incumbent_exe.as_deref().unwrap_or("unattested"),
+        match scope {
+            BenchScope::TranscribeOnly => "proc_self_exe_in_process",
+            BenchScope::WholeJob => "proc_pid_exe_of_worker",
+        },
+    );
+
     let wer = word_error_rate(&wc_warm.transcript, &fw_warm.transcript);
     let quality_clear = wer.wer <= MAX_CROSS_ENGINE_WER;
     let configured_thread_clear = !enforce_matched_threads
@@ -1890,6 +2244,8 @@ fn main() {
         || !external_host_clear
         || !host_wide_clear
         || !cpu_frequency_policy_clear
+        || !identity_clear
+        || !decode_matched
     {
         "UNDECIDABLE"
     } else if cmp_med > required && cmp_lo > 1.0 {
@@ -1908,14 +2264,118 @@ fn main() {
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
          host_wide_clear={host_wide_clear} \
          cpu_frequency_policy_clear={cpu_frequency_policy_clear} \
+         identity_clear={identity_clear} decode_matched={decode_matched} \
+         incumbent_version={} incumbent_exe_sha256={} \
          work_counts_stable=true work_count_classification={work_count_class} \
-         cv_is_provenance_only=true class=vs_incumbent verdict={verdict}"
+         cv_is_provenance_only=true class=vs_incumbent verdict={verdict}",
+        contract.version,
+        incumbent_exe.as_deref().unwrap_or("unattested"),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vendored `whisper.cpp` tree is gitignored and is not synced to remote
+    /// build workers, so source-drift assertions must skip rather than fail where
+    /// the incumbent's source is simply absent. The runtime gate is unaffected:
+    /// `identity_clear` still fails closed on drift wherever a ratio is produced.
+    fn vendored_incumbent_source_present(contract: &IncumbentContract) -> bool {
+        let present = Path::new(CRATE_ROOT)
+            .join(&contract.source_root)
+            .join("CMakeLists.txt")
+            .is_file();
+        if !present {
+            println!("SKIP vendored incumbent source absent at {}", contract.source_root);
+        }
+        present
+    }
+
+    #[test]
+    fn shipped_contract_matches_the_vendored_incumbent_source() {
+        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+        assert_eq!(contract.project, "whisper.cpp");
+        if !vendored_incumbent_source_present(&contract) {
+            return;
+        }
+        for (file, matches, observed) in contract.source_verdicts() {
+            assert!(
+                matches,
+                "incumbent contract drifted from the vendored source at {file}: observed \
+                 {observed}; bump docs/INCUMBENT_CONTRACT.json in the same commit"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_pins_matched_greedy_decode_on_both_arms() {
+        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+        // whisper-cli defaults to -bs 5 -bo 5; a contract that let those stand
+        // would compare beam search against franken's greedy path.
+        assert_eq!(contract.decode.beam_size, 1);
+        assert_eq!(contract.decode.best_of, 1);
+        assert!(!contract.decode.temperature_fallback);
+        let args = contract.decode.incumbent_args();
+        for expected in ["-bs", "1", "-bo", "1", "-nf", "-l", "en", "-tp", "0.00"] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "incumbent args {args:?} must state {expected}"
+            );
+        }
+        assert!(contract.decode.as_row().contains("decode_mode=greedy"));
+    }
+
+    #[test]
+    fn beam_contract_is_reported_as_beam_not_greedy() {
+        let decode = MatchedDecode::from_json(&json!({
+            "beam_size": 5,
+            "best_of": 5,
+            "temperature": 0.0,
+            "temperature_fallback": true,
+            "language": "en",
+            "translate": false,
+            "word_timestamps": false
+        }));
+        assert!(decode.as_row().contains("decode_mode=beam"));
+        // Fallback enabled means no `-nf`: the flag must track the contract, not
+        // a hardcoded assumption at the call site.
+        assert!(!decode.incumbent_args().iter().any(|arg| arg == "-nf"));
+    }
+
+    #[test]
+    fn identical_arm_digests_fail_the_distinctness_control() {
+        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+        let same = Some(contract.binary_sha256.clone());
+        let distinct = match (&same, &same) {
+            (Some(franken), Some(incumbent)) => franken != incumbent,
+            _ => false,
+        };
+        assert!(
+            !distinct,
+            "one build measured twice must never read as a competitive pair"
+        );
+        // An unattested arm is also not clear: absence of a digest is not proof.
+        assert!(!contract.binary_matches(None));
+        assert!(!contract.binary_matches(Some("deadbeef")));
+        assert!(contract.binary_matches(Some(&contract.binary_sha256)));
+    }
+
+    #[test]
+    fn declared_source_version_parses_the_cmake_project_line() {
+        assert_eq!(declared_source_version(Path::new("/nonexistent")), None);
+        let contract = IncumbentContract::load(Path::new(INCUMBENT_CONTRACT_PATH));
+        if !vendored_incumbent_source_present(&contract) {
+            return;
+        }
+        let cmakelists = Path::new(CRATE_ROOT)
+            .join(&contract.source_root)
+            .join("CMakeLists.txt");
+        assert_eq!(
+            declared_source_version(&cmakelists).as_deref(),
+            Some(contract.version.as_str())
+        );
+    }
 
     #[test]
     fn covariate_split_excludes_middle_round_and_reports_absolute_gap() {
