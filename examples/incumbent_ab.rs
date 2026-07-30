@@ -44,10 +44,12 @@
 //!
 //! Two A/A nulls run in the same invocation and the same alternating shape:
 //! franken against itself, and `whisper.cpp` against itself. A claim is
-//! decidable only when the comparison median lies outside **both** null CI95s
-//! with a 2× margin, and when the comparison medians from independently
-//! sampled lighter- and heavier-load rounds differ by at most 0.1×. `cv` is
-//! recorded as provenance and decides nothing. Whole-job runs also census
+//! decidable only when the comparison CI95 excludes 1.0, the comparison median
+//! clears the widest null CI95 edge by a 2× margin, and the comparison medians
+//! from independently sampled lighter- and heavier-load rounds differ by at
+//! most 0.1×. A null CI95 does **not** have to contain 1.0: its distance from
+//! 1.0 calibrates the decision floor. `cv` is recorded as provenance and
+//! decides nothing. Whole-job runs also census
 //! persistent non-harness processes between every arm: a process consuming more
 //! than 0.1 CPU core makes the result undecidable, because steady cross-tool
 //! load bias can survive both numerical controls.
@@ -1340,6 +1342,50 @@ fn cv(values: &[f64]) -> f64 {
     var.sqrt() / mean
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StatisticalGate {
+    fw_null_half: f64,
+    wc_null_half: f64,
+    required: f64,
+    verdict: &'static str,
+}
+
+/// Apply only the statistical portion of the live-incumbent decision contract.
+///
+/// Null CIs remain part of the 2x decision floor, but whether they happen to
+/// contain 1.0 is deliberately irrelevant. This is the historical live
+/// comparator rule extracted without changing its verdict behavior so the
+/// absence of a precision-coupled straddle veto can be regression-tested.
+fn statistical_gate(
+    fw_null: (f64, f64, f64),
+    wc_null: (f64, f64, f64),
+    comparison: (f64, f64, f64),
+    prerequisite_gates_clear: bool,
+) -> StatisticalGate {
+    let (_, fw_lo, fw_hi) = fw_null;
+    let (_, wc_lo, wc_hi) = wc_null;
+    let (cmp_med, cmp_lo, cmp_hi) = comparison;
+    let fw_null_half = (fw_hi - 1.0).abs().max((1.0 - fw_lo).abs());
+    let wc_null_half = (wc_hi - 1.0).abs().max((1.0 - wc_lo).abs());
+    let required = 1.0 + 2.0 * fw_null_half.max(wc_null_half);
+    let verdict = if !prerequisite_gates_clear {
+        "UNDECIDABLE"
+    } else if cmp_med > required && cmp_lo > 1.0 {
+        "WIN"
+    } else if cmp_med < 1.0 / required && cmp_hi < 1.0 {
+        "LOSS"
+    } else {
+        "UNDECIDABLE"
+    };
+
+    StatisticalGate {
+        fw_null_half,
+        wc_null_half,
+        required,
+        verdict,
+    }
+}
+
 /// Split ratios at the median of an independent covariate and return the
 /// comparison median for the lighter and heavier halves plus their absolute
 /// gap. For an odd number of rounds, the single middle-covariate round is
@@ -2256,36 +2302,29 @@ fn main() {
          max_gap={MAX_LOAD_SPLIT_GAP:.6}",
         rounds / 2
     );
-    let (_, fw_lo, fw_hi) = report("INCUMBENT_AB_NULL_FW", &fw_null);
-    let (_, wc_lo, wc_hi) = report("INCUMBENT_AB_NULL_WC", &wc_null);
-    let (cmp_med, cmp_lo, cmp_hi) = report("INCUMBENT_AB_COMPARE", &compare);
-
-    // Decidable only if the comparison clears BOTH nulls' worst edge by 2x.
-    let fw_half = (fw_hi - 1.0).abs().max((1.0 - fw_lo).abs());
-    let wc_half = (wc_hi - 1.0).abs().max((1.0 - wc_lo).abs());
-    let required = 1.0 + 2.0 * fw_half.max(wc_half);
+    let fw_null_stats = report("INCUMBENT_AB_NULL_FW", &fw_null);
+    let wc_null_stats = report("INCUMBENT_AB_NULL_WC", &wc_null);
+    let comparison_stats = report("INCUMBENT_AB_COMPARE", &compare);
     let load_split_clear = load_split_gap <= MAX_LOAD_SPLIT_GAP;
-    let verdict = if !quality_clear
-        || !thread_clear
-        || !load_split_clear
-        || !external_host_clear
-        || !host_wide_clear
-        || !cpu_frequency_policy_clear
-        || !identity_clear
-        || !decode_matched
-    {
-        "UNDECIDABLE"
-    } else if cmp_med > required && cmp_lo > 1.0 {
-        "WIN"
-    } else if cmp_med < 1.0 / required && cmp_hi < 1.0 {
-        "LOSS"
-    } else {
-        "UNDECIDABLE"
-    };
+    let prerequisite_gates_clear = quality_clear
+        && thread_clear
+        && load_split_clear
+        && external_host_clear
+        && host_wide_clear
+        && cpu_frequency_policy_clear
+        && identity_clear
+        && decode_matched;
+    let gate = statistical_gate(
+        fw_null_stats,
+        wc_null_stats,
+        comparison_stats,
+        prerequisite_gates_clear,
+    );
     println!(
         "INCUMBENT_AB_GATE method=median_vs_both_null_ci95_2x_margin \
-         fw_null_half={fw_half:.6} wc_null_half={wc_half:.6} required={required:.6} \
-         compare_median={cmp_med:.6} compare_ci95=[{cmp_lo:.6},{cmp_hi:.6}] \
+         null_ci_straddle_required=false \
+         fw_null_half={:.6} wc_null_half={:.6} required={:.6} \
+         compare_median={:.6} compare_ci95=[{:.6},{:.6}] \
          load_split_gap={load_split_gap:.6} load_split_max={MAX_LOAD_SPLIT_GAP:.6} \
          load_split_clear={load_split_clear} quality_clear={quality_clear} \
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
@@ -2294,9 +2333,16 @@ fn main() {
          identity_clear={identity_clear} decode_matched={decode_matched} \
          incumbent_version={} incumbent_exe_sha256={} \
          work_counts_stable=true work_count_classification={work_count_class} \
-         cv_is_provenance_only=true class=vs_incumbent verdict={verdict}",
+         cv_is_provenance_only=true class=vs_incumbent verdict={}",
+        gate.fw_null_half,
+        gate.wc_null_half,
+        gate.required,
+        comparison_stats.0,
+        comparison_stats.1,
+        comparison_stats.2,
         contract.version,
         incumbent_exe.as_deref().unwrap_or("unattested"),
+        gate.verdict,
     );
 }
 
@@ -2436,6 +2482,100 @@ mod tests {
         assert!(split_by_covariate(&[1.0, 2.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, 2.0, 3.0], &[1.0, 2.0]).is_none());
         assert!(split_by_covariate(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]).is_none());
+    }
+
+    #[test]
+    fn existing_gate_classifies_all_seven_reference_losses_and_creates_zero_wins() {
+        // Exact medians and CI95s from frankenlibc's second wordexp run, which
+        // reproduced its straddle-veto precision defect across a different
+        // core/load. This comparator already ignored straddling. The effect is
+        // reported as franken/incumbent, so invert the median and CI into this
+        // harness's incumbent/franken orientation before adjudicating.
+        let rows = [
+            (
+                "plain_split",
+                (1.002_309, 1.000_400, 1.005_380),
+                (0.992_411, 0.981_933, 1.007_598),
+                (2.930_311, 2.906_338, 2.951_770),
+            ),
+            (
+                "quoted_mix",
+                (1.002_050, 0.993_515, 1.004_092),
+                (0.995_116, 0.983_071, 1.003_489),
+                (3.951_984, 3.922_415, 3.967_720),
+            ),
+            (
+                "param_simple",
+                (0.998_526, 0.993_386, 1.002_382),
+                (0.988_760, 0.982_182, 0.998_423),
+                (2.833_764, 2.822_487, 2.842_885),
+            ),
+            (
+                "param_braced",
+                (0.994_133, 0.985_840, 1.006_088),
+                (0.995_028, 0.976_079, 1.009_118),
+                (3.416_667, 3.334_717, 3.570_602),
+            ),
+            (
+                "param_default",
+                (0.994_730, 0.990_901, 1.001_109),
+                (0.988_910, 0.977_533, 0.994_789),
+                (2.323_656, 2.305_838, 2.332_914),
+            ),
+            (
+                "escapes",
+                (1.000_292, 0.993_404, 1.003_369),
+                (1.000_201, 0.989_835, 1.009_008),
+                (2.963_092, 2.952_614, 2.982_285),
+            ),
+            (
+                "many_fields",
+                (0.995_260, 0.990_393, 0.998_880),
+                (0.999_463, 0.995_460, 1.007_522),
+                (3.643_581, 3.597_722, 3.664_674),
+            ),
+        ];
+
+        let mut losses = 0;
+        let mut wins = 0;
+        let mut non_straddling_cases = 0;
+        for (name, fw_null, wc_null, (effect_med, effect_lo, effect_hi)) in rows {
+            let comparison = (1.0 / effect_med, 1.0 / effect_hi, 1.0 / effect_lo);
+            let gate = statistical_gate(fw_null, wc_null, comparison, true);
+            let fw_straddles = fw_null.1 <= 1.0 && fw_null.2 >= 1.0;
+            let wc_straddles = wc_null.1 <= 1.0 && wc_null.2 >= 1.0;
+            non_straddling_cases += usize::from(!fw_straddles || !wc_straddles);
+            assert_eq!(gate.verdict, "LOSS", "{name}");
+            losses += usize::from(gate.verdict == "LOSS");
+            wins += usize::from(gate.verdict == "WIN");
+        }
+
+        assert_eq!(non_straddling_cases, 4);
+        assert_eq!(losses, 7);
+        assert_eq!(wins, 0);
+    }
+
+    #[test]
+    fn statistical_gate_retains_margin_effect_ci_and_prerequisite_vetoes() {
+        let clear_nulls = (
+            (1.000_000, 0.990_000, 1.010_000),
+            (1.000_000, 0.995_000, 1.005_000),
+        );
+
+        let prerequisite_failure =
+            statistical_gate(clear_nulls.0, clear_nulls.1, (1.50, 1.40, 1.60), false);
+        assert_eq!(prerequisite_failure.verdict, "UNDECIDABLE");
+
+        let ci_touches_one =
+            statistical_gate(clear_nulls.0, clear_nulls.1, (1.50, 1.00, 1.60), true);
+        assert_eq!(ci_touches_one.verdict, "UNDECIDABLE");
+
+        let inside_twice_null_margin =
+            statistical_gate(clear_nulls.0, clear_nulls.1, (1.01, 1.005, 1.02), true);
+        assert_eq!(inside_twice_null_margin.verdict, "UNDECIDABLE");
+
+        let clear_win = statistical_gate(clear_nulls.0, clear_nulls.1, (1.50, 1.40, 1.60), true);
+        assert_eq!(clear_win.verdict, "WIN");
     }
 
     #[test]

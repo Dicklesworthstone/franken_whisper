@@ -3,7 +3,7 @@
 > Forward-looking playbook, not a log. The historical record is `PERF_LEDGER.md`
 > (measured wins) and `NEGATIVE_EVIDENCE.md` (rejections + blockers). This file is
 > the short answer to "what's left and exactly how to do it." Owned by swarm agent
-> **BlackThrush**. Last updated 2026-07-27.
+> **BlackThrush**. Last updated 2026-07-30.
 >
 > The byte-exact envelope includes AVX2 encoder activation quantization
 > (`26feafd`), AVX2+F16C decoder weight quantization
@@ -17,9 +17,10 @@ For the exact `tiny.en` architecture in segment-timestamp mode, the default
 policy suppresses cross-window prompt carry while preserving the initial
 prompt. Explicit `max_context` or `FW_TINY_EN_TS_CONTEXT=1` restores prompt
 carry, and the failed-window retry remains a conservative fallback. On the
-124.5 s / 5-window `track01.wav` fixture the default emits 21 segments and
-1,301 characters with full segment/timestamp/text parity against the
-same-binary historical arm.
+current 124.5 s / 5-window `track01.wav` fixture the default emits 20 segments
+and 1,294 characters. This is behavior provenance, not a competitive
+performance ratio; the current timestamp timing cell is rejected in
+`NEGATIVE_EVIDENCE.md`.
 
 ## Current live-incumbent matched-greedy CPU results
 
@@ -29,17 +30,15 @@ matched thread counts and greedy decode on both sides (`-bs 1 -bo 1`).
 
 | Clip | Model | Mode | Result vs `whisper.cpp` |
 |---|---|---|---|
-| `track01.wav` (124.5 s / 5 windows) | large-v3-turbo | no timestamps | **2.07× faster** |
-| `track01.wav` (124.5 s / 5 windows) | tiny.en | no timestamps | **1.10× faster** |
-| `track01.wav` (124.5 s / 5 windows) | tiny.en | segment timestamps | **1.41× faster** |
+| `track01.wav` (124.5 s / 5 windows) | tiny.en | no timestamps | **1.52× faster** |
+| `keynote300.wav` (300 s / 10 windows) | tiny.en | no timestamps | **1.51× faster** |
 
-The no-timestamp rows come from `scripts/whisper_cpp_ab.sh`; the
-segment-timestamp row comes from `examples/incumbent_ab.rs`. The harnesses
-self-report executable SHA-256 values, run per-engine A/A null controls in the
-same invocation, and gate on the comparison median against the bootstrap 95%
-null interval with a 2× margin. CV is provenance only. Full measurement and
-quality evidence lives in `PERF_LEDGER.md`; rejected and non-comparable work
-lives in `NEGATIVE_EVIDENCE.md`.
+Both rows come from `examples/incumbent_ab.rs`. The harness self-reports
+executable SHA-256 values, runs per-engine A/A null controls in the same
+invocation, and gates on the comparison median and CI95 against the widest
+null edge with a 2× margin. CV is provenance only. Full measurement and
+quality evidence lives in `PERF_LEDGER.md`; rejected timestamp and
+large-v3-turbo cells live in `NEGATIVE_EVIDENCE.md`.
 
 ## Live full-pipeline span breakdown (measured 2026-07-12, real `fw transcribe`, not isolated benches)
 
@@ -182,16 +181,16 @@ no pending lever.
 
 ## Recommendation
 
-Use only the three live-incumbent matched-greedy rows at the top of this
-document for competitive copy: **2.07×** large-v3-turbo no timestamps,
-**1.10×** tiny.en no timestamps, and **1.41×** tiny.en segment timestamps.
+Use only the two live-incumbent matched-greedy rows at the top of this
+document for competitive copy: **1.52×** tiny.en on the 124.5-second track and
+**1.51×** tiny.en on the 300-second keynote, both without timestamps.
 Self-speedups are maintenance evidence and do not count as campaign output.
 The byte-exact performance frontier is closed; redirect work to the
 owner-scoped items below.
 
 **Validation COVERAGE + what's resource-blocked (so the owner knows what to supply to extend it):** the
-numbers above cover **English** speech on the **two real on-box models** — `tiny.en` (74 MB, English-only)
-and `large-v3-turbo` (1.5 GB, multilingual-capable). Two axes remain UN-measured and are **blocked on
+numbers above cover **English** speech on `tiny.en` (74 MB, English-only).
+Two axes remain UN-measured and are **blocked on
 missing on-box assets, not effort**: (1) **multilingual** — turbo *can* do it, but there is **no non-English
 audio on box** (all clips — jfk / track01 / sjobs / test_10s_speech — are English); (2) the **intermediate
 models** (base / small / medium) — only 562 KB *test stubs* are present, no real weights. To extend the

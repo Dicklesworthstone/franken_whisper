@@ -4,6 +4,93 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
+
+The exclusive current-source certification used frozen `release-perf` harness
+ELF SHA-256
+`d2fa276c53d306d2930e95cdff4bc560084d00e46878d060fbf5b5e495b4251f`
+against live whisper.cpp 1.8.3 ELF SHA-256
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`.
+The Threadripper admission was quiet: five samples at 100.000% idle average
+and minimum with 0.000% maximum iowait. Terminal post-run samples were
+99–100% idle with 0% iowait. The two admissible tiny.en text wins are recorded
+in `PERF_LEDGER.md`; this row preserves the two cells which failed closed.
+
+The `track01` tiny.en segment-timestamp cell completed mechanically. Its
+apparent incumbent/franken ratio was `1.444458`, CI95
+`[1.428232, 1.458462]`, against a 2×-null floor of `1.044427`; medians were
+803.718 ms and 1160.936 ms. Quality passed at WER `0.058594`, work matched
+(5/5 windows and encodes; incumbent/franken single-token work `0.979472`),
+host-wide CPU samples were clear, and the load-split gap was `0.016225`.
+However, the persistent-process census observed `sbh` at `0.129419` CPU core
+against the `0.100000` maximum. `external_host_clear=false` made the formal
+verdict `UNDECIDABLE`. **The apparent 1.444458× is not a performance claim.**
+
+The subsequent `track01` large-v3-turbo text cell aborted before any timing.
+Franken and the incumbent produced 287 and 431 words respectively, yielding
+WER `0.479167` (207 edits) against the `0.100000` maximum. Although both
+attempted five windows and five encodes, the incumbent performed 452
+single-token decoder runs against franken's 311, a `1.453376` ratio classified
+as `incumbent_more_work`. The immediate pre-measurement host-wide sample also
+observed `cpu82=27.6%` busy against the 20% ceiling. The harness exited 101;
+there is no turbo timing, ratio, or verdict to report.
+
+Preserved artifacts on `threadripperje` are under
+`/data/tmp/fw-realistic-phase4/exclusive_d2fa276c53d3_claim6986_t32_n3`;
+the full driver log is
+`/data/tmp/fw-realistic-phase4/full-run_claim6986.log`. The exclusive booking
+was released after the terminal exit.
+
+**Concrete timestamp retry predicate:** rerun the exact frozen timestamp cell
+only when every persistent external process, including `sbh`, remains at or
+below 0.100000 CPU core at every checkpoint, while retaining the same artifact,
+incumbent, model, audio, identity, work, quality, frequency, host-wide, load,
+and 2×-null gates.
+
+**Concrete turbo retry predicate:** first make the matched-greedy comparator
+produce WER at or below 0.100000 and matched work within 10% on this exact
+model/audio pair. Only then rerun timing under the same identity and work
+contract, with every online CPU at or below 20% busy at preflight,
+pre-measurement, and post-measurement and every persistent external process at
+or below 0.100000 CPU core. More samples of the current mismatched cell cannot
+repair it.
+
+---
+## 2026-07-30 - OliveIsland: **AUDIT / NO GATE CHANGE — the provisional null-CI-straddle diagnosis was false; this comparator has never vetoed a row because a null CI excludes 1.0.**
+
+The previous low-context handoff said that `examples/incumbent_ab.rs` still
+required both A/A null confidence intervals to contain 1.0. Re-verification on
+the higher-context turn disproved that premise before certification. The gate
+at handoff commit `87af19f`, its last four commits, and the comparator's
+introducing commit `9a97466` all use the same rule: compute each null's worst
+edge relative to 1.0, double the wider edge to set the effect-size floor, and
+then require the comparison's own CI95 to exclude 1.0. No null-straddle
+predicate exists. Repository-wide and history searches for the possible
+straddle forms found none.
+
+That distinction matters under
+`PRIMITIVE_null_gate_precision_defect.md`: its evidence standard explicitly
+says that a stable verdict which does not veto on CI straddling is not
+exhibiting the defect and must be left alone. Accordingly, the runtime verdict
+contract was **not loosened or tightened**. The statistical portion was only
+extracted into a testable helper, the existing 2x-widest-null arithmetic and
+every identity, work, quality, thread, load, CPU-policy, per-process, and
+host-wide gate remain literal prerequisites, and the emitted gate row now says
+`null_ci_straddle_required=false`.
+
+The required fleet integrity replay uses the exact seven medians and CI95s from
+frankenlibc's second `wordexp` run. Four of those seven cases have at least one
+null CI that excludes 1.0. Under Franken Whisper's pre-existing rule all seven
+are decidable **LOSSES**, and zero become wins. Focused regression coverage
+also proves that a failed prerequisite, an effect CI touching 1.0, or an effect
+inside the 2x-widest-null floor remains `UNDECIDABLE`.
+
+**Verdict:** retract only the provisional diagnosis; retain the gate. This is
+an evidence-only audit correction, not a performance result. The quiet-host
+live-incumbent certification below must still establish its own artifact,
+identity, work, quality, and host conditions before any ratio is admissible.
+
+---
 ## 2026-07-29 - OliveIsland: **NO ADMISSIBLE VERDICT — the current-source t32-first live-incumbent sweep failed closed on resident host activity after one mechanically complete but invalid cell.**
 
 The frozen whole-job harness ELF was built from base

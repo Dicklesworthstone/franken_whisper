@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In live-incumbent, same-invocation matched-greedy CPU comparisons, the native engine is 2.07× faster than whisper.cpp on large-v3-turbo no-timestamp transcription, 1.10× faster on tiny.en no-timestamp transcription, and 1.47× faster on tiny.en segment-timestamp transcription.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native tiny.en engine is 1.52× faster than whisper.cpp on a 124.5-second no-timestamp workload and 1.51× faster on a 300-second no-timestamp workload.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -31,9 +31,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 >
 > | Model / workload | Mode | Matched-greedy result |
 > |---|---|---|
-> | large-v3-turbo, 124.5 s / 5 windows | no timestamps | **2.07× faster** |
-> | tiny.en, 124.5 s / 5 windows | no timestamps | **1.10× faster** |
-> | tiny.en, 124.5 s / 5 windows | segment timestamps | **1.47× faster** |
+> | tiny.en, 124.5 s / 5 windows | no timestamps | **1.52× faster** |
+> | tiny.en, 300 s / 10 windows | no timestamps | **1.51× faster** |
 
 ---
 
@@ -2615,29 +2614,15 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 
 ### Native Engine Speed (measured)
 
-The in-process Rust native engine is faster than realtime on both `tiny.en` and
-`large-v3-turbo`. The competitive rows below come from live `whisper-cli`
-incumbent arms in `scripts/whisper_cpp_ab.sh` and
+The competitive rows below come from live `whisper-cli` incumbent arms in
 `examples/incumbent_ab.rs`: both binaries run side-by-side in the same
-invocation, at matched greedy decode settings, with each engine using its
-fastest screened thread setting (`whisper-cli -bs 1 -bo 1`).
+invocation at 32 requested threads and matched greedy decode settings
+(`whisper-cli -bs 1 -bo 1`).
 
 | Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|
-| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, no timestamps | **2.07× faster** |
-| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, no timestamps | **1.10× faster** |
-| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, segment timestamps | **1.47× faster** |
-
-**`tiny.en` segment timestamps.** In timestamp mode on `tiny.en` the engine
-suppresses cross-window prompt carry by default, matching `whisper.cpp`'s
-`no_context` policy. This deterministic policy is scoped to that exact model
-and mode; an explicit context request or `FW_TINY_EN_TS_CONTEXT=1` selects
-cross-window context carry. Certified against the live `whisper-cli` incumbent
-by `examples/incumbent_ab.rs` on `track01.wav` (124.5 s / 5 windows), 31
-order-alternating rounds with an A/A null for **each** engine in the same
-invocation: **1.479×** (CI95 [1.407, 1.612]) at franken 873.5 ms vs
-whisper.cpp 1282.9 ms. The independently sampled lighter/heavier load split
-differed by 0.041×, within the 0.1× acceptance limit.
+| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, no timestamps | **1.52× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 300 s, no timestamps | **1.51× faster** |
 
 **Measurement contract.**
 
