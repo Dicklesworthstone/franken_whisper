@@ -8983,9 +8983,9 @@ mod tests {
 
     fn synthetic_typed_diarization_report() -> DiarizationReport {
         DiarizationReport {
-            implementation: "native-acoustic-v1".to_owned(),
+            implementation: "native-acoustic-v2".to_owned(),
             contract_version: "acoustic-diarization-v1".to_owned(),
-            feature_schema: "acoustic-feature-v1".to_owned(),
+            feature_schema: crate::diarization::ACOUSTIC_FEATURE_SCHEMA_VERSION.to_owned(),
             normalized_input_sha256:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             hint_document_sha256: None,

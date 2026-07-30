@@ -78,18 +78,117 @@ evidence.
 
 ## 4. Acoustic evidence
 
-The feature schema maintains two views:
+The default `acoustic-feature-v2` schema maintains two views:
 
-- **Voice:** non-globally-normalized cepstral envelope, deltas, fundamental
-  frequency with voicing confidence, harmonicity, voiced fraction, and robust
-  vocal-tract summaries.
+- **Voice:** twelve energy-centered filterbank cepstra, selected first and
+  second differences, nullable fundamental frequency with a separate validity
+  mask and uncertainty, periodicity, harmonic-to-noise ratio, three
+  vocal-tract/formant proxies, voiced fraction, and temporal modulation.
 - **Channel:** RMS and dynamics, spectral centroid/bandwidth/rolloff/flatness,
-  spectral tilt, band ratios, crest/clipping, noise floor, and conservative
-  temporal-smearing or distortion summaries.
+  effective band limit, high-frequency attenuation, spectral tilt, band
+  ratios, crest/clipping, noise floor, stationary coloration, and conservative
+  temporal-smearing, muffling, or distortion summaries.
 
 Voice evidence is primary. Channel evidence is capped and may create multiple
 channel subprofiles beneath one voice profile. Pitch is never sufficient by
-itself and must never be translated into a gender label.
+itself and must never be translated into a gender label. Missing or uncertain
+pitch is an invalid coordinate, never a physical zero.
+
+### 4.1 Feature schema and aggregation
+
+The library exposes a declarative `AcousticFeatureSchema` for v1 and v2. Every
+family declares its coordinate range, units, voice/channel ownership, validity
+rule, and normalization rule. The default is v2. The old eight-voice/eight-
+channel v1 representation is reachable only through the explicit
+`AcousticFeatureSchemaVersion::V1` segmentation entry point; it is not selected
+by compatibility inference.
+
+V2 owns 28 voice coordinates and 14 channel coordinates. Every tracklet,
+enrollment observation, profile, prototype, and cluster carries the active
+channel-coordinate prefix explicitly. V1 therefore compares exactly its first
+eight channel coordinates, while a no-channel evaluation owns zero; neither
+choice may be inferred from whichever voice coordinates happen to be valid.
+
+V2 identity aggregation admits only voiced frames that are neither low-energy,
+clipped, nor transient. It retains at most 64 deterministic highest-quality
+subwindows per tracklet, then uses per-coordinate medians and MAD-derived
+variance. A coordinate with no supporting subwindow remains invalid through
+enrollment, prototype construction, clustering, and assignment distance.
+Channel statistics separately admit usable non-clipped speech.
+
+Per-recording normalization gives every provisional tracklet equal weight. It
+uses the median and the larger of scaled MAD, scaled IQR, and a conservative
+floor for each supported coordinate. This prevents a long or dominant speaker
+from defining the center by frame count and erasing a short minority speaker.
+The normalization never imputes a missing coordinate.
+
+The frozen representation ablation surface is `full_v2`, `no_pitch`,
+`no_channel`, `no_deltas`, `no_modulation`, and `v1`. These are experiment
+configurations, not adaptive runtime selections. Each retained result records
+the ablation ID, feature schema and hash, complete diarization request and
+hash, and a configuration hash binding all of them to the runner version. The
+speaker-count complexity penalty uses supported voice coordinates instead of
+charging reduced representations for absent v2 dimensions.
+
+`fw diarization-corpus ablate` executes all six representations with the same
+frozen scorer: 250 ms speaker-boundary collar, 250 ms change collar, excluded
+overlap, and ten calibration bins. It uses reference speech regions only as
+oracle VAD, subtracts ignored scoring regions, and never supplies the reference
+speaker count. Source WAV/RTTM
+files remain beneath an external input root. The validated reference bundle
+and aggregate-only ablation evidence must be new JSON files in a separate
+external directory; no source media or per-recording hypotheses are copied.
+Evidence parsing recomputes schema, scorer, request, configuration,
+development and held-out gates, and self hashes before accepting an artifact.
+The artifact also carries a deterministic accuracy hash computed after
+normalizing wall time, RTF, and process-RSS observations away, so identical
+accuracy results can be distinguished from expected host-performance drift.
+
+The representation decision is predeclared before observing corpus output.
+On the frozen development split, full v2 must reduce micro-DER by at least 5%
+relative to v1, must not increase macro-JER, and must not reduce change-F1.
+On the frozen test split, full v2 must not increase either micro-DER or
+macro-JER. Both decisions and their component deltas are part of the
+self-hashed aggregate artifact; a run that merely completes is not a
+successful representation result.
+
+### 4.2 Frozen AMI representation result
+
+The first non-synthetic run was frozen before its metrics were inspected. It
+used the public AMI scenario split, oracle VAD but not oracle speaker count,
+two recordings per development/test split, and deterministic 300-second
+prefixes (600 seconds of scored audio per split). The path-free bundle hash is
+`0d5219be241a3560cb55e3d8d9f63cd8d78ded4e46774d490583f34265eacd59`;
+the performance-independent accuracy hash is
+`9a0adb04b474d12a58f54cba63040b88b6f8139b73944c599603be95593c03b7`;
+and the self-hashed aggregate result is
+`de956df2fd96c690e866947fa44051ece31ea4e670933f4bf6058d7164b88696`.
+The evidence JSON remains outside the checkout.
+
+Full v2 reduced development micro-DER from `0.70067` to `0.53905` (23.07%
+relative), reduced macro-JER from `0.90291` to `0.85863`, and raised
+change-F1 from `0.09924` to `0.11429`, so the predeclared development gate
+passed. On the frozen test slice, micro-DER fell from `0.69968` to `0.48714`
+and macro-JER from `0.90965` to `0.85830`, so the held-out non-regression gate
+also passed. Full-v2 RTF was `0.1069` on development and `0.0935` on test with
+a sampled peak process RSS of 137,363,456 bytes on the measurement host.
+
+The ablation is deliberately treated as diagnostic rather than uniformly
+positive. Removing deltas made development micro-DER substantially worse
+(`0.62330`), and removing modulation slightly worsened DER/JER and materially
+worsened change-F1 (`0.09249`). Removing pitch or channel coordinates improved
+DER/JER but reduced development change-F1. Most importantly, no variant found
+the exact speaker count on this small slice; full v2 had mean absolute count
+error `2.5`. The representation is therefore promoted over v1, while
+pitch/channel fusion, boundary calibration, and count selection remain open
+accuracy work. Because this test slice has now been observed, it must not be
+reused as unseen promotion evidence after tuning; a new frozen test subset is
+required.
+
+Privacy-safe diagnostics expose only schema and schema hash, aggregate
+frame/missingness counts, supported dimension counts, bounded retained state,
+and fallback/calibration state. They never expose feature values, audio,
+transcript text, paths, or recording identifiers.
 
 Wavelet evidence is limited to inexpensive Haar-like multiscale contrasts over
 feature trajectories. A full raw-waveform CWT is not the default algorithm.
@@ -114,7 +213,7 @@ Soft hints contribute capped pseudo-counts and priors. They can be rejected
 when acoustically contradictory. Provenance is audit metadata and cannot
 increase confidence by itself.
 
-Acoustic v1 accepts at most 1,024 known intervals per request, 256 bytes per
+The native acoustic contract accepts at most 1,024 known intervals per request, 256 bytes per
 speaker reference, and 4,096 bytes per provenance value. These limits are
 validated before the hard-hint overlap check.
 
@@ -203,7 +302,7 @@ projection provenance is retrieved through the stored-run surface instead.
 That surface exposes only the privacy-safe `projection_timeline` sub-object,
 not the rest of backend raw output or its internal model paths.
 
-Acoustic v1 confidence currently combines best-versus-second assignment margin
+Native acoustic confidence currently combines best-versus-second assignment margin
 with profile reliability and reports `heuristic_uncalibrated`. Resampling
 stability and a named corpus calibration artifact remain promotion gates, not
 inputs the current implementation pretends to possess. The retained scoring
@@ -213,14 +312,15 @@ cannot appear successful.
 
 ## 7. Determinism and resource limits
 
-- Frame cadence is 16 kHz, 400 samples, 160-sample hop for feature schema v1.
+- Frame cadence is 16 kHz, 400 samples, 160-sample hop for feature schemas v1
+  and v2.
 - Cancellation is checked at least every 32 frames and within clustering and
   smoothing. Projection is bounded linear work inside the independently
   budgeted Diarize stage; persistence and cleanup retain their existing
   pipeline cancellation boundaries.
 - Whole-call raw frame matrices and full raw-audio wavelet transforms are
   forbidden.
-- Acoustic v1 defaults to at most 512 global prototypes. Anchored prototypes
+- The native acoustic implementation defaults to at most 512 global prototypes. Anchored prototypes
   are never discarded. Cap pressure is reported.
 - Exact constrained agglomeration is bounded by the prototype cap, followed by
   linear-in-turns temporal refinement.
