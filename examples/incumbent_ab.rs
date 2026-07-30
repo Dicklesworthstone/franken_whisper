@@ -51,6 +51,12 @@
 //! persistent non-harness processes between every arm: a process consuming more
 //! than 0.1 CPU core makes the result undecidable, because steady cross-tool
 //! load bias can survive both numerical controls.
+//! Work-count provenance is a separate diagnostic, never a substitute for the
+//! median-CI speed gate. The classification compares only counters with matched
+//! semantics across engines: window attempts, encoder calls, and single-token
+//! decoder calls. The incumbent's printed sample/batch/prompt denominators are
+//! retained as raw provenance but cannot drive the classification because this
+//! vendored greedy path does not maintain them as comparable call/token counts.
 //! The harness additionally copies FrankenFS's fail-closed host-wide
 //! quiescence contract: every online logical CPU must be sampled for 300 ms and
 //! remain at or below 20% busy at preflight and immediately before measurement.
@@ -84,7 +90,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use franken_whisper::conformance::word_error_rate;
-use franken_whisper::native_engine::decode::{DecodeParams, LoadedModel, transcribe_samples};
+use franken_whisper::native_engine::decode::{
+    DecodeParams, DecodeWorkStats, LoadedModel, transcribe_samples,
+};
 use franken_whisper::native_engine::find_model_file;
 use franken_whisper::native_engine::ggml::GgmlModel;
 use serde_json::{Value, json};
@@ -132,6 +140,91 @@ struct Observation {
     actual_threads: usize,
     observed_active_threads: usize,
     peak_process_threads: usize,
+    work: EngineWork,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EngineWork {
+    window_attempts: usize,
+    encoder_calls: usize,
+    decoder_prefill_calls: usize,
+    decoder_prefill_tokens: usize,
+    selected_tokens: usize,
+    single_token_decode_calls: usize,
+    incumbent_sampling_counter: usize,
+    incumbent_batch_decode_counter: usize,
+    incumbent_prompt_counter: usize,
+    accepted_windows: usize,
+    accepted_result_tokens: usize,
+    prompt_reset_retries: usize,
+    temperature_fallback_retries: usize,
+    prompt_fallbacks: usize,
+    hallucination_fallbacks: usize,
+}
+
+impl EngineWork {
+    fn from_franken(work: &DecodeWorkStats) -> Self {
+        Self {
+            window_attempts: work.window_attempts,
+            encoder_calls: work.encoder_calls,
+            decoder_prefill_calls: work.decoder_prefill_calls,
+            decoder_prefill_tokens: work.decoder_prefill_tokens,
+            selected_tokens: work.sampled_tokens,
+            single_token_decode_calls: work.greedy_single_token_forwards,
+            accepted_windows: work.accepted_windows,
+            accepted_result_tokens: work.accepted_result_tokens,
+            prompt_reset_retries: work.prompt_reset_retries,
+            temperature_fallback_retries: work.temperature_fallback_retries,
+            ..Self::default()
+        }
+    }
+
+    fn from_worker_json(value: &Value) -> Self {
+        let field = |name: &str| {
+            value[name]
+                .as_u64()
+                .unwrap_or_else(|| panic!("franken worker work result missing {name}"))
+                as usize
+        };
+        Self {
+            window_attempts: field("window_attempts"),
+            encoder_calls: field("encoder_calls"),
+            decoder_prefill_calls: field("decoder_prefill_calls"),
+            decoder_prefill_tokens: field("decoder_prefill_tokens"),
+            selected_tokens: field("sampled_tokens"),
+            single_token_decode_calls: field("greedy_single_token_forwards"),
+            accepted_windows: field("accepted_windows"),
+            accepted_result_tokens: field("accepted_result_tokens"),
+            prompt_reset_retries: field("prompt_reset_retries"),
+            temperature_fallback_retries: field("temperature_fallback_retries"),
+            ..Self::default()
+        }
+    }
+}
+
+fn work_count_classification(franken: &EngineWork, incumbent: &EngineWork) -> &'static str {
+    let exceeds_by_ten_percent =
+        |left: usize, right: usize| left.saturating_mul(10) > right.saturating_mul(11);
+    let franken_more_work =
+        exceeds_by_ten_percent(franken.window_attempts, incumbent.window_attempts)
+            || exceeds_by_ten_percent(franken.encoder_calls, incumbent.encoder_calls)
+            || exceeds_by_ten_percent(
+                franken.single_token_decode_calls,
+                incumbent.single_token_decode_calls,
+            );
+    let incumbent_more_work =
+        exceeds_by_ten_percent(incumbent.window_attempts, franken.window_attempts)
+            || exceeds_by_ten_percent(incumbent.encoder_calls, franken.encoder_calls)
+            || exceeds_by_ten_percent(
+                incumbent.single_token_decode_calls,
+                franken.single_token_decode_calls,
+            );
+    match (franken_more_work, incumbent_more_work) {
+        (true, false) => "franken_more_work",
+        (false, true) => "incumbent_more_work",
+        (true, true) => "mixed_work_counts",
+        (false, false) => "matched_within_10pct",
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1037,6 +1130,60 @@ fn incumbent_actual_threads(text: &str) -> Option<usize> {
     })
 }
 
+fn incumbent_timing_runs(text: &str, label: &str) -> Option<usize> {
+    text.lines()
+        .find(|line| line.contains(label))
+        .and_then(|line| line.split_once('/'))
+        .and_then(|(_, suffix)| suffix.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+}
+
+fn incumbent_fallbacks(text: &str) -> Option<(usize, usize)> {
+    let line = text.lines().find(|line| line.contains("fallbacks"))?;
+    let (_, suffix) = line.split_once('=')?;
+    let mut fields = suffix.split_whitespace();
+    let prompt = fields.next()?.parse().ok()?;
+    (fields.next()? == "p").then_some(())?;
+    (fields.next()? == "/").then_some(())?;
+    let hallucination = fields.next()?.parse().ok()?;
+    (fields.next()? == "h").then_some(())?;
+    Some((prompt, hallucination))
+}
+
+fn incumbent_work_counts(text: &str) -> EngineWork {
+    let required_runs = |label: &str| {
+        incumbent_timing_runs(text, label)
+            .unwrap_or_else(|| panic!("could not parse whisper.cpp {label} run count"))
+    };
+    // This is deliberately retained only as raw provenance. Although the
+    // upstream field is named `n_sample`, this vendored greedy implementation
+    // increments it only for non-empty beam-candidate lists and prints
+    // `max(1, n_sample)`. It is therefore not a selected-token count for the
+    // matched greedy arm and must never drive the work-count classification.
+    let incumbent_sampling_counter = required_runs("sample time");
+    let encoder_calls = required_runs("encode time");
+    let single_token_decode_calls = required_runs("decode time");
+    // These two printed "runs" denominators are also raw counters: the
+    // incumbent increments them by input token count, not decoder-call count,
+    // and prints `max(1, counter)`.
+    let incumbent_batch_decode_counter = required_runs("batchd time");
+    let incumbent_prompt_counter = required_runs("prompt time");
+    let (prompt_fallbacks, hallucination_fallbacks) =
+        incumbent_fallbacks(text).expect("could not parse whisper.cpp fallback counts");
+    EngineWork {
+        window_attempts: encoder_calls + prompt_fallbacks + hallucination_fallbacks,
+        encoder_calls,
+        single_token_decode_calls,
+        incumbent_sampling_counter,
+        incumbent_batch_decode_counter,
+        incumbent_prompt_counter,
+        accepted_windows: encoder_calls,
+        prompt_fallbacks,
+        hallucination_fallbacks,
+        ..EngineWork::default()
+    }
+}
+
 /// One `whisper.cpp` run.
 ///
 /// `transcribe_only` measures the incumbent's self-reported `total − load`.
@@ -1116,6 +1263,7 @@ fn run_incumbent(
         actual_threads: incumbent_actual_threads(&text).unwrap_or(0),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
+        work: incumbent_work_counts(&text),
     }
 }
 
@@ -1135,6 +1283,7 @@ fn run_franken_resident(
         .collect();
     let chars = segments.iter().map(String::len).sum();
     let transcript = segments.join(" ");
+    let work = EngineWork::from_franken(&out.work);
     Observation {
         measured_ms: elapsed,
         chars,
@@ -1145,6 +1294,7 @@ fn run_franken_resident(
         actual_threads: rayon::current_num_threads(),
         observed_active_threads: 0,
         peak_process_threads: 0,
+        work,
     }
 }
 
@@ -1202,6 +1352,7 @@ fn run_franken_whole(
         actual_threads: field_u64("actual_threads"),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
+        work: EngineWork::from_worker_json(&value["work"]),
     }
 }
 
@@ -1250,6 +1401,18 @@ fn franken_worker_main(args: &[String]) {
             "serialized_segments_sha256": sha256_bytes(&serialized_segments),
             "transcript": transcript,
             "actual_threads": rayon::current_num_threads(),
+            "work": {
+                "window_attempts": out.work.window_attempts,
+                "encoder_calls": out.work.encoder_calls,
+                "decoder_prefill_calls": out.work.decoder_prefill_calls,
+                "decoder_prefill_tokens": out.work.decoder_prefill_tokens,
+                "sampled_tokens": out.work.sampled_tokens,
+                "greedy_single_token_forwards": out.work.greedy_single_token_forwards,
+                "accepted_windows": out.work.accepted_windows,
+                "accepted_result_tokens": out.work.accepted_result_tokens,
+                "prompt_reset_retries": out.work.prompt_reset_retries,
+                "temperature_fallback_retries": out.work.temperature_fallback_retries,
+            },
         })
     );
 }
@@ -1495,6 +1658,57 @@ fn main() {
             .map(|value| value.trim().to_owned())
             .unwrap_or_else(|_| "unavailable".to_owned()),
     );
+    assert!(
+        fw_warm.work.window_attempts > 0
+            && wc_warm.work.window_attempts > 0
+            && fw_warm.work.encoder_calls > 0
+            && wc_warm.work.encoder_calls > 0
+            && fw_warm.work.single_token_decode_calls > 0
+            && wc_warm.work.single_token_decode_calls > 0,
+        "benchmark work counters must be positive for both matched greedy arms"
+    );
+    let attempt_work_ratio =
+        wc_warm.work.window_attempts as f64 / fw_warm.work.window_attempts as f64;
+    let encode_work_ratio = wc_warm.work.encoder_calls as f64 / fw_warm.work.encoder_calls as f64;
+    let decode_work_ratio = wc_warm.work.single_token_decode_calls as f64
+        / fw_warm.work.single_token_decode_calls as f64;
+    let work_count_class = work_count_classification(&fw_warm.work, &wc_warm.work);
+    println!(
+        "INCUMBENT_AB_WORK franken_window_attempts={} franken_encoder_calls={} \
+         franken_decoder_prefills={} franken_decoder_prefill_tokens={} \
+         franken_selected_tokens={} \
+         franken_single_token_forwards={} franken_accepted_windows={} \
+         franken_accepted_result_tokens={} franken_prompt_reset_retries={} \
+         franken_temperature_fallback_retries={} incumbent_window_attempts={} \
+         incumbent_encode_runs={} incumbent_sample_counter_raw={} incumbent_decode_runs={} \
+         incumbent_batchd_counter_raw={} incumbent_prompt_counter_raw={} \
+         incumbent_prompt_fallbacks={} \
+         incumbent_hallucination_fallbacks={} \
+         incumbent_over_franken_window_attempt_work={attempt_work_ratio:.6} \
+         incumbent_over_franken_encode_work={encode_work_ratio:.6} \
+         incumbent_over_franken_single_token_decode_work={decode_work_ratio:.6} \
+         incumbent_sample_counter_comparable=false \
+         incumbent_batchd_prompt_counters_comparable=false \
+         classification={work_count_class}",
+        fw_warm.work.window_attempts,
+        fw_warm.work.encoder_calls,
+        fw_warm.work.decoder_prefill_calls,
+        fw_warm.work.decoder_prefill_tokens,
+        fw_warm.work.selected_tokens,
+        fw_warm.work.single_token_decode_calls,
+        fw_warm.work.accepted_windows,
+        fw_warm.work.accepted_result_tokens,
+        fw_warm.work.prompt_reset_retries,
+        fw_warm.work.temperature_fallback_retries,
+        wc_warm.work.window_attempts,
+        wc_warm.work.encoder_calls,
+        wc_warm.work.incumbent_sampling_counter,
+        wc_warm.work.single_token_decode_calls,
+        wc_warm.work.incumbent_batch_decode_counter,
+        wc_warm.work.incumbent_prompt_counter,
+        wc_warm.work.prompt_fallbacks,
+        wc_warm.work.hallucination_fallbacks,
+    );
     let run_franken_checked = || {
         let observation = run_franken();
         assert_eq!(
@@ -1504,6 +1718,10 @@ fn main() {
         assert_eq!(
             observation.actual_threads, fw_warm.actual_threads,
             "franken configured thread count changed within one invocation"
+        );
+        assert_eq!(
+            observation.work, fw_warm.work,
+            "franken work count changed within one invocation"
         );
         observation
     };
@@ -1516,6 +1734,10 @@ fn main() {
         assert_eq!(
             observation.actual_threads, wc_warm.actual_threads,
             "whisper.cpp configured thread count changed within one invocation"
+        );
+        assert_eq!(
+            observation.work, wc_warm.work,
+            "whisper.cpp work count changed within one invocation"
         );
         observation
     };
@@ -1686,6 +1908,7 @@ fn main() {
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
          host_wide_clear={host_wide_clear} \
          cpu_frequency_policy_clear={cpu_frequency_policy_clear} \
+         work_counts_stable=true work_count_classification={work_count_class} \
          cv_is_provenance_only=true class=vs_incumbent verdict={verdict}"
     );
 }
@@ -1889,7 +2112,13 @@ mod tests {
 system_info: n_threads = 64 / 128 | AVX2 = 1\n\
 [00:00:00.000 --> 00:00:01.000]  hello world\n\
 diagnostic line\n\
-[00:00:01.000 --> 00:00:02.000]  from whisper\n";
+[00:00:01.000 --> 00:00:02.000]  from whisper\n\
+whisper_print_timings:     fallbacks =   1 p /   2 h\n\
+whisper_print_timings:   sample time =     8.77 ms /    31 runs (0.28 ms per run)\n\
+whisper_print_timings:   encode time =  1421.36 ms /     4 runs (355.34 ms per run)\n\
+whisper_print_timings:   decode time =   156.54 ms /    27 runs (5.80 ms per run)\n\
+whisper_print_timings:   batchd time =     9.15 ms /     4 runs (2.29 ms per run)\n\
+whisper_print_timings:   prompt time =     0.00 ms /     4 runs (0.00 ms per run)\n";
 
         assert_eq!(
             incumbent_segments(output, true),
@@ -1899,6 +2128,51 @@ diagnostic line\n\
         assert_eq!(
             incumbent_segments("\n hello world from whisper\n", false),
             ["hello world from whisper".to_owned()]
+        );
+        assert_eq!(
+            incumbent_work_counts(output),
+            EngineWork {
+                window_attempts: 7,
+                encoder_calls: 4,
+                single_token_decode_calls: 27,
+                incumbent_sampling_counter: 31,
+                incumbent_batch_decode_counter: 4,
+                incumbent_prompt_counter: 4,
+                accepted_windows: 4,
+                prompt_fallbacks: 1,
+                hallucination_fallbacks: 2,
+                ..EngineWork::default()
+            }
+        );
+    }
+
+    #[test]
+    fn work_classification_uses_only_semantically_matched_counters() {
+        let franken = EngineWork {
+            window_attempts: 4,
+            encoder_calls: 4,
+            selected_tokens: 163,
+            single_token_decode_calls: 160,
+            ..EngineWork::default()
+        };
+        let mut incumbent = EngineWork {
+            window_attempts: 4,
+            encoder_calls: 4,
+            incumbent_sampling_counter: 1,
+            single_token_decode_calls: 160,
+            incumbent_batch_decode_counter: 2,
+            incumbent_prompt_counter: 1,
+            ..EngineWork::default()
+        };
+
+        assert_eq!(
+            work_count_classification(&franken, &incumbent),
+            "matched_within_10pct"
+        );
+        incumbent.single_token_decode_calls = 244;
+        assert_eq!(
+            work_count_classification(&franken, &incumbent),
+            "incumbent_more_work"
         );
     }
 
