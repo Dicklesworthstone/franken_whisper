@@ -1952,9 +1952,16 @@ fn main() {
     };
     let contract_binary_clear = contract.binary_matches(incumbent_exe.as_deref());
     let identity_clear = distinct_binaries && contract_binary_clear && source_clear;
+    // Builder identity, per the fleet local-perf-binary policy: `rch exec` has no
+    // artifact-retrieval mechanism, so a release-perf harness is built on a remote
+    // worker and copied back. A digest alone does not say which machine produced
+    // it, and a binary of unknown origin is not evidence.
+    let harness_builder =
+        std::env::var("FW_HARNESS_BUILDER").unwrap_or_else(|_| "unrecorded".to_owned());
     println!(
         "INCUMBENT_AB_IDENTITY franken_exe_sha256={} incumbent_exe_sha256={} \
          attestation=proc_exe_of_running_process franken_source={} \
+         harness_builder={harness_builder} \
          distinct_binaries={distinct_binaries} \
          contract_binary_clear={contract_binary_clear} source_clear={source_clear} \
          identity_clear={identity_clear}",
