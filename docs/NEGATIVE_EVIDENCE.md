@@ -26139,3 +26139,38 @@ A/A controls and the live whisper.cpp greedy incumbent. Accept or reject only
 from the bootstrap median-CI gate with the independent-load split and 2x null
 margin; CV remains provenance only. Release trj immediately on success or
 failure.
+
+---
+## 2026-07-30 - CoralBeacon: **NO-PROMOTION — probabilistic acoustic clustering improves development micro-DER but fails macro-JER and assignment-calibration gates; held-out remains sealed.**
+
+The public, path-free AMI development run used
+`public-diarization-acoustic-ablation-v7`,
+`public-diarization-acoustic-ablation-runner-v7`, and
+`diarization-scorer-v3`, with two deterministic 120-second development
+prefixes, oracle VAD, and no oracle speaker count. No private Downloads audio
+or transcript was accessed. The public bundle hash is
+`34f405b6220d479f4d0d86937de77d51375ed39120abfd3a2f38e775a24e874e`,
+the speaker-pair calibration hash is
+`fc286e7aec51d4b2362e3162bcd8a77451ef610a9e31f1295ba469856f4025ca`,
+the deterministic accuracy hash is
+`4a0e62a073067c2d9c5f45378600844e240d9a0447954219ec6f28dd8d203f34`,
+and the self-hashed result is
+`8aef28a314c500feb33ff96afe233067fb03a6b92d093171967136e2ca8aac55`.
+Artifacts remain outside the checkout.
+
+The candidate reduced micro-DER from `0.277232` to `0.246490` (11.09%
+relative), confusion by 3.990 seconds, count MAE from `2.0` to `1.5`, and
+selective risk from `0.167412` to `0.166832`; coverage rose from `0.873234` to
+`0.909523`. Five-view count stability was `1.0` and fallback count was zero.
+Those gains are insufficient for promotion: macro-JER regressed from
+`0.510011` to `0.589858` (delta `+0.079847` against a `+0.01` allowance),
+assignment ECE was `0.217159` against the `0.10` limit, and neither mode
+detected reference overlap (F1 `0.0`). A prior development-only square-root
+confidence mapping improved ECE to `0.139682` but still failed.
+
+The retained selector therefore chose `fixed_safe_v1`. No development lock
+was minted and no held-out/test audio was read. Retry only after a new
+predeclared calibration method and speaker-fragmentation/count objective are
+implemented and validated without further fitting to these two development
+meetings; do not use this result to claim held-out accuracy or production
+promotion.

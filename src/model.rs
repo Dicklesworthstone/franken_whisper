@@ -421,6 +421,27 @@ pub struct DiarizationTurn {
     pub hard_hint_attributed: bool,
 }
 
+/// Why an agent may want to provide another contextual timestamp interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerAttributionQueryReason {
+    UnknownAttribution,
+    LowConfidence,
+    OverlapAmbiguity,
+}
+
+/// Content-bound, feature-value-free request for optional agent supervision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerAttributionQuery {
+    pub query_id_sha256: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub reason: SpeakerAttributionQueryReason,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_speaker_refs: Vec<String>,
+    pub suggested_policy: KnownSpeakerPolicy,
+}
+
 /// Privacy-safe quality summary for one within-run speaker profile.
 ///
 /// Raw acoustic vectors and audio are intentionally absent.
@@ -430,7 +451,15 @@ pub struct SpeakerProfileSummary {
     pub frame_count: u64,
     pub voiced_duration_ms: u64,
     pub reliability: f64,
+    #[serde(default)]
+    pub voice_profile_count: u32,
     pub channel_profile_count: u32,
+    #[serde(default)]
+    pub training_accepted_count: u32,
+    #[serde(default)]
+    pub training_downweighted_count: u32,
+    #[serde(default)]
+    pub training_quarantined_count: u32,
     pub anchored: bool,
     pub soft_hint_contradiction: Option<f64>,
 }
@@ -446,6 +475,8 @@ pub struct DiarizationReport {
     pub hint_document_sha256: Option<String>,
     pub turns: Vec<DiarizationTurn>,
     pub profiles: Vec<SpeakerProfileSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_queries: Vec<SpeakerAttributionQuery>,
     pub detected_speakers: u32,
     pub constraints_satisfied: bool,
     pub fallback_status: DiarizationFallbackStatus,
@@ -3141,9 +3172,22 @@ mod tests {
                 frame_count: 72,
                 voiced_duration_ms: 720,
                 reliability: 0.9,
+                voice_profile_count: 1,
                 channel_profile_count: 1,
+                training_accepted_count: 1,
+                training_downweighted_count: 0,
+                training_quarantined_count: 0,
                 anchored: true,
                 soft_hint_contradiction: None,
+            }],
+            speaker_queries: vec![SpeakerAttributionQuery {
+                query_id_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_owned(),
+                start_ms: 1_000,
+                end_ms: 1_500,
+                reason: SpeakerAttributionQueryReason::LowConfidence,
+                candidate_speaker_refs: vec!["near".to_owned()],
+                suggested_policy: KnownSpeakerPolicy::SoftEnrollment,
             }],
             detected_speakers: 1,
             constraints_satisfied: true,

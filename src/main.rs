@@ -265,6 +265,10 @@ fn run(cli: Cli) -> FwResult<()> {
                             evidence_output_path: &args.output,
                             license_acknowledgement_id: &args.license_ack,
                             maximum_recording_duration_ms: args.maximum_recording_duration_ms,
+                            evaluation_stage: args.stage.into(),
+                            locked_development_evidence_path: args
+                                .locked_development_evidence
+                                .as_deref(),
                         },
                         ShutdownController::is_shutting_down,
                     )?;

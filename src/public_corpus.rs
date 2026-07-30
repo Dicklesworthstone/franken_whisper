@@ -15,14 +15,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::diarization::{
-    AcousticBoundaryHints, AcousticDiarizationInput, AcousticFeatureAblation,
+    ACOUSTIC_CHANGE_CALIBRATION_FIT_VERSION, ACOUSTIC_CHANGE_CALIBRATION_VERSION,
+    ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION, AcousticBoundaryHints, AcousticChangeDetectorMode,
+    AcousticClusteringEvaluationEvidence, AcousticClusteringFallbackReason, AcousticClusteringMode,
+    AcousticDiarizationInput, AcousticFeatureAblation, ChangePointScore,
     DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION, DIARIZATION_HYPOTHESIS_SCHEMA_VERSION,
     DIARIZATION_REFERENCE_SCHEMA_VERSION, DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest,
     DiarizationHypothesisDocument, DiarizationLeakageAudit, DiarizationReferenceDocument,
     DiarizationScorerConfig, EvaluationOverlapPolicy, EvaluationPerformanceObservation,
-    EvaluationRegion, EvaluationSplit, EvaluationTurn, acoustic_feature_schema_sha256,
-    audit_diarization_manifest, diarize_acoustic_pcm_with_ablation,
-    parse_diarization_corpus_manifest, parse_diarization_reference, score_diarization_documents,
+    EvaluationRegion, EvaluationSplit, EvaluationTurn, acoustic_change_calibration,
+    acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
+    acoustic_speaker_pair_calibration_sha256, audit_diarization_manifest,
+    diarize_acoustic_pcm_with_modes_evidence, parse_diarization_corpus_manifest,
+    parse_diarization_reference, score_change_points, score_diarization_documents,
+    select_acoustic_change_evidence_at_threshold, speaker_change_points_ms,
     verify_leakage_audit_hash,
 };
 use crate::error::{FwError, FwResult};
@@ -37,12 +43,45 @@ pub const PUBLIC_CORPUS_ADAPTER_VERSION: &str = "public-diarization-corpus-adapt
 /// Schema identity for the built-in public-corpus registry.
 pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corpus-registry-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v1";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v7";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v1";
+    "public-diarization-acoustic-ablation-runner-v7";
 /// Predeclared minimum relative micro-DER reduction required on development.
 pub const PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.05;
+/// Predeclared relative change-F1 gain for the calibrated detector.
+pub const PUBLIC_CORPUS_MIN_CHANGE_F1_IMPROVEMENT: f64 = 0.20;
+/// Maximum absolute DER or JER regression admitted during detector tuning.
+pub const PUBLIC_CORPUS_MAX_CHANGE_DER_JER_REGRESSION: f64 = 0.01;
+/// Maximum event-level Brier score admitted for a calibrated detector.
+pub const PUBLIC_CORPUS_MAX_CHANGE_BRIER: f64 = 0.25;
+/// Maximum event-level expected calibration error admitted for promotion.
+pub const PUBLIC_CORPUS_MAX_CHANGE_ECE: f64 = 0.10;
+/// Minimum relative micro-DER gain required for probabilistic clustering.
+pub const PUBLIC_CORPUS_MIN_CLUSTERING_DER_IMPROVEMENT: f64 = 0.05;
+/// Maximum macro-JER regression admitted while tuning clustering.
+pub const PUBLIC_CORPUS_MAX_CLUSTERING_JER_REGRESSION: f64 = 0.01;
+/// Maximum assignment-confidence ECE admitted for clustering promotion.
+pub const PUBLIC_CORPUS_MAX_CLUSTERING_ECE: f64 = 0.10;
+/// Minimum deterministic perturbation agreement admitted for count selection.
+pub const PUBLIC_CORPUS_MIN_CLUSTERING_COUNT_STABILITY: f64 = 2.0 / 3.0;
+/// Maximum absolute loss of reference-time coverage allowed for a candidate.
+pub const PUBLIC_CORPUS_MAX_CLUSTERING_COVERAGE_REGRESSION: f64 = 0.01;
+/// Maximum selective-risk regression allowed on development or held-out data.
+pub const PUBLIC_CORPUS_MAX_CLUSTERING_SELECTIVE_RISK_REGRESSION: f64 = 0.0;
+/// Identity for the fail-closed public development selector.
+pub const PUBLIC_CORPUS_CHANGE_SELECTION_POLICY_VERSION: &str =
+    "public-change-detector-selection-v1";
+const PUBLIC_CORPUS_CHANGE_CANDIDATE_ORDER: [AcousticChangeDetectorMode; 3] = [
+    AcousticChangeDetectorMode::CalibratedPosterior,
+    AcousticChangeDetectorMode::PageHinkleyV1,
+    AcousticChangeDetectorMode::BayesianTwoRegimeV1,
+];
+const PUBLIC_CHANGE_DIAGNOSTIC_COLLARS_MS: [u64; 3] = [100, 250, 500];
+const PUBLIC_CHANGE_THRESHOLD_SWEEP: [f64; 19] = [
+    0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80,
+    0.85, 0.90, 0.95,
+];
 
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ANNOTATION_BYTES: u64 = 64 * 1024 * 1024;
@@ -63,6 +102,24 @@ pub enum PublicCorpusSplitPolicy {
     AmiScenarioOfficialV1,
     /// The external descriptor is frozen by its SHA-256 and then leakage-audited.
     ExternalDescriptorV1,
+}
+
+/// Explicit authority boundary for tuning versus held-out certification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCorpusEvaluationStage {
+    Development,
+    Certification,
+}
+
+impl PublicCorpusEvaluationStage {
+    #[must_use]
+    const fn selected_split(self) -> EvaluationSplit {
+        match self {
+            Self::Development => EvaluationSplit::Development,
+            Self::Certification => EvaluationSplit::Test,
+        }
+    }
 }
 
 /// One built-in corpus source and its reproducibility/licensing contract.
@@ -139,6 +196,63 @@ pub struct PublicCorpusAblationProtocol {
     pub rss_observation: String,
     pub diarization_request: DiarizationRequest,
     pub diarization_request_sha256: String,
+    pub change_calibration_id: String,
+    pub change_calibration_fit_id: String,
+    pub change_calibration_sha256: String,
+    pub change_decision_probability: f64,
+    pub change_calibration_bins: usize,
+    pub change_selection_policy_id: String,
+    pub change_selection_policy_sha256: String,
+    pub speaker_pair_calibration_id: String,
+    pub speaker_pair_calibration_sha256: String,
+}
+
+/// One aggregate event-confidence reliability bin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicChangeReliabilityBin {
+    pub index: usize,
+    pub lower_probability: f64,
+    pub upper_probability: f64,
+    pub observation_count: u64,
+    pub positive_count: u64,
+    pub mean_probability: Option<f64>,
+    pub empirical_frequency: Option<f64>,
+}
+
+/// Aggregate operating-point metrics at one declared boundary collar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicChangeCollarMetrics {
+    pub collar_ms: u64,
+    pub reference_count: u64,
+    pub hypothesis_count: u64,
+    pub matched_count: u64,
+    pub precision: Option<f64>,
+    pub recall: Option<f64>,
+    pub f1: Option<f64>,
+    pub mean_absolute_error_sec: Option<f64>,
+    pub p50_absolute_error_sec: Option<f64>,
+    pub p90_absolute_error_sec: Option<f64>,
+    pub p95_absolute_error_sec: Option<f64>,
+}
+
+/// Development diagnostic for one predeclared probability threshold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicChangeThresholdSweepPoint {
+    pub threshold: f64,
+    pub collar_ms: u64,
+    pub reference_count: u64,
+    pub hypothesis_count: u64,
+    pub matched_count: u64,
+    pub precision: Option<f64>,
+    pub recall: Option<f64>,
+    pub f1: Option<f64>,
+    pub mean_absolute_error_sec: Option<f64>,
+    pub p50_absolute_error_sec: Option<f64>,
+    pub p90_absolute_error_sec: Option<f64>,
+    pub p95_absolute_error_sec: Option<f64>,
 }
 
 /// Aggregate metrics for one feature ablation and one frozen corpus split.
@@ -151,9 +265,49 @@ pub struct PublicCorpusAblationSplit {
     pub micro_der: Option<f64>,
     pub macro_der: Option<f64>,
     pub macro_jer: Option<f64>,
+    pub speaker_confusion_sec: f64,
+    pub overlap_reference_sec: f64,
+    pub overlap_hypothesis_sec: f64,
+    pub overlap_true_positive_sec: f64,
+    pub overlap_false_positive_sec: f64,
+    pub overlap_false_negative_sec: f64,
+    pub overlap_precision: Option<f64>,
+    pub overlap_recall: Option<f64>,
+    pub overlap_f1: Option<f64>,
+    pub change_reference_count: u64,
+    pub change_hypothesis_count: u64,
+    pub change_matched_count: u64,
+    pub change_precision: Option<f64>,
+    pub change_recall: Option<f64>,
     pub change_f1: Option<f64>,
+    pub change_mean_absolute_error_sec: Option<f64>,
+    pub change_event_observation_count: u64,
+    pub change_event_positive_count: u64,
+    pub change_brier_score: Option<f64>,
+    pub change_expected_calibration_error: Option<f64>,
+    pub change_reliability: Vec<PublicChangeReliabilityBin>,
+    pub change_collar_metrics: Vec<PublicChangeCollarMetrics>,
+    pub change_threshold_sweep: Vec<PublicChangeThresholdSweepPoint>,
     pub exact_speaker_count_rate: Option<f64>,
+    pub mean_signed_speaker_count_error: Option<f64>,
     pub mean_absolute_speaker_count_error: Option<f64>,
+    pub selective_reference_speaker_time_sec: f64,
+    pub selective_covered_speaker_time_sec: f64,
+    pub selective_correct_covered_speaker_time_sec: f64,
+    pub selective_error_covered_speaker_time_sec: f64,
+    pub selective_unknown_speaker_time_sec: f64,
+    pub selective_coverage: Option<f64>,
+    pub selective_risk: Option<f64>,
+    pub assignment_observed_duration_sec: f64,
+    pub assignment_opportunity_duration_sec: f64,
+    pub assignment_coverage: Option<f64>,
+    pub assignment_brier_score: Option<f64>,
+    pub assignment_expected_calibration_error: Option<f64>,
+    pub mean_speaker_count_stability: Option<f64>,
+    pub clustering_fallback_count: u64,
+    pub clustering_insufficient_voice_fallback_count: u64,
+    pub clustering_invalid_posterior_fallback_count: u64,
+    pub clustering_unstable_count_fallback_count: u64,
     pub audio_duration_sec: f64,
     pub wall_time_sec: f64,
     pub real_time_factor: Option<f64>,
@@ -169,6 +323,108 @@ pub struct PublicCorpusAblationVariant {
     pub feature_schema_sha256: String,
     pub feature_configuration_sha256: String,
     pub splits: Vec<PublicCorpusAblationSplit>,
+}
+
+/// Aggregate public evidence for one frozen speaker-change detector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusChangeDetectorVariant {
+    pub detector_mode: AcousticChangeDetectorMode,
+    pub feature_ablation: AcousticFeatureAblation,
+    pub feature_schema_sha256: String,
+    pub configuration_sha256: String,
+    pub splits: Vec<PublicCorpusAblationSplit>,
+}
+
+/// Aggregate public evidence for one frozen acoustic clustering strategy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusClusteringVariant {
+    pub clustering_mode: AcousticClusteringMode,
+    pub detector_mode: AcousticChangeDetectorMode,
+    pub feature_ablation: AcousticFeatureAblation,
+    pub configuration_sha256: String,
+    pub splits: Vec<PublicCorpusAblationSplit>,
+}
+
+/// Development decision for probabilistic clustering versus fixed-safe v1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusClusteringDevelopmentGate {
+    pub split: EvaluationSplit,
+    pub candidate: AcousticClusteringMode,
+    pub baseline: AcousticClusteringMode,
+    pub minimum_relative_micro_der_improvement: f64,
+    pub maximum_macro_jer_regression: f64,
+    pub maximum_assignment_expected_calibration_error: f64,
+    pub minimum_mean_speaker_count_stability: f64,
+    pub maximum_selective_coverage_regression: f64,
+    pub maximum_selective_risk_regression: f64,
+    pub relative_micro_der_improvement: Option<f64>,
+    pub macro_jer_delta: Option<f64>,
+    pub speaker_confusion_delta_sec: Option<f64>,
+    pub overlap_f1_delta: Option<f64>,
+    pub mean_absolute_speaker_count_error_delta: Option<f64>,
+    pub selective_coverage_regression: Option<f64>,
+    pub selective_risk_delta: Option<f64>,
+    pub candidate_assignment_expected_calibration_error: Option<f64>,
+    pub candidate_mean_speaker_count_stability: Option<f64>,
+    pub candidate_fallback_count: u64,
+    pub passed: bool,
+}
+
+/// Held-out non-regression decision for a locked clustering candidate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusClusteringHeldOutGate {
+    pub split: EvaluationSplit,
+    pub candidate: AcousticClusteringMode,
+    pub baseline: AcousticClusteringMode,
+    pub micro_der_delta: Option<f64>,
+    pub macro_jer_delta: Option<f64>,
+    pub overlap_f1_delta: Option<f64>,
+    pub mean_absolute_speaker_count_error_delta: Option<f64>,
+    pub selective_coverage_regression: Option<f64>,
+    pub selective_risk_delta: Option<f64>,
+    pub candidate_assignment_expected_calibration_error: Option<f64>,
+    pub candidate_fallback_count: u64,
+    pub passed: bool,
+}
+
+/// Development decision for the calibrated detector versus fixed-safe v1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusChangeDevelopmentGate {
+    pub split: EvaluationSplit,
+    pub candidate: AcousticChangeDetectorMode,
+    pub baseline: AcousticChangeDetectorMode,
+    pub minimum_relative_change_f1_improvement: f64,
+    pub maximum_der_jer_regression: f64,
+    pub maximum_brier_score: f64,
+    pub maximum_expected_calibration_error: f64,
+    pub relative_change_f1_improvement: Option<f64>,
+    pub mean_absolute_timing_error_delta_sec: Option<f64>,
+    pub micro_der_delta: Option<f64>,
+    pub macro_jer_delta: Option<f64>,
+    pub candidate_brier_score: Option<f64>,
+    pub candidate_expected_calibration_error: Option<f64>,
+    pub passed: bool,
+}
+
+/// Held-out non-regression decision for the locked calibrated detector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusChangeHeldOutGate {
+    pub split: EvaluationSplit,
+    pub candidate: AcousticChangeDetectorMode,
+    pub baseline: AcousticChangeDetectorMode,
+    pub change_f1_delta: Option<f64>,
+    pub timing_error_delta_sec: Option<f64>,
+    pub micro_der_delta: Option<f64>,
+    pub macro_jer_delta: Option<f64>,
+    pub candidate_brier_score: Option<f64>,
+    pub candidate_expected_calibration_error: Option<f64>,
+    pub passed: bool,
 }
 
 /// Predeclared development-set improvement decision for full v2 versus v1.
@@ -210,10 +466,21 @@ pub struct PublicCorpusAblationEvidence {
     pub descriptor_sha256: String,
     pub scorer_config: DiarizationScorerConfig,
     pub scorer_config_sha256: String,
+    pub evaluation_stage: PublicCorpusEvaluationStage,
+    pub locked_development_result_sha256: Option<String>,
+    pub locked_development_accuracy_sha256: Option<String>,
+    pub selected_change_detector_mode: AcousticChangeDetectorMode,
+    pub selected_clustering_mode: AcousticClusteringMode,
     pub protocol: PublicCorpusAblationProtocol,
     pub variants: Vec<PublicCorpusAblationVariant>,
-    pub development_gate: PublicCorpusDevelopmentGate,
-    pub held_out_gate: PublicCorpusHeldOutGate,
+    pub change_detector_variants: Vec<PublicCorpusChangeDetectorVariant>,
+    pub clustering_variants: Vec<PublicCorpusClusteringVariant>,
+    pub development_gate: Option<PublicCorpusDevelopmentGate>,
+    pub held_out_gate: Option<PublicCorpusHeldOutGate>,
+    pub change_development_gate: Option<PublicCorpusChangeDevelopmentGate>,
+    pub change_held_out_gate: Option<PublicCorpusChangeHeldOutGate>,
+    pub clustering_development_gate: Option<PublicCorpusClusteringDevelopmentGate>,
+    pub clustering_held_out_gate: Option<PublicCorpusClusteringHeldOutGate>,
     /// Hash with wall-time, RSS, and RTF observations normalized away.
     pub deterministic_accuracy_sha256: String,
     /// Hash of this evidence with this field temporarily empty.
@@ -233,6 +500,8 @@ pub struct PublicCorpusAblationRequest<'a> {
     pub evidence_output_path: &'a Path,
     pub license_acknowledgement_id: &'a str,
     pub maximum_recording_duration_ms: Option<u64>,
+    pub evaluation_stage: PublicCorpusEvaluationStage,
+    pub locked_development_evidence_path: Option<&'a Path>,
 }
 
 #[derive(Serialize)]
@@ -241,6 +510,41 @@ struct PublicFeatureConfigurationFingerprint<'a> {
     ablation: AcousticFeatureAblation,
     feature_schema_sha256: &'a str,
     diarization_request_sha256: &'a str,
+    change_calibration_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct PublicChangeConfigurationFingerprint<'a> {
+    runner_version: &'a str,
+    detector_mode: AcousticChangeDetectorMode,
+    feature_ablation: AcousticFeatureAblation,
+    feature_schema_sha256: &'a str,
+    diarization_request_sha256: &'a str,
+    change_calibration_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct PublicClusteringConfigurationFingerprint<'a> {
+    runner_version: &'a str,
+    clustering_mode: AcousticClusteringMode,
+    detector_mode: AcousticChangeDetectorMode,
+    feature_ablation: AcousticFeatureAblation,
+    feature_schema_sha256: &'a str,
+    diarization_request_sha256: &'a str,
+    speaker_pair_calibration_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct PublicChangeSelectionPolicyFingerprint {
+    policy_id: &'static str,
+    candidate_order: [AcousticChangeDetectorMode; 3],
+    baseline: AcousticChangeDetectorMode,
+    minimum_relative_change_f1_improvement: f64,
+    maximum_der_jer_regression: f64,
+    maximum_brier_score: f64,
+    maximum_expected_calibration_error: f64,
+    require_timing_non_regression: bool,
+    fail_closed_default: AcousticChangeDetectorMode,
 }
 
 /// External-only local descriptor. It intentionally has neither `Debug` nor
@@ -874,12 +1178,30 @@ pub fn run_public_corpus_ablation_with_cancel(
         evidence_output_path,
         license_acknowledgement_id,
         maximum_recording_duration_ms,
+        evaluation_stage,
+        locked_development_evidence_path,
     } = request;
     if maximum_recording_duration_ms == Some(0) {
         return Err(public_corpus_error(
             "ablation_duration",
             "maximum recording duration must be positive when supplied",
         ));
+    }
+    match (evaluation_stage, locked_development_evidence_path) {
+        (PublicCorpusEvaluationStage::Development, None)
+        | (PublicCorpusEvaluationStage::Certification, Some(_)) => {}
+        (PublicCorpusEvaluationStage::Development, Some(_)) => {
+            return Err(public_corpus_error(
+                "ablation_stage_lock",
+                "development evaluation must not receive held-out lock evidence",
+            ));
+        }
+        (PublicCorpusEvaluationStage::Certification, None) => {
+            return Err(public_corpus_error(
+                "ablation_stage_lock",
+                "certification requires locked development evidence",
+            ));
+        }
     }
     let canonical_project = canonical_directory(project_root, "project_root")?;
     let canonical_input = canonical_directory(input_root, "input_root")?;
@@ -902,6 +1224,39 @@ pub fn run_public_corpus_ablation_with_cancel(
             "bundle and ablation evidence outputs must be distinct",
         ));
     }
+    let locked_development = if let Some(path) = locked_development_evidence_path {
+        let canonical_locked = canonical_external_file(
+            &canonical_project,
+            &canonical_input,
+            path,
+            "development_lock",
+        )?;
+        let bytes = read_bounded(&canonical_locked, MAX_DESCRIPTOR_BYTES, "development_lock")?;
+        let evidence = parse_public_corpus_ablation_evidence(&bytes)?;
+        let all_development_gates_passed = evidence
+            .development_gate
+            .as_ref()
+            .is_some_and(|gate| gate.passed)
+            && evidence
+                .change_development_gate
+                .as_ref()
+                .is_some_and(|gate| gate.passed)
+            && evidence
+                .clustering_development_gate
+                .as_ref()
+                .is_some_and(|gate| gate.passed);
+        if evidence.evaluation_stage != PublicCorpusEvaluationStage::Development
+            || !all_development_gates_passed
+        {
+            return Err(public_corpus_error(
+                "ablation_stage_lock",
+                "held-out certification requires locked development evidence whose representation, change-detector, and clustering gates all passed",
+            ));
+        }
+        Some(evidence)
+    } else {
+        None
+    };
     let bundle = build_public_corpus_bundle_with_cancel(
         project_root,
         input_root,
@@ -911,6 +1266,17 @@ pub fn run_public_corpus_ablation_with_cancel(
         &mut is_cancelled,
     )?;
     checkpoint_cancelled(&mut is_cancelled)?;
+    if let Some(evidence) = &locked_development
+        && (evidence.evaluation_stage != PublicCorpusEvaluationStage::Development
+            || evidence.bundle_sha256 != bundle.bundle_sha256
+            || evidence.descriptor_sha256 != bundle.descriptor_sha256
+            || evidence.protocol.maximum_recording_duration_ms != maximum_recording_duration_ms)
+    {
+        return Err(public_corpus_error(
+            "ablation_stage_lock",
+            "locked development evidence does not bind this exact corpus and duration protocol",
+        ));
+    }
 
     let canonical_descriptor =
         canonical_input_file(&canonical_input, descriptor_path, "descriptor")?;
@@ -961,142 +1327,33 @@ pub fn run_public_corpus_ablation_with_cancel(
         rss_observation: "linux-vmhwm-otherwise-sampled-process-rss-v1".to_owned(),
         diarization_request: diarization_request.clone(),
         diarization_request_sha256: diarization_request_sha256.clone(),
+        change_calibration_id: ACOUSTIC_CHANGE_CALIBRATION_VERSION.to_owned(),
+        change_calibration_fit_id: ACOUSTIC_CHANGE_CALIBRATION_FIT_VERSION.to_owned(),
+        change_calibration_sha256: acoustic_change_calibration_sha256(),
+        change_decision_probability: canonical_evidence_number(f64::from(
+            acoustic_change_calibration().decision_probability,
+        )),
+        change_calibration_bins: scorer_config.calibration_bins,
+        change_selection_policy_id: PUBLIC_CORPUS_CHANGE_SELECTION_POLICY_VERSION.to_owned(),
+        change_selection_policy_sha256: change_selection_policy_sha256()?,
+        speaker_pair_calibration_id: ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.to_owned(),
+        speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
     };
     let mut variants = Vec::with_capacity(AcousticFeatureAblation::ALL.len());
     for feature_ablation in AcousticFeatureAblation::ALL {
-        let mut by_split = BTreeMap::<EvaluationSplit, PublicAblationAccumulator>::new();
-        for ((reference, recording_evidence), manifest_recording) in bundle
-            .references
-            .iter()
-            .zip(&bundle.recordings)
-            .zip(&bundle.manifest.recordings)
-        {
-            checkpoint_cancelled(&mut is_cancelled)?;
-            let input_recording =
-                input_recordings
-                    .get(&reference.recording_id)
-                    .ok_or_else(|| {
-                        public_corpus_error(
-                            "ablation_alignment",
-                            "validated recording is absent from the descriptor",
-                        )
-                    })?;
-            if recording_evidence.sample_rate_hz != 16_000
-                || recording_evidence.channel_count != 1
-                || recording_evidence.selected_channel != 1
-            {
-                return Err(public_corpus_error(
-                    "ablation_audio_contract",
-                    "the current acoustic ablation runner requires 16 kHz mono PCM WAV input",
-                ));
-            }
-            let audio_path =
-                canonical_relative_file(&canonical_input, &input_recording.audio_path, "audio")?;
-            let audio_bytes =
-                read_bounded(&audio_path, MAX_EVALUATION_AUDIO_BYTES, "ablation_audio")?;
-            checkpoint_cancelled(&mut is_cancelled)?;
-            if format!("{:x}", Sha256::digest(&audio_bytes)) != recording_evidence.audio_sha256 {
-                return Err(public_corpus_error(
-                    "audio_changed",
-                    "audio changed after bundle validation and before ablation execution",
-                ));
-            }
-            let mut samples = crate::native_engine::decode::read_wav_16k_mono(&audio_bytes)
-                .map_err(|_| {
-                    public_corpus_error(
-                        "ablation_audio_decode",
-                        "one validated WAV could not be decoded as 16 kHz mono PCM",
-                    )
-                })?;
-            checkpoint_cancelled(&mut is_cancelled)?;
-            let available_duration_ms = u64::try_from(samples.len()).unwrap_or(u64::MAX) / 16;
-            let evaluation_duration_ms = maximum_recording_duration_ms
-                .map_or(available_duration_ms, |maximum| {
-                    maximum.min(available_duration_ms)
-                });
-            let clipped_reference = clipped_reference(reference, Some(evaluation_duration_ms))?;
-            let maximum_samples = usize::try_from(clipped_reference.duration_ms)
-                .ok()
-                .and_then(|duration_ms| duration_ms.checked_mul(16))
-                .ok_or_else(|| {
-                    public_corpus_error(
-                        "ablation_duration",
-                        "clipped recording duration exceeds the supported sample range",
-                    )
-                })?;
-            samples.truncate(maximum_samples);
-            let boundary_hints = AcousticBoundaryHints {
-                speech_regions_ms: merged_scored_speech_regions(
-                    &clipped_reference.turns,
-                    &clipped_reference.ignored_regions,
-                ),
-                ..AcousticBoundaryHints::default()
-            };
-            let started = Instant::now();
-            let report_turns = if boundary_hints.speech_regions_ms.is_empty() {
-                checkpoint_cancelled(&mut is_cancelled)?;
-                Vec::new()
-            } else {
-                let input_sha256 = hash_pcm_prefix(&samples);
-                let (report, _) = diarize_acoustic_pcm_with_ablation(
-                    AcousticDiarizationInput {
-                        samples: &samples,
-                        normalized_input_sha256: &input_sha256,
-                        segments: &[],
-                        word_aligned: false,
-                        request: &diarization_request,
-                        constraints: None,
-                        boundary_hints: &boundary_hints,
-                    },
-                    feature_ablation,
-                    &mut is_cancelled,
-                )?;
-                report.turns
-            };
-            let wall_time_ms = u64::try_from(started.elapsed().as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1);
-            let peak_rss_bytes = sampled_process_rss_bytes();
-            let hypothesis = DiarizationHypothesisDocument {
-                schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
-                recording_id: clipped_reference.recording_id.clone(),
-                duration_ms: clipped_reference.duration_ms,
-                turns: report_turns
-                    .into_iter()
-                    .map(|turn| EvaluationTurn {
-                        start_ms: turn.start_ms,
-                        end_ms: turn.end_ms.min(clipped_reference.duration_ms),
-                        speaker: turn.speaker_ref,
-                        speaker_confidence: turn.speaker_confidence,
-                        overlap_suspected: turn.overlap_suspected,
-                    })
-                    .filter(|turn| turn.end_ms > turn.start_ms)
-                    .collect(),
-                performance: Some(EvaluationPerformanceObservation {
-                    audio_duration_ms: clipped_reference.duration_ms,
-                    wall_time_ms,
-                    peak_rss_bytes,
-                }),
-            };
-            let score =
-                score_diarization_documents(&clipped_reference, &hypothesis, &scorer_config)?;
-            by_split
-                .entry(manifest_recording.split)
-                .or_default()
-                .push(&score)?;
-        }
-        let splits = [
-            EvaluationSplit::Train,
-            EvaluationSplit::Development,
-            EvaluationSplit::Test,
-        ]
-        .into_iter()
-        .filter_map(|split| {
-            by_split
-                .remove(&split)
-                .map(|aggregate| aggregate.finish(split))
-        })
-        .collect();
+        let splits = evaluate_public_variant(
+            &bundle,
+            &input_recordings,
+            &canonical_input,
+            maximum_recording_duration_ms,
+            &diarization_request,
+            &scorer_config,
+            feature_ablation,
+            AcousticChangeDetectorMode::CalibratedPosterior,
+            AcousticClusteringMode::FixedSafeV1,
+            Some(evaluation_stage.selected_split()),
+            &mut is_cancelled,
+        )?;
         let feature_schema_sha256 =
             acoustic_feature_schema_sha256(feature_ablation.schema_version());
         let feature_configuration_sha256 =
@@ -1105,6 +1362,7 @@ pub fn run_public_corpus_ablation_with_cancel(
                 ablation: feature_ablation,
                 feature_schema_sha256: &feature_schema_sha256,
                 diarization_request_sha256: &diarization_request_sha256,
+                change_calibration_sha256: &protocol.change_calibration_sha256,
             })?;
         variants.push(PublicCorpusAblationVariant {
             ablation: feature_ablation,
@@ -1114,8 +1372,191 @@ pub fn run_public_corpus_ablation_with_cancel(
             splits,
         });
     }
-    let development_gate = development_improvement_gate(&variants)?;
-    let held_out_gate = held_out_non_regression_gate(&variants)?;
+    let mut change_detector_variants = Vec::with_capacity(AcousticChangeDetectorMode::ALL.len());
+    for detector_mode in AcousticChangeDetectorMode::ALL {
+        let splits = if detector_mode == AcousticChangeDetectorMode::CalibratedPosterior {
+            variants
+                .iter()
+                .find(|variant| variant.ablation == AcousticFeatureAblation::FullV2)
+                .map(|variant| variant.splits.clone())
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "change_detector_alignment",
+                        "full-v2 representation evidence is unavailable",
+                    )
+                })?
+        } else {
+            evaluate_public_variant(
+                &bundle,
+                &input_recordings,
+                &canonical_input,
+                maximum_recording_duration_ms,
+                &diarization_request,
+                &scorer_config,
+                AcousticFeatureAblation::FullV2,
+                detector_mode,
+                AcousticClusteringMode::FixedSafeV1,
+                Some(evaluation_stage.selected_split()),
+                &mut is_cancelled,
+            )?
+        };
+        let feature_schema_sha256 =
+            acoustic_feature_schema_sha256(AcousticFeatureAblation::FullV2.schema_version());
+        let configuration_sha256 = canonical_sha256(&PublicChangeConfigurationFingerprint {
+            runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
+            detector_mode,
+            feature_ablation: AcousticFeatureAblation::FullV2,
+            feature_schema_sha256: &feature_schema_sha256,
+            diarization_request_sha256: &diarization_request_sha256,
+            change_calibration_sha256: &protocol.change_calibration_sha256,
+        })?;
+        change_detector_variants.push(PublicCorpusChangeDetectorVariant {
+            detector_mode,
+            feature_ablation: AcousticFeatureAblation::FullV2,
+            feature_schema_sha256,
+            configuration_sha256,
+            splits,
+        });
+    }
+    let mut clustering_variants = Vec::with_capacity(AcousticClusteringMode::ALL.len());
+    for clustering_mode in AcousticClusteringMode::ALL {
+        let detector_mode = AcousticChangeDetectorMode::FixedSafeV1;
+        let splits = if clustering_mode == AcousticClusteringMode::FixedSafeV1 {
+            change_detector_variants
+                .iter()
+                .find(|variant| variant.detector_mode == detector_mode)
+                .map(|variant| variant.splits.clone())
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "clustering_alignment",
+                        "fixed-safe detector evidence is unavailable",
+                    )
+                })?
+        } else {
+            evaluate_public_variant(
+                &bundle,
+                &input_recordings,
+                &canonical_input,
+                maximum_recording_duration_ms,
+                &diarization_request,
+                &scorer_config,
+                AcousticFeatureAblation::FullV2,
+                detector_mode,
+                clustering_mode,
+                Some(evaluation_stage.selected_split()),
+                &mut is_cancelled,
+            )?
+        };
+        let feature_schema_sha256 =
+            acoustic_feature_schema_sha256(AcousticFeatureAblation::FullV2.schema_version());
+        let configuration_sha256 = canonical_sha256(&PublicClusteringConfigurationFingerprint {
+            runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
+            clustering_mode,
+            detector_mode,
+            feature_ablation: AcousticFeatureAblation::FullV2,
+            feature_schema_sha256: &feature_schema_sha256,
+            diarization_request_sha256: &diarization_request_sha256,
+            speaker_pair_calibration_sha256: &protocol.speaker_pair_calibration_sha256,
+        })?;
+        clustering_variants.push(PublicCorpusClusteringVariant {
+            clustering_mode,
+            detector_mode,
+            feature_ablation: AcousticFeatureAblation::FullV2,
+            configuration_sha256,
+            splits,
+        });
+    }
+    let (
+        development_gate,
+        held_out_gate,
+        change_development_gate,
+        change_held_out_gate,
+        selected_change_detector_mode,
+        clustering_development_gate,
+        clustering_held_out_gate,
+        selected_clustering_mode,
+    ) = match evaluation_stage {
+        PublicCorpusEvaluationStage::Development => {
+            let change_gate = change_development_gate(&change_detector_variants)?;
+            let selected_change = if change_gate.passed {
+                change_gate.candidate
+            } else {
+                change_gate.baseline
+            };
+            let clustering_gate = clustering_development_gate(&clustering_variants)?;
+            let selected_clustering = if clustering_gate.passed {
+                clustering_gate.candidate
+            } else {
+                clustering_gate.baseline
+            };
+            (
+                Some(development_improvement_gate(&variants)?),
+                None,
+                Some(change_gate),
+                None,
+                selected_change,
+                Some(clustering_gate),
+                None,
+                selected_clustering,
+            )
+        }
+        PublicCorpusEvaluationStage::Certification => {
+            let locked = locked_development.as_ref().ok_or_else(|| {
+                public_corpus_error(
+                    "ablation_stage_lock",
+                    "certification requires locked development evidence",
+                )
+            })?;
+            let change_gate = locked.change_development_gate.as_ref().ok_or_else(|| {
+                public_corpus_error(
+                    "ablation_stage_lock",
+                    "locked development evidence has no change-detector gate",
+                )
+            })?;
+            let clustering_gate = locked.clustering_development_gate.as_ref().ok_or_else(|| {
+                public_corpus_error(
+                    "ablation_stage_lock",
+                    "locked development evidence has no clustering gate",
+                )
+            })?;
+            let representation_gate = locked.development_gate.as_ref().ok_or_else(|| {
+                public_corpus_error(
+                    "ablation_stage_lock",
+                    "locked development evidence has no representation gate",
+                )
+            })?;
+            if !representation_gate.passed || !change_gate.passed || !clustering_gate.passed {
+                return Err(public_corpus_error(
+                    "ablation_stage_lock",
+                    "held-out certification is forbidden until every development candidate passes its promotion gate",
+                ));
+            }
+            let selected_change = locked.selected_change_detector_mode;
+            let selected_clustering = locked.selected_clustering_mode;
+            (
+                None,
+                Some(held_out_non_regression_gate(&variants)?),
+                None,
+                Some(change_held_out_gate(
+                    &change_detector_variants,
+                    selected_change,
+                )?),
+                selected_change,
+                None,
+                Some(clustering_held_out_gate(
+                    &clustering_variants,
+                    selected_clustering,
+                )?),
+                selected_clustering,
+            )
+        }
+    };
+    let locked_development_result_sha256 = locked_development
+        .as_ref()
+        .map(|evidence| evidence.result_sha256.clone());
+    let locked_development_accuracy_sha256 = locked_development
+        .as_ref()
+        .map(|evidence| evidence.deterministic_accuracy_sha256.clone());
     let mut result = PublicCorpusAblationEvidence {
         schema_version: PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION.to_owned(),
         runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION.to_owned(),
@@ -1126,10 +1567,21 @@ pub fn run_public_corpus_ablation_with_cancel(
         descriptor_sha256: bundle.descriptor_sha256,
         scorer_config,
         scorer_config_sha256,
+        evaluation_stage,
+        locked_development_result_sha256,
+        locked_development_accuracy_sha256,
+        selected_change_detector_mode,
+        selected_clustering_mode,
         protocol,
         variants,
+        change_detector_variants,
+        clustering_variants,
         development_gate,
         held_out_gate,
+        change_development_gate,
+        change_held_out_gate,
+        clustering_development_gate,
+        clustering_held_out_gate,
         deterministic_accuracy_sha256: String::new(),
         result_sha256: String::new(),
     };
@@ -1146,6 +1598,608 @@ pub fn run_public_corpus_ablation_with_cancel(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evaluate_public_variant(
+    bundle: &PublicCorpusBundle,
+    input_recordings: &BTreeMap<String, PublicCorpusInputRecording>,
+    canonical_input: &Path,
+    maximum_recording_duration_ms: Option<u64>,
+    diarization_request: &DiarizationRequest,
+    scorer_config: &DiarizationScorerConfig,
+    feature_ablation: AcousticFeatureAblation,
+    detector_mode: AcousticChangeDetectorMode,
+    clustering_mode: AcousticClusteringMode,
+    target_split: Option<EvaluationSplit>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<Vec<PublicCorpusAblationSplit>> {
+    let mut by_split = BTreeMap::<EvaluationSplit, PublicAblationAccumulator>::new();
+    for ((reference, recording_evidence), manifest_recording) in bundle
+        .references
+        .iter()
+        .zip(&bundle.recordings)
+        .zip(&bundle.manifest.recordings)
+    {
+        if target_split.is_some_and(|target| manifest_recording.split != target) {
+            continue;
+        }
+        checkpoint_cancelled(is_cancelled)?;
+        let input_recording = input_recordings
+            .get(&reference.recording_id)
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "ablation_alignment",
+                    "validated recording is absent from the descriptor",
+                )
+            })?;
+        if recording_evidence.sample_rate_hz != 16_000
+            || recording_evidence.channel_count != 1
+            || recording_evidence.selected_channel != 1
+        {
+            return Err(public_corpus_error(
+                "ablation_audio_contract",
+                "the current acoustic ablation runner requires 16 kHz mono PCM WAV input",
+            ));
+        }
+        let audio_path =
+            canonical_relative_file(canonical_input, &input_recording.audio_path, "audio")?;
+        let audio_bytes = read_bounded(&audio_path, MAX_EVALUATION_AUDIO_BYTES, "ablation_audio")?;
+        checkpoint_cancelled(is_cancelled)?;
+        if format!("{:x}", Sha256::digest(&audio_bytes)) != recording_evidence.audio_sha256 {
+            return Err(public_corpus_error(
+                "audio_changed",
+                "audio changed after bundle validation and before ablation execution",
+            ));
+        }
+        let mut samples =
+            crate::native_engine::decode::read_wav_16k_mono(&audio_bytes).map_err(|_| {
+                public_corpus_error(
+                    "ablation_audio_decode",
+                    "one validated WAV could not be decoded as 16 kHz mono PCM",
+                )
+            })?;
+        checkpoint_cancelled(is_cancelled)?;
+        let available_duration_ms = u64::try_from(samples.len()).unwrap_or(u64::MAX) / 16;
+        let evaluation_duration_ms = maximum_recording_duration_ms
+            .map_or(available_duration_ms, |maximum| {
+                maximum.min(available_duration_ms)
+            });
+        let clipped_reference = clipped_reference(reference, Some(evaluation_duration_ms))?;
+        let maximum_samples = usize::try_from(clipped_reference.duration_ms)
+            .ok()
+            .and_then(|duration_ms| duration_ms.checked_mul(16))
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "ablation_duration",
+                    "clipped recording duration exceeds the supported sample range",
+                )
+            })?;
+        samples.truncate(maximum_samples);
+        let boundary_hints = AcousticBoundaryHints {
+            speech_regions_ms: merged_scored_speech_regions(
+                &clipped_reference.turns,
+                &clipped_reference.ignored_regions,
+            ),
+            ..AcousticBoundaryHints::default()
+        };
+        let started = Instant::now();
+        let (report_turns, detector_changes, evaluated_changes, clustering_evidence) =
+            if boundary_hints.speech_regions_ms.is_empty() {
+                checkpoint_cancelled(is_cancelled)?;
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    AcousticClusteringEvaluationEvidence {
+                        requested_mode: clustering_mode,
+                        executed_mode: AcousticClusteringMode::FixedSafeV1,
+                        fallback_reason: None,
+                        speaker_count_stability: 0.0,
+                    },
+                )
+            } else {
+                let input_sha256 = hash_pcm_prefix(&samples);
+                let (report, _, change_evidence, clustering_evidence) =
+                    diarize_acoustic_pcm_with_modes_evidence(
+                        AcousticDiarizationInput {
+                            samples: &samples,
+                            normalized_input_sha256: &input_sha256,
+                            segments: &[],
+                            word_aligned: false,
+                            request: diarization_request,
+                            constraints: None,
+                            boundary_hints: &boundary_hints,
+                        },
+                        feature_ablation,
+                        detector_mode,
+                        clustering_mode,
+                        &mut *is_cancelled,
+                    )?;
+                let detector_changes = change_evidence
+                    .emitted
+                    .into_iter()
+                    .filter(|evidence| {
+                        !evidence.vad_boundary
+                            && !evidence.supervised_boundary
+                            && evidence.boundary_ms > 0
+                            && evidence.boundary_ms < clipped_reference.duration_ms
+                    })
+                    .map(|evidence| ChangeProbabilityObservation {
+                        boundary_ms: evidence.boundary_ms,
+                        probability: f64::from(evidence.change_probability),
+                    })
+                    .collect();
+                (
+                    report.turns,
+                    detector_changes,
+                    change_evidence.evaluated,
+                    clustering_evidence,
+                )
+            };
+        let wall_time_ms = u64::try_from(started.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let peak_rss_bytes = sampled_process_rss_bytes();
+        let hypothesis = DiarizationHypothesisDocument {
+            schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: clipped_reference.recording_id.clone(),
+            duration_ms: clipped_reference.duration_ms,
+            turns: report_turns
+                .into_iter()
+                .map(|turn| EvaluationTurn {
+                    start_ms: turn.start_ms,
+                    end_ms: turn.end_ms.min(clipped_reference.duration_ms),
+                    speaker: turn.speaker_ref,
+                    speaker_confidence: turn.speaker_confidence,
+                    overlap_suspected: turn.overlap_suspected,
+                })
+                .filter(|turn| turn.end_ms > turn.start_ms)
+                .collect(),
+            performance: Some(EvaluationPerformanceObservation {
+                audio_duration_ms: clipped_reference.duration_ms,
+                wall_time_ms,
+                peak_rss_bytes,
+            }),
+        };
+        let score = score_diarization_documents(&clipped_reference, &hypothesis, scorer_config)?;
+        let reference_changes = speaker_change_points_ms(
+            &clipped_reference.turns,
+            clipped_reference.duration_ms,
+            true,
+        )?;
+        let detector_change_score = score_change_points(
+            &reference_changes
+                .iter()
+                .map(|timestamp| *timestamp as f64 / 1_000.0)
+                .collect::<Vec<_>>(),
+            &detector_changes
+                .iter()
+                .map(|observation| observation.boundary_ms as f64 / 1_000.0)
+                .collect::<Vec<_>>(),
+            scorer_config.change_boundary_collar_ms as f64 / 1_000.0,
+        )?;
+        let detector_change_ms = detector_changes
+            .iter()
+            .map(|observation| observation.boundary_ms)
+            .collect::<Vec<_>>();
+        let change_collar_metrics = PUBLIC_CHANGE_DIAGNOSTIC_COLLARS_MS
+            .iter()
+            .map(|&collar_ms| {
+                score_change_metric_observation(
+                    &reference_changes,
+                    &detector_change_ms,
+                    collar_ms,
+                    collar_ms as f64,
+                )
+            })
+            .collect::<FwResult<Vec<_>>>()?;
+        let change_threshold_sweep = PUBLIC_CHANGE_THRESHOLD_SWEEP
+            .iter()
+            .map(|&threshold| {
+                let selected = select_acoustic_change_evidence_at_threshold(
+                    &evaluated_changes,
+                    threshold as f32,
+                )?;
+                let hypothesis_ms = selected
+                    .into_iter()
+                    .filter_map(|evidence| {
+                        (evidence.boundary_ms > 0
+                            && evidence.boundary_ms < clipped_reference.duration_ms)
+                            .then_some(evidence.boundary_ms)
+                    })
+                    .collect::<Vec<_>>();
+                score_change_metric_observation(
+                    &reference_changes,
+                    &hypothesis_ms,
+                    scorer_config.change_boundary_collar_ms,
+                    threshold,
+                )
+            })
+            .collect::<FwResult<Vec<_>>>()?;
+        let change_calibration = score_change_event_calibration(
+            &reference_changes,
+            &detector_changes,
+            scorer_config.change_boundary_collar_ms,
+            scorer_config.calibration_bins,
+        )?;
+        by_split.entry(manifest_recording.split).or_default().push(
+            &score,
+            &detector_change_score,
+            &change_calibration,
+            &change_collar_metrics,
+            &change_threshold_sweep,
+            &clustering_evidence,
+        )?;
+    }
+    let splits = [
+        EvaluationSplit::Train,
+        EvaluationSplit::Development,
+        EvaluationSplit::Test,
+    ]
+    .into_iter()
+    .filter_map(|split| {
+        by_split
+            .remove(&split)
+            .map(|aggregate| aggregate.finish(split))
+    })
+    .collect::<Vec<_>>();
+    if let Some(target_split) = target_split
+        && (splits.len() != 1 || splits[0].split != target_split)
+    {
+        return Err(public_corpus_error(
+            "ablation_split_missing",
+            "the selected evaluation stage has no recording in the validated bundle",
+        ));
+    }
+    Ok(splits)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChangeProbabilityObservation {
+    boundary_ms: u64,
+    probability: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChangeReliabilityAccumulator {
+    observation_count: u64,
+    positive_count: u64,
+    probability_sum: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ChangeEventCalibrationAggregate {
+    observation_count: u64,
+    positive_count: u64,
+    brier_sum: f64,
+    bins: Vec<ChangeReliabilityAccumulator>,
+}
+
+#[derive(Debug)]
+struct ChangeMetricObservation {
+    key: f64,
+    collar_ms: u64,
+    score: ChangePointScore,
+    absolute_errors_sec: Vec<f64>,
+}
+
+#[derive(Debug, Default)]
+struct ChangeMetricAccumulator {
+    key: f64,
+    collar_ms: u64,
+    reference_count: u64,
+    hypothesis_count: u64,
+    matched_count: u64,
+    absolute_errors_sec: Vec<f64>,
+}
+
+#[derive(Debug)]
+struct ChangeMetricValues {
+    reference_count: u64,
+    hypothesis_count: u64,
+    matched_count: u64,
+    precision: Option<f64>,
+    recall: Option<f64>,
+    f1: Option<f64>,
+    mean_absolute_error_sec: Option<f64>,
+    p50_absolute_error_sec: Option<f64>,
+    p90_absolute_error_sec: Option<f64>,
+    p95_absolute_error_sec: Option<f64>,
+}
+
+impl ChangeMetricAccumulator {
+    fn push(&mut self, observation: &ChangeMetricObservation) -> FwResult<()> {
+        if self.reference_count == 0 && self.hypothesis_count == 0 && self.matched_count == 0 {
+            self.key = observation.key;
+            self.collar_ms = observation.collar_ms;
+        } else if self.key.to_bits() != observation.key.to_bits()
+            || self.collar_ms != observation.collar_ms
+        {
+            return Err(public_corpus_error(
+                "change_diagnostic_grid",
+                "all recordings must use the same change diagnostic grid",
+            ));
+        }
+        if observation.absolute_errors_sec.len() != observation.score.matched_count {
+            return Err(public_corpus_error(
+                "change_diagnostic_match",
+                "change timing-error count does not match the scored boundary matches",
+            ));
+        }
+        self.reference_count = self
+            .reference_count
+            .saturating_add(u64::try_from(observation.score.reference_count).unwrap_or(u64::MAX));
+        self.hypothesis_count = self
+            .hypothesis_count
+            .saturating_add(u64::try_from(observation.score.hypothesis_count).unwrap_or(u64::MAX));
+        self.matched_count = self
+            .matched_count
+            .saturating_add(u64::try_from(observation.score.matched_count).unwrap_or(u64::MAX));
+        self.absolute_errors_sec
+            .extend_from_slice(&observation.absolute_errors_sec);
+        Ok(())
+    }
+
+    fn finish_values(mut self) -> ChangeMetricValues {
+        self.absolute_errors_sec.sort_by(f64::total_cmp);
+        let precision = ratio(self.matched_count, self.hypothesis_count);
+        let recall = ratio(self.matched_count, self.reference_count);
+        let f1 = precision.zip(recall).map(|(precision, recall)| {
+            let denominator = precision + recall;
+            if denominator > 0.0 {
+                2.0 * precision * recall / denominator
+            } else {
+                0.0
+            }
+        });
+        let mean = (!self.absolute_errors_sec.is_empty()).then(|| {
+            canonical_evidence_number(
+                self.absolute_errors_sec.iter().sum::<f64>()
+                    / self.absolute_errors_sec.len() as f64,
+            )
+        });
+        let quantile = |probability: f64| {
+            (!self.absolute_errors_sec.is_empty()).then(|| {
+                let index = ((self.absolute_errors_sec.len() - 1) as f64 * probability)
+                    .round()
+                    .clamp(0.0, (self.absolute_errors_sec.len() - 1) as f64)
+                    as usize;
+                canonical_evidence_number(self.absolute_errors_sec[index])
+            })
+        };
+        ChangeMetricValues {
+            reference_count: self.reference_count,
+            hypothesis_count: self.hypothesis_count,
+            matched_count: self.matched_count,
+            precision,
+            recall,
+            f1,
+            mean_absolute_error_sec: mean,
+            p50_absolute_error_sec: quantile(0.50),
+            p90_absolute_error_sec: quantile(0.90),
+            p95_absolute_error_sec: quantile(0.95),
+        }
+    }
+}
+
+fn score_change_metric_observation(
+    reference_ms: &[u64],
+    hypothesis_ms: &[u64],
+    collar_ms: u64,
+    key: f64,
+) -> FwResult<ChangeMetricObservation> {
+    let reference_sec = reference_ms
+        .iter()
+        .map(|timestamp| *timestamp as f64 / 1_000.0)
+        .collect::<Vec<_>>();
+    let hypothesis_sec = hypothesis_ms
+        .iter()
+        .map(|timestamp| *timestamp as f64 / 1_000.0)
+        .collect::<Vec<_>>();
+    let collar_sec = collar_ms as f64 / 1_000.0;
+    let score = score_change_points(&reference_sec, &hypothesis_sec, collar_sec)?;
+    let absolute_errors_sec =
+        minimum_error_change_match_errors(&reference_sec, &hypothesis_sec, collar_sec);
+    Ok(ChangeMetricObservation {
+        key,
+        collar_ms,
+        score,
+        absolute_errors_sec,
+    })
+}
+
+fn minimum_error_change_match_errors(
+    reference: &[f64],
+    hypothesis: &[f64],
+    collar_sec: f64,
+) -> Vec<f64> {
+    #[derive(Clone, Copy, Default)]
+    struct Match {
+        count: usize,
+        total_error: f64,
+    }
+    let better = |left: Match, right: Match| {
+        if right.count > left.count
+            || (right.count == left.count && right.total_error < left.total_error)
+        {
+            right
+        } else {
+            left
+        }
+    };
+    let columns = hypothesis.len() + 1;
+    let mut previous = vec![Match::default(); columns];
+    let mut current = vec![Match::default(); columns];
+    let mut decisions = vec![0_u8; (reference.len() + 1).saturating_mul(columns)];
+    for reference_index in 1..=reference.len() {
+        decisions[reference_index * columns] = 1;
+        current[0] = Match::default();
+        for hypothesis_index in 1..=hypothesis.len() {
+            let up = previous[hypothesis_index];
+            let left = current[hypothesis_index - 1];
+            let mut best = better(up, left);
+            let mut decision = if best.count == left.count
+                && best.total_error.to_bits() == left.total_error.to_bits()
+                && (up.count != left.count
+                    || up.total_error.to_bits() != left.total_error.to_bits())
+            {
+                2
+            } else {
+                1
+            };
+            let error = (reference[reference_index - 1] - hypothesis[hypothesis_index - 1]).abs();
+            if error <= collar_sec {
+                let matched = Match {
+                    count: previous[hypothesis_index - 1].count + 1,
+                    total_error: previous[hypothesis_index - 1].total_error + error,
+                };
+                let selected = better(best, matched);
+                if selected.count == matched.count
+                    && selected.total_error.to_bits() == matched.total_error.to_bits()
+                    && (best.count != matched.count
+                        || best.total_error.to_bits() != matched.total_error.to_bits())
+                {
+                    best = selected;
+                    decision = 3;
+                }
+            }
+            current[hypothesis_index] = best;
+            decisions[reference_index * columns + hypothesis_index] = decision;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    let mut errors = Vec::with_capacity(previous[hypothesis.len()].count);
+    let (mut reference_index, mut hypothesis_index) = (reference.len(), hypothesis.len());
+    while reference_index > 0 && hypothesis_index > 0 {
+        match decisions[reference_index * columns + hypothesis_index] {
+            3 => {
+                errors.push(
+                    (reference[reference_index - 1] - hypothesis[hypothesis_index - 1]).abs(),
+                );
+                reference_index -= 1;
+                hypothesis_index -= 1;
+            }
+            2 => hypothesis_index -= 1,
+            _ => reference_index -= 1,
+        }
+    }
+    errors
+}
+
+fn accumulate_change_metric_grid(
+    aggregate: &mut Vec<ChangeMetricAccumulator>,
+    recording: &[ChangeMetricObservation],
+    label: &str,
+) -> FwResult<()> {
+    if aggregate.is_empty() {
+        aggregate.resize_with(recording.len(), ChangeMetricAccumulator::default);
+    } else if aggregate.len() != recording.len() {
+        return Err(public_corpus_error(
+            "change_diagnostic_grid",
+            &format!("{label} diagnostic grid changed between recordings"),
+        ));
+    }
+    for (aggregate, observation) in aggregate.iter_mut().zip(recording) {
+        aggregate.push(observation)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn report_change_observations(
+    turns: &[crate::model::DiarizationTurn],
+) -> Vec<ChangeProbabilityObservation> {
+    turns
+        .windows(2)
+        .filter_map(|window| {
+            let previous = &window[0];
+            let next = &window[1];
+            (previous.end_ms == next.start_ms && previous.speaker_ref != next.speaker_ref).then(
+                || ChangeProbabilityObservation {
+                    boundary_ms: next.start_ms,
+                    probability: previous.change_confidence.unwrap_or(0.0),
+                },
+            )
+        })
+        .collect()
+}
+
+fn score_change_event_calibration(
+    reference_ms: &[u64],
+    hypothesis: &[ChangeProbabilityObservation],
+    collar_ms: u64,
+    bins: usize,
+) -> FwResult<ChangeEventCalibrationAggregate> {
+    if bins == 0 || bins > 100 {
+        return Err(public_corpus_error(
+            "change_calibration_bins",
+            "change-event calibration bins must be within 1..=100",
+        ));
+    }
+    if reference_ms.windows(2).any(|window| window[0] >= window[1])
+        || hypothesis
+            .windows(2)
+            .any(|window| window[0].boundary_ms >= window[1].boundary_ms)
+    {
+        return Err(public_corpus_error(
+            "change_calibration_order",
+            "change-event inputs must be strictly increasing",
+        ));
+    }
+    if hypothesis.iter().any(|observation| {
+        !observation.probability.is_finite() || !(0.0..=1.0).contains(&observation.probability)
+    }) {
+        return Err(public_corpus_error(
+            "change_calibration_probability",
+            "change-event probabilities must be finite and within [0, 1]",
+        ));
+    }
+
+    let mut aggregate = ChangeEventCalibrationAggregate {
+        observation_count: 0,
+        positive_count: 0,
+        brier_sum: 0.0,
+        bins: vec![ChangeReliabilityAccumulator::default(); bins],
+    };
+    let mut observe = |probability: f64, positive: bool| {
+        let outcome = f64::from(positive);
+        let bin = ((probability * bins as f64).floor() as usize).min(bins - 1);
+        aggregate.observation_count = aggregate.observation_count.saturating_add(1);
+        aggregate.positive_count = aggregate.positive_count.saturating_add(u64::from(positive));
+        aggregate.brier_sum += (probability - outcome).powi(2);
+        aggregate.bins[bin].observation_count =
+            aggregate.bins[bin].observation_count.saturating_add(1);
+        aggregate.bins[bin].positive_count = aggregate.bins[bin]
+            .positive_count
+            .saturating_add(u64::from(positive));
+        aggregate.bins[bin].probability_sum += probability;
+    };
+
+    let mut reference_index = 0usize;
+    let mut hypothesis_index = 0usize;
+    while reference_index < reference_ms.len() && hypothesis_index < hypothesis.len() {
+        let reference = reference_ms[reference_index];
+        let prediction = hypothesis[hypothesis_index];
+        if prediction.boundary_ms.saturating_add(collar_ms) < reference {
+            observe(prediction.probability, false);
+            hypothesis_index += 1;
+        } else if reference.saturating_add(collar_ms) < prediction.boundary_ms {
+            observe(0.0, true);
+            reference_index += 1;
+        } else {
+            observe(prediction.probability, true);
+            reference_index += 1;
+            hypothesis_index += 1;
+        }
+    }
+    for prediction in &hypothesis[hypothesis_index..] {
+        observe(prediction.probability, false);
+    }
+    for _ in &reference_ms[reference_index..] {
+        observe(0.0, true);
+    }
+    Ok(aggregate)
+}
+
 #[derive(Default)]
 struct PublicAblationAccumulator {
     recording_count: u64,
@@ -1153,6 +2207,11 @@ struct PublicAblationAccumulator {
     missed_speech_sec: f64,
     false_alarm_sec: f64,
     speaker_confusion_sec: f64,
+    overlap_reference_sec: f64,
+    overlap_hypothesis_sec: f64,
+    overlap_true_positive_sec: f64,
+    overlap_false_positive_sec: f64,
+    overlap_false_negative_sec: f64,
     macro_der_sum: f64,
     macro_der_count: u64,
     macro_jer_sum: f64,
@@ -1160,15 +2219,48 @@ struct PublicAblationAccumulator {
     change_reference_count: u64,
     change_hypothesis_count: u64,
     change_matched_count: u64,
+    change_absolute_error_sec: f64,
+    change_event_observation_count: u64,
+    change_event_positive_count: u64,
+    change_event_brier_sum: f64,
+    change_reliability: Vec<ChangeReliabilityAccumulator>,
+    change_collar_metrics: Vec<ChangeMetricAccumulator>,
+    change_threshold_sweep: Vec<ChangeMetricAccumulator>,
     exact_speaker_count: u64,
+    signed_speaker_count_error: i64,
     absolute_speaker_count_error: u64,
+    selective_reference_speaker_time_sec: f64,
+    selective_covered_speaker_time_sec: f64,
+    selective_correct_covered_speaker_time_sec: f64,
+    selective_error_covered_speaker_time_sec: f64,
+    selective_unknown_speaker_time_sec: f64,
+    assignment_observed_duration_sec: f64,
+    assignment_opportunity_duration_sec: f64,
+    assignment_brier_weighted_sum: f64,
+    assignment_brier_weight: f64,
+    assignment_ece_weighted_sum: f64,
+    assignment_ece_weight: f64,
+    speaker_count_stability_sum: f64,
+    speaker_count_stability_count: u64,
+    clustering_fallback_count: u64,
+    clustering_insufficient_voice_fallback_count: u64,
+    clustering_invalid_posterior_fallback_count: u64,
+    clustering_unstable_count_fallback_count: u64,
     audio_duration_sec: f64,
     wall_time_sec: f64,
     sampled_peak_rss_bytes: u64,
 }
 
 impl PublicAblationAccumulator {
-    fn push(&mut self, score: &crate::diarization::AuthoritativeDiarizationScore) -> FwResult<()> {
+    fn push(
+        &mut self,
+        score: &crate::diarization::AuthoritativeDiarizationScore,
+        detector_change_score: &ChangePointScore,
+        change_calibration: &ChangeEventCalibrationAggregate,
+        change_collar_metrics: &[ChangeMetricObservation],
+        change_threshold_sweep: &[ChangeMetricObservation],
+        clustering: &AcousticClusteringEvaluationEvidence,
+    ) -> FwResult<()> {
         self.recording_count = self.recording_count.checked_add(1).ok_or_else(|| {
             public_corpus_error(
                 "ablation_aggregate_overflow",
@@ -1179,6 +2271,11 @@ impl PublicAblationAccumulator {
         self.missed_speech_sec += score.diarization.missed_speech_sec;
         self.false_alarm_sec += score.diarization.false_alarm_sec;
         self.speaker_confusion_sec += score.diarization.speaker_confusion_sec;
+        self.overlap_reference_sec += score.overlap.reference_overlap_sec;
+        self.overlap_hypothesis_sec += score.overlap.hypothesis_overlap_sec;
+        self.overlap_true_positive_sec += score.overlap.true_positive_sec;
+        self.overlap_false_positive_sec += score.overlap.false_positive_sec;
+        self.overlap_false_negative_sec += score.overlap.false_negative_sec;
         if let Some(value) = score.diarization.der {
             self.macro_der_sum += value;
             self.macro_der_count += 1;
@@ -1187,19 +2284,115 @@ impl PublicAblationAccumulator {
             self.macro_jer_sum += value;
             self.macro_jer_count += 1;
         }
-        self.change_reference_count = self
-            .change_reference_count
-            .saturating_add(u64::try_from(score.change_points.reference_count).unwrap_or(u64::MAX));
+        self.change_reference_count = self.change_reference_count.saturating_add(
+            u64::try_from(detector_change_score.reference_count).unwrap_or(u64::MAX),
+        );
         self.change_hypothesis_count = self.change_hypothesis_count.saturating_add(
-            u64::try_from(score.change_points.hypothesis_count).unwrap_or(u64::MAX),
+            u64::try_from(detector_change_score.hypothesis_count).unwrap_or(u64::MAX),
         );
         self.change_matched_count = self
             .change_matched_count
-            .saturating_add(u64::try_from(score.change_points.matched_count).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(detector_change_score.matched_count).unwrap_or(u64::MAX));
+        if let Some(mean_absolute_error_sec) = detector_change_score.mean_absolute_error_sec {
+            self.change_absolute_error_sec +=
+                mean_absolute_error_sec * detector_change_score.matched_count as f64;
+        }
+        if self.change_reliability.is_empty() {
+            self.change_reliability.resize(
+                change_calibration.bins.len(),
+                ChangeReliabilityAccumulator::default(),
+            );
+        } else if self.change_reliability.len() != change_calibration.bins.len() {
+            return Err(public_corpus_error(
+                "change_calibration_bins",
+                "all recordings in an ablation split must use the same reliability bins",
+            ));
+        }
+        self.change_event_observation_count = self
+            .change_event_observation_count
+            .saturating_add(change_calibration.observation_count);
+        self.change_event_positive_count = self
+            .change_event_positive_count
+            .saturating_add(change_calibration.positive_count);
+        self.change_event_brier_sum += change_calibration.brier_sum;
+        for (aggregate, recording) in self
+            .change_reliability
+            .iter_mut()
+            .zip(&change_calibration.bins)
+        {
+            aggregate.observation_count = aggregate
+                .observation_count
+                .saturating_add(recording.observation_count);
+            aggregate.positive_count = aggregate
+                .positive_count
+                .saturating_add(recording.positive_count);
+            aggregate.probability_sum += recording.probability_sum;
+        }
+        accumulate_change_metric_grid(
+            &mut self.change_collar_metrics,
+            change_collar_metrics,
+            "change collar",
+        )?;
+        accumulate_change_metric_grid(
+            &mut self.change_threshold_sweep,
+            change_threshold_sweep,
+            "change threshold",
+        )?;
         self.exact_speaker_count += u64::from(score.speaker_count.absolute_error == 0);
+        self.signed_speaker_count_error = self
+            .signed_speaker_count_error
+            .saturating_add(score.speaker_count.signed_error);
         self.absolute_speaker_count_error = self
             .absolute_speaker_count_error
             .saturating_add(score.speaker_count.absolute_error);
+        self.selective_reference_speaker_time_sec +=
+            score.selective_attribution.reference_speaker_time_sec;
+        self.selective_covered_speaker_time_sec +=
+            score.selective_attribution.covered_speaker_time_sec;
+        self.selective_correct_covered_speaker_time_sec +=
+            score.selective_attribution.correct_covered_speaker_time_sec;
+        self.selective_error_covered_speaker_time_sec +=
+            score.selective_attribution.error_covered_speaker_time_sec;
+        self.selective_unknown_speaker_time_sec +=
+            score.selective_attribution.unknown_speaker_time_sec;
+        let assignment_observed = score.calibration.observed_duration_sec;
+        let assignment_opportunities = score.calibration.opportunity_duration_sec;
+        self.assignment_observed_duration_sec += assignment_observed;
+        self.assignment_opportunity_duration_sec += assignment_opportunities;
+        if let Some(brier) = score.calibration.brier_score {
+            self.assignment_brier_weighted_sum += brier * assignment_observed;
+            self.assignment_brier_weight += assignment_observed;
+        }
+        if let Some(ece) = score.calibration.expected_calibration_error {
+            self.assignment_ece_weighted_sum += ece * assignment_observed;
+            self.assignment_ece_weight += assignment_observed;
+        }
+        if clustering.requested_mode == AcousticClusteringMode::ProbabilisticV1 {
+            self.speaker_count_stability_sum += f64::from(clustering.speaker_count_stability);
+            self.speaker_count_stability_count =
+                self.speaker_count_stability_count.saturating_add(1);
+        }
+        self.clustering_fallback_count = self
+            .clustering_fallback_count
+            .saturating_add(u64::from(clustering.fallback_reason.is_some()));
+        match clustering.fallback_reason {
+            Some(AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions) => {
+                self.clustering_insufficient_voice_fallback_count = self
+                    .clustering_insufficient_voice_fallback_count
+                    .saturating_add(1);
+            }
+            Some(AcousticClusteringFallbackReason::InvalidPosterior) => {
+                self.clustering_invalid_posterior_fallback_count = self
+                    .clustering_invalid_posterior_fallback_count
+                    .saturating_add(1);
+            }
+            Some(AcousticClusteringFallbackReason::UnstableSpeakerCount) => {
+                self.clustering_unstable_count_fallback_count = self
+                    .clustering_unstable_count_fallback_count
+                    .saturating_add(1);
+            }
+            None => {}
+        }
         let performance = score.performance.as_ref().ok_or_else(|| {
             public_corpus_error(
                 "ablation_performance",
@@ -1215,27 +2408,203 @@ impl PublicAblationAccumulator {
     fn finish(self, split: EvaluationSplit) -> PublicCorpusAblationSplit {
         let precision = ratio(self.change_matched_count, self.change_hypothesis_count);
         let recall = ratio(self.change_matched_count, self.change_reference_count);
-        let change_f1 = precision.zip(recall).and_then(|(precision, recall)| {
+        let change_f1 = precision.zip(recall).map(|(precision, recall)| {
             let denominator = precision + recall;
-            (denominator > 0.0).then_some(2.0 * precision * recall / denominator)
+            if denominator > 0.0 {
+                2.0 * precision * recall / denominator
+            } else {
+                0.0
+            }
         });
         let diarization_error =
             self.missed_speech_sec + self.false_alarm_sec + self.speaker_confusion_sec;
+        let overlap_precision = positive_ratio(
+            self.overlap_true_positive_sec,
+            self.overlap_true_positive_sec + self.overlap_false_positive_sec,
+        );
+        let overlap_recall = positive_ratio(
+            self.overlap_true_positive_sec,
+            self.overlap_true_positive_sec + self.overlap_false_negative_sec,
+        );
+        let overlap_f1 = positive_ratio(
+            2.0 * self.overlap_true_positive_sec,
+            2.0 * self.overlap_true_positive_sec
+                + self.overlap_false_positive_sec
+                + self.overlap_false_negative_sec,
+        );
+        let change_brier_score = positive_ratio(
+            self.change_event_brier_sum,
+            self.change_event_observation_count as f64,
+        );
+        let mut change_expected_calibration_error = 0.0;
+        let change_reliability = self
+            .change_reliability
+            .iter()
+            .enumerate()
+            .map(|(index, bin)| {
+                let mean_probability =
+                    positive_ratio(bin.probability_sum, bin.observation_count as f64);
+                let empirical_frequency = ratio(bin.positive_count, bin.observation_count);
+                if let (Some(mean), Some(empirical)) = (mean_probability, empirical_frequency) {
+                    change_expected_calibration_error += bin.observation_count as f64
+                        / self.change_event_observation_count.max(1) as f64
+                        * (mean - empirical).abs();
+                }
+                PublicChangeReliabilityBin {
+                    index,
+                    lower_probability: canonical_evidence_number(
+                        index as f64 / self.change_reliability.len() as f64,
+                    ),
+                    upper_probability: canonical_evidence_number(
+                        (index + 1) as f64 / self.change_reliability.len() as f64,
+                    ),
+                    observation_count: bin.observation_count,
+                    positive_count: bin.positive_count,
+                    mean_probability,
+                    empirical_frequency,
+                }
+            })
+            .collect::<Vec<_>>();
+        let change_collar_metrics = self
+            .change_collar_metrics
+            .into_iter()
+            .map(|metric| {
+                let collar_ms = metric.collar_ms;
+                let values = metric.finish_values();
+                PublicChangeCollarMetrics {
+                    collar_ms,
+                    reference_count: values.reference_count,
+                    hypothesis_count: values.hypothesis_count,
+                    matched_count: values.matched_count,
+                    precision: values.precision,
+                    recall: values.recall,
+                    f1: values.f1,
+                    mean_absolute_error_sec: values.mean_absolute_error_sec,
+                    p50_absolute_error_sec: values.p50_absolute_error_sec,
+                    p90_absolute_error_sec: values.p90_absolute_error_sec,
+                    p95_absolute_error_sec: values.p95_absolute_error_sec,
+                }
+            })
+            .collect();
+        let change_threshold_sweep = self
+            .change_threshold_sweep
+            .into_iter()
+            .map(|metric| {
+                let threshold = canonical_evidence_number(metric.key);
+                let collar_ms = metric.collar_ms;
+                let values = metric.finish_values();
+                PublicChangeThresholdSweepPoint {
+                    threshold,
+                    collar_ms,
+                    reference_count: values.reference_count,
+                    hypothesis_count: values.hypothesis_count,
+                    matched_count: values.matched_count,
+                    precision: values.precision,
+                    recall: values.recall,
+                    f1: values.f1,
+                    mean_absolute_error_sec: values.mean_absolute_error_sec,
+                    p50_absolute_error_sec: values.p50_absolute_error_sec,
+                    p90_absolute_error_sec: values.p90_absolute_error_sec,
+                    p95_absolute_error_sec: values.p95_absolute_error_sec,
+                }
+            })
+            .collect();
         PublicCorpusAblationSplit {
             split,
             recording_count: self.recording_count,
-            reference_speaker_time_sec: self.reference_speaker_time_sec,
+            reference_speaker_time_sec: canonical_evidence_number(self.reference_speaker_time_sec),
             micro_der: positive_ratio(diarization_error, self.reference_speaker_time_sec),
             macro_der: positive_ratio(self.macro_der_sum, self.macro_der_count as f64),
             macro_jer: positive_ratio(self.macro_jer_sum, self.macro_jer_count as f64),
+            speaker_confusion_sec: canonical_evidence_number(self.speaker_confusion_sec),
+            overlap_reference_sec: canonical_evidence_number(self.overlap_reference_sec),
+            overlap_hypothesis_sec: canonical_evidence_number(self.overlap_hypothesis_sec),
+            overlap_true_positive_sec: canonical_evidence_number(self.overlap_true_positive_sec),
+            overlap_false_positive_sec: canonical_evidence_number(self.overlap_false_positive_sec),
+            overlap_false_negative_sec: canonical_evidence_number(self.overlap_false_negative_sec),
+            overlap_precision,
+            overlap_recall,
+            overlap_f1,
+            change_reference_count: self.change_reference_count,
+            change_hypothesis_count: self.change_hypothesis_count,
+            change_matched_count: self.change_matched_count,
+            change_precision: precision,
+            change_recall: recall,
             change_f1,
+            change_mean_absolute_error_sec: positive_ratio(
+                self.change_absolute_error_sec,
+                self.change_matched_count as f64,
+            ),
+            change_event_observation_count: self.change_event_observation_count,
+            change_event_positive_count: self.change_event_positive_count,
+            change_brier_score,
+            change_expected_calibration_error: (self.change_event_observation_count > 0)
+                .then(|| canonical_evidence_number(change_expected_calibration_error)),
+            change_reliability,
+            change_collar_metrics,
+            change_threshold_sweep,
             exact_speaker_count_rate: ratio(self.exact_speaker_count, self.recording_count),
+            mean_signed_speaker_count_error: signed_ratio(
+                self.signed_speaker_count_error as f64,
+                self.recording_count as f64,
+            ),
             mean_absolute_speaker_count_error: positive_ratio(
                 self.absolute_speaker_count_error as f64,
                 self.recording_count as f64,
             ),
-            audio_duration_sec: self.audio_duration_sec,
-            wall_time_sec: self.wall_time_sec,
+            selective_reference_speaker_time_sec: canonical_evidence_number(
+                self.selective_reference_speaker_time_sec,
+            ),
+            selective_covered_speaker_time_sec: canonical_evidence_number(
+                self.selective_covered_speaker_time_sec,
+            ),
+            selective_correct_covered_speaker_time_sec: canonical_evidence_number(
+                self.selective_correct_covered_speaker_time_sec,
+            ),
+            selective_error_covered_speaker_time_sec: canonical_evidence_number(
+                self.selective_error_covered_speaker_time_sec,
+            ),
+            selective_unknown_speaker_time_sec: canonical_evidence_number(
+                self.selective_unknown_speaker_time_sec,
+            ),
+            selective_coverage: positive_ratio(
+                self.selective_covered_speaker_time_sec,
+                self.selective_reference_speaker_time_sec,
+            ),
+            selective_risk: positive_ratio(
+                self.selective_error_covered_speaker_time_sec,
+                self.selective_covered_speaker_time_sec,
+            ),
+            assignment_observed_duration_sec: canonical_evidence_number(
+                self.assignment_observed_duration_sec,
+            ),
+            assignment_opportunity_duration_sec: canonical_evidence_number(
+                self.assignment_opportunity_duration_sec,
+            ),
+            assignment_coverage: positive_ratio(
+                self.assignment_observed_duration_sec,
+                self.assignment_opportunity_duration_sec,
+            ),
+            assignment_brier_score: positive_ratio(
+                self.assignment_brier_weighted_sum,
+                self.assignment_brier_weight,
+            ),
+            assignment_expected_calibration_error: positive_ratio(
+                self.assignment_ece_weighted_sum,
+                self.assignment_ece_weight,
+            ),
+            mean_speaker_count_stability: positive_ratio(
+                self.speaker_count_stability_sum,
+                self.speaker_count_stability_count as f64,
+            ),
+            clustering_fallback_count: self.clustering_fallback_count,
+            clustering_insufficient_voice_fallback_count: self
+                .clustering_insufficient_voice_fallback_count,
+            clustering_invalid_posterior_fallback_count: self
+                .clustering_invalid_posterior_fallback_count,
+            clustering_unstable_count_fallback_count: self.clustering_unstable_count_fallback_count,
+            audio_duration_sec: canonical_evidence_number(self.audio_duration_sec),
+            wall_time_sec: canonical_evidence_number(self.wall_time_sec),
             real_time_factor: positive_ratio(self.wall_time_sec, self.audio_duration_sec),
             sampled_peak_rss_bytes: self.sampled_peak_rss_bytes,
         }
@@ -1380,6 +2749,28 @@ fn sampled_process_rss_bytes() -> u64 {
         .saturating_mul(1_024)
 }
 
+fn change_selection_policy_fingerprint() -> PublicChangeSelectionPolicyFingerprint {
+    PublicChangeSelectionPolicyFingerprint {
+        policy_id: PUBLIC_CORPUS_CHANGE_SELECTION_POLICY_VERSION,
+        candidate_order: PUBLIC_CORPUS_CHANGE_CANDIDATE_ORDER,
+        baseline: AcousticChangeDetectorMode::FixedSafeV1,
+        minimum_relative_change_f1_improvement: canonical_evidence_number(
+            PUBLIC_CORPUS_MIN_CHANGE_F1_IMPROVEMENT,
+        ),
+        maximum_der_jer_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_MAX_CHANGE_DER_JER_REGRESSION,
+        ),
+        maximum_brier_score: canonical_evidence_number(PUBLIC_CORPUS_MAX_CHANGE_BRIER),
+        maximum_expected_calibration_error: canonical_evidence_number(PUBLIC_CORPUS_MAX_CHANGE_ECE),
+        require_timing_non_regression: true,
+        fail_closed_default: AcousticChangeDetectorMode::FixedSafeV1,
+    }
+}
+
+fn change_selection_policy_sha256() -> FwResult<String> {
+    canonical_sha256(&change_selection_policy_fingerprint())
+}
+
 fn development_improvement_gate(
     variants: &[PublicCorpusAblationVariant],
 ) -> FwResult<PublicCorpusDevelopmentGate> {
@@ -1411,16 +2802,17 @@ fn development_improvement_gate(
             .micro_der
             .zip(baseline.micro_der)
             .and_then(|(candidate, baseline)| {
-                (baseline > 0.0).then_some((baseline - candidate) / baseline)
+                (baseline > 0.0)
+                    .then(|| canonical_evidence_number((baseline - candidate) / baseline))
             });
     let macro_jer_delta = candidate
         .macro_jer
         .zip(baseline.macro_jer)
-        .map(|(candidate, baseline)| candidate - baseline);
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
     let change_f1_delta = candidate
         .change_f1
         .zip(baseline.change_f1)
-        .map(|(candidate, baseline)| candidate - baseline);
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
     let passed = relative_micro_der_improvement
         .is_some_and(|improvement| improvement >= PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT)
         && macro_jer_delta.is_some_and(|delta| delta <= 0.0)
@@ -1429,7 +2821,9 @@ fn development_improvement_gate(
         split: EvaluationSplit::Development,
         candidate: AcousticFeatureAblation::FullV2,
         baseline: AcousticFeatureAblation::V1,
-        minimum_relative_micro_der_improvement: PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT,
+        minimum_relative_micro_der_improvement: canonical_evidence_number(
+            PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT,
+        ),
         relative_micro_der_improvement,
         macro_jer_delta,
         change_f1_delta,
@@ -1466,11 +2860,11 @@ fn held_out_non_regression_gate(
     let micro_der_delta = candidate
         .micro_der
         .zip(baseline.micro_der)
-        .map(|(candidate, baseline)| candidate - baseline);
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
     let macro_jer_delta = candidate
         .macro_jer
         .zip(baseline.macro_jer)
-        .map(|(candidate, baseline)| candidate - baseline);
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
     let passed = micro_der_delta.is_some_and(|delta| delta <= 0.0)
         && macro_jer_delta.is_some_and(|delta| delta <= 0.0);
     Ok(PublicCorpusHeldOutGate {
@@ -1479,6 +2873,463 @@ fn held_out_non_regression_gate(
         baseline: AcousticFeatureAblation::V1,
         micro_der_delta,
         macro_jer_delta,
+        passed,
+    })
+}
+
+fn change_detector_split(
+    variants: &[PublicCorpusChangeDetectorVariant],
+    detector_mode: AcousticChangeDetectorMode,
+    split: EvaluationSplit,
+) -> Option<&PublicCorpusAblationSplit> {
+    variants
+        .iter()
+        .find(|variant| variant.detector_mode == detector_mode)
+        .and_then(|variant| {
+            variant
+                .splits
+                .iter()
+                .find(|candidate| candidate.split == split)
+        })
+}
+
+fn change_timing_requirement_passed(candidate: Option<f64>, baseline: Option<f64>) -> bool {
+    match (candidate, baseline) {
+        (Some(candidate), Some(baseline)) => candidate <= baseline,
+        (Some(_), None) => true,
+        (None, Some(_)) | (None, None) => false,
+    }
+}
+
+fn change_candidate_development_gate(
+    variants: &[PublicCorpusChangeDetectorVariant],
+    candidate_mode: AcousticChangeDetectorMode,
+) -> FwResult<PublicCorpusChangeDevelopmentGate> {
+    let candidate = change_detector_split(variants, candidate_mode, EvaluationSplit::Development)
+        .ok_or_else(|| {
+        public_corpus_error(
+            "change_development",
+            "candidate detector evidence is missing the development split",
+        )
+    })?;
+    let baseline = change_detector_split(
+        variants,
+        AcousticChangeDetectorMode::FixedSafeV1,
+        EvaluationSplit::Development,
+    )
+    .ok_or_else(|| {
+        public_corpus_error(
+            "change_development",
+            "fixed-safe detector evidence is missing the development split",
+        )
+    })?;
+    let relative_change_f1_improvement =
+        candidate
+            .change_f1
+            .zip(baseline.change_f1)
+            .and_then(|(candidate, baseline)| {
+                if baseline > 0.0 {
+                    Some(canonical_evidence_number((candidate - baseline) / baseline))
+                } else if candidate > 0.0 {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            });
+    let mean_absolute_timing_error_delta_sec = candidate
+        .change_mean_absolute_error_sec
+        .zip(baseline.change_mean_absolute_error_sec)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let micro_der_delta = candidate
+        .micro_der
+        .zip(baseline.micro_der)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let macro_jer_delta = candidate
+        .macro_jer
+        .zip(baseline.macro_jer)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let candidate_brier_score = candidate.change_brier_score;
+    let candidate_expected_calibration_error = candidate.change_expected_calibration_error;
+    let passed = relative_change_f1_improvement
+        .is_some_and(|gain| gain >= PUBLIC_CORPUS_MIN_CHANGE_F1_IMPROVEMENT)
+        && change_timing_requirement_passed(
+            candidate.change_mean_absolute_error_sec,
+            baseline.change_mean_absolute_error_sec,
+        )
+        && micro_der_delta
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CHANGE_DER_JER_REGRESSION)
+        && macro_jer_delta
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CHANGE_DER_JER_REGRESSION)
+        && candidate_brier_score.is_some_and(|score| score <= PUBLIC_CORPUS_MAX_CHANGE_BRIER)
+        && candidate_expected_calibration_error
+            .is_some_and(|error| error <= PUBLIC_CORPUS_MAX_CHANGE_ECE);
+    Ok(PublicCorpusChangeDevelopmentGate {
+        split: EvaluationSplit::Development,
+        candidate: candidate_mode,
+        baseline: AcousticChangeDetectorMode::FixedSafeV1,
+        minimum_relative_change_f1_improvement: canonical_evidence_number(
+            PUBLIC_CORPUS_MIN_CHANGE_F1_IMPROVEMENT,
+        ),
+        maximum_der_jer_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_MAX_CHANGE_DER_JER_REGRESSION,
+        ),
+        maximum_brier_score: canonical_evidence_number(PUBLIC_CORPUS_MAX_CHANGE_BRIER),
+        maximum_expected_calibration_error: canonical_evidence_number(PUBLIC_CORPUS_MAX_CHANGE_ECE),
+        relative_change_f1_improvement,
+        mean_absolute_timing_error_delta_sec,
+        micro_der_delta,
+        macro_jer_delta,
+        candidate_brier_score,
+        candidate_expected_calibration_error,
+        passed,
+    })
+}
+
+fn change_development_gate(
+    variants: &[PublicCorpusChangeDetectorVariant],
+) -> FwResult<PublicCorpusChangeDevelopmentGate> {
+    let fail_closed = change_candidate_development_gate(
+        variants,
+        AcousticChangeDetectorMode::CalibratedPosterior,
+    )?;
+    let mut selected: Option<PublicCorpusChangeDevelopmentGate> = None;
+    for candidate_mode in PUBLIC_CORPUS_CHANGE_CANDIDATE_ORDER {
+        let candidate_gate = change_candidate_development_gate(variants, candidate_mode)?;
+        if !candidate_gate.passed {
+            continue;
+        }
+        let candidate_split =
+            change_detector_split(variants, candidate_mode, EvaluationSplit::Development)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "change_development",
+                        "candidate detector evidence disappeared during selection",
+                    )
+                })?;
+        let replace = selected.as_ref().is_none_or(|incumbent| {
+            let Some(incumbent_split) =
+                change_detector_split(variants, incumbent.candidate, EvaluationSplit::Development)
+            else {
+                return true;
+            };
+            let descending = |candidate: Option<f64>, incumbent: Option<f64>| {
+                candidate
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .total_cmp(&incumbent.unwrap_or(f64::NEG_INFINITY))
+            };
+            let ascending = |candidate: Option<f64>, incumbent: Option<f64>| {
+                incumbent
+                    .unwrap_or(f64::INFINITY)
+                    .total_cmp(&candidate.unwrap_or(f64::INFINITY))
+            };
+            descending(candidate_split.change_f1, incumbent_split.change_f1)
+                .then_with(|| {
+                    ascending(
+                        candidate_split.change_mean_absolute_error_sec,
+                        incumbent_split.change_mean_absolute_error_sec,
+                    )
+                })
+                .then_with(|| {
+                    ascending(
+                        candidate_split.change_brier_score,
+                        incumbent_split.change_brier_score,
+                    )
+                })
+                .then_with(|| {
+                    ascending(
+                        candidate_split.change_expected_calibration_error,
+                        incumbent_split.change_expected_calibration_error,
+                    )
+                })
+                .then_with(|| ascending(candidate_split.micro_der, incumbent_split.micro_der))
+                .then_with(|| ascending(candidate_split.macro_jer, incumbent_split.macro_jer))
+                .is_gt()
+        });
+        if replace {
+            selected = Some(candidate_gate);
+        }
+    }
+    Ok(selected.unwrap_or(fail_closed))
+}
+
+fn change_held_out_gate(
+    variants: &[PublicCorpusChangeDetectorVariant],
+    selected_mode: AcousticChangeDetectorMode,
+) -> FwResult<PublicCorpusChangeHeldOutGate> {
+    if selected_mode == AcousticChangeDetectorMode::FixedSafeV1 {
+        return Err(public_corpus_error(
+            "change_held_out",
+            "the fixed-safe baseline cannot be promoted as its own candidate",
+        ));
+    }
+    let candidate = change_detector_split(variants, selected_mode, EvaluationSplit::Test)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "change_held_out",
+                "selected detector evidence is missing the held-out split",
+            )
+        })?;
+    let baseline = change_detector_split(
+        variants,
+        AcousticChangeDetectorMode::FixedSafeV1,
+        EvaluationSplit::Test,
+    )
+    .ok_or_else(|| {
+        public_corpus_error(
+            "change_held_out",
+            "fixed-safe detector evidence is missing the held-out split",
+        )
+    })?;
+    let change_f1_delta = candidate
+        .change_f1
+        .zip(baseline.change_f1)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let timing_error_delta_sec = candidate
+        .change_mean_absolute_error_sec
+        .zip(baseline.change_mean_absolute_error_sec)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let micro_der_delta = candidate
+        .micro_der
+        .zip(baseline.micro_der)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let macro_jer_delta = candidate
+        .macro_jer
+        .zip(baseline.macro_jer)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let candidate_brier_score = candidate.change_brier_score;
+    let candidate_expected_calibration_error = candidate.change_expected_calibration_error;
+    let passed = change_f1_delta.is_some_and(|delta| delta >= 0.0)
+        && change_timing_requirement_passed(
+            candidate.change_mean_absolute_error_sec,
+            baseline.change_mean_absolute_error_sec,
+        )
+        && micro_der_delta
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CHANGE_DER_JER_REGRESSION)
+        && macro_jer_delta
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CHANGE_DER_JER_REGRESSION)
+        && candidate_brier_score.is_some_and(|score| score <= PUBLIC_CORPUS_MAX_CHANGE_BRIER)
+        && candidate_expected_calibration_error
+            .is_some_and(|error| error <= PUBLIC_CORPUS_MAX_CHANGE_ECE);
+    Ok(PublicCorpusChangeHeldOutGate {
+        split: EvaluationSplit::Test,
+        candidate: selected_mode,
+        baseline: AcousticChangeDetectorMode::FixedSafeV1,
+        change_f1_delta,
+        timing_error_delta_sec,
+        micro_der_delta,
+        macro_jer_delta,
+        candidate_brier_score,
+        candidate_expected_calibration_error,
+        passed,
+    })
+}
+
+fn clustering_split(
+    variants: &[PublicCorpusClusteringVariant],
+    clustering_mode: AcousticClusteringMode,
+    split: EvaluationSplit,
+) -> Option<&PublicCorpusAblationSplit> {
+    variants
+        .iter()
+        .find(|variant| variant.clustering_mode == clustering_mode)
+        .and_then(|variant| {
+            variant
+                .splits
+                .iter()
+                .find(|candidate| candidate.split == split)
+        })
+}
+
+fn clustering_development_gate(
+    variants: &[PublicCorpusClusteringVariant],
+) -> FwResult<PublicCorpusClusteringDevelopmentGate> {
+    let candidate = clustering_split(
+        variants,
+        AcousticClusteringMode::ProbabilisticV1,
+        EvaluationSplit::Development,
+    )
+    .ok_or_else(|| {
+        public_corpus_error(
+            "clustering_development",
+            "probabilistic clustering evidence is missing the development split",
+        )
+    })?;
+    let baseline = clustering_split(
+        variants,
+        AcousticClusteringMode::FixedSafeV1,
+        EvaluationSplit::Development,
+    )
+    .ok_or_else(|| {
+        public_corpus_error(
+            "clustering_development",
+            "fixed-safe clustering evidence is missing the development split",
+        )
+    })?;
+    let relative_micro_der_improvement =
+        candidate
+            .micro_der
+            .zip(baseline.micro_der)
+            .and_then(|(candidate, baseline)| {
+                (baseline > 0.0)
+                    .then(|| canonical_evidence_number((baseline - candidate) / baseline))
+            });
+    let macro_jer_delta = candidate
+        .macro_jer
+        .zip(baseline.macro_jer)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let speaker_confusion_delta_sec = Some(canonical_evidence_number(
+        candidate.speaker_confusion_sec - baseline.speaker_confusion_sec,
+    ));
+    let overlap_f1_delta = candidate
+        .overlap_f1
+        .zip(baseline.overlap_f1)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let mean_absolute_speaker_count_error_delta = candidate
+        .mean_absolute_speaker_count_error
+        .zip(baseline.mean_absolute_speaker_count_error)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let selective_coverage_regression = candidate
+        .selective_coverage
+        .zip(baseline.selective_coverage)
+        .map(|(candidate, baseline)| canonical_evidence_number(baseline - candidate));
+    let selective_risk_delta = candidate
+        .selective_risk
+        .zip(baseline.selective_risk)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let candidate_assignment_expected_calibration_error =
+        candidate.assignment_expected_calibration_error;
+    let candidate_mean_speaker_count_stability = candidate.mean_speaker_count_stability;
+    let candidate_fallback_count = candidate.clustering_fallback_count;
+    let passed = relative_micro_der_improvement
+        .is_some_and(|gain| gain >= PUBLIC_CORPUS_MIN_CLUSTERING_DER_IMPROVEMENT)
+        && macro_jer_delta
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CLUSTERING_JER_REGRESSION)
+        && speaker_confusion_delta_sec.is_some_and(|delta| delta <= 0.0)
+        && overlap_f1_delta.is_some_and(|delta| delta >= 0.0)
+        && mean_absolute_speaker_count_error_delta.is_some_and(|delta| delta <= 0.0)
+        && selective_coverage_regression
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CLUSTERING_COVERAGE_REGRESSION)
+        && selective_risk_delta
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CLUSTERING_SELECTIVE_RISK_REGRESSION)
+        && candidate_assignment_expected_calibration_error
+            .is_some_and(|error| error <= PUBLIC_CORPUS_MAX_CLUSTERING_ECE)
+        && candidate_mean_speaker_count_stability
+            .is_some_and(|stability| stability >= PUBLIC_CORPUS_MIN_CLUSTERING_COUNT_STABILITY)
+        && candidate_fallback_count == 0;
+    Ok(PublicCorpusClusteringDevelopmentGate {
+        split: EvaluationSplit::Development,
+        candidate: AcousticClusteringMode::ProbabilisticV1,
+        baseline: AcousticClusteringMode::FixedSafeV1,
+        minimum_relative_micro_der_improvement: canonical_evidence_number(
+            PUBLIC_CORPUS_MIN_CLUSTERING_DER_IMPROVEMENT,
+        ),
+        maximum_macro_jer_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_MAX_CLUSTERING_JER_REGRESSION,
+        ),
+        maximum_assignment_expected_calibration_error: canonical_evidence_number(
+            PUBLIC_CORPUS_MAX_CLUSTERING_ECE,
+        ),
+        minimum_mean_speaker_count_stability: canonical_evidence_number(
+            PUBLIC_CORPUS_MIN_CLUSTERING_COUNT_STABILITY,
+        ),
+        maximum_selective_coverage_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_MAX_CLUSTERING_COVERAGE_REGRESSION,
+        ),
+        maximum_selective_risk_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_MAX_CLUSTERING_SELECTIVE_RISK_REGRESSION,
+        ),
+        relative_micro_der_improvement,
+        macro_jer_delta,
+        speaker_confusion_delta_sec,
+        overlap_f1_delta,
+        mean_absolute_speaker_count_error_delta,
+        selective_coverage_regression,
+        selective_risk_delta,
+        candidate_assignment_expected_calibration_error,
+        candidate_mean_speaker_count_stability,
+        candidate_fallback_count,
+        passed,
+    })
+}
+
+fn clustering_held_out_gate(
+    variants: &[PublicCorpusClusteringVariant],
+    selected_mode: AcousticClusteringMode,
+) -> FwResult<PublicCorpusClusteringHeldOutGate> {
+    if selected_mode == AcousticClusteringMode::FixedSafeV1 {
+        return Err(public_corpus_error(
+            "clustering_held_out",
+            "the fixed-safe clustering baseline cannot be promoted as its own candidate",
+        ));
+    }
+    let candidate =
+        clustering_split(variants, selected_mode, EvaluationSplit::Test).ok_or_else(|| {
+            public_corpus_error(
+                "clustering_held_out",
+                "selected clustering evidence is missing the held-out split",
+            )
+        })?;
+    let baseline = clustering_split(
+        variants,
+        AcousticClusteringMode::FixedSafeV1,
+        EvaluationSplit::Test,
+    )
+    .ok_or_else(|| {
+        public_corpus_error(
+            "clustering_held_out",
+            "fixed-safe clustering evidence is missing the held-out split",
+        )
+    })?;
+    let micro_der_delta = candidate
+        .micro_der
+        .zip(baseline.micro_der)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let macro_jer_delta = candidate
+        .macro_jer
+        .zip(baseline.macro_jer)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let overlap_f1_delta = candidate
+        .overlap_f1
+        .zip(baseline.overlap_f1)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let mean_absolute_speaker_count_error_delta = candidate
+        .mean_absolute_speaker_count_error
+        .zip(baseline.mean_absolute_speaker_count_error)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let selective_coverage_regression = candidate
+        .selective_coverage
+        .zip(baseline.selective_coverage)
+        .map(|(candidate, baseline)| canonical_evidence_number(baseline - candidate));
+    let selective_risk_delta = candidate
+        .selective_risk
+        .zip(baseline.selective_risk)
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let candidate_assignment_expected_calibration_error =
+        candidate.assignment_expected_calibration_error;
+    let candidate_fallback_count = candidate.clustering_fallback_count;
+    let passed = micro_der_delta.is_some_and(|delta| delta <= 0.0)
+        && macro_jer_delta.is_some_and(|delta| delta <= 0.0)
+        && overlap_f1_delta.is_some_and(|delta| delta >= 0.0)
+        && mean_absolute_speaker_count_error_delta.is_some_and(|delta| delta <= 0.0)
+        && selective_coverage_regression
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CLUSTERING_COVERAGE_REGRESSION)
+        && selective_risk_delta
+            .is_some_and(|delta| delta <= PUBLIC_CORPUS_MAX_CLUSTERING_SELECTIVE_RISK_REGRESSION)
+        && candidate_assignment_expected_calibration_error
+            .is_some_and(|error| error <= PUBLIC_CORPUS_MAX_CLUSTERING_ECE)
+        && candidate_fallback_count == 0;
+    Ok(PublicCorpusClusteringHeldOutGate {
+        split: EvaluationSplit::Test,
+        candidate: selected_mode,
+        baseline: AcousticClusteringMode::FixedSafeV1,
+        micro_der_delta,
+        macro_jer_delta,
+        overlap_f1_delta,
+        mean_absolute_speaker_count_error_delta,
+        selective_coverage_regression,
+        selective_risk_delta,
+        candidate_assignment_expected_calibration_error,
+        candidate_fallback_count,
         passed,
     })
 }
@@ -1517,6 +3368,18 @@ pub fn verify_public_corpus_ablation_evidence(
             &evidence.protocol.diarization_request_sha256,
         ),
         (
+            "change_calibration_sha256",
+            &evidence.protocol.change_calibration_sha256,
+        ),
+        (
+            "change_selection_policy_sha256",
+            &evidence.protocol.change_selection_policy_sha256,
+        ),
+        (
+            "speaker_pair_calibration_sha256",
+            &evidence.protocol.speaker_pair_calibration_sha256,
+        ),
+        (
             "deterministic_accuracy_sha256",
             &evidence.deterministic_accuracy_sha256,
         ),
@@ -1528,6 +3391,77 @@ pub fn verify_public_corpus_ablation_evidence(
                 &format!("{field} must be 64 lowercase hexadecimal characters"),
             ));
         }
+    }
+    for (field, value) in [
+        (
+            "locked_development_result_sha256",
+            evidence.locked_development_result_sha256.as_deref(),
+        ),
+        (
+            "locked_development_accuracy_sha256",
+            evidence.locked_development_accuracy_sha256.as_deref(),
+        ),
+    ] {
+        if value.is_some_and(|value| !is_sha256_hex(value)) {
+            return Err(public_corpus_error(
+                "ablation_hash_format",
+                &format!("{field} must be absent or 64 lowercase hexadecimal characters"),
+            ));
+        }
+    }
+    let stage_contract_valid = match evidence.evaluation_stage {
+        PublicCorpusEvaluationStage::Development => {
+            evidence.locked_development_result_sha256.is_none()
+                && evidence.locked_development_accuracy_sha256.is_none()
+                && evidence.development_gate.is_some()
+                && evidence.held_out_gate.is_none()
+                && evidence
+                    .change_development_gate
+                    .as_ref()
+                    .is_some_and(|gate| {
+                        evidence.selected_change_detector_mode
+                            == if gate.passed {
+                                gate.candidate
+                            } else {
+                                gate.baseline
+                            }
+                    })
+                && evidence.change_held_out_gate.is_none()
+                && evidence
+                    .clustering_development_gate
+                    .as_ref()
+                    .is_some_and(|gate| {
+                        evidence.selected_clustering_mode
+                            == if gate.passed {
+                                gate.candidate
+                            } else {
+                                gate.baseline
+                            }
+                    })
+                && evidence.clustering_held_out_gate.is_none()
+        }
+        PublicCorpusEvaluationStage::Certification => {
+            evidence.locked_development_result_sha256.is_some()
+                && evidence.locked_development_accuracy_sha256.is_some()
+                && evidence.development_gate.is_none()
+                && evidence.held_out_gate.is_some()
+                && evidence.change_development_gate.is_none()
+                && evidence
+                    .change_held_out_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.candidate == evidence.selected_change_detector_mode)
+                && evidence.clustering_development_gate.is_none()
+                && evidence
+                    .clustering_held_out_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.candidate == evidence.selected_clustering_mode)
+        }
+    };
+    if !stage_contract_valid {
+        return Err(public_corpus_error(
+            "ablation_stage_contract",
+            "evaluation stage, development lock, and gate authority are inconsistent",
+        ));
     }
     if canonical_sha256(&evidence.scorer_config)? != evidence.scorer_config_sha256 {
         return Err(public_corpus_error(
@@ -1560,6 +3494,21 @@ pub fn verify_public_corpus_ablation_evidence(
         || evidence.protocol.diarization_request != expected_request
         || canonical_sha256(&evidence.protocol.diarization_request)?
             != evidence.protocol.diarization_request_sha256
+        || evidence.protocol.change_calibration_id != ACOUSTIC_CHANGE_CALIBRATION_VERSION
+        || evidence.protocol.change_calibration_fit_id != ACOUSTIC_CHANGE_CALIBRATION_FIT_VERSION
+        || evidence.protocol.change_calibration_sha256 != acoustic_change_calibration_sha256()
+        || evidence.protocol.change_decision_probability
+            != canonical_evidence_number(f64::from(
+                acoustic_change_calibration().decision_probability,
+            ))
+        || evidence.protocol.change_calibration_bins != evidence.scorer_config.calibration_bins
+        || evidence.protocol.change_selection_policy_id
+            != PUBLIC_CORPUS_CHANGE_SELECTION_POLICY_VERSION
+        || evidence.protocol.change_selection_policy_sha256 != change_selection_policy_sha256()?
+        || evidence.protocol.speaker_pair_calibration_id
+            != ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION
+        || evidence.protocol.speaker_pair_calibration_sha256
+            != acoustic_speaker_pair_calibration_sha256()
     {
         return Err(public_corpus_error(
             "ablation_protocol",
@@ -1581,12 +3530,15 @@ pub fn verify_public_corpus_ablation_evidence(
                 ablation: expected_ablation,
                 feature_schema_sha256: &expected_schema_sha256,
                 diarization_request_sha256: &evidence.protocol.diarization_request_sha256,
+                change_calibration_sha256: &evidence.protocol.change_calibration_sha256,
             })?;
         if variant.ablation != expected_ablation
             || variant.feature_schema != expected_ablation.schema_version().id()
             || variant.feature_schema_sha256 != expected_schema_sha256
             || variant.feature_configuration_sha256 != expected_configuration_sha256
-            || !variant_splits_are_valid(&variant.splits)
+            || !variant_splits_are_valid(&variant.splits, evidence.protocol.change_calibration_bins)
+            || variant.splits.len() != 1
+            || variant.splits[0].split != evidence.evaluation_stage.selected_split()
         {
             return Err(public_corpus_error(
                 "ablation_variant_contract",
@@ -1594,9 +3546,162 @@ pub fn verify_public_corpus_ablation_evidence(
             ));
         }
     }
-    if development_improvement_gate(&evidence.variants)? != evidence.development_gate
-        || held_out_non_regression_gate(&evidence.variants)? != evidence.held_out_gate
+    if evidence.change_detector_variants.len() != AcousticChangeDetectorMode::ALL.len() {
+        return Err(public_corpus_error(
+            "change_detector_variants",
+            "change-detector evidence must contain every frozen detector exactly once",
+        ));
+    }
+    for (variant, expected_mode) in evidence
+        .change_detector_variants
+        .iter()
+        .zip(AcousticChangeDetectorMode::ALL)
     {
+        let expected_schema_sha256 =
+            acoustic_feature_schema_sha256(AcousticFeatureAblation::FullV2.schema_version());
+        let expected_configuration_sha256 =
+            canonical_sha256(&PublicChangeConfigurationFingerprint {
+                runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
+                detector_mode: expected_mode,
+                feature_ablation: AcousticFeatureAblation::FullV2,
+                feature_schema_sha256: &expected_schema_sha256,
+                diarization_request_sha256: &evidence.protocol.diarization_request_sha256,
+                change_calibration_sha256: &evidence.protocol.change_calibration_sha256,
+            })?;
+        if variant.detector_mode != expected_mode
+            || variant.feature_ablation != AcousticFeatureAblation::FullV2
+            || variant.feature_schema_sha256 != expected_schema_sha256
+            || variant.configuration_sha256 != expected_configuration_sha256
+            || !variant_splits_are_valid(&variant.splits, evidence.protocol.change_calibration_bins)
+            || variant.splits.len() != 1
+            || variant.splits[0].split != evidence.evaluation_stage.selected_split()
+        {
+            return Err(public_corpus_error(
+                "change_detector_variant_contract",
+                "change-detector identity, hashes, ordering, or aggregates are invalid",
+            ));
+        }
+    }
+    if evidence.clustering_variants.len() != AcousticClusteringMode::ALL.len() {
+        return Err(public_corpus_error(
+            "clustering_variants",
+            "clustering evidence must contain every frozen mode exactly once",
+        ));
+    }
+    for (variant, expected_mode) in evidence
+        .clustering_variants
+        .iter()
+        .zip(AcousticClusteringMode::ALL)
+    {
+        let expected_schema_sha256 =
+            acoustic_feature_schema_sha256(AcousticFeatureAblation::FullV2.schema_version());
+        let expected_configuration_sha256 =
+            canonical_sha256(&PublicClusteringConfigurationFingerprint {
+                runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
+                clustering_mode: expected_mode,
+                detector_mode: AcousticChangeDetectorMode::FixedSafeV1,
+                feature_ablation: AcousticFeatureAblation::FullV2,
+                feature_schema_sha256: &expected_schema_sha256,
+                diarization_request_sha256: &evidence.protocol.diarization_request_sha256,
+                speaker_pair_calibration_sha256: &evidence.protocol.speaker_pair_calibration_sha256,
+            })?;
+        if variant.clustering_mode != expected_mode
+            || variant.detector_mode != AcousticChangeDetectorMode::FixedSafeV1
+            || variant.feature_ablation != AcousticFeatureAblation::FullV2
+            || variant.configuration_sha256 != expected_configuration_sha256
+            || !variant_splits_are_valid(&variant.splits, evidence.protocol.change_calibration_bins)
+            || variant.splits.len() != 1
+            || variant.splits[0].split != evidence.evaluation_stage.selected_split()
+        {
+            return Err(public_corpus_error(
+                "clustering_variant_contract",
+                "clustering identity, hashes, ordering, or aggregates are invalid",
+            ));
+        }
+    }
+    let full_v2_splits = evidence
+        .variants
+        .iter()
+        .find(|variant| variant.ablation == AcousticFeatureAblation::FullV2)
+        .map(|variant| &variant.splits)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "change_detector_alignment",
+                "full-v2 representation evidence is unavailable",
+            )
+        })?;
+    let calibrated_splits = evidence
+        .change_detector_variants
+        .iter()
+        .find(|variant| variant.detector_mode == AcousticChangeDetectorMode::CalibratedPosterior)
+        .map(|variant| &variant.splits)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "change_detector_alignment",
+                "calibrated detector evidence is unavailable",
+            )
+        })?;
+    if calibrated_splits != full_v2_splits {
+        return Err(public_corpus_error(
+            "change_detector_alignment",
+            "calibrated detector and full-v2 representation aggregates differ",
+        ));
+    }
+    let fixed_detector_splits = evidence
+        .change_detector_variants
+        .iter()
+        .find(|variant| variant.detector_mode == AcousticChangeDetectorMode::FixedSafeV1)
+        .map(|variant| &variant.splits)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "clustering_alignment",
+                "fixed-safe detector evidence is unavailable",
+            )
+        })?;
+    let fixed_clustering_splits = evidence
+        .clustering_variants
+        .iter()
+        .find(|variant| variant.clustering_mode == AcousticClusteringMode::FixedSafeV1)
+        .map(|variant| &variant.splits)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "clustering_alignment",
+                "fixed-safe clustering evidence is unavailable",
+            )
+        })?;
+    if fixed_clustering_splits != fixed_detector_splits {
+        return Err(public_corpus_error(
+            "clustering_alignment",
+            "fixed-safe clustering and detector aggregates differ",
+        ));
+    }
+    let gates_match = match evidence.evaluation_stage {
+        PublicCorpusEvaluationStage::Development => {
+            evidence.development_gate.as_ref()
+                == Some(&development_improvement_gate(&evidence.variants)?)
+                && evidence.change_development_gate.as_ref()
+                    == Some(&change_development_gate(
+                        &evidence.change_detector_variants,
+                    )?)
+                && evidence.clustering_development_gate.as_ref()
+                    == Some(&clustering_development_gate(&evidence.clustering_variants)?)
+        }
+        PublicCorpusEvaluationStage::Certification => {
+            evidence.held_out_gate.as_ref()
+                == Some(&held_out_non_regression_gate(&evidence.variants)?)
+                && evidence.change_held_out_gate.as_ref()
+                    == Some(&change_held_out_gate(
+                        &evidence.change_detector_variants,
+                        evidence.selected_change_detector_mode,
+                    )?)
+                && evidence.clustering_held_out_gate.as_ref()
+                    == Some(&clustering_held_out_gate(
+                        &evidence.clustering_variants,
+                        evidence.selected_clustering_mode,
+                    )?)
+        }
+    };
+    if !gates_match {
         return Err(public_corpus_error(
             "ablation_gate_mismatch",
             "development or held-out decision does not match the retained aggregate metrics",
@@ -1631,10 +3736,163 @@ fn deterministic_accuracy_sha256(evidence: &PublicCorpusAblationEvidence) -> FwR
             split.sampled_peak_rss_bytes = 0;
         }
     }
+    for variant in &mut normalized.change_detector_variants {
+        for split in &mut variant.splits {
+            split.wall_time_sec = 0.0;
+            split.real_time_factor = None;
+            split.sampled_peak_rss_bytes = 0;
+        }
+    }
+    for variant in &mut normalized.clustering_variants {
+        for split in &mut variant.splits {
+            split.wall_time_sec = 0.0;
+            split.real_time_factor = None;
+            split.sampled_peak_rss_bytes = 0;
+        }
+    }
     canonical_sha256(&normalized)
 }
 
-fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit]) -> bool {
+#[derive(Debug, Clone, Copy)]
+struct ChangeMetricValidation {
+    reference_count: u64,
+    hypothesis_count: u64,
+    matched_count: u64,
+    precision: Option<f64>,
+    recall: Option<f64>,
+    f1: Option<f64>,
+    mean: Option<f64>,
+    p50: Option<f64>,
+    p90: Option<f64>,
+    p95: Option<f64>,
+    collar_ms: u64,
+}
+
+impl ChangeMetricValidation {
+    fn from_collar(metric: &PublicChangeCollarMetrics) -> Self {
+        Self {
+            reference_count: metric.reference_count,
+            hypothesis_count: metric.hypothesis_count,
+            matched_count: metric.matched_count,
+            precision: metric.precision,
+            recall: metric.recall,
+            f1: metric.f1,
+            mean: metric.mean_absolute_error_sec,
+            p50: metric.p50_absolute_error_sec,
+            p90: metric.p90_absolute_error_sec,
+            p95: metric.p95_absolute_error_sec,
+            collar_ms: metric.collar_ms,
+        }
+    }
+
+    fn from_threshold(metric: &PublicChangeThresholdSweepPoint) -> Self {
+        Self {
+            reference_count: metric.reference_count,
+            hypothesis_count: metric.hypothesis_count,
+            matched_count: metric.matched_count,
+            precision: metric.precision,
+            recall: metric.recall,
+            f1: metric.f1,
+            mean: metric.mean_absolute_error_sec,
+            p50: metric.p50_absolute_error_sec,
+            p90: metric.p90_absolute_error_sec,
+            p95: metric.p95_absolute_error_sec,
+            collar_ms: metric.collar_ms,
+        }
+    }
+}
+
+fn change_metric_is_valid(metric: ChangeMetricValidation) -> bool {
+    let ChangeMetricValidation {
+        reference_count,
+        hypothesis_count,
+        matched_count,
+        precision,
+        recall,
+        f1,
+        mean,
+        p50,
+        p90,
+        p95,
+        collar_ms,
+    } = metric;
+    let expected_precision = ratio(matched_count, hypothesis_count);
+    let expected_recall = ratio(matched_count, reference_count);
+    let expected_f1 = expected_precision
+        .zip(expected_recall)
+        .map(|(precision, recall)| {
+            let denominator = precision + recall;
+            if denominator > 0.0 {
+                2.0 * precision * recall / denominator
+            } else {
+                0.0
+            }
+        });
+    let finite_nonnegative =
+        |value: Option<f64>| value.is_none_or(|value| value.is_finite() && value >= 0.0);
+    let timing_shape_valid = if matched_count == 0 {
+        mean.is_none() && p50.is_none() && p90.is_none() && p95.is_none()
+    } else {
+        mean.is_some()
+            && p50.is_some()
+            && p90.is_some()
+            && p95.is_some()
+            && p50 <= p90
+            && p90 <= p95
+            && p95.is_some_and(|value| value <= collar_ms as f64 / 1_000.0 + 1e-12)
+    };
+    matched_count <= reference_count
+        && matched_count <= hypothesis_count
+        && precision == expected_precision
+        && recall == expected_recall
+        && f1 == expected_f1
+        && finite_nonnegative(mean)
+        && finite_nonnegative(p50)
+        && finite_nonnegative(p90)
+        && finite_nonnegative(p95)
+        && timing_shape_valid
+}
+
+fn change_diagnostic_grids_are_valid(split: &PublicCorpusAblationSplit) -> bool {
+    let collars_valid = split.change_collar_metrics.len()
+        == PUBLIC_CHANGE_DIAGNOSTIC_COLLARS_MS.len()
+        && split
+            .change_collar_metrics
+            .iter()
+            .zip(PUBLIC_CHANGE_DIAGNOSTIC_COLLARS_MS)
+            .all(|(metric, expected_collar)| {
+                metric.collar_ms == expected_collar
+                    && metric.reference_count == split.change_reference_count
+                    && change_metric_is_valid(ChangeMetricValidation::from_collar(metric))
+            });
+    let operating_point_valid = split
+        .change_collar_metrics
+        .iter()
+        .find(|metric| metric.collar_ms == 250)
+        .is_some_and(|metric| {
+            metric.hypothesis_count == split.change_hypothesis_count
+                && metric.matched_count == split.change_matched_count
+                && metric.precision == split.change_precision
+                && metric.recall == split.change_recall
+                && metric.f1 == split.change_f1
+                && metric.mean_absolute_error_sec == split.change_mean_absolute_error_sec
+        });
+    let threshold_sweep_valid = split.change_threshold_sweep.len()
+        == PUBLIC_CHANGE_THRESHOLD_SWEEP.len()
+        && split
+            .change_threshold_sweep
+            .iter()
+            .zip(PUBLIC_CHANGE_THRESHOLD_SWEEP)
+            .all(|(metric, expected_threshold)| {
+                metric.threshold == canonical_evidence_number(expected_threshold)
+                    && metric.collar_ms == 250
+                    && metric.reference_count == split.change_reference_count
+                    && change_metric_is_valid(ChangeMetricValidation::from_threshold(metric))
+            });
+    collars_valid && operating_point_valid && threshold_sweep_valid
+}
+
+fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bins: usize) -> bool {
     if splits.is_empty()
         || !splits
             .windows(2)
@@ -1647,16 +3905,178 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit]) -> bool {
         let bounded = |value: Option<f64>| {
             value.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
         };
+        let reliability_valid = split.change_reliability.len() == calibration_bins
+            && split
+                .change_reliability
+                .iter()
+                .enumerate()
+                .all(|(index, bin)| {
+                    bin.index == index
+                        && bin.lower_probability
+                            == canonical_evidence_number(index as f64 / calibration_bins as f64)
+                        && bin.upper_probability
+                            == canonical_evidence_number(
+                                (index + 1) as f64 / calibration_bins as f64,
+                            )
+                        && bin.positive_count <= bin.observation_count
+                        && match (bin.mean_probability, bin.empirical_frequency) {
+                            (None, None) => bin.observation_count == 0,
+                            (Some(mean), Some(empirical)) => {
+                                bin.observation_count > 0
+                                    && (0.0..=1.0).contains(&mean)
+                                    && (0.0..=1.0).contains(&empirical)
+                            }
+                            _ => false,
+                        }
+                });
+        let reliability_observations = split
+            .change_reliability
+            .iter()
+            .map(|bin| bin.observation_count)
+            .sum::<u64>();
+        let reliability_positives = split
+            .change_reliability
+            .iter()
+            .map(|bin| bin.positive_count)
+            .sum::<u64>();
+        let expected_ece = canonical_evidence_number(
+            split
+                .change_reliability
+                .iter()
+                .filter_map(|bin| {
+                    bin.mean_probability
+                        .zip(bin.empirical_frequency)
+                        .map(|(mean, empirical)| {
+                            bin.observation_count as f64
+                                / split.change_event_observation_count.max(1) as f64
+                                * (mean - empirical).abs()
+                        })
+                })
+                .sum::<f64>(),
+        );
+        let calibration_valid = reliability_valid
+            && reliability_observations == split.change_event_observation_count
+            && reliability_positives == split.change_event_positive_count
+            && split.change_event_positive_count == split.change_reference_count
+            && split.change_event_observation_count
+                == split
+                    .change_reference_count
+                    .saturating_add(split.change_hypothesis_count)
+                    .saturating_sub(split.change_matched_count)
+            && bounded(split.change_brier_score)
+            && bounded(split.change_expected_calibration_error)
+            && if split.change_event_observation_count == 0 {
+                split.change_brier_score.is_none()
+                    && split.change_expected_calibration_error.is_none()
+            } else {
+                split.change_brier_score.is_some()
+                    && split
+                        .change_expected_calibration_error
+                        .is_some_and(|ece| (ece - expected_ece).abs() <= 1e-12)
+            };
+        let assignment_calibration_valid = split.assignment_observed_duration_sec
+            <= split.assignment_opportunity_duration_sec
+            && finite_nonnegative(split.assignment_observed_duration_sec)
+            && finite_nonnegative(split.assignment_opportunity_duration_sec)
+            && split.assignment_coverage
+                == positive_ratio(
+                    split.assignment_observed_duration_sec,
+                    split.assignment_opportunity_duration_sec,
+                )
+            && bounded(split.assignment_brier_score)
+            && bounded(split.assignment_expected_calibration_error)
+            && if split.assignment_observed_duration_sec == 0.0 {
+                split.assignment_brier_score.is_none()
+                    && split.assignment_expected_calibration_error.is_none()
+            } else {
+                split.assignment_brier_score.is_some()
+                    && split.assignment_expected_calibration_error.is_some()
+            };
+        let selective_valid = [
+            split.selective_reference_speaker_time_sec,
+            split.selective_covered_speaker_time_sec,
+            split.selective_correct_covered_speaker_time_sec,
+            split.selective_error_covered_speaker_time_sec,
+            split.selective_unknown_speaker_time_sec,
+        ]
+        .into_iter()
+        .all(finite_nonnegative)
+            && split.selective_covered_speaker_time_sec
+                <= split.selective_reference_speaker_time_sec + 1e-9
+            && (split.selective_correct_covered_speaker_time_sec
+                + split.selective_error_covered_speaker_time_sec
+                - split.selective_covered_speaker_time_sec)
+                .abs()
+                <= 1e-9
+            && (split.selective_covered_speaker_time_sec
+                + split.selective_unknown_speaker_time_sec
+                - split.selective_reference_speaker_time_sec)
+                .abs()
+                <= 1e-9
+            && split.selective_coverage
+                == positive_ratio(
+                    split.selective_covered_speaker_time_sec,
+                    split.selective_reference_speaker_time_sec,
+                )
+            && split.selective_risk
+                == positive_ratio(
+                    split.selective_error_covered_speaker_time_sec,
+                    split.selective_covered_speaker_time_sec,
+                )
+            && bounded(split.selective_coverage)
+            && bounded(split.selective_risk);
         split.recording_count > 0
             && finite_nonnegative(split.reference_speaker_time_sec)
             && split.micro_der.is_none_or(finite_nonnegative)
             && split.macro_der.is_none_or(finite_nonnegative)
             && bounded(split.macro_jer)
+            && finite_nonnegative(split.speaker_confusion_sec)
+            && [
+                split.overlap_reference_sec,
+                split.overlap_hypothesis_sec,
+                split.overlap_true_positive_sec,
+                split.overlap_false_positive_sec,
+                split.overlap_false_negative_sec,
+            ]
+            .into_iter()
+            .all(finite_nonnegative)
+            && (split.overlap_true_positive_sec + split.overlap_false_negative_sec
+                - split.overlap_reference_sec)
+                .abs()
+                <= 1e-9
+            && (split.overlap_true_positive_sec + split.overlap_false_positive_sec
+                - split.overlap_hypothesis_sec)
+                .abs()
+                <= 1e-9
+            && bounded(split.overlap_precision)
+            && bounded(split.overlap_recall)
+            && bounded(split.overlap_f1)
+            && split.change_matched_count <= split.change_reference_count
+            && split.change_matched_count <= split.change_hypothesis_count
+            && bounded(split.change_precision)
+            && bounded(split.change_recall)
             && bounded(split.change_f1)
+            && split
+                .change_mean_absolute_error_sec
+                .is_none_or(finite_nonnegative)
+            && change_diagnostic_grids_are_valid(split)
+            && calibration_valid
             && bounded(split.exact_speaker_count_rate)
+            && split
+                .mean_signed_speaker_count_error
+                .is_none_or(f64::is_finite)
             && split
                 .mean_absolute_speaker_count_error
                 .is_none_or(finite_nonnegative)
+            && selective_valid
+            && assignment_calibration_valid
+            && bounded(split.mean_speaker_count_stability)
+            && split.clustering_fallback_count <= split.recording_count
+            && split.clustering_fallback_count
+                == split
+                    .clustering_insufficient_voice_fallback_count
+                    .saturating_add(split.clustering_invalid_posterior_fallback_count)
+                    .saturating_add(split.clustering_unstable_count_fallback_count)
             && finite_nonnegative(split.audio_duration_sec)
             && finite_nonnegative(split.wall_time_sec)
             && split.real_time_factor.is_none_or(finite_nonnegative)
@@ -1664,11 +4084,32 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit]) -> bool {
 }
 
 fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
-    (denominator > 0).then(|| numerator as f64 / denominator as f64)
+    (denominator > 0).then(|| canonical_evidence_number(numerator as f64 / denominator as f64))
 }
 
 fn positive_ratio(numerator: f64, denominator: f64) -> Option<f64> {
-    (denominator > 0.0).then(|| numerator / denominator)
+    (denominator > 0.0).then(|| canonical_evidence_number(numerator / denominator))
+}
+
+fn signed_ratio(numerator: f64, denominator: f64) -> Option<f64> {
+    (denominator > 0.0 && numerator.is_finite())
+        .then(|| canonical_evidence_number(numerator / denominator))
+}
+
+/// Quantize retained aggregate evidence without changing inference precision.
+///
+/// JSON is the lock artifact for the two-stage public evaluation. Constraining
+/// its floating-point fields to twelve decimal places prevents adjacent binary
+/// representations of the same aggregate from invalidating their own hash
+/// after a serialize/parse cycle. Twelve places are substantially finer than
+/// the scorer's millisecond timing resolution and predeclared gate margins.
+fn canonical_evidence_number(value: f64) -> f64 {
+    const SCALE: f64 = 1_000_000_000_000.0;
+    if !value.is_finite() || value.abs() > f64::MAX / SCALE {
+        return value;
+    }
+    let rounded = (value * SCALE).round() / SCALE;
+    if rounded == 0.0 { 0.0 } else { rounded }
 }
 
 fn parse_rttm(
@@ -2130,6 +4571,37 @@ fn canonical_input_file(root: &Path, path: &Path, field: &str) -> FwResult<PathB
         return Err(public_corpus_error(
             "input_escape",
             &format!("{field} must resolve beneath input_root"),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn canonical_external_file(
+    project: &Path,
+    input: &Path,
+    path: &Path,
+    field: &str,
+) -> FwResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(public_corpus_error(
+            "absolute_path",
+            &format!("{field} must be absolute"),
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|_| {
+        public_corpus_error(
+            "external_file",
+            &format!("{field} must resolve to a readable file"),
+        )
+    })?;
+    if !canonical.is_file()
+        || canonical.extension().and_then(|value| value.to_str()) != Some("json")
+        || canonical.starts_with(project)
+        || canonical.starts_with(input)
+    {
+        return Err(public_corpus_error(
+            "external_file",
+            &format!("{field} must be an external JSON file"),
         ));
     }
     Ok(canonical)
@@ -2718,6 +5190,103 @@ mod tests {
     }
 
     #[test]
+    fn change_event_calibration_counts_matches_false_alarms_and_misses_once() {
+        let hypothesis = [
+            super::ChangeProbabilityObservation {
+                boundary_ms: 900,
+                probability: 0.8,
+            },
+            super::ChangeProbabilityObservation {
+                boundary_ms: 1_500,
+                probability: 0.9,
+            },
+            super::ChangeProbabilityObservation {
+                boundary_ms: 2_050,
+                probability: 0.6,
+            },
+        ];
+        let aggregate =
+            super::score_change_event_calibration(&[1_000, 2_000], &hypothesis, 200, 10)
+                .expect("event calibration");
+        assert_eq!(aggregate.observation_count, 3);
+        assert_eq!(aggregate.positive_count, 2);
+        assert!((aggregate.brier_sum - 1.01).abs() < 1e-12);
+        assert_eq!(aggregate.bins[6].observation_count, 1);
+        assert_eq!(aggregate.bins[8].observation_count, 1);
+        assert_eq!(aggregate.bins[9].observation_count, 1);
+
+        let missed =
+            super::score_change_event_calibration(&[1_000], &[], 200, 10).expect("missed event");
+        assert_eq!(missed.observation_count, 1);
+        assert_eq!(missed.positive_count, 1);
+        assert_eq!(missed.brier_sum, 1.0);
+        assert_eq!(missed.bins[0].positive_count, 1);
+    }
+
+    #[test]
+    fn change_timing_traceback_matches_the_max_cardinality_minimum_error_score() {
+        let reference = [0.0, 1.0, 2.0];
+        let hypothesis = [0.20, 0.85, 2.40];
+        let errors = super::minimum_error_change_match_errors(&reference, &hypothesis, 0.30);
+        let score =
+            crate::diarization::score_change_points(&reference, &hypothesis, 0.30).expect("score");
+        assert_eq!(errors.len(), score.matched_count);
+        assert!(
+            (errors.iter().sum::<f64>()
+                - score.mean_absolute_error_sec.expect("matched") * score.matched_count as f64)
+                .abs()
+                < 1e-12
+        );
+        assert!((errors[0] - 0.15).abs() < 1e-12);
+        assert!((errors[1] - 0.20).abs() < 1e-12);
+    }
+
+    #[test]
+    fn zero_match_aggregate_reports_defined_zero_f1_and_timing_authority_is_asymmetric() {
+        let aggregate = PublicAblationAccumulator {
+            recording_count: 1,
+            change_reference_count: 1,
+            change_hypothesis_count: 1,
+            overlap_reference_sec: 1.0,
+            overlap_false_negative_sec: 1.0,
+            ..PublicAblationAccumulator::default()
+        }
+        .finish(EvaluationSplit::Development);
+        assert_eq!(aggregate.change_precision, Some(0.0));
+        assert_eq!(aggregate.change_recall, Some(0.0));
+        assert_eq!(aggregate.change_f1, Some(0.0));
+        assert_eq!(aggregate.overlap_precision, None);
+        assert_eq!(aggregate.overlap_recall, Some(0.0));
+        assert_eq!(aggregate.overlap_f1, Some(0.0));
+        assert!(super::change_timing_requirement_passed(Some(0.2), None));
+        assert!(!super::change_timing_requirement_passed(None, Some(0.2)));
+        assert!(!super::change_timing_requirement_passed(None, None));
+    }
+
+    #[test]
+    fn report_change_observations_ignore_silence_gaps_and_use_boundary_confidence() {
+        let turn = |start_ms, end_ms, speaker: Option<&str>, change_confidence| {
+            crate::model::DiarizationTurn {
+                start_ms,
+                end_ms,
+                speaker_ref: speaker.map(str::to_owned),
+                speaker_confidence: speaker.map(|_| 0.8),
+                change_confidence,
+                overlap_suspected: false,
+                hard_hint_attributed: false,
+            }
+        };
+        let observations = super::report_change_observations(&[
+            turn(0, 1_000, Some("a"), Some(0.75)),
+            turn(1_000, 2_000, Some("b"), Some(0.25)),
+            turn(2_100, 3_000, Some("a"), Some(0.9)),
+        ]);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].boundary_ms, 1_000);
+        assert_eq!(observations[0].probability, 0.75);
+    }
+
+    #[test]
     fn ablation_aggregate_uses_micro_and_macro_denominators_exactly() {
         let aggregate = PublicAblationAccumulator {
             recording_count: 2,
@@ -2737,6 +5306,7 @@ mod tests {
             audio_duration_sec: 20.0,
             wall_time_sec: 5.0,
             sampled_peak_rss_bytes: 123,
+            ..PublicAblationAccumulator::default()
         }
         .finish(EvaluationSplit::Development);
         assert_eq!(aggregate.micro_der, Some(0.2));
@@ -2765,9 +5335,90 @@ mod tests {
             micro_der,
             macro_der: micro_der,
             macro_jer,
+            speaker_confusion_sec: 0.0,
+            overlap_reference_sec: 1.0,
+            overlap_hypothesis_sec: 1.0,
+            overlap_true_positive_sec: 1.0,
+            overlap_false_positive_sec: 0.0,
+            overlap_false_negative_sec: 0.0,
+            overlap_precision: Some(1.0),
+            overlap_recall: Some(1.0),
+            overlap_f1: Some(1.0),
+            change_reference_count: 1,
+            change_hypothesis_count: 1,
+            change_matched_count: 1,
+            change_precision: Some(1.0),
+            change_recall: Some(1.0),
             change_f1: Some(1.0),
+            change_mean_absolute_error_sec: Some(0.0),
+            change_event_observation_count: 1,
+            change_event_positive_count: 1,
+            change_brier_score: Some(0.0),
+            change_expected_calibration_error: Some(0.0),
+            change_reliability: (0..10)
+                .map(|index| super::PublicChangeReliabilityBin {
+                    index,
+                    lower_probability: index as f64 / 10.0,
+                    upper_probability: (index + 1) as f64 / 10.0,
+                    observation_count: u64::from(index == 9),
+                    positive_count: u64::from(index == 9),
+                    mean_probability: (index == 9).then_some(1.0),
+                    empirical_frequency: (index == 9).then_some(1.0),
+                })
+                .collect(),
+            change_collar_metrics: super::PUBLIC_CHANGE_DIAGNOSTIC_COLLARS_MS
+                .into_iter()
+                .map(|collar_ms| super::PublicChangeCollarMetrics {
+                    collar_ms,
+                    reference_count: 1,
+                    hypothesis_count: 1,
+                    matched_count: 1,
+                    precision: Some(1.0),
+                    recall: Some(1.0),
+                    f1: Some(1.0),
+                    mean_absolute_error_sec: Some(0.0),
+                    p50_absolute_error_sec: Some(0.0),
+                    p90_absolute_error_sec: Some(0.0),
+                    p95_absolute_error_sec: Some(0.0),
+                })
+                .collect(),
+            change_threshold_sweep: super::PUBLIC_CHANGE_THRESHOLD_SWEEP
+                .into_iter()
+                .map(|threshold| super::PublicChangeThresholdSweepPoint {
+                    threshold,
+                    collar_ms: 250,
+                    reference_count: 1,
+                    hypothesis_count: 1,
+                    matched_count: 1,
+                    precision: Some(1.0),
+                    recall: Some(1.0),
+                    f1: Some(1.0),
+                    mean_absolute_error_sec: Some(0.0),
+                    p50_absolute_error_sec: Some(0.0),
+                    p90_absolute_error_sec: Some(0.0),
+                    p95_absolute_error_sec: Some(0.0),
+                })
+                .collect(),
             exact_speaker_count_rate: Some(1.0),
+            mean_signed_speaker_count_error: Some(0.0),
             mean_absolute_speaker_count_error: Some(0.0),
+            selective_reference_speaker_time_sec: 1.0,
+            selective_covered_speaker_time_sec: 1.0,
+            selective_correct_covered_speaker_time_sec: 1.0,
+            selective_error_covered_speaker_time_sec: 0.0,
+            selective_unknown_speaker_time_sec: 0.0,
+            selective_coverage: Some(1.0),
+            selective_risk: Some(0.0),
+            assignment_observed_duration_sec: 1.0,
+            assignment_opportunity_duration_sec: 1.0,
+            assignment_coverage: Some(1.0),
+            assignment_brier_score: Some(0.0),
+            assignment_expected_calibration_error: Some(0.0),
+            mean_speaker_count_stability: Some(1.0),
+            clustering_fallback_count: 0,
+            clustering_insufficient_voice_fallback_count: 0,
+            clustering_invalid_posterior_fallback_count: 0,
+            clustering_unstable_count_fallback_count: 0,
             audio_duration_sec: 1.0,
             wall_time_sec: 0.1,
             real_time_factor: Some(0.1),
@@ -2831,6 +5482,275 @@ mod tests {
         .expect("complete evidence");
         assert!(!failed.passed);
         assert!(failed.macro_jer_delta.is_some_and(|delta| delta > 0.0));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn clustering_variant(
+        clustering_mode: super::AcousticClusteringMode,
+        micro_der: f64,
+        macro_jer: f64,
+        speaker_confusion_sec: f64,
+        count_error: f64,
+        assignment_ece: f64,
+        count_stability: f64,
+        fallback_count: u64,
+    ) -> super::PublicCorpusClusteringVariant {
+        let mut splits = ablation_variant(
+            AcousticFeatureAblation::FullV2,
+            Some(micro_der),
+            Some(macro_jer),
+        )
+        .splits;
+        for split in &mut splits {
+            split.speaker_confusion_sec = speaker_confusion_sec;
+            split.mean_absolute_speaker_count_error = Some(count_error);
+            split.assignment_expected_calibration_error = Some(assignment_ece);
+            split.mean_speaker_count_stability = Some(count_stability);
+            split.clustering_fallback_count = fallback_count;
+        }
+        super::PublicCorpusClusteringVariant {
+            clustering_mode,
+            detector_mode: super::AcousticChangeDetectorMode::FixedSafeV1,
+            feature_ablation: AcousticFeatureAblation::FullV2,
+            configuration_sha256: "1".repeat(64),
+            splits,
+        }
+    }
+
+    #[test]
+    fn clustering_development_gate_requires_accuracy_calibration_and_stability() {
+        let passing_candidate = clustering_variant(
+            super::AcousticClusteringMode::ProbabilisticV1,
+            0.18,
+            0.30,
+            0.8,
+            0.5,
+            0.05,
+            1.0,
+            0,
+        );
+        let baseline = clustering_variant(
+            super::AcousticClusteringMode::FixedSafeV1,
+            0.20,
+            0.30,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            0,
+        );
+        let passed =
+            super::clustering_development_gate(&[baseline.clone(), passing_candidate.clone()])
+                .expect("complete clustering evidence");
+        assert!(passed.passed);
+        assert_eq!(passed.candidate_fallback_count, 0);
+        assert_eq!(passed.selective_coverage_regression, Some(0.0));
+        assert_eq!(passed.selective_risk_delta, Some(0.0));
+
+        let mut uncalibrated = passing_candidate.clone();
+        for split in &mut uncalibrated.splits {
+            split.assignment_expected_calibration_error = Some(0.11);
+        }
+        assert!(
+            !super::clustering_development_gate(&[baseline.clone(), uncalibrated])
+                .expect("uncalibrated evidence")
+                .passed
+        );
+
+        let mut unstable = passing_candidate.clone();
+        for split in &mut unstable.splits {
+            split.mean_speaker_count_stability = Some(1.0 / 3.0);
+        }
+        assert!(
+            !super::clustering_development_gate(&[baseline.clone(), unstable])
+                .expect("unstable evidence")
+                .passed
+        );
+
+        let mut coverage_regression = passing_candidate.clone();
+        for split in &mut coverage_regression.splits {
+            split.selective_covered_speaker_time_sec *= 0.98;
+            split.selective_correct_covered_speaker_time_sec *= 0.98;
+            split.selective_coverage = Some(0.98);
+        }
+        assert!(
+            !super::clustering_development_gate(&[baseline.clone(), coverage_regression])
+                .expect("coverage-regressing evidence")
+                .passed
+        );
+
+        let mut risk_regression = passing_candidate.clone();
+        for split in &mut risk_regression.splits {
+            split.selective_error_covered_speaker_time_sec = 0.01;
+            split.selective_correct_covered_speaker_time_sec =
+                split.selective_covered_speaker_time_sec - 0.01;
+            split.selective_risk = Some(0.01 / split.selective_covered_speaker_time_sec);
+        }
+        assert!(
+            !super::clustering_development_gate(&[baseline.clone(), risk_regression])
+                .expect("risk-regressing evidence")
+                .passed
+        );
+
+        let mut fallback = passing_candidate;
+        for split in &mut fallback.splits {
+            split.clustering_fallback_count = 1;
+        }
+        assert!(
+            !super::clustering_development_gate(&[baseline, fallback])
+                .expect("fallback evidence")
+                .passed
+        );
+    }
+
+    #[test]
+    fn clustering_held_out_gate_requires_non_regression() {
+        let baseline = clustering_variant(
+            super::AcousticClusteringMode::FixedSafeV1,
+            0.20,
+            0.30,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            0,
+        );
+        let passing = clustering_variant(
+            super::AcousticClusteringMode::ProbabilisticV1,
+            0.19,
+            0.30,
+            0.8,
+            0.5,
+            0.05,
+            1.0,
+            0,
+        );
+        assert!(
+            super::clustering_held_out_gate(
+                &[baseline.clone(), passing],
+                super::AcousticClusteringMode::ProbabilisticV1,
+            )
+            .expect("complete held-out evidence")
+            .passed
+        );
+
+        let regressing = clustering_variant(
+            super::AcousticClusteringMode::ProbabilisticV1,
+            0.21,
+            0.30,
+            0.8,
+            0.5,
+            0.05,
+            1.0,
+            0,
+        );
+        assert!(
+            !super::clustering_held_out_gate(
+                &[baseline, regressing],
+                super::AcousticClusteringMode::ProbabilisticV1,
+            )
+            .expect("regressing held-out evidence")
+            .passed
+        );
+    }
+
+    fn change_detector_variant(
+        detector_mode: super::AcousticChangeDetectorMode,
+        change_f1: f64,
+        timing_error_sec: f64,
+        micro_der: f64,
+        macro_jer: f64,
+        brier: f64,
+        ece: f64,
+    ) -> super::PublicCorpusChangeDetectorVariant {
+        let mut splits = ablation_variant(
+            AcousticFeatureAblation::FullV2,
+            Some(micro_der),
+            Some(macro_jer),
+        )
+        .splits;
+        for split in &mut splits {
+            split.change_f1 = Some(change_f1);
+            split.change_mean_absolute_error_sec = Some(timing_error_sec);
+            split.change_brier_score = Some(brier);
+            split.change_expected_calibration_error = Some(ece);
+        }
+        super::PublicCorpusChangeDetectorVariant {
+            detector_mode,
+            feature_ablation: AcousticFeatureAblation::FullV2,
+            feature_schema_sha256: "0".repeat(64),
+            configuration_sha256: "1".repeat(64),
+            splits,
+        }
+    }
+
+    #[test]
+    fn development_selector_chooses_only_the_best_fully_eligible_candidate() {
+        let variants = vec![
+            change_detector_variant(
+                super::AcousticChangeDetectorMode::CalibratedPosterior,
+                0.55,
+                0.10,
+                0.20,
+                0.30,
+                0.10,
+                0.05,
+            ),
+            change_detector_variant(
+                super::AcousticChangeDetectorMode::PageHinkleyV1,
+                0.65,
+                0.09,
+                0.20,
+                0.30,
+                0.10,
+                0.05,
+            ),
+            change_detector_variant(
+                super::AcousticChangeDetectorMode::BayesianTwoRegimeV1,
+                0.75,
+                0.08,
+                0.20,
+                0.30,
+                0.40,
+                0.05,
+            ),
+            change_detector_variant(
+                super::AcousticChangeDetectorMode::FixedSafeV1,
+                0.50,
+                0.10,
+                0.20,
+                0.30,
+                0.20,
+                0.05,
+            ),
+        ];
+        let selected = super::change_development_gate(&variants).expect("development selection");
+        assert!(selected.passed);
+        assert_eq!(
+            selected.candidate,
+            super::AcousticChangeDetectorMode::PageHinkleyV1
+        );
+        let held_out = super::change_held_out_gate(
+            &variants,
+            super::AcousticChangeDetectorMode::PageHinkleyV1,
+        )
+        .expect("held-out decision");
+        assert!(held_out.passed);
+        assert_eq!(held_out.candidate, selected.candidate);
+    }
+
+    #[test]
+    fn development_selector_fails_closed_when_no_candidate_is_eligible() {
+        let variants = super::AcousticChangeDetectorMode::ALL
+            .into_iter()
+            .map(|mode| change_detector_variant(mode, 0.50, 0.10, 0.20, 0.30, 0.20, 0.05))
+            .collect::<Vec<_>>();
+        let selected = super::change_development_gate(&variants).expect("development selection");
+        assert!(!selected.passed);
+        assert_eq!(
+            selected.candidate,
+            super::AcousticChangeDetectorMode::CalibratedPosterior
+        );
     }
 
     #[test]
@@ -2904,20 +5824,29 @@ mod tests {
                 evidence_output_path: &evidence_path,
                 license_acknowledgement_id: "accept-aishell-4-cc-by-sa-4.0",
                 maximum_recording_duration_ms: Some(1_000),
+                evaluation_stage: super::PublicCorpusEvaluationStage::Development,
+                locked_development_evidence_path: None,
             },
             || false,
         )
         .expect("complete public ablation");
 
         assert_eq!(evidence.variants.len(), AcousticFeatureAblation::ALL.len());
+        assert!(evidence.variants.iter().all(|variant| {
+            variant.splits.len() == 1 && variant.splits[0].split == EvaluationSplit::Development
+        }));
         assert!(
-            evidence
-                .variants
-                .iter()
-                .all(|variant| variant.splits.len() == 3)
+            !evidence
+                .development_gate
+                .as_ref()
+                .expect("development gate")
+                .passed
         );
-        assert!(!evidence.development_gate.passed);
-        assert!(evidence.held_out_gate.passed);
+        assert!(evidence.held_out_gate.is_none());
+        assert_eq!(
+            evidence.change_detector_variants.len(),
+            super::AcousticChangeDetectorMode::ALL.len()
+        );
         assert!(bundle_path.is_file());
         assert!(evidence_path.is_file());
         super::verify_public_corpus_ablation_evidence(&evidence).expect("verified evidence");
@@ -2927,6 +5856,43 @@ mod tests {
         assert!(!encoded.contains("aishell-fixture-train"));
         assert!(!encoded.contains("aishell-fixture-development"));
         assert!(!encoded.contains("aishell-fixture-test"));
+        let retained_development: super::PublicCorpusAblationEvidence =
+            serde_json::from_slice(&std::fs::read(&evidence_path).expect("development evidence"))
+                .expect("retained development JSON");
+        assert!(
+            retained_development == evidence,
+            "retained evidence must round-trip exactly"
+        );
+        assert_eq!(
+            super::deterministic_accuracy_sha256(&retained_development)
+                .expect("retained accuracy hash"),
+            retained_development.deterministic_accuracy_sha256
+        );
+
+        let certification_bundle_path = output.path().join("certification-bundle.json");
+        let certification_evidence_path = output.path().join("certification-evidence.json");
+        let certification_error = super::run_public_corpus_ablation_with_cancel(
+            super::PublicCorpusAblationRequest {
+                project_root: project.path(),
+                input_root: input.path(),
+                descriptor_path: &descriptor_path,
+                bundle_output_path: &certification_bundle_path,
+                evidence_output_path: &certification_evidence_path,
+                license_acknowledgement_id: "accept-aishell-4-cc-by-sa-4.0",
+                maximum_recording_duration_ms: Some(1_000),
+                evaluation_stage: super::PublicCorpusEvaluationStage::Certification,
+                locked_development_evidence_path: Some(&evidence_path),
+            },
+            || false,
+        )
+        .expect_err("failed development gates must block certification before corpus access");
+        assert!(
+            certification_error
+                .to_string()
+                .contains("ablation_stage_lock")
+        );
+        assert!(!certification_bundle_path.exists());
+        assert!(!certification_evidence_path.exists());
     }
 
     #[test]
@@ -2948,6 +5914,9 @@ mod tests {
             .into_iter()
             .map(|ablation| {
                 let mut variant = ablation_variant(ablation, Some(0.2), Some(0.3));
+                variant
+                    .splits
+                    .retain(|split| split.split == EvaluationSplit::Development);
                 let schema_hash =
                     crate::diarization::acoustic_feature_schema_sha256(ablation.schema_version());
                 variant.feature_schema_sha256 = schema_hash.clone();
@@ -2957,15 +5926,78 @@ mod tests {
                         ablation,
                         feature_schema_sha256: &schema_hash,
                         diarization_request_sha256: &diarization_request_sha256,
+                        change_calibration_sha256: &super::acoustic_change_calibration_sha256(),
                     })
                     .expect("feature configuration hash");
                 variant
             })
             .collect::<Vec<_>>();
+        let change_calibration_sha256 = super::acoustic_change_calibration_sha256();
+        let full_v2_splits = variants
+            .iter()
+            .find(|variant| variant.ablation == AcousticFeatureAblation::FullV2)
+            .expect("full v2")
+            .splits
+            .clone();
+        let change_detector_variants = super::AcousticChangeDetectorMode::ALL
+            .into_iter()
+            .map(|detector_mode| {
+                let schema_hash = crate::diarization::acoustic_feature_schema_sha256(
+                    AcousticFeatureAblation::FullV2.schema_version(),
+                );
+                let configuration_sha256 =
+                    super::canonical_sha256(&super::PublicChangeConfigurationFingerprint {
+                        runner_version: super::PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
+                        detector_mode,
+                        feature_ablation: AcousticFeatureAblation::FullV2,
+                        feature_schema_sha256: &schema_hash,
+                        diarization_request_sha256: &diarization_request_sha256,
+                        change_calibration_sha256: &change_calibration_sha256,
+                    })
+                    .expect("change configuration hash");
+                super::PublicCorpusChangeDetectorVariant {
+                    detector_mode,
+                    feature_ablation: AcousticFeatureAblation::FullV2,
+                    feature_schema_sha256: schema_hash,
+                    configuration_sha256,
+                    splits: full_v2_splits.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
         let development_gate = development_improvement_gate(&variants)
             .expect("development gate from complete variants");
-        let held_out_gate =
-            held_out_non_regression_gate(&variants).expect("held-out gate from complete variants");
+        let change_development_gate = super::change_development_gate(&change_detector_variants)
+            .expect("change development gate");
+        let speaker_pair_calibration_sha256 =
+            crate::diarization::acoustic_speaker_pair_calibration_sha256();
+        let clustering_variants = super::AcousticClusteringMode::ALL
+            .into_iter()
+            .map(|clustering_mode| {
+                let schema_hash = crate::diarization::acoustic_feature_schema_sha256(
+                    AcousticFeatureAblation::FullV2.schema_version(),
+                );
+                let configuration_sha256 =
+                    super::canonical_sha256(&super::PublicClusteringConfigurationFingerprint {
+                        runner_version: super::PUBLIC_CORPUS_ABLATION_RUNNER_VERSION,
+                        clustering_mode,
+                        detector_mode: super::AcousticChangeDetectorMode::FixedSafeV1,
+                        feature_ablation: AcousticFeatureAblation::FullV2,
+                        feature_schema_sha256: &schema_hash,
+                        diarization_request_sha256: &diarization_request_sha256,
+                        speaker_pair_calibration_sha256: &speaker_pair_calibration_sha256,
+                    })
+                    .expect("clustering configuration hash");
+                super::PublicCorpusClusteringVariant {
+                    clustering_mode,
+                    detector_mode: super::AcousticChangeDetectorMode::FixedSafeV1,
+                    feature_ablation: AcousticFeatureAblation::FullV2,
+                    configuration_sha256,
+                    splits: full_v2_splits.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let clustering_development_gate = super::clustering_development_gate(&clustering_variants)
+            .expect("clustering development gate");
         let mut evidence = super::PublicCorpusAblationEvidence {
             schema_version: super::PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION.to_owned(),
             runner_version: super::PUBLIC_CORPUS_ABLATION_RUNNER_VERSION.to_owned(),
@@ -2975,6 +6007,19 @@ mod tests {
             bundle_sha256: "2".repeat(64),
             descriptor_sha256: "3".repeat(64),
             scorer_config_sha256: super::canonical_sha256(&scorer_config).expect("scorer hash"),
+            evaluation_stage: super::PublicCorpusEvaluationStage::Development,
+            locked_development_result_sha256: None,
+            locked_development_accuracy_sha256: None,
+            selected_change_detector_mode: if change_development_gate.passed {
+                change_development_gate.candidate
+            } else {
+                super::AcousticChangeDetectorMode::FixedSafeV1
+            },
+            selected_clustering_mode: if clustering_development_gate.passed {
+                clustering_development_gate.candidate
+            } else {
+                super::AcousticClusteringMode::FixedSafeV1
+            },
             scorer_config,
             protocol: super::PublicCorpusAblationProtocol {
                 oracle_vad: true,
@@ -2984,10 +6029,31 @@ mod tests {
                 rss_observation: "linux-vmhwm-otherwise-sampled-process-rss-v1".to_owned(),
                 diarization_request,
                 diarization_request_sha256,
+                change_calibration_id: super::ACOUSTIC_CHANGE_CALIBRATION_VERSION.to_owned(),
+                change_calibration_fit_id: super::ACOUSTIC_CHANGE_CALIBRATION_FIT_VERSION
+                    .to_owned(),
+                change_calibration_sha256,
+                change_decision_probability: super::canonical_evidence_number(f64::from(
+                    super::acoustic_change_calibration().decision_probability,
+                )),
+                change_calibration_bins: 10,
+                change_selection_policy_id: super::PUBLIC_CORPUS_CHANGE_SELECTION_POLICY_VERSION
+                    .to_owned(),
+                change_selection_policy_sha256: super::change_selection_policy_sha256()
+                    .expect("selection policy hash"),
+                speaker_pair_calibration_id:
+                    crate::diarization::ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.to_owned(),
+                speaker_pair_calibration_sha256,
             },
             variants,
-            development_gate,
-            held_out_gate,
+            change_detector_variants,
+            clustering_variants,
+            development_gate: Some(development_gate),
+            held_out_gate: None,
+            change_development_gate: Some(change_development_gate),
+            change_held_out_gate: None,
+            clustering_development_gate: Some(clustering_development_gate),
+            clustering_held_out_gate: None,
             deterministic_accuracy_sha256: String::new(),
             result_sha256: String::new(),
         };
@@ -3018,6 +6084,11 @@ mod tests {
         .expect_err("tampered metric");
         assert!(
             error.to_string().contains("ablation_gate_mismatch")
+                || error.to_string().contains("ablation_variant_contract")
+                || error.to_string().contains("change_detector_alignment")
+                || error
+                    .to_string()
+                    .contains("ablation_accuracy_hash_mismatch")
                 || error.to_string().contains("ablation_hash_mismatch")
         );
     }

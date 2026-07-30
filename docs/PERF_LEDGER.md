@@ -4773,3 +4773,30 @@ cross-worker timing is not comparable. Certification requires a single
 self-reporting host, order-interleaved A/A then A/B where applicable, exact
 output-hash/determinism proof, RTF, peak-memory or allocation evidence, and the
 corresponding accuracy gate. Current performance state is **NO-DATA**.
+
+---
+## 2026-07-30 - Public AMI development diarization: **OBSERVATION ONLY / ACCURACY GATE FAILED**
+
+One local `fw diarization-corpus ablate --stage development` invocation
+evaluated fixed-safe and probabilistic clustering on the same host and exact
+two-recording, 240-second AMI development slice. The path-free bundle hash is
+`34f405b6220d479f4d0d86937de77d51375ed39120abfd3a2f38e775a24e874e`;
+the deterministic accuracy hash is
+`4a0e62a073067c2d9c5f45378600844e240d9a0447954219ec6f28dd8d203f34`;
+and the result hash is
+`8aef28a314c500feb33ff96afe233067fb03a6b92d093171967136e2ca8aac55`.
+No private audio was used or transferred.
+
+| Mode | Wall time | RTF | Sampled peak RSS |
+|---|---:|---:|---:|
+| `fixed_safe_v1` | 33.757 s | 0.140654 | 136,265,728 B |
+| `probabilistic_v1` | 33.702 s | 0.140425 | 136,609,792 B |
+
+The candidate was 0.16% faster in this single ordered observation and used
+344,064 additional sampled peak bytes. This is not a competitive performance
+certification: there was no order interleaving, A/A null control, idle-host
+preflight, or confidence interval. More importantly, the candidate failed its
+macro-JER and ECE accuracy gates, so performance cannot authorize promotion.
+The observation does establish that the implemented five-view count consensus,
+duration-aware smoothing, overlap checks, and query construction remained well
+below real time on this development workload without an obvious memory blowup.

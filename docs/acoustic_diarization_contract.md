@@ -76,6 +76,15 @@ accuracy claim:
 Changing these weights changes the policy identity and requires retained
 evidence.
 
+Speaker-change selection has a separate v2 loss contract. Its states are
+`NoBoundary`, `Defer`, `EmitBoundary`, and `ConservativeFallback`. False splits
+cost `1.0`; missed changes cost `9.0` because a later clustering stage can
+reversibly merge an over-segmented tracklet, while an omitted boundary mixes
+two acoustic regimes before clustering. The corresponding Bayes action
+threshold is `1 / (1 + 9) = 0.10`. Timing, hint contradiction, latency, and
+fallback costs are also frozen in `AcousticChangeCalibration`; changing any
+value changes `acoustic_change_calibration_sha256`.
+
 ## 4. Acoustic evidence
 
 The default `acoustic-feature-v2` schema maintains two views:
@@ -130,11 +139,14 @@ hash, and a configuration hash binding all of them to the runner version. The
 speaker-count complexity penalty uses supported voice coordinates instead of
 charging reduced representations for absent v2 dimensions.
 
-`fw diarization-corpus ablate` executes all six representations with the same
-frozen scorer: 250 ms speaker-boundary collar, 250 ms change collar, excluded
-overlap, and ten calibration bins. It uses reference speech regions only as
-oracle VAD, subtracts ignored scoring regions, and never supplies the reference
-speaker count. Source WAV/RTTM
+`fw diarization-corpus ablate` executes all six representations and four
+speaker-change detectors with the same frozen scorer: 250 ms speaker-boundary
+collar, 250 ms primary change collar, excluded overlap, and ten calibration
+bins. Change diagnostics additionally retain aggregate precision, recall, F1,
+and p50/p90/p95 absolute timing error at 100, 250, and 500 ms collars, plus a
+predeclared 19-point threshold sweep from 0.05 through 0.95. It uses reference
+speech regions only as oracle VAD, subtracts ignored scoring regions, and never
+supplies the reference speaker count. Source WAV/RTTM
 files remain beneath an external input root. The validated reference bundle
 and aggregate-only ablation evidence must be new JSON files in a separate
 external directory; no source media or per-recording hypotheses are copied.
@@ -151,6 +163,19 @@ On the frozen test split, full v2 must not increase either micro-DER or
 macro-JER. Both decisions and their component deltas are part of the
 self-hashed aggregate artifact; a run that merely completes is not a
 successful representation result.
+
+The v7 runner has an authority-bearing two-stage interface. `--stage
+development` evaluates only the development split and cannot issue a held-out
+verdict. `--stage certification` evaluates only the test split and requires
+`--locked-development-evidence`; it verifies the exact development result
+hash, accuracy hash, bundle, descriptor, duration protocol, calibration
+identity, calibration-fit identity, detector-selection policy, and selected
+detector and clustering mode before reading test audio. The v7 aggregate adds
+selective coverage/risk, duration-weighted assignment calibration, typed
+fallback counts, signed count error, and overlap TP/FP/FN. Overlap DER
+exclusion does not remove intervals from the independent overlap detector
+score. Test recordings observed during an earlier experiment are no longer
+unseen and cannot be reused to mint a new promotion claim.
 
 ### 4.2 Frozen AMI representation result
 
@@ -185,6 +210,44 @@ accuracy work. Because this test slice has now been observed, it must not be
 reused as unseen promotion evidence after tuning; a new frozen test subset is
 required.
 
+### 4.3 Change posterior v2 development status
+
+`acoustic-change-posterior-v2` replaces the raw Euclidean threshold with
+bounded diagonal sufficient statistics and explicit detector ablations:
+variance-aware GLR posterior, terminal Page-Hinkley/CUSUM approximation,
+two-regime diagonal Bayesian/BIC approximation, and `FixedSafeV1`. All five
+temporal scales remain inside a 401-frame ring. Voice and channel evidence are
+fused separately; silence, legal word geometry, and optional TinyDiarize
+support are typed bonuses rather than timestamp overrides. A coarse boundary
+is refined inside a hash-bound ±300 ms neighborhood using spectral flux,
+voicing and pitch discontinuity, energy valleys, and legal timestamp support.
+
+Weak posterior excursions use bounded hysteresis: at most one candidate is
+emitted during a 100-frame active interval and the detector re-arms only after
+20 frames below half the action threshold. Evidence at or above 0.50 uses the
+short 20-frame peak lane so rapid, unambiguous alternation is not swallowed.
+Ill-conditioned covariance or insufficient voiced support invokes the frozen
+fixed-safe score and records the fallback reason. The fixed-safe detector keeps
+its original 20-frame suppression and remains the production default.
+
+Development comparisons use the aggregate-only
+`public-diarization-acoustic-ablation-v3` artifact. A 120-second-per-recording
+AMI development diagnostic found that the Bayesian candidate reached change
+F1 `0.13333`, Brier `0.21668`, and mean absolute boundary error `0.1975` s,
+while the fixed-safe operating point matched no reference changes on that
+slice. The candidate nevertheless failed promotion: ECE was `0.19496` against
+the `0.10` gate, micro-DER regressed from `0.33854` to `0.51338`, and macro-JER
+regressed from `0.52042` to `0.69470`. A two-second weak-peak suppression
+experiment reduced recall to `0.08333` and was rejected. These are development
+diagnostics, not certification.
+
+Accordingly, normal segmentation and diarization entry points remain on
+`FixedSafeV1`; posterior candidates are available only through explicit
+ablation APIs. No held-out certification has been run for v2, and no
+development result may be described as a promotion. The next accuracy work
+must improve reversible clustering and boundary fusion before rerunning the
+hash-locked development gate.
+
 Privacy-safe diagnostics expose only schema and schema hash, aggregate
 frame/missingness counts, supported dimension counts, bounded retained state,
 and fallback/calibration state. They never expose feature values, audio,
@@ -192,6 +255,42 @@ transcript text, paths, or recording identifiers.
 
 Wavelet evidence is limited to inexpensive Haar-like multiscale contrasts over
 feature trajectories. A full raw-waveform CWT is not the default algorithm.
+
+### 4.4 Probabilistic clustering v2 development status
+
+The current clustering evidence uses
+`public-diarization-acoustic-ablation-v7`,
+`public-diarization-acoustic-ablation-runner-v7`, and
+`diarization-scorer-v3`. It evaluates two public AMI development recordings,
+each clipped to a deterministic 120-second prefix, with oracle VAD and without
+oracle speaker count. The public bundle hash is
+`34f405b6220d479f4d0d86937de77d51375ed39120abfd3a2f38e775a24e874e`;
+the candidate calibration hash is
+`fc286e7aec51d4b2362e3162bcd8a77451ef610a9e31f1295ba469856f4025ca`;
+the performance-independent accuracy hash is
+`4a0e62a073067c2d9c5f45378600844e240d9a0447954219ec6f28dd8d203f34`;
+and the self-hashed result is
+`8aef28a314c500feb33ff96afe233067fb03a6b92d093171967136e2ca8aac55`.
+The aggregate artifacts remain outside the checkout.
+
+Against fixed-safe clustering, the probabilistic candidate reduced micro-DER
+from `0.27723` to `0.24649` (11.09% relative), reduced speaker confusion by
+3.99 seconds, reduced mean absolute count error from `2.0` to `1.5`, increased
+selective coverage from `0.87323` to `0.90952`, and slightly reduced selective
+risk from `0.16741` to `0.16683`. All requested probabilistic runs completed
+without fallback and mean five-view count stability was `1.0`. Wall time for
+240 seconds of audio was `33.702` seconds (RTF `0.14043`) versus `33.757`
+seconds (RTF `0.14065`) for fixed-safe; sampled peak RSS was 136,609,792 versus
+136,265,728 bytes.
+
+The candidate did not pass. Macro-JER regressed from `0.51001` to `0.58986`,
+assignment ECE was `0.21716` against the `0.10` limit, and both modes had
+overlap F1 `0.0`. An intermediate monotone square-root confidence experiment
+reduced ECE to `0.13968` but still missed the limit and was not selected.
+Accordingly, `selected_clustering_mode` remains `fixed_safe_v1`, no candidate
+lock was minted, and no held-out recording was read. These results establish
+real public development evidence and performance observations, not production
+promotion or held-out certification.
 
 ## 5. Known intervals
 
@@ -213,9 +312,24 @@ Soft hints contribute capped pseudo-counts and priors. They can be rejected
 when acoustically contradictory. Provenance is audit metadata and cannot
 increase confidence by itself.
 
-The native acoustic contract accepts at most 1,024 known intervals per request, 256 bytes per
-speaker reference, and 4,096 bytes per provenance value. These limits are
-validated before the hard-hint overlap check.
+Profile training is independently audited from attribution. A hard interval
+remains an immutable assignment even when its acoustic observation is
+quarantined from profile training. Training uses robust global and
+leave-one-out distance checks, a nearest-peer contamination check, and a
+low-voiced-coverage downweight. One speaker may retain at most four voice
+subprofiles and multiple channel subprofiles, which preserves repeated vocal
+or recording modes without allowing unbounded profile growth.
+
+Within-call metric adaptation is conservative and reversible. It requires at
+least two enrolled speakers, two observations per speaker, and six total
+observations. Per-coordinate weights are bounded to `[0.9375, 1.0625]`; unmet
+support returns exact unit weights with a typed fallback. Durable profile
+summaries expose only counts and policy outcomes, never reusable voice or
+channel vectors.
+
+The native acoustic contract accepts at most 1,024 known intervals per
+request, 256 bytes per speaker reference, and 4,096 bytes per provenance
+value. These limits are validated before the hard-hint overlap check.
 
 ## 6. Output and confidence
 
@@ -302,13 +416,39 @@ projection provenance is retrieved through the stored-run surface instead.
 That surface exposes only the privacy-safe `projection_timeline` sub-object,
 not the rest of backend raw output or its internal model paths.
 
-Native acoustic confidence currently combines best-versus-second assignment margin
-with profile reliability and reports `heuristic_uncalibrated`. Resampling
-stability and a named corpus calibration artifact remain promotion gates, not
-inputs the current implementation pretends to possess. The retained scoring
-surface reports Brier score, expected calibration error, and coverage when
-ground-truth observations are available, so returning unknown everywhere
+The fixed-safe speaker assignment combines best-versus-second margin with
+profile reliability and reports `heuristic_uncalibrated`. The probabilistic
+development candidate reports a separately versioned likelihood calibration;
+the raw likelihood, not the reported mapping, controls unknown rejection so a
+confidence transform cannot silently expand coverage. Speaker-change
+candidates separately carry the versioned v2 posterior, component evidence,
+supporting-scale mask, refinement offset, detector identity, fallback reason,
+and calibration hash. The retained scoring surface reports Brier score,
+expected calibration error, reliability bins, threshold sweeps, and coverage
+when ground truth is available, so returning unknown or emitting no boundaries
 cannot appear successful.
+
+The probabilistic temporal path uses duration-aware continuity: switching cost
+depends on current run length, next-tracklet duration, inter-tracklet gap,
+boundary confidence, and whether `UNKNOWN` is involved. Short unsupported
+fragments receive a penalty, while a strong acoustic boundary or real gap earns
+bounded credit. The fixed-safe path retains its original constants, and every
+candidate parameter is part of the speaker-pair calibration hash.
+
+Overlap is an independent acoustic claim. The tracklet aggregates a bounded
+dual-periodicity probability only from non-clipped, non-transient frames. A
+probabilistic assignment emits a second speaker only when both independent
+speaker likelihoods exceed their floor and their ratio is sufficiently close;
+otherwise `overlap_suspected` remains diagnostic. A supported secondary
+assignment projects to two simultaneous turns. A secondary label without
+overlap evidence fails closed.
+
+`speaker_queries` is a bounded active-agent surface for unknown, low-confidence,
+or overlap-ambiguous spans. Adjacent requests are merged and capped at 32.
+Each query ID hashes the input hash, interval, reason, candidates, and policy.
+Queries contain no audio, transcript text, feature values, or path. When an
+agent supplies a known interval in response, its provenance changes the
+canonical hint hash but never its acoustic weight.
 
 ## 7. Determinism and resource limits
 
@@ -319,7 +459,19 @@ cannot appear successful.
   budgeted Diarize stage; persistence and cleanup retain their existing
   pipeline cancellation boundaries.
 - Whole-call raw frame matrices and full raw-audio wavelet transforms are
-  forbidden.
+  forbidden. `AcousticFeatureStream` accepts arbitrary sample chunks, retains
+  only one fixed frame buffer plus DSP state, and is byte-for-byte equivalent
+  to batch extraction across chunk boundaries. A late invalid chunk may return
+  an error after earlier frames have already been emitted; callers that require
+  atomic publication must buffer or transact their own output sink.
+- `AcousticSegmentationStream` adds the fixed 401-frame change ring and emits
+  compact tracklets. Its retained working state is duration-independent;
+  returned tracklets are deliberately output-proportional. Normal runtime
+  retains only that ring and compact tracklets. The
+  public evaluator may opt into a duration-proportional score stream, but its
+  existing 256 MiB source-audio cap gives that diagnostic allocation a fixed
+  upper bound; it is immediately reduced to aggregate metrics and never enters
+  the stable report.
 - The native acoustic implementation defaults to at most 512 global prototypes. Anchored prototypes
   are never discarded. Cap pressure is reported.
 - Exact constrained agglomeration is bounded by the prototype cap, followed by
@@ -338,13 +490,22 @@ intervals may remain labeled while all other speech stays unknown. The engine
 does not invent speakers merely to satisfy `min_speakers`; it reports the
 unsatisfied constraint or returns a hard error according to typed policy.
 
+The probabilistic speaker-count candidate uses five deterministic semantic
+views: full evidence, no pitch, no dynamics, no formants, and no channel.
+Count selection requires a three-of-five majority and a matching
+co-association consensus. Insufficient shared voice evidence, invalid
+posterior arithmetic, or unstable count invokes a typed fixed-safe fallback.
+Public evidence aggregates stability for every requested probabilistic run,
+including runs that fell back, so fallback cannot inflate the mean by
+disappearing from its denominator.
+
 The six-dimensional temporal/lexical heuristic is not an acoustic fallback.
 An explicit acoustic request cannot silently invoke external or lexical
 behavior. Every fallback names its source and reason.
 
 ## 9. Scoring
 
-The retained evaluation authority is `diarization-scorer-v1`. Low-level
+The retained evaluation authority is `diarization-scorer-v3`. Low-level
 metric helpers are not sufficient evidence by themselves: a retained verdict
 must be produced by `score_diarization_documents` from these exact versioned
 documents:
@@ -384,7 +545,9 @@ DER = (missed speaker-time + false-alarm speaker-time
 
 The report keeps all three components separate. Overlapping reference speakers
 contribute speaker-time independently. JER is the mean per-reference-speaker
-Jaccard error after the same mapping.
+Jaccard error after the same mapping. Overlap F1 is computed directly as
+`2 TP / (2 TP + FP + FN)`, so a corpus with reference overlap and no predicted
+overlap has defined F1 zero even though precision alone is undefined.
 
 `speaker_boundary_collar_ms` is the half-width removed around each reference
 speaker change for DER/JER and associated attribution metrics. It does not
@@ -441,7 +604,7 @@ configuration, and output hashes.
 
 ## 10. Evidence and rollout
 
-Every retained decision artifact records:
+Internal decision evidence can contain:
 
 - normalized input, hint document, algorithm, feature, weights, calibration,
   parameter, and loss-matrix hashes;
@@ -451,6 +614,12 @@ Every retained decision artifact records:
   pressure, and temporal refinement settings;
 - assignment margins, confidence, unknown/overlap decisions, and fallback;
 - stage duration, RTF, allocations or peak memory, cancellation, and errors.
+
+Retained public corpus artifacts are stricter: they contain only path-free
+aggregate counts, metrics, reliability bins, threshold/collar summaries,
+configuration hashes, stage locks, and performance totals. They never retain a
+per-recording boundary, score, feature, identifier, filename, transcript, or
+audio excerpt.
 
 Focused unit/e2e proof, corpus DER/JER proof, broad Cargo proof, and performance
 certification are separate authority states. Rollout follows
