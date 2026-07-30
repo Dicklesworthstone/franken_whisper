@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "Version contract for the legacy incumbent used by every vs-incumbent perf claim.",
+    "A competitive ratio is only bankable against a PINNED incumbent: without this file,",
+    "'franken is 2x faster than whisper.cpp' silently means 'faster than whatever binary",
+    "happened to sit at that path on that day, built with whatever flags'.",
+    "examples/incumbent_ab.rs loads this file at preflight and FAILS CLOSED when the",
+    "running incumbent process image, or the vendored source version, drifts from it.",
+    "Updating the incumbent is legal; updating it silently is not. Bump the digests here",
+    "in the same commit, and prior ledger rows keep pointing at the digests they used."
+  ],
+  "incumbent": {
+    "project": "whisper.cpp",
+    "version": "1.8.3",
+    "cli": "whisper-cli",
+    "source_root": "legacy_whispercpp/whisper.cpp",
+    "default_path": "legacy_whispercpp/whisper.cpp/build/bin/whisper-cli",
+    "binary_sha256": "73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10",
+    "binary_built": "2026-06-25",
+    "source_sha256": {
+      "src/whisper.cpp": "2d0e9cde5f5d82b45ce19edf94d742f1a2b6b26fa6c4729a5ba09019132c0cbc",
+      "examples/cli/cli.cpp": "053da25f98f0684104f24afa6184592ad6fc85681f13b32f0ff68bdff3901467"
+    },
+    "build": {
+      "cmake_build_type": "Release",
+      "ggml_native": true,
+      "ggml_openmp": true,
+      "ggml_blas": false,
+      "ggml_cuda": false,
+      "_comment": [
+        "GGML_NATIVE=ON compiles -march=native, so the incumbent is built FOR this host and",
+        "gets its AVX2/F16C/FMA. GGML_AVX2:BOOL=OFF in CMakeCache is not a downgrade: that",
+        "switch only applies when GGML_NATIVE is off. Recorded because a competitive claim",
+        "against an ISA-hobbled incumbent would be worthless, and franken ships AVX2.",
+        "GGML_OPENMP=ON means the incumbent has a persistent OpenMP pool, i.e. it does not",
+        "pay per-call thread spawn. That is the incumbent at its strongest on CPU."
+      ]
+    }
+  },
+  "matched_decode": {
+    "_comment": [
+      "Both arms are driven from these values in one place. Greedy-vs-beam is the easiest",
+      "way to accidentally fabricate a speedup: whisper-cli defaults to beam_size 5 and",
+      "best_of 5, which would make the incumbent do ~5x the decode work franken does.",
+      "temperature_fallback=false matches franken, whose fallback ladder is gated off by",
+      "default (FW_TEMP_FALLBACK); leaving the incumbent's -tpi 0.20 ladder enabled would",
+      "charge it for retry windows franken never attempts."
+    ],
+    "beam_size": 1,
+    "best_of": 1,
+    "temperature": 0.0,
+    "temperature_fallback": false,
+    "language": "en",
+    "translate": false,
+    "word_timestamps": false
+  }
+}
