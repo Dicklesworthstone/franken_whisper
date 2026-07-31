@@ -22,16 +22,16 @@ use crate::error::{FwError, FwResult};
 
 /// Schema for an external, path-bearing local evaluation manifest.
 pub const CONFIDENTIAL_EVALUATION_MANIFEST_SCHEMA_VERSION: &str =
-    "confidential-diarization-evaluation-manifest-v1";
+    "confidential-diarization-evaluation-manifest-v2";
 /// Schema for the path-free aggregate emitted by this module.
 pub const CONFIDENTIAL_EVALUATION_AGGREGATE_SCHEMA_VERSION: &str =
-    "confidential-diarization-evaluation-aggregate-v1";
+    "confidential-diarization-evaluation-aggregate-v2";
 
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECORDINGS: usize = 10_000;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
-const HASH_DOMAIN_SEPARATOR: &[u8] = b"franken-whisper-confidential-evaluation-v1\0";
+const HASH_DOMAIN_SEPARATOR: &[u8] = b"franken-whisper-confidential-evaluation-v2\0";
 
 /// Path-free micro/macro diarization aggregate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +66,62 @@ pub struct ConfidentialSpeakerCountAggregate {
     pub exact_recordings: u64,
     pub exact_rate: Option<f64>,
     pub mean_absolute_error: Option<f64>,
+}
+
+/// Aggregate proper scores and coverage for automatic speaker-count posteriors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfidentialSpeakerCountPosteriorAggregate {
+    pub observed_recordings: u64,
+    pub unavailable_recordings: u64,
+    pub unresolved_recordings: u64,
+    pub zero_reference_probability_recordings: u64,
+    pub finite_negative_log_likelihood_recordings: u64,
+    pub mean_finite_negative_log_likelihood: Option<f64>,
+    pub brier_observation_count: u64,
+    pub mean_brier_score: Option<f64>,
+    pub top_k_observation_count: u64,
+    pub top_k_hit_count: u64,
+    pub top_k_coverage: Option<f64>,
+    pub credible_set_observation_count: u64,
+    pub credible_set_hit_count: u64,
+    pub credible_set_coverage: Option<f64>,
+    pub entropy_observation_count: u64,
+    pub mean_entropy_bits: Option<f64>,
+}
+
+/// Aggregate occupancy diagnostics without retaining speaker or recording IDs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfidentialSpeakerOccupancyAggregate {
+    pub dominant_collapse_recordings: u64,
+    pub reference_collapse_recordings: u64,
+    pub phantom_speaker_count: u64,
+    pub collapsed_reference_speaker_count: u64,
+    pub mean_effective_speaker_count: Option<f64>,
+    pub dominant_share_observation_count: u64,
+    pub mean_dominant_speaker_share: Option<f64>,
+    pub maximum_dominant_speaker_share: Option<f64>,
+    pub unknown_share_observation_count: u64,
+    pub mean_unknown_speaker_share: Option<f64>,
+    pub maximum_unknown_speaker_share: Option<f64>,
+    pub minority_recall_observation_count: u64,
+    pub mean_minority_reference_recall: Option<f64>,
+}
+
+/// Aggregate transcript-free aligned-word speaker attribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfidentialWordAttributionAggregate {
+    pub reference_word_count: u64,
+    pub scored_word_count: u64,
+    pub correct_word_count: u64,
+    pub incorrect_word_count: u64,
+    pub unknown_word_count: u64,
+    pub excluded_word_count: u64,
+    pub macro_observation_count: u64,
+    pub micro_word_diarization_error_rate: Option<f64>,
+    pub macro_word_diarization_error_rate: Option<f64>,
 }
 
 /// Duration-weighted overlap-detection aggregate.
@@ -119,6 +175,9 @@ pub struct ConfidentialEvaluationAggregate {
     pub diarization: ConfidentialDiarizationAggregate,
     pub change_points: ConfidentialChangeAggregate,
     pub speaker_count: ConfidentialSpeakerCountAggregate,
+    pub speaker_count_posterior: ConfidentialSpeakerCountPosteriorAggregate,
+    pub speaker_occupancy: ConfidentialSpeakerOccupancyAggregate,
+    pub word_attribution: ConfidentialWordAttributionAggregate,
     pub overlap: ConfidentialOverlapAggregate,
     pub calibration: ConfidentialCalibrationAggregate,
     pub performance_observed_recordings: u64,
@@ -169,6 +228,41 @@ struct AggregateAccumulator {
     change_error_sum_sec: f64,
     exact_speaker_count_recordings: u64,
     absolute_speaker_count_error_sum: u64,
+    count_posterior_recordings: u64,
+    count_posterior_unavailable_recordings: u64,
+    count_unresolved_recordings: u64,
+    count_zero_reference_probability_recordings: u64,
+    count_negative_log_likelihood_sum: f64,
+    count_negative_log_likelihood_count: u64,
+    count_brier_sum: f64,
+    count_brier_count: u64,
+    count_top_k_observation_count: u64,
+    count_top_k_hit_count: u64,
+    count_credible_set_observation_count: u64,
+    count_credible_set_hit_count: u64,
+    count_entropy_sum: f64,
+    count_entropy_count: u64,
+    dominant_collapse_recordings: u64,
+    reference_collapse_recordings: u64,
+    phantom_speaker_count: u64,
+    collapsed_reference_speaker_count: u64,
+    effective_speaker_count_sum: u64,
+    dominant_share_sum: f64,
+    dominant_share_count: u64,
+    maximum_dominant_share: Option<f64>,
+    unknown_share_sum: f64,
+    unknown_share_count: u64,
+    maximum_unknown_share: Option<f64>,
+    minority_recall_sum: f64,
+    minority_recall_count: u64,
+    reference_word_count: u64,
+    scored_word_count: u64,
+    correct_word_count: u64,
+    incorrect_word_count: u64,
+    unknown_word_count: u64,
+    excluded_word_count: u64,
+    macro_word_error_sum: f64,
+    macro_word_error_count: u64,
     reference_overlap_sec: f64,
     hypothesis_overlap_sec: f64,
     overlap_true_positive_sec: f64,
@@ -271,6 +365,189 @@ impl AggregateAccumulator {
                 )
             })?;
 
+        if score.speaker_count_posterior.posterior_available {
+            self.count_posterior_recordings = checked_aggregate_add(
+                self.count_posterior_recordings,
+                1,
+                "count posterior observation",
+            )?;
+        } else {
+            self.count_posterior_unavailable_recordings = checked_aggregate_add(
+                self.count_posterior_unavailable_recordings,
+                1,
+                "count posterior unavailability",
+            )?;
+        }
+        if score.speaker_count_posterior.unresolved {
+            self.count_unresolved_recordings = checked_aggregate_add(
+                self.count_unresolved_recordings,
+                1,
+                "unresolved count posterior",
+            )?;
+        }
+        if score
+            .speaker_count_posterior
+            .infinite_negative_log_likelihood
+        {
+            self.count_zero_reference_probability_recordings = checked_aggregate_add(
+                self.count_zero_reference_probability_recordings,
+                1,
+                "zero-probability count posterior",
+            )?;
+        }
+        if let Some(value) = score.speaker_count_posterior.negative_log_likelihood {
+            self.count_negative_log_likelihood_sum += value;
+            self.count_negative_log_likelihood_count = checked_aggregate_add(
+                self.count_negative_log_likelihood_count,
+                1,
+                "count negative-log-likelihood observation",
+            )?;
+        }
+        if let Some(value) = score.speaker_count_posterior.brier_score {
+            self.count_brier_sum += value;
+            self.count_brier_count =
+                checked_aggregate_add(self.count_brier_count, 1, "count Brier observation")?;
+        }
+        if let Some(hit) = score.speaker_count_posterior.top_k_hit {
+            self.count_top_k_observation_count = checked_aggregate_add(
+                self.count_top_k_observation_count,
+                1,
+                "count top-k observation",
+            )?;
+            self.count_top_k_hit_count = checked_aggregate_add(
+                self.count_top_k_hit_count,
+                u64::from(hit),
+                "count top-k hit",
+            )?;
+        }
+        if let Some(hit) = score.speaker_count_posterior.credible_set_hit {
+            self.count_credible_set_observation_count = checked_aggregate_add(
+                self.count_credible_set_observation_count,
+                1,
+                "count credible-set observation",
+            )?;
+            self.count_credible_set_hit_count = checked_aggregate_add(
+                self.count_credible_set_hit_count,
+                u64::from(hit),
+                "count credible-set hit",
+            )?;
+        }
+        if score.speaker_count_posterior.posterior_available
+            && let Some(value) = score.speaker_count_posterior.entropy_bits
+        {
+            self.count_entropy_sum += value;
+            self.count_entropy_count =
+                checked_aggregate_add(self.count_entropy_count, 1, "count entropy observation")?;
+        }
+
+        self.dominant_collapse_recordings = checked_aggregate_add(
+            self.dominant_collapse_recordings,
+            u64::from(score.speaker_occupancy.dominant_collapse_detected),
+            "dominant-collapse recording",
+        )?;
+        self.reference_collapse_recordings = checked_aggregate_add(
+            self.reference_collapse_recordings,
+            u64::from(score.speaker_occupancy.any_reference_collapse_detected),
+            "reference-collapse recording",
+        )?;
+        self.phantom_speaker_count = checked_aggregate_add(
+            self.phantom_speaker_count,
+            u64::try_from(score.speaker_occupancy.phantom_speaker_count).map_err(|_| {
+                confidential_error(
+                    "aggregate_overflow",
+                    "phantom-speaker count exceeds the supported range",
+                )
+            })?,
+            "phantom-speaker count",
+        )?;
+        self.collapsed_reference_speaker_count = checked_aggregate_add(
+            self.collapsed_reference_speaker_count,
+            u64::try_from(score.speaker_occupancy.collapsed_reference_speaker_count).map_err(
+                |_| {
+                    confidential_error(
+                        "aggregate_overflow",
+                        "collapsed reference-speaker count exceeds the supported range",
+                    )
+                },
+            )?,
+            "collapsed reference-speaker count",
+        )?;
+        self.effective_speaker_count_sum = checked_aggregate_add(
+            self.effective_speaker_count_sum,
+            u64::try_from(score.speaker_occupancy.effective_speaker_count).map_err(|_| {
+                confidential_error(
+                    "aggregate_overflow",
+                    "effective-speaker count exceeds the supported range",
+                )
+            })?,
+            "effective-speaker count",
+        )?;
+        if let Some(value) = score.speaker_occupancy.dominant_speaker_share {
+            self.dominant_share_sum += value;
+            self.dominant_share_count =
+                checked_aggregate_add(self.dominant_share_count, 1, "dominant-share observation")?;
+            self.maximum_dominant_share = Some(
+                self.maximum_dominant_share
+                    .map_or(value, |maximum| maximum.max(value)),
+            );
+        }
+        if let Some(value) = score.speaker_occupancy.unknown_speaker_share {
+            self.unknown_share_sum += value;
+            self.unknown_share_count =
+                checked_aggregate_add(self.unknown_share_count, 1, "unknown-share observation")?;
+            self.maximum_unknown_share = Some(
+                self.maximum_unknown_share
+                    .map_or(value, |maximum| maximum.max(value)),
+            );
+        }
+        if let Some(value) = score.speaker_occupancy.minority_reference_recall {
+            self.minority_recall_sum += value;
+            self.minority_recall_count = checked_aggregate_add(
+                self.minority_recall_count,
+                1,
+                "minority-recall observation",
+            )?;
+        }
+
+        self.reference_word_count = checked_aggregate_add(
+            self.reference_word_count,
+            score.word_attribution.reference_word_count,
+            "reference-word count",
+        )?;
+        self.scored_word_count = checked_aggregate_add(
+            self.scored_word_count,
+            score.word_attribution.scored_word_count,
+            "scored-word count",
+        )?;
+        self.correct_word_count = checked_aggregate_add(
+            self.correct_word_count,
+            score.word_attribution.correct_word_count,
+            "correct-word count",
+        )?;
+        self.incorrect_word_count = checked_aggregate_add(
+            self.incorrect_word_count,
+            score.word_attribution.incorrect_word_count,
+            "incorrect-word count",
+        )?;
+        self.unknown_word_count = checked_aggregate_add(
+            self.unknown_word_count,
+            score.word_attribution.unknown_word_count,
+            "unknown-word count",
+        )?;
+        self.excluded_word_count = checked_aggregate_add(
+            self.excluded_word_count,
+            score.word_attribution.excluded_word_count,
+            "excluded-word count",
+        )?;
+        if let Some(value) = score.word_attribution.word_diarization_error_rate {
+            self.macro_word_error_sum += value;
+            self.macro_word_error_count = checked_aggregate_add(
+                self.macro_word_error_count,
+                1,
+                "word-attribution recording",
+            )?;
+        }
+
         self.reference_overlap_sec += score.overlap.reference_overlap_sec;
         self.hypothesis_overlap_sec += score.overlap.hypothesis_overlap_sec;
         self.overlap_true_positive_sec += score.overlap.true_positive_sec;
@@ -371,6 +648,85 @@ impl AggregateAccumulator {
                 mean_absolute_error: ratio(
                     self.absolute_speaker_count_error_sum as f64,
                     self.recording_count as f64,
+                ),
+            },
+            speaker_count_posterior: ConfidentialSpeakerCountPosteriorAggregate {
+                observed_recordings: self.count_posterior_recordings,
+                unavailable_recordings: self.count_posterior_unavailable_recordings,
+                unresolved_recordings: self.count_unresolved_recordings,
+                zero_reference_probability_recordings: self
+                    .count_zero_reference_probability_recordings,
+                finite_negative_log_likelihood_recordings: self.count_negative_log_likelihood_count,
+                mean_finite_negative_log_likelihood: ratio(
+                    self.count_negative_log_likelihood_sum,
+                    self.count_negative_log_likelihood_count as f64,
+                ),
+                brier_observation_count: self.count_brier_count,
+                mean_brier_score: ratio(self.count_brier_sum, self.count_brier_count as f64),
+                top_k_observation_count: self.count_top_k_observation_count,
+                top_k_hit_count: self.count_top_k_hit_count,
+                top_k_coverage: ratio(
+                    self.count_top_k_hit_count as f64,
+                    self.count_top_k_observation_count as f64,
+                ),
+                credible_set_observation_count: self.count_credible_set_observation_count,
+                credible_set_hit_count: self.count_credible_set_hit_count,
+                credible_set_coverage: ratio(
+                    self.count_credible_set_hit_count as f64,
+                    self.count_credible_set_observation_count as f64,
+                ),
+                entropy_observation_count: self.count_entropy_count,
+                mean_entropy_bits: ratio(self.count_entropy_sum, self.count_entropy_count as f64),
+            },
+            speaker_occupancy: ConfidentialSpeakerOccupancyAggregate {
+                dominant_collapse_recordings: self.dominant_collapse_recordings,
+                reference_collapse_recordings: self.reference_collapse_recordings,
+                phantom_speaker_count: self.phantom_speaker_count,
+                collapsed_reference_speaker_count: self.collapsed_reference_speaker_count,
+                mean_effective_speaker_count: ratio(
+                    self.effective_speaker_count_sum as f64,
+                    self.recording_count as f64,
+                ),
+                dominant_share_observation_count: self.dominant_share_count,
+                mean_dominant_speaker_share: ratio(
+                    self.dominant_share_sum,
+                    self.dominant_share_count as f64,
+                ),
+                maximum_dominant_speaker_share: self.maximum_dominant_share,
+                unknown_share_observation_count: self.unknown_share_count,
+                mean_unknown_speaker_share: ratio(
+                    self.unknown_share_sum,
+                    self.unknown_share_count as f64,
+                ),
+                maximum_unknown_speaker_share: self.maximum_unknown_share,
+                minority_recall_observation_count: self.minority_recall_count,
+                mean_minority_reference_recall: ratio(
+                    self.minority_recall_sum,
+                    self.minority_recall_count as f64,
+                ),
+            },
+            word_attribution: ConfidentialWordAttributionAggregate {
+                reference_word_count: self.reference_word_count,
+                scored_word_count: self.scored_word_count,
+                correct_word_count: self.correct_word_count,
+                incorrect_word_count: self.incorrect_word_count,
+                unknown_word_count: self.unknown_word_count,
+                excluded_word_count: self.excluded_word_count,
+                macro_observation_count: self.macro_word_error_count,
+                micro_word_diarization_error_rate: ratio(
+                    self.incorrect_word_count
+                        .checked_add(self.unknown_word_count)
+                        .ok_or_else(|| {
+                            confidential_error(
+                                "aggregate_overflow",
+                                "word-attribution error count exceeds the supported range",
+                            )
+                        })? as f64,
+                    self.scored_word_count as f64,
+                ),
+                macro_word_diarization_error_rate: ratio(
+                    self.macro_word_error_sum,
+                    self.macro_word_error_count as f64,
                 ),
             },
             overlap: ConfidentialOverlapAggregate {
@@ -1005,6 +1361,15 @@ fn is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn checked_aggregate_add(current: u64, increment: u64, name: &str) -> FwResult<u64> {
+    current.checked_add(increment).ok_or_else(|| {
+        confidential_error(
+            "aggregate_overflow",
+            &format!("{name} exceeds the supported range"),
+        )
+    })
+}
+
 fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwResult<()> {
     let required = [
         aggregate.total_annotation_duration_sec,
@@ -1030,6 +1395,21 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
         aggregate.change_points.mean_absolute_error_sec,
         aggregate.speaker_count.exact_rate,
         aggregate.speaker_count.mean_absolute_error,
+        aggregate
+            .speaker_count_posterior
+            .mean_finite_negative_log_likelihood,
+        aggregate.speaker_count_posterior.mean_brier_score,
+        aggregate.speaker_count_posterior.top_k_coverage,
+        aggregate.speaker_count_posterior.credible_set_coverage,
+        aggregate.speaker_count_posterior.mean_entropy_bits,
+        aggregate.speaker_occupancy.mean_effective_speaker_count,
+        aggregate.speaker_occupancy.mean_dominant_speaker_share,
+        aggregate.speaker_occupancy.maximum_dominant_speaker_share,
+        aggregate.speaker_occupancy.mean_unknown_speaker_share,
+        aggregate.speaker_occupancy.maximum_unknown_speaker_share,
+        aggregate.speaker_occupancy.mean_minority_reference_recall,
+        aggregate.word_attribution.micro_word_diarization_error_rate,
+        aggregate.word_attribution.macro_word_diarization_error_rate,
         aggregate.overlap.precision,
         aggregate.overlap.recall,
         aggregate.overlap.f1,
@@ -1047,6 +1427,15 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
         aggregate.change_points.recall,
         aggregate.change_points.f1,
         aggregate.speaker_count.exact_rate,
+        aggregate.speaker_count_posterior.top_k_coverage,
+        aggregate.speaker_count_posterior.credible_set_coverage,
+        aggregate.speaker_occupancy.mean_dominant_speaker_share,
+        aggregate.speaker_occupancy.maximum_dominant_speaker_share,
+        aggregate.speaker_occupancy.mean_unknown_speaker_share,
+        aggregate.speaker_occupancy.maximum_unknown_speaker_share,
+        aggregate.speaker_occupancy.mean_minority_reference_recall,
+        aggregate.word_attribution.micro_word_diarization_error_rate,
+        aggregate.word_attribution.macro_word_diarization_error_rate,
         aggregate.overlap.precision,
         aggregate.overlap.recall,
         aggregate.overlap.f1,
@@ -1060,6 +1449,11 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
         aggregate.diarization.macro_der,
         aggregate.change_points.mean_absolute_error_sec,
         aggregate.speaker_count.mean_absolute_error,
+        aggregate
+            .speaker_count_posterior
+            .mean_finite_negative_log_likelihood,
+        aggregate.speaker_count_posterior.mean_entropy_bits,
+        aggregate.speaker_occupancy.mean_effective_speaker_count,
     ];
     let performance_presence_is_consistent = match &aggregate.performance {
         Some(_) => aggregate.performance_observed_recordings == aggregate.recording_count,
@@ -1071,6 +1465,100 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
         && aggregate.change_points.matched_count <= aggregate.change_points.hypothesis_count
         && aggregate.speaker_count.exact_recordings <= aggregate.recording_count
         && performance_presence_is_consistent;
+    let posterior = &aggregate.speaker_count_posterior;
+    let posterior_counts_are_consistent = posterior
+        .observed_recordings
+        .checked_add(posterior.unavailable_recordings)
+        == Some(aggregate.recording_count)
+        && posterior.unresolved_recordings <= aggregate.recording_count
+        && posterior.zero_reference_probability_recordings <= posterior.observed_recordings
+        && posterior
+            .finite_negative_log_likelihood_recordings
+            .checked_add(posterior.zero_reference_probability_recordings)
+            == Some(posterior.observed_recordings)
+        && posterior.brier_observation_count == posterior.observed_recordings
+        && posterior.top_k_observation_count == posterior.observed_recordings
+        && posterior.credible_set_observation_count == posterior.observed_recordings
+        && posterior.entropy_observation_count == posterior.observed_recordings
+        && posterior.top_k_hit_count <= posterior.top_k_observation_count
+        && posterior.credible_set_hit_count <= posterior.credible_set_observation_count
+        && option_matches_count(
+            posterior.mean_finite_negative_log_likelihood,
+            posterior.finite_negative_log_likelihood_recordings,
+        )
+        && option_matches_count(
+            posterior.mean_brier_score,
+            posterior.brier_observation_count,
+        )
+        && option_matches_count(posterior.top_k_coverage, posterior.top_k_observation_count)
+        && option_matches_count(
+            posterior.credible_set_coverage,
+            posterior.credible_set_observation_count,
+        )
+        && option_matches_count(
+            posterior.mean_entropy_bits,
+            posterior.entropy_observation_count,
+        )
+        && posterior
+            .mean_brier_score
+            .is_none_or(|value| (0.0..=2.0).contains(&value));
+    let occupancy = &aggregate.speaker_occupancy;
+    let occupancy_is_consistent = occupancy.dominant_collapse_recordings
+        <= aggregate.recording_count
+        && occupancy.reference_collapse_recordings <= aggregate.recording_count
+        && occupancy.dominant_share_observation_count <= aggregate.recording_count
+        && occupancy.unknown_share_observation_count <= aggregate.recording_count
+        && occupancy.minority_recall_observation_count <= aggregate.recording_count
+        && option_matches_count(
+            occupancy.mean_dominant_speaker_share,
+            occupancy.dominant_share_observation_count,
+        )
+        && option_matches_count(
+            occupancy.maximum_dominant_speaker_share,
+            occupancy.dominant_share_observation_count,
+        )
+        && option_matches_count(
+            occupancy.mean_unknown_speaker_share,
+            occupancy.unknown_share_observation_count,
+        )
+        && option_matches_count(
+            occupancy.maximum_unknown_speaker_share,
+            occupancy.unknown_share_observation_count,
+        )
+        && option_matches_count(
+            occupancy.mean_minority_reference_recall,
+            occupancy.minority_recall_observation_count,
+        )
+        && occupancy.mean_effective_speaker_count.is_some()
+        && occupancy
+            .mean_effective_speaker_count
+            .is_none_or(|value| value <= f64::from(crate::model::MAX_SPEAKER_COUNT))
+        && occupancy.mean_dominant_speaker_share <= occupancy.maximum_dominant_speaker_share
+        && occupancy.mean_unknown_speaker_share <= occupancy.maximum_unknown_speaker_share;
+    let words = &aggregate.word_attribution;
+    let word_errors = words
+        .incorrect_word_count
+        .checked_add(words.unknown_word_count);
+    let words_are_consistent = words
+        .scored_word_count
+        .checked_add(words.excluded_word_count)
+        == Some(words.reference_word_count)
+        && words
+            .correct_word_count
+            .checked_add(words.incorrect_word_count)
+            .and_then(|value| value.checked_add(words.unknown_word_count))
+            == Some(words.scored_word_count)
+        && words.macro_observation_count <= aggregate.recording_count
+        && option_matches_count(
+            words.micro_word_diarization_error_rate,
+            words.scored_word_count,
+        )
+        && option_matches_count(
+            words.macro_word_diarization_error_rate,
+            words.macro_observation_count,
+        )
+        && words.micro_word_diarization_error_rate
+            == word_errors.and_then(|errors| ratio(errors as f64, words.scored_word_count as f64));
     let durations_are_consistent = required.iter().all(|value| *value >= 0.0)
         && aggregate.calibration.observed_duration_sec
             <= aggregate.calibration.opportunity_duration_sec;
@@ -1085,6 +1573,9 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
             .flatten()
             .all(|value| *value >= 0.0)
         && counts_are_consistent
+        && posterior_counts_are_consistent
+        && occupancy_is_consistent
+        && words_are_consistent
         && durations_are_consistent
         && performance_finite
         && aggregate.performance.as_ref().is_none_or(|performance| {
@@ -1098,6 +1589,10 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
             "confidential aggregate contains invalid semantic values",
         ))
     }
+}
+
+fn option_matches_count(value: Option<f64>, count: u64) -> bool {
+    value.is_some() == (count > 0)
 }
 
 fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
@@ -1130,7 +1625,12 @@ mod tests {
     use crate::diarization::{
         DIARIZATION_HYPOTHESIS_SCHEMA_VERSION, DIARIZATION_REFERENCE_SCHEMA_VERSION,
         DiarizationHypothesisDocument, DiarizationReferenceDocument,
-        EvaluationPerformanceObservation, EvaluationTurn,
+        EvaluationPerformanceObservation, EvaluationTurn, EvaluationWord,
+    };
+    use crate::model::{
+        SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
+        SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountPosteriorBin,
+        SpeakerCountRange, SpeakerCountResourceSummary,
     };
 
     use super::{
@@ -1139,6 +1639,73 @@ mod tests {
         run_confidential_evaluation, run_confidential_evaluation_with_cancel,
         verify_confidential_evaluation_aggregate,
     };
+
+    fn speaker_count_estimate() -> SpeakerCountEstimate {
+        let posterior = vec![
+            SpeakerCountPosteriorBin {
+                count: 1,
+                probability: 0.2,
+            },
+            SpeakerCountPosteriorBin {
+                count: 2,
+                probability: 0.7,
+            },
+        ];
+        let unresolved_probability = 0.1;
+        let entropy_bits = posterior
+            .iter()
+            .map(|bin| -bin.probability * bin.probability.log2())
+            .sum::<f64>()
+            - unresolved_probability * unresolved_probability.log2();
+        let available_lane = |lane| SpeakerCountLaneEvidence {
+            lane,
+            available: true,
+            proposed_count: Some(2),
+            confidence: 0.75,
+            unavailable_reason: None,
+        };
+        SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count: Some(2),
+            supported_range: Some(SpeakerCountRange {
+                minimum: 2,
+                maximum: 2,
+            }),
+            posterior,
+            unresolved_probability,
+            entropy_bits,
+            stability: 0.75,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 2,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: vec![
+                available_lane(SpeakerCountEvidenceLane::MergeRisk),
+                available_lane(SpeakerCountEvidenceLane::SparseNormalizedEigengap),
+                available_lane(SpeakerCountEvidenceLane::FeatureJackknife),
+                available_lane(SpeakerCountEvidenceLane::EffectiveOccupancy),
+                available_lane(SpeakerCountEvidenceLane::ConstraintGraph),
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+                },
+            ],
+            resources: SpeakerCountResourceSummary {
+                prototype_count: 2,
+                affinity_pair_evaluations: 2,
+                retained_sparse_edges: 1,
+                estimated_peak_buffer_bytes: 1_024,
+                stability_replicates: 3,
+                solver_iterations: 4,
+                solver_sparse_matvec_terms: 8,
+                solver_residual: Some(0.01),
+            },
+        }
+    }
 
     fn write_fixture(input_root: &Path, manifest_path: &Path, source_override: Option<&Path>) {
         let audio_path = source_override
@@ -1157,6 +1724,20 @@ mod tests {
             ],
             ignored_regions: vec![],
             speaker_hints: vec![],
+            words: vec![
+                EvaluationWord {
+                    word_id: "word-000001".to_owned(),
+                    start_ms: 200,
+                    end_ms: 400,
+                    speaker_ref: "speaker-private-a".to_owned(),
+                },
+                EvaluationWord {
+                    word_id: "word-000002".to_owned(),
+                    start_ms: 1_200,
+                    end_ms: 1_400,
+                    speaker_ref: "speaker-private-b".to_owned(),
+                },
+            ],
         };
         let hypothesis = DiarizationHypothesisDocument {
             schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
@@ -1172,6 +1753,7 @@ mod tests {
                     ..EvaluationTurn::labeled(1_000, 2_000, "cluster-y")
                 },
             ],
+            speaker_count_estimate: Some(speaker_count_estimate()),
             performance: Some(EvaluationPerformanceObservation {
                 audio_duration_ms: 2_000,
                 wall_time_ms: 1_000,
@@ -1230,6 +1812,19 @@ mod tests {
         );
         assert_eq!(first.recording_count, 1);
         assert_eq!(first.diarization.micro_der, Some(0.0));
+        assert_eq!(first.speaker_count_posterior.observed_recordings, 1);
+        assert_eq!(
+            first
+                .speaker_count_posterior
+                .zero_reference_probability_recordings,
+            0
+        );
+        assert_eq!(first.speaker_occupancy.dominant_collapse_recordings, 0);
+        assert_eq!(first.word_attribution.reference_word_count, 2);
+        assert_eq!(
+            first.word_attribution.micro_word_diarization_error_rate,
+            Some(0.0)
+        );
         assert_eq!(
             first
                 .performance

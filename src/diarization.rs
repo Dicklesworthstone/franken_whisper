@@ -32,15 +32,15 @@ use crate::model::{
 /// Stable identifier for the native acoustic diarization contract.
 pub const ACOUSTIC_DIARIZATION_CONTRACT_VERSION: &str = "acoustic-diarization-v2";
 /// Frozen implementation identity for retained diarization evaluation results.
-pub const DIARIZATION_SCORER_VERSION: &str = "diarization-scorer-v3";
+pub const DIARIZATION_SCORER_VERSION: &str = "diarization-scorer-v4";
 /// Schema identity for reference annotations accepted by the frozen scorer.
-pub const DIARIZATION_REFERENCE_SCHEMA_VERSION: &str = "diarization-reference-v1";
+pub const DIARIZATION_REFERENCE_SCHEMA_VERSION: &str = "diarization-reference-v2";
 /// Schema identity for system hypotheses accepted by the frozen scorer.
-pub const DIARIZATION_HYPOTHESIS_SCHEMA_VERSION: &str = "diarization-hypothesis-v1";
+pub const DIARIZATION_HYPOTHESIS_SCHEMA_VERSION: &str = "diarization-hypothesis-v2";
 /// Schema identity for scorer configuration.
-pub const DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION: &str = "diarization-scorer-config-v1";
+pub const DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION: &str = "diarization-scorer-config-v2";
 /// Schema identity for retained scorer results.
-pub const DIARIZATION_SCORE_RESULT_SCHEMA_VERSION: &str = "diarization-score-result-v1";
+pub const DIARIZATION_SCORE_RESULT_SCHEMA_VERSION: &str = "diarization-score-result-v2";
 /// Schema identity for privacy-safe corpus manifests.
 pub const DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION: &str = "diarization-corpus-manifest-v1";
 /// Schema identity for split-leakage audit results.
@@ -164,6 +164,16 @@ pub struct DiarizationScorerConfig {
     pub change_boundary_collar_ms: u64,
     pub overlap_policy: EvaluationOverlapPolicy,
     pub calibration_bins: usize,
+    /// Number of concrete count bins in the count-posterior top-k diagnostic.
+    pub count_top_k: usize,
+    /// Target posterior mass for the deterministic count credible set.
+    pub count_credible_mass_millionths: u32,
+    /// Dominant labeled-speaker share at which a multi-speaker run is collapsed.
+    pub dominant_speaker_collapse_share_millionths: u32,
+    /// Minimum recall below which one mapped reference speaker is collapsed.
+    pub minimum_reference_speaker_recall_millionths: u32,
+    /// Minimum scored occupancy for one hypothesis label to be effective.
+    pub minimum_effective_occupancy_ms: u64,
 }
 
 impl Default for DiarizationScorerConfig {
@@ -174,6 +184,11 @@ impl Default for DiarizationScorerConfig {
             change_boundary_collar_ms: 250,
             overlap_policy: EvaluationOverlapPolicy::Include,
             calibration_bins: 10,
+            count_top_k: 3,
+            count_credible_mass_millionths: 900_000,
+            dominant_speaker_collapse_share_millionths: 990_000,
+            minimum_reference_speaker_recall_millionths: 100_000,
+            minimum_effective_occupancy_ms: 250,
         }
     }
 }
@@ -236,6 +251,20 @@ pub struct EvaluationSpeakerHint {
     pub policy: EvaluationHintPolicy,
 }
 
+/// One transcript-free aligned word used for speaker-attribution scoring.
+///
+/// `word_id` is an opaque annotation identity, never lexical content. The
+/// scorer projects the diarization hypothesis at this interval onto the
+/// reference speaker, so no transcript token is retained in the score.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationWord {
+    pub word_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub speaker_ref: String,
+}
+
 /// Frozen ground-truth document. It deliberately has no path or transcript field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +275,7 @@ pub struct DiarizationReferenceDocument {
     pub turns: Vec<EvaluationTurn>,
     pub ignored_regions: Vec<EvaluationRegion>,
     pub speaker_hints: Vec<EvaluationSpeakerHint>,
+    pub words: Vec<EvaluationWord>,
 }
 
 /// Runtime resource observation associated with one hypothesis.
@@ -265,6 +295,7 @@ pub struct DiarizationHypothesisDocument {
     pub recording_id: String,
     pub duration_ms: u64,
     pub turns: Vec<EvaluationTurn>,
+    pub speaker_count_estimate: Option<SpeakerCountEstimate>,
     pub performance: Option<EvaluationPerformanceObservation>,
 }
 
@@ -295,6 +326,65 @@ pub struct SpeakerCountScore {
     pub hypothesis_speakers: usize,
     pub signed_error: i64,
     pub absolute_error: u64,
+}
+
+/// Proper scores and set diagnostics for one automatic speaker-count posterior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerCountPosteriorScore {
+    pub reference_speakers: usize,
+    pub posterior_available: bool,
+    pub selected_count: Option<u32>,
+    pub unresolved: bool,
+    pub reference_probability: Option<f64>,
+    pub negative_log_likelihood: Option<f64>,
+    pub infinite_negative_log_likelihood: bool,
+    pub brier_score: Option<f64>,
+    pub top_k_hit: Option<bool>,
+    pub credible_set: Vec<u32>,
+    pub credible_set_includes_unresolved: bool,
+    pub credible_set_hit: Option<bool>,
+    pub unresolved_probability: Option<f64>,
+    pub entropy_bits: Option<f64>,
+    pub calibration_status: Option<SpeakerCountCalibrationStatus>,
+}
+
+/// Duration and recurrence evidence for one anonymized hypothesis label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerOccupancyEntry {
+    pub hypothesis_speaker: String,
+    pub mapped_reference_speaker: Option<String>,
+    pub voiced_duration_sec: f64,
+    pub labeled_share: f64,
+    pub recurrence_episode_count: u64,
+    pub effective: bool,
+}
+
+/// Run-level collapse and phantom-speaker diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerOccupancyScore {
+    pub labeled_speaker_time_sec: f64,
+    pub unknown_speaker_time_sec: f64,
+    pub dominant_speaker_share: Option<f64>,
+    pub unknown_speaker_share: Option<f64>,
+    pub effective_speaker_count: usize,
+    pub phantom_speaker_count: usize,
+    pub collapsed_reference_speaker_count: usize,
+    pub minority_reference_recall: Option<f64>,
+    pub dominant_collapse_detected: bool,
+    pub any_reference_collapse_detected: bool,
+    pub speakers: Vec<SpeakerOccupancyEntry>,
+}
+
+/// Speaker attribution over aligned reference word intervals without text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordAttributionScore {
+    pub reference_word_count: u64,
+    pub scored_word_count: u64,
+    pub correct_word_count: u64,
+    pub incorrect_word_count: u64,
+    pub unknown_word_count: u64,
+    pub excluded_word_count: u64,
+    pub word_diarization_error_rate: Option<f64>,
 }
 
 /// Duration-weighted overlap-region detection.
@@ -370,6 +460,9 @@ pub struct AuthoritativeDiarizationScore {
     pub change_points: ChangePointScore,
     pub speaker_attribution: SpeakerAttributionScore,
     pub speaker_count: SpeakerCountScore,
+    pub speaker_count_posterior: SpeakerCountPosteriorScore,
+    pub speaker_occupancy: SpeakerOccupancyScore,
+    pub word_attribution: WordAttributionScore,
     pub overlap: OverlapDetectionScore,
     pub hints: HintAdherenceScore,
     pub selective_attribution: SelectiveAttributionScore,
@@ -781,6 +874,25 @@ pub fn score_diarization_documents(
     let speech_activity = score_speech_activity(&atoms);
     let speaker_attribution = score_speaker_attribution(&diarization);
     let speaker_count = score_speaker_count(&scoring_reference, &scoring_hypothesis);
+    let speaker_count_posterior = score_speaker_count_posterior(
+        speaker_count.reference_speakers,
+        hypothesis.speaker_count_estimate.as_ref(),
+        config,
+    );
+    let speaker_occupancy = score_speaker_occupancy(
+        reference,
+        hypothesis,
+        &atoms,
+        &diarization.speaker_mapping,
+        config,
+    );
+    let word_attribution = score_word_attribution(
+        reference,
+        hypothesis,
+        &diarization.speaker_mapping,
+        config,
+        &reference_changes,
+    );
     let overlap = score_overlap_detection(&atoms);
     let hints = score_hint_adherence(
         &atoms,
@@ -833,6 +945,9 @@ pub fn score_diarization_documents(
         change_points,
         speaker_attribution,
         speaker_count,
+        speaker_count_posterior,
+        speaker_occupancy,
+        word_attribution,
         overlap,
         hints,
         selective_attribution,
@@ -1075,6 +1190,7 @@ fn validate_reference_document(document: &DiarizationReferenceDocument) -> FwRes
         .iter()
         .filter_map(|turn| turn.speaker.as_ref())
         .collect::<BTreeSet<_>>();
+    validate_evaluation_words(document, &reference_speakers)?;
     for (index, hint) in document.speaker_hints.iter().enumerate() {
         validate_ms_interval(
             hint.start_ms,
@@ -1120,6 +1236,14 @@ fn validate_hypothesis_document(document: &DiarizationHypothesisDocument) -> FwR
         ));
     }
     validate_evaluation_turns(&document.turns, document.duration_ms, false, "hypothesis")?;
+    if let Some(estimate) = &document.speaker_count_estimate {
+        estimate.validate().map_err(|message| {
+            score_error(
+                "speaker_count_estimate",
+                &format!("hypothesis speaker-count estimate is invalid: {message}"),
+            )
+        })?;
+    }
     if let Some(performance) = &document.performance {
         if performance.audio_duration_ms == 0 {
             return Err(score_error(
@@ -1148,6 +1272,98 @@ fn validate_scorer_config(config: &DiarizationScorerConfig) -> FwResult<()> {
         return Err(score_error(
             "calibration_bins",
             "calibration_bins must be within 1..=1000",
+        ));
+    }
+    if config.count_top_k == 0 || config.count_top_k > MAX_SPEAKER_COUNT as usize {
+        return Err(score_error(
+            "count_top_k",
+            &format!("count_top_k must be within 1..={}", MAX_SPEAKER_COUNT),
+        ));
+    }
+    if !(1..=1_000_000).contains(&config.count_credible_mass_millionths) {
+        return Err(score_error(
+            "count_credible_mass",
+            "count_credible_mass_millionths must be within 1..=1000000",
+        ));
+    }
+    if !(500_001..=1_000_000).contains(&config.dominant_speaker_collapse_share_millionths) {
+        return Err(score_error(
+            "dominant_speaker_collapse_share",
+            "dominant_speaker_collapse_share_millionths must be within 500001..=1000000",
+        ));
+    }
+    if !(1..=1_000_000).contains(&config.minimum_reference_speaker_recall_millionths) {
+        return Err(score_error(
+            "minimum_reference_speaker_recall",
+            "minimum_reference_speaker_recall_millionths must be within 1..=1000000",
+        ));
+    }
+    if config.minimum_effective_occupancy_ms == 0 {
+        return Err(score_error(
+            "minimum_effective_occupancy",
+            "minimum_effective_occupancy_ms must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evaluation_words(
+    document: &DiarizationReferenceDocument,
+    reference_speakers: &BTreeSet<&String>,
+) -> FwResult<()> {
+    let mut word_ids = BTreeSet::new();
+    for (index, word) in document.words.iter().enumerate() {
+        validate_opaque_word_id(&word.word_id, index)?;
+        validate_opaque_id(
+            &word.speaker_ref,
+            &format!("reference word {index} speaker_ref"),
+        )?;
+        validate_ms_interval(
+            word.start_ms,
+            word.end_ms,
+            document.duration_ms,
+            &format!("reference word {index}"),
+        )?;
+        if !word_ids.insert(&word.word_id) {
+            return Err(score_error(
+                "word_id_duplicate",
+                &format!("reference word {index} repeats an opaque word_id"),
+            ));
+        }
+        if !reference_speakers.contains(&word.speaker_ref) {
+            return Err(score_error(
+                "word_speaker_not_in_reference",
+                &format!("reference word {index} does not name a reference speaker"),
+            ));
+        }
+        let point_ms = word.start_ms + (word.end_ms - word.start_ms) / 2;
+        if !document.turns.iter().any(|turn| {
+            turn.speaker.as_ref() == Some(&word.speaker_ref)
+                && turn.start_ms <= point_ms
+                && point_ms < turn.end_ms
+        }) {
+            return Err(score_error(
+                "word_speaker_inactive",
+                &format!("reference word {index} speaker is not active at the word midpoint"),
+            ));
+        }
+    }
+    if !document.words.windows(2).all(|window| {
+        (
+            window[0].start_ms,
+            window[0].end_ms,
+            window[0].word_id.as_str(),
+            window[0].speaker_ref.as_str(),
+        ) < (
+            window[1].start_ms,
+            window[1].end_ms,
+            window[1].word_id.as_str(),
+            window[1].speaker_ref.as_str(),
+        )
+    }) {
+        return Err(score_error(
+            "word_order",
+            "reference words must use strictly increasing start/end/id/speaker order",
         ));
     }
     Ok(())
@@ -1374,6 +1590,20 @@ fn validate_opaque_id(value: &str, field: &str) -> FwResult<()> {
         return Err(score_error(
             "opaque_id_sensitive_marker",
             &format!("{field} contains a forbidden media, transcript, or path marker"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_opaque_word_id(value: &str, index: usize) -> FwResult<()> {
+    validate_opaque_id(value, &format!("reference word {index} word_id"))?;
+    if value
+        .strip_prefix("word-")
+        .is_none_or(|suffix| suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(score_error(
+            "word_id_shape",
+            &format!("reference word {index} word_id must use the non-lexical word-<digits> form"),
         ));
     }
     Ok(())
@@ -1656,6 +1886,338 @@ fn score_speaker_count(reference: &[ScoringTurn], hypothesis: &[ScoringTurn]) ->
         signed_error,
         absolute_error: signed_error.unsigned_abs(),
     }
+}
+
+fn score_speaker_count_posterior(
+    reference_speakers: usize,
+    estimate: Option<&SpeakerCountEstimate>,
+    config: &DiarizationScorerConfig,
+) -> SpeakerCountPosteriorScore {
+    let Some(estimate) = estimate else {
+        return SpeakerCountPosteriorScore {
+            reference_speakers,
+            posterior_available: false,
+            selected_count: None,
+            unresolved: true,
+            reference_probability: None,
+            negative_log_likelihood: None,
+            infinite_negative_log_likelihood: false,
+            brier_score: None,
+            top_k_hit: None,
+            credible_set: Vec::new(),
+            credible_set_includes_unresolved: false,
+            credible_set_hit: None,
+            unresolved_probability: None,
+            entropy_bits: None,
+            calibration_status: None,
+        };
+    };
+
+    let posterior_available = !estimate.posterior.is_empty()
+        && matches!(
+            estimate.calibration_status,
+            SpeakerCountCalibrationStatus::Certified
+                | SpeakerCountCalibrationStatus::DevelopmentUncertified
+        );
+    let reference_count = u32::try_from(reference_speakers).unwrap_or(u32::MAX);
+    let reference_probability = posterior_available.then(|| {
+        estimate
+            .posterior
+            .iter()
+            .find(|bin| bin.count == reference_count)
+            .map_or(0.0, |bin| bin.probability)
+    });
+    let negative_log_likelihood = reference_probability
+        .and_then(|probability| (probability > 0.0).then(|| -probability.ln()));
+    let infinite_negative_log_likelihood =
+        reference_probability.is_some_and(|probability| probability == 0.0);
+    let brier_score = posterior_available.then(|| {
+        let concrete = estimate
+            .posterior
+            .iter()
+            .map(|bin| {
+                let target = f64::from(bin.count == reference_count);
+                (bin.probability - target).powi(2)
+            })
+            .sum::<f64>();
+        concrete + estimate.unresolved_probability.powi(2)
+    });
+
+    let mut ranked_bins = estimate.posterior.clone();
+    ranked_bins.sort_by(|left, right| {
+        right
+            .probability
+            .total_cmp(&left.probability)
+            .then_with(|| left.count.cmp(&right.count))
+    });
+    let top_k_hit = posterior_available.then(|| {
+        ranked_bins
+            .iter()
+            .take(config.count_top_k)
+            .any(|bin| bin.count == reference_count)
+    });
+
+    let target_mass = f64::from(config.count_credible_mass_millionths) / 1_000_000.0;
+    let mut ranked_mass = ranked_bins
+        .iter()
+        .map(|bin| (Some(bin.count), bin.probability))
+        .collect::<Vec<_>>();
+    ranked_mass.push((None, estimate.unresolved_probability));
+    ranked_mass.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.is_none().cmp(&right.0.is_none()))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut credible_set = Vec::new();
+    let mut credible_set_includes_unresolved = false;
+    let mut accumulated_mass = 0.0;
+    if posterior_available {
+        for (count, probability) in ranked_mass {
+            if accumulated_mass >= target_mass {
+                break;
+            }
+            accumulated_mass += probability;
+            if let Some(count) = count {
+                credible_set.push(count);
+            } else {
+                credible_set_includes_unresolved = true;
+            }
+        }
+        credible_set.sort_unstable();
+    }
+    let credible_set_hit =
+        posterior_available.then(|| credible_set.binary_search(&reference_count).is_ok());
+
+    SpeakerCountPosteriorScore {
+        reference_speakers,
+        posterior_available,
+        selected_count: estimate.selected_count,
+        unresolved: estimate.selected_count.is_none(),
+        reference_probability,
+        negative_log_likelihood,
+        infinite_negative_log_likelihood,
+        brier_score,
+        top_k_hit,
+        credible_set,
+        credible_set_includes_unresolved,
+        credible_set_hit,
+        unresolved_probability: Some(estimate.unresolved_probability),
+        entropy_bits: Some(estimate.entropy_bits),
+        calibration_status: Some(estimate.calibration_status),
+    }
+}
+
+fn score_speaker_occupancy(
+    reference: &DiarizationReferenceDocument,
+    hypothesis: &DiarizationHypothesisDocument,
+    atoms: &[EvaluationAtomicInterval],
+    mapping: &BTreeMap<String, String>,
+    config: &DiarizationScorerConfig,
+) -> SpeakerOccupancyScore {
+    let hypothesis_labels = hypothesis
+        .turns
+        .iter()
+        .filter_map(|turn| turn.speaker.clone())
+        .collect::<BTreeSet<_>>();
+    let mut hypothesis_duration = hypothesis_labels
+        .iter()
+        .cloned()
+        .map(|speaker| (speaker, 0.0_f64))
+        .collect::<BTreeMap<_, _>>();
+    let reference_labels = reference
+        .turns
+        .iter()
+        .filter_map(|turn| turn.speaker.clone())
+        .collect::<BTreeSet<_>>();
+    let mut reference_duration = reference_labels
+        .iter()
+        .cloned()
+        .map(|speaker| (speaker, 0.0_f64))
+        .collect::<BTreeMap<_, _>>();
+    let mut correct_by_reference = reference_labels
+        .iter()
+        .cloned()
+        .map(|speaker| (speaker, 0.0_f64))
+        .collect::<BTreeMap<_, _>>();
+    let mut unknown_speaker_time_sec = 0.0;
+    for atom in atoms.iter().filter(|atom| !atom.excluded) {
+        let duration = atom.duration_sec();
+        for reference_speaker in &atom.reference {
+            if let Some(total) = reference_duration.get_mut(reference_speaker) {
+                *total += duration;
+            }
+        }
+        for state in &atom.hypothesis {
+            let Some(hypothesis_speaker) = state.speaker.as_ref() else {
+                unknown_speaker_time_sec += duration;
+                continue;
+            };
+            if let Some(total) = hypothesis_duration.get_mut(hypothesis_speaker) {
+                *total += duration;
+            }
+            if let Some(reference_speaker) = mapping.get(hypothesis_speaker)
+                && atom.reference.contains(reference_speaker)
+                && let Some(correct) = correct_by_reference.get_mut(reference_speaker)
+            {
+                *correct += duration;
+            }
+        }
+    }
+
+    let labeled_speaker_time_sec = hypothesis_duration.values().sum::<f64>();
+    let minimum_effective_occupancy_sec = config.minimum_effective_occupancy_ms as f64 / 1_000.0;
+    let mut speakers = hypothesis_duration
+        .iter()
+        .map(|(speaker, &duration)| {
+            let labeled_share = if labeled_speaker_time_sec > SCORE_EPSILON_SEC {
+                duration / labeled_speaker_time_sec
+            } else {
+                0.0
+            };
+            SpeakerOccupancyEntry {
+                hypothesis_speaker: speaker.clone(),
+                mapped_reference_speaker: mapping.get(speaker).cloned(),
+                voiced_duration_sec: duration,
+                labeled_share,
+                recurrence_episode_count: recurrence_episode_count(atoms, speaker),
+                effective: duration + SCORE_EPSILON_SEC >= minimum_effective_occupancy_sec,
+            }
+        })
+        .collect::<Vec<_>>();
+    speakers.sort_by(|left, right| left.hypothesis_speaker.cmp(&right.hypothesis_speaker));
+    let dominant_speaker_share = speakers
+        .iter()
+        .map(|speaker| speaker.labeled_share)
+        .max_by(f64::total_cmp)
+        .filter(|_| labeled_speaker_time_sec > SCORE_EPSILON_SEC);
+    let dominant_threshold =
+        f64::from(config.dominant_speaker_collapse_share_millionths) / 1_000_000.0;
+    let dominant_collapse_detected = reference_labels.len() > 1
+        && dominant_speaker_share.is_some_and(|share| share >= dominant_threshold);
+    let minimum_reference_recall =
+        f64::from(config.minimum_reference_speaker_recall_millionths) / 1_000_000.0;
+    let reference_recalls = reference_duration
+        .iter()
+        .map(|(speaker, &duration)| {
+            let correct = correct_by_reference.get(speaker).copied().unwrap_or(0.0);
+            (
+                speaker,
+                ratio_or_none(correct, duration).unwrap_or(0.0),
+                duration,
+            )
+        })
+        .collect::<Vec<_>>();
+    let collapsed_reference_speaker_count = reference_recalls
+        .iter()
+        .filter(|(_, recall, _)| *recall < minimum_reference_recall)
+        .count();
+    let minority_reference_recall = reference_recalls
+        .iter()
+        .min_by(|left, right| left.2.total_cmp(&right.2).then_with(|| left.0.cmp(right.0)))
+        .map(|(_, recall, _)| *recall);
+
+    SpeakerOccupancyScore {
+        labeled_speaker_time_sec,
+        unknown_speaker_time_sec,
+        dominant_speaker_share,
+        unknown_speaker_share: ratio_or_none(
+            unknown_speaker_time_sec,
+            labeled_speaker_time_sec + unknown_speaker_time_sec,
+        ),
+        effective_speaker_count: speakers.iter().filter(|speaker| speaker.effective).count(),
+        phantom_speaker_count: speakers
+            .iter()
+            .filter(|speaker| speaker.effective && speaker.mapped_reference_speaker.is_none())
+            .count(),
+        collapsed_reference_speaker_count,
+        minority_reference_recall,
+        dominant_collapse_detected,
+        any_reference_collapse_detected: collapsed_reference_speaker_count > 0,
+        speakers,
+    }
+}
+
+fn recurrence_episode_count(atoms: &[EvaluationAtomicInterval], speaker: &str) -> u64 {
+    let mut episodes = 0_u64;
+    let mut previously_active = false;
+    for atom in atoms {
+        let active = !atom.excluded
+            && atom
+                .hypothesis
+                .iter()
+                .any(|state| state.speaker.as_deref() == Some(speaker));
+        if active && !previously_active {
+            episodes = episodes.saturating_add(1);
+        }
+        previously_active = active;
+    }
+    episodes
+}
+
+fn score_word_attribution(
+    reference: &DiarizationReferenceDocument,
+    hypothesis: &DiarizationHypothesisDocument,
+    mapping: &BTreeMap<String, String>,
+    config: &DiarizationScorerConfig,
+    reference_changes: &[u64],
+) -> WordAttributionScore {
+    let mut score = WordAttributionScore {
+        reference_word_count: u64::try_from(reference.words.len()).unwrap_or(u64::MAX),
+        scored_word_count: 0,
+        correct_word_count: 0,
+        incorrect_word_count: 0,
+        unknown_word_count: 0,
+        excluded_word_count: 0,
+        word_diarization_error_rate: None,
+    };
+    for word in &reference.words {
+        let point_ms = word.start_ms + (word.end_ms - word.start_ms) / 2;
+        let reference_overlap = reference
+            .turns
+            .iter()
+            .filter(|turn| turn.start_ms <= point_ms && point_ms < turn.end_ms)
+            .filter_map(|turn| turn.speaker.as_ref())
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1;
+        let in_collar = config.speaker_boundary_collar_ms > 0
+            && reference_changes.iter().any(|change| {
+                let lower = change.saturating_sub(config.speaker_boundary_collar_ms);
+                let upper = change
+                    .saturating_add(config.speaker_boundary_collar_ms)
+                    .min(reference.duration_ms);
+                lower <= point_ms && point_ms < upper
+            });
+        if millisecond_is_ignored(point_ms, &reference.ignored_regions)
+            || in_collar
+            || (config.overlap_policy == EvaluationOverlapPolicy::Exclude && reference_overlap)
+        {
+            score.excluded_word_count = score.excluded_word_count.saturating_add(1);
+            continue;
+        }
+        score.scored_word_count = score.scored_word_count.saturating_add(1);
+        let active_mapped = hypothesis
+            .turns
+            .iter()
+            .filter(|turn| turn.start_ms <= point_ms && point_ms < turn.end_ms)
+            .filter_map(|turn| turn.speaker.as_ref())
+            .filter_map(|speaker| mapping.get(speaker))
+            .collect::<BTreeSet<_>>();
+        if active_mapped.contains(&word.speaker_ref) {
+            score.correct_word_count = score.correct_word_count.saturating_add(1);
+        } else if active_mapped.is_empty() {
+            score.unknown_word_count = score.unknown_word_count.saturating_add(1);
+        } else {
+            score.incorrect_word_count = score.incorrect_word_count.saturating_add(1);
+        }
+    }
+    score.word_diarization_error_rate = ratio_or_none(
+        (score.incorrect_word_count + score.unknown_word_count) as f64,
+        score.scored_word_count as f64,
+    );
+    score
 }
 
 fn score_overlap_detection(atoms: &[EvaluationAtomicInterval]) -> OverlapDetectionScore {
@@ -11929,22 +12491,25 @@ mod tests {
         DiarizationCorpusManifest, DiarizationHypothesisDocument, DiarizationReferenceDocument,
         DiarizationScorerConfig, EvaluationHintPolicy, EvaluationOverlapPolicy,
         EvaluationPerformanceObservation, EvaluationRegion, EvaluationSpeakerHint, EvaluationSplit,
-        EvaluationTurn, LeakageKind, ProfileEnrollmentCode, ProfileMetricAdaptationFallback,
-        ProfileTrainingDisposition, ProfileTrainingReason, ScoringTurn, VOICE_VECTOR_DIMENSIONS,
-        VoiceFeatureView, audit_diarization_manifest, cluster_acoustic_tracklets,
-        diarization_turns_from_assignments, diarize_acoustic_pcm, enroll_known_speaker_profiles,
-        extract_acoustic_features, merge_tracklet_statistics, parse_diarization_corpus_manifest,
-        parse_diarization_reference, project_diarization_onto_segments, score_calibration,
-        score_change_points, score_diarization, score_diarization_documents,
-        segment_acoustic_frames, verify_authoritative_score_hash, verify_leakage_audit_hash,
+        EvaluationTurn, EvaluationWord, LeakageKind, ProfileEnrollmentCode,
+        ProfileMetricAdaptationFallback, ProfileTrainingDisposition, ProfileTrainingReason,
+        ScoringTurn, VOICE_VECTOR_DIMENSIONS, VoiceFeatureView, audit_diarization_manifest,
+        cluster_acoustic_tracklets, diarization_turns_from_assignments, diarize_acoustic_pcm,
+        enroll_known_speaker_profiles, extract_acoustic_features, merge_tracklet_statistics,
+        parse_diarization_corpus_manifest, parse_diarization_reference,
+        project_diarization_onto_segments, score_calibration, score_change_points,
+        score_diarization, score_diarization_documents, segment_acoustic_frames,
+        verify_authoritative_score_hash, verify_leakage_audit_hash,
     };
     use crate::FwError;
     use crate::model::{
         DiarizationEngine, DiarizationFallbackStatus, DiarizationRequest, DiarizationTurn,
         KnownSpeakerInterval, KnownSpeakerPolicy, SpeakerAttributionQueryReason,
-        SpeakerCountCalibrationStatus, SpeakerCountEvidenceLane, SpeakerCountLaneUnavailableReason,
-        SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
-        SpeakerEvidenceReason, SpeakerHintDisposition, TranscriptionSegment,
+        SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
+        SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountOutcomeReason,
+        SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
+        SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
+        SpeakerHintDisposition, TranscriptionSegment,
     };
     use sha2::{Digest, Sha256};
 
@@ -11953,6 +12518,71 @@ mod tests {
             (actual - expected).abs() < 1e-9,
             "expected {expected}, got {actual}"
         );
+    }
+
+    fn count_estimate(
+        selected_count: Option<u32>,
+        posterior: &[(u32, f64)],
+        unresolved_probability: f64,
+    ) -> SpeakerCountEstimate {
+        let posterior = posterior
+            .iter()
+            .map(|&(count, probability)| SpeakerCountPosteriorBin { count, probability })
+            .collect::<Vec<_>>();
+        let entropy_bits = posterior
+            .iter()
+            .map(|bin| super::entropy_term(bin.probability))
+            .sum::<f64>()
+            + super::entropy_term(unresolved_probability);
+        let proposed_count = selected_count.or_else(|| posterior.first().map(|bin| bin.count));
+        let available_lane = |lane| SpeakerCountLaneEvidence {
+            lane,
+            available: true,
+            proposed_count,
+            confidence: 0.75,
+            unavailable_reason: None,
+        };
+        SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count,
+            supported_range: selected_count.map(|count| SpeakerCountRange {
+                minimum: count,
+                maximum: count,
+            }),
+            posterior,
+            unresolved_probability,
+            entropy_bits,
+            stability: 0.75,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 3,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: vec![
+                available_lane(SpeakerCountEvidenceLane::MergeRisk),
+                available_lane(SpeakerCountEvidenceLane::SparseNormalizedEigengap),
+                available_lane(SpeakerCountEvidenceLane::FeatureJackknife),
+                available_lane(SpeakerCountEvidenceLane::EffectiveOccupancy),
+                available_lane(SpeakerCountEvidenceLane::ConstraintGraph),
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+                },
+            ],
+            resources: SpeakerCountResourceSummary {
+                prototype_count: 4,
+                affinity_pair_evaluations: 12,
+                retained_sparse_edges: 6,
+                estimated_peak_buffer_bytes: 1_024,
+                stability_replicates: 3,
+                solver_iterations: 4,
+                solver_sparse_matvec_terms: 24,
+                solver_residual: Some(0.01),
+            },
+        }
     }
 
     fn evaluation_reference() -> DiarizationReferenceDocument {
@@ -11981,6 +12611,7 @@ mod tests {
                     policy: EvaluationHintPolicy::Soft,
                 },
             ],
+            words: Vec::new(),
         }
     }
 
@@ -12013,6 +12644,7 @@ mod tests {
                 confident_turn(4_000, 5_000, "cluster-y", 0.6, true),
                 confident_turn(5_000, 5_500, "cluster-x", 0.4, false),
             ],
+            speaker_count_estimate: None,
             performance: Some(EvaluationPerformanceObservation {
                 audio_duration_ms: 6_000,
                 wall_time_ms: 120,
@@ -12098,6 +12730,186 @@ mod tests {
             0.02,
         );
         verify_authoritative_score_hash(&result).expect("valid result hash");
+    }
+
+    #[test]
+    fn speaker_count_posterior_uses_proper_scores_and_explicit_unresolved_mass() {
+        let mut hypothesis = evaluation_hypothesis();
+        hypothesis.speaker_count_estimate = Some(count_estimate(
+            Some(2),
+            &[(1, 0.1), (2, 0.7), (3, 0.1)],
+            0.1,
+        ));
+        let result = score_diarization_documents(
+            &evaluation_reference(),
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("posterior score");
+        let score = result.speaker_count_posterior;
+        assert!(score.posterior_available);
+        assert_eq!(score.selected_count, Some(2));
+        assert!(!score.unresolved);
+        assert_close(score.reference_probability.expect("reference mass"), 0.7);
+        assert_close(
+            score
+                .negative_log_likelihood
+                .expect("finite negative log likelihood"),
+            -0.7_f64.ln(),
+        );
+        assert_close(score.brier_score.expect("multiclass Brier"), 0.12);
+        assert_eq!(score.top_k_hit, Some(true));
+        assert_eq!(score.credible_set_hit, Some(true));
+        assert!(score.credible_set.contains(&2));
+        assert_eq!(
+            score.calibration_status,
+            Some(SpeakerCountCalibrationStatus::DevelopmentUncertified)
+        );
+
+        let mut unresolved_hypothesis = evaluation_hypothesis();
+        unresolved_hypothesis.speaker_count_estimate =
+            Some(count_estimate(None, &[(1, 0.3), (2, 0.2)], 0.5));
+        let unresolved = score_diarization_documents(
+            &evaluation_reference(),
+            &unresolved_hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("unresolved posterior")
+        .speaker_count_posterior;
+        assert!(unresolved.posterior_available);
+        assert!(unresolved.unresolved);
+        assert_eq!(unresolved.selected_count, None);
+        assert_eq!(unresolved.unresolved_probability, Some(0.5));
+        assert!(unresolved.credible_set_includes_unresolved);
+    }
+
+    #[test]
+    fn occupancy_score_catches_exact_cardinality_with_dominant_speaker_collapse() {
+        let reference = DiarizationReferenceDocument {
+            schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
+            recording_id: "collapse-fixture".to_owned(),
+            duration_ms: 10_000,
+            turns: vec![
+                EvaluationTurn::labeled(0, 5_000, "reference-a"),
+                EvaluationTurn::labeled(5_000, 10_000, "reference-b"),
+            ],
+            ignored_regions: Vec::new(),
+            speaker_hints: Vec::new(),
+            words: Vec::new(),
+        };
+        let hypothesis = DiarizationHypothesisDocument {
+            schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: reference.recording_id.clone(),
+            duration_ms: reference.duration_ms,
+            turns: vec![
+                EvaluationTurn::labeled(0, 9_970, "cluster-dominant"),
+                EvaluationTurn::labeled(9_970, 10_000, "cluster-token"),
+            ],
+            speaker_count_estimate: None,
+            performance: None,
+        };
+        let score = score_diarization_documents(
+            &reference,
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("collapse score");
+        assert_eq!(score.speaker_count.absolute_error, 0);
+        assert_close(
+            score
+                .speaker_occupancy
+                .dominant_speaker_share
+                .expect("dominant share"),
+            0.997,
+        );
+        assert!(score.speaker_occupancy.dominant_collapse_detected);
+        assert!(score.speaker_occupancy.any_reference_collapse_detected);
+        assert_eq!(score.speaker_occupancy.effective_speaker_count, 1);
+        assert_eq!(score.speaker_occupancy.collapsed_reference_speaker_count, 1);
+        assert!(
+            score
+                .speaker_occupancy
+                .minority_reference_recall
+                .is_some_and(|recall| recall < 0.01)
+        );
+    }
+
+    #[test]
+    fn aligned_word_attribution_is_transcript_free_and_permutation_invariant() {
+        let reference = DiarizationReferenceDocument {
+            schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
+            recording_id: "word-fixture".to_owned(),
+            duration_ms: 2_000,
+            turns: vec![
+                EvaluationTurn::labeled(0, 1_000, "reference-a"),
+                EvaluationTurn::labeled(1_000, 2_000, "reference-b"),
+            ],
+            ignored_regions: Vec::new(),
+            speaker_hints: Vec::new(),
+            words: vec![
+                EvaluationWord {
+                    word_id: "word-001".to_owned(),
+                    start_ms: 100,
+                    end_ms: 200,
+                    speaker_ref: "reference-a".to_owned(),
+                },
+                EvaluationWord {
+                    word_id: "word-002".to_owned(),
+                    start_ms: 1_100,
+                    end_ms: 1_200,
+                    speaker_ref: "reference-b".to_owned(),
+                },
+                EvaluationWord {
+                    word_id: "word-003".to_owned(),
+                    start_ms: 1_600,
+                    end_ms: 1_700,
+                    speaker_ref: "reference-b".to_owned(),
+                },
+            ],
+        };
+        let hypothesis = DiarizationHypothesisDocument {
+            schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: reference.recording_id.clone(),
+            duration_ms: reference.duration_ms,
+            turns: vec![
+                EvaluationTurn::labeled(0, 1_000, "cluster-z"),
+                EvaluationTurn::labeled(1_000, 1_500, "cluster-a"),
+                EvaluationTurn::unknown(1_500, 2_000),
+            ],
+            speaker_count_estimate: None,
+            performance: None,
+        };
+        let score = score_diarization_documents(
+            &reference,
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("word attribution")
+        .word_attribution;
+        assert_eq!(score.reference_word_count, 3);
+        assert_eq!(score.scored_word_count, 3);
+        assert_eq!(score.correct_word_count, 2);
+        assert_eq!(score.unknown_word_count, 1);
+        assert_eq!(score.incorrect_word_count, 0);
+        assert_close(
+            score.word_diarization_error_rate.expect("word error"),
+            1.0 / 3.0,
+        );
+    }
+
+    #[test]
+    fn invalid_hypothesis_count_posterior_fails_before_scoring() {
+        let mut hypothesis = evaluation_hypothesis();
+        let mut estimate = count_estimate(Some(2), &[(1, 0.1), (2, 0.7), (3, 0.1)], 0.1);
+        estimate.posterior[1].probability = 0.8;
+        hypothesis.speaker_count_estimate = Some(estimate);
+        let error = score_diarization_documents(
+            &evaluation_reference(),
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect_err("invalid posterior must fail");
+        assert!(error.to_string().contains("speaker_count_estimate"));
     }
 
     #[test]
