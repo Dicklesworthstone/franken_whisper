@@ -469,6 +469,20 @@ fn verify_loaded_ecapa_package(package: &SafetensorsFile) -> FwResult<()> {
             "compiled ECAPA tensor census is inconsistent",
         ));
     }
+    let payload_bytes = expected.iter().try_fold(0u64, |total, tensor| {
+        let tensor_bytes = checked_element_count(&tensor.shape)?
+            .checked_mul(4)
+            .ok_or_else(|| ecapa_error("tensor_shape", "tensor byte count overflows"))?;
+        total
+            .checked_add(tensor_bytes)
+            .ok_or_else(|| ecapa_error("tensor_shape", "package byte count overflows"))
+    })?;
+    if payload_bytes != ECAPA_EXPORTED_PAYLOAD_BYTES {
+        return Err(ecapa_error(
+            "contract_internal_drift",
+            "compiled ECAPA tensor byte census is inconsistent",
+        ));
+    }
     verify_loaded_ecapa_package_against(package, &expected, &expected_ecapa_package_metadata())
 }
 
