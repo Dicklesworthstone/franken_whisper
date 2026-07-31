@@ -137,13 +137,9 @@ fn build_args(
                 args.push("--num-speakers".to_owned());
                 args.push(count.to_string());
             }
-            SpeakerCountRequest::Range { minimum, maximum } => {
-                args.push("--min-speakers".to_owned());
-                args.push(minimum.to_string());
-                args.push("--max-speakers".to_owned());
-                args.push(maximum.to_string());
-            }
-            SpeakerCountRequest::Infer | SpeakerCountRequest::Prior { .. } => {}
+            SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. } => {}
         }
     }
 
@@ -194,17 +190,24 @@ fn build_args(
 
 fn validate_external_speaker_count(request: &TranscribeRequest) -> FwResult<()> {
     if request.diarize
-        && matches!(
-            request
-                .backend_params
-                .acoustic_diarization
-                .as_ref()
-                .map(|request| &request.speaker_count),
-            Some(SpeakerCountRequest::Prior { .. })
-        )
+        && request
+            .backend_params
+            .acoustic_diarization
+            .as_ref()
+            .is_some_and(|diarization| {
+                matches!(
+                    &diarization.speaker_count,
+                    SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+                ) && matches!(
+                    diarization.engine,
+                    crate::model::DiarizationEngine::External
+                        | crate::model::DiarizationEngine::Neural
+                )
+            })
     {
         return Err(FwError::InvalidRequest(
-            "insanely-fast-whisper cannot faithfully execute a speaker-count prior".to_owned(),
+            "insanely-fast-whisper cannot faithfully execute a soft speaker-count prior or range"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -487,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_speaker_count_range_emits_both_bounds() {
+    fn soft_speaker_count_range_is_not_reinterpreted_as_hard_backend_bounds() {
         let mut request = minimal_request();
         request.diarize = true;
         set_speaker_count(
@@ -499,8 +502,10 @@ mod tests {
         );
         let args = build_args(&request, &PathBuf::from("n.wav"), &PathBuf::from("o.json"));
         assert!(!has_flag(&args, "--num-speakers"));
-        assert_eq!(arg_value(&args, "--min-speakers"), Some("2"));
-        assert_eq!(arg_value(&args, "--max-speakers"), Some("64"));
+        assert!(!has_flag(&args, "--min-speakers"));
+        assert!(!has_flag(&args, "--max-speakers"));
+        super::validate_external_speaker_count(&request)
+            .expect("native acoustic overlay owns the soft range");
     }
 
     #[test]
@@ -516,6 +521,12 @@ mod tests {
                 }],
             },
         );
+        request
+            .backend_params
+            .acoustic_diarization
+            .as_mut()
+            .expect("diarization request")
+            .engine = crate::model::DiarizationEngine::External;
         let error = super::validate_external_speaker_count(&request)
             .expect_err("external backend cannot silently approximate a count prior");
         assert!(error.to_string().contains("cannot faithfully execute"));

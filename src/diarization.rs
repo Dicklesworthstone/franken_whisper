@@ -20,12 +20,13 @@ use crate::error::{FwError, FwResult};
 use crate::model::{
     DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
     DiarizationRequest, DiarizationTurn, KnownSpeakerInterval, KnownSpeakerPolicy,
-    SpeakerAttributionQuery, SpeakerAttributionQueryReason, SpeakerCountCalibrationStatus,
-    SpeakerCountEstimate, SpeakerCountEvidenceLane, SpeakerCountLaneEvidence,
-    SpeakerCountLaneUnavailableReason, SpeakerCountOutcome, SpeakerCountOutcomeReason,
-    SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange, SpeakerCountRequest,
-    SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerHintDisposition,
-    SpeakerHintEvidenceSummary, SpeakerProfileSummary, TranscriptionSegment,
+    MAX_SPEAKER_COUNT, SpeakerAttributionQuery, SpeakerAttributionQueryReason,
+    SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
+    SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountOutcome,
+    SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin,
+    SpeakerCountRange, SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
+    SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
+    SpeakerProfileSummary, TranscriptionSegment,
 };
 
 /// Stable identifier for the native acoustic diarization contract.
@@ -3393,6 +3394,20 @@ const SPEAKER_COUNT_PERTURBATION_LANES: usize = 5;
 const SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE: usize = 8;
 const SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS: usize = 96;
 const SPEAKER_COUNT_EIGENSOLVER_TOLERANCE: f64 = 1.0e-7;
+const SPEAKER_COUNT_EIGENSOLVER_DIAGONAL_SHIFT: f64 = 1.01;
+const SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT: f64 = 0.15;
+const SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION: f64 = 0.50;
+const SPEAKER_COUNT_JACKKNIFE_LOG_WEIGHT: f64 = 0.25;
+const SPEAKER_COUNT_SPECTRAL_LOG_WEIGHT: f64 = 0.35;
+const SPEAKER_COUNT_STABILITY_EVIDENCE_WEIGHT: f64 = 0.55;
+const SPEAKER_COUNT_RISK_EVIDENCE_WEIGHT: f64 = 0.30;
+const SPEAKER_COUNT_SPECTRAL_EVIDENCE_WEIGHT: f64 = 0.15;
+const SPEAKER_COUNT_UNRESOLVED_INTERCEPT: f64 = 0.90;
+const SPEAKER_COUNT_UNRESOLVED_EVIDENCE_SLOPE: f64 = 0.75;
+const SPEAKER_COUNT_MINIMUM_UNRESOLVED_MASS: f64 = 0.15;
+const SPEAKER_COUNT_MAXIMUM_UNRESOLVED_MASS: f64 = 0.90;
+const SPEAKER_COUNT_CONCRETE_CREDIBLE_MASS: f64 = 0.90;
+const SPEAKER_COUNT_OCCUPANCY_STABILITY_WEIGHT: f64 = 0.30;
 /// Versioned monotone map from the candidate's raw attribution likelihood to
 /// its reported confidence. Rejection continues to use the raw likelihood so
 /// calibration cannot silently increase selective coverage.
@@ -3414,7 +3429,9 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v2-development";
+    "acoustic-clustering-probabilistic-v3-development";
+/// Public schema for bounded count distributions with explicit unresolved mass.
+pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
 const TEMPORAL_UNKNOWN_SWITCH_BASE: f32 = 0.10;
 const TEMPORAL_KNOWN_BOUNDARY_CREDIT: f32 = 0.18;
@@ -3505,7 +3522,29 @@ pub fn acoustic_speaker_pair_calibration_sha256() -> String {
     }
     hasher.update((SPEAKER_PAIR_MINIMUM_ACTIVE_DIMENSIONS as u64).to_le_bytes());
     hasher.update((SPEAKER_COUNT_PERTURBATION_LANES as u64).to_le_bytes());
-    hasher.update(b"feature-jackknife-full-no-pitch-no-dynamics-no-formants-no-channel-v2");
+    hasher.update((SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE as u64).to_le_bytes());
+    hasher.update((SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS as u64).to_le_bytes());
+    for value in [
+        SPEAKER_COUNT_EIGENSOLVER_TOLERANCE,
+        SPEAKER_COUNT_EIGENSOLVER_DIAGONAL_SHIFT,
+        SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT,
+        SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION,
+        SPEAKER_COUNT_JACKKNIFE_LOG_WEIGHT,
+        SPEAKER_COUNT_SPECTRAL_LOG_WEIGHT,
+        SPEAKER_COUNT_STABILITY_EVIDENCE_WEIGHT,
+        SPEAKER_COUNT_RISK_EVIDENCE_WEIGHT,
+        SPEAKER_COUNT_SPECTRAL_EVIDENCE_WEIGHT,
+        SPEAKER_COUNT_UNRESOLVED_INTERCEPT,
+        SPEAKER_COUNT_UNRESOLVED_EVIDENCE_SLOPE,
+        SPEAKER_COUNT_MINIMUM_UNRESOLVED_MASS,
+        SPEAKER_COUNT_MAXIMUM_UNRESOLVED_MASS,
+        SPEAKER_COUNT_CONCRETE_CREDIBLE_MASS,
+        SPEAKER_COUNT_OCCUPANCY_STABILITY_WEIGHT,
+    ] {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    hasher.update(b"bounded-soft-count-prior-linear-pool-v1");
+    hasher.update(b"feature-jackknife-full-no-pitch-no-dynamics-no-formants-no-channel-v3");
     hasher.update(ACOUSTIC_ASSIGNMENT_CONFIDENCE_CALIBRATION_VERSION.as_bytes());
     for value in [
         ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR,
@@ -6929,6 +6968,7 @@ pub struct ClusterMergeTrace {
 pub struct AcousticClusteringResult {
     pub assignments: Vec<AcousticSpeakerAssignment>,
     pub profiles: Vec<SpeakerProfileSummary>,
+    pub count_estimate: Option<SpeakerCountEstimate>,
     pub detected_speakers: usize,
     pub prototype_count: usize,
     pub prototype_cap: usize,
@@ -7129,7 +7169,17 @@ where
     let speaker_queries =
         speaker_attribution_queries(&clustering.assignments, normalized_input_sha256);
     let projection = project_diarization_onto_segments(segments, &turns, word_aligned)?;
-    let fallback_status = if matches!(request.speaker_count, SpeakerCountRequest::Prior { .. }) {
+    let fallback_status = if matches!(
+        request.speaker_count,
+        SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. }
+    ) && clustering
+        .count_estimate
+        .as_ref()
+        .and_then(|estimate| estimate.selected_count)
+        .is_none()
+    {
         DiarizationFallbackStatus::SpeakerCountUnresolved
     } else if !clustering.constraints_satisfied {
         DiarizationFallbackStatus::UnsatisfiedConstraints
@@ -7193,6 +7243,31 @@ where
             projection.mixed_speaker_segment_indices.len(),
             projection.overlap_suspected_segment_indices.len(),
             clustering.calibration_status
+        ),
+        clustering.count_estimate.as_ref().map_or_else(
+            || "speaker_count_estimate=absent".to_owned(),
+            |estimate| {
+                format!(
+                    "speaker_count_schema={} selected={:?} range={:?} unresolved_probability={:.6} entropy_bits={:.6} stability={:.6} calibration={} calibration_sha256={} evidence_sha256={} prototypes={} affinity_pair_evaluations={} sparse_edges={} estimated_peak_buffer_bytes={} stability_replicates={} solver_iterations={} solver_sparse_matvec_terms={} solver_residual={:?}",
+                    estimate.schema_version,
+                    estimate.selected_count,
+                    estimate.supported_range,
+                    estimate.unresolved_probability,
+                    estimate.entropy_bits,
+                    estimate.stability,
+                    speaker_count_calibration_status_label(estimate.calibration_status),
+                    estimate.calibration_sha256,
+                    estimate.evidence_sha256,
+                    estimate.resources.prototype_count,
+                    estimate.resources.affinity_pair_evaluations,
+                    estimate.resources.retained_sparse_edges,
+                    estimate.resources.estimated_peak_buffer_bytes,
+                    estimate.resources.stability_replicates,
+                    estimate.resources.solver_iterations,
+                    estimate.resources.solver_sparse_matvec_terms,
+                    estimate.resources.solver_residual,
+                )
+            },
         ),
     ];
     let clustering_evaluation = AcousticClusteringEvaluationEvidence {
@@ -7277,19 +7352,25 @@ fn public_speaker_count_outcome(
         })
         .collect::<FwResult<Vec<_>>>()?;
     let status = match request {
-        SpeakerCountRequest::Infer if supported_speaker_count > 0 => {
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. }
+            if clustering
+                .count_estimate
+                .as_ref()
+                .and_then(|estimate| estimate.selected_count)
+                .is_some()
+                && supported_speaker_count > 0 =>
+        {
             SpeakerCountOutcomeStatus::Resolved
         }
-        SpeakerCountRequest::Infer => SpeakerCountOutcomeStatus::Unresolved,
-        SpeakerCountRequest::Prior { .. } => SpeakerCountOutcomeStatus::Unresolved,
-        SpeakerCountRequest::Range { .. } | SpeakerCountRequest::HardConstraint { .. }
-            if clustering.constraints_satisfied =>
-        {
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => SpeakerCountOutcomeStatus::Unresolved,
+        SpeakerCountRequest::HardConstraint { .. } if clustering.constraints_satisfied => {
             SpeakerCountOutcomeStatus::Satisfied
         }
-        SpeakerCountRequest::Range { .. } | SpeakerCountRequest::HardConstraint { .. } => {
-            SpeakerCountOutcomeStatus::Unsatisfied
-        }
+        SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
     };
     let mut reasons = Vec::new();
     match status {
@@ -7303,10 +7384,14 @@ fn public_speaker_count_outcome(
             reasons.push(SpeakerCountOutcomeReason::RequestedCountMismatch);
         }
         SpeakerCountOutcomeStatus::Unresolved => {
-            if matches!(request, SpeakerCountRequest::Prior { .. }) {
+            if supported_speaker_count == 0 {
+                reasons.push(SpeakerCountOutcomeReason::NoSupportedSpeakers);
+            } else if matches!(request, SpeakerCountRequest::Prior { .. })
+                && clustering.count_estimate.is_none()
+            {
                 reasons.push(SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable);
             } else {
-                reasons.push(SpeakerCountOutcomeReason::NoSupportedSpeakers);
+                reasons.push(SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved);
             }
         }
     }
@@ -7320,6 +7405,7 @@ fn public_speaker_count_outcome(
     }
     Ok(SpeakerCountOutcome {
         request: request.clone(),
+        estimate: clustering.count_estimate.clone(),
         status,
         supported_speaker_count,
         active_speaker_refs,
@@ -7510,30 +7596,12 @@ where
     validate_tracklet_timeline(tracklets)?;
     crate::model::validate_speaker_count_request(speaker_count)
         .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
-    if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
-        let assignments = tracklets.iter().map(unknown_assignment).collect::<Vec<_>>();
-        let (_, unknown_voiced_share) = assignment_voiced_shares(tracklets, &assignments)?;
-        return Ok(AcousticClusteringResult {
-            assignments,
-            profiles: Vec::new(),
-            detected_speakers: 0,
-            prototype_count: 0,
-            prototype_cap: requested_prototype_cap,
-            cap_pressure: false,
-            constraints_satisfied: false,
-            speaker_evidence: Vec::new(),
-            dominant_speaker_share: 0.0,
-            unknown_voiced_share,
-            speaker_separation_satisfied: true,
-            bootstrap_stability: 0.0,
-            requested_mode,
-            executed_mode: AcousticClusteringMode::FixedSafeV1,
-            fallback_reason: Some(AcousticClusteringFallbackReason::SpeakerCountPriorUnresolved),
-            speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
-            calibration_status: "speaker_count_prior_unresolved",
-            merge_trace: Vec::new(),
-        });
-    }
+    let constraint_lower_bound = enrollment
+        .hard_assignments
+        .values()
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1);
     if tracklets
         .iter()
         .all(|tracklet| !tracklet.voice_valid.iter().any(|valid| *valid))
@@ -7541,6 +7609,14 @@ where
         return Ok(AcousticClusteringResult {
             assignments: tracklets.iter().map(unknown_assignment).collect(),
             profiles: enrollment.summaries.clone(),
+            count_estimate: unavailable_speaker_count_estimate(
+                speaker_count,
+                constraint_lower_bound,
+                1,
+                0,
+                SpeakerCountCalibrationStatus::Unavailable,
+                SpeakerCountLaneUnavailableReason::InsufficientVoicedEvidence,
+            ),
             detected_speakers: 0,
             prototype_count: 0,
             prototype_cap: requested_prototype_cap,
@@ -7570,6 +7646,14 @@ where
         return Ok(AcousticClusteringResult {
             assignments: tracklets.iter().map(unknown_assignment).collect(),
             profiles: enrollment.summaries.clone(),
+            count_estimate: unavailable_speaker_count_estimate(
+                speaker_count,
+                constraint_lower_bound,
+                1,
+                0,
+                SpeakerCountCalibrationStatus::Unavailable,
+                SpeakerCountLaneUnavailableReason::InsufficientPrototypes,
+            ),
             detected_speakers: 0,
             prototype_count: 0,
             prototype_cap: requested_prototype_cap,
@@ -7593,12 +7677,12 @@ where
     let initial_clusters = initial_clusters(&prototypes, enrollment);
     let requested_minimum = match speaker_count {
         SpeakerCountRequest::HardConstraint { count } => *count as usize,
-        SpeakerCountRequest::Range { minimum, .. } => *minimum as usize,
-        SpeakerCountRequest::Infer => 1,
-        SpeakerCountRequest::Prior { .. } => unreachable!("prior returned before clustering"),
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => 1,
     };
     let count_constraints_feasible = requested_minimum <= initial_clusters.len();
-    let count_policy = if count_constraints_feasible {
+    let mut count_policy = if count_constraints_feasible {
         resolve_count_policy(speaker_count, initial_clusters.len())?
     } else {
         SpeakerCountPolicy {
@@ -7607,56 +7691,104 @@ where
             exact: Some(initial_clusters.len()),
         }
     };
-    let (clusters, merge_trace, bootstrap_stability, executed_mode, fallback_reason) =
-        if requested_mode == AcousticClusteringMode::ProbabilisticV1 {
-            match probabilistic_agglomerate_clusters(
-                &initial_clusters,
-                &enrollment.cannot_links,
-                count_policy,
-                &mut is_cancelled,
-            )? {
-                ProbabilisticAgglomeration::Selected {
-                    clusters,
-                    merge_trace,
-                    stability,
-                } => (
-                    clusters,
-                    merge_trace,
-                    stability,
-                    AcousticClusteringMode::ProbabilisticV1,
-                    None,
-                ),
-                ProbabilisticAgglomeration::Fallback(reason) => {
-                    let (clusters, merge_trace) = agglomerate_clusters(
-                        initial_clusters,
-                        &enrollment.cannot_links,
-                        count_policy,
-                        &mut is_cancelled,
-                    )?;
-                    (
-                        clusters,
-                        merge_trace,
-                        0.0,
-                        AcousticClusteringMode::FixedSafeV1,
-                        Some(reason),
-                    )
-                }
-            }
-        } else {
-            let (clusters, merge_trace) = agglomerate_clusters(
-                initial_clusters,
-                &enrollment.cannot_links,
-                count_policy,
-                &mut is_cancelled,
-            )?;
-            (
+    count_policy.min = count_policy.min.max(constraint_lower_bound);
+    let (
+        clusters,
+        merge_trace,
+        bootstrap_stability,
+        mut count_estimate,
+        executed_mode,
+        fallback_reason,
+    ) = if requested_mode == AcousticClusteringMode::ProbabilisticV1 {
+        match probabilistic_agglomerate_clusters(
+            &initial_clusters,
+            &enrollment.cannot_links,
+            speaker_count,
+            count_policy,
+            &mut is_cancelled,
+        )? {
+            ProbabilisticAgglomeration::Selected {
                 clusters,
                 merge_trace,
-                0.0,
-                AcousticClusteringMode::FixedSafeV1,
+                stability,
+                count_estimate,
+            } => (
+                clusters,
+                merge_trace,
+                stability,
+                Some(count_estimate),
+                AcousticClusteringMode::ProbabilisticV1,
                 None,
-            )
-        };
+            ),
+            ProbabilisticAgglomeration::Fallback {
+                reason,
+                count_estimate,
+            } => {
+                let unavailable_reason = match reason {
+                    AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions => {
+                        SpeakerCountLaneUnavailableReason::InsufficientIndependentReplicates
+                    }
+                    AcousticClusteringFallbackReason::InvalidPosterior => {
+                        SpeakerCountLaneUnavailableReason::CalibrationUnavailable
+                    }
+                    AcousticClusteringFallbackReason::UnstableSpeakerCount => {
+                        SpeakerCountLaneUnavailableReason::SolverDidNotConverge
+                    }
+                    AcousticClusteringFallbackReason::SpeakerCountPriorUnresolved => {
+                        SpeakerCountLaneUnavailableReason::CalibrationUnavailable
+                    }
+                };
+                let count_estimate = count_estimate.or_else(|| {
+                    unavailable_speaker_count_estimate(
+                        speaker_count,
+                        constraint_lower_bound,
+                        initial_clusters.len(),
+                        initial_clusters.len(),
+                        SpeakerCountCalibrationStatus::Unavailable,
+                        unavailable_reason,
+                    )
+                });
+                let (clusters, merge_trace) = agglomerate_clusters(
+                    initial_clusters,
+                    &enrollment.cannot_links,
+                    count_policy,
+                    &mut is_cancelled,
+                )?;
+                (
+                    clusters,
+                    merge_trace,
+                    0.0,
+                    count_estimate,
+                    AcousticClusteringMode::FixedSafeV1,
+                    Some(reason),
+                )
+            }
+        }
+    } else {
+        let initial_cluster_count = initial_clusters.len();
+        let (clusters, merge_trace) = agglomerate_clusters(
+            initial_clusters,
+            &enrollment.cannot_links,
+            count_policy,
+            &mut is_cancelled,
+        )?;
+        let count_estimate = unavailable_speaker_count_estimate(
+            speaker_count,
+            constraint_lower_bound,
+            initial_cluster_count,
+            initial_cluster_count,
+            SpeakerCountCalibrationStatus::FixedSafeUncalibrated,
+            SpeakerCountLaneUnavailableReason::CalibrationUnavailable,
+        );
+        (
+            clusters,
+            merge_trace,
+            0.0,
+            count_estimate,
+            AcousticClusteringMode::FixedSafeV1,
+            None,
+        )
+    };
     let labels = canonical_cluster_labels(&clusters, enrollment);
     let mut assignments = viterbi_assignments(
         tracklets,
@@ -7685,6 +7817,9 @@ where
         .iter()
         .filter(|evidence| evidence.supported)
         .count();
+    count_estimate = count_estimate.and_then(|estimate| {
+        finalize_speaker_count_estimate(estimate, &speaker_evidence, supported_speakers)
+    });
     let hard_constraints_satisfied =
         hard_assignments_satisfied(tracklets, enrollment, &assignments);
     let (dominant_speaker_share, unknown_voiced_share) =
@@ -7710,6 +7845,7 @@ where
     Ok(AcousticClusteringResult {
         assignments,
         profiles,
+        count_estimate,
         detected_speakers,
         prototype_count: prototypes.len(),
         prototype_cap: requested_prototype_cap,
@@ -8703,19 +8839,12 @@ fn resolve_count_policy(
 ) -> FwResult<SpeakerCountPolicy> {
     let (min, max, exact) = match request {
         SpeakerCountRequest::Infer => (1, available.clamp(1, 8), None),
-        SpeakerCountRequest::Range { minimum, maximum } => {
-            (*minimum as usize, *maximum as usize, None)
-        }
+        SpeakerCountRequest::Range { .. } => (1, available, None),
         SpeakerCountRequest::HardConstraint { count } => {
             let exact = *count as usize;
             (exact, exact, Some(exact))
         }
-        SpeakerCountRequest::Prior { .. } => {
-            return Err(FwError::InvalidRequest(
-                "speaker-count priors remain unresolved until calibrated posterior fusion"
-                    .to_owned(),
-            ));
-        }
+        SpeakerCountRequest::Prior { .. } => (1, available, None),
     };
     if min == 0 || min > max || min > available {
         return Err(FwError::InvalidRequest(format!(
@@ -8887,13 +9016,18 @@ enum ProbabilisticAgglomeration {
         clusters: Vec<AcousticCluster>,
         merge_trace: Vec<ClusterMergeTrace>,
         stability: f32,
+        count_estimate: SpeakerCountEstimate,
     },
-    Fallback(AcousticClusteringFallbackReason),
+    Fallback {
+        reason: AcousticClusteringFallbackReason,
+        count_estimate: Option<SpeakerCountEstimate>,
+    },
 }
 
 fn probabilistic_agglomerate_clusters<C>(
     initial: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
+    request: &SpeakerCountRequest,
     policy: SpeakerCountPolicy,
     is_cancelled: &mut C,
 ) -> FwResult<ProbabilisticAgglomeration>
@@ -8910,45 +9044,76 @@ where
             is_cancelled,
         )?
         else {
-            return Ok(ProbabilisticAgglomeration::Fallback(
-                AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions,
-            ));
+            return Ok(ProbabilisticAgglomeration::Fallback {
+                reason: AcousticClusteringFallbackReason::InsufficientSharedVoiceDimensions,
+                count_estimate: None,
+            });
         };
         lane_results.push(result);
     }
-    let spectral_proposal =
-        match build_sparse_speaker_affinity(initial, cannot_links, &mut *is_cancelled)? {
-            Some(graph) => {
-                sparse_normalized_eigengap(&graph, policy.min, policy.max, &mut *is_cancelled)?
-            }
-            None => None,
-        };
-    let Some(selected_count) =
-        fused_merge_risk_count(&lane_results, spectral_proposal.as_ref(), policy)
+    let affinity_build = build_sparse_speaker_affinity(initial, cannot_links, &mut *is_cancelled)?;
+    let spectral_run = match affinity_build.graph.as_ref() {
+        Some(graph) => {
+            sparse_normalized_eigengap_run(graph, policy.min, policy.max, &mut *is_cancelled)?
+        }
+        None => SparseEigengapRun::unavailable(
+            affinity_build
+                .unavailable_reason
+                .unwrap_or(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            0,
+            None,
+            0,
+        ),
+    };
+    let resources = speaker_count_resource_summary(&affinity_build, &spectral_run)?;
+    let spectral_proposal = spectral_run.proposal.as_ref();
+    let constraint_lower_bound = initial
+        .iter()
+        .filter_map(|cluster| cluster.hard_anchor.as_ref())
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1);
+    let Some(count_estimate) = fused_speaker_count_estimate(
+        &lane_results,
+        spectral_proposal,
+        spectral_run.unavailable_reason,
+        request,
+        policy,
+        constraint_lower_bound,
+        resources,
+    ) else {
+        return Ok(ProbabilisticAgglomeration::Fallback {
+            reason: AcousticClusteringFallbackReason::InvalidPosterior,
+            count_estimate: None,
+        });
+    };
+    let Some(selected_count) = count_estimate
+        .selected_count
+        .and_then(|count| usize::try_from(count).ok())
     else {
-        return Ok(ProbabilisticAgglomeration::Fallback(
-            AcousticClusteringFallbackReason::InvalidPosterior,
-        ));
+        return Ok(ProbabilisticAgglomeration::Fallback {
+            reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
+            count_estimate: Some(count_estimate),
+        });
     };
     let agreeing_lanes = lane_results
         .iter()
         .filter(|result| result.selected_count == selected_count)
         .count();
     let feature_stability = agreeing_lanes as f32 / SPEAKER_COUNT_PERTURBATION_LANES as f32;
-    let stability = spectral_proposal
-        .as_ref()
-        .map_or(feature_stability, |proposal| {
-            let spectral_support = if proposal.count == selected_count {
-                proposal.confidence as f32
-            } else {
-                0.0
-            };
-            0.5 * (feature_stability + spectral_support)
-        });
+    let stability = spectral_proposal.map_or(feature_stability, |proposal| {
+        let spectral_support = if proposal.count == selected_count {
+            proposal.confidence as f32
+        } else {
+            0.0
+        };
+        0.5 * (feature_stability + spectral_support)
+    });
     if stability < acoustic_speaker_pair_calibration().minimum_stable_lane_fraction {
-        return Ok(ProbabilisticAgglomeration::Fallback(
-            AcousticClusteringFallbackReason::UnstableSpeakerCount,
-        ));
+        return Ok(ProbabilisticAgglomeration::Fallback {
+            reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
+            count_estimate: Some(count_estimate),
+        });
     }
     let Some((clusters, merge_trace)) = coassociation_consensus_clusters(
         initial,
@@ -8958,33 +9123,90 @@ where
         is_cancelled,
     )?
     else {
-        return Ok(ProbabilisticAgglomeration::Fallback(
-            AcousticClusteringFallbackReason::UnstableSpeakerCount,
-        ));
+        return Ok(ProbabilisticAgglomeration::Fallback {
+            reason: AcousticClusteringFallbackReason::UnstableSpeakerCount,
+            count_estimate: Some(count_estimate),
+        });
     };
     Ok(ProbabilisticAgglomeration::Selected {
         clusters,
         merge_trace,
         stability,
+        count_estimate,
     })
 }
 
+#[cfg(test)]
 fn fused_merge_risk_count(
     lanes: &[ProbabilisticLaneResult],
     spectral: Option<&SparseEigengapProposal>,
     policy: SpeakerCountPolicy,
 ) -> Option<usize> {
+    fused_count_loss_points(lanes, spectral, policy)?
+        .into_iter()
+        .min_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .map(|(count, _)| count)
+}
+
+fn fused_count_loss_points(
+    lanes: &[ProbabilisticLaneResult],
+    spectral: Option<&SparseEigengapProposal>,
+    policy: SpeakerCountPolicy,
+) -> Option<Vec<(usize, f64)>> {
+    let merge_risk_points = merge_risk_loss_points(lanes, policy)?;
+    let candidate_count = policy.max.checked_sub(policy.min)?.checked_add(1)?;
+    let mut points = Vec::with_capacity(merge_risk_points.len());
+    for (count, mean_normalized_loss) in merge_risk_points {
+        let selected_lane_count = lanes
+            .iter()
+            .filter(|lane| lane.selected_count == count)
+            .count();
+        let smoothed_lane_probability = (selected_lane_count as f64 + 0.5)
+            / (lanes.len() as f64 + 0.5 * candidate_count as f64);
+        let spectral_probability = spectral.map_or(1.0, |proposal| {
+            if proposal.eigenvalues.is_empty()
+                || !proposal.residual.is_finite()
+                || proposal.iterations == 0
+            {
+                return 1.0e-9;
+            }
+            if candidate_count == 1 {
+                1.0
+            } else if proposal.count == count {
+                proposal.confidence.max(1.0e-9)
+            } else {
+                ((1.0 - proposal.confidence) / (candidate_count - 1) as f64).max(1.0e-9)
+            }
+        });
+        let fused_loss = mean_normalized_loss
+            - SPEAKER_COUNT_JACKKNIFE_LOG_WEIGHT * smoothed_lane_probability.ln()
+            - SPEAKER_COUNT_SPECTRAL_LOG_WEIGHT * spectral_probability.ln();
+        if !fused_loss.is_finite() {
+            return None;
+        }
+        points.push((count, fused_loss));
+    }
+    (!points.is_empty()).then_some(points)
+}
+
+fn merge_risk_loss_points(
+    lanes: &[ProbabilisticLaneResult],
+    policy: SpeakerCountPolicy,
+) -> Option<Vec<(usize, f64)>> {
     if lanes.is_empty() {
         return None;
     }
-    let candidate_count = policy.max.checked_sub(policy.min)?.checked_add(1)?;
-    let mut best = None::<(f64, usize)>;
+    let capacity = policy.max.checked_sub(policy.min)?.checked_add(1)?;
+    let mut points = Vec::with_capacity(capacity);
     for count in policy.min..=policy.max {
         if !speaker_count_allowed(count, policy) {
             continue;
         }
         let mut normalized_loss_sum = 0.0;
-        let mut selected_lane_count = 0usize;
         for lane in lanes {
             let minimum = lane
                 .risk_curve
@@ -9005,40 +9227,659 @@ fn fused_merge_risk_count(
                 .find(|point| point.count == count)?;
             let scale = (maximum - minimum).max(1.0e-9);
             normalized_loss_sum += (point.expected_loss - minimum) / scale;
-            selected_lane_count += usize::from(lane.selected_count == count);
         }
         let mean_normalized_loss = normalized_loss_sum / lanes.len() as f64;
-        let smoothed_lane_probability = (selected_lane_count as f64 + 0.5)
-            / (lanes.len() as f64 + 0.5 * candidate_count as f64);
-        let spectral_probability = spectral.map_or(1.0, |proposal| {
-            if proposal.eigenvalues.is_empty()
-                || !proposal.residual.is_finite()
-                || proposal.iterations == 0
-            {
-                return 1.0e-9;
-            }
-            if candidate_count == 1 {
-                1.0
-            } else if proposal.count == count {
-                proposal.confidence.max(1.0e-9)
-            } else {
-                ((1.0 - proposal.confidence) / (candidate_count - 1) as f64).max(1.0e-9)
-            }
-        });
-        let fused_loss = mean_normalized_loss
-            - 0.25 * smoothed_lane_probability.ln()
-            - 0.35 * spectral_probability.ln();
-        if !fused_loss.is_finite() {
+        if !mean_normalized_loss.is_finite() {
             return None;
         }
-        if best.as_ref().is_none_or(|&(best_loss, best_count)| {
-            fused_loss < best_loss
-                || (fused_loss.to_bits() == best_loss.to_bits() && count > best_count)
-        }) {
-            best = Some((fused_loss, count));
+        points.push((count, mean_normalized_loss));
+    }
+    (!points.is_empty()).then_some(points)
+}
+
+fn fused_speaker_count_estimate(
+    lanes: &[ProbabilisticLaneResult],
+    spectral: Option<&SparseEigengapProposal>,
+    spectral_unavailable_reason: Option<SpeakerCountLaneUnavailableReason>,
+    request: &SpeakerCountRequest,
+    policy: SpeakerCountPolicy,
+    constraint_lower_bound: usize,
+    resources: SpeakerCountResourceSummary,
+) -> Option<SpeakerCountEstimate> {
+    let merge_risk_losses = merge_risk_loss_points(lanes, policy)?;
+    let merge_risk_count = merge_risk_losses
+        .iter()
+        .min_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })?
+        .0;
+    let mut ordered_merge_risk_losses = merge_risk_losses
+        .iter()
+        .map(|(_, loss)| *loss)
+        .collect::<Vec<_>>();
+    ordered_merge_risk_losses.sort_by(f64::total_cmp);
+    let risk_confidence = if ordered_merge_risk_losses.len() > 1 {
+        (1.0 - (-(ordered_merge_risk_losses[1] - ordered_merge_risk_losses[0]).max(0.0)).exp())
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut losses = fused_count_loss_points(lanes, spectral, policy)?;
+    losses.sort_by_key(|(count, _)| *count);
+    let minimum_loss = losses
+        .iter()
+        .map(|(_, loss)| *loss)
+        .min_by(f64::total_cmp)?;
+    let mut concrete_weights = losses
+        .iter()
+        .map(|(count, loss)| (*count, (minimum_loss - *loss).exp()))
+        .collect::<Vec<_>>();
+    let concrete_weight_sum = concrete_weights
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<f64>();
+    if !concrete_weight_sum.is_finite() || concrete_weight_sum <= 0.0 {
+        return None;
+    }
+    for (_, weight) in &mut concrete_weights {
+        *weight /= concrete_weight_sum;
+    }
+    let acoustic_map_count = concrete_weights
+        .iter()
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })?
+        .0;
+    let acoustic_selection_stability = lanes
+        .iter()
+        .filter(|lane| lane.selected_count == acoustic_map_count)
+        .count() as f64
+        / lanes.len() as f64;
+
+    // A soft request is deliberately a bounded linear pool rather than a
+    // log-pool. Log evidence gives a caller's zero or near-zero probability
+    // unbounded leverage and can therefore behave like an undeclared hard
+    // constraint. The linear pool guarantees that every acoustically
+    // supported count retains most of its acoustic probability while still
+    // allowing the caller to move posterior mass. Five-lane acoustic agreement
+    // attenuates the caller's influence further, so a contradictory hint
+    // cannot veto unanimous evidence indirectly through the unresolved-mass
+    // threshold.
+    let mut soft_prior_weights = vec![0.0; concrete_weights.len()];
+    match request {
+        SpeakerCountRequest::Prior { bins } => {
+            for (index, (count, _)) in concrete_weights.iter().enumerate() {
+                soft_prior_weights[index] = bins
+                    .iter()
+                    .find(|bin| bin.count as usize == *count)
+                    .map_or(0.0, |bin| bin.probability);
+            }
+        }
+        SpeakerCountRequest::Range { minimum, maximum } => {
+            for (index, (count, _)) in concrete_weights.iter().enumerate() {
+                let count = u32::try_from(*count).ok()?;
+                if (*minimum..=*maximum).contains(&count) {
+                    soft_prior_weights[index] = 1.0;
+                }
+            }
+        }
+        SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. } => {}
+    }
+    let soft_prior_weight_sum = soft_prior_weights.iter().sum::<f64>();
+    if soft_prior_weight_sum.is_finite() && soft_prior_weight_sum > 0.0 {
+        let effective_prior_mix_weight = SPEAKER_COUNT_SOFT_PRIOR_MIX_WEIGHT
+            * (1.0 - SPEAKER_COUNT_SOFT_PRIOR_STABILITY_ATTENUATION * acoustic_selection_stability);
+        for ((_, acoustic_weight), prior_weight) in
+            concrete_weights.iter_mut().zip(soft_prior_weights)
+        {
+            let normalized_prior_weight = prior_weight / soft_prior_weight_sum;
+            *acoustic_weight = (1.0 - effective_prior_mix_weight) * *acoustic_weight
+                + effective_prior_mix_weight * normalized_prior_weight;
         }
     }
-    best.map(|(_, count)| count)
+    let concrete_weight_sum = concrete_weights
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<f64>();
+    if !concrete_weight_sum.is_finite() || concrete_weight_sum <= 0.0 {
+        return None;
+    }
+
+    let mut lane_counts = BTreeMap::<usize, usize>::new();
+    for lane in lanes {
+        *lane_counts.entry(lane.selected_count).or_default() += 1;
+    }
+    let (jackknife_count, agreeing_lanes) = lane_counts
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))?;
+    let jackknife_stability = agreeing_lanes as f64 / lanes.len() as f64;
+    let raw_map_count = concrete_weights
+        .iter()
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })?
+        .0;
+    let selection_stability = lanes
+        .iter()
+        .filter(|lane| lane.selected_count == raw_map_count)
+        .count() as f64
+        / lanes.len() as f64;
+    let spectral_confidence = spectral.map_or(0.0, |proposal| proposal.confidence);
+    let evidence_strength = SPEAKER_COUNT_STABILITY_EVIDENCE_WEIGHT * selection_stability
+        + SPEAKER_COUNT_RISK_EVIDENCE_WEIGHT * risk_confidence
+        + SPEAKER_COUNT_SPECTRAL_EVIDENCE_WEIGHT * spectral_confidence;
+    let unresolved_probability = (SPEAKER_COUNT_UNRESOLVED_INTERCEPT
+        - SPEAKER_COUNT_UNRESOLVED_EVIDENCE_SLOPE * evidence_strength)
+        .clamp(
+            SPEAKER_COUNT_MINIMUM_UNRESOLVED_MASS,
+            SPEAKER_COUNT_MAXIMUM_UNRESOLVED_MASS,
+        );
+    let concrete_mass = 1.0 - unresolved_probability;
+    for (_, weight) in &mut concrete_weights {
+        *weight = concrete_mass * *weight / concrete_weight_sum;
+    }
+    let map = concrete_weights
+        .iter()
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .copied()?;
+    let selected_count = (selection_stability
+        >= f64::from(acoustic_speaker_pair_calibration().minimum_stable_lane_fraction)
+        && map.1 >= unresolved_probability)
+        .then_some(u32::try_from(map.0).ok()?);
+
+    let mut credible_bins = concrete_weights.clone();
+    credible_bins.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let credible_target = SPEAKER_COUNT_CONCRETE_CREDIBLE_MASS * concrete_mass;
+    let mut credible_mass = 0.0;
+    let mut credible_minimum = usize::MAX;
+    let mut credible_maximum = 0usize;
+    for (count, probability) in credible_bins {
+        credible_mass += probability;
+        credible_minimum = credible_minimum.min(count);
+        credible_maximum = credible_maximum.max(count);
+        if credible_mass + f64::EPSILON >= credible_target {
+            break;
+        }
+    }
+    if credible_minimum == usize::MAX {
+        return None;
+    }
+    let supported_range = SpeakerCountRange {
+        minimum: u32::try_from(credible_minimum).ok()?,
+        maximum: u32::try_from(credible_maximum).ok()?,
+    };
+    let posterior = concrete_weights
+        .into_iter()
+        .map(|(count, probability)| {
+            Some(SpeakerCountPosteriorBin {
+                count: u32::try_from(count).ok()?,
+                probability,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let entropy_bits = posterior
+        .iter()
+        .map(|bin| count_entropy_term(bin.probability))
+        .sum::<f64>()
+        + count_entropy_term(unresolved_probability);
+    let constraint_lower_bound = u32::try_from(constraint_lower_bound).ok()?;
+    let candidate_upper_bound = u32::try_from(policy.max).ok()?;
+    let calibration_sha256 = acoustic_speaker_pair_calibration_sha256();
+    let evidence_sha256 = speaker_count_evidence_sha256(
+        lanes,
+        spectral,
+        &resources,
+        request,
+        constraint_lower_bound,
+        candidate_upper_bound,
+    );
+    let prior_lane =
+        speaker_count_prior_lane(request, constraint_lower_bound, candidate_upper_bound)?;
+    let estimate = SpeakerCountEstimate {
+        schema_version: SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION.to_owned(),
+        selected_count,
+        supported_range: Some(supported_range),
+        posterior,
+        unresolved_probability,
+        entropy_bits,
+        stability: selection_stability,
+        constraint_lower_bound,
+        candidate_upper_bound,
+        calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+        calibration_sha256,
+        evidence_sha256,
+        lanes: vec![
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::MergeRisk,
+                available: true,
+                proposed_count: Some(u32::try_from(merge_risk_count).ok()?),
+                confidence: risk_confidence,
+                unavailable_reason: None,
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                available: spectral.is_some(),
+                proposed_count: spectral.and_then(|proposal| u32::try_from(proposal.count).ok()),
+                confidence: spectral_confidence,
+                unavailable_reason: spectral.is_none().then_some(
+                    spectral_unavailable_reason
+                        .unwrap_or(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+                ),
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::FeatureJackknife,
+                available: true,
+                proposed_count: Some(u32::try_from(jackknife_count).ok()?),
+                confidence: jackknife_stability,
+                unavailable_reason: None,
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+                available: false,
+                proposed_count: None,
+                confidence: 0.0,
+                unavailable_reason: Some(
+                    SpeakerCountLaneUnavailableReason::InsufficientVoicedEvidence,
+                ),
+            },
+            SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::ConstraintGraph,
+                available: true,
+                proposed_count: Some(constraint_lower_bound),
+                confidence: 1.0,
+                unavailable_reason: None,
+            },
+            prior_lane,
+        ],
+        resources,
+    };
+    estimate.validate().ok()?;
+    Some(estimate)
+}
+
+fn speaker_count_evidence_sha256(
+    lanes: &[ProbabilisticLaneResult],
+    spectral: Option<&SparseEigengapProposal>,
+    resources: &SpeakerCountResourceSummary,
+    request: &SpeakerCountRequest,
+    constraint_lower_bound: u32,
+    candidate_upper_bound: u32,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION.as_bytes());
+    hasher.update(ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.as_bytes());
+    hasher.update(constraint_lower_bound.to_le_bytes());
+    hasher.update(candidate_upper_bound.to_le_bytes());
+    hash_speaker_count_resources(&mut hasher, resources);
+    hash_speaker_count_request(&mut hasher, request);
+    for lane in lanes {
+        hasher.update((lane.selected_count as u64).to_le_bytes());
+        for point in &lane.risk_curve.points {
+            hasher.update((point.count as u64).to_le_bytes());
+            hasher.update(point.expected_loss.to_bits().to_le_bytes());
+        }
+    }
+    if let Some(spectral) = spectral {
+        hasher.update((spectral.count as u64).to_le_bytes());
+        hasher.update(spectral.confidence.to_bits().to_le_bytes());
+        hasher.update(spectral.residual.to_bits().to_le_bytes());
+        hasher.update((spectral.iterations as u64).to_le_bytes());
+        for eigenvalue in &spectral.eigenvalues {
+            hasher.update(eigenvalue.to_bits().to_le_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_speaker_count_resources(hasher: &mut Sha256, resources: &SpeakerCountResourceSummary) {
+    hasher.update(resources.prototype_count.to_le_bytes());
+    hasher.update(resources.affinity_pair_evaluations.to_le_bytes());
+    hasher.update(resources.retained_sparse_edges.to_le_bytes());
+    hasher.update(resources.estimated_peak_buffer_bytes.to_le_bytes());
+    hasher.update(resources.stability_replicates.to_le_bytes());
+    hasher.update(resources.solver_iterations.to_le_bytes());
+    hasher.update(resources.solver_sparse_matvec_terms.to_le_bytes());
+    match resources.solver_residual {
+        Some(residual) => {
+            hasher.update([1]);
+            hasher.update(residual.to_bits().to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn count_entropy_term(probability: f64) -> f64 {
+    if probability > 0.0 {
+        -probability * probability.log2()
+    } else {
+        0.0
+    }
+}
+
+fn unavailable_speaker_count_resources(
+    prototype_count: usize,
+) -> Option<SpeakerCountResourceSummary> {
+    Some(SpeakerCountResourceSummary {
+        prototype_count: u32::try_from(prototype_count).ok()?,
+        affinity_pair_evaluations: 0,
+        retained_sparse_edges: 0,
+        estimated_peak_buffer_bytes: 0,
+        stability_replicates: 0,
+        solver_iterations: 0,
+        solver_sparse_matvec_terms: 0,
+        solver_residual: None,
+    })
+}
+
+fn unavailable_speaker_count_estimate(
+    request: &SpeakerCountRequest,
+    constraint_lower_bound: usize,
+    available_candidates: usize,
+    prototype_count: usize,
+    calibration_status: SpeakerCountCalibrationStatus,
+    unavailable_reason: SpeakerCountLaneUnavailableReason,
+) -> Option<SpeakerCountEstimate> {
+    let constraint_lower_bound = u32::try_from(constraint_lower_bound).ok()?;
+    let available_candidates = u32::try_from(available_candidates)
+        .ok()?
+        .clamp(1, MAX_SPEAKER_COUNT);
+    let requested_upper_bound = match request {
+        SpeakerCountRequest::Infer => available_candidates,
+        SpeakerCountRequest::Prior { bins } => bins.last()?.count.max(available_candidates),
+        SpeakerCountRequest::Range { maximum, .. } => (*maximum).max(available_candidates),
+        SpeakerCountRequest::HardConstraint { count } => *count,
+    };
+    let candidate_upper_bound = requested_upper_bound.max(constraint_lower_bound);
+    let prior_lane =
+        speaker_count_prior_lane(request, constraint_lower_bound, candidate_upper_bound)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"speaker-count-unavailable-v1");
+    hash_speaker_count_request(&mut hasher, request);
+    hasher.update(constraint_lower_bound.to_le_bytes());
+    hasher.update(candidate_upper_bound.to_le_bytes());
+    hasher.update(speaker_count_calibration_status_label(calibration_status).as_bytes());
+    hasher.update(speaker_count_lane_unavailable_reason_label(unavailable_reason).as_bytes());
+    let resources = unavailable_speaker_count_resources(prototype_count)?;
+    hash_speaker_count_resources(&mut hasher, &resources);
+    let evidence_sha256 = format!("{:x}", hasher.finalize());
+    let mut lanes = [
+        SpeakerCountEvidenceLane::MergeRisk,
+        SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+        SpeakerCountEvidenceLane::FeatureJackknife,
+        SpeakerCountEvidenceLane::EffectiveOccupancy,
+    ]
+    .into_iter()
+    .map(|lane| SpeakerCountLaneEvidence {
+        lane,
+        available: false,
+        proposed_count: None,
+        confidence: 0.0,
+        unavailable_reason: Some(unavailable_reason),
+    })
+    .collect::<Vec<_>>();
+    lanes.push(SpeakerCountLaneEvidence {
+        lane: SpeakerCountEvidenceLane::ConstraintGraph,
+        available: true,
+        proposed_count: Some(constraint_lower_bound),
+        confidence: 1.0,
+        unavailable_reason: None,
+    });
+    lanes.push(prior_lane);
+    let estimate = SpeakerCountEstimate {
+        schema_version: SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION.to_owned(),
+        selected_count: None,
+        supported_range: None,
+        posterior: Vec::new(),
+        unresolved_probability: 1.0,
+        entropy_bits: 0.0,
+        stability: 0.0,
+        constraint_lower_bound,
+        candidate_upper_bound,
+        calibration_status,
+        calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
+        evidence_sha256,
+        lanes,
+        resources,
+    };
+    estimate.validate().ok()?;
+    Some(estimate)
+}
+
+fn unavailable_count_prior_lane(
+    reason: SpeakerCountLaneUnavailableReason,
+) -> SpeakerCountLaneEvidence {
+    SpeakerCountLaneEvidence {
+        lane: SpeakerCountEvidenceLane::CallerPrior,
+        available: false,
+        proposed_count: None,
+        confidence: 0.0,
+        unavailable_reason: Some(reason),
+    }
+}
+
+fn speaker_count_prior_lane(
+    request: &SpeakerCountRequest,
+    constraint_lower_bound: u32,
+    candidate_upper_bound: u32,
+) -> Option<SpeakerCountLaneEvidence> {
+    match request {
+        SpeakerCountRequest::Prior { bins } => {
+            let proposed = bins
+                .iter()
+                .filter(|bin| {
+                    bin.count >= constraint_lower_bound && bin.count <= candidate_upper_bound
+                })
+                .max_by(|left, right| {
+                    left.probability
+                        .total_cmp(&right.probability)
+                        .then_with(|| right.count.cmp(&left.count))
+                });
+            Some(proposed.map_or_else(
+                || {
+                    unavailable_count_prior_lane(
+                        SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
+                    )
+                },
+                |proposed| SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: true,
+                    proposed_count: Some(proposed.count),
+                    confidence: proposed.probability,
+                    unavailable_reason: None,
+                },
+            ))
+        }
+        SpeakerCountRequest::Range { minimum, maximum } => {
+            let width = maximum.checked_sub(*minimum)?.checked_add(1)?;
+            if *maximum < constraint_lower_bound || *minimum > candidate_upper_bound {
+                Some(unavailable_count_prior_lane(
+                    SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
+                ))
+            } else {
+                Some(SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: true,
+                    proposed_count: Some((*minimum).max(constraint_lower_bound)),
+                    confidence: 1.0 / f64::from(width),
+                    unavailable_reason: None,
+                })
+            }
+        }
+        SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. } => Some(
+            unavailable_count_prior_lane(SpeakerCountLaneUnavailableReason::NotRequested),
+        ),
+    }
+}
+
+fn hash_speaker_count_request(hasher: &mut Sha256, request: &SpeakerCountRequest) {
+    match request {
+        SpeakerCountRequest::Infer => hasher.update(b"infer"),
+        SpeakerCountRequest::Range { minimum, maximum } => {
+            hasher.update(b"range");
+            hasher.update(minimum.to_le_bytes());
+            hasher.update(maximum.to_le_bytes());
+        }
+        SpeakerCountRequest::HardConstraint { count } => {
+            hasher.update(b"hard");
+            hasher.update(count.to_le_bytes());
+        }
+        SpeakerCountRequest::Prior { bins } => {
+            hasher.update(b"prior");
+            for bin in bins {
+                hasher.update(bin.count.to_le_bytes());
+                hasher.update(bin.probability.to_bits().to_le_bytes());
+            }
+        }
+    }
+}
+
+const fn speaker_count_calibration_status_label(
+    status: SpeakerCountCalibrationStatus,
+) -> &'static str {
+    match status {
+        SpeakerCountCalibrationStatus::Certified => "certified",
+        SpeakerCountCalibrationStatus::DevelopmentUncertified => "development_uncertified",
+        SpeakerCountCalibrationStatus::FixedSafeUncalibrated => "fixed_safe_uncalibrated",
+        SpeakerCountCalibrationStatus::Unavailable => "unavailable",
+    }
+}
+
+const fn speaker_count_lane_unavailable_reason_label(
+    reason: SpeakerCountLaneUnavailableReason,
+) -> &'static str {
+    match reason {
+        SpeakerCountLaneUnavailableReason::InsufficientPrototypes => "insufficient_prototypes",
+        SpeakerCountLaneUnavailableReason::InvalidAffinity => "invalid_affinity",
+        SpeakerCountLaneUnavailableReason::SolverDidNotConverge => "solver_did_not_converge",
+        SpeakerCountLaneUnavailableReason::InsufficientIndependentReplicates => {
+            "insufficient_independent_replicates"
+        }
+        SpeakerCountLaneUnavailableReason::InsufficientVoicedEvidence => {
+            "insufficient_voiced_evidence"
+        }
+        SpeakerCountLaneUnavailableReason::NotRequested => "not_requested",
+        SpeakerCountLaneUnavailableReason::CalibrationUnavailable => "calibration_unavailable",
+        SpeakerCountLaneUnavailableReason::ResourceLimit => "resource_limit",
+        SpeakerCountLaneUnavailableReason::ContradictoryConstraints => "contradictory_constraints",
+    }
+}
+
+fn finalize_speaker_count_estimate(
+    mut estimate: SpeakerCountEstimate,
+    evidence: &[AcousticSpeakerEvidenceSummary],
+    supported_speakers: usize,
+) -> Option<SpeakerCountEstimate> {
+    let supported_count = u32::try_from(supported_speakers).ok()?;
+    let supported = evidence
+        .iter()
+        .filter(|speaker| speaker.supported)
+        .collect::<Vec<_>>();
+    let occupancy_confidence = if supported.is_empty() {
+        0.0
+    } else {
+        supported
+            .iter()
+            .map(|speaker| {
+                f64::from(
+                    speaker
+                        .mean_assignment_confidence
+                        .min(speaker.cluster_reliability),
+                )
+            })
+            .fold(1.0_f64, f64::min)
+            .clamp(0.0, 1.0)
+    };
+    let occupancy_in_bounds = supported_count >= estimate.constraint_lower_bound
+        && supported_count <= estimate.candidate_upper_bound
+        && supported_count > 0;
+    let occupancy_lane = estimate
+        .lanes
+        .iter_mut()
+        .find(|lane| lane.lane == SpeakerCountEvidenceLane::EffectiveOccupancy)?;
+    if occupancy_in_bounds {
+        *occupancy_lane = SpeakerCountLaneEvidence {
+            lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+            available: true,
+            proposed_count: Some(supported_count),
+            confidence: occupancy_confidence,
+            unavailable_reason: None,
+        };
+    } else {
+        *occupancy_lane = SpeakerCountLaneEvidence {
+            lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+            available: false,
+            proposed_count: None,
+            confidence: 0.0,
+            unavailable_reason: Some(if supported_count == 0 {
+                SpeakerCountLaneUnavailableReason::InsufficientVoicedEvidence
+            } else {
+                SpeakerCountLaneUnavailableReason::ContradictoryConstraints
+            }),
+        };
+    }
+
+    let occupancy_agreement =
+        if estimate.selected_count == Some(supported_count) && occupancy_in_bounds {
+            occupancy_confidence
+        } else {
+            0.0
+        };
+    estimate.stability = ((1.0 - SPEAKER_COUNT_OCCUPANCY_STABILITY_WEIGHT) * estimate.stability
+        + SPEAKER_COUNT_OCCUPANCY_STABILITY_WEIGHT * occupancy_agreement)
+        .clamp(0.0, 1.0);
+    if occupancy_agreement == 0.0 {
+        estimate.selected_count = None;
+        let unresolved_probability = estimate.unresolved_probability.max(0.51);
+        let old_concrete_mass = 1.0 - estimate.unresolved_probability;
+        let new_concrete_mass = 1.0 - unresolved_probability;
+        if old_concrete_mass > f64::EPSILON {
+            for bin in &mut estimate.posterior {
+                bin.probability *= new_concrete_mass / old_concrete_mass;
+            }
+        } else {
+            estimate.posterior.clear();
+        }
+        estimate.unresolved_probability = unresolved_probability;
+    }
+    estimate.entropy_bits = estimate
+        .posterior
+        .iter()
+        .map(|bin| count_entropy_term(bin.probability))
+        .sum::<f64>()
+        + count_entropy_term(estimate.unresolved_probability);
+    let mut hasher = Sha256::new();
+    hasher.update(b"speaker-count-occupancy-finalization-v1");
+    hasher.update(estimate.evidence_sha256.as_bytes());
+    hasher.update(supported_count.to_le_bytes());
+    for speaker in evidence {
+        hasher.update((speaker.assigned_tracklet_count as u64).to_le_bytes());
+        hasher.update((speaker.independent_tracklet_count as u64).to_le_bytes());
+        hasher.update((speaker.recurrence_episode_count as u64).to_le_bytes());
+        hasher.update((speaker.voiced_frame_count as u64).to_le_bytes());
+        hasher.update((speaker.independent_voiced_frame_count as u64).to_le_bytes());
+        hasher.update(speaker.voiced_duration_ms.to_le_bytes());
+        hasher.update(speaker.mean_assignment_confidence.to_bits().to_le_bytes());
+        hasher.update(speaker.cluster_reliability.to_bits().to_le_bytes());
+        hasher.update([u8::from(speaker.hard_anchored), u8::from(speaker.supported)]);
+    }
+    estimate.evidence_sha256 = format!("{:x}", hasher.finalize());
+    estimate.validate().ok()?;
+    Some(estimate)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9046,6 +9887,15 @@ struct SparseSpeakerAffinityGraph {
     rows: Vec<Vec<(usize, f64)>>,
     degrees: Vec<f64>,
     undirected_edge_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SparseSpeakerAffinityBuild {
+    graph: Option<SparseSpeakerAffinityGraph>,
+    prototype_count: usize,
+    affinity_pair_evaluations: u64,
+    estimated_peak_buffer_bytes: u64,
+    unavailable_reason: Option<SpeakerCountLaneUnavailableReason>,
 }
 
 impl SparseSpeakerAffinityGraph {
@@ -9089,22 +9939,62 @@ struct SparseEigengapProposal {
     iterations: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct SparseEigengapRun {
+    proposal: Option<SparseEigengapProposal>,
+    iterations: usize,
+    residual: Option<f64>,
+    subspace_dimensions: usize,
+    unavailable_reason: Option<SpeakerCountLaneUnavailableReason>,
+}
+
+impl SparseEigengapRun {
+    fn unavailable(
+        reason: SpeakerCountLaneUnavailableReason,
+        iterations: usize,
+        residual: Option<f64>,
+        subspace_dimensions: usize,
+    ) -> Self {
+        Self {
+            proposal: None,
+            iterations,
+            residual,
+            subspace_dimensions,
+            unavailable_reason: Some(reason),
+        }
+    }
+}
+
 fn build_sparse_speaker_affinity<C>(
     clusters: &[AcousticCluster],
     cannot_links: &BTreeSet<(String, String)>,
     mut is_cancelled: C,
-) -> FwResult<Option<SparseSpeakerAffinityGraph>>
+) -> FwResult<SparseSpeakerAffinityBuild>
 where
     C: FnMut() -> bool,
 {
+    let prototype_count = clusters.len();
     if clusters.len() < 2 {
-        return Ok(None);
+        return Ok(SparseSpeakerAffinityBuild {
+            graph: None,
+            prototype_count,
+            affinity_pair_evaluations: 0,
+            estimated_peak_buffer_bytes: 0,
+            unavailable_reason: Some(SpeakerCountLaneUnavailableReason::InsufficientPrototypes),
+        });
     }
     let edge_capacity = clusters
         .len()
         .checked_mul(SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE)
+        .map(|directed_capacity| directed_capacity / 2)
         .ok_or_else(|| FwError::InvalidRequest("speaker affinity edge cap overflow".to_owned()))?;
-    let mut retained_edges = BTreeMap::<(usize, usize), f64>::new();
+    let mut affinity_pair_evaluations = 0_u64;
+    let estimated_peak_buffer_bytes = estimated_sparse_affinity_peak_bytes(
+        clusters.len(),
+        edge_capacity,
+        SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE,
+    )?;
+    let mut candidate_edges = BTreeMap::<(usize, usize), f64>::new();
     for left in 0..clusters.len() {
         if left.is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES) && is_cancelled() {
             return Err(FwError::Cancelled(format!(
@@ -9118,6 +10008,10 @@ where
             {
                 continue;
             }
+            affinity_pair_evaluations =
+                affinity_pair_evaluations.checked_add(1).ok_or_else(|| {
+                    FwError::InvalidRequest("speaker affinity comparison count overflow".to_owned())
+                })?;
             let Some(evidence) = cluster_pair_evidence(
                 &clusters[left],
                 &clusters[right],
@@ -9145,23 +10039,56 @@ where
             } else {
                 (right, left)
             };
-            retained_edges
+            candidate_edges
                 .entry(edge)
-                .and_modify(|retained| *retained = retained.max(weight))
+                .and_modify(|candidate| *candidate = candidate.max(weight))
                 .or_insert(weight);
         }
     }
-    if retained_edges.is_empty() {
-        return Ok(None);
+    if candidate_edges.is_empty() {
+        return Ok(SparseSpeakerAffinityBuild {
+            graph: None,
+            prototype_count,
+            affinity_pair_evaluations,
+            estimated_peak_buffer_bytes,
+            unavailable_reason: Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+        });
     }
-    if retained_edges.len() > edge_capacity {
-        return Err(FwError::InvalidRequest(
-            "symmetrized speaker affinity exceeded its edge cap".to_owned(),
-        ));
+    let mut candidate_edges = candidate_edges
+        .into_iter()
+        .map(|((left, right), weight)| (weight, left, right))
+        .collect::<Vec<_>>();
+    candidate_edges.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let mut retained_degrees = vec![0usize; clusters.len()];
+    let mut retained_edges = Vec::with_capacity(edge_capacity.min(candidate_edges.len()));
+    for (weight, left, right) in candidate_edges {
+        if retained_degrees[left] >= SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE
+            || retained_degrees[right] >= SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE
+        {
+            continue;
+        }
+        retained_degrees[left] += 1;
+        retained_degrees[right] += 1;
+        retained_edges.push((left, right, weight));
+    }
+    if retained_edges.is_empty() {
+        return Ok(SparseSpeakerAffinityBuild {
+            graph: None,
+            prototype_count,
+            affinity_pair_evaluations,
+            estimated_peak_buffer_bytes,
+            unavailable_reason: Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+        });
     }
     let mut rows = vec![Vec::new(); clusters.len()];
     let mut degrees = vec![1.0; clusters.len()];
-    for ((left, right), weight) in retained_edges {
+    for (left, right, weight) in retained_edges {
         rows[left].push((right, weight));
         rows[right].push((left, weight));
         degrees[left] += weight;
@@ -9170,42 +10097,188 @@ where
     for row in &mut rows {
         row.sort_by_key(|(neighbor, _)| *neighbor);
     }
+    if rows
+        .iter()
+        .any(|row| row.len() > SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE)
+    {
+        return Err(FwError::InvalidRequest(
+            "symmetrized speaker affinity exceeded its row-degree cap".to_owned(),
+        ));
+    }
     let undirected_edge_count = rows.iter().map(Vec::len).sum::<usize>() / 2;
-    Ok(Some(SparseSpeakerAffinityGraph {
-        rows,
-        degrees,
-        undirected_edge_count,
-    }))
+    Ok(SparseSpeakerAffinityBuild {
+        graph: Some(SparseSpeakerAffinityGraph {
+            rows,
+            degrees,
+            undirected_edge_count,
+        }),
+        prototype_count,
+        affinity_pair_evaluations,
+        estimated_peak_buffer_bytes,
+        unavailable_reason: None,
+    })
 }
 
-fn sparse_normalized_eigengap<C>(
+fn estimated_sparse_affinity_peak_bytes(
+    prototype_count: usize,
+    retained_edge_capacity: usize,
+    neighbor_degree: usize,
+) -> FwResult<u64> {
+    let node_bytes = prototype_count
+        .checked_mul(
+            std::mem::size_of::<Vec<(usize, f64)>>()
+                + std::mem::size_of::<f64>()
+                + std::mem::size_of::<usize>(),
+        )
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker affinity node-buffer byte count overflow".to_owned())
+        })?;
+    let retained_edge_bytes = retained_edge_capacity
+        .checked_mul(2)
+        .and_then(|directed_edges| directed_edges.checked_mul(std::mem::size_of::<(usize, f64)>()))
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker affinity edge-buffer byte count overflow".to_owned())
+        })?;
+    let row_candidate_bytes = prototype_count
+        .checked_mul(std::mem::size_of::<(f64, usize)>())
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker affinity candidate-row byte count overflow".to_owned())
+        })?;
+    let retained_candidate_bytes = prototype_count
+        .checked_mul(neighbor_degree)
+        .and_then(|edges| edges.checked_mul(std::mem::size_of::<(f64, usize, usize)>()))
+        .ok_or_else(|| {
+            FwError::InvalidRequest(
+                "speaker affinity candidate-edge byte count overflow".to_owned(),
+            )
+        })?;
+    node_bytes
+        .checked_add(retained_edge_bytes)
+        .and_then(|bytes| bytes.checked_add(row_candidate_bytes))
+        .and_then(|bytes| bytes.checked_add(retained_candidate_bytes))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker affinity peak byte estimate overflow".to_owned())
+        })
+}
+
+fn speaker_count_resource_summary(
+    affinity: &SparseSpeakerAffinityBuild,
+    solver: &SparseEigengapRun,
+) -> FwResult<SpeakerCountResourceSummary> {
+    let retained_sparse_edges = affinity
+        .graph
+        .as_ref()
+        .map_or(0, |graph| graph.undirected_edge_count);
+    let node_count = affinity.prototype_count;
+    let sparse_product_terms = node_count
+        .checked_add(retained_sparse_edges.checked_mul(2).ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count sparse term count overflow".to_owned())
+        })?)
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count sparse term count overflow".to_owned())
+        })?;
+    let solver_sparse_matvec_terms = sparse_product_terms
+        .checked_mul(solver.subspace_dimensions)
+        .and_then(|terms| terms.checked_mul(2))
+        .and_then(|terms| terms.checked_mul(solver.iterations))
+        .and_then(|terms| u64::try_from(terms).ok())
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count solver operation count overflow".to_owned())
+        })?;
+    let solver_vector_bytes = node_count
+        .checked_mul(solver.subspace_dimensions)
+        .and_then(|values| values.checked_mul(3))
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count solver vector byte count overflow".to_owned())
+        })?;
+    let solver_matrix_bytes = solver
+        .subspace_dimensions
+        .checked_mul(solver.subspace_dimensions)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count solver matrix byte count overflow".to_owned())
+        })?;
+    let estimated_peak_buffer_bytes = affinity
+        .estimated_peak_buffer_bytes
+        .checked_add(u64::try_from(solver_vector_bytes).map_err(|_| {
+            FwError::InvalidRequest("speaker-count solver vector byte count overflow".to_owned())
+        })?)
+        .and_then(|bytes| bytes.checked_add(u64::try_from(solver_matrix_bytes).ok()?))
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count peak byte estimate overflow".to_owned())
+        })?;
+    Ok(SpeakerCountResourceSummary {
+        prototype_count: u32::try_from(affinity.prototype_count).map_err(|_| {
+            FwError::InvalidRequest("speaker-count prototype count overflow".to_owned())
+        })?,
+        affinity_pair_evaluations: affinity.affinity_pair_evaluations,
+        retained_sparse_edges: u32::try_from(retained_sparse_edges).map_err(|_| {
+            FwError::InvalidRequest("speaker-count sparse edge count overflow".to_owned())
+        })?,
+        estimated_peak_buffer_bytes,
+        stability_replicates: u32::try_from(SPEAKER_COUNT_PERTURBATION_LANES).map_err(|_| {
+            FwError::InvalidRequest("speaker-count replicate count overflow".to_owned())
+        })?,
+        solver_iterations: u32::try_from(solver.iterations).map_err(|_| {
+            FwError::InvalidRequest("speaker-count solver iteration count overflow".to_owned())
+        })?,
+        solver_sparse_matvec_terms,
+        solver_residual: solver.residual,
+    })
+}
+
+fn sparse_normalized_eigengap_run<C>(
     graph: &SparseSpeakerAffinityGraph,
     minimum_count: usize,
     maximum_count: usize,
     mut is_cancelled: C,
-) -> FwResult<Option<SparseEigengapProposal>>
+) -> FwResult<SparseEigengapRun>
 where
     C: FnMut() -> bool,
 {
     let node_count = graph.rows.len();
     if node_count == 0 || graph.degrees.len() != node_count {
-        return Ok(None);
+        return Ok(SparseEigengapRun::unavailable(
+            SpeakerCountLaneUnavailableReason::InvalidAffinity,
+            0,
+            None,
+            0,
+        ));
     }
     if node_count == 1 {
-        return Ok(Some(SparseEigengapProposal {
+        let proposal = SparseEigengapProposal {
             count: 1,
             confidence: 1.0,
             eigenvalues: vec![1.0],
             residual: 0.0,
             iterations: 0,
-        }));
+        };
+        return Ok(SparseEigengapRun {
+            proposal: Some(proposal),
+            iterations: 0,
+            residual: Some(0.0),
+            subspace_dimensions: 1,
+            unavailable_reason: None,
+        });
     }
     if graph.undirected_edge_count == 0 || minimum_count == 0 || minimum_count > maximum_count {
-        return Ok(None);
+        return Ok(SparseEigengapRun::unavailable(
+            SpeakerCountLaneUnavailableReason::InvalidAffinity,
+            0,
+            None,
+            0,
+        ));
     }
     let bounded_maximum = maximum_count.min(node_count);
     if minimum_count > bounded_maximum {
-        return Ok(None);
+        return Ok(SparseEigengapRun::unavailable(
+            SpeakerCountLaneUnavailableReason::ContradictoryConstraints,
+            0,
+            None,
+            0,
+        ));
     }
     let subspace_dimensions = bounded_maximum.saturating_add(1).min(node_count);
     let mut basis = deterministic_spectral_basis(graph, subspace_dimensions)?;
@@ -9220,7 +10293,13 @@ where
         }
         let mut next = basis
             .iter()
-            .map(|column| graph.apply_normalized(column))
+            .map(|column| {
+                let mut product = graph.apply_normalized(column)?;
+                for (value, &input) in product.iter_mut().zip(column) {
+                    *value += SPEAKER_COUNT_EIGENSOLVER_DIAGONAL_SHIFT * input;
+                }
+                Some(product)
+            })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
                 FwError::InvalidRequest(
@@ -9228,7 +10307,12 @@ where
                 )
             })?;
         if !orthonormalize_columns(&mut next) {
-            return Ok(None);
+            return Ok(SparseEigengapRun::unavailable(
+                SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
+                iteration + 1,
+                None,
+                subspace_dimensions,
+            ));
         }
         basis = next;
         let applied = basis
@@ -9252,7 +10336,12 @@ where
         }
     }
     if residual > SPEAKER_COUNT_EIGENSOLVER_TOLERANCE {
-        return Ok(None);
+        return Ok(SparseEigengapRun::unavailable(
+            SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
+            iterations,
+            residual.is_finite().then_some(residual),
+            subspace_dimensions,
+        ));
     }
     let mut eigenvalues = jacobi_symmetric_eigenvalues(rayleigh)?;
     eigenvalues.sort_by(|left, right| right.total_cmp(left));
@@ -9264,29 +10353,66 @@ where
         let Some(&left) = eigenvalues.get(count - 1) else {
             continue;
         };
-        let right = eigenvalues.get(count).copied().unwrap_or(0.0);
+        let Some(&right) = eigenvalues.get(count) else {
+            // An eigengap at K requires both lambda_K and lambda_(K+1).
+            // Treating a missing lambda_(K+1) as zero manufactures a large
+            // terminal gap whenever K equals the number of prototypes.
+            continue;
+        };
         let gap = (left - right).max(0.0);
         let normalized_gap = gap / left.abs().max(1.0e-9);
         if normalized_gap.is_finite() {
             scores.push((count, normalized_gap));
         }
     }
-    let &(count, best_score) = scores.iter().max_by(|left, right| {
+    let Some(&(count, best_score)) = scores.iter().max_by(|left, right| {
         left.1
             .total_cmp(&right.1)
             .then_with(|| right.0.cmp(&left.0))
-    })?;
+    }) else {
+        return Ok(SparseEigengapRun::unavailable(
+            SpeakerCountLaneUnavailableReason::InvalidAffinity,
+            iterations,
+            Some(residual),
+            subspace_dimensions,
+        ));
+    };
     let total_score = scores.iter().map(|(_, score)| *score).sum::<f64>();
     if best_score <= 0.0 || !total_score.is_finite() || total_score <= 0.0 {
-        return Ok(None);
+        return Ok(SparseEigengapRun::unavailable(
+            SpeakerCountLaneUnavailableReason::InvalidAffinity,
+            iterations,
+            Some(residual),
+            subspace_dimensions,
+        ));
     }
-    Ok(Some(SparseEigengapProposal {
+    let proposal = SparseEigengapProposal {
         count,
         confidence: (best_score / total_score).clamp(0.0, 1.0),
         eigenvalues,
         residual,
         iterations,
-    }))
+    };
+    Ok(SparseEigengapRun {
+        proposal: Some(proposal),
+        iterations,
+        residual: Some(residual),
+        subspace_dimensions,
+        unavailable_reason: None,
+    })
+}
+
+#[cfg(test)]
+fn sparse_normalized_eigengap<C>(
+    graph: &SparseSpeakerAffinityGraph,
+    minimum_count: usize,
+    maximum_count: usize,
+    is_cancelled: C,
+) -> FwResult<Option<SparseEigengapProposal>>
+where
+    C: FnMut() -> bool,
+{
+    Ok(sparse_normalized_eigengap_run(graph, minimum_count, maximum_count, is_cancelled)?.proposal)
 }
 
 fn deterministic_spectral_basis(
@@ -9386,17 +10512,25 @@ fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>>
             "speaker-count Rayleigh matrix is not square".to_owned(),
         ));
     }
-    for row in 0..dimensions {
-        for column in 0..dimensions {
-            if !matrix[row][column].is_finite() {
+    for matrix_row in &matrix {
+        for value in matrix_row {
+            if !value.is_finite() {
                 return Err(FwError::InvalidRequest(
                     "speaker-count Rayleigh matrix is non-finite".to_owned(),
                 ));
             }
+        }
+    }
+    let mut row = 0;
+    while row < dimensions {
+        let mut column = row + 1;
+        while column < dimensions {
             let symmetric = 0.5 * (matrix[row][column] + matrix[column][row]);
             matrix[row][column] = symmetric;
             matrix[column][row] = symmetric;
+            column += 1;
         }
+        row += 1;
     }
     let iteration_cap = dimensions
         .checked_mul(dimensions)
@@ -9407,9 +10541,9 @@ fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>>
     for _ in 0..iteration_cap {
         let mut largest = 0.0_f64;
         let mut pivot = None;
-        for row in 0..dimensions {
-            for column in row + 1..dimensions {
-                let magnitude = matrix[row][column].abs();
+        for (row, matrix_row) in matrix.iter().enumerate() {
+            for (column, value) in matrix_row.iter().enumerate().skip(row + 1) {
+                let magnitude = value.abs();
                 if magnitude > largest {
                     largest = magnitude;
                     pivot = Some((row, column));
@@ -9436,8 +10570,10 @@ fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>>
             + cosine * cosine * right_diagonal;
         matrix[left][right] = 0.0;
         matrix[right][left] = 0.0;
-        for index in 0..dimensions {
+        let mut index = 0;
+        while index < dimensions {
             if index == left || index == right {
+                index += 1;
                 continue;
             }
             let left_value = matrix[index][left];
@@ -9446,6 +10582,7 @@ fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>>
             matrix[left][index] = matrix[index][left];
             matrix[index][right] = sine * left_value + cosine * right_value;
             matrix[right][index] = matrix[index][right];
+            index += 1;
         }
     }
     Err(FwError::InvalidRequest(
@@ -10727,17 +11864,20 @@ fn assignment_voiced_shares(
 }
 
 fn count_request_allows_zero(request: &SpeakerCountRequest) -> bool {
-    matches!(request, SpeakerCountRequest::Infer)
+    matches!(
+        request,
+        SpeakerCountRequest::Infer
+            | SpeakerCountRequest::Prior { .. }
+            | SpeakerCountRequest::Range { .. }
+    )
 }
 
 fn speaker_count_satisfies(count: usize, request: &SpeakerCountRequest) -> bool {
     match request {
         SpeakerCountRequest::Infer => true,
-        SpeakerCountRequest::Range { minimum, maximum } => {
-            count >= *minimum as usize && count <= *maximum as usize
-        }
+        SpeakerCountRequest::Range { .. } => true,
         SpeakerCountRequest::HardConstraint { count: exact } => count == *exact as usize,
-        SpeakerCountRequest::Prior { .. } => false,
+        SpeakerCountRequest::Prior { .. } => true,
     }
 }
 
@@ -10802,8 +11942,9 @@ mod tests {
     use crate::model::{
         DiarizationEngine, DiarizationFallbackStatus, DiarizationRequest, DiarizationTurn,
         KnownSpeakerInterval, KnownSpeakerPolicy, SpeakerAttributionQueryReason,
-        SpeakerCountOutcomeStatus, SpeakerCountRequest, SpeakerEvidenceReason,
-        SpeakerHintDisposition, TranscriptionSegment,
+        SpeakerCountCalibrationStatus, SpeakerCountEvidenceLane, SpeakerCountLaneUnavailableReason,
+        SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
+        SpeakerEvidenceReason, SpeakerHintDisposition, TranscriptionSegment,
     };
     use sha2::{Digest, Sha256};
 
@@ -13956,7 +15097,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_and_bounded_speaker_counts_are_enforced() {
+    fn hard_count_is_enforced_while_soft_range_permits_disagreement() {
         let request = DiarizationRequest::default();
         let tracklets =
             sequential_profile_tracklets(&[0.0, 2.0, 4.0, 0.0, 2.0, 4.0, 0.0, 2.0, 4.0], 500, 50);
@@ -13969,15 +15110,18 @@ mod tests {
         assert_eq!(exact_result.detected_speakers, 3);
         assert!(exact_result.constraints_satisfied);
 
-        let bounded = SpeakerCountRequest::Range {
+        let soft_range = SpeakerCountRequest::Range {
             minimum: 1,
-            maximum: 2,
+            maximum: 1,
         };
-        let bounded_result =
-            cluster_acoustic_tracklets(&tracklets, &enrollment, &bounded, 512, || false)
-                .expect("bounded clustering");
-        assert!((1..=2).contains(&bounded_result.detected_speakers));
-        assert!(bounded_result.constraints_satisfied);
+        let ranged_result =
+            cluster_acoustic_tracklets(&tracklets, &enrollment, &soft_range, 512, || false)
+                .expect("soft-range clustering");
+        assert_eq!(
+            ranged_result.detected_speakers, 3,
+            "soft range must not force three recurrent separated regimes into one speaker"
+        );
+        assert!(ranged_result.constraints_satisfied);
     }
 
     #[test]
@@ -14418,7 +15562,8 @@ mod tests {
         .expect("probabilistic clustering");
         assert_eq!(
             result.executed_mode,
-            super::AcousticClusteringMode::ProbabilisticV1
+            super::AcousticClusteringMode::ProbabilisticV1,
+            "{result:#?}"
         );
         assert_eq!(result.detected_speakers, 1, "{result:#?}");
         assert!(
@@ -14426,6 +15571,22 @@ mod tests {
                 .assignments
                 .iter()
                 .all(|assignment| assignment.speaker_ref.is_some())
+        );
+        let resources = &result
+            .count_estimate
+            .as_ref()
+            .expect("count estimate")
+            .resources;
+        assert_eq!(resources.prototype_count, 8);
+        assert_eq!(resources.affinity_pair_evaluations, 56);
+        assert!(resources.retained_sparse_edges <= 32, "{resources:#?}");
+        assert_eq!(resources.stability_replicates, 5);
+        assert!(resources.solver_iterations > 0, "{resources:#?}");
+        assert!(
+            resources
+                .solver_residual
+                .is_some_and(|residual| { residual <= super::SPEAKER_COUNT_EIGENSOLVER_TOLERANCE }),
+            "{resources:#?}"
         );
     }
 
@@ -14480,6 +15641,338 @@ mod tests {
     }
 
     #[test]
+    fn fused_speaker_count_estimate_normalizes_with_explicit_unresolved_mass() {
+        let lane = |losses: [f64; 3]| super::ProbabilisticLaneResult {
+            selected_count: 2,
+            groups: vec![vec![0], vec![1]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 2,
+                points: losses
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, expected_loss)| super::SpeakerCountRiskPoint {
+                        count: index + 1,
+                        expected_loss,
+                    })
+                    .collect(),
+            },
+        };
+        let lanes = vec![
+            lane([4.0, 0.0, 3.0]),
+            lane([5.0, 0.0, 2.0]),
+            lane([6.0, 0.0, 4.0]),
+            lane([4.5, 0.0, 2.5]),
+            lane([5.5, 0.0, 3.5]),
+        ];
+        let estimate = super::fused_speaker_count_estimate(
+            &lanes,
+            None,
+            Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            &SpeakerCountRequest::Infer,
+            super::SpeakerCountPolicy {
+                min: 1,
+                max: 3,
+                exact: None,
+            },
+            1,
+            super::unavailable_speaker_count_resources(3).expect("resource summary"),
+        )
+        .expect("fused estimate");
+        estimate.validate().expect("valid estimate");
+        assert_eq!(estimate.selected_count, Some(2), "{estimate:#?}");
+        assert_eq!(estimate.posterior.len(), 3);
+        assert_eq!(estimate.lanes.len(), 6);
+        let total = estimate
+            .posterior
+            .iter()
+            .map(|bin| bin.probability)
+            .sum::<f64>()
+            + estimate.unresolved_probability;
+        assert!((total - 1.0).abs() <= 1.0e-9, "{estimate:#?}");
+        assert!(
+            estimate.unresolved_probability >= 0.15,
+            "development evidence must retain unresolved mass: {estimate:#?}"
+        );
+    }
+
+    #[test]
+    fn fixed_safe_infer_reports_explicit_uncalibrated_count_evidence() {
+        let request = DiarizationRequest::default();
+        let tracklets = sequential_profile_tracklets(&[0.0; 6], 500, 50);
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 3_000).expect("enrollment");
+        let result =
+            cluster_acoustic_tracklets(&tracklets, &enrollment, &request.speaker_count, 64, || {
+                false
+            })
+            .expect("fixed-safe clustering");
+        let estimate = result
+            .count_estimate
+            .as_ref()
+            .expect("native count object must never silently disappear");
+        estimate.validate().expect("valid count estimate");
+        assert_eq!(
+            estimate.calibration_status,
+            SpeakerCountCalibrationStatus::FixedSafeUncalibrated
+        );
+        assert_eq!(estimate.selected_count, None);
+        assert!(estimate.posterior.is_empty());
+        assert_eq!(estimate.unresolved_probability, 1.0);
+        assert_eq!(estimate.lanes.len(), 6);
+
+        let outcome =
+            super::public_speaker_count_outcome(&request.speaker_count, &result).expect("outcome");
+        assert_eq!(outcome.status, SpeakerCountOutcomeStatus::Unresolved);
+        assert!(
+            outcome
+                .reasons
+                .contains(&SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved),
+            "{outcome:#?}"
+        );
+    }
+
+    #[test]
+    fn no_voice_infer_returns_unavailable_count_without_fabricated_bins() {
+        let request = DiarizationRequest::default();
+        let mut tracklet = profile_tracklet(0, 0, 500, 0.0, 0.0, 50);
+        tracklet.voice_valid = [false; super::VOICE_VECTOR_DIMENSIONS];
+        tracklet.voice_mean = [0.0; super::VOICE_VECTOR_DIMENSIONS];
+        tracklet.voice_variance = [0.0; super::VOICE_VECTOR_DIMENSIONS];
+        tracklet.voice_support = [0; super::VOICE_VECTOR_DIMENSIONS];
+        tracklet.voiced_frame_count = 0;
+        tracklet.identity_frame_count = 0;
+        let enrollment =
+            enroll_known_speaker_profiles(std::slice::from_ref(&tracklet), &request, 500)
+                .expect("enrollment");
+        let result =
+            cluster_acoustic_tracklets(&[tracklet], &enrollment, &request.speaker_count, 8, || {
+                false
+            })
+            .expect("no-voice count fallback");
+        let estimate = result
+            .count_estimate
+            .as_ref()
+            .expect("unavailable estimate");
+        estimate.validate().expect("valid unavailable estimate");
+        assert_eq!(
+            estimate.calibration_status,
+            SpeakerCountCalibrationStatus::Unavailable
+        );
+        assert_eq!(estimate.selected_count, None);
+        assert!(estimate.posterior.is_empty());
+        assert_eq!(estimate.unresolved_probability, 1.0);
+        assert_eq!(result.detected_speakers, 0);
+    }
+
+    #[test]
+    fn soft_count_prior_disagreement_cannot_override_acoustic_selection() {
+        let lane = || super::ProbabilisticLaneResult {
+            selected_count: 2,
+            groups: vec![vec![0], vec![1]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 2,
+                points: vec![
+                    super::SpeakerCountRiskPoint {
+                        count: 2,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 3,
+                        expected_loss: 0.1,
+                    },
+                ],
+            },
+        };
+        let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
+            .map(|_| lane())
+            .collect::<Vec<_>>();
+        let estimate = super::fused_speaker_count_estimate(
+            &lanes,
+            None,
+            Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            &SpeakerCountRequest::Prior {
+                bins: vec![
+                    crate::model::SpeakerCountPriorMass {
+                        count: 2,
+                        probability: 0.001,
+                    },
+                    crate::model::SpeakerCountPriorMass {
+                        count: 3,
+                        probability: 0.999,
+                    },
+                ],
+            },
+            super::SpeakerCountPolicy {
+                min: 2,
+                max: 3,
+                exact: None,
+            },
+            1,
+            super::unavailable_speaker_count_resources(3).expect("resource summary"),
+        )
+        .expect("prior-disagreement estimate");
+        estimate.validate().expect("valid estimate");
+        assert_eq!(
+            estimate.selected_count,
+            Some(2),
+            "a soft prior may move mass but cannot override unanimous acoustic evidence"
+        );
+        assert_eq!(
+            estimate
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == SpeakerCountEvidenceLane::CallerPrior)
+                .and_then(|lane| lane.proposed_count),
+            Some(3)
+        );
+        assert_eq!(
+            estimate
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == SpeakerCountEvidenceLane::MergeRisk)
+                .and_then(|lane| lane.proposed_count),
+            Some(2),
+            "merge-risk evidence must remain independent of the conflicting caller prior"
+        );
+    }
+
+    #[test]
+    fn soft_count_prior_does_not_exclude_acoustically_supported_counts() {
+        let lane = || super::ProbabilisticLaneResult {
+            selected_count: 1,
+            groups: vec![vec![0, 1, 2]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 1,
+                points: vec![
+                    super::SpeakerCountRiskPoint {
+                        count: 1,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 2,
+                        expected_loss: 8.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 3,
+                        expected_loss: 12.0,
+                    },
+                ],
+            },
+        };
+        let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
+            .map(|_| lane())
+            .collect::<Vec<_>>();
+        let request = SpeakerCountRequest::Prior {
+            bins: vec![crate::model::SpeakerCountPriorMass {
+                count: 3,
+                probability: 1.0,
+            }],
+        };
+        let policy = super::resolve_count_policy(&request, 3).expect("soft-prior search policy");
+        assert_eq!(policy.min, 1);
+        assert_eq!(policy.max, 3);
+        assert_eq!(policy.exact, None);
+        let estimate = super::fused_speaker_count_estimate(
+            &lanes,
+            None,
+            Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            &request,
+            policy,
+            1,
+            super::unavailable_speaker_count_resources(3).expect("resource summary"),
+        )
+        .expect("soft-prior estimate");
+        estimate.validate().expect("valid estimate");
+        assert_eq!(
+            estimate.selected_count,
+            Some(1),
+            "strong acoustic agreement must be allowed to select outside soft prior support"
+        );
+        assert_eq!(
+            estimate
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == SpeakerCountEvidenceLane::CallerPrior)
+                .and_then(|lane| lane.proposed_count),
+            Some(3)
+        );
+        let acoustic_only = super::fused_speaker_count_estimate(
+            &lanes,
+            None,
+            Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            &SpeakerCountRequest::Infer,
+            policy,
+            1,
+            super::unavailable_speaker_count_resources(3).expect("resource summary"),
+        )
+        .expect("acoustic-only estimate");
+        let count_three_probability = |estimate: &crate::model::SpeakerCountEstimate| {
+            estimate
+                .posterior
+                .iter()
+                .find(|bin| bin.count == 3)
+                .map(|bin| bin.probability)
+                .expect("count-three posterior bin")
+        };
+        assert!(
+            count_three_probability(&estimate) > count_three_probability(&acoustic_only),
+            "the bounded soft prior must still move posterior mass toward its support"
+        );
+    }
+
+    #[test]
+    fn partially_feasible_soft_count_input_retains_a_non_authoritative_lane() {
+        let range = super::speaker_count_prior_lane(
+            &SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 4,
+            },
+            2,
+            3,
+        )
+        .expect("range lane");
+        assert!(range.available);
+        assert_eq!(range.proposed_count, Some(2));
+        assert_eq!(range.unavailable_reason, None);
+
+        let prior = super::speaker_count_prior_lane(
+            &SpeakerCountRequest::Prior {
+                bins: vec![
+                    crate::model::SpeakerCountPriorMass {
+                        count: 1,
+                        probability: 0.9,
+                    },
+                    crate::model::SpeakerCountPriorMass {
+                        count: 2,
+                        probability: 0.1,
+                    },
+                ],
+            },
+            2,
+            3,
+        )
+        .expect("prior lane");
+        assert!(prior.available);
+        assert_eq!(prior.proposed_count, Some(2));
+        assert_eq!(prior.confidence, 0.1);
+
+        let contradictory = super::speaker_count_prior_lane(
+            &SpeakerCountRequest::Range {
+                minimum: 4,
+                maximum: 6,
+            },
+            1,
+            3,
+        )
+        .expect("contradictory range lane");
+        assert!(!contradictory.available);
+        assert_eq!(
+            contradictory.unavailable_reason,
+            Some(SpeakerCountLaneUnavailableReason::ContradictoryConstraints)
+        );
+    }
+
+    #[test]
     fn sparse_normalized_eigengap_distinguishes_one_and_two_components() {
         let graph = |node_count: usize, edges: &[(usize, usize, f64)]| {
             let mut rows = vec![Vec::new(); node_count];
@@ -14519,6 +16012,14 @@ mod tests {
             .expect("spectral solver")
             .expect("connected proposal");
         assert_eq!(proposal.count, 1, "{proposal:#?}");
+
+        let proposal = super::sparse_normalized_eigengap(&connected, 1, 4, || false)
+            .expect("spectral solver")
+            .expect("connected proposal at the prototype ceiling");
+        assert_eq!(
+            proposal.count, 1,
+            "a missing fifth eigenvalue must not fabricate a terminal K=4 gap: {proposal:#?}"
+        );
     }
 
     #[test]

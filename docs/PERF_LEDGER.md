@@ -4881,3 +4881,31 @@ macro-JER and ECE accuracy gates, so performance cannot authorize promotion.
 The observation does establish that the implemented five-view count consensus,
 duration-aware smoothing, overlap checks, and query construction remained well
 below real time on this development workload without an obvious memory blowup.
+
+---
+## 2026-07-31 - Speaker-count v3 resource envelope: **INSTRUMENTED / NO PERFORMANCE CERTIFICATION**
+
+`acoustic-clustering-probabilistic-v3-development` now records bounded,
+content-free resource telemetry in every development speaker-count estimate:
+retained prototypes and sparse edges, directed affinity-pair evaluations,
+estimated peak algorithm-buffer bytes, stability-replicate count, eigensolver
+iterations, sparse matrix-vector terms, and final residual when available.
+These fields are validated, serialized through SQLite/JSONL, and included in
+the evidence fingerprint. They contain no audio, transcript, path, embedding,
+or reusable biometric value.
+
+The configured envelope is 512 prototypes, degree 8, five deterministic
+feature-family replicates, 96 eigensolver iterations, residual tolerance
+`1e-7`, and a positive diagonal iteration shift of `1.01`. The retained graph
+is `O(N * 8)` even though graph construction currently evaluates the bounded
+directed prototype-pair surface. Checked arithmetic covers comparison counts,
+edge capacities, solver operations, and byte estimates. Cancellation is
+checked per prototype row, replicate, and eigensolver iteration. A missing or
+non-converged spectral result becomes a typed non-authoritative lane and can
+only widen uncertainty or trigger the fixed-safe assignment fallback.
+
+No 10-minute, 1-hour, or long-call public-safe timing/memory sensitivity sweep
+has been run for this v3 estimator. The retained 2026-07-30 v2 observation
+cannot certify a changed v3 solver. Therefore latency, RTF, peak RSS, and
+count/degree/tolerance sensitivity remain **NO-DATA** and cannot authorize
+default promotion.

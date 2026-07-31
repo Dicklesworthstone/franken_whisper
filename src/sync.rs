@@ -3178,8 +3178,11 @@ mod tests {
     use crate::model::{
         BackendKind, BackendParams, DiarizationEngine, DiarizationFallbackStatus,
         DiarizationReport, DiarizationRequest, DiarizationTurn, InputSource, KnownSpeakerInterval,
-        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerCountOutcome, SpeakerCountOutcomeReason,
-        SpeakerCountOutcomeStatus, SpeakerCountRequest, SpeakerEvidenceReason,
+        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerCountCalibrationStatus,
+        SpeakerCountEstimate, SpeakerCountEvidenceLane, SpeakerCountLaneEvidence,
+        SpeakerCountLaneUnavailableReason, SpeakerCountOutcome, SpeakerCountOutcomeReason,
+        SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange,
+        SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
         SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
         SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
@@ -3412,13 +3415,13 @@ mod tests {
                     minimum: 1,
                     maximum: 2,
                 },
-                estimate: None,
-                status: SpeakerCountOutcomeStatus::Satisfied,
+                estimate: Some(synthetic_speaker_count_estimate()),
+                status: SpeakerCountOutcomeStatus::Resolved,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["speaker_a".to_owned()],
                 dominant_speaker_share: 1.0,
                 unknown_voiced_share: 0.1,
-                reasons: vec![SpeakerCountOutcomeReason::RequestedCountMatched],
+                reasons: vec![SpeakerCountOutcomeReason::EvidenceSupportedCount],
                 speaker_evidence: vec![SpeakerEvidenceSummary {
                     speaker_ref: "speaker_a".to_owned(),
                     assigned_tracklet_count: 3,
@@ -3466,6 +3469,96 @@ mod tests {
                 ]
             }
         });
+    }
+
+    fn synthetic_speaker_count_estimate() -> SpeakerCountEstimate {
+        let first_probability = 0.7_f64;
+        let second_probability = 0.15_f64;
+        let unresolved_probability = 0.15_f64;
+        let estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count: Some(1),
+            supported_range: Some(SpeakerCountRange {
+                minimum: 1,
+                maximum: 2,
+            }),
+            posterior: vec![
+                SpeakerCountPosteriorBin {
+                    count: 1,
+                    probability: first_probability,
+                },
+                SpeakerCountPosteriorBin {
+                    count: 2,
+                    probability: second_probability,
+                },
+            ],
+            unresolved_probability,
+            entropy_bits: -first_probability * first_probability.log2()
+                - second_probability * second_probability.log2()
+                - unresolved_probability * unresolved_probability.log2(),
+            stability: 0.8,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 2,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "c".repeat(64),
+            evidence_sha256: "d".repeat(64),
+            lanes: vec![
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::MergeRisk,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.8,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.65,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::FeatureJackknife,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.8,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.88,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::ConstraintGraph,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 1.0,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+                },
+            ],
+            resources: SpeakerCountResourceSummary {
+                prototype_count: 2,
+                affinity_pair_evaluations: 2,
+                retained_sparse_edges: 1,
+                estimated_peak_buffer_bytes: 512,
+                stability_replicates: 5,
+                solver_iterations: 8,
+                solver_sparse_matvec_terms: 128,
+                solver_residual: Some(1.0e-8),
+            },
+        };
+        estimate.validate().expect("synthetic count estimate");
+        estimate
     }
 
     fn test_cursor(ts: &str, run_id: Option<&str>) -> SyncCursor {
@@ -3636,12 +3729,29 @@ mod tests {
             .expect("typed diarization result");
         assert_eq!(
             recovered_report.speaker_count.status,
-            SpeakerCountOutcomeStatus::Satisfied
+            SpeakerCountOutcomeStatus::Resolved
         );
         assert_eq!(
             recovered_report.speaker_count.reasons,
-            vec![SpeakerCountOutcomeReason::RequestedCountMatched]
+            vec![SpeakerCountOutcomeReason::EvidenceSupportedCount]
         );
+        let recovered_estimate = recovered_report
+            .speaker_count
+            .estimate
+            .as_ref()
+            .expect("speaker-count estimate should survive JSONL recovery");
+        recovered_estimate
+            .validate()
+            .expect("recovered speaker-count estimate should remain valid");
+        assert_eq!(
+            recovered_estimate.schema_version,
+            "speaker-count-estimate-v2"
+        );
+        assert_eq!(recovered_estimate.selected_count, Some(1));
+        assert_eq!(recovered_estimate.posterior.len(), 2);
+        assert_eq!(recovered_estimate.resources.prototype_count, 2);
+        assert_eq!(recovered_estimate.resources.retained_sparse_edges, 1);
+        assert_eq!(recovered_estimate.resources.solver_residual, Some(1.0e-8));
         assert_eq!(
             recovered_report.hint_evidence[0].disposition,
             SpeakerHintDisposition::PartiallyAccepted
@@ -3668,10 +3778,33 @@ mod tests {
                 .map(|report| report.turns.as_slice()),
             "typed speaker turns must survive SQLite -> JSONL -> fresh SQLite"
         );
+        let recovered_entropy = recovered
+            .diarization
+            .as_ref()
+            .and_then(|report| report.speaker_count.estimate.as_ref())
+            .map(|estimate| estimate.entropy_bits)
+            .expect("recovered speaker-count entropy");
+        let mut expected_diarization = report.result.diarization.clone();
+        let expected_entropy = expected_diarization
+            .as_ref()
+            .and_then(|report| report.speaker_count.estimate.as_ref())
+            .map(|estimate| estimate.entropy_bits)
+            .expect("expected speaker-count entropy");
+        let entropy_tolerance = 4.0 * f64::EPSILON * expected_entropy.abs().max(1.0);
+        assert!(
+            (recovered_entropy - expected_entropy).abs() <= entropy_tolerance,
+            "derived speaker-count entropy must survive JSON numeric normalization within \
+             floating-point roundoff: recovered={recovered_entropy}, expected={expected_entropy}"
+        );
+        expected_diarization
+            .as_mut()
+            .and_then(|report| report.speaker_count.estimate.as_mut())
+            .expect("expected speaker-count estimate")
+            .entropy_bits = recovered_entropy;
         assert_eq!(
-            recovered.diarization, report.result.diarization,
+            recovered.diarization, expected_diarization,
             "count mode, reasons, occupancy evidence, hint dispositions, and fallback status must \
-             survive SQLite -> JSONL -> fresh SQLite"
+             survive SQLite -> JSONL -> fresh SQLite exactly apart from derived-float roundoff"
         );
         assert_eq!(
             recovered

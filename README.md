@@ -356,10 +356,21 @@ franken_whisper transcribe \
   --input meeting.mp3 \
   --diarize \
   --diarization-engine acoustic \
-  --min-speakers 2 \
-  --max-speakers 5 \
   --json
 ```
+
+Omitting all count options is the primary native path and means automatic
+inference intent. The report always contains a versioned
+`speaker_count.estimate` object. The retained fixed-safe assignment default
+reports explicit uncalibrated/unresolved mass; the development probabilistic
+candidate adds bounded count bins and may select a count only after its
+evidence and occupancy gates pass. A soft preference can be added with
+`--speaker-count-range 2..5` or
+`--speaker-count-prior 2=0.25,3=0.75`. Use
+`--speaker-count-hard 3` only when the caller intentionally wants a hard search
+constraint; it never fabricates occupancy or removes UNKNOWN. Soft count
+options require the native acoustic engine because external/neural backends
+cannot faithfully fuse them.
 
 Known intervals can enroll an opaque speaker reference without retaining the
 hint document's source path or raw source bytes:
@@ -632,9 +643,9 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
 | `--diarization-max-prototypes <N>` | `512` | Bounded global prototype cap (`1..=512`) |
 | `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v5 still stores privacy-safe summaries rather than reusable acoustic vectors |
-| `--num-speakers <N>` | — | Hard count search constraint; success still requires independent evidence for all N speakers and uncertain speech remains unknown |
-| `--min-speakers <N>` | — | Minimum evidence-supported count; insufficient evidence remains unknown and reports the range unsatisfied |
-| `--max-speakers <N>` | — | Maximum speakers |
+| `--speaker-count-hard <K>` | — | Explicit hard search constraint; success still requires independent evidence for every speaker and uncertain speech remains UNKNOWN |
+| `--speaker-count-range <MIN..MAX>` | — | Soft bounded count preference; acoustic evidence may disagree or remain unresolved |
+| `--speaker-count-prior <PRIOR>` | — | Soft point prior (`K`) or normalized distribution (`K=P,K=P`); never forces occupancy |
 | `--no-stem` | `false` | Disable external-backend vocal isolation |
 | `--suppress-numerals` | `false` | Spell out numbers for external alignment stability |
 | `--diarization-model <MODEL>` | — | Override the external diarization model |
@@ -2292,9 +2303,7 @@ franken_whisper transcribe --input meeting.mp3 \
   --backend whisper_cpp \
   --model large-v3 \
   --diarize \
-  --hf-token "$HF_TOKEN" \
-  --min-speakers 2 \
-  --max-speakers 8 \
+  --diarization-engine acoustic \
   --vad \
   --json
 ```
@@ -3901,7 +3910,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 
 | Use case | Configuration sketch |
 |----------|----------------------|
-| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --diarization-engine acoustic --min-speakers 2 --max-speakers 8 --json` |
+| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --diarization-engine acoustic --json` (automatic count inference; optional soft `--speaker-count-range 2..8`) |
 | **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper_cpp --model large-v3 --json; done` |
 | **Live transcription dashboard** | `robot run --mic --mic-seconds 300 --speculative --fast-model tiny.en --quality-model large-v3` piped to a Server-Sent Events translator |
 | **Voicemail archival** | `transcribe --stdin --backend auto --json` invoked from a mail-handler hook |
