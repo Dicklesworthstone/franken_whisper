@@ -387,22 +387,61 @@ impl AcousticPerturbation {
     }
 }
 
+/// Proof boundary for sources admitted to the adversarial harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum AdversarialSourceAuthority {
+    /// The source is generated entirely from `SyntheticCallPlan`.
+    Synthetic,
+    /// The operator has separately verified a public or user-held license.
+    PublicLicensed {
+        /// Hash of an external acknowledgement or license record, never its path.
+        acknowledgement_sha256: String,
+    },
+}
+
 /// A content-bound sequence of perturbations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransformPlan {
     pub schema_version: String,
     pub source_audio_sha256: String,
+    pub source_authority: AdversarialSourceAuthority,
     pub seed: u64,
     pub steps: Vec<AcousticPerturbation>,
 }
 
 impl TransformPlan {
+    /// Construct a plan whose source was produced by the synthetic generator.
     #[must_use]
-    pub fn new(source_audio_sha256: String, seed: u64, steps: Vec<AcousticPerturbation>) -> Self {
+    pub fn new_synthetic(
+        source_audio_sha256: String,
+        seed: u64,
+        steps: Vec<AcousticPerturbation>,
+    ) -> Self {
         Self {
             schema_version: TRANSFORM_PLAN_SCHEMA_VERSION.to_owned(),
             source_audio_sha256,
+            source_authority: AdversarialSourceAuthority::Synthetic,
+            seed,
+            steps,
+        }
+    }
+
+    /// Construct a plan for an externally held, license-cleared public source.
+    #[must_use]
+    pub fn new_public_licensed(
+        source_audio_sha256: String,
+        acknowledgement_sha256: String,
+        seed: u64,
+        steps: Vec<AcousticPerturbation>,
+    ) -> Self {
+        Self {
+            schema_version: TRANSFORM_PLAN_SCHEMA_VERSION.to_owned(),
+            source_audio_sha256,
+            source_authority: AdversarialSourceAuthority::PublicLicensed {
+                acknowledgement_sha256,
+            },
             seed,
             steps,
         }
@@ -410,6 +449,16 @@ impl TransformPlan {
 
     pub fn sha256(&self) -> FwResult<String> {
         canonical_sha256(self)
+    }
+
+    fn with_steps(&self, steps: Vec<AcousticPerturbation>) -> Self {
+        Self {
+            schema_version: self.schema_version.clone(),
+            source_audio_sha256: self.source_audio_sha256.clone(),
+            source_authority: self.source_authority.clone(),
+            seed: self.seed,
+            steps,
+        }
     }
 }
 
@@ -655,9 +704,7 @@ pub fn minimize_failing_plan(
                 .filter(|(index, _)| *index < start || *index >= end)
                 .map(|(_, item)| item.clone())
                 .collect();
-            let candidate = TransformPlan::new(
-                plan.source_audio_sha256.clone(),
-                plan.seed,
+            let candidate = plan.with_steps(
                 candidate_items
                     .iter()
                     .map(|(_, step)| step.clone())
@@ -681,11 +728,7 @@ pub fn minimize_failing_plan(
         granularity = (granularity * 2).min(retained.len());
     }
 
-    let minimized_plan = TransformPlan::new(
-        plan.source_audio_sha256.clone(),
-        plan.seed,
-        retained.iter().map(|(_, step)| step.clone()).collect(),
-    );
+    let minimized_plan = plan.with_steps(retained.iter().map(|(_, step)| step.clone()).collect());
     let minimized_plan_sha256 = minimized_plan.sha256()?;
     Ok(MinimizedReproSeed {
         schema_version: MINIMIZED_REPRO_SCHEMA_VERSION.to_owned(),
@@ -931,7 +974,8 @@ pub fn known_acoustic_challenge_seeds() -> FwResult<Vec<AcousticChallengeSeed>> 
             }
         };
         let source = generate_synthetic_call_uncancellable(&source_plan)?;
-        let transform = TransformPlan::new(source.audio.sha256(), 10_000 + index as u64, steps);
+        let transform =
+            TransformPlan::new_synthetic(source.audio.sha256(), 10_000 + index as u64, steps);
         seeds.push(AcousticChallengeSeed {
             family,
             synthetic_call: source_plan,
@@ -1120,6 +1164,15 @@ fn validate_transform_plan(plan: &TransformPlan) -> FwResult<()> {
         ));
     }
     validate_sha256(&plan.source_audio_sha256, "source_audio_sha256")?;
+    match &plan.source_authority {
+        AdversarialSourceAuthority::Synthetic => {}
+        AdversarialSourceAuthority::PublicLicensed {
+            acknowledgement_sha256,
+        } => validate_sha256(
+            acknowledgement_sha256,
+            "source_authority.acknowledgement_sha256",
+        )?,
+    }
     if plan.steps.len() > MAX_TRANSFORM_STEPS {
         return Err(adversarial_error(
             "too_many_transform_steps",
@@ -1925,7 +1978,7 @@ mod tests {
                 after_ms: 80,
             },
         ];
-        let plan = TransformPlan::new(source.sha256(), 123, steps);
+        let plan = TransformPlan::new_synthetic(source.sha256(), 123, steps);
         let left = apply_transform_plan_uncancellable(&source, &plan).expect("left");
         let right = apply_transform_plan_uncancellable(&source, &plan).expect("right");
         assert_eq!(left.audio, right.audio);
@@ -1937,7 +1990,7 @@ mod tests {
     #[test]
     fn transform_hash_mismatch_and_invalid_ranges_fail_closed() {
         let source = materialized_base(1).audio;
-        let plan = TransformPlan::new(
+        let plan = TransformPlan::new_synthetic(
             "0".repeat(64),
             1,
             vec![AcousticPerturbation::Gain {
@@ -1947,7 +2000,7 @@ mod tests {
         let error = apply_transform_plan_uncancellable(&source, &plan).expect_err("hash mismatch");
         assert!(error.to_string().contains("source_hash_mismatch"));
 
-        let plan = TransformPlan::new(
+        let plan = TransformPlan::new_synthetic(
             source.sha256(),
             1,
             vec![AcousticPerturbation::BandLimit {
@@ -1957,13 +2010,23 @@ mod tests {
         );
         let error = apply_transform_plan_uncancellable(&source, &plan).expect_err("bad band");
         assert!(error.to_string().contains("invalid_transform_step"));
+
+        let plan = TransformPlan::new_public_licensed(
+            source.sha256(),
+            "not-a-hash".to_owned(),
+            1,
+            Vec::new(),
+        );
+        let error =
+            apply_transform_plan_uncancellable(&source, &plan).expect_err("bad license proof");
+        assert!(error.to_string().contains("invalid_sha256"));
     }
 
     #[test]
     fn transform_directional_effects_match_their_declared_contracts() {
         let source = materialized_base(2).audio;
 
-        let gain_plan = TransformPlan::new(
+        let gain_plan = TransformPlan::new_synthetic(
             source.sha256(),
             1,
             vec![AcousticPerturbation::Gain {
@@ -1977,7 +2040,7 @@ mod tests {
             assert!((*after - *before * 0.5).abs() <= f32::EPSILON);
         }
 
-        let clip_plan = TransformPlan::new(
+        let clip_plan = TransformPlan::new_synthetic(
             source.sha256(),
             2,
             vec![AcousticPerturbation::Clip {
@@ -1994,7 +2057,7 @@ mod tests {
                 .all(|sample| sample.abs() <= 0.100_001)
         );
 
-        let interrupt_plan = TransformPlan::new(
+        let interrupt_plan = TransformPlan::new_synthetic(
             source.sha256(),
             3,
             vec![AcousticPerturbation::Interrupt {
@@ -2013,7 +2076,7 @@ mod tests {
                 .all(|sample| *sample == 0.0)
         );
 
-        let resample_plan = TransformPlan::new(
+        let resample_plan = TransformPlan::new_synthetic(
             source.sha256(),
             4,
             vec![AcousticPerturbation::ResampleRoundTrip {
@@ -2026,7 +2089,7 @@ mod tests {
         assert_eq!(resampled.frame_count(), source.frame_count());
         assert_ne!(resampled.sha256(), source.sha256());
 
-        let swap_plan = TransformPlan::new(
+        let swap_plan = TransformPlan::new_synthetic(
             source.sha256(),
             5,
             vec![
@@ -2047,7 +2110,7 @@ mod tests {
             sample_rate_hz: 16_000,
             channels: 1,
         };
-        let plan = TransformPlan::new(
+        let plan = TransformPlan::new_synthetic(
             source.sha256(),
             1,
             vec![AcousticPerturbation::Gain {
@@ -2061,7 +2124,7 @@ mod tests {
     #[test]
     fn silence_padding_has_exact_reference_shift() {
         let source = materialized_base(1);
-        let plan = TransformPlan::new(
+        let plan = TransformPlan::new_synthetic(
             source.audio.sha256(),
             1,
             vec![
@@ -2146,7 +2209,7 @@ mod tests {
         let essential = AcousticPerturbation::Clip {
             threshold_millionths: 200_000,
         };
-        let plan = TransformPlan::new(
+        let plan = TransformPlan::new_synthetic(
             source_hash,
             5,
             vec![
@@ -2178,7 +2241,7 @@ mod tests {
 
     #[test]
     fn minimizer_rejects_non_reproducing_original_plan() {
-        let plan = TransformPlan::new("a".repeat(64), 1, Vec::new());
+        let plan = TransformPlan::new_synthetic("a".repeat(64), 1, Vec::new());
         let expected = RegressionClassification {
             code: "FW-ADVERSARIAL-SCORING-REGRESSION".to_owned(),
             first_divergent_stage: AdversarialPipelineStage::Scoring,
@@ -2258,7 +2321,7 @@ mod tests {
         assert!(matches!(error, FwError::Cancelled(_)));
 
         let source = materialized_base(1).audio;
-        let plan = TransformPlan::new(
+        let plan = TransformPlan::new_synthetic(
             source.sha256(),
             1,
             vec![AcousticPerturbation::Gain {

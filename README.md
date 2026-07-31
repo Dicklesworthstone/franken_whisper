@@ -409,9 +409,10 @@ muffling, band-limit, resampling, quantization, clipping, noise, reverb,
 interruption, silence, channel-shift, playback, channel-swap, and overlap
 recipes. Retained repro seeds contain parameters, stable classifications, and
 content hashes—not samples, paths, transcripts, embeddings, or real speaker
-identifiers. The same API attributes the first divergent pipeline stage and
-delta-minimizes a failing transform sequence while preserving its exact
-classification.
+identifiers. Plans declare synthetic source authority or bind a hash of an
+external public-license acknowledgement. The same API attributes the first
+divergent pipeline stage and delta-minimizes a failing transform sequence while
+preserving its exact classification.
 
 ### 4. Microphone Capture
 

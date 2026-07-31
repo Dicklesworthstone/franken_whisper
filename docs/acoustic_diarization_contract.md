@@ -899,11 +899,13 @@ regime:
 | Controlled overlap | Overlap evidence increases without fabricating a third identity |
 
 Every `adversarial-transform-plan-v1` binds the exact input PCM hash and
-contains at most 64 bounded integer-parameter steps. Execution checkpoints
-cancellation between steps, rejects non-finite or malformed PCM, caps
-allocations, and emits `adversarial-transform-evidence-v1`. Its graph records
-only the plan hash, per-step recipe hash, input/output audio hashes, and
-expected relationship. It contains no audio, path, filename, transcript,
+contains at most 64 bounded integer-parameter steps. Source authority is either
+synthetic or public-licensed; the latter requires a lowercase SHA-256 of an
+external acknowledgement or license record, never its path or text. Execution
+checkpoints cancellation between steps, rejects non-finite or malformed PCM,
+caps allocations, and emits `adversarial-transform-evidence-v1`. Its graph
+records only the plan hash, per-step recipe hash, input/output audio hashes,
+and expected relationship. It contains no audio, path, filename, transcript,
 embedding, speaker name, or per-frame feature.
 
 Pipeline harnesses provide aggregate fingerprints for input, normalization,
