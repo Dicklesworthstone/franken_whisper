@@ -271,6 +271,35 @@ below 0.100000 CPU core at every checkpoint, while retaining the same artifact,
 incumbent, model, audio, identity, work, quality, frequency, host-wide, load,
 and 2×-null gates.
 
+### 2026-07-31 timestamp retry: rejected at preflight before work
+
+Claim `7774` used the current strict-RCH artifact to retry the exact
+`track01` tiny.en segment-timestamp cell for seven rounds. The harness
+self-reported ELF SHA-256
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`;
+it emitted the pinned incumbent SHA-256
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`,
+tiny.en model SHA-256
+`921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`,
+and audio SHA-256
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+The pinned 1.8.3 source and uniform 128-CPU performance-governor contracts
+passed.
+
+The unchanged host-wide preflight then observed `cpu102=100.0%` busy against
+the `20.0%` ceiling and exited 101. A terminal census found an unclaimed
+`sudo du -xsh /home/ubuntu/...` scratch survey active. The abort occurred
+before either engine's parity probe, so there are deliberately **no observed
+thread counts, work counts, A/A nulls, timing ratio, or verdict**. The raw log
+is `/data/tmp/fw-realistic-phase5/tiny_ts_claim7774_n7.log`, SHA-256
+`502d41c4176187c36517399db5d7c5d645e4d00d443f64c4f298ef9a24362d89`.
+
+**Retry predicate remains unchanged:** wait for that survey and the hourly
+fsck sweep to reach terminal, take a fresh clean census, and rerun the exact
+frozen n=7 cell with the corrected `[0.98, 1.02]` dual-null-median clause,
+retained 2x-widest-null margin, and every identity, work, quality, actual-
+thread, frequency, process-exclusivity, host-wide, and load gate.
+
 **Concrete turbo retry predicate:** first make the matched-greedy comparator
 produce WER at or below 0.100000 and matched work within 10% on this exact
 model/audio pair. Only then rerun timing under the same identity and work
