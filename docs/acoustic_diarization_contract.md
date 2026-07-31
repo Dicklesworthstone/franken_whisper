@@ -1,7 +1,7 @@
-# Acoustic Diarization Contract v1
+# Acoustic Diarization Contract v2
 
 Status: implementation contract for `bd-odj7`
-Contract identifier: `acoustic-diarization-v1`
+Contract identifier: `acoustic-diarization-v2`
 
 ## 1. Purpose and authority
 
@@ -46,7 +46,8 @@ The decision state consists of:
 - microturn voice and channel sufficient statistics plus quality masks;
 - hard and soft known-speaker intervals;
 - current robust profiles and channel subprofiles;
-- exact/minimum/maximum speaker constraints;
+- one typed speaker-count request: inference, calibrated prior, range, or hard
+  search constraint;
 - prior temporal assignment;
 - algorithm, feature-schema, weights, and calibration identities;
 - remaining time, memory, and prototype budgets.
@@ -346,7 +347,42 @@ ASR segment `confidence` remains ASR confidence. Speaker confidence is a
 separate field. Transcript projection may split only at legal DTW word
 boundaries and cannot invent, drop, duplicate, or reorder text.
 
-### 6.1 Canonical DTW projection timeline (`bd-2noc.1`, `bd-2noc.2`)
+### 6.1 Speaker-count and evidence result
+
+`SpeakerCountRequest` has exactly one mode:
+
+- `Infer` selects only speakers that pass acoustic evidence gates;
+- `Prior` carries sorted, unique probability mass over positive counts and
+  currently returns `speaker_count_unresolved` until calibrated prior fusion is
+  implemented;
+- `Range` bounds the evidence-supported search;
+- `HardConstraint` searches for exactly the requested count but does not assert
+  that the count exists in the recording.
+
+Every mode keeps `UNKNOWN` legal. Only a `hard_must_link` interval can prohibit
+`UNKNOWN` for its own tracklet. Count cardinality never suppresses rejection,
+and no assignment may be changed merely to make a missing label appear.
+
+An inferred speaker must have retained occupancy and quality evidence:
+independent voiced support, recurrence or repeated tracklets, assignment
+confidence, profile reliability, and separation from already-supported
+speakers. A hard-hinted speaker is supported by the hard attribution even when
+its sample is quarantined from profile training. Soft-enrollment observations
+cannot validate themselves; an uncorroborated soft name remains an audited
+hint and does not become a fabricated profile or output label.
+
+`speaker_count` in the stable report contains the original typed request,
+`resolved`, `satisfied`, `unsatisfied`, or `unresolved` status, the
+evidence-supported count, active references, dominant and unknown voiced
+shares, structured reasons, and a per-speaker evidence summary. `hint_evidence`
+separately records a privacy-safe disposition and count audit for every known
+interval. The report does not expose acoustic feature values.
+
+Adjacent assignments merge into a turn only when their hard-hint and overlap
+provenance agree. This prevents a long merged turn from laundering a weak or
+unsupported assignment into the confidence of a neighboring tracklet.
+
+### 6.2 Canonical DTW projection timeline (`bd-2noc.1`, `bd-2noc.2`)
 
 `group_tokens_into_words` quantizes token boundaries to the alignment grid and
 may legitimately emit a terminal `[t, t]` observation. That decoder
@@ -487,8 +523,9 @@ canonical hint hash but never its acoustic weight.
 
 Insufficient or out-of-calibration evidence remains unknown. Hard-hinted
 intervals may remain labeled while all other speech stays unknown. The engine
-does not invent speakers merely to satisfy `min_speakers`; it reports the
-unsatisfied constraint or returns a hard error according to typed policy.
+does not invent speakers merely to satisfy a range minimum or exact count; it
+reports `unsatisfied_constraints`, reports `speaker_count_unresolved`, or
+returns a hard error according to typed fallback policy.
 
 The probabilistic speaker-count candidate uses five deterministic semantic
 views: full evidence, no pitch, no dynamics, no formants, and no channel.
@@ -644,11 +681,11 @@ resource, privacy, or fallback rules.
 
 ## 11. Privacy and corpus handling
 
-Schema v4 may persist turns, hint audit rows, and privacy-safe profile summaries
-inside SQLite. It does not persist raw PCM, frame features, Fourier spectra,
-cepstra, reusable speaker vectors, the CLI hint-document source path, or corpus
-metadata.
-`persist_profiles` records explicit consent but does not expand the v4 storage
+Schema v5 may persist turns, hint audit rows, typed speaker-count outcomes,
+per-hint dispositions, and privacy-safe profile summaries inside SQLite. It
+does not persist raw PCM, frame features, Fourier spectra, cepstra, reusable
+speaker vectors, the CLI hint-document source path, or corpus metadata.
+`persist_profiles` records explicit consent but does not expand the v5 storage
 surface; reusable vectors require a separately reviewed schema and retention
 policy.
 

@@ -16,8 +16,9 @@
 //!    (`request.model` → `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`), load it, read
 //!    the normalized WAV, decode through the engine.
 //! 2. **Diarize**: assign a speaker to every real segment via the orchestrator's
-//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]), honoring
-//!    the request's num/min/max speaker constraints. Segments are labeled
+//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]). A range
+//!    maximum can cap its provisional clusters, but a hard count never forces
+//!    cluster collapse without acoustic evidence. Segments are labeled
 //!    `SPEAKER_NN` (DISC-002: cross-engine labels need not match exactly).
 //!
 //! ## Diarizer honesty — NOT a neural speaker encoder
@@ -49,7 +50,7 @@ use serde_json::{Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, SpeakerConstraints, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+    BackendKind, SpeakerCountRequest, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
 };
 use crate::native_engine::{self, NativeWhisperModel, decode};
 use crate::orchestrator::{self, DiarizeReport};
@@ -156,11 +157,14 @@ fn checkpoint_for(
     move || token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint)
 }
 
-/// The effective speaker constraints for diarization: the request's
-/// `num`/`min`/`max` speaker constraints, honored end-to-end by the diarizer.
-/// `None` means "auto-detect speaker count".
-fn speaker_constraints_for(request: &TranscribeRequest) -> Option<SpeakerConstraints> {
-    request.backend_params.speaker_constraints.clone()
+fn speaker_count_for(request: &TranscribeRequest) -> SpeakerCountRequest {
+    request
+        .backend_params
+        .acoustic_diarization
+        .as_ref()
+        .map_or(SpeakerCountRequest::Infer, |request| {
+            request.speaker_count.clone()
+        })
 }
 
 /// Compute the whole-clip audio duration in seconds for the diarizer, preferring
@@ -242,9 +246,15 @@ pub fn run(
     }
 
     // Real diarization: assign a speaker to every engine segment via the
-    // heuristic diarizer, honoring the request's speaker constraints.
+    // heuristic diarizer. Its provisional labels may honor a range maximum,
+    // but a hard count never forces cluster collapse without acoustic evidence.
     let mut segments = output.segments.clone();
-    let constraints = speaker_constraints_for(request);
+    let speaker_count = speaker_count_for(request);
+    if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
+        return Err(FwError::InvalidRequest(
+            "legacy native diarization cannot faithfully execute a speaker-count prior".to_owned(),
+        ));
+    }
     let duration_sec = audio_duration_sec(request, &output);
     let diarize_token = token
         .copied()
@@ -252,7 +262,7 @@ pub fn run(
     let report = orchestrator::diarize_segments(
         &mut segments,
         duration_sec,
-        constraints.as_ref(),
+        &speaker_count,
         &diarize_token,
     )?;
 
@@ -420,7 +430,8 @@ mod tests {
 
     use crate::backend::Engine;
     use crate::model::{
-        BackendKind, BackendParams, InputSource, SpeakerConstraints, TranscribeRequest,
+        BackendKind, BackendParams, DiarizationRequest, InputSource, SpeakerCountRequest,
+        TranscribeRequest,
     };
     use crate::native_engine::{self, decode};
     use crate::orchestrator::CancellationToken;
@@ -668,8 +679,13 @@ mod tests {
             seg(7.0, 9.0, "ask what you can do for your country"),
         ];
         let token = CancellationToken::unbounded();
-        let report = orchestrator::diarize_segments(&mut segments, Some(9.0), None, &token)
-            .expect("diarize");
+        let report = orchestrator::diarize_segments(
+            &mut segments,
+            Some(9.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .expect("diarize");
         assert_eq!(report.segments_labeled, 3);
         let re = regex_speaker();
         for s in &segments {
@@ -856,10 +872,12 @@ mod tests {
         let mut req = request();
         req.model = Some("tiny.en".to_owned());
         req.language = None;
-        req.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(2),
-            max_speakers: None,
+        req.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 64,
+            },
+            ..DiarizationRequest::default()
         });
 
         let result = run(&req, &wav, dir.path(), Duration::from_secs(180), None)
