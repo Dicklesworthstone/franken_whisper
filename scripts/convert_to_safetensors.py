@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import struct
 import sys
 from pathlib import Path
 
@@ -55,6 +57,51 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _save_deterministic_safetensors(
+    tensors: dict[str, "torch.Tensor"],
+    output: Path,
+    metadata: dict[str, str],
+) -> None:
+    """Write canonical F32 safetensors, then validate it with safetensors."""
+    from safetensors import safe_open
+
+    header: dict[str, object] = {"__metadata__": metadata}
+    offset = 0
+    for name in sorted(tensors):
+        tensor = tensors[name]
+        byte_length = tensor.numel() * 4
+        header[name] = {
+            "dtype": "F32",
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, offset + byte_length],
+        }
+        offset += byte_length
+
+    header_json = json.dumps(
+        header,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    header_json += b" " * (-len(header_json) % 8)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("xb") as destination:
+        destination.write(struct.pack("<Q", len(header_json)))
+        destination.write(header_json)
+        for name in sorted(tensors):
+            array = tensors[name].numpy().astype("<f4", copy=False)
+            destination.write(array.tobytes(order="C"))
+
+    # Independent format validation. The Rust runtime performs stricter
+    # model-specific census, dtype, metadata, byte-size, and hash checks.
+    with safe_open(output, framework="pt", device="cpu") as package:
+        if sorted(package.keys()) != sorted(tensors):
+            raise RuntimeError("written safetensors tensor census changed")
+        if package.metadata() != metadata:
+            raise RuntimeError("written safetensors metadata changed")
 
 
 def main() -> int:
@@ -82,7 +129,6 @@ def main() -> int:
         import numpy
         import safetensors
         import torch
-        from safetensors.torch import save_file
     except ImportError as exc:  # pragma: no cover - environment dependent
         print(f"error: missing dependency ({exc}); pip install torch safetensors", file=sys.stderr)
         return 2
@@ -229,8 +275,7 @@ def main() -> int:
             "exported_dtype": "F32",
         }
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, str(args.output), metadata=metadata)
+    _save_deterministic_safetensors(tensors, args.output, metadata)
 
     out_sha = _sha256(args.output)
     print(f"wrote {len(tensors)} tensors -> {args.output}")
