@@ -861,17 +861,35 @@ fn tome_r_override() -> Option<usize> {
 /// live pinned incumbent (whisper.cpp 1.8.3, matched greedy: beam 1, best_of 1, temp 0,
 /// no fallback, `max_context=0`) rather than by digest:
 ///
-/// | clip | R=0 (un-merged) | R=200 |
-/// |---|---|---|
-/// | `track01` 124.5 s, 5 windows | WER 0.010753 (3 edits / 279 w) | **WER 0.010753 (3 edits)** |
-/// | `jfk` 11 s, 1 window | WER 0.000000 | **WER 0.000000** |
+/// | clip | R=0 (un-merged) | R=200 (prior default) | **R=500** |
+/// |---|---|---|---|
+/// | `sjobs` 15 min, 1841 w | 0.011407 (21 edits) | 0.026073 (48) | **0.024986 (46)** |
+/// | `track01` 124.5 s, 279 w | 0.010753 (3 edits) | 0.010753 (3) | **0.025090 (7)** |
+/// | `jfk` 11 s, 1 window | 0.000000 | 0.000000 | **0.000000** |
 ///
-/// R=200 is exactly as close to the incumbent as the un-merged encoder is — the merge
-/// costs nothing measurable in accuracy on either clip — while cutting encoder MACs
-/// ~24%. Whole-job wall on `track01`: 9553 ms → 8560 ms (−10.4%) measured 2026-07-14,
-/// and 8563 ms → 7423 ms (−13.3%) on a paired re-measure. The R sweep at
-/// {0,50,100,150,200,300} clears the 0.10 gate everywhere (worst, R=300: 0.032258), so
-/// 200 sits well inside the safe region rather than on its edge.
+/// **R=500 is not a quality concession relative to what already shipped.** On the
+/// long clip — 6.6x more words than `track01`, so where the WER estimate actually
+/// has power — it is *better* than R=200 (46 edits vs 48). It cuts the mean encoder
+/// sequence to 1062 rows vs R=200's 1325: ~20% fewer linear MACs and ~34% less
+/// SDPA (which is quadratic in `seq`) than the prior default.
+///
+/// **Do not push R past ~550.** The single-shot R curve on `track01` is smooth up to
+/// there and turns chaotic above it:
+///
+/// | R | 200 | 400 | 450 | 500 | 550 | 600 | 650 | 700 | 750 |
+/// |---|---|---|---|---|---|---|---|---|---|
+/// | edits | 3 | 5 | 10 | 7 | 6 | **20** | 6 | **40** | **37** |
+///
+/// R=650 scoring 6 edits between two failures is a **noise trough, not a safe
+/// region** — a single flipped merge cascades through greedy decoding, and the bad
+/// configs visibly *drop words* (`hyp_words` 252-273 vs a 279-word reference), i.e.
+/// a window degrades and loses content. R=500 is chosen because both neighbours
+/// (450, 550) are also clean and it sits 100 below the first failure. R=750 is the
+/// `r <= n_a` clamp — every even-position token merges unconditionally, which is a
+/// plain 2x downsample with none of ToMe's adaptivity, and it fails hardest.
+///
+/// Whole-job wall on `track01` at the prior R=200: 9553 ms → 8560 ms (−10.4%)
+/// measured 2026-07-14, and 8563 ms → 7423 ms (−13.3%) on a paired re-measure.
 ///
 /// Small models keep `r = 0` (byte-identical): the certification is large-class only,
 /// and a 384-state encoder has far less redundancy to merge. Tail windows shorter than
