@@ -2643,7 +2643,7 @@ invocation at 32 requested threads and matched greedy decode settings
 - **Paired null (A/A) control, same binary** — every new wall-time A/B verdict must carry an identity null in the same invocation, with order-interleaved arms, so host contention and run-order bias cannot masquerade as a speedup. A counted-mechanism rejection may omit timing inference only when the unchanged count itself proves that no work was removed.
 - **Byte/ULP-exact where claimed** — byte-exact levers are asserted bit-identical to the reference path; the sole numerics-affecting default (poly-exp) is held to WER-Δ 0.000 vs `whisper.cpp`.
 - **Negative-evidence ledger** — new rejected levers record either a numerical same-invocation A/A null or a counted unchanged-work mechanism, plus a concrete retry predicate. The pre-commit gate rejects undecidable rows. See [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md) and [`docs/LEDGER_RESURRECTION.md`](docs/LEDGER_RESURRECTION.md).
-- **Gate.** A result is decidable only when its median lies outside the A/A null's 95% CI with a 2× margin. `cv` is recorded as provenance and never decides a verdict.
+- **Gate.** A result is decidable only when both same-invocation A/A null medians lie in `[0.98, 1.02]` inclusive, its comparison CI95 excludes `1.0`, and its effect clears 2× the widest null-CI edge from `1.0`. A null CI need not straddle `1.0`; its widest edge calibrates the margin. `cv` is recorded as provenance and never decides a verdict.
 
 **Scope.** These are **greedy / temperature-0** comparisons with the reference
 explicitly forced to the same decode mode (`-bs 1 -bo 1`). The no-timestamp
