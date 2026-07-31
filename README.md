@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.26× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -31,7 +31,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 >
 > | Model / workload | Mode | Matched-greedy result |
 > |---|---|---|
-> | large-v3-turbo, 124.5 s / 5 windows | whole job, no timestamps | **2.26× faster** |
+> | large-v3-turbo, 124.5 s / 5 windows | whole job, no timestamps | **2.99× faster** |
 > | tiny.en, 124.5 s / 5 windows | transcribe only, no timestamps | **1.52× faster** |
 > | tiny.en, 300 s / 10 windows | transcribe only, no timestamps | **1.51× faster** |
 
@@ -2686,7 +2686,7 @@ invocation at 32 requested threads and matched greedy decode settings
 
 | Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|
-| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, whole job, no timestamps | **2.26× faster** |
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, whole job, no timestamps | **2.99× faster** |
 | vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, transcribe only, no timestamps | **1.52× faster** |
 | vs `whisper.cpp` (CPU) | `tiny.en` | 300 s, transcribe only, no timestamps | **1.51× faster** |
 

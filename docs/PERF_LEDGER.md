@@ -49,6 +49,100 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-07-31 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — `large-v3-turbo` whole job: **2.992045×** (ToMe R=500)
+
+**Result class: INCUMBENT-WIN / CAMPAIGN WIN.** Supersedes the `2.264127×`
+row below as the flagship whole-job claim; that row remains valid for the
+un-merged encoder and is now also the *control arm* of this one.
+
+**Legacy incumbent:** whisper.cpp 1.8.3 `whisper-cli`
+(`incumbent_bin_sha256=73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`).
+
+**Comparator execution:** the actual legacy incumbent and franken ran
+side-by-side in the same invocation. Seven comparison rounds alternated arm
+order, and the same invocation ran a seven-round A/A null for each engine.
+
+**Measured incumbent ratio:** `2.992045×` (`whisper.cpp / franken`), CI95
+`[2.937305, 3.025916]`, `n=7`. Median whole-job wall was `4958.984 ms` for
+franken and `14837.504 ms` for whisper.cpp. Per-round ratios:
+`[2.993139, 2.974436, 2.992045, 3.031284, 2.937305, 2.914369, 3.025916]`.
+
+**The lever: ToMe token merge raised from R=200 to R=500** (`encoder.rs`,
+`TOME_R_LARGE_DEFAULT`). The encoder wall on this box is an all-core frequency
+throttle, not idle workers, so the only thing it yields to is fewer MACs. One
+adaptive bipartite merge after layer 3 takes the sequence from 1500 to 1000
+rows for the remaining 28 of 32 blocks: mean encoder sequence 1062 vs the prior
+default's 1325, which is ~20% fewer linear MACs and ~34% less SDPA (quadratic
+in `seq`). whisper.cpp has no equivalent — it runs every window at full length
+regardless of how redundant the frames are.
+
+**Same-session control arm, so the gain is attributed and not inferred.** The
+identical binary was re-run with `FW_TOME_R=0` on the same quiet host minutes
+later, against the same live incumbent:
+
+| arm | franken median | vs incumbent | CI95 | WER vs incumbent |
+|---|---|---|---|---|
+| `FW_TOME_R=0` (un-merged control) | `6630.436 ms` | `2.273710×` | `[2.208881, 2.303804]` | `0.010753` (3 edits) |
+| **R=500 (shipped default)** | **`4958.984 ms`** | **`2.992045×`** | `[2.937305, 3.025916]` | `0.025090` (7 edits) |
+
+Both arms returned `verdict=WIN`. The control reproduces the previously
+certified `2.264127×` flagship row to within 0.4% (`2.273710` vs `2.264127`)
+on the same host, model, audio and incumbent binary — so the harness is stable
+across the two sessions and the `+31.6%` ratio improvement is the merge, not
+drift. franken's own whole-job wall improves `1.337×`.
+
+**Quality is gated, not assumed.** The harness's own cross-engine gate passed
+in the measured invocation (`wer=0.025090 wer_edits=7 wer_max=0.100000
+quality_clear=true`), independently reproducing the offline certification. R
+was chosen from a sweep on a third, previously unused 15-minute clip with 1841
+reference words, where **R=500 beats the R=200 that already shipped** (46 edits
+vs 48) — see the `encoder.rs` doc comment for the full table and for why R>550
+is off-limits (the curve turns chaotic; R=650's good score is a noise trough
+between two failures).
+
+**Whole-job scope and matched decode.** Both arms processed the same 124.5 s
+normalized WAV as fresh processes. Timed wall includes process startup, model
+and audio I/O, inference, result serialization, and teardown. Both used beam
+size 1, best-of 1, temperature 0, temperature fallback off, `max_context=0`,
+language `en`, translate false, word timestamps false. Text/no-timestamps,
+requested and configured at 32 threads. `work_count_classification=matched_within_10pct`.
+
+**Running-image and input identity.** Identical to the `2.264127×` row for
+model, audio and incumbent, which is what makes the two directly comparable:
+
+- benchmark ELF SHA-256
+  `8b56bcd79aaa980ee1ca516057b58859e1a360719dbb368ac3670cfb2f4b8fcf`
+  (`distinct_binaries=true`, `identity_clear=true`);
+- incumbent running-image SHA-256
+  `73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+  the pinned 1.8.3 source/version/build-option contract passed;
+- `ggml-large-v3-turbo.bin` SHA-256
+  `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`;
+  normalized WAV SHA-256
+  `fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+
+**Gates.** All clear: `quality_clear`, `thread_clear`, `normalization_clear`,
+`word_timing_clear`, `external_host_clear`, `host_wide_clear`,
+`cpu_frequency_policy_clear`, `identity_clear`, `load_split_clear`,
+`decode_matched=true`. Nulls `fw=1.001413` / `wc=0.999952`, both inside
+`[0.98, 1.02]`; required margin `1.068979` against a compare median of
+`2.992045`.
+
+**Host.** `threadripperje` (Threadripper PRO 5995WX, 64C/128T), all 128 CPUs
+`performance`, host-wide quiescence `max_busy_fraction=0.000000` at
+`pre_measurement`. The originating box `thinkstation1` carried other tenants
+(`cc1plus`/`rustc`, load 300-600) for the whole session and its gate correctly
+refused; the run moved to the quiet host rather than loosening a threshold.
+
+**Logs.** `whole_job_tome500_n7.log` SHA-256
+`79ab9b5af99fd1e0f9ae3ba6e10864680edd82f58d2eb181c47a481db5656f65`;
+control `whole_job_tome0_n7.log` SHA-256
+`331a4b57df752762621638ec58fe0cab66cc736a1c704351fbe920976e7cf927`.
+Retained under `/data/tmp/fw-tome-prog/logs/`.
+
+**Rollback.** `FW_TOME_R=200` restores the prior default; `FW_TOME_R=0`
+restores the byte-exact un-merged encoder (and the `2.27×` control row).
+
 ## 2026-07-31 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — `large-v3-turbo` whole job: **2.264127×** (bd-pjl6)
 
 **Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
