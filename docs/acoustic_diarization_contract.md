@@ -1015,7 +1015,89 @@ All input documents, media, and output reports must be absolute external
 files. A missing `--reference` is valid and produces
 `inconclusive_no_reference` for genuine disagreements.
 
-### 11.5 Repository and release guard
+### 11.5 Optional ECAPA model and numerical conformance boundary
+
+`src/ecapa_conformance.rs` freezes the prerequisite contract for a later
+safe-Rust ECAPA-TDNN engine. It does **not** admit neural inference into
+`auto`, change the acoustic default, download a model, or parse a framework
+checkpoint at runtime. Full forward inference and routing remain separate
+work.
+
+The source is
+[`speechbrain/spkrec-ecapa-voxceleb`](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/tree/eac27266f68caa806381260bd44ace38b136c76a)
+at immutable revision `eac27266f68caa806381260bd44ace38b136c76a`,
+under Apache-2.0. The `embedding_model.ckpt` identity is:
+
+- 83,316,686 source bytes;
+- SHA-256
+  `0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2`;
+- 231 source entries: 200 inference `f32` tensors and 31 scalar `i64`
+  BatchNorm `num_batches_tracked` counters;
+- hyperparameter SHA-256
+  `ecd11c44202b32edb72709dd1013a16f2f060ebee3438ae8a9f9fecb0666ecd2`;
+- training-code revision
+  `aa0185408025e80f6c748d2c7af7fa96958c2231`.
+
+The model card says the model was trained on VoxCeleb1 and VoxCeleb2. That is
+speaker-verification training over English web video, not calibration for
+meeting diarization. Telephone, far-field, playback, muffling, accent,
+language, overlap, and domain shifts require held-out validation. An embedding
+is acoustic similarity evidence, never a gender, name, or person-identity
+claim.
+
+The versioned export protocol is
+`franken-whisper-ecapa-export-v1`. Source checkpoint loading is a
+development-only, out-of-process trust boundary: a conforming exporter may
+load only the checkpoint with the exact hash above in an isolated
+SpeechBrain 0.5.16 / Torch 2.7.1 environment. It must then:
+
+1. require the exact ordered name and shape inventory returned by
+   `expected_ecapa_tensors`;
+2. reject every unexpected dtype or tensor, dropping only the 31 named
+   `num_batches_tracked` counters;
+3. preserve unfused BatchNorm parameters and PyTorch logical row-major layout;
+4. materialize contiguous IEEE-754 `f32` values in little-endian order;
+5. hash every tensor and the 83,223,808-byte payload; and
+6. emit a path-free `franken-whisper-ecapa-weights-v1` canonical JSON
+   manifest whose self-hash is computed with `manifest_sha256` empty.
+
+Neither source nor exported weights belong in Git. The shipped Rust verifier
+requires the model revision, checkpoint identity, contract hash, exporter
+version, all 200 names/shapes/dtypes/offsets/lengths, every tensor hash, the
+payload hash, and the manifest self-hash before inference can consume a byte.
+It streams verification in bounded chunks, checks cancellation between
+chunks, and reports stable `ecapa.*` reasons without printing paths, tensor
+contents, or source bytes.
+
+The frontend is exact 16 kHz mono finite PCM in `[-1, 1]`, with a 400-sample
+periodic Hamming window, 160-sample hop, centered zero padding, 400-point
+one-sided squared-magnitude spectrum, 80 SpeechBrain symmetric triangular HTK
+mel filters over 0–8 kHz, `amin=1e-10`, 80 dB clipping, and per-utterance
+feature-mean subtraction without standard-deviation normalization. Model
+windows shorter than 0.5 seconds fail closed. Resampling and downmixing must
+already have occurred at the normalized-audio boundary; mislabeled 8 kHz or
+interleaved PCM is rejected rather than guessed.
+
+The raw 192-value model output is the golden embedding stage. Production
+clustering receives an L2-unit-normalized vector and rejects non-finite,
+wrong-shaped, or norm-below-`1e-6` output. The public analytic fixture combines
+173 Hz and 347 Hz harmonics, a chirp, and one impulse; it contains no speech or
+identity evidence. `franken-whisper-ecapa-golden-v1` binds full-array hashes
+and selected values for the two frontend stages, initial TDNN, first SE-Res2
+block, multi-feature aggregation, attentive pooling, and raw embedding.
+
+Declared maximum absolute/relative tolerances are respectively `0.05/0.005`
+for pre-normalization filterbanks, `0.08/0.005` for normalized filterbanks,
+`0.002/0.002` for initial TDNN, SE-Res2, and aggregation, `0.001/0.002` for
+pooling, and `0.02/0.002` for the raw embedding. The scalar Rust frontend is
+held to a tighter `0.001` absolute error on the frozen selected points.
+Non-finite values, shape drift, hash drift, version drift, or a tolerance
+failure are hard conformance failures. They may not be waived by downstream
+DER, silently widened, or converted into an acoustic-engine success. A
+tolerance change requires a new schema/version, regenerated public evidence,
+and an explicit discrepancy record.
+
+### 11.6 Repository and release guard
 
 Audio/video extensions and transcript sidecars are ignored broadly, including
 case variants and text/JSON/subtitle forms. Raw decoder spans and transcript-

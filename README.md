@@ -428,6 +428,15 @@ The full adapter protocol, environment overrides, privacy rules, and authority
 boundary are in the
 [`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
 
+The optional neural path is deliberately not advertised as operational yet.
+The library currently freezes and verifies a license-compatible ECAPA-TDNN
+source revision, exact 200-tensor safe-package layout, SpeechBrain-compatible
+Rust frontend, public analytic golden stages, and fail-closed numerical
+tolerances. It does not vendor weights, parse PyTorch checkpoints in the
+runtime, or enable neural routing; safe-Rust forward inference and evaluation
+remain subsequent gates. See the
+[`ECAPA conformance boundary`](docs/acoustic_diarization_contract.md#115-optional-ecapa-model-and-numerical-conformance-boundary).
+
 ### 4. Microphone Capture
 
 ```bash

@@ -66,7 +66,7 @@ Features originating from or inspired by the whisper-diarization (Python) projec
 | Source separation (Demucs vocal isolation) | legacy_whisper_diarization | `backend::whisper_diarization` | Partial | Supported via `--no-stem` toggle in `DiarizationConfig`. The Demucs stage runs inside the legacy Python script; no native Rust source separation exists. |
 | Forced alignment (CTC) | legacy_whisper_diarization | `backend::whisper_diarization` | Partial | CTC forced alignment runs inside the legacy Python pipeline via `diarize.py`. `--suppress_numerals` toggle forwarded. No native Rust CTC aligner implementation. |
 | Punctuation restoration | legacy_whisper_diarization | `backend::whisper_diarization` | Partial | Multilingual punctuation restoration runs inside the legacy Python pipeline. No native Rust punctuation restoration model. |
-| Speaker embedding extraction (NeMo TitaNet) | legacy_whisper_diarization | `backend::whisper_diarization` | Partial | Speaker embedding and clustering run inside the legacy Python pipeline. No native Rust speaker embedding implementation. |
+| Speaker embedding extraction (NeMo TitaNet) | legacy_whisper_diarization | `backend::whisper_diarization`, `ecapa_conformance` | Partial | The legacy bridge still runs TitaNet embedding and clustering. The native ECAPA source/export/frontend contract, exact tensor-package verifier, public golden stages, and normalization boundary are complete; safe-Rust network forward inference and pipeline integration are not yet implemented. |
 | SRT output parsing | legacy_whisper_diarization | `backend::whisper_diarization` | Done | Hardened SRT parser handles timestamp extraction and speaker label recognition from diarization output. |
 | Device and batch size configuration | legacy_whisper_diarization | `model::DiarizationConfig` | Done | `--device`, `--batch-size`, and `--whisper-model` forwarded. Env fallback via `FRANKEN_WHISPER_DIARIZATION_DEVICE`. |
 | Suppress numerals option | legacy_whisper_diarization | `model::DiarizationConfig` | Done | `--suppress_numerals` flag forwarded to improve CTC alignment stability. |
@@ -147,7 +147,12 @@ Features that span all legacy projects or are new to franken_whisper.
 
 1. **Streaming transcription (live audio chunked inference)**: whisper.cpp's real-time sliding-window transcription is not yet replicated natively. The `StreamingEngine` trait is implemented and `WhisperCppEngine` has a streaming adapter, but native chunked audio streaming inference (sliding-window on live audio) is not yet available. The `LiveTranscriptionView` TUI component is ready to consume streaming segments.
 
-2. **Native diarization pipeline stages**: Source separation, forced alignment, punctuation restoration, and speaker embedding extraction are all functional via the legacy Python subprocess bridge, but none have native Rust implementations. The pipeline now has dedicated `PipelineStage` variants (Vad, Separate, Align, Punctuate, Diarize) and model-layer configuration types (`AlignmentConfig`, `PunctuationConfig`, `SourceSeparationConfig`), but the actual compute for these stages still delegates to the legacy Python environment.
+2. **Remaining native diarization stages**: The classical Rust acoustic
+   diarizer is operational, and the native ECAPA source/export/frontend
+   conformance boundary is complete. Source separation, forced alignment, and
+   punctuation restoration still delegate to the legacy Python environment;
+   safe-Rust ECAPA forward inference, clustering integration, and neural
+   rollout evaluation remain incomplete.
 
 ---
 
