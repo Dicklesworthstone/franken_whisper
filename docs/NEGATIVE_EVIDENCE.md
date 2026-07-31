@@ -4,6 +4,71 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-31 - BlackThrush: **CORRECTION + METHOD — the `sbh` retry predicate on the tiny.en timestamp cell IS satisfied, and the aggregate admission census that cleared this host is not admissible evidence.**
+
+This does **not** add a second veto for the same cell. Claim `7774` below
+already records the preflight rejection. Two things in that record need
+correcting, both found by an independent duplicate attempt of the identical
+cell run minutes later (log SHA-256
+`583da7ad85d277939f8715ea206502a2fc56622a308117e4d898cc5c0ef9103a`, artifacts
+`/data/tmp/fw-realistic-phase5/segts_retry_4a5eb947_t32_n7`), which reproduced
+the same `cpu102=100.0%` abort and exit 101.
+
+**1. The predicate that vetoed the 2026-07-30 run is satisfied; "unchanged" is
+too strong.** That run was `UNDECIDABLE` for exactly one reason — the resident
+`sbh` daemon reached `0.129419` CPU core against the `0.100000` maximum — and
+its predicate named `sbh` specifically. Sampled immediately before this
+attempt, **`sbh` held `0.031` CPU core**, under a third of the ceiling. The
+named blocker is gone and should not be re-cited. What replaced it is a
+different, unrelated co-tenant class: a `sudo du -xsh` scratch survey, plus
+`git -C /data/projects/flywheel_connectors` at ~1.0 core and a system
+`apt-get -f install` at ~1.1 core observed in the same window. Recording this
+as "predicate unchanged" would leave a future reader waiting on a daemon that
+has already stood down.
+
+**2. The driver's own admission census cleared a host that was not clear.**
+The five-sample `vmstat` gate inherited verbatim from the frozen phase-4
+driver — ≥95% average idle, zero iowait — **passed**: `samples=5
+idle_avg_pct=99.000 idle_min_pct=99.000 iowait_max_pct=0.000 clear=true`. It
+passed *while a core was pinned at 100%*, because one saturated core is 1/128
+of this host and rounds to 99% idle. `load1` told the same lie: `0.65` at claim
+time, `1.40` ninety seconds later, with a full core busy throughout. Only the
+harness's per-CPU sample caught it. **On a 128-thread host, aggregate idle and
+load average are not admissible exclusivity evidence; per-CPU and per-process
+sampling are.** The driver census stays for provenance and must never be
+quoted as the exclusivity gate — it is precisely the kind of gate that passes
+when it should fail.
+
+Two deviations from the frozen cell are recorded so the attempts are
+comparable, both strictly tightening: artifact
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a` (source
+`1b87400583767ef181a7a9388587119e60dd8a3dbf4e03c6695fd8cd972cd7cb`,
+byte-identical to HEAD `examples/incumbent_ab.rs` — the harness carrying the
+corrected dual-null-median clause) instead of the older `d2fa276c…` ELF that
+predates that clause; and rounds 3 → 7 so each half of the odd-round load
+split carries three observations. Incumbent, model, audio, threads, scope,
+timestamp mode, and workload name were byte-identical; all four input digests
+were re-verified before launch and the uniform `performance` governor was
+confirmed on all 128 CPUs. No timing, ratio, or verdict exists for this
+attempt and none is inferred.
+
+**Coordination cost, recorded honestly.** Two lanes ran the same frozen cell on
+the same host within roughly ninety seconds, having each independently judged
+the predicate satisfied. Neither run contaminated the other — claim `7774`
+reached terminal before this attempt started — but the duplication was real and
+avoidable. The `trj-booking` thread was claimed and released for this attempt;
+it should be checked *and* answered before any trj cell, not only claimed.
+
+**Concrete retry predicate (updated, supersedes the `sbh` clause).** Rerun the
+frozen n=7 cell only after a **per-process** census — not `vmstat`, not
+`load1` — shows no process above `0.100000` CPU core, and a **per-CPU** sample
+shows every online CPU at or below 20% busy; take both within the minute before
+launch and re-check across the full invocation. Retain the artifact, incumbent,
+model, audio, decode, work, quality, actual-thread, frequency, host-wide,
+load-split, corrected `[0.98, 1.02]` dual-null-median, and 2×-widest-null
+gates unchanged.
+
+---
 ## 2026-07-31 - BlackThrush: **NO ADMISSIBLE VERDICT — the first matched whole-job `large-v3-turbo` ratio failed closed on a mid-run external process and the corrected null-median clause.**
 
 The first mechanically complete whole-job retry produced a
@@ -226,6 +291,55 @@ The admissible campaign row is now in `docs/PERF_LEDGER.md`. Raw log:
 `3a0332c6726b86c4422ba91e190c54f26032ea9910c1a8c398bd8867f207f1c4`.
 This closes the retry obligation; it does not retroactively admit any of the
 diagnostic ratios above.
+
+---
+## 2026-07-31 - BlackThrush: **PRE-TIMING VETO — the real-MP3 whole-job cell fails normalization-frame equivalence; lossless FLAC clears the same predicate.**
+
+The landed codec comparator was exercised with the frozen strict-RCH harness
+ELF SHA-256
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`
+before booking a measurement host. The source fixture was the pinned
+1,991,339-frame WAV, SHA-256
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+It was encoded as mono 16 kHz, 128 kbit/s MP3 with ffmpeg 7.0.2-static
+(executable SHA-256
+`e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99`);
+the resulting 124.560 s, 1,993,580-byte input had SHA-256
+`731ef3f1e3e5a4a512a0b93cf0cbb971c065026f4786cf7d6e9c7a4d4801a9fe`.
+
+An untimed, low-priority frozen-worker smoke on `thinkstation1` (AMD Ryzen
+Threadripper PRO 5975WX, 32 physical cores / 64 logical threads, one NUMA
+node) forced the built-in Symphonia path by pointing ffmpeg at a missing
+sentinel. Native normalization emitted **1,992,960 frames**, while both the
+reference and comparator-exact ffmpeg normalization emitted **1,991,339**.
+The `1,621`-frame delta exceeds the fixed `320`-frame ceiling, so this MP3
+cell cannot enter timing. Native normalized-WAV SHA-256 was
+`7d863ab0af9ca58361db196c8bccba0ab748d2b981cebeccb1a8daf59aff599e`;
+worker-log SHA-256 was
+`2f2e9f8108c7148487629c1e8710b92900c05f860da47217a9bdd1ed6d0b4302`.
+
+This was deliberately not a performance invocation: it bypassed the parent
+thread/process probe and host/null machinery. The worker was configured at 8
+threads, but **no actual CPU-tick-positive TID census was recorded**; no
+cross-engine transcript/work check, A/A null, corrected-null-median gate,
+ratio, or verdict exists. The frame mismatch alone is a fail-closed mechanism
+rejection.
+
+**Concrete MP3 retry predicate:** account for encoded MP3 delay/padding so the
+built-in and ffmpeg/reference frame counts differ by at most 320, then rerun
+the whole parent comparator and require exact running-image identity, matched
+decode/work, transcript WER at most 0.1, actual observed threads, uniform
+performance governor, process/host exclusivity, both A/A medians in
+`[0.98, 1.02]`, the retained 2x-widest-null margin, and the load split.
+
+The same prep was repeated with a common lossless FLAC input instead of
+weakening that gate. FLAC level 8 SHA-256
+`fc591b8a46b62d6a8a9e58baaa58a525ab5a260827a0ed561c184d2ea0a74502`
+is 1,606,651 bytes and 124.458688 s. Native and ffmpeg normalization each
+emitted exactly 1,991,339 frames, and all 1,991,339 PCM samples were identical
+(maximum absolute sample delta 0). That clears only the pre-timing
+normalization predicate; the FLAC whole-job incumbent ratio remains unmeasured
+until its own fully gated host invocation completes.
 
 ---
 ## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
