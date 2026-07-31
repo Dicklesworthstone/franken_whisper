@@ -643,7 +643,9 @@ The same result separately reports:
 - proper multiclass count-posterior Brier score, finite negative log
   likelihood plus an explicit zero-reference-probability flag, concrete
   top-k coverage, a deterministic credible set that may retain unresolved
-  mass, entropy, and calibration authority;
+  mass, entropy, and calibration authority; a reference count outside the
+  concrete posterior support still contributes its missing target-class term
+  to the Brier score rather than disappearing from the outcome space;
 - scored occupancy per anonymized hypothesis label, effective speaker count,
   phantom-label count, dominant-label share, UNKNOWN share, recurrence, and
   per-reference recall-collapse diagnostics;
@@ -676,6 +678,11 @@ speakers. UNKNOWN share is measured over hypothesis speaker-time
 (`UNKNOWN / (labeled + UNKNOWN)`), so false alarms cannot make it exceed one.
 All thresholds are integer millionths or milliseconds in the self-hashed
 configuration.
+
+Reference labels that occur only inside excluded scoring regions do not enter
+the reference-collapse count or minority-recall diagnostic. Hypothesis labels
+seen only there remain visible with zero scored occupancy, but are neither
+effective nor phantom speakers.
 
 ### 9.2 Corpus manifests and leakage
 
