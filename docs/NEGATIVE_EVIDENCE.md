@@ -293,6 +293,55 @@ This closes the retry obligation; it does not retroactively admit any of the
 diagnostic ratios above.
 
 ---
+## 2026-07-31 - BlackThrush: **PRE-TIMING VETO — the real-MP3 whole-job cell fails normalization-frame equivalence; lossless FLAC clears the same predicate.**
+
+The landed codec comparator was exercised with the frozen strict-RCH harness
+ELF SHA-256
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`
+before booking a measurement host. The source fixture was the pinned
+1,991,339-frame WAV, SHA-256
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+It was encoded as mono 16 kHz, 128 kbit/s MP3 with ffmpeg 7.0.2-static
+(executable SHA-256
+`e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99`);
+the resulting 124.560 s, 1,993,580-byte input had SHA-256
+`731ef3f1e3e5a4a512a0b93cf0cbb971c065026f4786cf7d6e9c7a4d4801a9fe`.
+
+An untimed, low-priority frozen-worker smoke on `thinkstation1` (AMD Ryzen
+Threadripper PRO 5975WX, 32 physical cores / 64 logical threads, one NUMA
+node) forced the built-in Symphonia path by pointing ffmpeg at a missing
+sentinel. Native normalization emitted **1,992,960 frames**, while both the
+reference and comparator-exact ffmpeg normalization emitted **1,991,339**.
+The `1,621`-frame delta exceeds the fixed `320`-frame ceiling, so this MP3
+cell cannot enter timing. Native normalized-WAV SHA-256 was
+`7d863ab0af9ca58361db196c8bccba0ab748d2b981cebeccb1a8daf59aff599e`;
+worker-log SHA-256 was
+`2f2e9f8108c7148487629c1e8710b92900c05f860da47217a9bdd1ed6d0b4302`.
+
+This was deliberately not a performance invocation: it bypassed the parent
+thread/process probe and host/null machinery. The worker was configured at 8
+threads, but **no actual CPU-tick-positive TID census was recorded**; no
+cross-engine transcript/work check, A/A null, corrected-null-median gate,
+ratio, or verdict exists. The frame mismatch alone is a fail-closed mechanism
+rejection.
+
+**Concrete MP3 retry predicate:** account for encoded MP3 delay/padding so the
+built-in and ffmpeg/reference frame counts differ by at most 320, then rerun
+the whole parent comparator and require exact running-image identity, matched
+decode/work, transcript WER at most 0.1, actual observed threads, uniform
+performance governor, process/host exclusivity, both A/A medians in
+`[0.98, 1.02]`, the retained 2x-widest-null margin, and the load split.
+
+The same prep was repeated with a common lossless FLAC input instead of
+weakening that gate. FLAC level 8 SHA-256
+`fc591b8a46b62d6a8a9e58baaa58a525ab5a260827a0ed561c184d2ea0a74502`
+is 1,606,651 bytes and 124.458688 s. Native and ffmpeg normalization each
+emitted exactly 1,991,339 frames, and all 1,991,339 PCM samples were identical
+(maximum absolute sample delta 0). That clears only the pre-timing
+normalization predicate; the FLAC whole-job incumbent ratio remains unmeasured
+until its own fully gated host invocation completes.
+
+---
 ## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
 
 The exclusive current-source certification used frozen `release-perf` harness
