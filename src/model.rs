@@ -605,6 +605,259 @@ pub enum SpeakerCountOutcomeReason {
     ExternalAttribution,
 }
 
+/// One normalized probability mass in a bounded speaker-count estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerCountPosteriorBin {
+    pub count: u32,
+    pub probability: f64,
+}
+
+/// Inclusive count interval supported by the retained acoustic evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerCountRange {
+    pub minimum: u32,
+    pub maximum: u32,
+}
+
+/// Independent evidence view contributing to speaker-count selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountEvidenceLane {
+    MergeRisk,
+    SparseNormalizedEigengap,
+    FeatureJackknife,
+    EffectiveOccupancy,
+    ConstraintGraph,
+    CallerPrior,
+}
+
+/// Why one count-evidence lane could not contribute authoritative evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountLaneUnavailableReason {
+    InsufficientPrototypes,
+    InvalidAffinity,
+    SolverDidNotConverge,
+    InsufficientIndependentReplicates,
+    InsufficientVoicedEvidence,
+    NotRequested,
+    CalibrationUnavailable,
+    ResourceLimit,
+}
+
+/// Privacy-safe summary of one count-evidence lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerCountLaneEvidence {
+    pub lane: SpeakerCountEvidenceLane,
+    pub available: bool,
+    pub proposed_count: Option<u32>,
+    pub confidence: f64,
+    pub unavailable_reason: Option<SpeakerCountLaneUnavailableReason>,
+}
+
+/// Authority attached to the fused speaker-count distribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerCountCalibrationStatus {
+    Certified,
+    DevelopmentUncertified,
+    FixedSafeUncalibrated,
+    Unavailable,
+}
+
+/// Versioned, bounded and privacy-safe speaker-count estimate.
+///
+/// `posterior` contains only concrete count bins. `unresolved_probability` is
+/// separate so weak, contradictory, out-of-domain, or resource-limited
+/// evidence cannot be normalized into fabricated certainty over a count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerCountEstimate {
+    pub schema_version: String,
+    pub selected_count: Option<u32>,
+    pub supported_range: Option<SpeakerCountRange>,
+    pub posterior: Vec<SpeakerCountPosteriorBin>,
+    pub unresolved_probability: f64,
+    pub entropy_bits: f64,
+    pub stability: f64,
+    pub constraint_lower_bound: u32,
+    pub candidate_upper_bound: u32,
+    pub calibration_status: SpeakerCountCalibrationStatus,
+    pub calibration_sha256: String,
+    pub evidence_sha256: String,
+    pub lanes: Vec<SpeakerCountLaneEvidence>,
+}
+
+impl SpeakerCountEstimate {
+    /// Validate normalization, bounds, deterministic ordering and lane
+    /// availability semantics before this estimate crosses a public boundary.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version.is_empty() {
+            return Err("speaker-count estimate schema version is empty".to_owned());
+        }
+        if self.constraint_lower_bound > self.candidate_upper_bound {
+            return Err(
+                "speaker-count estimate lower bound exceeds its candidate upper bound".to_owned(),
+            );
+        }
+        if !unit_interval(self.unresolved_probability) {
+            return Err("speaker-count unresolved probability is not finite in 0..=1".to_owned());
+        }
+        if !unit_interval(self.stability) {
+            return Err("speaker-count stability is not finite in 0..=1".to_owned());
+        }
+        if !self.entropy_bits.is_finite() || self.entropy_bits < 0.0 {
+            return Err("speaker-count entropy is not finite and non-negative".to_owned());
+        }
+        if !lowercase_sha256(&self.calibration_sha256) {
+            return Err(
+                "speaker-count calibration fingerprint is not lowercase SHA-256".to_owned(),
+            );
+        }
+        if !lowercase_sha256(&self.evidence_sha256) {
+            return Err("speaker-count evidence fingerprint is not lowercase SHA-256".to_owned());
+        }
+
+        let mut previous_count = None;
+        let mut concrete_mass = 0.0;
+        let mut entropy_bits = entropy_term(self.unresolved_probability);
+        let mut map = None::<(f64, u32)>;
+        for bin in &self.posterior {
+            if bin.count < self.constraint_lower_bound || bin.count > self.candidate_upper_bound {
+                return Err("speaker-count posterior bin lies outside candidate bounds".to_owned());
+            }
+            if previous_count.is_some_and(|previous| bin.count <= previous) {
+                return Err(
+                    "speaker-count posterior bins are not strictly count-ordered".to_owned(),
+                );
+            }
+            if !bin.probability.is_finite() || bin.probability <= 0.0 || bin.probability > 1.0 {
+                return Err("speaker-count posterior probability is not finite in 0..=1".to_owned());
+            }
+            previous_count = Some(bin.count);
+            concrete_mass += bin.probability;
+            entropy_bits += entropy_term(bin.probability);
+            if map.as_ref().is_none_or(|&(probability, count)| {
+                bin.probability > probability
+                    || (bin.probability.to_bits() == probability.to_bits() && bin.count < count)
+            }) {
+                map = Some((bin.probability, bin.count));
+            }
+        }
+        if (concrete_mass + self.unresolved_probability - 1.0).abs() > 1.0e-9 {
+            return Err(
+                "speaker-count posterior and unresolved mass do not normalize to one".to_owned(),
+            );
+        }
+        if (entropy_bits - self.entropy_bits).abs() > 1.0e-9 {
+            return Err(
+                "speaker-count entropy does not match retained probability mass".to_owned(),
+            );
+        }
+
+        if let Some(range) = self.supported_range {
+            if range.minimum > range.maximum
+                || range.minimum < self.constraint_lower_bound
+                || range.maximum > self.candidate_upper_bound
+            {
+                return Err(
+                    "speaker-count supported range lies outside candidate bounds".to_owned(),
+                );
+            }
+        }
+        match self.selected_count {
+            Some(selected) => {
+                let Some((map_probability, map_count)) = map else {
+                    return Err(
+                        "speaker-count selection exists without concrete posterior mass".to_owned(),
+                    );
+                };
+                if selected != map_count || map_probability < self.unresolved_probability {
+                    return Err(
+                        "speaker-count selection is not the authoritative posterior action"
+                            .to_owned(),
+                    );
+                }
+                if self
+                    .supported_range
+                    .is_none_or(|range| selected < range.minimum || selected > range.maximum)
+                {
+                    return Err(
+                        "speaker-count selection lies outside the supported range".to_owned()
+                    );
+                }
+            }
+            None => {
+                if map.is_some_and(|(probability, _)| probability > self.unresolved_probability) {
+                    return Err(
+                        "speaker-count estimate is unresolved despite dominant concrete mass"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+
+        let mut seen_lanes = [false; 6];
+        for lane in &self.lanes {
+            if !unit_interval(lane.confidence) {
+                return Err("speaker-count lane confidence is not finite in 0..=1".to_owned());
+            }
+            let lane_index = match lane.lane {
+                SpeakerCountEvidenceLane::MergeRisk => 0,
+                SpeakerCountEvidenceLane::SparseNormalizedEigengap => 1,
+                SpeakerCountEvidenceLane::FeatureJackknife => 2,
+                SpeakerCountEvidenceLane::EffectiveOccupancy => 3,
+                SpeakerCountEvidenceLane::ConstraintGraph => 4,
+                SpeakerCountEvidenceLane::CallerPrior => 5,
+            };
+            if std::mem::replace(&mut seen_lanes[lane_index], true) {
+                return Err("speaker-count evidence lane is duplicated".to_owned());
+            }
+            if lane.available {
+                if lane.unavailable_reason.is_some() {
+                    return Err(
+                        "available speaker-count lane carries an unavailable reason".to_owned()
+                    );
+                }
+                if lane.proposed_count.is_none() {
+                    return Err("available speaker-count lane has no proposed count".to_owned());
+                }
+            } else if lane.proposed_count.is_some()
+                || lane.confidence != 0.0
+                || lane.unavailable_reason.is_none()
+            {
+                return Err(
+                    "unavailable speaker-count lane carries authoritative evidence".to_owned(),
+                );
+            }
+            if lane.proposed_count.is_some_and(|count| {
+                count < self.constraint_lower_bound || count > self.candidate_upper_bound
+            }) {
+                return Err("speaker-count lane proposal lies outside candidate bounds".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unit_interval(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+fn lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn entropy_term(probability: f64) -> f64 {
+    if probability > 0.0 {
+        -probability * probability.log2()
+    } else {
+        0.0
+    }
+}
+
 /// Auditable result of applying one speaker-count request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerCountOutcome {
@@ -1334,6 +1587,124 @@ mod tests {
             let deserialized: SpeakerCountRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, request);
         }
+    }
+
+    #[test]
+    fn speaker_count_estimate_serialization_round_trip() {
+        let entropy_bits = [0.62, 0.23, 0.15].into_iter().map(entropy_term).sum();
+        let estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v1".to_owned(),
+            selected_count: Some(2),
+            supported_range: Some(SpeakerCountRange {
+                minimum: 2,
+                maximum: 3,
+            }),
+            posterior: vec![
+                SpeakerCountPosteriorBin {
+                    count: 2,
+                    probability: 0.62,
+                },
+                SpeakerCountPosteriorBin {
+                    count: 3,
+                    probability: 0.23,
+                },
+            ],
+            unresolved_probability: 0.15,
+            entropy_bits,
+            stability: 0.8,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 5,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: vec![
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::MergeRisk,
+                    available: true,
+                    proposed_count: Some(2),
+                    confidence: 0.75,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(
+                        SpeakerCountLaneUnavailableReason::SolverDidNotConverge,
+                    ),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&estimate).unwrap();
+        let deserialized: SpeakerCountEstimate = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, estimate);
+        estimate.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&estimate).unwrap()["calibration_status"],
+            "development_uncertified"
+        );
+        assert_eq!(
+            serde_json::to_value(&estimate).unwrap()["lanes"][1]["unavailable_reason"],
+            "solver_did_not_converge"
+        );
+    }
+
+    #[test]
+    fn speaker_count_estimate_validation_fails_closed() {
+        let mut estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v1".to_owned(),
+            selected_count: None,
+            supported_range: Some(SpeakerCountRange {
+                minimum: 1,
+                maximum: 2,
+            }),
+            posterior: vec![
+                SpeakerCountPosteriorBin {
+                    count: 1,
+                    probability: 0.2,
+                },
+                SpeakerCountPosteriorBin {
+                    count: 2,
+                    probability: 0.3,
+                },
+            ],
+            unresolved_probability: 0.5,
+            entropy_bits: [0.2, 0.3, 0.5].into_iter().map(entropy_term).sum(),
+            stability: 0.0,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 2,
+            calibration_status: SpeakerCountCalibrationStatus::Unavailable,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: vec![SpeakerCountLaneEvidence {
+                lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                available: false,
+                proposed_count: None,
+                confidence: 0.0,
+                unavailable_reason: Some(SpeakerCountLaneUnavailableReason::InsufficientPrototypes),
+            }],
+        };
+        estimate.validate().unwrap();
+
+        estimate.posterior.swap(0, 1);
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count posterior bins are not strictly count-ordered"
+        );
+        estimate.posterior.swap(0, 1);
+        estimate.selected_count = Some(1);
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "speaker-count selection is not the authoritative posterior action"
+        );
+        estimate.selected_count = None;
+        estimate.lanes[0].available = true;
+        assert_eq!(
+            estimate.validate().unwrap_err(),
+            "available speaker-count lane carries an unavailable reason"
+        );
     }
 
     #[test]

@@ -20,8 +20,10 @@ use crate::error::{FwError, FwResult};
 use crate::model::{
     DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
     DiarizationRequest, DiarizationTurn, KnownSpeakerInterval, KnownSpeakerPolicy,
-    SpeakerAttributionQuery, SpeakerAttributionQueryReason, SpeakerCountOutcome,
-    SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
+    SpeakerAttributionQuery, SpeakerAttributionQueryReason, SpeakerCountCalibrationStatus,
+    SpeakerCountEstimate, SpeakerCountEvidenceLane, SpeakerCountLaneEvidence,
+    SpeakerCountLaneUnavailableReason, SpeakerCountOutcome, SpeakerCountOutcomeReason,
+    SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin, SpeakerCountRange, SpeakerCountRequest,
     SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerHintDisposition,
     SpeakerHintEvidenceSummary, SpeakerProfileSummary, TranscriptionSegment,
 };
@@ -8858,10 +8860,23 @@ struct ProbabilisticLaneMergeStep {
     same_speaker_probability: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SpeakerCountRiskPoint {
+    count: usize,
+    expected_loss: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SpeakerCountRiskCurve {
+    selected_count: usize,
+    points: Vec<SpeakerCountRiskPoint>,
+}
+
 #[derive(Debug, Clone)]
 struct ProbabilisticLaneResult {
     selected_count: usize,
     groups: Vec<Vec<usize>>,
+    risk_curve: SpeakerCountRiskCurve,
 }
 
 enum ProbabilisticAgglomeration {
@@ -8898,12 +8913,11 @@ where
         };
         lane_results.push(result);
     }
-    let mut ordered_counts = lane_results
-        .iter()
-        .map(|result| result.selected_count)
-        .collect::<Vec<_>>();
-    ordered_counts.sort_unstable();
-    let selected_count = ordered_counts[SPEAKER_COUNT_PERTURBATION_LANES / 2];
+    let Some(selected_count) = fused_merge_risk_count(&lane_results, policy) else {
+        return Ok(ProbabilisticAgglomeration::Fallback(
+            AcousticClusteringFallbackReason::InvalidPosterior,
+        ));
+    };
     let agreeing_lanes = lane_results
         .iter()
         .filter(|result| result.selected_count == selected_count)
@@ -8931,6 +8945,60 @@ where
         merge_trace,
         stability,
     })
+}
+
+fn fused_merge_risk_count(
+    lanes: &[ProbabilisticLaneResult],
+    policy: SpeakerCountPolicy,
+) -> Option<usize> {
+    if lanes.is_empty() {
+        return None;
+    }
+    let candidate_count = policy.max.checked_sub(policy.min)?.checked_add(1)?;
+    let mut best = None::<(f64, usize)>;
+    for count in policy.min..=policy.max {
+        if !speaker_count_allowed(count, policy) {
+            continue;
+        }
+        let mut normalized_loss_sum = 0.0;
+        let mut selected_lane_count = 0usize;
+        for lane in lanes {
+            let minimum = lane
+                .risk_curve
+                .points
+                .iter()
+                .map(|point| point.expected_loss)
+                .min_by(f64::total_cmp)?;
+            let maximum = lane
+                .risk_curve
+                .points
+                .iter()
+                .map(|point| point.expected_loss)
+                .max_by(f64::total_cmp)?;
+            let point = lane
+                .risk_curve
+                .points
+                .iter()
+                .find(|point| point.count == count)?;
+            let scale = (maximum - minimum).max(1.0e-9);
+            normalized_loss_sum += (point.expected_loss - minimum) / scale;
+            selected_lane_count += usize::from(lane.selected_count == count);
+        }
+        let mean_normalized_loss = normalized_loss_sum / lanes.len() as f64;
+        let smoothed_lane_probability = (selected_lane_count as f64 + 0.5)
+            / (lanes.len() as f64 + 0.5 * candidate_count as f64);
+        let fused_loss = mean_normalized_loss - 0.25 * smoothed_lane_probability.ln();
+        if !fused_loss.is_finite() {
+            return None;
+        }
+        if best.as_ref().is_none_or(|&(best_loss, best_count)| {
+            fused_loss < best_loss
+                || (fused_loss.to_bits() == best_loss.to_bits() && count > best_count)
+        }) {
+            best = Some((fused_loss, count));
+        }
+    }
+    best.map(|(_, count)| count)
 }
 
 fn probabilistic_agglomeration_lane<C>(
@@ -9072,10 +9140,10 @@ where
         }
     }
 
-    let Some(selected_count) = minimum_expected_loss_speaker_count(initial_count, &steps, policy)
-    else {
+    let Some(risk_curve) = speaker_count_expected_loss_curve(initial_count, &steps, policy) else {
         return Ok(None);
     };
+    let selected_count = risk_curve.selected_count;
 
     let mut groups = (0..initial_count)
         .map(|index| Some(vec![index]))
@@ -9098,6 +9166,7 @@ where
     Ok(Some(ProbabilisticLaneResult {
         selected_count,
         groups: groups.into_iter().flatten().collect(),
+        risk_curve,
     }))
 }
 
@@ -9232,35 +9301,55 @@ where
     )))
 }
 
-fn minimum_expected_loss_speaker_count(
+fn speaker_count_expected_loss_curve(
     initial_count: usize,
     steps: &[ProbabilisticLaneMergeStep],
     policy: SpeakerCountPolicy,
-) -> Option<usize> {
+) -> Option<SpeakerCountRiskCurve> {
     let calibration = acoustic_speaker_pair_calibration();
-    let mut risk = steps
+    let mut expected_loss = steps
         .iter()
-        .map(|step| step.same_speaker_probability * calibration.false_split_loss)
-        .sum::<f32>();
-    let mut best = speaker_count_allowed(initial_count, policy).then_some((risk, initial_count));
+        .map(|step| {
+            f64::from(step.same_speaker_probability) * f64::from(calibration.false_split_loss)
+        })
+        .sum::<f64>();
+    if !expected_loss.is_finite() {
+        return None;
+    }
+    let mut points = Vec::with_capacity(steps.len().saturating_add(1));
+    if speaker_count_allowed(initial_count, policy) {
+        points.push(SpeakerCountRiskPoint {
+            count: initial_count,
+            expected_loss,
+        });
+    }
     for step in steps {
-        let same_probability = step.same_speaker_probability;
-        risk += (1.0 - same_probability) * calibration.false_merge_loss
-            - same_probability * calibration.false_split_loss;
-        if !risk.is_finite() {
+        let same_probability = f64::from(step.same_speaker_probability);
+        expected_loss += (1.0 - same_probability) * f64::from(calibration.false_merge_loss)
+            - same_probability * f64::from(calibration.false_split_loss);
+        if !expected_loss.is_finite() {
             return None;
         }
-        if speaker_count_allowed(step.remaining_clusters, policy)
-            && best.as_ref().is_none_or(|(best_risk, best_count)| {
-                risk < *best_risk
-                    || (risk.to_bits() == best_risk.to_bits()
-                        && step.remaining_clusters > *best_count)
-            })
-        {
-            best = Some((risk, step.remaining_clusters));
+        if speaker_count_allowed(step.remaining_clusters, policy) {
+            points.push(SpeakerCountRiskPoint {
+                count: step.remaining_clusters,
+                expected_loss,
+            });
         }
     }
-    best.map(|(_, count)| count)
+    points.sort_by_key(|point| point.count);
+    let selected_count = points
+        .iter()
+        .min_by(|left, right| {
+            left.expected_loss
+                .total_cmp(&right.expected_loss)
+                .then_with(|| right.count.cmp(&left.count))
+        })?
+        .count;
+    Some(SpeakerCountRiskCurve {
+        selected_count,
+        points,
+    })
 }
 
 fn speaker_count_allowed(count: usize, policy: SpeakerCountPolicy) -> bool {
@@ -13865,6 +13954,53 @@ mod tests {
                 .assignments
                 .iter()
                 .all(|assignment| assignment.speaker_ref.is_some())
+        );
+    }
+
+    #[test]
+    fn fused_merge_risk_count_is_bounded_and_permutation_invariant() {
+        let lane = |selected_count, losses: [f64; 3]| super::ProbabilisticLaneResult {
+            selected_count,
+            groups: vec![vec![0]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count,
+                points: losses
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, expected_loss)| super::SpeakerCountRiskPoint {
+                        count: index + 1,
+                        expected_loss,
+                    })
+                    .collect(),
+            },
+        };
+        let lanes = vec![
+            lane(2, [5.0, 0.0, 3.0]),
+            lane(2, [4.0, 0.0, 2.0]),
+            lane(2, [6.0, 0.0, 4.0]),
+            lane(3, [6.0, 1.0, 0.0]),
+            lane(3, [7.0, 1.5, 0.0]),
+        ];
+        let policy = super::SpeakerCountPolicy {
+            min: 1,
+            max: 3,
+            exact: None,
+        };
+        assert_eq!(super::fused_merge_risk_count(&lanes, policy), Some(2));
+
+        let mut reversed = lanes.clone();
+        reversed.reverse();
+        assert_eq!(super::fused_merge_risk_count(&reversed, policy), Some(2));
+
+        let exact = super::SpeakerCountPolicy {
+            min: 3,
+            max: 3,
+            exact: Some(3),
+        };
+        assert_eq!(
+            super::fused_merge_risk_count(&lanes, exact),
+            Some(3),
+            "a hard count restricts candidate search without changing lane losses"
         );
     }
 
