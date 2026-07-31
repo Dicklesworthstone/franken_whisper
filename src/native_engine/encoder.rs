@@ -826,7 +826,15 @@ fn enc_prof_add(i: usize, ns: u128) {
 /// ToMe merge count applied by default on the large-class encoder (n_head ≥ 20:
 /// `large-v3`, `large-v3-turbo`, `distil-large-v3` — all share one 32-layer,
 /// 1280-state, 20-head encoder). 200 of 1500 window tokens.
-const TOME_R_LARGE_DEFAULT: usize = 200;
+const TOME_R_LARGE_DEFAULT: usize = 500;
+
+/// Merge cadence for the large-class encoder, in layers. See [`tome_every_layers`].
+/// `0` = the single-shot schedule, and it stays 0: the progressive schedule was
+/// built and MEASURED WORSE per MAC removed (see [`tome_every_layers`]).
+const TOME_EVERY_LARGE_DEFAULT: usize = 0;
+
+/// Floor on the merged sequence length for the large-class encoder. See [`tome_floor`].
+const TOME_FLOOR_LARGE_DEFAULT: usize = 128;
 
 /// Explicit `FW_TOME_R` override. `Some(0)` is the kill switch and restores the
 /// byte-identical un-merged encoder on every model.
@@ -896,6 +904,48 @@ fn tome_after_layer() -> usize {
     })
 }
 
+/// Merge cadence in layers (`FW_TOME_EVERY`). `0` = the single-shot schedule:
+/// one merge after `tome_after_layer`, every later block at `seq - r`. `N > 0`
+/// = the *progressive* schedule of the ToMe paper: merge again after every `N`
+/// blocks, so the sequence decays step-wise down the stack instead of sitting
+/// at one shortened length.
+///
+/// **MEASURED NEGATIVE — stays 0.** Progressive looks like the stronger lever
+/// (linear ops cost `O(seq)` and SDPA `O(seq²)`, so a decaying schedule should
+/// pay compounding interest), but it buys MACs at a worse quality price than one
+/// deep merge. At comparable mean sequence length on `track01`, progressive
+/// `r=100 every 4` (mean seq 1150) costs **18 edits** while single-shot `r=400`
+/// (mean seq 1150) costs **5**. The reason is the unmerge: it broadcasts one
+/// merged row back to every original position that fed it, so re-merging
+/// already-merged rows averages the same frames repeatedly and coarsens the time
+/// axis the decoder cross-attends to. One adaptive merge, chosen over the full
+/// 1500-row sequence, discards better than seven greedy ones.
+fn tome_every_layers() -> usize {
+    use std::sync::OnceLock;
+    static E: OnceLock<usize> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("FW_TOME_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(TOME_EVERY_LARGE_DEFAULT)
+    })
+}
+
+/// Floor on the merged sequence length (`FW_TOME_FLOOR`). A progressive
+/// schedule would otherwise run the sequence into the ground on a deep stack;
+/// once `seq - r` would drop below this, merging stops and the remaining blocks
+/// run at the floor.
+fn tome_floor() -> usize {
+    use std::sync::OnceLock;
+    static F: OnceLock<usize> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("FW_TOME_FLOOR")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(TOME_FLOOR_LARGE_DEFAULT)
+    })
+}
+
 /// Bipartite soft matching token merge (ToMe, Bolya et al. 2023). Partition tokens
 /// alternately into A (even positions) and B (odd); each A token draws one edge to its
 /// most-cosine-similar B token; the `r` highest-similarity A tokens merge (count-weighted
@@ -930,18 +980,28 @@ fn tome_merge(x: &Mat, r: usize) -> (Mat, Vec<usize>) {
     };
     let a_norm: Vec<f32> = (0..n_a).map(|a| norm(&a_data, a)).collect();
     let b_norm: Vec<f32> = (0..n_b).map(|b| norm(&b_data, b)).collect();
-    let mut best_b = vec![0usize; n_a];
-    let mut best_sim = vec![f32::NEG_INFINITY; n_a];
-    for a in 0..n_a {
+    // Per-A-row argmax over B. Each row is independent and the reduction keeps
+    // the first strict maximum, so fanning it over rayon is deterministic — it
+    // yields the same `best_b`/`best_sim` the serial scan does, element for
+    // element. Worth doing because a progressive schedule calls this once per
+    // merge, not once per window.
+    let mut best = vec![(0usize, f32::NEG_INFINITY); n_a];
+    best.par_iter_mut().enumerate().for_each(|(a, slot)| {
         let row = sim.row(a);
+        let na = a_norm[a];
+        let mut bb = 0usize;
+        let mut bs = f32::NEG_INFINITY;
         for (b, &s) in row.iter().enumerate().take(n_b) {
-            let cos = s / (a_norm[a] * b_norm[b]);
-            if cos > best_sim[a] {
-                best_sim[a] = cos;
-                best_b[a] = b;
+            let cos = s / (na * b_norm[b]);
+            if cos > bs {
+                bs = cos;
+                bb = b;
             }
         }
-    }
+        *slot = (bb, bs);
+    });
+    let best_b: Vec<usize> = best.iter().map(|&(b, _)| b).collect();
+    let best_sim: Vec<f32> = best.iter().map(|&(_, s)| s).collect();
     let mut order: Vec<usize> = (0..n_a).collect();
     order.sort_by(|&i, &j| {
         best_sim[j]
@@ -1065,14 +1125,32 @@ fn forward_time_major(
         // restores the un-merged encoder.
         let tome = tome_r_for(w.n_head, x.rows);
         let tome_after = tome_after_layer();
+        let tome_every = tome_every_layers();
+        let tome_floor = tome_floor();
+        // `cum` maps ORIGINAL row -> current row and is re-composed through every
+        // merge, so a progressive schedule needs exactly one unmerge at the end.
         let mut tome_state: Option<(Vec<usize>, usize)> = None;
         for (li, layer) in w.layers.iter().take(n_run).enumerate() {
             encoder_block(&mut x, layer, w.n_head)?;
-            if tome > 0 && tome_state.is_none() && li == tome_after && x.rows > tome + 2 {
-                let orig_seq = x.rows;
+            let due = if tome_every == 0 {
+                tome_state.is_none() && li == tome_after
+            } else {
+                li >= tome_after && (li - tome_after) % tome_every == 0
+            };
+            if tome > 0 && due && x.rows > tome + 2 && x.rows - tome >= tome_floor {
                 let (merged, umap) = tome_merge(&x, tome);
+                let pre_seq = x.rows;
                 x = merged;
-                tome_state = Some((umap, orig_seq));
+                match tome_state.as_mut() {
+                    // First merge: `umap` is already original -> merged.
+                    None => tome_state = Some((umap, pre_seq)),
+                    // Later merges: compose original -> prev row -> merged row.
+                    Some((cum, _)) => {
+                        for slot in cum.iter_mut() {
+                            *slot = umap[*slot];
+                        }
+                    }
+                }
             }
             checkpoint()?;
         }
