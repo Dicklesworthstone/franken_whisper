@@ -111,18 +111,20 @@
 //! ## Usage
 //!
 //! ```text
-//! incumbent_ab <model_short> <wav> [rounds]
+//! incumbent_ab <model_short> <wav> [rounds] [no_ts|ts|word_ts]
 //! FW_INCUMBENT_BIN=/path/to/whisper-cli   (default: legacy_whispercpp/.../whisper-cli)
 //! FW_INCUMBENT_THREADS=27                 (screen the host and use its best setting)
 //! FW_BENCH_SCOPE=whole_job                 (fresh-process end-to-end jobs)
 //! FW_BENCH_THREADS=64                      (same requested count for both arms)
 //! FW_WORKLOAD_NAME=meeting-text-only       (ledger-facing workload identity)
+//! FW_WORD_TS_ARTIFACT_DIR=/retained/path   (required for word_ts; never overwritten)
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -130,6 +132,7 @@ use franken_whisper::conformance::word_error_rate;
 use franken_whisper::native_engine::decode::{
     DecodeParams, DecodeWorkStats, LoadedModel, transcribe_samples,
 };
+use franken_whisper::native_engine::dtw::WordTiming;
 use franken_whisper::native_engine::find_model_file;
 use franken_whisper::native_engine::ggml::GgmlModel;
 use serde_json::{Value, json};
@@ -147,6 +150,8 @@ const CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 const MAX_LOAD_SPLIT_GAP: f64 = 0.1;
 const MAX_CROSS_ENGINE_WER: f64 = 0.1;
+const MIN_WORD_TIMING_ALIGNMENT_COVERAGE: f64 = 0.90;
+const MAX_WORD_TIMING_P95_DELTA_MS: u64 = 750;
 const MAX_EXTERNAL_CPU_CORE_FRACTION: f64 = 0.1;
 const HOST_CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
 const MAX_HOST_CPU_BUSY_FRACTION: f64 = 0.20;
@@ -179,6 +184,57 @@ impl BenchScope {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimestampMode {
+    None,
+    Segment,
+    Word,
+}
+
+impl TimestampMode {
+    fn from_arg(value: Option<&str>) -> Self {
+        match value {
+            Some("no_ts") => Self::None,
+            Some("word_ts") => Self::Word,
+            Some("ts") | None => Self::Segment,
+            Some(other) => {
+                panic!("unsupported timestamp mode {other:?}; use no_ts, ts, or word_ts")
+            }
+        }
+    }
+
+    const fn timestamps(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn word_timestamps(self) -> bool {
+        matches!(self, Self::Word)
+    }
+
+    const fn as_arg(self) -> &'static str {
+        match self {
+            Self::None => "no_ts",
+            Self::Segment => "ts",
+            Self::Word => "word_ts",
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Segment => "segment",
+            Self::Word => "word",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimedWord {
+    text: String,
+    start_ms: u64,
+    end_ms: u64,
+}
+
 #[derive(Debug)]
 struct Observation {
     measured_ms: f64,
@@ -187,6 +243,8 @@ struct Observation {
     segments: usize,
     transcript: String,
     transcript_sha256: String,
+    timed_words: Vec<TimedWord>,
+    timed_words_sha256: String,
     actual_threads: usize,
     observed_active_threads: usize,
     peak_process_threads: usize,
@@ -541,6 +599,208 @@ fn sha256_file(path: &Path) -> String {
     }
 }
 
+fn seconds_to_milliseconds(seconds: f64) -> u64 {
+    assert!(
+        seconds.is_finite() && seconds >= 0.0,
+        "word timestamp must be finite and non-negative, got {seconds}"
+    );
+    (seconds * 1000.0).round() as u64
+}
+
+fn timed_words_sha256(words: &[TimedWord]) -> String {
+    let mut canonical = String::new();
+    for word in words {
+        canonical.push_str(&word.start_ms.to_string());
+        canonical.push('\t');
+        canonical.push_str(&word.end_ms.to_string());
+        canonical.push('\t');
+        canonical.push_str(&word.text);
+        canonical.push('\n');
+    }
+    sha256_bytes(canonical.as_bytes())
+}
+
+fn native_timed_words(word_timings: Option<&Vec<Vec<WordTiming>>>) -> Vec<TimedWord> {
+    word_timings
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|word| TimedWord {
+            text: word.text.trim().to_owned(),
+            start_ms: seconds_to_milliseconds(word.start_sec),
+            end_ms: seconds_to_milliseconds(word.end_sec),
+        })
+        .collect()
+}
+
+fn push_grouped_word(words: &mut Vec<TimedWord>, text: &mut String, start_ms: u64, end_ms: u64) {
+    let normalized = text.trim();
+    if !normalized.is_empty() {
+        words.push(TimedWord {
+            text: normalized.to_owned(),
+            start_ms,
+            end_ms: end_ms.max(start_ms),
+        });
+    }
+    text.clear();
+}
+
+/// Parse whisper.cpp's full JSON token output into the same space-prefixed word
+/// grouping used by the native DTW path. Tokens without a DTW timestamp are
+/// special/control tokens and are excluded.
+fn incumbent_timed_words(value: &Value) -> Vec<TimedWord> {
+    let transcription = value["transcription"]
+        .as_array()
+        .expect("whisper.cpp word-timestamp JSON missing transcription");
+    let mut words = Vec::new();
+    for segment in transcription {
+        let segment_end_ms = segment["offsets"]["to"]
+            .as_u64()
+            .expect("whisper.cpp segment missing end offset");
+        let tokens = segment["tokens"]
+            .as_array()
+            .expect("whisper.cpp full JSON segment missing tokens");
+        let mut text = String::new();
+        let mut start_ms = 0;
+        let mut have_word = false;
+        for token in tokens {
+            let Some(dtw) = token["t_dtw"].as_f64() else {
+                continue;
+            };
+            if dtw < 0.0 {
+                continue;
+            }
+            let token_text = token["text"]
+                .as_str()
+                .expect("whisper.cpp token missing text");
+            let token_start_ms = token["offsets"]["from"]
+                .as_u64()
+                .expect("whisper.cpp timed token missing start offset");
+            if token_text.as_bytes().first() == Some(&b' ') && have_word {
+                push_grouped_word(&mut words, &mut text, start_ms, token_start_ms);
+                start_ms = token_start_ms;
+            } else if !have_word {
+                start_ms = token_start_ms;
+            }
+            text.push_str(token_text);
+            have_word = true;
+        }
+        if have_word {
+            push_grouped_word(&mut words, &mut text, start_ms, segment_end_ms);
+        }
+    }
+    words
+}
+
+fn normalized_word(word: &str) -> String {
+    word.chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn timed_words_monotonic(words: &[TimedWord]) -> bool {
+    words.iter().all(|word| word.start_ms <= word.end_ms)
+        && words
+            .windows(2)
+            .all(|pair| pair[0].end_ms <= pair[1].start_ms)
+}
+
+fn percentile_u64(sorted: &[u64], percentile: f64) -> u64 {
+    assert!(!sorted.is_empty());
+    let rank = (percentile * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WordTimingComparison {
+    matched_words: usize,
+    alignment_coverage: f64,
+    start_delta_p50_ms: u64,
+    start_delta_p95_ms: u64,
+    start_delta_max_ms: u64,
+    franken_monotonic: bool,
+    incumbent_monotonic: bool,
+    clear: bool,
+}
+
+/// Align exact normalized words with an LCS, then compare their start times.
+/// Transcript WER remains a separate gate; the LCS prevents one insertion from
+/// shifting every later timestamp comparison by one slot.
+fn compare_word_timings(franken: &[TimedWord], incumbent: &[TimedWord]) -> WordTimingComparison {
+    let fw_normalized: Vec<String> = franken
+        .iter()
+        .map(|word| normalized_word(&word.text))
+        .collect();
+    let wc_normalized: Vec<String> = incumbent
+        .iter()
+        .map(|word| normalized_word(&word.text))
+        .collect();
+    let width = incumbent.len() + 1;
+    let mut lcs = vec![0usize; (franken.len() + 1) * width];
+    for i in 1..=franken.len() {
+        for j in 1..=incumbent.len() {
+            let words_match =
+                !fw_normalized[i - 1].is_empty() && fw_normalized[i - 1] == wc_normalized[j - 1];
+            lcs[i * width + j] = if words_match {
+                lcs[(i - 1) * width + (j - 1)] + 1
+            } else {
+                lcs[(i - 1) * width + j].max(lcs[i * width + (j - 1)])
+            };
+        }
+    }
+
+    let mut deltas = Vec::with_capacity(lcs[franken.len() * width + incumbent.len()]);
+    let (mut i, mut j) = (franken.len(), incumbent.len());
+    while i > 0 && j > 0 {
+        let words_match =
+            !fw_normalized[i - 1].is_empty() && fw_normalized[i - 1] == wc_normalized[j - 1];
+        if words_match {
+            deltas.push(franken[i - 1].start_ms.abs_diff(incumbent[j - 1].start_ms));
+            i -= 1;
+            j -= 1;
+        } else if lcs[(i - 1) * width + j] >= lcs[i * width + (j - 1)] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    deltas.sort_unstable();
+
+    let matched_words = deltas.len();
+    let denominator = franken.len().max(incumbent.len());
+    let alignment_coverage = if denominator == 0 {
+        0.0
+    } else {
+        matched_words as f64 / denominator as f64
+    };
+    let start_delta_p50_ms = (!deltas.is_empty())
+        .then(|| percentile_u64(&deltas, 0.50))
+        .unwrap_or(u64::MAX);
+    let start_delta_p95_ms = (!deltas.is_empty())
+        .then(|| percentile_u64(&deltas, 0.95))
+        .unwrap_or(u64::MAX);
+    let start_delta_max_ms = deltas.last().copied().unwrap_or(u64::MAX);
+    let franken_monotonic = timed_words_monotonic(franken);
+    let incumbent_monotonic = timed_words_monotonic(incumbent);
+    let clear = !franken.is_empty()
+        && !incumbent.is_empty()
+        && franken_monotonic
+        && incumbent_monotonic
+        && alignment_coverage >= MIN_WORD_TIMING_ALIGNMENT_COVERAGE
+        && start_delta_p95_ms <= MAX_WORD_TIMING_P95_DELTA_MS;
+    WordTimingComparison {
+        matched_words,
+        alignment_coverage,
+        start_delta_p50_ms,
+        start_delta_p95_ms,
+        start_delta_max_ms,
+        franken_monotonic,
+        incumbent_monotonic,
+        clear,
+    }
+}
+
 /// Self-reported identity of this harness binary (campaign harness contract).
 fn executable_identity() -> String {
     match std::env::current_exe() {
@@ -735,6 +995,12 @@ impl IncumbentContract {
             build: incumbent["build"].clone(),
             decode: MatchedDecode::from_json(&value["matched_decode"]),
         }
+    }
+
+    fn for_timestamp_mode(mode: TimestampMode) -> Self {
+        let mut contract = Self::shipped();
+        contract.decode.word_timestamps = mode.word_timestamps();
+        contract
     }
 
     /// Check the *attested* image of the incumbent process against the contract.
@@ -1585,6 +1851,51 @@ fn incumbent_work_counts(text: &str) -> EngineWork {
     }
 }
 
+static WORD_TS_OUTPUT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+fn incumbent_dtw_preset(model_short: &str) -> &'static str {
+    match model_short {
+        "tiny" => "tiny",
+        "tiny.en" => "tiny.en",
+        "base" => "base",
+        "base.en" => "base.en",
+        "small" => "small",
+        "small.en" => "small.en",
+        "medium" => "medium",
+        "medium.en" => "medium.en",
+        "large-v1" => "large.v1",
+        "large-v2" => "large.v2",
+        "large-v3" => "large.v3",
+        "large-v3-turbo" => "large.v3.turbo",
+        other => panic!("no pinned whisper.cpp DTW alignment-head preset for {other:?}"),
+    }
+}
+
+fn next_word_timestamp_output_prefix() -> PathBuf {
+    let root = std::env::var_os("FW_WORD_TS_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .expect("word_ts mode requires FW_WORD_TS_ARTIFACT_DIR");
+    std::fs::create_dir_all(&root).unwrap_or_else(|error| {
+        panic!(
+            "create word-timestamp artifact directory {}: {error}",
+            root.display()
+        )
+    });
+    let sequence = WORD_TS_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let prefix = root.join(format!(
+        "incumbent-word-ts-{}-{sequence:04}",
+        std::process::id()
+    ));
+    let mut json_path = prefix.clone();
+    json_path.set_extension("json");
+    assert!(
+        !json_path.exists(),
+        "refusing to overwrite retained word-timestamp evidence {}",
+        json_path.display()
+    );
+    prefix
+}
+
 /// One `whisper.cpp` run.
 ///
 /// `transcribe_only` measures the incumbent's self-reported `total − load`.
@@ -1593,9 +1904,10 @@ fn incumbent_work_counts(text: &str) -> EngineWork {
 fn run_incumbent(
     bin: &Path,
     model: &Path,
+    model_short: &str,
     wav: &str,
     threads: usize,
-    timestamps: bool,
+    timestamp_mode: TimestampMode,
     scope: BenchScope,
     observe_threads: bool,
     decode: &MatchedDecode,
@@ -1614,9 +1926,23 @@ fn run_incumbent(
     // Match franken's mode on the incumbent side too: comparing franken's
     // no-timestamp decode against whisper.cpp's timestamped decode would charge
     // the incumbent for timestamp work franken is not doing.
-    if !timestamps {
+    if !timestamp_mode.timestamps() {
         args.push("-nt".into());
     }
+    let word_json_path = timestamp_mode.word_timestamps().then(|| {
+        let prefix = next_word_timestamp_output_prefix();
+        args.extend([
+            "-dtw".to_owned(),
+            incumbent_dtw_preset(model_short).to_owned(),
+            "-nfa".to_owned(),
+            "-ojf".to_owned(),
+            "-of".to_owned(),
+            prefix.display().to_string(),
+        ]);
+        let mut json_path = prefix;
+        json_path.set_extension("json");
+        json_path
+    });
     let mut command = Command::new(bin);
     command.args(&args);
     let (output, process_wall_ms, thread_probe) = run_command(&mut command, observe_threads);
@@ -1646,11 +1972,23 @@ fn run_incumbent(
         total.is_finite() && load.is_finite(),
         "could not parse whisper.cpp timings; is this whisper-cli?"
     );
-    let segments = incumbent_segments(&stdout, timestamps);
+    let segments = incumbent_segments(&stdout, timestamp_mode.timestamps());
     let chars = segments.iter().map(String::len).sum();
     let transcript = segments.join(" ");
     let words = transcript.split_whitespace().count();
     let transcript_sha256 = sha256_bytes(transcript.as_bytes());
+    let timed_words = word_json_path.map_or_else(Vec::new, |path| {
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "read retained whisper.cpp word-timestamp JSON {}: {error}",
+                path.display()
+            )
+        });
+        let value: Value =
+            serde_json::from_slice(&bytes).expect("parse whisper.cpp word-timestamp JSON");
+        incumbent_timed_words(&value)
+    });
+    let timed_words_sha256 = timed_words_sha256(&timed_words);
     Observation {
         measured_ms: match scope {
             BenchScope::TranscribeOnly => total - load,
@@ -1661,6 +1999,8 @@ fn run_incumbent(
         segments: segments.len(),
         transcript,
         transcript_sha256,
+        timed_words,
+        timed_words_sha256,
         actual_threads: incumbent_actual_threads(&text).unwrap_or(0),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
@@ -1687,6 +2027,8 @@ fn run_franken_resident(
     let chars = segments.iter().map(String::len).sum();
     let transcript = segments.join(" ");
     let work = EngineWork::from_franken(&out.work);
+    let timed_words = native_timed_words(out.word_timings.as_ref());
+    let timed_words_sha256 = timed_words_sha256(&timed_words);
     Observation {
         measured_ms: elapsed,
         chars,
@@ -1694,6 +2036,8 @@ fn run_franken_resident(
         segments: segments.len(),
         transcript_sha256: sha256_bytes(transcript.as_bytes()),
         transcript,
+        timed_words,
+        timed_words_sha256,
         actual_threads: rayon::current_num_threads(),
         observed_active_threads: 0,
         peak_process_threads: 0,
@@ -1711,7 +2055,7 @@ fn run_franken_whole(
     model_short: &str,
     wav: &str,
     threads: usize,
-    timestamps: bool,
+    timestamp_mode: TimestampMode,
     observe_threads: bool,
 ) -> Observation {
     let current_exe = std::env::current_exe().expect("resolve harness executable");
@@ -1721,7 +2065,7 @@ fn run_franken_whole(
         .arg(model)
         .arg(model_short)
         .arg(wav)
-        .arg(if timestamps { "ts" } else { "no_ts" })
+        .arg(timestamp_mode.as_arg())
         .arg(threads.to_string())
         .env("RAYON_NUM_THREADS", threads.to_string())
         .env("FW_LOAD_WORKERS", threads.to_string());
@@ -1754,11 +2098,30 @@ fn run_franken_whole(
     let worker_decode_row = value["decode_row"]
         .as_str()
         .expect("franken worker result missing decode_row");
-    let parent_decode_row = IncumbentContract::shipped().decode.as_row();
+    let parent_decode_row = IncumbentContract::for_timestamp_mode(timestamp_mode)
+        .decode
+        .as_row();
     assert_eq!(
         worker_decode_row, parent_decode_row,
         "whole-job franken arm decoded under a different contract than the parent certifies"
     );
+    let timed_words: Vec<TimedWord> = value["timed_words"]
+        .as_array()
+        .expect("franken worker result missing timed_words")
+        .iter()
+        .map(|word| TimedWord {
+            text: word["text"]
+                .as_str()
+                .expect("franken worker timed word missing text")
+                .to_owned(),
+            start_ms: word["start_ms"]
+                .as_u64()
+                .expect("franken worker timed word missing start_ms"),
+            end_ms: word["end_ms"]
+                .as_u64()
+                .expect("franken worker timed word missing end_ms"),
+        })
+        .collect();
     Observation {
         measured_ms: process_wall_ms,
         chars: field_u64("chars"),
@@ -1769,6 +2132,11 @@ fn run_franken_whole(
             .expect("franken worker result missing transcript_sha256")
             .to_owned(),
         transcript,
+        timed_words_sha256: value["timed_words_sha256"]
+            .as_str()
+            .expect("franken worker result missing timed_words_sha256")
+            .to_owned(),
+        timed_words,
         actual_threads: field_u64("actual_threads"),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
@@ -1781,7 +2149,7 @@ fn franken_worker_main(args: &[String]) {
     let model_path = Path::new(args.get(2).expect("worker model path"));
     let model_short = args.get(3).expect("worker model short name");
     let wav = args.get(4).expect("worker wav");
-    let timestamps = args.get(5).map(String::as_str) != Some("no_ts");
+    let timestamp_mode = TimestampMode::from_arg(args.get(5).map(String::as_str));
     let threads: usize = args
         .get(6)
         .and_then(|value| value.parse().ok())
@@ -1799,7 +2167,7 @@ fn franken_worker_main(args: &[String]) {
     // twice. Both happened to agree with the shipped contract, so nothing was
     // mismeasured -- but the parent was attesting a params struct the measured
     // arm never used, and the next contract edit would have silently split them.
-    let contract = IncumbentContract::shipped();
+    let contract = IncumbentContract::for_timestamp_mode(timestamp_mode);
     // The spawned arm inherits the parent's environment, so it re-checks the
     // hatch that would override the contract's carry policy here rather than
     // trusting that the parent looked.
@@ -1814,7 +2182,7 @@ fn franken_worker_main(args: &[String]) {
         translate: contract.decode.translate,
         beam_size: Some(contract.decode.beam_size),
         max_context: Some(contract.decode.max_context),
-        timestamps,
+        timestamps: timestamp_mode.timestamps(),
         n_threads: threads,
         max_text_ctx: None,
         word_timestamps: contract.decode.word_timestamps,
@@ -1830,6 +2198,17 @@ fn franken_worker_main(args: &[String]) {
         .collect();
     let chars = segments.iter().map(String::len).sum::<usize>();
     let transcript = segments.join(" ");
+    let timed_words = native_timed_words(out.word_timings.as_ref());
+    let timed_words_json: Vec<Value> = timed_words
+        .iter()
+        .map(|word| {
+            json!({
+                "text": &word.text,
+                "start_ms": word.start_ms,
+                "end_ms": word.end_ms,
+            })
+        })
+        .collect();
     let serialized_segments =
         serde_json::to_vec(&out.segments).expect("serialize worker transcription segments");
     println!(
@@ -1839,6 +2218,8 @@ fn franken_worker_main(args: &[String]) {
             "words": transcript.split_whitespace().count(),
             "segments": segments.len(),
             "transcript_sha256": sha256_bytes(transcript.as_bytes()),
+            "timed_words_sha256": timed_words_sha256(&timed_words),
+            "timed_words": timed_words_json,
             "serialized_segments_sha256": sha256_bytes(&serialized_segments),
             "transcript": transcript,
             "actual_threads": rayon::current_num_threads(),
@@ -1886,22 +2267,26 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "tests/fixtures/native/jfk.wav".to_string());
     let rounds: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(11);
-    // 4th positional arg "no_ts" certifies the no-timestamp cell instead. Both
+    // The fourth positional argument selects one explicit output mode. Both
     // engines switch together; a mismatched pair would charge one side for work
     // the other is not doing.
-    let timestamps = args.get(4).map(String::as_str) != Some("no_ts");
+    let timestamp_mode = TimestampMode::from_arg(args.get(4).map(String::as_str));
     assert!(
         rounds >= 3 && rounds % 2 == 1,
         "rounds must be odd and >= 3"
     );
     let scope = BenchScope::from_env();
+    assert!(
+        !timestamp_mode.word_timestamps() || scope == BenchScope::WholeJob,
+        "word_ts requires FW_BENCH_SCOPE=whole_job so both arms include output serialization"
+    );
     let workload = std::env::var("FW_WORKLOAD_NAME").unwrap_or_else(|_| {
         format!(
             "{model_short}-{}",
-            if timestamps {
-                "segment-timestamps"
-            } else {
-                "text-only"
+            match timestamp_mode {
+                TimestampMode::None => "text-only",
+                TimestampMode::Segment => "segment-timestamps",
+                TimestampMode::Word => "word-timestamps",
             }
         )
     });
@@ -1930,13 +2315,13 @@ fn main() {
     // The version contract is loaded before anything is measured, and it drives
     // BOTH arms' decoding parameters. A matched-params claim asserted at two
     // separate call sites is a claim that drifts on the next edit.
-    let contract = IncumbentContract::shipped();
+    let contract = IncumbentContract::for_timestamp_mode(timestamp_mode);
     let params = DecodeParams {
         language: Some(contract.decode.language.clone()),
         translate: contract.decode.translate,
         beam_size: Some(contract.decode.beam_size),
         max_context: Some(contract.decode.max_context),
-        timestamps,
+        timestamps: timestamp_mode.timestamps(),
         n_threads: matched_threads.as_ref().map_or(0, |_| threads),
         max_text_ctx: None,
         word_timestamps: contract.decode.word_timestamps,
@@ -1978,9 +2363,14 @@ fn main() {
             &params,
             false,
         ),
-        BenchScope::WholeJob => {
-            run_franken_whole(&model_path, model_short, &wav, threads, timestamps, false)
-        }
+        BenchScope::WholeJob => run_franken_whole(
+            &model_path,
+            model_short,
+            &wav,
+            threads,
+            timestamp_mode,
+            false,
+        ),
     };
     let probe_franken_threads = || match scope {
         BenchScope::TranscribeOnly => run_franken_resident(
@@ -1989,17 +2379,23 @@ fn main() {
             &params,
             true,
         ),
-        BenchScope::WholeJob => {
-            run_franken_whole(&model_path, model_short, &wav, threads, timestamps, true)
-        }
+        BenchScope::WholeJob => run_franken_whole(
+            &model_path,
+            model_short,
+            &wav,
+            threads,
+            timestamp_mode,
+            true,
+        ),
     };
     let run_whisper = || {
         run_incumbent(
             &incumbent,
             &model_path,
+            model_short,
             &wav,
             threads,
-            timestamps,
+            timestamp_mode,
             scope,
             false,
             &contract.decode,
@@ -2009,9 +2405,10 @@ fn main() {
         run_incumbent(
             &incumbent,
             &model_path,
+            model_short,
             &wav,
             threads,
-            timestamps,
+            timestamp_mode,
             scope,
             true,
             &contract.decode,
@@ -2051,7 +2448,7 @@ fn main() {
         "INCUMBENT_AB_CONTRACT path={INCUMBENT_CONTRACT_PATH} project={} version={} \
          contract_source_root={} runtime_source_root={} \
          contract_binary_sha256={} source_clear={source_clear} \
-         source_verdicts={} build={} decode_source=version_contract {} \
+         source_verdicts={} build={} decode_source=version_contract_plus_timestamp_mode {} \
          franken_temp_fallback_env={franken_fallback_on} decode_matched={decode_matched}",
         contract.project,
         contract.version,
@@ -2083,9 +2480,13 @@ fn main() {
     );
     println!(
         "INCUMBENT_AB_CONFIG workload={workload:?} rounds={rounds} order=alternating \
-         wav={wav} audio_sec={:.1} requested_threads={threads} timestamps={timestamps} \
+         wav={wav} audio_sec={:.1} requested_threads={threads} \
+         timestamp_mode={} timestamps={} word_timestamps={} \
          scope={} measured={}",
         samples.len() as f64 / 16000.0,
+        timestamp_mode.as_str(),
+        timestamp_mode.timestamps(),
+        timestamp_mode.word_timestamps(),
         scope.as_str(),
         match scope {
             BenchScope::TranscribeOnly => "transcribe_excluding_model_load",
@@ -2170,6 +2571,39 @@ fn main() {
 
     let wer = word_error_rate(&wc_warm.transcript, &fw_warm.transcript);
     let quality_clear = wer.wer <= MAX_CROSS_ENGINE_WER;
+    let word_timing_comparison = timestamp_mode
+        .word_timestamps()
+        .then(|| compare_word_timings(&fw_warm.timed_words, &wc_warm.timed_words));
+    let word_timing_clear = word_timing_comparison
+        .as_ref()
+        .is_none_or(|comparison| comparison.clear);
+    if let Some(comparison) = &word_timing_comparison {
+        println!(
+            "INCUMBENT_AB_WORD_TIMINGS mode=dtw \
+             franken_count={} incumbent_count={} matched_words={} \
+             alignment_coverage={:.6} min_coverage={MIN_WORD_TIMING_ALIGNMENT_COVERAGE:.6} \
+             start_delta_p50_ms={} start_delta_p95_ms={} start_delta_max_ms={} \
+             p95_max_ms={MAX_WORD_TIMING_P95_DELTA_MS} \
+             franken_monotonic={} incumbent_monotonic={} \
+             franken_sha256={} incumbent_sha256={} word_timing_clear={word_timing_clear}",
+            fw_warm.timed_words.len(),
+            wc_warm.timed_words.len(),
+            comparison.matched_words,
+            comparison.alignment_coverage,
+            comparison.start_delta_p50_ms,
+            comparison.start_delta_p95_ms,
+            comparison.start_delta_max_ms,
+            comparison.franken_monotonic,
+            comparison.incumbent_monotonic,
+            fw_warm.timed_words_sha256,
+            wc_warm.timed_words_sha256,
+        );
+    } else {
+        println!(
+            "INCUMBENT_AB_WORD_TIMINGS mode=disabled franken_count=0 incumbent_count=0 \
+             word_timing_clear=true"
+        );
+    }
     let configured_thread_clear = !enforce_matched_threads
         || (fw_warm.actual_threads == threads && wc_warm.actual_threads == threads);
     let observed_thread_clear = scope != BenchScope::WholeJob
@@ -2272,6 +2706,10 @@ fn main() {
             "franken transcript changed within one invocation"
         );
         assert_eq!(
+            observation.timed_words_sha256, fw_warm.timed_words_sha256,
+            "franken word timings changed within one invocation"
+        );
+        assert_eq!(
             observation.actual_threads, fw_warm.actual_threads,
             "franken configured thread count changed within one invocation"
         );
@@ -2286,6 +2724,10 @@ fn main() {
         assert_eq!(
             observation.transcript_sha256, wc_warm.transcript_sha256,
             "whisper.cpp transcript changed within one invocation"
+        );
+        assert_eq!(
+            observation.timed_words_sha256, wc_warm.timed_words_sha256,
+            "whisper.cpp word timings changed within one invocation"
         );
         assert_eq!(
             observation.actual_threads, wc_warm.actual_threads,
@@ -2436,6 +2878,7 @@ fn main() {
     let comparison_stats = report("INCUMBENT_AB_COMPARE", &compare);
     let load_split_clear = load_split_gap <= MAX_LOAD_SPLIT_GAP;
     let prerequisite_gates_clear = quality_clear
+        && word_timing_clear
         && thread_clear
         && load_split_clear
         && external_host_clear
@@ -2456,6 +2899,7 @@ fn main() {
          compare_median={:.6} compare_ci95=[{:.6},{:.6}] \
          load_split_gap={load_split_gap:.6} load_split_max={MAX_LOAD_SPLIT_GAP:.6} \
          load_split_clear={load_split_clear} quality_clear={quality_clear} \
+         word_timing_clear={word_timing_clear} \
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
          host_wide_clear={host_wide_clear} \
          host_quiescence_threshold={MAX_HOST_CPU_BUSY_FRACTION:.6} \
@@ -3085,6 +3529,110 @@ mod tests {
         assert_eq!(activity.command, "competitor");
         assert_eq!(activity.checkpoint, "after_franken");
         assert_eq!(activity.intervals, 1);
+    }
+
+    #[test]
+    fn timestamp_mode_drives_both_arms_from_one_contract() {
+        assert_eq!(TimestampMode::from_arg(Some("no_ts")), TimestampMode::None);
+        assert_eq!(
+            TimestampMode::from_arg(Some("word_ts")),
+            TimestampMode::Word
+        );
+        assert_eq!(TimestampMode::from_arg(None), TimestampMode::Segment);
+        assert!(
+            !IncumbentContract::for_timestamp_mode(TimestampMode::None)
+                .decode
+                .word_timestamps
+        );
+        assert!(
+            IncumbentContract::for_timestamp_mode(TimestampMode::Word)
+                .decode
+                .word_timestamps
+        );
+        assert_eq!(incumbent_dtw_preset("large-v3-turbo"), "large.v3.turbo");
+    }
+
+    #[test]
+    fn incumbent_full_json_groups_space_prefixed_tokens_like_native_dtw() {
+        let value = json!({
+            "transcription": [{
+                "offsets": {"from": 0, "to": 2_000},
+                "tokens": [
+                    {
+                        "text": "[_BEG_]",
+                        "t_dtw": -1,
+                        "offsets": {"from": 0, "to": 0}
+                    },
+                    {
+                        "text": " hello",
+                        "t_dtw": 10,
+                        "offsets": {"from": 100, "to": 500}
+                    },
+                    {
+                        "text": " world",
+                        "t_dtw": 80,
+                        "offsets": {"from": 800, "to": 1_200}
+                    },
+                    {
+                        "text": "!",
+                        "t_dtw": 120,
+                        "offsets": {"from": 1_200, "to": 1_300}
+                    },
+                    {
+                        "text": "[_TT_100]",
+                        "t_dtw": -1,
+                        "offsets": {"from": 2_000, "to": 2_000}
+                    }
+                ]
+            }]
+        });
+        assert_eq!(
+            incumbent_timed_words(&value),
+            [
+                TimedWord {
+                    text: "hello".to_owned(),
+                    start_ms: 100,
+                    end_ms: 800,
+                },
+                TimedWord {
+                    text: "world!".to_owned(),
+                    start_ms: 800,
+                    end_ms: 2_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn word_timing_alignment_handles_insertions_without_index_shift() {
+        let word = |text: &str, start_ms: u64, end_ms: u64| TimedWord {
+            text: text.to_owned(),
+            start_ms,
+            end_ms,
+        };
+        let franken = [
+            word("hello", 100, 900),
+            word("world", 900, 1_900),
+            word("again", 1_900, 2_900),
+        ];
+        let incumbent = [
+            word("hello", 150, 700),
+            word("inserted", 700, 950),
+            word("world", 950, 1_950),
+            word("again", 1_950, 2_950),
+        ];
+        let comparison = compare_word_timings(&franken, &incumbent);
+        assert_eq!(comparison.matched_words, 3);
+        assert_eq!(comparison.start_delta_p95_ms, 50);
+        assert!((comparison.alignment_coverage - 0.75).abs() < f64::EPSILON);
+        assert!(
+            !comparison.clear,
+            "timing agreement must not hide low word coverage"
+        );
+
+        let clear = compare_word_timings(&franken, &franken);
+        assert!(clear.clear);
+        assert_eq!(clear.start_delta_max_ms, 0);
     }
 
     #[test]
