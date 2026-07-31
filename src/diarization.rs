@@ -879,12 +879,8 @@ pub fn score_diarization_documents(
         hypothesis.speaker_count_estimate.as_ref(),
         config,
     );
-    let speaker_occupancy = score_speaker_occupancy(
-        hypothesis,
-        &atoms,
-        &diarization.speaker_mapping,
-        config,
-    );
+    let speaker_occupancy =
+        score_speaker_occupancy(hypothesis, &atoms, &diarization.speaker_mapping, config);
     let word_attribution = score_word_attribution(
         reference,
         hypothesis,
@@ -2119,7 +2115,12 @@ fn score_speaker_occupancy(
         .count();
     let minority_reference_recall = reference_recalls
         .iter()
-        .min_by(|left, right| left.2.total_cmp(&right.2).then_with(|| left.0.cmp(right.0)))
+        .min_by(|left, right| {
+            left.2
+                .total_cmp(&right.2)
+                .then_with(|| left.1.total_cmp(&right.1))
+                .then_with(|| left.0.cmp(right.0))
+        })
         .map(|(_, recall, _)| *recall);
 
     SpeakerOccupancyScore {
