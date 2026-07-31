@@ -862,6 +862,8 @@ fn entropy_term(probability: f64) -> f64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerCountOutcome {
     pub request: SpeakerCountRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<SpeakerCountEstimate>,
     pub status: SpeakerCountOutcomeStatus,
     pub supported_speaker_count: u32,
     pub active_speaker_refs: Vec<String>,
