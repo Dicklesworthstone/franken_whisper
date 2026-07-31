@@ -544,7 +544,7 @@ fn verify_payload(
                         .map_err(|_| ecapa_error("payload_read", "chunk size is invalid"))?,
                 ),
             )
-                .map_err(|_| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
+            .map_err(|_| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
             let chunk = buffer
                 .get_mut(..wanted)
                 .ok_or_else(|| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
