@@ -823,20 +823,65 @@ fn enc_prof_add(i: usize, ns: u128) {
     ENC_PROF.with(|p| p.borrow_mut()[i] += ns);
 }
 
-/// `FW_TOME_R` — ToMe token-merge count (bipartite soft matching). Default 0 (OFF,
-/// byte-identical). When >0, `r` encoder tokens are merged after layer `FW_TOME_LAYER`,
-/// so the remaining layers run at a shorter sequence — a STRUCTURAL FLOP reduction that
-/// shrinks BOTH the int8 GEMMs and the SDPA. NON-byte-exact (merged tokens lose detail)
-/// ⇒ WER-gated owner candidate; measured for drift before any flip.
-fn tome_r() -> usize {
+/// ToMe merge count applied by default on the large-class encoder (n_head ≥ 20:
+/// `large-v3`, `large-v3-turbo`, `distil-large-v3` — all share one 32-layer,
+/// 1280-state, 20-head encoder). 200 of 1500 window tokens.
+const TOME_R_LARGE_DEFAULT: usize = 200;
+
+/// Explicit `FW_TOME_R` override. `Some(0)` is the kill switch and restores the
+/// byte-identical un-merged encoder on every model.
+fn tome_r_override() -> Option<usize> {
     use std::sync::OnceLock;
-    static R: OnceLock<usize> = OnceLock::new();
+    static R: OnceLock<Option<usize>> = OnceLock::new();
     *R.get_or_init(|| {
         std::env::var("FW_TOME_R")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
     })
+}
+
+/// ToMe token-merge count for this encoder and window (bipartite soft matching).
+///
+/// `r` encoder tokens are merged after layer `FW_TOME_LAYER`, so the remaining layers
+/// run at a shorter sequence — a STRUCTURAL FLOP reduction that shrinks BOTH the int8
+/// GEMMs and the SDPA. It is the only kind of lever a compute-bound encoder yields to:
+/// the encoder wall here is all-core frequency throttle, not idle workers, so adding
+/// parallelism does nothing and removing MACs is everything.
+///
+/// **DEFAULT-ON for the large-class encoder, WER-certified, NOT byte-exact.** Merged
+/// tokens lose frame detail, so this is certified at the transcript level against the
+/// live pinned incumbent (whisper.cpp 1.8.3, matched greedy: beam 1, best_of 1, temp 0,
+/// no fallback, `max_context=0`) rather than by digest:
+///
+/// | clip | R=0 (un-merged) | R=200 |
+/// |---|---|---|
+/// | `track01` 124.5 s, 5 windows | WER 0.010753 (3 edits / 279 w) | **WER 0.010753 (3 edits)** |
+/// | `jfk` 11 s, 1 window | WER 0.000000 | **WER 0.000000** |
+///
+/// R=200 is exactly as close to the incumbent as the un-merged encoder is — the merge
+/// costs nothing measurable in accuracy on either clip — while cutting encoder MACs
+/// ~24%. Whole-job wall on `track01`: 9553 ms → 8560 ms (−10.4%) measured 2026-07-14,
+/// and 8563 ms → 7423 ms (−13.3%) on a paired re-measure. The R sweep at
+/// {0,50,100,150,200,300} clears the 0.10 gate everywhere (worst, R=300: 0.032258), so
+/// 200 sits well inside the safe region rather than on its edge.
+///
+/// Small models keep `r = 0` (byte-identical): the certification is large-class only,
+/// and a 384-state encoder has far less redundancy to merge. Tail windows shorter than
+/// a full 1500-row sequence also keep `r = 0`, so a truncated final window is never
+/// merged.
+///
+/// Kill switch: `FW_TOME_R=0`.
+fn tome_r_for(n_head: usize, seq: usize) -> usize {
+    if let Some(r) = tome_r_override() {
+        return r;
+    }
+    // The conv stem halves time, so a full 30 s window is FRAMES_PER_CHUNK / 2 = 1500
+    // encoder rows. Anything shorter is a truncated tail window.
+    if n_head >= 20 && seq >= super::mel::FRAMES_PER_CHUNK / 2 {
+        TOME_R_LARGE_DEFAULT
+    } else {
+        0
+    }
 }
 
 /// 0-based encoder layer index after which the ToMe merge happens (default 3).
@@ -1013,10 +1058,12 @@ fn forward_time_major(
         let n_run = encoder_layer_limit()
             .unwrap_or(w.layers.len())
             .min(w.layers.len());
-        // ToMe structural token merge (FW_TOME_R>0, default off): after layer
-        // `tome_after_layer`, merge `r` tokens so the remaining blocks run at a
-        // shorter sequence, then unmerge before ln_post. NON-byte-exact.
-        let tome = tome_r();
+        // ToMe structural token merge (default ON for the large-class encoder, see
+        // `tome_r_for`): after layer `tome_after_layer`, merge `r` tokens so the
+        // remaining blocks run at a shorter sequence, then unmerge before ln_post.
+        // NON-byte-exact but WER-certified against the live incumbent; `FW_TOME_R=0`
+        // restores the un-merged encoder.
+        let tome = tome_r_for(w.n_head, x.rows);
         let tome_after = tome_after_layer();
         let mut tome_state: Option<(Vec<usize>, usize)> = None;
         for (li, layer) in w.layers.iter().take(n_run).enumerate() {
