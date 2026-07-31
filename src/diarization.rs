@@ -3390,6 +3390,9 @@ const MAX_MULTI_SPEAKER_DOMINANT_SHARE: f32 = 0.98;
 const CHANNEL_DISTANCE_WEIGHT: f32 = 0.08;
 const SPEAKER_PAIR_MINIMUM_ACTIVE_DIMENSIONS: usize = 4;
 const SPEAKER_COUNT_PERTURBATION_LANES: usize = 5;
+const SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE: usize = 8;
+const SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS: usize = 96;
+const SPEAKER_COUNT_EIGENSOLVER_TOLERANCE: f64 = 1.0e-7;
 /// Versioned monotone map from the candidate's raw attribution likelihood to
 /// its reported confidence. Rejection continues to use the raw likelihood so
 /// calibration cannot silently increase selective coverage.
@@ -8913,7 +8916,16 @@ where
         };
         lane_results.push(result);
     }
-    let Some(selected_count) = fused_merge_risk_count(&lane_results, policy) else {
+    let spectral_proposal =
+        match build_sparse_speaker_affinity(initial, cannot_links, &mut *is_cancelled)? {
+            Some(graph) => {
+                sparse_normalized_eigengap(&graph, policy.min, policy.max, &mut *is_cancelled)?
+            }
+            None => None,
+        };
+    let Some(selected_count) =
+        fused_merge_risk_count(&lane_results, spectral_proposal.as_ref(), policy)
+    else {
         return Ok(ProbabilisticAgglomeration::Fallback(
             AcousticClusteringFallbackReason::InvalidPosterior,
         ));
@@ -8922,7 +8934,17 @@ where
         .iter()
         .filter(|result| result.selected_count == selected_count)
         .count();
-    let stability = agreeing_lanes as f32 / SPEAKER_COUNT_PERTURBATION_LANES as f32;
+    let feature_stability = agreeing_lanes as f32 / SPEAKER_COUNT_PERTURBATION_LANES as f32;
+    let stability = spectral_proposal
+        .as_ref()
+        .map_or(feature_stability, |proposal| {
+            let spectral_support = if proposal.count == selected_count {
+                proposal.confidence as f32
+            } else {
+                0.0
+            };
+            0.5 * (feature_stability + spectral_support)
+        });
     if stability < acoustic_speaker_pair_calibration().minimum_stable_lane_fraction {
         return Ok(ProbabilisticAgglomeration::Fallback(
             AcousticClusteringFallbackReason::UnstableSpeakerCount,
@@ -8949,6 +8971,7 @@ where
 
 fn fused_merge_risk_count(
     lanes: &[ProbabilisticLaneResult],
+    spectral: Option<&SparseEigengapProposal>,
     policy: SpeakerCountPolicy,
 ) -> Option<usize> {
     if lanes.is_empty() {
@@ -8987,7 +9010,24 @@ fn fused_merge_risk_count(
         let mean_normalized_loss = normalized_loss_sum / lanes.len() as f64;
         let smoothed_lane_probability = (selected_lane_count as f64 + 0.5)
             / (lanes.len() as f64 + 0.5 * candidate_count as f64);
-        let fused_loss = mean_normalized_loss - 0.25 * smoothed_lane_probability.ln();
+        let spectral_probability = spectral.map_or(1.0, |proposal| {
+            if proposal.eigenvalues.is_empty()
+                || !proposal.residual.is_finite()
+                || proposal.iterations == 0
+            {
+                return 1.0e-9;
+            }
+            if candidate_count == 1 {
+                1.0
+            } else if proposal.count == count {
+                proposal.confidence.max(1.0e-9)
+            } else {
+                ((1.0 - proposal.confidence) / (candidate_count - 1) as f64).max(1.0e-9)
+            }
+        });
+        let fused_loss = mean_normalized_loss
+            - 0.25 * smoothed_lane_probability.ln()
+            - 0.35 * spectral_probability.ln();
         if !fused_loss.is_finite() {
             return None;
         }
@@ -8999,6 +9039,438 @@ fn fused_merge_risk_count(
         }
     }
     best.map(|(_, count)| count)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SparseSpeakerAffinityGraph {
+    rows: Vec<Vec<(usize, f64)>>,
+    degrees: Vec<f64>,
+    undirected_edge_count: usize,
+}
+
+impl SparseSpeakerAffinityGraph {
+    fn apply_normalized(&self, input: &[f64]) -> Option<Vec<f64>> {
+        if input.len() != self.rows.len() || self.degrees.len() != self.rows.len() {
+            return None;
+        }
+        let mut output = vec![0.0; input.len()];
+        for (row, neighbors) in self.rows.iter().enumerate() {
+            let row_degree = *self.degrees.get(row)?;
+            if !row_degree.is_finite() || row_degree <= 0.0 {
+                return None;
+            }
+            output[row] += input[row] / row_degree;
+            for &(column, weight) in neighbors {
+                let column_degree = *self.degrees.get(column)?;
+                let denominator = (row_degree * column_degree).sqrt();
+                if !weight.is_finite()
+                    || weight <= 0.0
+                    || !denominator.is_finite()
+                    || denominator <= 0.0
+                {
+                    return None;
+                }
+                output[row] += weight * input[column] / denominator;
+            }
+            if !output[row].is_finite() {
+                return None;
+            }
+        }
+        Some(output)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SparseEigengapProposal {
+    count: usize,
+    confidence: f64,
+    eigenvalues: Vec<f64>,
+    residual: f64,
+    iterations: usize,
+}
+
+fn build_sparse_speaker_affinity<C>(
+    clusters: &[AcousticCluster],
+    cannot_links: &BTreeSet<(String, String)>,
+    mut is_cancelled: C,
+) -> FwResult<Option<SparseSpeakerAffinityGraph>>
+where
+    C: FnMut() -> bool,
+{
+    if clusters.len() < 2 {
+        return Ok(None);
+    }
+    let edge_capacity = clusters
+        .len()
+        .checked_mul(SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE)
+        .ok_or_else(|| FwError::InvalidRequest("speaker affinity edge cap overflow".to_owned()))?;
+    let mut retained_edges = BTreeMap::<(usize, usize), f64>::new();
+    for left in 0..clusters.len() {
+        if left.is_multiple_of(ACOUSTIC_CANCELLATION_INTERVAL_FRAMES) && is_cancelled() {
+            return Err(FwError::Cancelled(format!(
+                "speaker affinity construction cancelled after {left} prototype rows"
+            )));
+        }
+        let mut neighbors = Vec::<(f64, usize)>::new();
+        for right in 0..clusters.len() {
+            if left == right
+                || !clusters_compatible(&clusters[left], &clusters[right], cannot_links)
+            {
+                continue;
+            }
+            let Some(evidence) = cluster_pair_evidence(
+                &clusters[left],
+                &clusters[right],
+                SpeakerPairPerturbation::Full,
+            ) else {
+                continue;
+            };
+            let weight = f64::from(
+                ((2.0 * evidence.same_speaker_probability - 1.0).max(0.0)) * evidence.support,
+            );
+            if weight.is_finite() && weight > 0.0 {
+                neighbors.push((weight, right));
+            }
+        }
+        neighbors.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        neighbors.truncate(SPEAKER_COUNT_SPARSE_NEIGHBOR_DEGREE);
+        for (weight, right) in neighbors {
+            let edge = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            retained_edges
+                .entry(edge)
+                .and_modify(|retained| *retained = retained.max(weight))
+                .or_insert(weight);
+        }
+    }
+    if retained_edges.is_empty() {
+        return Ok(None);
+    }
+    if retained_edges.len() > edge_capacity {
+        return Err(FwError::InvalidRequest(
+            "symmetrized speaker affinity exceeded its edge cap".to_owned(),
+        ));
+    }
+    let mut rows = vec![Vec::new(); clusters.len()];
+    let mut degrees = vec![1.0; clusters.len()];
+    for ((left, right), weight) in retained_edges {
+        rows[left].push((right, weight));
+        rows[right].push((left, weight));
+        degrees[left] += weight;
+        degrees[right] += weight;
+    }
+    for row in &mut rows {
+        row.sort_by_key(|(neighbor, _)| *neighbor);
+    }
+    let undirected_edge_count = rows.iter().map(Vec::len).sum::<usize>() / 2;
+    Ok(Some(SparseSpeakerAffinityGraph {
+        rows,
+        degrees,
+        undirected_edge_count,
+    }))
+}
+
+fn sparse_normalized_eigengap<C>(
+    graph: &SparseSpeakerAffinityGraph,
+    minimum_count: usize,
+    maximum_count: usize,
+    mut is_cancelled: C,
+) -> FwResult<Option<SparseEigengapProposal>>
+where
+    C: FnMut() -> bool,
+{
+    let node_count = graph.rows.len();
+    if node_count == 0 || graph.degrees.len() != node_count {
+        return Ok(None);
+    }
+    if node_count == 1 {
+        return Ok(Some(SparseEigengapProposal {
+            count: 1,
+            confidence: 1.0,
+            eigenvalues: vec![1.0],
+            residual: 0.0,
+            iterations: 0,
+        }));
+    }
+    if graph.undirected_edge_count == 0 || minimum_count == 0 || minimum_count > maximum_count {
+        return Ok(None);
+    }
+    let bounded_maximum = maximum_count.min(node_count);
+    if minimum_count > bounded_maximum {
+        return Ok(None);
+    }
+    let subspace_dimensions = bounded_maximum.saturating_add(1).min(node_count);
+    let mut basis = deterministic_spectral_basis(graph, subspace_dimensions)?;
+    let mut residual = f64::INFINITY;
+    let mut iterations = 0usize;
+    let mut rayleigh = vec![vec![0.0; subspace_dimensions]; subspace_dimensions];
+    for iteration in 0..SPEAKER_COUNT_EIGENSOLVER_MAX_ITERATIONS {
+        if is_cancelled() {
+            return Err(FwError::Cancelled(format!(
+                "speaker-count eigensolver cancelled after {iteration} iterations"
+            )));
+        }
+        let mut next = basis
+            .iter()
+            .map(|column| graph.apply_normalized(column))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "speaker-count eigensolver encountered an invalid sparse product".to_owned(),
+                )
+            })?;
+        if !orthonormalize_columns(&mut next) {
+            return Ok(None);
+        }
+        basis = next;
+        let applied = basis
+            .iter()
+            .map(|column| graph.apply_normalized(column))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "speaker-count eigensolver encountered an invalid Rayleigh product".to_owned(),
+                )
+            })?;
+        for row in 0..subspace_dimensions {
+            for column in 0..subspace_dimensions {
+                rayleigh[row][column] = dot_f64(&basis[row], &applied[column])?;
+            }
+        }
+        residual = invariant_subspace_residual(&basis, &applied, &rayleigh)?;
+        iterations = iteration + 1;
+        if residual <= SPEAKER_COUNT_EIGENSOLVER_TOLERANCE {
+            break;
+        }
+    }
+    if residual > SPEAKER_COUNT_EIGENSOLVER_TOLERANCE {
+        return Ok(None);
+    }
+    let mut eigenvalues = jacobi_symmetric_eigenvalues(rayleigh)?;
+    eigenvalues.sort_by(|left, right| right.total_cmp(left));
+    for eigenvalue in &mut eigenvalues {
+        *eigenvalue = eigenvalue.clamp(-1.0, 1.0);
+    }
+    let mut scores = Vec::<(usize, f64)>::new();
+    for count in minimum_count..=bounded_maximum {
+        let Some(&left) = eigenvalues.get(count - 1) else {
+            continue;
+        };
+        let right = eigenvalues.get(count).copied().unwrap_or(0.0);
+        let gap = (left - right).max(0.0);
+        let normalized_gap = gap / left.abs().max(1.0e-9);
+        if normalized_gap.is_finite() {
+            scores.push((count, normalized_gap));
+        }
+    }
+    let &(count, best_score) = scores.iter().max_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| right.0.cmp(&left.0))
+    })?;
+    let total_score = scores.iter().map(|(_, score)| *score).sum::<f64>();
+    if best_score <= 0.0 || !total_score.is_finite() || total_score <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(SparseEigengapProposal {
+        count,
+        confidence: (best_score / total_score).clamp(0.0, 1.0),
+        eigenvalues,
+        residual,
+        iterations,
+    }))
+}
+
+fn deterministic_spectral_basis(
+    graph: &SparseSpeakerAffinityGraph,
+    dimensions: usize,
+) -> FwResult<Vec<Vec<f64>>> {
+    let node_count = graph.rows.len();
+    if dimensions == 0 || dimensions > node_count {
+        return Err(FwError::InvalidRequest(
+            "speaker-count eigensolver basis dimensions are invalid".to_owned(),
+        ));
+    }
+    let mut basis = Vec::with_capacity(dimensions);
+    for column in 0..dimensions {
+        let mut values = Vec::with_capacity(node_count);
+        for (row, degree) in graph.degrees.iter().copied().enumerate() {
+            let value = if column == 0 {
+                degree.sqrt()
+            } else {
+                let angle =
+                    std::f64::consts::PI * column as f64 * (row as f64 + 0.5) / node_count as f64;
+                angle.cos()
+            };
+            values.push(value);
+        }
+        basis.push(values);
+    }
+    if !orthonormalize_columns(&mut basis) {
+        return Err(FwError::InvalidRequest(
+            "speaker-count eigensolver basis is rank deficient".to_owned(),
+        ));
+    }
+    Ok(basis)
+}
+
+fn orthonormalize_columns(columns: &mut [Vec<f64>]) -> bool {
+    for column in 0..columns.len() {
+        let (previous_columns, current_and_remaining) = columns.split_at_mut(column);
+        let current = &mut current_and_remaining[0];
+        for _ in 0..2 {
+            for previous in previous_columns.iter() {
+                let Ok(projection) = dot_f64(current, previous) else {
+                    return false;
+                };
+                for row in 0..current.len() {
+                    current[row] -= projection * previous[row];
+                }
+            }
+        }
+        let Ok(norm_squared) = dot_f64(current, current) else {
+            return false;
+        };
+        let norm = norm_squared.sqrt();
+        if !norm.is_finite() || norm <= 1.0e-12 {
+            return false;
+        }
+        for value in current {
+            *value /= norm;
+        }
+    }
+    true
+}
+
+fn invariant_subspace_residual(
+    basis: &[Vec<f64>],
+    applied: &[Vec<f64>],
+    rayleigh: &[Vec<f64>],
+) -> FwResult<f64> {
+    if basis.len() != applied.len() || rayleigh.len() != basis.len() {
+        return Err(FwError::InvalidRequest(
+            "speaker-count eigensolver residual dimensions do not match".to_owned(),
+        ));
+    }
+    let mut maximum = 0.0_f64;
+    for column in 0..basis.len() {
+        for row in 0..basis[column].len() {
+            let mut projected = 0.0;
+            for component in 0..basis.len() {
+                projected += basis[component][row] * rayleigh[component][column];
+            }
+            maximum = maximum.max((applied[column][row] - projected).abs());
+        }
+    }
+    if maximum.is_finite() {
+        Ok(maximum)
+    } else {
+        Err(FwError::InvalidRequest(
+            "speaker-count eigensolver residual is non-finite".to_owned(),
+        ))
+    }
+}
+
+fn jacobi_symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> FwResult<Vec<f64>> {
+    let dimensions = matrix.len();
+    if dimensions == 0 || matrix.iter().any(|row| row.len() != dimensions) {
+        return Err(FwError::InvalidRequest(
+            "speaker-count Rayleigh matrix is not square".to_owned(),
+        ));
+    }
+    for row in 0..dimensions {
+        for column in 0..dimensions {
+            if !matrix[row][column].is_finite() {
+                return Err(FwError::InvalidRequest(
+                    "speaker-count Rayleigh matrix is non-finite".to_owned(),
+                ));
+            }
+            let symmetric = 0.5 * (matrix[row][column] + matrix[column][row]);
+            matrix[row][column] = symmetric;
+            matrix[column][row] = symmetric;
+        }
+    }
+    let iteration_cap = dimensions
+        .checked_mul(dimensions)
+        .and_then(|value| value.checked_mul(64))
+        .ok_or_else(|| {
+            FwError::InvalidRequest("speaker-count Jacobi iteration cap overflow".to_owned())
+        })?;
+    for _ in 0..iteration_cap {
+        let mut largest = 0.0_f64;
+        let mut pivot = None;
+        for row in 0..dimensions {
+            for column in row + 1..dimensions {
+                let magnitude = matrix[row][column].abs();
+                if magnitude > largest {
+                    largest = magnitude;
+                    pivot = Some((row, column));
+                }
+            }
+        }
+        if largest <= 1.0e-12 {
+            return Ok((0..dimensions).map(|index| matrix[index][index]).collect());
+        }
+        let Some((left, right)) = pivot else {
+            break;
+        };
+        let angle =
+            0.5 * (2.0 * matrix[left][right]).atan2(matrix[right][right] - matrix[left][left]);
+        let cosine = angle.cos();
+        let sine = angle.sin();
+        let left_diagonal = matrix[left][left];
+        let right_diagonal = matrix[right][right];
+        let off_diagonal = matrix[left][right];
+        matrix[left][left] = cosine * cosine * left_diagonal - 2.0 * sine * cosine * off_diagonal
+            + sine * sine * right_diagonal;
+        matrix[right][right] = sine * sine * left_diagonal
+            + 2.0 * sine * cosine * off_diagonal
+            + cosine * cosine * right_diagonal;
+        matrix[left][right] = 0.0;
+        matrix[right][left] = 0.0;
+        for index in 0..dimensions {
+            if index == left || index == right {
+                continue;
+            }
+            let left_value = matrix[index][left];
+            let right_value = matrix[index][right];
+            matrix[index][left] = cosine * left_value - sine * right_value;
+            matrix[left][index] = matrix[index][left];
+            matrix[index][right] = sine * left_value + cosine * right_value;
+            matrix[right][index] = matrix[index][right];
+        }
+    }
+    Err(FwError::InvalidRequest(
+        "speaker-count Jacobi eigensolver did not converge".to_owned(),
+    ))
+}
+
+fn dot_f64(left: &[f64], right: &[f64]) -> FwResult<f64> {
+    if left.len() != right.len() {
+        return Err(FwError::InvalidRequest(
+            "speaker-count eigensolver vector dimensions do not match".to_owned(),
+        ));
+    }
+    let value = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(FwError::InvalidRequest(
+            "speaker-count eigensolver dot product is non-finite".to_owned(),
+        ))
+    }
 }
 
 fn probabilistic_agglomeration_lane<C>(
@@ -13986,11 +14458,14 @@ mod tests {
             max: 3,
             exact: None,
         };
-        assert_eq!(super::fused_merge_risk_count(&lanes, policy), Some(2));
+        assert_eq!(super::fused_merge_risk_count(&lanes, None, policy), Some(2));
 
         let mut reversed = lanes.clone();
         reversed.reverse();
-        assert_eq!(super::fused_merge_risk_count(&reversed, policy), Some(2));
+        assert_eq!(
+            super::fused_merge_risk_count(&reversed, None, policy),
+            Some(2)
+        );
 
         let exact = super::SpeakerCountPolicy {
             min: 3,
@@ -13998,9 +14473,66 @@ mod tests {
             exact: Some(3),
         };
         assert_eq!(
-            super::fused_merge_risk_count(&lanes, exact),
+            super::fused_merge_risk_count(&lanes, None, exact),
             Some(3),
             "a hard count restricts candidate search without changing lane losses"
+        );
+    }
+
+    #[test]
+    fn sparse_normalized_eigengap_distinguishes_one_and_two_components() {
+        let graph = |node_count: usize, edges: &[(usize, usize, f64)]| {
+            let mut rows = vec![Vec::new(); node_count];
+            let mut degrees = vec![1.0; node_count];
+            for &(left, right, weight) in edges {
+                rows[left].push((right, weight));
+                rows[right].push((left, weight));
+                degrees[left] += weight;
+                degrees[right] += weight;
+            }
+            super::SparseSpeakerAffinityGraph {
+                rows,
+                degrees,
+                undirected_edge_count: edges.len(),
+            }
+        };
+        let two_components = graph(4, &[(0, 1, 1.0), (2, 3, 1.0)]);
+        let proposal = super::sparse_normalized_eigengap(&two_components, 1, 3, || false)
+            .expect("spectral solver")
+            .expect("two-component proposal");
+        assert_eq!(proposal.count, 2, "{proposal:#?}");
+        assert!(proposal.confidence > 0.99, "{proposal:#?}");
+        assert!(proposal.residual <= super::SPEAKER_COUNT_EIGENSOLVER_TOLERANCE);
+
+        let connected = graph(
+            4,
+            &[
+                (0, 1, 1.0),
+                (0, 2, 1.0),
+                (0, 3, 1.0),
+                (1, 2, 1.0),
+                (1, 3, 1.0),
+                (2, 3, 1.0),
+            ],
+        );
+        let proposal = super::sparse_normalized_eigengap(&connected, 1, 3, || false)
+            .expect("spectral solver")
+            .expect("connected proposal");
+        assert_eq!(proposal.count, 1, "{proposal:#?}");
+    }
+
+    #[test]
+    fn sparse_normalized_eigengap_is_cancellable() {
+        let graph = super::SparseSpeakerAffinityGraph {
+            rows: vec![vec![(1, 1.0)], vec![(0, 1.0)]],
+            degrees: vec![2.0, 2.0],
+            undirected_edge_count: 1,
+        };
+        let error = super::sparse_normalized_eigengap(&graph, 1, 2, || true)
+            .expect_err("cancellation must stop spectral iteration");
+        assert!(
+            matches!(error, crate::error::FwError::Cancelled(_)),
+            "{error:?}"
         );
     }
 
