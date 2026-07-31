@@ -492,7 +492,7 @@ pub fn verify_ecapa_weight_package(
     manifest: &EcapaWeightManifest,
     payload_path: &Path,
 ) -> FwResult<()> {
-    let token = CancellationToken::unbounded();
+    let token = CancellationToken::unbounded(); // ubs:ignore — cancellation token is not a secret
     verify_ecapa_weight_package_with_token(manifest, payload_path, &token)
 }
 
@@ -538,14 +538,27 @@ fn verify_payload(
         let mut remaining = tensor.byte_length;
         while remaining > 0 {
             token.checkpoint()?;
-            let wanted = usize::try_from(remaining.min(READ_CHUNK_BYTES as u64))
+            let wanted = usize::try_from(
+                remaining.min(
+                    u64::try_from(READ_CHUNK_BYTES)
+                        .map_err(|_| ecapa_error("payload_read", "chunk size is invalid"))?,
+                ),
+            )
                 .map_err(|_| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
+            let chunk = buffer
+                .get_mut(..wanted)
+                .ok_or_else(|| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
             reader
-                .read_exact(&mut buffer[..wanted])
+                .read_exact(chunk)
                 .map_err(|_| ecapa_error("payload_read", "weight payload could not be read"))?;
-            payload_hasher.update(&buffer[..wanted]);
-            tensor_hasher.update(&buffer[..wanted]);
-            remaining -= wanted as u64;
+            payload_hasher.update(&*chunk);
+            tensor_hasher.update(&*chunk);
+            remaining = remaining
+                .checked_sub(
+                    u64::try_from(wanted)
+                        .map_err(|_| ecapa_error("payload_read", "chunk size is invalid"))?,
+                )
+                .ok_or_else(|| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
         }
         if hex_digest(tensor_hasher.finalize()) != tensor.tensor_sha256 {
             return Err(ecapa_error(
