@@ -880,7 +880,6 @@ pub fn score_diarization_documents(
         config,
     );
     let speaker_occupancy = score_speaker_occupancy(
-        reference,
         hypothesis,
         &atoms,
         &diarization.speaker_mapping,
@@ -1940,7 +1939,13 @@ fn score_speaker_count_posterior(
                 (bin.probability - target).powi(2)
             })
             .sum::<f64>();
-        concrete + estimate.unresolved_probability.powi(2)
+        let unsupported_reference_target = f64::from(
+            !estimate
+                .posterior
+                .iter()
+                .any(|bin| bin.count == reference_count),
+        );
+        concrete + unsupported_reference_target + estimate.unresolved_probability.powi(2)
     });
 
     let mut ranked_bins = estimate.posterior.clone();
@@ -2010,7 +2015,6 @@ fn score_speaker_count_posterior(
 }
 
 fn score_speaker_occupancy(
-    reference: &DiarizationReferenceDocument,
     hypothesis: &DiarizationHypothesisDocument,
     atoms: &[EvaluationAtomicInterval],
     mapping: &BTreeMap<String, String>,
@@ -2026,10 +2030,10 @@ fn score_speaker_occupancy(
         .cloned()
         .map(|speaker| (speaker, 0.0_f64))
         .collect::<BTreeMap<_, _>>();
-    let reference_labels = reference
-        .turns
+    let reference_labels = atoms
         .iter()
-        .filter_map(|turn| turn.speaker.clone())
+        .filter(|atom| !atom.excluded)
+        .flat_map(|atom| atom.reference.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut reference_duration = reference_labels
         .iter()
@@ -12786,6 +12790,19 @@ mod tests {
         assert_eq!(unresolved.selected_count, None);
         assert_eq!(unresolved.unresolved_probability, Some(0.5));
         assert!(unresolved.credible_set_includes_unresolved);
+
+        let unsupported_reference = super::score_speaker_count_posterior(
+            crate::model::MAX_SPEAKER_COUNT as usize + 1,
+            unresolved_hypothesis.speaker_count_estimate.as_ref(),
+            &DiarizationScorerConfig::default(),
+        );
+        assert!(unsupported_reference.infinite_negative_log_likelihood);
+        assert_close(
+            unsupported_reference
+                .brier_score
+                .expect("out-of-support Brier"),
+            1.38,
+        );
     }
 
     #[test]
@@ -12845,7 +12862,10 @@ mod tests {
             schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
             recording_id: "ignored-occupancy-fixture".to_owned(),
             duration_ms: 2_000,
-            turns: vec![EvaluationTurn::labeled(0, 1_000, "reference-a")],
+            turns: vec![
+                EvaluationTurn::labeled(0, 1_000, "reference-a"),
+                EvaluationTurn::labeled(1_000, 2_000, "excluded-reference"),
+            ],
             ignored_regions: vec![EvaluationRegion {
                 start_ms: 1_000,
                 end_ms: 2_000,
@@ -12881,6 +12901,8 @@ mod tests {
         assert_eq!(excluded.recurrence_episode_count, 0);
         assert!(!excluded.effective);
         assert_eq!(score.speaker_occupancy.phantom_speaker_count, 0);
+        assert_eq!(score.speaker_occupancy.collapsed_reference_speaker_count, 0);
+        assert_eq!(score.speaker_occupancy.minority_reference_recall, Some(1.0));
     }
 
     #[test]
