@@ -87,6 +87,15 @@ impl StDType {
             Self::F16 | Self::Bf16 => 2,
         }
     }
+
+    /// Canonical safetensors header spelling for this dtype.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Bf16 => "BF16",
+        }
+    }
 }
 
 /// One parsed tensor directory entry: its dtype, logical shape, and the
@@ -326,6 +335,24 @@ impl SafetensorsFile {
         self.tensors
             .get(name)
             .map(|e| e.shape.as_slice())
+            .ok_or_else(|| {
+                FwError::InvalidRequest(format!("safetensors tensor `{name}` not found"))
+            })
+    }
+
+    /// The canonical safetensors dtype spelling for tensor `name`.
+    ///
+    /// This permits a model-specific loader to reject an otherwise supported
+    /// half-precision package when its numerical contract requires exact F32
+    /// source values, without materializing the tensor.
+    ///
+    /// # Errors
+    ///
+    /// [`FwError::InvalidRequest`] if `name` is absent.
+    pub fn dtype_name(&self, name: &str) -> FwResult<&'static str> {
+        self.tensors
+            .get(name)
+            .map(|entry| entry.dtype.name())
             .ok_or_else(|| {
                 FwError::InvalidRequest(format!("safetensors tensor `{name}` not found"))
             })
@@ -835,6 +862,8 @@ mod tests {
 
         assert_eq!(file.metadata(), Some(&metadata));
         assert_eq!(file.shape("w_f32").expect("shape"), &[2, 3]);
+        assert_eq!(file.dtype_name("w_f32").expect("dtype"), "F32");
+        assert_eq!(file.dtype_name("a_f16").expect("dtype"), "F16");
     }
 
     #[test]
@@ -859,6 +888,7 @@ mod tests {
         let (shape, vals) = file.tensor_f32("b").expect("decode bf16");
         assert_eq!(shape, vec![2]);
         assert_eq!(vals, vec![1.0, -2.0]);
+        assert_eq!(file.dtype_name("b").expect("dtype"), "BF16");
         // No metadata key present.
         assert!(file.metadata().is_none());
     }
@@ -877,6 +907,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("absent"), "names missing tensor: {msg}");
         assert!(msg.contains("present"), "lists available: {msg}");
+        assert!(file.dtype_name("absent").is_err());
     }
 
     // ─────────────────────────────────────────────────────────────────────
