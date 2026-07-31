@@ -1179,11 +1179,11 @@ fn render_synthetic_turn(
             * playback_gain
             * envelope
             * modulation;
-        for channel in 0..plan.channels {
+        for (channel, channel_state) in channel_state.iter_mut().enumerate().take(plan.channels) {
             let channel_gain =
                 synthetic_channel_gain(channel, plan.channels, profile.stereo_position_millionths);
-            let filtered = raw.mul_add(1.0 - retention, retention * channel_state[channel]);
-            channel_state[channel] = filtered;
+            let filtered = raw.mul_add(1.0 - retention, retention * *channel_state);
+            *channel_state = filtered;
             let index = frame
                 .checked_mul(plan.channels)
                 .and_then(|value| value.checked_add(channel))
@@ -1681,7 +1681,7 @@ fn apply_stereo_swap(audio: &mut AdversarialAudio) -> FwResult<()> {
             "stereo channel swap requires exactly two channels",
         ));
     }
-    for frame in audio.samples.chunks_exact_mut(2) {
+    for frame in audio.samples.chunks_exact_mut(audio.channels) {
         frame.swap(0, 1);
     }
     Ok(())
