@@ -273,6 +273,9 @@ def main() -> int:
             "source_sha256": input_sha,
             "exported_tensor_count": str(len(tensors)),
             "exported_dtype": "F32",
+            "numpy_version": numpy.__version__,
+            "torch_version": torch.__version__,
+            "safetensors_version": safetensors.__version__,
         }
 
     _save_deterministic_safetensors(tensors, args.output, metadata)

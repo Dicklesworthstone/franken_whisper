@@ -163,6 +163,19 @@ impl SafetensorsFile {
     /// JSON; [`FwError::InvalidRequest`] for any structural violation above.
     pub fn load(path: &Path) -> FwResult<Self> {
         let bytes = std::fs::read(path)?;
+        Self::from_owned_bytes(bytes)
+    }
+
+    /// Parse an owned safetensors byte buffer without copying its data section.
+    ///
+    /// This is the preferred entry point when a caller has already read and
+    /// authenticated a file and must parse those exact bytes without reopening
+    /// its path. The returned object retains `bytes` as its backing storage.
+    ///
+    /// # Errors
+    ///
+    /// See [`load`](Self::load).
+    pub fn from_owned_bytes(bytes: Vec<u8>) -> FwResult<Self> {
         // Retain the whole file buffer and index tensors past the header, instead
         // of `from_bytes`' second `to_vec()` of the entire data section. The tensor
         // bytes read are byte-identical (`bytes[header_end..][begin..end]` ==
@@ -1045,6 +1058,7 @@ mod tests {
 
         let disk = SafetensorsFile::load(&path).expect("load from disk");
         let mem = SafetensorsFile::from_bytes(&bytes).expect("from_bytes");
+        let owned = SafetensorsFile::from_owned_bytes(bytes.clone()).expect("from_owned_bytes");
 
         // Same directory; the disk path retains the whole file, the mem path
         // copies just the (smaller) data section.
@@ -1053,11 +1067,21 @@ mod tests {
             mem.names().collect::<Vec<_>>()
         );
         assert_eq!(
+            disk.names().collect::<Vec<_>>(),
+            owned.names().collect::<Vec<_>>()
+        );
+        assert_eq!(
             disk.data.len(),
             bytes.len(),
             "disk path retains the whole file"
         );
         assert!(disk.data_offset > 0, "disk path indexes past the header");
+        assert!(owned.data_offset > 0, "owned path indexes past the header");
+        assert_eq!(
+            owned.data.len(),
+            bytes.len(),
+            "owned path retains the whole file"
+        );
         assert_eq!(
             mem.data_offset, 0,
             "from_bytes copies just the data section"
@@ -1067,11 +1091,18 @@ mod tests {
         for name in ["a.w", "b.empty", "c.f16", "d.tail"] {
             let (disk_shape, disk_vals) = disk.tensor_f32(name).expect("disk decode");
             let (mem_shape, mem_vals) = mem.tensor_f32(name).expect("mem decode");
+            let (owned_shape, owned_vals) = owned.tensor_f32(name).expect("owned decode");
             assert_eq!(disk_shape, mem_shape, "shape differs for {name}");
+            assert_eq!(disk_shape, owned_shape, "owned shape differs for {name}");
             assert_eq!(
                 disk_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 mem_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "decoded f32 bits differ for {name}"
+            );
+            assert_eq!(
+                disk_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                owned_vals.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "owned decoded f32 bits differ for {name}"
             );
         }
     }

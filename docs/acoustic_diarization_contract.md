@@ -1072,7 +1072,8 @@ hash, conversion command, and output hash without pretending that a download
 is available.
 
 The shipped Rust verifier first streams the complete package through a bounded,
-cancel-aware exact-size and SHA-256 check. It then reuses
+cancel-aware exact-size and SHA-256 check. It then passes that same
+authenticated owned byte buffer—without reopening the path—to
 `native_engine::weights::SafetensorsFile` and `WeightsManifest` to require the
 exact 200 names and shapes, require every dtype to be `F32`, and compare the
 complete deterministic metadata object. Structural, mapping, dtype, metadata,

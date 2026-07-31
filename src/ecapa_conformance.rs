@@ -386,14 +386,14 @@ pub fn verify_ecapa_weight_package_with_token(
     package_path: &Path,
     token: &CancellationToken,
 ) -> FwResult<()> {
-    verify_ecapa_package_identity(
+    let package_bytes = read_verified_ecapa_package(
         package_path,
         ECAPA_PACKAGE_BYTES,
         ECAPA_PACKAGE_SHA256,
         token,
     )?;
     token.checkpoint()?;
-    let package = SafetensorsFile::load(package_path).map_err(|_| {
+    let package = SafetensorsFile::from_owned_bytes(package_bytes).map_err(|_| {
         ecapa_error(
             "safetensors_structure",
             "weight package is not structurally valid safetensors",
@@ -403,12 +403,12 @@ pub fn verify_ecapa_weight_package_with_token(
     token.checkpoint()
 }
 
-fn verify_ecapa_package_identity(
+fn read_verified_ecapa_package(
     package_path: &Path,
     expected_bytes: u64,
     expected_sha256: &str,
     token: &CancellationToken,
-) -> FwResult<()> {
+) -> FwResult<Vec<u8>> {
     token.checkpoint()?;
     let file = File::open(package_path)
         .map_err(|_| ecapa_error("package_open", "weight package could not be opened"))?;
@@ -424,6 +424,13 @@ fn verify_ecapa_package_identity(
     }
     let mut reader = BufReader::new(file);
     let mut package_hasher = Sha256::new();
+    let capacity = usize::try_from(expected_bytes).map_err(|_| {
+        ecapa_error(
+            "package_identity",
+            "weight package length does not fit this platform",
+        )
+    })?;
+    let mut package_bytes = Vec::with_capacity(capacity);
     let mut buffer = [0u8; READ_CHUNK_BYTES];
     loop {
         token.checkpoint()?;
@@ -433,11 +440,17 @@ fn verify_ecapa_package_identity(
         if read == 0 {
             break;
         }
-        package_hasher.update(
-            buffer
-                .get(..read)
-                .ok_or_else(|| ecapa_error("package_read", "weight package read is invalid"))?,
-        );
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| ecapa_error("package_read", "weight package read is invalid"))?;
+        package_hasher.update(chunk);
+        package_bytes.extend_from_slice(chunk);
+    }
+    if package_bytes.len() != capacity {
+        return Err(ecapa_error(
+            "package_identity",
+            "weight package length changed while it was read",
+        ));
     }
     if hex_digest(package_hasher.finalize()) != expected_sha256 {
         return Err(ecapa_error(
@@ -445,7 +458,7 @@ fn verify_ecapa_package_identity(
             "weight package checksum does not match the frozen artifact",
         ));
     }
-    Ok(())
+    Ok(package_bytes)
 }
 
 fn verify_loaded_ecapa_package(package: &SafetensorsFile) -> FwResult<()> {
@@ -1176,16 +1189,17 @@ mod tests {
         let path = directory.path().join("weights.safetensors");
         let payload = b"abcdefgh";
         std::fs::write(&path, payload).expect("write payload");
-        verify_ecapa_package_identity(
+        let verified = read_verified_ecapa_package(
             &path,
             payload.len() as u64,
             &bytes_sha256(payload),
             &CancellationToken::unbounded(),
         )
         .expect("valid identity");
+        assert_eq!(verified, payload);
 
         assert!(
-            verify_ecapa_package_identity(
+            read_verified_ecapa_package(
                 &path,
                 payload.len() as u64,
                 &"f".repeat(64),
@@ -1194,7 +1208,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            verify_ecapa_package_identity(
+            read_verified_ecapa_package(
                 &path,
                 payload.len() as u64 + 1,
                 &bytes_sha256(payload),
@@ -1203,7 +1217,7 @@ mod tests {
             .is_err()
         );
         assert!(matches!(
-            verify_ecapa_package_identity(
+            read_verified_ecapa_package(
                 &path,
                 payload.len() as u64,
                 &bytes_sha256(payload),
