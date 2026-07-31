@@ -10,8 +10,9 @@ use serde_json::json;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, BackendParams, DecodingParams, DiarizationConfig, DiarizationEngine,
-    DiarizationFallbackPolicy, DiarizationRequest, InputSource, KnownSpeakerInterval, OutputFormat,
-    SpeakerConstraints, TimestampLevel, TranscribeRequest, VadParams,
+    DiarizationFallbackPolicy, DiarizationRequest, InputSource, KnownSpeakerInterval,
+    MAX_SPEAKER_COUNT, OutputFormat, SpeakerCountRequest, TimestampLevel, TranscribeRequest,
+    VadParams,
 };
 use crate::sync::ConflictPolicy;
 
@@ -1114,19 +1115,7 @@ impl TranscribeArgs {
             None
         };
 
-        // Speaker constraints — only build if any field is set.
-        let speaker_constraints = if self.num_speakers.is_some()
-            || self.min_speakers.is_some()
-            || self.max_speakers.is_some()
-        {
-            Some(SpeakerConstraints {
-                num_speakers: self.num_speakers,
-                min_speakers: self.min_speakers,
-                max_speakers: self.max_speakers,
-            })
-        } else {
-            None
-        };
+        let speaker_count = self.speaker_count_request()?;
 
         // Diarization config — only build if any diarization-specific flag is set.
         let diarization_config =
@@ -1149,9 +1138,13 @@ impl TranscribeArgs {
             .map(read_speaker_hints)
             .transpose()?
             .unwrap_or_default();
-        let acoustic_diarization = self.diarize.then_some(DiarizationRequest {
+        let has_diarization_request = self.diarize
+            || !known_intervals.is_empty()
+            || speaker_count != SpeakerCountRequest::Infer;
+        let acoustic_diarization = has_diarization_request.then_some(DiarizationRequest {
             engine: self.diarization_engine,
             fallback: self.diarization_fallback,
+            speaker_count,
             known_intervals,
             enrollment_edge_guard_ms: self.enrollment_edge_guard_ms,
             max_prototypes: self.diarization_max_prototypes,
@@ -1167,7 +1160,6 @@ impl TranscribeArgs {
             timestamp_level: self.timestamp_level,
             decoding,
             vad,
-            speaker_constraints,
             diarization_config,
             acoustic_diarization,
             gpu_device: self.gpu_device.take(),
@@ -1217,6 +1209,26 @@ impl TranscribeArgs {
         })
     }
 
+    fn speaker_count_request(&self) -> FwResult<SpeakerCountRequest> {
+        let request = if let Some(count) = self.num_speakers {
+            if self.min_speakers.is_some() || self.max_speakers.is_some() {
+                return Err(FwError::InvalidRequest(
+                    "--num-speakers cannot be combined with --min-speakers or --max-speakers"
+                        .to_owned(),
+                ));
+            }
+            SpeakerCountRequest::HardConstraint { count }
+        } else if self.min_speakers.is_some() || self.max_speakers.is_some() {
+            SpeakerCountRequest::Range {
+                minimum: self.min_speakers.unwrap_or(1),
+                maximum: self.max_speakers.unwrap_or(MAX_SPEAKER_COUNT),
+            }
+        } else {
+            SpeakerCountRequest::Infer
+        };
+        Ok(request)
+    }
+
     #[must_use]
     pub fn robot_summary(&self) -> serde_json::Value {
         json!({
@@ -1227,6 +1239,7 @@ impl TranscribeArgs {
             "diarize": self.diarize,
             "diarization_engine": self.diarization_engine,
             "diarization_fallback": self.diarization_fallback,
+            "speaker_count": self.speaker_count_request().ok(),
             "speaker_hints_present": self.speaker_hints.is_some(),
             "persist_speaker_profiles": self.persist_speaker_profiles,
             "persist": !self.no_persist,
@@ -1562,6 +1575,7 @@ mod tests {
         assert_eq!(summary["translate"], false);
         assert_eq!(summary["persist"], true);
         assert_eq!(summary["diarization_engine"], "auto");
+        assert_eq!(summary["speaker_count"]["mode"], "infer");
         assert_eq!(summary["speaker_hints_present"], false);
     }
 
@@ -1729,42 +1743,49 @@ mod tests {
         assert!(!request.backend_params.tiny_diarize);
     }
 
-    // --- Speaker constraints ---
+    // --- Speaker count request ---
 
     #[test]
-    fn speaker_constraints_none_when_no_speaker_args() {
+    fn speaker_count_infers_when_no_speaker_args() {
         let args = minimal_args();
         let request = args.to_request().expect("should succeed");
-        assert!(request.backend_params.speaker_constraints.is_none());
+        assert!(request.backend_params.acoustic_diarization.is_none());
     }
 
     #[test]
-    fn speaker_constraints_built_from_num_speakers() {
+    fn speaker_count_built_from_num_speakers() {
         let mut args = minimal_args();
         args.num_speakers = Some(3);
+        let summary = args.robot_summary();
+        assert_eq!(summary["speaker_count"]["mode"], "hard_constraint");
+        assert_eq!(summary["speaker_count"]["count"], 3);
         let request = args.to_request().expect("should succeed");
-        let sc = request
+        let count = &request
             .backend_params
-            .speaker_constraints
-            .expect("should be Some");
-        assert_eq!(sc.num_speakers, Some(3));
-        assert!(sc.min_speakers.is_none());
-        assert!(sc.max_speakers.is_none());
+            .acoustic_diarization
+            .expect("speaker count creates a diarization request")
+            .speaker_count;
+        assert_eq!(count, &SpeakerCountRequest::HardConstraint { count: 3 });
     }
 
     #[test]
-    fn speaker_constraints_built_from_min_and_max() {
+    fn speaker_count_built_from_min_and_max() {
         let mut args = minimal_args();
         args.min_speakers = Some(2);
         args.max_speakers = Some(8);
         let request = args.to_request().expect("should succeed");
-        let sc = request
+        let count = &request
             .backend_params
-            .speaker_constraints
-            .expect("should be Some");
-        assert!(sc.num_speakers.is_none());
-        assert_eq!(sc.min_speakers, Some(2));
-        assert_eq!(sc.max_speakers, Some(8));
+            .acoustic_diarization
+            .expect("speaker range creates a diarization request")
+            .speaker_count;
+        assert_eq!(
+            count,
+            &SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 8
+            }
+        );
     }
 
     // --- Diarization config ---
@@ -2203,7 +2224,14 @@ mod tests {
             request.backend_params.timestamp_level,
             Some(TimestampLevel::Word)
         );
-        assert!(request.backend_params.speaker_constraints.is_some());
+        assert!(matches!(
+            request
+                .backend_params
+                .acoustic_diarization
+                .as_ref()
+                .map(|request| &request.speaker_count),
+            Some(SpeakerCountRequest::HardConstraint { count: 3 })
+        ));
         assert_eq!(request.backend_params.output_formats.len(), 2);
         assert!(request.backend_params.diarization_config.is_some());
         assert!(request.backend_params.vad.is_some());
@@ -2258,19 +2286,15 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_all_fields() {
+    fn exact_and_range_speaker_flags_are_rejected_as_ambiguous() {
         let mut args = minimal_args();
         args.num_speakers = Some(4);
         args.min_speakers = Some(2);
         args.max_speakers = Some(6);
-        let request = args.to_request().expect("should succeed");
-        let sc = request
-            .backend_params
-            .speaker_constraints
-            .expect("should be Some");
-        assert_eq!(sc.num_speakers, Some(4));
-        assert_eq!(sc.min_speakers, Some(2));
-        assert_eq!(sc.max_speakers, Some(6));
+        let error = args
+            .to_request()
+            .expect_err("typed count request cannot represent contradictory modes");
+        assert!(error.to_string().contains("cannot be combined"));
     }
 
     #[test]
@@ -2416,6 +2440,7 @@ mod tests {
             "diarize",
             "diarization_engine",
             "diarization_fallback",
+            "speaker_count",
             "speaker_hints_present",
             "persist_speaker_profiles",
             "persist",
