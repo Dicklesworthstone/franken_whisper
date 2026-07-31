@@ -582,6 +582,12 @@ struct MatchedDecode {
     best_of: usize,
     temperature: f64,
     temperature_fallback: bool,
+    /// Cross-window prompt-carry cap, pinned on both arms. `whisper-cli -mc N`;
+    /// franken `DecodeParams.max_context`. Left unpinned the two engines carry
+    /// different prompt histories — franken's is a per-model/mode policy,
+    /// `whisper-cli`'s default is `-1` (unbounded) — which changes decode work
+    /// and the transcript, so the ratio would not be matched.
+    max_context: i32,
     language: String,
     translate: bool,
     word_timestamps: bool,
@@ -615,6 +621,12 @@ impl MatchedDecode {
                 .as_f64()
                 .expect("contract matched_decode.temperature must be a number"),
             temperature_fallback: bool_field("temperature_fallback"),
+            max_context: i32::try_from(
+                field("max_context")
+                    .as_i64()
+                    .expect("contract matched_decode.max_context must be an integer"),
+            )
+            .expect("contract matched_decode.max_context must fit in i32"),
             language: field("language")
                 .as_str()
                 .expect("contract matched_decode.language must be a string")
@@ -638,6 +650,8 @@ impl MatchedDecode {
             format!("{:.2}", self.temperature),
             "-l".to_owned(),
             self.language.clone(),
+            "-mc".to_owned(),
+            self.max_context.to_string(),
         ];
         if !self.temperature_fallback {
             args.push("-nf".to_owned());
@@ -653,11 +667,12 @@ impl MatchedDecode {
     fn as_row(&self) -> String {
         format!(
             "beam_size={} best_of={} temperature={:.2} temperature_fallback={} \
-             language={} translate={} word_timestamps={} decode_mode={}",
+             max_context={} language={} translate={} word_timestamps={} decode_mode={}",
             self.beam_size,
             self.best_of,
             self.temperature,
             self.temperature_fallback,
+            self.max_context,
             self.language,
             self.translate,
             self.word_timestamps,
@@ -1785,10 +1800,20 @@ fn franken_worker_main(args: &[String]) {
     // mismeasured -- but the parent was attesting a params struct the measured
     // arm never used, and the next contract edit would have silently split them.
     let contract = IncumbentContract::shipped();
+    // The spawned arm inherits the parent's environment, so it re-checks the
+    // hatch that would override the contract's carry policy here rather than
+    // trusting that the parent looked.
+    assert!(
+        std::env::var_os("FW_NO_CONTEXT").is_none(),
+        "FW_NO_CONTEXT is set in the whole-job worker, overriding the contract's \
+         matched max_context={}",
+        contract.decode.max_context
+    );
     let params = DecodeParams {
         language: Some(contract.decode.language.clone()),
         translate: contract.decode.translate,
         beam_size: Some(contract.decode.beam_size),
+        max_context: Some(contract.decode.max_context),
         timestamps,
         n_threads: threads,
         max_text_ctx: None,
@@ -1910,6 +1935,7 @@ fn main() {
         language: Some(contract.decode.language.clone()),
         translate: contract.decode.translate,
         beam_size: Some(contract.decode.beam_size),
+        max_context: Some(contract.decode.max_context),
         timestamps,
         n_threads: matched_threads.as_ref().map_or(0, |_| threads),
         max_text_ctx: None,
@@ -1922,8 +1948,21 @@ fn main() {
     // do retry work the incumbent's `-nf` forbids — unmatched in franken's
     // favour or against it, either way not this comparison.
     let franken_fallback_on = std::env::var_os("FW_TEMP_FALLBACK").is_some();
+    // `FW_NO_CONTEXT` is franken's env hatch for the same knob the contract now
+    // pins. An operator with it set would silently override the contract's
+    // carry policy on franken's side ONLY, leaving the incumbent at `-mc 0` and
+    // the row still claiming matched decode. The contract owns this parameter,
+    // so the hatch is a hard abort rather than a gate flag: unlike a busy CPU,
+    // no amount of extra sampling makes an unmatched decode admissible.
+    assert!(
+        std::env::var_os("FW_NO_CONTEXT").is_none(),
+        "FW_NO_CONTEXT is set, which overrides the contract's matched \
+         max_context={} on franken's arm only; unset it and re-run",
+        contract.decode.max_context
+    );
     let decode_matched = franken_fallback_on == contract.decode.temperature_fallback
         && params.beam_size == Some(contract.decode.beam_size)
+        && params.max_context == Some(contract.decode.max_context)
         && params.translate == contract.decode.translate
         && params.word_timestamps == contract.decode.word_timestamps
         && params.language.as_deref() == Some(contract.decode.language.as_str());
@@ -2501,6 +2540,7 @@ mod tests {
             "best_of": 5,
             "temperature": 0.0,
             "temperature_fallback": true,
+            "max_context": 0,
             "language": "en",
             "translate": false,
             "word_timestamps": false
@@ -2688,6 +2728,74 @@ mod tests {
     }
 
     #[test]
+    fn contract_pins_matched_no_context_carry_on_both_arms() {
+        let contract = IncumbentContract::shipped();
+        // Carry is pinned OFF, and 0 is the one value both engines express
+        // exactly: franken `Some(0)` disables carry, `whisper-cli -mc 0` stores
+        // no text context. whisper-cli's own default is -1 (unbounded), and
+        // franken's is a per-model/mode policy, so an unpinned cell compares
+        // two different prompt histories.
+        assert_eq!(contract.decode.max_context, 0);
+
+        let args = contract.decode.incumbent_args();
+        let mc = args
+            .iter()
+            .position(|arg| arg == "-mc")
+            .expect("incumbent args must state -mc");
+        assert_eq!(args[mc + 1], "0");
+
+        // The matched row must echo it: a matched-params claim that is not
+        // printed is not checkable by a reviewer.
+        assert!(contract.decode.as_row().contains("max_context=0"));
+
+        // Both franken arms take it from the contract, not from a literal.
+        for params in [
+            DecodeParams {
+                max_context: Some(contract.decode.max_context),
+                ..DecodeParams::default()
+            },
+            DecodeParams {
+                max_context: Some(contract.decode.max_context),
+                beam_size: Some(contract.decode.beam_size),
+                ..DecodeParams::default()
+            },
+        ] {
+            assert_eq!(params.max_context, Some(0));
+        }
+    }
+
+    #[test]
+    fn unpinned_or_unbounded_context_is_reported_as_such() {
+        // A contract that left carry unbounded must not silently read as the
+        // pinned no-context cell: -1 is whisper-cli's own default and franken's
+        // "restore n_text_ctx/2" sentinel, i.e. the unmatched case.
+        let unbounded = MatchedDecode::from_json(&json!({
+            "beam_size": 1,
+            "best_of": 1,
+            "temperature": 0.0,
+            "temperature_fallback": false,
+            "max_context": -1,
+            "language": "en",
+            "translate": false,
+            "word_timestamps": false
+        }));
+        assert_eq!(unbounded.max_context, -1);
+        assert!(unbounded.as_row().contains("max_context=-1"));
+        let args = unbounded.incumbent_args();
+        let mc = args
+            .iter()
+            .position(|arg| arg == "-mc")
+            .expect("-mc stated");
+        assert_eq!(args[mc + 1], "-1");
+        // Still explicitly passed: a default is a fact about a version, not
+        // about the comparison, and it can move under a pinned digest bump.
+        assert_ne!(
+            unbounded.as_row(),
+            IncumbentContract::shipped().decode.as_row()
+        );
+    }
+
+    #[test]
     fn whole_job_worker_decode_is_derived_from_the_contract_not_literals() {
         // The whole-job arm runs in a spawned copy of this same ELF, so it must
         // re-derive decode from the shipped contract. If it rebuilds those
@@ -2698,6 +2806,7 @@ mod tests {
             language: Some(contract.decode.language.clone()),
             translate: contract.decode.translate,
             beam_size: Some(contract.decode.beam_size),
+            max_context: Some(contract.decode.max_context),
             timestamps: false,
             n_threads: 32,
             max_text_ctx: None,
@@ -2707,6 +2816,7 @@ mod tests {
         };
         // Exactly the predicates `decode_matched` asserts in the parent.
         assert_eq!(worker_params.beam_size, Some(contract.decode.beam_size));
+        assert_eq!(worker_params.max_context, Some(contract.decode.max_context));
         assert_eq!(worker_params.translate, contract.decode.translate);
         assert_eq!(
             worker_params.word_timestamps,
