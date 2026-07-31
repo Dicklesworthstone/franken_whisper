@@ -49,6 +49,107 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-07-31 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — `large-v3-turbo` whole job: **2.264127×** (bd-pjl6)
+
+**Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
+
+**Legacy incumbent:** whisper.cpp 1.8.3 `whisper-cli`
+(`incumbent_bin_sha256=73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`).
+
+**Comparator execution:** the actual legacy incumbent and franken ran
+side-by-side in the same invocation. Seven comparison rounds alternated arm
+order, and the same invocation ran a seven-round A/A null for each engine.
+
+**Measured incumbent ratio:** `2.264127×` (`whisper.cpp / franken`), CI95
+`[2.244706, 2.277732]`. Median whole-job wall time was `6497.139 ms` for
+franken and `14798.745 ms` for whisper.cpp.
+
+**Whole-job scope and matched decode.** Both arms processed the same 124.5 s
+normalized WAV as fresh processes. Timed wall includes process startup, model
+and audio I/O, inference, result serialization, and teardown. Both used beam
+size 1, best-of 1, temperature 0, temperature fallback off,
+`max_context=0`, language `en`, translate false, and word timestamps false.
+The workload was text/no-timestamps, requested and configured at 32 threads.
+
+**Running-image and input identity.** The same-invocation harness hashed both
+running `/proc/<pid>/exe` images and emitted them in
+`INCUMBENT_AB_IDENTITY`; the franken benchmark also self-reported its own ELF:
+
+- strict-RCH harness source SHA-256
+  `1b87400583767ef181a7a9388587119e60dd8a3dbf4e03c6695fd8cd972cd7cb`;
+  benchmark ELF SHA-256
+  `4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`;
+  Build ID `368bafca5e5d973946d8f954827163b2808d2f37`;
+- incumbent running-image SHA-256
+  `73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+  the pinned 1.8.3 source/version/build-option contract passed;
+- `ggml-large-v3-turbo.bin` SHA-256
+  `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`;
+  normalized WAV SHA-256
+  `fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+
+The frozen production artifact was built with strict remote execution on
+`ovh-a`, `RCH_REQUIRE_REMOTE=1`, base `43a2b10`, `--clean-overlay`, and only
+`--overlay-path examples/incumbent_ab.rs`, while reusing the single repo
+target directory `/data/tmp/cargo-target-franken-whisper`. The emitted builder
+attestation was
+`RCH:ovh-a:base=43a2b10:clean-overlay:examples/incumbent_ab.rs@1b87400583767ef181a7a9388587119e60dd8a3dbf4e03c6695fd8cd972cd7cb:elf=4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`.
+
+**Transcript and work equivalence.** The untimed parity probe produced 279
+words from each engine with three word edits (`WER=0.010753`, below the
+`0.100000` gate). Text SHA-256 values were
+`6655771d39fac2d1cd9b665f6663892bf5211ee0c1be39ec638a3837c5bef5a7`
+for franken and
+`e745608b69fe52c0f9d7f9a0e69fbd3c27e8c63a44533407ad84686b108045ea`
+for whisper.cpp. Both performed five window attempts, five encodes, and 319
+single-token decoder forwards. There were no prompt-reset, temperature,
+hallucination, or fallback retries.
+
+**Actual observed thread use.** `/proc/<pid>/task/*/stat` observed CPU ticks on
+98 distinct franken TIDs and 63 distinct incumbent TIDs over their process
+lifetimes; peak simultaneous process-thread counts were 53 and 32. These are
+the observed values, separate from the requested/configured width of 32.
+
+**Host and exclusivity.** The run used `threadripperje`, boot
+`b107a2c6-9fac-40df-a637-c3a772b0ad57`: AMD Ryzen Threadripper PRO 5995WX,
+64 physical cores, 128 logical threads, 536,069,869,568 bytes RAM, one NUMA
+node, and affinity/effective cpuset `0-127`. All 128 online CPUs reported
+`amd-pstate-epp`, `performance` governor, and `performance` EPP. The fresh
+pre-claim census found no benchmark/compiler process; a five-second all-CPU
+probe peaked at `0.1414` busy, below the unchanged `0.200000` gate.
+Harness preflight, immediate/settled pre-measurement, and immediate/settled
+post-measurement maxima were respectively `0.033333`, `0.033333`,
+`0.107143`, `0.033333`, and `0.033333`. Full-window external-process maximum
+was `0.045164` CPU core against `0.100000`. The terminal census found no
+benchmark, whisper.cpp, or compiler process; three vmstat samples were
+99/99/100% idle with 0% iowait.
+
+| observation | raw values | median / CI95 |
+|---|---|---|
+| franken whole-job ms | `6497.139, 6546.594, 6487.203, 6733.869, 6483.901, 6487.796, 6566.046` | `6497.139 ms` |
+| whisper.cpp whole-job ms | `14798.745, 14695.177, 14754.819, 14798.776, 14680.377, 14915.441, 14841.651` | `14798.745 ms` |
+| whisper.cpp / franken | `2.277732, 2.244706, 2.274450, 2.197663, 2.264127, 2.299000, 2.260364` | **`2.264127 [2.244706, 2.277732]`** |
+| franken A/A | `0.985352, 1.001690, 0.992267, 1.043452, 0.976048, 1.000623, 1.019217` | `1.000623 [0.985352, 1.019217]` |
+| whisper.cpp A/A | `0.996563, 0.992364, 0.999469, 1.000040, 0.988145, 1.006807, 1.009363` | `0.999469 [0.992364, 1.006807]` |
+
+Both corrected null medians lie inside `[0.98, 1.02]`. The widest null edge
+from 1.0 was `0.019217`, so the retained 2x-null decision floor was
+`1.038433`; the comparison CI excludes 1.0 and the median clears that floor.
+The independent pre-round-load split was `0.014086` against the `0.100000`
+maximum. Identity, decode, transcript quality, exact work, actual-thread,
+frequency-policy, host-wide, process-exclusivity, load, and statistical gates
+all passed. `cv` was provenance only: franken null `0.020849`, incumbent null
+`0.006950`, comparison `0.013150`.
+
+Raw log:
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7738_n7.log`, SHA-256
+`3a0332c6726b86c4422ba91e190c54f26032ea9910c1a8c398bd8867f207f1c4`.
+
+**Verdict: KEEP / CAMPAIGN WIN.** This is the first admissible
+`large-v3-turbo` and first admissible whole-job ratio against the pinned
+incumbent. Re-certify if the harness, native source, incumbent, model, audio,
+decode contract, whole-job scope, or host class changes.
+
 ## 2026-07-30 — KEEP / **CAMPAIGN WINS (vs-incumbent)** — current-source tiny.en text certification: **1.518913×** on 124.5 s and **1.512159×** on 300 s (bd-b4hp)
 
 **Result class: INCUMBENT-WIN / CAMPAIGN WIN.**
