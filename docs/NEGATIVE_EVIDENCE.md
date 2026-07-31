@@ -207,6 +207,26 @@ process above `0.100000` CPU core for the entire invocation, and retain every
 null-median, 2x margin, load, identity, work, quality, thread, frequency, and
 host-wide gate unchanged.
 
+### Resolution: the exact n=7 retry passed every gate
+
+Claim `7738` satisfied that predicate without changing the artifact, inputs,
+decode parameters, workload, sample count, or gate. The same-invocation
+whole-job result is `2.264127×` (`whisper.cpp / franken`), CI95
+`[2.244706, 2.277732]`, from medians `6497.139 ms` and `14798.745 ms`.
+Both corrected null medians passed (`1.000623` franken, `0.999469`
+whisper.cpp); the retained 2x-widest-null floor was `1.038433`.
+Full-window external CPU was at most `0.045164` core, the independent load
+split was `0.014086`, and every host-wide sample passed. Exact work,
+279/279-word equivalence at `WER=0.010753`, running-image identity, uniform
+performance governor, and actual observed threads (98/63 CPU-tick-positive
+TIDs; 53/32 peak process threads) also passed.
+
+The admissible campaign row is now in `docs/PERF_LEDGER.md`. Raw log:
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7738_n7.log`, SHA-256
+`3a0332c6726b86c4422ba91e190c54f26032ea9910c1a8c398bd8867f207f1c4`.
+This closes the retry obligation; it does not retroactively admit any of the
+diagnostic ratios above.
+
 ---
 ## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
 
