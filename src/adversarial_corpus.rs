@@ -501,6 +501,14 @@ pub fn transform_reference_turns(
     plan: &TransformPlan,
 ) -> FwResult<Vec<SyntheticReferenceTurn>> {
     validate_transform_plan(plan)?;
+    for (index, turn) in reference.iter().enumerate() {
+        if turn.start_ms >= turn.end_ms {
+            return Err(adversarial_error(
+                "invalid_reference_turn",
+                &format!("reference turn {index} must have positive duration"),
+            ));
+        }
+    }
     let mut shift_ms = 0u64;
     for step in &plan.steps {
         if let AcousticPerturbation::PadSilence { before_ms, .. } = step {
@@ -1952,6 +1960,87 @@ mod tests {
     }
 
     #[test]
+    fn transform_directional_effects_match_their_declared_contracts() {
+        let source = materialized_base(2).audio;
+
+        let gain_plan = TransformPlan::new(
+            source.sha256(),
+            1,
+            vec![AcousticPerturbation::Gain {
+                gain_millionths: 500_000,
+            }],
+        );
+        let gained = apply_transform_plan_uncancellable(&source, &gain_plan)
+            .expect("gain")
+            .audio;
+        for (before, after) in source.samples.iter().zip(&gained.samples) {
+            assert!((*after - *before * 0.5).abs() <= f32::EPSILON);
+        }
+
+        let clip_plan = TransformPlan::new(
+            source.sha256(),
+            2,
+            vec![AcousticPerturbation::Clip {
+                threshold_millionths: 100_000,
+            }],
+        );
+        let clipped = apply_transform_plan_uncancellable(&source, &clip_plan)
+            .expect("clip")
+            .audio;
+        assert!(
+            clipped
+                .samples
+                .iter()
+                .all(|sample| sample.abs() <= 0.100_001)
+        );
+
+        let interrupt_plan = TransformPlan::new(
+            source.sha256(),
+            3,
+            vec![AcousticPerturbation::Interrupt {
+                start_ms: 400,
+                duration_ms: 100,
+            }],
+        );
+        let interrupted = apply_transform_plan_uncancellable(&source, &interrupt_plan)
+            .expect("interrupt")
+            .audio;
+        let start = 400 * source.sample_rate_hz as usize / 1_000;
+        let end = 500 * source.sample_rate_hz as usize / 1_000;
+        assert!(
+            interrupted.samples[start * 2..end * 2]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+
+        let resample_plan = TransformPlan::new(
+            source.sha256(),
+            4,
+            vec![AcousticPerturbation::ResampleRoundTrip {
+                intermediate_rate_hz: 8_000,
+            }],
+        );
+        let resampled = apply_transform_plan_uncancellable(&source, &resample_plan)
+            .expect("resample")
+            .audio;
+        assert_eq!(resampled.frame_count(), source.frame_count());
+        assert_ne!(resampled.sha256(), source.sha256());
+
+        let swap_plan = TransformPlan::new(
+            source.sha256(),
+            5,
+            vec![
+                AcousticPerturbation::StereoChannelSwap,
+                AcousticPerturbation::StereoChannelSwap,
+            ],
+        );
+        let swapped_twice = apply_transform_plan_uncancellable(&source, &swap_plan)
+            .expect("swap twice")
+            .audio;
+        assert_eq!(swapped_twice, source);
+    }
+
+    #[test]
     fn non_finite_audio_fails_before_transforming() {
         let source = AdversarialAudio {
             samples: vec![0.0, f32::NAN],
@@ -1992,6 +2081,14 @@ mod tests {
             source.reference_turns[0].start_ms + 500
         );
         assert_eq!(shifted[0].end_ms, source.reference_turns[0].end_ms + 500);
+
+        let malformed = [SyntheticReferenceTurn {
+            speaker_index: 0,
+            start_ms: 10,
+            end_ms: 10,
+        }];
+        let error = transform_reference_turns(&malformed, &plan).expect_err("malformed");
+        assert!(error.to_string().contains("invalid_reference_turn"));
     }
 
     #[test]
@@ -2147,7 +2244,7 @@ mod tests {
             "embedding",
             ".wav",
             ".m4a",
-            "Jeffrey",
+            "private_person_name",
         ] {
             assert!(!serialized.contains(forbidden), "{forbidden}");
         }
