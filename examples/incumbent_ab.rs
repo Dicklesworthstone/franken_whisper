@@ -1732,6 +1732,18 @@ fn run_franken_whole(
         .as_str()
         .expect("franken worker result missing transcript")
         .to_owned();
+    // Fail closed if the spawned arm decoded under a different contract than the
+    // parent is about to certify. Both processes are this same ELF, so a
+    // mismatch means the two derivations have drifted apart and the parent's
+    // `decode_matched` would be describing work that did not happen.
+    let worker_decode_row = value["decode_row"]
+        .as_str()
+        .expect("franken worker result missing decode_row");
+    let parent_decode_row = IncumbentContract::shipped().decode.as_row();
+    assert_eq!(
+        worker_decode_row, parent_decode_row,
+        "whole-job franken arm decoded under a different contract than the parent certifies"
+    );
     Observation {
         measured_ms: process_wall_ms,
         chars: field_u64("chars"),
@@ -1764,13 +1776,23 @@ fn franken_worker_main(args: &[String]) {
     let model = GgmlModel::load(model_path)
         .and_then(LoadedModel::from_ggml)
         .expect("worker load model");
+    // The worker is this same ELF, so it re-derives decode from the SAME
+    // compiled-in contract rather than repeating literals. Hardcoding them here
+    // made the whole-job arm's decode independent of the contract that
+    // `decode_matched` is asserted against in the parent: `beam_size` was not
+    // passed at all, and `language`/`translate`/`word_timestamps` were written
+    // twice. Both happened to agree with the shipped contract, so nothing was
+    // mismeasured -- but the parent was attesting a params struct the measured
+    // arm never used, and the next contract edit would have silently split them.
+    let contract = IncumbentContract::shipped();
     let params = DecodeParams {
-        language: Some("en".to_owned()),
-        translate: false,
+        language: Some(contract.decode.language.clone()),
+        translate: contract.decode.translate,
+        beam_size: Some(contract.decode.beam_size),
         timestamps,
         n_threads: threads,
         max_text_ctx: None,
-        word_timestamps: false,
+        word_timestamps: contract.decode.word_timestamps,
         model_hint: Some(model_short.to_owned()),
         ..DecodeParams::default()
     };
@@ -1795,6 +1817,10 @@ fn franken_worker_main(args: &[String]) {
             "serialized_segments_sha256": sha256_bytes(&serialized_segments),
             "transcript": transcript,
             "actual_threads": rayon::current_num_threads(),
+            // The measured arm attests the decode row it actually ran, so the
+            // parent's matched-decode claim is checked against this process
+            // rather than against a params struct built in the parent.
+            "decode_row": contract.decode.as_row(),
             "work": {
                 "window_attempts": out.work.window_attempts,
                 "encoder_calls": out.work.encoder_calls,
@@ -2659,6 +2685,42 @@ mod tests {
                 "{name}: the 2x floor must still bite"
             );
         }
+    }
+
+    #[test]
+    fn whole_job_worker_decode_is_derived_from_the_contract_not_literals() {
+        // The whole-job arm runs in a spawned copy of this same ELF, so it must
+        // re-derive decode from the shipped contract. If it rebuilds those
+        // values from literals, the parent's `decode_matched` describes params
+        // the measured process never used, and the two only agree by luck.
+        let contract = IncumbentContract::shipped();
+        let worker_params = DecodeParams {
+            language: Some(contract.decode.language.clone()),
+            translate: contract.decode.translate,
+            beam_size: Some(contract.decode.beam_size),
+            timestamps: false,
+            n_threads: 32,
+            max_text_ctx: None,
+            word_timestamps: contract.decode.word_timestamps,
+            model_hint: Some("large-v3-turbo".to_owned()),
+            ..DecodeParams::default()
+        };
+        // Exactly the predicates `decode_matched` asserts in the parent.
+        assert_eq!(worker_params.beam_size, Some(contract.decode.beam_size));
+        assert_eq!(worker_params.translate, contract.decode.translate);
+        assert_eq!(
+            worker_params.word_timestamps,
+            contract.decode.word_timestamps
+        );
+        assert_eq!(
+            worker_params.language.as_deref(),
+            Some(contract.decode.language.as_str())
+        );
+        // The row the worker attests back is the row the parent compares to.
+        assert_eq!(
+            contract.decode.as_row(),
+            IncumbentContract::shipped().decode.as_row()
+        );
     }
 
     #[test]
