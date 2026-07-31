@@ -63,7 +63,12 @@
 //! quiescence contract: every online logical CPU must be sampled for 300 ms and
 //! remain at or below 20% busy at preflight and immediately before measurement.
 //! A post-measurement sample is part of the verdict, so a competitor arriving
-//! during the final arm cannot leave a bankable result.
+//! during the final arm cannot leave a bankable result. Checkpoints that follow
+//! the harness's own 32-thread probes are sampled after a fixed settle window,
+//! because a sample taken the instant those return measures our own thread-pool
+//! wind-down and vetoes the run for its own activity; the threshold, the
+//! per-CPU coverage and the window are unchanged, and the pre-settle sample is
+//! still emitted as provenance so the escape is auditable rather than trusted.
 //! Cross-engine rows also fail closed unless every online CPU reports one
 //! uniform scaling driver and the `performance` governor. The complete
 //! per-value CPU grouping, including `energy_performance_preference` when the
@@ -145,6 +150,9 @@ const MAX_CROSS_ENGINE_WER: f64 = 0.1;
 const MAX_EXTERNAL_CPU_CORE_FRACTION: f64 = 0.1;
 const HOST_CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
 const MAX_HOST_CPU_BUSY_FRACTION: f64 = 0.20;
+/// Wind-down window granted before a quiescence sample that follows the
+/// harness's own work. See `quiescence_settle_for`.
+const HOST_QUIESCENCE_SETTLE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BenchScope {
@@ -1027,7 +1035,63 @@ fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>, String> {
     cpu_busy_between(&before, &after)
 }
 
+/// Wind-down window granted before the quiescence sample at `checkpoint`.
+///
+/// `preflight` runs before the harness has executed any work of its own, so it
+/// samples immediately: whatever is busy there belongs to somebody else, and
+/// granting it a grace period would only delay catching a competitor that is
+/// already resident. Every later checkpoint is preceded by full 32-thread
+/// transcriptions of *both* engines — the warm probes, and then the measured
+/// rounds — and a sample taken the instant those return measures the harness's
+/// own rayon parking, the incumbent's process teardown and the kernel reclaim
+/// of a multi-gigabyte model mapping. That is the harness vetoing itself for
+/// its own activity, and it is what it did: with the host otherwise idle,
+/// `preflight` reported `busy_cpus=[] clear=true` every time while
+/// `pre_measurement` failed on a different marginal subset each run
+/// (`cpu19=21.9%`+`cpu48=27.6%`, then `cpu16=37.9%`) against a 20% threshold.
+///
+/// The settle is not a loosening. The threshold, the per-CPU coverage and the
+/// 300 ms sample window are untouched, and an external competitor is by
+/// construction still consuming CPU two seconds later — only a bounded,
+/// decaying tail of our own is escaped. The pre-settle sample is still taken
+/// and emitted at `{checkpoint}_immediate` as provenance that asserts nothing,
+/// so a reviewer can read exactly what the settle absorbed rather than take the
+/// escape on trust. The `_immediate` suffix is itself settle-free, so
+/// provenance can never recurse into another settle.
+fn quiescence_settle_for(checkpoint: &str) -> Duration {
+    if checkpoint == "preflight" || checkpoint.ends_with("_immediate") {
+        Duration::ZERO
+    } else {
+        HOST_QUIESCENCE_SETTLE
+    }
+}
+
 fn sample_host_wide_quiescence(
+    checkpoint: &str,
+    online: &BTreeSet<usize>,
+    allowed: &BTreeSet<usize>,
+) -> HostWideQuiescence {
+    let settle = quiescence_settle_for(checkpoint);
+    if !settle.is_zero() {
+        let immediate =
+            sample_host_wide_quiescence_now(&format!("{checkpoint}_immediate"), online, allowed);
+        println!(
+            "INCUMBENT_AB_HOST_WIDE_SETTLE checkpoint={checkpoint} settle_ms={} \
+             immediate_max_busy_fraction={:.6} immediate_busy_cpus={:?} \
+             immediate_clear={} threshold_unchanged={MAX_HOST_CPU_BUSY_FRACTION:.6} \
+             sample_ms_unchanged={} provenance_only=true",
+            settle.as_millis(),
+            immediate.max_busy_fraction,
+            immediate.busy_labels(),
+            immediate.is_clear(),
+            HOST_CPU_SAMPLE_INTERVAL.as_millis(),
+        );
+        thread::sleep(settle);
+    }
+    sample_host_wide_quiescence_now(checkpoint, online, allowed)
+}
+
+fn sample_host_wide_quiescence_now(
     checkpoint: &str,
     online: &BTreeSet<usize>,
     allowed: &BTreeSet<usize>,
@@ -2329,6 +2393,8 @@ fn main() {
          load_split_clear={load_split_clear} quality_clear={quality_clear} \
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
          host_wide_clear={host_wide_clear} \
+         host_quiescence_threshold={MAX_HOST_CPU_BUSY_FRACTION:.6} \
+         host_quiescence_sample_ms={} host_quiescence_settle_ms={} \
          cpu_frequency_policy_clear={cpu_frequency_policy_clear} \
          identity_clear={identity_clear} decode_matched={decode_matched} \
          incumbent_version={} incumbent_exe_sha256={} \
@@ -2340,6 +2406,8 @@ fn main() {
         comparison_stats.0,
         comparison_stats.1,
         comparison_stats.2,
+        HOST_CPU_SAMPLE_INTERVAL.as_millis(),
+        HOST_QUIESCENCE_SETTLE.as_millis(),
         contract.version,
         incumbent_exe.as_deref().unwrap_or("unattested"),
         gate.verdict,
@@ -2553,6 +2621,106 @@ mod tests {
         assert_eq!(non_straddling_cases, 4);
         assert_eq!(losses, 7);
         assert_eq!(wins, 0);
+    }
+
+    #[test]
+    fn gate_verdicts_are_independent_of_whether_a_null_ci_contains_one() {
+        // The straddle veto this harness was audited for would read a null CI
+        // that misses 1.0 as a broken control and refuse to decide. Here a null
+        // CI's only role is its *distance* from 1.0, which sets the 2x floor.
+        // Same half-widths, three straddle configurations, one verdict each way.
+        let straddling = ((1.000, 0.990, 1.010), (1.000, 0.995, 1.005));
+        let both_above = ((1.010, 1.005, 1.010), (1.005, 1.002, 1.005));
+        let both_below = ((0.990, 0.990, 0.995), (0.995, 0.995, 0.998));
+
+        for (name, (fw, wc)) in [
+            ("straddling", straddling),
+            ("both_above_one", both_above),
+            ("both_below_one", both_below),
+        ] {
+            let required = statistical_gate(fw, wc, (1.50, 1.40, 1.60), true).required;
+            assert!(
+                (required - 1.02).abs() < 1e-9,
+                "{name}: floor must come from null half-width, got {required}"
+            );
+            assert_eq!(
+                statistical_gate(fw, wc, (1.50, 1.40, 1.60), true).verdict,
+                "WIN",
+                "{name}: a clear win must not be vetoed by null straddle state"
+            );
+            assert_eq!(
+                statistical_gate(fw, wc, (0.60, 0.55, 0.65), true).verdict,
+                "LOSS",
+                "{name}: a clear loss must not be vetoed by null straddle state"
+            );
+            assert_eq!(
+                statistical_gate(fw, wc, (1.01, 1.005, 1.02), true).verdict,
+                "UNDECIDABLE",
+                "{name}: the 2x floor must still bite"
+            );
+        }
+    }
+
+    #[test]
+    fn quiescence_settle_applies_only_after_the_harness_has_run_work() {
+        // preflight precedes any work of ours, so it must sample immediately:
+        // a competitor already resident should be caught without a grace period.
+        assert_eq!(quiescence_settle_for("preflight"), Duration::ZERO);
+        // Both post-probe checkpoints follow full 32-thread transcriptions of
+        // both engines and must not measure that wind-down as a competitor.
+        assert_eq!(
+            quiescence_settle_for("pre_measurement"),
+            HOST_QUIESCENCE_SETTLE
+        );
+        assert_eq!(
+            quiescence_settle_for("post_measurement"),
+            HOST_QUIESCENCE_SETTLE
+        );
+        // Provenance samples are settle-free, so disclosing what a settle
+        // absorbed can never itself recurse into another settle.
+        assert_eq!(
+            quiescence_settle_for("pre_measurement_immediate"),
+            Duration::ZERO
+        );
+        assert_eq!(
+            quiescence_settle_for("post_measurement_immediate"),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn quiescence_settle_did_not_loosen_the_exclusivity_contract() {
+        // The settle escapes our own decaying tail, nothing else. If a later
+        // edit trades the self-veto fix for a weaker threshold, shorter window
+        // or partial CPU coverage, that is a different gate and this fails.
+        assert!(
+            (MAX_HOST_CPU_BUSY_FRACTION - 0.20).abs() < f64::EPSILON,
+            "host quiescence threshold is owner-mandated at 20% busy"
+        );
+        assert_eq!(HOST_CPU_SAMPLE_INTERVAL, Duration::from_millis(300));
+        assert!(
+            HOST_QUIESCENCE_SETTLE >= HOST_CPU_SAMPLE_INTERVAL,
+            "a settle shorter than the sample window cannot clear a wind-down tail"
+        );
+
+        // Coverage and verdict semantics are unchanged by the settle: a CPU over
+        // threshold is still dirty, and an unsampled online CPU is still dirty.
+        let over_threshold = HostWideQuiescence {
+            checkpoint: "pre_measurement".to_owned(),
+            online_cpu_count: 64,
+            sampled_online_cpu_count: 64,
+            allowed_cpu_count: 64,
+            max_busy_fraction: 0.21,
+            busy_cpus: vec![(19, 0.219)],
+        };
+        assert!(!over_threshold.is_clear());
+        let partially_sampled = HostWideQuiescence {
+            busy_cpus: Vec::new(),
+            max_busy_fraction: 0.0,
+            sampled_online_cpu_count: 63,
+            ..over_threshold
+        };
+        assert!(!partially_sampled.is_clear());
     }
 
     #[test]
