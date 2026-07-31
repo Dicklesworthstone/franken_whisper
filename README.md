@@ -389,6 +389,18 @@ contradictory. Parsed hint fields are part of the typed request and are
 persisted with the run unless `--no-persist` is used. Labels remain within-run
 references, not biometric identities.
 
+Evaluation uses the frozen `diarization-scorer-v4` contract. In addition to
+DER/JER, it reports a calibrated speaker-count posterior, explicit unresolved
+and zero-probability outcomes, effective occupancy, dominant/reference
+collapse, phantom labels, and optional transcript-free aligned-word WDER.
+This prevents a nominally correct label count from hiding a run where one
+label received nearly all speech. Public ablations aggregate these metrics by
+reference count and duration; `diarization-eval` emits the same evidence only
+as a path-free, aggregate-only confidential result. Aligned-word inputs retain
+opaque non-lexical IDs and timing/speaker annotations, never token text. See
+[`docs/acoustic_diarization_contract.md`](docs/acoustic_diarization_contract.md)
+for the versioned schemas and fail-closed policy.
+
 ### 4. Microphone Capture
 
 ```bash
