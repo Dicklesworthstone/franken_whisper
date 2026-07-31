@@ -14,7 +14,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native tiny.en engine is 1.52× faster than whisper.cpp on a 124.5-second no-timestamp workload and 1.51× faster on a 300-second no-timestamp workload.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming, DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.26× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -27,12 +27,13 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/franken_whisper/
 
 </div>
 
-> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. Native-vs-whisper.cpp conformance on the reference fixture remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
+> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels, `#![forbid(unsafe_code)]` in-crate) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
 >
 > | Model / workload | Mode | Matched-greedy result |
 > |---|---|---|
-> | tiny.en, 124.5 s / 5 windows | no timestamps | **1.52× faster** |
-> | tiny.en, 300 s / 10 windows | no timestamps | **1.51× faster** |
+> | large-v3-turbo, 124.5 s / 5 windows | whole job, no timestamps | **2.26× faster** |
+> | tiny.en, 124.5 s / 5 windows | transcribe only, no timestamps | **1.52× faster** |
+> | tiny.en, 300 s / 10 windows | transcribe only, no timestamps | **1.51× faster** |
 
 ---
 
@@ -2634,8 +2635,9 @@ invocation at 32 requested threads and matched greedy decode settings
 
 | Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|
-| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, no timestamps | **1.52× faster** |
-| vs `whisper.cpp` (CPU) | `tiny.en` | 300 s, no timestamps | **1.51× faster** |
+| vs `whisper.cpp` (CPU) | `large-v3-turbo` | 124.5 s, whole job, no timestamps | **2.26× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 124.5 s, transcribe only, no timestamps | **1.52× faster** |
+| vs `whisper.cpp` (CPU) | `tiny.en` | 300 s, transcribe only, no timestamps | **1.51× faster** |
 
 **Measurement contract.**
 
@@ -2646,11 +2648,12 @@ invocation at 32 requested threads and matched greedy decode settings
 - **Gate.** A result is decidable only when both same-invocation A/A null medians lie in `[0.98, 1.02]` inclusive, its comparison CI95 excludes `1.0`, and its effect clears 2× the widest null-CI edge from `1.0`. A null CI need not straddle `1.0`; its widest edge calibrates the margin. `cv` is recorded as provenance and never decides a verdict.
 
 **Scope.** These are **greedy / temperature-0** comparisons with the reference
-explicitly forced to the same decode mode (`-bs 1 -bo 1`). The no-timestamp
-rows use a quiet 32-core x86 host at each engine's fastest screened thread
-setting;
-the segment-timestamp row uses order-alternating pairs and per-engine A/A
-controls on a clean-start 32-core Threadripper affinity. The full record lives in
+explicitly forced to the same decode mode (`-bs 1 -bo 1`). The turbo row is
+whole-process wall time, including startup, model/audio I/O, inference,
+serialization, and teardown; both arms also use `max_context=0`. The tiny.en
+rows are transcribe-only and exclude one-time model load. All three use a
+quiet Threadripper host at requested/configured width 32 with order-alternating
+pairs and per-engine A/A controls. The full record lives in
 [`docs/PERF_LEDGER.md`](docs/PERF_LEDGER.md) and
 [`docs/NEGATIVE_EVIDENCE.md`](docs/NEGATIVE_EVIDENCE.md).
 
