@@ -2774,6 +2774,7 @@ mod tests {
             speaker_queries: Vec::new(),
             speaker_count: SpeakerCountOutcome {
                 request: SpeakerCountRequest::HardConstraint { count: 1 },
+                estimate: None,
                 status: SpeakerCountOutcomeStatus::Satisfied,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["speaker_a".to_owned()],

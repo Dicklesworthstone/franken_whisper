@@ -3412,6 +3412,7 @@ mod tests {
                     minimum: 1,
                     maximum: 2,
                 },
+                estimate: None,
                 status: SpeakerCountOutcomeStatus::Satisfied,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["speaker_a".to_owned()],
