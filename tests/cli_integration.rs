@@ -515,6 +515,7 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         turns: vec![EvaluationTurn::labeled(0, 1_000, "private-speaker")],
         ignored_regions: vec![],
         speaker_hints: vec![],
+        words: vec![],
     };
     let hypothesis = DiarizationHypothesisDocument {
         schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
@@ -524,6 +525,7 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
             speaker_confidence: Some(0.75),
             ..EvaluationTurn::labeled(0, 1_000, "private-cluster")
         }],
+        speaker_count_estimate: None,
         performance: None,
     };
     std::fs::write(
@@ -586,6 +588,19 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         CONFIDENTIAL_EVALUATION_AGGREGATE_SCHEMA_VERSION
     );
     assert_eq!(aggregate["recording_count"], 1);
+    assert_eq!(
+        aggregate["speaker_count_posterior"]["observed_recordings"],
+        0
+    );
+    assert_eq!(
+        aggregate["speaker_count_posterior"]["unavailable_recordings"],
+        1
+    );
+    assert_eq!(
+        aggregate["speaker_count_posterior"]["unresolved_recordings"],
+        1
+    );
+    assert_eq!(aggregate["word_attribution"]["reference_word_count"], 0);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&retained).expect("retained aggregate"),
         aggregate
