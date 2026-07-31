@@ -318,6 +318,13 @@ cell cannot enter timing. Native normalized-WAV SHA-256 was
 worker-log SHA-256 was
 `2f2e9f8108c7148487629c1e8710b92900c05f860da47217a9bdd1ed6d0b4302`.
 
+The mismatch is now accounted exactly. ffprobe packet side data records
+`skip_samples=1105` on the first MP3 packet and `discard_padding=516` on the
+last; `1105 + 516 = 1621`, exactly the excess emitted by the built-in path.
+The current Symphonia loop appends every decoded packet without applying
+those gapless-playback trims. The retry is therefore an explicit two-ended
+trim contract, not an unexplained decoder discrepancy.
+
 This was deliberately not a performance invocation: it bypassed the parent
 thread/process probe and host/null machinery. The worker was configured at 8
 threads, but **no actual CPU-tick-positive TID census was recorded**; no
