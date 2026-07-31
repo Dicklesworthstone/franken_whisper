@@ -63,6 +63,12 @@ impl AdversarialAudio {
                 "channels must be one or two",
             ));
         }
+        if self.samples.is_empty() {
+            return Err(adversarial_error(
+                "empty_audio",
+                "audio must contain at least one complete frame",
+            ));
+        }
         if self.samples.len() > MAX_INTERLEAVED_SAMPLES {
             return Err(adversarial_error(
                 "audio_too_large",
@@ -79,6 +85,16 @@ impl AdversarialAudio {
             return Err(adversarial_error(
                 "non_finite_audio",
                 "audio samples must all be finite",
+            ));
+        }
+        if self
+            .samples
+            .iter()
+            .any(|sample| !(-1.0..=1.0).contains(sample))
+        {
+            return Err(adversarial_error(
+                "audio_sample_out_of_range",
+                "audio samples must be in the closed range [-1.0, 1.0]",
             ));
         }
         Ok(())
@@ -100,7 +116,7 @@ impl AdversarialAudio {
         for sample in &self.samples {
             hasher.update(sample.to_bits().to_le_bytes());
         }
-        format!("{hasher:x}")
+        format!("{:x}", hasher.finalize())
     }
 }
 
@@ -481,6 +497,7 @@ pub struct TransformEvidence {
     pub engine_version: String,
     pub plan_sha256: String,
     pub source_audio_sha256: String,
+    pub source_authority: AdversarialSourceAuthority,
     pub output_audio_sha256: String,
     pub graph: Vec<TransformGraphNode>,
 }
@@ -529,7 +546,8 @@ pub fn apply_transform_plan(
         schema_version: TRANSFORM_EVIDENCE_SCHEMA_VERSION.to_owned(),
         engine_version: ADVERSARIAL_CORPUS_ENGINE_VERSION.to_owned(),
         plan_sha256: plan.sha256()?,
-        source_audio_sha256,
+        source_audio_sha256: source_sha256,
+        source_authority: plan.source_authority.clone(),
         output_audio_sha256: audio.sha256(),
         graph,
     };
@@ -1017,8 +1035,7 @@ fn validate_synthetic_call_plan(plan: &SyntheticCallPlan) -> FwResult<()> {
         ));
     }
     for (index, speaker) in plan.speakers.iter().enumerate() {
-        let fundamental_hz = speaker.fundamental_millihz / 1_000;
-        if !(60..=500).contains(&fundamental_hz)
+        if !(60_000..=500_000).contains(&speaker.fundamental_millihz)
             || speaker.harmonic_count == 0
             || speaker.harmonic_count > 8
             || speaker.harmonic_decay_millionths > MILLION
@@ -1032,9 +1049,10 @@ fn validate_synthetic_call_plan(plan: &SyntheticCallPlan) -> FwResult<()> {
                 &format!("synthetic speaker profile {index} is outside its bounded domain"),
             ));
         }
-        let highest_harmonic_hz =
-            u64::from(speaker.fundamental_millihz) * u64::from(speaker.harmonic_count) / 1_000;
-        if highest_harmonic_hz >= u64::from(plan.sample_rate_hz / 2) {
+        let highest_harmonic_millihz =
+            u64::from(speaker.fundamental_millihz) * u64::from(speaker.harmonic_count);
+        let nyquist_millihz = u64::from(plan.sample_rate_hz) * 500;
+        if highest_harmonic_millihz >= nyquist_millihz {
             return Err(adversarial_error(
                 "speaker_profile_aliasing",
                 &format!("synthetic speaker profile {index} exceeds Nyquist"),
@@ -1058,6 +1076,21 @@ fn validate_synthetic_call_plan(plan: &SyntheticCallPlan) -> FwResult<()> {
             return Err(adversarial_error(
                 "turn_pitch_out_of_range",
                 &format!("synthetic turn {index} pitch is outside 60..=500 Hz"),
+            ));
+        }
+        let shifted_highest_harmonic_millihz = shifted
+            .checked_mul(i64::from(speaker.harmonic_count))
+            .ok_or_else(|| {
+                adversarial_error(
+                    "turn_pitch_overflow",
+                    &format!("synthetic turn {index} harmonic frequency overflowed"),
+                )
+            })?;
+        let nyquist_millihz = i64::from(plan.sample_rate_hz) * 500;
+        if shifted_highest_harmonic_millihz >= nyquist_millihz {
+            return Err(adversarial_error(
+                "turn_pitch_aliasing",
+                &format!("synthetic turn {index} harmonics exceed Nyquist"),
             ));
         }
     }
@@ -1918,6 +1951,20 @@ mod tests {
         plan.turns[0].end_ms = plan.turns[0].start_ms;
         let error = generate_synthetic_call_uncancellable(&plan).expect_err("invalid turn");
         assert!(error.to_string().contains("invalid_synthetic_turn"));
+
+        let mut plan = base_synthetic_plan(1, 1);
+        plan.sample_rate_hz = 8_000;
+        plan.speakers[0].fundamental_millihz = 500_000;
+        plan.speakers[0].harmonic_count = 8;
+        let error = generate_synthetic_call_uncancellable(&plan).expect_err("aliasing");
+        assert!(error.to_string().contains("speaker_profile_aliasing"));
+
+        let mut plan = base_synthetic_plan(1, 1);
+        plan.sample_rate_hz = 8_000;
+        plan.speakers[0].harmonic_count = 8;
+        plan.turns[0].pitch_shift_millihz = 382_000;
+        let error = generate_synthetic_call_uncancellable(&plan).expect_err("turn aliasing");
+        assert!(error.to_string().contains("turn_pitch_aliasing"));
     }
 
     #[test]
@@ -2020,6 +2067,12 @@ mod tests {
         let error =
             apply_transform_plan_uncancellable(&source, &plan).expect_err("bad license proof");
         assert!(error.to_string().contains("invalid_sha256"));
+
+        let plan =
+            TransformPlan::new_public_licensed(source.sha256(), "b".repeat(64), 1, Vec::new());
+        let transformed =
+            apply_transform_plan_uncancellable(&source, &plan).expect("licensed source");
+        assert_eq!(transformed.evidence.source_authority, plan.source_authority);
     }
 
     #[test]
@@ -2119,6 +2172,24 @@ mod tests {
         );
         let error = apply_transform_plan_uncancellable(&source, &plan).expect_err("non-finite");
         assert!(error.to_string().contains("non_finite_audio"));
+
+        let source = AdversarialAudio {
+            samples: vec![1.01],
+            sample_rate_hz: 16_000,
+            channels: 1,
+        };
+        let plan = TransformPlan::new_synthetic(source.sha256(), 1, Vec::new());
+        let error = apply_transform_plan_uncancellable(&source, &plan).expect_err("range");
+        assert!(error.to_string().contains("audio_sample_out_of_range"));
+
+        let source = AdversarialAudio {
+            samples: Vec::new(),
+            sample_rate_hz: 16_000,
+            channels: 1,
+        };
+        let plan = TransformPlan::new_synthetic(source.sha256(), 1, Vec::new());
+        let error = apply_transform_plan_uncancellable(&source, &plan).expect_err("empty");
+        assert!(error.to_string().contains("empty_audio"));
     }
 
     #[test]
