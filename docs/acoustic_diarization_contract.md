@@ -1046,28 +1046,39 @@ is acoustic similarity evidence, never a gender, name, or person-identity
 claim.
 
 The versioned export protocol is
-`franken-whisper-ecapa-export-v1`. Source checkpoint loading is a
-development-only, out-of-process trust boundary: a conforming exporter may
-load only the checkpoint with the exact hash above in an isolated
-SpeechBrain 0.5.16 / Torch 2.7.1 environment. It must then:
+`franken-whisper-ecapa-export-v1`, implemented by the
+`ecapa-tdnn-voxceleb-v1` profile in
+`scripts/convert_to_safetensors.py`. Source checkpoint loading is a
+development-only, out-of-process trust boundary. The profile accepts only the
+checkpoint identity above and requires Python 3.13, NumPy 2.2.6, Torch 2.7.1,
+and safetensors 0.5.3. It then:
 
-1. require the exact ordered name and shape inventory returned by
-   `expected_ecapa_tensors`;
-2. reject every unexpected dtype or tensor, dropping only the 31 named
+1. require the exact 83,316,686-byte source hash and 231-entry census;
+2. reject every non-tensor or unexpected dtype, dropping only the 31 named
    `num_batches_tracked` counters;
 3. preserve unfused BatchNorm parameters and PyTorch logical row-major layout;
 4. materialize contiguous IEEE-754 `f32` values in little-endian order;
-5. hash every tensor and the 83,223,808-byte payload; and
-6. emit a path-free `franken-whisper-ecapa-weights-v1` canonical JSON
-   manifest whose self-hash is computed with `manifest_sha256` empty.
+5. emit canonical, lexicographically ordered safetensors header and payload
+   data with path- and time-free provenance metadata; and
+6. reopen the result with the official safetensors reader before reporting its
+   identity.
 
-Neither source nor exported weights belong in Git. The shipped Rust verifier
-requires the model revision, checkpoint identity, contract hash, exporter
-version, all 200 names/shapes/dtypes/offsets/lengths, every tensor hash, the
-payload hash, and the manifest self-hash before inference can consume a byte.
-It streams verification in bounded chunks, checks cancellation between
-chunks, and reports stable `ecapa.*` reasons without printing paths, tensor
-contents, or source bytes.
+Two isolated executions produce the same 83,246,544-byte package, SHA-256
+`9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc`.
+The contained tensor payload is 83,223,808 bytes. Neither source nor exported
+weights belong in Git, and the converted artifact is not yet published.
+`scripts/fetch_aux_models.sh` therefore pins the immutable source URL, source
+hash, conversion command, and output hash without pretending that a download
+is available.
+
+The shipped Rust verifier first streams the complete package through a bounded,
+cancel-aware exact-size and SHA-256 check. It then reuses
+`native_engine::weights::SafetensorsFile` and `WeightsManifest` to require the
+exact 200 names and shapes, require every dtype to be `F32`, and compare the
+complete deterministic metadata object. Structural, mapping, dtype, metadata,
+truncation, corruption, and cancellation failures report stable `ecapa.*`
+reasons without printing paths, tensor contents, or source bytes. There is no
+second model-package format or sidecar manifest.
 
 The frontend is exact 16 kHz mono finite PCM in `[-1, 1]`, with a 400-sample
 periodic Hamming window, 160-sample hop, centered zero padding, 400-point

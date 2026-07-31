@@ -472,9 +472,7 @@ fn verify_loaded_ecapa_package_against(
     validate(package, &manifest).map_err(|error| {
         ecapa_error(
             "tensor_mapping",
-            &format!(
-                "safetensors names or shapes do not match the frozen census: {error}"
-            ),
+            &format!("safetensors names or shapes do not match the frozen census: {error}"),
         )
     })?;
     for tensor in expected {
