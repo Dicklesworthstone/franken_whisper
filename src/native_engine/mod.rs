@@ -1601,7 +1601,7 @@ impl NativeWhisperModel {
         &self,
         samples: &[f32],
         params: &decode::DecodeParams,
-        checkpoint: &dyn Fn() -> FwResult<()>,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
     ) -> FwResult<decode::DecodeOutput> {
         decode::transcribe_samples(&self.inner, samples, params, checkpoint)
     }
