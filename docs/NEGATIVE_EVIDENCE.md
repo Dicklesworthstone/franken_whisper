@@ -81,6 +81,33 @@ The raw log is
 released after verifying that no harness, native worker, or incumbent process
 remained.
 
+### Immediate n=5 retry: the nulls centred; a second graph replay still overlapped
+
+After the first graph sequence reached its terminal `summary.json`, claim
+`7577` took a new five-sample census: every sample was 100% idle with 0%
+iowait, all 128 CPUs still reported the required frequency policy, and the
+broad process list was clear. The exact same artifact and inputs then ran five
+rounds. Both corrected same-invocation A/A medians passed:
+franken `1.006086` (CI95 `[0.977498, 1.130336]`) and whisper.cpp `1.000417`
+(CI95 `[0.995307, 1.006895]`). The retained 2x floor was `1.260673`.
+
+The second run produced a `2.217353` point estimate, CI95
+`[1.969586, 2.342880]`, from whole-job medians `6669.965 ms` franken and
+`14826.977 ms` whisper.cpp. Work and transcript equivalence exactly
+reproduced the first run. Actual CPU-tick-positive TID counts were again
+98/63; peak simultaneous process-thread counts were 56/32.
+
+It also failed closed. A new unclaimed graph replay under `results_v2` started
+after the clean census and during the measured rounds. The process gate caught
+`n6_three_two` at `0.999997` CPU core during `round_3_incumbent_b`;
+`n6_fourcycles` remained active at release. Immediate/settled post-run
+host-wide samples found maximum busy fractions `0.700000` and `1.000000`.
+The independent load-split gap was `0.125246`, above the `0.100000` maximum.
+Therefore `external_host_clear=false`, `host_wide_clear=false`,
+`load_split_clear=false`, and the formal verdict was again `UNDECIDABLE`
+despite both null medians passing. Its raw log is
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7577_n5.log`.
+
 **Concrete retry predicate:** rerun this exact frozen cell only after a fresh
 broad census finds no benchmark/compiler process, the last five admission
 samples are each at least 95% idle with 0% iowait, and no persistent external
