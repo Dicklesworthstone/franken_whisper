@@ -169,6 +169,44 @@ require `load_split_gap <= 0.100000`, both A/A medians in `[0.98, 1.02]`
 inclusive, the retained 2x-widest-null margin, and every existing
 identity/work/quality/frequency/host gate.
 
+### Predeclared n=7 retry: the load gate passed; an unclaimed compiler overlapped
+
+Claim `7659` started after a fresh load average of `1.41`, fifteen consecutive
+100% idle and 0% iowait samples, no benchmark/compiler/graph process, and
+uniform `amd-pstate-epp` plus `performance` governor/EPP on all 128 online
+CPUs. The seven-round cell mechanically completed and repaired the prior load
+gate: its lighter/heavier pre-round-load split medians were `2.176036` and
+`2.209458`, a `0.033422` gap within the fixed `0.100000` maximum.
+
+The diagnostic whole-job point estimate was `2.198874`, CI95
+`[2.157498, 2.273546]`; medians were `6735.215 ms` franken and
+`14813.337 ms` whisper.cpp. The corrected A/A medians were `0.990083`
+(franken, CI95 `[0.960836, 1.011440]`) and `0.998881` (whisper.cpp, CI95
+`[0.998406, 1.001337]`), both inside `[0.98, 1.02]`. The retained
+2x-widest-null floor was `1.078329`. Artifact identity, pinned incumbent
+contract, matched decode, 279/279-word equivalence (`WER=0.010753`), 5/5
+encodes, 319/319 single-token decodes, requested/configured 32-thread checks,
+and immediate/settled pre- and post-host-wide gates all passed. Actual
+CPU-tick-positive TID counts were 98 native and 63 incumbent; peak simultaneous
+process-thread counts were 61 and 32.
+
+The run still failed closed because an unclaimed `cc1` process appeared after
+the clear admission census and reached `0.543643` CPU core at
+`round_1_franken_b`. Thus `external_host_clear=false` and the formal verdict
+was `UNDECIDABLE` even though every other gate passed. **The apparent
+`2.198874x` is diagnostic, not a performance claim.**
+
+The raw log is
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7659_n7.log`, SHA-256
+`991f0b0795e4ab82213e16aac774bbf74e4f8bda746348325fff7196daa16dcc`.
+
+**Concrete retry predicate:** rerun the exact frozen seven-round cell only
+after a fresh clean census and an explicit no-build/no-benchmark exclusive
+window. Accept the complete result as-is; require no persistent external
+process above `0.100000` CPU core for the entire invocation, and retain every
+null-median, 2x margin, load, identity, work, quality, thread, frequency, and
+host-wide gate unchanged.
+
 ---
 ## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
 
