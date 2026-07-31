@@ -1313,7 +1313,7 @@ fn validate_evaluation_words(
 ) -> FwResult<()> {
     let mut word_ids = BTreeSet::new();
     for (index, word) in document.words.iter().enumerate() {
-        validate_opaque_id(&word.word_id, &format!("reference word {index} word_id"))?;
+        validate_opaque_word_id(&word.word_id, index)?;
         validate_opaque_id(
             &word.speaker_ref,
             &format!("reference word {index} speaker_ref"),
@@ -1590,6 +1590,20 @@ fn validate_opaque_id(value: &str, field: &str) -> FwResult<()> {
         return Err(score_error(
             "opaque_id_sensitive_marker",
             &format!("{field} contains a forbidden media, transcript, or path marker"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_opaque_word_id(value: &str, index: usize) -> FwResult<()> {
+    validate_opaque_id(value, &format!("reference word {index} word_id"))?;
+    if value
+        .strip_prefix("word-")
+        .is_none_or(|suffix| suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(score_error(
+            "word_id_shape",
+            &format!("reference word {index} word_id must use the non-lexical word-<digits> form"),
         ));
     }
     Ok(())
