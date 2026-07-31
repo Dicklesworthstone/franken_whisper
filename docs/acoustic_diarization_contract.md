@@ -293,6 +293,15 @@ lock was minted, and no held-out recording was read. These results establish
 real public development evidence and performance observations, not production
 promotion or held-out certification.
 
+The subsequent `acoustic-clustering-probabilistic-v3-development` count
+candidate adds a separately versioned `speaker-count-estimate-v2` report. It
+has not inherited the v2 evaluation authority: until a new frozen public
+development bundle passes the count, DER/JER, calibration, determinism, memory,
+and latency gates, the normal assignment path remains `fixed_safe_v1`. Native
+fixed-safe runs still emit the count-estimate object, but with
+`fixed_safe_uncalibrated`, no concrete bins or selected count, and all
+probability mass assigned to `unresolved`.
+
 ## 5. Known intervals
 
 `speaker-hints-v1` carries:
@@ -352,10 +361,12 @@ boundaries and cannot invent, drop, duplicate, or reorder text.
 `SpeakerCountRequest` has exactly one mode:
 
 - `Infer` selects only speakers that pass acoustic evidence gates;
-- `Prior` carries sorted, unique probability mass over positive counts and
-  currently returns `speaker_count_unresolved` until calibrated prior fusion is
-  implemented;
-- `Range` bounds the evidence-supported search;
+- `Prior` carries sorted, unique probability mass over positive counts as soft
+  evidence pooled into at most 15% of concrete posterior mass; counts outside
+  its support remain eligible, and five-view acoustic agreement attenuates the
+  prior to 7.5% at unanimity;
+- `Range` is a soft uniform preference inside the interval, not a hard search
+  bound;
 - `HardConstraint` searches for exactly the requested count but does not assert
   that the count exists in the recording.
 
@@ -527,18 +538,43 @@ does not invent speakers merely to satisfy a range minimum or exact count; it
 reports `unsatisfied_constraints`, reports `speaker_count_unresolved`, or
 returns a hard error according to typed fallback policy.
 
-The probabilistic speaker-count candidate uses five deterministic semantic
-views: full evidence, no pitch, no dynamics, no formants, and no channel.
-Count selection requires a three-of-five majority and a matching
-co-association consensus. Insufficient shared voice evidence, invalid
-posterior arithmetic, or unstable count invokes a typed fixed-safe fallback.
-Public evidence aggregates stability for every requested probabilistic run,
-including runs that fell back, so fallback cannot inflate the mean by
-disappearing from its denominator.
+The v3 probabilistic speaker-count candidate uses five deterministic semantic
+views: full evidence, no pitch, no dynamics, no formants, and no channel. It
+retains their complete bounded merge-risk curves, combines them with a
+symmetrized degree-bounded normalized-affinity eigengap proposal, applies hard
+constraint-graph lower bounds, and linearly pools at most 15% caller-prior mass
+into the acoustic count distribution before checking the selected count
+against effective post-assignment occupancy. Five-view acoustic agreement
+linearly attenuates that mix to 7.5% at unanimity. The bounded pool can move
+probability but cannot erase acoustically supported counts, acquire the
+unbounded leverage of a near-zero log prior, or veto unanimous evidence through
+the unresolved-mass threshold. The
+public estimate carries ordered concrete count bins plus separate unresolved
+mass, entropy, stability, six typed lane summaries, and content-free
+calibration/evidence hashes. It also reports content-free resource accounting:
+prototype and retained-edge counts, affinity comparisons, estimated peak
+algorithm buffers, stability replicates, eigensolver iterations and sparse
+matrix-vector terms, and the final residual when available. These values and
+the solver's diagonal shift are bound into the evidence/calibration
+fingerprints. Lane agreement is only a development score input; the estimate
+is explicitly `development_uncertified`, not described as a calibrated
+posterior.
+
+Selection requires the concrete MAP action to dominate unresolved mass, at
+least three of five feature views to support it, co-association consensus, and
+matching supported occupancy. Any failure retains an unresolved estimate and
+invokes the typed fixed-safe assignment fallback. No-voice, insufficient
+prototype, invalid-affinity, non-convergence, contradictory-constraint, and
+resource-limited states remain non-authoritative. Public evidence aggregates
+stability for every requested probabilistic run, including runs that fell
+back, so fallback cannot inflate the mean by disappearing from its
+denominator.
 
 The six-dimensional temporal/lexical heuristic is not an acoustic fallback.
 An explicit acoustic request cannot silently invoke external or lexical
-behavior. Every fallback names its source and reason.
+behavior. Soft count priors and ranges are rejected by external/neural engines
+instead of being silently hardened into backend min/max controls. Every
+fallback names its source and reason.
 
 ## 9. Scoring
 

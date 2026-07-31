@@ -10,9 +10,8 @@ use serde_json::json;
 use crate::error::{FwError, FwResult};
 use crate::model::{
     BackendKind, BackendParams, DecodingParams, DiarizationConfig, DiarizationEngine,
-    DiarizationFallbackPolicy, DiarizationRequest, InputSource, KnownSpeakerInterval,
-    MAX_SPEAKER_COUNT, OutputFormat, SpeakerCountRequest, TimestampLevel, TranscribeRequest,
-    VadParams,
+    DiarizationFallbackPolicy, DiarizationRequest, InputSource, KnownSpeakerInterval, OutputFormat,
+    SpeakerCountPriorMass, SpeakerCountRequest, TimestampLevel, TranscribeRequest, VadParams,
 };
 use crate::sync::ConflictPolicy;
 
@@ -73,6 +72,73 @@ fn read_speaker_hints(path: &Path) -> FwResult<Vec<KnownSpeakerInterval>> {
         ));
     }
     parse_speaker_hints(&bytes)
+}
+
+fn parse_speaker_count_range(value: &str) -> FwResult<(u32, u32)> {
+    let Some((minimum, maximum)) = value.split_once("..") else {
+        return Err(FwError::InvalidRequest(
+            "--speaker-count-range must use MIN..MAX".to_owned(),
+        ));
+    };
+    if maximum.contains("..") {
+        return Err(FwError::InvalidRequest(
+            "--speaker-count-range must contain exactly one `..` separator".to_owned(),
+        ));
+    }
+    let minimum = minimum.trim().parse::<u32>().map_err(|_| {
+        FwError::InvalidRequest("--speaker-count-range MIN must be an unsigned integer".to_owned())
+    })?;
+    let maximum = maximum.trim().parse::<u32>().map_err(|_| {
+        FwError::InvalidRequest("--speaker-count-range MAX must be an unsigned integer".to_owned())
+    })?;
+    Ok((minimum, maximum))
+}
+
+fn parse_speaker_count_prior(value: &str) -> FwResult<Vec<SpeakerCountPriorMass>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(FwError::InvalidRequest(
+            "--speaker-count-prior must not be empty".to_owned(),
+        ));
+    }
+    if !value.contains('=') && !value.contains(',') {
+        let count = value.parse::<u32>().map_err(|_| {
+            FwError::InvalidRequest(
+                "--speaker-count-prior point mass must be an unsigned integer".to_owned(),
+            )
+        })?;
+        return Ok(vec![SpeakerCountPriorMass {
+            count,
+            probability: 1.0,
+        }]);
+    }
+
+    let mut bins = Vec::new();
+    for entry in value.split(',') {
+        let Some((count, probability)) = entry.split_once('=') else {
+            return Err(FwError::InvalidRequest(
+                "--speaker-count-prior distribution must use K=P entries".to_owned(),
+            ));
+        };
+        if probability.contains('=') {
+            return Err(FwError::InvalidRequest(
+                "--speaker-count-prior entries must contain exactly one `=` separator".to_owned(),
+            ));
+        }
+        let count = count.trim().parse::<u32>().map_err(|_| {
+            FwError::InvalidRequest(
+                "--speaker-count-prior counts must be unsigned integers".to_owned(),
+            )
+        })?;
+        let probability = probability.trim().parse::<f64>().map_err(|_| {
+            FwError::InvalidRequest(
+                "--speaker-count-prior probabilities must be finite decimal numbers".to_owned(),
+            )
+        })?;
+        bins.push(SpeakerCountPriorMass { count, probability });
+    }
+    bins.sort_by_key(|bin| bin.count);
+    Ok(bins)
 }
 
 // ---------------------------------------------------------------------------
@@ -759,17 +825,29 @@ pub struct TranscribeArgs {
     #[arg(long, value_enum)]
     pub timestamp_level: Option<TimestampLevel>,
 
-    /// Exact number of speakers (insanely-fast diarization).
-    #[arg(long)]
-    pub num_speakers: Option<u32>,
+    /// Explicit hard speaker count. Unsupported speakers remain UNKNOWN.
+    #[arg(
+        long,
+        value_name = "K",
+        conflicts_with_all = ["speaker_count_range", "speaker_count_prior"]
+    )]
+    pub speaker_count_hard: Option<u32>,
 
-    /// Minimum number of speakers (insanely-fast diarization).
-    #[arg(long)]
-    pub min_speakers: Option<u32>,
+    /// Soft bounded speaker-count preference in MIN..MAX form.
+    #[arg(
+        long,
+        value_name = "MIN..MAX",
+        conflicts_with_all = ["speaker_count_hard", "speaker_count_prior"]
+    )]
+    pub speaker_count_range: Option<String>,
 
-    /// Maximum number of speakers (insanely-fast diarization).
-    #[arg(long)]
-    pub max_speakers: Option<u32>,
+    /// Soft count prior: K for point mass or K=P,K=P for a distribution.
+    #[arg(
+        long,
+        value_name = "PRIOR",
+        conflicts_with_all = ["speaker_count_hard", "speaker_count_range"]
+    )]
+    pub speaker_count_prior: Option<String>,
 
     /// GPU device identifier, e.g. "0" or "mps" (insanely-fast, diarization).
     #[arg(long)]
@@ -1032,9 +1110,9 @@ impl TranscribeArgs {
                 || self.persist_speaker_profiles
                 || self.diarization_engine != DiarizationEngine::Auto
                 || self.diarization_fallback != DiarizationFallbackPolicy::Unknown
-                || self.num_speakers.is_some()
-                || self.min_speakers.is_some()
-                || self.max_speakers.is_some())
+                || self.speaker_count_hard.is_some()
+                || self.speaker_count_range.is_some()
+                || self.speaker_count_prior.is_some())
         {
             return Err(FwError::InvalidRequest(
                 "diarization controls require --diarize".to_owned(),
@@ -1213,22 +1291,29 @@ impl TranscribeArgs {
     }
 
     fn speaker_count_request(&self) -> FwResult<SpeakerCountRequest> {
-        let request = if let Some(count) = self.num_speakers {
-            if self.min_speakers.is_some() || self.max_speakers.is_some() {
-                return Err(FwError::InvalidRequest(
-                    "--num-speakers cannot be combined with --min-speakers or --max-speakers"
-                        .to_owned(),
-                ));
-            }
+        let specified_modes = usize::from(self.speaker_count_hard.is_some())
+            + usize::from(self.speaker_count_range.is_some())
+            + usize::from(self.speaker_count_prior.is_some());
+        if specified_modes > 1 {
+            return Err(FwError::InvalidRequest(
+                "--speaker-count-hard, --speaker-count-range, and --speaker-count-prior are mutually exclusive"
+                    .to_owned(),
+            ));
+        }
+        let request = if let Some(count) = self.speaker_count_hard {
             SpeakerCountRequest::HardConstraint { count }
-        } else if self.min_speakers.is_some() || self.max_speakers.is_some() {
-            SpeakerCountRequest::Range {
-                minimum: self.min_speakers.unwrap_or(1),
-                maximum: self.max_speakers.unwrap_or(MAX_SPEAKER_COUNT),
+        } else if let Some(range) = self.speaker_count_range.as_deref() {
+            let (minimum, maximum) = parse_speaker_count_range(range)?;
+            SpeakerCountRequest::Range { minimum, maximum }
+        } else if let Some(prior) = self.speaker_count_prior.as_deref() {
+            SpeakerCountRequest::Prior {
+                bins: parse_speaker_count_prior(prior)?,
             }
         } else {
             SpeakerCountRequest::Infer
         };
+        crate::model::validate_speaker_count_request(&request)
+            .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
         Ok(request)
     }
 
@@ -1374,9 +1459,9 @@ mod tests {
             vad_samples_overlap: None,
             batch_size: None,
             timestamp_level: None,
-            num_speakers: None,
-            min_speakers: None,
-            max_speakers: None,
+            speaker_count_hard: None,
+            speaker_count_range: None,
+            speaker_count_prior: None,
             gpu_device: None,
             flash_attention: false,
             hf_token: None,
@@ -1624,7 +1709,7 @@ mod tests {
         );
 
         let mut args = minimal_args();
-        args.num_speakers = Some(2);
+        args.speaker_count_hard = Some(2);
         assert!(
             args.to_request()
                 .expect_err("speaker-count search without --diarize must fail")
@@ -1759,16 +1844,24 @@ mod tests {
 
     #[test]
     fn speaker_count_infers_when_no_speaker_args() {
-        let args = minimal_args();
+        let mut args = minimal_args();
+        args.diarize = true;
         let request = args.to_request().expect("should succeed");
-        assert!(request.backend_params.acoustic_diarization.is_none());
+        assert_eq!(
+            request
+                .backend_params
+                .acoustic_diarization
+                .expect("--diarize creates native request")
+                .speaker_count,
+            SpeakerCountRequest::Infer
+        );
     }
 
     #[test]
-    fn speaker_count_built_from_num_speakers() {
+    fn speaker_count_built_from_explicit_hard_count() {
         let mut args = minimal_args();
         args.diarize = true;
-        args.num_speakers = Some(3);
+        args.speaker_count_hard = Some(3);
         let summary = args.robot_summary();
         assert_eq!(summary["speaker_count"]["mode"], "hard_constraint");
         assert_eq!(summary["speaker_count"]["count"], 3);
@@ -1782,11 +1875,10 @@ mod tests {
     }
 
     #[test]
-    fn speaker_count_built_from_min_and_max() {
+    fn speaker_count_built_from_explicit_range() {
         let mut args = minimal_args();
         args.diarize = true;
-        args.min_speakers = Some(2);
-        args.max_speakers = Some(8);
+        args.speaker_count_range = Some("2..8".to_owned());
         let request = args.to_request().expect("should succeed");
         let count = &request
             .backend_params
@@ -1799,6 +1891,81 @@ mod tests {
                 minimum: 2,
                 maximum: 8
             }
+        );
+    }
+
+    #[test]
+    fn speaker_count_point_prior_remains_soft() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_prior = Some("3".to_owned());
+        let count = args
+            .to_request()
+            .expect("point prior")
+            .backend_params
+            .acoustic_diarization
+            .expect("diarization request")
+            .speaker_count;
+        assert_eq!(
+            count,
+            SpeakerCountRequest::Prior {
+                bins: vec![SpeakerCountPriorMass {
+                    count: 3,
+                    probability: 1.0,
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn speaker_count_distribution_prior_is_sorted_and_validated() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_prior = Some("3=0.75,2=0.25".to_owned());
+        let count = args
+            .to_request()
+            .expect("distribution prior")
+            .backend_params
+            .acoustic_diarization
+            .expect("diarization request")
+            .speaker_count;
+        assert_eq!(
+            count,
+            SpeakerCountRequest::Prior {
+                bins: vec![
+                    SpeakerCountPriorMass {
+                        count: 2,
+                        probability: 0.25,
+                    },
+                    SpeakerCountPriorMass {
+                        count: 3,
+                        probability: 0.75,
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_speaker_count_cli_values_fail_with_typed_messages() {
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_range = Some("4..2".to_owned());
+        assert!(
+            args.to_request()
+                .expect_err("reversed range")
+                .to_string()
+                .contains("minimum <= maximum")
+        );
+
+        let mut args = minimal_args();
+        args.diarize = true;
+        args.speaker_count_prior = Some("2=0.8,3=0.8".to_owned());
+        assert!(
+            args.to_request()
+                .expect_err("unnormalized prior")
+                .to_string()
+                .contains("sum to exactly 1")
         );
     }
 
@@ -2195,7 +2362,7 @@ mod tests {
         args.batch_size = Some(24);
         args.gpu_device = Some("cuda:0".to_owned());
         args.timestamp_level = Some(TimestampLevel::Word);
-        args.num_speakers = Some(3);
+        args.speaker_count_hard = Some(3);
         args.hf_token = Some("hf_123".to_owned());
         args.transcript_path = Some(PathBuf::from("artifacts/ifw-out.json"));
         args.output_srt = true;
@@ -2303,13 +2470,12 @@ mod tests {
     fn exact_and_range_speaker_flags_are_rejected_as_ambiguous() {
         let mut args = minimal_args();
         args.diarize = true;
-        args.num_speakers = Some(4);
-        args.min_speakers = Some(2);
-        args.max_speakers = Some(6);
+        args.speaker_count_hard = Some(4);
+        args.speaker_count_range = Some("2..6".to_owned());
         let error = args
             .to_request()
             .expect_err("typed count request cannot represent contradictory modes");
-        assert!(error.to_string().contains("cannot be combined"));
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]
