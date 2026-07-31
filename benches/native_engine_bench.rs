@@ -42,7 +42,7 @@
 //! `logits_gemv_large` and `encoder_window_large` / `decoder_token_step_large`
 //! numbers for the f16 levers specifically.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -122,6 +122,114 @@ fn native_bench_identity() -> String {
         bytes.len(),
         path.display()
     )
+}
+
+fn native_bench_host_identity() -> String {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "unavailable".to_owned());
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|_| "unavailable".to_owned());
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|cpuinfo| {
+            cpuinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("model name\t: "))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let mem_total_kib = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| {
+            meminfo
+                .lines()
+                .find_map(|line| line.strip_prefix("MemTotal:"))
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let numa_nodes = std::fs::read_dir("/sys/devices/system/node")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .strip_prefix("node")
+                        .is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let configured_threads = rayon::current_num_threads();
+    let logical_cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(0);
+
+    format!(
+        "hostname={hostname:?} boot_id={boot_id} cpu_model={cpu_model:?} \
+         logical_cpus={logical_cpus} rayon_configured_threads={configured_threads} \
+         mem_total_kib={mem_total_kib} numa_nodes={numa_nodes}"
+    )
+}
+
+fn native_bench_governor_summary() -> String {
+    let logical_cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(0);
+    let mut by_value = BTreeMap::<String, usize>::new();
+    for cpu in 0..logical_cpus {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor");
+        let value = std::fs::read_to_string(path)
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "unavailable".to_owned());
+        *by_value.entry(value).or_default() += 1;
+    }
+    format!("{by_value:?}")
+}
+
+fn native_bench_thread_ticks() -> BTreeMap<u32, u64> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return BTreeMap::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let tid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let after_comm = stat.rsplit_once(") ")?.1;
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            let user = fields.get(11)?.parse::<u64>().ok()?;
+            let system = fields.get(12)?.parse::<u64>().ok()?;
+            Some((tid, user + system))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct NativeBenchThreadObservation {
+    active_tids: BTreeSet<u32>,
+    max_active_per_arm: usize,
+    peak_process_threads: usize,
+}
+
+impl NativeBenchThreadObservation {
+    fn observe(&mut self, before: &BTreeMap<u32, u64>, after: &BTreeMap<u32, u64>) {
+        let active: Vec<u32> = after
+            .iter()
+            .filter_map(|(tid, ticks)| {
+                (*ticks > before.get(tid).copied().unwrap_or(0)).then_some(*tid)
+            })
+            .collect();
+        self.max_active_per_arm = self.max_active_per_arm.max(active.len());
+        self.peak_process_threads = self.peak_process_threads.max(after.len());
+        self.active_tids.extend(active);
+    }
 }
 
 fn sdpa_harness_percentile(values: &[f64], percentile: usize) -> f64 {
@@ -1297,6 +1405,333 @@ fn bench_i7_qkv_activation_reuse(c: &mut Criterion) {
     group.finish();
 }
 
+/// Reconstruct the reverted i7 bias-specialization candidate faithfully:
+/// current production const-specializes bias presence, while the retained
+/// baseline executes the historical runtime `Option` branches. Both arms call
+/// the real turbo-shaped Q/K/V projection body in one self-hashing ELF.
+fn bench_i7_bias_specialization_resurrection(_c: &mut Criterion) {
+    if std::env::args().nth(1).is_some_and(|filter| {
+        !filter.starts_with('-') && !filter.contains("i7_bias_specialization_resurrection")
+    }) {
+        return;
+    }
+
+    use franken_whisper::native_engine::nn;
+
+    #[derive(Clone, Copy)]
+    enum Arm {
+        Historical,
+        Specialized,
+    }
+
+    fn project(
+        arm: Arm,
+        activation: &nn::I7Activation,
+        weight: &nn::I7Mat,
+        bias: Option<&[f32]>,
+    ) -> Mat {
+        match arm {
+            Arm::Historical => nn::matmul_bias_i7_quantized_unspecialized(activation, weight, bias),
+            Arm::Specialized => {
+                nn::matmul_bias_i7_quantized_specialized_ab(activation, weight, bias)
+            }
+        }
+        .expect("turbo-shaped i7 projection")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_qkv(
+        arm: Arm,
+        activation: &nn::I7Activation,
+        q_weight: &nn::I7Mat,
+        k_weight: &nn::I7Mat,
+        v_weight: &nn::I7Mat,
+        q_bias: &[f32],
+        v_bias: &[f32],
+    ) -> [Mat; 3] {
+        [
+            project(arm, activation, q_weight, Some(q_bias)),
+            project(arm, activation, k_weight, None),
+            project(arm, activation, v_weight, Some(v_bias)),
+        ]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn min_ns_per_qkv(
+        arm: Arm,
+        repetitions: usize,
+        activation: &nn::I7Activation,
+        q_weight: &nn::I7Mat,
+        k_weight: &nn::I7Mat,
+        v_weight: &nn::I7Mat,
+        q_bias: &[f32],
+        v_bias: &[f32],
+        thread_observation: &mut NativeBenchThreadObservation,
+    ) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..SDPA_HARNESS_MIN_OF {
+            let before = native_bench_thread_ticks();
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..repetitions {
+                let outputs = run_qkv(
+                    arm, activation, q_weight, k_weight, v_weight, q_bias, v_bias,
+                );
+                checksum ^= outputs
+                    .iter()
+                    .map(|output| {
+                        u64::from(output.data[0].to_bits())
+                            ^ u64::from(output.data[output.data.len() - 1].to_bits())
+                    })
+                    .fold(0_u64, u64::wrapping_add);
+                black_box(outputs);
+            }
+            let elapsed = started.elapsed().as_nanos() as f64 / repetitions as f64;
+            let after = native_bench_thread_ticks();
+            thread_observation.observe(&before, &after);
+            black_box(checksum);
+            best = best.min(elapsed);
+        }
+        best
+    }
+
+    let activation_source = synthetic_mat(1_500, 1_280, 0xb1a5);
+    let activation = nn::quantize_act_i7(&activation_source);
+    let q_weight = nn::quantize_mat_to_i7(&synthetic_mat(1_280, 1_280, 0xb1a6));
+    let k_weight = nn::quantize_mat_to_i7(&synthetic_mat(1_280, 1_280, 0xb1a7));
+    let v_weight = nn::quantize_mat_to_i7(&synthetic_mat(1_280, 1_280, 0xb1a8));
+    let q_bias = synthetic_vec(1_280, 0xb1a9);
+    let v_bias = synthetic_vec(1_280, 0xb1aa);
+
+    let historical = run_qkv(
+        Arm::Historical,
+        &activation,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &q_bias,
+        &v_bias,
+    );
+    let specialized = run_qkv(
+        Arm::Specialized,
+        &activation,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &q_bias,
+        &v_bias,
+    );
+    assert!(
+        historical
+            .iter()
+            .zip(&specialized)
+            .all(|(baseline, candidate)| baseline
+                .data
+                .iter()
+                .zip(&candidate.data)
+                .all(|(left, right)| left.to_bits() == right.to_bits())),
+        "const-specialized Q/K/V must match the historical runtime-Option body bit-for-bit"
+    );
+    let mut parity_hasher = Sha256::new();
+    for output in &historical {
+        for value in &output.data {
+            parity_hasher.update(value.to_bits().to_le_bytes());
+        }
+    }
+    println!(
+        "I7_BIAS_PARITY shape=1500x1280x1280 projections=3 bias_pattern=some/none/some \
+         output_f32={} sha256={:x}",
+        historical
+            .iter()
+            .map(|output| output.data.len())
+            .sum::<usize>(),
+        parity_hasher.finalize()
+    );
+    println!(
+        "I7_BIAS_HOST {} governors={} loadavg_before={}",
+        native_bench_host_identity(),
+        native_bench_governor_summary(),
+        std::fs::read_to_string("/proc/loadavg")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "unavailable".to_owned())
+    );
+    println!(
+        "I7_BIAS_PROFILE retained_current_production_self_time_pct=14.34 \
+         attribution_source=docs/PERF_LEDGER.md"
+    );
+
+    let probe_started = Instant::now();
+    black_box(run_qkv(
+        Arm::Historical,
+        &activation,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &q_bias,
+        &v_bias,
+    ));
+    let probe_ns = probe_started.elapsed().as_nanos().max(1);
+    let repetitions =
+        usize::try_from((100_000_000_u128 / probe_ns).clamp(1, 16)).expect("bounded repetitions");
+
+    let mut thread_observation = NativeBenchThreadObservation::default();
+    let mut null_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (left, right) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_qkv(
+                    Arm::Historical,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+                min_ns_per_qkv(
+                    Arm::Historical,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+            )
+        } else {
+            let right = min_ns_per_qkv(
+                Arm::Historical,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            let left = min_ns_per_qkv(
+                Arm::Historical,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            (left, right)
+        };
+        null_ratios.push(left / right.max(f64::MIN_POSITIVE));
+    }
+
+    let mut candidate_ratios = Vec::with_capacity(SDPA_HARNESS_PAIRS);
+    for pair in 0..SDPA_HARNESS_PAIRS {
+        let (baseline, candidate) = if pair.is_multiple_of(2) {
+            (
+                min_ns_per_qkv(
+                    Arm::Historical,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+                min_ns_per_qkv(
+                    Arm::Specialized,
+                    repetitions,
+                    &activation,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_bias,
+                    &v_bias,
+                    &mut thread_observation,
+                ),
+            )
+        } else {
+            let candidate = min_ns_per_qkv(
+                Arm::Specialized,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            let baseline = min_ns_per_qkv(
+                Arm::Historical,
+                repetitions,
+                &activation,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &q_bias,
+                &v_bias,
+                &mut thread_observation,
+            );
+            (baseline, candidate)
+        };
+        candidate_ratios.push(baseline / candidate.max(f64::MIN_POSITIVE));
+    }
+
+    let (null_ci_low, null_ci_high) = sdpa_bootstrap_median_ci(&null_ratios);
+    let (candidate_ci_low, candidate_ci_high) = sdpa_bootstrap_median_ci(&candidate_ratios);
+    let null_half_width = (1.0 - null_ci_low).abs().max((null_ci_high - 1.0).abs());
+    let required_speedup = 1.0 + 2.0 * null_half_width;
+    let candidate_median = sdpa_harness_percentile(&candidate_ratios, 50);
+    let keep = candidate_median > required_speedup && candidate_ci_low > 1.0;
+    println!(
+        "I7_BIAS_NULL ratios={null_ratios:?} median={:.6} \
+         median_ci95=[{null_ci_low:.6},{null_ci_high:.6}] cv={:.6}",
+        sdpa_harness_percentile(&null_ratios, 50),
+        sdpa_harness_cv(&null_ratios)
+    );
+    println!(
+        "I7_BIAS_CANDIDATE ratios={candidate_ratios:?} median={candidate_median:.6} \
+         median_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] cv={:.6} wins={}/{}",
+        sdpa_harness_cv(&candidate_ratios),
+        candidate_ratios
+            .iter()
+            .filter(|ratio| **ratio > 1.0)
+            .count(),
+        SDPA_HARNESS_PAIRS
+    );
+    println!(
+        "I7_BIAS_THREADS configured={} observed_active_union={} \
+         observed_active_max_per_arm={} peak_process_threads={} \
+         observed_source=proc_self_task_cpu_ticks",
+        rayon::current_num_threads(),
+        thread_observation.active_tids.len(),
+        thread_observation.max_active_per_arm,
+        thread_observation.peak_process_threads
+    );
+    println!(
+        "I7_BIAS_GATE method=median_vs_null_ci95_2x_margin \
+         null_ci_straddle_required=false null_half_width={null_half_width:.6} \
+         required_speedup={required_speedup:.6} candidate_median={candidate_median:.6} \
+         candidate_ci95=[{candidate_ci_low:.6},{candidate_ci_high:.6}] \
+         median_clause_clear={} effect_ci_excludes_one={} \
+         cv_is_provenance_only=true verdict={} loadavg_after={}",
+        candidate_median > required_speedup,
+        candidate_ci_low > 1.0,
+        if keep { "KEEP" } else { "REJECT" },
+        std::fs::read_to_string("/proc/loadavg")
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|_| "unavailable".to_owned())
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 7. layer_norm — vertical-SIMD per-row normalization (hermetic).
 //     Direct instrument for the L5 lever: one encoder-window-shaped
@@ -2013,6 +2448,7 @@ criterion_group!(
     bench_logits_gemv_large,
     bench_f16_gemv_dequant,
     bench_i7_qkv_activation_reuse,
+    bench_i7_bias_specialization_resurrection,
     bench_layer_norm,
     bench_gelu,
     bench_resample,
