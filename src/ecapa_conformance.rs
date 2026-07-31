@@ -2,11 +2,10 @@
 //!
 //! The optional neural diarizer is not admitted by this module. This module
 //! freezes the independently reproducible source model and provides a
-//! fail-closed bridge from an unsafe framework checkpoint to a simple,
-//! checksummed, little-endian inference payload that a later safe-Rust engine
-//! can consume. No source weights or framework runtime are vendored.
+//! fail-closed bridge from an unsafe framework checkpoint to the existing
+//! native safetensors loader that a later safe-Rust engine can consume. No
+//! source weights, exported weights, or framework runtime are vendored.
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -16,13 +15,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{FwError, FwResult};
+use crate::native_engine::weights::{SafetensorsFile, WeightsManifest, validate};
 use crate::orchestrator::CancellationToken;
 
 pub const ECAPA_CONTRACT_SCHEMA: &str = "franken-whisper-ecapa-contract-v1";
 pub const ECAPA_CONTRACT_SHA256: &str =
-    "3c47b9e9a75ca4c6e4ce957dac810a92ff085af82fb76d4991cbf6423d3b1040";
-pub const ECAPA_WEIGHT_MANIFEST_SCHEMA: &str = "franken-whisper-ecapa-weights-v1";
+    "6cded282c81301f9faaa7266de454350730f0e8d56427550fc5f82c898c9e8d1";
 pub const ECAPA_EXPORTER_VERSION: &str = "franken-whisper-ecapa-export-v1";
+pub const ECAPA_EXPORT_PROFILE: &str = "ecapa-tdnn-voxceleb-v1";
+pub const ECAPA_PACKAGE_FILENAME: &str = "ecapa_tdnn_voxceleb.safetensors";
+pub const ECAPA_PACKAGE_SHA256: &str =
+    "9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc";
+pub const ECAPA_PACKAGE_BYTES: u64 = 83_246_544;
+pub const ECAPA_EXPORT_NUMPY_VERSION: &str = "2.2.6";
+pub const ECAPA_EXPORT_TORCH_VERSION: &str = "2.7.1";
+pub const ECAPA_EXPORT_SAFETENSORS_VERSION: &str = "0.5.3";
 pub const ECAPA_GOLDEN_SCHEMA: &str = "franken-whisper-ecapa-golden-v1";
 pub const ECAPA_GOLDEN_EVIDENCE_SHA256: &str =
     "073a910a2a8d171dca45e28940387ebfc0642e63224d62ebd62abe2b8efd9ac2";
@@ -105,11 +112,18 @@ pub struct EcapaFrontendContract {
 #[serde(deny_unknown_fields)]
 pub struct EcapaExportContract {
     pub exporter_version: String,
+    pub export_profile: String,
     pub package_format: String,
+    pub package_filename: String,
+    pub package_sha256: String,
+    pub package_bytes: u64,
     pub dtype: String,
     pub byte_order: String,
     pub tensor_order: String,
     pub logical_layout: String,
+    pub numpy_version: String,
+    pub torch_version: String,
+    pub safetensors_version: String,
     pub batch_norm_folding: bool,
     pub batch_norm_epsilon: f32,
     pub batch_norm_momentum: f32,
@@ -174,11 +188,18 @@ pub fn frozen_ecapa_contract() -> EcapaContract {
         },
         export: EcapaExportContract {
             exporter_version: ECAPA_EXPORTER_VERSION.to_owned(),
-            package_format: "canonical_json_manifest_plus_raw_payload".to_owned(),
+            export_profile: ECAPA_EXPORT_PROFILE.to_owned(),
+            package_format: "safetensors".to_owned(),
+            package_filename: ECAPA_PACKAGE_FILENAME.to_owned(),
+            package_sha256: ECAPA_PACKAGE_SHA256.to_owned(),
+            package_bytes: ECAPA_PACKAGE_BYTES,
             dtype: "ieee754_f32".to_owned(),
             byte_order: "little_endian".to_owned(),
-            tensor_order: "source_checkpoint_iteration_order".to_owned(),
+            tensor_order: "lexicographic_name_order".to_owned(),
             logical_layout: "pytorch_contiguous_row_major".to_owned(),
+            numpy_version: ECAPA_EXPORT_NUMPY_VERSION.to_owned(),
+            torch_version: ECAPA_EXPORT_TORCH_VERSION.to_owned(),
+            safetensors_version: ECAPA_EXPORT_SAFETENSORS_VERSION.to_owned(),
             batch_norm_folding: false,
             batch_norm_epsilon: 1.0e-5,
             batch_norm_momentum: 0.1,
@@ -219,16 +240,13 @@ pub fn ecapa_contract_sha256() -> FwResult<String> {
     if observed != ECAPA_CONTRACT_SHA256 {
         return Err(ecapa_error(
             "contract_internal_drift",
-            "compiled ECAPA contract does not match its versioned hash",
+            &format!(
+                "compiled ECAPA contract hash {observed} does not match frozen \
+                 {ECAPA_CONTRACT_SHA256}"
+            ),
         ));
     }
     Ok(observed)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EcapaWeightDType {
-    F32LittleEndian,
 }
 
 /// One exact inference tensor expected after the pinned checkpoint is exported.
@@ -236,37 +254,6 @@ pub enum EcapaWeightDType {
 pub struct EcapaTensorSpec {
     pub name: String,
     pub shape: Vec<usize>,
-}
-
-/// One tensor in the safe contiguous payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EcapaTensorDescriptor {
-    pub name: String,
-    pub dtype: EcapaWeightDType,
-    pub shape: Vec<usize>,
-    pub byte_offset: u64,
-    pub byte_length: u64,
-    pub tensor_sha256: String,
-}
-
-/// Path-free manifest for an exported inference payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EcapaWeightManifest {
-    pub schema_version: String,
-    pub contract_sha256: String,
-    pub exporter_version: String,
-    pub source_model_id: String,
-    pub source_model_revision: String,
-    pub source_checkpoint_sha256: String,
-    pub source_checkpoint_bytes: u64,
-    pub source_tensor_count: usize,
-    pub dropped_batch_counter_count: usize,
-    pub payload_bytes: u64,
-    pub payload_sha256: String,
-    pub tensors: Vec<EcapaTensorDescriptor>,
-    pub manifest_sha256: String,
 }
 
 /// Generate the exact 200-tensor inference inventory in checkpoint order.
@@ -315,7 +302,7 @@ pub fn expected_ecapa_tensors() -> Vec<EcapaTensorSpec> {
     }
     push_conv_bn(&mut tensors, "mfa", vec![3_072, 3_072, 1], 3_072);
     push_conv_bn(&mut tensors, "asp.tdnn", vec![128, 9_216, 1], 128);
-    push_conv(&mut tensors, "asp.conv", vec![3_072, 128, 1], 3_072);
+    push_bare_conv(&mut tensors, "asp.conv", vec![3_072, 128, 1], 3_072);
     push_batch_norm(&mut tensors, "asp_bn", 6_144, false);
     tensors.push(EcapaTensorSpec {
         name: "fc.conv.weight".to_owned(),
@@ -389,191 +376,147 @@ fn push_batch_norm(
     }
 }
 
-/// Parse and verify a path-free weight manifest.
-pub fn parse_ecapa_weight_manifest(bytes: &[u8]) -> FwResult<EcapaWeightManifest> {
-    let manifest = serde_json::from_slice(bytes)
-        .map_err(|_| ecapa_error("manifest_json", "weight manifest is invalid"))?;
-    verify_ecapa_weight_manifest(&manifest)?;
-    Ok(manifest)
-}
-
-/// Verify source identity, exact tensor mapping, payload geometry, and self-hash.
-pub fn verify_ecapa_weight_manifest(manifest: &EcapaWeightManifest) -> FwResult<()> {
-    if manifest.schema_version != ECAPA_WEIGHT_MANIFEST_SCHEMA
-        || manifest.exporter_version != ECAPA_EXPORTER_VERSION
-    {
-        return Err(ecapa_error(
-            "manifest_schema",
-            "weight manifest schema or exporter is unsupported",
-        ));
-    }
-    if manifest.contract_sha256 != ecapa_contract_sha256()? {
-        return Err(ecapa_error(
-            "contract_hash",
-            "weight manifest does not bind the frozen contract",
-        ));
-    }
-    if manifest.source_model_id != ECAPA_MODEL_ID
-        || manifest.source_model_revision != ECAPA_MODEL_REVISION
-        || manifest.source_checkpoint_sha256 != ECAPA_SOURCE_CHECKPOINT_SHA256
-        || manifest.source_checkpoint_bytes != ECAPA_SOURCE_CHECKPOINT_BYTES
-        || manifest.source_tensor_count != ECAPA_SOURCE_TENSOR_COUNT
-        || manifest.dropped_batch_counter_count != ECAPA_DROPPED_BATCH_COUNTER_COUNT
-    {
-        return Err(ecapa_error(
-            "source_identity",
-            "weight manifest source identity is not the frozen model",
-        ));
-    }
-    if manifest.payload_bytes != ECAPA_EXPORTED_PAYLOAD_BYTES
-        || !is_sha256_hex(&manifest.payload_sha256)
-    {
-        return Err(ecapa_error(
-            "payload_identity",
-            "weight payload size or hash is invalid",
-        ));
-    }
-    let expected = expected_ecapa_tensors();
-    if expected.len() != ECAPA_EXPORTED_TENSOR_COUNT || manifest.tensors.len() != expected.len() {
-        return Err(ecapa_error(
-            "tensor_count",
-            "weight manifest tensor count is invalid",
-        ));
-    }
-    let mut expected_offset = 0u64;
-    let mut names = BTreeSet::new();
-    for (descriptor, spec) in manifest.tensors.iter().zip(expected) {
-        let element_count = checked_element_count(&spec.shape)?;
-        let byte_length = element_count
-            .checked_mul(4)
-            .ok_or_else(|| ecapa_error("tensor_size", "tensor byte size overflows"))?;
-        if descriptor.name != spec.name
-            || descriptor.dtype != EcapaWeightDType::F32LittleEndian
-            || descriptor.shape != spec.shape
-            || descriptor.byte_offset != expected_offset
-            || descriptor.byte_length != byte_length
-            || !is_sha256_hex(&descriptor.tensor_sha256)
-            || !names.insert(descriptor.name.as_str())
-        {
-            return Err(ecapa_error(
-                "tensor_mapping",
-                "weight manifest tensor mapping is invalid",
-            ));
-        }
-        expected_offset = expected_offset
-            .checked_add(byte_length)
-            .ok_or_else(|| ecapa_error("tensor_size", "tensor payload size overflows"))?;
-    }
-    if expected_offset != manifest.payload_bytes {
-        return Err(ecapa_error(
-            "payload_geometry",
-            "weight manifest payload geometry is inconsistent",
-        ));
-    }
-    if !is_sha256_hex(&manifest.manifest_sha256) {
-        return Err(ecapa_error(
-            "manifest_hash",
-            "weight manifest hash is invalid",
-        ));
-    }
-    let mut unhashed = manifest.clone();
-    unhashed.manifest_sha256.clear();
-    if canonical_sha256(&unhashed)? != manifest.manifest_sha256 {
-        return Err(ecapa_error(
-            "manifest_hash",
-            "weight manifest hash does not match",
-        ));
-    }
-    Ok(())
-}
-
-/// Validate the payload bytes without loading the model or exposing its path.
-pub fn verify_ecapa_weight_package(
-    manifest: &EcapaWeightManifest,
-    payload_path: &Path,
-) -> FwResult<()> {
+/// Validate the exact frozen safetensors package without exposing its path.
+pub fn verify_ecapa_weight_package(package_path: &Path) -> FwResult<()> {
     let token = CancellationToken::unbounded(); // ubs:ignore — cancellation token is not a secret
-    verify_ecapa_weight_package_with_token(manifest, payload_path, &token)
+    verify_ecapa_weight_package_with_token(package_path, &token)
 }
 
 pub fn verify_ecapa_weight_package_with_token(
-    manifest: &EcapaWeightManifest,
-    payload_path: &Path,
+    package_path: &Path,
     token: &CancellationToken,
 ) -> FwResult<()> {
-    verify_ecapa_weight_manifest(manifest)?;
-    verify_payload(
-        payload_path,
-        manifest.payload_bytes,
-        &manifest.payload_sha256,
-        &manifest.tensors,
+    verify_ecapa_package_identity(
+        package_path,
+        ECAPA_PACKAGE_BYTES,
+        ECAPA_PACKAGE_SHA256,
         token,
-    )
+    )?;
+    token.checkpoint()?;
+    let package = SafetensorsFile::load(package_path).map_err(|_| {
+        ecapa_error(
+            "safetensors_structure",
+            "weight package is not structurally valid safetensors",
+        )
+    })?;
+    verify_loaded_ecapa_package(&package)?;
+    token.checkpoint()
 }
 
-fn verify_payload(
-    payload_path: &Path,
+fn verify_ecapa_package_identity(
+    package_path: &Path,
     expected_bytes: u64,
     expected_sha256: &str,
-    tensors: &[EcapaTensorDescriptor],
     token: &CancellationToken,
 ) -> FwResult<()> {
-    let file = File::open(payload_path)
-        .map_err(|_| ecapa_error("payload_open", "weight payload could not be opened"))?;
+    token.checkpoint()?;
+    let file = File::open(package_path)
+        .map_err(|_| ecapa_error("package_open", "weight package could not be opened"))?;
     let actual_bytes = file
         .metadata()
-        .map_err(|_| ecapa_error("payload_metadata", "weight payload metadata is unavailable"))?
+        .map_err(|_| ecapa_error("package_metadata", "weight package metadata is unavailable"))?
         .len();
     if actual_bytes != expected_bytes {
         return Err(ecapa_error(
-            "payload_size",
-            "weight payload length does not match",
+            "package_identity",
+            "weight package length does not match the frozen artifact",
         ));
     }
     let mut reader = BufReader::new(file);
-    let mut payload_hasher = Sha256::new();
+    let mut package_hasher = Sha256::new();
     let mut buffer = [0u8; READ_CHUNK_BYTES];
-    for tensor in tensors {
-        let mut tensor_hasher = Sha256::new();
-        let mut remaining = tensor.byte_length;
-        while remaining > 0 {
-            token.checkpoint()?;
-            let wanted = usize::try_from(
-                remaining.min(
-                    u64::try_from(READ_CHUNK_BYTES)
-                        .map_err(|_| ecapa_error("payload_read", "chunk size is invalid"))?,
-                ),
-            )
-            .map_err(|_| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
-            let chunk = buffer
-                .get_mut(..wanted)
-                .ok_or_else(|| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
-            reader
-                .read_exact(chunk)
-                .map_err(|_| ecapa_error("payload_read", "weight payload could not be read"))?;
-            payload_hasher.update(&*chunk);
-            tensor_hasher.update(&*chunk);
-            remaining = remaining
-                .checked_sub(
-                    u64::try_from(wanted)
-                        .map_err(|_| ecapa_error("payload_read", "chunk size is invalid"))?,
-                )
-                .ok_or_else(|| ecapa_error("payload_read", "weight payload chunk is invalid"))?;
+    loop {
+        token.checkpoint()?;
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|_| ecapa_error("package_read", "weight package could not be read"))?;
+        if read == 0 {
+            break;
         }
-        if hex_digest(tensor_hasher.finalize()) != tensor.tensor_sha256 {
-            return Err(ecapa_error(
-                "tensor_hash",
-                "weight tensor checksum does not match",
-            ));
-        }
+        package_hasher.update(
+            buffer
+                .get(..read)
+                .ok_or_else(|| ecapa_error("package_read", "weight package read is invalid"))?,
+        );
     }
-    if hex_digest(payload_hasher.finalize()) != expected_sha256 {
+    if hex_digest(package_hasher.finalize()) != expected_sha256 {
         return Err(ecapa_error(
-            "payload_hash",
-            "weight payload checksum does not match",
+            "package_identity",
+            "weight package checksum does not match the frozen artifact",
         ));
     }
     Ok(())
+}
+
+fn verify_loaded_ecapa_package(package: &SafetensorsFile) -> FwResult<()> {
+    let expected = expected_ecapa_tensors();
+    if expected.len() != ECAPA_EXPORTED_TENSOR_COUNT {
+        return Err(ecapa_error(
+            "contract_internal_drift",
+            "compiled ECAPA tensor census is inconsistent",
+        ));
+    }
+    verify_loaded_ecapa_package_against(package, &expected, &expected_ecapa_package_metadata())
+}
+
+fn verify_loaded_ecapa_package_against(
+    package: &SafetensorsFile,
+    expected: &[EcapaTensorSpec],
+    expected_metadata: &serde_json::Value,
+) -> FwResult<()> {
+    let manifest = WeightsManifest::new(
+        expected
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor.shape.clone())),
+    );
+    validate(package, &manifest).map_err(|error| {
+        ecapa_error(
+            "tensor_mapping",
+            &format!(
+                "safetensors names or shapes do not match the frozen census: {error}"
+            ),
+        )
+    })?;
+    for tensor in expected {
+        if package.dtype_name(&tensor.name).map_err(|_| {
+            ecapa_error(
+                "tensor_mapping",
+                "safetensors tensor is absent from the frozen census",
+            )
+        })? != "F32"
+        {
+            return Err(ecapa_error(
+                "tensor_dtype",
+                "every exported ECAPA tensor must be F32",
+            ));
+        }
+    }
+    if package.metadata() != Some(expected_metadata) {
+        return Err(ecapa_error(
+            "package_metadata",
+            "safetensors metadata does not match the frozen export profile",
+        ));
+    }
+    Ok(())
+}
+
+fn expected_ecapa_package_metadata() -> serde_json::Value {
+    serde_json::json!({
+        "converter": "franken_whisper/scripts/convert_to_safetensors.py",
+        "dropped_batch_counter_count": ECAPA_DROPPED_BATCH_COUNTER_COUNT.to_string(),
+        "exported_dtype": "F32",
+        "exported_tensor_count": ECAPA_EXPORTED_TENSOR_COUNT.to_string(),
+        "exporter_version": ECAPA_EXPORTER_VERSION,
+        "numpy_version": ECAPA_EXPORT_NUMPY_VERSION,
+        "profile": ECAPA_EXPORT_PROFILE,
+        "safetensors_version": ECAPA_EXPORT_SAFETENSORS_VERSION,
+        "source_checkpoint_bytes": ECAPA_SOURCE_CHECKPOINT_BYTES.to_string(),
+        "source_checkpoint_sha256": ECAPA_SOURCE_CHECKPOINT_SHA256,
+        "source_model_id": ECAPA_MODEL_ID,
+        "source_model_revision": ECAPA_MODEL_REVISION,
+        "source_tensor_count": ECAPA_SOURCE_TENSOR_COUNT.to_string(),
+        "torch_version": ECAPA_EXPORT_TORCH_VERSION,
+    })
 }
 
 fn checked_element_count(shape: &[usize]) -> FwResult<u64> {
@@ -1154,49 +1097,33 @@ fn ecapa_error(code: &str, message: &str) -> FwError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
     use super::*;
 
-    fn valid_manifest() -> EcapaWeightManifest {
-        let mut offset = 0u64;
-        let tensors = expected_ecapa_tensors()
-            .into_iter()
-            .map(|spec| {
-                let byte_length = checked_element_count(&spec.shape)
-                    .expect("known shape")
-                    .checked_mul(4)
-                    .expect("known byte length");
-                let descriptor = EcapaTensorDescriptor {
-                    name: spec.name,
-                    dtype: EcapaWeightDType::F32LittleEndian,
-                    shape: spec.shape,
-                    byte_offset: offset,
-                    byte_length,
-                    tensor_sha256: "0".repeat(64),
-                };
-                offset += byte_length;
-                descriptor
-            })
-            .collect();
-        let mut manifest = EcapaWeightManifest {
-            schema_version: ECAPA_WEIGHT_MANIFEST_SCHEMA.to_owned(),
-            contract_sha256: ecapa_contract_sha256().expect("contract hash"),
-            exporter_version: ECAPA_EXPORTER_VERSION.to_owned(),
-            source_model_id: ECAPA_MODEL_ID.to_owned(),
-            source_model_revision: ECAPA_MODEL_REVISION.to_owned(),
-            source_checkpoint_sha256: ECAPA_SOURCE_CHECKPOINT_SHA256.to_owned(),
-            source_checkpoint_bytes: ECAPA_SOURCE_CHECKPOINT_BYTES,
-            source_tensor_count: ECAPA_SOURCE_TENSOR_COUNT,
-            dropped_batch_counter_count: ECAPA_DROPPED_BATCH_COUNTER_COUNT,
-            payload_bytes: offset,
-            payload_sha256: "1".repeat(64),
-            tensors,
-            manifest_sha256: String::new(),
-        };
-        manifest.manifest_sha256 = canonical_sha256(&manifest).expect("manifest hash");
-        manifest
+    fn tiny_safetensors(
+        name: &str,
+        dtype: &str,
+        shape: &[usize],
+        payload: &[u8],
+        metadata: &serde_json::Value,
+    ) -> Vec<u8> {
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_owned(), metadata.clone());
+        header.insert(
+            name.to_owned(),
+            serde_json::json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [0, payload.len()],
+            }),
+        );
+        let mut header_bytes =
+            serde_json::to_vec(&serde_json::Value::Object(header)).expect("header");
+        header_bytes.resize(header_bytes.len().next_multiple_of(8), b' ');
+        let mut package = Vec::with_capacity(8 + header_bytes.len() + payload.len());
+        package.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        package.extend_from_slice(&header_bytes);
+        package.extend_from_slice(payload);
+        package
     }
 
     #[test]
@@ -1206,6 +1133,9 @@ mod tests {
         assert_eq!(contract.model_revision, ECAPA_MODEL_REVISION);
         assert_eq!(contract.frontend.mel_bands, 80);
         assert!(!contract.export.batch_norm_folding);
+        assert_eq!(contract.export.package_format, "safetensors");
+        assert_eq!(contract.export.package_sha256, ECAPA_PACKAGE_SHA256);
+        assert_eq!(contract.export.package_bytes, ECAPA_PACKAGE_BYTES);
         assert_eq!(contract.architecture.embedding_dimensions, 192);
         assert_eq!(
             contract.architecture.golden_embedding_stage,
@@ -1233,107 +1163,106 @@ mod tests {
     }
 
     #[test]
-    fn manifest_is_exact_and_tamper_evident() {
-        let manifest = valid_manifest();
-        verify_ecapa_weight_manifest(&manifest).expect("valid manifest");
-        let bytes = serde_json::to_vec(&manifest).expect("serialize");
-        assert_eq!(
-            parse_ecapa_weight_manifest(&bytes).expect("parse"),
-            manifest
-        );
-        let invalid_dtype = String::from_utf8(bytes.clone())
-            .expect("manifest JSON is valid UTF-8")
-            .replacen("f32_little_endian", "native_endian_f32", 1);
-        assert!(parse_ecapa_weight_manifest(invalid_dtype.as_bytes()).is_err());
-
-        for mutation in 0..7 {
-            let mut invalid = manifest.clone();
-            match mutation {
-                0 => invalid.source_model_revision.push('0'),
-                1 => {
-                    invalid.tensors.pop();
-                }
-                2 => invalid.tensors[0].shape[0] -= 1,
-                3 => invalid.tensors[0].byte_offset = 4,
-                4 => invalid.tensors[0].tensor_sha256 = "not-a-hash".to_owned(),
-                5 => invalid.payload_bytes -= 4,
-                _ => invalid.manifest_sha256 = "f".repeat(64),
-            }
-            assert!(verify_ecapa_weight_manifest(&invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn small_payload_verifier_detects_corruption_truncation_and_cancellation() {
+    fn package_identity_detects_corruption_truncation_and_cancellation() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("weights.bin");
+        let path = directory.path().join("weights.safetensors");
         let payload = b"abcdefgh";
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .expect("new payload")
-            .write_all(payload)
-            .expect("write payload");
-        let descriptors = vec![
-            EcapaTensorDescriptor {
-                name: "a".to_owned(),
-                dtype: EcapaWeightDType::F32LittleEndian,
-                shape: vec![1],
-                byte_offset: 0,
-                byte_length: 4,
-                tensor_sha256: bytes_sha256(&payload[..4]),
-            },
-            EcapaTensorDescriptor {
-                name: "b".to_owned(),
-                dtype: EcapaWeightDType::F32LittleEndian,
-                shape: vec![1],
-                byte_offset: 4,
-                byte_length: 4,
-                tensor_sha256: bytes_sha256(&payload[4..]),
-            },
-        ];
-        verify_payload(
+        std::fs::write(&path, payload).expect("write payload");
+        verify_ecapa_package_identity(
             &path,
             payload.len() as u64,
             &bytes_sha256(payload),
-            &descriptors,
             &CancellationToken::unbounded(),
         )
-        .expect("valid payload");
+        .expect("valid identity");
 
-        let mut corrupt = descriptors.clone();
-        corrupt[1].tensor_sha256 = "f".repeat(64);
         assert!(
-            verify_payload(
+            verify_ecapa_package_identity(
                 &path,
                 payload.len() as u64,
-                &bytes_sha256(payload),
-                &corrupt,
+                &"f".repeat(64),
                 &CancellationToken::unbounded(),
             )
             .is_err()
         );
         assert!(
-            verify_payload(
+            verify_ecapa_package_identity(
                 &path,
                 payload.len() as u64 + 1,
                 &bytes_sha256(payload),
-                &descriptors,
                 &CancellationToken::unbounded(),
             )
             .is_err()
         );
         assert!(matches!(
-            verify_payload(
+            verify_ecapa_package_identity(
                 &path,
                 payload.len() as u64,
                 &bytes_sha256(payload),
-                &descriptors,
                 &CancellationToken::already_expired(),
             ),
             Err(FwError::Cancelled(_))
         ));
+    }
+
+    #[test]
+    fn safetensors_wrapper_rejects_mapping_dtype_and_metadata_drift() {
+        let expected_metadata = serde_json::json!({"profile": "test"});
+        let expected = vec![EcapaTensorSpec {
+            name: "weight".to_owned(),
+            shape: vec![1],
+        }];
+
+        let valid_bytes = tiny_safetensors(
+            "weight",
+            "F32",
+            &[1],
+            &0.25f32.to_le_bytes(),
+            &expected_metadata,
+        );
+        let valid = SafetensorsFile::from_bytes(&valid_bytes).expect("valid safetensors");
+        verify_loaded_ecapa_package_against(&valid, &expected, &expected_metadata)
+            .expect("valid package contract");
+
+        let wrong_shape_bytes =
+            tiny_safetensors("weight", "F32", &[2], &[0; 8], &expected_metadata);
+        let wrong_shape =
+            SafetensorsFile::from_bytes(&wrong_shape_bytes).expect("shape package parses");
+        let shape_error =
+            verify_loaded_ecapa_package_against(&wrong_shape, &expected, &expected_metadata)
+                .expect_err("shape drift fails");
+        assert!(shape_error.to_string().contains("ecapa.tensor_mapping"));
+
+        let wrong_dtype_bytes =
+            tiny_safetensors("weight", "F16", &[1], &[0; 2], &expected_metadata);
+        let wrong_dtype =
+            SafetensorsFile::from_bytes(&wrong_dtype_bytes).expect("dtype package parses");
+        let dtype_error =
+            verify_loaded_ecapa_package_against(&wrong_dtype, &expected, &expected_metadata)
+                .expect_err("dtype drift fails");
+        assert!(dtype_error.to_string().contains("ecapa.tensor_dtype"));
+
+        let wrong_metadata = serde_json::json!({"profile": "wrong"});
+        let metadata_bytes = tiny_safetensors("weight", "F32", &[1], &[0; 4], &wrong_metadata);
+        let metadata_package =
+            SafetensorsFile::from_bytes(&metadata_bytes).expect("metadata package parses");
+        let metadata_error =
+            verify_loaded_ecapa_package_against(&metadata_package, &expected, &expected_metadata)
+                .expect_err("metadata drift fails");
+        assert!(
+            metadata_error
+                .to_string()
+                .contains("ecapa.package_metadata")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an externally converted public ECAPA package"]
+    fn external_frozen_safetensors_package_verifies_end_to_end() {
+        let path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS")
+            .map(std::path::PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS");
+        verify_ecapa_weight_package(&path).expect("frozen package");
     }
 
     #[test]
