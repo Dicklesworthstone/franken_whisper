@@ -45,7 +45,9 @@ CPU at or below 20% busy in the preflight and immediate pre-measurement
 samples, a clear post-measurement sample, and no persistent external process
 above 0.1 CPU core between arms. These are formal verdict inputs alongside the
 same-invocation dual A/A controls, bootstrap median-CI 2x-null-margin gate, and
-independent load split. `cv` remains provenance only.
+independent load split. Both A/A medians must lie in `[0.98, 1.02]`
+inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
+calibrates the retained 2x margin. `cv` remains provenance only.
 
 ## 2026-07-30 — KEEP / **CAMPAIGN WINS (vs-incumbent)** — current-source tiny.en text certification: **1.518913×** on 124.5 s and **1.512159×** on 300 s (bd-b4hp)
 
