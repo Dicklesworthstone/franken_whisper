@@ -578,17 +578,17 @@ fallback names its source and reason.
 
 ## 9. Scoring
 
-The retained evaluation authority is `diarization-scorer-v3`. Low-level
+The retained evaluation authority is `diarization-scorer-v4`. Low-level
 metric helpers are not sufficient evidence by themselves: a retained verdict
 must be produced by `score_diarization_documents` from these exact versioned
 documents:
 
 | Document | Schema identity |
 |---|---|
-| Reference | `diarization-reference-v1` |
-| Hypothesis | `diarization-hypothesis-v1` |
-| Configuration | `diarization-scorer-config-v1` |
-| Result | `diarization-score-result-v1` |
+| Reference | `diarization-reference-v2` |
+| Hypothesis | `diarization-hypothesis-v2` |
+| Configuration | `diarization-scorer-config-v2` |
+| Result | `diarization-score-result-v2` |
 | Corpus manifest | `diarization-corpus-manifest-v1` |
 | Leakage audit | `diarization-leakage-audit-v1` |
 
@@ -601,11 +601,16 @@ attached to an unknown label, ambiguous overlapping hints, and non-canonical
 ordering fail closed with `diarization.scorer.*` reason codes.
 
 The reference and hypothesis identify the same opaque recording and exact
-duration. They contain timed speaker turns only: there is deliberately no
+duration. They contain timed speaker turns but deliberately contain no
 filesystem path, media URI, transcript text, or free-form provenance field.
-Reference turns are labeled; hypothesis turns may use an absent label for an
-honest unknown. Hypothesis assignment confidence and overlap suspicion remain
-separate observations.
+Reference v2 may additionally contain aligned word intervals whose `word_id`
+is an opaque non-lexical annotation identity. The interval and reference
+speaker are sufficient to score speaker attribution; lexical tokens are
+forbidden from retained evaluation inputs. Reference turns are labeled;
+hypothesis turns may use an absent label for an honest unknown. Hypothesis v2
+may carry the complete bounded `speaker-count-estimate-v2`. Assignment
+confidence, count uncertainty, and overlap suspicion remain separate
+observations.
 
 ### 9.1 Frozen metric policy
 
@@ -634,7 +639,17 @@ The same result separately reports:
 - union speech miss, false alarm, and speech-activity error rate;
 - one-to-one change precision, recall, F1, and mean absolute timing error under
   the named `change_boundary_collar_ms`;
-- conditional speaker-attribution accuracy and speaker-count error;
+- conditional speaker-attribution accuracy and raw speaker-count error;
+- proper multiclass count-posterior Brier score, finite negative log
+  likelihood plus an explicit zero-reference-probability flag, concrete
+  top-k coverage, a deterministic credible set that may retain unresolved
+  mass, entropy, and calibration authority;
+- scored occupancy per anonymized hypothesis label, effective speaker count,
+  phantom-label count, dominant-label share, UNKNOWN share, recurrence, and
+  per-reference recall-collapse diagnostics;
+- transcript-free aligned-word speaker counts and word diarization error rate
+  (WDER), with the same ignored-region, collar, and overlap policy as the
+  duration score;
 - duration-weighted overlap precision, recall, and F1;
 - hard/soft hint adherence, contradiction, unknown duration, and hard
   violation duration;
@@ -649,6 +664,18 @@ Reference, hypothesis, configuration, and result hashes use canonical compact
 JSON and SHA-256. `result_sha256` hashes the complete result with that one field
 temporarily empty, making tampering independently detectable. Repeated scoring
 of identical canonical inputs must serialize byte-for-byte identically.
+
+Speaker-count exactness is not a collapse test. A hypothesis can emit exactly
+the reference number of label names while assigning nearly all speech to one
+label. Scorer v4 therefore independently declares dominant collapse when a
+multi-speaker reference crosses the configured labeled-share threshold, and
+reference collapse when any mapped reference speaker falls below its
+configured attribution recall. Labels below
+`minimum_effective_occupancy_ms` do not count as effective or phantom
+speakers. UNKNOWN share is measured over hypothesis speaker-time
+(`UNKNOWN / (labeled + UNKNOWN)`), so false alarms cannot make it exceed one.
+All thresholds are integer millionths or milliseconds in the self-hashed
+configuration.
 
 ### 9.2 Corpus manifests and leakage
 
@@ -734,7 +761,7 @@ approved.
 
 ### 11.1 Local confidential evaluator
 
-`confidential-diarization-evaluation-manifest-v1` is deliberately different
+`confidential-diarization-evaluation-manifest-v2` is deliberately different
 from the path-free public corpus manifest. It is a local input document that
 contains absolute audio, reference, and hypothesis paths and therefore must
 remain outside the checkout. Its Rust representation supports deserialization
@@ -757,11 +784,14 @@ The `diarization-eval` command:
   streaming audio-hash block, and the final write, leaving no aggregate when
   cancelled;
 - writes only
-  `confidential-diarization-evaluation-aggregate-v1`.
+  `confidential-diarization-evaluation-aggregate-v2`.
 
-The aggregate contains micro/macro accuracy, change, count, overlap,
-calibration, and optional performance summaries plus opaque content/config
-fingerprints. It contains no per-recording row, path, filename, transcript,
+The aggregate contains micro/macro accuracy, change, raw count error,
+count-posterior proper scores and coverage, occupancy-collapse totals,
+transcript-free word-attribution totals, overlap, calibration, and optional
+performance summaries plus opaque content/config fingerprints. Posterior
+unavailability, unresolved selections, and zero reference probability remain
+separate counts. It contains no per-recording row, path, filename, transcript,
 timestamp, speaker/recording identity, feature vector, or excerpt. Repeated
 evaluation of identical content is byte-stable apart from the caller-chosen
 external filename, which is never serialized.
@@ -787,7 +817,7 @@ rights. The LDC entry is usable only by an operator who already has lawful
 access.
 
 `diarization-corpus build` consumes
-`public-diarization-corpus-input-v1` from an absolute root outside the checkout.
+`public-diarization-corpus-input-v2` from an absolute root outside the checkout.
 Every selected input is a relative path under that canonical root. Symlink
 escapes, traversal, absolute descriptor paths, wrong SHA-256 values, unexpected
 WAV sample rate/channel count, invalid selected channels, malformed RTTM,
@@ -797,13 +827,29 @@ one selected recording/channel, and an explicit source-label to path-free
 speaker-ID map. Concurrent different-speaker turns are preserved and marked as
 overlap. Ignored regions remain explicit scorer inputs.
 
-The generated `public-diarization-corpus-bundle-v1` contains the path-free
+Each recording may bind an optional external
+`public-diarization-word-annotation-v1` document by relative path and exact
+SHA-256. It contains only the recording identity and canonically ordered
+opaque word IDs, integer-millisecond intervals, and reference speaker IDs.
+The adapter validates every word against active reference speech, caps
+per-recording and corpus totals, and never imports lexical text.
+
+The generated `public-diarization-corpus-bundle-v2` contains the path-free
 manifest, canonical reference documents, media/annotation/reference SHA-256
-values, checked WAV geometry, and a passing self-hashed leakage audit. It never
-contains local paths, URIs, transcripts, or media bytes. The output is created
-once in a directory outside both the checkout and input root; source media is
-never copied. The path-bearing descriptor type is deserialization-only and has
-no `Debug` or serialization implementation.
+values, optional word-annotation SHA-256 values and counts, checked WAV
+geometry, and a passing self-hashed leakage audit. It never contains local
+paths, URIs, transcripts, or media bytes. The output is created once in a
+directory outside both the checkout and input root; source media is never
+copied. The path-bearing descriptor type is deserialization-only and has no
+`Debug` or serialization implementation.
+
+The current ablation evidence is
+`public-diarization-acoustic-ablation-v8` with runner v8. Every split reports
+the full count confusion matrix, exact/error quantiles, reference-count and
+duration strata, posterior calibration summaries, collapse/occupancy
+diagnostics, and optional micro/macro WDER. These additions do not promote a
+candidate: the historical v7 development result in section 4.4 remains the
+last retained verdict until a hash-locked v8 development run passes.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an
