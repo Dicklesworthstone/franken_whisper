@@ -4812,6 +4812,7 @@ fn unknown_diarization_report(
         speaker_queries: Vec::new(),
         speaker_count: SpeakerCountOutcome {
             request: speaker_count.clone(),
+            estimate: None,
             status,
             supported_speaker_count: 0,
             active_speaker_refs: Vec::new(),
@@ -4992,6 +4993,7 @@ fn external_diarization_report(
         speaker_queries: Vec::new(),
         speaker_count: SpeakerCountOutcome {
             request: speaker_count.clone(),
+            estimate: None,
             status,
             supported_speaker_count: detected_speakers,
             active_speaker_refs: profile_totals.keys().cloned().collect(),
@@ -9128,6 +9130,7 @@ mod tests {
             speaker_queries: Vec::new(),
             speaker_count: SpeakerCountOutcome {
                 request: SpeakerCountRequest::Infer,
+                estimate: None,
                 status: SpeakerCountOutcomeStatus::Resolved,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["speaker_a".to_owned()],

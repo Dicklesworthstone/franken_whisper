@@ -3739,6 +3739,7 @@ mod tests {
             }],
             speaker_count: SpeakerCountOutcome {
                 request: SpeakerCountRequest::HardConstraint { count: 1 },
+                estimate: None,
                 status: SpeakerCountOutcomeStatus::Satisfied,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["near".to_owned()],
