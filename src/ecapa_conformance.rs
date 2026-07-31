@@ -1151,6 +1151,16 @@ mod tests {
         assert_eq!(tensors[0].name, "blocks.0.conv.conv.weight");
         assert_eq!(tensors[0].shape, vec![1_024, 80, 5]);
         assert_eq!(tensors[60].name, "blocks.1.se_block.conv1.conv.weight");
+        assert!(
+            tensors
+                .iter()
+                .any(|tensor| tensor.name == "asp.conv.conv.weight")
+        );
+        assert!(
+            tensors
+                .iter()
+                .all(|tensor| tensor.name != "asp.conv.conv.conv.weight")
+        );
         assert_eq!(
             tensors.last().map(|tensor| tensor.name.as_str()),
             Some("fc.conv.bias")
