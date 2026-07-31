@@ -35,6 +35,13 @@
 //! fresh process for each engine and parent-observed wall includes process
 //! startup, model and audio I/O, inference, output serialization/formatting, and
 //! teardown. The franken arm re-executes this same ELF in a hidden worker mode.
+//! With `FW_INPUT_MODE=codec`, that wall starts from the original compressed
+//! input: franken uses its in-process Symphonia normalizer, while the incumbent
+//! uses an independently attested `ffmpeg` process before `whisper-cli`. The
+//! worker is given a deliberately nonexistent ffmpeg path, so an unsupported
+//! input fails rather than silently converting the purported built-in arm into
+//! another ffmpeg arm. The two normalized WAVs and their hashes/frame counts are
+//! retained under one caller-supplied evidence directory.
 //!
 //! ## Statistic and gate
 //!
@@ -111,13 +118,17 @@
 //! ## Usage
 //!
 //! ```text
-//! incumbent_ab <model_short> <wav> [rounds] [no_ts|ts|word_ts]
+//! incumbent_ab <model_short> <audio> [rounds] [no_ts|ts|word_ts]
 //! FW_INCUMBENT_BIN=/path/to/whisper-cli   (default: legacy_whispercpp/.../whisper-cli)
 //! FW_INCUMBENT_THREADS=27                 (screen the host and use its best setting)
 //! FW_BENCH_SCOPE=whole_job                 (fresh-process end-to-end jobs)
 //! FW_BENCH_THREADS=64                      (same requested count for both arms)
 //! FW_WORKLOAD_NAME=meeting-text-only       (ledger-facing workload identity)
 //! FW_WORD_TS_ARTIFACT_DIR=/retained/path   (required for word_ts; never overwritten)
+//! FW_INPUT_MODE=codec                      (compressed-input normalization + ASR)
+//! FW_CODEC_ARTIFACT_DIR=/retained/path     (fresh root for both normalized WAVs)
+//! FW_CODEC_REFERENCE_WAV=/path/reference   (duration/frame provenance; not timed)
+//! FRANKEN_WHISPER_FFMPEG_BIN=/path/ffmpeg  (incumbent normalizer)
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -128,6 +139,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use franken_whisper::audio::normalize_to_wav;
 use franken_whisper::conformance::word_error_rate;
 use franken_whisper::native_engine::decode::{
     DecodeParams, DecodeWorkStats, LoadedModel, transcribe_samples,
@@ -152,6 +164,7 @@ const MAX_LOAD_SPLIT_GAP: f64 = 0.1;
 const MAX_CROSS_ENGINE_WER: f64 = 0.1;
 const MIN_WORD_TIMING_ALIGNMENT_COVERAGE: f64 = 0.90;
 const MAX_WORD_TIMING_P95_DELTA_MS: u64 = 750;
+const MAX_NORMALIZED_FRAME_DELTA: usize = 320;
 const MAX_EXTERNAL_CPU_CORE_FRACTION: f64 = 0.1;
 const HOST_CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
 const MAX_HOST_CPU_BUSY_FRACTION: f64 = 0.20;
@@ -228,6 +241,43 @@ impl TimestampMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputMode {
+    NormalizedWav,
+    Codec,
+}
+
+impl InputMode {
+    fn from_env() -> Self {
+        match std::env::var("FW_INPUT_MODE").as_deref() {
+            Ok("codec") => Self::Codec,
+            Ok("normalized_wav") | Err(_) => Self::NormalizedWav,
+            Ok(other) => {
+                panic!("unsupported FW_INPUT_MODE={other:?}; use normalized_wav or codec")
+            }
+        }
+    }
+
+    fn from_arg(value: &str) -> Self {
+        match value {
+            "normalized_wav" => Self::NormalizedWav,
+            "codec" => Self::Codec,
+            other => panic!("unsupported worker input mode {other:?}"),
+        }
+    }
+
+    const fn as_arg(self) -> &'static str {
+        match self {
+            Self::NormalizedWav => "normalized_wav",
+            Self::Codec => "codec",
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        self.as_arg()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TimedWord {
     text: String,
@@ -245,6 +295,12 @@ struct Observation {
     transcript_sha256: String,
     timed_words: Vec<TimedWord>,
     timed_words_sha256: String,
+    normalization_ms: Option<f64>,
+    normalized_audio_sha256: Option<String>,
+    normalized_frames: Option<usize>,
+    normalizer_exe_sha256: Option<String>,
+    normalizer_observed_active_threads: usize,
+    normalizer_peak_process_threads: usize,
     actual_threads: usize,
     observed_active_threads: usize,
     peak_process_threads: usize,
@@ -548,8 +604,8 @@ impl ExternalCpuActivity {
 }
 
 /// Read a PCM16 WAV into mono f32. Mirrors `e2e_probe`'s reader.
-fn read_wav_mono16k(path: &str) -> Vec<f32> {
-    let bytes = std::fs::read(path).expect("read wav");
+fn read_wav_mono16k(path: impl AsRef<Path>) -> Vec<f32> {
+    let bytes = std::fs::read(path.as_ref()).expect("read wav");
     assert_eq!(&bytes[0..4], b"RIFF", "not a RIFF file");
     assert_eq!(&bytes[8..12], b"WAVE", "not a WAVE file");
     let mut pos = 12;
@@ -1896,6 +1952,80 @@ fn next_word_timestamp_output_prefix() -> PathBuf {
     prefix
 }
 
+#[derive(Clone, Debug)]
+struct CodecWorkDirs {
+    franken: PathBuf,
+    incumbent: PathBuf,
+}
+
+fn prepare_codec_work_dirs() -> CodecWorkDirs {
+    let root = std::env::var_os("FW_CODEC_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .expect("codec input mode requires a fresh FW_CODEC_ARTIFACT_DIR");
+    let franken = root.join("franken");
+    let incumbent = root.join("incumbent");
+    for path in [&franken, &incumbent] {
+        assert!(
+            !path.exists(),
+            "refusing to reuse codec evidence directory {}",
+            path.display()
+        );
+        std::fs::create_dir_all(path).unwrap_or_else(|error| {
+            panic!(
+                "create codec evidence directory {}: {error}",
+                path.display()
+            )
+        });
+    }
+    CodecWorkDirs { franken, incumbent }
+}
+
+fn ffmpeg_normalization_args(input: &Path, output: &Path) -> Vec<String> {
+    vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-y".to_owned(),
+        "-i".to_owned(),
+        input.display().to_string(),
+        "-vn".to_owned(),
+        "-ar".to_owned(),
+        "16000".to_owned(),
+        "-ac".to_owned(),
+        "1".to_owned(),
+        "-c:a".to_owned(),
+        "pcm_s16le".to_owned(),
+        output.display().to_string(),
+    ]
+}
+
+fn run_incumbent_normalizer(
+    input: &Path,
+    work_dir: &Path,
+    observe_threads: bool,
+) -> (PathBuf, f64, ChildThreadProbe) {
+    let output = work_dir.join("normalized_16k_mono.wav");
+    let ffmpeg = std::env::var_os("FRANKEN_WHISPER_FFMPEG_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let mut command = Command::new(&ffmpeg);
+    command.args(ffmpeg_normalization_args(input, &output));
+    let (result, wall_ms, probe) = run_command(&mut command, observe_threads);
+    assert!(
+        result.status.success(),
+        "ffmpeg normalizer {} exited with {}: {}",
+        ffmpeg.display(),
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        output.is_file(),
+        "ffmpeg normalizer emitted no WAV at {}",
+        output.display()
+    );
+    (output, wall_ms, probe)
+}
+
 /// One `whisper.cpp` run.
 ///
 /// `transcribe_only` measures the incumbent's self-reported `total − load`.
@@ -1905,18 +2035,30 @@ fn run_incumbent(
     bin: &Path,
     model: &Path,
     model_short: &str,
-    wav: &str,
+    input: &str,
+    input_mode: InputMode,
+    codec_work_dir: Option<&Path>,
     threads: usize,
     timestamp_mode: TimestampMode,
     scope: BenchScope,
     observe_threads: bool,
     decode: &MatchedDecode,
 ) -> Observation {
+    let job_started = Instant::now();
+    let (wav, normalization_ms, normalizer_probe) = match input_mode {
+        InputMode::NormalizedWav => (PathBuf::from(input), None, ChildThreadProbe::default()),
+        InputMode::Codec => {
+            let work_dir = codec_work_dir.expect("codec incumbent work directory");
+            let (wav, wall_ms, probe) =
+                run_incumbent_normalizer(Path::new(input), work_dir, observe_threads);
+            (wav, Some(wall_ms), probe)
+        }
+    };
     let mut args: Vec<String> = vec![
         "-m".into(),
         model.display().to_string(),
         "-f".into(),
-        wav.into(),
+        wav.display().to_string(),
         "-t".into(),
         threads.to_string(),
     ];
@@ -1945,7 +2087,9 @@ fn run_incumbent(
     });
     let mut command = Command::new(bin);
     command.args(&args);
-    let (output, process_wall_ms, thread_probe) = run_command(&mut command, observe_threads);
+    let (output, whisper_process_wall_ms, thread_probe) =
+        run_command(&mut command, observe_threads);
+    let whole_job_wall_ms = job_started.elapsed().as_secs_f64() * 1e3;
     assert!(
         output.status.success(),
         "whisper-cli exited with {}",
@@ -1989,10 +2133,20 @@ fn run_incumbent(
         incumbent_timed_words(&value)
     });
     let timed_words_sha256 = timed_words_sha256(&timed_words);
+    let normalized_samples = (input_mode == InputMode::Codec).then(|| read_wav_mono16k(&wav));
+    let normalizer_observed_active_threads = normalizer_probe.observed_active_threads();
+    let normalizer_peak_process_threads = normalizer_probe.peak_process_threads;
+    let normalizer_exe_sha256 = normalizer_probe.exe_sha256;
     Observation {
         measured_ms: match scope {
             BenchScope::TranscribeOnly => total - load,
-            BenchScope::WholeJob => process_wall_ms,
+            BenchScope::WholeJob => {
+                if input_mode == InputMode::Codec {
+                    whole_job_wall_ms
+                } else {
+                    whisper_process_wall_ms
+                }
+            }
         },
         chars,
         words,
@@ -2001,6 +2155,12 @@ fn run_incumbent(
         transcript_sha256,
         timed_words,
         timed_words_sha256,
+        normalization_ms,
+        normalized_audio_sha256: normalized_samples.as_ref().map(|_| sha256_file(&wav)),
+        normalized_frames: normalized_samples.as_ref().map(Vec::len),
+        normalizer_exe_sha256,
+        normalizer_observed_active_threads,
+        normalizer_peak_process_threads,
         actual_threads: incumbent_actual_threads(&text).unwrap_or(0),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
@@ -2038,6 +2198,12 @@ fn run_franken_resident(
         transcript,
         timed_words,
         timed_words_sha256,
+        normalization_ms: None,
+        normalized_audio_sha256: None,
+        normalized_frames: None,
+        normalizer_exe_sha256: None,
+        normalizer_observed_active_threads: 0,
+        normalizer_peak_process_threads: 0,
         actual_threads: rayon::current_num_threads(),
         observed_active_threads: 0,
         peak_process_threads: 0,
@@ -2053,7 +2219,9 @@ fn run_franken_resident(
 fn run_franken_whole(
     model: &Path,
     model_short: &str,
-    wav: &str,
+    input: &str,
+    input_mode: InputMode,
+    codec_work_dir: Option<&Path>,
     threads: usize,
     timestamp_mode: TimestampMode,
     observe_threads: bool,
@@ -2064,11 +2232,31 @@ fn run_franken_whole(
         .arg("--franken-worker")
         .arg(model)
         .arg(model_short)
-        .arg(wav)
+        .arg(input)
+        .arg(input_mode.as_arg())
+        .arg(
+            codec_work_dir
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        )
         .arg(timestamp_mode.as_arg())
         .arg(threads.to_string())
         .env("RAYON_NUM_THREADS", threads.to_string())
         .env("FW_LOAD_WORKERS", threads.to_string());
+    if input_mode == InputMode::Codec {
+        let work_dir = codec_work_dir.expect("codec franken work directory");
+        let missing_ffmpeg = work_dir.join(".builtin_only_no_ffmpeg");
+        assert!(
+            !missing_ffmpeg.exists(),
+            "builtin-only ffmpeg sentinel unexpectedly exists at {}",
+            missing_ffmpeg.display()
+        );
+        command
+            .env("FRANKEN_WHISPER_FFMPEG_BIN", missing_ffmpeg)
+            .env("FRANKEN_WHISPER_AUTO_PROVISION_FFMPEG", "0")
+            .env("FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE", "0")
+            .env("FRANKEN_WHISPER_WAV_PASSTHROUGH", "0");
+    }
     let (output, process_wall_ms, thread_probe) = run_command(&mut command, observe_threads);
     assert!(
         output.status.success(),
@@ -2122,6 +2310,26 @@ fn run_franken_whole(
                 .expect("franken worker timed word missing end_ms"),
         })
         .collect();
+    let normalization_ms = value["normalization_ms"].as_f64();
+    let normalized_wav = (input_mode == InputMode::Codec).then(|| {
+        codec_work_dir
+            .expect("codec franken work directory")
+            .join("normalized_16k_mono.wav")
+    });
+    let normalized_audio_sha256 = normalized_wav.as_ref().map(|path| sha256_file(path));
+    let normalized_frames = normalized_wav
+        .as_ref()
+        .map(|path| read_wav_mono16k(path).len());
+    let worker_normalized_frames = value["normalized_frames"]
+        .as_u64()
+        .map(|frames| frames as usize);
+    assert_eq!(
+        normalized_frames, worker_normalized_frames,
+        "parent and measured worker disagree on normalized frame count"
+    );
+    let normalizer_exe_sha256 = (input_mode == InputMode::Codec)
+        .then(|| thread_probe.exe_sha256.clone())
+        .flatten();
     Observation {
         measured_ms: process_wall_ms,
         chars: field_u64("chars"),
@@ -2137,6 +2345,18 @@ fn run_franken_whole(
             .expect("franken worker result missing timed_words_sha256")
             .to_owned(),
         timed_words,
+        normalization_ms,
+        normalized_audio_sha256,
+        normalized_frames,
+        normalizer_exe_sha256,
+        // Native normalization runs in this same observed worker process, so
+        // the job-level active/peak census is also the normalizer census.
+        normalizer_observed_active_threads: (input_mode == InputMode::Codec)
+            .then(|| thread_probe.observed_active_threads())
+            .unwrap_or(0),
+        normalizer_peak_process_threads: (input_mode == InputMode::Codec)
+            .then_some(thread_probe.peak_process_threads)
+            .unwrap_or(0),
         actual_threads: field_u64("actual_threads"),
         observed_active_threads: thread_probe.observed_active_threads(),
         peak_process_threads: thread_probe.peak_process_threads,
@@ -2148,14 +2368,30 @@ fn run_franken_whole(
 fn franken_worker_main(args: &[String]) {
     let model_path = Path::new(args.get(2).expect("worker model path"));
     let model_short = args.get(3).expect("worker model short name");
-    let wav = args.get(4).expect("worker wav");
-    let timestamp_mode = TimestampMode::from_arg(args.get(5).map(String::as_str));
+    let input = args.get(4).expect("worker input");
+    let input_mode = InputMode::from_arg(args.get(5).expect("worker input mode"));
+    let codec_work_dir = args.get(6).expect("worker codec work directory");
+    let timestamp_mode = TimestampMode::from_arg(args.get(7).map(String::as_str));
     let threads: usize = args
-        .get(6)
+        .get(8)
         .and_then(|value| value.parse().ok())
         .expect("worker threads");
 
-    let samples = read_wav_mono16k(wav);
+    let (wav, normalization_ms) = match input_mode {
+        InputMode::NormalizedWav => (PathBuf::from(input), None),
+        InputMode::Codec => {
+            assert_ne!(
+                codec_work_dir, "-",
+                "codec worker requires a work directory"
+            );
+            let started = Instant::now();
+            let wav = normalize_to_wav(Path::new(input), Path::new(codec_work_dir))
+                .expect("native codec normalization");
+            (wav, Some(started.elapsed().as_secs_f64() * 1e3))
+        }
+    };
+    let samples = read_wav_mono16k(&wav);
+    let normalized_frames = (input_mode == InputMode::Codec).then_some(samples.len());
     let model = GgmlModel::load(model_path)
         .and_then(LoadedModel::from_ggml)
         .expect("worker load model");
@@ -2220,6 +2456,8 @@ fn franken_worker_main(args: &[String]) {
             "transcript_sha256": sha256_bytes(transcript.as_bytes()),
             "timed_words_sha256": timed_words_sha256(&timed_words),
             "timed_words": timed_words_json,
+            "normalization_ms": normalization_ms,
+            "normalized_frames": normalized_frames,
             "serialized_segments_sha256": sha256_bytes(&serialized_segments),
             "transcript": transcript,
             "actual_threads": rayon::current_num_threads(),
@@ -2276,10 +2514,20 @@ fn main() {
         "rounds must be odd and >= 3"
     );
     let scope = BenchScope::from_env();
+    let input_mode = InputMode::from_env();
     assert!(
         !timestamp_mode.word_timestamps() || scope == BenchScope::WholeJob,
         "word_ts requires FW_BENCH_SCOPE=whole_job so both arms include output serialization"
     );
+    assert!(
+        input_mode != InputMode::Codec || scope == BenchScope::WholeJob,
+        "codec input mode requires FW_BENCH_SCOPE=whole_job"
+    );
+    assert!(
+        input_mode != InputMode::Codec || timestamp_mode == TimestampMode::None,
+        "codec input mode currently certifies the text-only whole-job cell"
+    );
+    let codec_work_dirs = (input_mode == InputMode::Codec).then(prepare_codec_work_dirs);
     let workload = std::env::var("FW_WORKLOAD_NAME").unwrap_or_else(|_| {
         format!(
             "{model_short}-{}",
@@ -2310,7 +2558,14 @@ fn main() {
 
     let model_path = find_model_file(model_short)
         .unwrap_or_else(|| panic!("model {model_short} not found in search dirs"));
-    let samples = read_wav_mono16k(&wav);
+    let reference_wav = if input_mode == InputMode::Codec {
+        std::env::var("FW_CODEC_REFERENCE_WAV")
+            .map(PathBuf::from)
+            .expect("codec input mode requires FW_CODEC_REFERENCE_WAV")
+    } else {
+        PathBuf::from(&wav)
+    };
+    let samples = read_wav_mono16k(&reference_wav);
 
     // The version contract is loaded before anything is measured, and it drives
     // BOTH arms' decoding parameters. A matched-params claim asserted at two
@@ -2367,6 +2622,8 @@ fn main() {
             &model_path,
             model_short,
             &wav,
+            input_mode,
+            codec_work_dirs.as_ref().map(|dirs| dirs.franken.as_path()),
             threads,
             timestamp_mode,
             false,
@@ -2383,6 +2640,8 @@ fn main() {
             &model_path,
             model_short,
             &wav,
+            input_mode,
+            codec_work_dirs.as_ref().map(|dirs| dirs.franken.as_path()),
             threads,
             timestamp_mode,
             true,
@@ -2394,6 +2653,10 @@ fn main() {
             &model_path,
             model_short,
             &wav,
+            input_mode,
+            codec_work_dirs
+                .as_ref()
+                .map(|dirs| dirs.incumbent.as_path()),
             threads,
             timestamp_mode,
             scope,
@@ -2407,6 +2670,10 @@ fn main() {
             &model_path,
             model_short,
             &wav,
+            input_mode,
+            codec_work_dirs
+                .as_ref()
+                .map(|dirs| dirs.incumbent.as_path()),
             threads,
             timestamp_mode,
             scope,
@@ -2427,6 +2694,13 @@ fn main() {
         model_path.display()
     );
     println!("audio_sha256={} {}", sha256_file(Path::new(&wav)), wav);
+    if input_mode == InputMode::Codec {
+        println!(
+            "codec_reference_wav_sha256={} {}",
+            sha256_file(&reference_wav),
+            reference_wav.display()
+        );
+    }
 
     // Version contract. The incumbent is a pinned version, not "whatever binary
     // was at that path today": source digests plus the declared project version
@@ -2480,9 +2754,12 @@ fn main() {
     );
     println!(
         "INCUMBENT_AB_CONFIG workload={workload:?} rounds={rounds} order=alternating \
-         wav={wav} audio_sec={:.1} requested_threads={threads} \
+         input={wav} input_mode={} reference_wav={} audio_sec={:.1} \
+         requested_threads={threads} \
          timestamp_mode={} timestamps={} word_timestamps={} \
          scope={} measured={}",
+        input_mode.as_str(),
+        reference_wav.display(),
         samples.len() as f64 / 16000.0,
         timestamp_mode.as_str(),
         timestamp_mode.timestamps(),
@@ -2547,7 +2824,13 @@ fn main() {
         _ => false,
     };
     let contract_binary_clear = contract.binary_matches(incumbent_exe.as_deref());
-    let identity_clear = distinct_binaries && contract_binary_clear && source_clear;
+    let normalizer_identity_clear = input_mode != InputMode::Codec
+        || (fw_warm.normalizer_exe_sha256 == franken_exe
+            && wc_warm.normalizer_exe_sha256.is_some()
+            && wc_warm.normalizer_exe_sha256 != incumbent_exe
+            && wc_warm.normalizer_exe_sha256 != franken_exe);
+    let identity_clear =
+        distinct_binaries && contract_binary_clear && source_clear && normalizer_identity_clear;
     // Builder identity, per the fleet local-perf-binary policy: `rch exec` has no
     // artifact-retrieval mechanism, so a release-perf harness is built on a remote
     // worker and copied back. A digest alone does not say which machine produced
@@ -2560,6 +2843,7 @@ fn main() {
          harness_builder={harness_builder} \
          distinct_binaries={distinct_binaries} \
          contract_binary_clear={contract_binary_clear} source_clear={source_clear} \
+         normalizer_identity_clear={normalizer_identity_clear} \
          identity_clear={identity_clear}",
         franken_exe.as_deref().unwrap_or("unattested"),
         incumbent_exe.as_deref().unwrap_or("unattested"),
@@ -2567,6 +2851,32 @@ fn main() {
             BenchScope::TranscribeOnly => "proc_self_exe_in_process",
             BenchScope::WholeJob => "proc_pid_exe_of_worker",
         },
+    );
+    println!(
+        "INCUMBENT_AB_NORMALIZER_IDENTITY input_mode={} \
+         franken_normalizer={} franken_normalizer_exe_sha256={} \
+         incumbent_normalizer={} incumbent_normalizer_exe_sha256={} \
+         attestation=proc_exe_of_running_process \
+         normalizer_identity_clear={normalizer_identity_clear}",
+        input_mode.as_str(),
+        if input_mode == InputMode::Codec {
+            "builtin_symphonia_in_process"
+        } else {
+            "not_applicable"
+        },
+        fw_warm
+            .normalizer_exe_sha256
+            .as_deref()
+            .unwrap_or("not_applicable"),
+        if input_mode == InputMode::Codec {
+            "ffmpeg_subprocess"
+        } else {
+            "not_applicable"
+        },
+        wc_warm
+            .normalizer_exe_sha256
+            .as_deref()
+            .unwrap_or("not_applicable"),
     );
 
     let wer = word_error_rate(&wc_warm.transcript, &fw_warm.transcript);
@@ -2604,11 +2914,80 @@ fn main() {
              word_timing_clear=true"
         );
     }
+    let normalized_frame_delta = match (fw_warm.normalized_frames, wc_warm.normalized_frames) {
+        (Some(franken), Some(incumbent)) => franken.abs_diff(incumbent),
+        _ => 0,
+    };
+    let franken_reference_frame_delta = fw_warm
+        .normalized_frames
+        .map(|frames| frames.abs_diff(samples.len()))
+        .unwrap_or(0);
+    let incumbent_reference_frame_delta = wc_warm
+        .normalized_frames
+        .map(|frames| frames.abs_diff(samples.len()))
+        .unwrap_or(0);
+    let normalization_clear = input_mode != InputMode::Codec
+        || (fw_warm.normalized_audio_sha256.is_some()
+            && wc_warm.normalized_audio_sha256.is_some()
+            && fw_warm.normalized_frames.is_some()
+            && wc_warm.normalized_frames.is_some()
+            && normalized_frame_delta <= MAX_NORMALIZED_FRAME_DELTA
+            && franken_reference_frame_delta <= MAX_NORMALIZED_FRAME_DELTA
+            && incumbent_reference_frame_delta <= MAX_NORMALIZED_FRAME_DELTA);
+    println!(
+        "INCUMBENT_AB_NORMALIZATION input_mode={} \
+         franken_normalizer_ms={} incumbent_normalizer_ms={} \
+         franken_frames={} incumbent_frames={} frame_delta={} \
+         reference_frames={} franken_reference_frame_delta={} \
+         incumbent_reference_frame_delta={} \
+         max_frame_delta={MAX_NORMALIZED_FRAME_DELTA} \
+         franken_wav_sha256={} incumbent_wav_sha256={} exact_wav_match={} \
+         franken_fallback_policy=fail_closed_missing_ffmpeg \
+         normalization_clear={normalization_clear}",
+        input_mode.as_str(),
+        fw_warm
+            .normalization_ms
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "not_applicable".to_owned()),
+        wc_warm
+            .normalization_ms
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "not_applicable".to_owned()),
+        fw_warm
+            .normalized_frames
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "not_applicable".to_owned()),
+        wc_warm
+            .normalized_frames
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "not_applicable".to_owned()),
+        normalized_frame_delta,
+        samples.len(),
+        franken_reference_frame_delta,
+        incumbent_reference_frame_delta,
+        fw_warm
+            .normalized_audio_sha256
+            .as_deref()
+            .unwrap_or("not_applicable"),
+        wc_warm
+            .normalized_audio_sha256
+            .as_deref()
+            .unwrap_or("not_applicable"),
+        fw_warm.normalized_audio_sha256.is_some()
+            && fw_warm.normalized_audio_sha256 == wc_warm.normalized_audio_sha256,
+    );
     let configured_thread_clear = !enforce_matched_threads
         || (fw_warm.actual_threads == threads && wc_warm.actual_threads == threads);
     let observed_thread_clear = scope != BenchScope::WholeJob
         || (fw_warm.observed_active_threads > 0 && wc_warm.observed_active_threads > 0);
-    let thread_clear = configured_thread_clear && observed_thread_clear;
+    let normalizer_thread_clear = input_mode != InputMode::Codec
+        || (fw_warm.normalizer_observed_active_threads > 0
+            && wc_warm.normalizer_observed_active_threads > 0
+            && fw_warm.normalizer_observed_active_threads
+                <= fw_warm.normalizer_peak_process_threads
+            && wc_warm.normalizer_observed_active_threads
+                <= wc_warm.normalizer_peak_process_threads);
+    let thread_clear = configured_thread_clear && observed_thread_clear && normalizer_thread_clear;
     println!(
         "INCUMBENT_AB_COVERAGE fw_chars={} wc_chars={} fw_words={} wc_words={} \
          fw_segments={} wc_segments={} fw_text_sha256={} wc_text_sha256={} \
@@ -2628,16 +3007,23 @@ fn main() {
         "INCUMBENT_AB_THREADS requested={threads} franken_configured={} \
          incumbent_configured={} franken_observed_active={} incumbent_observed_active={} \
          franken_peak_process={} incumbent_peak_process={} \
+         franken_normalizer_observed_active={} incumbent_normalizer_observed_active={} \
+         franken_normalizer_peak_process={} incumbent_normalizer_peak_process={} \
          observed_source=proc_task_cpu_ticks franken_load_workers_config={} \
          affinity={} cpuset_effective={} enforce_matched={enforce_matched_threads} \
          configured_thread_clear={configured_thread_clear} \
-         observed_thread_clear={observed_thread_clear} thread_clear={thread_clear}",
+         observed_thread_clear={observed_thread_clear} \
+         normalizer_thread_clear={normalizer_thread_clear} thread_clear={thread_clear}",
         fw_warm.actual_threads,
         wc_warm.actual_threads,
         fw_warm.observed_active_threads,
         wc_warm.observed_active_threads,
         fw_warm.peak_process_threads,
         wc_warm.peak_process_threads,
+        fw_warm.normalizer_observed_active_threads,
+        wc_warm.normalizer_observed_active_threads,
+        fw_warm.normalizer_peak_process_threads,
+        wc_warm.normalizer_peak_process_threads,
         if scope == BenchScope::WholeJob {
             threads.to_string()
         } else {
@@ -2710,6 +3096,14 @@ fn main() {
             "franken word timings changed within one invocation"
         );
         assert_eq!(
+            observation.normalized_audio_sha256, fw_warm.normalized_audio_sha256,
+            "franken normalized audio changed within one invocation"
+        );
+        assert_eq!(
+            observation.normalized_frames, fw_warm.normalized_frames,
+            "franken normalized frame count changed within one invocation"
+        );
+        assert_eq!(
             observation.actual_threads, fw_warm.actual_threads,
             "franken configured thread count changed within one invocation"
         );
@@ -2728,6 +3122,14 @@ fn main() {
         assert_eq!(
             observation.timed_words_sha256, wc_warm.timed_words_sha256,
             "whisper.cpp word timings changed within one invocation"
+        );
+        assert_eq!(
+            observation.normalized_audio_sha256, wc_warm.normalized_audio_sha256,
+            "ffmpeg normalized audio changed within one invocation"
+        );
+        assert_eq!(
+            observation.normalized_frames, wc_warm.normalized_frames,
+            "ffmpeg normalized frame count changed within one invocation"
         );
         assert_eq!(
             observation.actual_threads, wc_warm.actual_threads,
@@ -2879,6 +3281,7 @@ fn main() {
     let load_split_clear = load_split_gap <= MAX_LOAD_SPLIT_GAP;
     let prerequisite_gates_clear = quality_clear
         && word_timing_clear
+        && normalization_clear
         && thread_clear
         && load_split_clear
         && external_host_clear
@@ -2899,7 +3302,7 @@ fn main() {
          compare_median={:.6} compare_ci95=[{:.6},{:.6}] \
          load_split_gap={load_split_gap:.6} load_split_max={MAX_LOAD_SPLIT_GAP:.6} \
          load_split_clear={load_split_clear} quality_clear={quality_clear} \
-         word_timing_clear={word_timing_clear} \
+         word_timing_clear={word_timing_clear} normalization_clear={normalization_clear} \
          thread_clear={thread_clear} external_host_clear={external_host_clear} \
          host_wide_clear={host_wide_clear} \
          host_quiescence_threshold={MAX_HOST_CPU_BUSY_FRACTION:.6} \
@@ -3550,6 +3953,38 @@ mod tests {
                 .word_timestamps
         );
         assert_eq!(incumbent_dtw_preset("large-v3-turbo"), "large.v3.turbo");
+    }
+
+    #[test]
+    fn input_mode_round_trips_worker_arguments() {
+        for mode in [InputMode::NormalizedWav, InputMode::Codec] {
+            assert_eq!(InputMode::from_arg(mode.as_arg()), mode);
+            assert_eq!(mode.as_str(), mode.as_arg());
+        }
+    }
+
+    #[test]
+    fn ffmpeg_normalization_args_pin_the_matched_audio_format() {
+        let args = ffmpeg_normalization_args(Path::new("source.mp3"), Path::new("normalized.wav"));
+        assert_eq!(
+            args,
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                "source.mp3",
+                "-vn",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                "normalized.wav",
+            ]
+        );
     }
 
     #[test]
