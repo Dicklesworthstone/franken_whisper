@@ -761,7 +761,14 @@ pub fn ecapa_frontend_conformance(samples: &[f32]) -> FwResult<EcapaFrontendOutp
         *value = value.max(floor);
     }
     let mut means = [0.0f64; ECAPA_MEL_BANDS];
-    for frame in log_fbank_db.chunks_exact(ECAPA_MEL_BANDS) {
+    let (frames, remainder) = log_fbank_db.as_chunks::<ECAPA_MEL_BANDS>();
+    if !remainder.is_empty() {
+        return Err(ecapa_error(
+            "frontend_size",
+            "frontend output is not frame aligned",
+        ));
+    }
+    for frame in frames {
         for (mean, value) in means.iter_mut().zip(frame) {
             *mean += f64::from(*value);
         }
