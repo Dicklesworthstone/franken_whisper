@@ -2028,11 +2028,8 @@ fn score_speaker_occupancy(
         .map(|speaker| (speaker, 0.0_f64))
         .collect::<BTreeMap<_, _>>();
     let mut unknown_speaker_time_sec = 0.0;
-    let mut reference_speaker_time_sec = 0.0;
-
     for atom in atoms.iter().filter(|atom| !atom.excluded) {
         let duration = atom.duration_sec();
-        reference_speaker_time_sec += duration * atom.reference.len() as f64;
         for reference_speaker in &atom.reference {
             if let Some(total) = reference_duration.get_mut(reference_speaker) {
                 *total += duration;
@@ -2070,7 +2067,7 @@ fn score_speaker_occupancy(
                 mapped_reference_speaker: mapping.get(speaker).cloned(),
                 voiced_duration_sec: duration,
                 labeled_share,
-                recurrence_episode_count: recurrence_episode_count(&hypothesis.turns, speaker),
+                recurrence_episode_count: recurrence_episode_count(atoms, speaker),
                 effective: duration + SCORE_EPSILON_SEC >= minimum_effective_occupancy_sec,
             }
         })
@@ -2111,11 +2108,14 @@ fn score_speaker_occupancy(
         labeled_speaker_time_sec,
         unknown_speaker_time_sec,
         dominant_speaker_share,
-        unknown_speaker_share: ratio_or_none(unknown_speaker_time_sec, reference_speaker_time_sec),
+        unknown_speaker_share: ratio_or_none(
+            unknown_speaker_time_sec,
+            labeled_speaker_time_sec + unknown_speaker_time_sec,
+        ),
         effective_speaker_count: speakers.iter().filter(|speaker| speaker.effective).count(),
         phantom_speaker_count: speakers
             .iter()
-            .filter(|speaker| speaker.mapped_reference_speaker.is_none())
+            .filter(|speaker| speaker.effective && speaker.mapped_reference_speaker.is_none())
             .count(),
         collapsed_reference_speaker_count,
         minority_reference_recall,
@@ -2125,22 +2125,19 @@ fn score_speaker_occupancy(
     }
 }
 
-fn recurrence_episode_count(turns: &[EvaluationTurn], speaker: &str) -> u64 {
-    let mut intervals = turns
-        .iter()
-        .filter(|turn| turn.speaker.as_deref() == Some(speaker))
-        .map(|turn| (turn.start_ms, turn.end_ms))
-        .collect::<Vec<_>>();
-    intervals.sort_unstable();
+fn recurrence_episode_count(atoms: &[EvaluationAtomicInterval], speaker: &str) -> u64 {
     let mut episodes = 0_u64;
-    let mut current_end = None::<u64>;
-    for (start_ms, end_ms) in intervals {
-        if current_end.is_none_or(|current_end| start_ms > current_end) {
+    let mut previously_active = false;
+    for atom in atoms {
+        let active = !atom.excluded
+            && atom
+                .hypothesis
+                .iter()
+                .any(|state| state.speaker.as_deref() == Some(speaker));
+        if active && !previously_active {
             episodes = episodes.saturating_add(1);
-            current_end = Some(end_ms);
-        } else if current_end.is_some_and(|current_end| end_ms > current_end) {
-            current_end = Some(end_ms);
         }
+        previously_active = active;
     }
     episodes
 }
