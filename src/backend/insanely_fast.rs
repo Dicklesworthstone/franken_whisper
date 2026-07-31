@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_only_when_diarize() {
+    fn hard_speaker_count_only_when_diarize() {
         let mut request = minimal_request();
         set_speaker_count(
             &mut request,
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_speaker_constraints_only_emits_set_fields() {
+    fn partial_speaker_count_range_emits_both_bounds() {
         let mut request = minimal_request();
         request.diarize = true;
         set_speaker_count(
@@ -501,6 +501,24 @@ mod tests {
         assert!(!has_flag(&args, "--num-speakers"));
         assert_eq!(arg_value(&args, "--min-speakers"), Some("2"));
         assert_eq!(arg_value(&args, "--max-speakers"), Some("64"));
+    }
+
+    #[test]
+    fn calibrated_speaker_count_prior_is_rejected_before_subprocess_execution() {
+        let mut request = minimal_request();
+        request.diarize = true;
+        set_speaker_count(
+            &mut request,
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        );
+        let error = super::validate_external_speaker_count(&request)
+            .expect_err("external backend cannot silently approximate a count prior");
+        assert!(error.to_string().contains("cannot faithfully execute"));
     }
 
     #[test]
@@ -568,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn speaker_constraints_without_diarize_omitted() {
+    fn speaker_count_without_diarize_is_omitted() {
         let mut request = minimal_request();
         request.diarize = false;
         set_speaker_count(

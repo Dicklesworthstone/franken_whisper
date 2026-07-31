@@ -570,7 +570,7 @@ pub struct TranscribeArgs {
 
     /// Record consent for future reusable-profile persistence.
     ///
-    /// Schema v4 stores privacy-safe summaries only, never raw acoustic vectors.
+    /// Schema v5 stores privacy-safe summaries only, never raw acoustic vectors.
     #[arg(long)]
     pub persist_speaker_profiles: bool,
 
@@ -1031,7 +1031,10 @@ impl TranscribeArgs {
             && (self.speaker_hints.is_some()
                 || self.persist_speaker_profiles
                 || self.diarization_engine != DiarizationEngine::Auto
-                || self.diarization_fallback != DiarizationFallbackPolicy::Unknown)
+                || self.diarization_fallback != DiarizationFallbackPolicy::Unknown
+                || self.num_speakers.is_some()
+                || self.min_speakers.is_some()
+                || self.max_speakers.is_some())
         {
             return Err(FwError::InvalidRequest(
                 "diarization controls require --diarize".to_owned(),
@@ -1619,6 +1622,15 @@ mod tests {
                 .to_string()
                 .contains("require --diarize")
         );
+
+        let mut args = minimal_args();
+        args.num_speakers = Some(2);
+        assert!(
+            args.to_request()
+                .expect_err("speaker-count search without --diarize must fail")
+                .to_string()
+                .contains("require --diarize")
+        );
     }
 
     #[test]
@@ -1755,6 +1767,7 @@ mod tests {
     #[test]
     fn speaker_count_built_from_num_speakers() {
         let mut args = minimal_args();
+        args.diarize = true;
         args.num_speakers = Some(3);
         let summary = args.robot_summary();
         assert_eq!(summary["speaker_count"]["mode"], "hard_constraint");
@@ -1771,6 +1784,7 @@ mod tests {
     #[test]
     fn speaker_count_built_from_min_and_max() {
         let mut args = minimal_args();
+        args.diarize = true;
         args.min_speakers = Some(2);
         args.max_speakers = Some(8);
         let request = args.to_request().expect("should succeed");
@@ -2288,6 +2302,7 @@ mod tests {
     #[test]
     fn exact_and_range_speaker_flags_are_rejected_as_ambiguous() {
         let mut args = minimal_args();
+        args.diarize = true;
         args.num_speakers = Some(4);
         args.min_speakers = Some(2);
         args.max_speakers = Some(6);

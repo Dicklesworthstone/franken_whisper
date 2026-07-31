@@ -3615,7 +3615,35 @@ mod tests {
                 .diarization
                 .as_ref()
                 .map(|report| report.implementation.as_str()),
-            Some("native-acoustic-v1")
+            Some("native-acoustic-v2")
+        );
+        let recovered_request = request
+            .backend_params
+            .acoustic_diarization
+            .as_ref()
+            .expect("typed diarization request");
+        assert_eq!(
+            recovered_request.speaker_count,
+            SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2
+            }
+        );
+        let recovered_report = result
+            .diarization
+            .as_ref()
+            .expect("typed diarization result");
+        assert_eq!(
+            recovered_report.speaker_count.status,
+            SpeakerCountOutcomeStatus::Satisfied
+        );
+        assert_eq!(
+            recovered_report.speaker_count.reasons,
+            vec![SpeakerCountOutcomeReason::RequestedCountMatched]
+        );
+        assert_eq!(
+            recovered_report.hint_evidence[0].disposition,
+            SpeakerHintDisposition::PartiallyAccepted
         );
         assert!(
             !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
@@ -3638,6 +3666,11 @@ mod tests {
                 .as_ref()
                 .map(|report| report.turns.as_slice()),
             "typed speaker turns must survive SQLite -> JSONL -> fresh SQLite"
+        );
+        assert_eq!(
+            recovered.diarization, report.result.diarization,
+            "count mode, reasons, occupancy evidence, hint dispositions, and fallback status must \
+             survive SQLite -> JSONL -> fresh SQLite"
         );
         assert_eq!(
             recovered

@@ -32,7 +32,7 @@ use crate::diarization::{
     verify_leakage_audit_hash,
 };
 use crate::error::{FwError, FwResult};
-use crate::model::{DiarizationEngine, DiarizationRequest};
+use crate::model::{DiarizationEngine, DiarizationRequest, SpeakerCountRequest};
 
 /// Schema identity for the path-bearing, external-only adapter input.
 pub const PUBLIC_CORPUS_INPUT_SCHEMA_VERSION: &str = "public-diarization-corpus-input-v1";
@@ -1316,6 +1316,7 @@ pub fn run_public_corpus_ablation_with_cancel(
     let scorer_config_sha256 = canonical_sha256(&scorer_config)?;
     let diarization_request = DiarizationRequest {
         engine: DiarizationEngine::Acoustic,
+        speaker_count: SpeakerCountRequest::Infer,
         ..DiarizationRequest::default()
     };
     let diarization_request_sha256 = canonical_sha256(&diarization_request)?;
@@ -1706,7 +1707,6 @@ fn evaluate_public_variant(
                             segments: &[],
                             word_aligned: false,
                             request: diarization_request,
-                            constraints: None,
                             boundary_hints: &boundary_hints,
                         },
                         feature_ablation,
@@ -2390,6 +2390,12 @@ impl PublicAblationAccumulator {
                 self.clustering_unstable_count_fallback_count = self
                     .clustering_unstable_count_fallback_count
                     .saturating_add(1);
+            }
+            Some(AcousticClusteringFallbackReason::SpeakerCountPriorUnresolved) => {
+                return Err(public_corpus_error(
+                    "ablation_speaker_count_prior_unresolved",
+                    "public-corpus ablation evidence cannot admit an unresolved speaker-count prior",
+                ));
             }
             None => {}
         }
@@ -3484,6 +3490,7 @@ pub fn verify_public_corpus_ablation_evidence(
     }
     let expected_request = DiarizationRequest {
         engine: DiarizationEngine::Acoustic,
+        speaker_count: SpeakerCountRequest::Infer,
         ..DiarizationRequest::default()
     };
     if !evidence.protocol.oracle_vad
@@ -5906,6 +5913,7 @@ mod tests {
         };
         let diarization_request = crate::model::DiarizationRequest {
             engine: crate::model::DiarizationEngine::Acoustic,
+            speaker_count: crate::model::SpeakerCountRequest::Infer,
             ..crate::model::DiarizationRequest::default()
         };
         let diarization_request_sha256 =
