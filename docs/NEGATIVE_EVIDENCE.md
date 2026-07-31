@@ -116,6 +116,59 @@ artifact/input hashes, matched decode/work/transcript checks, actual-thread
 observation, frequency/identity/host/load gates, require both A/A medians in
 `[0.98, 1.02]` inclusive, and retain the 2x-widest-null margin.
 
+### Exclusive-host n=5 retry: every gate but the load split passed
+
+Claim `7640` satisfied the process-exclusivity retry predicate. The fresh
+pre-claim census had five 99-100% idle, 0% iowait samples and no
+benchmark/compiler/graph process. The exact frozen artifact ran alone through
+terminal on the same host and boot. Its full-window persistent-process maximum
+was `0.067615` CPU core against the `0.100000` ceiling. Immediate and settled
+pre- and post-measurement host-wide samples all passed, every online CPU still
+reported `amd-pstate-epp` with `performance` governor/EPP, and the terminal
+census found no surviving benchmark process.
+
+The diagnostic whole-job point estimate was `2.199298`, CI95
+`[1.947164, 2.276881]`, from franken and whisper.cpp medians of
+`6690.201 ms` and `14713.747 ms`:
+
+| observation | raw values |
+|---|---|
+| franken milliseconds | `6690.201, 6509.753, 6780.759, 6457.751, 7563.618` |
+| whisper.cpp milliseconds | `14713.747, 14637.256, 14727.538, 14703.531, 14727.604` |
+| whisper.cpp / franken | `2.199298, 2.248512, 2.171960, 2.276881, 1.947164` |
+| franken A/A | `1.014257, 1.007297, 1.051764, 0.967962, 1.061193` |
+| whisper.cpp A/A | `0.999069, 0.999306, 1.001095, 0.999879, 0.995186` |
+
+Both corrected null medians passed: franken `1.014257` (CI95
+`[0.967962, 1.061193]`) and whisper.cpp `0.999306` (CI95
+`[0.995186, 1.001095]`). The retained 2x-widest-null floor was `1.122386`.
+The exact artifact identities, contract, matched decode, 279/279-word
+equivalence (`WER=0.010753`), 5/5 encodes, 319/319 single-token decodes, and
+requested/configured 32-thread checks all passed. The actual CPU-tick-positive
+TID counts were 98 native and 63 incumbent; peak simultaneous process-thread
+counts were 54 and 32.
+
+This run nevertheless failed closed on the independent load gate. Pre-round
+one-minute load averages were
+`[9.77, 20.24, 23.12, 27.46, 29.39]`; the lighter and heavier split medians
+were `2.223905` and `2.112022`, a `0.111883` gap against the fixed `0.100000`
+maximum. Therefore `load_split_clear=false` and the formal verdict was
+`UNDECIDABLE`. **The apparent `2.199298x` remains diagnostic, not a
+performance claim.**
+
+The raw log is
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7640_n5.log`, SHA-256
+`3a8d9b90a72a97128aae32387c41af9fe6fc8740663de5dbe999944a265a6c34`.
+
+**Concrete retry predicate:** predeclare seven rounds with the exact same
+frozen artifact, incumbent, model, audio, decode, work, and thread contract so
+each half of the odd-round load split has three observations rather than two.
+Run only after the same clean five-sample census and full-window exclusivity
+conditions pass. Accept the resulting ratio or loss without selecting rounds;
+require `load_split_gap <= 0.100000`, both A/A medians in `[0.98, 1.02]`
+inclusive, the retained 2x-widest-null margin, and every existing
+identity/work/quality/frequency/host gate.
+
 ---
 ## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
 
