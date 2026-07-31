@@ -12529,11 +12529,16 @@ mod tests {
             .iter()
             .map(|&(count, probability)| SpeakerCountPosteriorBin { count, probability })
             .collect::<Vec<_>>();
+        let entropy_term = |probability: f64| {
+            (probability > 0.0)
+                .then(|| -probability * probability.log2())
+                .unwrap_or(0.0)
+        };
         let entropy_bits = posterior
             .iter()
-            .map(|bin| super::entropy_term(bin.probability))
+            .map(|bin| entropy_term(bin.probability))
             .sum::<f64>()
-            + super::entropy_term(unresolved_probability);
+            + entropy_term(unresolved_probability);
         let proposed_count = selected_count.or_else(|| posterior.first().map(|bin| bin.count));
         let available_lane = |lane| SpeakerCountLaneEvidence {
             lane,
@@ -12835,6 +12840,50 @@ mod tests {
     }
 
     #[test]
+    fn occupancy_ignores_labels_that_exist_only_in_excluded_regions() {
+        let reference = DiarizationReferenceDocument {
+            schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
+            recording_id: "ignored-occupancy-fixture".to_owned(),
+            duration_ms: 2_000,
+            turns: vec![EvaluationTurn::labeled(0, 1_000, "reference-a")],
+            ignored_regions: vec![EvaluationRegion {
+                start_ms: 1_000,
+                end_ms: 2_000,
+                reason_code: "annotation_uncertain".to_owned(),
+            }],
+            speaker_hints: Vec::new(),
+            words: Vec::new(),
+        };
+        let hypothesis = DiarizationHypothesisDocument {
+            schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: reference.recording_id.clone(),
+            duration_ms: reference.duration_ms,
+            turns: vec![
+                EvaluationTurn::labeled(0, 1_000, "cluster-a"),
+                EvaluationTurn::labeled(1_000, 2_000, "excluded-cluster"),
+            ],
+            speaker_count_estimate: None,
+            performance: None,
+        };
+        let score = score_diarization_documents(
+            &reference,
+            &hypothesis,
+            &DiarizationScorerConfig::default(),
+        )
+        .expect("ignored occupancy");
+        let excluded = score
+            .speaker_occupancy
+            .speakers
+            .iter()
+            .find(|speaker| speaker.hypothesis_speaker == "excluded-cluster")
+            .expect("excluded label evidence");
+        assert_eq!(excluded.voiced_duration_sec, 0.0);
+        assert_eq!(excluded.recurrence_episode_count, 0);
+        assert!(!excluded.effective);
+        assert_eq!(score.speaker_occupancy.phantom_speaker_count, 0);
+    }
+
+    #[test]
     fn aligned_word_attribution_is_transcript_free_and_permutation_invariant() {
         let reference = DiarizationReferenceDocument {
             schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
@@ -12895,6 +12944,22 @@ mod tests {
             score.word_diarization_error_rate.expect("word error"),
             1.0 / 3.0,
         );
+    }
+
+    #[test]
+    fn aligned_word_ids_reject_lexical_content() {
+        let mut reference = evaluation_reference();
+        reference.words = vec![EvaluationWord {
+            word_id: "confidential-spoken-token".to_owned(),
+            start_ms: 100,
+            end_ms: 200,
+            speaker_ref: "speaker-a".to_owned(),
+        }];
+        let error = parse_diarization_reference(
+            &serde_json::to_vec(&reference).expect("reference serialization"),
+        )
+        .expect_err("lexical word identity must fail closed");
+        assert!(error.to_string().contains("word_id_shape"));
     }
 
     #[test]

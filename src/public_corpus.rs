@@ -6523,6 +6523,20 @@ mod tests {
         assert!(failed.macro_jer_delta.is_some_and(|delta| delta > 0.0));
     }
 
+    #[test]
+    fn ablation_split_verifier_recomputes_count_and_word_conservation() {
+        let valid = ablation_variant(AcousticFeatureAblation::FullV2, Some(0.2), Some(0.3));
+        assert!(super::variant_splits_are_valid(&valid.splits, 10));
+
+        let mut forged_count = valid.clone();
+        forged_count.splits[0].exact_speaker_count_rate = Some(0.0);
+        assert!(!super::variant_splits_are_valid(&forged_count.splits, 10));
+
+        let mut forged_words = valid;
+        forged_words.splits[0].reference_word_count = 1;
+        assert!(!super::variant_splits_are_valid(&forged_words.splits, 10));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn clustering_variant(
         clustering_mode: super::AcousticClusteringMode,
