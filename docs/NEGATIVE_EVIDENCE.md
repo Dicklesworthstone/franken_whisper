@@ -4,6 +4,210 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-31 - BlackThrush: **NO ADMISSIBLE VERDICT — the first matched whole-job `large-v3-turbo` ratio failed closed on a mid-run external process and the corrected null-median clause.**
+
+The first mechanically complete whole-job retry produced a
+`whisper.cpp / franken` point estimate of `2.153823`, CI95
+`[2.133895, 2.190183]`. **That number is not a performance claim.** The formal
+verdict was `UNDECIDABLE` because two independent admission conditions failed.
+
+The frozen harness was built remotely with
+`rch exec --base 43a2b10 --clean-overlay --overlay-path
+examples/incumbent_ab.rs` while reusing
+`CARGO_TARGET_DIR=/data/tmp/cargo-target-franken-whisper`. Its source SHA-256
+was `1b87400583767ef181a7a9388587119e60dd8a3dbf4e03c6695fd8cd972cd7cb`;
+the copied ELF self-reported SHA-256
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`
+and Build ID `368bafca5e5d973946d8f954827163b2808d2f37`. The live incumbent
+was pinned whisper.cpp 1.8.3, SHA-256
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`.
+The harness attested both running images through `/proc/<pid>/exe`, and the
+incumbent source/version/build-option contract passed.
+
+**Matched whole job.** Both arms processed the same 124.5 s normalized WAV
+(SHA-256
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`)
+with the same `large-v3-turbo` model (SHA-256
+`1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`).
+Both included process startup, model/audio I/O, inference, serialization, and
+teardown. Decode was explicitly matched at beam size 1, best-of 1,
+temperature 0, temperature fallback off, `max_context=0`, language `en`,
+translate false, and word timestamps false. The untimed equivalence probe
+returned 279/279 words and 3 edits (`WER=0.010753`), with exactly 5/5 encoder
+calls and 319/319 single-token decoder calls. Transcript SHA-256 values were
+`6655771d39fac2d1cd9b665f6663892bf5211ee0c1be39ec638a3837c5bef5a7`
+and
+`e745608b69fe52c0f9d7f9a0e69fbd3c27e8c63a44533407ad84686b108045ea`;
+the accepted discrepancy was therefore measured rather than hidden.
+
+Both arms were requested and configured for 32 threads. The untimed
+`/proc/<pid>/task/*/stat` probe observed CPU ticks on 98 distinct native TIDs
+and 63 distinct incumbent TIDs over each process lifetime; peak simultaneous
+process-thread counts were 62 and 32 respectively. These are the actual
+observations, not the requested width.
+
+**Same-invocation A/A controls:** the franken null median was `1.020649`;
+the whisper.cpp A/A null median was `1.002598`.
+
+| arm | raw whole-job milliseconds | median / CI95 |
+|---|---|---|
+| franken | `6818.980, 6914.079, 6731.532` | `6818.980 ms` |
+| whisper.cpp | `14686.876, 14753.919, 14743.286` | `14743.286 ms` |
+| comparison, whisper.cpp / franken | `2.153823, 2.133895, 2.190183` | `2.153823 [2.133895, 2.190183]` |
+| franken A/A | `0.987115, 1.040170, 1.020649` | `1.020649 [0.987115, 1.040170]` |
+| whisper.cpp A/A | `1.004629, 1.002598, 0.991349` | `1.002598 [0.991349, 1.004629]` |
+
+**Host failure.** Claim `7535` ran on `threadripperje`, boot
+`b107a2c6-9fac-40df-a637-c3a772b0ad57`, an AMD Ryzen Threadripper PRO
+5995WX with 64 physical cores, 128 logical threads, 536,069,869,568 bytes
+RAM, one NUMA node, and affinity/effective cpuset `0-127`. All 128 CPUs
+reported `amd-pstate-epp`, `performance` governor, and `performance` EPP.
+The fresh pre-claim census had five consecutive 100% idle, 0% iowait samples,
+and the harness preflight/pre-measurement maximum busy fractions were
+`0.137931` and `0.033333`, both clear. An unclaimed graph-reconstruction job
+then started during the measured rounds. The persistent-process census caught
+`n6_threecycles` at `0.999813` core during `round_2_franken_b`; post-run
+host-wide samples independently found one CPU 100% busy. Thus
+`external_host_clear=false` and `host_wide_clear=false`.
+
+**Corrected null gate.** Even without that co-tenant, the native A/A median
+`1.020649` exceeded the inclusive `[0.98, 1.02]` band by `0.000649`.
+The incumbent null median was centered. The retained 2x-widest-null margin
+required only `1.080340`, and the comparison CI excluded 1.0, but the
+median clause is a prerequisite rather than a margin substitute.
+
+The raw log is
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7535.log`. The claim was
+released after verifying that no harness, native worker, or incumbent process
+remained.
+
+### Immediate n=5 retry: the nulls centred; a second graph replay still overlapped
+
+After the first graph sequence reached its terminal `summary.json`, claim
+`7577` took a new five-sample census: every sample was 100% idle with 0%
+iowait, all 128 CPUs still reported the required frequency policy, and the
+broad process list was clear. The exact same artifact and inputs then ran five
+rounds. Both corrected same-invocation A/A medians passed:
+franken `1.006086` (CI95 `[0.977498, 1.130336]`) and whisper.cpp `1.000417`
+(CI95 `[0.995307, 1.006895]`). The retained 2x floor was `1.260673`.
+
+The second run produced a `2.217353` point estimate, CI95
+`[1.969586, 2.342880]`, from whole-job medians `6669.965 ms` franken and
+`14826.977 ms` whisper.cpp. Work and transcript equivalence exactly
+reproduced the first run. Actual CPU-tick-positive TID counts were again
+98/63; peak simultaneous process-thread counts were 56/32.
+
+It also failed closed. A new unclaimed graph replay under `results_v2` started
+after the clean census and during the measured rounds. The process gate caught
+`n6_three_two` at `0.999997` CPU core during `round_3_incumbent_b`;
+`n6_fourcycles` remained active at release. Immediate/settled post-run
+host-wide samples found maximum busy fractions `0.700000` and `1.000000`.
+The independent load-split gap was `0.125246`, above the `0.100000` maximum.
+Therefore `external_host_clear=false`, `host_wide_clear=false`,
+`load_split_clear=false`, and the formal verdict was again `UNDECIDABLE`
+despite both null medians passing. Its raw log is
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7577_n5.log`.
+
+**Concrete retry predicate:** rerun this exact frozen cell only after a fresh
+broad census finds no benchmark/compiler process, the last five admission
+samples are each at least 95% idle with 0% iowait, and no persistent external
+process exceeds 0.100000 CPU core for the entire invocation. Retain the same
+artifact/input hashes, matched decode/work/transcript checks, actual-thread
+observation, frequency/identity/host/load gates, require both A/A medians in
+`[0.98, 1.02]` inclusive, and retain the 2x-widest-null margin.
+
+### Exclusive-host n=5 retry: every gate but the load split passed
+
+Claim `7640` satisfied the process-exclusivity retry predicate. The fresh
+pre-claim census had five 99-100% idle, 0% iowait samples and no
+benchmark/compiler/graph process. The exact frozen artifact ran alone through
+terminal on the same host and boot. Its full-window persistent-process maximum
+was `0.067615` CPU core against the `0.100000` ceiling. Immediate and settled
+pre- and post-measurement host-wide samples all passed, every online CPU still
+reported `amd-pstate-epp` with `performance` governor/EPP, and the terminal
+census found no surviving benchmark process.
+
+The diagnostic whole-job point estimate was `2.199298`, CI95
+`[1.947164, 2.276881]`, from franken and whisper.cpp medians of
+`6690.201 ms` and `14713.747 ms`:
+
+| observation | raw values |
+|---|---|
+| franken milliseconds | `6690.201, 6509.753, 6780.759, 6457.751, 7563.618` |
+| whisper.cpp milliseconds | `14713.747, 14637.256, 14727.538, 14703.531, 14727.604` |
+| whisper.cpp / franken | `2.199298, 2.248512, 2.171960, 2.276881, 1.947164` |
+| franken A/A | `1.014257, 1.007297, 1.051764, 0.967962, 1.061193` |
+| whisper.cpp A/A | `0.999069, 0.999306, 1.001095, 0.999879, 0.995186` |
+
+Both corrected null medians passed: franken `1.014257` (CI95
+`[0.967962, 1.061193]`) and whisper.cpp `0.999306` (CI95
+`[0.995186, 1.001095]`). The retained 2x-widest-null floor was `1.122386`.
+The exact artifact identities, contract, matched decode, 279/279-word
+equivalence (`WER=0.010753`), 5/5 encodes, 319/319 single-token decodes, and
+requested/configured 32-thread checks all passed. The actual CPU-tick-positive
+TID counts were 98 native and 63 incumbent; peak simultaneous process-thread
+counts were 54 and 32.
+
+This run nevertheless failed closed on the independent load gate. Pre-round
+one-minute load averages were
+`[9.77, 20.24, 23.12, 27.46, 29.39]`; the lighter and heavier split medians
+were `2.223905` and `2.112022`, a `0.111883` gap against the fixed `0.100000`
+maximum. Therefore `load_split_clear=false` and the formal verdict was
+`UNDECIDABLE`. **The apparent `2.199298x` remains diagnostic, not a
+performance claim.**
+
+The raw log is
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7640_n5.log`, SHA-256
+`3a8d9b90a72a97128aae32387c41af9fe6fc8740663de5dbe999944a265a6c34`.
+
+**Concrete retry predicate:** predeclare seven rounds with the exact same
+frozen artifact, incumbent, model, audio, decode, work, and thread contract so
+each half of the odd-round load split has three observations rather than two.
+Run only after the same clean five-sample census and full-window exclusivity
+conditions pass. Accept the resulting ratio or loss without selecting rounds;
+require `load_split_gap <= 0.100000`, both A/A medians in `[0.98, 1.02]`
+inclusive, the retained 2x-widest-null margin, and every existing
+identity/work/quality/frequency/host gate.
+
+### Predeclared n=7 retry: the load gate passed; an unclaimed compiler overlapped
+
+Claim `7659` started after a fresh load average of `1.41`, fifteen consecutive
+100% idle and 0% iowait samples, no benchmark/compiler/graph process, and
+uniform `amd-pstate-epp` plus `performance` governor/EPP on all 128 online
+CPUs. The seven-round cell mechanically completed and repaired the prior load
+gate: its lighter/heavier pre-round-load split medians were `2.176036` and
+`2.209458`, a `0.033422` gap within the fixed `0.100000` maximum.
+
+The diagnostic whole-job point estimate was `2.198874`, CI95
+`[2.157498, 2.273546]`; medians were `6735.215 ms` franken and
+`14813.337 ms` whisper.cpp. The corrected A/A medians were `0.990083`
+(franken, CI95 `[0.960836, 1.011440]`) and `0.998881` (whisper.cpp, CI95
+`[0.998406, 1.001337]`), both inside `[0.98, 1.02]`. The retained
+2x-widest-null floor was `1.078329`. Artifact identity, pinned incumbent
+contract, matched decode, 279/279-word equivalence (`WER=0.010753`), 5/5
+encodes, 319/319 single-token decodes, requested/configured 32-thread checks,
+and immediate/settled pre- and post-host-wide gates all passed. Actual
+CPU-tick-positive TID counts were 98 native and 63 incumbent; peak simultaneous
+process-thread counts were 61 and 32.
+
+The run still failed closed because an unclaimed `cc1` process appeared after
+the clear admission census and reached `0.543643` CPU core at
+`round_1_franken_b`. Thus `external_host_clear=false` and the formal verdict
+was `UNDECIDABLE` even though every other gate passed. **The apparent
+`2.198874x` is diagnostic, not a performance claim.**
+
+The raw log is
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7659_n7.log`, SHA-256
+`991f0b0795e4ab82213e16aac774bbf74e4f8bda746348325fff7196daa16dcc`.
+
+**Concrete retry predicate:** rerun the exact frozen seven-round cell only
+after a fresh clean census and an explicit no-build/no-benchmark exclusive
+window. Accept the complete result as-is; require no persistent external
+process above `0.100000` CPU core for the entire invocation, and retain every
+null-median, 2x margin, load, identity, work, quality, thread, frequency, and
+host-wide gate unchanged.
+
+---
 ## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
 
 The exclusive current-source certification used frozen `release-perf` harness
