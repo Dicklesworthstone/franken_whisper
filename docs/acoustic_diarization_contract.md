@@ -913,9 +913,10 @@ speech mask, feature extraction, change detection, clustering, projection,
 and scoring. Comparison returns the first differing or missing stage. A stable
 regression classification is an uppercase error code plus that stage.
 Deterministic delta minimization removes transform subsequences only when the
-caller-supplied evaluator reproduces the exact same classification, and
-retains original step indices and an evaluation count. The minimized artifact
-is a recipe, not an accuracy certificate.
+caller-supplied evaluator reproduces the exact same classification twice;
+disagreement fails as a non-deterministic classifier. The result retains
+original step indices and an evaluation count. The minimized artifact is a
+recipe, not an accuracy certificate.
 
 An identity-preserving recipe does not promise that an imperfect candidate
 will pass. Its purpose is to turn violations into small, reproducible public
