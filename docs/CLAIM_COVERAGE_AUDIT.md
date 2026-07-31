@@ -78,12 +78,23 @@ by ratio size.
    encoder windows and produce 279/279 words with 3 edits (WER 0.010753).
    Commit `4c4aaef` pins that parameter in the shared contract; a strict-RCH
    artifact and exclusive quiet-host timing verdict still remain.*
-2. **Flagship `whole_job` scope.** The July 30 current-source 124.5 s and
-   300 s tiny.en text ratios are explicitly `FW_BENCH_SCOPE=whole_job`: they
-   include process startup, model/audio I/O, inference, serialization, and
-   teardown. Thus `whole_job` is measured, but only for tiny.en. A real user's
-   single-shot turbo job also includes model load (~35% of turbo wall), and no
-   admissible turbo `whole_job` ratio exists yet.
+2. **`whole_job` scope — coverage is ZERO, not "tiny.en only".** An earlier
+   revision of this row said the July 30 124.5 s / 300 s tiny.en ratios were
+   `FW_BENCH_SCOPE=whole_job`. That is not what the ledger records, and the
+   correction matters because it changes the item from "extend an existing
+   measurement to turbo" to "no whole-job incumbent ratio exists at all":
+   - `FW_BENCH_SCOPE`, `whole_job`, and `whole-job` appear **nowhere** in
+     `docs/PERF_LEDGER.md` (zero grep matches across the file).
+   - The July 30 row states its own scope at `PERF_LEDGER.md:174`: *"Transcribe
+     work **excluding one-time model load on both sides**… franken is timed
+     in-process with the model resident."* It then explains that full process
+     wall was deliberately **not** used, because it would pit `whisper-cli`'s
+     thin inference binary against franken's orchestrator.
+   All three supported ratios (07-27, 07-28, 07-30) are therefore
+   `transcribe_only`. Model load is ~35% of single-shot turbo wall, so this is
+   not a rounding correction on the published number — it is a scope a real
+   user's single-shot job includes and we have never certified against the
+   incumbent.
 3. **The beam-search path — an unconverted *negative*.** The ledger's own
    honest row records native `retry+beam5` at **~3–4.6× SLOWER** than
    `whisper-cli -bs 5` on long-form. Converting this publishes a loss, which is

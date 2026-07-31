@@ -51,7 +51,8 @@
 //!
 //! Two A/A nulls run in the same invocation and the same alternating shape:
 //! franken against itself, and `whisper.cpp` against itself. A claim is
-//! decidable only when the comparison CI95 excludes 1.0, the comparison median
+//! decidable only when **both null medians lie within 0.98–1.02 inclusive**,
+//! the comparison CI95 excludes 1.0, the comparison median
 //! clears the widest null CI95 edge by a 2× margin, and the comparison medians
 //! from independently sampled lighter- and heavier-load rounds differ by at
 //! most 0.1×. A null CI95 does **not** have to contain 1.0: its distance from
@@ -1743,10 +1744,25 @@ fn cv(values: &[f64]) -> f64 {
     var.sqrt() / mean
 }
 
+/// Inclusive band an A/A null's **median** must sit in for the run to decide.
+///
+/// A null's CI half-width calibrates the effect floor, but it says nothing about
+/// where the null is *centred*. An identity arm that reads 1.05 is not a null at
+/// all: the same binary measured against itself came out 5% apart, so the
+/// instrument has a systematic offset, and an "effect" measured on that
+/// instrument inherits it. The CI can be arbitrarily tight while this is true,
+/// which is exactly the case the 2x-margin rule alone does not catch.
+const NULL_MEDIAN_CENTER_MIN: f64 = 0.98;
+const NULL_MEDIAN_CENTER_MAX: f64 = 1.02;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StatisticalGate {
     fw_null_half: f64,
     wc_null_half: f64,
+    fw_null_median: f64,
+    wc_null_median: f64,
+    fw_null_median_clear: bool,
+    wc_null_median_clear: bool,
     required: f64,
     verdict: &'static str,
 }
@@ -1757,19 +1773,33 @@ struct StatisticalGate {
 /// contain 1.0 is deliberately irrelevant. This is the historical live
 /// comparator rule extracted without changing its verdict behavior so the
 /// absence of a precision-coupled straddle veto can be regression-tested.
+///
+/// One prerequisite is added on top: both A/A null **medians** must lie in
+/// `[NULL_MEDIAN_CENTER_MIN, NULL_MEDIAN_CENTER_MAX]`. That constrains the
+/// null's *location*, where the 2x margin constrains its *width* — an identity
+/// arm centred at 1.05 is a broken instrument regardless of how tight its
+/// interval is, and any effect measured on it inherits the offset.
 fn statistical_gate(
     fw_null: (f64, f64, f64),
     wc_null: (f64, f64, f64),
     comparison: (f64, f64, f64),
     prerequisite_gates_clear: bool,
 ) -> StatisticalGate {
-    let (_, fw_lo, fw_hi) = fw_null;
-    let (_, wc_lo, wc_hi) = wc_null;
+    let (fw_med, fw_lo, fw_hi) = fw_null;
+    let (wc_med, wc_lo, wc_hi) = wc_null;
     let (cmp_med, cmp_lo, cmp_hi) = comparison;
     let fw_null_half = (fw_hi - 1.0).abs().max((1.0 - fw_lo).abs());
     let wc_null_half = (wc_hi - 1.0).abs().max((1.0 - wc_lo).abs());
     let required = 1.0 + 2.0 * fw_null_half.max(wc_null_half);
-    let verdict = if !prerequisite_gates_clear {
+    // Both identity arms must be centred on 1.0. This is a prerequisite, not a
+    // second effect-size rule: it constrains the null's LOCATION, where the
+    // 2x margin constrains its WIDTH. Straddling stays irrelevant — a null CI
+    // that misses 1.0 while its median sits inside the band still decides.
+    let centered =
+        |median: f64| (NULL_MEDIAN_CENTER_MIN..=NULL_MEDIAN_CENTER_MAX).contains(&median);
+    let fw_null_median_clear = centered(fw_med);
+    let wc_null_median_clear = centered(wc_med);
+    let verdict = if !prerequisite_gates_clear || !fw_null_median_clear || !wc_null_median_clear {
         "UNDECIDABLE"
     } else if cmp_med > required && cmp_lo > 1.0 {
         "WIN"
@@ -1782,6 +1812,10 @@ fn statistical_gate(
     StatisticalGate {
         fw_null_half,
         wc_null_half,
+        fw_null_median: fw_med,
+        wc_null_median: wc_med,
+        fw_null_median_clear,
+        wc_null_median_clear,
         required,
         verdict,
     }
@@ -3298,6 +3332,10 @@ fn main() {
     println!(
         "INCUMBENT_AB_GATE method=median_vs_both_null_ci95_2x_margin \
          null_ci_straddle_required=false \
+         fw_null_median={:.6} fw_null_median_clear={} \
+         wc_null_median={:.6} wc_null_median_clear={} \
+         null_median_min={NULL_MEDIAN_CENTER_MIN:.6} \
+         null_median_max={NULL_MEDIAN_CENTER_MAX:.6} \
          fw_null_half={:.6} wc_null_half={:.6} required={:.6} \
          compare_median={:.6} compare_ci95=[{:.6},{:.6}] \
          load_split_gap={load_split_gap:.6} load_split_max={MAX_LOAD_SPLIT_GAP:.6} \
@@ -3312,6 +3350,10 @@ fn main() {
          incumbent_version={} incumbent_exe_sha256={} \
          work_counts_stable=true work_count_classification={work_count_class} \
          cv_is_provenance_only=true class=vs_incumbent verdict={}",
+        gate.fw_null_median,
+        gate.fw_null_median_clear,
+        gate.wc_null_median,
+        gate.wc_null_median_clear,
         gate.fw_null_half,
         gate.wc_null_half,
         gate.required,
@@ -3572,6 +3614,82 @@ mod tests {
                 "{name}: the 2x floor must still bite"
             );
         }
+    }
+
+    #[test]
+    fn off_center_null_median_makes_a_separated_effect_undecidable() {
+        // A tight but OFF-CENTRE null: the same binary measured against itself
+        // came out 5% apart. The CI is narrow, so the 2x-margin floor is low
+        // (1.004) and a 1.50x effect clears it easily -- yet the instrument has
+        // a 5% systematic offset and the "effect" inherits it. Width alone
+        // cannot catch this; the centering prerequisite is what does.
+        let offset_fw = (
+            (1.050_000, 1.048_000, 1.052_000),
+            (1.000_000, 0.998_000, 1.002_000),
+        );
+        let gate = statistical_gate(offset_fw.0, offset_fw.1, (1.50, 1.40, 1.60), true);
+        // The effect is "otherwise separated": it clears the 2x width floor AND
+        // its CI excludes 1.0, so every pre-existing rule would have decided it.
+        // (Note the floor is NOT low here -- half-width is measured from 1.0, so
+        // an offset null already inflates it to 1.104. Centering is still a
+        // distinct constraint: this effect clears that inflated floor anyway.)
+        assert!(
+            1.50 > gate.required && 1.40 > 1.0,
+            "floor: {}",
+            gate.required
+        );
+        assert!(!gate.fw_null_median_clear);
+        assert!(gate.wc_null_median_clear);
+        assert_eq!(gate.verdict, "UNDECIDABLE");
+
+        // Either arm off-centre is disqualifying, and it applies to a LOSS too:
+        // the prerequisite is about the instrument, not the claim's direction.
+        let offset_wc = (
+            (1.000_000, 0.998_000, 1.002_000),
+            (0.950_000, 0.948_000, 0.952_000),
+        );
+        let loss = statistical_gate(offset_wc.0, offset_wc.1, (0.60, 0.55, 0.65), true);
+        assert!(!loss.wc_null_median_clear);
+        assert_eq!(loss.verdict, "UNDECIDABLE");
+
+        // The band is inclusive at both edges.
+        for edge in [NULL_MEDIAN_CENTER_MIN, NULL_MEDIAN_CENTER_MAX] {
+            let at_edge = statistical_gate(
+                (edge, 0.999, 1.001),
+                (1.000, 0.999, 1.001),
+                (1.50, 1.40, 1.60),
+                true,
+            );
+            assert!(
+                at_edge.fw_null_median_clear,
+                "edge {edge} must be inclusive"
+            );
+            assert_eq!(at_edge.verdict, "WIN");
+        }
+    }
+
+    #[test]
+    fn centered_non_straddling_null_ci_still_decides() {
+        // The property the straddle audit protects, now stated against the new
+        // prerequisite: a null CI that entirely EXCLUDES 1.0 is still fine so
+        // long as its median is centred. Location is gated; straddling is not.
+        let fw = (1.010_000, 1.002_000, 1.018_000); // strictly above 1.0
+        let wc = (0.990_000, 0.982_000, 0.998_000); // strictly below 1.0
+        assert!(
+            fw.1 > 1.0 && wc.2 < 1.0,
+            "both nulls must be non-straddling"
+        );
+
+        let win = statistical_gate(fw, wc, (1.50, 1.40, 1.60), true);
+        assert!(win.fw_null_median_clear && win.wc_null_median_clear);
+        assert_eq!(win.verdict, "WIN");
+
+        let loss = statistical_gate(fw, wc, (0.60, 0.55, 0.65), true);
+        assert_eq!(loss.verdict, "LOSS");
+
+        // And the 2x width floor is still doing its job on the same nulls.
+        let inside_floor = statistical_gate(fw, wc, (1.01, 1.005, 1.02), true);
+        assert_eq!(inside_floor.verdict, "UNDECIDABLE");
     }
 
     #[test]
