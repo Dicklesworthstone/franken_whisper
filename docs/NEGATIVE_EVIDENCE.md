@@ -4,6 +4,71 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-31 - BlackThrush: **CORRECTION + METHOD — the `sbh` retry predicate on the tiny.en timestamp cell IS satisfied, and the aggregate admission census that cleared this host is not admissible evidence.**
+
+This does **not** add a second veto for the same cell. Claim `7774` below
+already records the preflight rejection. Two things in that record need
+correcting, both found by an independent duplicate attempt of the identical
+cell run minutes later (log SHA-256
+`583da7ad85d277939f8715ea206502a2fc56622a308117e4d898cc5c0ef9103a`, artifacts
+`/data/tmp/fw-realistic-phase5/segts_retry_4a5eb947_t32_n7`), which reproduced
+the same `cpu102=100.0%` abort and exit 101.
+
+**1. The predicate that vetoed the 2026-07-30 run is satisfied; "unchanged" is
+too strong.** That run was `UNDECIDABLE` for exactly one reason — the resident
+`sbh` daemon reached `0.129419` CPU core against the `0.100000` maximum — and
+its predicate named `sbh` specifically. Sampled immediately before this
+attempt, **`sbh` held `0.031` CPU core**, under a third of the ceiling. The
+named blocker is gone and should not be re-cited. What replaced it is a
+different, unrelated co-tenant class: a `sudo du -xsh` scratch survey, plus
+`git -C /data/projects/flywheel_connectors` at ~1.0 core and a system
+`apt-get -f install` at ~1.1 core observed in the same window. Recording this
+as "predicate unchanged" would leave a future reader waiting on a daemon that
+has already stood down.
+
+**2. The driver's own admission census cleared a host that was not clear.**
+The five-sample `vmstat` gate inherited verbatim from the frozen phase-4
+driver — ≥95% average idle, zero iowait — **passed**: `samples=5
+idle_avg_pct=99.000 idle_min_pct=99.000 iowait_max_pct=0.000 clear=true`. It
+passed *while a core was pinned at 100%*, because one saturated core is 1/128
+of this host and rounds to 99% idle. `load1` told the same lie: `0.65` at claim
+time, `1.40` ninety seconds later, with a full core busy throughout. Only the
+harness's per-CPU sample caught it. **On a 128-thread host, aggregate idle and
+load average are not admissible exclusivity evidence; per-CPU and per-process
+sampling are.** The driver census stays for provenance and must never be
+quoted as the exclusivity gate — it is precisely the kind of gate that passes
+when it should fail.
+
+Two deviations from the frozen cell are recorded so the attempts are
+comparable, both strictly tightening: artifact
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a` (source
+`1b87400583767ef181a7a9388587119e60dd8a3dbf4e03c6695fd8cd972cd7cb`,
+byte-identical to HEAD `examples/incumbent_ab.rs` — the harness carrying the
+corrected dual-null-median clause) instead of the older `d2fa276c…` ELF that
+predates that clause; and rounds 3 → 7 so each half of the odd-round load
+split carries three observations. Incumbent, model, audio, threads, scope,
+timestamp mode, and workload name were byte-identical; all four input digests
+were re-verified before launch and the uniform `performance` governor was
+confirmed on all 128 CPUs. No timing, ratio, or verdict exists for this
+attempt and none is inferred.
+
+**Coordination cost, recorded honestly.** Two lanes ran the same frozen cell on
+the same host within roughly ninety seconds, having each independently judged
+the predicate satisfied. Neither run contaminated the other — claim `7774`
+reached terminal before this attempt started — but the duplication was real and
+avoidable. The `trj-booking` thread was claimed and released for this attempt;
+it should be checked *and* answered before any trj cell, not only claimed.
+
+**Concrete retry predicate (updated, supersedes the `sbh` clause).** Rerun the
+frozen n=7 cell only after a **per-process** census — not `vmstat`, not
+`load1` — shows no process above `0.100000` CPU core, and a **per-CPU** sample
+shows every online CPU at or below 20% busy; take both within the minute before
+launch and re-check across the full invocation. Retain the artifact, incumbent,
+model, audio, decode, work, quality, actual-thread, frequency, host-wide,
+load-split, corrected `[0.98, 1.02]` dual-null-median, and 2×-widest-null
+gates unchanged.
+
+---
 ## 2026-07-31 - BlackThrush: **NO ADMISSIBLE VERDICT — the first matched whole-job `large-v3-turbo` ratio failed closed on a mid-run external process and the corrected null-median clause.**
 
 The first mechanically complete whole-job retry produced a
@@ -207,6 +272,26 @@ process above `0.100000` CPU core for the entire invocation, and retain every
 null-median, 2x margin, load, identity, work, quality, thread, frequency, and
 host-wide gate unchanged.
 
+### Resolution: the exact n=7 retry passed every gate
+
+Claim `7738` satisfied that predicate without changing the artifact, inputs,
+decode parameters, workload, sample count, or gate. The same-invocation
+whole-job result is `2.264127×` (`whisper.cpp / franken`), CI95
+`[2.244706, 2.277732]`, from medians `6497.139 ms` and `14798.745 ms`.
+Both corrected null medians passed (`1.000623` franken, `0.999469`
+whisper.cpp); the retained 2x-widest-null floor was `1.038433`.
+Full-window external CPU was at most `0.045164` core, the independent load
+split was `0.014086`, and every host-wide sample passed. Exact work,
+279/279-word equivalence at `WER=0.010753`, running-image identity, uniform
+performance governor, and actual observed threads (98/63 CPU-tick-positive
+TIDs; 53/32 peak process threads) also passed.
+
+The admissible campaign row is now in `docs/PERF_LEDGER.md`. Raw log:
+`/data/tmp/fw-realistic-phase5/turbo_whole_job_claim7738_n7.log`, SHA-256
+`3a0332c6726b86c4422ba91e190c54f26032ea9910c1a8c398bd8867f207f1c4`.
+This closes the retry obligation; it does not retroactively admit any of the
+diagnostic ratios above.
+
 ---
 ## 2026-07-30 - OliveIsland: **MIXED CERTIFICATION CLOSEOUT — two tiny.en text wins are admissible; the timestamp and turbo cells remain unclaimed.**
 
@@ -250,6 +335,35 @@ only when every persistent external process, including `sbh`, remains at or
 below 0.100000 CPU core at every checkpoint, while retaining the same artifact,
 incumbent, model, audio, identity, work, quality, frequency, host-wide, load,
 and 2×-null gates.
+
+### 2026-07-31 timestamp retry: rejected at preflight before work
+
+Claim `7774` used the current strict-RCH artifact to retry the exact
+`track01` tiny.en segment-timestamp cell for seven rounds. The harness
+self-reported ELF SHA-256
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`;
+it emitted the pinned incumbent SHA-256
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`,
+tiny.en model SHA-256
+`921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f`,
+and audio SHA-256
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+The pinned 1.8.3 source and uniform 128-CPU performance-governor contracts
+passed.
+
+The unchanged host-wide preflight then observed `cpu102=100.0%` busy against
+the `20.0%` ceiling and exited 101. A terminal census found an unclaimed
+`sudo du -xsh /home/ubuntu/...` scratch survey active. The abort occurred
+before either engine's parity probe, so there are deliberately **no observed
+thread counts, work counts, A/A nulls, timing ratio, or verdict**. The raw log
+is `/data/tmp/fw-realistic-phase5/tiny_ts_claim7774_n7.log`, SHA-256
+`502d41c4176187c36517399db5d7c5d645e4d00d443f64c4f298ef9a24362d89`.
+
+**Retry predicate remains unchanged:** wait for that survey and the hourly
+fsck sweep to reach terminal, take a fresh clean census, and rerun the exact
+frozen n=7 cell with the corrected `[0.98, 1.02]` dual-null-median clause,
+retained 2x-widest-null margin, and every identity, work, quality, actual-
+thread, frequency, process-exclusivity, host-wide, and load gate.
 
 **Concrete turbo retry predicate:** first make the matched-greedy comparator
 produce WER at or below 0.100000 and matched work within 10% on this exact
