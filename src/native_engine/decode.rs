@@ -53,6 +53,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use rayon::prelude::*;
+
 use crate::error::{FwError, FwResult};
 use crate::model::TranscriptionSegment;
 
@@ -1003,15 +1005,14 @@ fn beam_decode_window(
             .map(|h| Some(h.state))
             .collect();
 
-        // PASS 2 — fork + forward each survivor to its hidden state (per-hypothesis
-        // self-attn/MLP; can't batch across differing KV). The tied-output logits
-        // ARE batched below.
-        let mut next_active: Vec<BeamHyp> = Vec::with_capacity(expands.len());
-        let mut hidden_rows: Vec<f32> = Vec::new();
+        // PASS 2a — fork: materialise each survivor's KV state. Sequential because
+        // the clone/move bookkeeping above is order-dependent, but it is only
+        // memcpy, not compute.
         let mut used = vec![0usize; child_count.len()];
-        for e in expands {
+        let mut states: Vec<DecoderState> = Vec::with_capacity(expands.len());
+        for e in &expands {
             used[e.parent] += 1;
-            let mut state = if used[e.parent] == child_count[e.parent] {
+            states.push(if used[e.parent] == child_count[e.parent] {
                 parent_states[e.parent]
                     .take()
                     .expect("last surviving child moves the parent state")
@@ -1020,10 +1021,39 @@ fn beam_decode_window(
                     .as_ref()
                     .expect("earlier surviving child clones the parent state")
                     .clone()
-            };
-            let (x_last, _draft) =
-                decoder::forward_step_hidden(&m.decoder, &mut state, &[e.tok], checkpoint)?;
-            hidden_rows.extend_from_slice(&x_last.data);
+            });
+        }
+
+        // PASS 2b — forward every survivor to its hidden state CONCURRENTLY.
+        // Each hypothesis carries its own KV, so the stacks cannot be fused into
+        // one batched GEMM the way whisper.cpp fuses them (it packs one token per
+        // decoder into a single sequence-indexed batch, `whisper.cpp` ~7442-7472,
+        // and so reads the decoder weights ONCE per step where we read them once
+        // per beam). Running them concurrently recovers most of that anyway: a
+        // single-token forward is latency-bound and cannot saturate a 64-core pool
+        // on its own, and every hypothesis streams the SAME weight bytes, which
+        // coalesce into one DRAM stream rather than `beam` of them
+        // ([[project_nominal_vs_dram_bytes]]).
+        //
+        // BYTE-EXACT BY CONSTRUCTION: the hypotheses are independent given their
+        // states, results are reassembled in the original order, and no arithmetic
+        // is reordered. `checkpoint` is not `Sync` so the inner probe is a no-op
+        // here; cancellation is still checked once per decode step at the top of
+        // the loop, i.e. granularity drops from per-layer to per-step.
+        let toks: Vec<i32> = expands.iter().map(|e| e.tok).collect();
+        let hiddens: Vec<FwResult<super::Mat>> = states
+            .par_iter_mut()
+            .zip(toks.par_iter())
+            .map(|(state, &tok)| {
+                let noop = || -> FwResult<()> { Ok(()) };
+                decoder::forward_step_hidden(&m.decoder, state, &[tok], &noop).map(|(x, _)| x)
+            })
+            .collect();
+
+        let mut next_active: Vec<BeamHyp> = Vec::with_capacity(expands.len());
+        let mut hidden_rows: Vec<f32> = Vec::new();
+        for ((e, state), hidden) in expands.into_iter().zip(states).zip(hiddens) {
+            hidden_rows.extend_from_slice(&hidden?.data);
             next_active.push(BeamHyp {
                 state,
                 tokens: e.tokens,
