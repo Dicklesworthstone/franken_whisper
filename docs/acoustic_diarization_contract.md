@@ -872,7 +872,55 @@ license acknowledgement, cancellation, and byte-stable replay. Full accuracy
 certification points the same command at externally acquired data and retains
 the resulting bundle and scorer outputs outside the repository.
 
-### 11.3 Repository and release guard
+### 11.3 Adversarial and metamorphic acoustic recipes
+
+`src/adversarial_corpus.rs` is the public-safe failure-reproduction substrate.
+It generates finite in-memory PCM from `adversarial-synthetic-call-v1` recipes;
+it does not read a path or serialize the resulting samples. Synthetic profiles
+contain only oscillator, amplitude, stationary coloration, and stereo-position
+parameters. Turns contain only a numeric profile index, integer time range,
+gain, pitch movement, and a playback condition. They do not contain words,
+names, demographic labels, recordings, or biometric templates.
+
+The v1 challenge registry contains one deterministic seed for each required
+regime:
+
+| Source or transform family | Metamorphic contract |
+|---|---|
+| Gain/distance imbalance | Speaker labels remain permutation-equivalent |
+| Stationary EQ/muffling and band limitation | Labels remain stable; quality may degrade |
+| Resampling and quantization | Timing is unchanged; consistency error is measured |
+| Clipping, noise, reverb, and interruptions | Labels remain stable or become explicitly uncertain; no invented identity |
+| Leading/trailing silence | Every reference boundary shifts by the exact leading duration |
+| Rapid turns and long turns | Source geometry is authoritative |
+| Similar pitch and within-speaker voice-state shifts | Pitch alone may neither merge nor split an identity |
+| Within-speaker channel shifts and loudspeaker playback | Channel evidence may create a subprofile, not a new voice |
+| Stereo channel swap | Speaker output is channel-permutation invariant |
+| Controlled overlap | Overlap evidence increases without fabricating a third identity |
+
+Every `adversarial-transform-plan-v1` binds the exact input PCM hash and
+contains at most 64 bounded integer-parameter steps. Execution checkpoints
+cancellation between steps, rejects non-finite or malformed PCM, caps
+allocations, and emits `adversarial-transform-evidence-v1`. Its graph records
+only the plan hash, per-step recipe hash, input/output audio hashes, and
+expected relationship. It contains no audio, path, filename, transcript,
+embedding, speaker name, or per-frame feature.
+
+Pipeline harnesses provide aggregate fingerprints for input, normalization,
+speech mask, feature extraction, change detection, clustering, projection,
+and scoring. Comparison returns the first differing or missing stage. A stable
+regression classification is an uppercase error code plus that stage.
+Deterministic delta minimization removes transform subsequences only when the
+caller-supplied evaluator reproduces the exact same classification, and
+retains original step indices and an evaluation count. The minimized artifact
+is a recipe, not an accuracy certificate.
+
+An identity-preserving recipe does not promise that an imperfect candidate
+will pass. Its purpose is to turn violations into small, reproducible public
+regressions. Promotion still requires the frozen scorer, public corpus gates,
+unseen held-out evidence, and the rollout authority described above.
+
+### 11.4 Repository and release guard
 
 Audio/video extensions and transcript sidecars are ignored broadly, including
 case variants and text/JSON/subtitle forms. Raw decoder spans and transcript-
