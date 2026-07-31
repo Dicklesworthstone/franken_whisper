@@ -923,7 +923,99 @@ will pass. Its purpose is to turn violations into small, reproducible public
 regressions. Promotion still requires the frozen scorer, public corpus gates,
 unseen held-out evidence, and the rollout authority described above.
 
-### 11.4 Repository and release guard
+### 11.4 Stage-aware external differential oracles
+
+`src/differential_oracle.rs` is an explicit developer-only bridge to
+operator-installed diarization systems. It does not add a Cargo dependency,
+does not run during transcription, and does not make any external system part
+of the shipped native decision path. Its stable registry spans three
+architecturally different families:
+
+- cascaded pipelines: pyannote and NeMo spectral clustering;
+- Bayesian HMM refinement: VBx;
+- end-to-end/attractor systems: EEND, DiaPer, and Sortformer.
+
+Each registry entry names a dedicated
+`FRANKEN_WHISPER_*_ORACLE_BIN` override and a default adapter executable. The
+operator supplies that adapter. A version probe receives
+`--franken-whisper-diarization-oracle-version --protocol
+franken-whisper-diarization-oracle-protocol-v1` and must emit one strict
+`franken-whisper-diarization-oracle-version-v1` JSON object on stdout. A run
+receives `--franken-whisper-diarization-oracle-run`, the same protocol flag,
+an external `--audio` path, and a lowercase SHA-256 `--recording-key`. It must
+emit one strict `franken-whisper-diarization-stage-document-v1` object on
+stdout. Arguments are never retained, and neither stdout nor stderr content is
+copied into the report.
+
+The canonical stage document has a duration and optional outputs for:
+
+1. speech activity intervals;
+2. opaque, non-lexical word timing IDs;
+3. speaker-change boundaries;
+4. opaque segment-to-cluster assignments;
+5. overlap intervals;
+6. final diarization turns.
+
+Word identities must use bounded `w-` hexadecimal tokens and cluster segment
+identities bounded `seg-` hexadecimal tokens. There is no field for transcript
+text, a media path, a model path, a raw embedding vector, or a speaker name.
+Intervals and counts are bounded; activity/overlap intervals must be ordered
+and non-overlapping; confidences must be finite and in `[0, 1]`.
+
+The comparator reports all six stages in that order. Activity and overlap use
+exact integer-millisecond intersection-over-union. Word timing joins opaque
+IDs and measures two-boundary collar recall. Change points use the frozen
+one-to-one matcher. Cluster comparison uses contingency counts and pairwise
+co-assignment, making it label-permutation invariant in linear-logarithmic
+time rather than materializing all segment pairs. It also measures shared
+segment coverage and requires matching geometry for each shared opaque segment
+identity, so an adapter cannot appear equivalent by omitting or moving
+anchors. Confidence availability and mean absolute confidence delta are
+reported separately, but do not determine equivalence because independently
+implemented tools need not calibrate confidence to the same scale. Final turns
+use the frozen Hungarian speaker mapping and retain only label-free DER/JER
+components. Missing stages remain explicitly missing; they are not converted
+into errors or fabricated values. `earliest_divergence` is the first present
+stage whose frozen diagnostic threshold is exceeded.
+
+An optional third stage document can help interpret a disagreement. Its only
+categories are `reference_favors_native`, `reference_favors_oracle`,
+`reference_tied`, and inconclusive/unavailable states. These are diagnostics,
+not correctness certificates. Every report hard-codes:
+
+```json
+{"authority":"diagnostic_only","native_incorrectness_claim_permitted":false}
+```
+
+Missing binaries, nonzero exits, timeouts, incompatible versions, invalid
+JSON, invalid geometry, and tool/recording identity mismatches create a clean
+`skipped` report with a stable reason and failure stage. Cancellation remains
+cancellation and kills the child rather than being misreported as a tool
+result. Safe partial provenance is retained when available: tool family,
+validated tool/adapter versions, executable hash, version/run stdout hashes,
+audio hash, and input-document hashes. Paths, stderr, output content, labels,
+word IDs, and local recording identities are not retained. Every report
+self-verifies its authority, state invariants, stage ordering, configuration
+hash, provenance hashes, and result hash before being written with
+create-new semantics outside the checkout.
+
+The CLI exposes only explicit development commands:
+
+```bash
+franken_whisper diarization-oracle registry
+franken_whisper diarization-oracle run \
+  --tool pyannote \
+  --audio /absolute/external/audio \
+  --native /absolute/external/native-stage.json \
+  --reference /absolute/external/reference-stage.json \
+  --output /absolute/external/differential-report.json
+```
+
+All input documents, media, and output reports must be absolute external
+files. A missing `--reference` is valid and produces
+`inconclusive_no_reference` for genuine disagreements.
+
+### 11.5 Repository and release guard
 
 Audio/video extensions and transcript sidecars are ignored broadly, including
 case variants and text/JSON/subtitle forms. Raw decoder spans and transcript-

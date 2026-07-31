@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use franken_whisper::cli::{
-    Cli, Command, ControlFrameKind, PublicCorpusCommand, RobotCommand, RunsOutputFormat,
-    ShutdownController, SyncCommand, TtyAudioCommand, TtyAudioControlCommand,
+    Cli, Command, ControlFrameKind, DifferentialOracleCommand, PublicCorpusCommand, RobotCommand,
+    RunsOutputFormat, ShutdownController, SyncCommand, TtyAudioCommand, TtyAudioControlCommand,
 };
 use franken_whisper::model::StoredRunDetails;
 use franken_whisper::robot::{
@@ -273,6 +273,42 @@ fn run(cli: Cli) -> FwResult<()> {
                         ShutdownController::is_shutting_down,
                     )?;
                 println!("{}", serde_json::to_string_pretty(&evidence)?);
+                Ok(())
+            }
+        },
+        Command::DiarizationOracle { command } => match command {
+            DifferentialOracleCommand::Registry => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &franken_whisper::differential_oracle::differential_oracle_registry()
+                    )?
+                );
+                Ok(())
+            }
+            DifferentialOracleCommand::Run(args) => {
+                let current_dir = std::env::current_dir().map_err(|_| {
+                    FwError::InvalidRequest(
+                        "differential_oracle.project_root: current directory could not be resolved"
+                            .to_owned(),
+                    )
+                })?;
+                let project_root =
+                    franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+                let report =
+                    franken_whisper::differential_oracle::run_differential_oracle(
+                        franken_whisper::differential_oracle::DifferentialOracleRequest {
+                            project_root: &project_root,
+                            audio_path: &args.audio,
+                            native_document_path: &args.native,
+                            reference_document_path: args.reference.as_deref(),
+                            output_path: &args.output,
+                            tool: args.tool.into(),
+                            hard_timeout: Duration::from_secs(args.timeout_seconds),
+                            comparison_config: franken_whisper::differential_oracle::DifferentialComparisonConfig::default(),
+                        },
+                    )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
         },
