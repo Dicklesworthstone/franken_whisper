@@ -1184,6 +1184,68 @@ pub fn matmul_bias_i7_quantized(
     w: &I7Mat,
     bias: Option<&[f32]>,
 ) -> FwResult<Mat> {
+    if bias.is_some() {
+        matmul_bias_i7_quantized_impl::<true, true>(x, w, bias)
+    } else {
+        matmul_bias_i7_quantized_impl::<true, false>(x, w, bias)
+    }
+}
+
+/// Const-specialized implementation behind a non-inlined boundary for the
+/// same-ELF bias-specialization A/B. Keeping both A/B entry points non-inlined
+/// prevents thin LTO from specializing the historical runtime `Option` at the
+/// benchmark call site while preserving the production entry point above.
+#[doc(hidden)]
+#[inline(never)]
+pub fn matmul_bias_i7_quantized_specialized_ab(
+    x: &I7Activation,
+    w: &I7Mat,
+    bias: Option<&[f32]>,
+) -> FwResult<Mat> {
+    if bias.is_some() {
+        matmul_bias_i7_quantized_impl::<true, true>(x, w, bias)
+    } else {
+        matmul_bias_i7_quantized_impl::<true, false>(x, w, bias)
+    }
+}
+
+/// Historical runtime-`Option` implementation retained for the same-ELF
+/// bias-specialization A/B. Production callers use
+/// [`matmul_bias_i7_quantized`]; this entry point exists only so the reverted
+/// candidate can be measured against its exact former branch shape without a
+/// cross-binary comparison.
+#[doc(hidden)]
+#[inline(never)]
+pub fn matmul_bias_i7_quantized_unspecialized(
+    x: &I7Activation,
+    w: &I7Mat,
+    bias: Option<&[f32]>,
+) -> FwResult<Mat> {
+    matmul_bias_i7_quantized_impl::<false, false>(x, w, bias)
+}
+
+#[inline(always)]
+fn i7_projection_bias<const SPECIALIZED: bool, const HAS_BIAS: bool>(
+    runtime_bias: Option<&[f32]>,
+    specialized_bias: &[f32],
+    output: usize,
+) -> Option<f32> {
+    if SPECIALIZED {
+        if HAS_BIAS {
+            Some(specialized_bias[output])
+        } else {
+            None
+        }
+    } else {
+        runtime_bias.map(|bias| bias[output])
+    }
+}
+
+fn matmul_bias_i7_quantized_impl<const SPECIALIZED: bool, const HAS_BIAS: bool>(
+    x: &I7Activation,
+    w: &I7Mat,
+    bias: Option<&[f32]>,
+) -> FwResult<Mat> {
     let m = x.rows;
     let inp = x.inp;
     if inp != w.inp {
@@ -1201,6 +1263,12 @@ pub fn matmul_bias_i7_quantized(
             w.out
         )));
     }
+    debug_assert!(!SPECIALIZED || HAS_BIAS == bias.is_some());
+    let specialized_bias = if SPECIALIZED && HAS_BIAS {
+        bias.expect("specialized bias arm requires a validated bias slice")
+    } else {
+        &[]
+    };
     let out = w.out;
     let xu = &x.data;
     let sa = &x.scale;
@@ -1243,9 +1311,32 @@ pub fn matmul_bias_i7_quantized(
                             let sc1 = w.scale[o + 1];
                             let sc2 = w.scale[o + 2];
                             let sc3 = w.scale[o + 3];
-                            let (bo0, bo1, bo2, bo3) = bias.map_or((0.0, 0.0, 0.0, 0.0), |b| {
-                                (b[o], b[o + 1], b[o + 2], b[o + 3])
-                            });
+                            let (bo0, bo1, bo2, bo3) = (
+                                i7_projection_bias::<SPECIALIZED, HAS_BIAS>(
+                                    bias,
+                                    specialized_bias,
+                                    o,
+                                )
+                                .unwrap_or(0.0),
+                                i7_projection_bias::<SPECIALIZED, HAS_BIAS>(
+                                    bias,
+                                    specialized_bias,
+                                    o + 1,
+                                )
+                                .unwrap_or(0.0),
+                                i7_projection_bias::<SPECIALIZED, HAS_BIAS>(
+                                    bias,
+                                    specialized_bias,
+                                    o + 2,
+                                )
+                                .unwrap_or(0.0),
+                                i7_projection_bias::<SPECIALIZED, HAS_BIAS>(
+                                    bias,
+                                    specialized_bias,
+                                    o + 3,
+                                )
+                                .unwrap_or(0.0),
+                            );
                             cblk[o] = (raw01[0] - off0) as f32 * s0 * sc0 + bo0;
                             cblk[out + o] = (raw01[1] - off0) as f32 * s1 * sc0 + bo0;
                             cblk[2 * out + o] = (raw23[0] - off0) as f32 * s2 * sc0 + bo0;
@@ -1281,8 +1372,14 @@ pub fn matmul_bias_i7_quantized(
                         let mut b1v = (raw[5] - off1) as f32 * s1 * sc1;
                         let mut b2v = (raw[6] - off1) as f32 * s2 * sc1;
                         let mut b3v = (raw[7] - off1) as f32 * s3 * sc1;
-                        if let Some(b) = bias {
-                            let (bo0, bo1) = (b[o], b[o + 1]);
+                        if let (Some(bo0), Some(bo1)) = (
+                            i7_projection_bias::<SPECIALIZED, HAS_BIAS>(bias, specialized_bias, o),
+                            i7_projection_bias::<SPECIALIZED, HAS_BIAS>(
+                                bias,
+                                specialized_bias,
+                                o + 1,
+                            ),
+                        ) {
                             a0v += bo0;
                             a1v += bo0;
                             a2v += bo0;
@@ -1311,8 +1408,9 @@ pub fn matmul_bias_i7_quantized(
                         let mut v1 = (raw[1] - off) as f32 * s1 * sc;
                         let mut v2 = (raw[2] - off) as f32 * s2 * sc;
                         let mut v3 = (raw[3] - off) as f32 * s3 * sc;
-                        if let Some(b) = bias {
-                            let bo = b[o];
+                        if let Some(bo) =
+                            i7_projection_bias::<SPECIALIZED, HAS_BIAS>(bias, specialized_bias, o)
+                        {
                             v0 += bo;
                             v1 += bo;
                             v2 += bo;
@@ -1334,8 +1432,9 @@ pub fn matmul_bias_i7_quantized(
                         let mut v1 = (raw[1] - off) as f32 * s1 * sc;
                         let mut v2 = (raw[2] - off) as f32 * s2 * sc;
                         let mut v3 = (raw[3] - off) as f32 * s3 * sc;
-                        if let Some(b) = bias {
-                            let bo = b[o];
+                        if let Some(bo) =
+                            i7_projection_bias::<SPECIALIZED, HAS_BIAS>(bias, specialized_bias, o)
+                        {
                             v0 += bo;
                             v1 += bo;
                             v2 += bo;
@@ -1356,8 +1455,10 @@ pub fn matmul_bias_i7_quantized(
                         let wrow = &w.data[o * inp..(o + 1) * inp];
                         let dot = dot_maddubs_i7(xr, wrow) - 128 * w.colsum[o];
                         let mut val = dot as f32 * sar * w.scale[o];
-                        if let Some(b) = bias {
-                            val += b[o];
+                        if let Some(bo) =
+                            i7_projection_bias::<SPECIALIZED, HAS_BIAS>(bias, specialized_bias, o)
+                        {
+                            val += bo;
                         }
                         cblk[j * out + o] = val;
                     }
@@ -5830,6 +5931,45 @@ mod tests {
         assert_eq!(inline.rows, reused.rows);
         assert_eq!(inline.cols, reused.cols);
         assert_eq!(inline.data, reused.data);
+    }
+
+    #[test]
+    fn i7_bias_specialization_matches_runtime_option_bit_exact() {
+        let mut rng = Lcg::new(0xb1a5);
+        for (rows, inp, out) in [(5, 37, 9), (8, 32, 32), (4, 17, 41)] {
+            let x = rng.mat(rows, inp);
+            let xq = quantize_act_i7(&x);
+            let w = quantize_mat_to_i7(&rng.mat(inp, out));
+            let bias: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
+
+            for runtime_bias in [None, Some(bias.as_slice())] {
+                let historical = matmul_bias_i7_quantized_unspecialized(&xq, &w, runtime_bias)
+                    .expect("historical runtime-option projection");
+                let specialized = matmul_bias_i7_quantized(&xq, &w, runtime_bias)
+                    .expect("const-specialized projection");
+                let specialized_ab = matmul_bias_i7_quantized_specialized_ab(&xq, &w, runtime_bias)
+                    .expect("non-inlined const-specialized projection");
+
+                assert_eq!(
+                    historical
+                        .data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    specialized
+                        .data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "rows={rows} inp={inp} out={out} bias={}",
+                    runtime_bias.is_some()
+                );
+                assert_eq!(
+                    specialized.data, specialized_ab.data,
+                    "A/B entry point must execute the production specialized arm"
+                );
+            }
+        }
     }
 
     #[test]
