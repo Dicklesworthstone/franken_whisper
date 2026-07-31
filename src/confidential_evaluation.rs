@@ -432,7 +432,9 @@ impl AggregateAccumulator {
                 "count credible-set hit",
             )?;
         }
-        if let Some(value) = score.speaker_count_posterior.entropy_bits {
+        if score.speaker_count_posterior.posterior_available
+            && let Some(value) = score.speaker_count_posterior.entropy_bits
+        {
             self.count_entropy_sum += value;
             self.count_entropy_count =
                 checked_aggregate_add(self.count_entropy_count, 1, "count entropy observation")?;
@@ -1468,7 +1470,7 @@ fn validate_finite_aggregate(aggregate: &ConfidentialEvaluationAggregate) -> FwR
         .observed_recordings
         .checked_add(posterior.unavailable_recordings)
         == Some(aggregate.recording_count)
-        && posterior.unresolved_recordings <= posterior.observed_recordings
+        && posterior.unresolved_recordings <= aggregate.recording_count
         && posterior.zero_reference_probability_recordings <= posterior.observed_recordings
         && posterior
             .finite_negative_log_likelihood_recordings
