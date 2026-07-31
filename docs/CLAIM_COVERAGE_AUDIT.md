@@ -1,6 +1,12 @@
 # Claim Coverage Audit — how much of our claimed ground rests on a live incumbent
 
-**Date:** 2026-07-30 · **Auditor:** MagentaMeadow (cc lane) · **Bead:** bd-b4hp
+**Date:** 2026-07-30, re-verified at HEAD `ec96916` 2026-07-31 ·
+**Auditor:** MagentaMeadow (cc lane), re-run by BlackThrush · **Bead:** bd-b4hp
+
+**Reproduce with `python3 scripts/claim_coverage_audit.py [--detail]`.** The
+first publication of this audit stated its method in prose but shipped no
+script, so the headline could not be re-derived by a reader. It now can be, and
+the re-run at HEAD reproduces 44 / 3 / 41 unchanged.
 
 Fleet policy under audit: **a perf KEEP requires a vs-incumbent ratio**, and a
 competitive result requires the legacy incumbent to run *side-by-side with
@@ -29,7 +35,14 @@ The three supported claims, all from `examples/incumbent_ab.rs`, all **tiny.en**
 
 ## The 41 unsupported claims split into two genuinely different problems
 
-**17 — no incumbent arm can exist.** These are on surfaces `whisper.cpp` does
+**Arithmetic correction (2026-07-31).** This section originally read "17" and
+"22", which sum to **39**, not 41 — two rows fell through the hand split. The
+script now derives the split by surface keyword and prints its per-row
+assignment (`--detail`), so the parts sum to the whole by construction. The
+corrected counts are **18** and **23**. Both extra rows land in the two buckets
+below; neither changes the headline 3-of-44, and neither is user-facing.
+
+**18 — no incumbent arm can exist.** These are on surfaces `whisper.cpp` does
 not have at all: the Bayesian backend router, the diarizer, SQLite run storage,
 SRT/VTT export, NDJSON streaming, the YouTube renderer, CLI request building.
 There is nothing to compare against; `whisper-cli` implements none of it. These
@@ -37,7 +50,7 @@ are **permanently unconvertible**, and the correct remedy is labelling, not
 measurement — they must read "self-speedup / maintenance" and must never be
 quoted as competitive wins.
 
-**22 — convertible in principle.** These are on the shared ASR surface: mel
+**23 — convertible in principle.** These are on the shared ASR surface: mel
 projection, GELU, the resampler, the i7/f16 GEMV kernels, beam KV reuse and
 logits batching, the tiny.en no-carry decode policy. An incumbent arm is
 *possible* for each. But most are **sub-lever kernels** whose honest incumbent
@@ -101,11 +114,14 @@ by ratio size.
    exactly why it should be converted rather than left in a ledger: our public
    claim is greedy-only, and a user who turns on beam gets the opposite of the
    README's promise.
-4. **The 22 shared-surface kernel rows.** Convert at the engine level (items
+4. **The 23 shared-surface kernel rows.** Convert at the engine level (items
    1–2), not individually.
-5. **The 17 no-arm rows.** Relabel as maintenance; do not attempt conversion.
+5. **The 18 no-arm rows.** Relabel as maintenance; do not attempt conversion.
 
 ## Method
+
+Implemented in `scripts/claim_coverage_audit.py`; run it to reproduce every
+number on this page.
 
 `docs/PERF_LEDGER.md` + `docs/NEGATIVE_EVIDENCE.md` parsed into `## `-headed
 sections; a section counts as a perf KEEP when it carries a KEEP/WIN verdict
@@ -118,3 +134,11 @@ claims precisely because it matched franken-vs-franken interleaving, and three
 further false positives (a row self-labelled NON-CAMPAIGN, a harness-contract
 row, a doc-structure header) were removed by inspection. The reported 3 is the
 count that survives that filtering.
+
+Both hand-removals are now rules in the script rather than judgement calls:
+a ledger row's title starts with its ISO date, so document structure
+("Levers", "Result classes") is excluded structurally (2 sections); and a row
+that self-labels `NON-CAMPAIGN` is excluded from the supported set even though
+it does quote a live incumbent run. Without the date rule the population reads
+46, which is why the two published totals must be quoted together with the
+rule that produced them.
