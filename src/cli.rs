@@ -253,6 +253,12 @@ pub enum Command {
         #[command(subcommand)]
         command: PublicCorpusCommand,
     },
+    /// Run explicit development-only differential diagnostics against external tools.
+    #[command(name = "diarization-oracle")]
+    DiarizationOracle {
+        #[command(subcommand)]
+        command: DifferentialOracleCommand,
+    },
     Tui,
     /// Download YouTube audio (videos / playlists / a URL file) and
     /// transcribe each into a markdown + JSON pair.
@@ -268,6 +274,81 @@ pub enum PublicCorpusCommand {
     Build(PublicCorpusBuildArgs),
     /// Run all frozen acoustic feature ablations and emit aggregates only.
     Ablate(PublicCorpusAblationArgs),
+}
+
+/// Developer-only external differential-diagnostic commands.
+#[derive(Debug, Subcommand)]
+pub enum DifferentialOracleCommand {
+    /// Emit the path-free external adapter registry as JSON.
+    Registry,
+    /// Run one external adapter and compare its transcript-free stages.
+    Run(DifferentialOracleArgs),
+}
+
+/// External tool selected for one development-only diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DifferentialOracleToolArg {
+    Pyannote,
+    NemoSpectral,
+    Vbx,
+    Eend,
+    Diaper,
+    Sortformer,
+}
+
+impl From<DifferentialOracleToolArg> for crate::differential_oracle::DifferentialOracleTool {
+    fn from(value: DifferentialOracleToolArg) -> Self {
+        match value {
+            DifferentialOracleToolArg::Pyannote => Self::Pyannote,
+            DifferentialOracleToolArg::NemoSpectral => Self::NemoSpectral,
+            DifferentialOracleToolArg::Vbx => Self::Vbx,
+            DifferentialOracleToolArg::Eend => Self::Eend,
+            DifferentialOracleToolArg::Diaper => Self::Diaper,
+            DifferentialOracleToolArg::Sortformer => Self::Sortformer,
+        }
+    }
+}
+
+/// Arguments for an external, path-free differential diagnostic.
+#[derive(Args)]
+pub struct DifferentialOracleArgs {
+    /// Operator-installed adapter family to probe.
+    #[arg(long, value_enum)]
+    pub tool: DifferentialOracleToolArg,
+
+    /// Absolute external audio path; bytes and path are never retained.
+    #[arg(long)]
+    pub audio: PathBuf,
+
+    /// Absolute external native stage-document path.
+    #[arg(long)]
+    pub native: PathBuf,
+
+    /// Optional absolute external reference stage-document path.
+    #[arg(long)]
+    pub reference: Option<PathBuf>,
+
+    /// New absolute report path outside the project tree.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Hard limit for the external adapter run.
+    #[arg(long, default_value_t = 1_800)]
+    pub timeout_seconds: u64,
+}
+
+impl fmt::Debug for DifferentialOracleArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DifferentialOracleArgs")
+            .field("tool", &self.tool)
+            .field("audio", &"<redacted>")
+            .field("native", &"<redacted>")
+            .field("reference", &self.reference.as_ref().map(|_| "<redacted>"))
+            .field("output", &"<redacted>")
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
 }
 
 /// Arguments for external public-corpus preparation.
@@ -3346,6 +3427,52 @@ mod tests {
         assert!(args.locked_development_evidence.is_none());
         let debug = format!("{args:?}");
         assert!(!debug.contains("EXTERNAL"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn differential_oracle_cli_parses_registry() {
+        let cli = Cli::try_parse_from(["franken_whisper", "diarization-oracle", "registry"])
+            .expect("oracle registry");
+        assert!(matches!(
+            cli.command,
+            Command::DiarizationOracle {
+                command: DifferentialOracleCommand::Registry
+            }
+        ));
+    }
+
+    #[test]
+    fn differential_oracle_cli_parses_run_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-oracle",
+            "run",
+            "--tool",
+            "nemo-spectral",
+            "--audio",
+            "/PRIVATE/call.m4a",
+            "--native",
+            "/PRIVATE/native.json",
+            "--reference",
+            "/PRIVATE/reference.json",
+            "--output",
+            "/PRIVATE/report.json",
+            "--timeout-seconds",
+            "90",
+        ])
+        .expect("oracle run");
+        let Command::DiarizationOracle {
+            command: DifferentialOracleCommand::Run(args),
+        } = cli.command
+        else {
+            panic!("expected differential oracle run");
+        };
+        assert_eq!(args.tool, DifferentialOracleToolArg::NemoSpectral);
+        assert_eq!(args.timeout_seconds, 90);
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("PRIVATE"));
+        assert!(!debug.contains("call.m4a"));
         assert!(debug.contains("<redacted>"));
     }
 }

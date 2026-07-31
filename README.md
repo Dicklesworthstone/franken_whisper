@@ -414,6 +414,20 @@ external public-license acknowledgement. The same API attributes the first
 divergent pipeline stage and delta-minimizes a failing transform sequence while
 preserving its exact classification.
 
+For development-only differential diagnosis, `diarization-oracle` can compare
+the native stage document with an operator-installed pyannote, NeMo spectral,
+VBx, EEND, DiaPer, or Sortformer adapter. Start with
+`franken_whisper diarization-oracle registry`, then run the selected adapter
+against absolute external audio and stage-document paths. Comparisons are
+separate for speech activity, opaque word timing, change boundaries,
+label-permutation-invariant clusters, overlap, and final projection. Missing
+or failing tools produce a path-free skipped report; disagreements are
+diagnostic only and can never certify that the native path is wrong. External
+tools remain optional subprocesses with no normal runtime or Cargo dependency.
+The full adapter protocol, environment overrides, privacy rules, and authority
+boundary are in the
+[`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
+
 ### 4. Microphone Capture
 
 ```bash
