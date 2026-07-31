@@ -1651,7 +1651,7 @@ mod tests {
                 probability: 0.7,
             },
         ];
-        let unresolved_probability = 0.1;
+        let unresolved_probability = 0.1_f64;
         let entropy_bits = posterior
             .iter()
             .map(|bin| -bin.probability * bin.probability.log2())
@@ -1857,6 +1857,18 @@ mod tests {
                 .expect_err("tampering must fail")
                 .to_string()
                 .contains("aggregate_hash")
+        );
+
+        let mut forged_posterior = first.clone();
+        forged_posterior.speaker_count_posterior.top_k_hit_count = 2;
+        forged_posterior.result_sha256.clear();
+        forged_posterior.result_sha256 =
+            canonical_sha256(&forged_posterior).expect("forged posterior hash");
+        assert!(
+            verify_confidential_evaluation_aggregate(&forged_posterior)
+                .expect_err("posterior semantic forgery must fail")
+                .to_string()
+                .contains("aggregate_semantics")
         );
 
         let mut semantically_invalid = first;
