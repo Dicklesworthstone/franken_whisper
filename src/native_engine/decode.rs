@@ -1647,6 +1647,46 @@ fn pipeline_windows_enabled() -> bool {
     })
 }
 
+/// Decode independent no-context windows concurrently on hosts whose Rayon
+/// pool already spans every physical core. The ordinary loop carries prompt
+/// state and therefore has to remain serial; with `max_context=0`, explicit
+/// language, greedy no-timestamp decode, and no fallback/DTW, each 30-second
+/// window is a pure function of its own mel offset and the shared read-only
+/// weights. Running several token streams at once fills the cores left idle by
+/// the latency-bound parts of a single greedy stream.
+///
+/// The path is deliberately restricted to long jobs on 64+ physical-core
+/// hosts and a physical-core-sized Rayon pool. Smaller pools, SMT-sized pools,
+/// and all stateful decode modes retain the established serial pipeline.
+/// `FW_PARALLEL_NO_CONTEXT_WINDOWS=0` is the process-lifetime rollback switch.
+fn parallel_no_context_windows_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FW_PARALLEL_NO_CONTEXT_WINDOWS").map_or(true, |v| {
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        })
+    })
+}
+
+fn parallel_no_context_window_lanes(
+    windows: usize,
+    rayon_threads: usize,
+    physical_cores: usize,
+) -> usize {
+    const MIN_WINDOWS: usize = 4;
+    const MIN_PHYSICAL_CORES: usize = 64;
+    const MIN_THREADS_PER_STREAM: usize = 8;
+
+    if windows < MIN_WINDOWS
+        || physical_cores < MIN_PHYSICAL_CORES
+        || rayon_threads != physical_cores
+    {
+        return 1;
+    }
+    windows.min((rayon_threads / MIN_THREADS_PER_STREAM).max(1))
+}
+
 /// Derive this window's encoder context (in encoder frames) from the real
 /// (unpadded) audio frame count remaining in the window.
 ///
@@ -1733,6 +1773,293 @@ fn single_timestamp_ending(
         && decoded[decoded.len() - 1] > timestamp_begin
 }
 
+struct IndependentWindowResult {
+    seek_cs: i64,
+    segments: Vec<TranscriptionSegment>,
+    stats: WindowStats,
+    work: DecodeWorkStats,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_independent_no_timestamp_window(
+    m: &LoadedModel,
+    full_mel: &super::Mel,
+    params: &DecodeParams,
+    cfg: &FilterConfig,
+    language: &str,
+    seek_cs: i64,
+    seek_end_cs: i64,
+    n_max_tokens: usize,
+    user_max_tokens: Option<usize>,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<IndependentWindowResult> {
+    checkpoint()?;
+    let tk = &m.tokenizer;
+    let mut work = DecodeWorkStats {
+        window_attempts: 1,
+        ..DecodeWorkStats::default()
+    };
+    let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
+
+    let t_enc = std::time::Instant::now();
+    let enc = encoder::forward_from_full_mel_window(
+        &m.encoder,
+        full_mel,
+        frame_offset,
+        FRAMES_PER_CHUNK,
+        params.n_threads,
+        checkpoint,
+    )?;
+    work.encoder_calls = 1;
+    super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
+
+    let t_xkv = std::time::Instant::now();
+    let mut st = DecoderState::new(&m.decoder, &enc)?;
+    super::perf_span("cross_kv", t_xkv.elapsed().as_secs_f64() * 1e3, "");
+
+    // This fast path is admitted only when cross-window prompt carry is
+    // disabled, so the prompt is exactly the per-window SOT sequence.
+    let prompt = tk.sot_sequence(Some(language), params.translate, false);
+    let t_prefill = std::time::Instant::now();
+    let prefill_logits = decoder::forward_step(&m.decoder, &mut st, &prompt, checkpoint)?;
+    work.decoder_prefill_calls = 1;
+    work.decoder_prefill_tokens = prompt.len();
+    super::perf_span(
+        "decoder_prefill",
+        t_prefill.elapsed().as_secs_f64() * 1e3,
+        &format!("\"prompt_tokens\":{}", prompt.len()),
+    );
+    let no_speech_prob = {
+        let lp = compute_logprobs(&prefill_logits);
+        usize::try_from(tk.no_speech)
+            .ok()
+            .and_then(|i| lp.get(i).copied())
+            .map_or(0.0, |x| {
+                let p = f64::from(x.exp());
+                if p.is_finite() { p } else { 0.0 }
+            })
+    };
+
+    let t_loop = std::time::Instant::now();
+    let mut decoded: Vec<i32> = Vec::new();
+    let mut plogs: Vec<f32> = Vec::new();
+    let mut has_ts = false;
+    let mut seek_delta_cs = CHUNK_CS;
+    let mut result_len = 0usize;
+    let mut step_logits = prefill_logits;
+
+    for i in 0..n_max_tokens {
+        let (filtered, logprobs) = process_logits(
+            tk,
+            cfg,
+            step_logits,
+            &decoded,
+            has_ts,
+            seek_delta_cs,
+            decoded.len(),
+        );
+        let (tok, plog) = argmax(&filtered, &logprobs);
+        decoded.push(tok);
+        plogs.push(plog);
+
+        // Timestamp tokens are masked by this path's filter, but retaining the
+        // established update makes the specialization mechanically identical
+        // if a malformed model ever surfaces one.
+        if tok > tk.timestamp_begin {
+            let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
+            if has_ts && seek_delta_cs > new_delta && result_len < i {
+                break;
+            }
+            seek_delta_cs = new_delta;
+            result_len = i + 1;
+            has_ts = true;
+        }
+
+        let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
+        let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+        if tok == tk.eot || budget_reached || reached_end {
+            result_len = i + 1;
+            seek_delta_cs = CHUNK_CS;
+            break;
+        }
+
+        checkpoint()?;
+        step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
+        work.greedy_single_token_forwards += 1;
+    }
+    work.sampled_tokens = decoded.len();
+    super::perf_span(
+        "decode_loop",
+        t_loop.elapsed().as_secs_f64() * 1e3,
+        &format!("\"tokens\":{}", decoded.len()),
+    );
+
+    let result_plogs: &[f32] = if result_len > 0 && result_len <= plogs.len() {
+        &plogs[..result_len]
+    } else {
+        &plogs[..]
+    };
+    let avg_logprob = if result_plogs.is_empty() {
+        EMPTY_WINDOW_AVG_LOGPROB
+    } else {
+        result_plogs.iter().map(|&p| f64::from(p)).sum::<f64>() / result_plogs.len() as f64
+    };
+    let avg_logprob = if avg_logprob.is_finite() {
+        avg_logprob
+    } else {
+        EMPTY_WINDOW_AVG_LOGPROB
+    };
+    let is_no_speech = no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob < LOGPROB_THRESHOLD;
+
+    work.accepted_windows = 1;
+    work.accepted_result_tokens = result_len;
+    let segments = if !is_no_speech && !decoded.is_empty() {
+        let take = result_len.min(decoded.len());
+        build_segments(
+            tk,
+            &decoded[..take],
+            &plogs[..take],
+            seek_cs,
+            seek_delta_cs,
+            seek_end_cs,
+            false,
+        )
+    } else {
+        Vec::new()
+    };
+
+    Ok(IndependentWindowResult {
+        seek_cs,
+        segments,
+        stats: WindowStats {
+            avg_logprob,
+            no_speech_prob,
+            tokens: result_len,
+            window_offset_sec: seek_cs as f64 / 100.0,
+        },
+        work,
+    })
+}
+
+fn add_decode_work(total: &mut DecodeWorkStats, part: &DecodeWorkStats) {
+    total.window_attempts += part.window_attempts;
+    total.encoder_calls += part.encoder_calls;
+    total.decoder_prefill_calls += part.decoder_prefill_calls;
+    total.decoder_prefill_tokens += part.decoder_prefill_tokens;
+    total.sampled_tokens += part.sampled_tokens;
+    total.greedy_single_token_forwards += part.greedy_single_token_forwards;
+    total.accepted_windows += part.accepted_windows;
+    total.accepted_result_tokens += part.accepted_result_tokens;
+    total.prompt_reset_retries += part.prompt_reset_retries;
+    total.temperature_fallback_retries += part.temperature_fallback_retries;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_independent_no_timestamp_windows(
+    m: &LoadedModel,
+    full_mel: &super::Mel,
+    params: &DecodeParams,
+    cfg: &FilterConfig,
+    language: &str,
+    seek_end_cs: i64,
+    n_max_tokens: usize,
+    user_max_tokens: Option<usize>,
+    lanes: usize,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<DecodeOutput> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let offsets: Vec<i64> = (0..)
+        .map(|window| window * CHUNK_CS)
+        .take_while(|seek| seek + DELTA_MIN < seek_end_cs)
+        .collect();
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let first_error: Mutex<Option<FwError>> = Mutex::new(None);
+    let results: Mutex<Vec<IndependentWindowResult>> =
+        Mutex::new(Vec::with_capacity(offsets.len()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..lanes.min(offsets.len()) {
+            scope.spawn(|| {
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&seek_cs) = offsets.get(index) else {
+                        break;
+                    };
+                    let worker_checkpoint = || -> FwResult<()> {
+                        if stop.load(Ordering::Relaxed) {
+                            return Err(FwError::Cancelled(
+                                "parallel no-context window worker stopped".to_owned(),
+                            ));
+                        }
+                        checkpoint()
+                    };
+                    match decode_independent_no_timestamp_window(
+                        m,
+                        full_mel,
+                        params,
+                        cfg,
+                        language,
+                        seek_cs,
+                        seek_end_cs,
+                        n_max_tokens,
+                        user_max_tokens,
+                        &worker_checkpoint,
+                    ) {
+                        Ok(result) => results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(result),
+                        Err(error) => {
+                            let mut slot = first_error
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(error);
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(error) = first_error
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return Err(error);
+    }
+
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    results.sort_by_key(|result| result.seek_cs);
+    let mut segments = Vec::new();
+    let mut windows = Vec::with_capacity(results.len());
+    let mut work = DecodeWorkStats::default();
+    for result in results {
+        segments.extend(result.segments);
+        windows.push(result.stats);
+        add_decode_work(&mut work, &result.work);
+    }
+
+    Ok(DecodeOutput {
+        segments,
+        language: Some(language.to_owned()),
+        windows,
+        work,
+        word_timings: None,
+    })
+}
+
 /// Transcribe 16 kHz mono PCM `samples` with the greedy / temperature-0 path of
 /// whisper, returning timed segments + per-window QC statistics.
 ///
@@ -1748,7 +2075,7 @@ pub fn transcribe_samples(
     m: &LoadedModel,
     samples_16k_mono: &[f32],
     params: &DecodeParams,
-    checkpoint: &dyn Fn() -> FwResult<()>,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<DecodeOutput> {
     if samples_16k_mono.is_empty() {
         return Err(FwError::InvalidRequest(
@@ -1868,6 +2195,48 @@ pub fn transcribe_samples(
     // Beam width (whisper `--beam-size`): field or FW_BEAM_SIZE override, resolved
     // once. 1 = greedy (byte-identical default).
     let effective_beam_size = resolve_beam_size(params);
+
+    // Long no-context jobs have no cross-window dependency: timestamp tokens
+    // are masked (fixed 30 s seek), the language is already known, prompt carry
+    // is disabled, and the greedy/default-off fallback path owns no shared
+    // decoder state. On a 64+ physical-core host whose Rayon pool spans exactly
+    // those physical cores, fan the independent token streams out while sharing
+    // the immutable model and the one full-audio mel. This preserves the exact
+    // mel frames at every boundary (unlike slicing/re-mel range batchers) and
+    // merges results by offset, so scheduling cannot reorder output.
+    let independent_window_count = usize::try_from((seek_end_cs - DELTA_MIN).max(0))
+        .unwrap_or(0)
+        .div_ceil(CHUNK_CS as usize);
+    let independent_window_lanes = super::physical_cores().map_or(1, |physical| {
+        parallel_no_context_window_lanes(
+            independent_window_count,
+            rayon::current_num_threads(),
+            physical,
+        )
+    });
+    if parallel_no_context_windows_enabled()
+        && cfg.no_timestamps
+        && max_prompt_ctx <= 1
+        && !params.word_timestamps
+        && effective_beam_size == 1
+        && !temp_fallback_enabled()
+        && std::env::var_os("PROBE_DUMP_TOKENS").is_none()
+        && independent_window_lanes > 1
+        && let Some(language) = used_language.as_deref()
+    {
+        return decode_independent_no_timestamp_windows(
+            m,
+            &full_mel,
+            params,
+            &cfg,
+            language,
+            seek_end_cs,
+            n_max_tokens,
+            user_max_tokens,
+            independent_window_lanes,
+            checkpoint,
+        );
+    }
 
     // Tail-window encoder-context truncation kill switch, resolved once.
     //
@@ -3787,6 +4156,21 @@ mod tests {
         assert!(should_clear_short_tail_prompt(600, 1000));
         // Last partial window near the very end.
         assert!(should_clear_short_tail_prompt(900, 1000));
+    }
+
+    #[test]
+    fn parallel_no_context_windows_use_one_lane_outside_large_host_regime() {
+        assert_eq!(parallel_no_context_window_lanes(3, 64, 64), 1);
+        assert_eq!(parallel_no_context_window_lanes(5, 32, 64), 1);
+        assert_eq!(parallel_no_context_window_lanes(5, 128, 64), 1);
+        assert_eq!(parallel_no_context_window_lanes(5, 48, 48), 1);
+    }
+
+    #[test]
+    fn parallel_no_context_windows_fill_physical_core_pool_without_oversubscription() {
+        assert_eq!(parallel_no_context_window_lanes(5, 64, 64), 5);
+        assert_eq!(parallel_no_context_window_lanes(20, 64, 64), 8);
+        assert_eq!(parallel_no_context_window_lanes(12, 128, 128), 12);
     }
 
     // ----- Tail-window encoder-context truncation derivation (pure) -----
