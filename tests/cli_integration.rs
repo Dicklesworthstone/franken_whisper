@@ -19,8 +19,9 @@ use franken_whisper::diarization::{
 };
 use franken_whisper::model::{
     BackendKind, BackendParams, DecodingParams, DiarizationConfig, DiarizationEngine,
-    DiarizationFallbackPolicy, InputSource, OutputFormat, RunEvent, RunReport, SpeakerConstraints,
-    TimestampLevel, TranscribeRequest, TranscriptionResult, TranscriptionSegment, VadParams,
+    DiarizationFallbackPolicy, DiarizationRequest, InputSource, OutputFormat, RunEvent, RunReport,
+    SpeakerCountRequest, TimestampLevel, TranscribeRequest, TranscriptionResult,
+    TranscriptionSegment, VadParams,
 };
 use franken_whisper::public_corpus::{
     PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION, PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
@@ -2114,10 +2115,12 @@ fn backend_params_populated_round_trips_through_json() {
             min_speech_duration_ms: Some(250),
             ..VadParams::default()
         }),
-        speaker_constraints: Some(SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(2),
-            max_speakers: Some(5),
+        acoustic_diarization: Some(DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 5,
+            },
+            ..DiarizationRequest::default()
         }),
         diarization_config: Some(DiarizationConfig {
             no_stem: true,
@@ -2162,8 +2165,14 @@ fn backend_params_populated_round_trips_through_json() {
     assert_eq!(parsed.decoding.as_ref().unwrap().best_of, Some(5));
     assert_eq!(parsed.vad.as_ref().unwrap().threshold, Some(0.5));
     assert_eq!(
-        parsed.speaker_constraints.as_ref().unwrap().min_speakers,
-        Some(2)
+        parsed
+            .acoustic_diarization
+            .as_ref()
+            .map(|request| &request.speaker_count),
+        Some(&SpeakerCountRequest::Range {
+            minimum: 2,
+            maximum: 5
+        })
     );
     assert!(parsed.diarization_config.as_ref().unwrap().no_stem);
     assert_eq!(parsed.batch_size, Some(16));
@@ -2321,13 +2330,19 @@ fn transcribe_args_maps_output_formats_to_backend_params() {
     let vad = bp.vad.as_ref().expect("vad should be Some");
     assert_eq!(vad.threshold, Some(0.6));
 
-    // Speaker constraints.
-    let sc = bp
-        .speaker_constraints
+    // Speaker count request.
+    let count = &bp
+        .acoustic_diarization
         .as_ref()
-        .expect("speaker constraints");
-    assert_eq!(sc.min_speakers, Some(2));
-    assert_eq!(sc.max_speakers, Some(4));
+        .expect("speaker count request")
+        .speaker_count;
+    assert_eq!(
+        count,
+        &SpeakerCountRequest::Range {
+            minimum: 2,
+            maximum: 4
+        }
+    );
 
     // Top-level batch/timestamp/GPU.
     assert_eq!(bp.batch_size, Some(24));

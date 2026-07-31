@@ -3178,8 +3178,10 @@ mod tests {
     use crate::model::{
         BackendKind, BackendParams, DiarizationEngine, DiarizationFallbackStatus,
         DiarizationReport, DiarizationRequest, DiarizationTurn, InputSource, KnownSpeakerInterval,
-        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerProfileSummary, TranscribeRequest,
-        TranscriptionResult, TranscriptionSegment,
+        KnownSpeakerPolicy, RunEvent, RunReport, SpeakerCountOutcome, SpeakerCountOutcomeReason,
+        SpeakerCountOutcomeStatus, SpeakerCountRequest, SpeakerEvidenceReason,
+        SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
+        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
     use crate::storage::{BlockingConnection, RunStore};
 
@@ -3345,6 +3347,10 @@ mod tests {
         report.request.diarize = true;
         report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
             engine: DiarizationEngine::Acoustic,
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2,
+            },
             known_intervals: vec![KnownSpeakerInterval {
                 speaker_ref: "speaker_a".to_owned(),
                 start_ms: 0,
@@ -3356,8 +3362,8 @@ mod tests {
             ..DiarizationRequest::default()
         });
         report.result.diarization = Some(DiarizationReport {
-            implementation: "native-acoustic-v1".to_owned(),
-            contract_version: "acoustic-diarization-v1".to_owned(),
+            implementation: "native-acoustic-v2".to_owned(),
+            contract_version: "acoustic-diarization-v2".to_owned(),
             feature_schema: "acoustic-feature-v1".to_owned(),
             normalized_input_sha256:
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
@@ -3386,9 +3392,48 @@ mod tests {
                 anchored: true,
                 soft_hint_contradiction: Some(0.04),
             }],
+            hint_evidence: vec![SpeakerHintEvidenceSummary {
+                hint_index: 0,
+                speaker_ref: "speaker_a".to_owned(),
+                policy: KnownSpeakerPolicy::SoftEnrollment,
+                disposition: SpeakerHintDisposition::PartiallyAccepted,
+                usable_tracklet_count: 3,
+                accepted_tracklet_count: 2,
+                rejected_tracklet_count: 1,
+                profile_accepted_tracklet_count: 1,
+                profile_downweighted_tracklet_count: 1,
+                profile_quarantined_tracklet_count: 0,
+                applied_weight: 20.0,
+                contradiction_score: Some(0.04),
+            }],
             speaker_queries: Vec::new(),
-            detected_speakers: 1,
-            constraints_satisfied: true,
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::Range {
+                    minimum: 1,
+                    maximum: 2,
+                },
+                status: SpeakerCountOutcomeStatus::Satisfied,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["speaker_a".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.1,
+                reasons: vec![SpeakerCountOutcomeReason::RequestedCountMatched],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "speaker_a".to_owned(),
+                    assigned_tracklet_count: 3,
+                    independent_tracklet_count: 2,
+                    recurrence_episode_count: 2,
+                    voiced_frame_count: 180,
+                    independent_voiced_frame_count: 120,
+                    voiced_duration_ms: 1_800,
+                    mean_assignment_confidence: 0.9,
+                    profile_reliability: 0.88,
+                    hard_anchored: false,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByIndependentRecurrence],
+                    supported: true,
+                }],
+            },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             diagnostics: vec!["synthetic sync fixture".to_owned()],
         });
@@ -3570,7 +3615,35 @@ mod tests {
                 .diarization
                 .as_ref()
                 .map(|report| report.implementation.as_str()),
-            Some("native-acoustic-v1")
+            Some("native-acoustic-v2")
+        );
+        let recovered_request = request
+            .backend_params
+            .acoustic_diarization
+            .as_ref()
+            .expect("typed diarization request");
+        assert_eq!(
+            recovered_request.speaker_count,
+            SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2
+            }
+        );
+        let recovered_report = result
+            .diarization
+            .as_ref()
+            .expect("typed diarization result");
+        assert_eq!(
+            recovered_report.speaker_count.status,
+            SpeakerCountOutcomeStatus::Satisfied
+        );
+        assert_eq!(
+            recovered_report.speaker_count.reasons,
+            vec![SpeakerCountOutcomeReason::RequestedCountMatched]
+        );
+        assert_eq!(
+            recovered_report.hint_evidence[0].disposition,
+            SpeakerHintDisposition::PartiallyAccepted
         );
         assert!(
             !value_to_string_sqlite(canonical[0].get(1)).contains("feature_vector"),
@@ -3593,6 +3666,11 @@ mod tests {
                 .as_ref()
                 .map(|report| report.turns.as_slice()),
             "typed speaker turns must survive SQLite -> JSONL -> fresh SQLite"
+        );
+        assert_eq!(
+            recovered.diarization, report.result.diarization,
+            "count mode, reasons, occupancy evidence, hint dispositions, and fallback status must \
+             survive SQLite -> JSONL -> fresh SQLite"
         );
         assert_eq!(
             recovered

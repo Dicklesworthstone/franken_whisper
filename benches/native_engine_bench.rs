@@ -66,7 +66,7 @@ use franken_whisper::{
         AcousticBoundaryHints, AcousticDiarizationInput, diarize_acoustic_pcm,
         extract_acoustic_features,
     },
-    model::{DiarizationEngine, DiarizationRequest, SpeakerConstraints},
+    model::{DiarizationEngine, DiarizationRequest, SpeakerCountRequest},
 };
 
 // ---------------------------------------------------------------------------
@@ -541,12 +541,9 @@ fn bench_acoustic_diarization(c: &mut Criterion) {
     let samples = synthetic_audio(SAMPLE_RATE * seconds as usize, 0xd1a4_1200);
     let request = DiarizationRequest {
         engine: DiarizationEngine::Acoustic,
+        speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
         max_prototypes: 64,
         ..DiarizationRequest::default()
-    };
-    let constraints = SpeakerConstraints {
-        num_speakers: Some(1),
-        ..SpeakerConstraints::default()
     };
     let boundaries = AcousticBoundaryHints {
         speech_regions_ms: vec![(0, seconds * 1_000)],
@@ -563,7 +560,6 @@ fn bench_acoustic_diarization(c: &mut Criterion) {
                     segments: &[],
                     word_aligned: false,
                     request: black_box(&request),
-                    constraints: Some(black_box(&constraints)),
                     boundary_hints: black_box(&boundaries),
                 },
                 || false,
