@@ -178,7 +178,7 @@ pub struct DiarizationRequest {
     /// Maximum number of global clustering prototypes.
     pub max_prototypes: u16,
     /// Record explicit consent for reusable-profile persistence. Default-off.
-    /// Schema v4 deliberately persists only privacy-safe summaries; raw
+    /// Schema v5 deliberately persists only privacy-safe summaries; raw
     /// acoustic vectors remain excluded until a separately reviewed schema.
     #[serde(default)]
     pub persist_profiles: bool,
@@ -262,7 +262,7 @@ impl DiarizationRequest {
         if self.max_prototypes == 0 || self.max_prototypes > 512 {
             return Err(DiarizationValidationError {
                 code: DiarizationValidationCode::InvalidPrototypeCap,
-                message: "max_prototypes must be within 1..=512 for acoustic-v1".to_owned(),
+                message: "max_prototypes must be within 1..=512 for acoustic-v2".to_owned(),
                 hint_index: None,
             });
         }
@@ -270,7 +270,7 @@ impl DiarizationRequest {
             return Err(DiarizationValidationError {
                 code: DiarizationValidationCode::TooManyKnownIntervals,
                 message: format!(
-                    "known_intervals exceeds the acoustic-v1 limit of {MAX_KNOWN_SPEAKER_INTERVALS}"
+                    "known_intervals exceeds the acoustic-v2 limit of {MAX_KNOWN_SPEAKER_INTERVALS}"
                 ),
                 hint_index: None,
             });
@@ -289,7 +289,7 @@ impl DiarizationRequest {
                 return Err(DiarizationValidationError {
                     code: DiarizationValidationCode::SpeakerRefTooLong,
                     message: format!(
-                        "speaker_ref exceeds the {MAX_SPEAKER_REF_BYTES}-byte acoustic-v1 limit"
+                        "speaker_ref exceeds the {MAX_SPEAKER_REF_BYTES}-byte acoustic-v2 limit"
                     ),
                     hint_index: Some(index),
                 });
@@ -302,7 +302,7 @@ impl DiarizationRequest {
                 return Err(DiarizationValidationError {
                     code: DiarizationValidationCode::ProvenanceTooLong,
                     message: format!(
-                        "hint provenance exceeds the {MAX_HINT_PROVENANCE_BYTES}-byte acoustic-v1 limit"
+                        "hint provenance exceeds the {MAX_HINT_PROVENANCE_BYTES}-byte acoustic-v2 limit"
                     ),
                     hint_index: Some(index),
                 });
@@ -3312,7 +3312,7 @@ mod tests {
     fn diarization_report_is_typed_and_privacy_safe() {
         let report = DiarizationReport {
             implementation: "native_acoustic".to_owned(),
-            contract_version: "acoustic-diarization-v1".to_owned(),
+            contract_version: "acoustic-diarization-v2".to_owned(),
             feature_schema: "acoustic-feature-v1".to_owned(),
             normalized_input_sha256:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),

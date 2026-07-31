@@ -8697,7 +8697,7 @@ fn resolve_count_policy(
     available: usize,
 ) -> FwResult<SpeakerCountPolicy> {
     let (min, max, exact) = match request {
-        SpeakerCountRequest::Infer => (1, available.min(8).max(1), None),
+        SpeakerCountRequest::Infer => (1, available.clamp(1, 8), None),
         SpeakerCountRequest::Range { minimum, maximum } => {
             (*minimum as usize, *maximum as usize, None)
         }
@@ -9537,7 +9537,7 @@ where
     }
     if previous.iter().all(|cost| !cost.is_finite()) {
         return Err(FwError::InvalidRequest(
-            "hard speaker constraints leave no finite acoustic assignment path".to_owned(),
+            "hard speaker hints leave no finite acoustic assignment path".to_owned(),
         ));
     }
     let mut state = previous
@@ -9590,7 +9590,16 @@ where
                 let reliability = 0.85 + 0.15 * clusters[state].reliability.clamp(0.0, 1.0);
                 (chosen_likelihood * discrimination * reliability).clamp(0.0, 1.0)
             } else {
-                (margin / (margin + 0.5) * clusters[state].reliability).clamp(0.0, 1.0)
+                // Assignment discrimination and accumulated profile reliability
+                // are separate evidence gates. Multiplying by raw reliability
+                // here counted cluster occupancy twice and systematically pushed
+                // recurring minority speakers below the rejection threshold.
+                // Keep only a bounded calibration adjustment in assignment
+                // confidence; evaluate_speaker_evidence enforces reliability
+                // independently before a label can become authoritative.
+                let discrimination = margin / (margin + 0.5);
+                let reliability = 0.85 + 0.15 * clusters[state].reliability.clamp(0.0, 1.0);
+                (discrimination * reliability).clamp(0.0, 1.0)
             };
             let reject = if clustering_mode == AcousticClusteringMode::ProbabilisticV1 {
                 raw_confidence < acoustic_speaker_pair_calibration().minimum_assignment_probability
@@ -9893,9 +9902,16 @@ fn evaluate_speaker_evidence(
                 "speaker assignment references unknown acoustic label {label:?}"
             )));
         };
-        let voiced_duration_ms = u64::try_from(tracklet.voiced_frame_count)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(10);
+        let voiced_duration_ms = report_count(
+            tracklet.voiced_frame_count,
+            "speaker-evidence voiced frame count",
+        )?
+        .checked_mul(10)
+        .ok_or_else(|| {
+            FwError::InvalidRequest(
+                "speaker-evidence voiced duration exceeds the report schema".to_owned(),
+            )
+        })?;
         evidence.assigned_tracklet_count = evidence.assigned_tracklet_count.saturating_add(1);
         evidence.voiced_frame_count = evidence
             .voiced_frame_count
@@ -10025,17 +10041,16 @@ fn evaluate_speaker_evidence(
                 .reasons
                 .push(SpeakerEvidenceReason::MergeCompatibleWithSupportedSpeaker);
         } else {
-            summaries[candidate]
-                .reasons
-                .push(if summaries[candidate].hard_anchored {
-                    SpeakerEvidenceReason::SupportedByHardHint
-                } else if summaries[candidate].recurrence_episode_count
-                    < MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
-                {
-                    SpeakerEvidenceReason::SupportedByRepeatedTracklets
-                } else {
-                    SpeakerEvidenceReason::SupportedByIndependentRecurrence
-                });
+            let support_reason = if summaries[candidate].hard_anchored {
+                SpeakerEvidenceReason::SupportedByHardHint
+            } else if summaries[candidate].recurrence_episode_count
+                < MIN_SPEAKER_EVIDENCE_RECURRENCE_EPISODES
+            {
+                SpeakerEvidenceReason::SupportedByRepeatedTracklets
+            } else {
+                SpeakerEvidenceReason::SupportedByIndependentRecurrence
+            };
+            summaries[candidate].reasons.push(support_reason);
             accepted.push(candidate);
         }
     }
@@ -10227,7 +10242,7 @@ mod tests {
         DiarizationEngine, DiarizationFallbackStatus, DiarizationRequest, DiarizationTurn,
         KnownSpeakerInterval, KnownSpeakerPolicy, SpeakerAttributionQueryReason,
         SpeakerCountOutcomeStatus, SpeakerCountRequest, SpeakerEvidenceReason,
-        TranscriptionSegment,
+        SpeakerHintDisposition, TranscriptionSegment,
     };
     use sha2::{Digest, Sha256};
 
@@ -11046,6 +11061,15 @@ mod tests {
         assert_eq!(
             report.speaker_count.status,
             SpeakerCountOutcomeStatus::Satisfied
+        );
+        assert_eq!(report.hint_evidence.len(), 1);
+        assert_eq!(
+            report.hint_evidence[0].disposition,
+            SpeakerHintDisposition::HardAttributed
+        );
+        assert_eq!(
+            report.speaker_count.speaker_evidence[0].reasons,
+            vec![SpeakerEvidenceReason::SupportedByHardHint]
         );
         assert_eq!(report.fallback_status, DiarizationFallbackStatus::NotNeeded);
         assert_eq!(
@@ -13277,9 +13301,12 @@ mod tests {
             enrollment_edge_guard_ms: 50,
             ..DiarizationRequest::default()
         };
-        let tracklets = vec![profile_tracklet(0, 200, 700, 0.0, 0.0, 50)];
+        let tracklets = vec![
+            profile_tracklet(0, 200, 700, 0.0, 0.0, 50),
+            profile_tracklet(1, 800, 1_300, 0.0, 0.0, 50),
+        ];
         let mut enrollment =
-            enroll_known_speaker_profiles(&tracklets, &request, 1_000).expect("enrollment");
+            enroll_known_speaker_profiles(&tracklets, &request, 1_500).expect("enrollment");
         assert_eq!(enrollment.evidence[0].usable_tracklet_count, 0);
         enrollment.evidence.clear();
 
@@ -13343,9 +13370,12 @@ mod tests {
         let tracklets = vec![
             profile_tracklet(0, 200, 700, 0.0, 0.0, 50),
             profile_tracklet(1, 1_200, 1_700, 3.0, 0.0, 50),
+            profile_tracklet(2, 1_800, 2_300, 0.02, 0.0, 50),
+            profile_tracklet(3, 2_400, 2_900, 3.02, 0.0, 50),
+            profile_tracklet(4, 3_000, 3_500, -0.02, 0.0, 50),
         ];
         let enrollment =
-            enroll_known_speaker_profiles(&tracklets, &request, 2_000).expect("enrollment");
+            enroll_known_speaker_profiles(&tracklets, &request, 3_500).expect("enrollment");
         let result = cluster_acoustic_tracklets(
             &tracklets,
             &enrollment,
@@ -13387,6 +13417,82 @@ mod tests {
                 .expect("bounded clustering");
         assert!((1..=2).contains(&bounded_result.detected_speakers));
         assert!(bounded_result.constraints_satisfied);
+    }
+
+    #[test]
+    fn long_imbalanced_three_speaker_fixture_retains_supported_minority_speakers() {
+        let tracklets = (0..90)
+            .map(|index| {
+                let (voice, channel) = match index % 15 {
+                    5 => (4.0, -1.5),
+                    10 => (-4.0, 0.0),
+                    _ => (0.0, 1.5),
+                };
+                let start_ms = index * 500;
+                profile_tracklet(
+                    usize::try_from(index).expect("fixture index"),
+                    start_ms,
+                    start_ms + 500,
+                    voice,
+                    channel,
+                    50,
+                )
+            })
+            .collect::<Vec<_>>();
+        let request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 3 },
+            known_intervals: vec![
+                known_interval("near", 0, 500, KnownSpeakerPolicy::SoftEnrollment),
+                known_interval("far", 2_500, 3_000, KnownSpeakerPolicy::SoftEnrollment),
+                known_interval("minority", 5_000, 5_500, KnownSpeakerPolicy::SoftEnrollment),
+            ],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let enrollment =
+            enroll_known_speaker_profiles(&tracklets, &request, 45_000).expect("enrollment");
+        let result = cluster_acoustic_tracklets(
+            &tracklets,
+            &enrollment,
+            &request.speaker_count,
+            512,
+            || false,
+        )
+        .expect("cluster long imbalanced synthetic call");
+        let occupancy = primary_voiced_occupancy(&tracklets, &result.assignments);
+
+        assert!(
+            result.constraints_satisfied,
+            "condition=long-near-far-imbalanced requested=3 detected={} evidence={:#?}",
+            result.detected_speakers, result.speaker_evidence
+        );
+        assert_eq!(result.detected_speakers, 3);
+        assert_eq!(occupancy.len(), 3);
+        assert!(
+            result.dominant_speaker_share < 0.90,
+            "dominant speaker collapsed the call: share={} occupancy={occupancy:#?}",
+            result.dominant_speaker_share
+        );
+        let total_duration = occupancy
+            .values()
+            .map(|(_, _, duration_ms)| *duration_ms)
+            .sum::<u64>();
+        let minority_duration = occupancy
+            .values()
+            .map(|(_, _, duration_ms)| *duration_ms)
+            .min()
+            .expect("three supported speakers");
+        assert!(
+            minority_duration * 20 >= total_duration,
+            "minority speaker lost despite 6.7% recurring support: {occupancy:#?}"
+        );
+        assert!(
+            result
+                .speaker_evidence
+                .iter()
+                .filter(|evidence| evidence.supported)
+                .all(|evidence| evidence.independent_tracklet_count >= 2)
+        );
     }
 
     #[test]
@@ -13616,9 +13722,11 @@ mod tests {
             profile_tracklet(0, 0, 500, 0.0, 0.0, 50),
             profile_tracklet(1, 500, 1_000, 0.01, 0.0, 50),
             profile_tracklet(2, 1_000, 1_500, 8.0, 0.0, 50),
+            profile_tracklet(3, 1_500, 2_000, 0.01, 0.0, 50),
+            profile_tracklet(4, 2_000, 2_500, 8.0, 0.0, 50),
         ];
         let enrollment =
-            enroll_known_speaker_profiles(&tracklets, &request, 1_500).expect("enrollment");
+            enroll_known_speaker_profiles(&tracklets, &request, 2_500).expect("enrollment");
         let result = cluster_acoustic_tracklets(
             &tracklets,
             &enrollment,
@@ -13697,9 +13805,11 @@ mod tests {
         let different_voices = vec![
             profile_tracklet(0, 0, 500, -1.5, 0.0, 50),
             profile_tracklet(1, 500, 1_000, 1.5, 0.0, 50),
+            profile_tracklet(2, 1_000, 1_500, -1.5, 0.0, 50),
+            profile_tracklet(3, 1_500, 2_000, 1.5, 0.0, 50),
         ];
         let different_enrollment =
-            enroll_known_speaker_profiles(&different_voices, &request, 1_000).expect("enrollment");
+            enroll_known_speaker_profiles(&different_voices, &request, 2_000).expect("enrollment");
         let different_result = super::cluster_acoustic_tracklets_with_mode(
             &different_voices,
             &different_enrollment,
@@ -14019,7 +14129,17 @@ mod tests {
         assert!(result.cap_pressure);
         assert_eq!(result.prototype_count, 32);
         assert_eq!(result.prototype_cap, 32);
-        assert_eq!(result.detected_speakers, 1);
+        assert_eq!(
+            result.detected_speakers, 0,
+            "prototype pressure must not promote 100 ms outliers into a supported speaker"
+        );
+        assert!(!result.constraints_satisfied);
+        assert!(
+            result
+                .assignments
+                .iter()
+                .all(|assignment| assignment.speaker_ref.is_none())
+        );
     }
 
     #[test]

@@ -631,9 +631,9 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 | `--speaker-hints <PATH>` | — | Read a `speaker-hints-v1` document in place; the path is not retained, but parsed fields persist with the run unless `--no-persist` is used |
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
 | `--diarization-max-prototypes <N>` | `512` | Bounded global prototype cap (`1..=512`) |
-| `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v4 still stores privacy-safe summaries rather than reusable acoustic vectors |
-| `--num-speakers <N>` | — | Exact speaker count |
-| `--min-speakers <N>` | — | Minimum speakers; insufficient evidence remains unknown rather than inventing a speaker |
+| `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v5 still stores privacy-safe summaries rather than reusable acoustic vectors |
+| `--num-speakers <N>` | — | Hard count search constraint; success still requires independent evidence for all N speakers and uncertain speech remains unknown |
+| `--min-speakers <N>` | — | Minimum evidence-supported count; insufficient evidence remains unknown and reports the range unsatisfied |
 | `--max-speakers <N>` | — | Maximum speakers |
 | `--no-stem` | `false` | Disable external-backend vocal isolation |
 | `--suppress-numerals` | `false` | Spell out numbers for external alignment stability |
@@ -1175,7 +1175,7 @@ speaker_profile_summaries    (run_id, idx, speaker_ref, reliability, ...)
           -- deterministic indexes rebuilt from runs.request_json/result_json
 
 _meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL)
-          -- holds 'schema_version' => '4' among other metadata
+          -- holds 'schema_version' => '5' among other metadata
 ```
 
 **Schema Migrations.** When opening older databases, the storage layer walks forward through the migration ladder:
@@ -1184,6 +1184,8 @@ _meta    (key TEXT PRIMARY KEY, value TEXT NOT NULL)
 - **v2 → v3:** create indexes on hot query paths (recent-runs listing, per-run segment / event lookup) for faster `robot health` and `runs` queries.
 - **v3 → v4:** add privacy-safe normalized diarization indexes and rebuild
   them from canonical typed request/result JSON.
+- **v4 → v5:** add typed speaker-count status/outcome and per-hint evidence
+  columns, then rebuild the derived index from canonical run JSON.
 
 The legacy column-add migration runs safely:
 
@@ -2527,13 +2529,15 @@ CREATE TABLE events (
 -- Key-value schema metadata
 CREATE TABLE _meta (
     key   TEXT PRIMARY KEY,                  -- e.g. 'schema_version'
-    value TEXT NOT NULL                      -- 'schema_version' currently '4'
+    value TEXT NOT NULL                      -- 'schema_version' currently '5'
 );
 
 -- v3 migration adds indexes on hot query paths (recent-runs listing,
 -- per-run segment + event lookup).
 -- v4 adds derived diarization reports, turns, hint audits, and privacy-safe
 -- profile summaries rebuilt from canonical runs JSON.
+-- v5 adds typed speaker-count status/outcome JSON and privacy-safe per-hint
+-- disposition JSON to the derived diarization report index.
 ```
 
 ### NDJSON Export Format
@@ -4383,6 +4387,7 @@ The router is doing nothing exotic: it blends priors with empirical data via Bet
 | Dependencies | Built-in Rust + the normalized PCM already used by ASR | Typically Python, model files, and possibly an HF token | whisper-cli |
 | Output | Independent turns plus conservative projection to ASR segments | Timed backend labels normalized to the common report | Inline turn hints |
 | Known intervals | Hard must-link and soft enrollment | Backend-specific | No |
+| Speaker count | Infer by default; optional fail-closed range or exact search constraint | Backend-specific | No |
 | Unknown/overlap | Explicit unknown and overlap suspicion | Backend-specific | No calibrated assignment |
 | Accuracy authority | Synthetic invariant proof only; public corpus DER/JER remains `NO-DATA` | Depends on the installed backend and corpus | No project accuracy certification |
 

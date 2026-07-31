@@ -741,16 +741,16 @@ CREATE TABLE IF NOT EXISTS _meta (
         // initialize_schema(). A markerless legacy database can also report
         // version=0, but CREATE TABLE IF NOT EXISTS has already supplied every
         // table that was absent. When the runs table has the v2 columns, finish
-        // the index-only v3/v4 work directly and rebuild the derived cache. This
-        // avoids replaying v4's table DDL against a brand-new current-shape DB,
-        // which leaves needless freelist pages in fsqlite.
+        // the index-only v3/v4 work directly. The following v5 migration owns
+        // the derived-cache rebuild after ensuring its typed evidence columns.
+        // This avoids replaying v4's table DDL against a brand-new current-shape
+        // DB, which leaves needless freelist pages in fsqlite.
         if current == 0 {
             let has_replay = self.table_has_column("runs", "replay_json")?;
             let has_acceleration = self.table_has_column("runs", "acceleration_json")?;
             if has_replay && has_acceleration {
                 self.apply_migration(3)?;
                 self.ensure_diarization_indexes_v4()?;
-                self.rebuild_diarization_index()?;
                 self.set_schema_version(4)?;
                 current = 4;
             }
@@ -878,8 +878,7 @@ CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
                 )
                 .map_err(|error| FwError::Storage(error.to_string()))?;
 
-            self.ensure_diarization_indexes_v4()?;
-            self.rebuild_diarization_index_inner()
+            self.ensure_diarization_indexes_v4()
         })();
 
         match result {
@@ -6994,6 +6993,22 @@ mod tests {
             RunStore::SCHEMA_VERSION,
             "should have migrated to the latest schema"
         );
+        let diarization_columns = store
+            .table_columns("diarization_reports")
+            .expect("diarization report columns");
+        for expected in [
+            "supported_speaker_count",
+            "speaker_count_status",
+            "speaker_count_json",
+            "hint_evidence_json",
+        ] {
+            assert!(
+                diarization_columns
+                    .iter()
+                    .any(|column| column.name == expected),
+                "v5 migration must add `{expected}`"
+            );
+        }
 
         // Verify indexes exist.
         let indexes = store

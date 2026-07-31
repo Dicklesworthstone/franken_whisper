@@ -16,8 +16,9 @@
 //!    (`request.model` → `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`), load it, read
 //!    the normalized WAV, decode through the engine.
 //! 2. **Diarize**: assign a speaker to every real segment via the orchestrator's
-//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]), honoring
-//!    the request's num/min/max speaker constraints. Segments are labeled
+//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]). A range
+//!    maximum can cap its provisional clusters, but a hard count never forces
+//!    cluster collapse without acoustic evidence. Segments are labeled
 //!    `SPEAKER_NN` (DISC-002: cross-engine labels need not match exactly).
 //!
 //! ## Diarizer honesty — NOT a neural speaker encoder
@@ -245,7 +246,8 @@ pub fn run(
     }
 
     // Real diarization: assign a speaker to every engine segment via the
-    // heuristic diarizer, honoring the request's speaker constraints.
+    // heuristic diarizer. Its provisional labels may honor a range maximum,
+    // but a hard count never forces cluster collapse without acoustic evidence.
     let mut segments = output.segments.clone();
     let speaker_count = speaker_count_for(request);
     if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
@@ -677,8 +679,13 @@ mod tests {
             seg(7.0, 9.0, "ask what you can do for your country"),
         ];
         let token = CancellationToken::unbounded();
-        let report = orchestrator::diarize_segments(&mut segments, Some(9.0), None, &token)
-            .expect("diarize");
+        let report = orchestrator::diarize_segments(
+            &mut segments,
+            Some(9.0),
+            &SpeakerCountRequest::Infer,
+            &token,
+        )
+        .expect("diarize");
         assert_eq!(report.segments_labeled, 3);
         let re = regex_speaker();
         for s in &segments {
