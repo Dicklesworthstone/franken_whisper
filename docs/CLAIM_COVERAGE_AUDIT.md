@@ -70,14 +70,20 @@ by ratio size.
    Every supported claim is tiny.en. The README sells "a real in-process
    pure-Rust Whisper engine"; a user running the flagship turbo model has **no
    supported number at all**. Highest exposure of anything in this queue.
-   *Status: the blocking clause was cleared on 2026-07-30 — the matched-greedy
-   turbo comparator now measures **WER 0.034483** against the 0.10 gate on
-   track01 (261 ref words vs 257, 9 edits), so the 287-vs-431 word divergence
-   that aborted the cell does not reproduce at HEAD. Only a quiet host remains.*
-2. **`whole_job` scope.** All three supported ratios are `transcribe_only`,
-   which excludes one-time model load. A real user's whole job includes it, and
-   load is ~35% of single-shot turbo wall. The scope exists in the harness and
-   is unmeasured against the incumbent.
+   *Status: the exact frozen no-timestamp cell still reproduces the default-
+   context mismatch: native/whisper.cpp produce 287/431 words and WER 0.479167.
+   The matched predicate is cleared only by explicit no-context decoding on
+   both arms. With native `DecodeParams.max_context=Some(0)` and
+   `whisper-cli -mc 0`, both perform 319 single-token decode steps over five
+   encoder windows and produce 279/279 words with 3 edits (WER 0.010753).
+   Commit `4c4aaef` pins that parameter in the shared contract; a strict-RCH
+   artifact and exclusive quiet-host timing verdict still remain.*
+2. **Flagship `whole_job` scope.** The July 30 current-source 124.5 s and
+   300 s tiny.en text ratios are explicitly `FW_BENCH_SCOPE=whole_job`: they
+   include process startup, model/audio I/O, inference, serialization, and
+   teardown. Thus `whole_job` is measured, but only for tiny.en. A real user's
+   single-shot turbo job also includes model load (~35% of turbo wall), and no
+   admissible turbo `whole_job` ratio exists yet.
 3. **The beam-search path — an unconverted *negative*.** The ledger's own
    honest row records native `retry+beam5` at **~3–4.6× SLOWER** than
    `whisper-cli -bs 5` on long-form. Converting this publishes a loss, which is
