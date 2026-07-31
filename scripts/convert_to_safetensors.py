@@ -11,6 +11,7 @@ excludes source paths and timestamps so the same pinned input and dependency
 versions produce a byte-identical package.
 
 The frozen ECAPA profile requires exactly:
+    numpy==2.2.6
     torch==2.7.1
     safetensors==0.5.3
 
@@ -45,6 +46,7 @@ ECAPA_DROPPED_BATCH_COUNTERS = 31
 ECAPA_EXPORTED_TENSORS = 200
 REQUIRED_TORCH_VERSION = "2.7.1"
 REQUIRED_SAFETENSORS_VERSION = "0.5.3"
+REQUIRED_NUMPY_VERSION = "2.2.6"
 
 
 def _sha256(path: Path) -> str:
@@ -77,6 +79,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        import numpy
         import safetensors
         import torch
         from safetensors.torch import save_file
@@ -122,6 +125,13 @@ def main() -> int:
             print(
                 f"error: {ECAPA_PROFILE} requires safetensors=="
                 f"{REQUIRED_SAFETENSORS_VERSION} (got {safetensors.__version__})",
+                file=sys.stderr,
+            )
+            return 2
+        if numpy.__version__ != REQUIRED_NUMPY_VERSION:
+            print(
+                f"error: {ECAPA_PROFILE} requires numpy=={REQUIRED_NUMPY_VERSION} "
+                f"(got {numpy.__version__})",
                 file=sys.stderr,
             )
             return 2
@@ -206,6 +216,7 @@ def main() -> int:
             "dropped_batch_counter_count": str(ECAPA_DROPPED_BATCH_COUNTERS),
             "exported_tensor_count": str(ECAPA_EXPORTED_TENSORS),
             "exported_dtype": "F32",
+            "numpy_version": REQUIRED_NUMPY_VERSION,
             "torch_version": REQUIRED_TORCH_VERSION,
             "safetensors_version": REQUIRED_SAFETENSORS_VERSION,
         }
