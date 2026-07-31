@@ -17,6 +17,7 @@ pub mod confidential_evaluation;
 pub mod conformance;
 pub mod diarization;
 pub mod differential_oracle;
+pub mod ecapa_conformance;
 pub mod error;
 pub mod export;
 pub mod logging;
