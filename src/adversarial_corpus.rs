@@ -698,8 +698,8 @@ pub fn minimize_failing_plan(
     validate_transform_plan(plan)?;
     validate_regression_classification(expected)?;
     let original_plan_sha256 = plan.sha256()?;
-    let initial = classify(plan)?;
-    let mut evaluation_count = 1usize;
+    let mut evaluation_count = 0usize;
+    let initial = classify_reproducibly(plan, &mut classify, &mut evaluation_count)?;
     if initial.as_ref() != Some(expected) {
         return Err(adversarial_error(
             "failure_classification_mismatch",
@@ -710,11 +710,11 @@ pub fn minimize_failing_plan(
     let mut retained: Vec<(usize, AcousticPerturbation)> =
         plan.steps.iter().cloned().enumerate().collect();
     let mut granularity = 2usize;
-    while !retained.is_empty() && evaluation_count < MAX_MINIMIZER_EVALUATIONS {
+    while !retained.is_empty() && evaluation_count + 2 <= MAX_MINIMIZER_EVALUATIONS {
         let chunk_size = retained.len().div_ceil(granularity);
         let mut reduced = false;
         let mut start = 0usize;
-        while start < retained.len() && evaluation_count < MAX_MINIMIZER_EVALUATIONS {
+        while start < retained.len() && evaluation_count + 2 <= MAX_MINIMIZER_EVALUATIONS {
             let end = (start + chunk_size).min(retained.len());
             let candidate_items: Vec<_> = retained
                 .iter()
@@ -728,8 +728,9 @@ pub fn minimize_failing_plan(
                     .map(|(_, step)| step.clone())
                     .collect(),
             );
-            evaluation_count += 1;
-            if classify(&candidate)?.as_ref() == Some(expected) {
+            if classify_reproducibly(&candidate, &mut classify, &mut evaluation_count)?.as_ref()
+                == Some(expected)
+            {
                 retained = candidate_items;
                 granularity = granularity.saturating_sub(1).max(2);
                 reduced = true;
@@ -758,6 +759,29 @@ pub fn minimize_failing_plan(
         minimized_plan,
         evaluation_count,
     })
+}
+
+fn classify_reproducibly(
+    plan: &TransformPlan,
+    classify: &mut impl FnMut(&TransformPlan) -> FwResult<Option<RegressionClassification>>,
+    evaluation_count: &mut usize,
+) -> FwResult<Option<RegressionClassification>> {
+    if *evaluation_count + 2 > MAX_MINIMIZER_EVALUATIONS {
+        return Err(adversarial_error(
+            "minimizer_evaluation_budget_exhausted",
+            "failure minimization exhausted its evaluation budget",
+        ));
+    }
+    let first = classify(plan)?;
+    let second = classify(plan)?;
+    *evaluation_count += 2;
+    if first != second {
+        return Err(adversarial_error(
+            "nondeterministic_failure_classification",
+            "repeated evaluation produced different failure classifications",
+        ));
+    }
+    Ok(first)
 }
 
 /// Integer-valued comparison suitable for path-free consistency evidence.
@@ -970,12 +994,12 @@ pub fn known_acoustic_challenge_seeds() -> FwResult<Vec<AcousticChallengeSeed>> 
                     muffle_retention_millionths: 930_000,
                 }]
             }
-            Family::SpeakerPlayback => vec![Perturbation::SpeakerPlayback {
-                gain_millionths: 620_000,
-                muffle_retention_millionths: 950_000,
-                delay_ms: 55,
-                decay_millionths: 300_000,
-            }],
+            Family::SpeakerPlayback => {
+                for turn in &mut source_plan.turns {
+                    turn.playback = turn.speaker_index == 1;
+                }
+                Vec::new()
+            }
             Family::StereoChannelSwap => vec![Perturbation::StereoChannelSwap],
             Family::ControlledOverlap => {
                 source_plan.turns = vec![
@@ -2302,7 +2326,7 @@ mod tests {
             Ok(candidate
                 .steps
                 .contains(&essential)
-                .then(|| expected.clone()))
+                .then_some(expected.clone()))
         })
         .expect("minimized");
         assert_eq!(minimized.minimized_plan.steps, vec![essential]);
@@ -2323,6 +2347,27 @@ mod tests {
             error
                 .to_string()
                 .contains("failure_classification_mismatch")
+        );
+    }
+
+    #[test]
+    fn minimizer_rejects_nondeterministic_classification() {
+        let plan = TransformPlan::new_synthetic("a".repeat(64), 1, Vec::new());
+        let expected = RegressionClassification {
+            code: "FW-ADVERSARIAL-SCORING-REGRESSION".to_owned(),
+            first_divergent_stage: AdversarialPipelineStage::Scoring,
+        };
+        let mut reproduce = true;
+        let error = minimize_failing_plan(&plan, &expected, |_| {
+            let result = reproduce.then_some(expected.clone());
+            reproduce = !reproduce;
+            Ok(result)
+        })
+        .expect_err("nondeterministic");
+        assert!(
+            error
+                .to_string()
+                .contains("nondeterministic_failure_classification")
         );
     }
 
