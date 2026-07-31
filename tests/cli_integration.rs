@@ -515,6 +515,7 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         turns: vec![EvaluationTurn::labeled(0, 1_000, "private-speaker")],
         ignored_regions: vec![],
         speaker_hints: vec![],
+        words: vec![],
     };
     let hypothesis = DiarizationHypothesisDocument {
         schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
@@ -524,6 +525,7 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
             speaker_confidence: Some(0.75),
             ..EvaluationTurn::labeled(0, 1_000, "private-cluster")
         }],
+        speaker_count_estimate: None,
         performance: None,
     };
     std::fs::write(
