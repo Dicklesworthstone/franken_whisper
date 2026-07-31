@@ -565,7 +565,7 @@ impl RunStore {
     }
 
     /// Current schema version. Bump when adding migrations.
-    pub const SCHEMA_VERSION: u32 = 4;
+    pub const SCHEMA_VERSION: u32 = 5;
 
     fn initialize_schema(&self) -> FwResult<()> {
         // Enable WAL mode for concurrent read/write support.
@@ -621,6 +621,10 @@ CREATE TABLE IF NOT EXISTS diarization_reports (
     hint_document_sha256 TEXT,
     detected_speakers INTEGER NOT NULL,
     constraints_satisfied INTEGER NOT NULL,
+    supported_speaker_count INTEGER NOT NULL,
+    speaker_count_status TEXT NOT NULL,
+    speaker_count_json TEXT NOT NULL,
+    hint_evidence_json TEXT NOT NULL,
     fallback_status TEXT NOT NULL,
     diagnostics_json TEXT NOT NULL,
     profile_persistence_opt_in INTEGER NOT NULL
@@ -805,6 +809,7 @@ CREATE TABLE IF NOT EXISTS _meta (
                 Ok(())
             }
             4 => self.migrate_diarization_schema_v4(),
+            5 => self.migrate_diarization_schema_v5(),
             _ => Err(FwError::Storage(format!(
                 "unknown migration version: {version}"
             ))),
@@ -874,6 +879,49 @@ CREATE TABLE IF NOT EXISTS speaker_profile_summaries (
                 .map_err(|error| FwError::Storage(error.to_string()))?;
 
             self.ensure_diarization_indexes_v4()?;
+            self.rebuild_diarization_index_inner()
+        })();
+
+        match result {
+            Ok(()) => {
+                self.connection
+                    .execute(&format!("RELEASE SAVEPOINT {SAVEPOINT};"))
+                    .map_err(|error| FwError::Storage(error.to_string()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_savepoint(&self.connection, SAVEPOINT);
+                Err(error)
+            }
+        }
+    }
+
+    fn migrate_diarization_schema_v5(&self) -> FwResult<()> {
+        const SAVEPOINT: &str = "fw_migrate_diarization_v5";
+        self.connection
+            .execute(&format!("SAVEPOINT {SAVEPOINT};"))
+            .map_err(|error| FwError::Storage(error.to_string()))?;
+        let result = (|| {
+            self.ensure_column_exists(
+                "diarization_reports",
+                "supported_speaker_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            self.ensure_column_exists(
+                "diarization_reports",
+                "speaker_count_status",
+                "TEXT NOT NULL DEFAULT 'unresolved'",
+            )?;
+            self.ensure_column_exists(
+                "diarization_reports",
+                "speaker_count_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )?;
+            self.ensure_column_exists(
+                "diarization_reports",
+                "hint_evidence_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
             self.rebuild_diarization_index_inner()
         })();
 
@@ -981,6 +1029,14 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 .pointer("/backend_params/acoustic_diarization")
                 .filter(|value| !value.is_null())
                 .map(|value| {
+                    if value.get("speaker_count").is_none() {
+                        return Err(FwError::Storage(format!(
+                            "cannot rebuild acoustic diarization request for run {run_id}: \
+                             legacy speaker-count encoding is unsupported by \
+                             acoustic-diarization-v2; export or recover the canonical run JSON \
+                             with a matching franken_whisper version before migrating"
+                        )));
+                    }
                     serde_json::from_value::<crate::model::DiarizationRequest>(value.clone())
                         .map_err(|error| {
                             FwError::Storage(format!(
@@ -993,6 +1049,21 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 .get("diarization")
                 .filter(|value| !value.is_null())
                 .map(|value| {
+                    let contract_version = value
+                        .get("contract_version")
+                        .and_then(serde_json::Value::as_str);
+                    if contract_version
+                        != Some(crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION)
+                        || value.get("speaker_count").is_none()
+                    {
+                        return Err(FwError::Storage(format!(
+                            "cannot rebuild diarization report for run {run_id}: contract {:?} \
+                             is unsupported by {}; export or recover the canonical run JSON with \
+                             a matching franken_whisper version before migrating",
+                            contract_version,
+                            crate::diarization::ACOUSTIC_DIARIZATION_CONTRACT_VERSION
+                        )));
+                    }
                     serde_json::from_value::<crate::model::DiarizationReport>(value.clone())
                         .map_err(|error| {
                             FwError::Storage(format!(
@@ -1581,7 +1652,7 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         };
         self.persist_insert(
             skip_sp,
-            "INSERT INTO diarization_reports (run_id, implementation, contract_version, feature_schema, normalized_input_sha256, hint_document_sha256, detected_speakers, constraints_satisfied, fallback_status, diagnostics_json, profile_persistence_opt_in) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO diarization_reports (run_id, implementation, contract_version, feature_schema, normalized_input_sha256, hint_document_sha256, detected_speakers, constraints_satisfied, supported_speaker_count, speaker_count_status, speaker_count_json, hint_evidence_json, fallback_status, diagnostics_json, profile_persistence_opt_in) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             &[
                 run_id_value.clone(),
                 text_value(report.implementation.clone()),
@@ -1589,8 +1660,26 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
                 text_value(report.feature_schema.clone()),
                 text_value(report.normalized_input_sha256.clone()),
                 optional_text(report.hint_document_sha256.as_deref()),
-                SqliteValue::Integer(i64::from(report.detected_speakers)),
-                SqliteValue::Integer(if report.constraints_satisfied { 1 } else { 0 }),
+                SqliteValue::Integer(i64::from(
+                    report.speaker_count.supported_speaker_count,
+                )),
+                SqliteValue::Integer(
+                    if matches!(
+                        report.speaker_count.status,
+                        crate::model::SpeakerCountOutcomeStatus::Resolved
+                            | crate::model::SpeakerCountOutcomeStatus::Satisfied
+                    ) {
+                        1
+                    } else {
+                        0
+                    },
+                ),
+                SqliteValue::Integer(i64::from(
+                    report.speaker_count.supported_speaker_count,
+                )),
+                text_value(serde_enum_name(&report.speaker_count.status)?),
+                text_value(serde_json::to_string(&report.speaker_count)?),
+                text_value(serde_json::to_string(&report.hint_evidence)?),
                 text_value(serde_enum_name(&report.fallback_status)?),
                 text_value(serde_json::to_string(&report.diagnostics)?),
                 SqliteValue::Integer(if profile_persistence_opt_in { 1 } else { 0 }),
@@ -2423,7 +2512,10 @@ mod tests {
         AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
         DiarizationFallbackStatus, DiarizationReport, DiarizationRequest, DiarizationTurn,
         InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent, RunReport,
-        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+        SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus,
+        SpeakerCountRequest, SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerHintDisposition,
+        SpeakerHintEvidenceSummary, SpeakerProfileSummary, TranscribeRequest, TranscriptionResult,
+        TranscriptionSegment,
     };
 
     use super::{BlockingConnection, RunStore, stored_projection_timeline, value_to_string};
@@ -2592,6 +2684,7 @@ mod tests {
         report.request.diarize = true;
         report.request.backend_params.acoustic_diarization = Some(DiarizationRequest {
             engine: DiarizationEngine::Acoustic,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
             known_intervals: vec![KnownSpeakerInterval {
                 speaker_ref: "speaker_a".to_owned(),
                 start_ms: 0,
@@ -2604,8 +2697,8 @@ mod tests {
             ..DiarizationRequest::default()
         });
         report.result.diarization = Some(DiarizationReport {
-            implementation: "native-acoustic-v1".to_owned(),
-            contract_version: "acoustic-diarization-v1".to_owned(),
+            implementation: "native-acoustic-v2".to_owned(),
+            contract_version: "acoustic-diarization-v2".to_owned(),
             feature_schema: "acoustic-feature-v1".to_owned(),
             normalized_input_sha256:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -2634,9 +2727,45 @@ mod tests {
                 anchored: true,
                 soft_hint_contradiction: None,
             }],
+            hint_evidence: vec![SpeakerHintEvidenceSummary {
+                hint_index: 0,
+                speaker_ref: "speaker_a".to_owned(),
+                policy: KnownSpeakerPolicy::HardMustLink,
+                disposition: SpeakerHintDisposition::HardAttributed,
+                usable_tracklet_count: 1,
+                accepted_tracklet_count: 1,
+                rejected_tracklet_count: 0,
+                profile_accepted_tracklet_count: 1,
+                profile_downweighted_tracklet_count: 0,
+                profile_quarantined_tracklet_count: 0,
+                applied_weight: 50.0,
+                contradiction_score: None,
+            }],
             speaker_queries: Vec::new(),
-            detected_speakers: 1,
-            constraints_satisfied: true,
+            speaker_count: SpeakerCountOutcome {
+                request: SpeakerCountRequest::HardConstraint { count: 1 },
+                status: SpeakerCountOutcomeStatus::Satisfied,
+                supported_speaker_count: 1,
+                active_speaker_refs: vec!["speaker_a".to_owned()],
+                dominant_speaker_share: 1.0,
+                unknown_voiced_share: 0.0,
+                reasons: vec![SpeakerCountOutcomeReason::RequestedCountMatched],
+                speaker_evidence: vec![SpeakerEvidenceSummary {
+                    speaker_ref: "speaker_a".to_owned(),
+                    assigned_tracklet_count: 1,
+                    independent_tracklet_count: 1,
+                    recurrence_episode_count: 1,
+                    voiced_frame_count: 87,
+                    independent_voiced_frame_count: 87,
+                    voiced_duration_ms: 870,
+                    mean_assignment_confidence: 0.96,
+                    profile_reliability: 0.94,
+                    hard_anchored: true,
+                    separated_from_supported_speakers: true,
+                    reasons: vec![SpeakerEvidenceReason::SupportedByHardHint],
+                    supported: true,
+                }],
+            },
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             diagnostics: vec!["synthetic persistence fixture".to_owned()],
         });
@@ -2712,6 +2841,52 @@ mod tests {
             .expect("report flags");
         assert_eq!(value_to_string(report_flags[0].get(0)), "0");
         assert_eq!(value_to_string(report_flags[1].get(0)), "1");
+
+        let typed_evidence = store
+            .connection
+            .query(
+                "SELECT supported_speaker_count, speaker_count_status, speaker_count_json, \
+                 hint_evidence_json FROM diarization_reports ORDER BY run_id ASC;",
+            )
+            .expect("typed diarization evidence");
+        assert_eq!(value_to_string(typed_evidence[0].get(0)), "1");
+        assert_eq!(value_to_string(typed_evidence[0].get(1)), "satisfied");
+        let stored_count: SpeakerCountOutcome =
+            serde_json::from_str(&value_to_string(typed_evidence[0].get(2)))
+                .expect("typed count JSON");
+        assert_eq!(
+            stored_count.request,
+            SpeakerCountRequest::HardConstraint { count: 1 }
+        );
+        assert_eq!(
+            stored_count.reasons,
+            vec![SpeakerCountOutcomeReason::RequestedCountMatched]
+        );
+        let stored_hints: Vec<SpeakerHintEvidenceSummary> =
+            serde_json::from_str(&value_to_string(typed_evidence[0].get(3)))
+                .expect("typed hint evidence JSON");
+        assert_eq!(
+            stored_hints[0].disposition,
+            SpeakerHintDisposition::HardAttributed
+        );
+
+        let loaded = store
+            .load_run_details("run-diarization-default")
+            .expect("load typed diarization")
+            .expect("canonical run");
+        let loaded_diarization = loaded.diarization.expect("diarization report");
+        assert_eq!(
+            loaded_diarization.speaker_count.request,
+            SpeakerCountRequest::HardConstraint { count: 1 }
+        );
+        assert_eq!(
+            loaded_diarization.hint_evidence[0].disposition,
+            SpeakerHintDisposition::HardAttributed
+        );
+        assert_eq!(
+            loaded_diarization.speaker_count.speaker_evidence[0].voiced_frame_count,
+            87
+        );
 
         let profile_flags = store
             .connection

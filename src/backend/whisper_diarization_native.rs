@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    BackendKind, SpeakerConstraints, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
+    BackendKind, SpeakerCountRequest, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
 };
 use crate::native_engine::{self, NativeWhisperModel, decode};
 use crate::orchestrator::{self, DiarizeReport};
@@ -156,11 +156,14 @@ fn checkpoint_for(
     move || token.map_or(Ok(()), crate::orchestrator::CancellationToken::checkpoint)
 }
 
-/// The effective speaker constraints for diarization: the request's
-/// `num`/`min`/`max` speaker constraints, honored end-to-end by the diarizer.
-/// `None` means "auto-detect speaker count".
-fn speaker_constraints_for(request: &TranscribeRequest) -> Option<SpeakerConstraints> {
-    request.backend_params.speaker_constraints.clone()
+fn speaker_count_for(request: &TranscribeRequest) -> SpeakerCountRequest {
+    request
+        .backend_params
+        .acoustic_diarization
+        .as_ref()
+        .map_or(SpeakerCountRequest::Infer, |request| {
+            request.speaker_count.clone()
+        })
 }
 
 /// Compute the whole-clip audio duration in seconds for the diarizer, preferring
@@ -244,7 +247,12 @@ pub fn run(
     // Real diarization: assign a speaker to every engine segment via the
     // heuristic diarizer, honoring the request's speaker constraints.
     let mut segments = output.segments.clone();
-    let constraints = speaker_constraints_for(request);
+    let speaker_count = speaker_count_for(request);
+    if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
+        return Err(FwError::InvalidRequest(
+            "legacy native diarization cannot faithfully execute a speaker-count prior".to_owned(),
+        ));
+    }
     let duration_sec = audio_duration_sec(request, &output);
     let diarize_token = token
         .copied()
@@ -252,7 +260,7 @@ pub fn run(
     let report = orchestrator::diarize_segments(
         &mut segments,
         duration_sec,
-        constraints.as_ref(),
+        &speaker_count,
         &diarize_token,
     )?;
 
@@ -420,7 +428,8 @@ mod tests {
 
     use crate::backend::Engine;
     use crate::model::{
-        BackendKind, BackendParams, InputSource, SpeakerConstraints, TranscribeRequest,
+        BackendKind, BackendParams, DiarizationRequest, InputSource, SpeakerCountRequest,
+        TranscribeRequest,
     };
     use crate::native_engine::{self, decode};
     use crate::orchestrator::CancellationToken;
@@ -856,10 +865,12 @@ mod tests {
         let mut req = request();
         req.model = Some("tiny.en".to_owned());
         req.language = None;
-        req.backend_params.speaker_constraints = Some(SpeakerConstraints {
-            num_speakers: None,
-            min_speakers: Some(2),
-            max_speakers: None,
+        req.backend_params.acoustic_diarization = Some(DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 64,
+            },
+            ..DiarizationRequest::default()
         });
 
         let result = run(&req, &wav, dir.path(), Duration::from_secs(180), None)
