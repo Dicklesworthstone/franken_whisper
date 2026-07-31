@@ -2394,6 +2394,14 @@ mod tests {
         for seed in &seeds {
             assert!(families.insert(seed.family));
             assert!(hashes.insert(seed.sha256().expect("seed hash")));
+            assert!(matches!(
+                &seed.transform.source_authority,
+                AdversarialSourceAuthority::Synthetic
+            ));
+            if seed.family == AcousticChallengeFamily::SpeakerPlayback {
+                assert!(seed.synthetic_call.turns.iter().any(|turn| turn.playback));
+                assert!(seed.synthetic_call.turns.iter().any(|turn| !turn.playback));
+            }
             let left = seed.materialize().expect("left");
             let right = seed.materialize().expect("right");
             assert_eq!(left.audio, right.audio);
