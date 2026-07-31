@@ -401,6 +401,18 @@ opaque non-lexical IDs and timing/speaker annotations, never token text. See
 [`docs/acoustic_diarization_contract.md`](docs/acoustic_diarization_contract.md)
 for the versioned schemas and fail-closed policy.
 
+The library's `adversarial_corpus` module supplies a Rust-native, public-safe
+accuracy harness without checking audio fixtures into the repository. It
+generates transcript-free harmonic calls with deterministic speaker, turn,
+overlap, pitch, playback, and stereo regimes, then applies bounded gain,
+muffling, band-limit, resampling, quantization, clipping, noise, reverb,
+interruption, silence, channel-shift, playback, channel-swap, and overlap
+recipes. Retained repro seeds contain parameters, stable classifications, and
+content hashes—not samples, paths, transcripts, embeddings, or real speaker
+identifiers. The same API attributes the first divergent pipeline stage and
+delta-minimizes a failing transform sequence while preserving its exact
+classification.
+
 ### 4. Microphone Capture
 
 ```bash
@@ -2291,6 +2303,7 @@ In addition to conventional unit and integration tests, the project ships dedica
 | [`tests/metamorphic_audio_tests.rs`](tests/metamorphic_audio_tests.rs) | Audio normalization is stable under permutation of decoder paths, silence padding is idempotent, stereo→mono averaging matches manual computation |
 | [`tests/metamorphic_accelerate_tests.rs`](tests/metamorphic_accelerate_tests.rs) | Softmax is permutation-equivariant and scale-invariant; layer-norm output mean ≈ 0, variance ≈ 1; attention scoring respects masking |
 | [`tests/metamorphic_speculation_tests.rs`](tests/metamorphic_speculation_tests.rs) | String-distance functions are symmetric, satisfy the triangle inequality, and window-size adjustments respect bounds |
+| [`src/adversarial_corpus.rs`](src/adversarial_corpus.rs) | Seventeen deterministic, public-safe diarization challenge families; bounded transform composition; exact time-shift contracts; stage-specific regression attribution; minimized content-free repro seeds |
 
 Metamorphic tests catch entire categories of regressions where the "correct" answer is unknown but the *relationship* between inputs and outputs must hold.
 
