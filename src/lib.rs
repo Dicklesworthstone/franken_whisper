@@ -9,6 +9,7 @@
 #![allow(clippy::needless_raw_string_hashes)]
 
 pub mod accelerate;
+pub mod adversarial_corpus;
 pub mod audio;
 pub mod backend;
 pub mod cli;
