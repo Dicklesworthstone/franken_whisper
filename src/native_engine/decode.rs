@@ -1734,21 +1734,36 @@ fn parallel_no_context_window_lanes(
     if windows < MIN_WINDOWS || physical_cores < min_physical || rayon_threads != physical_cores {
         return 1;
     }
-    // NOTE: a beam lane is not one stream — it internally forwards `beam`
-    // hypotheses concurrently through the SAME Rayon pool, so the pool sees
-    // `lanes * beam` in-flight single-token decodes and each one individually
-    // slows down (per-window `decode_loop` 3.5 s → ~9 s going 1 → 4 lanes at
-    // beam 5 on 32 threads). The NET is still strongly positive, so the derived
-    // thread-budgeted count stands: swept on jfk×15 / turbo / beam 5 / 32
-    // threads, whole-job median ms was 28667 (1 lane) / 20151 (2) / 16862 (3) /
-    // 16450 (4) — i.e. the 32/8 = 4 this formula already yields. Lanes also made
-    // the job far more contention-STABLE (1 lane ranged 22.0-38.0 s under a
-    // varying co-tenant load, 3-4 lanes stayed inside 15.8-19.7 s).
-    // `FW_NO_CONTEXT_WINDOW_LANES` re-runs that sweep on another host without a
+    // A beam lane is not one stream: it internally forwards `beam` hypotheses
+    // concurrently through the SAME Rayon pool, so the pool sees `lanes * beam`
+    // in-flight single-token decodes. Budget ONE forward per thread —
+    // `lanes = threads / beam` — instead of reusing the encoder's
+    // threads-per-stream figure, which describes a very different (compute-bound,
+    // pool-saturating) unit of work.
+    //
+    // Measured, jfk×15 / turbo / beam 5 / 32 threads, whole-job median ms
+    // (interleaved reps, rotating arm order, rep 1 discarded):
+    //
+    //   lanes  1      2      3      4      5      6 (= threads/beam)
+    //   ms     28667  20151  16862  14718  14923  13677
+    //
+    // The bump at 5 is not noise, it is TAIL IMBALANCE: with 6 windows, 4 lanes
+    // runs 4+2 and 5 lanes runs 5+1, so the final wave leaves most lanes idle,
+    // while 6 lanes runs a single full wave. `threads / beam` lands on 6 here.
+    // It also bounds concurrent decoder K/V at ~`threads` hypotheses no matter
+    // how long the audio is — a lane count driven by the window count alone
+    // would grow in-flight K/V with file length.
+    //
+    // Lanes additionally made the job far more contention-STABLE (1 lane ranged
+    // 22.0-38.0 s under a varying co-tenant load; 3+ lanes stayed 13.1-19.7 s).
+    // `FW_NO_CONTEXT_WINDOW_LANES` re-runs this sweep on another host without a
     // rebuild, so the constant stays settled by measurement, not guesswork.
-    let lane_cap =
-        beam_lane_override().unwrap_or_else(|| (rayon_threads / MIN_THREADS_PER_STREAM).max(1));
-    windows.min(lane_cap)
+    let derived = if beam > 1 {
+        (rayon_threads / beam).max(1)
+    } else {
+        (rayon_threads / MIN_THREADS_PER_STREAM).max(1)
+    };
+    windows.min(beam_lane_override().unwrap_or(derived))
 }
 
 /// `FW_NO_CONTEXT_WINDOW_LANES` — explicit lane-count override for the
@@ -4344,14 +4359,18 @@ mod tests {
     fn parallel_no_context_windows_lower_the_core_floor_for_beam_search() {
         // Beam 1 on a 32-physical-core host: no lanes (encoder-saturated).
         assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 1), 1);
-        // Same host, beam 5: lanes open up, still 8 threads per stream.
-        assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 5), 4);
+        // Same host, beam 5: lanes open up, budgeted at one forward per thread
+        // (32/5 = 6), which is the measured optimum for this 6-window job.
+        assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 5), 6);
         // Fewer windows than lanes ⇒ bounded by the window count.
         assert_eq!(parallel_no_context_window_lanes(2, 32, 32, 5), 1);
         // The floor only halves — it does not vanish.
         assert_eq!(parallel_no_context_window_lanes(6, 16, 16, 5), 1);
-        // Beam does not change the oversubscription bound on a big host.
-        assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 5), 8);
+        // A wider beam already carries its own concurrency, so it takes FEWER
+        // lanes: lanes * beam stays ~= the thread count either way.
+        assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 5), 12);
+        assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 2), 20);
+        assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 8), 8);
     }
 
     // ----- Tail-window encoder-context truncation derivation (pure) -----
