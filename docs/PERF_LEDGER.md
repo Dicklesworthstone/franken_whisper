@@ -49,6 +49,44 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-07-31 — **NON-CAMPAIGN / INFORMATIONAL** — shared-model multi-file work stealing
+
+**No competitive claim.** This row records routing evidence for the new opt-in
+`transcribe_samples_batch` capability; the formal verdict was `UNDECIDABLE`.
+
+**The lever.** Independent files now share one immutable loaded model and one
+fixed Rayon pool. An atomic queue admits one file lane per four workers, lets a
+lane that finishes a short clip immediately steal the next job, and restores
+results to input order. Nested encoder/decoder kernels reuse the same pool, so
+file concurrency creates no additional worker threads and avoids both serial
+file execution and one multi-GB model load per process.
+
+**Live-incumbent routing run.** The actual whisper.cpp 1.8.3 `whisper-cli` and
+franken ran side-by-side in the same whole-job invocation on `thinkstation2`
+(Threadripper PRO 5995WX, 64C/128T, CPUs `0-63`, 64 configured threads). Each
+arm loaded one `large-v3-turbo` model and processed the same two normalized WAV
+inputs. Transcript SHA-256 was byte-identical, WER was `0`, and work matched at
+two windows, two encodes, and 52 single-token decode steps per arm.
+
+**Raw routing ratio, not admissible:** `2.915590x` whisper.cpp/franken
+(`fw_median_ms=2395.759`, `wc_median_ms=6918.012`, comparison samples
+`[2.553543, 4.053624, 2.915590]`). Host-wide pre/warmup/post samples passed and
+the Btrfs scrub was reversibly paused, but a peer Claude process reached
+`0.326112` core; incumbent A/A median `0.921865` and load-split gap `0.362046`
+therefore failed. `verdict=UNDECIDABLE`, so none of these numbers supports a
+competitive claim.
+
+**Identity and retry predicate.** Candidate ELF
+`f97d1c3d9e24666b94c99e2cda451828c90a7be6622ffc1c0af82efb68f12b18`;
+incumbent ELF
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+model `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`;
+audio `59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`.
+Retry only with these identities on a Zen 3 host where every external process
+stays below `0.1` core for the entire invocation. Log
+`formal_f97d_retry17.log` SHA-256
+`61fcfcc7689f2fd8ca60e960e08d0bf889bf7a62f280971d40d0a407490225c9`.
+
 ## 2026-07-31 — KEEP / **CAMPAIGN WIN (vs-incumbent)** — `large-v3-turbo` whole job: **2.992045×** (ToMe R=500)
 
 **Result class: INCUMBENT-WIN / CAMPAIGN WIN.** Supersedes the `2.264127×`
