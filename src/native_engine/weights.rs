@@ -306,10 +306,26 @@ impl SafetensorsFile {
             ))
         })?;
 
-        let raw = &self.data[self.data_offset + entry.begin..self.data_offset + entry.end];
-        let n_elements: usize = entry.shape.iter().product();
+        let (n_elements, expected_bytes) = checked_tensor_layout(name, &entry.shape, entry.dtype)?;
+        let raw_begin = self.data_offset.checked_add(entry.begin).ok_or_else(|| {
+            FwError::InvalidRequest(format!(
+                "safetensors tensor `{name}`: data start offset overflows usize"
+            ))
+        })?;
+        let raw_end = self.data_offset.checked_add(entry.end).ok_or_else(|| {
+            FwError::InvalidRequest(format!(
+                "safetensors tensor `{name}`: data end offset overflows usize"
+            ))
+        })?;
+        let raw = self.data.get(raw_begin..raw_end).ok_or_else(|| {
+            FwError::InvalidRequest(format!(
+                "safetensors tensor `{name}`: byte span [{raw_begin}, {raw_end}) falls outside \
+                 the {}-byte backing buffer",
+                self.data.len()
+            ))
+        })?;
         let width = entry.dtype.byte_width();
-        if raw.len() != n_elements * width {
+        if raw.len() != expected_bytes {
             return Err(FwError::InvalidRequest(format!(
                 "safetensors tensor `{name}`: byte span {} != {} elements * {} bytes",
                 raw.len(),
@@ -395,6 +411,25 @@ impl SafetensorsFile {
     }
 }
 
+/// Compute a tensor's element and byte counts without permitting either
+/// multiplication to wrap. Dimensions are folded in header order so a hostile
+/// prefix cannot overflow before a later zero dimension masks it.
+fn checked_tensor_layout(name: &str, shape: &[usize], dtype: StDType) -> FwResult<(usize, usize)> {
+    let n_elements = shape.iter().try_fold(1usize, |product, &dimension| {
+        product.checked_mul(dimension).ok_or_else(|| {
+            FwError::InvalidRequest(format!(
+                "safetensors tensor `{name}`: shape element count overflows usize"
+            ))
+        })
+    })?;
+    let byte_len = n_elements.checked_mul(dtype.byte_width()).ok_or_else(|| {
+        FwError::InvalidRequest(format!(
+            "safetensors tensor `{name}`: shape byte length overflows usize"
+        ))
+    })?;
+    Ok((n_elements, byte_len))
+}
+
 /// Parse and validate one tensor directory entry against the data section length.
 fn parse_tensor_entry(name: &str, value: &Value, data_len: usize) -> FwResult<TensorEntry> {
     let obj = value.as_object().ok_or_else(|| {
@@ -458,12 +493,7 @@ fn parse_tensor_entry(name: &str, value: &Value, data_len: usize) -> FwResult<Te
     }
 
     let span = end - begin;
-    let n_elements: usize = shape.iter().product();
-    let expected = n_elements.checked_mul(dtype.byte_width()).ok_or_else(|| {
-        FwError::InvalidRequest(format!(
-            "safetensors tensor `{name}`: shape element count overflows when sized"
-        ))
-    })?;
+    let (n_elements, expected) = checked_tensor_layout(name, &shape, dtype)?;
     if span != expected {
         return Err(FwError::InvalidRequest(format!(
             "safetensors tensor `{name}`: byte span {span} != shape product {n_elements} \
@@ -985,6 +1015,29 @@ mod tests {
         let err = SafetensorsFile::from_bytes(&bytes).expect_err("span mismatch");
         let msg = err.to_string();
         assert!(msg.contains("byte span"), "msg: {msg}");
+    }
+
+    #[test]
+    fn shape_element_count_overflow_errors_before_trailing_zero_can_mask_it() {
+        let header = serde_json::json!({
+            "hostile": {
+                "dtype": "F32",
+                "shape": [usize::MAX, 2, 0],
+                "data_offsets": [0, 0]
+            }
+        });
+        let header_json = serde_json::to_vec(&header).expect("serialize header");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header_json);
+
+        let err = SafetensorsFile::from_bytes(&bytes).expect_err("shape must overflow");
+        let msg = err.to_string();
+        assert!(msg.contains("hostile"), "names tensor: {msg}");
+        assert!(
+            msg.contains("shape element count overflows usize"),
+            "msg: {msg}"
+        );
     }
 
     #[test]

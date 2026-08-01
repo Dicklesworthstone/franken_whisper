@@ -521,6 +521,46 @@ pub fn matmul_raw_lhs(lhs: &[f32], m: usize, b: &Mat) -> FwResult<Mat> {
     Ok(Mat::from_vec(m, n, data))
 }
 
+/// `[m,k] x [k,n] -> [m,n]` on the allocating FrankenTorch CPU f32 path.
+///
+/// Unlike [`matmul_raw_lhs`], this entry point never takes the local GEMV fast
+/// path, the uninitialized-output path, or Metal auto-offload. It is intended
+/// for inference contracts that report an explicitly CPU-only compute path.
+/// Every storage/product bound is checked before constructing kernel metadata.
+pub(crate) fn matmul_raw_lhs_cpu(lhs: &[f32], m: usize, b: &Mat) -> FwResult<Mat> {
+    let k = b.rows;
+    let n = b.cols;
+    if m == 0 || k == 0 || n == 0 {
+        return Err(FwError::InvalidRequest(
+            "matmul_raw_lhs_cpu: dimensions must be non-zero".to_owned(),
+        ));
+    }
+    let lhs_len = m.checked_mul(k).ok_or_else(|| {
+        FwError::InvalidRequest("matmul_raw_lhs_cpu: lhs dimensions overflow".to_owned())
+    })?;
+    let rhs_len = k.checked_mul(n).ok_or_else(|| {
+        FwError::InvalidRequest("matmul_raw_lhs_cpu: rhs dimensions overflow".to_owned())
+    })?;
+    let output_len = m.checked_mul(n).ok_or_else(|| {
+        FwError::InvalidRequest("matmul_raw_lhs_cpu: output dimensions overflow".to_owned())
+    })?;
+    if lhs.len() != lhs_len || b.data.len() != rhs_len {
+        return Err(FwError::InvalidRequest(
+            "matmul_raw_lhs_cpu: storage length does not match dimensions".to_owned(),
+        ));
+    }
+    let lhs_meta = meta_2d(m, k);
+    let rhs_meta = meta_2d(k, n);
+    let data = ft_kernel_cpu::matmul_tensor_contiguous_f32(lhs, &b.data, &lhs_meta, &rhs_meta)
+        .map_err(kernel_err)?;
+    if data.len() != output_len {
+        return Err(FwError::InvalidRequest(
+            "matmul_raw_lhs_cpu: kernel returned an invalid output length".to_owned(),
+        ));
+    }
+    Ok(Mat::from_vec(m, n, data))
+}
+
 /// Affine projection `x @ w_t (+ bias)`.
 ///
 /// Whisper linear layers are `y = x @ W^T + b` with `W` shaped
@@ -4846,7 +4886,7 @@ impl KvCache {
             self.v[off..off + span].copy_from_slice(&v.data);
             if !self.k_columns.is_empty() {
                 for r in 0..t {
-                    let token = self.len + r;
+                    let token = self.len + r; // ubs:ignore — cache position, not a secret
                     let src = &k.data[r * self.n_state..(r + 1) * self.n_state];
                     for (d, &value) in src.iter().enumerate() {
                         self.k_columns[d * self.capacity_tokens + token] = value;
@@ -7612,6 +7652,18 @@ mod tests {
     fn matmul_raw_lhs_len_mismatch_errors() {
         let b = Mat::zeros(3, 2);
         assert!(matmul_raw_lhs(&[1.0, 2.0], 1, &b).is_err());
+    }
+
+    #[test]
+    fn matmul_raw_lhs_cpu_is_checked_and_uses_expected_layout() {
+        let b = Mat::from_vec(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let output =
+            matmul_raw_lhs_cpu(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, &b).expect("CPU matmul");
+        assert_eq!(output.rows, 2);
+        assert_eq!(output.cols, 2);
+        assert_eq!(output.data, vec![58.0, 64.0, 139.0, 154.0]);
+        assert!(matmul_raw_lhs_cpu(&[1.0, 2.0], 1, &b).is_err());
+        assert!(matmul_raw_lhs_cpu(&[], 0, &b).is_err());
     }
 
     #[test]
