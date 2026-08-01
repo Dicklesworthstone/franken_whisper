@@ -18,6 +18,7 @@ pub mod conformance;
 pub mod diarization;
 pub mod differential_oracle;
 pub mod ecapa_conformance;
+pub mod ecapa_inference;
 pub mod error;
 pub mod export;
 pub mod logging;
