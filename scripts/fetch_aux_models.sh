@@ -81,7 +81,7 @@ log()  { printf '[fetch-aux] %s\n' "$*" >&2; }
 die()  { printf '[fetch-aux] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -179,7 +179,7 @@ fetch_ecapa() {
 [fetch-aux]      Verify its SHA-256 before unpickling:
 [fetch-aux]        printf '%s  %s\n' "$ECAPA_CKPT_SHA256" embedding_model.ckpt | shasum -a 256 -c -
 [fetch-aux]   2. Convert it with the exact deterministic profile:
-[fetch-aux]        uv run --isolated --python 3.13 \\
+[fetch-aux]        uv run --isolated --python 3.12.12 \\
 [fetch-aux]          --with numpy==2.2.6 --with torch==2.7.1 --with safetensors==0.5.3 \\
 [fetch-aux]          python scripts/convert_to_safetensors.py \\
 [fetch-aux]          embedding_model.ckpt \\
