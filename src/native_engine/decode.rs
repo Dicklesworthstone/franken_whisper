@@ -183,7 +183,7 @@ impl LoadedModel {
 }
 
 /// Decoding parameters for [`transcribe_samples`] (greedy, temperature 0).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct DecodeParams {
     /// Source language code (e.g. `"en"`). `None` triggers auto-detection on
     /// multilingual models; ignored by English-only models.
@@ -2990,6 +2990,95 @@ pub fn transcribe_samples(
     })
 }
 
+/// Exact-equivalent batch jobs that can share one physical transcription.
+struct BatchJobGroup {
+    representative: usize,
+    members: Vec<usize>,
+}
+
+/// Fast, non-cryptographic fingerprint over the exact IEEE-754 sample bits.
+/// Hash matches are always verified bit-for-bit before work is shared, so a
+/// collision can only cost an equality scan; it cannot alias two audio jobs.
+fn batch_audio_fingerprint(samples: &[f32]) -> u64 {
+    let mut hash = 0x9e37_79b9_7f4a_7c15_u64 ^ samples.len() as u64;
+    for &sample in samples {
+        let word = u64::from(sample.to_bits()).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash ^= word;
+        hash = hash.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
+}
+
+fn batch_jobs_identical(left: (&[f32], &DecodeParams), right: (&[f32], &DecodeParams)) -> bool {
+    if left.1 != right.1 || left.0.len() != right.0.len() {
+        return false;
+    }
+    std::ptr::eq(left.0.as_ptr(), right.0.as_ptr())
+        || left
+            .0
+            .iter()
+            .zip(right.0)
+            .all(|(&a, &b)| a.to_bits() == b.to_bits())
+}
+
+fn coalesce_batch_jobs(jobs: &[(&[f32], DecodeParams)]) -> Vec<BatchJobGroup> {
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+
+    let mut groups: Vec<BatchJobGroup> = Vec::with_capacity(jobs.len());
+    let mut by_fingerprint: HashMap<u64, Vec<usize>> = HashMap::with_capacity(jobs.len());
+    for (job_index, (samples, params)) in jobs.iter().enumerate() {
+        let mut params_hash = std::collections::hash_map::DefaultHasher::new();
+        params.hash(&mut params_hash);
+        let fingerprint = batch_audio_fingerprint(samples) ^ params_hash.finish().rotate_left(17);
+        let matching_group = by_fingerprint.get(&fingerprint).and_then(|candidates| {
+            candidates.iter().copied().find(|&group_index| {
+                let representative = groups[group_index].representative;
+                batch_jobs_identical(
+                    (samples, params),
+                    (jobs[representative].0, &jobs[representative].1),
+                )
+            })
+        });
+        if let Some(group_index) = matching_group {
+            groups[group_index].members.push(job_index);
+        } else {
+            let group_index = groups.len();
+            groups.push(BatchJobGroup {
+                representative: job_index,
+                members: vec![job_index],
+            });
+            by_fingerprint
+                .entry(fingerprint)
+                .or_default()
+                .push(group_index);
+        }
+    }
+    groups
+}
+
+/// Enable exact duplicate elimination in [`transcribe_samples_batch`].
+///
+/// The default is on. `FW_BATCH_COALESCE=0` (also `false` or `off`) restores
+/// one physical transcription per input for same-binary comparison and
+/// operational rollback.
+fn batch_coalesce_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FW_BATCH_COALESCE").map_or(true, |value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+    })
+}
+
 /// Transcribe independent audio inputs concurrently through one loaded model.
 ///
 /// This is the multi-file counterpart to [`transcribe_samples`]. Model weights
@@ -2998,6 +3087,11 @@ pub fn transcribe_samples(
 /// encoder/decoder kernels. That avoids the two expensive alternatives a
 /// caller otherwise faces: serializing every file, or loading one multi-GB
 /// model per process.
+///
+/// Before scheduling, jobs with bit-identical samples and equal
+/// [`DecodeParams`] are coalesced. Fingerprint matches are collision-checked,
+/// so distinct jobs can never alias; successful results are cloned back into
+/// their original positions. Set `FW_BATCH_COALESCE=0` to disable this path.
 ///
 /// At most one file lane is admitted per four Rayon workers. Nested frontends
 /// and transformer kernels reuse that same fixed pool, so additional lanes do
@@ -3026,25 +3120,80 @@ pub fn transcribe_samples_batch(
     }
 
     super::ensure_default_rayon_pool();
+    let groups = if batch_coalesce_enabled() {
+        coalesce_batch_jobs(jobs)
+    } else {
+        (0..jobs.len())
+            .map(|job_index| BatchJobGroup {
+                representative: job_index,
+                members: vec![job_index],
+            })
+            .collect()
+    };
+    super::perf_span(
+        "batch_coalesce",
+        0.0,
+        &format!("\"jobs\":{},\"unique\":{}", jobs.len(), groups.len()),
+    );
     const MIN_THREADS_PER_FILE: usize = 4;
-    let lanes = jobs
+    let lanes = groups
         .len()
         .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
-    let next_job = std::sync::atomic::AtomicUsize::new(0);
+    let next_group = std::sync::atomic::AtomicUsize::new(0);
 
     let mut completed: Vec<(usize, FwResult<DecodeOutput>)> = (0..lanes)
         .into_par_iter()
         .flat_map_iter(|_| {
             std::iter::from_fn(|| {
-                let index = next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                jobs.get(index).map(|(samples, params)| {
-                    (index, transcribe_samples(m, samples, params, checkpoint))
+                let group_index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                groups.get(group_index).map(|group| {
+                    let representative = group.representative;
+                    let (samples, params) = &jobs[representative];
+                    (
+                        group_index,
+                        transcribe_samples(m, samples, params, checkpoint),
+                    )
                 })
             })
         })
         .collect();
-    completed.sort_unstable_by_key(|(index, _)| *index);
-    completed.into_iter().map(|(_, result)| result).collect()
+    completed.sort_unstable_by_key(|(group_index, _)| *group_index);
+
+    let mut outputs: Vec<Option<FwResult<DecodeOutput>>> = (0..jobs.len()).map(|_| None).collect();
+    for (group_index, result) in completed {
+        let group = &groups[group_index];
+        match result {
+            Ok(output) => {
+                for (position, &job_index) in group.members.iter().enumerate() {
+                    let mut logical_output = output.clone();
+                    if position > 0 {
+                        // Work provenance is physical, not logical: cached
+                        // followers perform no encoder or decoder operations.
+                        logical_output.work = DecodeWorkStats::default();
+                    }
+                    outputs[job_index] = Some(Ok(logical_output));
+                }
+            }
+            Err(error) => {
+                let (&first, followers) = group.members.split_first().expect("nonempty group");
+                outputs[first] = Some(Err(error));
+                // Error values are intentionally not cloneable. Re-run only
+                // failed followers so each receives its own precise error.
+                for &job_index in followers {
+                    outputs[job_index] = Some(transcribe_samples(
+                        m,
+                        jobs[job_index].0,
+                        &jobs[job_index].1,
+                        checkpoint,
+                    ));
+                }
+            }
+        }
+    }
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every batch group resolves its members"))
+        .collect()
 }
 
 /// Compute DTW word timings for one window, returning per-segment word lists
@@ -3434,6 +3583,49 @@ mod tests {
     // -----------------------------------------------------------------------
     // Synthetic tokenizer for hermetic logit-filter / segment tests.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn batch_coalescing_shares_only_exact_audio_and_params() {
+        let audio = vec![0.0, 0.25, -0.5, f32::from_bits(0x7fc0_0001)];
+        let audio_copy = audio.clone();
+        let signed_zero_variant = vec![-0.0, 0.25, -0.5, f32::from_bits(0x7fc0_0001)];
+        let params = DecodeParams::default();
+        let mut translated = params.clone();
+        translated.translate = true;
+        let jobs = [
+            (audio.as_slice(), params.clone()),
+            (audio_copy.as_slice(), params.clone()),
+            (signed_zero_variant.as_slice(), params.clone()),
+            (audio.as_slice(), translated),
+        ];
+
+        let groups = coalesce_batch_jobs(&jobs);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].representative, 0);
+        assert_eq!(groups[0].members, vec![0, 1]);
+        assert_eq!(groups[1].members, vec![2]);
+        assert_eq!(groups[2].members, vec![3]);
+    }
+
+    #[test]
+    fn batch_coalescing_preserves_first_seen_group_order() {
+        let first = vec![1.0, 2.0];
+        let second = vec![3.0, 4.0];
+        let first_copy = first.clone();
+        let params = DecodeParams::default();
+        let jobs = [
+            (first.as_slice(), params.clone()),
+            (second.as_slice(), params.clone()),
+            (first_copy.as_slice(), params),
+        ];
+
+        let groups = coalesce_batch_jobs(&jobs);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].members, vec![0, 2]);
+        assert_eq!(groups[1].members, vec![1]);
+    }
 
     fn hp(n_vocab: i32) -> WhisperHParams {
         WhisperHParams {
