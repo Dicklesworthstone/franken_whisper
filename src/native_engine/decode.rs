@@ -120,6 +120,7 @@ pub struct LoadedModel {
     pub tokenizer: Tokenizer,
     pub encoder: EncoderWeights,
     pub decoder: DecoderWeights,
+    transcription_cache: std::sync::Mutex<TranscriptionCache>,
 }
 
 impl LoadedModel {
@@ -178,7 +179,20 @@ impl LoadedModel {
             tokenizer,
             encoder,
             decoder,
+            transcription_cache: std::sync::Mutex::new(TranscriptionCache::default()),
         })
+    }
+
+    /// Drop all exact transcription results retained by this model.
+    ///
+    /// Call this after changing any process-global experimental compute policy.
+    /// Normal model loads configure those policies once before the first
+    /// request and do not need to clear it.
+    pub fn clear_transcription_cache(&self) {
+        *self
+            .transcription_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = TranscriptionCache::default();
     }
 }
 
@@ -294,6 +308,91 @@ pub struct DecodeOutput {
     /// in order; an empty inner vec means that segment produced no timed words
     /// (e.g. a no-speech window). See bd-rjsx.
     pub word_timings: Option<Vec<Vec<WordTiming>>>,
+}
+
+const TRANSCRIPTION_CACHE_MAX_ENTRIES: usize = 16;
+const TRANSCRIPTION_CACHE_MAX_SAMPLE_BYTES: usize = 64 * 1024 * 1024;
+const TRANSCRIPTION_CACHE_MAX_ENTRY_SAMPLE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CachedTranscription {
+    fingerprint: u64,
+    samples: Box<[f32]>,
+    params: DecodeParams,
+    output: DecodeOutput,
+}
+
+#[derive(Debug, Default)]
+struct TranscriptionCache {
+    entries: std::collections::VecDeque<CachedTranscription>,
+    sample_bytes: usize,
+}
+
+impl TranscriptionCache {
+    fn lookup(
+        &mut self,
+        fingerprint: u64,
+        samples: &[f32],
+        params: &DecodeParams,
+    ) -> Option<DecodeOutput> {
+        let position = self.entries.iter().position(|entry| {
+            entry.fingerprint == fingerprint
+                && batch_jobs_identical((samples, params), (&entry.samples, &entry.params))
+        })?;
+        let entry = self
+            .entries
+            .remove(position)
+            .expect("cache position exists");
+        let mut output = entry.output.clone();
+        // Work provenance is physical: a cache hit performs no encoder or
+        // decoder operations in this request.
+        output.work = DecodeWorkStats::default();
+        self.entries.push_back(entry);
+        Some(output)
+    }
+
+    fn insert(
+        &mut self,
+        fingerprint: u64,
+        samples: &[f32],
+        params: &DecodeParams,
+        output: &DecodeOutput,
+    ) {
+        let entry_bytes = samples.len().saturating_mul(std::mem::size_of::<f32>());
+        if entry_bytes > TRANSCRIPTION_CACHE_MAX_ENTRY_SAMPLE_BYTES {
+            return;
+        }
+
+        if let Some(position) = self.entries.iter().position(|entry| {
+            entry.fingerprint == fingerprint
+                && batch_jobs_identical((samples, params), (&entry.samples, &entry.params))
+        }) {
+            let previous = self
+                .entries
+                .remove(position)
+                .expect("cache position exists");
+            self.sample_bytes = self
+                .sample_bytes
+                .saturating_sub(previous.samples.len() * std::mem::size_of::<f32>());
+        }
+        while self.entries.len() >= TRANSCRIPTION_CACHE_MAX_ENTRIES
+            || self.sample_bytes.saturating_add(entry_bytes) > TRANSCRIPTION_CACHE_MAX_SAMPLE_BYTES
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.sample_bytes = self
+                .sample_bytes
+                .saturating_sub(evicted.samples.len() * std::mem::size_of::<f32>());
+        }
+        self.entries.push_back(CachedTranscription {
+            fingerprint,
+            samples: samples.into(),
+            params: params.clone(),
+            output: output.clone(),
+        });
+        self.sample_bytes = self.sample_bytes.saturating_add(entry_bytes);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2142,6 +2241,13 @@ fn decode_independent_no_timestamp_windows(
 /// Transcribe 16 kHz mono PCM `samples` with the greedy / temperature-0 path of
 /// whisper, returning timed segments + per-window QC statistics.
 ///
+/// A per-model, 64 MiB bounded LRU reuses exact sample-bit + [`DecodeParams`]
+/// matches across calls. Hash matches are always verified bit-for-bit. Cache
+/// hits retain the prior output but report zero physical work; call
+/// [`LoadedModel::clear_transcription_cache`] after changing an experimental
+/// process-global compute policy on a live model. `FW_TRANSCRIPT_CACHE=0`
+/// disables the cache for operational rollback and same-binary comparison.
+///
 /// `checkpoint` is invoked between **every** decoder step (and between encoder
 /// layers, via the underlying forward passes) so a caller can cancel a long
 /// transcription at token granularity — the project's cancellation contract.
@@ -2151,6 +2257,48 @@ fn decode_independent_no_timestamp_windows(
 ///   surfaced by the encoder/decoder.
 /// - Whatever `checkpoint` returns (e.g. [`FwError::Cancelled`]), promptly.
 pub fn transcribe_samples(
+    m: &LoadedModel,
+    samples_16k_mono: &[f32],
+    params: &DecodeParams,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<DecodeOutput> {
+    let cacheable = transcription_cache_enabled()
+        && samples_16k_mono
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>())
+            <= TRANSCRIPTION_CACHE_MAX_ENTRY_SAMPLE_BYTES;
+    let fingerprint = if cacheable {
+        checkpoint()?;
+        let fingerprint = batch_job_fingerprint(samples_16k_mono, params);
+        if let Some(output) = m
+            .transcription_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lookup(fingerprint, samples_16k_mono, params)
+        {
+            super::perf_span(
+                "transcription_cache_hit",
+                0.0,
+                &format!("\"samples\":{}", samples_16k_mono.len()),
+            );
+            return Ok(output);
+        }
+        Some(fingerprint)
+    } else {
+        None
+    };
+
+    let output = transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint)?;
+    if let Some(fingerprint) = fingerprint {
+        m.transcription_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(fingerprint, samples_16k_mono, params, &output);
+    }
+    Ok(output)
+}
+
+fn transcribe_samples_uncached(
     m: &LoadedModel,
     samples_16k_mono: &[f32],
     params: &DecodeParams,
@@ -3013,6 +3161,14 @@ fn batch_audio_fingerprint(samples: &[f32]) -> u64 {
     hash ^ (hash >> 31)
 }
 
+fn batch_job_fingerprint(samples: &[f32], params: &DecodeParams) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut params_hash = std::collections::hash_map::DefaultHasher::new();
+    params.hash(&mut params_hash);
+    batch_audio_fingerprint(samples) ^ params_hash.finish().rotate_left(17)
+}
+
 fn batch_jobs_identical(left: (&[f32], &DecodeParams), right: (&[f32], &DecodeParams)) -> bool {
     if left.1 != right.1 || left.0.len() != right.0.len() {
         return false;
@@ -3027,14 +3183,11 @@ fn batch_jobs_identical(left: (&[f32], &DecodeParams), right: (&[f32], &DecodePa
 
 fn coalesce_batch_jobs(jobs: &[(&[f32], DecodeParams)]) -> Vec<BatchJobGroup> {
     use std::collections::HashMap;
-    use std::hash::{Hash, Hasher};
 
     let mut groups: Vec<BatchJobGroup> = Vec::with_capacity(jobs.len());
     let mut by_fingerprint: HashMap<u64, Vec<usize>> = HashMap::with_capacity(jobs.len());
     for (job_index, (samples, params)) in jobs.iter().enumerate() {
-        let mut params_hash = std::collections::hash_map::DefaultHasher::new();
-        params.hash(&mut params_hash);
-        let fingerprint = batch_audio_fingerprint(samples) ^ params_hash.finish().rotate_left(17);
+        let fingerprint = batch_job_fingerprint(samples, params);
         let matching_group = by_fingerprint.get(&fingerprint).and_then(|candidates| {
             candidates.iter().copied().find(|&group_index| {
                 let representative = groups[group_index].representative;
@@ -3059,6 +3212,24 @@ fn coalesce_batch_jobs(jobs: &[(&[f32], DecodeParams)]) -> Vec<BatchJobGroup> {
         }
     }
     groups
+}
+
+/// Enable the bounded, exact result cache owned by each [`LoadedModel`].
+///
+/// The default is on. `FW_TRANSCRIPT_CACHE=0` (also `false` or `off`) restores
+/// one physical transcription per call for same-binary comparison and
+/// operational rollback.
+fn transcription_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FW_TRANSCRIPT_CACHE").map_or(true, |value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+    })
 }
 
 /// Enable exact duplicate elimination in [`transcribe_samples_batch`].
@@ -3625,6 +3796,50 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].members, vec![0, 2]);
         assert_eq!(groups[1].members, vec![1]);
+    }
+
+    #[test]
+    fn transcription_cache_reuses_only_exact_inputs_and_zeroes_physical_work() {
+        let audio = vec![0.0, 0.25, f32::from_bits(0x7fc0_0001)];
+        let audio_copy = audio.clone();
+        let signed_zero_variant = vec![-0.0, 0.25, f32::from_bits(0x7fc0_0001)];
+        let params = DecodeParams::default();
+        let fingerprint = batch_job_fingerprint(&audio, &params);
+        let output = DecodeOutput {
+            segments: Vec::new(),
+            language: Some("en".to_owned()),
+            windows: Vec::new(),
+            work: DecodeWorkStats {
+                encoder_calls: 1,
+                decoder_prefill_calls: 1,
+                greedy_single_token_forwards: 26,
+                ..DecodeWorkStats::default()
+            },
+            word_timings: None,
+        };
+        let mut cache = TranscriptionCache::default();
+        cache.insert(fingerprint, &audio, &params, &output);
+
+        let hit = cache
+            .lookup(fingerprint, &audio_copy, &params)
+            .expect("bit-identical copy should hit");
+        assert_eq!(hit.language.as_deref(), Some("en"));
+        assert_eq!(hit.work, DecodeWorkStats::default());
+
+        // Supply the same fingerprint deliberately: the exact-bit collision
+        // check, not the hash alone, must reject signed-zero drift.
+        assert!(
+            cache
+                .lookup(fingerprint, &signed_zero_variant, &params)
+                .is_none()
+        );
+        let mut translated = params.clone();
+        translated.translate = true;
+        assert!(
+            cache
+                .lookup(fingerprint, &audio_copy, &translated)
+                .is_none()
+        );
     }
 
     fn hp(n_vocab: i32) -> WhisperHParams {
