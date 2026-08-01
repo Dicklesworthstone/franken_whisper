@@ -1703,18 +1703,66 @@ fn parallel_no_context_window_lanes(
     windows: usize,
     rayon_threads: usize,
     physical_cores: usize,
+    beam: usize,
 ) -> usize {
     const MIN_WINDOWS: usize = 4;
     const MIN_PHYSICAL_CORES: usize = 64;
     const MIN_THREADS_PER_STREAM: usize = 8;
 
-    if windows < MIN_WINDOWS
-        || physical_cores < MIN_PHYSICAL_CORES
-        || rayon_threads != physical_cores
-    {
+    // Beam search INVERTS this path's cost model, so the core floor is
+    // beam-dependent.
+    //
+    // At beam 1 a window is ENCODER-dominated, and the encoder already
+    // saturates the Rayon pool on its own — splitting it into lanes just
+    // re-partitions work that was not idle (measured on a 32-physical-core
+    // host: window fan-out was byte-exact but 0.8% *slower*). Lanes only earn
+    // their keep once the host has enough physical cores to hand every lane a
+    // full-width encoder, hence the 64-core floor.
+    //
+    // At beam > 1 the window is DECODE-dominated — measured at beam 5,
+    // `decode_loop` 7371 ms vs `encoder_window` 673 ms, i.e. ~91% of the window
+    // — and a single-token decode step is LATENCY-bound: it cannot saturate the
+    // pool even with the beam's hypotheses forwarded concurrently. The idle-core
+    // headroom that makes lanes worthless at beam 1 is precisely what makes them
+    // nearly free at beam > 1, so the floor drops to half the cores.
+    let min_physical = if beam > 1 {
+        MIN_PHYSICAL_CORES / 2
+    } else {
+        MIN_PHYSICAL_CORES
+    };
+
+    if windows < MIN_WINDOWS || physical_cores < min_physical || rayon_threads != physical_cores {
         return 1;
     }
-    windows.min((rayon_threads / MIN_THREADS_PER_STREAM).max(1))
+    // NOTE: a beam lane is not one stream — it internally forwards `beam`
+    // hypotheses concurrently through the SAME Rayon pool, so the pool sees
+    // `lanes * beam` in-flight single-token decodes and each one individually
+    // slows down (per-window `decode_loop` 3.5 s → ~9 s going 1 → 4 lanes at
+    // beam 5 on 32 threads). The NET is still strongly positive, so the derived
+    // thread-budgeted count stands: swept on jfk×15 / turbo / beam 5 / 32
+    // threads, whole-job median ms was 28667 (1 lane) / 20151 (2) / 16862 (3) /
+    // 16450 (4) — i.e. the 32/8 = 4 this formula already yields. Lanes also made
+    // the job far more contention-STABLE (1 lane ranged 22.0-38.0 s under a
+    // varying co-tenant load, 3-4 lanes stayed inside 15.8-19.7 s).
+    // `FW_NO_CONTEXT_WINDOW_LANES` re-runs that sweep on another host without a
+    // rebuild, so the constant stays settled by measurement, not guesswork.
+    let lane_cap =
+        beam_lane_override().unwrap_or_else(|| (rayon_threads / MIN_THREADS_PER_STREAM).max(1));
+    windows.min(lane_cap)
+}
+
+/// `FW_NO_CONTEXT_WINDOW_LANES` — explicit lane-count override for the
+/// independent-window path, so the lane/beam product can be swept on a host
+/// without a rebuild. Unset (the default) ⇒ the derived count above.
+fn beam_lane_override() -> Option<usize> {
+    use std::sync::OnceLock;
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FW_NO_CONTEXT_WINDOW_LANES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+    })
 }
 
 /// Derive this window's encoder context (in encoder frames) from the real
@@ -1821,6 +1869,7 @@ fn decode_independent_no_timestamp_window(
     seek_end_cs: i64,
     n_max_tokens: usize,
     user_max_tokens: Option<usize>,
+    beam: usize,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<IndependentWindowResult> {
     checkpoint()?;
@@ -1871,52 +1920,46 @@ fn decode_independent_no_timestamp_window(
     };
 
     let t_loop = std::time::Instant::now();
-    let mut decoded: Vec<i32> = Vec::new();
-    let mut plogs: Vec<f32> = Vec::new();
-    let mut has_ts = false;
-    let mut seek_delta_cs = CHUNK_CS;
-    let mut result_len = 0usize;
-    let mut step_logits = prefill_logits;
-
-    for i in 0..n_max_tokens {
-        let (filtered, logprobs) = process_logits(
+    let (decoded, plogs, seek_delta_cs, result_len) = if beam > 1 {
+        // Beam search for this window. This is the SAME `beam_decode_window` the
+        // sequential path calls, seeded from this window's own `st` / prefill
+        // logits, so a lane's result cannot depend on any other lane — the
+        // window stays independent and the transcript is unchanged by lane count.
+        //
+        // `checkpoint` is `&(dyn Fn + Sync)` while the beam entry point takes
+        // `&dyn Fn`; trait-object-to-trait-object unsizing does not coerce, so
+        // re-wrap rather than cast.
+        let cp = || checkpoint();
+        let (decoded, plogs, _has_ts, seek_delta_cs, result_len) = beam_decode_window(
+            m,
+            &st,
+            prefill_logits,
             tk,
             cfg,
-            step_logits,
-            &decoded,
-            has_ts,
-            seek_delta_cs,
-            decoded.len(),
-        );
-        let (tok, plog) = argmax(&filtered, &logprobs);
-        decoded.push(tok);
-        plogs.push(plog);
-
-        // Timestamp tokens are masked by this path's filter, but retaining the
-        // established update makes the specialization mechanically identical
-        // if a malformed model ever surfaces one.
-        if tok > tk.timestamp_begin {
-            let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
-            if has_ts && seek_delta_cs > new_delta && result_len < i {
-                break;
-            }
-            seek_delta_cs = new_delta;
-            result_len = i + 1;
-            has_ts = true;
-        }
-
-        let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
-        let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
-        if tok == tk.eot || budget_reached || reached_end {
-            result_len = i + 1;
-            seek_delta_cs = CHUNK_CS;
-            break;
-        }
-
-        checkpoint()?;
-        step_logits = decoder::forward_step(&m.decoder, &mut st, &[tok], checkpoint)?;
-        work.greedy_single_token_forwards += 1;
-    }
+            params,
+            seek_cs,
+            seek_end_cs,
+            n_max_tokens,
+            user_max_tokens,
+            beam,
+            &cp,
+        )?;
+        (decoded, plogs, seek_delta_cs, result_len)
+    } else {
+        greedy_independent_window_loop(
+            m,
+            &mut st,
+            prefill_logits,
+            tk,
+            cfg,
+            seek_cs,
+            seek_end_cs,
+            n_max_tokens,
+            user_max_tokens,
+            &mut work,
+            checkpoint,
+        )?
+    };
     work.sampled_tokens = decoded.len();
     super::perf_span(
         "decode_loop",
@@ -1971,6 +2014,75 @@ fn decode_independent_no_timestamp_window(
     })
 }
 
+/// The greedy (beam 1) decode loop of one independent no-timestamp window.
+///
+/// Split out verbatim from [`decode_independent_no_timestamp_window`] when beam
+/// search joined that path, so the default greedy behavior stays literally the
+/// same code rather than a re-derivation of it.
+#[allow(clippy::too_many_arguments)]
+fn greedy_independent_window_loop(
+    m: &LoadedModel,
+    st: &mut DecoderState,
+    prefill_logits: Vec<f32>,
+    tk: &Tokenizer,
+    cfg: &FilterConfig,
+    seek_cs: i64,
+    seek_end_cs: i64,
+    n_max_tokens: usize,
+    user_max_tokens: Option<usize>,
+    work: &mut DecodeWorkStats,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<(Vec<i32>, Vec<f32>, i64, usize)> {
+    let mut decoded: Vec<i32> = Vec::new();
+    let mut plogs: Vec<f32> = Vec::new();
+    let mut has_ts = false;
+    let mut seek_delta_cs = CHUNK_CS;
+    let mut result_len = 0usize;
+    let mut step_logits = prefill_logits;
+
+    for i in 0..n_max_tokens {
+        let (filtered, logprobs) = process_logits(
+            tk,
+            cfg,
+            step_logits,
+            &decoded,
+            has_ts,
+            seek_delta_cs,
+            decoded.len(),
+        );
+        let (tok, plog) = argmax(&filtered, &logprobs);
+        decoded.push(tok);
+        plogs.push(plog);
+
+        // Timestamp tokens are masked by this path's filter, but retaining the
+        // established update makes the specialization mechanically identical
+        // if a malformed model ever surfaces one.
+        if tok > tk.timestamp_begin {
+            let new_delta = 2 * i64::from(tok - tk.timestamp_begin);
+            if has_ts && seek_delta_cs > new_delta && result_len < i {
+                break;
+            }
+            seek_delta_cs = new_delta;
+            result_len = i + 1;
+            has_ts = true;
+        }
+
+        let budget_reached = user_max_tokens.is_some_and(|mt| i >= mt);
+        let reached_end = has_ts && seek_cs + seek_delta_cs + DELTA_MIN >= seek_end_cs;
+        if tok == tk.eot || budget_reached || reached_end {
+            result_len = i + 1;
+            seek_delta_cs = CHUNK_CS;
+            break;
+        }
+
+        checkpoint()?;
+        step_logits = decoder::forward_step(&m.decoder, st, &[tok], checkpoint)?;
+        work.greedy_single_token_forwards += 1;
+    }
+
+    Ok((decoded, plogs, seek_delta_cs, result_len))
+}
+
 fn add_decode_work(total: &mut DecodeWorkStats, part: &DecodeWorkStats) {
     total.window_attempts += part.window_attempts;
     total.encoder_calls += part.encoder_calls;
@@ -1995,6 +2107,7 @@ fn decode_independent_no_timestamp_windows(
     n_max_tokens: usize,
     user_max_tokens: Option<usize>,
     lanes: usize,
+    beam: usize,
     checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<DecodeOutput> {
     use std::sync::Mutex;
@@ -2039,6 +2152,7 @@ fn decode_independent_no_timestamp_windows(
                         seek_end_cs,
                         n_max_tokens,
                         user_max_tokens,
+                        beam,
                         &worker_checkpoint,
                     ) {
                         Ok(result) => results
@@ -2242,13 +2356,30 @@ pub fn transcribe_samples(
             independent_window_count,
             rayon::current_num_threads(),
             physical,
+            effective_beam_size,
         )
     });
+    // Beam width is deliberately NOT a gate here. Beam search runs strictly
+    // WITHIN a window (`beam_decode_window` seeds from that window's own
+    // cross-K/V and never reads another window's state), so in no-timestamps
+    // mode with prompt carry disabled the windows stay independent at any beam
+    // width — the old `effective_beam_size == 1` condition was a capability
+    // limit of this path's inline greedy loop, not a correctness requirement,
+    // and it cost us the window parallelism on exactly the workload that needs
+    // it most (see the lane-heuristic comment).
+    // Window independence has TWO sufficient conditions, and this gate used to
+    // test only one. `prompt_carried` below is `!condition_on_prev_disabled()
+    // && ... && max_prompt_ctx > 1`, so carry is unconditionally off when the
+    // context budget is <= 1 OR when `FW_NO_CONTEXT` disables conditioning
+    // outright (whisper.cpp's `-nc`). Both leave every window's prompt equal to
+    // the bare SOT sequence, which is exactly what this path decodes; admitting
+    // only the first was a capability limit that kept the `-nc` cell — the one
+    // cell where the windows genuinely ARE independent — on the sequential path.
+    let prompt_carry_disabled = max_prompt_ctx <= 1 || condition_on_prev_disabled();
     if parallel_no_context_windows_enabled()
         && cfg.no_timestamps
-        && max_prompt_ctx <= 1
+        && prompt_carry_disabled
         && !params.word_timestamps
-        && effective_beam_size == 1
         && !temp_fallback_enabled()
         && std::env::var_os("PROBE_DUMP_TOKENS").is_none()
         && independent_window_lanes > 1
@@ -2264,6 +2395,7 @@ pub fn transcribe_samples(
             n_max_tokens,
             user_max_tokens,
             independent_window_lanes,
+            effective_beam_size,
             checkpoint,
         );
     }
@@ -4190,17 +4322,36 @@ mod tests {
 
     #[test]
     fn parallel_no_context_windows_use_one_lane_outside_large_host_regime() {
-        assert_eq!(parallel_no_context_window_lanes(3, 64, 64), 1);
-        assert_eq!(parallel_no_context_window_lanes(5, 32, 64), 1);
-        assert_eq!(parallel_no_context_window_lanes(5, 128, 64), 1);
-        assert_eq!(parallel_no_context_window_lanes(5, 48, 48), 1);
+        assert_eq!(parallel_no_context_window_lanes(3, 64, 64, 1), 1);
+        assert_eq!(parallel_no_context_window_lanes(5, 32, 64, 1), 1);
+        assert_eq!(parallel_no_context_window_lanes(5, 128, 64, 1), 1);
+        assert_eq!(parallel_no_context_window_lanes(5, 48, 48, 1), 1);
     }
 
     #[test]
     fn parallel_no_context_windows_fill_physical_core_pool_without_oversubscription() {
-        assert_eq!(parallel_no_context_window_lanes(5, 64, 64), 5);
-        assert_eq!(parallel_no_context_window_lanes(20, 64, 64), 8);
-        assert_eq!(parallel_no_context_window_lanes(12, 128, 128), 12);
+        assert_eq!(parallel_no_context_window_lanes(5, 64, 64, 1), 5);
+        assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 1), 8);
+        assert_eq!(parallel_no_context_window_lanes(12, 128, 128, 1), 12);
+    }
+
+    // Beam search makes a window decode-dominated and latency-bound, so the
+    // physical-core floor halves: a 32-core host that is (correctly) denied
+    // lanes at beam 1 — the encoder there already saturates the pool — gets
+    // them at beam > 1, which is exactly the workload that was losing to
+    // whisper.cpp's batched beam graph.
+    #[test]
+    fn parallel_no_context_windows_lower_the_core_floor_for_beam_search() {
+        // Beam 1 on a 32-physical-core host: no lanes (encoder-saturated).
+        assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 1), 1);
+        // Same host, beam 5: lanes open up, still 8 threads per stream.
+        assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 5), 4);
+        // Fewer windows than lanes ⇒ bounded by the window count.
+        assert_eq!(parallel_no_context_window_lanes(2, 32, 32, 5), 1);
+        // The floor only halves — it does not vanish.
+        assert_eq!(parallel_no_context_window_lanes(6, 16, 16, 5), 1);
+        // Beam does not change the oversubscription bound on a big host.
+        assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 5), 8);
     }
 
     // ----- Tail-window encoder-context truncation derivation (pure) -----
