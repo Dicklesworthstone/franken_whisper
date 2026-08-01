@@ -1017,11 +1017,11 @@ files. A missing `--reference` is valid and produces
 
 ### 11.5 Optional ECAPA model and numerical conformance boundary
 
-`src/ecapa_conformance.rs` freezes the prerequisite contract for a later
-safe-Rust ECAPA-TDNN engine. It does **not** admit neural inference into
-`auto`, change the acoustic default, download a model, or parse a framework
-checkpoint at runtime. Full forward inference and routing remain separate
-work.
+`src/ecapa_conformance.rs` freezes the model/evidence contract and
+`src/ecapa_inference.rs` implements its bounded safe-Rust ECAPA-TDNN forward
+path. Neither module admits neural inference into `auto`, changes the acoustic
+default, downloads a model, or parses a framework checkpoint at runtime.
+Profile/clustering integration and routing remain separate work.
 
 The source is
 [`speechbrain/spkrec-ecapa-voxceleb`](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/tree/eac27266f68caa806381260bd44ace38b136c76a)
@@ -1050,18 +1050,20 @@ The versioned export protocol is
 `ecapa-tdnn-voxceleb-v1` profile in
 `scripts/convert_to_safetensors.py`. Source checkpoint loading is a
 development-only, out-of-process trust boundary. The profile accepts only the
-checkpoint identity above and requires Python 3.13, NumPy 2.2.6, Torch 2.7.1,
-and safetensors 0.5.3. It then:
+checkpoint identity above and requires Python 3.12.12, NumPy 2.2.6, Torch 2.7.1,
+and safetensors 0.5.3. It then does the following:
 
-1. require the exact 83,316,686-byte source hash and 231-entry census;
-2. reject every non-tensor or unexpected dtype, dropping only the 31 named
+1. requires the exact 83,316,686-byte source hash and 231-entry census;
+2. rejects every non-tensor or unexpected dtype, dropping only the 31 named
    `num_batches_tracked` counters;
-3. preserve unfused BatchNorm parameters and PyTorch logical row-major layout;
-4. materialize contiguous IEEE-754 `f32` values in little-endian order;
-5. emit canonical, lexicographically ordered safetensors header and payload
+3. preserves unfused BatchNorm parameters and PyTorch logical row-major layout;
+4. materializes contiguous IEEE-754 `f32` values in little-endian order;
+5. emits canonical, lexicographically ordered safetensors header and payload
    data with path- and time-free provenance metadata; and
-6. reopen the result with the official safetensors reader before reporting its
-   identity.
+6. parses the complete in-memory byte stream with the official safetensors
+   reader, then writes, fsyncs, and rehashes a same-directory temporary file
+   before atomically hard-linking that verified inode into an exclusively
+   created final path.
 
 Two isolated executions produce the same 83,246,544-byte package, SHA-256
 `9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc`.
@@ -1081,33 +1083,140 @@ truncation, corruption, and cancellation failures report stable `ecapa.*`
 reasons without printing paths, tensor contents, or source bytes. There is no
 second model-package format or sidecar manifest.
 
-The frontend is exact 16 kHz mono finite PCM in `[-1, 1]`, with a 400-sample
-periodic Hamming window, 160-sample hop, centered zero padding, 400-point
-one-sided squared-magnitude spectrum, 80 SpeechBrain symmetric triangular HTK
-mel filters over 0–8 kHz, `amin=1e-10`, 80 dB clipping, and per-utterance
-feature-mean subtraction without standard-deviation normalization. Model
-windows shorter than 0.5 seconds fail closed. Resampling and downmixing must
-already have occurred at the normalized-audio boundary; mislabeled 8 kHz or
-interleaved PCM is rejected rather than guessed.
+The Rust PCM frontend in this bead is a bounded scalar conformance reference,
+not the later production kernel; it accepts at most 16,000 samples (one second).
+For exact 16 kHz mono finite PCM in `[-1, 1]`, it uses a 400-sample periodic
+Hamming window, 160-sample hop, centered zero padding, 400-point one-sided
+squared-magnitude spectrum, 80 SpeechBrain symmetric triangular HTK mel filters
+over 0–8 kHz, `amin=1e-10`, 80 dB clipping, and per-utterance feature-mean
+subtraction without standard-deviation normalization. The neural boundary
+separately rejects normalized feature windows below 51 frames. Resampling and
+downmixing must already have occurred at the normalized-audio boundary. Callers
+must apply `validate_ecapa_input_format` while sample-rate and channel metadata
+are still available; the raw-slice conformance frontend cannot detect
+mislabeled 8 kHz or interleaved PCM and never guesses their format. A
+production PCM-to-feature kernel and common-pipeline hookup remain integration
+gates.
 
-The raw 192-value model output is the golden embedding stage. Production
-clustering receives an L2-unit-normalized vector and rejects non-finite,
-wrong-shaped, or norm-below-`1e-6` output. The public analytic fixture combines
-173 Hz and 347 Hz harmonics, a chirp, and one impulse; it contains no speech or
-identity evidence. `franken-whisper-ecapa-golden-v1` binds full-array hashes
-and selected values for the two frontend stages, initial TDNN, first SE-Res2
-block, multi-feature aggregation, attentive pooling, and raw embedding.
+The raw 192-value model output is the golden embedding stage. `EcapaModel`
+returns an L2-unit-normalized vector and rejects non-finite, wrong-shaped, or
+norm-below-`1e-6` output. Future common-diarizer integration will consume that
+normalized representation; it is not routed into production clustering yet.
+The public analytic fixture combines 173 Hz and 347 Hz harmonics, a chirp, and
+one impulse; it contains no speech or identity evidence.
+`franken-whisper-ecapa-golden-v1` binds full-array hashes and selected values
+for the two frontend stages, initial TDNN, first SE-Res2 block, multi-feature
+aggregation, attentive pooling, and raw embedding.
+
+`franken-whisper-ecapa-full-oracle-v1` is the corresponding transcript-free
+seven-tensor safetensors capture. Its exact identity is 2,160,320 bytes and
+SHA-256
+`2c80806fbf68262ab1e0a1b52af18139f08272b7802fc3b0fd96011192dcf485`.
+The payload contains 539,616 `f32` values: 16,160 frontend values and 523,456
+neural-stage values. Its deterministic metadata binds the golden-evidence and
+contract identities, analytic fixture, model and training-code revisions,
+export schema, Python 3.12.12, NumPy 2.2.6, Torch and Torchaudio 2.7.1,
+Safetensors 0.5.3, and SpeechBrain 0.5.16. Oracle generation passes explicit
+all-valid lengths through SpeechBrain normalization and ECAPA inference, clones
+the raw filterbank before sentence normalization, and snapshots every hooked
+stage so later in-place operations cannot mutate evidence.
+
+The offline exporter constructs and independently parses both safetensors byte
+streams before exclusively creating either output. The Rust oracle verifier
+then applies the same bounded, cancel-aware exact-size and SHA-256 check as the
+weight verifier, parses that authenticated owned buffer without reopening the
+path, and requires the exact names, shapes, `F32` dtypes, metadata, and
+per-tensor payload hashes. Neither artifact is vendored or tracked in Git.
+
+The network convolution boundary is distinct from the frontend boundary.
+Every ECAPA convolution uses SpeechBrain's same-length reflection padding over
+the dilation-expanded effective kernel; it does not use the frontend's centered
+zero padding. TDNN order is convolution, ReLU, then evaluation-mode BatchNorm.
+Res2Net chunk zero is the identity, chunk one is convolved directly, and each
+later chunk is added to the preceding block output before convolution.
+Attention is normalized over time independently for every channel, and both
+global-context and attentive standard deviations clamp variance at `1e-12`.
+Inference accepts 51 through 301 frames (one half-second through three seconds
+at the frozen hop) and features with absolute value at most 160. Longer
+tracklets must, once this representation is integrated, be deterministically
+windowed by the common diarization pipeline; the neural kernel never allocates
+or runs in proportion to a complete recording.
+
+The forward path preplans a checked conservative numeric-buffer ceiling before
+copying input. At 301 frames, the ECAPA-owned `f32` activation and kernel-band
+payload ceiling is 7,944,704 bytes. The plan adds an 8,388,608-byte reserve for
+the reviewed FrankenTorch/matrixmultiply packing buffers, yielding a combined
+16,333,312-byte ceiling and a 20 MiB default caller limit. Allocator metadata,
+stack use, resident weights, and test-only golden captures are explicitly
+outside that number. Every in-scope production-forward ECAPA-owned heap `f32`
+scratch allocation first acquires a safe RAII logical-byte lease. The lease
+fails closed if live buffers would exceed the admitted owned bound and
+decrements on every success/error/cancellation drop path. Successful inference
+requires the live count to return to zero and then records the observed logical
+peak in the versioned trace. The external model test exercises this meter at
+both the oracle's 101 frames and the admitted 301-frame maximum; test-only stage
+captures remain deliberately unmetered.
+
+Folded evaluation BatchNorm makes the resident model payload 83,070,208 bytes.
+The separately named 204,065,488-byte load accounting is exactly the retained
+83,246,544-byte package plus that resident payload plus the largest
+37,748,736-byte decoded source tensor. It bounds those logical payloads, not
+allocator capacity/metadata, JSON maps, names, shapes, reader buffers, stack,
+or process RSS. Compute loops and finite-value scans checkpoint in bounded row,
+channel, or value chunks. Public library callers can supply the same callback
+while loading and inferring; the no-callback convenience still honors the
+process Ctrl-C token. The kernel entry point is explicitly FrankenTorch CPU f32
+and cannot auto-dispatch to Metal. Timing and maximum-attention-sum diagnostics
+are observational, content-redacted, and nondeterministic; the latter is a
+low-bandwidth signal-derived aggregate rather than source content. Exact
+repeatability is asserted only within the same process/build/host kernel path;
+portable cross-backend and cross-host conformance is tolerance-based.
+
+The packing proof was reviewed against FrankenTorch revision
+`523aaf827faf538aa541126ee222fcd7af348410`. Diagnostics expose that evidence
+identity as `scratch_proof_reviewed_frankentorch_revision`; the field records
+the source revision against which the proof was reviewed, not an attestation of
+the mutable sibling checkout compiled into the running binary. The repository
+intentionally consumes FrankenTorch as a sibling path dependency rather than
+pretending Cargo pins that checkout. Changing that checkout or source topology
+requires renewing the proof and updating the field. Builds also reject
+matrixmultiply's `MATMUL_SGEMM_NC`, `MATMUL_SGEMM_KC`, and
+`MATMUL_SGEMM_MC` compile-time overrides; they would otherwise invalidate the
+published packing reserve.
+
+Each golden `reference_sha256` hashes the CPU-contiguous C-order tensor in its
+declared shape after encoding every value as little-endian IEEE-754 `f32`.
+The network-stage shapes are channel-first `[1, channels, time]`; a native
+time-major matrix must therefore be logically transposed before comparison.
+The hash authenticates the exact SpeechBrain/PyTorch oracle capture and its
+layout; it is not an exact-byte requirement for output from a distinct numeric
+backend. A supplied full oracle capture must match this hash before its values
+can be used for tolerance-based native comparison.
 
 Declared maximum absolute/relative tolerances are respectively `0.05/0.005`
 for pre-normalization filterbanks, `0.08/0.005` for normalized filterbanks,
 `0.002/0.002` for initial TDNN, SE-Res2, and aggregation, `0.001/0.002` for
 pooling, and `0.02/0.002` for the raw embedding. The scalar Rust frontend is
 held to a tighter `0.001` absolute error on the frozen selected points.
-Non-finite values, shape drift, hash drift, version drift, or a tolerance
-failure are hard conformance failures. They may not be waived by downstream
-DER, silently widened, or converted into an acoustic-engine success. A
-tolerance change requires a new schema/version, regenerated public evidence,
-and an explicit discrepancy record.
+The authenticated external conformance test compares the complete Rust frontend
+arrays with the two oracle frontend tensors. It then feeds the oracle-normalized
+filterbank into the native forward path, isolating backend arithmetic while it
+compares every value in all five neural-stage tensors. A second full neural pass
+feeds the Rust frontend output into the same network and compares all 523,456
+neural-stage values again, detecting error amplification across the composed
+boundary. Thus all 539,616 reference elements are checked and every neural
+value is also checked through composition, together with attention
+normalization, output unit norm, fixed-build repeatability, and observed scratch
+accounting. The weight package and full oracle remain external test inputs
+supplied through
+`FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS` and
+`FRANKEN_WHISPER_ECAPA_TEST_ORACLE`; ordinary `cargo test` deliberately skips
+this large public-artifact proof rather than silently substituting a fixture.
+Non-finite values, native shape drift, oracle evidence hash/version/shape
+drift, or a tolerance failure are hard conformance failures. They may not be
+waived by downstream DER, silently widened, or converted into an
+acoustic-engine success. A tolerance change requires a new schema/version,
+regenerated public evidence, and an explicit discrepancy record.
 
 ### 11.6 Repository and release guard
 

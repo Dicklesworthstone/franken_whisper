@@ -2,10 +2,13 @@
 //!
 //! The optional neural diarizer is not admitted by this module. This module
 //! freezes the independently reproducible source model and provides a
-//! fail-closed bridge from an unsafe framework checkpoint to the existing
-//! native safetensors loader that a later safe-Rust engine can consume. No
-//! source weights, exported weights, or framework runtime are vendored.
+//! fail-closed bridge from an unsafe framework checkpoint to the native
+//! safetensors loader consumed by [`crate::ecapa_inference`]. No source
+//! weights, exported weights, or framework runtime are vendored.
 
+#![forbid(unsafe_code)]
+
+use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -18,9 +21,9 @@ use crate::error::{FwError, FwResult};
 use crate::native_engine::weights::{SafetensorsFile, WeightsManifest, validate};
 use crate::orchestrator::CancellationToken;
 
-pub const ECAPA_CONTRACT_SCHEMA: &str = "franken-whisper-ecapa-contract-v1";
+pub const ECAPA_CONTRACT_SCHEMA: &str = "franken-whisper-ecapa-contract-v2";
 pub const ECAPA_CONTRACT_SHA256: &str =
-    "6cded282c81301f9faaa7266de454350730f0e8d56427550fc5f82c898c9e8d1";
+    "9eb3e323aaa5550c87057996978d38ce57f9b280b829be6217440c8e63cef7a4";
 pub const ECAPA_EXPORTER_VERSION: &str = "franken-whisper-ecapa-export-v1";
 pub const ECAPA_EXPORT_PROFILE: &str = "ecapa-tdnn-voxceleb-v1";
 pub const ECAPA_PACKAGE_FILENAME: &str = "ecapa_tdnn_voxceleb.safetensors";
@@ -33,6 +36,23 @@ pub const ECAPA_EXPORT_SAFETENSORS_VERSION: &str = "0.5.3";
 pub const ECAPA_GOLDEN_SCHEMA: &str = "franken-whisper-ecapa-golden-v1";
 pub const ECAPA_GOLDEN_EVIDENCE_SHA256: &str =
     "073a910a2a8d171dca45e28940387ebfc0642e63224d62ebd62abe2b8efd9ac2";
+pub const ECAPA_FULL_ORACLE_SCHEMA: &str = "franken-whisper-ecapa-full-oracle-v1";
+pub const ECAPA_FULL_ORACLE_EXPORTER_VERSION: &str = "franken-whisper-ecapa-full-oracle-export-v1";
+pub const ECAPA_FULL_ORACLE_FILENAME: &str = "ecapa_tdnn_voxceleb_full_oracle.safetensors";
+pub const ECAPA_FULL_ORACLE_SHA256: &str =
+    "2c80806fbf68262ab1e0a1b52af18139f08272b7802fc3b0fd96011192dcf485";
+pub const ECAPA_FULL_ORACLE_BYTES: u64 = 2_160_320;
+pub const ECAPA_FULL_ORACLE_TENSOR_COUNT: usize = 7;
+pub const ECAPA_FULL_ORACLE_F32_ELEMENTS: u64 = 539_616;
+pub const ECAPA_FULL_ORACLE_FRONTEND_F32_ELEMENTS: u64 = 16_160;
+pub const ECAPA_FULL_ORACLE_NEURAL_F32_ELEMENTS: u64 = 523_456;
+pub const ECAPA_FULL_ORACLE_PAYLOAD_BYTES: u64 = ECAPA_FULL_ORACLE_F32_ELEMENTS * 4;
+pub const ECAPA_ORACLE_SPEECHBRAIN_VERSION: &str = "0.5.16";
+pub const ECAPA_ORACLE_TORCHAUDIO_VERSION: &str = "2.7.1";
+pub const ECAPA_ORACLE_PYTHON_VERSION: &str = "3.12.12";
+pub const ECAPA_FIXTURE_ID: &str = "analytic-harmonic-chirp-impulse-v1";
+pub const ECAPA_FIXTURE_PCM_SHA256: &str =
+    "acc240c07370020bbd1b3aaf9b8b81be43ef053b8da950969e86f62b6f1dba2f";
 pub const ECAPA_MODEL_ID: &str = "speechbrain/spkrec-ecapa-voxceleb";
 pub const ECAPA_MODEL_REVISION: &str = "eac27266f68caa806381260bd44ace38b136c76a";
 pub const ECAPA_TRAINING_CODE_REVISION: &str = "aa0185408025e80f6c748d2c7af7fa96958c2231";
@@ -53,7 +73,14 @@ pub const ECAPA_FFT_BINS: usize = 201;
 pub const ECAPA_MEL_BANDS: usize = 80;
 pub const ECAPA_EMBEDDING_DIMENSIONS: usize = 192;
 pub const ECAPA_MINIMUM_RUNTIME_SAMPLES: usize = ECAPA_SAMPLE_RATE_HZ / 2;
+pub const ECAPA_MAXIMUM_RUNTIME_SAMPLES: usize = ECAPA_SAMPLE_RATE_HZ * 3;
 pub const ECAPA_MAXIMUM_CONFORMANCE_SAMPLES: usize = ECAPA_SAMPLE_RATE_HZ;
+pub const ECAPA_MINIMUM_INFERENCE_FRAMES: usize =
+    ECAPA_MINIMUM_RUNTIME_SAMPLES / ECAPA_HOP_SAMPLES + 1;
+pub const ECAPA_MAXIMUM_INFERENCE_FRAMES: usize = 301;
+pub const ECAPA_MAXIMUM_ABSOLUTE_INPUT_FEATURE: f32 = 160.0;
+pub const ECAPA_BATCH_NORM_EPSILON: f32 = 1.0e-5;
+pub const ECAPA_POOLING_VARIANCE_FLOOR: f32 = 1.0e-12;
 
 const HASH_HEX_LEN: usize = 64;
 const READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -142,6 +169,14 @@ pub struct EcapaArchitectureContract {
     pub squeeze_excitation_channels: usize,
     pub attention_channels: usize,
     pub global_attention_context: bool,
+    pub convolution_padding: String,
+    pub tdnn_operation_order: String,
+    pub res2net_accumulation: String,
+    pub attention_softmax_axis: String,
+    pub pooling_variance_floor: f32,
+    pub minimum_inference_frames: usize,
+    pub maximum_inference_frames: usize,
+    pub maximum_absolute_input_feature: f32,
     pub embedding_dimensions: usize,
     pub golden_embedding_stage: String,
     pub embedding_normalization: String,
@@ -201,7 +236,7 @@ pub fn frozen_ecapa_contract() -> EcapaContract {
             torch_version: ECAPA_EXPORT_TORCH_VERSION.to_owned(),
             safetensors_version: ECAPA_EXPORT_SAFETENSORS_VERSION.to_owned(),
             batch_norm_folding: false,
-            batch_norm_epsilon: 1.0e-5,
+            batch_norm_epsilon: ECAPA_BATCH_NORM_EPSILON,
             batch_norm_momentum: 0.1,
             dropped_source_tensors: "batch_norm_num_batches_tracked_i64_only".to_owned(),
         },
@@ -215,6 +250,14 @@ pub fn frozen_ecapa_contract() -> EcapaContract {
             squeeze_excitation_channels: 128,
             attention_channels: 128,
             global_attention_context: true,
+            convolution_padding: "same_reflect_effective_kernel".to_owned(),
+            tdnn_operation_order: "conv_relu_batch_norm_eval".to_owned(),
+            res2net_accumulation: "chunk_0_identity_then_recursive_previous_output".to_owned(),
+            attention_softmax_axis: "time_per_channel".to_owned(),
+            pooling_variance_floor: ECAPA_POOLING_VARIANCE_FLOOR,
+            minimum_inference_frames: ECAPA_MINIMUM_INFERENCE_FRAMES,
+            maximum_inference_frames: ECAPA_MAXIMUM_INFERENCE_FRAMES,
+            maximum_absolute_input_feature: ECAPA_MAXIMUM_ABSOLUTE_INPUT_FEATURE,
             embedding_dimensions: ECAPA_EMBEDDING_DIMENSIONS,
             golden_embedding_stage: "raw_model_output_before_l2_normalization".to_owned(),
             embedding_normalization: "l2_unit_norm_fail_below_epsilon".to_owned(),
@@ -382,17 +425,46 @@ pub fn verify_ecapa_weight_package(package_path: &Path) -> FwResult<()> {
     verify_ecapa_weight_package_with_token(package_path, &token)
 }
 
-pub fn verify_ecapa_weight_package_with_token(
+pub(crate) fn verify_ecapa_weight_package_with_token(
     package_path: &Path,
     token: &CancellationToken,
 ) -> FwResult<()> {
-    let package_bytes = read_verified_ecapa_package(
+    load_verified_ecapa_weight_package_with_token(package_path, token).map(drop)
+}
+
+/// Load and authenticate the exact frozen package without reopening its path.
+///
+/// Callers receive the [`SafetensorsFile`] backed by the same owned bytes that
+/// passed the size and SHA-256 checks. This prevents a path replacement between
+/// verification and model construction while keeping all path and tensor data
+/// out of diagnostics.
+pub fn load_verified_ecapa_weight_package(package_path: &Path) -> FwResult<SafetensorsFile> {
+    let token = CancellationToken::unbounded(); // ubs:ignore — cancellation token is not a secret
+    load_verified_ecapa_weight_package_with_token(package_path, &token)
+}
+
+pub(crate) fn load_verified_ecapa_weight_package_with_token(
+    package_path: &Path,
+    token: &CancellationToken,
+) -> FwResult<SafetensorsFile> {
+    load_verified_ecapa_weight_package_with_checkpoint(package_path, &|| token.checkpoint())
+}
+
+/// Load and authenticate the exact package with a caller-owned checkpoint.
+///
+/// The checkpoint runs before opening the package, between every bounded read,
+/// and around safetensors parsing and census validation.
+pub fn load_verified_ecapa_weight_package_with_checkpoint(
+    package_path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<SafetensorsFile> {
+    let package_bytes = read_verified_ecapa_artifact(
         package_path,
         ECAPA_PACKAGE_BYTES,
         ECAPA_PACKAGE_SHA256,
-        token,
+        checkpoint,
     )?;
-    token.checkpoint()?;
+    ecapa_load_checkpoint(checkpoint)?;
     let package = SafetensorsFile::from_owned_bytes(package_bytes).map_err(|_| {
         ecapa_error(
             "safetensors_structure",
@@ -400,62 +472,123 @@ pub fn verify_ecapa_weight_package_with_token(
         )
     })?;
     verify_loaded_ecapa_package(&package)?;
-    token.checkpoint()
+    ecapa_load_checkpoint(checkpoint)?;
+    Ok(package)
 }
 
-fn read_verified_ecapa_package(
-    package_path: &Path,
+/// Load and authenticate the complete public seven-stage ECAPA oracle.
+///
+/// The returned tensors are backed by the same owned bytes whose exact length
+/// and SHA-256 were checked. The tensor census, shapes, F32 payload hashes, and
+/// provenance metadata are then checked independently before the artifact is
+/// returned. No audio or transcript supplied by a user is read by this path.
+pub fn load_verified_ecapa_full_oracle(oracle_path: &Path) -> FwResult<SafetensorsFile> {
+    let token = CancellationToken::unbounded(); // ubs:ignore — cancellation token is not a secret
+    load_verified_ecapa_full_oracle_with_checkpoint(oracle_path, &|| token.checkpoint())
+}
+
+/// Authenticate the public full oracle with a cooperative checkpoint.
+pub fn load_verified_ecapa_full_oracle_with_checkpoint(
+    oracle_path: &Path,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<SafetensorsFile> {
+    let oracle_bytes = read_verified_ecapa_artifact(
+        oracle_path,
+        ECAPA_FULL_ORACLE_BYTES,
+        ECAPA_FULL_ORACLE_SHA256,
+        checkpoint,
+    )?;
+    ecapa_load_checkpoint(checkpoint)?;
+    let oracle = SafetensorsFile::from_owned_bytes(oracle_bytes).map_err(|_| {
+        ecapa_error(
+            "oracle_structure",
+            "full oracle is not structurally valid safetensors",
+        )
+    })?;
+    verify_loaded_ecapa_full_oracle(&oracle, checkpoint)?;
+    ecapa_load_checkpoint(checkpoint)?;
+    Ok(oracle)
+}
+
+pub(crate) fn ecapa_load_checkpoint(
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    match checkpoint() {
+        Ok(()) => Ok(()),
+        Err(FwError::Cancelled(_)) => Err(FwError::Cancelled(
+            "ecapa.load_cancelled: cooperative checkpoint requested cancellation".to_owned(),
+        )),
+        Err(_) => Err(ecapa_error(
+            "checkpoint_failure",
+            "caller checkpoint returned a non-cancellation failure",
+        )),
+    }
+}
+
+fn read_verified_ecapa_artifact(
+    artifact_path: &Path,
     expected_bytes: u64,
     expected_sha256: &str,
-    token: &CancellationToken,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
 ) -> FwResult<Vec<u8>> {
-    token.checkpoint()?;
-    let file = File::open(package_path)
-        .map_err(|_| ecapa_error("package_open", "weight package could not be opened"))?;
+    ecapa_load_checkpoint(checkpoint)?;
+    let file = File::open(artifact_path)
+        .map_err(|_| ecapa_error("artifact_open", "ECAPA artifact could not be opened"))?;
     let actual_bytes = file
         .metadata()
-        .map_err(|_| ecapa_error("package_metadata", "weight package metadata is unavailable"))?
+        .map_err(|_| {
+            ecapa_error(
+                "artifact_metadata",
+                "ECAPA artifact metadata is unavailable",
+            )
+        })?
         .len();
     if actual_bytes != expected_bytes {
         return Err(ecapa_error(
-            "package_identity",
-            "weight package length does not match the frozen artifact",
+            "artifact_identity",
+            "ECAPA artifact length does not match the frozen identity",
         ));
     }
     let mut reader = BufReader::new(file);
     let mut package_hasher = Sha256::new();
     let capacity = usize::try_from(expected_bytes).map_err(|_| {
         ecapa_error(
-            "package_identity",
-            "weight package length does not fit this platform",
+            "artifact_identity",
+            "ECAPA artifact length does not fit this platform",
         )
     })?;
     let mut package_bytes = Vec::with_capacity(capacity);
     let mut buffer = [0u8; READ_CHUNK_BYTES];
     loop {
-        token.checkpoint()?;
+        ecapa_load_checkpoint(checkpoint)?;
         let read = reader
             .read(&mut buffer)
-            .map_err(|_| ecapa_error("package_read", "weight package could not be read"))?;
+            .map_err(|_| ecapa_error("artifact_read", "ECAPA artifact could not be read"))?;
         if read == 0 {
             break;
         }
+        if read > capacity.saturating_sub(package_bytes.len()) {
+            return Err(ecapa_error(
+                "artifact_identity",
+                "ECAPA artifact length changed while it was read",
+            ));
+        }
         let chunk = buffer
             .get(..read)
-            .ok_or_else(|| ecapa_error("package_read", "weight package read is invalid"))?;
+            .ok_or_else(|| ecapa_error("artifact_read", "ECAPA artifact read is invalid"))?;
         package_hasher.update(chunk);
         package_bytes.extend_from_slice(chunk);
     }
     if package_bytes.len() != capacity {
         return Err(ecapa_error(
-            "package_identity",
-            "weight package length changed while it was read",
+            "artifact_identity",
+            "ECAPA artifact length changed while it was read",
         ));
     }
     if hex_digest(package_hasher.finalize()) != expected_sha256 {
         return Err(ecapa_error(
-            "package_identity",
-            "weight package checksum does not match the frozen artifact",
+            "artifact_identity",
+            "ECAPA artifact checksum does not match the frozen identity",
         ));
     }
     Ok(package_bytes)
@@ -484,6 +617,96 @@ fn verify_loaded_ecapa_package(package: &SafetensorsFile) -> FwResult<()> {
         ));
     }
     verify_loaded_ecapa_package_against(package, &expected, &expected_ecapa_package_metadata())
+}
+
+fn verify_loaded_ecapa_full_oracle(
+    oracle: &SafetensorsFile,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<()> {
+    frozen_ecapa_golden_evidence().map(drop)?;
+    let expected = expected_ecapa_full_oracle_tensors();
+    if expected.len() != ECAPA_FULL_ORACLE_TENSOR_COUNT {
+        return Err(ecapa_error(
+            "contract_internal_drift",
+            "compiled ECAPA oracle tensor census is inconsistent",
+        ));
+    }
+    let value_count = expected.iter().try_fold(0u64, |total, tensor| {
+        total
+            .checked_add(checked_element_count(&tensor.shape)?)
+            .ok_or_else(|| ecapa_error("oracle_shape", "oracle value count overflows"))
+    })?;
+    let frontend_value_count = expected.iter().take(2).try_fold(0u64, |total, tensor| {
+        total
+            .checked_add(checked_element_count(&tensor.shape)?)
+            .ok_or_else(|| ecapa_error("oracle_shape", "oracle frontend value count overflows"))
+    })?;
+    let neural_value_count = expected.iter().skip(2).try_fold(0u64, |total, tensor| {
+        total
+            .checked_add(checked_element_count(&tensor.shape)?)
+            .ok_or_else(|| ecapa_error("oracle_shape", "oracle neural value count overflows"))
+    })?;
+    if value_count != ECAPA_FULL_ORACLE_F32_ELEMENTS
+        || frontend_value_count != ECAPA_FULL_ORACLE_FRONTEND_F32_ELEMENTS
+        || neural_value_count != ECAPA_FULL_ORACLE_NEURAL_F32_ELEMENTS
+        || value_count
+            .checked_mul(4)
+            .ok_or_else(|| ecapa_error("oracle_shape", "oracle payload size overflows"))?
+            != ECAPA_FULL_ORACLE_PAYLOAD_BYTES
+    {
+        return Err(ecapa_error(
+            "contract_internal_drift",
+            "compiled ECAPA oracle payload census is inconsistent",
+        ));
+    }
+    let manifest = WeightsManifest::new(
+        expected
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor.shape.clone())),
+    );
+    validate(oracle, &manifest).map_err(|_| {
+        ecapa_error(
+            "oracle_mapping",
+            "full oracle names or shapes do not match the frozen census",
+        )
+    })?;
+    if oracle.metadata() != Some(&expected_ecapa_full_oracle_metadata()) {
+        return Err(ecapa_error(
+            "oracle_metadata",
+            "full oracle metadata does not match the frozen provenance",
+        ));
+    }
+    for tensor in expected {
+        ecapa_load_checkpoint(checkpoint)?;
+        if oracle.dtype_name(&tensor.name).map_err(|_| {
+            ecapa_error(
+                "oracle_mapping",
+                "full oracle tensor is absent from the frozen census",
+            )
+        })? != "F32"
+        {
+            return Err(ecapa_error(
+                "oracle_dtype",
+                "every full oracle tensor must be F32",
+            ));
+        }
+        let (shape, values) = oracle.tensor_f32(&tensor.name).map_err(|_| {
+            ecapa_error(
+                "oracle_payload",
+                "full oracle tensor payload could not be decoded",
+            )
+        })?;
+        if shape != tensor.shape
+            || ecapa_reference_f32_sha256(&values, &shape)? != tensor.reference_sha256
+        {
+            return Err(ecapa_error(
+                "oracle_payload",
+                "full oracle tensor payload does not match the frozen evidence",
+            ));
+        }
+        ecapa_load_checkpoint(checkpoint)?;
+    }
+    Ok(())
 }
 
 fn verify_loaded_ecapa_package_against(
@@ -544,6 +767,35 @@ fn expected_ecapa_package_metadata() -> serde_json::Value {
     })
 }
 
+fn expected_ecapa_full_oracle_metadata() -> serde_json::Value {
+    serde_json::json!({
+        "canonical_layout": "speechbrain_cpu_contiguous_c_order",
+        "contract_sha256": ECAPA_CONTRACT_SHA256,
+        "device": "cpu",
+        "evaluation_mode": "true",
+        "exported_dtype": "F32",
+        "exported_tensor_count": ECAPA_FULL_ORACLE_TENSOR_COUNT.to_string(),
+        "exporter_version": ECAPA_FULL_ORACLE_EXPORTER_VERSION,
+        "fixture_id": ECAPA_FIXTURE_ID,
+        "fixture_pcm_sha256": ECAPA_FIXTURE_PCM_SHA256,
+        "fixture_sample_count": ECAPA_SAMPLE_RATE_HZ.to_string(),
+        "generator": "franken_whisper/scripts/convert_to_safetensors.py",
+        "golden_evidence_sha256": ECAPA_GOLDEN_EVIDENCE_SHA256,
+        "numpy_version": ECAPA_EXPORT_NUMPY_VERSION,
+        "python_version": ECAPA_ORACLE_PYTHON_VERSION,
+        "safetensors_version": ECAPA_EXPORT_SAFETENSORS_VERSION,
+        "schema_version": ECAPA_FULL_ORACLE_SCHEMA,
+        "source_checkpoint_sha256": ECAPA_SOURCE_CHECKPOINT_SHA256,
+        "source_model_id": ECAPA_MODEL_ID,
+        "source_model_revision": ECAPA_MODEL_REVISION,
+        "source_weight_package_sha256": ECAPA_PACKAGE_SHA256,
+        "speechbrain_version": ECAPA_ORACLE_SPEECHBRAIN_VERSION,
+        "torch_version": ECAPA_EXPORT_TORCH_VERSION,
+        "torchaudio_version": ECAPA_ORACLE_TORCHAUDIO_VERSION,
+        "training_code_revision": ECAPA_TRAINING_CODE_REVISION,
+    })
+}
+
 fn checked_element_count(shape: &[usize]) -> FwResult<u64> {
     if shape.is_empty() || shape.len() > 4 || shape.contains(&0) {
         return Err(ecapa_error("tensor_shape", "tensor shape is invalid"));
@@ -567,6 +819,78 @@ pub enum EcapaConformanceStage {
     MultiFeatureAggregation,
     AttentivePooling,
     Embedding,
+}
+
+/// One complete tensor in the independently generated public ECAPA oracle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcapaFullOracleTensorSpec {
+    pub stage: EcapaConformanceStage,
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub reference_sha256: String,
+}
+
+/// Exact tensor census, canonical layouts, and payload hashes for the oracle.
+#[must_use]
+pub fn expected_ecapa_full_oracle_tensors() -> Vec<EcapaFullOracleTensorSpec> {
+    vec![
+        full_oracle_tensor(
+            EcapaConformanceStage::FbankPreNormalization,
+            "fbank_pre_normalization",
+            &[1, 101, ECAPA_MEL_BANDS],
+            "8fd529b6f2d3ec34d7b45bf39196ec8ebfb0c2b407d8b2e308717fe5bf8fcde8",
+        ),
+        full_oracle_tensor(
+            EcapaConformanceStage::FbankSentenceMeanNormalized,
+            "fbank_sentence_mean_normalized",
+            &[1, 101, ECAPA_MEL_BANDS],
+            "32afe9ace7c803c7e777e1d19ffe0630549f59da69c6593fe4aa4bff30cb5370",
+        ),
+        full_oracle_tensor(
+            EcapaConformanceStage::InitialTdnn,
+            "initial_tdnn",
+            &[1, 1_024, 101],
+            "18274d7866b0181b17f9d3d58d0b585d9eb99ba7c9b8fabda6d3d7d23478d112",
+        ),
+        full_oracle_tensor(
+            EcapaConformanceStage::FirstSeRes2,
+            "first_se_res2",
+            &[1, 1_024, 101],
+            "b37629ffd2cca7c00533cd8f2baf23a22ce6b5b7348343c10b855cc37ef7bc24",
+        ),
+        full_oracle_tensor(
+            EcapaConformanceStage::MultiFeatureAggregation,
+            "multi_feature_aggregation",
+            &[1, 3_072, 101],
+            "f8787f6f3fd0038d11feeb49b4e821993a9f4e890f518e03d890384e3ddbafb0",
+        ),
+        full_oracle_tensor(
+            EcapaConformanceStage::AttentivePooling,
+            "attentive_pooling",
+            &[1, 6_144, 1],
+            "31261217b61f9519c6756330a8e9d6797626c49ece4fe2d4ee39f18c408e62b2",
+        ),
+        full_oracle_tensor(
+            EcapaConformanceStage::Embedding,
+            "embedding",
+            &[1, 1, ECAPA_EMBEDDING_DIMENSIONS],
+            "ff4b056c34a75e59ff51662faa22293cc7ef18785441d584b2b61dfd0b8cb5ae",
+        ),
+    ]
+}
+
+fn full_oracle_tensor(
+    stage: EcapaConformanceStage,
+    name: &str,
+    shape: &[usize],
+    reference_sha256: &str,
+) -> EcapaFullOracleTensorSpec {
+    EcapaFullOracleTensorSpec {
+        stage,
+        name: name.to_owned(),
+        shape: shape.to_vec(),
+        reference_sha256: reference_sha256.to_owned(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -640,6 +964,12 @@ pub fn compare_ecapa_values(
         }
         let absolute = (expected - observed).abs();
         let relative = absolute / expected.abs().max(1.0e-6);
+        if !absolute.is_finite() || !relative.is_finite() {
+            return Err(ecapa_error(
+                "comparison_value",
+                "conformance error arithmetic must remain finite",
+            ));
+        }
         maximum_absolute_error = maximum_absolute_error.max(absolute);
         maximum_relative_error = maximum_relative_error.max(relative);
         passes &= absolute <= tolerance.absolute + tolerance.relative * expected.abs();
@@ -653,13 +983,57 @@ pub fn compare_ecapa_values(
     })
 }
 
+/// Hash one reference tensor in the frozen oracle byte domain.
+///
+/// `values` must already be ordered in the declared stage shape using
+/// C-contiguous row-major order. Each finite value is serialized as one
+/// little-endian IEEE-754 `f32` before SHA-256 is applied. Native time-major
+/// matrices therefore need a logical transpose before hashing a declared
+/// `[1, channels, time]` network stage.
+pub fn ecapa_reference_f32_sha256(values: &[f32], shape: &[usize]) -> FwResult<String> {
+    let expected = shape.iter().try_fold(1usize, |product, dimension| {
+        product
+            .checked_mul(*dimension)
+            .ok_or_else(|| ecapa_error("reference_shape", "reference tensor shape overflows"))
+    })?;
+    if shape.is_empty() || shape.contains(&0) || values.len() != expected {
+        return Err(ecapa_error(
+            "reference_shape",
+            "reference tensor values do not match the declared shape",
+        ));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(ecapa_error(
+            "reference_value",
+            "reference tensor contains a non-finite value",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.to_le_bytes());
+    }
+    Ok(hex_digest(hasher.finalize()))
+}
+
 /// Bounded reference frontend used only for numerical conformance.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct EcapaFrontendOutput {
     pub frame_count: usize,
     pub mel_band_count: usize,
     pub log_fbank_db: Vec<f32>,
     pub sentence_mean_normalized: Vec<f32>,
+}
+
+impl fmt::Debug for EcapaFrontendOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EcapaFrontendOutput")
+            .field("frame_count", &self.frame_count)
+            .field("mel_band_count", &self.mel_band_count)
+            .field("log_fbank_db", &"<redacted>")
+            .field("sentence_mean_normalized", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Compute the pinned SpeechBrain 80-band frontend for a short public fixture.
@@ -759,10 +1133,10 @@ pub fn ecapa_frontend_conformance(samples: &[f32]) -> FwResult<EcapaFrontendOutp
 
 /// Enforce the product-side duration and PCM boundary separately from fixtures.
 pub fn validate_ecapa_runtime_input(samples: &[f32]) -> FwResult<()> {
-    if samples.len() < ECAPA_MINIMUM_RUNTIME_SAMPLES {
+    if !(ECAPA_MINIMUM_RUNTIME_SAMPLES..=ECAPA_MAXIMUM_RUNTIME_SAMPLES).contains(&samples.len()) {
         return Err(ecapa_error(
             "runtime_duration",
-            "neural speaker window is shorter than the admitted minimum",
+            "neural speaker window is outside the admitted duration range",
         ));
     }
     if samples
@@ -903,11 +1277,10 @@ pub fn frozen_ecapa_golden_evidence() -> FwResult<EcapaGoldenEvidence> {
     let mut evidence = EcapaGoldenEvidence {
         schema_version: ECAPA_GOLDEN_SCHEMA.to_owned(),
         model_revision: ECAPA_MODEL_REVISION.to_owned(),
-        oracle_speechbrain_version: "0.5.16".to_owned(),
-        oracle_torch_version: "2.7.1".to_owned(),
-        fixture_id: "analytic-harmonic-chirp-impulse-v1".to_owned(),
-        fixture_pcm_sha256: "acc240c07370020bbd1b3aaf9b8b81be43ef053b8da950969e86f62b6f1dba2f"
-            .to_owned(),
+        oracle_speechbrain_version: ECAPA_ORACLE_SPEECHBRAIN_VERSION.to_owned(),
+        oracle_torch_version: ECAPA_EXPORT_TORCH_VERSION.to_owned(),
+        fixture_id: ECAPA_FIXTURE_ID.to_owned(),
+        fixture_pcm_sha256: ECAPA_FIXTURE_PCM_SHA256.to_owned(),
         fixture_sample_count: ECAPA_SAMPLE_RATE_HZ,
         stages: vec![
             golden_stage(
@@ -1025,33 +1398,23 @@ fn golden_stage(
 pub fn verify_ecapa_golden_evidence(evidence: &EcapaGoldenEvidence) -> FwResult<()> {
     if evidence.schema_version != ECAPA_GOLDEN_SCHEMA
         || evidence.model_revision != ECAPA_MODEL_REVISION
-        || evidence.oracle_speechbrain_version != "0.5.16"
-        || evidence.oracle_torch_version != "2.7.1"
-        || evidence.fixture_id != "analytic-harmonic-chirp-impulse-v1"
-        || evidence.fixture_pcm_sha256
-            != "acc240c07370020bbd1b3aaf9b8b81be43ef053b8da950969e86f62b6f1dba2f"
+        || evidence.oracle_speechbrain_version != ECAPA_ORACLE_SPEECHBRAIN_VERSION
+        || evidence.oracle_torch_version != ECAPA_EXPORT_TORCH_VERSION
+        || evidence.fixture_id != ECAPA_FIXTURE_ID
+        || evidence.fixture_pcm_sha256 != ECAPA_FIXTURE_PCM_SHA256
         || evidence.fixture_sample_count != ECAPA_SAMPLE_RATE_HZ
-        || evidence.stages.len() != 7
+        || evidence.stages.len() != ECAPA_FULL_ORACLE_TENSOR_COUNT
     {
         return Err(ecapa_error(
             "golden_identity",
             "ECAPA golden evidence identity is invalid",
         ));
     }
-    let expected_stages = [
-        EcapaConformanceStage::FbankPreNormalization,
-        EcapaConformanceStage::FbankSentenceMeanNormalized,
-        EcapaConformanceStage::InitialTdnn,
-        EcapaConformanceStage::FirstSeRes2,
-        EcapaConformanceStage::MultiFeatureAggregation,
-        EcapaConformanceStage::AttentivePooling,
-        EcapaConformanceStage::Embedding,
-    ];
+    let expected_stages = expected_ecapa_full_oracle_tensors();
     for (stage, expected_stage) in evidence.stages.iter().zip(expected_stages) {
-        if stage.stage != expected_stage
-            || stage.shape.is_empty()
-            || stage.shape.contains(&0)
-            || !is_sha256_hex(&stage.reference_sha256)
+        if stage.stage != expected_stage.stage
+            || stage.shape != expected_stage.shape
+            || stage.reference_sha256 != expected_stage.reference_sha256
             || stage.points.is_empty()
             || stage.points.iter().any(|point| {
                 point.index.len() != stage.shape.len()
@@ -1114,6 +1477,23 @@ fn is_sha256_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+pub(crate) fn ecapa_analytic_fixture() -> Vec<f32> {
+    (0..ECAPA_SAMPLE_RATE_HZ)
+        .map(|index| {
+            let time = index as f64 / ECAPA_SAMPLE_RATE_HZ as f64;
+            let chirp_phase = 2.0 * std::f64::consts::PI * (120.0 * time + 180.0 * time * time);
+            let mut value = 0.22 * (2.0 * std::f64::consts::PI * 173.0 * time).sin();
+            value += 0.11 * (2.0 * std::f64::consts::PI * 347.0 * time).sin();
+            value += 0.07 * chirp_phase.sin();
+            if index == 1_234 {
+                value += 0.5;
+            }
+            value as f32
+        })
+        .collect()
 }
 
 fn ecapa_error(code: &str, message: &str) -> FwError {
@@ -1195,6 +1575,14 @@ mod tests {
             .map(|tensor| checked_element_count(&tensor.shape).expect("shape"))
             .sum::<u64>();
         assert_eq!(elements, ECAPA_EXPORTED_F32_ELEMENTS);
+
+        let oracle_tensors = expected_ecapa_full_oracle_tensors();
+        assert_eq!(oracle_tensors.len(), ECAPA_FULL_ORACLE_TENSOR_COUNT);
+        let oracle_elements = oracle_tensors
+            .iter()
+            .map(|tensor| checked_element_count(&tensor.shape).expect("oracle shape"))
+            .sum::<u64>();
+        assert_eq!(oracle_elements, ECAPA_FULL_ORACLE_F32_ELEMENTS);
     }
 
     #[test]
@@ -1203,42 +1591,81 @@ mod tests {
         let path = directory.path().join("weights.safetensors");
         let payload = b"abcdefgh";
         std::fs::write(&path, payload).expect("write payload");
-        let verified = read_verified_ecapa_package(
+        let no_cancel = || Ok(());
+        let verified = read_verified_ecapa_artifact(
             &path,
             payload.len() as u64,
             &bytes_sha256(payload),
-            &CancellationToken::unbounded(),
+            &no_cancel,
         )
         .expect("valid identity");
         assert_eq!(verified, payload);
 
         assert!(
-            read_verified_ecapa_package(
-                &path,
-                payload.len() as u64,
-                &"f".repeat(64),
-                &CancellationToken::unbounded(),
-            )
-            .is_err()
+            read_verified_ecapa_artifact(&path, payload.len() as u64, &"f".repeat(64), &no_cancel,)
+                .is_err()
         );
         assert!(
-            read_verified_ecapa_package(
+            read_verified_ecapa_artifact(
                 &path,
                 payload.len() as u64 + 1,
                 &bytes_sha256(payload),
-                &CancellationToken::unbounded(),
+                &no_cancel,
             )
             .is_err()
         );
+        let expired = CancellationToken::already_expired();
+        let cancel = || expired.checkpoint();
         assert!(matches!(
-            read_verified_ecapa_package(
+            read_verified_ecapa_artifact(
                 &path,
                 payload.len() as u64,
                 &bytes_sha256(payload),
-                &CancellationToken::already_expired(),
+                &cancel,
             ),
             Err(FwError::Cancelled(_))
         ));
+
+        let secret_failure = || {
+            Err(FwError::InvalidRequest(
+                "confidential caller checkpoint detail".to_owned(),
+            ))
+        };
+        let error = read_verified_ecapa_artifact(
+            &path,
+            payload.len() as u64,
+            &bytes_sha256(payload),
+            &secret_failure,
+        )
+        .expect_err("non-cancellation checkpoint failure must fail closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("ecapa.checkpoint_failure"));
+        assert!(!rendered.contains("confidential"));
+
+        std::fs::write(&path, payload).expect("restore payload");
+        let checkpoint_calls = std::sync::atomic::AtomicUsize::new(0);
+        let append_after_metadata = || {
+            if checkpoint_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .expect("open package for concurrent append");
+                std::io::Write::write_all(&mut file, b"extra bytes").expect("append package bytes");
+            }
+            Ok(())
+        };
+        let error = read_verified_ecapa_artifact(
+            &path,
+            payload.len() as u64,
+            &bytes_sha256(payload),
+            &append_after_metadata,
+        )
+        .expect_err("growth after metadata validation must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("ECAPA artifact length changed while it was read")
+        );
     }
 
     #[test]
@@ -1302,8 +1729,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the externally generated public ECAPA full oracle"]
+    fn external_full_oracle_verifies_end_to_end() {
+        let path = std::env::var_os("FRANKEN_WHISPER_ECAPA_TEST_ORACLE")
+            .map(std::path::PathBuf::from)
+            .expect("set FRANKEN_WHISPER_ECAPA_TEST_ORACLE");
+        let oracle = load_verified_ecapa_full_oracle(&path).expect("frozen full oracle");
+        assert_eq!(oracle.len(), ECAPA_FULL_ORACLE_TENSOR_COUNT);
+    }
+
+    #[test]
     fn frontend_matches_independent_speechbrain_golden_points() {
-        let samples = analytic_fixture();
+        let samples = ecapa_analytic_fixture();
         assert_eq!(
             bytes_sha256(
                 &samples
@@ -1379,14 +1816,32 @@ mod tests {
     }
 
     #[test]
-    fn runtime_input_has_an_explicit_conservative_minimum() {
+    fn runtime_input_has_an_explicit_duration_range() {
         assert!(validate_ecapa_input_format(ECAPA_SAMPLE_RATE_HZ, 1).is_ok());
         assert!(validate_ecapa_input_format(8_000, 1).is_err());
         assert!(validate_ecapa_input_format(ECAPA_SAMPLE_RATE_HZ, 2).is_err());
         assert!(validate_ecapa_runtime_input(&vec![0.0; ECAPA_MINIMUM_RUNTIME_SAMPLES]).is_ok());
+        assert!(validate_ecapa_runtime_input(&vec![0.0; ECAPA_MAXIMUM_RUNTIME_SAMPLES]).is_ok());
         assert!(
             validate_ecapa_runtime_input(&vec![0.0; ECAPA_MINIMUM_RUNTIME_SAMPLES - 1]).is_err()
         );
+        assert!(
+            validate_ecapa_runtime_input(&vec![0.0; ECAPA_MAXIMUM_RUNTIME_SAMPLES + 1]).is_err()
+        );
+    }
+
+    #[test]
+    fn frontend_debug_redacts_audio_derived_features() {
+        let output = EcapaFrontendOutput {
+            frame_count: 1,
+            mel_band_count: ECAPA_MEL_BANDS,
+            log_fbank_db: vec![12_345.625],
+            sentence_mean_normalized: vec![-54_321.125],
+        };
+        let rendered = format!("{output:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("12345.625"));
+        assert!(!rendered.contains("54321.125"));
     }
 
     #[test]
@@ -1418,6 +1873,10 @@ mod tests {
             compare_ecapa_values(EcapaConformanceStage::Embedding, &[0.0], &[f32::NAN]).is_err()
         );
         assert!(
+            compare_ecapa_values(EcapaConformanceStage::Embedding, &[f32::MAX], &[-f32::MAX],)
+                .is_err()
+        );
+        assert!(
             compare_ecapa_values(EcapaConformanceStage::Embedding, &[10.0], &[10.01])
                 .expect("within tolerance")
                 .passes
@@ -1446,21 +1905,5 @@ mod tests {
         let mut tampered = evidence;
         tampered.stages[0].points[0].value += 1.0;
         assert!(verify_ecapa_golden_evidence(&tampered).is_err());
-    }
-
-    fn analytic_fixture() -> Vec<f32> {
-        (0..ECAPA_SAMPLE_RATE_HZ)
-            .map(|index| {
-                let time = index as f64 / ECAPA_SAMPLE_RATE_HZ as f64;
-                let chirp_phase = 2.0 * std::f64::consts::PI * (120.0 * time + 180.0 * time * time);
-                let mut value = 0.22 * (2.0 * std::f64::consts::PI * 173.0 * time).sin();
-                value += 0.11 * (2.0 * std::f64::consts::PI * 347.0 * time).sin();
-                value += 0.07 * chirp_phase.sin();
-                if index == 1_234 {
-                    value += 0.5;
-                }
-                value as f32
-            })
-            .collect()
     }
 }

@@ -428,15 +428,26 @@ The full adapter protocol, environment overrides, privacy rules, and authority
 boundary are in the
 [`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
 
-The optional neural path is deliberately not advertised as operational yet.
-The library currently freezes and verifies a license-compatible ECAPA-TDNN
-source revision, deterministic 200-tensor safetensors package, exact package
-hash and metadata, SpeechBrain-compatible Rust frontend, public analytic golden
-stages, and fail-closed numerical tolerances. The package verifier reuses the
-native safetensors loader; no parallel weight format or sidecar manifest is
-introduced. The project does not vendor weights, parse PyTorch checkpoints in
-the runtime, or enable neural routing; safe-Rust forward inference and
-evaluation remain subsequent gates. See the
+The optional neural path is deliberately not advertised as operational routing
+yet. The library freezes and verifies a license-compatible ECAPA-TDNN source
+revision, deterministic 200-tensor safetensors package, exact package hash and
+metadata, a bounded one-second SpeechBrain-compatible scalar conformance
+frontend, public analytic golden stages, and fail-closed numerical tolerances.
+A bounded safe-Rust ECAPA forward path now implements TDNN/SE-Res2 aggregation,
+attentive statistics pooling, projection, and embedding normalization on
+explicit FrankenTorch CPU kernels, with cooperative cancellation and
+content-redacted diagnostics. The package verifier reuses the native safetensors
+loader; no parallel weight format or sidecar manifest is introduced. A
+separately authenticated 2,160,320-byte public seven-stage oracle lets the
+external conformance test compare all 539,616 frontend and neural `f32` values,
+then recheck all 523,456 neural values through the composed Rust frontend, not
+only selected checkpoints. Safe RAII logical-buffer leases enforce and report
+the preplanned ECAPA-owned logical `f32` scratch-payload bound. Both generated
+artifacts remain outside Git. The
+project does not vendor weights, parse PyTorch checkpoints in the runtime, or
+yet provide a production PCM frontend or enable this representation in
+clustering and fallback policy; common-diarizer integration and evaluation
+remain subsequent gates. See the
 [`ECAPA conformance boundary`](docs/acoustic_diarization_contract.md#115-optional-ecapa-model-and-numerical-conformance-boundary).
 
 ### 4. Microphone Capture
