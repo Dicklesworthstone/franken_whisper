@@ -55,6 +55,7 @@
 
 use crate::error::{FwError, FwResult};
 use crate::model::TranscriptionSegment;
+use rayon::prelude::*;
 
 use super::decoder::{self, DecoderState, DecoderWeights};
 use super::dtw::{self, WordTiming};
@@ -2987,6 +2988,63 @@ pub fn transcribe_samples(
             None
         },
     })
+}
+
+/// Transcribe independent audio inputs concurrently through one loaded model.
+///
+/// This is the multi-file counterpart to [`transcribe_samples`]. Model weights
+/// are immutable during inference, so every input shares `m` while Rayon's
+/// work-stealing pool schedules both the file-level jobs and their nested
+/// encoder/decoder kernels. That avoids the two expensive alternatives a
+/// caller otherwise faces: serializing every file, or loading one multi-GB
+/// model per process.
+///
+/// At most one file lane is admitted per four Rayon workers. Nested frontends
+/// and transformer kernels reuse that same fixed pool, so additional lanes do
+/// not create additional threads; they expose independent ready work whenever
+/// one stream reaches a serial decode boundary. Batches larger than the lane
+/// count are drawn from one atomic work queue, so a lane finishing a short clip
+/// immediately takes the next input instead of waiting behind a long,
+/// statically-partitioned neighbor. Results are restored to input order before
+/// return.
+///
+/// Each item carries its own [`DecodeParams`], allowing language and decode
+/// policy to vary across the batch. `checkpoint` is shared and may be called
+/// concurrently, so it retains the same `Sync` contract as the single-input
+/// entry point.
+#[must_use]
+pub fn transcribe_samples_batch(
+    m: &LoadedModel,
+    jobs: &[(&[f32], DecodeParams)],
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> Vec<FwResult<DecodeOutput>> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    if jobs.len() == 1 {
+        return vec![transcribe_samples(m, jobs[0].0, &jobs[0].1, checkpoint)];
+    }
+
+    super::ensure_default_rayon_pool();
+    const MIN_THREADS_PER_FILE: usize = 4;
+    let lanes = jobs
+        .len()
+        .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
+    let next_job = std::sync::atomic::AtomicUsize::new(0);
+
+    let mut completed: Vec<(usize, FwResult<DecodeOutput>)> = (0..lanes)
+        .into_par_iter()
+        .flat_map_iter(|_| {
+            std::iter::from_fn(|| {
+                let index = next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                jobs.get(index).map(|(samples, params)| {
+                    (index, transcribe_samples(m, samples, params, checkpoint))
+                })
+            })
+        })
+        .collect();
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    completed.into_iter().map(|(_, result)| result).collect()
 }
 
 /// Compute DTW word timings for one window, returning per-segment word lists
