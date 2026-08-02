@@ -4413,17 +4413,33 @@ fn kv_f16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FW_KV_F16").is_some())
 }
 
+/// Materialize only live KV rows instead of zero-filling the future context.
+/// Default-on after whole-job validation; `0` restores full materialization.
+fn kv_live_prefix_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FW_KV_LIVE_PREFIX") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
 /// Incremental key/value cache for autoregressive self-attention.
 ///
-/// Stores keys and values as contiguous `[capacity_tokens, n_state]` row-
-/// major buffers; [`KvCache::append`] copies new per-token rows in and
-/// advances `len`. [`KvCache::keys`] / [`KvCache::values`] expose the
-/// populated prefix as a `[len, n_state]` [`Mat`] for [`attention`].
+/// Reserves capacity for `[capacity_tokens, n_state]` keys and values, but only
+/// materializes the contiguous `[len, n_state]` populated prefix. This avoids
+/// zero-filling dead future rows and lets a beam fork clone only live rows while
+/// retaining allocation capacity for future appends. [`KvCache::append`] extends
+/// the prefix and advances `len`; [`KvCache::keys`] / [`KvCache::values`]
+/// expose that prefix as a [`Mat`] for [`attention`].
 ///
 /// When [`kv_f16_enabled`] is on the storage is f16 (`k16`/`v16`, `k`/`v`
 /// empty), halving the per-step cache-read bandwidth; otherwise f32
 /// (`k`/`v`, `k16`/`v16` empty). The mode is fixed at construction.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -4434,32 +4450,101 @@ pub struct KvCache {
     k16: Vec<Float16>,
     v16: Vec<Float16>,
     f16: bool,
+    live_prefix: bool,
     len: usize,
     capacity_tokens: usize,
     n_state: usize,
 }
 
+impl Clone for KvCache {
+    fn clone(&self) -> Self {
+        let capacity = self.capacity_tokens * self.n_state;
+        // A beam fork consumes one token before it is either discarded or
+        // forked again. Give the clone exactly that headroom instead of asking
+        // the allocator for a full-context buffer on every hypothesis edge.
+        // Vec still grows normally if a caller appends a wider chunk.
+        let fork_capacity = |source_len: usize| {
+            if self.live_prefix {
+                source_len.saturating_add(self.n_state).min(capacity)
+            } else {
+                capacity
+            }
+        };
+        let clone_prefix = |source: &[f32]| {
+            let mut values = Vec::with_capacity(fork_capacity(source.len()));
+            values.extend_from_slice(source);
+            values
+        };
+        let clone_prefix_f16 = |source: &[Float16]| {
+            let mut values = Vec::with_capacity(fork_capacity(source.len()));
+            values.extend_from_slice(source);
+            values
+        };
+        Self {
+            k: if self.f16 {
+                Vec::new()
+            } else {
+                clone_prefix(&self.k)
+            },
+            v: if self.f16 {
+                Vec::new()
+            } else {
+                clone_prefix(&self.v)
+            },
+            // The optional column-major mirror uses capacity as its row stride,
+            // so it remains fully materialized. Production caches leave it empty.
+            k_columns: self.k_columns.clone(),
+            k16: if self.f16 {
+                clone_prefix_f16(&self.k16)
+            } else {
+                Vec::new()
+            },
+            v16: if self.f16 {
+                clone_prefix_f16(&self.v16)
+            } else {
+                Vec::new()
+            },
+            f16: self.f16,
+            live_prefix: self.live_prefix,
+            len: self.len,
+            capacity_tokens: self.capacity_tokens,
+            n_state: self.n_state,
+        }
+    }
+}
+
 impl KvCache {
-    /// Allocate a cache for up to `capacity_tokens` tokens of width
-    /// `n_state`.
+    /// Reserve a cache for up to `capacity_tokens` tokens of width `n_state`.
+    /// No token rows are initialized until [`Self::append`].
     #[must_use]
     pub fn new(capacity_tokens: usize, n_state: usize) -> Self {
         let f16 = kv_f16_enabled();
-        Self::new_with_layout(capacity_tokens, n_state, f16, false)
+        Self::new_with_layout(
+            capacity_tokens,
+            n_state,
+            f16,
+            false,
+            kv_live_prefix_enabled(),
+        )
     }
 
     /// Construct the historical f32 token-major cache for same-binary A/B.
     #[doc(hidden)]
     #[must_use]
     pub fn new_row_major_keys_for_bench(capacity_tokens: usize, n_state: usize) -> Self {
-        Self::new_with_layout(capacity_tokens, n_state, false, false)
+        Self::new_with_layout(capacity_tokens, n_state, false, false, false)
     }
 
     /// Construct the packed-key f32 candidate for same-binary A/B.
     #[doc(hidden)]
     #[must_use]
     pub fn new_column_major_keys_for_bench(capacity_tokens: usize, n_state: usize) -> Self {
-        Self::new_with_layout(capacity_tokens, n_state, false, true)
+        Self::new_with_layout(capacity_tokens, n_state, false, true, false)
+    }
+
+    #[cfg(test)]
+    fn new_live_prefix_for_test(capacity_tokens: usize, n_state: usize) -> Self {
+        Self::new_with_layout(capacity_tokens, n_state, false, false, true)
     }
 
     fn new_with_layout(
@@ -4467,27 +4552,49 @@ impl KvCache {
         n_state: usize,
         f16: bool,
         column_keys: bool,
+        live_prefix: bool,
     ) -> Self {
         let n = capacity_tokens * n_state;
         Self {
-            k: if f16 { Vec::new() } else { vec![0.0; n] },
-            v: if f16 { Vec::new() } else { vec![0.0; n] },
+            k: if f16 {
+                Vec::new()
+            } else if live_prefix {
+                Vec::with_capacity(n)
+            } else {
+                vec![0.0; n]
+            },
+            v: if f16 {
+                Vec::new()
+            } else if live_prefix {
+                Vec::with_capacity(n)
+            } else {
+                vec![0.0; n]
+            },
             k_columns: if column_keys && !f16 {
                 vec![0.0; n]
             } else {
                 Vec::new()
             },
             k16: if f16 {
-                vec![Float16::from_f32(0.0); n]
+                if live_prefix {
+                    Vec::with_capacity(n)
+                } else {
+                    vec![Float16::from_f32(0.0); n]
+                }
             } else {
                 Vec::new()
             },
             v16: if f16 {
-                vec![Float16::from_f32(0.0); n]
+                if live_prefix {
+                    Vec::with_capacity(n)
+                } else {
+                    vec![Float16::from_f32(0.0); n]
+                }
             } else {
                 Vec::new()
             },
             f16,
+            live_prefix,
             len: 0,
             capacity_tokens,
             n_state,
@@ -4533,6 +4640,12 @@ impl KvCache {
 
     /// Clear the cache (retains the allocation).
     pub fn reset(&mut self) {
+        if self.live_prefix {
+            self.k.clear();
+            self.v.clear();
+            self.k16.clear();
+            self.v16.clear();
+        }
         self.len = 0;
     }
 
@@ -4565,15 +4678,31 @@ impl KvCache {
         let span = t * self.n_state;
         if self.f16 {
             // f16 storage: convert on append (halves the per-step cache-read DRAM).
-            for (dst, &src) in self.k16[off..off + span].iter_mut().zip(&k.data) {
-                *dst = Float16::from_f32(src);
-            }
-            for (dst, &src) in self.v16[off..off + span].iter_mut().zip(&v.data) {
-                *dst = Float16::from_f32(src);
+            if self.live_prefix {
+                self.k16.truncate(off);
+                self.v16.truncate(off);
+                self.k16
+                    .extend(k.data.iter().copied().map(Float16::from_f32));
+                self.v16
+                    .extend(v.data.iter().copied().map(Float16::from_f32));
+            } else {
+                for (dst, &src) in self.k16[off..off + span].iter_mut().zip(&k.data) {
+                    *dst = Float16::from_f32(src);
+                }
+                for (dst, &src) in self.v16[off..off + span].iter_mut().zip(&v.data) {
+                    *dst = Float16::from_f32(src);
+                }
             }
         } else {
-            self.k[off..off + span].copy_from_slice(&k.data);
-            self.v[off..off + span].copy_from_slice(&v.data);
+            if self.live_prefix {
+                self.k.truncate(off);
+                self.v.truncate(off);
+                self.k.extend_from_slice(&k.data[..span]);
+                self.v.extend_from_slice(&v.data[..span]);
+            } else {
+                self.k[off..off + span].copy_from_slice(&k.data);
+                self.v[off..off + span].copy_from_slice(&v.data);
+            }
             if !self.k_columns.is_empty() {
                 for r in 0..t {
                     let token = self.len + r;
@@ -7316,6 +7445,35 @@ mod tests {
         assert!(cache.is_empty());
         cache.append(&row, &row).unwrap();
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn kv_cache_clone_copies_only_the_live_prefix() {
+        let mut cache = KvCache::new_live_prefix_for_test(8, 4);
+        assert!(cache.k.is_empty());
+        assert!(cache.v.is_empty());
+        assert!(cache.k.capacity() >= 32);
+        assert!(cache.v.capacity() >= 32);
+
+        let first = Mat::from_vec(1, 4, vec![1.0, 2.0, 3.0, 4.0]);
+        cache.append(&first, &first).unwrap();
+        let mut fork = cache.clone();
+        assert_eq!(fork.k, first.data);
+        assert_eq!(fork.v, first.data);
+        assert!(fork.k.capacity() >= 8);
+        assert!(fork.v.capacity() >= 8);
+        assert!(fork.k.capacity() < 32);
+        assert!(fork.v.capacity() < 32);
+
+        let second = Mat::from_vec(1, 4, vec![5.0, 6.0, 7.0, 8.0]);
+        fork.append(&second, &second).unwrap();
+        assert_eq!(cache.len(), 1, "fork append must not mutate the parent");
+        assert_eq!(fork.len(), 2);
+        assert_eq!(fork.key_slice(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+
+        fork.truncate_for_bench(1);
+        fork.append(&first, &first).unwrap();
+        assert_eq!(fork.key_slice(), &[1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
