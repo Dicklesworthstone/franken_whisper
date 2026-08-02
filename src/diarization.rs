@@ -4311,10 +4311,10 @@ fn normalize_masked_trajectory(
     }
     let mut valid_count = 0usize;
     let mut sum = 0.0_f64;
-    for offset in 0..ACOUSTIC_TRAJECTORY_HISTORY_FRAMES {
+    for (offset, normalized_is_valid) in normalized_valid.iter_mut().enumerate() {
         let ring_index = (oldest_index + offset) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES;
-        normalized_valid[offset] = valid[ring_index];
-        if valid[ring_index] {
+        *normalized_is_valid = valid[ring_index];
+        if *normalized_is_valid {
             let value = values[ring_index];
             if !family.value_is_in_domain(value) {
                 return Err(FwError::InvalidRequest(format!(
@@ -4331,8 +4331,8 @@ fn normalize_masked_trajectory(
     }
     let mean = sum / valid_count as f64;
     let mut centered_energy = 0.0_f64;
-    for offset in 0..ACOUSTIC_TRAJECTORY_HISTORY_FRAMES {
-        if !normalized_valid[offset] {
+    for (offset, normalized_is_valid) in normalized_valid.iter().copied().enumerate() {
+        if !normalized_is_valid {
             continue;
         }
         let ring_index = (oldest_index + offset) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES;
@@ -4346,14 +4346,18 @@ fn normalize_masked_trajectory(
         return Ok((valid_count, false, true));
     }
     let inverse_norm = centered_energy.sqrt().recip();
-    for offset in 0..ACOUSTIC_TRAJECTORY_HISTORY_FRAMES {
-        if !normalized_valid[offset] {
-            normalized[offset] = 0.0;
+    for (offset, (normalized_value, normalized_is_valid)) in normalized
+        .iter_mut()
+        .zip(normalized_valid.iter().copied())
+        .enumerate()
+    {
+        if !normalized_is_valid {
+            *normalized_value = 0.0;
             continue;
         }
         let ring_index = (oldest_index + offset) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES;
-        normalized[offset] = ((f64::from(values[ring_index]) - mean) * inverse_norm) as f32;
-        if !normalized[offset].is_finite() {
+        *normalized_value = ((f64::from(values[ring_index]) - mean) * inverse_norm) as f32;
+        if !normalized_value.is_finite() {
             return Err(FwError::InvalidRequest(
                 "acoustic trajectory normalization produced a non-finite value".to_owned(),
             ));
@@ -4515,7 +4519,7 @@ where
         let mut detail = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
         let mut detail_valid = [false; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
         let mut current_len = ACOUSTIC_TRAJECTORY_HISTORY_FRAMES;
-        let tap_count = match basis {
+        let tap_count: usize = match basis {
             AcousticWaveletBasis::Haar => 2,
             AcousticWaveletBasis::DaubechiesFourTap => 4,
         };
@@ -4609,8 +4613,10 @@ fn valid_haar_modulus(
     input_len: usize,
     support: usize,
     normalizer: f64,
-    output: &mut [f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
-    output_valid: &mut [bool; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
+    output: (
+        &mut [f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
+        &mut [bool; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
+    ),
     accounting: &mut AcousticFilterAccounting,
 ) -> FwResult<usize> {
     if input_len > ACOUSTIC_TRAJECTORY_HISTORY_FRAMES || support == 0 || support > input_len {
@@ -4618,7 +4624,8 @@ fn valid_haar_modulus(
             "scattering filter support exceeds its non-wrapping input geometry".to_owned(),
         ));
     }
-    output.fill(0.0);
+    let (output_values, output_valid) = output;
+    output_values.fill(0.0);
     output_valid.fill(false);
     let mut valid_positions = 0usize;
     let output_len = input_len - support + 1;
@@ -4633,7 +4640,7 @@ fn valid_haar_modulus(
         }
         output_valid[position] = support_valid;
         if !support_valid {
-            output[position] = 0.0;
+            output_values[position] = 0.0;
             continue;
         }
         let mut response = 0.0_f64;
@@ -4641,8 +4648,8 @@ fn valid_haar_modulus(
             let sign = if tap < support / 2 { 1.0 } else { -1.0 };
             response += sign * f64::from(input[position + tap]);
         }
-        output[position] = (response * normalizer).abs() as f32;
-        if !output[position].is_finite() {
+        output_values[position] = (response * normalizer).abs() as f32;
+        if !output_values[position].is_finite() {
             return Err(FwError::InvalidRequest(
                 "scattering filter produced a non-finite modulus".to_owned(),
             ));
@@ -4760,8 +4767,10 @@ where
                 ACOUSTIC_TRAJECTORY_HISTORY_FRAMES,
                 ACOUSTIC_SCATTERING_SCALE_SUPPORTS[scale_index],
                 ACOUSTIC_SCATTERING_SCALE_NORMALIZERS[scale_index],
-                &mut first_modulus[scale_index],
-                &mut first_valid[scale_index],
+                (
+                    &mut first_modulus[scale_index],
+                    &mut first_valid[scale_index],
+                ),
                 &mut accounting,
             )?;
             if mode.emits_first_order() {
@@ -4795,8 +4804,7 @@ where
                     first_output_lengths[first_scale],
                     ACOUSTIC_SCATTERING_SCALE_SUPPORTS[second_scale],
                     ACOUSTIC_SCATTERING_SCALE_NORMALIZERS[second_scale],
-                    &mut second_modulus,
-                    &mut second_valid,
+                    (&mut second_modulus, &mut second_valid),
                     &mut accounting,
                 )?;
                 family_summary.second_order_valid_positions[pair_index] = valid_positions;
@@ -4840,7 +4848,7 @@ impl std::fmt::Debug for AcousticTrajectorySidecar {
             .field("expected_next_frame_index", &self.expected_next_frame_index)
             .field(
                 "retained_state_bytes_on_target",
-                &self.retained_state_bytes_on_target(),
+                &Self::retained_state_bytes_on_target(),
             )
             .finish_non_exhaustive()
     }
@@ -4857,7 +4865,7 @@ impl AcousticTrajectorySidecar {
         }
     }
 
-    const fn retained_state_bytes_on_target(&self) -> usize {
+    const fn retained_state_bytes_on_target() -> usize {
         std::mem::size_of::<Self>()
     }
 
@@ -16934,6 +16942,7 @@ mod tests {
                 + 0.12 * (7.0 * phase - coefficient_phase).cos();
         }
         frame.voice.voiced_fraction = 0.55 + 0.25 * (3.0 * phase).sin();
+        frame.voice.temporal_modulation = 0.5 + 0.3 * (4.0 * phase).sin();
         if frame_index % 5 == 0 {
             frame.voice.f0_hz = None;
             frame.voice.pitch_uncertainty_octaves = None;
@@ -17246,20 +17255,20 @@ mod tests {
         assert_eq!(
             hashes,
             [
-                "eed6f4fa6570b11791d46d7a1c523b87d36f484538b0ad00042780489798a640",
-                "11093d16a3ec1b07e2baaa6b0560ff2a7e6c518123ae1330debcdfa5f8028c46",
-                "437f76b810f55a704d3b26293d98ebf981e5bf6eccba745ab32899455abe6928",
-                "5d6cfa31ca93b91e8f243e96b46aed8174f396f45d6a83319dba2dd3a09eeaa5",
-                "fae9f0d577800b52d0e8d7717af013fad4991d4c64312f4c4ccd40003b0855c8",
-                "2de4489926e864db7c132783590b6cbed921a41af683d1a761b6db4efe39b601",
-                "f2e38257fc587bcbd37fabd73b79824dfabf504d7f22265e066354fda278b7b6",
-                "024945c208643f5847504c6fbd363552509644b83b8cbbfa427e91937f73e510",
-                "2bd00e82bb398c96877016eb7db9f401b2a3cc1c8ca5a6e81ba20cd7e5df2547",
-                "64e96d50e5bbe959fe376d88375851ec962ddfe029bd5fbf7a77050cfa7aa469",
-                "dc56d46b92892282a5efd3dd42c9cce1d1dd8689821e8eb4e3d5a2193a0674ae",
-                "27efe1319d8b06cbbfb417a6ae8a095375745ff604b0497d7b32656a2fb188fe",
-                "111ccfe725b2045f9ca4936f844eb74585afc8815a15d02f3154fdd03bd43089",
-                "62ca701270c89de0440694e8c59ae057621f6e937bc01027f28240ab29b272b5",
+                "81c36005a07e581909fe42bed98e94ed479256076566cc7486b302bc5266b605",
+                "1947d3852b83f5380a5917060a5a1646ba286882d973aa7790a7483c3f4b03be",
+                "08def1fe1baa69cbb69a41f8626edbd2263d0bd3a91225f5684d2790e06e66ea",
+                "29d301cafa8ae0c21813d8dfd1439e55e871b6b0781b259e5ac89e316bbf97bf",
+                "2d078469c52d1c0a4e12e1e984a0f139f5f18a6713c0217eeb4dd69d128b7ad5",
+                "3d55c2f9aa421e79cc2a26bfdbf997aee3ca2f8c241fc54c4015b2fd03b9f3b9",
+                "2fff2e27c5ff570b1d2fcb86d6f7f3647ac1d0d2c8544122b060265afc52d995",
+                "35e017672700fd19ebc2fc1cf6ec79713ee318e639cb00e5e273996dfca0d7ef",
+                "5762e5d9ef7c0e9872f308853ca69afd170186f1556b448af4dbc7291a9a1822",
+                "72105ea0336b1172b8c0a0e5d9f21d29f5c7df308506d53ab8e4e11894443ae0",
+                "d5ee2d0e3ac90d5bb91d9c4ac4bb72cdf458765161aa45f871d32f9b568becf2",
+                "cdb2b61ff70712a2daff7629bc1d0cbd5d0b365d9d4a8daac8ff76720891b9f0",
+                "9513314c56c1d06158208dd7f3a1ecf1582363ae01387235813fb9fea8759ad4",
+                "06a750f232ff9d6f5cffeba192eb9543742f3a37161344b54e3e584b6b3ff5a7",
             ]
         );
         assert_ne!(hashes[1], hashes[12]);
@@ -18621,7 +18630,7 @@ mod tests {
         let mut above_floor = [[0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
             super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
         for (family_index, family) in above_floor.iter_mut().enumerate() {
-            let mean = if family_index == 0 { 500_000.0 } else { 0.5 };
+            let mean: f32 = if family_index == 0 { 500_000.0 } else { 0.5 };
             let delta = 2.0 * relative_floor * mean.max(1.0);
             for (offset, value) in family.iter_mut().enumerate() {
                 *value = mean + if offset % 2 == 0 { delta } else { -delta };
