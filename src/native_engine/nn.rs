@@ -127,14 +127,40 @@ pub(crate) fn worker_count() -> usize {
 fn gemv_worker_count(out: usize) -> usize {
     let avail = avail_parallelism();
     // Only the vocab-class GEMV (tens of thousands of rows) is bandwidth-bound
-    // enough to want >8 threads; below that the 8-cap wins (see fn docs).
+    // enough to want the wide cap; below that the sub-vocab cap applies.
     const WIDE_OUT_THRESHOLD: usize = 1 << 14; // 16384 rows
     let cap = if out >= WIDE_OUT_THRESHOLD {
         wide_gemv_cap()
     } else {
-        8
+        mid_gemv_cap()
     };
     avail.min(cap)
+}
+
+/// Worker cap for every sub-vocab GEMV — i.e. EVERY decoder-layer projection
+/// (`qkv` 3840x1280, `mlp_0` 5120x1280, `mlp_2` 1280x5120, `attn_out`/`cross_q`/
+/// `cross_out` 1280x1280). Overridable via `FW_MID_GEMV_CAP`.
+///
+/// The 8 it defaults to came from criterion runs on an **M4 Pro (10 performance
+/// + 4 efficiency cores)**, where widening past 8 recruited the efficiency cores
+/// and measured +29% on `f16_gemv_dequant_1280x1280`. That is a statement about
+/// a heterogeneous 14-core laptop, not about an 8-CCD server part, and it is the
+/// same reasoning the vocab head already outgrew when its own cap went 12 -> 32
+/// for ~1.4-1.8x (see [`wide_gemv_cap`]). Re-screen it per host rather than
+/// inheriting the laptop number.
+///
+/// Row bands are disjoint and each output row's dot is independent of the split,
+/// so this is **bit-identical** at any value — purely a scheduling knob.
+fn mid_gemv_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FW_MID_GEMV_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&c: &usize| c >= 1)
+            .unwrap_or(8)
+    })
 }
 
 /// Worker cap for the vocab-class (bandwidth-bound) GEMV. **32** (measured optimum):
