@@ -3130,12 +3130,20 @@ pub const ACOUSTIC_WAVELET_ENERGY_TOLERANCE: f32 = 2e-5;
 /// acquire representation noise after a DC offset is added and removed. A
 /// scale-relative floor preserves gain invariance without changing acoustic-v2.
 pub const ACOUSTIC_WAVELET_FLATNESS_RELATIVE_POWER_FLOOR: f32 = f32::EPSILON;
+/// Centered-RMS floor relative to `max(1, abs(input_mean))` before a raw-PCM
+/// wavelet window is energy-normalized. This prevents representational jitter
+/// in a constant or near-constant frame from becoming unit-energy evidence.
+pub const ACOUSTIC_WAVELET_CENTERED_RMS_RELATIVE_FLOOR: f32 = 8.0 * f32::EPSILON;
 /// Independent contract identity for the evaluation-only sidecar surface.
-pub const ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION: &str = "acoustic-multiscale-sidecar-v2";
+pub const ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION: &str = "acoustic-multiscale-sidecar-v3";
 /// Fixed temporal support of the modulation sidecar at the 10 ms cadence.
 pub const ACOUSTIC_MODULATION_HISTORY_FRAMES: usize = 64;
 /// Minimum valid trajectory observations required by a modulation regression.
 pub const ACOUSTIC_MODULATION_MIN_VALID_FRAMES: usize = 32;
+/// Centered-RMS floor relative to `max(1, abs(valid_mean))` before modulation
+/// regression. Below this floor, f32 quantization residue is absence rather
+/// than evidence with an arbitrary normalized spectrum.
+pub const ACOUSTIC_MODULATION_CENTERED_RMS_RELATIVE_FLOOR: f32 = 8.0 * f32::EPSILON;
 /// Fixed modulation frequencies represented by harmonics 1, 2, 4, and 8 of a
 /// 64-frame window sampled at 100 Hz. These are point frequencies, not bands.
 pub const ACOUSTIC_MODULATION_FREQUENCY_HZ: [f32; 4] = [1.5625, 3.125, 6.25, 12.5];
@@ -3422,6 +3430,7 @@ fn acoustic_sidecar_study_config_digest(config: AcousticSidecarStudyConfig) -> F
         "detail-energy-local-to-level",
         "detail-stats=energy-fraction-ln-mean-square-entropy-flatness-crest-adjacent-change",
         "coefficient-flatness=geometric-mean-of-power-plus-relative-floor-over-mean-power-plus-relative-floor",
+        "frame-wavelet-near-constant=centered-rms-at-most-relative-floor-times-max-one-absolute-input-mean-is-unavailable",
         "d4-minimum-support=4-times-two-to-level-minus-one",
         "voice=temporal-modulation-mean-absolute-dct-delta",
         "voice-valid=voiced-and-not-low-energy-clipped-transient-and-frame-index-positive",
@@ -3432,6 +3441,7 @@ fn acoustic_sidecar_study_config_digest(config: AcousticSidecarStudyConfig) -> F
         "modulation-ring=oldest-index-forward-to-newest",
         "twiddles=unit-seed-forward-complex-recurrence-negative-imaginary",
         "intercept-residualized-sine-cosine-regression-r-squared",
+        "modulation-near-constant=centered-rms-at-most-relative-floor-times-max-one-absolute-valid-mean-is-unavailable",
         "wavelet-owner=mixed-auxiliary",
         "modulation-owners=voice-channel-channel",
         "trajectory-order=voiced-cepstral-envelope-magnitude-voiced-occupancy-low-mid-high-band-fractions",
@@ -3498,6 +3508,16 @@ fn acoustic_sidecar_study_config_digest(config: AcousticSidecarStudyConfig) -> F
     hasher.update(ACOUSTIC_WAVELET_ENERGY_TOLERANCE.to_bits().to_le_bytes());
     hasher.update(
         ACOUSTIC_WAVELET_FLATNESS_RELATIVE_POWER_FLOOR
+            .to_bits()
+            .to_le_bytes(),
+    );
+    hasher.update(
+        ACOUSTIC_WAVELET_CENTERED_RMS_RELATIVE_FLOOR
+            .to_bits()
+            .to_le_bytes(),
+    );
+    hasher.update(
+        ACOUSTIC_MODULATION_CENTERED_RMS_RELATIVE_FLOOR
             .to_bits()
             .to_le_bytes(),
     );
@@ -3640,7 +3660,7 @@ pub struct AcousticWaveletSummary {
     pub owner: AcousticSidecarFeatureOwner,
     pub input_samples: usize,
     pub valid_level_count: usize,
-    pub input_was_silent: bool,
+    pub input_was_silent_or_near_constant: bool,
     pub levels: [AcousticWaveletLevelSummary; ACOUSTIC_WAVELET_MAX_LEVELS],
     /// Approximation energy relative to the even-extended input of the final
     /// requested level.
@@ -3661,7 +3681,10 @@ impl std::fmt::Debug for AcousticWaveletSummary {
             .field("owner", &self.owner)
             .field("input_samples", &self.input_samples)
             .field("valid_level_count", &self.valid_level_count)
-            .field("input_was_silent", &self.input_was_silent)
+            .field(
+                "input_was_silent_or_near_constant",
+                &self.input_was_silent_or_near_constant,
+            )
             .field("filter_tap_terms", &self.filter_tap_terms)
             .field(
                 "maximum_energy_conservation_relative_error",
@@ -3678,11 +3701,13 @@ impl std::fmt::Debug for AcousticWaveletSummary {
 /// Analyze one normalized PCM window with a bounded orthogonal DWT.
 ///
 /// Input is mean-centered and energy-normalized before analysis. For inputs
-/// that remain above the absolute silence floor, this makes the descriptors
-/// invariant to DC offset and positive gain up to floating-point roundoff. Odd
-/// widths use a declared right half-sample symmetric extension (duplicate the
-/// final sample) to the next even width, followed by periodized filter support.
-/// Cancellation is checked before validation and between decomposition levels.
+/// that remain above the centered-RMS admission gate, this makes the descriptors
+/// invariant to DC offset and positive gain up to floating-point roundoff. A
+/// centered-RMS gate rejects constant or representationally near-constant
+/// windows before unit-energy normalization. Odd widths use a declared right
+/// half-sample symmetric extension (duplicate the final sample) to the next
+/// even width, followed by periodized filter support. Cancellation is checked
+/// before validation and between decomposition levels.
 pub fn analyze_acoustic_wavelet<C>(
     samples: &[f32],
     config: AcousticWaveletConfig,
@@ -3739,13 +3764,16 @@ where
     let scratch_buffer_payload_bytes = std::mem::size_of_val(&current)
         + std::mem::size_of_val(&approximation)
         + std::mem::size_of_val(&detail);
-    if centered_energy <= f64::from(PCM_EPSILON * PCM_EPSILON) {
+    let centered_rms = (centered_energy / samples.len() as f64).sqrt();
+    let centered_rms_floor =
+        f64::from(ACOUSTIC_WAVELET_CENTERED_RMS_RELATIVE_FLOOR) * mean.abs().max(1.0);
+    if centered_rms <= centered_rms_floor {
         return Ok(AcousticWaveletSummary {
             basis: config.basis,
             owner: AcousticSidecarFeatureOwner::MixedAuxiliary,
             input_samples: samples.len(),
             valid_level_count: 0,
-            input_was_silent: true,
+            input_was_silent_or_near_constant: true,
             levels: [AcousticWaveletLevelSummary::default(); ACOUSTIC_WAVELET_MAX_LEVELS],
             final_approximation_energy_fraction: 0.0,
             filter_tap_terms: 0,
@@ -3821,7 +3849,7 @@ where
         owner: AcousticSidecarFeatureOwner::MixedAuxiliary,
         input_samples: samples.len(),
         valid_level_count: config.levels,
-        input_was_silent: false,
+        input_was_silent_or_near_constant: false,
         levels: summaries,
         final_approximation_energy_fraction,
         filter_tap_terms,
@@ -5255,7 +5283,10 @@ where
             })
         })
         .sum::<f64>();
-    if centered_energy <= f64::from(PCM_EPSILON * PCM_EPSILON) {
+    let centered_rms = (centered_energy / valid_count as f64).sqrt();
+    let centered_rms_floor =
+        f64::from(ACOUSTIC_MODULATION_CENTERED_RMS_RELATIVE_FLOOR) * mean.abs().max(1.0);
+    if centered_rms <= centered_rms_floor {
         return Ok((false, valid_count, [0.0; 4], 0));
     }
     let mut power = [0.0_f32; 4];
@@ -17255,20 +17286,20 @@ mod tests {
         assert_eq!(
             hashes,
             [
-                "81c36005a07e581909fe42bed98e94ed479256076566cc7486b302bc5266b605",
-                "1947d3852b83f5380a5917060a5a1646ba286882d973aa7790a7483c3f4b03be",
-                "08def1fe1baa69cbb69a41f8626edbd2263d0bd3a91225f5684d2790e06e66ea",
-                "29d301cafa8ae0c21813d8dfd1439e55e871b6b0781b259e5ac89e316bbf97bf",
-                "2d078469c52d1c0a4e12e1e984a0f139f5f18a6713c0217eeb4dd69d128b7ad5",
-                "3d55c2f9aa421e79cc2a26bfdbf997aee3ca2f8c241fc54c4015b2fd03b9f3b9",
-                "2fff2e27c5ff570b1d2fcb86d6f7f3647ac1d0d2c8544122b060265afc52d995",
-                "35e017672700fd19ebc2fc1cf6ec79713ee318e639cb00e5e273996dfca0d7ef",
-                "5762e5d9ef7c0e9872f308853ca69afd170186f1556b448af4dbc7291a9a1822",
-                "72105ea0336b1172b8c0a0e5d9f21d29f5c7df308506d53ab8e4e11894443ae0",
-                "d5ee2d0e3ac90d5bb91d9c4ac4bb72cdf458765161aa45f871d32f9b568becf2",
-                "cdb2b61ff70712a2daff7629bc1d0cbd5d0b365d9d4a8daac8ff76720891b9f0",
-                "9513314c56c1d06158208dd7f3a1ecf1582363ae01387235813fb9fea8759ad4",
-                "06a750f232ff9d6f5cffeba192eb9543742f3a37161344b54e3e584b6b3ff5a7",
+                "e59973e20004c82faf5ae067545ca4be06687022e4c2c67339cc9453fc82e674",
+                "2031666579708d1e4eca890419fe7b74747804ee36244b39048e9ad9d535cfc9",
+                "c1c855dd5407d8655180792967790bdb635a248c3fbfeb36f80182a6cade344b",
+                "ee22bdabb00bb91e98bb3245b293f1472884660faa9a758c2e08d4ac23a97916",
+                "255a7d5f4e8d61c443c23d781edf8ce0f9b07c5fe5f7a84eb9cc30666a025402",
+                "b45ec7998f440cbd9b2d7ee25956760ff4a14aae470b0f6b4e3858f565801d6a",
+                "0b0ed57488db29a83762f28881186175d59dfd5c9adff1456e917c55c75bdb4f",
+                "5f441b7196a02bee56d75a5754f9da2d2a3737a92a6a2c3c87d560b6de4aee87",
+                "b8ac6b61a6647252497901670a82f33c6216e9ecb5dbef5bab870bfcaa24dd05",
+                "bcff0833c7b70558c2a338d31b2f030b61c5f63bbc2bbefda91f2339fe8d7fb0",
+                "fb4fb971a0d75f6ab2fec42573ed8004b9f86f16b918412de2056ed8299dbb4a",
+                "21c35b475ff716d2ef125663fa1d181fcabf7c467b6503395aeb7100ed98a02e",
+                "8b0fadf34e35a740a013382650edad273c9168a78b4df0c2e434a390cc7ca4f9",
+                "d339b2d3ab1789d9efbd151333973a00fb93d4b9236339aeaee93631c547e3f2",
             ]
         );
         assert_ne!(hashes[1], hashes[12]);
@@ -17553,12 +17584,12 @@ mod tests {
         assert_eq!(
             format!("{quiet:?}"),
             format!(
-                "AcousticWaveletSummary {{ basis: {:?}, owner: {:?}, input_samples: {}, valid_level_count: {}, input_was_silent: {}, filter_tap_terms: {}, maximum_energy_conservation_relative_error: {:?}, scratch_buffer_payload_bytes: {}, .. }}",
+                "AcousticWaveletSummary {{ basis: {:?}, owner: {:?}, input_samples: {}, valid_level_count: {}, input_was_silent_or_near_constant: {}, filter_tap_terms: {}, maximum_energy_conservation_relative_error: {:?}, scratch_buffer_payload_bytes: {}, .. }}",
                 quiet.basis,
                 quiet.owner,
                 quiet.input_samples,
                 quiet.valid_level_count,
-                quiet.input_was_silent,
+                quiet.input_was_silent_or_near_constant,
                 quiet.filter_tap_terms,
                 quiet.maximum_energy_conservation_relative_error,
                 quiet.scratch_buffer_payload_bytes
@@ -17603,6 +17634,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn wavelet_sidecar_suppresses_f32_jitter_but_retains_above_floor_variation() {
+        let config = AcousticWaveletConfig {
+            basis: AcousticWaveletBasis::Haar,
+            levels: 4,
+        };
+        let mut quantization_only = [0.5_f32; 64];
+        quantization_only[63] = f32::from_bits(0.5_f32.to_bits() + 1);
+        let suppressed = analyze_acoustic_wavelet(&quantization_only, config, || false)
+            .expect("quantization-only frame wavelet");
+        assert!(suppressed.input_was_silent_or_near_constant);
+        assert_eq!(suppressed.valid_level_count, 0);
+        assert_eq!(suppressed.filter_tap_terms, 0);
+        assert_eq!(suppressed.final_approximation_energy_fraction, 0.0);
+        assert_eq!(suppressed.maximum_energy_conservation_relative_error, 0.0);
+        assert!(
+            suppressed
+                .levels
+                .iter()
+                .all(|level| *level == super::AcousticWaveletLevelSummary::default())
+        );
+
+        let at_floor: [f32; 64] = std::array::from_fn(|index| {
+            if index % 2 == 0 {
+                super::ACOUSTIC_WAVELET_CENTERED_RMS_RELATIVE_FLOOR
+            } else {
+                -super::ACOUSTIC_WAVELET_CENTERED_RMS_RELATIVE_FLOOR
+            }
+        });
+        let boundary =
+            analyze_acoustic_wavelet(&at_floor, config, || false).expect("at-floor frame wavelet");
+        assert!(boundary.input_was_silent_or_near_constant);
+        assert_eq!(boundary.valid_level_count, 0);
+
+        let delta = 2.0 * super::ACOUSTIC_WAVELET_CENTERED_RMS_RELATIVE_FLOOR;
+        let above_floor: [f32; 64] =
+            std::array::from_fn(|index| 0.5 + if index % 2 == 0 { delta } else { -delta });
+        let retained = analyze_acoustic_wavelet(&above_floor, config, || false)
+            .expect("above-floor frame wavelet");
+        assert!(!retained.input_was_silent_or_near_constant);
+        assert_eq!(retained.valid_level_count, 4);
+        assert!(retained.filter_tap_terms > 0);
+        assert!(retained.levels[0].detail_energy_fraction > 0.99);
     }
 
     #[test]
@@ -17984,6 +18060,9 @@ mod tests {
         assert!(!summary.voice_available);
         assert!(!summary.channel_level_available);
         assert!(!summary.channel_coloration_available);
+        assert_eq!(summary.voice_normalized_power, [0.0; 4]);
+        assert_eq!(summary.channel_level_normalized_power, [0.0; 4]);
+        assert_eq!(summary.channel_coloration_normalized_power, [0.0; 4]);
         assert_eq!(summary.projection_sample_frequency_visits, 0);
     }
 
@@ -18069,6 +18148,58 @@ mod tests {
         assert!(!summary.channel_level_available);
         assert!(!summary.channel_coloration_available);
         assert_eq!(summary.projection_sample_frequency_visits, 0);
+    }
+
+    #[test]
+    fn modulation_suppresses_f32_jitter_but_retains_above_floor_variation() {
+        let valid = [true; ACOUSTIC_MODULATION_HISTORY_FRAMES];
+        let mut active = || false;
+        for mean in [0.5_f32, 200.0] {
+            let next = f32::from_bits(mean.to_bits() + 1);
+            let quantization_only: [f32; ACOUSTIC_MODULATION_HISTORY_FRAMES] =
+                std::array::from_fn(|index| if index % 16 < 8 { next } else { mean });
+            let suppressed = super::modulation_spectrum(
+                &quantization_only,
+                &valid,
+                0,
+                "quantization-only",
+                &mut active,
+            )
+            .expect("quantization-only modulation");
+            assert!(!suppressed.0);
+            assert_eq!(suppressed.1, ACOUSTIC_MODULATION_HISTORY_FRAMES);
+            assert_eq!(suppressed.2, [0.0; 4]);
+            assert_eq!(suppressed.3, 0);
+
+            let at_floor: [f32; ACOUSTIC_MODULATION_HISTORY_FRAMES] =
+                std::array::from_fn(|index| {
+                    if index % 2 == 0 {
+                        super::ACOUSTIC_MODULATION_CENTERED_RMS_RELATIVE_FLOOR
+                    } else {
+                        -super::ACOUSTIC_MODULATION_CENTERED_RMS_RELATIVE_FLOOR
+                    }
+                });
+            let boundary =
+                super::modulation_spectrum(&at_floor, &valid, 0, "at-floor", &mut active)
+                    .expect("at-floor modulation");
+            assert!(!boundary.0);
+            assert_eq!(boundary.1, ACOUSTIC_MODULATION_HISTORY_FRAMES);
+            assert_eq!(boundary.2, [0.0; 4]);
+            assert_eq!(boundary.3, 0);
+
+            let delta =
+                2.0 * super::ACOUSTIC_MODULATION_CENTERED_RMS_RELATIVE_FLOOR * mean.abs().max(1.0);
+            let above_floor: [f32; ACOUSTIC_MODULATION_HISTORY_FRAMES] =
+                std::array::from_fn(|index| mean + if index % 16 < 8 { delta } else { -delta });
+            let retained =
+                super::modulation_spectrum(&above_floor, &valid, 0, "above-floor", &mut active)
+                    .expect("above-floor modulation");
+            assert!(retained.0);
+            assert_eq!(retained.1, ACOUSTIC_MODULATION_HISTORY_FRAMES);
+            assert!(retained.2.iter().all(|power| power.is_finite()));
+            assert!(retained.2[2] > 0.75);
+            assert_eq!(retained.3, 4 * ACOUSTIC_MODULATION_HISTORY_FRAMES * 2);
+        }
     }
 
     #[test]
@@ -18227,6 +18358,56 @@ mod tests {
     }
 
     #[test]
+    fn stationary_d4_boundary_impulse_matches_closed_form_all_level_goldens() {
+        let mut values = [[0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+            super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        for family in &mut values {
+            family[0] = 1.0;
+        }
+        let valid =
+            [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        let mut active = || false;
+        let summary = super::analyze_acoustic_trajectory_wavelet(
+            trajectory_window(&values, &valid, 0, 0, 63),
+            AcousticWaveletBasis::DaubechiesFourTap,
+            4,
+            &mut active,
+        )
+        .expect("closed-form stationary D4 impulse");
+        let expected_valid_coefficients = [61, 55, 43, 19];
+        let expected_mean_absolute = [
+            0.002_138_238_3,
+            0.001_145_346_9,
+            0.000_707_530_3,
+            0.000_773_345_7,
+        ];
+        let expected_rms = [0.016_700_175, 0.008_494_12, 0.004_639_586_4, 0.003_370_936];
+        let expected_normalized_change = [0.130_170_82, 0.137_337_01, 0.156_129_5, 0.242_161_05];
+        for (level_index, level) in summary.families[0].levels.iter().enumerate() {
+            assert!(level.available);
+            assert_eq!(
+                level.valid_coefficients,
+                expected_valid_coefficients[level_index]
+            );
+            assert_eq!(
+                level.adjacent_valid_pairs,
+                expected_valid_coefficients[level_index] - 1
+            );
+            assert!(
+                (level.mean_absolute_detail - expected_mean_absolute[level_index]).abs() < 1e-7
+            );
+            assert!((level.detail_rms - expected_rms[level_index]).abs() < 1e-7);
+            assert!(level.normalized_entropy_available);
+            assert!(level.normalized_entropy < 1e-6);
+            assert!(level.normalized_detail_change_available);
+            assert!(
+                (level.normalized_detail_change - expected_normalized_change[level_index]).abs()
+                    < 1e-7
+            );
+        }
+    }
+
+    #[test]
     fn trajectory_detail_change_distinguishes_missing_adjacency_from_measured_zero() {
         let mut detail = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
         let mut valid = [false; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
@@ -18265,6 +18446,13 @@ mod tests {
         assert_eq!(below.normalized_entropy, 0.0);
         assert!(!below.normalized_detail_change_available);
         assert_eq!(below.normalized_detail_change, 0.0);
+
+        detail[..4].copy_from_slice(&[floor, -floor, floor, -floor]);
+        let at_floor = super::summarize_masked_trajectory_detail(&detail, &valid, 4);
+        assert!(!at_floor.normalized_entropy_available);
+        assert_eq!(at_floor.normalized_entropy, 0.0);
+        assert!(!at_floor.normalized_detail_change_available);
+        assert_eq!(at_floor.normalized_detail_change, 0.0);
 
         detail[..4].copy_from_slice(&[2.0 * floor, -2.0 * floor, 2.0 * floor, -2.0 * floor]);
         let above = super::summarize_masked_trajectory_detail(&detail, &valid, 4);
@@ -18428,12 +18616,14 @@ mod tests {
             &mut active,
         )
         .expect("linear stationary D4 trajectory");
-        let first_level = summary.families[0].levels[0];
-        assert!(first_level.detail_rms <= super::ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR);
-        assert!(!first_level.normalized_entropy_available);
-        assert_eq!(first_level.normalized_entropy, 0.0);
-        assert!(!first_level.normalized_detail_change_available);
-        assert_eq!(first_level.normalized_detail_change, 0.0);
+        for level in summary.families[0].levels {
+            assert!(level.available);
+            assert!(level.detail_rms <= super::ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR);
+            assert!(!level.normalized_entropy_available);
+            assert_eq!(level.normalized_entropy, 0.0);
+            assert!(!level.normalized_detail_change_available);
+            assert_eq!(level.normalized_detail_change, 0.0);
+        }
     }
 
     #[test]
@@ -18838,6 +19028,50 @@ mod tests {
         {
             assert!(
                 (*actual - expected).abs() < 2e-6,
+                "{actual} versus {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn scattering_boundary_impulse_matches_closed_form_nonzero_order_goldens() {
+        let mut values = [[0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+            super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        for family in &mut values {
+            family[0] = 1.0;
+        }
+        let valid =
+            [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        let mut active = || false;
+        let summary = super::analyze_acoustic_scattering(
+            trajectory_window(&values, &valid, 0, 0, 63),
+            AcousticScatteringMode::FirstAndSecondOrder,
+            &mut active,
+        )
+        .expect("closed-form scattering impulse");
+        let family = summary.families[0];
+        assert!(!family.input_was_constant_or_near_constant);
+        assert_eq!(family.first_order_available, [true; 3]);
+        assert_eq!(family.first_order_valid_positions, [63, 61, 57]);
+        assert_eq!(family.second_order_available, [true; 3]);
+        assert_eq!(family.second_order_valid_positions, [60, 56, 54]);
+        for (actual, expected) in family.first_order_mean_modulus.into_iter().zip([
+            0.011_312_645,
+            0.008_261_519,
+            0.006_251_725,
+        ]) {
+            assert!(
+                (actual - expected).abs() < 1e-7,
+                "{actual} versus {expected}"
+            );
+        }
+        for (actual, expected) in family.second_order_mean_modulus.into_iter().zip([
+            0.005_939_139,
+            0.004_499_577,
+            0.003_299_521_5,
+        ]) {
+            assert!(
+                (actual - expected).abs() < 1e-7,
                 "{actual} versus {expected}"
             );
         }

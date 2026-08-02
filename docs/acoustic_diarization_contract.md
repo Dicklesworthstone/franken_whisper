@@ -254,15 +254,21 @@ frame/missingness counts, supported dimension counts, bounded retained state,
 and fallback/calibration state. They never expose feature values, audio,
 transcript text, paths, or recording identifiers.
 
-### 4.3.1 Experimental multiscale sidecar v2
+### 4.3.1 Experimental multiscale sidecar v3
 
-`acoustic-multiscale-sidecar-v2` is an evaluation-only surface. Its
+`acoustic-multiscale-sidecar-v3` is an evaluation-only surface. Its
 configuration defaults to `Off`, has independent per-axis mode orders and a
 SHA-256, and is not a member of the six frozen `AcousticFeatureAblation`
 variants. No
 normal transcription, segmentation, clustering, robot, or persistence path
 constructs this study. Running its arithmetic therefore cannot change the
 acoustic-v2 schema hash, feature dimensions, report bytes, or default result.
+This v3 identity corrects the pre-evidence v2 identity after the prototype's
+semantics accumulated material changes: observations bind the complete
+configuration, trajectory summaries expose independent availability,
+transforms use stationary non-wrapping geometry, and every unit-energy lane
+now rejects representationally near-constant input. None of those v2-labeled
+prototype observations are schema-compatible with v3.
 
 The current prototype implements four independently selectable, bounded
 kernel families:
@@ -296,11 +302,13 @@ preserve contiguous frame indices, and bind its extractor revision separately.
 The sidecar digest identifies configuration, schema, and sidecar arithmetic;
 it does not hash every upstream acoustic-v2 threshold or FFT-bin decision.
 
-Wavelet input is mean-centered and unit-energy normalized. DC-offset and
+Wavelet input is mean-centered and unit-energy normalized. Its centered RMS
+must first exceed `8 * f32::EPSILON * max(1, abs(input_mean))`; otherwise a
+constant or representationally near-constant frame is explicitly unavailable
+instead of having quantization residue amplified to unit energy. DC-offset and
 positive-gain invariance applies only while the centered input remains above
-the absolute silence floor and every transformed PCM sample remains within the
-submitted `[-1, 1]` domain; below the floor, the result is explicitly
-unavailable as silence. Coefficient flatness adds a configuration-hashed,
+that gate and every transformed PCM sample remains within the submitted
+`[-1, 1]` domain. Coefficient flatness adds a configuration-hashed,
 scale-relative power stabilizer equal to the level's mean detail power times `f32::EPSILON`
 to every coefficient power and to the arithmetic-mean denominator. This keeps
 the ratio gain-invariant and bounded while preventing `f32` re-quantization of
@@ -314,8 +322,8 @@ and the analysis filters then use periodic support. Haar uses
 four-tap analysis coefficients with forward taps starting at `2 * output_index`
 and approximation-then-detail output order. Every level checks a Parseval
 residual computed from raw energies, independently of reported-fraction
-clamping, and rejects a relative error above `2e-5`. Silence returns an
-explicit zero-level result rather than invented coefficients. Raw-PCM wavelets
+clamping, and rejects a relative error above `2e-5`. Silence or near-constant
+input returns an explicit zero-level result rather than invented coefficients. Raw-PCM wavelets
 combine vocal source, room, device, codec, and
 playback effects, so they may never enter a reusable voice profile.
 
@@ -324,8 +332,9 @@ family removes its valid-sample mean, residualizes the sine/cosine basis
 against the intercept, solves the checked two-coordinate least-squares system,
 and reports explained-energy fraction. A summary exists only after 64
 contiguous frames; a duplicate or gap is rejected without state mutation. A
-family requires at least 32 valid observations, non-negligible centered energy,
-and a full-rank residualized sine/cosine Gram system at every selected
+family requires at least 32 valid observations, centered RMS above
+`8 * f32::EPSILON * max(1, abs(valid_mean))`, and a full-rank residualized
+sine/cosine Gram system at every selected
 frequency. Failure of any condition makes that complete family unavailable
 with zero output rather than inventing measured absence. Invalid observations
 are omitted, never replaced with zeros. Voice validity is a broader
@@ -361,7 +370,7 @@ silently promoted into a sidecar identity.
 
 No trajectory result exists before 64 contiguous frames, and a duplicate or
 gap is rejected without advancing state. A family requires at least 32 of 64
-valid observations and non-negligible centered energy; an otherwise supported
+valid observations and centered RMS above the declared gate; an otherwise supported
 constant or near-constant family is explicitly unavailable. Specifically, its
 centered RMS must exceed `8 * f32::EPSILON * max(1, abs(valid_mean))` before
 unit-energy normalization. That representability gate prevents one-ULP input
