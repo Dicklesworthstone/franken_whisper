@@ -271,8 +271,8 @@ kernel families:
 |---|---|---|---|
 | Frame Haar or D4/db2 analysis | One exact 400-sample normalized 16 kHz frame through the configuration-bound runner; at most four levels | Per-level local detail-energy fraction, log mean-square energy, normalized entropy, coefficient flatness, crest factor, adjacent-detail change, and Parseval residual | `MixedAuxiliary` |
 | Modulation regression | A 64-frame ring at the acoustic-v2 10 ms cadence | Normalized regression power at 1.5625, 3.125, 6.25, and 12.5 Hz for the voice temporal-modulation, channel-level, and channel-coloration trajectories | `Voice`, `Channel`, and `Channel` respectively |
-| Masked trajectory Haar or D4/db2 analysis | One shared 64-frame ring of voiced cepstral-envelope magnitude, frame-local voiced occupancy, and low/mid/high band-energy fractions; at most four levels | Per-family and per-level valid support, mean absolute detail, RMS detail, normalized entropy, and separately available adjacent-detail change | `Voice` for envelope magnitude, `MixedAuxiliary` for voiced occupancy, and `Channel` for every band fraction |
-| Fixed scattering summaries | The same masked, normalized 64-frame trajectories with circular undecimated Haar supports 2, 4, and 8 | Independently selected first-order mean modulus and/or second-order mean modulus for ordered scale pairs `(2,4)`, `(2,8)`, and `(4,8)` | Same per-trajectory ownership as the masked trajectory input |
+| Masked stationary trajectory Haar or D4/db2 analysis | One shared 64-frame ring of voiced cepstral-envelope magnitude, frame-local voiced occupancy, and low/mid/high band-energy fractions; at most four levels | Per-family and per-level valid support, mean absolute detail, RMS detail, separately available normalized entropy, and separately available adjacent-detail change | `Voice` for envelope magnitude, `MixedAuxiliary` for voiced occupancy, and `Channel` for every band fraction |
+| Fixed scattering summaries | The same masked, normalized 64-frame trajectories with non-wrapping undecimated Haar supports 2, 4, and 8 | Independently selected first-order mean modulus and/or second-order mean modulus for ordered scale pairs `(2,4)`, `(2,8)`, and `(4,8)` | Same per-trajectory ownership as the masked trajectory input |
 
 The standalone wavelet kernel also accepts bounded conformance fixtures from
 the basis-specific minimum through 400 samples, and the public standalone
@@ -280,11 +280,12 @@ modulation sidecar can emit an unbound summary. Evaluation evidence must instead
 use `AcousticSidecarStudy::observe_normalized_16khz_frame`; that executor binds
 the 400-sample support, 16 kHz sample rate, 160-sample hop, selected bases,
 level counts, scattering selection, and numerical contract to one configuration
-digest. A study observation carries the raw 32-byte digest in a private,
-getter-only binding, so the configuration-bound observation type cannot be
-silently relabeled under another mode. Direct standalone or otherwise unbound
-kernel results do not carry this binding and are therefore conformance
-diagnostics, not evaluation evidence.
+digest. A study observation carries both the complete configuration and the
+raw 32-byte digest in private, getter-only bindings, so a trajectory-only or
+scattering-only result cannot be misleadingly described as merely `Off` by
+its frame-wavelet axis or silently relabeled under another configuration.
+Direct standalone or otherwise unbound kernel results do not carry this
+binding and are therefore conformance diagnostics, not evaluation evidence.
 
 Those physical declarations are caller preconditions, not content-provenance
 proof. The in-memory executor cannot verify an external sample rate, prove
@@ -361,31 +362,41 @@ silently promoted into a sidecar identity.
 No trajectory result exists before 64 contiguous frames, and a duplicate or
 gap is rejected without advancing state. A family requires at least 32 of 64
 valid observations and non-negligible centered energy; an otherwise supported
-constant or near-constant family is explicitly unavailable. Its valid
+constant or near-constant family is explicitly unavailable. Specifically, its
+centered RMS must exceed `8 * f32::EPSILON * max(1, abs(valid_mean))` before
+unit-energy normalization. That representability gate prevents one-ULP input
+jitter from becoming full-scale evidence; offset and gain invariance apply
+only while both compared trajectories remain above the gate. Its valid
 observations are mean-centered and jointly unit-energy normalized. Invalid
 observations are omitted from both moments and coefficients; they are never
-zero-imputed. A trajectory DWT coefficient exists only when every input in
-that filter support is valid, and that mask is propagated through the
-approximation path. A reported level requires at least two valid detail
-coefficients. Adjacent-detail change has its own availability flag and valid
-pair count, so a missing adjacent pair cannot masquerade as measured zero
-change. Adjacent change is linear over neighboring retained coefficients and
-does not wrap the final coefficient back to the first. The masked DWT uses
-periodic forward taps at `2 * output_index`;
-unlike the scattering aggregate, its decimated statistics are deliberately
-phase-sensitive.
+zero-imputed. The trajectory transform is an undecimated stationary cascade:
+level `j` applies forward taps at every retained position with dyadic dilation
+`2^j`, then passes the approximation path to the next level. It uses only
+non-wrapping valid support, so the newest frame is never treated as adjacent
+to the oldest and a one-frame sliding window does not re-anchor a decimation
+lattice. A coefficient exists only when every input in that filter support is
+valid, and that mask is propagated through the approximation path. A reported
+level requires at least two valid detail coefficients. Normalized entropy and
+adjacent-detail change have independent availability flags; both are
+unavailable at or below a unit-normalized detail RMS floor of
+`8 * f32::EPSILON`, preventing transform roundoff from becoming full-scale
+shape evidence. Adjacent-detail change also retains its valid-pair count, so a
+missing adjacent pair cannot masquerade as measured zero change. Adjacent
+change is linear over neighboring retained coefficients and never wraps the
+final coefficient back to the first.
 
-The scattering candidate uses fixed, zero-learned, undecimated circular Haar
-high-pass filters: the first half of each support is positive, the second half
-negative, and the complete filter has unit L2 norm. First order averages the
-valid modulus response at each support. Second order filters a first-order
-modulus path only at a larger support and averages the resulting valid
-modulus. One output requires at least eight valid circular positions. Circular
-shift invariance applies to these full-window averages, within floating-point
-tolerance, when the values and validity mask move together. Focused tests use
-`2e-6`; the promotion tolerance remains to be frozen by `.15.3`. A constant or
-near-constant normalized input is unavailable rather than reported as a bank
-of zeros. `FirstOrder`, `SecondOrder`, and `FirstAndSecondOrder` are distinct
+The scattering candidate uses fixed, zero-learned, undecimated non-wrapping
+Haar high-pass filters: the first half of each support is positive, the second
+half negative, and the complete filter has unit L2 norm. First order averages
+the valid modulus response at each support. Second order filters a first-order
+modulus path only at a larger support and averages the resulting valid modulus.
+One output requires at least eight valid positions. Non-wrapping
+support prevents a smooth trend or single regime boundary from acquiring an
+artificial reverse transition at the window seam. Focused analytic ramp and
+scalar differential tests use `2e-6`; the promotion tolerance remains to be
+frozen by `.15.3`. A constant or near-constant input trajectory is rejected
+before normalization rather than reported as a bank of zeros. `FirstOrder`,
+`SecondOrder`, and `FirstAndSecondOrder` are distinct
 hashed selections. `SecondOrder` computes
 only prerequisite first-order supports 2 and 4, then deliberately leaves
 first-order output fields unavailable and zero. The combined selection also
@@ -394,25 +405,26 @@ with hidden intermediate work.
 
 Cancellation is checked before a study frame, before wavelet levels, before
 each modulation family, before each selected frequency, before each trajectory
-family and DWT level, and before each scattering scale and scale pair. The
-modulation and trajectory states are cloned together and committed only after
-every enabled family succeeds. A cancelled frame can therefore be retried
-without a hidden advance in either ring, including cancellation after the
-modulation projections have completed but before trajectory analysis begins.
+family and stationary-wavelet level, and before each scattering scale and
+scale pair. The modulation and trajectory states are cloned together and
+committed only after every enabled family succeeds. A cancelled frame can
+therefore be retried without a hidden advance in either ring, including
+cancellation after the modulation projections have completed but before
+trajectory analysis begins.
 Diagnostics name filter-tap terms, validity-mask visits, valid
 sample-frequency visits, exact buffer/table payload bytes, and target-specific
 in-struct bytes. On direct five-family, fully valid conformance arrays, four
-trajectory levels use 1,200 filter-tap terms and 600 validity visits for Haar,
-or 2,400 and 1,200 for D4. Full-valid first-order scattering uses 4,480 filter
-terms and visits; second-order uses 8,320; combined selection uses 10,880.
-The trajectory-DWT scratch payload is 960 bytes. Scattering scratch is 1,280
+stationary trajectory levels use 4,600 filter-tap terms and 2,300 validity
+visits for Haar, or 7,120 and 3,560 for D4. Full-valid first-order scattering
+uses 4,130 filter terms and visits; second-order uses 7,450; combined selection
+uses 9,730. The trajectory-wavelet scratch payload is 960 bytes. Scattering scratch is 1,280
 bytes for first order alone and 1,600 bytes whenever second order is selected
 on the declared Rust representation. A visit
 count is not a scalar FLOP count, and none of these fields is a stack or RSS
 bound. Wall time, RTF, and sampled RSS belong in the outer public evaluator so
 host-dependent measurements cannot contaminate deterministic accuracy hashes.
 
-All frame-wavelet, modulation, trajectory-DWT, and scattering results remain
+All frame-wavelet, modulation, trajectory-wavelet, and scattering results remain
 signal-derived. They intentionally have no serialization implementation, and
 their custom `Debug` output omits feature values. Source-derived, public-corpus,
 or per-recording sidecar observations and feature values must not be logged,
@@ -423,11 +435,12 @@ only aggregate, path-free and transcript-free metrics plus schema/configuration
 hashes, operation counts, performance observations, and a self-hash.
 
 This prototype is not an accuracy result or promotion. Focused synthetic/unit
-checks cover bounded arithmetic, independent transform oracles, masked
-band-energy trajectory DWT, fixed first/second-order scattering summaries, a
+checks cover bounded arithmetic, fixed transform goldens plus in-tree scalar
+differential references, masked
+band-energy stationary trajectory wavelets, fixed first/second-order scattering summaries, a
 Voice-owned voiced-envelope magnitude trajectory, frame-local occupancy,
 cancellation rollback,
-missingness boundaries, affine and circular-shift metamorphic checks,
+missingness boundaries, affine and one-frame-translation metamorphic checks,
 fixed-state accounting, configuration separation, and default-path isolation.
 It does not yet include multi-coordinate cepstral trajectory candidates—the
 current RMS magnitude intentionally collapses coefficient sign and ordering—a
