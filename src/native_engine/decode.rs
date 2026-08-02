@@ -2219,6 +2219,105 @@ fn decode_independent_no_timestamp_windows(
     })
 }
 
+fn batch_transcription_lanes(input_count: usize, thread_budget: usize) -> usize {
+    const THREADS_PER_STREAM: usize = 8;
+    if input_count == 0 {
+        return 0;
+    }
+    input_count.min((thread_budget.max(1) / THREADS_PER_STREAM).max(1))
+}
+
+/// Transcribe several independent audio inputs as one shared-model job.
+///
+/// A `whisper-cli` process normally walks its input files serially even though a
+/// single decode leaves substantial cores idle during latency-bound token steps.
+/// This entry point keeps one immutable [`LoadedModel`] resident, caps the number
+/// of simultaneous streams to one per eight requested threads, and lets their
+/// nested encoder/decoder work share one Rayon pool. The pool therefore steals
+/// useful work across clips instead of multiplying per-clip thread pools or
+/// reloading the model. Results retain input order, and each element is produced
+/// by the unchanged [`transcribe_samples`] path.
+///
+/// # Errors
+///
+/// Returns the first input error in input order, or an I/O error if the bounded
+/// worker pool cannot be created.
+pub fn transcribe_samples_batch(
+    m: &LoadedModel,
+    inputs: &[&[f32]],
+    params: &DecodeParams,
+    checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+) -> FwResult<Vec<DecodeOutput>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let thread_budget = if params.n_threads == 0 {
+        super::default_threads()
+    } else {
+        params.n_threads
+    }
+    .max(1);
+    let lanes = batch_transcription_lanes(inputs.len(), thread_budget);
+    if lanes == 1 {
+        return inputs
+            .iter()
+            .map(|samples| transcribe_samples(m, samples, params, checkpoint))
+            .collect();
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_budget)
+        .thread_name(|index| format!("fw-batch-{index}"))
+        .build()
+        .map_err(|error| {
+            FwError::Io(std::io::Error::other(format!(
+                "build transcription batch pool: {error}"
+            )))
+        })?;
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<FwResult<DecodeOutput>>>> =
+        (0..inputs.len()).map(|_| Mutex::new(None)).collect();
+
+    std::thread::scope(|scope| {
+        for _ in 0..lanes {
+            let pool = &pool;
+            let next = &next;
+            let slots = &slots;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(samples) = inputs.get(index) else {
+                        break;
+                    };
+                    let result =
+                        pool.install(|| transcribe_samples(m, samples, params, checkpoint));
+                    *slots[index]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+                }
+            });
+        }
+    });
+
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            slot.into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(|| {
+                    Err(FwError::InvalidRequest(format!(
+                        "batch scheduler omitted input {index}"
+                    )))
+                })
+        })
+        .collect()
+}
+
 /// Transcribe 16 kHz mono PCM `samples` with the greedy / temperature-0 path of
 /// whisper, returning timed segments + per-window QC statistics.
 ///
@@ -4348,6 +4447,16 @@ mod tests {
         assert_eq!(parallel_no_context_window_lanes(5, 64, 64, 1), 5);
         assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 1), 8);
         assert_eq!(parallel_no_context_window_lanes(12, 128, 128, 1), 12);
+    }
+
+    #[test]
+    fn batch_transcription_lanes_bound_streams_and_cover_small_pools() {
+        assert_eq!(batch_transcription_lanes(0, 64), 0);
+        assert_eq!(batch_transcription_lanes(8, 1), 1);
+        assert_eq!(batch_transcription_lanes(8, 7), 1);
+        assert_eq!(batch_transcription_lanes(8, 16), 2);
+        assert_eq!(batch_transcription_lanes(100, 64), 8);
+        assert_eq!(batch_transcription_lanes(3, 128), 3);
     }
 
     // Beam search makes a window decode-dominated and latency-bound, so the
