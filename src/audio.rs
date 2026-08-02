@@ -984,6 +984,10 @@ pub fn resample_mono_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<
     output
 }
 
+#[allow(
+    clippy::manual_clamp,
+    reason = "max/min avoids a documented aarch64 nightly clamp miscompile"
+)]
 fn write_mono_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) -> FwResult<()> {
     const WRITE_CHUNK_SAMPLES: usize = 8_192;
 
