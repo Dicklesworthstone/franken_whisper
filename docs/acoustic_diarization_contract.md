@@ -254,38 +254,53 @@ frame/missingness counts, supported dimension counts, bounded retained state,
 and fallback/calibration state. They never expose feature values, audio,
 transcript text, paths, or recording identifiers.
 
-### 4.3.1 Experimental wavelet and modulation sidecar v1
+### 4.3.1 Experimental multiscale sidecar v2
 
-`acoustic-wavelet-modulation-sidecar-v1` is an evaluation-only surface. Its
-configuration defaults to `Off`, has an independent mode order and SHA-256,
-and is not a member of the six frozen `AcousticFeatureAblation` variants. No
+`acoustic-multiscale-sidecar-v2` is an evaluation-only surface. Its
+configuration defaults to `Off`, has independent per-axis mode orders and a
+SHA-256, and is not a member of the six frozen `AcousticFeatureAblation`
+variants. No
 normal transcription, segmentation, clustering, robot, or persistence path
 constructs this study. Running its arithmetic therefore cannot change the
 acoustic-v2 schema hash, feature dimensions, report bytes, or default result.
 
-The current prototype implements two bounded kernel families:
+The current prototype implements four independently selectable, bounded
+kernel families:
 
 | Family | Input and support | Output | Owner |
 |---|---|---|---|
-| Haar or D4/db2 analysis | One exact 400-sample normalized 16 kHz frame through the configuration-bound runner; at most four levels | Per-level local detail-energy fraction, log mean-square energy, normalized entropy, coefficient flatness, crest factor, adjacent-detail change, and Parseval residual | `MixedAuxiliary` |
+| Frame Haar or D4/db2 analysis | One exact 400-sample normalized 16 kHz frame through the configuration-bound runner; at most four levels | Per-level local detail-energy fraction, log mean-square energy, normalized entropy, coefficient flatness, crest factor, adjacent-detail change, and Parseval residual | `MixedAuxiliary` |
 | Modulation regression | A 64-frame ring at the acoustic-v2 10 ms cadence | Normalized regression power at 1.5625, 3.125, 6.25, and 12.5 Hz for the voice temporal-modulation, channel-level, and channel-coloration trajectories | `Voice`, `Channel`, and `Channel` respectively |
+| Masked trajectory Haar or D4/db2 analysis | One shared 64-frame ring of voiced cepstral-envelope magnitude, frame-local voiced occupancy, and low/mid/high band-energy fractions; at most four levels | Per-family and per-level valid support, mean absolute detail, RMS detail, normalized entropy, and separately available adjacent-detail change | `Voice` for envelope magnitude, `MixedAuxiliary` for voiced occupancy, and `Channel` for every band fraction |
+| Fixed scattering summaries | The same masked, normalized 64-frame trajectories with circular undecimated Haar supports 2, 4, and 8 | Independently selected first-order mean modulus and/or second-order mean modulus for ordered scale pairs `(2,4)`, `(2,8)`, and `(4,8)` | Same per-trajectory ownership as the masked trajectory input |
 
 The standalone wavelet kernel also accepts bounded conformance fixtures from
-the basis-specific minimum through 400 samples, but evidence must use
-`AcousticSidecarStudy::observe_normalized_16khz_frame`; that executor binds
-the 400-sample support, 16 kHz sample rate, 160-sample hop, selected basis,
-level count, and numerical contract to one configuration digest. A study
-observation carries the raw 32-byte digest in a private, getter-only binding,
-so the configuration-bound observation type cannot be silently relabeled
-under another mode. Direct standalone kernel results do not carry this binding
-and are therefore conformance diagnostics, not evaluation evidence.
+the basis-specific minimum through 400 samples, and the public standalone
+modulation sidecar can emit an unbound summary. Evaluation evidence must instead
+use `AcousticSidecarStudy::observe_normalized_16khz_frame`; that executor binds
+the 400-sample support, 16 kHz sample rate, 160-sample hop, selected bases,
+level counts, scattering selection, and numerical contract to one configuration
+digest. A study observation carries the raw 32-byte digest in a private,
+getter-only binding, so the configuration-bound observation type cannot be
+silently relabeled under another mode. Direct standalone or otherwise unbound
+kernel results do not carry this binding and are therefore conformance
+diagnostics, not evaluation evidence.
+
+Those physical declarations are caller preconditions, not content-provenance
+proof. The in-memory executor cannot verify an external sample rate, prove
+that successive arrays advance by exactly 160 samples, or infer that a
+separately supplied `AcousticFrameFeatures` value was derived from the same
+PCM array. A valid evaluator must construct both from one normalized stream,
+preserve contiguous frame indices, and bind its extractor revision separately.
+The sidecar digest identifies configuration, schema, and sidecar arithmetic;
+it does not hash every upstream acoustic-v2 threshold or FFT-bin decision.
 
 Wavelet input is mean-centered and unit-energy normalized. DC-offset and
 positive-gain invariance applies only while the centered input remains above
-the absolute silence floor; below it, the result is explicitly unavailable as
-silence, and a DC shift must leave every submitted PCM sample within
-`[-1, 1]`. Coefficient flatness adds a configuration-hashed, scale-relative
-power stabilizer equal to the level's mean detail power times `f32::EPSILON`
+the absolute silence floor and every transformed PCM sample remains within the
+submitted `[-1, 1]` domain; below the floor, the result is explicitly
+unavailable as silence. Coefficient flatness adds a configuration-hashed,
+scale-relative power stabilizer equal to the level's mean detail power times `f32::EPSILON`
 to every coefficient power and to the arithmetic-mean denominator. This keeps
 the ratio gain-invariant and bounded while preventing `f32` re-quantization of
 mathematically zero coefficients after a DC shift from dominating the
@@ -296,18 +311,24 @@ duplicates its final sample, which is right half-sample symmetric extension,
 and the analysis filters then use periodic support. Haar uses
 `[1/sqrt(2), 1/sqrt(2)]` and `[1/sqrt(2), -1/sqrt(2)]`. D4 uses the frozen
 four-tap analysis coefficients with forward taps starting at `2 * output_index`
-and approximation-then-detail output order. Every level checks the raw Parseval
-residual before clamping reported fractions and rejects a relative error above
-`2e-5`. Silence returns an explicit zero-level result rather than invented
-coefficients. Raw-PCM wavelets combine vocal source, room, device, codec, and
+and approximation-then-detail output order. Every level checks a Parseval
+residual computed from raw energies, independently of reported-fraction
+clamping, and rejects a relative error above `2e-5`. Silence returns an
+explicit zero-level result rather than invented coefficients. Raw-PCM wavelets
+combine vocal source, room, device, codec, and
 playback effects, so they may never enter a reusable voice profile.
 
 Modulation outputs are point-frequency regressions, not frequency bands. Each
 family removes its valid-sample mean, residualizes the sine/cosine basis
 against the intercept, solves the checked two-coordinate least-squares system,
-and reports explained-energy fraction. A family requires at least 32 of 64
-valid observations; invalid observations are omitted, never replaced with
-zeros. Voice validity is a broader sidecar-specific temporal-modulation mask:
+and reports explained-energy fraction. A summary exists only after 64
+contiguous frames; a duplicate or gap is rejected without state mutation. A
+family requires at least 32 valid observations, non-negligible centered energy,
+and a full-rank residualized sine/cosine Gram system at every selected
+frequency. Failure of any condition makes that complete family unavailable
+with zero output rather than inventing measured absence. Invalid observations
+are omitted, never replaced with zeros. Voice validity is a broader
+sidecar-specific temporal-modulation mask:
 voiced, non-low-energy, non-clipped, non-transient, and with a positive frame
 index. Unlike the acoustic-v2 identity mask, it intentionally does not require
 reliable pitch or RMS at or above -50 dBFS; public coverage and channel-confound
@@ -318,31 +339,102 @@ recurrence are configuration-hashed and avoid target-varying runtime
 transcendental calls. The summary retains the valid counts, so an evaluator can
 measure coverage and reject a candidate that works only on easy speech.
 
+The trajectory ring has canonical family order
+`voiced_cepstral_envelope_magnitude`, `voiced_occupancy`, `low_band_fraction`,
+`mid_band_fraction`, `high_band_fraction`, and canonical oldest-to-newest time
+order. Cepstral-envelope magnitude is the frame-local RMS across all 12
+gain-centered acoustic-v2 cepstral-envelope coordinates. It is voice-owned and
+valid on a voiced, non-low-energy, non-clipped, non-transient frame; it has no
+predecessor-frame or positive-index dependency. Gain centering removes level,
+not room, device, or codec coloration, so `Voice` remains a provisional study
+axis subject to the channel-confound gate rather than proof of reusable identity.
+Voiced occupancy is the frame-local binary `quality.voiced` indicator, not the
+history-bearing `voiced_fraction` IIR; it is valid whenever the frame is not
+clipped and remains mixed auxiliary activity evidence rather than reusable
+speaker identity. Each band fraction is valid only on a non-low-energy,
+non-clipped frame and remains channel-owned. With the current 40 Hz FFT-bin
+centers, acoustic-v2 derives the fractions over half-open bin-index ranges
+whose centers are 0-440 Hz, 480-1,960 Hz, and 2,000-8,000 Hz respectively.
+Those truncated extractor cut points are upstream provenance and are not
+silently promoted into a sidecar identity.
+
+No trajectory result exists before 64 contiguous frames, and a duplicate or
+gap is rejected without advancing state. A family requires at least 32 of 64
+valid observations and non-negligible centered energy; an otherwise supported
+constant or near-constant family is explicitly unavailable. Its valid
+observations are mean-centered and jointly unit-energy normalized. Invalid
+observations are omitted from both moments and coefficients; they are never
+zero-imputed. A trajectory DWT coefficient exists only when every input in
+that filter support is valid, and that mask is propagated through the
+approximation path. A reported level requires at least two valid detail
+coefficients. Adjacent-detail change has its own availability flag and valid
+pair count, so a missing adjacent pair cannot masquerade as measured zero
+change. Adjacent change is linear over neighboring retained coefficients and
+does not wrap the final coefficient back to the first. The masked DWT uses
+periodic forward taps at `2 * output_index`;
+unlike the scattering aggregate, its decimated statistics are deliberately
+phase-sensitive.
+
+The scattering candidate uses fixed, zero-learned, undecimated circular Haar
+high-pass filters: the first half of each support is positive, the second half
+negative, and the complete filter has unit L2 norm. First order averages the
+valid modulus response at each support. Second order filters a first-order
+modulus path only at a larger support and averages the resulting valid
+modulus. One output requires at least eight valid circular positions. Circular
+shift invariance applies to these full-window averages, within floating-point
+tolerance, when the values and validity mask move together. Focused tests use
+`2e-6`; the promotion tolerance remains to be frozen by `.15.3`. A constant or
+near-constant normalized input is unavailable rather than reported as a bank
+of zeros. `FirstOrder`, `SecondOrder`, and `FirstAndSecondOrder` are distinct
+hashed selections. `SecondOrder` computes
+only prerequisite first-order supports 2 and 4, then deliberately leaves
+first-order output fields unavailable and zero. The combined selection also
+computes and reports support 8. Selected evidence therefore cannot be confused
+with hidden intermediate work.
+
 Cancellation is checked before a study frame, before wavelet levels, before
-each modulation family, and before each selected frequency. Modulation updates
-are staged and committed only after every enabled projection succeeds, so a
-cancelled frame can be retried without a hidden ring advance. Diagnostics name
-filter-tap terms, valid sample-frequency visits, exact buffer/table payload
-bytes, and target-specific in-struct bytes. A visit count is not a scalar FLOP
-count, and none of these fields is a stack or RSS bound. Wall time, RTF, and
-sampled RSS belong in the outer public evaluator so host-dependent measurements
-cannot contaminate deterministic accuracy hashes.
+each modulation family, before each selected frequency, before each trajectory
+family and DWT level, and before each scattering scale and scale pair. The
+modulation and trajectory states are cloned together and committed only after
+every enabled family succeeds. A cancelled frame can therefore be retried
+without a hidden advance in either ring, including cancellation after the
+modulation projections have completed but before trajectory analysis begins.
+Diagnostics name filter-tap terms, validity-mask visits, valid
+sample-frequency visits, exact buffer/table payload bytes, and target-specific
+in-struct bytes. On direct five-family, fully valid conformance arrays, four
+trajectory levels use 1,200 filter-tap terms and 600 validity visits for Haar,
+or 2,400 and 1,200 for D4. Full-valid first-order scattering uses 4,480 filter
+terms and visits; second-order uses 8,320; combined selection uses 10,880.
+The trajectory-DWT scratch payload is 960 bytes. Scattering scratch is 1,280
+bytes for first order alone and 1,600 bytes whenever second order is selected
+on the declared Rust representation. A visit
+count is not a scalar FLOP count, and none of these fields is a stack or RSS
+bound. Wall time, RTF, and sampled RSS belong in the outer public evaluator so
+host-dependent measurements cannot contaminate deterministic accuracy hashes.
 
-All wavelet and modulation results remain signal-derived. They intentionally
-have no serialization implementation, and their custom `Debug` output omits
-feature values. They must not be logged, written to SQLite/JSONL, placed in a
-speaker-profile store, or retained in repository evidence. A future public
-study artifact may retain only aggregate, path-free and transcript-free
-metrics plus schema/configuration hashes, operation counts, performance
-observations, and a self-hash.
+All frame-wavelet, modulation, trajectory-DWT, and scattering results remain
+signal-derived. They intentionally have no serialization implementation, and
+their custom `Debug` output omits feature values. Source-derived, public-corpus,
+or per-recording sidecar observations and feature values must not be logged,
+written to SQLite/JSONL, placed in a speaker-profile store, or retained in
+repository evidence. Deterministically generated synthetic conformance values
+and goldens may remain in unit tests. A future public study artifact may retain
+only aggregate, path-free and transcript-free metrics plus schema/configuration
+hashes, operation counts, performance observations, and a self-hash.
 
-This prototype is not an accuracy result or promotion. Current proof covers
-bounded arithmetic, transform goldens, cancellation, missingness, fixed-state
-accounting, and default-path isolation. It does not yet include the requested
-voiced-envelope or subband DWT, first/second-order scattering-inspired
-candidate, cepstral and band-energy trajectory modulation, public pair and
-boundary discrimination, DER/JER/count/calibration results, or held-out
-certification. `bd-odj7.13.15` therefore remains in progress.
+This prototype is not an accuracy result or promotion. Focused synthetic/unit
+checks cover bounded arithmetic, independent transform oracles, masked
+band-energy trajectory DWT, fixed first/second-order scattering summaries, a
+Voice-owned voiced-envelope magnitude trajectory, frame-local occupancy,
+cancellation rollback,
+missingness boundaries, affine and circular-shift metamorphic checks,
+fixed-state accounting, configuration separation, and default-path isolation.
+It does not yet include multi-coordinate cepstral trajectory candidates—the
+current RMS magnitude intentionally collapses coefficient sign and ordering—a
+public sidecar evaluator, public pair and boundary discrimination,
+DER/JER/count/calibration results, RTF/RSS evidence,
+or held-out certification. Nothing in this section establishes that any new
+candidate improves diarization. `bd-odj7.13.15` therefore remains in progress.
 
 The future sidecar evaluator must be a schema separate from public acoustic
 ablation v8. It must freeze the full-v2 baseline and candidate order before
