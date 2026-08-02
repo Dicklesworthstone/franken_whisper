@@ -3122,15 +3122,42 @@ pub struct FeatureExtractionSummary {
 pub const ACOUSTIC_WAVELET_MAX_SAMPLES: usize = ACOUSTIC_FRAME_SAMPLES;
 /// Maximum decomposition depth admitted by the experimental sidecar.
 pub const ACOUSTIC_WAVELET_MAX_LEVELS: usize = 4;
+/// Maximum admitted relative Parseval residual for one transform level.
+pub const ACOUSTIC_WAVELET_ENERGY_TOLERANCE: f32 = 2e-5;
+/// Relative power added to every coefficient when computing wavelet flatness.
+///
+/// DWT coefficients are retained as `f32`, so mathematically zero values can
+/// acquire representation noise after a DC offset is added and removed. A
+/// scale-relative floor preserves gain invariance without changing acoustic-v2.
+pub const ACOUSTIC_WAVELET_FLATNESS_RELATIVE_POWER_FLOOR: f32 = f32::EPSILON;
 /// Independent contract identity for the evaluation-only sidecar surface.
 pub const ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION: &str = "acoustic-wavelet-modulation-sidecar-v1";
 /// Fixed temporal support of the modulation sidecar at the 10 ms cadence.
 pub const ACOUSTIC_MODULATION_HISTORY_FRAMES: usize = 64;
-/// Fixed modulation frequencies represented by bins 1, 2, 4, and 8 of a
-/// 64-frame window sampled at 100 Hz.
-pub const ACOUSTIC_MODULATION_BAND_HZ: [f32; 4] = [1.5625, 3.125, 6.25, 12.5];
+/// Minimum valid trajectory observations required by a modulation regression.
+pub const ACOUSTIC_MODULATION_MIN_VALID_FRAMES: usize = 32;
+/// Fixed modulation frequencies represented by harmonics 1, 2, 4, and 8 of a
+/// 64-frame window sampled at 100 Hz. These are point frequencies, not bands.
+pub const ACOUSTIC_MODULATION_FREQUENCY_HZ: [f32; 4] = [1.5625, 3.125, 6.25, 12.5];
 
 const ACOUSTIC_MODULATION_BIN_INDICES: [usize; 4] = [1, 2, 4, 8];
+const ACOUSTIC_MODULATION_STEP_COMPLEX: [[f64; 2]; 4] = [
+    [0.995_184_726_672_196_9, -0.098_017_140_329_560_6],
+    [0.980_785_280_403_230_4, -0.195_090_322_016_128_25],
+    [0.923_879_532_511_286_7, -0.382_683_432_365_089_8],
+    [
+        std::f64::consts::FRAC_1_SQRT_2,
+        -std::f64::consts::FRAC_1_SQRT_2,
+    ],
+];
+const HAAR_LOW: [f64; 2] = [
+    std::f64::consts::FRAC_1_SQRT_2,
+    std::f64::consts::FRAC_1_SQRT_2,
+];
+const HAAR_HIGH: [f64; 2] = [
+    std::f64::consts::FRAC_1_SQRT_2,
+    -std::f64::consts::FRAC_1_SQRT_2,
+];
 const DAUBECHIES_FOUR_TAP_LOW: [f64; 4] = [
     0.482_962_913_144_534_16,
     0.836_516_303_737_807_9,
@@ -3236,42 +3263,106 @@ impl AcousticSidecarStudyConfig {
 
 /// Canonical configuration fingerprint for an evaluation-only sidecar lane.
 ///
-/// The hash binds the frozen acoustic-v2 base plus every numerical, boundary,
-/// validity, ownership, and operation-accounting convention used below.
+/// The hash binds the frozen acoustic-v2 base plus the numerical, boundary,
+/// validity, ownership, cancellation, and accounting conventions used below.
 pub fn acoustic_sidecar_study_config_sha256(
     config: AcousticSidecarStudyConfig,
 ) -> FwResult<String> {
+    Ok(sidecar_sha256_hex(&acoustic_sidecar_study_config_digest(
+        config,
+    )?))
+}
+
+fn acoustic_sidecar_study_config_digest(config: AcousticSidecarStudyConfig) -> FwResult<[u8; 32]> {
     config.validate()?;
     let mut hasher = Sha256::new();
     for field in [
         ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION,
         ACOUSTIC_FEATURE_SCHEMA_VERSION,
         config.mode.id(),
+        "configured-runner=exact-400-sample-16khz-frame-at-160-sample-hop",
         "mean-center-energy-normalize",
-        "whole-point-symmetric-to-even-then-periodic",
+        "right-half-sample-symmetric-endpoint-duplicate-to-even-then-periodic",
         "approximation-then-detail-level-order",
+        "wavelet-analysis-phase=forward-taps-at-two-times-output-index",
         "detail-energy-local-to-level",
-        "voice=cepstral-delta-magnitude",
-        "channel=rms-dbfs-and-muffling",
-        "complete-contiguous-64-frame-validity",
-        "variance-fraction-positive-frequency-normalization",
-        "filter-tap-and-valid-projection-term-accounting",
+        "detail-stats=energy-fraction-ln-mean-square-entropy-flatness-crest-adjacent-change",
+        "coefficient-flatness=geometric-mean-of-power-plus-relative-floor-over-mean-power-plus-relative-floor",
+        "d4-minimum-support=4-times-two-to-level-minus-one",
+        "voice=temporal-modulation-mean-absolute-dct-delta",
+        "voice-valid=voiced-and-not-low-energy-clipped-transient-and-frame-index-positive",
+        "channel-level=rms-dbfs",
+        "channel-coloration=muffling-proxy",
+        "channel-valid=not-low-energy-and-not-clipped",
+        "minimum-32-of-64-valid-no-zero-fill",
+        "modulation-ring=oldest-index-forward-to-newest",
+        "twiddles=unit-seed-forward-complex-recurrence-negative-imaginary",
+        "intercept-residualized-sine-cosine-regression-r-squared",
+        "wavelet-owner=mixed-auxiliary",
+        "modulation-owners=voice-channel-channel",
+        "cancellation=entry-level-family-frequency-with-staged-modulation-commit",
+        "filter-tap-and-valid-sample-frequency-visit-accounting",
     ] {
         hasher.update((field.len() as u64).to_le_bytes());
         hasher.update(field.as_bytes());
     }
+    let acoustic_v2_sha256 = acoustic_feature_schema_sha256(AcousticFeatureSchemaVersion::V2);
+    hasher.update((acoustic_v2_sha256.len() as u64).to_le_bytes());
+    hasher.update(acoustic_v2_sha256.as_bytes());
     hasher.update((config.wavelet_levels as u64).to_le_bytes());
+    hasher.update((crate::native_engine::mel::SAMPLE_RATE as u64).to_le_bytes());
+    hasher.update((ACOUSTIC_FRAME_SAMPLES as u64).to_le_bytes());
+    hasher.update((ACOUSTIC_HOP_SAMPLES as u64).to_le_bytes());
+    hasher.update((ACOUSTIC_WAVELET_MAX_SAMPLES as u64).to_le_bytes());
+    hasher.update((ACOUSTIC_WAVELET_MAX_LEVELS as u64).to_le_bytes());
     hasher.update((ACOUSTIC_MODULATION_HISTORY_FRAMES as u64).to_le_bytes());
-    for frequency in ACOUSTIC_MODULATION_BAND_HZ {
+    hasher.update((ACOUSTIC_MODULATION_MIN_VALID_FRAMES as u64).to_le_bytes());
+    hasher.update(PCM_EPSILON.to_bits().to_le_bytes());
+    hasher.update(POWER_EPSILON.to_bits().to_le_bytes());
+    hasher.update(ACOUSTIC_WAVELET_ENERGY_TOLERANCE.to_bits().to_le_bytes());
+    hasher.update(
+        ACOUSTIC_WAVELET_FLATNESS_RELATIVE_POWER_FLOOR
+            .to_bits()
+            .to_le_bytes(),
+    );
+    for bin in ACOUSTIC_MODULATION_BIN_INDICES {
+        hasher.update((bin as u64).to_le_bytes());
+    }
+    for frequency in ACOUSTIC_MODULATION_FREQUENCY_HZ {
         hasher.update(frequency.to_bits().to_le_bytes());
     }
-    for coefficient in DAUBECHIES_FOUR_TAP_LOW
+    for component in ACOUSTIC_MODULATION_STEP_COMPLEX.into_iter().flatten() {
+        hasher.update(component.to_bits().to_le_bytes());
+    }
+    for frequency in &MODULATION_TWIDDLES {
+        for twiddle in frequency {
+            for component in twiddle {
+                hasher.update(component.to_bits().to_le_bytes());
+            }
+        }
+    }
+    for coefficient in HAAR_LOW
         .into_iter()
+        .chain(HAAR_HIGH)
+        .chain(DAUBECHIES_FOUR_TAP_LOW)
         .chain(DAUBECHIES_FOUR_TAP_HIGH)
     {
         hasher.update(coefficient.to_bits().to_le_bytes());
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let digest = hasher.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+fn sidecar_sha256_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 /// One explicitly selected orthogonal wavelet family.
@@ -3360,8 +3451,9 @@ pub struct AcousticWaveletSummary {
     /// Number of low/high analysis-filter coefficient applications.
     pub filter_tap_terms: usize,
     pub maximum_energy_conservation_relative_error: f32,
-    /// Fixed stack scratch bound; no duration-proportional allocation occurs.
-    pub scratch_bytes_upper_bound: usize,
+    /// Exact payload bytes of the three fixed scratch buffers. Compiler stack
+    /// layout and local scalar metadata are deliberately outside this value.
+    pub scratch_buffer_payload_bytes: usize,
 }
 
 impl std::fmt::Debug for AcousticWaveletSummary {
@@ -3378,18 +3470,22 @@ impl std::fmt::Debug for AcousticWaveletSummary {
                 "maximum_energy_conservation_relative_error",
                 &self.maximum_energy_conservation_relative_error,
             )
-            .field("scratch_bytes_upper_bound", &self.scratch_bytes_upper_bound)
+            .field(
+                "scratch_buffer_payload_bytes",
+                &self.scratch_buffer_payload_bytes,
+            )
             .finish_non_exhaustive()
     }
 }
 
 /// Analyze one normalized PCM window with a bounded orthogonal DWT.
 ///
-/// Input is mean-centered and energy-normalized before analysis, making the
-/// descriptors invariant to DC offset and positive gain. Odd widths use a
-/// declared whole-point symmetric extension to the next even width, followed
-/// by periodized filter support. Cancellation is checked before validation and
-/// between decomposition levels.
+/// Input is mean-centered and energy-normalized before analysis. For inputs
+/// that remain above the absolute silence floor, this makes the descriptors
+/// invariant to DC offset and positive gain up to floating-point roundoff. Odd
+/// widths use a declared right half-sample symmetric extension (duplicate the
+/// final sample) to the next even width, followed by periodized filter support.
+/// Cancellation is checked before validation and between decomposition levels.
 pub fn analyze_acoustic_wavelet<C>(
     samples: &[f32],
     config: AcousticWaveletConfig,
@@ -3443,7 +3539,7 @@ where
             centered * centered
         })
         .sum::<f64>();
-    let scratch_bytes_upper_bound = std::mem::size_of_val(&current)
+    let scratch_buffer_payload_bytes = std::mem::size_of_val(&current)
         + std::mem::size_of_val(&approximation)
         + std::mem::size_of_val(&detail);
     if centered_energy <= f64::from(PCM_EPSILON * PCM_EPSILON) {
@@ -3457,7 +3553,7 @@ where
             final_approximation_energy_fraction: 0.0,
             filter_tap_terms: 0,
             maximum_energy_conservation_relative_error: 0.0,
-            scratch_bytes_upper_bound,
+            scratch_buffer_payload_bytes,
         });
     }
     let inverse_norm = centered_energy.sqrt().recip();
@@ -3502,7 +3598,7 @@ where
             0.0
         };
         if !energy_conservation_relative_error.is_finite()
-            || energy_conservation_relative_error > 2e-5
+            || energy_conservation_relative_error > ACOUSTIC_WAVELET_ENERGY_TOLERANCE
         {
             return Err(FwError::InvalidRequest(format!(
                 "acoustic wavelet energy invariant failed at level {level}"
@@ -3533,7 +3629,7 @@ where
         final_approximation_energy_fraction,
         filter_tap_terms,
         maximum_energy_conservation_relative_error,
-        scratch_bytes_upper_bound,
+        scratch_buffer_payload_bytes,
     })
 }
 
@@ -3573,10 +3669,9 @@ fn wavelet_pair(
         AcousticWaveletBasis::Haar => {
             let left = wavelet_extended_sample(input, input_len, base);
             let right = wavelet_extended_sample(input, input_len, base + 1);
-            let scale = std::f64::consts::FRAC_1_SQRT_2;
             (
-                ((left + right) * scale) as f32,
-                ((left - right) * scale) as f32,
+                (HAAR_LOW[0] * left + HAAR_LOW[1] * right) as f32,
+                (HAAR_HIGH[0] * left + HAAR_HIGH[1] * right) as f32,
                 4,
             )
         }
@@ -3601,9 +3696,15 @@ fn summarize_wavelet_detail(
         .iter()
         .map(|value| f64::from(*value) * f64::from(*value))
         .sum::<f64>();
+    let detail_energy_fraction = if level_input_energy > 0.0 {
+        (detail_energy / level_input_energy).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
     if detail_energy <= f64::from(PCM_EPSILON * PCM_EPSILON) {
         return (
             AcousticWaveletLevelSummary {
+                detail_energy_fraction,
                 detail_log_energy: POWER_EPSILON.ln(),
                 ..AcousticWaveletLevelSummary::default()
             },
@@ -3645,24 +3746,22 @@ fn summarize_wavelet_detail(
     };
     let log_floor = f64::from(POWER_EPSILON);
     let coefficient_flatness = {
+        let relative_floor =
+            mean_squared * f64::from(ACOUSTIC_WAVELET_FLATNESS_RELATIVE_POWER_FLOOR);
         let geometric_mean = (detail
             .iter()
             .map(|value| {
                 let squared = f64::from(*value) * f64::from(*value);
-                squared.max(log_floor).ln()
+                (squared + relative_floor).ln()
             })
             .sum::<f64>()
             / detail.len() as f64)
             .exp();
-        (geometric_mean / mean_squared.max(log_floor)).clamp(0.0, 1.0)
+        (geometric_mean / (mean_squared + relative_floor)).clamp(0.0, 1.0)
     };
     (
         AcousticWaveletLevelSummary {
-            detail_energy_fraction: if level_input_energy > 0.0 {
-                (detail_energy / level_input_energy).clamp(0.0, 1.0) as f32
-            } else {
-                0.0
-            },
+            detail_energy_fraction,
             detail_log_energy: mean_squared.max(log_floor).ln() as f32,
             normalized_entropy: normalized_entropy as f32,
             coefficient_flatness: coefficient_flatness as f32,
@@ -3691,10 +3790,14 @@ pub struct AcousticModulationSummary {
     pub voice_owner: AcousticSidecarFeatureOwner,
     pub channel_level_owner: AcousticSidecarFeatureOwner,
     pub channel_coloration_owner: AcousticSidecarFeatureOwner,
-    /// Number of valid scalar/bin projection terms evaluated for this summary.
-    pub projection_terms: usize,
-    pub retained_state_bytes_upper_bound: usize,
-    pub cached_twiddle_bytes_upper_bound: usize,
+    /// Number of valid sample-frequency visits across the basis-centering and
+    /// regression passes. This is not a floating-point-operation count.
+    pub projection_sample_frequency_visits: usize,
+    /// Exact in-struct bytes on this compilation target. This is not RSS and
+    /// is not a cross-target canonical size.
+    pub retained_state_bytes_on_target: usize,
+    /// Exact payload bytes of the process-global complex twiddle table.
+    pub cached_twiddle_payload_bytes: usize,
 }
 
 impl std::fmt::Debug for AcousticModulationSummary {
@@ -3711,14 +3814,17 @@ impl std::fmt::Debug for AcousticModulationSummary {
             )
             .field("voice_valid_frames", &self.voice_valid_frames)
             .field("channel_valid_frames", &self.channel_valid_frames)
-            .field("projection_terms", &self.projection_terms)
             .field(
-                "retained_state_bytes_upper_bound",
-                &self.retained_state_bytes_upper_bound,
+                "projection_sample_frequency_visits",
+                &self.projection_sample_frequency_visits,
             )
             .field(
-                "cached_twiddle_bytes_upper_bound",
-                &self.cached_twiddle_bytes_upper_bound,
+                "retained_state_bytes_on_target",
+                &self.retained_state_bytes_on_target,
+            )
+            .field(
+                "cached_twiddle_payload_bytes",
+                &self.cached_twiddle_payload_bytes,
             )
             .finish_non_exhaustive()
     }
@@ -3749,8 +3855,8 @@ impl std::fmt::Debug for AcousticModulationSidecar {
             .field("buffered_frames", &self.buffered_frames)
             .field("expected_next_frame_index", &self.expected_next_frame_index)
             .field(
-                "retained_state_bytes_upper_bound",
-                &self.retained_state_bytes_upper_bound(),
+                "retained_state_bytes_on_target",
+                &self.retained_state_bytes_on_target(),
             )
             .finish_non_exhaustive()
     }
@@ -3778,7 +3884,7 @@ impl AcousticModulationSidecar {
     }
 
     #[must_use]
-    pub const fn retained_state_bytes_upper_bound(&self) -> usize {
+    pub const fn retained_state_bytes_on_target(&self) -> usize {
         std::mem::size_of::<Self>()
     }
 
@@ -3815,10 +3921,10 @@ impl AcousticModulationSidecar {
         })?;
         let mut staged = self.clone();
         let voice_valid = frame.quality.voiced
-            && frame.quality.reliable_pitch
             && !frame.quality.low_energy
             && !frame.quality.clipped
-            && !frame.quality.transient;
+            && !frame.quality.transient
+            && frame.frame_index > 0;
         let channel_valid = !frame.quality.low_energy && !frame.quality.clipped;
         staged.voice[staged.next_index] = frame.voice.temporal_modulation;
         staged.channel_level[staged.next_index] = frame.channel.rms_dbfs;
@@ -3877,7 +3983,7 @@ impl AcousticModulationSidecar {
                         .to_owned(),
                 )
             })?;
-        let projection_terms = voice_terms
+        let projection_sample_frequency_visits = voice_terms
             .checked_add(channel_level_terms)
             .and_then(|terms| terms.checked_add(channel_coloration_terms))
             .ok_or_else(|| {
@@ -3899,9 +4005,9 @@ impl AcousticModulationSidecar {
             voice_owner: AcousticSidecarFeatureOwner::Voice,
             channel_level_owner: AcousticSidecarFeatureOwner::Channel,
             channel_coloration_owner: AcousticSidecarFeatureOwner::Channel,
-            projection_terms,
-            retained_state_bytes_upper_bound: staged.retained_state_bytes_upper_bound(),
-            cached_twiddle_bytes_upper_bound: std::mem::size_of::<ModulationTwiddles>(),
+            projection_sample_frequency_visits,
+            retained_state_bytes_on_target: staged.retained_state_bytes_on_target(),
+            cached_twiddle_payload_bytes: std::mem::size_of::<ModulationTwiddles>(),
         };
         *self = staged;
         Ok(Some(summary))
@@ -3910,19 +4016,30 @@ impl AcousticModulationSidecar {
 
 type ModulationTwiddles = [[[f64; 2]; ACOUSTIC_MODULATION_HISTORY_FRAMES]; 4];
 
-fn cached_modulation_twiddles() -> &'static ModulationTwiddles {
-    static TWIDDLES: std::sync::OnceLock<ModulationTwiddles> = std::sync::OnceLock::new();
-    TWIDDLES.get_or_init(|| {
-        let mut twiddles = [[[0.0_f64; 2]; ACOUSTIC_MODULATION_HISTORY_FRAMES]; 4];
-        for (band, bin) in ACOUSTIC_MODULATION_BIN_INDICES.into_iter().enumerate() {
-            for offset in 0..ACOUSTIC_MODULATION_HISTORY_FRAMES {
-                let phase = std::f64::consts::TAU * bin as f64 * offset as f64
-                    / ACOUSTIC_MODULATION_HISTORY_FRAMES as f64;
-                twiddles[band][offset] = [phase.cos(), -phase.sin()];
-            }
+const fn build_modulation_twiddles() -> ModulationTwiddles {
+    let mut twiddles = [[[0.0_f64; 2]; ACOUSTIC_MODULATION_HISTORY_FRAMES]; 4];
+    let mut frequency = 0usize;
+    while frequency < ACOUSTIC_MODULATION_STEP_COMPLEX.len() {
+        let step = ACOUSTIC_MODULATION_STEP_COMPLEX[frequency];
+        let mut current = [1.0_f64, 0.0_f64];
+        let mut offset = 0usize;
+        while offset < ACOUSTIC_MODULATION_HISTORY_FRAMES {
+            twiddles[frequency][offset] = current;
+            current = [
+                current[0] * step[0] - current[1] * step[1],
+                current[0] * step[1] + current[1] * step[0],
+            ];
+            offset += 1;
         }
-        twiddles
-    })
+        frequency += 1;
+    }
+    twiddles
+}
+
+static MODULATION_TWIDDLES: ModulationTwiddles = build_modulation_twiddles();
+
+fn cached_modulation_twiddles() -> &'static ModulationTwiddles {
+    &MODULATION_TWIDDLES
 }
 
 fn modulation_spectrum<C>(
@@ -3941,7 +4058,7 @@ where
         )));
     }
     let valid_count = valid.iter().filter(|is_valid| **is_valid).count();
-    if valid_count != ACOUSTIC_MODULATION_HISTORY_FRAMES {
+    if valid_count < ACOUSTIC_MODULATION_MIN_VALID_FRAMES {
         return Ok((false, valid_count, [0.0; 4], 0));
     }
     let mean = (0..ACOUSTIC_MODULATION_HISTORY_FRAMES)
@@ -3964,31 +4081,238 @@ where
         return Ok((false, valid_count, [0.0; 4], 0));
     }
     let mut power = [0.0_f32; 4];
-    let mut projection_terms = 0usize;
+    let mut projection_sample_frequency_visits = 0usize;
     let twiddles = cached_modulation_twiddles();
-    for (band, output) in power.iter_mut().enumerate() {
+    for (frequency, output) in power.iter_mut().enumerate() {
         if is_cancelled() {
             return Err(FwError::Cancelled(format!(
-                "acoustic modulation sidecar cancelled before {family} bin {band}"
+                "acoustic modulation sidecar cancelled before {family} frequency {frequency}"
             )));
         }
-        let mut real = 0.0_f64;
-        let mut imaginary = 0.0_f64;
-        for offset in 0..ACOUSTIC_MODULATION_HISTORY_FRAMES {
+        let mut basis_real_mean = 0.0_f64;
+        let mut basis_imaginary_mean = 0.0_f64;
+        let frequency_twiddles = &twiddles[frequency];
+        for (offset, twiddle) in frequency_twiddles.iter().enumerate() {
+            let index = (oldest_index + offset) % ACOUSTIC_MODULATION_HISTORY_FRAMES;
+            if !valid[index] {
+                continue;
+            }
+            basis_real_mean += twiddle[0];
+            basis_imaginary_mean += twiddle[1];
+            projection_sample_frequency_visits += 1;
+        }
+        basis_real_mean /= valid_count as f64;
+        basis_imaginary_mean /= valid_count as f64;
+
+        let mut gram_real_real = 0.0_f64;
+        let mut gram_real_imaginary = 0.0_f64;
+        let mut gram_imaginary_imaginary = 0.0_f64;
+        let mut projection_real = 0.0_f64;
+        let mut projection_imaginary = 0.0_f64;
+        for (offset, twiddle) in frequency_twiddles.iter().enumerate() {
             let index = (oldest_index + offset) % ACOUSTIC_MODULATION_HISTORY_FRAMES;
             if !valid[index] {
                 continue;
             }
             let centered = f64::from(values[index]) - mean;
-            real += centered * twiddles[band][offset][0];
-            imaginary += centered * twiddles[band][offset][1];
-            projection_terms += 1;
+            let basis_real = twiddle[0] - basis_real_mean;
+            let basis_imaginary = twiddle[1] - basis_imaginary_mean;
+            gram_real_real += basis_real * basis_real;
+            gram_real_imaginary += basis_real * basis_imaginary;
+            gram_imaginary_imaginary += basis_imaginary * basis_imaginary;
+            projection_real += centered * basis_real;
+            projection_imaginary += centered * basis_imaginary;
+            projection_sample_frequency_visits += 1;
         }
-        let normalized = 2.0 * (real * real + imaginary * imaginary)
-            / (ACOUSTIC_MODULATION_HISTORY_FRAMES as f64 * centered_energy);
-        *output = normalized.clamp(0.0, 1.0) as f32;
+        let determinant =
+            gram_real_real * gram_imaginary_imaginary - gram_real_imaginary * gram_real_imaginary;
+        let determinant_floor =
+            f64::from(PCM_EPSILON) * (gram_real_real * gram_imaginary_imaginary).max(1.0);
+        if !determinant.is_finite() || determinant <= determinant_floor {
+            return Ok((
+                false,
+                valid_count,
+                [0.0; 4],
+                projection_sample_frequency_visits,
+            ));
+        }
+        let coefficient_real = (projection_real * gram_imaginary_imaginary
+            - projection_imaginary * gram_real_imaginary)
+            / determinant;
+        let coefficient_imaginary = (projection_imaginary * gram_real_real
+            - projection_real * gram_real_imaginary)
+            / determinant;
+        let explained_energy =
+            coefficient_real * projection_real + coefficient_imaginary * projection_imaginary;
+        let normalized_power = explained_energy / centered_energy;
+        if !normalized_power.is_finite() {
+            return Err(FwError::InvalidRequest(format!(
+                "acoustic modulation sidecar produced non-finite {family} frequency {frequency}"
+            )));
+        }
+        *output = normalized_power.clamp(0.0, 1.0) as f32;
     }
-    Ok((true, valid_count, power, projection_terms))
+    Ok((true, valid_count, power, projection_sample_frequency_visits))
+}
+
+/// One configuration-bound sidecar observation at the acoustic-v2 cadence.
+///
+/// The contained feature summaries remain signal-derived and intentionally
+/// have no serialization implementation. `Debug` exposes only identities and
+/// availability, never feature values.
+#[derive(Clone, Copy, PartialEq)]
+pub struct AcousticSidecarStudyObservation {
+    schema_version: &'static str,
+    configuration_sha256_digest: [u8; 32],
+    mode: AcousticSidecarStudyMode,
+    frame_index: usize,
+    wavelet: Option<AcousticWaveletSummary>,
+    modulation: Option<AcousticModulationSummary>,
+}
+
+impl AcousticSidecarStudyObservation {
+    #[must_use]
+    pub const fn schema_version(&self) -> &'static str {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn configuration_sha256_digest(&self) -> [u8; 32] {
+        self.configuration_sha256_digest
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> AcousticSidecarStudyMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn frame_index(&self) -> usize {
+        self.frame_index
+    }
+
+    #[must_use]
+    pub const fn wavelet(&self) -> Option<AcousticWaveletSummary> {
+        self.wavelet
+    }
+
+    #[must_use]
+    pub const fn modulation(&self) -> Option<AcousticModulationSummary> {
+        self.modulation
+    }
+}
+
+impl std::fmt::Debug for AcousticSidecarStudyObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcousticSidecarStudyObservation")
+            .field("schema_version", &self.schema_version)
+            .field("mode", &self.mode)
+            .field("frame_index", &self.frame_index)
+            .field("wavelet_available", &self.wavelet.is_some())
+            .field("modulation_available", &self.modulation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Authoritative executor that binds one study configuration to its kernels.
+///
+/// The wavelet input is statically fixed to one normalized 16 kHz, 400-sample
+/// acoustic frame. This prevents a single configuration digest from silently
+/// describing different physical supports. The executor is never constructed
+/// by the default diarization path.
+pub struct AcousticSidecarStudy {
+    config: AcousticSidecarStudyConfig,
+    configuration_sha256_digest: [u8; 32],
+    modulation: AcousticModulationSidecar,
+}
+
+impl std::fmt::Debug for AcousticSidecarStudy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcousticSidecarStudy")
+            .field("mode", &self.config.mode)
+            .field("wavelet_levels", &self.config.wavelet_levels)
+            .field(
+                "retained_state_bytes_on_target",
+                &self.retained_state_bytes_on_target(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcousticSidecarStudy {
+    pub fn new(config: AcousticSidecarStudyConfig) -> FwResult<Self> {
+        let configuration_sha256_digest = acoustic_sidecar_study_config_digest(config)?;
+        Ok(Self {
+            config,
+            configuration_sha256_digest,
+            modulation: AcousticModulationSidecar::new(),
+        })
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> AcousticSidecarStudyConfig {
+        self.config
+    }
+
+    #[must_use]
+    pub fn configuration_sha256_hex(&self) -> String {
+        sidecar_sha256_hex(&self.configuration_sha256_digest)
+    }
+
+    #[must_use]
+    pub const fn retained_state_bytes_on_target(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+
+    /// Analyze one exact acoustic-v2 frame with the configured sidecars.
+    ///
+    /// Cancellation is checked before validation and then by each enabled
+    /// kernel. Modulation mutation remains staged until all projections for
+    /// the frame complete successfully.
+    pub fn observe_normalized_16khz_frame<C>(
+        &mut self,
+        frame_samples: &[f32; ACOUSTIC_FRAME_SAMPLES],
+        frame: &AcousticFrameFeatures,
+        is_cancelled: &mut C,
+    ) -> FwResult<AcousticSidecarStudyObservation>
+    where
+        C: FnMut() -> bool,
+    {
+        if is_cancelled() {
+            return Err(FwError::Cancelled(format!(
+                "acoustic sidecar study cancelled before frame {}",
+                frame.frame_index
+            )));
+        }
+        validate_acoustic_frame(frame)?;
+        let wavelet = if let Some(basis) = self.config.mode.wavelet_basis() {
+            Some(analyze_acoustic_wavelet(
+                frame_samples,
+                AcousticWaveletConfig {
+                    basis,
+                    levels: self.config.wavelet_levels,
+                },
+                &mut *is_cancelled,
+            )?)
+        } else {
+            None
+        };
+        let modulation = if self.config.mode.uses_modulation() {
+            self.modulation.push(frame, is_cancelled)?
+        } else {
+            None
+        };
+        Ok(AcousticSidecarStudyObservation {
+            schema_version: ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION,
+            configuration_sha256_digest: self.configuration_sha256_digest,
+            mode: self.config.mode,
+            frame_index: frame.frame_index,
+            wavelet,
+            modulation,
+        })
+    }
 }
 
 /// Stream acoustic-v2 features from normalized 16 kHz mono PCM.
@@ -13360,14 +13684,14 @@ mod tests {
 
     use super::{
         ACOUSTIC_CANCELLATION_INTERVAL_FRAMES, ACOUSTIC_FRAME_SAMPLES, ACOUSTIC_HOP_SAMPLES,
-        ACOUSTIC_MODULATION_BAND_HZ, ACOUSTIC_MODULATION_HISTORY_FRAMES, AcousticBoundaryHints,
-        AcousticDiarizationInput, AcousticFeatureStream, AcousticFrameFeatures,
-        AcousticModulationSidecar, AcousticQualityMask, AcousticSegmentationStream,
-        AcousticSegmenter, AcousticSidecarFeatureOwner, AcousticSidecarStudyConfig,
-        AcousticSidecarStudyMode, AcousticSpeakerAssignment, AcousticTracklet,
-        AcousticWaveletBasis, AcousticWaveletConfig, CEPSTRAL_COEFFICIENTS,
-        CHANNEL_VECTOR_DIMENSIONS, CalibrationObservation, ChannelFeatureView,
-        CorpusRecordingManifest, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
+        ACOUSTIC_MODULATION_FREQUENCY_HZ, ACOUSTIC_MODULATION_HISTORY_FRAMES,
+        AcousticBoundaryHints, AcousticDiarizationInput, AcousticFeatureStream,
+        AcousticFrameFeatures, AcousticModulationSidecar, AcousticQualityMask,
+        AcousticSegmentationStream, AcousticSegmenter, AcousticSidecarFeatureOwner,
+        AcousticSidecarStudy, AcousticSidecarStudyConfig, AcousticSidecarStudyMode,
+        AcousticSpeakerAssignment, AcousticTracklet, AcousticWaveletBasis, AcousticWaveletConfig,
+        CEPSTRAL_COEFFICIENTS, CHANNEL_VECTOR_DIMENSIONS, CalibrationObservation,
+        ChannelFeatureView, CorpusRecordingManifest, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
         DIARIZATION_HYPOTHESIS_SCHEMA_VERSION, DIARIZATION_REFERENCE_SCHEMA_VERSION,
         DiarizationCorpusManifest, DiarizationHypothesisDocument, DiarizationReferenceDocument,
         DiarizationScorerConfig, EvaluationHintPolicy, EvaluationOverlapPolicy,
@@ -14429,6 +14753,82 @@ mod tests {
         output
     }
 
+    fn acoustic_feature_bytes(frames: &[AcousticFrameFeatures]) -> Vec<u8> {
+        fn append_f32(output: &mut Vec<u8>, value: f32) {
+            output.extend(value.to_bits().to_le_bytes());
+        }
+
+        fn append_optional_f32(output: &mut Vec<u8>, value: Option<f32>) {
+            match value {
+                Some(value) => {
+                    output.push(1);
+                    append_f32(output, value);
+                }
+                None => output.push(0),
+            }
+        }
+
+        let mut output = Vec::new();
+        output.extend((frames.len() as u64).to_le_bytes());
+        for frame in frames {
+            output.extend((frame.frame_index as u64).to_le_bytes());
+            output.extend(frame.start_ms.to_le_bytes());
+            output.extend(frame.end_ms.to_le_bytes());
+            for value in frame
+                .voice
+                .cepstral_envelope
+                .iter()
+                .chain(frame.voice.cepstral_delta.iter())
+                .chain(frame.voice.cepstral_delta_delta.iter())
+            {
+                append_f32(&mut output, *value);
+            }
+            append_optional_f32(&mut output, frame.voice.f0_hz);
+            append_optional_f32(&mut output, frame.voice.pitch_uncertainty_octaves);
+            for value in [
+                frame.voice.voicing_confidence,
+                frame.voice.harmonicity,
+                frame.voice.harmonic_to_noise_db,
+                frame.voice.formant_proxies_hz[0],
+                frame.voice.formant_proxies_hz[1],
+                frame.voice.formant_proxies_hz[2],
+                frame.voice.temporal_modulation,
+                frame.voice.voiced_fraction,
+                frame.channel.rms_dbfs,
+                frame.channel.dynamics_above_noise_db,
+                frame.channel.spectral_centroid_hz,
+                frame.channel.spectral_bandwidth_hz,
+                frame.channel.spectral_rolloff_hz,
+                frame.channel.spectral_flatness,
+                frame.channel.spectral_tilt,
+                frame.channel.low_band_fraction,
+                frame.channel.mid_band_fraction,
+                frame.channel.high_band_fraction,
+                frame.channel.crest_factor,
+                frame.channel.clipping_fraction,
+                frame.channel.noise_floor_dbfs,
+                frame.channel.spectral_flux,
+                frame.channel.distortion_proxy,
+                frame.channel.effective_band_limit_hz,
+                frame.channel.high_frequency_attenuation,
+                frame.channel.reverberation_proxy,
+                frame.channel.muffling_proxy,
+                frame.channel.stationary_coloration,
+                frame.overlap_probability,
+            ] {
+                append_f32(&mut output, value);
+            }
+            output.extend([
+                u8::from(frame.quality.voiced),
+                u8::from(frame.quality.reliable_pitch),
+                u8::from(frame.quality.low_energy),
+                u8::from(frame.quality.clipped),
+                u8::from(frame.quality.transient),
+            ]);
+        }
+        output
+    }
+
     fn median_pitch(frames: &[AcousticFrameFeatures]) -> f32 {
         let mut pitches = frames
             .iter()
@@ -15098,7 +15498,10 @@ mod tests {
                 .maximum_energy_conservation_relative_error
                 .is_finite()
         );
-        assert!(summary.maximum_energy_conservation_relative_error <= 2e-5);
+        assert!(
+            summary.maximum_energy_conservation_relative_error
+                <= super::ACOUSTIC_WAVELET_ENERGY_TOLERANCE
+        );
         for level in summary.levels.iter().take(summary.valid_level_count) {
             assert!(level.detail_energy_fraction.is_finite());
             assert!((0.0..=1.0).contains(&level.detail_energy_fraction));
@@ -15112,7 +15515,10 @@ mod tests {
             assert!(level.normalized_detail_change.is_finite());
             assert!(level.normalized_detail_change >= 0.0);
             assert!(level.energy_conservation_relative_error.is_finite());
-            assert!(level.energy_conservation_relative_error <= 2e-5);
+            assert!(
+                level.energy_conservation_relative_error
+                    <= super::ACOUSTIC_WAVELET_ENERGY_TOLERANCE
+            );
         }
     }
 
@@ -15132,6 +15538,22 @@ mod tests {
                 "modulation",
                 "haar_modulation",
                 "daubechies_four_tap_modulation",
+            ]
+        );
+        assert_eq!(
+            AcousticSidecarStudyMode::ALL.map(|mode| {
+                (
+                    mode.wavelet_basis().map(AcousticWaveletBasis::id),
+                    mode.uses_modulation(),
+                )
+            }),
+            [
+                (None, false),
+                (Some("haar"), false),
+                (Some("daubechies-four-tap"), false),
+                (None, true),
+                (Some("haar"), true),
+                (Some("daubechies-four-tap"), true),
             ]
         );
         assert_eq!(
@@ -15177,6 +15599,17 @@ mod tests {
             .map(|config| acoustic_sidecar_study_config_sha256(config).expect("config hash"));
         assert!(hashes.iter().all(|hash| hash.len() == 64));
         assert_eq!(hashes.iter().collect::<BTreeSet<_>>().len(), hashes.len());
+        assert_eq!(
+            hashes,
+            [
+                "1de6645d703fc13c79bde7cec6c87b2a2ca19cfb677fd592148c744ccfe35431",
+                "672ab215ebcdcc3ccd374b85566c83bc584ee988600368fe79b004c87935d410",
+                "47322136ad53e5d199c2216a9304992b6a80374d52906dcf4d3294bd5de58c42",
+                "c03e748958704c9c93946efe86fa3b75de3f9302d17c9d1056dccafabbfaff22",
+                "16ea26f7227db185658580018d389b8e5a5f864798a32514f41d7a660f2ff4f4",
+                "7520e81e612c0b9111bf77cf185cf1862cfee39d1cc623bc5f8854c507b8d990",
+            ]
+        );
         for invalid in [
             AcousticSidecarStudyConfig {
                 mode: AcousticSidecarStudyMode::Off,
@@ -15193,6 +15626,119 @@ mod tests {
         ] {
             assert!(acoustic_sidecar_study_config_sha256(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn configured_sidecar_study_binds_mode_hash_and_fixed_frame_support() {
+        let frame_samples = [0.0_f32; ACOUSTIC_FRAME_SAMPLES];
+        let frame = synthetic_feature(0, 0.0, false, false);
+        let mut active = || false;
+
+        let mut off = AcousticSidecarStudy::new(AcousticSidecarStudyConfig::default())
+            .expect("default-off study");
+        let off_observation = off
+            .observe_normalized_16khz_frame(&frame_samples, &frame, &mut active)
+            .expect("default-off observation");
+        assert_eq!(off_observation.mode(), AcousticSidecarStudyMode::Off);
+        assert_eq!(off_observation.frame_index(), 0);
+        assert_eq!(
+            off_observation.schema_version(),
+            super::ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION
+        );
+        assert!(off_observation.wavelet().is_none());
+        assert!(off_observation.modulation().is_none());
+        assert_eq!(
+            off.configuration_sha256_hex(),
+            acoustic_sidecar_study_config_sha256(AcousticSidecarStudyConfig::default())
+                .expect("default hash")
+        );
+        assert_eq!(
+            off_observation.configuration_sha256_digest(),
+            super::acoustic_sidecar_study_config_digest(AcousticSidecarStudyConfig::default())
+                .expect("default digest")
+        );
+
+        let config = AcousticSidecarStudyConfig {
+            mode: AcousticSidecarStudyMode::DaubechiesFourTapAndModulation,
+            wavelet_levels: 4,
+        };
+        let mut combined = AcousticSidecarStudy::new(config).expect("combined study");
+        let combined_observation = combined
+            .observe_normalized_16khz_frame(&frame_samples, &frame, &mut active)
+            .expect("combined observation");
+        assert_eq!(combined_observation.mode(), config.mode);
+        assert_eq!(
+            combined_observation.wavelet().map(|summary| summary.basis),
+            Some(AcousticWaveletBasis::DaubechiesFourTap)
+        );
+        assert!(combined_observation.modulation().is_none());
+        assert_eq!(combined.config(), config);
+        assert_eq!(
+            combined.configuration_sha256_hex(),
+            acoustic_sidecar_study_config_sha256(config).expect("combined hash")
+        );
+        let debug = format!("{combined_observation:?}");
+        assert_eq!(
+            debug,
+            format!(
+                "AcousticSidecarStudyObservation {{ schema_version: {:?}, mode: {:?}, frame_index: 0, wavelet_available: true, modulation_available: false, .. }}",
+                super::ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION,
+                config.mode
+            )
+        );
+
+        assert!(
+            AcousticSidecarStudy::new(AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Modulation,
+                wavelet_levels: 1,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn configured_sidecar_study_emits_modulation_after_exact_fixed_window() {
+        let config = AcousticSidecarStudyConfig {
+            mode: AcousticSidecarStudyMode::HaarAndModulation,
+            wavelet_levels: 4,
+        };
+        let mut study = AcousticSidecarStudy::new(config).expect("combined study");
+        let frame_samples = [0.0_f32; ACOUSTIC_FRAME_SAMPLES];
+        let mut active = || false;
+        let mut final_observation = None;
+        for frame_index in 1..=ACOUSTIC_MODULATION_HISTORY_FRAMES {
+            let mut frame = synthetic_feature(frame_index, 0.0, false, false);
+            let phase = std::f32::consts::TAU * frame_index as f32
+                / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
+            frame.voice.temporal_modulation = 0.5 + 0.3 * (4.0 * phase).sin();
+            frame.channel.rms_dbfs = -20.0 + 3.0 * (2.0 * phase).sin();
+            frame.channel.muffling_proxy = 0.5 + 0.3 * (8.0 * phase).sin();
+            let observation = study
+                .observe_normalized_16khz_frame(&frame_samples, &frame, &mut active)
+                .expect("configured observation");
+            assert_eq!(observation.frame_index(), frame_index);
+            assert!(observation.wavelet().is_some());
+            if frame_index < ACOUSTIC_MODULATION_HISTORY_FRAMES {
+                assert!(observation.modulation().is_none());
+            } else {
+                final_observation = Some(observation);
+            }
+        }
+        let observation = final_observation.expect("complete configured window");
+        assert_eq!(observation.mode(), config.mode);
+        assert_eq!(
+            observation.configuration_sha256_digest(),
+            super::acoustic_sidecar_study_config_digest(config).expect("configuration digest")
+        );
+        let modulation = observation.modulation().expect("modulation summary");
+        assert_eq!(modulation.window_start_frame_index, 1);
+        assert_eq!(
+            modulation.window_end_frame_index,
+            ACOUSTIC_MODULATION_HISTORY_FRAMES
+        );
+        assert!(modulation.voice_available);
+        assert!(modulation.channel_level_available);
+        assert!(modulation.channel_coloration_available);
     }
 
     #[test]
@@ -15298,35 +15844,97 @@ mod tests {
     }
 
     #[test]
-    fn wavelet_sidecar_is_gain_invariant_and_has_fixed_accounting() {
-        let quiet = sine_wave(440.0, 0.025, 0.2);
-        let loud = sine_wave(440.0, 0.025, 0.8);
+    fn wavelet_sidecar_is_gain_and_dc_invariant_above_floor_with_fixed_accounting() {
+        let quiet_samples = sine_wave(440.0, 0.025, 0.2);
+        let loud_samples = sine_wave(440.0, 0.025, 0.8);
+        let dc_shifted_samples = quiet_samples
+            .iter()
+            .map(|sample| sample + 0.3)
+            .collect::<Vec<_>>();
         let config = AcousticWaveletConfig {
             basis: AcousticWaveletBasis::DaubechiesFourTap,
             levels: 4,
         };
-        let quiet = analyze_acoustic_wavelet(&quiet, config, || false).expect("quiet summary");
-        let loud = analyze_acoustic_wavelet(&loud, config, || false).expect("loud summary");
+        let quiet =
+            analyze_acoustic_wavelet(&quiet_samples, config, || false).expect("quiet summary");
+        let loud = analyze_acoustic_wavelet(&loud_samples, config, || false).expect("loud summary");
+        let dc_shifted = analyze_acoustic_wavelet(&dc_shifted_samples, config, || false)
+            .expect("DC-shifted summary");
         assert_eq!(quiet.filter_tap_terms, 3_000);
         assert_eq!(quiet.filter_tap_terms, loud.filter_tap_terms);
-        assert_eq!(quiet.scratch_bytes_upper_bound, 3 * 400 * 4);
-        assert!(!format!("{quiet:?}").contains("levels"));
-        for (quiet_level, loud_level) in quiet.levels.iter().zip(loud.levels) {
-            assert!(
-                (quiet_level.detail_energy_fraction - loud_level.detail_energy_fraction).abs()
-                    < 2e-6
-            );
-            assert!((quiet_level.detail_log_energy - loud_level.detail_log_energy).abs() < 2e-6);
-            assert!((quiet_level.normalized_entropy - loud_level.normalized_entropy).abs() < 2e-6);
-            assert!(
-                (quiet_level.coefficient_flatness - loud_level.coefficient_flatness).abs() < 2e-6
-            );
-            assert!((quiet_level.crest_factor - loud_level.crest_factor).abs() < 2e-6);
-            assert!(
-                (quiet_level.normalized_detail_change - loud_level.normalized_detail_change).abs()
-                    < 2e-6
-            );
+        assert_eq!(quiet.filter_tap_terms, dc_shifted.filter_tap_terms);
+        assert_eq!(quiet.scratch_buffer_payload_bytes, 3 * 400 * 4);
+        assert_eq!(
+            format!("{quiet:?}"),
+            format!(
+                "AcousticWaveletSummary {{ basis: {:?}, owner: {:?}, input_samples: {}, valid_level_count: {}, input_was_silent: {}, filter_tap_terms: {}, maximum_energy_conservation_relative_error: {:?}, scratch_buffer_payload_bytes: {}, .. }}",
+                quiet.basis,
+                quiet.owner,
+                quiet.input_samples,
+                quiet.valid_level_count,
+                quiet.input_was_silent,
+                quiet.filter_tap_terms,
+                quiet.maximum_energy_conservation_relative_error,
+                quiet.scratch_buffer_payload_bytes
+            )
+        );
+        for (level_index, ((quiet_level, loud_level), dc_shifted_level)) in quiet
+            .levels
+            .iter()
+            .zip(&loud.levels)
+            .zip(&dc_shifted.levels)
+            .enumerate()
+        {
+            for (variant, candidate, flatness_tolerance) in [
+                ("gain", loud_level, 2e-6),
+                // Adding a non-dyadic DC value re-quantizes the source samples
+                // before mean removal. Bound that representational loss by a
+                // small multiple of the f32 machine epsilon while retaining
+                // the stricter tolerance for exactly representable gain.
+                ("DC", dc_shifted_level, 64.0 * f32::EPSILON),
+            ] {
+                assert!(
+                    (quiet_level.detail_energy_fraction - candidate.detail_energy_fraction).abs()
+                        < 2e-6
+                );
+                assert!((quiet_level.detail_log_energy - candidate.detail_log_energy).abs() < 2e-6);
+                assert!(
+                    (quiet_level.normalized_entropy - candidate.normalized_entropy).abs() < 2e-6
+                );
+                assert!(
+                    (quiet_level.coefficient_flatness - candidate.coefficient_flatness).abs()
+                        < flatness_tolerance,
+                    "level {level_index} {variant} flatness differs: reference={} candidate={} difference={}",
+                    quiet_level.coefficient_flatness,
+                    candidate.coefficient_flatness,
+                    (quiet_level.coefficient_flatness - candidate.coefficient_flatness).abs()
+                );
+                assert!((quiet_level.crest_factor - candidate.crest_factor).abs() < 2e-6);
+                assert!(
+                    (quiet_level.normalized_detail_change - candidate.normalized_detail_change)
+                        .abs()
+                        < 2e-6
+                );
+            }
         }
+    }
+
+    #[test]
+    fn wavelet_tiny_detail_retains_its_local_energy_fraction() {
+        let detail = [0.1 * super::PCM_EPSILON, -0.1 * super::PCM_EPSILON];
+        let detail_energy = detail
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>();
+        let (summary, observed_energy) =
+            super::summarize_wavelet_detail(&detail, 2.0 * detail_energy);
+        assert_eq!(observed_energy, detail_energy);
+        assert!((summary.detail_energy_fraction - 0.5).abs() < f32::EPSILON);
+        assert_eq!(summary.detail_log_energy, super::POWER_EPSILON.ln());
+        assert_eq!(summary.normalized_entropy, 0.0);
+        assert_eq!(summary.coefficient_flatness, 0.0);
+        assert_eq!(summary.crest_factor, 0.0);
+        assert_eq!(summary.normalized_detail_change, 0.0);
     }
 
     #[test]
@@ -15450,12 +16058,16 @@ mod tests {
     }
 
     #[test]
-    fn modulation_sidecar_resolves_declared_voice_and_channel_bands() {
-        assert_eq!(ACOUSTIC_MODULATION_BAND_HZ, [1.5625, 3.125, 6.25, 12.5]);
+    fn modulation_sidecar_resolves_declared_voice_and_channel_frequencies() {
+        assert_eq!(
+            ACOUSTIC_MODULATION_FREQUENCY_HZ,
+            [1.5625, 3.125, 6.25, 12.5]
+        );
         let mut sidecar = AcousticModulationSidecar::new();
         let mut is_cancelled = || false;
+        let mut first_window = None;
         let mut final_summary = None;
-        for frame_index in 0..ACOUSTIC_MODULATION_HISTORY_FRAMES {
+        for frame_index in 0..=ACOUSTIC_MODULATION_HISTORY_FRAMES {
             let mut frame = synthetic_feature(frame_index, 0.0, false, false);
             let voice_phase = std::f32::consts::TAU * 4.0 * frame_index as f32
                 / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
@@ -15471,13 +16083,36 @@ mod tests {
                 .expect("modulation push");
             if frame_index + 1 < ACOUSTIC_MODULATION_HISTORY_FRAMES {
                 assert!(summary.is_none());
+            } else if frame_index + 1 == ACOUSTIC_MODULATION_HISTORY_FRAMES {
+                first_window = summary;
             } else {
                 final_summary = summary;
             }
         }
-        let summary = final_summary.expect("first complete window");
-        assert_eq!(summary.window_start_frame_index, 0);
-        assert_eq!(summary.window_end_frame_index, 63);
+        let historyless = first_window.expect("first complete channel window");
+        assert_eq!(historyless.window_start_frame_index, 0);
+        assert_eq!(historyless.window_end_frame_index, 63);
+        assert!(historyless.voice_available);
+        assert_eq!(historyless.voice_valid_frames, 63);
+        assert!(historyless.channel_level_available);
+        assert!(historyless.channel_coloration_available);
+        assert!(historyless.voice_normalized_power[2] > 0.999);
+        for (frequency, power) in historyless.voice_normalized_power.iter().enumerate() {
+            if frequency != 2 {
+                assert!(
+                    *power < 0.01,
+                    "unexpected voice leakage at {frequency}: {power}"
+                );
+            }
+        }
+        assert_eq!(
+            historyless.projection_sample_frequency_visits,
+            (63 + 64 + 64) * 4 * 2
+        );
+
+        let summary = final_summary.expect("first complete voice window");
+        assert_eq!(summary.window_start_frame_index, 1);
+        assert_eq!(summary.window_end_frame_index, 64);
         assert!(summary.voice_available);
         assert!(summary.channel_level_available);
         assert!(summary.channel_coloration_available);
@@ -15486,6 +16121,34 @@ mod tests {
         assert!(summary.voice_normalized_power[2] > 0.999);
         assert!(summary.channel_level_normalized_power[1] > 0.999);
         assert!(summary.channel_coloration_normalized_power[3] > 0.999);
+        for (frequency, power) in summary.voice_normalized_power.iter().enumerate() {
+            if frequency != 2 {
+                assert!(
+                    *power < 0.01,
+                    "unexpected voice leakage at {frequency}: {power}"
+                );
+            }
+        }
+        for (frequency, power) in summary.channel_level_normalized_power.iter().enumerate() {
+            if frequency != 1 {
+                assert!(
+                    *power < 0.01,
+                    "unexpected level leakage at {frequency}: {power}"
+                );
+            }
+        }
+        for (frequency, power) in summary
+            .channel_coloration_normalized_power
+            .iter()
+            .enumerate()
+        {
+            if frequency != 3 {
+                assert!(
+                    *power < 0.01,
+                    "unexpected color leakage at {frequency}: {power}"
+                );
+            }
+        }
         assert_eq!(summary.voice_owner, AcousticSidecarFeatureOwner::Voice);
         assert_eq!(
             summary.channel_level_owner,
@@ -15495,13 +16158,28 @@ mod tests {
             summary.channel_coloration_owner,
             AcousticSidecarFeatureOwner::Channel
         );
-        assert_eq!(summary.projection_terms, 3 * 4 * 64);
+        assert_eq!(summary.projection_sample_frequency_visits, 3 * 4 * 64 * 2);
         assert_eq!(
-            summary.retained_state_bytes_upper_bound,
-            sidecar.retained_state_bytes_upper_bound()
+            summary.retained_state_bytes_on_target,
+            sidecar.retained_state_bytes_on_target()
         );
-        assert_eq!(summary.cached_twiddle_bytes_upper_bound, 4 * 64 * 2 * 8);
-        assert!(!format!("{summary:?}").contains("normalized_power"));
+        assert_eq!(summary.cached_twiddle_payload_bytes, 4 * 64 * 2 * 8);
+        assert_eq!(
+            format!("{summary:?}"),
+            format!(
+                "AcousticModulationSummary {{ window_start_frame_index: {}, window_end_frame_index: {}, voice_available: {}, channel_level_available: {}, channel_coloration_available: {}, voice_valid_frames: {}, channel_valid_frames: {}, projection_sample_frequency_visits: {}, retained_state_bytes_on_target: {}, cached_twiddle_payload_bytes: {}, .. }}",
+                summary.window_start_frame_index,
+                summary.window_end_frame_index,
+                summary.voice_available,
+                summary.channel_level_available,
+                summary.channel_coloration_available,
+                summary.voice_valid_frames,
+                summary.channel_valid_frames,
+                summary.projection_sample_frequency_visits,
+                summary.retained_state_bytes_on_target,
+                summary.cached_twiddle_payload_bytes
+            )
+        );
     }
 
     #[test]
@@ -15536,39 +16214,71 @@ mod tests {
     }
 
     #[test]
-    fn modulation_sidecar_cancellation_between_bins_is_atomic() {
+    fn modulation_sidecar_cancellation_between_frequencies_is_atomic() {
         let mut sidecar = AcousticModulationSidecar::new();
         let mut active = || false;
-        for frame_index in 0..ACOUSTIC_MODULATION_HISTORY_FRAMES - 1 {
+        for frame_index in 1..ACOUSTIC_MODULATION_HISTORY_FRAMES {
             let mut frame = synthetic_feature(frame_index, 0.0, false, false);
             frame.voice.temporal_modulation = 0.5 + 0.2 * (frame_index as f32).sin();
             assert!(sidecar.push(&frame, &mut active).expect("warmup").is_none());
         }
-        let mut final_frame = synthetic_feature(63, 0.0, false, false);
-        final_frame.voice.temporal_modulation = 0.5 + 0.2 * 63.0_f32.sin();
-        final_frame.channel.rms_dbfs = -20.0 + 63.0_f32.sin();
-        final_frame.channel.muffling_proxy = 0.5 + 0.2 * 63.0_f32.cos();
+        let mut final_frame = synthetic_feature(64, 0.0, false, false);
+        final_frame.voice.temporal_modulation = 0.5 + 0.2 * 64.0_f32.sin();
+        final_frame.channel.rms_dbfs = -20.0 + 64.0_f32.sin();
+        final_frame.channel.muffling_proxy = 0.5 + 0.2 * 64.0_f32.cos();
         let mut checks = 0usize;
         let error = sidecar
             .push(&final_frame, &mut || {
                 checks += 1;
-                checks == 3
+                checks == 4
             })
-            .expect_err("cancel before first voice bin");
+            .expect_err("cancel between voice frequencies");
         assert!(matches!(error, FwError::Cancelled(_)));
-        assert!(error.to_string().contains("voice bin 0"));
-        assert_eq!(checks, 3);
+        assert!(error.to_string().contains("voice frequency 1"));
+        assert_eq!(checks, 4);
 
         let summary = sidecar
             .push(&final_frame, &mut active)
             .expect("retry complete frame")
             .expect("complete window after atomic retry");
-        assert_eq!(summary.window_start_frame_index, 0);
-        assert_eq!(summary.window_end_frame_index, 63);
+        assert_eq!(summary.window_start_frame_index, 1);
+        assert_eq!(summary.window_end_frame_index, 64);
     }
 
     #[test]
-    fn modulation_sidecar_marks_insufficient_or_constant_evidence_unavailable() {
+    fn modulation_sidecar_cancellation_between_families_is_atomic() {
+        let mut sidecar = AcousticModulationSidecar::new();
+        let mut active = || false;
+        for frame_index in 1..ACOUSTIC_MODULATION_HISTORY_FRAMES {
+            let mut frame = synthetic_feature(frame_index, 0.0, false, false);
+            frame.voice.temporal_modulation = 0.5 + 0.2 * (frame_index as f32).sin();
+            assert!(sidecar.push(&frame, &mut active).expect("warmup").is_none());
+        }
+        let mut final_frame = synthetic_feature(64, 0.0, false, false);
+        final_frame.voice.temporal_modulation = 0.5 + 0.2 * 64.0_f32.sin();
+        final_frame.channel.rms_dbfs = -20.0 + 64.0_f32.sin();
+        final_frame.channel.muffling_proxy = 0.5 + 0.2 * 64.0_f32.cos();
+        let mut checks = 0usize;
+        let error = sidecar
+            .push(&final_frame, &mut || {
+                checks += 1;
+                checks == 7
+            })
+            .expect_err("cancel between voice and channel-level families");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert!(error.to_string().contains("channel-level projection"));
+        assert_eq!(checks, 7);
+
+        let summary = sidecar
+            .push(&final_frame, &mut active)
+            .expect("retry complete frame")
+            .expect("complete window after atomic retry");
+        assert_eq!(summary.window_start_frame_index, 1);
+        assert_eq!(summary.window_end_frame_index, 64);
+    }
+
+    #[test]
+    fn modulation_sidecar_marks_insufficient_evidence_unavailable() {
         let mut sidecar = AcousticModulationSidecar::new();
         let mut active = || false;
         let mut summary = None;
@@ -15588,26 +16298,126 @@ mod tests {
         assert!(!summary.voice_available);
         assert!(!summary.channel_level_available);
         assert!(!summary.channel_coloration_available);
-        assert_eq!(summary.projection_terms, 0);
+        assert_eq!(summary.projection_sample_frequency_visits, 0);
+    }
+
+    #[test]
+    fn modulation_spectrum_enforces_exact_minimum_valid_boundary() {
+        let mut values = [0.0_f32; ACOUSTIC_MODULATION_HISTORY_FRAMES];
+        for (offset, value) in values.iter_mut().enumerate() {
+            let phase =
+                std::f32::consts::TAU * offset as f32 / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
+            *value = (4.0 * phase).sin();
+        }
+        let mut valid = [false; ACOUSTIC_MODULATION_HISTORY_FRAMES];
+        valid[..super::ACOUSTIC_MODULATION_MIN_VALID_FRAMES - 1].fill(true);
+        let mut active = || false;
+        let below = super::modulation_spectrum(&values, &valid, 0, "boundary", &mut active)
+            .expect("below-boundary spectrum");
+        assert!(!below.0);
+        assert_eq!(below.1, super::ACOUSTIC_MODULATION_MIN_VALID_FRAMES - 1);
+        assert_eq!(below.2, [0.0; 4]);
+        assert_eq!(below.3, 0);
+
+        valid[super::ACOUSTIC_MODULATION_MIN_VALID_FRAMES - 1] = true;
+        let boundary = super::modulation_spectrum(&values, &valid, 0, "boundary", &mut active)
+            .expect("at-boundary spectrum");
+        assert!(boundary.0);
+        assert_eq!(boundary.1, super::ACOUSTIC_MODULATION_MIN_VALID_FRAMES);
+        assert!(boundary.2[2] > 0.999);
+        assert_eq!(
+            boundary.3,
+            4 * super::ACOUSTIC_MODULATION_MIN_VALID_FRAMES * 2
+        );
+    }
+
+    #[test]
+    fn modulation_sidecar_regresses_over_valid_samples_without_zero_fill() {
+        let mut sidecar = AcousticModulationSidecar::new();
+        let mut active = || false;
+        let mut summary = None;
+        for frame_index in 1..=ACOUSTIC_MODULATION_HISTORY_FRAMES {
+            let low_energy = frame_index % 4 == 0;
+            let mut frame = synthetic_feature(frame_index, 0.0, low_energy, false);
+            let voice_phase = std::f32::consts::TAU * 4.0 * frame_index as f32
+                / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
+            let level_phase = std::f32::consts::TAU * 2.0 * frame_index as f32
+                / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
+            let color_phase = std::f32::consts::TAU * 8.0 * frame_index as f32
+                / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
+            frame.voice.temporal_modulation = 0.5 + 0.4 * voice_phase.sin();
+            if !low_energy {
+                frame.channel.rms_dbfs = -20.0 + 4.0 * level_phase.sin();
+            }
+            frame.channel.muffling_proxy = 0.5 + 0.4 * color_phase.sin();
+            summary = sidecar.push(&frame, &mut active).expect("masked push");
+        }
+        let summary = summary.expect("masked complete window");
+        assert_eq!(summary.voice_valid_frames, 48);
+        assert_eq!(summary.channel_valid_frames, 48);
+        assert!(summary.voice_available);
+        assert!(summary.channel_level_available);
+        assert!(summary.channel_coloration_available);
+        assert!(summary.voice_normalized_power[2] > 0.999);
+        assert!(summary.channel_level_normalized_power[1] > 0.999);
+        assert!(summary.channel_coloration_normalized_power[3] > 0.999);
+        assert_eq!(summary.projection_sample_frequency_visits, 3 * 4 * 48 * 2);
+    }
+
+    #[test]
+    fn modulation_sidecar_marks_all_valid_constant_trajectories_unavailable() {
+        let mut sidecar = AcousticModulationSidecar::new();
+        let mut active = || false;
+        let mut summary = None;
+        for frame_index in 1..=ACOUSTIC_MODULATION_HISTORY_FRAMES {
+            let mut frame = synthetic_feature(frame_index, 0.0, false, false);
+            frame.voice.temporal_modulation = 0.25;
+            frame.channel.rms_dbfs = -20.0;
+            frame.channel.muffling_proxy = 0.4;
+            summary = sidecar.push(&frame, &mut active).expect("constant push");
+        }
+        let summary = summary.expect("constant complete window");
+        assert_eq!(summary.voice_valid_frames, 64);
+        assert_eq!(summary.channel_valid_frames, 64);
+        assert!(!summary.voice_available);
+        assert!(!summary.channel_level_available);
+        assert!(!summary.channel_coloration_available);
+        assert_eq!(summary.projection_sample_frequency_visits, 0);
+    }
+
+    #[test]
+    fn modulation_frequency_power_is_circular_shift_tolerant() {
+        let mut values = [0.0_f32; ACOUSTIC_MODULATION_HISTORY_FRAMES];
+        for (offset, value) in values.iter_mut().enumerate() {
+            let phase =
+                std::f32::consts::TAU * offset as f32 / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
+            *value = 0.6 * (3.0 * phase).sin() + 0.3 * (7.0 * phase).cos();
+        }
+        values[11] += 0.2;
+        let mut shifted = [0.0_f32; ACOUSTIC_MODULATION_HISTORY_FRAMES];
+        for (offset, value) in values.into_iter().enumerate() {
+            shifted[(offset + 7) % ACOUSTIC_MODULATION_HISTORY_FRAMES] = value;
+        }
+        let valid = [true; ACOUSTIC_MODULATION_HISTORY_FRAMES];
+        let mut active = || false;
+        let original = super::modulation_spectrum(&values, &valid, 0, "test", &mut active)
+            .expect("original spectrum");
+        let shifted = super::modulation_spectrum(&shifted, &valid, 0, "test", &mut active)
+            .expect("shifted spectrum");
+        assert!(original.0);
+        assert!(shifted.0);
+        assert_eq!(original.1, 64);
+        assert_eq!(original.3, 4 * 64 * 2);
+        for (left, right) in original.2.into_iter().zip(shifted.2) {
+            assert!((left - right).abs() < 2e-6, "{left} versus {right}");
+        }
     }
 
     #[test]
     fn experimental_sidecars_leave_default_acoustic_v2_output_byte_exact() {
         let samples = sine_wave(180.0, 0.8, 0.35);
         let baseline = features(&samples);
-        let baseline_bytes = baseline
-            .iter()
-            .flat_map(|frame| {
-                frame
-                    .voice
-                    .cepstral_envelope
-                    .iter()
-                    .chain(frame.voice.cepstral_delta.iter())
-                    .chain(frame.voice.cepstral_delta_delta.iter())
-                    .flat_map(|value| value.to_bits().to_le_bytes())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let baseline_bytes = acoustic_feature_bytes(&baseline);
         let _wavelet = analyze_acoustic_wavelet(
             &samples[..ACOUSTIC_FRAME_SAMPLES],
             AcousticWaveletConfig {
@@ -15625,19 +16435,7 @@ mod tests {
                 .expect("opt-in modulation");
         }
         let repeated = features(&samples);
-        let repeated_bytes = repeated
-            .iter()
-            .flat_map(|frame| {
-                frame
-                    .voice
-                    .cepstral_envelope
-                    .iter()
-                    .chain(frame.voice.cepstral_delta.iter())
-                    .chain(frame.voice.cepstral_delta_delta.iter())
-                    .flat_map(|value| value.to_bits().to_le_bytes())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let repeated_bytes = acoustic_feature_bytes(&repeated);
         assert_eq!(baseline, repeated);
         assert_eq!(baseline_bytes, repeated_bytes);
     }
