@@ -1685,9 +1685,9 @@ fn pipeline_windows_enabled() -> bool {
 /// weights. Running several token streams at once fills the cores left idle by
 /// the latency-bound parts of a single greedy stream.
 ///
-/// The path is deliberately restricted to long jobs on 64+ physical-core
-/// hosts and a physical-core-sized Rayon pool. Smaller pools, SMT-sized pools,
-/// and all stateful decode modes retain the established serial pipeline.
+/// The path is deliberately restricted to long jobs on 32+ physical-core hosts
+/// with a physical-core-sized Rayon pool. Smaller hosts, SMT-sized pools, and
+/// all stateful decode modes retain the established serial pipeline.
 /// `FW_PARALLEL_NO_CONTEXT_WINDOWS=0` is the process-lifetime rollback switch.
 fn parallel_no_context_windows_enabled() -> bool {
     use std::sync::OnceLock;
@@ -1709,27 +1709,41 @@ fn parallel_no_context_window_lanes(
     const MIN_PHYSICAL_CORES: usize = 64;
     const MIN_THREADS_PER_STREAM: usize = 8;
 
-    // Beam search INVERTS this path's cost model, so the core floor is
-    // beam-dependent.
+    // The floor is half the nominal core count at EVERY beam width.
     //
-    // At beam 1 a window is ENCODER-dominated, and the encoder already
-    // saturates the Rayon pool on its own — splitting it into lanes just
-    // re-partitions work that was not idle (measured on a 32-physical-core
-    // host: window fan-out was byte-exact but 0.8% *slower*). Lanes only earn
-    // their keep once the host has enough physical cores to hand every lane a
-    // full-width encoder, hence the 64-core floor.
+    // It used to be the full 64 at beam 1, on the theory that a beam-1 window is
+    // ENCODER-dominated and the encoder already saturates the Rayon pool, so
+    // lanes could only re-partition work that was never idle. The evidence for
+    // that was a *different* mechanism: `FW_PIPELINE_DEPTH` fan-out, which runs
+    // D window ENCODES concurrently while decode stays serial (byte-exact but
+    // 0.8% slower — encode-vs-encode overlap has nothing to fill). Lanes are not
+    // that. A lane runs a whole window, so lanes overlap encode with OTHER
+    // lanes' decodes and decode with decode, and a greedy single-token decode is
+    // exactly as latency-bound at beam 1 as it is at beam 5 — it just occupies a
+    // smaller share of the window.
     //
-    // At beam > 1 the window is DECODE-dominated — measured at beam 5,
-    // `decode_loop` 7371 ms vs `encoder_window` 673 ms, i.e. ~91% of the window
-    // — and a single-token decode step is LATENCY-bound: it cannot saturate the
-    // pool even with the beam's hypotheses forwarded concurrently. The idle-core
-    // headroom that makes lanes worthless at beam 1 is precisely what makes them
-    // nearly free at beam > 1, so the floor drops to half the cores.
-    let min_physical = if beam > 1 {
-        MIN_PHYSICAL_CORES / 2
-    } else {
-        MIN_PHYSICAL_CORES
-    };
+    // Measured on this 32-physical-core host, turbo / track01 124.5 s / 5
+    // windows / no_timestamps / greedy / t32, paired ABBA, 11 kept pairs, pair 1
+    // dropped as cold-cache, statistic = median of PER-PAIR ratios (medians of
+    // separate arms drift under co-tenancy):
+    //
+    //   lanes 1  7484 ms   vs   lanes 4  6289 ms
+    //   per-pair ratio median 1.1853x, bootstrap CI95 [1.1583, 1.2904],
+    //   all 11 pairs > 1.15, transcript SHA-256 identical on all 24 runs.
+    //
+    // A same-binary lane sweep on the same cell put the optimum at the derived
+    // `threads / MIN_THREADS_PER_STREAM` = 4 (lanes 1/2/3/4/5 ⇒ 9297 / 9362 /
+    // 8621 / 7689 / 8015 ms), so the derivation below already lands on it.
+    let min_physical = MIN_PHYSICAL_CORES / 2;
+
+    // An explicit `FW_NO_CONTEXT_WINDOW_LANES` is an operator sweep instruction,
+    // so it outranks the derived floors — otherwise the knob can only ever
+    // narrow a path the host defaults already admitted, and the floors
+    // themselves become unfalsifiable on the very hosts where they bind. `=1`
+    // is the serial rollback, which is what the A/B baseline arm uses.
+    if let Some(lanes) = beam_lane_override() {
+        return windows.min(lanes.max(1)).max(1);
+    }
 
     if windows < MIN_WINDOWS || physical_cores < min_physical || rayon_threads != physical_cores {
         return 1;
@@ -1763,7 +1777,7 @@ fn parallel_no_context_window_lanes(
     } else {
         (rayon_threads / MIN_THREADS_PER_STREAM).max(1)
     };
-    windows.min(beam_lane_override().unwrap_or(derived))
+    windows.min(derived)
 }
 
 /// `FW_NO_CONTEXT_WINDOW_LANES` — explicit lane-count override for the
@@ -4337,29 +4351,39 @@ mod tests {
 
     #[test]
     fn parallel_no_context_windows_use_one_lane_outside_large_host_regime() {
+        // Too few windows to amortize the fan-out.
         assert_eq!(parallel_no_context_window_lanes(3, 64, 64, 1), 1);
+        // Rayon pool smaller than the physical core count (an SMT- or
+        // operator-sized pool): the lane budget is derived from the pool, so a
+        // mismatch means we cannot reason about oversubscription.
         assert_eq!(parallel_no_context_window_lanes(5, 32, 64, 1), 1);
+        // Pool larger than the physical cores (SMT-sized): same reason.
         assert_eq!(parallel_no_context_window_lanes(5, 128, 64, 1), 1);
-        assert_eq!(parallel_no_context_window_lanes(5, 48, 48, 1), 1);
+        // Below the half-core floor at every beam width.
+        assert_eq!(parallel_no_context_window_lanes(5, 16, 16, 1), 1);
+        assert_eq!(parallel_no_context_window_lanes(5, 24, 24, 1), 1);
     }
 
     #[test]
     fn parallel_no_context_windows_fill_physical_core_pool_without_oversubscription() {
         assert_eq!(parallel_no_context_window_lanes(5, 64, 64, 1), 5);
+        // A 48-core host clears the halved floor and is bounded by its windows.
+        assert_eq!(parallel_no_context_window_lanes(5, 48, 48, 1), 5);
         assert_eq!(parallel_no_context_window_lanes(20, 64, 64, 1), 8);
         assert_eq!(parallel_no_context_window_lanes(12, 128, 128, 1), 12);
     }
 
-    // Beam search makes a window decode-dominated and latency-bound, so the
-    // physical-core floor halves: a 32-core host that is (correctly) denied
-    // lanes at beam 1 — the encoder there already saturates the pool — gets
-    // them at beam > 1, which is exactly the workload that was losing to
-    // whisper.cpp's batched beam graph.
+    // Half-core hosts get lanes at EVERY beam width. The beam-1 case was denied
+    // until the 1.1853x paired-ABBA measurement on this 32-physical-core host
+    // (see the lane-heuristic comment); the old floor generalized a
+    // `FW_PIPELINE_DEPTH` encode-fan-out null to a mechanism that overlaps
+    // encode with other lanes' decodes.
     #[test]
     fn parallel_no_context_windows_lower_the_core_floor_for_beam_search() {
-        // Beam 1 on a 32-physical-core host: no lanes (encoder-saturated).
-        assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 1), 1);
-        // Same host, beam 5: lanes open up, budgeted at one forward per thread
+        // Beam 1 on a 32-physical-core host: lanes at the encoder's
+        // threads-per-stream budget (32/8 = 4), the measured optimum.
+        assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 1), 4);
+        // Same host, beam 5: lanes are budgeted one forward per thread instead
         // (32/5 = 6), which is the measured optimum for this 6-window job.
         assert_eq!(parallel_no_context_window_lanes(6, 32, 32, 5), 6);
         // Fewer windows than lanes ⇒ bounded by the window count.
