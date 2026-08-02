@@ -143,7 +143,7 @@ use std::time::{Duration, Instant};
 use franken_whisper::audio::normalize_to_wav;
 use franken_whisper::conformance::word_error_rate;
 use franken_whisper::native_engine::decode::{
-    DecodeParams, DecodeWorkStats, LoadedModel, transcribe_samples,
+    DecodeParams, DecodeWorkStats, LoadedModel, transcribe_samples, transcribe_samples_batch,
 };
 use franken_whisper::native_engine::dtw::WordTiming;
 use franken_whisper::native_engine::find_model_file;
@@ -2459,6 +2459,54 @@ fn franken_worker_main(args: &[String]) {
         model_hint: Some(model_short.to_owned()),
         ..DecodeParams::default()
     };
+    let batch_copies = std::env::var("FW_BATCH_COPIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&copies| copies > 1);
+    if let Some(copies) = batch_copies {
+        let inputs = vec![samples.as_slice(); copies];
+        let force_serial = std::env::var("FW_BATCH_SERIAL").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        });
+        let outputs = if force_serial {
+            inputs
+                .iter()
+                .map(|input| transcribe_samples(&model, input, &params, &(|| Ok(()))))
+                .collect::<Result<Vec<_>, _>>()
+        } else {
+            transcribe_samples_batch(&model, &inputs, &params, &(|| Ok(())))
+        }
+        .expect("worker batch transcribe");
+        let transcripts: Vec<String> = outputs
+            .iter()
+            .map(|output| {
+                output
+                    .segments
+                    .iter()
+                    .map(|segment| segment.text.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let transcript_sha256: Vec<String> = transcripts
+            .iter()
+            .map(|transcript| sha256_bytes(transcript.as_bytes()))
+            .collect();
+        println!(
+            "FW_BATCH_RESULT {}",
+            json!({
+                "copies": copies,
+                "serial": force_serial,
+                "transcript_sha256": transcript_sha256,
+                "chars": transcripts.iter().map(String::len).sum::<usize>(),
+                "decode_row": contract.decode.as_row(),
+            })
+        );
+        return;
+    }
     let out =
         transcribe_samples(&model, &samples, &params, &(|| Ok(()))).expect("worker transcribe");
     let segments: Vec<String> = out

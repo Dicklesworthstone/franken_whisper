@@ -1606,6 +1606,22 @@ impl NativeWhisperModel {
         decode::transcribe_samples(&self.inner, samples, params, checkpoint)
     }
 
+    /// Transcribe independent clips concurrently while sharing this loaded
+    /// model and one bounded compute pool. Output order matches input order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates model/decode/cancellation errors from the first failing input
+    /// in input order, or worker-pool construction failure.
+    pub fn transcribe_batch(
+        &self,
+        inputs: &[&[f32]],
+        params: &decode::DecodeParams,
+        checkpoint: &(dyn Fn() -> FwResult<()> + Sync),
+    ) -> FwResult<Vec<decode::DecodeOutput>> {
+        decode::transcribe_samples_batch(&self.inner, inputs, params, checkpoint)
+    }
+
     /// A stable identity string for this model's weights, of the form
     /// `"fw-native-v1+sha256:{first 12 hex of the model file's sha256}"`.
     ///
