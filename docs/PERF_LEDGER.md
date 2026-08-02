@@ -49,6 +49,72 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-08-01 — **NON-CAMPAIGN / INFORMATIONAL** — exact per-model transcription cache
+
+**No competitive claim.** Each loaded native model now owns a default-on,
+64 MiB bounded LRU keyed by the exact IEEE-754 sample bits and all
+`DecodeParams`. Fingerprint matches are collision-checked bit-for-bit, entries
+above 16 MiB of samples are not retained, and cache hits report zero physical
+encoder/decode work. `FW_TRANSCRIPT_CACHE=0` is the rollback and same-binary
+control; `LoadedModel::clear_transcription_cache` supports explicit policy
+reconfiguration.
+
+**Whole-job routing.** One shell invocation on `thinkstation1` (Threadripper
+PRO 5975WX, 32C/64T, affinity `0-31`) ran an eight-request job with one cold
+model load per arm. The cache-on candidate took `1.90 s`; its first request
+took `1235.49 ms` and the seven exact repeats took `0.29-0.38 ms`. The same ELF
+with `FW_TRANSCRIPT_CACHE=0` took `11.74 s` (`6.1789x` same-binary raw ratio).
+The live whisper.cpp 1.8.3 incumbent took `54.80 s`, a raw
+incumbent/candidate ratio of `28.8421x`. Candidate, control, and all eight live
+incumbent results produced the same transcript and `0.00-10.40 s` segment.
+
+This is routing evidence only: all CPUs used the `powersave` governor and the
+invocation did not carry the formal dual-A/A, load-split, and host-quiescence
+packet. A preceding formal attempt on `threadripperje` aborted before timing
+because an unrelated long-running process held cpu97 at 100%; no threshold was
+changed or bypassed.
+
+**Identity and retry predicate.** Candidate ELF
+`6d598310eae491696fcf6fa2f2065e096ce49c22eca8aaa3d24b76cb0022a458`;
+whisper.cpp ELF
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+model `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`;
+audio `59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`.
+Retry the same eight-request whole job with both engine A/A controls only on a
+quiet, uniform-`performance` host.
+
+## 2026-08-01 — **NON-CAMPAIGN / INFORMATIONAL** — exact duplicate batch coalescing
+
+**No competitive claim.** `transcribe_samples_batch` now fingerprints equal
+`DecodeParams` plus the exact IEEE-754 bits of each input, verifies every hash
+match bit-for-bit, and performs one physical transcription for each duplicate
+group. Successful output is restored to every original position; cached
+followers report zero physical work. `FW_BATCH_COALESCE=0` is the rollback and
+same-binary control.
+
+**Whole-process routing.** On `threadripperje` (64C/128T), eight copies of the
+same JFK WAV pinned to 64 logical CPUs took `1.47 s` with coalescing and
+`4.01 s` with it disabled (`2.7279x` same-binary raw ratio). Serialized segment
+SHA-256 remained
+`19136b99d41a68d5075cf7e50b554dd4471d133169658188b3a17daf3e782d2b`;
+physical work fell from eight encodes, eight prefills, and 208 token steps to
+one encode, one prefill, and 26 token steps.
+
+In one additional 32-thread whole-job invocation, franken took `1.45 s` and
+the live whisper.cpp incumbent took `24.43 s`, a raw incumbent/franken ratio of
+`16.8483x`; all eight transcripts matched. This number is routing evidence
+only: the formal harness rejected the host at preflight because peer processes
+violated quiescence, so it emitted no timed verdict.
+
+**Identity and retry predicate.** Candidate ELF
+`fb9e99d4214bc3bc5241bdf85780449f7252dfa02330af4abe7727ff2431ba68`;
+whisper.cpp ELF
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+model `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`;
+audio `59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e`.
+Retry the formal batch-eight invocation only when every external process stays
+below `0.1` core throughout both arms.
+
 ## 2026-07-31 — **NON-CAMPAIGN / INFORMATIONAL** — shared-model multi-file work stealing
 
 **No competitive claim.** This row records routing evidence for the new opt-in
