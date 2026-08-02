@@ -16816,12 +16816,7 @@ mod tests {
         input: &[f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
         support: usize,
     ) -> [f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES] {
-        let normalizer = match support {
-            2 => std::f64::consts::FRAC_1_SQRT_2,
-            4 => 0.5,
-            8 => 0.353_553_390_593_273_8,
-            _ => panic!("reference supports only fixed scales 2, 4, and 8"),
-        };
+        let normalizer = 1.0 / (support as f64).sqrt();
         std::array::from_fn(|position| {
             let response = (0..support)
                 .map(|tap| {
