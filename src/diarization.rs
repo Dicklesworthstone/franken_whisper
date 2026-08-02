@@ -3126,7 +3126,7 @@ pub const ACOUSTIC_WAVELET_MAX_LEVELS: usize = 4;
 pub const ACOUSTIC_WAVELET_ENERGY_TOLERANCE: f32 = 2e-5;
 /// Relative power added to every coefficient when computing wavelet flatness.
 ///
-/// DWT coefficients are retained as `f32`, so mathematically zero values can
+/// Wavelet coefficients are retained as `f32`, so mathematically zero values can
 /// acquire representation noise after a DC offset is added and removed. A
 /// scale-relative floor preserves gain invariance without changing acoustic-v2.
 pub const ACOUSTIC_WAVELET_FLATNESS_RELATIVE_POWER_FLOOR: f32 = f32::EPSILON;
@@ -3139,11 +3139,20 @@ pub const ACOUSTIC_MODULATION_MIN_VALID_FRAMES: usize = 32;
 /// Fixed modulation frequencies represented by harmonics 1, 2, 4, and 8 of a
 /// 64-frame window sampled at 100 Hz. These are point frequencies, not bands.
 pub const ACOUSTIC_MODULATION_FREQUENCY_HZ: [f32; 4] = [1.5625, 3.125, 6.25, 12.5];
-/// Fixed temporal support shared by trajectory DWT and scattering candidates.
+/// Fixed temporal support shared by trajectory-wavelet and scattering candidates.
 pub const ACOUSTIC_TRAJECTORY_HISTORY_FRAMES: usize = 64;
 /// Minimum observed values required before one trajectory family is analyzed.
 pub const ACOUSTIC_TRAJECTORY_MIN_VALID_FRAMES: usize = 32;
-/// Minimum retained detail coefficients required for one masked DWT level.
+/// Centered-RMS floor relative to `max(1, abs(valid_mean))` for trajectory
+/// admission. This suppresses representational jitter that unit-energy
+/// normalization would otherwise amplify into full-scale evidence.
+pub const ACOUSTIC_TRAJECTORY_CENTERED_RMS_RELATIVE_FLOOR: f32 = 8.0 * f32::EPSILON;
+/// RMS floor for distribution-shape statistics after a trajectory has been
+/// unit-energy normalized. Magnitudes remain observable below this floor, but
+/// f32 transform residue cannot create entropy or adjacent-change evidence.
+pub const ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR: f32 = 8.0 * f32::EPSILON;
+/// Minimum retained detail coefficients required for one masked
+/// trajectory-wavelet level.
 pub const ACOUSTIC_TRAJECTORY_MIN_VALID_COEFFICIENTS: usize = 2;
 /// Number and canonical order of trajectory families in the sidecar ring.
 pub const ACOUSTIC_TRAJECTORY_FAMILY_COUNT: usize = 5;
@@ -3151,7 +3160,7 @@ pub const ACOUSTIC_TRAJECTORY_FAMILY_COUNT: usize = 5;
 pub const ACOUSTIC_SCATTERING_SCALE_SUPPORTS: [usize; 3] = [2, 4, 8];
 /// Canonical `(first_scale, second_scale)` order for second-order outputs.
 pub const ACOUSTIC_SCATTERING_SCALE_PAIRS: [[usize; 2]; 3] = [[0, 1], [0, 2], [1, 2]];
-/// Minimum valid circular-filter positions required for one scattering output.
+/// Minimum valid non-wrapping filter positions required for one scattering output.
 pub const ACOUSTIC_SCATTERING_MIN_VALID_OUTPUTS: usize = 8;
 
 const ACOUSTIC_MODULATION_BIN_INDICES: [usize; 4] = [1, 2, 4, 8];
@@ -3247,7 +3256,7 @@ impl AcousticSidecarStudyMode {
     }
 }
 
-/// Independently selectable trajectory-DWT candidate.
+/// Independently selectable stationary trajectory-wavelet candidate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AcousticTrajectoryWaveletMode {
     #[default]
@@ -3434,17 +3443,18 @@ fn acoustic_sidecar_study_config_digest(config: AcousticSidecarStudyConfig) -> F
         "trajectory-occupancy-valid=not-clipped",
         "trajectory-band-valid=not-low-energy-and-not-clipped",
         "trajectory-normalization=valid-mean-center-unit-energy",
-        "trajectory-constant=all-candidate-outputs-unavailable-with-input-was-constant",
-        "masked-dwt=all-filter-support-valid-or-coefficient-absent",
-        "masked-dwt-invalid-values=omitted-never-zero-imputed",
-        "masked-dwt-phase=periodic-forward-taps-at-two-times-output-index",
-        "masked-dwt-output=mean-absolute-rms-entropy-adjacent-change-with-independent-pair-availability",
-        "masked-dwt-adjacent-change=linear-noncircular-neighbor-pairs",
-        "scattering-filter=undecimated-circular-forward-haar-unit-l2",
+        "trajectory-near-constant=centered-rms-at-most-relative-floor-times-max-one-absolute-valid-mean-makes-all-candidate-outputs-unavailable",
+        "masked-trajectory-wavelet=undecimated-stationary-all-filter-support-valid-or-coefficient-absent",
+        "masked-trajectory-wavelet-invalid-values=omitted-never-zero-imputed",
+        "masked-trajectory-wavelet-geometry=nonwrapping-valid-forward-taps-at-output-index-with-dyadic-level-dilation",
+        "masked-trajectory-wavelet-output=mean-absolute-rms-entropy-adjacent-change-with-independent-pair-availability",
+        "masked-trajectory-wavelet-detail-shape=entropy-and-adjacent-change-unavailable-at-or-below-unit-normalized-detail-rms-floor",
+        "masked-trajectory-wavelet-adjacent-change=linear-neighbor-pairs",
+        "scattering-filter=undecimated-nonwrapping-valid-forward-haar-unit-l2",
         "scattering-first-order=mean-absolute-filter-response",
         "scattering-second-order=mean-absolute-filtered-first-order-modulus-with-j2-greater-than-j1",
         "scattering-second-only=compute-required-first-scales-zero-and-one-hide-aggregates",
-        "scattering-average=arithmetic-mean-over-valid-circular-positions",
+        "scattering-average=arithmetic-mean-over-valid-nonwrapping-positions",
         "scattering-scratch=1280-first-only-1600-with-second-order",
         "cancellation=entry-frame-wavelet-modulation-family-frequency-trajectory-family-level-scale-pair",
         "mutation=all-enabled-incremental-families-staged-until-frame-success",
@@ -3467,6 +3477,12 @@ fn acoustic_sidecar_study_config_digest(config: AcousticSidecarStudyConfig) -> F
     hasher.update((ACOUSTIC_MODULATION_MIN_VALID_FRAMES as u64).to_le_bytes());
     hasher.update((ACOUSTIC_TRAJECTORY_HISTORY_FRAMES as u64).to_le_bytes());
     hasher.update((ACOUSTIC_TRAJECTORY_MIN_VALID_FRAMES as u64).to_le_bytes());
+    hasher.update(
+        ACOUSTIC_TRAJECTORY_CENTERED_RMS_RELATIVE_FLOOR
+            .to_bits()
+            .to_le_bytes(),
+    );
+    hasher.update(ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR.to_bits().to_le_bytes());
     hasher.update((ACOUSTIC_TRAJECTORY_MIN_VALID_COEFFICIENTS as u64).to_le_bytes());
     hasher.update((ACOUSTIC_TRAJECTORY_FAMILY_COUNT as u64).to_le_bytes());
     hasher.update((CEPSTRAL_COEFFICIENTS as u64).to_le_bytes());
@@ -3959,8 +3975,8 @@ fn summarize_wavelet_detail(
 pub enum AcousticTrajectoryFamily {
     /// Frame-local RMS magnitude of the gain-centered cepstral envelope on
     /// usable voiced frames. This candidate evaluates its trajectory with
-    /// scale-local DWT and scattering summaries without inheriting state from
-    /// a preceding frame.
+    /// scale-local stationary-wavelet and scattering summaries without
+    /// inheriting state from a preceding frame.
     #[default]
     VoicedCepstralEnvelopeMagnitude,
     /// Frame-local voiced occupancy. It is activity evidence, not reusable
@@ -4058,26 +4074,27 @@ impl AcousticTrajectoryFamily {
     }
 }
 
-/// Missingness-aware statistics for one decimated trajectory-DWT level.
+/// Missingness-aware statistics for one undecimated stationary trajectory-wavelet level.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub struct AcousticTrajectoryWaveletLevelSummary {
     pub available: bool,
     pub valid_coefficients: usize,
     pub mean_absolute_detail: f32,
     pub detail_rms: f32,
+    pub normalized_entropy_available: bool,
     pub normalized_entropy: f32,
     pub adjacent_valid_pairs: usize,
     pub normalized_detail_change_available: bool,
     pub normalized_detail_change: f32,
 }
 
-/// One trajectory family within a masked DWT result.
+/// One trajectory family within a masked stationary-wavelet result.
 #[derive(Clone, Copy, PartialEq)]
 pub struct AcousticTrajectoryWaveletFamilySummary {
     pub family: AcousticTrajectoryFamily,
     pub owner: AcousticSidecarFeatureOwner,
     pub input_valid_frames: usize,
-    pub input_was_constant: bool,
+    pub input_was_constant_or_near_constant: bool,
     pub valid_level_count: usize,
     pub levels: [AcousticTrajectoryWaveletLevelSummary; ACOUSTIC_WAVELET_MAX_LEVELS],
 }
@@ -4089,14 +4106,14 @@ impl Default for AcousticTrajectoryWaveletFamilySummary {
             family,
             owner: family.owner(),
             input_valid_frames: 0,
-            input_was_constant: false,
+            input_was_constant_or_near_constant: false,
             valid_level_count: 0,
             levels: [AcousticTrajectoryWaveletLevelSummary::default(); ACOUSTIC_WAVELET_MAX_LEVELS],
         }
     }
 }
 
-/// Fixed-size result of the trajectory DWT candidate.
+/// Fixed-size result of the stationary trajectory-wavelet candidate.
 ///
 /// Raw trajectory values and coefficients never leave the sidecar state.
 #[derive(Clone, Copy, PartialEq)]
@@ -4147,7 +4164,7 @@ pub struct AcousticScatteringFamilySummary {
     pub family: AcousticTrajectoryFamily,
     pub owner: AcousticSidecarFeatureOwner,
     pub input_valid_frames: usize,
-    pub input_was_constant: bool,
+    pub input_was_constant_or_near_constant: bool,
     pub first_order_available: [bool; ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()],
     pub first_order_valid_positions: [usize; ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()],
     pub first_order_mean_modulus: [f32; ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()],
@@ -4163,7 +4180,7 @@ impl Default for AcousticScatteringFamilySummary {
             family,
             owner: family.owner(),
             input_valid_frames: 0,
-            input_was_constant: false,
+            input_was_constant_or_near_constant: false,
             first_order_available: [false; ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()],
             first_order_valid_positions: [0; ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()],
             first_order_mean_modulus: [0.0; ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()],
@@ -4181,7 +4198,7 @@ pub struct AcousticScatteringSummary {
     pub window_start_frame_index: usize,
     pub window_end_frame_index: usize,
     pub families: [AcousticScatteringFamilySummary; ACOUSTIC_TRAJECTORY_FAMILY_COUNT],
-    /// Filter coefficient applications for valid circular output positions.
+    /// Filter coefficient applications for valid non-wrapping output positions.
     pub filter_sample_terms: usize,
     /// Validity-mask positions inspected across first- and second-order paths.
     pub validity_sample_visits: usize,
@@ -4322,7 +4339,10 @@ fn normalize_masked_trajectory(
         let centered = f64::from(values[ring_index]) - mean;
         centered_energy += centered * centered;
     }
-    if centered_energy <= f64::from(PCM_EPSILON * PCM_EPSILON) {
+    let centered_rms = (centered_energy / valid_count as f64).sqrt();
+    let centered_rms_floor =
+        f64::from(ACOUSTIC_TRAJECTORY_CENTERED_RMS_RELATIVE_FLOOR) * mean.abs().max(1.0);
+    if centered_rms <= centered_rms_floor {
         return Ok((valid_count, false, true));
     }
     let inverse_norm = centered_energy.sqrt().recip();
@@ -4345,13 +4365,13 @@ fn normalize_masked_trajectory(
 fn trajectory_wavelet_pair(
     basis: AcousticWaveletBasis,
     input: &[f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
-    input_len: usize,
     base: usize,
+    dilation: usize,
 ) -> (f32, f32) {
     match basis {
         AcousticWaveletBasis::Haar => {
-            let left = f64::from(input[base % input_len]);
-            let right = f64::from(input[(base + 1) % input_len]);
+            let left = f64::from(input[base]);
+            let right = f64::from(input[base + dilation]);
             (
                 (HAAR_LOW[0] * left + HAAR_LOW[1] * right) as f32,
                 (HAAR_HIGH[0] * left + HAAR_HIGH[1] * right) as f32,
@@ -4361,7 +4381,7 @@ fn trajectory_wavelet_pair(
             let mut low = 0.0_f64;
             let mut high = 0.0_f64;
             for tap in 0..4 {
-                let sample = f64::from(input[(base + tap) % input_len]);
+                let sample = f64::from(input[base + tap * dilation]);
                 low += DAUBECHIES_FOUR_TAP_LOW[tap] * sample;
                 high += DAUBECHIES_FOUR_TAP_HIGH[tap] * sample;
             }
@@ -4398,25 +4418,25 @@ fn summarize_masked_trajectory_detail(
         .sum::<f64>()
         / valid_coefficients as f64;
     let detail_rms = (detail_energy / valid_coefficients as f64).sqrt();
-    let normalized_entropy =
-        if detail_energy > f64::from(PCM_EPSILON * PCM_EPSILON) && valid_coefficients > 1 {
-            let entropy = detail[..detail_len]
-                .iter()
-                .zip(&valid[..detail_len])
-                .filter(|(_, is_valid)| **is_valid)
-                .map(|(value, _)| {
-                    let probability = f64::from(*value) * f64::from(*value) / detail_energy;
-                    if probability > 0.0 {
-                        -probability * probability.ln()
-                    } else {
-                        0.0
-                    }
-                })
-                .sum::<f64>();
-            (entropy / (valid_coefficients as f64).ln()).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+    let detail_shape_available = detail_rms > f64::from(ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR);
+    let normalized_entropy = if detail_shape_available && valid_coefficients > 1 {
+        let entropy = detail[..detail_len]
+            .iter()
+            .zip(&valid[..detail_len])
+            .filter(|(_, is_valid)| **is_valid)
+            .map(|(value, _)| {
+                let probability = f64::from(*value) * f64::from(*value) / detail_energy;
+                if probability > 0.0 {
+                    -probability * probability.ln()
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f64>();
+        (entropy / (valid_coefficients as f64).ln()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let mut adjacent_pairs = 0usize;
     let mut adjacent_change = 0.0_f64;
     for index in 1..detail_len {
@@ -4425,7 +4445,7 @@ fn summarize_masked_trajectory_detail(
             adjacent_change += f64::from((detail[index] - detail[index - 1]).abs());
         }
     }
-    let normalized_detail_change = if adjacent_pairs > 0 && detail_rms > f64::from(PCM_EPSILON) {
+    let normalized_detail_change = if adjacent_pairs > 0 && detail_shape_available {
         adjacent_change / adjacent_pairs as f64 / detail_rms
     } else {
         0.0
@@ -4435,10 +4455,10 @@ fn summarize_masked_trajectory_detail(
         valid_coefficients,
         mean_absolute_detail: mean_absolute_detail as f32,
         detail_rms: detail_rms as f32,
+        normalized_entropy_available: detail_shape_available && valid_coefficients > 1,
         normalized_entropy: normalized_entropy as f32,
         adjacent_valid_pairs: adjacent_pairs,
-        normalized_detail_change_available: adjacent_pairs > 0
-            && detail_rms > f64::from(PCM_EPSILON),
+        normalized_detail_change_available: adjacent_pairs > 0 && detail_shape_available,
         normalized_detail_change: normalized_detail_change as f32,
     }
 }
@@ -4476,7 +4496,7 @@ where
         }
         let mut current = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
         let mut current_valid = [false; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
-        let (input_valid_frames, input_available, input_was_constant) =
+        let (input_valid_frames, input_available, input_was_constant_or_near_constant) =
             normalize_masked_trajectory(
                 family_summary.family,
                 &window.values[family_index],
@@ -4486,7 +4506,7 @@ where
                 &mut current_valid,
             )?;
         family_summary.input_valid_frames = input_valid_frames;
-        family_summary.input_was_constant = input_was_constant;
+        family_summary.input_was_constant_or_near_constant = input_was_constant_or_near_constant;
         if !input_available {
             continue;
         }
@@ -4511,9 +4531,23 @@ where
                     family_summary.family.id()
                 )));
             }
-            let output_len = current_len / 2;
+            let dilation = 1usize.checked_shl(level as u32).ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "trajectory wavelet dilation exceeds size arithmetic".to_owned(),
+                )
+            })?;
+            let maximum_tap_offset = (tap_count - 1).checked_mul(dilation).ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "trajectory wavelet support exceeds size arithmetic".to_owned(),
+                )
+            })?;
+            let output_len = current_len.checked_sub(maximum_tap_offset).ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "trajectory wavelet level is shorter than its analysis filter".to_owned(),
+                )
+            })?;
             for output_index in 0..output_len {
-                let base = output_index * 2;
+                let base = output_index;
                 let mut support_valid = true;
                 for tap in 0..tap_count {
                     accounting.validity_visits =
@@ -4522,7 +4556,7 @@ where
                                 "trajectory wavelet validity accounting overflowed".to_owned(),
                             )
                         })?;
-                    support_valid &= current_valid[(base + tap) % current_len];
+                    support_valid &= current_valid[base + tap * dilation];
                 }
                 approximation_valid[output_index] = support_valid;
                 detail_valid[output_index] = support_valid;
@@ -4531,7 +4565,7 @@ where
                     detail[output_index] = 0.0;
                     continue;
                 }
-                let (low, high) = trajectory_wavelet_pair(basis, &current, current_len, base);
+                let (low, high) = trajectory_wavelet_pair(basis, &current, base, dilation);
                 approximation[output_index] = low;
                 detail[output_index] = high;
                 accounting.filter_terms = accounting
@@ -4569,24 +4603,33 @@ where
     })
 }
 
-fn circular_haar_modulus(
+fn valid_haar_modulus(
     input: &[f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
     valid: &[bool; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
+    input_len: usize,
     support: usize,
     normalizer: f64,
     output: &mut [f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
     output_valid: &mut [bool; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
     accounting: &mut AcousticFilterAccounting,
 ) -> FwResult<usize> {
+    if input_len > ACOUSTIC_TRAJECTORY_HISTORY_FRAMES || support == 0 || support > input_len {
+        return Err(FwError::InvalidRequest(
+            "scattering filter support exceeds its non-wrapping input geometry".to_owned(),
+        ));
+    }
+    output.fill(0.0);
+    output_valid.fill(false);
     let mut valid_positions = 0usize;
-    for position in 0..ACOUSTIC_TRAJECTORY_HISTORY_FRAMES {
+    let output_len = input_len - support + 1;
+    for position in 0..output_len {
         let mut support_valid = true;
         for tap in 0..support {
             accounting.validity_visits =
                 accounting.validity_visits.checked_add(1).ok_or_else(|| {
                     FwError::InvalidRequest("scattering validity accounting overflowed".to_owned())
                 })?;
-            support_valid &= valid[(position + tap) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+            support_valid &= valid[position + tap];
         }
         output_valid[position] = support_valid;
         if !support_valid {
@@ -4596,8 +4639,7 @@ fn circular_haar_modulus(
         let mut response = 0.0_f64;
         for tap in 0..support {
             let sign = if tap < support / 2 { 1.0 } else { -1.0 };
-            response +=
-                sign * f64::from(input[(position + tap) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]);
+            response += sign * f64::from(input[position + tap]);
         }
         output[position] = (response * normalizer).abs() as f32;
         if !output[position].is_finite() {
@@ -4680,7 +4722,7 @@ where
         }
         let mut normalized = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
         let mut normalized_valid = [false; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
-        let (input_valid_frames, input_available, input_was_constant) =
+        let (input_valid_frames, input_available, input_was_constant_or_near_constant) =
             normalize_masked_trajectory(
                 family_summary.family,
                 &window.values[family_index],
@@ -4690,7 +4732,7 @@ where
                 &mut normalized_valid,
             )?;
         family_summary.input_valid_frames = input_valid_frames;
-        family_summary.input_was_constant = input_was_constant;
+        family_summary.input_was_constant_or_near_constant = input_was_constant_or_near_constant;
         if !input_available {
             continue;
         }
@@ -4698,6 +4740,8 @@ where
             ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()];
         let mut first_valid =
             [[false; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()];
+        let first_output_lengths = ACOUSTIC_SCATTERING_SCALE_SUPPORTS
+            .map(|support| ACOUSTIC_TRAJECTORY_HISTORY_FRAMES - support + 1);
         let first_scale_count = if mode.emits_first_order() {
             ACOUSTIC_SCATTERING_SCALE_SUPPORTS.len()
         } else {
@@ -4710,9 +4754,10 @@ where
                     family_summary.family.id()
                 )));
             }
-            let valid_positions = circular_haar_modulus(
+            let valid_positions = valid_haar_modulus(
                 &normalized,
                 &normalized_valid,
+                ACOUSTIC_TRAJECTORY_HISTORY_FRAMES,
                 ACOUSTIC_SCATTERING_SCALE_SUPPORTS[scale_index],
                 ACOUSTIC_SCATTERING_SCALE_NORMALIZERS[scale_index],
                 &mut first_modulus[scale_index],
@@ -4744,9 +4789,10 @@ where
                         family_summary.family.id()
                     )));
                 }
-                let valid_positions = circular_haar_modulus(
+                let valid_positions = valid_haar_modulus(
                     &first_modulus[first_scale],
                     &first_valid[first_scale],
+                    first_output_lengths[first_scale],
                     ACOUSTIC_SCATTERING_SCALE_SUPPORTS[second_scale],
                     ACOUSTIC_SCATTERING_SCALE_NORMALIZERS[second_scale],
                     &mut second_modulus,
@@ -5288,7 +5334,7 @@ where
 pub struct AcousticSidecarStudyObservation {
     schema_version: &'static str,
     configuration_sha256_digest: [u8; 32],
-    mode: AcousticSidecarStudyMode,
+    config: AcousticSidecarStudyConfig,
     frame_index: usize,
     wavelet: Option<AcousticWaveletSummary>,
     modulation: Option<AcousticModulationSummary>,
@@ -5308,8 +5354,8 @@ impl AcousticSidecarStudyObservation {
     }
 
     #[must_use]
-    pub const fn mode(&self) -> AcousticSidecarStudyMode {
-        self.mode
+    pub const fn config(&self) -> AcousticSidecarStudyConfig {
+        self.config
     }
 
     #[must_use]
@@ -5343,7 +5389,7 @@ impl std::fmt::Debug for AcousticSidecarStudyObservation {
         formatter
             .debug_struct("AcousticSidecarStudyObservation")
             .field("schema_version", &self.schema_version)
-            .field("mode", &self.mode)
+            .field("config", &self.config)
             .field("frame_index", &self.frame_index)
             .field("wavelet_available", &self.wavelet.is_some())
             .field("modulation_available", &self.modulation.is_some())
@@ -5484,7 +5530,7 @@ impl AcousticSidecarStudy {
         Ok(AcousticSidecarStudyObservation {
             schema_version: ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION,
             configuration_sha256_digest: self.configuration_sha256_digest,
-            mode: self.config.mode,
+            config: self.config,
             frame_index: frame.frame_index,
             wavelet,
             modulation,
@@ -16715,7 +16761,7 @@ mod tests {
         std::array::from_fn(|index| ((f64::from(input[index]) - mean) * inverse_norm) as f32)
     }
 
-    fn reference_full_valid_trajectory_dwt(
+    fn scalar_reference_full_valid_trajectory_wavelet(
         input: &[f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
         basis: AcousticWaveletBasis,
     ) -> [super::AcousticTrajectoryWaveletLevelSummary; super::ACOUSTIC_WAVELET_MAX_LEVELS] {
@@ -16746,18 +16792,18 @@ mod tests {
         };
         let mut current = reference_normalized_trajectory(input);
         let mut current_len = ACOUSTIC_TRAJECTORY_HISTORY_FRAMES;
-        std::array::from_fn(|_| {
-            let output_len = current_len / 2;
+        std::array::from_fn(|level| {
+            let dilation = 1usize << level;
+            let output_len = current_len - (low_taps.len() - 1) * dilation;
             let mut approximation = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
             let mut detail = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
             for output_index in 0..output_len {
-                let base = 2 * output_index;
                 let mut low = 0.0_f64;
                 let mut high = 0.0_f64;
                 for (tap, (&low_coefficient, &high_coefficient)) in
                     low_taps.iter().zip(high_taps).enumerate()
                 {
-                    let sample = f64::from(current[(base + tap) % current_len]);
+                    let sample = f64::from(current[output_index + tap * dilation]);
                     low += low_coefficient * sample;
                     high += high_coefficient * sample;
                 }
@@ -16778,25 +16824,35 @@ mod tests {
                 .sum::<f64>()
                 / output_len as f64;
             let detail_rms = (detail_energy / output_len as f64).sqrt();
-            let normalized_entropy = detail
-                .iter()
-                .map(|value| {
-                    let value = f64::from(*value);
-                    let probability = value * value / detail_energy;
-                    if probability > 0.0 {
-                        -probability * probability.ln()
-                    } else {
-                        0.0
-                    }
-                })
-                .sum::<f64>()
-                / (output_len as f64).ln();
-            let normalized_detail_change = detail
-                .windows(2)
-                .map(|pair| f64::from((pair[1] - pair[0]).abs()))
-                .sum::<f64>()
-                / (output_len - 1) as f64
-                / detail_rms;
+            let shape_available =
+                detail_rms > f64::from(super::ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR);
+            let normalized_entropy = if shape_available && output_len > 1 {
+                detail
+                    .iter()
+                    .map(|value| {
+                        let value = f64::from(*value);
+                        let probability = value * value / detail_energy;
+                        if probability > 0.0 {
+                            -probability * probability.ln()
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum::<f64>()
+                    / (output_len as f64).ln()
+            } else {
+                0.0
+            };
+            let normalized_detail_change = if shape_available && output_len > 1 {
+                detail
+                    .windows(2)
+                    .map(|pair| f64::from((pair[1] - pair[0]).abs()))
+                    .sum::<f64>()
+                    / (output_len - 1) as f64
+                    / detail_rms
+            } else {
+                0.0
+            };
             current[..output_len].copy_from_slice(&approximation[..output_len]);
             current_len = output_len;
             super::AcousticTrajectoryWaveletLevelSummary {
@@ -16804,46 +16860,66 @@ mod tests {
                 valid_coefficients: output_len,
                 mean_absolute_detail: mean_absolute_detail as f32,
                 detail_rms: detail_rms as f32,
+                normalized_entropy_available: shape_available && output_len > 1,
                 normalized_entropy: normalized_entropy.clamp(0.0, 1.0) as f32,
                 adjacent_valid_pairs: output_len - 1,
-                normalized_detail_change_available: true,
+                normalized_detail_change_available: shape_available && output_len > 1,
                 normalized_detail_change: normalized_detail_change as f32,
             }
         })
     }
 
-    fn reference_circular_haar_modulus(
+    fn scalar_reference_valid_haar_modulus(
         input: &[f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
+        input_len: usize,
         support: usize,
-    ) -> [f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES] {
+    ) -> ([f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES], usize) {
         let normalizer = 1.0 / (support as f64).sqrt();
-        std::array::from_fn(|position| {
+        let output_len = input_len - support + 1;
+        let mut output = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+        for position in 0..output_len {
             let response = (0..support)
                 .map(|tap| {
                     let sign = if tap < support / 2 { 1.0 } else { -1.0 };
-                    sign * f64::from(input[(position + tap) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES])
+                    sign * f64::from(input[position + tap])
                 })
                 .sum::<f64>();
-            (response * normalizer).abs() as f32
-        })
+            output[position] = (response * normalizer).abs() as f32;
+        }
+        (output, output_len)
     }
 
-    fn reference_full_valid_scattering(
+    fn scalar_reference_full_valid_scattering(
         input: &[f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES],
     ) -> ([f32; 3], [f32; 3]) {
         let normalized = reference_normalized_trajectory(input);
-        let first_paths =
-            [2, 4, 8].map(|support| reference_circular_haar_modulus(&normalized, support));
-        let first_order = first_paths.map(|path| {
-            (path.iter().map(|value| f64::from(*value)).sum::<f64>()
-                / ACOUSTIC_TRAJECTORY_HISTORY_FRAMES as f64) as f32
+        let first_paths = [2, 4, 8].map(|support| {
+            scalar_reference_valid_haar_modulus(
+                &normalized,
+                ACOUSTIC_TRAJECTORY_HISTORY_FRAMES,
+                support,
+            )
+        });
+        let first_order = first_paths.map(|(path, output_len)| {
+            (path[..output_len]
+                .iter()
+                .map(|value| f64::from(*value))
+                .sum::<f64>()
+                / output_len as f64) as f32
         });
         let second_paths = [[0, 1], [0, 2], [1, 2]].map(|[first_scale, second_scale]| {
-            reference_circular_haar_modulus(&first_paths[first_scale], [2, 4, 8][second_scale])
+            scalar_reference_valid_haar_modulus(
+                &first_paths[first_scale].0,
+                first_paths[first_scale].1,
+                [2, 4, 8][second_scale],
+            )
         });
-        let second_order = second_paths.map(|path| {
-            (path.iter().map(|value| f64::from(*value)).sum::<f64>()
-                / ACOUSTIC_TRAJECTORY_HISTORY_FRAMES as f64) as f32
+        let second_order = second_paths.map(|(path, output_len)| {
+            (path[..output_len]
+                .iter()
+                .map(|value| f64::from(*value))
+                .sum::<f64>()
+                / output_len as f64) as f32
         });
         (first_order, second_order)
     }
@@ -16906,13 +16982,16 @@ mod tests {
             assert!(family.input_valid_frames <= ACOUSTIC_TRAJECTORY_HISTORY_FRAMES);
             assert!(family.valid_level_count <= summary.requested_levels);
             for level in family.levels.iter().take(summary.requested_levels) {
-                assert!(level.valid_coefficients <= ACOUSTIC_TRAJECTORY_HISTORY_FRAMES / 2);
+                assert!(level.valid_coefficients <= ACOUSTIC_TRAJECTORY_HISTORY_FRAMES);
                 assert!(level.mean_absolute_detail.is_finite());
                 assert!(level.mean_absolute_detail >= 0.0);
                 assert!(level.detail_rms.is_finite());
                 assert!(level.detail_rms >= 0.0);
                 assert!(level.normalized_entropy.is_finite());
                 assert!((0.0..=1.0).contains(&level.normalized_entropy));
+                if !level.normalized_entropy_available {
+                    assert_eq!(level.normalized_entropy, 0.0);
+                }
                 assert!(level.adjacent_valid_pairs <= level.valid_coefficients.saturating_sub(1));
                 assert!(level.normalized_detail_change.is_finite());
                 assert!(level.normalized_detail_change >= 0.0);
@@ -16922,6 +17001,7 @@ mod tests {
                 if !level.available {
                     assert_eq!(level.mean_absolute_detail, 0.0);
                     assert_eq!(level.detail_rms, 0.0);
+                    assert!(!level.normalized_entropy_available);
                     assert_eq!(level.normalized_entropy, 0.0);
                     assert_eq!(level.adjacent_valid_pairs, 0);
                     assert!(!level.normalized_detail_change_available);
@@ -17228,7 +17308,10 @@ mod tests {
         let off_observation = off
             .observe_normalized_16khz_frame(&frame_samples, &frame, &mut active)
             .expect("default-off observation");
-        assert_eq!(off_observation.mode(), AcousticSidecarStudyMode::Off);
+        assert_eq!(
+            off_observation.config(),
+            AcousticSidecarStudyConfig::default()
+        );
         assert_eq!(off_observation.frame_index(), 0);
         assert_eq!(
             off_observation.schema_version(),
@@ -17258,7 +17341,7 @@ mod tests {
         let combined_observation = combined
             .observe_normalized_16khz_frame(&frame_samples, &frame, &mut active)
             .expect("combined observation");
-        assert_eq!(combined_observation.mode(), config.mode);
+        assert_eq!(combined_observation.config(), config);
         assert_eq!(
             combined_observation.wavelet().map(|summary| summary.basis),
             Some(AcousticWaveletBasis::DaubechiesFourTap)
@@ -17273,9 +17356,9 @@ mod tests {
         assert_eq!(
             debug,
             format!(
-                "AcousticSidecarStudyObservation {{ schema_version: {:?}, mode: {:?}, frame_index: 0, wavelet_available: true, modulation_available: false, trajectory_wavelet_available: false, scattering_available: false, .. }}",
+                "AcousticSidecarStudyObservation {{ schema_version: {:?}, config: {:?}, frame_index: 0, wavelet_available: true, modulation_available: false, trajectory_wavelet_available: false, scattering_available: false, .. }}",
                 super::ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION,
-                config.mode
+                config
             )
         );
 
@@ -17319,7 +17402,7 @@ mod tests {
             }
         }
         let observation = final_observation.expect("complete configured window");
-        assert_eq!(observation.mode(), config.mode);
+        assert_eq!(observation.config(), config);
         assert_eq!(
             observation.configuration_sha256_digest(),
             super::acoustic_sidecar_study_config_digest(config).expect("configuration digest")
@@ -18014,9 +18097,14 @@ mod tests {
             [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
         let affine = values.map(|family| family.map(|value| 0.25 + 0.5 * value));
         let mut active = || false;
-        for (basis, expected_filter_terms, expected_validity_visits) in [
-            (AcousticWaveletBasis::Haar, 1_200, 600),
-            (AcousticWaveletBasis::DaubechiesFourTap, 2_400, 1_200),
+        for (basis, expected_filter_terms, expected_validity_visits, expected_support) in [
+            (AcousticWaveletBasis::Haar, 4_600, 2_300, [63, 61, 57, 49]),
+            (
+                AcousticWaveletBasis::DaubechiesFourTap,
+                7_120,
+                3_560,
+                [61, 55, 43, 19],
+            ),
         ] {
             let summary = super::analyze_acoustic_trajectory_wavelet(
                 trajectory_window(&values, &valid, 0, 11, 74),
@@ -18042,15 +18130,19 @@ mod tests {
             assert_trajectory_wavelet_summary_is_bounded(&summary);
             for (family, affine_family) in summary.families.iter().zip(affine_summary.families) {
                 assert_eq!(family.input_valid_frames, 64);
-                assert!(!family.input_was_constant);
+                assert!(!family.input_was_constant_or_near_constant);
                 assert_eq!(family.valid_level_count, 4);
                 assert_eq!(
                     family.levels.map(|level| level.valid_coefficients),
-                    [32, 16, 8, 4]
+                    expected_support
                 );
                 for (level, affine_level) in family.levels.iter().zip(affine_family.levels) {
                     assert_eq!(level.available, affine_level.available);
                     assert_eq!(level.valid_coefficients, affine_level.valid_coefficients);
+                    assert_eq!(
+                        level.normalized_entropy_available,
+                        affine_level.normalized_entropy_available
+                    );
                     assert_eq!(
                         level.adjacent_valid_pairs,
                         affine_level.adjacent_valid_pairs
@@ -18085,7 +18177,7 @@ mod tests {
     }
 
     #[test]
-    fn trajectory_wavelets_match_independent_full_valid_haar_and_d4_oracles() {
+    fn trajectory_wavelets_match_scalar_full_valid_haar_and_d4_references() {
         let values = trajectory_fixture_values();
         let valid =
             [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
@@ -18100,12 +18192,16 @@ mod tests {
                 4,
                 &mut active,
             )
-            .expect("full-valid differential DWT");
-            let expected = reference_full_valid_trajectory_dwt(&values[0], basis);
+            .expect("full-valid differential stationary wavelet");
+            let expected = scalar_reference_full_valid_trajectory_wavelet(&values[0], basis);
             for (actual, expected) in actual.families[0].levels.iter().zip(expected) {
                 assert_eq!(actual.available, expected.available);
                 assert_eq!(actual.valid_coefficients, expected.valid_coefficients);
                 assert_eq!(actual.adjacent_valid_pairs, expected.adjacent_valid_pairs);
+                assert_eq!(
+                    actual.normalized_entropy_available,
+                    expected.normalized_entropy_available
+                );
                 assert_eq!(
                     actual.normalized_detail_change_available,
                     expected.normalized_detail_change_available
@@ -18147,6 +18243,29 @@ mod tests {
     }
 
     #[test]
+    fn trajectory_detail_shape_floor_separates_roundoff_from_measured_structure() {
+        let floor = super::ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR;
+        let mut detail = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+        let mut valid = [false; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+        valid[..4].fill(true);
+        detail[..4].copy_from_slice(&[0.5 * floor, -0.5 * floor, 0.5 * floor, -0.5 * floor]);
+        let below = super::summarize_masked_trajectory_detail(&detail, &valid, 4);
+        assert!(below.available);
+        assert!(below.detail_rms > 0.0);
+        assert!(!below.normalized_entropy_available);
+        assert_eq!(below.normalized_entropy, 0.0);
+        assert!(!below.normalized_detail_change_available);
+        assert_eq!(below.normalized_detail_change, 0.0);
+
+        detail[..4].copy_from_slice(&[2.0 * floor, -2.0 * floor, 2.0 * floor, -2.0 * floor]);
+        let above = super::summarize_masked_trajectory_detail(&detail, &valid, 4);
+        assert!(above.normalized_entropy_available);
+        assert!((above.normalized_entropy - 1.0).abs() < f32::EPSILON);
+        assert!(above.normalized_detail_change_available);
+        assert!(above.normalized_detail_change > 0.0);
+    }
+
+    #[test]
     fn trajectory_wavelets_enforce_minimum_support_without_zero_imputation() {
         let values = trajectory_fixture_values();
         let mut valid =
@@ -18161,7 +18280,7 @@ mod tests {
             4,
             &mut active,
         )
-        .expect("below-boundary masked DWT");
+        .expect("below-boundary masked stationary wavelet");
         assert!(
             below
                 .families
@@ -18180,11 +18299,11 @@ mod tests {
             4,
             &mut active,
         )
-        .expect("at-boundary masked DWT");
+        .expect("at-boundary masked stationary wavelet");
         assert!(boundary.families.iter().all(|family| {
             family.input_valid_frames == 32
                 && family.valid_level_count == 4
-                && family.levels.map(|level| level.valid_coefficients) == [16, 8, 4, 2]
+                && family.levels.map(|level| level.valid_coefficients) == [31, 29, 25, 17]
         }));
 
         let mut sparse_valid =
@@ -18223,45 +18342,89 @@ mod tests {
             masked
                 .families
                 .iter()
-                .all(|family| family.levels[0].valid_coefficients == 23)
+                .all(|family| family.levels[0].valid_coefficients == 45)
         );
         assert_eq!(masked, changed);
     }
 
     #[test]
-    fn trajectory_dwt_is_phase_sensitive_under_one_frame_circular_shift() {
-        let mut values = [[0.1_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
-            super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
-        for family in &mut values {
-            family[0] = 0.9;
-            family[1] = 0.9;
-        }
-        let shifted = values.map(|family| {
-            let mut shifted_family = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
-            for (offset, value) in family.into_iter().enumerate() {
-                shifted_family[(offset + 1) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES] = value;
-            }
-            shifted_family
+    fn stationary_trajectory_wavelet_is_stable_under_one_frame_translation() {
+        let first = std::array::from_fn(|_| {
+            std::array::from_fn(|offset| if offset % 2 == 0 { 0.1 } else { 0.9 })
+        });
+        let shifted = std::array::from_fn(|_| {
+            std::array::from_fn(|offset| if offset % 2 == 0 { 0.9 } else { 0.1 })
         });
         let valid =
             [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
         let mut active = || false;
-        let aligned = super::analyze_acoustic_trajectory_wavelet(
+        for basis in [
+            AcousticWaveletBasis::Haar,
+            AcousticWaveletBasis::DaubechiesFourTap,
+        ] {
+            let first = super::analyze_acoustic_trajectory_wavelet(
+                trajectory_window(&first, &valid, 0, 0, 63),
+                basis,
+                4,
+                &mut active,
+            )
+            .expect("first stationary trajectory window");
+            let shifted = super::analyze_acoustic_trajectory_wavelet(
+                trajectory_window(&shifted, &valid, 0, 1, 64),
+                basis,
+                4,
+                &mut active,
+            )
+            .expect("translated stationary trajectory window");
+            if basis == AcousticWaveletBasis::Haar {
+                let level = first.families[0].levels[0];
+                assert_eq!(level.valid_coefficients, 63);
+                assert!((level.mean_absolute_detail - 0.176_776_69).abs() < 2e-6);
+                assert!((level.detail_rms - 0.176_776_69).abs() < 2e-6);
+                assert!(level.normalized_entropy_available);
+                assert!((level.normalized_entropy - 1.0).abs() < 2e-6);
+                assert!(level.normalized_detail_change_available);
+                assert!((level.normalized_detail_change - 2.0).abs() < 2e-6);
+            }
+            for (left, right) in first.families[0]
+                .levels
+                .iter()
+                .zip(shifted.families[0].levels)
+            {
+                assert_eq!(left.valid_coefficients, right.valid_coefficients);
+                assert!((left.mean_absolute_detail - right.mean_absolute_detail).abs() < 2e-6);
+                assert!((left.detail_rms - right.detail_rms).abs() < 2e-6);
+                assert!((left.normalized_entropy - right.normalized_entropy).abs() < 2e-6);
+                assert!(
+                    (left.normalized_detail_change - right.normalized_detail_change).abs() < 2e-6
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stationary_d4_does_not_invent_detail_shape_at_a_linear_window_seam() {
+        let values = std::array::from_fn(|_| {
+            std::array::from_fn(|offset| {
+                offset as f32 / (ACOUSTIC_TRAJECTORY_HISTORY_FRAMES - 1) as f32
+            })
+        });
+        let valid =
+            [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        let mut active = || false;
+        let summary = super::analyze_acoustic_trajectory_wavelet(
             trajectory_window(&values, &valid, 0, 0, 63),
-            AcousticWaveletBasis::Haar,
+            AcousticWaveletBasis::DaubechiesFourTap,
             4,
             &mut active,
         )
-        .expect("aligned trajectory DWT");
-        let shifted = super::analyze_acoustic_trajectory_wavelet(
-            trajectory_window(&shifted, &valid, 0, 0, 63),
-            AcousticWaveletBasis::Haar,
-            4,
-            &mut active,
-        )
-        .expect("shifted trajectory DWT");
-        assert!(aligned.families[0].levels[0].detail_rms < 1e-6);
-        assert!(shifted.families[0].levels[0].detail_rms > 0.1);
+        .expect("linear stationary D4 trajectory");
+        let first_level = summary.families[0].levels[0];
+        assert!(first_level.detail_rms <= super::ACOUSTIC_TRAJECTORY_DETAIL_RMS_FLOOR);
+        assert!(!first_level.normalized_entropy_available);
+        assert_eq!(first_level.normalized_entropy, 0.0);
+        assert!(!first_level.normalized_detail_change_available);
+        assert_eq!(first_level.normalized_detail_change, 0.0);
     }
 
     #[test]
@@ -18391,7 +18554,7 @@ mod tests {
         .expect("constant trajectory wavelet");
         assert!(wavelet.families.iter().all(|family| {
             family.input_valid_frames == 64
-                && family.input_was_constant
+                && family.input_was_constant_or_near_constant
                 && family.valid_level_count == 0
         }));
         assert_eq!(wavelet.filter_tap_terms, 0);
@@ -18405,12 +18568,87 @@ mod tests {
         .expect("constant scattering");
         assert!(scattering.families.iter().all(|family| {
             family.input_valid_frames == 64
-                && family.input_was_constant
+                && family.input_was_constant_or_near_constant
                 && family.first_order_available == [false; 3]
                 && family.second_order_available == [false; 3]
         }));
         assert_eq!(scattering.filter_sample_terms, 0);
         assert_eq!(scattering.validity_sample_visits, 0);
+    }
+
+    #[test]
+    fn trajectory_kernels_suppress_f32_jitter_but_retain_above_floor_variation() {
+        let mut quantization_only = [[0.5_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+            super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        for family in &mut quantization_only {
+            family[ACOUSTIC_TRAJECTORY_HISTORY_FRAMES - 1] = f32::from_bits(0.5_f32.to_bits() + 1);
+        }
+        quantization_only[0].fill(500_000.0);
+        quantization_only[0][ACOUSTIC_TRAJECTORY_HISTORY_FRAMES - 1] =
+            f32::from_bits(500_000.0_f32.to_bits() + 1);
+        let valid =
+            [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        let mut active = || false;
+        let wavelet = super::analyze_acoustic_trajectory_wavelet(
+            trajectory_window(&quantization_only, &valid, 0, 0, 63),
+            AcousticWaveletBasis::Haar,
+            4,
+            &mut active,
+        )
+        .expect("quantization-only trajectory wavelet");
+        assert!(wavelet.families.iter().all(|family| {
+            family.input_was_constant_or_near_constant && family.valid_level_count == 0
+        }));
+        assert_eq!(wavelet.filter_tap_terms, 0);
+        assert_eq!(wavelet.validity_sample_visits, 0);
+
+        let scattering = super::analyze_acoustic_scattering(
+            trajectory_window(&quantization_only, &valid, 0, 0, 63),
+            AcousticScatteringMode::FirstAndSecondOrder,
+            &mut active,
+        )
+        .expect("quantization-only scattering");
+        assert!(
+            scattering
+                .families
+                .iter()
+                .all(|family| family.input_was_constant_or_near_constant)
+        );
+        assert_eq!(scattering.filter_sample_terms, 0);
+        assert_eq!(scattering.validity_sample_visits, 0);
+
+        let relative_floor = super::ACOUSTIC_TRAJECTORY_CENTERED_RMS_RELATIVE_FLOOR;
+        let mut above_floor = [[0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
+            super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
+        for (family_index, family) in above_floor.iter_mut().enumerate() {
+            let mean = if family_index == 0 { 500_000.0 } else { 0.5 };
+            let delta = 2.0 * relative_floor * mean.max(1.0);
+            for (offset, value) in family.iter_mut().enumerate() {
+                *value = mean + if offset % 2 == 0 { delta } else { -delta };
+            }
+        }
+        let wavelet = super::analyze_acoustic_trajectory_wavelet(
+            trajectory_window(&above_floor, &valid, 0, 0, 63),
+            AcousticWaveletBasis::Haar,
+            4,
+            &mut active,
+        )
+        .expect("above-floor trajectory wavelet");
+        assert!(wavelet.families.iter().all(|family| {
+            !family.input_was_constant_or_near_constant && family.valid_level_count == 4
+        }));
+        let scattering = super::analyze_acoustic_scattering(
+            trajectory_window(&above_floor, &valid, 0, 0, 63),
+            AcousticScatteringMode::FirstAndSecondOrder,
+            &mut active,
+        )
+        .expect("above-floor scattering");
+        assert!(
+            scattering
+                .families
+                .iter()
+                .all(|family| !family.input_was_constant_or_near_constant)
+        );
     }
 
     #[test]
@@ -18517,12 +18755,12 @@ mod tests {
             &mut active,
         )
         .expect("combined scattering");
-        assert_eq!(first.filter_sample_terms, 4_480);
-        assert_eq!(first.validity_sample_visits, 4_480);
-        assert_eq!(second.filter_sample_terms, 8_320);
-        assert_eq!(second.validity_sample_visits, 8_320);
-        assert_eq!(combined.filter_sample_terms, 10_880);
-        assert_eq!(combined.validity_sample_visits, 10_880);
+        assert_eq!(first.filter_sample_terms, 4_130);
+        assert_eq!(first.validity_sample_visits, 4_130);
+        assert_eq!(second.filter_sample_terms, 7_450);
+        assert_eq!(second.validity_sample_visits, 7_450);
+        assert_eq!(combined.filter_sample_terms, 9_730);
+        assert_eq!(combined.validity_sample_visits, 9_730);
         assert_eq!(first.scratch_buffer_payload_bytes, 1_280);
         assert_eq!(second.scratch_buffer_payload_bytes, 1_600);
         assert_eq!(combined.scratch_buffer_payload_bytes, 1_600);
@@ -18531,7 +18769,7 @@ mod tests {
             let second_family = second.families[family_index];
             let combined_family = combined.families[family_index];
             assert_eq!(first_family.first_order_available, [true; 3]);
-            assert_eq!(first_family.first_order_valid_positions, [64; 3]);
+            assert_eq!(first_family.first_order_valid_positions, [63, 61, 57]);
             assert!((first_family.first_order_mean_modulus[0] - 0.176_776_69).abs() < 2e-6);
             assert!(first_family.first_order_mean_modulus[1].abs() < 2e-6);
             assert!(first_family.first_order_mean_modulus[2].abs() < 2e-6);
@@ -18540,7 +18778,8 @@ mod tests {
             assert_eq!(second_family.first_order_valid_positions, [0; 3]);
             assert_eq!(second_family.first_order_mean_modulus, [0.0; 3]);
             assert_eq!(second_family.second_order_available, [true; 3]);
-            assert_eq!(second_family.second_order_valid_positions, [64; 3]);
+            assert_eq!(second_family.second_order_valid_positions, [60, 56, 54]);
+            assert_eq!(second_family.second_order_mean_modulus, [0.0; 3]);
             assert_eq!(combined_family.first_order_available, [true; 3]);
             assert_eq!(
                 combined_family.first_order_mean_modulus,
@@ -18554,12 +18793,12 @@ mod tests {
         assert_scattering_summary_is_bounded(&combined);
         assert_eq!(
             format!("{combined:?}"),
-            "AcousticScatteringSummary { mode: FirstAndSecondOrder, window_start_frame_index: 0, window_end_frame_index: 63, available_first_order_count: 15, available_second_order_count: 15, filter_sample_terms: 10880, validity_sample_visits: 10880, scratch_buffer_payload_bytes: 1600, .. }"
+            "AcousticScatteringSummary { mode: FirstAndSecondOrder, window_start_frame_index: 0, window_end_frame_index: 63, available_first_order_count: 15, available_second_order_count: 15, filter_sample_terms: 9730, validity_sample_visits: 9730, scratch_buffer_payload_bytes: 1600, .. }"
         );
     }
 
     #[test]
-    fn scattering_matches_independent_nonzero_first_and_second_order_oracle() {
+    fn scattering_matches_scalar_nonzero_first_and_second_order_reference() {
         let values = trajectory_fixture_values();
         let valid =
             [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
@@ -18570,7 +18809,7 @@ mod tests {
             &mut active,
         )
         .expect("full-valid differential scattering");
-        let (expected_first, expected_second) = reference_full_valid_scattering(&values[0]);
+        let (expected_first, expected_second) = scalar_reference_full_valid_scattering(&values[0]);
         assert!(expected_first.iter().all(|value| *value > 1e-4));
         assert!(expected_second.iter().all(|value| *value > 1e-4));
         for (actual, expected) in actual.families[0]
@@ -18612,8 +18851,15 @@ mod tests {
             let mut active = || false;
             for frame_index in 0..ACOUSTIC_TRAJECTORY_HISTORY_FRAMES {
                 let mut frame = trajectory_sidecar_feature(frame_index);
-                frame.quality.voiced = frame_index < ACOUSTIC_TRAJECTORY_HISTORY_FRAMES / 2;
-                frame.quality.reliable_pitch = frame.quality.voiced;
+                let voiced = frame_index < ACOUSTIC_TRAJECTORY_HISTORY_FRAMES / 2;
+                frame.voice.f0_hz = voiced.then_some(140.0);
+                frame.voice.pitch_uncertainty_octaves = voiced.then_some(0.2);
+                frame.voice.voicing_confidence = if voiced { 0.9 } else { 0.0 };
+                frame.voice.harmonicity = if voiced { 0.9 } else { 0.0 };
+                frame.voice.harmonic_to_noise_db = if voiced { 9.5 } else { -20.0 };
+                frame.quality.voiced = voiced;
+                frame.quality.reliable_pitch = voiced;
+                assert!(super::validate_acoustic_frame(&frame).is_ok());
                 final_observation = Some(
                     study
                         .observe_normalized_16khz_frame(&frame_samples, &frame, &mut active)
@@ -18627,6 +18873,11 @@ mod tests {
             let summary = observation
                 .scattering()
                 .expect("selected scattering result");
+            assert_eq!(observation.config(), config);
+            assert!(
+                format!("{observation:?}").contains(&format!("config: {config:?}")),
+                "observation Debug must expose every configured study axis"
+            );
             assert_eq!(summary.mode, mode);
             let occupancy = summary.families[1];
             if mode.emits_first_order() {
@@ -18661,55 +18912,42 @@ mod tests {
     }
 
     #[test]
-    fn scattering_is_circular_shift_invariant_and_ignores_masked_values() {
-        let values = trajectory_fixture_values();
+    fn scattering_nonwrapping_ramp_goldens_and_masked_values() {
+        let ramp = std::array::from_fn(|family_index| {
+            std::array::from_fn(|offset| {
+                if family_index == 0 {
+                    offset as f32
+                } else {
+                    offset as f32 / (ACOUSTIC_TRAJECTORY_HISTORY_FRAMES - 1) as f32
+                }
+            })
+        });
         let valid =
             [[true; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES]; super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT];
-        let shifted = values.map(|family| {
-            let mut shifted_family = [0.0_f32; ACOUSTIC_TRAJECTORY_HISTORY_FRAMES];
-            for (offset, value) in family.into_iter().enumerate() {
-                shifted_family[(offset + 7) % ACOUSTIC_TRAJECTORY_HISTORY_FRAMES] = value;
-            }
-            shifted_family
-        });
         let mut active = || false;
-        let original = super::analyze_acoustic_scattering(
-            trajectory_window(&values, &valid, 0, 0, 63),
-            AcousticScatteringMode::FirstAndSecondOrder,
+        let ramp_summary = super::analyze_acoustic_scattering(
+            trajectory_window(&ramp, &valid, 0, 0, 63),
+            AcousticScatteringMode::FirstOrder,
             &mut active,
         )
-        .expect("original scattering");
-        let shifted = super::analyze_acoustic_scattering(
-            trajectory_window(&shifted, &valid, 0, 0, 63),
-            AcousticScatteringMode::FirstAndSecondOrder,
-            &mut active,
-        )
-        .expect("shifted scattering");
-        for (original_family, shifted_family) in original.families.iter().zip(shifted.families) {
-            assert_eq!(
-                original_family.first_order_available,
-                shifted_family.first_order_available
-            );
-            assert_eq!(
-                original_family.second_order_available,
-                shifted_family.second_order_available
-            );
-            for (left, right) in original_family
-                .first_order_mean_modulus
-                .into_iter()
-                .zip(shifted_family.first_order_mean_modulus)
-            {
-                assert!((left - right).abs() < 2e-6, "{left} versus {right}");
-            }
-            for (left, right) in original_family
-                .second_order_mean_modulus
-                .into_iter()
-                .zip(shifted_family.second_order_mean_modulus)
-            {
-                assert!((left - right).abs() < 2e-6, "{left} versus {right}");
-            }
+        .expect("non-wrapping ramp scattering");
+        let normalized_step = (21_840.0_f64).sqrt().recip();
+        let expected = [
+            normalized_step * std::f64::consts::FRAC_1_SQRT_2,
+            2.0 * normalized_step,
+            16.0 * normalized_step / 8.0_f64.sqrt(),
+        ];
+        let ramp_family = ramp_summary.families[0];
+        assert_eq!(ramp_family.first_order_valid_positions, [63, 61, 57]);
+        for (actual, expected) in ramp_family
+            .first_order_mean_modulus
+            .into_iter()
+            .zip(expected)
+        {
+            assert!((f64::from(actual) - expected).abs() < 2e-6);
         }
 
+        let values = trajectory_fixture_values();
         let mut sparse_valid = valid;
         let mut changed_invalid_values = values;
         for family_index in 0..super::ACOUSTIC_TRAJECTORY_FAMILY_COUNT {
@@ -18914,21 +19152,22 @@ mod tests {
         let scattering = observation.scattering().expect("configured scattering");
         assert_eq!(trajectory.window_start_frame_index, 1);
         assert_eq!(trajectory.window_end_frame_index, 64);
-        assert_eq!(trajectory.filter_tap_terms, 1_984);
-        assert_eq!(trajectory.validity_sample_visits, 1_152);
+        assert_eq!(trajectory.filter_tap_terms, 5_800);
+        assert_eq!(trajectory.validity_sample_visits, 3_312);
         assert_eq!(trajectory.scratch_buffer_payload_bytes, 960);
         assert_eq!(scattering.window_start_frame_index, 1);
         assert_eq!(scattering.window_end_frame_index, 64);
-        assert_eq!(scattering.filter_sample_terms, 8_872);
-        assert_eq!(scattering.validity_sample_visits, 10_880);
+        assert_eq!(scattering.filter_sample_terms, 7_914);
+        assert_eq!(scattering.validity_sample_visits, 9_730);
         assert_eq!(scattering.scratch_buffer_payload_bytes, 1_600);
         assert_trajectory_wavelet_summary_is_bounded(&trajectory);
         assert_scattering_summary_is_bounded(&scattering);
         assert_eq!(
             format!("{observation:?}"),
             format!(
-                "AcousticSidecarStudyObservation {{ schema_version: {:?}, mode: HaarAndModulation, frame_index: 64, wavelet_available: true, modulation_available: true, trajectory_wavelet_available: true, scattering_available: true, .. }}",
-                super::ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION
+                "AcousticSidecarStudyObservation {{ schema_version: {:?}, config: {:?}, frame_index: 64, wavelet_available: true, modulation_available: true, trajectory_wavelet_available: true, scattering_available: true, .. }}",
+                super::ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION,
+                config
             )
         );
         let next_observation = study
@@ -19043,7 +19282,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_sidecar_cancellation_after_trajectory_dwt_rolls_back_ring() {
+    fn configured_sidecar_cancellation_after_trajectory_wavelet_rolls_back_ring() {
         let config = AcousticSidecarStudyConfig {
             trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Haar,
             trajectory_wavelet_levels: 4,
@@ -19069,7 +19308,7 @@ mod tests {
                 checks += 1;
                 checks == 28
             })
-            .expect_err("cancel after completed trajectory DWT");
+            .expect_err("cancel after completed trajectory wavelet");
         assert!(matches!(error, FwError::Cancelled(_)));
         assert!(
             error
