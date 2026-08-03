@@ -315,6 +315,28 @@ fn is_media_extension(extension: &str) -> bool {
             | "mp4"
             | "mov"
             | "webm"
+            | "wv"
+            | "oga"
+            | "mka"
+            | "mkv"
+            | "adts"
+            | "ac3"
+            | "eac3"
+            | "dts"
+            | "ape"
+            | "alac"
+            | "au"
+            | "snd"
+            | "mp2"
+            | "mpa"
+            | "m4b"
+            | "m4p"
+            | "3g2"
+            | "ra"
+            | "rm"
+            | "weba"
+            | "raw"
+            | "pcm"
     )
 }
 
@@ -361,7 +383,16 @@ fn media_magic(bytes: &[u8]) -> bool {
     bytes.starts_with(b"fLaC")
         || bytes.starts_with(b"OggS")
         || bytes.starts_with(b"ID3")
+        || bytes.starts_with(b"wvpk")
+        || bytes.starts_with(b"caff")
+        || bytes.starts_with(b".snd")
+        || bytes.starts_with(b"MAC ")
+        || bytes.starts_with(b".RMF")
+        || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
         || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE")
+        || (bytes.len() >= 12
+            && bytes.starts_with(b"FORM")
+            && (&bytes[8..12] == b"AIFF" || &bytes[8..12] == b"AIFC"))
         || (bytes.len() >= 8 && &bytes[4..8] == b"ftyp")
         || (bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
 }
@@ -474,6 +505,18 @@ mod tests {
             "FW-PRIVACY-MEDIA-PATH"
         );
         assert_eq!(
+            inspect_path(Path::new("private/CALL.WV"))
+                .expect("WavPack finding")
+                .code,
+            "FW-PRIVACY-MEDIA-PATH"
+        );
+        assert_eq!(
+            inspect_path(Path::new("private/CALL.PCM"))
+                .expect("raw PCM finding")
+                .code,
+            "FW-PRIVACY-MEDIA-PATH"
+        );
+        assert_eq!(
             inspect_path(Path::new("notes/CustomerTranscript.MD"))
                 .expect("transcript finding")
                 .code,
@@ -516,6 +559,8 @@ mod tests {
         assert!(media_magic(b"RIFF....WAVEfmt "));
         assert!(media_magic(b"....ftypM4A "));
         assert!(media_magic(b"fLaC"));
+        assert!(media_magic(b"wvpk"));
+        assert!(media_magic(&[0x1a, 0x45, 0xdf, 0xa3]));
         assert!(!media_magic(b"plain text"));
     }
 }
