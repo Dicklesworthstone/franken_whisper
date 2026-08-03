@@ -2805,8 +2805,15 @@ fn nearest_energy_valley(
         return None;
     }
     let boundary_ms = boundary_sec * 1_000.0;
-    profile
+    let lower_ms = (boundary_ms - ENERGY_VALLEY_SNAP_RADIUS_MS as f64).max(0.0);
+    let upper_ms = boundary_ms + ENERGY_VALLEY_SNAP_RADIUS_MS as f64;
+    let start = profile
         .valleys
+        .partition_point(|valley| (valley.timestamp_ms as f64) < lower_ms);
+    let end = profile
+        .valleys
+        .partition_point(|valley| (valley.timestamp_ms as f64) <= upper_ms);
+    profile.valleys[start..end]
         .iter()
         .filter(|valley| valley.rms.is_finite())
         .filter_map(|valley| {
@@ -2987,7 +2994,7 @@ async fn execute_align(
     let audio_duration = inter.normalized_duration;
     let normalized_wav = inter.normalized_wav.clone();
 
-    let (updated_result, mut report) = match run_stage_with_budget(
+    let (updated_result, report) = match run_stage_with_budget(
         "align",
         align_budget_ms,
         move || {
@@ -5268,14 +5275,15 @@ mod tests {
         external_diarization_fallback_admitted, external_diarization_report,
         finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
         is_decimal_period, is_ellipsis_period, load_energy_valley_evidence, merge_regions_by_gap,
-        ms_to_frames, optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
-        parse_event_ts_ms, punctuate_segments, recommended_budget, resolved_diarization_engine,
-        resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
-        run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
-        sha256_file, sha256_json_value, silhouette_score, source_separate,
-        source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
-        stage_failure_message, stage_latency_profile, state_root, transcript_boundaries_ms,
-        vad_energy_detect, vad_energy_detect_with_analysis, validate_diarization_execution_request,
+        ms_to_frames, nearest_energy_valley, optional_stage_skip,
+        parse_acoustic_diarization_rollout, parse_budget_ms, parse_event_ts_ms, punctuate_segments,
+        recommended_budget, resolved_diarization_engine, resolved_diarization_engine_for_rollout,
+        result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
+        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_json_value,
+        silhouette_score, source_separate, source_separate_with_analysis, split_long_regions,
+        stage_budget_ms, stage_failure_code, stage_failure_message, stage_latency_profile,
+        state_root, transcript_boundaries_ms, vad_energy_detect, vad_energy_detect_with_analysis,
+        validate_diarization_execution_request,
     };
 
     #[test]
@@ -9704,6 +9712,35 @@ mod tests {
         assert_eq!(result.segments[0].text, original_text[0]);
         assert_eq!(result.segments[1].text, original_text[1]);
         assert_eq!(result.transcript, "alpha beta");
+    }
+
+    #[test]
+    fn nearest_energy_valley_uses_sorted_window_and_stable_tie_breaks() {
+        let profile = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![
+                crate::backend::native_audio::EnergyValley {
+                    timestamp_ms: 500,
+                    rms: 0.0,
+                },
+                crate::backend::native_audio::EnergyValley {
+                    timestamp_ms: 920,
+                    rms: 0.2,
+                },
+                crate::backend::native_audio::EnergyValley {
+                    timestamp_ms: 1_080,
+                    rms: 0.1,
+                },
+                crate::backend::native_audio::EnergyValley {
+                    timestamp_ms: 1_500,
+                    rms: 0.0,
+                },
+            ],
+        };
+
+        assert_eq!(nearest_energy_valley(1.0, &profile), Some(1.08));
+        assert_eq!(nearest_energy_valley(1.3, &profile), None);
     }
 
     #[test]
