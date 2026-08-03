@@ -50,7 +50,8 @@ pub enum PipelineStage {
     Backend,
     /// Run native acceleration pass (GPU confidence normalization).
     Accelerate,
-    /// CTC-based forced alignment for timestamp correction (bd-qla.3).
+    /// Evidence-gated timestamp alignment: canonical attention-DTW when
+    /// available, otherwise an explicitly labeled character-density fallback.
     Align,
     /// Punctuation restoration (bd-qla.4).
     Punctuate,
@@ -2615,13 +2616,21 @@ struct AlignmentReport {
     segments_corrected: usize,
     /// Number of segments that fell back to original timestamps.
     segments_fallback: usize,
+    /// The evidence source used for the primary timestamp path.
+    method: &'static str,
+    /// Number of segment endpoints conservatively snapped to energy valleys.
+    energy_valley_snaps: usize,
+    /// Whether private waveform evidence was available for boundary snapping.
+    energy_evidence_available: bool,
     /// Notes / warnings produced during alignment.
     notes: Vec<String>,
 }
 
-/// Simulated CTC log-probability frame.  In production this would come from
-/// the model's CTC head; here we derive a deterministic alignment from the
-/// segment text length and the audio duration.
+/// Legacy character-density timestamp fallback.
+///
+/// This is not CTC: it derives deterministic timestamps from segment text
+/// length and audio duration only.  Callers must label its output as
+/// `char_density_heuristic` and must not treat it as model-backed evidence.
 ///
 /// The algorithm works as follows for each segment:
 /// 1. Compute the character density (chars per second) across the full
@@ -2652,6 +2661,9 @@ fn ctc_forced_align(
             segments_total: 0,
             segments_corrected: 0,
             segments_fallback: 0,
+            method: "char_density_heuristic",
+            energy_valley_snaps: 0,
+            energy_evidence_available: false,
             notes,
         });
     }
@@ -2666,6 +2678,9 @@ fn ctc_forced_align(
             segments_total: total,
             segments_corrected: 0,
             segments_fallback: total,
+            method: "char_density_heuristic",
+            energy_valley_snaps: 0,
+            energy_evidence_available: false,
             notes,
         });
     };
@@ -2684,6 +2699,9 @@ fn ctc_forced_align(
             segments_total: total,
             segments_corrected: 0,
             segments_fallback: total,
+            method: "char_density_heuristic",
+            energy_valley_snaps: 0,
+            energy_evidence_available: false,
             notes,
         });
     }
@@ -2697,6 +2715,9 @@ fn ctc_forced_align(
             segments_total: total,
             segments_corrected: 0,
             segments_fallback: total,
+            method: "char_density_heuristic",
+            energy_valley_snaps: 0,
+            energy_evidence_available: false,
             notes,
         });
     }
@@ -2767,14 +2788,111 @@ fn ctc_forced_align(
         segments_total: total,
         segments_corrected: corrected,
         segments_fallback: fallback,
+        method: "char_density_heuristic",
+        energy_valley_snaps: 0,
+        energy_evidence_available: false,
         notes,
     })
+}
+
+const ENERGY_VALLEY_SNAP_RADIUS_MS: u64 = 120;
+
+fn nearest_energy_valley(
+    boundary_sec: f64,
+    profile: &backend::native_audio::EnergyValleyProfile,
+) -> Option<f64> {
+    if !boundary_sec.is_finite() || boundary_sec < 0.0 {
+        return None;
+    }
+    let boundary_ms = boundary_sec * 1_000.0;
+    profile
+        .valleys
+        .iter()
+        .filter(|valley| valley.rms.is_finite())
+        .filter_map(|valley| {
+            let delta_ms = (valley.timestamp_ms as f64 - boundary_ms).abs();
+            (delta_ms <= ENERGY_VALLEY_SNAP_RADIUS_MS as f64).then_some((
+                delta_ms,
+                valley.rms,
+                valley.timestamp_ms,
+            ))
+        })
+        .min_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        })
+        .map(|(_, _, timestamp_ms)| timestamp_ms as f64 / 1_000.0)
+}
+
+fn snap_segment_boundaries_to_energy_valleys(
+    segments: &mut [crate::model::TranscriptionSegment],
+    profile: &backend::native_audio::EnergyValleyProfile,
+    config: &AlignConfig,
+    token: &CancellationToken,
+) -> FwResult<usize> {
+    let mut snaps = 0usize;
+
+    if let Some(first) = segments.first_mut() {
+        token.checkpoint()?;
+        if let Some((start, end)) = first.start_sec.zip(first.end_sec)
+            && let Some(candidate) = nearest_energy_valley(start, profile)
+            && candidate + config.min_segment_duration_sec <= end
+        {
+            first.start_sec = Some(candidate);
+            snaps += 1;
+        }
+    }
+
+    for index in 0..segments.len().saturating_sub(1) {
+        token.checkpoint()?;
+        let Some((left_start, shared_end)) = segments[index].start_sec.zip(segments[index].end_sec)
+        else {
+            continue;
+        };
+        let Some((shared_start, right_end)) = segments[index + 1]
+            .start_sec
+            .zip(segments[index + 1].end_sec)
+        else {
+            continue;
+        };
+
+        // Do not invent a join for a gap, overlap, or missing timestamp. A
+        // proven shared boundary moves both sides together, preserving the
+        // segmentation topology exactly.
+        if shared_end != shared_start {
+            continue;
+        }
+        if let Some(candidate) = nearest_energy_valley(shared_end, profile)
+            && candidate >= left_start + config.min_segment_duration_sec
+            && candidate + config.min_segment_duration_sec <= right_end
+        {
+            segments[index].end_sec = Some(candidate);
+            segments[index + 1].start_sec = Some(candidate);
+            snaps += 1;
+        }
+    }
+
+    if let Some(last) = segments.last_mut() {
+        token.checkpoint()?;
+        if let Some((start, end)) = last.start_sec.zip(last.end_sec)
+            && let Some(candidate) = nearest_energy_valley(end, profile)
+            && candidate >= start + config.min_segment_duration_sec
+        {
+            last.end_sec = Some(candidate);
+            snaps += 1;
+        }
+    }
+
+    Ok(snaps)
 }
 
 fn align_transcription_result(
     result: &mut crate::model::TranscriptionResult,
     audio_duration_sec: Option<f64>,
     config: &AlignConfig,
+    energy_valleys: Option<&backend::native_audio::EnergyValleyProfile>,
     token: &CancellationToken,
 ) -> FwResult<AlignmentReport> {
     if has_canonical_word_alignment(&result.raw_output) {
@@ -2783,13 +2901,60 @@ fn align_transcription_result(
             segments_total: result.segments.len(),
             segments_corrected: 0,
             segments_fallback: result.segments.len(),
+            method: "dtw_attention",
+            energy_valley_snaps: 0,
+            energy_evidence_available: false,
             notes: vec![
-                "preserved authoritative canonical DTW projection timeline; synthetic alignment skipped"
+                "preserved authoritative canonical DTW projection timeline; character-density fallback skipped"
                     .to_owned(),
             ],
         });
     }
-    ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)
+
+    let mut report = ctc_forced_align(&mut result.segments, audio_duration_sec, config, token)?;
+
+    if let Some(profile) = energy_valleys {
+        report.energy_evidence_available = true;
+        report.energy_valley_snaps = snap_segment_boundaries_to_energy_valleys(
+            &mut result.segments,
+            profile,
+            config,
+            token,
+        )?;
+    } else {
+        report.notes.push(
+            "native frame-RMS evidence unavailable; energy-valley snapping skipped without changing timestamps"
+                .to_owned(),
+        );
+    }
+    Ok(report)
+}
+
+fn load_energy_valley_evidence(
+    normalized_wav: Option<&Path>,
+    token: &CancellationToken,
+) -> FwResult<(Option<backend::native_audio::EnergyValleyProfile>, String)> {
+    token.checkpoint()?;
+    match normalized_wav {
+        Some(path) => match backend::native_audio::energy_valleys_from_wav(path, token) {
+            Ok(profile) => Ok((
+                Some(profile),
+                "native frame-RMS energy evidence available".to_owned(),
+            )),
+            Err(error @ (FwError::Cancelled(_) | FwError::StageTimeout { .. })) => Err(error),
+            Err(error) => Ok((
+                None,
+                format!(
+                    "normalized PCM energy evidence unavailable ({error}); energy-valley snapping failed closed"
+                ),
+            )),
+        },
+        None => Ok((
+            None,
+            "normalized PCM energy evidence was not produced; energy-valley snapping failed closed"
+                .to_owned(),
+        )),
+    }
 }
 
 async fn execute_align(
@@ -2809,7 +2974,7 @@ async fn execute_align(
     log.push(
         "align",
         "align.start",
-        "running CTC-based forced alignment for timestamp correction",
+        "running evidence-gated timestamp alignment",
         json!({
             "segments": result.segments.len(),
             "budget_ms": stage_budgets.align_ms,
@@ -2820,46 +2985,74 @@ async fn execute_align(
     let align_budget_ms = stage_budgets.align_ms;
     let align_token = pcx.stage_token(align_budget_ms); // ubs:ignore — cancellation token is not a secret
     let audio_duration = inter.normalized_duration;
+    let normalized_wav = inter.normalized_wav.clone();
 
-    let (updated_result, report) =
-        match run_stage_with_budget("align", align_budget_ms, move || {
+    let (updated_result, mut report) = match run_stage_with_budget(
+        "align",
+        align_budget_ms,
+        move || {
             let config = AlignConfig::default();
-            let report =
-                align_transcription_result(&mut result, audio_duration, &config, &align_token)?;
+            align_token.checkpoint()?;
+            let canonical_dtw = has_canonical_word_alignment(&result.raw_output);
+            let (energy_valleys, energy_evidence_note) = if canonical_dtw {
+                (
+                    None,
+                    "authoritative canonical DTW geometry preserved byte-exact; energy-valley refinement not attempted"
+                        .to_owned(),
+                )
+            } else {
+                load_energy_valley_evidence(normalized_wav.as_deref(), &align_token)?
+            };
+            let mut report = align_transcription_result(
+                &mut result,
+                audio_duration,
+                &config,
+                energy_valleys.as_ref(),
+                &align_token,
+            )?;
+            report.notes.push(energy_evidence_note);
+            align_token.checkpoint()?;
             Ok((result, report))
-        }) {
-            Ok(output) => output,
-            Err(error) => {
-                let code = stage_failure_code("align", &error);
-                log.push(
-                    "align",
-                    &code,
-                    stage_failure_message(&error, "alignment stage failed"),
-                    json!({
-                        "error": error.to_string(),
-                        "budget_ms": stage_budgets.align_ms,
-                    }),
-                );
-                return Err(error);
-            }
-        };
+        },
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let code = stage_failure_code("align", &error);
+            log.push(
+                "align",
+                &code,
+                stage_failure_message(&error, "alignment stage failed"),
+                json!({
+                    "error": error.to_string(),
+                    "budget_ms": stage_budgets.align_ms,
+                }),
+            );
+            return Err(error);
+        }
+    };
 
     inter.result = Some(updated_result);
     inter.warnings.extend(report.notes.iter().cloned());
 
-    let align_code = if report.segments_corrected > 0 {
+    let align_code = if report.method == "dtw_attention"
+        || report.segments_corrected > 0
+        || report.energy_valley_snaps > 0
+    {
         tracing::debug!(
             stage = "align",
             corrected = report.segments_corrected,
             fallback = report.segments_fallback,
-            "forced alignment complete"
+            method = report.method,
+            energy_valley_snaps = report.energy_valley_snaps,
+            "alignment complete"
         );
         "align.ok"
     } else {
         tracing::warn!(
             stage = "align",
             fallback = report.segments_fallback,
-            "forced alignment produced no corrections"
+            method = report.method,
+            "alignment preserved authoritative timestamps"
         );
         "align.fallback"
     };
@@ -2867,11 +3060,14 @@ async fn execute_align(
     log.push(
         "align",
         align_code,
-        "forced alignment pass finished",
+        "alignment pass finished",
         json!({
+            "method": report.method,
             "segments_total": report.segments_total,
             "segments_corrected": report.segments_corrected,
             "segments_fallback": report.segments_fallback,
+            "energy_valley_snaps": report.energy_valley_snaps,
+            "energy_evidence_available": report.energy_evidence_available,
             "notes": report.notes,
         }),
     );
@@ -5071,8 +5267,8 @@ mod tests {
         ctc_forced_align, diarize_segments, emit_diarization_report_events, event_elapsed_ms,
         external_diarization_fallback_admitted, external_diarization_report,
         finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
-        is_decimal_period, is_ellipsis_period, merge_regions_by_gap, ms_to_frames,
-        optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
+        is_decimal_period, is_ellipsis_period, load_energy_valley_evidence, merge_regions_by_gap,
+        ms_to_frames, optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
         parse_event_ts_ms, punctuate_segments, recommended_budget, resolved_diarization_engine,
         resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
         run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
@@ -9433,15 +9629,26 @@ mod tests {
             }),
             artifact_paths: Vec::new(),
         };
+        let valleys = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![crate::backend::native_audio::EnergyValley {
+                timestamp_ms: 980,
+                rms: 0.0,
+            }],
+        };
         let report = align_transcription_result(
             &mut result,
             Some(1.0),
             &AlignConfig::default(),
+            Some(&valleys),
             &CancellationToken::no_deadline(),
         )
         .expect("canonical alignment preservation");
         assert_eq!(report.segments_corrected, 0);
         assert_eq!(report.segments_fallback, 2);
+        assert_eq!(report.energy_valley_snaps, 0);
+        assert!(!report.energy_evidence_available);
         assert!(
             report
                 .notes
@@ -9452,6 +9659,107 @@ mod tests {
             serde_json::to_value(&result.segments).expect("serialize preserved segments"),
             original_json
         );
+    }
+
+    #[test]
+    fn fallback_alignment_snaps_shared_boundary_without_creating_a_gap() {
+        let original_text = ["alpha".to_owned(), "beta".to_owned()];
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "alpha beta".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![
+                make_segment(0.0, 1.04, "alpha"),
+                make_segment(1.04, 2.0, "beta"),
+            ],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({}),
+            artifact_paths: Vec::new(),
+        };
+        let valleys = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![crate::backend::native_audio::EnergyValley {
+                timestamp_ms: 1_000,
+                rms: 0.0,
+            }],
+        };
+
+        let report = align_transcription_result(
+            &mut result,
+            Some(2.0),
+            &AlignConfig::default(),
+            Some(&valleys),
+            &CancellationToken::no_deadline(),
+        )
+        .expect("fallback alignment should retain legal transcript geometry");
+
+        assert_eq!(report.method, "char_density_heuristic");
+        assert_eq!(report.energy_valley_snaps, 1);
+        assert!(report.energy_evidence_available);
+        assert_eq!(result.segments[0].end_sec, Some(1.0));
+        assert_eq!(result.segments[1].start_sec, Some(1.0));
+        assert_eq!(result.segments[0].end_sec, result.segments[1].start_sec);
+        assert_eq!(result.segments[0].text, original_text[0]);
+        assert_eq!(result.segments[1].text, original_text[1]);
+        assert_eq!(result.transcript, "alpha beta");
+    }
+
+    #[test]
+    fn energy_valley_absence_preserves_authoritative_dtw_geometry() {
+        let mut result = TranscriptionResult {
+            backend: BackendKind::WhisperCpp,
+            transcript: "alpha".to_owned(),
+            language: Some("en".to_owned()),
+            segments: vec![make_segment(0.0, 1.0, "alpha")],
+            acceleration: None,
+            diarization: None,
+            raw_output: json!({
+                "projection_timeline": {
+                    "schema_version": crate::conformance::DTW_PROJECTION_SCHEMA_VERSION,
+                    "word_aligned_safe": true
+                }
+            }),
+            artifact_paths: Vec::new(),
+        };
+        let original_segments =
+            serde_json::to_value(&result.segments).expect("serialize original segments");
+        let report = align_transcription_result(
+            &mut result,
+            Some(1.0),
+            &AlignConfig::default(),
+            None,
+            &CancellationToken::no_deadline(),
+        )
+        .expect("unavailable energy evidence must fail closed");
+
+        assert_eq!(report.method, "dtw_attention");
+        assert!(!report.energy_evidence_available);
+        assert_eq!(report.energy_valley_snaps, 0);
+        assert_eq!(
+            serde_json::to_value(&result.segments).expect("serialize preserved segments"),
+            original_segments
+        );
+    }
+
+    #[test]
+    fn unavailable_energy_evidence_reports_the_specific_fail_closed_reason() {
+        let token = CancellationToken::no_deadline();
+        let (profile, absent_reason) = load_energy_valley_evidence(None, &token)
+            .expect("missing normalized audio is nonfatal");
+        assert!(profile.is_none());
+        assert!(absent_reason.contains("was not produced"));
+        assert!(absent_reason.contains("failed closed"));
+
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-normalized.wav");
+        let (profile, error_reason) = load_energy_valley_evidence(Some(&missing), &token)
+            .expect("unreadable normalized audio is nonfatal evidence absence");
+        assert!(profile.is_none());
+        assert!(error_reason.contains("energy evidence unavailable"));
+        assert!(error_reason.contains("i/o failure"));
+        assert!(error_reason.contains("failed closed"));
     }
 
     #[test]
@@ -10056,11 +10364,17 @@ mod tests {
             segments_total: 10,
             segments_corrected: 7,
             segments_fallback: 3,
+            method: "dtw_attention",
+            energy_valley_snaps: 2,
+            energy_evidence_available: true,
             notes: vec!["test note".to_owned()],
         };
         assert_eq!(report.segments_total, 10);
         assert_eq!(report.segments_corrected, 7);
         assert_eq!(report.segments_fallback, 3);
+        assert_eq!(report.method, "dtw_attention");
+        assert_eq!(report.energy_valley_snaps, 2);
+        assert!(report.energy_evidence_available);
         assert_eq!(report.notes.len(), 1);
     }
 

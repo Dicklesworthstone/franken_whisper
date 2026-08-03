@@ -189,6 +189,21 @@ fn e2e_pipeline_with_mock_whisper_cpp() {
         BackendKind::WhisperCpp,
         "resolved backend should be whisper_cpp"
     );
+    let align_event = report
+        .events
+        .iter()
+        .find(|event| event.code == "align.ok" || event.code == "align.fallback")
+        .expect("full pipeline should report the alignment outcome");
+    assert_eq!(
+        align_event.payload["method"].as_str(),
+        Some("char_density_heuristic"),
+        "bridge output without typed DTW proof must retain its honest fallback label"
+    );
+    assert_eq!(
+        align_event.payload["energy_evidence_available"].as_bool(),
+        Some(true),
+        "the normalized public synthetic WAV should provide transient RMS evidence"
+    );
 }
 
 // ---------------------------------------------------------------------------

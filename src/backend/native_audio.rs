@@ -9,10 +9,31 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
+use crate::error::{FwError, FwResult};
+use crate::orchestrator::CancellationToken;
+
 const FRAME_MS: u32 = 20;
 const MIN_THRESHOLD: f32 = 0.003;
 const GAP_BRIDGE_MAX_FRAMES: usize = 2;
 const MIN_REGION_FRAMES: usize = 2;
+
+/// A local minimum in the private frame-RMS trace.  This is transient
+/// waveform evidence for timestamp refinement; callers must not serialize it
+/// into run output or speaker profiles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EnergyValley {
+    pub timestamp_ms: u64,
+    pub rms: f32,
+}
+
+/// Private, bounded frame-energy evidence used by alignment.  The full RMS
+/// trace is intentionally discarded after valley candidates are derived.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EnergyValleyProfile {
+    pub frame_ms: u32,
+    pub activity_threshold: f32,
+    pub valleys: Vec<EnergyValley>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AudioRegion {
@@ -135,24 +156,84 @@ pub(crate) fn analyze_wav(
     })
 }
 
-fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
-    let file_len = fs::metadata(path)
-        .map_err(|error| format!("failed to read wav `{}`: {error}", path.display()))?
-        .len() as usize;
-    if file_len < 44 {
-        return Err(format!("wav too small: {file_len} bytes"));
+/// Derive conservative low-energy valley candidates from normalized PCM.
+///
+/// The helper deliberately returns only local minima below the same adaptive
+/// activity threshold used by native audio analysis.  It keeps no waveform or
+/// frame-RMS trace after returning, so alignment can refine timestamps without
+/// creating a new persisted audio-derived artifact.
+pub(crate) fn energy_valleys_from_wav(
+    path: &Path,
+    token: &CancellationToken,
+) -> FwResult<EnergyValleyProfile> {
+    token.checkpoint()?;
+    let wav = parse_pcm16_mono_wav_with_checkpoint(path, &mut || token.checkpoint())?;
+    let frame_samples = (((wav.sample_rate_hz as u64) * (FRAME_MS as u64)) / 1_000)
+        .max(1)
+        .try_into()
+        .unwrap_or(1usize);
+    let frame_rms = compute_frame_rms_with_checkpoint(&wav.samples, frame_samples, token)?;
+    if frame_rms.len() < 3 {
+        return Ok(EnergyValleyProfile {
+            frame_ms: FRAME_MS,
+            activity_threshold: MIN_THRESHOLD,
+            valleys: Vec::new(),
+        });
     }
 
-    let file = fs::File::open(path)
-        .map_err(|error| format!("failed to read wav `{}`: {error}", path.display()))?;
+    let avg_rms = frame_rms.iter().copied().sum::<f32>() / frame_rms.len() as f32;
+    let max_rms = frame_rms
+        .iter()
+        .copied()
+        .fold(0.0_f32, |acc, rms| acc.max(rms));
+    let activity_threshold =
+        ((avg_rms * 1.5).max(MIN_THRESHOLD)).min((max_rms * 0.8).max(MIN_THRESHOLD));
+
+    let valleys = frame_rms
+        .windows(3)
+        .enumerate()
+        .filter_map(|(offset, window)| {
+            let rms = window[1];
+            (rms.is_finite() && rms < activity_threshold && rms <= window[0] && rms <= window[2])
+                .then_some(EnergyValley {
+                    timestamp_ms: (offset as u64 + 1).saturating_mul(u64::from(FRAME_MS)),
+                    rms,
+                })
+        })
+        .collect();
+
+    Ok(EnergyValleyProfile {
+        frame_ms: FRAME_MS,
+        activity_threshold,
+        valleys,
+    })
+}
+
+fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
+    parse_pcm16_mono_wav_with_checkpoint(path, &mut || Ok(())).map_err(|error| error.to_string())
+}
+
+fn parse_pcm16_mono_wav_with_checkpoint(
+    path: &Path,
+    checkpoint: &mut impl FnMut() -> FwResult<()>,
+) -> FwResult<WavPcm16Mono> {
+    checkpoint()?;
+    let file_len = fs::metadata(path).map_err(FwError::Io)?.len() as usize;
+    if file_len < 44 {
+        return Err(FwError::InvalidRequest(format!(
+            "wav too small: {file_len} bytes"
+        )));
+    }
+
+    let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
 
     let mut header = [0u8; 12];
-    reader
-        .read_exact(&mut header)
-        .map_err(|error| format!("failed to read wav header: {error}"))?;
+    reader.read_exact(&mut header).map_err(FwError::Io)?;
     if header.get(0..4) != Some(b"RIFF") || header.get(8..12) != Some(b"WAVE") {
-        return Err("unsupported wav container; expected RIFF/WAVE".to_owned());
+        return Err(FwError::InvalidRequest(
+            "unsupported wav container; expected RIFF/WAVE".to_owned(),
+        ));
     }
 
     let mut sample_rate_hz: Option<u32> = None;
@@ -163,12 +244,13 @@ fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
     let mut data_len: Option<u32> = None;
 
     loop {
+        checkpoint()?;
         let mut chunk_header = [0u8; 8];
         match reader.read_exact(&mut chunk_header) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
-                return Err(format!("failed to read wav chunk header: {error}"));
+                return Err(FwError::Io(error));
             }
         }
 
@@ -179,18 +261,14 @@ fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
             chunk_header[6],
             chunk_header[7],
         ]);
-        let data_start = reader
-            .stream_position()
-            .map_err(|error| format!("failed to read wav chunk offset: {error}"))?;
+        let data_start = reader.stream_position().map_err(FwError::Io)?;
 
         if chunk_id == b"fmt " {
             if chunk_size < 16 {
-                return Err("invalid wav fmt chunk".to_owned());
+                return Err(FwError::InvalidRequest("invalid wav fmt chunk".to_owned()));
             }
             let mut fmt = [0u8; 16];
-            reader
-                .read_exact(&mut fmt)
-                .map_err(|error| format!("failed to read wav fmt chunk: {error}"))?;
+            reader.read_exact(&mut fmt).map_err(FwError::Io)?;
             audio_format = Some(u16::from_le_bytes([fmt[0], fmt[1]]));
             channels = Some(u16::from_le_bytes([fmt[2], fmt[3]]));
             sample_rate_hz = Some(u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]));
@@ -198,53 +276,58 @@ fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
             if chunk_size > 16 {
                 reader
                     .seek(SeekFrom::Current((chunk_size - 16) as i64))
-                    .map_err(|error| format!("failed to skip wav fmt padding: {error}"))?;
+                    .map_err(FwError::Io)?;
             }
         } else if chunk_id == b"data" {
             data_offset = Some(data_start);
             data_len = Some(chunk_size);
             reader
                 .seek(SeekFrom::Current(chunk_size as i64))
-                .map_err(|error| format!("failed to skip wav data chunk: {error}"))?;
+                .map_err(FwError::Io)?;
         } else {
             reader
                 .seek(SeekFrom::Current(chunk_size as i64))
-                .map_err(|error| format!("failed to skip wav chunk: {error}"))?;
+                .map_err(FwError::Io)?;
         }
 
         // Chunks are word-aligned.
         if chunk_size % 2 == 1 {
-            reader
-                .seek(SeekFrom::Current(1))
-                .map_err(|error| format!("failed to skip wav padding: {error}"))?;
+            reader.seek(SeekFrom::Current(1)).map_err(FwError::Io)?;
         }
     }
 
-    let sample_rate_hz = sample_rate_hz.ok_or_else(|| "missing wav fmt sample_rate".to_owned())?;
-    let channels = channels.ok_or_else(|| "missing wav fmt channels".to_owned())?;
-    let bits_per_sample =
-        bits_per_sample.ok_or_else(|| "missing wav fmt bits_per_sample".to_owned())?;
-    let audio_format = audio_format.ok_or_else(|| "missing wav fmt audio_format".to_owned())?;
-    let data_offset = data_offset.ok_or_else(|| "missing wav data chunk".to_owned())?;
-    let mut data_len = data_len.ok_or_else(|| "missing wav data chunk".to_owned())?;
+    let sample_rate_hz = sample_rate_hz
+        .ok_or_else(|| FwError::InvalidRequest("missing wav fmt sample_rate".to_owned()))?;
+    let channels =
+        channels.ok_or_else(|| FwError::InvalidRequest("missing wav fmt channels".to_owned()))?;
+    let bits_per_sample = bits_per_sample
+        .ok_or_else(|| FwError::InvalidRequest("missing wav fmt bits_per_sample".to_owned()))?;
+    let audio_format = audio_format
+        .ok_or_else(|| FwError::InvalidRequest("missing wav fmt audio_format".to_owned()))?;
+    let data_offset =
+        data_offset.ok_or_else(|| FwError::InvalidRequest("missing wav data chunk".to_owned()))?;
+    let mut data_len =
+        data_len.ok_or_else(|| FwError::InvalidRequest("missing wav data chunk".to_owned()))?;
 
     if audio_format != 1 {
-        return Err(format!(
+        return Err(FwError::InvalidRequest(format!(
             "unsupported wav audio_format={audio_format}; expected PCM (1)"
-        ));
+        )));
     }
     if channels != 1 {
-        return Err(format!(
+        return Err(FwError::InvalidRequest(format!(
             "unsupported wav channels={channels}; expected mono (1)"
-        ));
+        )));
     }
     if bits_per_sample != 16 {
-        return Err(format!(
+        return Err(FwError::InvalidRequest(format!(
             "unsupported wav bits_per_sample={bits_per_sample}; expected 16"
-        ));
+        )));
     }
     if sample_rate_hz == 0 {
-        return Err("invalid wav sample_rate 0".to_owned());
+        return Err(FwError::InvalidRequest(
+            "invalid wav sample_rate 0".to_owned(),
+        ));
     }
 
     let available = (file_len as u64).saturating_sub(data_offset);
@@ -260,7 +343,7 @@ fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
 
     reader
         .seek(SeekFrom::Start(data_offset))
-        .map_err(|error| format!("failed to seek wav data: {error}"))?;
+        .map_err(FwError::Io)?;
 
     let mut samples = Vec::with_capacity((data_len as usize) / 2);
     let mut remaining = data_len as usize;
@@ -268,10 +351,9 @@ fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
     let mut leftover: Option<u8> = None;
 
     while remaining > 0 {
+        checkpoint()?;
         let to_read = buf.len().min(remaining);
-        let read = reader
-            .read(&mut buf[..to_read])
-            .map_err(|error| format!("failed to read wav data: {error}"))?;
+        let read = reader.read(&mut buf[..to_read]).map_err(FwError::Io)?;
         if read == 0 {
             break;
         }
@@ -319,6 +401,30 @@ fn compute_frame_rms(samples: &[i16], frame_samples: usize) -> Vec<f32> {
         out.push(rms);
     }
     out
+}
+
+fn compute_frame_rms_with_checkpoint(
+    samples: &[i16],
+    frame_samples: usize,
+    token: &CancellationToken,
+) -> FwResult<Vec<f32>> {
+    let mut out = Vec::new();
+    for (index, chunk) in samples.chunks(frame_samples.max(1)).enumerate() {
+        if index % 64 == 0 {
+            token.checkpoint()?;
+        }
+        if chunk.is_empty() {
+            continue;
+        }
+        let sum_sq = chunk.iter().fold(0.0_f64, |acc, value| {
+            let normalized = (*value as f64) / 32768.0;
+            acc + (normalized * normalized)
+        });
+        let rms = (sum_sq / (chunk.len() as f64)).sqrt() as f32;
+        out.push(rms);
+    }
+    token.checkpoint()?;
+    Ok(out)
 }
 
 fn bridge_short_gaps(active: &mut [bool], max_gap_frames: usize) {
@@ -402,7 +508,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::analyze_wav;
+    use super::{analyze_wav, energy_valleys_from_wav};
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
         let data_len = (samples.len() * 2) as u32;
@@ -493,6 +599,30 @@ mod tests {
             assert_eq!(a.end_ms, b.end_ms);
             assert!((a.avg_rms - b.avg_rms).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn energy_valleys_keep_only_low_energy_local_minima() {
+        let dir = tempdir().expect("tempdir");
+        let wav = dir.path().join("valley.wav");
+        let mut samples = Vec::new();
+        samples.extend(vec![8_000i16; 320]);
+        samples.extend(vec![0i16; 320]);
+        samples.extend(vec![8_000i16; 320]);
+        write_pcm16_mono_wav(&wav, 16_000, &samples);
+
+        let profile =
+            energy_valleys_from_wav(&wav, &crate::orchestrator::CancellationToken::no_deadline())
+                .expect("derive energy valleys");
+
+        assert_eq!(profile.frame_ms, 20);
+        assert!(profile.activity_threshold > 0.0);
+        assert!(
+            profile
+                .valleys
+                .iter()
+                .any(|valley| valley.timestamp_ms == 20 && valley.rms == 0.0)
+        );
     }
 
     #[test]
