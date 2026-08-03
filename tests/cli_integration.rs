@@ -192,6 +192,58 @@ printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.
 }
 
 #[cfg(unix)]
+fn write_whisper_cpp_tiny_diarize_stub_binary(dir: &std::path::Path) -> PathBuf {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub_path = dir.join("whisper_cpp_tiny_diarize_stub.sh");
+    let script = r#"#!/bin/bash
+set -euo pipefail
+out_prefix=""
+tiny_diarize=0
+json_output=0
+max_context=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -of)
+      out_prefix="$2"
+      shift 2
+      ;;
+    -tdrz)
+      tiny_diarize=1
+      shift
+      ;;
+    --tdrz)
+      echo "unsupported TinyDiarize flag spelling" >&2
+      exit 41
+      ;;
+    -oj)
+      json_output=1
+      shift
+      ;;
+    -mc)
+      max_context="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "${out_prefix}" || "${tiny_diarize}" != "1" || "${json_output}" != "1" || "${max_context}" != "0" ]]; then
+  echo "missing TinyDiarize JSON artifact contract" >&2
+  exit 42
+fi
+printf '%s\n' '{"result":{"language":"en"},"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:00,500"},"offsets":{"from":0,"to":500},"text":" synthetic speaker one","speaker_turn_next":true},{"timestamps":{"from":"00:00:00,500","to":"00:00:01,000"},"offsets":{"from":500,"to":1000},"text":" synthetic speaker two","speaker_turn_next":false}]}' > "${out_prefix}.json"
+"#;
+    fs::write(&stub_path, script).expect("write TinyDiarize stub");
+    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub_path, perms).expect("chmod");
+    stub_path
+}
+
+#[cfg(unix)]
 fn write_whisper_cpp_stub_binary_without_speaker(dir: &std::path::Path) -> PathBuf {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -2945,6 +2997,55 @@ fn transcribe_file_input_crosses_ingest_normalize_backend_with_stub_whisper_cpp(
     assert_eq!(report["result"]["backend"], "whisper_cpp");
     assert_eq!(report["result"]["transcript"], "stub transcript");
     assert_eq!(report["result"]["segments"][0]["speaker"], "SPEAKER_00");
+}
+
+#[cfg(unix)]
+#[test]
+fn tiny_diarize_emits_native_json_artifact_and_preserves_speaker_turn_signal() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_tiny_diarize_stub_binary(dir.path());
+    let input_wav = dir.path().join("tiny_diarize_input.wav");
+    generate_voiced_wav_without_ffmpeg(&input_wav);
+
+    let report = run_transcribe_json_with_stub(
+        &[
+            "--input",
+            input_wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--tiny-diarize",
+            "--max-context",
+            "0",
+            "--no-persist",
+            "--json",
+        ],
+        None,
+        &stub_bin,
+        &state_root,
+    );
+
+    assert_eq!(report["result"]["backend"], "whisper_cpp");
+    assert_eq!(
+        report["result"]["transcript"],
+        "synthetic speaker one synthetic speaker two"
+    );
+    assert_eq!(
+        report["result"]["segments"][0]["text"],
+        "synthetic speaker one"
+    );
+    assert_eq!(report["result"]["segments"][0]["start_sec"], 0.0);
+    assert_eq!(report["result"]["segments"][0]["end_sec"], 0.5);
+    assert_eq!(report["result"]["segments"][1]["start_sec"], 0.5);
+    assert_eq!(report["result"]["segments"][1]["end_sec"], 1.0);
+    assert_eq!(
+        report["result"]["raw_output"]["transcription"][0]["speaker_turn_next"],
+        true
+    );
+    assert_eq!(
+        report["result"]["raw_output"]["transcription"][1]["speaker_turn_next"],
+        false
+    );
 }
 
 #[cfg(unix)]

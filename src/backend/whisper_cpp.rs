@@ -244,7 +244,10 @@ pub(crate) fn build_args(
         args.push("-sns".to_owned());
     }
     if bp.tiny_diarize {
-        args.push("--tdrz".to_owned());
+        // whisper.cpp accepts -tdrz (or --tinydiarize); --tdrz is not a
+        // supported spelling and prevents the CLI from producing its JSON
+        // artifact on current releases.
+        args.push("-tdrz".to_owned());
     }
     if let Some(regex) = &bp.suppress_regex {
         args.push("--suppress-regex".to_owned());
@@ -773,7 +776,8 @@ mod tests {
             &PathBuf::from("n.wav"),
             &PathBuf::from("/tmp/out"),
         );
-        assert!(args.contains(&"--tdrz".to_owned()));
+        assert!(args.contains(&"-tdrz".to_owned()));
+        assert!(!args.contains(&"--tdrz".to_owned()));
     }
 
     #[test]
@@ -784,7 +788,7 @@ mod tests {
             &PathBuf::from("n.wav"),
             &PathBuf::from("/tmp/out"),
         );
-        assert!(!args.contains(&"--tdrz".to_owned()));
+        assert!(!args.contains(&"-tdrz".to_owned()));
     }
 
     #[test]
