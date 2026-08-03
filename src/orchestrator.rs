@@ -21,10 +21,11 @@ use crate::conformance;
 use crate::diarization::{self, AcousticBoundaryHints};
 use crate::error::{FwError, FwResult};
 use crate::model::{
-    DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus, DiarizationReport,
-    DiarizationTurn, RunEvent, RunReport, SpeakerCountOutcome, SpeakerCountOutcomeReason,
-    SpeakerCountOutcomeStatus, SpeakerCountRequest, SpeakerEvidenceReason, SpeakerEvidenceSummary,
-    SpeakerProfileSummary, StreamedRunEvent, TranscribeRequest,
+    BackendKind, DiarizationEngine, DiarizationFallbackPolicy, DiarizationFallbackStatus,
+    DiarizationReport, DiarizationTurn, RunEvent, RunReport, SpeakerCountOutcome,
+    SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountRequest,
+    SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerProfileSummary, StreamedRunEvent,
+    TranscribeRequest,
 };
 use crate::storage::RunStore;
 
@@ -4476,6 +4477,7 @@ async fn execute_diarize(
         .clone()
         .unwrap_or_default();
     let fallback_policy = acoustic_request.fallback;
+    let tiny_diarize_requested = request.backend_params.tiny_diarize;
     let external_fallback_admitted =
         external_diarization_fallback_admitted(selected_diarization_engine(request), rollout_stage);
     let normalized_duration_ms = inter
@@ -4493,7 +4495,7 @@ async fn execute_diarize(
         })
         .unwrap_or_default();
 
-    let (updated_result, report) = match run_stage_with_budget(
+    let (updated_result, report, tiny_diarize_hint_evidence) = match run_stage_with_budget(
         "diarize",
         diarize_budget_ms,
         move || {
@@ -4514,10 +4516,17 @@ async fn execute_diarize(
                     } else {
                         Vec::new()
                     };
+                    let (tiny_diarize_boundaries_ms, tiny_diarize_hint_evidence) =
+                        tiny_diarize_boundary_hints(
+                            tiny_diarize_requested,
+                            result.backend == BackendKind::WhisperCpp,
+                            &result.raw_output,
+                            normalized_duration_ms,
+                        );
                     let boundary_hints = AcousticBoundaryHints {
                         speech_regions_ms,
                         word_boundaries_ms,
-                        tiny_diarize_boundaries_ms: Vec::new(),
+                        tiny_diarize_boundaries_ms,
                     };
                     let (diarization_report, projection) = diarization::diarize_acoustic_pcm(
                         diarization::AcousticDiarizationInput {
@@ -4571,6 +4580,7 @@ async fn execute_diarize(
                                     .to_owned(),
                             ],
                         },
+                        Some(tiny_diarize_hint_evidence),
                     ))
                     } else {
                         let notes = diarization_report.diagnostics.clone();
@@ -4601,6 +4611,7 @@ async fn execute_diarize(
                                 silhouette_score: None,
                                 notes,
                             },
+                            Some(tiny_diarize_hint_evidence),
                         ))
                     }
                 }
@@ -4637,6 +4648,7 @@ async fn execute_diarize(
                                     "accepted runtime-verified external diarization".to_owned(),
                                 ],
                             },
+                            None,
                         ))
                     } else if fallback_policy == DiarizationFallbackPolicy::Unknown {
                         let segments_total = result.segments.len();
@@ -4660,6 +4672,7 @@ async fn execute_diarize(
                                     .to_owned(),
                             ],
                             },
+                            None,
                         ))
                     } else {
                         Err(FwError::InvalidRequest(
@@ -4695,6 +4708,7 @@ async fn execute_diarize(
                                         .to_owned(),
                                 ],
                             },
+                            None,
                         ))
                     }
                     DiarizationFallbackPolicy::Error => Err(FwError::InvalidRequest(
@@ -4719,6 +4733,14 @@ async fn execute_diarize(
 
     inter.result = Some(updated_result);
     inter.warnings.extend(report.notes.iter().cloned());
+    if let Some(evidence) = tiny_diarize_hint_evidence {
+        log.push(
+            "diarize",
+            "diarize.tiny_diarize_hint_evidence",
+            "evaluated TinyDiarize acoustic boundary hints",
+            tiny_diarize_hint_evidence_payload(evidence),
+        );
+    }
     if let Some(diarization_report) = inter
         .result
         .as_ref()
@@ -4871,6 +4893,152 @@ fn transcript_boundaries_ms(segments: &[crate::model::TranscriptionSegment]) -> 
     boundaries.sort_unstable();
     boundaries.dedup();
     boundaries
+}
+
+/// Aggregate-only audit record for TinyDiarize timing hints.
+///
+/// This deliberately retains no offset, transcript, raw JSON, or path data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TinyDiarizeHintEvidence {
+    source: &'static str,
+    requested: bool,
+    accepted_count: usize,
+    validation: &'static str,
+}
+
+const TINY_DIARIZE_HINT_SOURCE: &str = "whisper_cpp.transcription";
+
+fn tiny_diarize_hint_evidence(
+    requested: bool,
+    accepted_count: usize,
+    validation: &'static str,
+) -> TinyDiarizeHintEvidence {
+    TinyDiarizeHintEvidence {
+        source: TINY_DIARIZE_HINT_SOURCE,
+        requested,
+        accepted_count,
+        validation,
+    }
+}
+
+fn tiny_diarize_hint_evidence_payload(evidence: TinyDiarizeHintEvidence) -> Value {
+    json!({
+        "source": evidence.source,
+        "requested": evidence.requested,
+        "accepted_count": evidence.accepted_count,
+        "validation": evidence.validation,
+    })
+}
+
+/// Extracts only validated TinyDiarize turn timings from backend JSON.
+///
+/// The parser intentionally never reads segment text. Any absent or malformed
+/// evidence produces no hint rather than a partial profile.
+fn tiny_diarize_boundary_hints(
+    requested: bool,
+    supported_backend: bool,
+    raw_output: &Value,
+    normalized_duration_ms: Option<u64>,
+) -> (Vec<u64>, TinyDiarizeHintEvidence) {
+    if !requested {
+        return (
+            Vec::new(),
+            tiny_diarize_hint_evidence(false, 0, "not_requested"),
+        );
+    }
+    if !supported_backend {
+        return (
+            Vec::new(),
+            tiny_diarize_hint_evidence(true, 0, "unsupported_backend"),
+        );
+    }
+    let Some(normalized_duration_ms) = normalized_duration_ms else {
+        return (
+            Vec::new(),
+            tiny_diarize_hint_evidence(true, 0, "missing_normalized_duration"),
+        );
+    };
+    let Some(transcription) = raw_output.get("transcription") else {
+        return (
+            Vec::new(),
+            tiny_diarize_hint_evidence(true, 0, "missing_transcription"),
+        );
+    };
+    let Some(entries) = transcription.as_array() else {
+        return (
+            Vec::new(),
+            tiny_diarize_hint_evidence(true, 0, "invalid_transcription"),
+        );
+    };
+
+    let mut boundaries_ms = Vec::new();
+    let mut previous_offset_ms = None;
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            return (
+                Vec::new(),
+                tiny_diarize_hint_evidence(true, 0, "invalid_transcription_entry"),
+            );
+        };
+        let Some(speaker_turn_next) = entry.get("speaker_turn_next").and_then(Value::as_bool)
+        else {
+            return (
+                Vec::new(),
+                tiny_diarize_hint_evidence(true, 0, "invalid_speaker_turn_next"),
+            );
+        };
+        let Some(offsets) = entry.get("offsets").and_then(Value::as_object) else {
+            return (
+                Vec::new(),
+                tiny_diarize_hint_evidence(true, 0, "invalid_offsets"),
+            );
+        };
+        let Some(offset_ms) = offsets.get("to").and_then(Value::as_u64) else {
+            return (
+                Vec::new(),
+                tiny_diarize_hint_evidence(true, 0, "invalid_offset_to"),
+            );
+        };
+        if previous_offset_ms.is_some_and(|previous| offset_ms < previous) {
+            return (
+                Vec::new(),
+                tiny_diarize_hint_evidence(true, 0, "offsets_out_of_order"),
+            );
+        }
+        previous_offset_ms = Some(offset_ms);
+
+        if offset_ms > normalized_duration_ms {
+            return (
+                Vec::new(),
+                tiny_diarize_hint_evidence(true, 0, "offset_exceeds_normalized_duration"),
+            );
+        }
+
+        if speaker_turn_next {
+            if offset_ms == 0 || offset_ms >= normalized_duration_ms {
+                return (
+                    Vec::new(),
+                    tiny_diarize_hint_evidence(true, 0, "boundary_not_strictly_interior"),
+                );
+            }
+            if boundaries_ms
+                .last()
+                .is_some_and(|previous| offset_ms <= *previous)
+            {
+                return (
+                    Vec::new(),
+                    tiny_diarize_hint_evidence(true, 0, "selected_boundaries_not_increasing"),
+                );
+            }
+            boundaries_ms.push(offset_ms);
+        }
+    }
+
+    let accepted_count = boundaries_ms.len();
+    (
+        boundaries_ms,
+        tiny_diarize_hint_evidence(true, accepted_count, "accepted"),
+    )
 }
 
 fn has_canonical_word_alignment(raw_output: &Value) -> bool {
@@ -5282,7 +5450,8 @@ mod tests {
         selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_json_value,
         silhouette_score, source_separate, source_separate_with_analysis, split_long_regions,
         stage_budget_ms, stage_failure_code, stage_failure_message, stage_latency_profile,
-        state_root, transcript_boundaries_ms, vad_energy_detect, vad_energy_detect_with_analysis,
+        state_root, tiny_diarize_boundary_hints, tiny_diarize_hint_evidence_payload,
+        transcript_boundaries_ms, vad_energy_detect, vad_energy_detect_with_analysis,
         validate_diarization_execution_request,
     };
 
@@ -9797,6 +9966,126 @@ mod tests {
         assert!(error_reason.contains("energy evidence unavailable"));
         assert!(error_reason.contains("i/o failure"));
         assert!(error_reason.contains("failed closed"));
+    }
+
+    #[test]
+    fn tiny_diarize_hints_accept_only_ordered_interior_turn_offsets() {
+        let raw_output = json!({
+            "transcription": [
+                {"speaker_turn_next": false, "offsets": {"to": 400}},
+                {"speaker_turn_next": true, "offsets": {"to": 1_000}},
+                {"speaker_turn_next": false, "offsets": {"to": 1_000}},
+                {"speaker_turn_next": true, "offsets": {"to": 2_000}}
+            ]
+        });
+
+        let (boundaries, evidence) =
+            tiny_diarize_boundary_hints(true, true, &raw_output, Some(3_000));
+
+        assert_eq!(boundaries, vec![1_000, 2_000]);
+        assert_eq!(evidence.source, "whisper_cpp.transcription");
+        assert!(evidence.requested);
+        assert_eq!(evidence.accepted_count, 2);
+        assert_eq!(evidence.validation, "accepted");
+    }
+
+    #[test]
+    fn tiny_diarize_hints_fail_closed_for_invalid_evidence() {
+        let cases = [
+            (json!({"transcription": {}}), "invalid_transcription"),
+            (
+                json!({"transcription": [{"speaker_turn_next": true, "offsets": {"to": 0}}]}),
+                "boundary_not_strictly_interior",
+            ),
+            (
+                json!({"transcription": [{"speaker_turn_next": true, "offsets": {"to": 3_000}}]}),
+                "boundary_not_strictly_interior",
+            ),
+            (
+                json!({"transcription": [{"speaker_turn_next": false, "offsets": {"to": 3_001}}]}),
+                "offset_exceeds_normalized_duration",
+            ),
+            (
+                json!({"transcription": [null]}),
+                "invalid_transcription_entry",
+            ),
+            (
+                json!({"transcription": [{"speaker_turn_next": "yes", "offsets": {"to": 1_000}}]}),
+                "invalid_speaker_turn_next",
+            ),
+            (
+                json!({"transcription": [{"speaker_turn_next": true, "offsets": null}]}),
+                "invalid_offsets",
+            ),
+            (
+                json!({"transcription": [
+                    {"speaker_turn_next": false, "offsets": {"to": 2_000}},
+                    {"speaker_turn_next": true, "offsets": {"to": 1_000}}
+                ]}),
+                "offsets_out_of_order",
+            ),
+            (
+                json!({"transcription": [
+                    {"speaker_turn_next": true, "offsets": {"to": 1_000}},
+                    {"speaker_turn_next": true, "offsets": {"to": 1_000}}
+                ]}),
+                "selected_boundaries_not_increasing",
+            ),
+            (
+                json!({"transcription": [{"speaker_turn_next": true, "offsets": {"to": 1.5}}]}),
+                "invalid_offset_to",
+            ),
+        ];
+
+        for (raw_output, validation) in cases {
+            let (boundaries, evidence) =
+                tiny_diarize_boundary_hints(true, true, &raw_output, Some(3_000));
+            assert!(boundaries.is_empty(), "{validation}");
+            assert_eq!(evidence.accepted_count, 0, "{validation}");
+            assert_eq!(evidence.validation, validation);
+        }
+    }
+
+    #[test]
+    fn tiny_diarize_hints_do_not_parse_unrequested_backend_output() {
+        let malformed_raw_output = json!({"transcription": "not-an-array"});
+        let (boundaries, evidence) =
+            tiny_diarize_boundary_hints(false, false, &malformed_raw_output, Some(3_000));
+
+        assert!(boundaries.is_empty());
+        assert!(!evidence.requested);
+        assert_eq!(evidence.accepted_count, 0);
+        assert_eq!(evidence.validation, "not_requested");
+    }
+
+    #[test]
+    fn tiny_diarize_hints_fail_closed_for_unsupported_backend() {
+        let raw_output = json!({
+            "transcription": [{"speaker_turn_next": true, "offsets": {"to": 1_000}}]
+        });
+        let (boundaries, evidence) =
+            tiny_diarize_boundary_hints(true, false, &raw_output, Some(3_000));
+
+        assert!(boundaries.is_empty());
+        assert!(evidence.requested);
+        assert_eq!(evidence.accepted_count, 0);
+        assert_eq!(evidence.validation, "unsupported_backend");
+    }
+
+    #[test]
+    fn tiny_diarize_hint_evidence_payload_is_aggregate_only() {
+        let (_, evidence) =
+            tiny_diarize_boundary_hints(true, true, &json!({"transcription": []}), Some(3_000));
+        let payload = tiny_diarize_hint_evidence_payload(evidence);
+        let fields = payload
+            .as_object()
+            .expect("TinyDiarize evidence payload must be an object");
+
+        assert_eq!(fields.len(), 4);
+        assert_eq!(payload["source"], "whisper_cpp.transcription");
+        assert_eq!(payload["requested"], true);
+        assert_eq!(payload["accepted_count"], 0);
+        assert_eq!(payload["validation"], "accepted");
     }
 
     #[test]
