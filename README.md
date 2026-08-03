@@ -407,7 +407,7 @@ evaluation command `diarization-corpus sidecar-study`. It is not a
 persistence, and acoustic-v2 report bytes remain unchanged. The command runs a
 frozen full-v2 baseline plus twelve ordered sidecar lanes, retains only
 aggregate path-free and transcript-free evidence, and creates both outputs in
-an external directory. Its stdout bytes exactly match the retained study
+external directories. Its stdout bytes exactly match the retained study
 evidence file. A completed study is not an automatic promotion; the artifact
 records whether each candidate was rejected, advanced for held-out
 certification, or adopted, and no lane has any such authority until a real
@@ -778,10 +778,11 @@ checkout, and bundle/evidence parents must be outside both the checkout and
 input root. Outputs use create-new semantics and are never overwritten. Add
 `--maximum-recording-duration-ms <N>` to freeze a deterministic prefix. A
 sidecar certification run uses `--stage certification` and must also supply
-`--locked-development-evidence <PATH>`; it evaluates only the single candidate
-selected by the exact locked development artifact. Source paths, filenames,
-recording/speaker identifiers, per-recording observations, feature values,
-audio, and transcripts never enter the aggregate study evidence.
+`--locked-development-evidence <PATH>`; it evaluates the unfused baseline and
+only the single candidate selected by the exact locked development artifact.
+Source paths, filenames, recording/speaker identifiers, per-recording
+observations, feature values, audio, and transcripts never enter the aggregate
+study evidence.
 
 ### `robot`
 
@@ -2850,7 +2851,7 @@ With the aggressive release profile (`opt-level = "z"`, LTO, stripped):
 | Backend engines | 3 bridge adapters + 3 paired native pilots under rollout governance |
 | Pipeline stages | 10 (composable, independently budgeted) |
 | Stage budget knobs | 12 (10 stages + probe + cleanup) |
-| CLI subcommands | 6 (`transcribe`, `robot`, `runs`, `sync`, `tty-audio`, `tui`) |
+| CLI subcommands | 10 (`transcribe`, `robot`, `runs`, `sync`, `tty-audio`, `diarization-eval`, `diarization-corpus`, `diarization-oracle`, `tui`, `youtube`) |
 | CLI flags (`transcribe`) | 70+ (inference, VAD, diarization, speculative, audio windowing, word timestamps) |
 | Robot event types | 12 (run lifecycle, stage, speculation, health, routing, transcript) |
 | TTY control frame types | 10 (`Handshake`, `HandshakeAck`, `Ack`, `RetransmitRequest`, `RetransmitResponse`, `Backpressure`, `TranscriptPartial`, `TranscriptRetract`, `TranscriptCorrect`, `SessionClose`) |
