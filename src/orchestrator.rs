@@ -9885,14 +9885,26 @@ mod tests {
 
     #[test]
     fn nearest_energy_valley_uses_sorted_window_and_stable_tie_breaks() {
-        let profile = crate::backend::native_audio::EnergyValleyProfile {
+        let lower_endpoint = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![crate::backend::native_audio::EnergyValley {
+                timestamp_ms: 880,
+                rms: 0.1,
+            }],
+        };
+        let upper_endpoint = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![crate::backend::native_audio::EnergyValley {
+                timestamp_ms: 1_120,
+                rms: 0.1,
+            }],
+        };
+        let lower_rms = crate::backend::native_audio::EnergyValleyProfile {
             frame_ms: 20,
             activity_threshold: 0.05,
             valleys: vec![
-                crate::backend::native_audio::EnergyValley {
-                    timestamp_ms: 500,
-                    rms: 0.0,
-                },
                 crate::backend::native_audio::EnergyValley {
                     timestamp_ms: 920,
                     rms: 0.2,
@@ -9901,15 +9913,28 @@ mod tests {
                     timestamp_ms: 1_080,
                     rms: 0.1,
                 },
+            ],
+        };
+        let timestamp_tie = crate::backend::native_audio::EnergyValleyProfile {
+            frame_ms: 20,
+            activity_threshold: 0.05,
+            valleys: vec![
                 crate::backend::native_audio::EnergyValley {
-                    timestamp_ms: 1_500,
-                    rms: 0.0,
+                    timestamp_ms: 920,
+                    rms: 0.1,
+                },
+                crate::backend::native_audio::EnergyValley {
+                    timestamp_ms: 1_080,
+                    rms: 0.1,
                 },
             ],
         };
 
-        assert_eq!(nearest_energy_valley(1.0, &profile), Some(1.08));
-        assert_eq!(nearest_energy_valley(1.3, &profile), None);
+        assert_eq!(nearest_energy_valley(1.0, &lower_endpoint), Some(0.88));
+        assert_eq!(nearest_energy_valley(1.0, &upper_endpoint), Some(1.12));
+        assert_eq!(nearest_energy_valley(1.0, &lower_rms), Some(1.08));
+        assert_eq!(nearest_energy_valley(1.0, &timestamp_tie), Some(0.92));
+        assert_eq!(nearest_energy_valley(1.3, &timestamp_tie), None);
     }
 
     #[test]

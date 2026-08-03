@@ -24,6 +24,8 @@ const MIN_REGION_FRAMES: usize = 2;
 /// covers more than 2.9 hours at that density while retaining a bounded
 /// roughly 8 MiB `EnergyValley` vector on 64-bit targets.
 const MAX_ENERGY_VALLEY_CANDIDATES: usize = 524_288;
+/// Fixed number of frame windows between cooperative cancellation checks.
+const ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE: usize = 256;
 
 /// A local minimum in the private frame-RMS trace.  This is transient
 /// waveform evidence for timestamp refinement; callers must not serialize it
@@ -198,7 +200,7 @@ pub(crate) fn energy_valleys_from_wav(
     let activity_threshold =
         ((avg_rms * 1.5).max(MIN_THRESHOLD)).min((max_rms * 0.8).max(MIN_THRESHOLD));
 
-    let valleys = collect_energy_valleys(&frame_rms, activity_threshold)?;
+    let valleys = collect_energy_valleys(&frame_rms, activity_threshold, token)?;
 
     Ok(EnergyValleyProfile {
         frame_ms: FRAME_MS,
@@ -210,9 +212,24 @@ pub(crate) fn energy_valleys_from_wav(
 fn collect_energy_valleys(
     frame_rms: &[f32],
     activity_threshold: f32,
+    token: &CancellationToken,
 ) -> FwResult<Vec<EnergyValley>> {
+    collect_energy_valleys_with_checkpoint(frame_rms, activity_threshold, |_| token.checkpoint())
+}
+
+fn collect_energy_valleys_with_checkpoint<F>(
+    frame_rms: &[f32],
+    activity_threshold: f32,
+    mut checkpoint: F,
+) -> FwResult<Vec<EnergyValley>>
+where
+    F: FnMut(usize) -> FwResult<()>,
+{
     let mut valleys = Vec::new();
     for (offset, window) in frame_rms.windows(3).enumerate() {
+        if offset % ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE == 0 {
+            checkpoint(offset)?;
+        }
         let rms = window[1];
         if !(rms.is_finite() && rms < activity_threshold && rms <= window[0] && rms <= window[2]) {
             continue;
@@ -529,8 +546,11 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::error::FwError;
+
     use super::{
-        MAX_ENERGY_VALLEY_CANDIDATES, analyze_wav, collect_energy_valleys, energy_valleys_from_wav,
+        MAX_ENERGY_VALLEY_CANDIDATES, analyze_wav, collect_energy_valleys,
+        collect_energy_valleys_with_checkpoint, energy_valleys_from_wav,
     };
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
@@ -655,10 +675,35 @@ mod tests {
         // inclusive local-minimum predicate, not merely alternating frames.
         let frame_rms = vec![0.0; MAX_ENERGY_VALLEY_CANDIDATES + 3];
 
-        let error = collect_energy_valleys(&frame_rms, 0.05)
-            .expect_err("candidate cap must reject rather than return a partial profile");
+        let error = collect_energy_valleys(
+            &frame_rms,
+            0.05,
+            &crate::orchestrator::CancellationToken::no_deadline(),
+        )
+        .expect_err("candidate cap must reject rather than return a partial profile");
         assert!(error.to_string().contains("retained-candidate cap"));
         assert!(error.to_string().contains("failed closed"));
+    }
+
+    #[test]
+    fn energy_valley_collection_checks_cancellation_at_fixed_stride() {
+        let mut offsets = Vec::new();
+        let error = collect_energy_valleys_with_checkpoint(
+            &vec![0.0; ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE + 3],
+            0.05,
+            |offset| {
+                offsets.push(offset);
+                if offset == ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE {
+                    return Err(FwError::Cancelled(
+                        "deterministic test cancellation".to_owned(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("cancellation at the stride checkpoint must prevent a partial profile");
+        assert!(matches!(error, FwError::Cancelled(_)));
+        assert_eq!(offsets, [0, ENERGY_VALLEY_SCAN_CHECKPOINT_STRIDE]);
     }
 
     #[test]
