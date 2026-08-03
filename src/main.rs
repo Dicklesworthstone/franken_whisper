@@ -275,6 +275,35 @@ fn run(cli: Cli) -> FwResult<()> {
                 println!("{}", serde_json::to_string_pretty(&evidence)?);
                 Ok(())
             }
+            PublicCorpusCommand::SidecarStudy(args) => {
+                let current_dir = std::env::current_dir().map_err(|_| {
+                    FwError::InvalidRequest(
+                        "public_corpus.project_root: current directory could not be resolved"
+                            .to_owned(),
+                    )
+                })?;
+                let project_root =
+                    franken_whisper::confidential_evaluation::discover_project_root(&current_dir)?;
+                let evidence =
+                    franken_whisper::public_corpus::run_public_corpus_sidecar_study_with_cancel(
+                        franken_whisper::public_corpus::PublicCorpusSidecarStudyRequest {
+                            project_root: &project_root,
+                            input_root: &args.input_root,
+                            descriptor_path: &args.descriptor,
+                            bundle_output_path: &args.bundle_output,
+                            evidence_output_path: &args.output,
+                            license_acknowledgement_id: &args.license_ack,
+                            maximum_recording_duration_ms: args.maximum_recording_duration_ms,
+                            evaluation_stage: args.stage.into(),
+                            locked_development_evidence_path: args
+                                .locked_development_evidence
+                                .as_deref(),
+                        },
+                        ShutdownController::is_shutting_down,
+                    )?;
+                println!("{}", serde_json::to_string_pretty(&evidence)?);
+                Ok(())
+            }
         },
         Command::DiarizationOracle { command } => match command {
             DifferentialOracleCommand::Registry => {

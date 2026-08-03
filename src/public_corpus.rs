@@ -16,18 +16,25 @@ use sha2::{Digest, Sha256};
 
 use crate::diarization::{
     ACOUSTIC_CHANGE_CALIBRATION_FIT_VERSION, ACOUSTIC_CHANGE_CALIBRATION_VERSION,
-    ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION, AcousticBoundaryHints, AcousticChangeDetectorMode,
+    ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION, ACOUSTIC_SIDECAR_FUSION_VERSION,
+    ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION, AcousticBoundaryHints, AcousticChangeDetectorMode,
     AcousticClusteringEvaluationEvidence, AcousticClusteringFallbackReason, AcousticClusteringMode,
-    AcousticDiarizationInput, AcousticFeatureAblation, ChangePointScore,
+    AcousticDiarizationInput, AcousticFeatureAblation, AcousticScatteringMode,
+    AcousticSidecarEvaluationRequest, AcousticSidecarFusionCalibration,
+    AcousticSidecarFusionEvaluationEvidence, AcousticSidecarStudyConfig, AcousticSidecarStudyMode,
+    AcousticTrajectoryWaveletMode, ChangePointScore,
     DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION, DIARIZATION_HYPOTHESIS_SCHEMA_VERSION,
     DIARIZATION_REFERENCE_SCHEMA_VERSION, DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest,
     DiarizationHypothesisDocument, DiarizationLeakageAudit, DiarizationReferenceDocument,
     DiarizationScorerConfig, EvaluationOverlapPolicy, EvaluationPerformanceObservation,
     EvaluationRegion, EvaluationSplit, EvaluationTurn, EvaluationWord, acoustic_change_calibration,
     acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
+    acoustic_sidecar_fusion_configuration_sha256,
+    acoustic_sidecar_observation_owner_contrast, acoustic_sidecar_study_config_sha256,
     acoustic_speaker_pair_calibration_sha256, audit_diarization_manifest,
-    diarize_acoustic_pcm_with_modes_evidence, parse_diarization_corpus_manifest,
-    parse_diarization_reference, score_change_points, score_diarization_documents,
+    diarize_acoustic_pcm_with_modes_evidence, diarize_acoustic_pcm_with_sidecar_evidence,
+    parse_diarization_corpus_manifest, parse_diarization_reference, score_change_points,
+    score_diarization_documents,
     select_acoustic_change_evidence_at_threshold, speaker_change_points_ms,
     verify_leakage_audit_hash,
 };
@@ -50,6 +57,47 @@ pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acou
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
     "public-diarization-acoustic-ablation-runner-v8";
+/// Schema identity for the separate aggregate-only acoustic sidecar study.
+pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
+    "public-diarization-acoustic-sidecar-study-v1";
+/// Frozen implementation identity for the aggregate-only sidecar runner.
+pub const PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION: &str =
+    "public-diarization-acoustic-sidecar-study-runner-v1";
+/// Identity of the bounded development calibration fit.
+pub const PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION: &str =
+    "public-sidecar-boundary-calibration-grid-v1";
+/// Identity of the deterministic conditional-pair scorer.
+pub const PUBLIC_CORPUS_SIDECAR_PAIR_SCORER_VERSION: &str =
+    "public-sidecar-conditional-pair-scorer-v1";
+/// Identity of the deterministic paired-recording uncertainty calculation.
+pub const PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION: &str =
+    "public-sidecar-paired-recording-normal-ci-v1";
+/// Identity of the fail-closed development selector and held-out gate.
+pub const PUBLIC_CORPUS_SIDECAR_SELECTION_POLICY_VERSION: &str =
+    "public-sidecar-selection-policy-v1";
+/// A candidate must reduce development micro-DER by at least one percent.
+pub const PUBLIC_CORPUS_SIDECAR_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.01;
+/// A candidate may regress macro-JER by no more than one absolute point.
+pub const PUBLIC_CORPUS_SIDECAR_MAX_MACRO_JER_REGRESSION: f64 = 0.01;
+/// At least one quarter of submitted frames must yield comparable evidence.
+pub const PUBLIC_CORPUS_SIDECAR_MIN_COMPARABLE_FRAME_COVERAGE: f64 = 0.25;
+/// Minimum conditional same/different ROC AUC admitted on development.
+pub const PUBLIC_CORPUS_SIDECAR_MIN_PAIR_ROC_AUC: f64 = 0.55;
+/// Maximum Brier score admitted for conditional different-speaker pairs.
+pub const PUBLIC_CORPUS_SIDECAR_MAX_PAIR_BRIER: f64 = 0.25;
+/// Maximum expected calibration error admitted for conditional pairs.
+pub const PUBLIC_CORPUS_SIDECAR_MAX_PAIR_ECE: f64 = 0.10;
+/// Maximum rate at which channel contrast dominates voice contrast on
+/// comparable different-speaker pairs.
+pub const PUBLIC_CORPUS_SIDECAR_MAX_CHANNEL_CONFOUND_RATE: f64 = 0.50;
+
+const PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS: u64 = 250;
+const PUBLIC_SIDECAR_RELIABILITY_BINS: usize = 10;
+const PUBLIC_SIDECAR_FIT_BINS: usize = 256;
+const PUBLIC_SIDECAR_PAIR_SCORE_BINS: usize = 256;
+const PUBLIC_SIDECAR_PAIR_LAGS_FRAMES: [usize; 4] = [25, 50, 100, 200];
+const PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING: usize = 4_096;
+const PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS: usize = 1;
 /// Predeclared minimum relative micro-DER reduction required on development.
 pub const PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.05;
 /// Predeclared relative change-F1 gain for the calibrated detector.
@@ -596,6 +644,479 @@ pub struct PublicCorpusAblationRequest<'a> {
     pub maximum_recording_duration_ms: Option<u64>,
     pub evaluation_stage: PublicCorpusEvaluationStage,
     pub locked_development_evidence_path: Option<&'a Path>,
+}
+
+/// Frozen lane identity for the aggregate-only acoustic sidecar study.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCorpusSidecarLane {
+    FullV2Baseline,
+    FrameHaarL4,
+    FrameD4L4,
+    Modulation,
+    FrameHaarL4AndModulation,
+    FrameD4L4AndModulation,
+    TrajectoryHaarL4,
+    TrajectoryD4L4,
+    ScatteringFirstOrder,
+    ScatteringSecondOrder,
+    ScatteringFirstAndSecondOrder,
+    AllHaarL4,
+    AllD4L4,
+}
+
+impl PublicCorpusSidecarLane {
+    /// Canonical lane order. This order is part of the retained artifact.
+    pub const ALL: [Self; 13] = [
+        Self::FullV2Baseline,
+        Self::FrameHaarL4,
+        Self::FrameD4L4,
+        Self::Modulation,
+        Self::FrameHaarL4AndModulation,
+        Self::FrameD4L4AndModulation,
+        Self::TrajectoryHaarL4,
+        Self::TrajectoryD4L4,
+        Self::ScatteringFirstOrder,
+        Self::ScatteringSecondOrder,
+        Self::ScatteringFirstAndSecondOrder,
+        Self::AllHaarL4,
+        Self::AllD4L4,
+    ];
+
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::FullV2Baseline => "full_v2_baseline",
+            Self::FrameHaarL4 => "frame_haar_l4",
+            Self::FrameD4L4 => "frame_d4_l4",
+            Self::Modulation => "modulation",
+            Self::FrameHaarL4AndModulation => "frame_haar_l4_and_modulation",
+            Self::FrameD4L4AndModulation => "frame_d4_l4_and_modulation",
+            Self::TrajectoryHaarL4 => "trajectory_haar_l4",
+            Self::TrajectoryD4L4 => "trajectory_d4_l4",
+            Self::ScatteringFirstOrder => "scattering_first_order",
+            Self::ScatteringSecondOrder => "scattering_second_order",
+            Self::ScatteringFirstAndSecondOrder => "scattering_first_and_second_order",
+            Self::AllHaarL4 => "all_haar_l4",
+            Self::AllD4L4 => "all_d4_l4",
+        }
+    }
+
+    const fn study_config(self) -> AcousticSidecarStudyConfig {
+        match self {
+            Self::FullV2Baseline => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Off,
+                frame_wavelet_levels: 0,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::FrameHaarL4 => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Haar,
+                frame_wavelet_levels: 4,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::FrameD4L4 => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::DaubechiesFourTap,
+                frame_wavelet_levels: 4,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::Modulation => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Modulation,
+                frame_wavelet_levels: 0,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::FrameHaarL4AndModulation => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::HaarAndModulation,
+                frame_wavelet_levels: 4,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::FrameD4L4AndModulation => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::DaubechiesFourTapAndModulation,
+                frame_wavelet_levels: 4,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::TrajectoryHaarL4 => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Off,
+                frame_wavelet_levels: 0,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Haar,
+                trajectory_wavelet_levels: 4,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::TrajectoryD4L4 => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Off,
+                frame_wavelet_levels: 0,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::DaubechiesFourTap,
+                trajectory_wavelet_levels: 4,
+                scattering_mode: AcousticScatteringMode::Off,
+            },
+            Self::ScatteringFirstOrder => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Off,
+                frame_wavelet_levels: 0,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::FirstOrder,
+            },
+            Self::ScatteringSecondOrder => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Off,
+                frame_wavelet_levels: 0,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::SecondOrder,
+            },
+            Self::ScatteringFirstAndSecondOrder => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Off,
+                frame_wavelet_levels: 0,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Off,
+                trajectory_wavelet_levels: 0,
+                scattering_mode: AcousticScatteringMode::FirstAndSecondOrder,
+            },
+            Self::AllHaarL4 => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::HaarAndModulation,
+                frame_wavelet_levels: 4,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::Haar,
+                trajectory_wavelet_levels: 4,
+                scattering_mode: AcousticScatteringMode::FirstAndSecondOrder,
+            },
+            Self::AllD4L4 => AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::DaubechiesFourTapAndModulation,
+                frame_wavelet_levels: 4,
+                trajectory_wavelet_mode: AcousticTrajectoryWaveletMode::DaubechiesFourTap,
+                trajectory_wavelet_levels: 4,
+                scattering_mode: AcousticScatteringMode::FirstAndSecondOrder,
+            },
+        }
+    }
+}
+
+/// Whether a lane is the unfused control or an opt-in boundary-fusion pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCorpusSidecarFusionScope {
+    BaselineUnfused,
+    BoundaryFusionV1,
+}
+
+/// Promotion authority attached to one lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCorpusSidecarDisposition {
+    Baseline,
+    Rejected,
+    AdvanceToCertification,
+    Adopted,
+}
+
+/// Stable, machine-readable reasons that a promotion gate failed closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCorpusSidecarGateFailure {
+    FusionNotExecuted,
+    MissingAccuracy,
+    InsufficientDerImprovement,
+    MacroJerRegression,
+    BoundaryF1Regression,
+    InsufficientComparableCoverage,
+    MissingConditionalPairs,
+    PairDiscrimination,
+    PairBrier,
+    PairCalibration,
+    ChannelConfound,
+    PairedDerUncertainty,
+}
+
+/// Frozen aggregate-only scoring and promotion policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarGatePolicy {
+    pub minimum_relative_development_micro_der_improvement: f64,
+    pub maximum_macro_jer_regression: f64,
+    pub minimum_comparable_frame_coverage: f64,
+    pub minimum_pair_roc_auc: f64,
+    pub maximum_pair_brier_score: f64,
+    pub maximum_pair_expected_calibration_error: f64,
+    pub maximum_channel_confound_rate: f64,
+    pub require_boundary_f1_non_regression: bool,
+    pub require_held_out_micro_der_non_regression: bool,
+    pub require_nonpositive_paired_der_upper_bound: bool,
+}
+
+/// Frozen protocol attached to every sidecar-study artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarStudyProtocol {
+    pub oracle_vad: bool,
+    pub oracle_speaker_count: bool,
+    pub maximum_recording_duration_ms: Option<u64>,
+    pub prefix_selection: String,
+    pub rss_observation: String,
+    pub diarization_request: DiarizationRequest,
+    pub diarization_request_sha256: String,
+    pub feature_ablation: AcousticFeatureAblation,
+    pub detector_mode: AcousticChangeDetectorMode,
+    pub clustering_mode: AcousticClusteringMode,
+    pub sidecar_schema_id: String,
+    pub fusion_id: String,
+    pub calibration_fit_id: String,
+    pub pair_scorer_id: String,
+    pub uncertainty_id: String,
+    pub selection_policy_id: String,
+    pub selection_policy_sha256: String,
+    pub boundary_collar_ms: u64,
+    pub reliability_bins: usize,
+    pub pair_lags_frames: [usize; 4],
+    pub maximum_pairs_per_recording: usize,
+    pub lane_order: Vec<PublicCorpusSidecarLane>,
+    pub gate_policy: PublicCorpusSidecarGatePolicy,
+}
+
+/// Development-fitted calibration that contains no raw frame observations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarCalibration {
+    pub fit_id: String,
+    pub logit_intercept: f64,
+    pub contrast_weight: f64,
+    pub minimum_comparable_components: usize,
+    pub fit_observation_count: u64,
+    pub fit_positive_count: u64,
+    pub fit_brier_score: Option<f64>,
+    pub calibration_sha256: String,
+}
+
+/// One fixed probability-reliability bin. Its count is aggregate-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarReliabilityBin {
+    pub index: usize,
+    pub lower_probability: f64,
+    pub upper_probability: f64,
+    pub observation_count: u64,
+    pub positive_count: u64,
+    pub mean_probability: Option<f64>,
+    pub empirical_frequency: Option<f64>,
+}
+
+/// Aggregate boundary metrics for one lane and split.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarBoundaryMetrics {
+    pub reference_count: u64,
+    pub hypothesis_count: u64,
+    pub matched_count: u64,
+    pub precision: Option<f64>,
+    pub recall: Option<f64>,
+    pub f1: Option<f64>,
+    pub mean_absolute_error_sec: Option<f64>,
+    pub probability_observation_count: u64,
+    pub probability_positive_count: u64,
+    pub brier_score: Option<f64>,
+    pub expected_calibration_error: Option<f64>,
+    pub reliability: Vec<PublicCorpusSidecarReliabilityBin>,
+}
+
+/// Aggregate conditional same/different-speaker discrimination metrics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarPairMetrics {
+    pub comparison_count: u64,
+    pub same_speaker_count: u64,
+    pub different_speaker_count: u64,
+    pub mean_same_speaker_probability: Option<f64>,
+    pub mean_different_speaker_probability: Option<f64>,
+    pub roc_auc: Option<f64>,
+    pub brier_score: Option<f64>,
+    pub expected_calibration_error: Option<f64>,
+    pub reliability: Vec<PublicCorpusSidecarReliabilityBin>,
+}
+
+/// Aggregate availability and channel-confound accounting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarCoverage {
+    pub submitted_frame_count: u64,
+    pub comparable_frame_count: u64,
+    pub comparable_frame_coverage: Option<f64>,
+    pub component_comparison_count: u64,
+    /// Canonical Voice, Channel, MixedAuxiliary order.
+    pub owner_available_frame_counts: [u64; 3],
+    pub channel_confound_opportunity_count: u64,
+    pub channel_confound_count: u64,
+    pub channel_confound_rate: Option<f64>,
+    pub maximum_retained_signal_count: u64,
+}
+
+/// Exact operation counts and bounded memory payloads reported by the kernels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarOperations {
+    pub frame_wavelet_filter_tap_terms: u64,
+    pub trajectory_wavelet_filter_tap_terms: u64,
+    pub trajectory_validity_sample_visits: u64,
+    pub scattering_filter_sample_terms: u64,
+    pub scattering_validity_sample_visits: u64,
+    pub modulation_projection_sample_frequency_visits: u64,
+    pub peak_scratch_buffer_payload_bytes: u64,
+    pub peak_retained_state_bytes_on_target: u64,
+    pub cached_twiddle_payload_bytes: u64,
+}
+
+/// Runtime observations retained even when candidate accuracy is withheld.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarPerformance {
+    pub audio_duration_sec: f64,
+    pub wall_time_sec: f64,
+    pub real_time_factor: Option<f64>,
+    pub sampled_peak_rss_bytes: u64,
+}
+
+/// Paired per-recording uncertainty versus the unfused baseline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarPairedUncertainty {
+    pub paired_recording_count: u64,
+    pub mean_der_delta: Option<f64>,
+    pub der_delta_standard_error: Option<f64>,
+    pub der_delta_ci95_lower: Option<f64>,
+    pub der_delta_ci95_upper: Option<f64>,
+    pub mean_jer_delta: Option<f64>,
+    pub jer_delta_standard_error: Option<f64>,
+    pub jer_delta_ci95_lower: Option<f64>,
+    pub jer_delta_ci95_upper: Option<f64>,
+}
+
+/// Aggregate evidence for one lane and one selected split.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarStudySplit {
+    pub split: EvaluationSplit,
+    /// Baseline metrics are always present. Candidate metrics are present only
+    /// when a calibrated sidecar probability reached the boundary selector.
+    pub pipeline: Option<PublicCorpusAblationSplit>,
+    pub fusion_executed: bool,
+    pub boundary: PublicCorpusSidecarBoundaryMetrics,
+    pub conditional_pairs: PublicCorpusSidecarPairMetrics,
+    pub coverage: PublicCorpusSidecarCoverage,
+    pub operations: PublicCorpusSidecarOperations,
+    pub performance: PublicCorpusSidecarPerformance,
+    pub paired_uncertainty: Option<PublicCorpusSidecarPairedUncertainty>,
+}
+
+/// Recomputed fail-closed decision for one candidate versus the baseline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarPromotionGate {
+    pub split: EvaluationSplit,
+    pub candidate: PublicCorpusSidecarLane,
+    pub baseline: PublicCorpusSidecarLane,
+    pub relative_micro_der_improvement: Option<f64>,
+    pub macro_jer_delta: Option<f64>,
+    pub boundary_f1_delta: Option<f64>,
+    pub comparable_frame_coverage: Option<f64>,
+    pub pair_roc_auc: Option<f64>,
+    pub pair_brier_score: Option<f64>,
+    pub pair_expected_calibration_error: Option<f64>,
+    pub channel_confound_rate: Option<f64>,
+    pub paired_der_ci95_upper: Option<f64>,
+    pub failures: Vec<PublicCorpusSidecarGateFailure>,
+    pub passed: bool,
+}
+
+/// Aggregate-only retained evidence for one frozen lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarStudyVariant {
+    pub lane: PublicCorpusSidecarLane,
+    pub fusion_scope: PublicCorpusSidecarFusionScope,
+    pub study_configuration_sha256: String,
+    pub fusion_configuration_sha256: Option<String>,
+    pub lane_configuration_sha256: String,
+    pub calibration: Option<PublicCorpusSidecarCalibration>,
+    pub disposition: PublicCorpusSidecarDisposition,
+    pub splits: Vec<PublicCorpusSidecarStudySplit>,
+    pub gate: Option<PublicCorpusSidecarPromotionGate>,
+}
+
+/// Path-free, transcript-free public acoustic-sidecar evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarStudyEvidence {
+    pub schema_version: String,
+    pub runner_version: String,
+    pub scorer_version: String,
+    pub corpus_key: String,
+    pub source_version: String,
+    pub bundle_sha256: String,
+    pub descriptor_sha256: String,
+    pub scorer_config: DiarizationScorerConfig,
+    pub scorer_config_sha256: String,
+    pub evaluation_stage: PublicCorpusEvaluationStage,
+    pub locked_development_result_sha256: Option<String>,
+    pub locked_development_accuracy_sha256: Option<String>,
+    pub protocol: PublicCorpusSidecarStudyProtocol,
+    pub protocol_sha256: String,
+    pub selected_candidate_lane: Option<PublicCorpusSidecarLane>,
+    pub adopted_candidate_lane: Option<PublicCorpusSidecarLane>,
+    pub variants: Vec<PublicCorpusSidecarStudyVariant>,
+    /// Hash with wall-time, RSS, and RTF observations normalized away.
+    pub deterministic_accuracy_sha256: String,
+    /// Hash of this evidence with this field temporarily empty.
+    pub result_sha256: String,
+}
+
+/// External-only inputs and outputs for one frozen sidecar study.
+///
+/// This request deliberately has no `Debug` or serialization implementation:
+/// local paths cannot enter diagnostics or retained evidence.
+pub struct PublicCorpusSidecarStudyRequest<'a> {
+    pub project_root: &'a Path,
+    pub input_root: &'a Path,
+    pub descriptor_path: &'a Path,
+    pub bundle_output_path: &'a Path,
+    pub evidence_output_path: &'a Path,
+    pub license_acknowledgement_id: &'a str,
+    pub maximum_recording_duration_ms: Option<u64>,
+    pub evaluation_stage: PublicCorpusEvaluationStage,
+    pub locked_development_evidence_path: Option<&'a Path>,
+}
+
+#[derive(Serialize)]
+struct PublicCorpusSidecarCalibrationFingerprint<'a> {
+    fit_id: &'a str,
+    logit_intercept: f64,
+    contrast_weight: f64,
+    minimum_comparable_components: usize,
+    fit_observation_count: u64,
+    fit_positive_count: u64,
+    fit_brier_score: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct PublicCorpusSidecarLaneFingerprint<'a> {
+    runner_version: &'a str,
+    lane: PublicCorpusSidecarLane,
+    fusion_scope: PublicCorpusSidecarFusionScope,
+    study_configuration_sha256: &'a str,
+    fusion_configuration_sha256: Option<&'a str>,
+    protocol_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct PublicCorpusSidecarSelectionFingerprint<'a> {
+    policy_id: &'a str,
+    lane_order: &'a [PublicCorpusSidecarLane],
+    gate_policy: &'a PublicCorpusSidecarGatePolicy,
 }
 
 #[derive(Serialize)]

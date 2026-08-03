@@ -25,6 +25,8 @@ use franken_whisper::model::{
 };
 use franken_whisper::public_corpus::{
     PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION, PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+    PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION, PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION,
+    PublicCorpusEvaluationStage, parse_public_corpus_sidecar_study_evidence,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::sync::{self, ConflictPolicy};
@@ -765,6 +767,225 @@ fn public_diarization_corpus_cli_builds_external_path_free_bundle() {
     ] {
         assert!(!stdout.contains(forbidden));
         assert!(!retained.contains(forbidden));
+    }
+}
+
+#[test]
+fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
+    use sha2::{Digest, Sha256};
+
+    let external_temp_root = if cfg!(unix) {
+        std::path::Path::new("/tmp")
+    } else {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("project parent")
+    };
+    let input = tempfile::Builder::new()
+        .prefix("fw-sidecar-corpus-input-")
+        .tempdir_in(external_temp_root)
+        .expect("external input");
+    let output = tempfile::Builder::new()
+        .prefix("fw-sidecar-corpus-output-")
+        .tempdir_in(external_temp_root)
+        .expect("external output");
+    let runtime_project = tempfile::Builder::new()
+        .prefix("fw-sidecar-corpus-project-")
+        .tempdir_in(external_temp_root)
+        .expect("runtime project");
+    std::fs::create_dir(runtime_project.path().join(".git")).expect("project marker");
+    std::fs::write(
+        runtime_project.path().join("Cargo.toml"),
+        "[package]\nname = \"sidecar-corpus-e2e-root\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("project manifest");
+
+    let audio_name = "sidecar-private-audio.wav";
+    let annotation_name = "sidecar-private-reference.rttm";
+    let descriptor_name = "sidecar-private-descriptor.json";
+    let audio_path = input.path().join(audio_name);
+    let annotation_path = input.path().join(annotation_name);
+    let descriptor_path = input.path().join(descriptor_name);
+    let bundle_path = output.path().join("sidecar-private-bundle.json");
+    let evidence_path = output.path().join("sidecar-private-evidence.json");
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&audio_path, spec).expect("WAV");
+    for sample_index in 0..20_000 {
+        let seconds = sample_index as f32 / 16_000.0;
+        let normalized = if sample_index < 10_000 {
+            0.24 * (std::f32::consts::TAU * 140.0 * seconds).sin()
+                + 0.06 * (std::f32::consts::TAU * 280.0 * seconds).sin()
+        } else {
+            0.18 * (std::f32::consts::TAU * 260.0 * seconds).sin()
+                + 0.04 * (std::f32::consts::TAU * 520.0 * seconds).sin()
+        };
+        let sample = (normalized * f32::from(i16::MAX)).round() as i16;
+        writer.write_sample(sample).expect("sample");
+    }
+    writer.finalize().expect("finalize WAV");
+    std::fs::write(
+        &annotation_path,
+        concat!(
+            "SPEAKER sidecar-source 1 0.000 0.625 <NA> <NA> sidecar-source-near <NA> <NA>\n",
+            "SPEAKER sidecar-source 1 0.625 0.625 <NA> <NA> sidecar-source-far <NA> <NA>\n",
+        ),
+    )
+    .expect("RTTM");
+    let audio_sha256 = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&audio_path).expect("WAV bytes"))
+    );
+    let annotation_sha256 = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&annotation_path).expect("RTTM bytes"))
+    );
+    std::fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+            "corpus_key": "aishell-4-openslr111-v1",
+            "source_version": "sidecar-cli-fixture-v1",
+            "recordings": [{
+                "recording_id": "sidecar-cli-development",
+                "split": "development",
+                "origin_recording_id": "sidecar-cli-origin",
+                "audio_path": audio_name,
+                "audio_sha256": audio_sha256,
+                "expected_sample_rate_hz": 16_000,
+                "expected_channel_count": 1,
+                "selected_channel": 1,
+                "annotation_path": annotation_name,
+                "annotation_sha256": annotation_sha256,
+                "annotation_recording_id": "sidecar-source",
+                "annotation_channel": "1",
+                "speaker_map": {
+                    "sidecar-source-near": "sidecar-cli-speaker-near",
+                    "sidecar-source-far": "sidecar-cli-speaker-far"
+                },
+                "ignored_regions": []
+            }]
+        }))
+        .expect("descriptor JSON"),
+    )
+    .expect("descriptor");
+
+    let invoke = || {
+        ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+            .current_dir(runtime_project.path())
+            .args([
+                "diarization-corpus",
+                "sidecar-study",
+                "--input-root",
+                input.path().to_str().expect("UTF-8 input root"),
+                "--descriptor",
+                descriptor_path.to_str().expect("UTF-8 descriptor"),
+                "--bundle-output",
+                bundle_path.to_str().expect("UTF-8 bundle output"),
+                "--output",
+                evidence_path.to_str().expect("UTF-8 evidence output"),
+                "--license-ack",
+                "accept-aishell-4-cc-by-sa-4.0",
+                "--maximum-recording-duration-ms",
+                "1250",
+                "--stage",
+                "development",
+            ])
+            .output()
+            .expect("public sidecar study")
+    };
+
+    let result = invoke();
+    assert!(
+        result.status.success(),
+        "public sidecar study failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let retained_evidence = std::fs::read(&evidence_path).expect("sidecar evidence output");
+    assert_eq!(
+        result.stdout, retained_evidence,
+        "stdout and the retained evidence file must be byte-identical"
+    );
+    let evidence = parse_public_corpus_sidecar_study_evidence(&retained_evidence)
+        .expect("verified sidecar evidence");
+    assert_eq!(
+        evidence.schema_version,
+        PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION
+    );
+    assert_eq!(
+        evidence.runner_version,
+        PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION
+    );
+    assert_eq!(
+        evidence.evaluation_stage,
+        PublicCorpusEvaluationStage::Development
+    );
+    assert_eq!(evidence.variants.len(), 13);
+    assert_eq!(evidence.deterministic_accuracy_sha256.len(), 64);
+    assert_eq!(evidence.result_sha256.len(), 64);
+    assert!(bundle_path.is_file());
+
+    let stdout = String::from_utf8(result.stdout).expect("UTF-8 stdout");
+    let retained = String::from_utf8(retained_evidence.clone()).expect("UTF-8 evidence");
+    for forbidden in [
+        input.path().to_str().expect("input path"),
+        output.path().to_str().expect("output path"),
+        runtime_project.path().to_str().expect("project path"),
+        audio_name,
+        annotation_name,
+        descriptor_name,
+        "sidecar-source",
+        "sidecar-source-near",
+        "sidecar-source-far",
+        "sidecar-cli-development",
+        "sidecar-cli-origin",
+        "sidecar-cli-speaker-near",
+        "sidecar-cli-speaker-far",
+        "audio_path",
+        "annotation_path",
+        "descriptor_path",
+        "bundle_output_path",
+        "evidence_output_path",
+        "locked_development_evidence_path",
+        "transcript",
+    ] {
+        assert!(!stdout.contains(forbidden), "stdout leaked {forbidden}");
+        assert!(!retained.contains(forbidden), "file leaked {forbidden}");
+    }
+
+    let original_bundle = std::fs::read(&bundle_path).expect("original bundle");
+    let second = invoke();
+    assert!(!second.status.success(), "create-new replay must fail");
+    assert!(
+        second.stdout.is_empty(),
+        "failed replay must not emit evidence"
+    );
+    assert_eq!(
+        std::fs::read(&bundle_path).expect("unchanged bundle"),
+        original_bundle
+    );
+    assert_eq!(
+        std::fs::read(&evidence_path).expect("unchanged evidence"),
+        retained_evidence
+    );
+    let stderr = String::from_utf8(second.stderr).expect("UTF-8 stderr");
+    for forbidden in [
+        input.path().to_str().expect("input path"),
+        output.path().to_str().expect("output path"),
+        runtime_project.path().to_str().expect("project path"),
+        audio_name,
+        annotation_name,
+        descriptor_name,
+        "sidecar-cli-development",
+        "sidecar-cli-speaker-near",
+        "sidecar-cli-speaker-far",
+    ] {
+        assert!(!stderr.contains(forbidden), "stderr leaked {forbidden}");
     }
 }
 
