@@ -844,6 +844,7 @@ pub enum PublicCorpusSidecarGateFailure {
     SpeakerCountRegression,
     PerformanceRegression,
     PairedDerUncertainty,
+    NotSelectedByRanking,
 }
 
 /// Frozen aggregate-only scoring and promotion policy.
@@ -3023,13 +3024,21 @@ impl SidecarOperationsAccumulator {
         };
         self.fusion_requested |= evidence.fusion_requested;
         self.fusion_executed |= evidence.fusion_executed;
-        self.evaluated_recording_count = self.evaluated_recording_count.saturating_add(1);
-        self.fusion_requested_recording_count = self
-            .fusion_requested_recording_count
-            .saturating_add(u64::from(evidence.fusion_requested));
-        self.fusion_executed_recording_count = self
-            .fusion_executed_recording_count
-            .saturating_add(u64::from(evidence.fusion_executed));
+        checked_add(
+            &mut self.evaluated_recording_count,
+            1,
+            "evaluated recording count",
+        )?;
+        checked_add(
+            &mut self.fusion_requested_recording_count,
+            u64::from(evidence.fusion_requested),
+            "fusion-requested recording count",
+        )?;
+        checked_add(
+            &mut self.fusion_executed_recording_count,
+            u64::from(evidence.fusion_executed),
+            "fusion-executed recording count",
+        )?;
         checked_add(
             &mut self.submitted_frame_count,
             checked_usize(evidence.submitted_frame_count, "submitted frame count")?,
@@ -3454,28 +3463,47 @@ impl SidecarCalibrationFitHistogram {
         Ok(())
     }
 
-    fn observation_count(&self) -> u64 {
+    fn observation_count(&self) -> FwResult<u64> {
         self.negative_counts
             .iter()
             .chain(&self.positive_counts)
             .copied()
-            .fold(0_u64, u64::saturating_add)
+            .try_fold(0_u64, |total, count| {
+                total.checked_add(count).ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_fit_overflow",
+                        "calibration observation count overflowed",
+                    )
+                })
+            })
     }
 
-    fn positive_count(&self) -> u64 {
+    fn positive_count(&self) -> FwResult<u64> {
         self.positive_counts
             .iter()
             .copied()
-            .fold(0_u64, u64::saturating_add)
+            .try_fold(0_u64, |total, count| {
+                total.checked_add(count).ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_fit_overflow",
+                        "calibration positive count overflowed",
+                    )
+                })
+            })
     }
 }
 
 fn fit_public_sidecar_calibration(
     histogram: &SidecarCalibrationFitHistogram,
 ) -> FwResult<Option<PublicCorpusSidecarCalibration>> {
-    let observation_count = histogram.observation_count();
-    let positive_count = histogram.positive_count();
-    let negative_count = observation_count.saturating_sub(positive_count);
+    let observation_count = histogram.observation_count()?;
+    let positive_count = histogram.positive_count()?;
+    let negative_count = observation_count.checked_sub(positive_count).ok_or_else(|| {
+        public_corpus_error(
+            "sidecar_fit_overflow",
+            "calibration positive count exceeds its observation count",
+        )
+    })?;
     if positive_count == 0 || negative_count == 0 {
         return Ok(None);
     }
