@@ -515,6 +515,7 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         turns: vec![EvaluationTurn::labeled(0, 1_000, "private-speaker")],
         ignored_regions: vec![],
         speaker_hints: vec![],
+        words: vec![],
     };
     let hypothesis = DiarizationHypothesisDocument {
         schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
@@ -524,6 +525,7 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
             speaker_confidence: Some(0.75),
             ..EvaluationTurn::labeled(0, 1_000, "private-cluster")
         }],
+        speaker_count_estimate: None,
         performance: None,
     };
     std::fs::write(
@@ -586,6 +588,19 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
         CONFIDENTIAL_EVALUATION_AGGREGATE_SCHEMA_VERSION
     );
     assert_eq!(aggregate["recording_count"], 1);
+    assert_eq!(
+        aggregate["speaker_count_posterior"]["observed_recordings"],
+        0
+    );
+    assert_eq!(
+        aggregate["speaker_count_posterior"]["unavailable_recordings"],
+        1
+    );
+    assert_eq!(
+        aggregate["speaker_count_posterior"]["unresolved_recordings"],
+        1
+    );
+    assert_eq!(aggregate["word_attribution"]["reference_word_count"], 0);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&retained).expect("retained aggregate"),
         aggregate
@@ -1377,9 +1392,9 @@ fn transcribe_args_rejects_no_input() {
         vad_samples_overlap: None,
         batch_size: None,
         timestamp_level: None,
-        num_speakers: None,
-        min_speakers: None,
-        max_speakers: None,
+        speaker_count_hard: None,
+        speaker_count_range: None,
+        speaker_count_prior: None,
         gpu_device: None,
         flash_attention: false,
         hf_token: None,
@@ -1470,9 +1485,9 @@ fn transcribe_args_rejects_multiple_inputs() {
         vad_samples_overlap: None,
         batch_size: None,
         timestamp_level: None,
-        num_speakers: None,
-        min_speakers: None,
-        max_speakers: None,
+        speaker_count_hard: None,
+        speaker_count_range: None,
+        speaker_count_prior: None,
         gpu_device: None,
         flash_attention: false,
         hf_token: None,
@@ -2239,7 +2254,7 @@ fn transcribe_args_maps_output_formats_to_backend_params() {
         model: None,
         language: None,
         translate: false,
-        diarize: false,
+        diarize: true,
         diarization_engine: DiarizationEngine::Auto,
         diarization_fallback: DiarizationFallbackPolicy::Unknown,
         speaker_hints: None,
@@ -2278,9 +2293,9 @@ fn transcribe_args_maps_output_formats_to_backend_params() {
         vad_samples_overlap: None,
         batch_size: Some(24),
         timestamp_level: Some(TimestampLevel::Word),
-        num_speakers: None,
-        min_speakers: Some(2),
-        max_speakers: Some(4),
+        speaker_count_hard: None,
+        speaker_count_range: Some("2..4".to_owned()),
+        speaker_count_prior: None,
         gpu_device: Some("0".to_owned()),
         flash_attention: true,
         hf_token: None,
@@ -3254,9 +3269,9 @@ fn transcribe_args_maps_mic_line_in_envelope_into_request() {
         vad_samples_overlap: None,
         batch_size: None,
         timestamp_level: None,
-        num_speakers: None,
-        min_speakers: None,
-        max_speakers: None,
+        speaker_count_hard: None,
+        speaker_count_range: None,
+        speaker_count_prior: None,
         gpu_device: None,
         flash_attention: false,
         hf_token: None,

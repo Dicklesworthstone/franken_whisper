@@ -9,12 +9,16 @@
 #![allow(clippy::needless_raw_string_hashes)]
 
 pub mod accelerate;
+pub mod adversarial_corpus;
 pub mod audio;
 pub mod backend;
 pub mod cli;
 pub mod confidential_evaluation;
 pub mod conformance;
 pub mod diarization;
+pub mod differential_oracle;
+pub mod ecapa_conformance;
+pub mod ecapa_inference;
 pub mod error;
 pub mod export;
 pub mod logging;

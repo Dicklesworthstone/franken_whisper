@@ -357,10 +357,21 @@ franken_whisper transcribe \
   --input meeting.mp3 \
   --diarize \
   --diarization-engine acoustic \
-  --min-speakers 2 \
-  --max-speakers 5 \
   --json
 ```
+
+Omitting all count options is the primary native path and means automatic
+inference intent. The report always contains a versioned
+`speaker_count.estimate` object. The retained fixed-safe assignment default
+reports explicit uncalibrated/unresolved mass; the development probabilistic
+candidate adds bounded count bins and may select a count only after its
+evidence and occupancy gates pass. A soft preference can be added with
+`--speaker-count-range 2..5` or
+`--speaker-count-prior 2=0.25,3=0.75`. Use
+`--speaker-count-hard 3` only when the caller intentionally wants a hard search
+constraint; it never fabricates occupancy or removes UNKNOWN. Soft count
+options require the native acoustic engine because external/neural backends
+cannot faithfully fuse them.
 
 Known intervals can enroll an opaque speaker reference without retaining the
 hint document's source path or raw source bytes:
@@ -377,6 +388,67 @@ immutable must-links; soft enrollment can be rejected when acoustically
 contradictory. Parsed hint fields are part of the typed request and are
 persisted with the run unless `--no-persist` is used. Labels remain within-run
 references, not biometric identities.
+
+Evaluation uses the frozen `diarization-scorer-v4` contract. In addition to
+DER/JER, it reports a calibrated speaker-count posterior, explicit unresolved
+and zero-probability outcomes, effective occupancy, dominant/reference
+collapse, phantom labels, and optional transcript-free aligned-word WDER.
+This prevents a nominally correct label count from hiding a run where one
+label received nearly all speech. Public ablations aggregate these metrics by
+reference count and duration; `diarization-eval` emits the same evidence only
+as a path-free, aggregate-only confidential result. Aligned-word inputs retain
+opaque non-lexical IDs and timing/speaker annotations, never token text. See
+[`docs/acoustic_diarization_contract.md`](docs/acoustic_diarization_contract.md)
+for the versioned schemas and fail-closed policy.
+
+The library's `adversarial_corpus` module supplies a Rust-native, public-safe
+accuracy harness without checking audio fixtures into the repository. It
+generates transcript-free harmonic calls with deterministic speaker, turn,
+overlap, pitch, playback, and stereo regimes, then applies bounded gain,
+muffling, band-limit, resampling, quantization, clipping, noise, reverb,
+interruption, silence, channel-shift, playback, channel-swap, and overlap
+recipes. Retained repro seeds contain parameters, stable classifications, and
+content hashes—not samples, paths, transcripts, embeddings, or real speaker
+identifiers. Plans declare synthetic source authority or bind a hash of an
+external public-license acknowledgement. The same API attributes the first
+divergent pipeline stage and delta-minimizes a failing transform sequence while
+preserving its exact classification.
+
+For development-only differential diagnosis, `diarization-oracle` can compare
+the native stage document with an operator-installed pyannote, NeMo spectral,
+VBx, EEND, DiaPer, or Sortformer adapter. Start with
+`franken_whisper diarization-oracle registry`, then run the selected adapter
+against absolute external audio and stage-document paths. Comparisons are
+separate for speech activity, opaque word timing, change boundaries,
+label-permutation-invariant clusters, overlap, and final projection. Missing
+or failing tools produce a path-free skipped report; disagreements are
+diagnostic only and can never certify that the native path is wrong. External
+tools remain optional subprocesses with no normal runtime or Cargo dependency.
+The full adapter protocol, environment overrides, privacy rules, and authority
+boundary are in the
+[`acoustic diarization contract`](docs/acoustic_diarization_contract.md#114-stage-aware-external-differential-oracles).
+
+The optional neural path is deliberately not advertised as operational routing
+yet. The library freezes and verifies a license-compatible ECAPA-TDNN source
+revision, deterministic 200-tensor safetensors package, exact package hash and
+metadata, a bounded one-second SpeechBrain-compatible scalar conformance
+frontend, public analytic golden stages, and fail-closed numerical tolerances.
+A bounded safe-Rust ECAPA forward path now implements TDNN/SE-Res2 aggregation,
+attentive statistics pooling, projection, and embedding normalization on
+explicit FrankenTorch CPU kernels, with cooperative cancellation and
+content-redacted diagnostics. The package verifier reuses the native safetensors
+loader; no parallel weight format or sidecar manifest is introduced. A
+separately authenticated 2,160,320-byte public seven-stage oracle lets the
+external conformance test compare all 539,616 frontend and neural `f32` values,
+then recheck all 523,456 neural values through the composed Rust frontend, not
+only selected checkpoints. Safe RAII logical-buffer leases enforce and report
+the preplanned ECAPA-owned logical `f32` scratch-payload bound. Both generated
+artifacts remain outside Git. The
+project does not vendor weights, parse PyTorch checkpoints in the runtime, or
+yet provide a production PCM frontend or enable this representation in
+clustering and fallback policy; common-diarizer integration and evaluation
+remain subsequent gates. See the
+[`ECAPA conformance boundary`](docs/acoustic_diarization_contract.md#115-optional-ecapa-model-and-numerical-conformance-boundary).
 
 ### 4. Microphone Capture
 
@@ -633,9 +705,9 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 | `--enrollment-edge-guard-ms <N>` | `100` | Remove boundary-adjacent audio before enrolling a known interval |
 | `--diarization-max-prototypes <N>` | `512` | Bounded global prototype cap (`1..=512`) |
 | `--persist-speaker-profiles` | `false` | Record explicit persistence consent; schema v5 still stores privacy-safe summaries rather than reusable acoustic vectors |
-| `--num-speakers <N>` | — | Hard count search constraint; success still requires independent evidence for all N speakers and uncertain speech remains unknown |
-| `--min-speakers <N>` | — | Minimum evidence-supported count; insufficient evidence remains unknown and reports the range unsatisfied |
-| `--max-speakers <N>` | — | Maximum speakers |
+| `--speaker-count-hard <K>` | — | Explicit hard search constraint; success still requires independent evidence for every speaker and uncertain speech remains UNKNOWN |
+| `--speaker-count-range <MIN..MAX>` | — | Soft bounded count preference; acoustic evidence may disagree or remain unresolved |
+| `--speaker-count-prior <PRIOR>` | — | Soft point prior (`K`) or normalized distribution (`K=P,K=P`); never forces occupancy |
 | `--no-stem` | `false` | Disable external-backend vocal isolation |
 | `--suppress-numerals` | `false` | Spell out numbers for external alignment stability |
 | `--diarization-model <MODEL>` | — | Override the external diarization model |
@@ -2268,6 +2340,7 @@ In addition to conventional unit and integration tests, the project ships dedica
 | [`tests/metamorphic_audio_tests.rs`](tests/metamorphic_audio_tests.rs) | Audio normalization is stable under permutation of decoder paths, silence padding is idempotent, stereo→mono averaging matches manual computation |
 | [`tests/metamorphic_accelerate_tests.rs`](tests/metamorphic_accelerate_tests.rs) | Softmax is permutation-equivariant and scale-invariant; layer-norm output mean ≈ 0, variance ≈ 1; attention scoring respects masking |
 | [`tests/metamorphic_speculation_tests.rs`](tests/metamorphic_speculation_tests.rs) | String-distance functions are symmetric, satisfy the triangle inequality, and window-size adjustments respect bounds |
+| [`src/adversarial_corpus.rs`](src/adversarial_corpus.rs) | Seventeen deterministic, public-safe diarization challenge families; bounded transform composition; exact time-shift contracts; stage-specific regression attribution; minimized content-free repro seeds |
 
 Metamorphic tests catch entire categories of regressions where the "correct" answer is unknown but the *relationship* between inputs and outputs must hold.
 
@@ -2293,9 +2366,7 @@ franken_whisper transcribe --input meeting.mp3 \
   --backend whisper_cpp \
   --model large-v3 \
   --diarize \
-  --hf-token "$HF_TOKEN" \
-  --min-speakers 2 \
-  --max-speakers 8 \
+  --diarization-engine acoustic \
   --vad \
   --json
 ```
@@ -3904,7 +3975,7 @@ The orchestrator treats backend output as untrusted JSON: it must parse correctl
 
 | Use case | Configuration sketch |
 |----------|----------------------|
-| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --diarization-engine acoustic --min-speakers 2 --max-speakers 8 --json` |
+| **Meeting transcription with speakers** | `transcribe --input meeting.mp3 --diarize --diarization-engine acoustic --json` (automatic count inference; optional soft `--speaker-count-range 2..8`) |
 | **Podcast batch processing** | `for f in podcasts/*.mp3; do franken_whisper transcribe --input "$f" --backend whisper_cpp --model large-v3 --json; done` |
 | **Live transcription dashboard** | `robot run --mic --mic-seconds 300 --speculative --fast-model tiny.en --quality-model large-v3` piped to a Server-Sent Events translator |
 | **Voicemail archival** | `transcribe --stdin --backend auto --json` invoked from a mail-handler hook |

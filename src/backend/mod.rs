@@ -1417,7 +1417,7 @@ pub fn diagnostics() -> Vec<serde_json::Value> {
             "env_override": "FRANKEN_WHISPER_WHISPER_CPP_BIN",
             "unsupported_options": [
                 "--timestamp-level",
-                "--num-speakers/--min-speakers/--max-speakers",
+                "--speaker-count-hard/--speaker-count-range/--speaker-count-prior",
                 "--gpu-device",
                 "--flash-attention",
                 "--diarization-model",

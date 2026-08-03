@@ -4,7 +4,7 @@
 # for FrankenWhisper's Epic B pipeline stages (neural diarization / separation).
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# STATUS / HONESTY (2026-06-04)
+# STATUS / HONESTY (2026-07-31)
 # ─────────────────────────────────────────────────────────────────────────────
 # The first aux model we need is the SpeechBrain ECAPA-TDNN VoxCeleb speaker
 # embedding network (consumed by bd-ohex). Its upstream repo
@@ -20,12 +20,11 @@
 # unpickles, by design — arbitrary-code-execution risk), so this script does
 # NOT yet install a usable safetensors file.
 #
-# Until a pinned safetensors artifact is published (tracked: convert the ckpt
-# with scripts/convert_to_safetensors.py and host the result + sha256 on a
-# Dicklesworthstone HF/GH release, then fill in the SHA256S table below and wire
-# the download), running this script for `ecapa` prints conversion instructions
-# instead of downloading. This is intentional and honest: we refuse to ship a
-# fake "it works" path.
+# The repository now freezes a deterministic local conversion profile and the
+# exact converted package SHA-256, but the converted artifact is not published.
+# Until it is hosted, `ecapa` prints pinned download, verification, and
+# conversion instructions instead of installing anything. This is intentional:
+# the runtime never unpickles the source checkpoint.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # USAGE
@@ -54,7 +53,9 @@ ALLOW_UNPINNED=0
 
 # Upstream sources. ECAPA weights are pickle-only upstream; the safetensors URL
 # is the converted artifact we publish (TBD).
-ECAPA_CKPT_URL="https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/resolve/main/embedding_model.ckpt?download=true"
+ECAPA_REVISION="eac27266f68caa806381260bd44ace38b136c76a"
+ECAPA_CKPT_URL="https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/resolve/$ECAPA_REVISION/embedding_model.ckpt?download=true"
+ECAPA_CKPT_SHA256="0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2"
 ECAPA_SAFETENSORS_FILE="ecapa_tdnn_voxceleb.safetensors"
 # Published converted artifact URL — fill in once hosted:
 ECAPA_SAFETENSORS_URL="TBD"
@@ -68,7 +69,7 @@ SEPARATION_SAFETENSORS_URL="TBD"
 # Format: FILENAME<space>SHA256HEX
 sha256_for() {
   case "$1" in
-    "$ECAPA_SAFETENSORS_FILE")      echo "TBD" ;;
+    "$ECAPA_SAFETENSORS_FILE")      echo "9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc" ;;
     "$SEPARATION_SAFETENSORS_FILE") echo "TBD" ;;
     *) echo "" ;;
   esac
@@ -80,7 +81,7 @@ log()  { printf '[fetch-aux] %s\n' "$*" >&2; }
 die()  { printf '[fetch-aux] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -175,12 +176,17 @@ fetch_ecapa() {
 [fetch-aux]   1. Download the upstream pickle checkpoint:
 [fetch-aux]        curl -fSL -o embedding_model.ckpt \\
 [fetch-aux]          "$ECAPA_CKPT_URL"
-[fetch-aux]   2. Convert it to safetensors (needs python3 + torch + safetensors):
-[fetch-aux]        python3 scripts/convert_to_safetensors.py \\
+[fetch-aux]      Verify its SHA-256 before unpickling:
+[fetch-aux]        printf '%s  %s\n' "$ECAPA_CKPT_SHA256" embedding_model.ckpt | shasum -a 256 -c -
+[fetch-aux]   2. Convert it with the exact deterministic profile:
+[fetch-aux]        uv run --isolated --python 3.12.12 \\
+[fetch-aux]          --with numpy==2.2.6 --with torch==2.7.1 --with safetensors==0.5.3 \\
+[fetch-aux]          python scripts/convert_to_safetensors.py \\
 [fetch-aux]          embedding_model.ckpt \\
-[fetch-aux]          "$DEST/$ECAPA_SAFETENSORS_FILE"
-[fetch-aux]   3. Record the printed sha256 in this script's sha256_for() table
-[fetch-aux]      and (optionally) host the artifact for a one-curl fetch.
+[fetch-aux]          "$DEST/$ECAPA_SAFETENSORS_FILE" \\
+[fetch-aux]          --profile ecapa-tdnn-voxceleb-v1
+[fetch-aux]   3. Require output SHA-256:
+[fetch-aux]        9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc
 [fetch-aux]
 [fetch-aux] The converted file lands at:
 [fetch-aux]   $DEST/$ECAPA_SAFETENSORS_FILE

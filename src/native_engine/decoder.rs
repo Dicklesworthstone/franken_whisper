@@ -349,6 +349,80 @@ impl Linear {
             }
         }
     }
+
+    /// Decoder-cohort projection.  Unlike ordinary multi-token prefill, these
+    /// rows are independent single-token streams and must retain the scalar
+    /// decode's packed-int4 / block-int8 representation.  The batched kernels
+    /// reuse each weight row across streams without changing any row's math.
+    fn forward_cohort(&self, x: &Mat) -> FwResult<Mat> {
+        if x.rows > 1 {
+            if let Some(w4) = &self.w_i4_pack {
+                if x.cols != w4.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i4-cohort) forward: x.cols {} != in {}",
+                        x.cols, w4.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(x.rows * w4.out);
+                nn::gemv_i4_packed_f32a_batch(w4, &x.data, x.rows, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(x.rows, w4.out, y));
+            }
+            if let Some(wb) = &self.w_i8_block {
+                if x.cols != wb.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8-block-cohort) forward: x.cols {} != in {}",
+                        x.cols, wb.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(x.rows * wb.out);
+                nn::gemv_i8w_f32a_blocked_batch(wb, &x.data, x.rows, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(x.rows, wb.out, y));
+            }
+            if let Some(w_i8) = &self.w_i8 {
+                if x.cols != w_i8.inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(i8-cohort) forward: x.cols {} != in {}",
+                        x.cols, w_i8.inp
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(x.rows * w_i8.out);
+                nn::gemv_i8_cohort(w_i8, &x.data, x.rows, self.bias.as_deref(), &mut y);
+                return Ok(Mat::from_vec(x.rows, w_i8.out, y));
+            }
+            if let WeightMat::F16 { data, out, inp } = &self.w {
+                if x.cols != *inp {
+                    return Err(FwError::InvalidRequest(format!(
+                        "Linear(f16-cohort) forward: x.cols {} != in {inp}",
+                        x.cols
+                    )));
+                }
+                let mut y = nn::gemv_out_buf(x.rows * out);
+                nn::gemv_f16_cohort(
+                    data,
+                    *out,
+                    *inp,
+                    &x.data,
+                    x.rows,
+                    self.bias.as_deref(),
+                    &mut y,
+                );
+                return Ok(Mat::from_vec(x.rows, *out, y));
+            }
+        }
+        if x.rows <= 1 {
+            return self.forward(x);
+        }
+        let out = match &self.w {
+            WeightMat::F32(w_t) => w_t.cols,
+            WeightMat::F16 { out, .. } => *out,
+        };
+        let mut rows = Vec::with_capacity(x.rows * out);
+        for row in 0..x.rows {
+            let one = Mat::from_vec(1, x.cols, x.row(row).to_vec());
+            rows.extend_from_slice(&self.forward(&one)?.data);
+        }
+        Ok(Mat::from_vec(x.rows, out, rows))
+    }
 }
 
 /// Affine layer-norm parameters (`weight`, `bias`), each length `n_state`.
@@ -1547,31 +1621,23 @@ fn cross_attention(
         return Ok(Mat::from_vec(tq, n_state, out));
     }
 
-    let workers = workers.min(n_head);
-    let band = n_head.div_ceil(workers).max(1);
-    // Dispatch head bands via rayon's persistent pool (no per-token spawn — the
-    // L11 lever, applied to the cross-attn wrapper). Each band scatters its heads
-    // into a private buffer; we disjoint-merge below (every position written by
-    // exactly one head → bit-identical). compute_head/scatter capture only shared
-    // refs, so they're Sync.
-    let band_starts: Vec<usize> = (0..n_head).step_by(band).collect();
-    let results: Vec<FwResult<Vec<f32>>> = band_starts
+    // Dispatch heads via rayon's persistent pool (no per-token spawn — the L11
+    // lever, applied to the cross-attn wrapper).  Return only each head's owned
+    // `tq*d_head` output.  The old band implementation allocated a zeroed
+    // `tq*n_state` row per band and then added every full row into the result;
+    // at large-v3-turbo's 20 heads that turned 64 useful output floats into a
+    // 1,280-float allocation and merge for every task, layer, token, and window.
+    // Ordered collection plus the existing serial scatter writes each position
+    // exactly once and keeps the per-head arithmetic unchanged.
+    let results: Vec<FwResult<Mat>> = (0..n_head)
         .into_par_iter()
-        .map(|h0| -> FwResult<Vec<f32>> {
-            let h1 = (h0 + band).min(n_head);
-            let mut local = vec![0.0f32; tq * n_state];
-            for h in h0..h1 {
-                let (_, out_h) = compute_head(h)?;
-                scatter(&mut local, h, &out_h);
-            }
-            Ok(local)
+        .map(|h| -> FwResult<Mat> {
+            let (_, out_h) = compute_head(h)?;
+            Ok(out_h)
         })
         .collect();
-    for r in results {
-        let local = r?;
-        for (o, l) in out.iter_mut().zip(local.iter()) {
-            *o += *l;
-        }
+    for (h, result) in results.into_iter().enumerate() {
+        scatter(&mut out, h, &result?);
     }
     Ok(Mat::from_vec(tq, n_state, out))
 }
@@ -1666,6 +1732,7 @@ pub fn forward_step_hidden(
                 &layer.attn_v,
                 w.n_state,
                 &h,
+                false,
             )?
         );
         let attn = timed!(
@@ -1738,6 +1805,155 @@ pub fn forward_step_hidden(
     let last = x.rows - 1;
     let x_last = Mat::from_vec(1, w.n_state, x.row(last).to_vec());
     Ok((x_last, draft_arg))
+}
+
+/// Advance one token in each of several independent decoder states as a single
+/// weight-amortized cohort.
+///
+/// Every state keeps its own self-attention cache and window-specific cross K/V,
+/// but the transformer weights are shared.  Gathering the states' hidden rows
+/// before each projection turns `N` bandwidth-bound GEMVs into one `N`-row
+/// batched projection: QKV, attention outputs, both MLP projections, and the
+/// tied vocabulary head each stream their weights once per cohort.  Attention
+/// itself remains state-local, so no token can observe another window's cache.
+///
+/// The batched kernels preserve each row's established accumulation order.  A
+/// single-state cohort and the optional draft diagnostic use [`forward_step`]
+/// directly, keeping those paths mechanically identical to the scalar entry
+/// point.
+pub fn forward_step_batch(
+    w: &DecoderWeights,
+    states: &mut [&mut DecoderState],
+    tokens: &[i32],
+    checkpoint: &dyn Fn() -> FwResult<()>,
+) -> FwResult<Vec<Vec<f32>>> {
+    if states.is_empty() {
+        return Err(FwError::InvalidRequest(
+            "forward_step_batch: empty state cohort".into(),
+        ));
+    }
+    if states.len() != tokens.len() {
+        return Err(FwError::InvalidRequest(format!(
+            "forward_step_batch: {} states != {} tokens",
+            states.len(),
+            tokens.len()
+        )));
+    }
+    if states.len() == 1 || draft_accept_layers().is_some() {
+        return states
+            .iter_mut()
+            .zip(tokens)
+            .map(|(st, &token)| forward_step(w, st, &[token], checkpoint))
+            .collect();
+    }
+    for st in states.iter() {
+        if st.n_state != w.n_state || st.n_head != w.n_head {
+            return Err(FwError::InvalidRequest(
+                "forward_step_batch: state/weights shape mismatch".into(),
+            ));
+        }
+    }
+
+    let cohort = states.len();
+    let mut embedded = Vec::with_capacity(cohort * w.n_state);
+    for (st, &token) in states.iter().zip(tokens) {
+        let row = embed_tokens(w, &[token], st.len)?;
+        embedded.extend_from_slice(&row.data);
+    }
+    let mut x = Mat::from_vec(cohort, w.n_state, embedded);
+
+    for st in states.iter_mut() {
+        if st.record_cross_attn {
+            st.cross_attn_weights.clear();
+        }
+    }
+
+    for (li, layer) in w.layers.iter().enumerate() {
+        let h = layer.attn_ln.apply_into(&x);
+        let (q, k, v) = project_qkv(
+            layer.attn_qkv.as_ref(),
+            &layer.attn_q,
+            &layer.attn_k,
+            &layer.attn_v,
+            w.n_state,
+            &h,
+            true,
+        )?;
+
+        // Every stream owns a private KV cache.  Fan the state-local attention
+        // calls out together so their nested head bands can fill the same
+        // persistent pool instead of leaving the other cohorts idle while one
+        // stream advances.
+        let attn_results: Vec<FwResult<Vec<f32>>> = states
+            .par_iter_mut()
+            .enumerate()
+            .map(|(row, st)| {
+                let q_row = Mat::from_vec(1, w.n_state, q.row(row).to_vec());
+                let k_row = Mat::from_vec(1, w.n_state, k.row(row).to_vec());
+                let v_row = Mat::from_vec(1, w.n_state, v.row(row).to_vec());
+                let out =
+                    nn::attention_with_cache(&q_row, &k_row, &v_row, w.n_head, &mut st.kv[li])?;
+                Ok(out.data)
+            })
+            .collect();
+        let mut attn_rows = Vec::with_capacity(cohort * w.n_state);
+        for row in attn_results {
+            attn_rows.extend_from_slice(&row?);
+        }
+        let attn = Mat::from_vec(cohort, w.n_state, attn_rows);
+        let attn_out = layer.attn_out.forward_cohort(&attn)?;
+        add_into(&mut x, &attn_out);
+
+        let hc = layer.cross_attn_ln.apply_into(&x);
+        let qc = layer.cross_attn_q.forward_cohort(&hc)?;
+        let cross_results: Vec<FwResult<Vec<f32>>> = states
+            .par_iter_mut()
+            .enumerate()
+            .map(|(row, st)| {
+                let q_row = Mat::from_vec(1, w.n_state, qc.row(row).to_vec());
+                let h0 = li * w.n_head;
+                let cross = cross_attention(
+                    &q_row,
+                    &st.cross_kh_t[h0..h0 + w.n_head],
+                    &st.cross_vh[h0..h0 + w.n_head],
+                    &st.cross_kh_f16[h0..h0 + w.n_head],
+                    &st.cross_vh_f16[h0..h0 + w.n_head],
+                    cross_kv_i8_slice(&st.cross_kh_i8, h0, w.n_head),
+                    cross_kv_i8_slice(&st.cross_vh_i8, h0, w.n_head),
+                    cross_vblock_slice(&st.cross_vh_i8_block, h0, w.n_head),
+                    st.enc_frames,
+                    w.n_head,
+                    st.record_cross_attn,
+                    &mut st.cross_attn_weights,
+                )?;
+                Ok(cross.data)
+            })
+            .collect();
+        let mut cross_rows = Vec::with_capacity(cohort * w.n_state);
+        for row in cross_results {
+            cross_rows.extend_from_slice(&row?);
+        }
+        let cross = Mat::from_vec(cohort, w.n_state, cross_rows);
+        let cross_out = layer.cross_attn_out.forward_cohort(&cross)?;
+        add_into(&mut x, &cross_out);
+
+        let hm = layer.mlp_ln.apply_into(&x);
+        let mut ff = layer.mlp_0.forward_cohort(&hm)?;
+        nn::gelu(&mut ff);
+        let ff = layer.mlp_2.forward_cohort(&ff)?;
+        add_into(&mut x, &ff);
+
+        if li + 1 < w.layers.len() {
+            checkpoint()?;
+        }
+    }
+
+    for st in states.iter_mut() {
+        st.len += 1;
+    }
+    w.ln.apply(&mut x);
+    let flat = logits_all_cohort(w, &x)?;
+    Ok(flat.chunks_exact(w.n_vocab).map(<[f32]>::to_vec).collect())
 }
 
 /// Single decode step: the transformer forward ([`forward_step_hidden`]) plus the
@@ -1900,6 +2116,33 @@ pub fn logits_all(w: &DecoderWeights, x: &Mat) -> FwResult<Vec<f32>> {
     Ok(logits)
 }
 
+/// Tied-output projection for independent decoder streams advanced in lockstep.
+/// Uses the persistent-pool cohort GEMVs rather than the long-prefill scheduler,
+/// so the five-window whole-job fixture fans the vocabulary head across all 64
+/// physical cores without creating worker threads on every token.
+fn logits_all_cohort(w: &DecoderWeights, x: &Mat) -> FwResult<Vec<f32>> {
+    let tq = x.rows;
+    let n_state = w.n_state;
+    debug_assert_eq!(x.cols, n_state, "logits_all_cohort: x.cols != n_state");
+    if let Some(i8) = &w.token_embedding_i8 {
+        let mut logits = nn::gemv_out_buf(tq * i8.out);
+        nn::gemv_i8_cohort(i8, &x.data, tq, None, &mut logits);
+        return Ok(logits);
+    }
+    if let WeightMat::F16 { data, out, inp } = &w.token_embedding {
+        let mut logits = nn::gemv_out_buf(tq * *out);
+        nn::gemv_f16_cohort(data, *out, *inp, &x.data, tq, None, &mut logits);
+        return Ok(logits);
+    }
+    let n_vocab = w.n_vocab;
+    let mut logits = Vec::with_capacity(tq * n_vocab);
+    for t in 0..tq {
+        let row = Mat::from_vec(1, n_state, x.row(t).to_vec());
+        logits.extend_from_slice(&logits_last(w, &row)?);
+    }
+    Ok(logits)
+}
+
 /// Project `h` through three independent linears (`q`, `k`, `v`) concurrently.
 ///
 /// The self-attention Q/K/V projections share the same input `h` and have no
@@ -1975,6 +2218,7 @@ fn project_qkv(
     v_lin: &Linear,
     n_state: usize,
     h: &Mat,
+    cohort: bool,
 ) -> FwResult<(Mat, Mat, Mat)> {
     // Fused path: one GEMV over the `[3*n_state, n_state]` weight, then split
     // each output row's `[3*n_state]` into q|k|v `[n_state]`. The GEMV runs
@@ -1988,7 +2232,11 @@ fn project_qkv(
     // + bias), and no per-call OS-thread spawn. bd-b4hp.
     if let Some(qkv) = fused {
         if !qkv_fuse_disabled() {
-            let out = qkv.forward(h)?; // [tq, 3*n_state]
+            let out = if cohort {
+                qkv.forward_cohort(h)?
+            } else {
+                qkv.forward(h)?
+            }; // [tq, 3*n_state]
             let tq = out.rows;
             let mut qd = Vec::with_capacity(tq * n_state);
             let mut kd = Vec::with_capacity(tq * n_state);
@@ -2011,9 +2259,25 @@ fn project_qkv(
     // computes here, so all three run concurrently. Kept for the f32 path and as
     // the `FW_NO_QKV_FUSE` escape hatch.
     std::thread::scope(|s| {
-        let kh = s.spawn(|| k_lin.forward(h));
-        let vh = s.spawn(|| v_lin.forward(h));
-        let q = q_lin.forward(h)?;
+        let kh = s.spawn(move || {
+            if cohort {
+                k_lin.forward_cohort(h)
+            } else {
+                k_lin.forward(h)
+            }
+        });
+        let vh = s.spawn(move || {
+            if cohort {
+                v_lin.forward_cohort(h)
+            } else {
+                v_lin.forward(h)
+            }
+        });
+        let q = if cohort {
+            q_lin.forward_cohort(h)?
+        } else {
+            q_lin.forward(h)?
+        };
         Ok((q, kh.join().unwrap()?, vh.join().unwrap()?))
     })
 }
@@ -2117,6 +2381,86 @@ mod tests {
             n_vocab: N_VOCAB,
             n_text_ctx: N_CTX,
         }
+    }
+
+    /// Convert the tiny f32 fixture to the production decode representations:
+    /// natural f16 weights plus the same int8/block-int8 priorities used by the
+    /// default single-token path.  (The fixture's width is 8, so packed int4's
+    /// required 32-channel block is covered separately by the NN kernel test.)
+    fn synthetic_quantized_weights(seed: u64) -> DecoderWeights {
+        fn to_f16(linear: &mut Linear) {
+            let converted = match &linear.w {
+                WeightMat::F32(transposed) => {
+                    let natural = transpose(transposed);
+                    Some((
+                        natural
+                            .data
+                            .iter()
+                            .map(|&value| Float16::from_f32(value))
+                            .collect::<Vec<_>>(),
+                        natural.rows,
+                        natural.cols,
+                    ))
+                }
+                WeightMat::F16 { .. } => None,
+            };
+            if let Some((data, out, inp)) = converted {
+                linear.w = WeightMat::F16 { data, out, inp };
+            }
+        }
+        fn attach_i8(linear: &mut Linear) {
+            if let WeightMat::F16 { data, out, inp } = &linear.w {
+                linear.w_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
+            }
+        }
+        fn attach_block_i8(linear: &mut Linear) {
+            if let WeightMat::F16 { data, out, inp } = &linear.w {
+                linear.w_i8_block = Some(nn::quantize_f16_to_i8_blocked(data, *out, *inp, N_STATE));
+            }
+        }
+
+        let mut w = synthetic_weights(seed);
+        for layer in &mut w.layers {
+            for linear in [
+                &mut layer.attn_q,
+                &mut layer.attn_k,
+                &mut layer.attn_v,
+                &mut layer.attn_out,
+                &mut layer.cross_attn_q,
+                &mut layer.cross_attn_k,
+                &mut layer.cross_attn_v,
+                &mut layer.cross_attn_out,
+                &mut layer.mlp_0,
+                &mut layer.mlp_2,
+            ] {
+                to_f16(linear);
+            }
+            layer.attn_qkv = fuse_qkv(&layer.attn_q, &layer.attn_k, &layer.attn_v);
+            if let Some(qkv) = &mut layer.attn_qkv {
+                attach_i8(qkv);
+            }
+            attach_i8(&mut layer.attn_out);
+            attach_i8(&mut layer.cross_attn_q);
+            attach_i8(&mut layer.cross_attn_out);
+            attach_i8(&mut layer.mlp_0);
+            attach_block_i8(&mut layer.mlp_2);
+        }
+        if let WeightMat::F32(embedding) = &w.token_embedding {
+            let data: Vec<Float16> = embedding
+                .data
+                .iter()
+                .map(|&value| Float16::from_f32(value))
+                .collect();
+            w.token_embedding = WeightMat::F16 {
+                data,
+                out: N_VOCAB,
+                inp: N_STATE,
+            };
+        }
+        if let WeightMat::F16 { data, out, inp } = &w.token_embedding {
+            w.token_embedding_i8 = Some(nn::quantize_f16_to_i8(data, *out, *inp));
+        }
+        w
     }
 
     fn noop_checkpoint() -> FwResult<()> {
@@ -2245,6 +2589,52 @@ mod tests {
         let logits2 = forward_step(&w, &mut st, &[2], &noop_checkpoint).unwrap();
         assert_eq!(logits2.len(), N_VOCAB);
         assert_eq!(st.len(), 2);
+    }
+
+    #[test]
+    fn forward_step_batch_matches_independent_states() {
+        let w = synthetic_quantized_weights(0x0BA7_C410);
+        let mut rng = Lcg::new(0x00C0_4027);
+        let encoders = [
+            rng.mat(6, N_STATE),
+            rng.mat(6, N_STATE),
+            rng.mat(6, N_STATE),
+        ];
+        let mut scalar: Vec<DecoderState> = encoders
+            .iter()
+            .map(|enc| DecoderState::new(&w, enc).unwrap())
+            .collect();
+        let mut batched = scalar.clone();
+        let tokens = [3, 5, 7];
+
+        let expected: Vec<Vec<f32>> = scalar
+            .iter_mut()
+            .zip(tokens)
+            .map(|(st, token)| forward_step(&w, st, &[token], &noop_checkpoint).unwrap())
+            .collect();
+        let actual = {
+            let mut refs: Vec<&mut DecoderState> = batched.iter_mut().collect();
+            forward_step_batch(&w, &mut refs, &tokens, &noop_checkpoint).unwrap()
+        };
+        for (stream, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+            assert_eq!(
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "cohort stream {stream} changed logits"
+            );
+        }
+
+        // The private KV caches must also be identical: a second scalar step
+        // from each state produces the same logits after the batched advance.
+        for (stream, (scalar, batched)) in scalar.iter_mut().zip(&mut batched).enumerate() {
+            let expected = forward_step(&w, scalar, &[11], &noop_checkpoint).unwrap();
+            let actual = forward_step(&w, batched, &[11], &noop_checkpoint).unwrap();
+            assert_eq!(
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "cohort stream {stream} changed its KV continuation"
+            );
+        }
     }
 
     #[test]

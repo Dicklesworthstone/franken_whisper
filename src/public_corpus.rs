@@ -23,7 +23,7 @@ use crate::diarization::{
     DIARIZATION_REFERENCE_SCHEMA_VERSION, DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest,
     DiarizationHypothesisDocument, DiarizationLeakageAudit, DiarizationReferenceDocument,
     DiarizationScorerConfig, EvaluationOverlapPolicy, EvaluationPerformanceObservation,
-    EvaluationRegion, EvaluationSplit, EvaluationTurn, acoustic_change_calibration,
+    EvaluationRegion, EvaluationSplit, EvaluationTurn, EvaluationWord, acoustic_change_calibration,
     acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
     acoustic_speaker_pair_calibration_sha256, audit_diarization_manifest,
     diarize_acoustic_pcm_with_modes_evidence, parse_diarization_corpus_manifest,
@@ -35,18 +35,21 @@ use crate::error::{FwError, FwResult};
 use crate::model::{DiarizationEngine, DiarizationRequest, SpeakerCountRequest};
 
 /// Schema identity for the path-bearing, external-only adapter input.
-pub const PUBLIC_CORPUS_INPUT_SCHEMA_VERSION: &str = "public-diarization-corpus-input-v1";
+pub const PUBLIC_CORPUS_INPUT_SCHEMA_VERSION: &str = "public-diarization-corpus-input-v2";
 /// Schema identity for the path-free generated bundle.
-pub const PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION: &str = "public-diarization-corpus-bundle-v1";
+pub const PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION: &str = "public-diarization-corpus-bundle-v2";
 /// Frozen implementation identity for this adapter.
-pub const PUBLIC_CORPUS_ADAPTER_VERSION: &str = "public-diarization-corpus-adapter-v1";
+pub const PUBLIC_CORPUS_ADAPTER_VERSION: &str = "public-diarization-corpus-adapter-v2";
 /// Schema identity for the built-in public-corpus registry.
 pub const PUBLIC_CORPUS_REGISTRY_SCHEMA_VERSION: &str = "public-diarization-corpus-registry-v1";
+/// Schema for optional transcript-free aligned-word annotation documents.
+pub const PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION: &str =
+    "public-diarization-word-annotation-v1";
 /// Schema identity for path-free public representation-ablation evidence.
-pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v7";
+pub const PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION: &str = "public-diarization-acoustic-ablation-v8";
 /// Frozen public ablation implementation identity.
 pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-ablation-runner-v7";
+    "public-diarization-acoustic-ablation-runner-v8";
 /// Predeclared minimum relative micro-DER reduction required on development.
 pub const PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.05;
 /// Predeclared relative change-F1 gain for the calibrated detector.
@@ -88,6 +91,8 @@ const MAX_ANNOTATION_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECORDINGS: usize = 100_000;
 const MAX_TURNS_PER_RECORDING: usize = 1_000_000;
 const MAX_TOTAL_TURNS: usize = 2_000_000;
+const MAX_WORDS_PER_RECORDING: usize = 2_000_000;
+const MAX_TOTAL_WORDS: usize = 4_000_000;
 const HASH_HEX_LEN: usize = 64;
 // The current decoder necessarily holds both source bytes and f32 samples.
 // Keep the fail-closed cap well below multi-gigabyte allocations; longer
@@ -157,11 +162,13 @@ pub struct PublicCorpusRecordingEvidence {
     pub split: EvaluationSplit,
     pub audio_sha256: String,
     pub annotation_sha256: String,
+    pub word_annotation_sha256: Option<String>,
     pub reference_sha256: String,
     pub sample_rate_hz: u32,
     pub channel_count: u16,
     pub selected_channel: u16,
     pub turn_count: usize,
+    pub word_count: usize,
     pub overlap_turn_count: usize,
     pub ignored_region_count: usize,
 }
@@ -255,6 +262,57 @@ pub struct PublicChangeThresholdSweepPoint {
     pub p95_absolute_error_sec: Option<f64>,
 }
 
+/// One permutation-invariant reference/hypothesis count confusion cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSpeakerCountConfusionCell {
+    pub reference_speakers: u32,
+    pub hypothesis_speakers: u32,
+    pub recording_count: u64,
+}
+
+/// Count-posterior quality stratified by the reference speaker count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSpeakerCountStratum {
+    pub reference_speakers: u32,
+    pub recording_count: u64,
+    pub posterior_recording_count: u64,
+    pub unresolved_recording_count: u64,
+    pub zero_reference_probability_count: u64,
+    pub exact_speaker_count_rate: Option<f64>,
+    pub mean_negative_log_likelihood: Option<f64>,
+    pub mean_brier_score: Option<f64>,
+    pub top_k_coverage: Option<f64>,
+    pub credible_set_coverage: Option<f64>,
+}
+
+/// Stable duration bucket for count-posterior calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicSpeakerCountDurationBucket {
+    UpToThirtySeconds,
+    UpToTwoMinutes,
+    UpToTenMinutes,
+    LongerThanTenMinutes,
+}
+
+/// Count-posterior quality stratified by scored recording duration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSpeakerCountDurationStratum {
+    pub duration_bucket: PublicSpeakerCountDurationBucket,
+    pub recording_count: u64,
+    pub posterior_recording_count: u64,
+    pub unresolved_recording_count: u64,
+    pub zero_reference_probability_count: u64,
+    pub exact_speaker_count_rate: Option<f64>,
+    pub mean_negative_log_likelihood: Option<f64>,
+    pub mean_brier_score: Option<f64>,
+    pub top_k_coverage: Option<f64>,
+    pub credible_set_coverage: Option<f64>,
+}
+
 /// Aggregate metrics for one feature ablation and one frozen corpus split.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -291,6 +349,42 @@ pub struct PublicCorpusAblationSplit {
     pub exact_speaker_count_rate: Option<f64>,
     pub mean_signed_speaker_count_error: Option<f64>,
     pub mean_absolute_speaker_count_error: Option<f64>,
+    pub p50_absolute_speaker_count_error: Option<f64>,
+    pub p90_absolute_speaker_count_error: Option<f64>,
+    pub p95_absolute_speaker_count_error: Option<f64>,
+    pub maximum_absolute_speaker_count_error: Option<u64>,
+    pub speaker_count_confusion: Vec<PublicSpeakerCountConfusionCell>,
+    pub speaker_count_strata: Vec<PublicSpeakerCountStratum>,
+    pub speaker_count_duration_strata: Vec<PublicSpeakerCountDurationStratum>,
+    pub count_posterior_recording_count: u64,
+    pub count_posterior_unavailable_count: u64,
+    pub count_unresolved_recording_count: u64,
+    pub count_zero_reference_probability_count: u64,
+    pub count_mean_negative_log_likelihood: Option<f64>,
+    pub count_mean_brier_score: Option<f64>,
+    pub count_top_k_coverage: Option<f64>,
+    pub count_credible_set_coverage: Option<f64>,
+    pub count_mean_entropy_bits: Option<f64>,
+    pub dominant_collapse_recording_count: u64,
+    pub reference_collapse_recording_count: u64,
+    pub phantom_speaker_count: u64,
+    pub collapsed_reference_speaker_count: u64,
+    pub mean_effective_speaker_count: Option<f64>,
+    pub mean_dominant_speaker_share: Option<f64>,
+    pub p90_dominant_speaker_share: Option<f64>,
+    pub p99_dominant_speaker_share: Option<f64>,
+    pub maximum_dominant_speaker_share: Option<f64>,
+    pub mean_unknown_speaker_share: Option<f64>,
+    pub maximum_unknown_speaker_share: Option<f64>,
+    pub mean_minority_reference_recall: Option<f64>,
+    pub reference_word_count: u64,
+    pub scored_word_count: u64,
+    pub correct_word_count: u64,
+    pub incorrect_word_count: u64,
+    pub unknown_word_count: u64,
+    pub excluded_word_count: u64,
+    pub micro_word_diarization_error_rate: Option<f64>,
+    pub macro_word_diarization_error_rate: Option<f64>,
     pub selective_reference_speaker_time_sec: f64,
     pub selective_covered_speaker_time_sec: f64,
     pub selective_correct_covered_speaker_time_sec: f64,
@@ -576,6 +670,10 @@ struct PublicCorpusInputRecording {
     annotation_channel: String,
     speaker_map: BTreeMap<String, String>,
     #[serde(default)]
+    word_annotation_path: Option<PathBuf>,
+    #[serde(default)]
+    word_annotation_sha256: Option<String>,
+    #[serde(default)]
     ignored_regions: Vec<EvaluationRegion>,
     #[serde(default)]
     derived_from_recording_ids: Vec<String>,
@@ -583,6 +681,14 @@ struct PublicCorpusInputRecording {
     augmentation_group_id: Option<String>,
     #[serde(default)]
     enrollment_recording_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicCorpusWordAnnotation {
+    schema_version: String,
+    recording_id: String,
+    words: Vec<EvaluationWord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,6 +957,8 @@ pub fn verify_public_corpus_bundle(bundle: &PublicCorpusBundle) -> FwResult<()> 
         }
         if evidence.reference_sha256 != canonical_sha256(reference)?
             || evidence.turn_count != reference.turns.len()
+            || evidence.word_count != reference.words.len()
+            || (!reference.words.is_empty() && evidence.word_annotation_sha256.is_none())
             || evidence.overlap_turn_count
                 != reference
                     .turns
@@ -866,6 +974,10 @@ pub fn verify_public_corpus_bundle(bundle: &PublicCorpusBundle) -> FwResult<()> 
         }
         if !is_sha256_hex(&evidence.audio_sha256)
             || !is_sha256_hex(&evidence.annotation_sha256)
+            || evidence
+                .word_annotation_sha256
+                .as_ref()
+                .is_some_and(|hash| !is_sha256_hex(hash))
             || !is_sha256_hex(&evidence.reference_sha256)
         {
             return Err(public_corpus_error(
@@ -989,6 +1101,7 @@ pub fn build_public_corpus_bundle_with_cancel(
     let mut manifest_recordings = Vec::with_capacity(descriptor.recordings.len());
     let mut evidence = Vec::with_capacity(descriptor.recordings.len());
     let mut total_turn_count = 0_usize;
+    let mut total_word_count = 0_usize;
     for recording in descriptor.recordings {
         checkpoint_cancelled(&mut is_cancelled)?;
         validate_public_id(&recording.recording_id, "recording_id")?;
@@ -1006,6 +1119,19 @@ pub fn build_public_corpus_bundle_with_cancel(
         )?;
         validate_sha256(&recording.audio_sha256, "audio_sha256")?;
         validate_sha256(&recording.annotation_sha256, "annotation_sha256")?;
+        match (
+            recording.word_annotation_path.as_ref(),
+            recording.word_annotation_sha256.as_ref(),
+        ) {
+            (Some(_), Some(hash)) => validate_sha256(hash, "word_annotation_sha256")?,
+            (None, None) => {}
+            _ => {
+                return Err(public_corpus_error(
+                    "word_annotation_pair",
+                    "word_annotation_path and word_annotation_sha256 must be supplied together",
+                ));
+            }
+        }
         if recording.expected_sample_rate_hz == 0
             || recording.expected_channel_count == 0
             || recording.selected_channel == 0
@@ -1055,6 +1181,60 @@ pub fn build_public_corpus_bundle_with_cancel(
             &recording.speaker_map,
             wave.duration_ms,
         )?;
+        let (mut words, actual_word_annotation_sha256) =
+            if let (Some(relative_path), Some(expected_sha256)) = (
+                recording.word_annotation_path.as_ref(),
+                recording.word_annotation_sha256.as_ref(),
+            ) {
+                let word_path =
+                    canonical_relative_file(&canonical_input, relative_path, "word_annotation")?;
+                let word_bytes = read_bounded(&word_path, MAX_ANNOTATION_BYTES, "word_annotation")?;
+                let actual_sha256 = format!("{:x}", Sha256::digest(&word_bytes));
+                if &actual_sha256 != expected_sha256 {
+                    return Err(public_corpus_error(
+                        "word_annotation_checksum_mismatch",
+                        "word-annotation SHA-256 does not match the descriptor",
+                    ));
+                }
+                let annotation: PublicCorpusWordAnnotation = serde_json::from_slice(&word_bytes)
+                    .map_err(|_| {
+                        public_corpus_error(
+                            "word_annotation_json",
+                            "word annotation must be valid schema-bound JSON",
+                        )
+                    })?;
+                if annotation.schema_version != PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION
+                    || annotation.recording_id != recording.recording_id
+                {
+                    return Err(public_corpus_error(
+                        "word_annotation_identity",
+                        "word annotation schema or recording identity does not match",
+                    ));
+                }
+                if annotation.words.len() > MAX_WORDS_PER_RECORDING {
+                    return Err(public_corpus_error(
+                        "word_annotation_count",
+                        "word annotation exceeds the per-recording memory-safety limit",
+                    ));
+                }
+                (annotation.words, Some(actual_sha256))
+            } else {
+                (Vec::new(), None)
+            };
+        words.sort_by(|left, right| {
+            (
+                left.start_ms,
+                left.end_ms,
+                left.word_id.as_str(),
+                left.speaker_ref.as_str(),
+            )
+                .cmp(&(
+                    right.start_ms,
+                    right.end_ms,
+                    right.word_id.as_str(),
+                    right.speaker_ref.as_str(),
+                ))
+        });
         total_turn_count = total_turn_count
             .checked_add(turns.len())
             .filter(|count| *count <= MAX_TOTAL_TURNS)
@@ -1062,6 +1242,15 @@ pub fn build_public_corpus_bundle_with_cancel(
                 public_corpus_error(
                     "total_turn_count",
                     "corpus turn count exceeds the supported memory-safety limit",
+                )
+            })?;
+        total_word_count = total_word_count
+            .checked_add(words.len())
+            .filter(|count| *count <= MAX_TOTAL_WORDS)
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "total_word_count",
+                    "corpus word count exceeds the supported memory-safety limit",
                 )
             })?;
         let mut ignored_regions = recording.ignored_regions;
@@ -1079,6 +1268,7 @@ pub fn build_public_corpus_bundle_with_cancel(
             turns,
             ignored_regions,
             speaker_hints: Vec::new(),
+            words,
         };
         parse_diarization_reference(&serde_json::to_vec(&reference)?)?;
         let reference_sha256 = canonical_sha256(&reference)?;
@@ -1108,11 +1298,13 @@ pub fn build_public_corpus_bundle_with_cancel(
             split: recording.split,
             audio_sha256: actual_audio_sha256,
             annotation_sha256: actual_annotation_sha256,
+            word_annotation_sha256: actual_word_annotation_sha256,
             reference_sha256,
             sample_rate_hz: wave.sample_rate_hz,
             channel_count: wave.channel_count,
             selected_channel: recording.selected_channel,
             turn_count: reference.turns.len(),
+            word_count: reference.words.len(),
             overlap_turn_count: reference
                 .turns
                 .iter()
@@ -1312,6 +1504,11 @@ pub fn run_public_corpus_ablation_with_cancel(
         change_boundary_collar_ms: 250,
         overlap_policy: EvaluationOverlapPolicy::Exclude,
         calibration_bins: 10,
+        count_top_k: 3,
+        count_credible_mass_millionths: 900_000,
+        dominant_speaker_collapse_share_millionths: 990_000,
+        minimum_reference_speaker_recall_millionths: 100_000,
+        minimum_effective_occupancy_ms: 250,
     };
     let scorer_config_sha256 = canonical_sha256(&scorer_config)?;
     let diarization_request = DiarizationRequest {
@@ -1683,58 +1880,65 @@ fn evaluate_public_variant(
             ..AcousticBoundaryHints::default()
         };
         let started = Instant::now();
-        let (report_turns, detector_changes, evaluated_changes, clustering_evidence) =
-            if boundary_hints.speech_regions_ms.is_empty() {
-                checkpoint_cancelled(is_cancelled)?;
-                (
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    AcousticClusteringEvaluationEvidence {
-                        requested_mode: clustering_mode,
-                        executed_mode: AcousticClusteringMode::FixedSafeV1,
-                        fallback_reason: None,
-                        speaker_count_stability: 0.0,
+        let (
+            report_turns,
+            speaker_count_estimate,
+            detector_changes,
+            evaluated_changes,
+            clustering_evidence,
+        ) = if boundary_hints.speech_regions_ms.is_empty() {
+            checkpoint_cancelled(is_cancelled)?;
+            (
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                AcousticClusteringEvaluationEvidence {
+                    requested_mode: clustering_mode,
+                    executed_mode: AcousticClusteringMode::FixedSafeV1,
+                    fallback_reason: None,
+                    speaker_count_stability: 0.0,
+                },
+            )
+        } else {
+            let input_sha256 = hash_pcm_prefix(&samples);
+            let (report, _, change_evidence, clustering_evidence) =
+                diarize_acoustic_pcm_with_modes_evidence(
+                    AcousticDiarizationInput {
+                        samples: &samples,
+                        normalized_input_sha256: &input_sha256,
+                        segments: &[],
+                        word_aligned: false,
+                        request: diarization_request,
+                        boundary_hints: &boundary_hints,
                     },
-                )
-            } else {
-                let input_sha256 = hash_pcm_prefix(&samples);
-                let (report, _, change_evidence, clustering_evidence) =
-                    diarize_acoustic_pcm_with_modes_evidence(
-                        AcousticDiarizationInput {
-                            samples: &samples,
-                            normalized_input_sha256: &input_sha256,
-                            segments: &[],
-                            word_aligned: false,
-                            request: diarization_request,
-                            boundary_hints: &boundary_hints,
-                        },
-                        feature_ablation,
-                        detector_mode,
-                        clustering_mode,
-                        &mut *is_cancelled,
-                    )?;
-                let detector_changes = change_evidence
-                    .emitted
-                    .into_iter()
-                    .filter(|evidence| {
-                        !evidence.vad_boundary
-                            && !evidence.supervised_boundary
-                            && evidence.boundary_ms > 0
-                            && evidence.boundary_ms < clipped_reference.duration_ms
-                    })
-                    .map(|evidence| ChangeProbabilityObservation {
-                        boundary_ms: evidence.boundary_ms,
-                        probability: f64::from(evidence.change_probability),
-                    })
-                    .collect();
-                (
-                    report.turns,
-                    detector_changes,
-                    change_evidence.evaluated,
-                    clustering_evidence,
-                )
-            };
+                    feature_ablation,
+                    detector_mode,
+                    clustering_mode,
+                    &mut *is_cancelled,
+                )?;
+            let detector_changes = change_evidence
+                .emitted
+                .into_iter()
+                .filter(|evidence| {
+                    !evidence.vad_boundary
+                        && !evidence.supervised_boundary
+                        && evidence.boundary_ms > 0
+                        && evidence.boundary_ms < clipped_reference.duration_ms
+                })
+                .map(|evidence| ChangeProbabilityObservation {
+                    boundary_ms: evidence.boundary_ms,
+                    probability: f64::from(evidence.change_probability),
+                })
+                .collect();
+            (
+                report.turns,
+                report.speaker_count.estimate,
+                detector_changes,
+                change_evidence.evaluated,
+                clustering_evidence,
+            )
+        };
         let wall_time_ms = u64::try_from(started.elapsed().as_millis())
             .unwrap_or(u64::MAX)
             .max(1);
@@ -1754,6 +1958,7 @@ fn evaluate_public_variant(
                 })
                 .filter(|turn| turn.end_ms > turn.start_ms)
                 .collect(),
+            speaker_count_estimate,
             performance: Some(EvaluationPerformanceObservation {
                 audio_duration_ms: clipped_reference.duration_ms,
                 wall_time_ms,
@@ -2201,6 +2406,23 @@ fn score_change_event_calibration(
 }
 
 #[derive(Default)]
+struct SpeakerCountStratumAccumulator {
+    recording_count: u64,
+    posterior_recording_count: u64,
+    unresolved_recording_count: u64,
+    zero_reference_probability_count: u64,
+    exact_speaker_count_count: u64,
+    negative_log_likelihood_sum: f64,
+    negative_log_likelihood_count: u64,
+    brier_sum: f64,
+    brier_count: u64,
+    top_k_hit_count: u64,
+    top_k_observation_count: u64,
+    credible_set_hit_count: u64,
+    credible_set_observation_count: u64,
+}
+
+#[derive(Default)]
 struct PublicAblationAccumulator {
     recording_count: u64,
     reference_speaker_time_sec: f64,
@@ -2229,6 +2451,43 @@ struct PublicAblationAccumulator {
     exact_speaker_count: u64,
     signed_speaker_count_error: i64,
     absolute_speaker_count_error: u64,
+    absolute_speaker_count_errors: Vec<u64>,
+    speaker_count_confusion: BTreeMap<(u32, u32), u64>,
+    speaker_count_strata: BTreeMap<u32, SpeakerCountStratumAccumulator>,
+    speaker_count_duration_strata:
+        BTreeMap<PublicSpeakerCountDurationBucket, SpeakerCountStratumAccumulator>,
+    count_posterior_recording_count: u64,
+    count_posterior_unavailable_count: u64,
+    count_unresolved_recording_count: u64,
+    count_zero_reference_probability_count: u64,
+    count_negative_log_likelihood_sum: f64,
+    count_negative_log_likelihood_count: u64,
+    count_brier_sum: f64,
+    count_brier_count: u64,
+    count_top_k_hit_count: u64,
+    count_top_k_observation_count: u64,
+    count_credible_set_hit_count: u64,
+    count_credible_set_observation_count: u64,
+    count_entropy_sum: f64,
+    count_entropy_count: u64,
+    dominant_collapse_recording_count: u64,
+    reference_collapse_recording_count: u64,
+    phantom_speaker_count: u64,
+    collapsed_reference_speaker_count: u64,
+    effective_speaker_count_sum: u64,
+    effective_speaker_count_count: u64,
+    dominant_speaker_shares: Vec<f64>,
+    unknown_speaker_shares: Vec<f64>,
+    minority_reference_recall_sum: f64,
+    minority_reference_recall_count: u64,
+    reference_word_count: u64,
+    scored_word_count: u64,
+    correct_word_count: u64,
+    incorrect_word_count: u64,
+    unknown_word_count: u64,
+    excluded_word_count: u64,
+    macro_word_diarization_error_sum: f64,
+    macro_word_diarization_error_count: u64,
     selective_reference_speaker_time_sec: f64,
     selective_covered_speaker_time_sec: f64,
     selective_correct_covered_speaker_time_sec: f64,
@@ -2345,6 +2604,196 @@ impl PublicAblationAccumulator {
         self.absolute_speaker_count_error = self
             .absolute_speaker_count_error
             .saturating_add(score.speaker_count.absolute_error);
+        self.absolute_speaker_count_errors
+            .push(score.speaker_count.absolute_error);
+        let reference_speakers =
+            u32::try_from(score.speaker_count.reference_speakers).unwrap_or(u32::MAX);
+        let hypothesis_speakers =
+            u32::try_from(score.speaker_count.hypothesis_speakers).unwrap_or(u32::MAX);
+        let confusion_count = self
+            .speaker_count_confusion
+            .entry((reference_speakers, hypothesis_speakers))
+            .or_default();
+        *confusion_count = confusion_count.saturating_add(1);
+        let stratum = self
+            .speaker_count_strata
+            .entry(reference_speakers)
+            .or_default();
+        stratum.recording_count = stratum.recording_count.saturating_add(1);
+        stratum.exact_speaker_count_count = stratum
+            .exact_speaker_count_count
+            .saturating_add(u64::from(score.speaker_count.absolute_error == 0));
+        if score.speaker_count_posterior.posterior_available {
+            self.count_posterior_recording_count =
+                self.count_posterior_recording_count.saturating_add(1);
+            stratum.posterior_recording_count = stratum.posterior_recording_count.saturating_add(1);
+        } else {
+            self.count_posterior_unavailable_count =
+                self.count_posterior_unavailable_count.saturating_add(1);
+        }
+        if score.speaker_count_posterior.unresolved {
+            self.count_unresolved_recording_count =
+                self.count_unresolved_recording_count.saturating_add(1);
+            stratum.unresolved_recording_count =
+                stratum.unresolved_recording_count.saturating_add(1);
+        }
+        if score
+            .speaker_count_posterior
+            .infinite_negative_log_likelihood
+        {
+            self.count_zero_reference_probability_count = self
+                .count_zero_reference_probability_count
+                .saturating_add(1);
+            stratum.zero_reference_probability_count =
+                stratum.zero_reference_probability_count.saturating_add(1);
+        }
+        if let Some(value) = score.speaker_count_posterior.negative_log_likelihood {
+            self.count_negative_log_likelihood_sum += value;
+            self.count_negative_log_likelihood_count =
+                self.count_negative_log_likelihood_count.saturating_add(1);
+            stratum.negative_log_likelihood_sum += value;
+            stratum.negative_log_likelihood_count =
+                stratum.negative_log_likelihood_count.saturating_add(1);
+        }
+        if let Some(value) = score.speaker_count_posterior.brier_score {
+            self.count_brier_sum += value;
+            self.count_brier_count = self.count_brier_count.saturating_add(1);
+            stratum.brier_sum += value;
+            stratum.brier_count = stratum.brier_count.saturating_add(1);
+        }
+        if let Some(hit) = score.speaker_count_posterior.top_k_hit {
+            self.count_top_k_observation_count =
+                self.count_top_k_observation_count.saturating_add(1);
+            self.count_top_k_hit_count = self.count_top_k_hit_count.saturating_add(u64::from(hit));
+            stratum.top_k_observation_count = stratum.top_k_observation_count.saturating_add(1);
+            stratum.top_k_hit_count = stratum.top_k_hit_count.saturating_add(u64::from(hit));
+        }
+        if let Some(hit) = score.speaker_count_posterior.credible_set_hit {
+            self.count_credible_set_observation_count =
+                self.count_credible_set_observation_count.saturating_add(1);
+            self.count_credible_set_hit_count = self
+                .count_credible_set_hit_count
+                .saturating_add(u64::from(hit));
+            stratum.credible_set_observation_count =
+                stratum.credible_set_observation_count.saturating_add(1);
+            stratum.credible_set_hit_count = stratum
+                .credible_set_hit_count
+                .saturating_add(u64::from(hit));
+        }
+        let duration_bucket =
+            speaker_count_duration_bucket(score.scored_duration_sec + score.ignored_duration_sec);
+        let duration_stratum = self
+            .speaker_count_duration_strata
+            .entry(duration_bucket)
+            .or_default();
+        duration_stratum.recording_count = duration_stratum.recording_count.saturating_add(1);
+        duration_stratum.exact_speaker_count_count = duration_stratum
+            .exact_speaker_count_count
+            .saturating_add(u64::from(score.speaker_count.absolute_error == 0));
+        if score.speaker_count_posterior.posterior_available {
+            duration_stratum.posterior_recording_count =
+                duration_stratum.posterior_recording_count.saturating_add(1);
+        }
+        if score.speaker_count_posterior.unresolved {
+            duration_stratum.unresolved_recording_count = duration_stratum
+                .unresolved_recording_count
+                .saturating_add(1);
+        }
+        if score
+            .speaker_count_posterior
+            .infinite_negative_log_likelihood
+        {
+            duration_stratum.zero_reference_probability_count = duration_stratum
+                .zero_reference_probability_count
+                .saturating_add(1);
+        }
+        if let Some(value) = score.speaker_count_posterior.negative_log_likelihood {
+            duration_stratum.negative_log_likelihood_sum += value;
+            duration_stratum.negative_log_likelihood_count = duration_stratum
+                .negative_log_likelihood_count
+                .saturating_add(1);
+        }
+        if let Some(value) = score.speaker_count_posterior.brier_score {
+            duration_stratum.brier_sum += value;
+            duration_stratum.brier_count = duration_stratum.brier_count.saturating_add(1);
+        }
+        if let Some(hit) = score.speaker_count_posterior.top_k_hit {
+            duration_stratum.top_k_observation_count =
+                duration_stratum.top_k_observation_count.saturating_add(1);
+            duration_stratum.top_k_hit_count = duration_stratum
+                .top_k_hit_count
+                .saturating_add(u64::from(hit));
+        }
+        if let Some(hit) = score.speaker_count_posterior.credible_set_hit {
+            duration_stratum.credible_set_observation_count = duration_stratum
+                .credible_set_observation_count
+                .saturating_add(1);
+            duration_stratum.credible_set_hit_count = duration_stratum
+                .credible_set_hit_count
+                .saturating_add(u64::from(hit));
+        }
+        if score.speaker_count_posterior.posterior_available
+            && let Some(entropy_bits) = score.speaker_count_posterior.entropy_bits
+        {
+            self.count_entropy_sum += entropy_bits;
+            self.count_entropy_count = self.count_entropy_count.saturating_add(1);
+        }
+        self.dominant_collapse_recording_count = self
+            .dominant_collapse_recording_count
+            .saturating_add(u64::from(
+                score.speaker_occupancy.dominant_collapse_detected,
+            ));
+        self.reference_collapse_recording_count = self
+            .reference_collapse_recording_count
+            .saturating_add(u64::from(
+                score.speaker_occupancy.any_reference_collapse_detected,
+            ));
+        self.phantom_speaker_count = self.phantom_speaker_count.saturating_add(
+            u64::try_from(score.speaker_occupancy.phantom_speaker_count).unwrap_or(u64::MAX),
+        );
+        self.collapsed_reference_speaker_count =
+            self.collapsed_reference_speaker_count.saturating_add(
+                u64::try_from(score.speaker_occupancy.collapsed_reference_speaker_count)
+                    .unwrap_or(u64::MAX),
+            );
+        self.effective_speaker_count_sum = self.effective_speaker_count_sum.saturating_add(
+            u64::try_from(score.speaker_occupancy.effective_speaker_count).unwrap_or(u64::MAX),
+        );
+        self.effective_speaker_count_count = self.effective_speaker_count_count.saturating_add(1);
+        if let Some(value) = score.speaker_occupancy.dominant_speaker_share {
+            self.dominant_speaker_shares.push(value);
+        }
+        if let Some(value) = score.speaker_occupancy.unknown_speaker_share {
+            self.unknown_speaker_shares.push(value);
+        }
+        if let Some(value) = score.speaker_occupancy.minority_reference_recall {
+            self.minority_reference_recall_sum += value;
+            self.minority_reference_recall_count =
+                self.minority_reference_recall_count.saturating_add(1);
+        }
+        self.reference_word_count = self
+            .reference_word_count
+            .saturating_add(score.word_attribution.reference_word_count);
+        self.scored_word_count = self
+            .scored_word_count
+            .saturating_add(score.word_attribution.scored_word_count);
+        self.correct_word_count = self
+            .correct_word_count
+            .saturating_add(score.word_attribution.correct_word_count);
+        self.incorrect_word_count = self
+            .incorrect_word_count
+            .saturating_add(score.word_attribution.incorrect_word_count);
+        self.unknown_word_count = self
+            .unknown_word_count
+            .saturating_add(score.word_attribution.unknown_word_count);
+        self.excluded_word_count = self
+            .excluded_word_count
+            .saturating_add(score.word_attribution.excluded_word_count);
+        if let Some(value) = score.word_attribution.word_diarization_error_rate {
+            self.macro_word_diarization_error_sum += value;
+            self.macro_word_diarization_error_count =
+                self.macro_word_diarization_error_count.saturating_add(1);
+        }
         self.selective_reference_speaker_time_sec +=
             score.selective_attribution.reference_speaker_time_sec;
         self.selective_covered_speaker_time_sec +=
@@ -2442,6 +2891,87 @@ impl PublicAblationAccumulator {
             self.change_event_brier_sum,
             self.change_event_observation_count as f64,
         );
+        let speaker_count_confusion = self
+            .speaker_count_confusion
+            .iter()
+            .map(
+                |(&(reference_speakers, hypothesis_speakers), &recording_count)| {
+                    PublicSpeakerCountConfusionCell {
+                        reference_speakers,
+                        hypothesis_speakers,
+                        recording_count,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let speaker_count_strata = self
+            .speaker_count_strata
+            .iter()
+            .map(|(&reference_speakers, stratum)| PublicSpeakerCountStratum {
+                reference_speakers,
+                recording_count: stratum.recording_count,
+                posterior_recording_count: stratum.posterior_recording_count,
+                unresolved_recording_count: stratum.unresolved_recording_count,
+                zero_reference_probability_count: stratum.zero_reference_probability_count,
+                exact_speaker_count_rate: ratio(
+                    stratum.exact_speaker_count_count,
+                    stratum.recording_count,
+                ),
+                mean_negative_log_likelihood: positive_ratio(
+                    stratum.negative_log_likelihood_sum,
+                    stratum.negative_log_likelihood_count as f64,
+                ),
+                mean_brier_score: positive_ratio(stratum.brier_sum, stratum.brier_count as f64),
+                top_k_coverage: ratio(stratum.top_k_hit_count, stratum.top_k_observation_count),
+                credible_set_coverage: ratio(
+                    stratum.credible_set_hit_count,
+                    stratum.credible_set_observation_count,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let speaker_count_duration_strata = self
+            .speaker_count_duration_strata
+            .iter()
+            .map(
+                |(&duration_bucket, stratum)| PublicSpeakerCountDurationStratum {
+                    duration_bucket,
+                    recording_count: stratum.recording_count,
+                    posterior_recording_count: stratum.posterior_recording_count,
+                    unresolved_recording_count: stratum.unresolved_recording_count,
+                    zero_reference_probability_count: stratum.zero_reference_probability_count,
+                    exact_speaker_count_rate: ratio(
+                        stratum.exact_speaker_count_count,
+                        stratum.recording_count,
+                    ),
+                    mean_negative_log_likelihood: positive_ratio(
+                        stratum.negative_log_likelihood_sum,
+                        stratum.negative_log_likelihood_count as f64,
+                    ),
+                    mean_brier_score: positive_ratio(stratum.brier_sum, stratum.brier_count as f64),
+                    top_k_coverage: ratio(stratum.top_k_hit_count, stratum.top_k_observation_count),
+                    credible_set_coverage: ratio(
+                        stratum.credible_set_hit_count,
+                        stratum.credible_set_observation_count,
+                    ),
+                },
+            )
+            .collect::<Vec<_>>();
+        let maximum_absolute_speaker_count_error =
+            self.absolute_speaker_count_errors.iter().copied().max();
+        let dominant_share_sum = self.dominant_speaker_shares.iter().sum::<f64>();
+        let unknown_share_sum = self.unknown_speaker_shares.iter().sum::<f64>();
+        let maximum_dominant_speaker_share = self
+            .dominant_speaker_shares
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .map(canonical_evidence_number);
+        let maximum_unknown_speaker_share = self
+            .unknown_speaker_shares
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .map(canonical_evidence_number);
         let mut change_expected_calibration_error = 0.0;
         let change_reliability = self
             .change_reliability
@@ -2558,6 +3088,91 @@ impl PublicAblationAccumulator {
                 self.absolute_speaker_count_error as f64,
                 self.recording_count as f64,
             ),
+            p50_absolute_speaker_count_error: quantile_nearest_rank_u64(
+                &self.absolute_speaker_count_errors,
+                500_000,
+            ),
+            p90_absolute_speaker_count_error: quantile_nearest_rank_u64(
+                &self.absolute_speaker_count_errors,
+                900_000,
+            ),
+            p95_absolute_speaker_count_error: quantile_nearest_rank_u64(
+                &self.absolute_speaker_count_errors,
+                950_000,
+            ),
+            maximum_absolute_speaker_count_error,
+            speaker_count_confusion,
+            speaker_count_strata,
+            speaker_count_duration_strata,
+            count_posterior_recording_count: self.count_posterior_recording_count,
+            count_posterior_unavailable_count: self.count_posterior_unavailable_count,
+            count_unresolved_recording_count: self.count_unresolved_recording_count,
+            count_zero_reference_probability_count: self.count_zero_reference_probability_count,
+            count_mean_negative_log_likelihood: positive_ratio(
+                self.count_negative_log_likelihood_sum,
+                self.count_negative_log_likelihood_count as f64,
+            ),
+            count_mean_brier_score: positive_ratio(
+                self.count_brier_sum,
+                self.count_brier_count as f64,
+            ),
+            count_top_k_coverage: ratio(
+                self.count_top_k_hit_count,
+                self.count_top_k_observation_count,
+            ),
+            count_credible_set_coverage: ratio(
+                self.count_credible_set_hit_count,
+                self.count_credible_set_observation_count,
+            ),
+            count_mean_entropy_bits: positive_ratio(
+                self.count_entropy_sum,
+                self.count_entropy_count as f64,
+            ),
+            dominant_collapse_recording_count: self.dominant_collapse_recording_count,
+            reference_collapse_recording_count: self.reference_collapse_recording_count,
+            phantom_speaker_count: self.phantom_speaker_count,
+            collapsed_reference_speaker_count: self.collapsed_reference_speaker_count,
+            mean_effective_speaker_count: positive_ratio(
+                self.effective_speaker_count_sum as f64,
+                self.effective_speaker_count_count as f64,
+            ),
+            mean_dominant_speaker_share: positive_ratio(
+                dominant_share_sum,
+                self.dominant_speaker_shares.len() as f64,
+            ),
+            p90_dominant_speaker_share: quantile_nearest_rank_f64(
+                &self.dominant_speaker_shares,
+                900_000,
+            ),
+            p99_dominant_speaker_share: quantile_nearest_rank_f64(
+                &self.dominant_speaker_shares,
+                990_000,
+            ),
+            maximum_dominant_speaker_share,
+            mean_unknown_speaker_share: positive_ratio(
+                unknown_share_sum,
+                self.unknown_speaker_shares.len() as f64,
+            ),
+            maximum_unknown_speaker_share,
+            mean_minority_reference_recall: positive_ratio(
+                self.minority_reference_recall_sum,
+                self.minority_reference_recall_count as f64,
+            ),
+            reference_word_count: self.reference_word_count,
+            scored_word_count: self.scored_word_count,
+            correct_word_count: self.correct_word_count,
+            incorrect_word_count: self.incorrect_word_count,
+            unknown_word_count: self.unknown_word_count,
+            excluded_word_count: self.excluded_word_count,
+            micro_word_diarization_error_rate: ratio(
+                self.incorrect_word_count
+                    .saturating_add(self.unknown_word_count),
+                self.scored_word_count,
+            ),
+            macro_word_diarization_error_rate: positive_ratio(
+                self.macro_word_diarization_error_sum,
+                self.macro_word_diarization_error_count as f64,
+            ),
             selective_reference_speaker_time_sec: canonical_evidence_number(
                 self.selective_reference_speaker_time_sec,
             ),
@@ -2662,6 +3277,17 @@ fn clipped_reference(
             hint
         })
         .filter(|hint| hint.end_ms > hint.start_ms)
+        .collect();
+    clipped.words = reference
+        .words
+        .iter()
+        .filter(|word| word.start_ms < duration_ms)
+        .cloned()
+        .map(|mut word| {
+            word.end_ms = word.end_ms.min(duration_ms);
+            word
+        })
+        .filter(|word| word.end_ms > word.start_ms)
         .collect();
     parse_diarization_reference(&serde_json::to_vec(&clipped)?)?;
     Ok(clipped)
@@ -3481,6 +4107,11 @@ pub fn verify_public_corpus_ablation_evidence(
         change_boundary_collar_ms: 250,
         overlap_policy: EvaluationOverlapPolicy::Exclude,
         calibration_bins: 10,
+        count_top_k: 3,
+        count_credible_mass_millionths: 900_000,
+        dominant_speaker_collapse_share_millionths: 990_000,
+        minimum_reference_speaker_recall_millionths: 100_000,
+        minimum_effective_occupancy_ms: 250,
     };
     if evidence.scorer_config != expected_scorer_config {
         return Err(public_corpus_error(
@@ -4032,6 +4663,222 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
                 )
             && bounded(split.selective_coverage)
             && bounded(split.selective_risk);
+        let confusion_recording_count = split
+            .speaker_count_confusion
+            .iter()
+            .map(|cell| cell.recording_count)
+            .sum::<u64>();
+        let confusion_exact_count = split
+            .speaker_count_confusion
+            .iter()
+            .filter(|cell| cell.reference_speakers == cell.hypothesis_speakers)
+            .map(|cell| cell.recording_count)
+            .sum::<u64>();
+        let confusion_signed_error = split
+            .speaker_count_confusion
+            .iter()
+            .map(|cell| {
+                i128::from(cell.hypothesis_speakers)
+                    .saturating_sub(i128::from(cell.reference_speakers))
+                    .saturating_mul(i128::from(cell.recording_count))
+            })
+            .sum::<i128>();
+        let confusion_absolute_error = split
+            .speaker_count_confusion
+            .iter()
+            .map(|cell| {
+                u128::from(cell.hypothesis_speakers.abs_diff(cell.reference_speakers))
+                    .saturating_mul(u128::from(cell.recording_count))
+            })
+            .sum::<u128>();
+        let confusion_valid = !split.speaker_count_confusion.is_empty()
+            && split.speaker_count_confusion.windows(2).all(|window| {
+                (window[0].reference_speakers, window[0].hypothesis_speakers)
+                    < (window[1].reference_speakers, window[1].hypothesis_speakers)
+            })
+            && split
+                .speaker_count_confusion
+                .iter()
+                .all(|cell| cell.recording_count > 0)
+            && confusion_recording_count == split.recording_count
+            && split.exact_speaker_count_rate
+                == ratio(confusion_exact_count, split.recording_count)
+            && split.mean_signed_speaker_count_error
+                == signed_ratio(confusion_signed_error as f64, split.recording_count as f64)
+            && split.mean_absolute_speaker_count_error
+                == positive_ratio(
+                    confusion_absolute_error as f64,
+                    split.recording_count as f64,
+                );
+        let stratum_recording_count = split
+            .speaker_count_strata
+            .iter()
+            .map(|stratum| stratum.recording_count)
+            .sum::<u64>();
+        let stratum_posterior_count = split
+            .speaker_count_strata
+            .iter()
+            .map(|stratum| stratum.posterior_recording_count)
+            .sum::<u64>();
+        let stratum_unresolved_count = split
+            .speaker_count_strata
+            .iter()
+            .map(|stratum| stratum.unresolved_recording_count)
+            .sum::<u64>();
+        let stratum_zero_probability_count = split
+            .speaker_count_strata
+            .iter()
+            .map(|stratum| stratum.zero_reference_probability_count)
+            .sum::<u64>();
+        let count_strata_valid = !split.speaker_count_strata.is_empty()
+            && split
+                .speaker_count_strata
+                .windows(2)
+                .all(|window| window[0].reference_speakers < window[1].reference_speakers)
+            && split.speaker_count_strata.iter().all(|stratum| {
+                stratum.recording_count > 0
+                    && stratum.posterior_recording_count <= stratum.recording_count
+                    && stratum.unresolved_recording_count <= stratum.recording_count
+                    && stratum.zero_reference_probability_count <= stratum.posterior_recording_count
+                    && bounded(stratum.exact_speaker_count_rate)
+                    && stratum
+                        .mean_negative_log_likelihood
+                        .is_none_or(finite_nonnegative)
+                    && stratum
+                        .mean_brier_score
+                        .is_none_or(|value| value.is_finite() && (0.0..=2.0).contains(&value))
+                    && bounded(stratum.top_k_coverage)
+                    && bounded(stratum.credible_set_coverage)
+            })
+            && stratum_recording_count == split.recording_count
+            && stratum_posterior_count == split.count_posterior_recording_count
+            && stratum_unresolved_count == split.count_unresolved_recording_count
+            && stratum_zero_probability_count == split.count_zero_reference_probability_count;
+        let duration_stratum_recording_count = split
+            .speaker_count_duration_strata
+            .iter()
+            .map(|stratum| stratum.recording_count)
+            .sum::<u64>();
+        let duration_stratum_posterior_count = split
+            .speaker_count_duration_strata
+            .iter()
+            .map(|stratum| stratum.posterior_recording_count)
+            .sum::<u64>();
+        let duration_stratum_unresolved_count = split
+            .speaker_count_duration_strata
+            .iter()
+            .map(|stratum| stratum.unresolved_recording_count)
+            .sum::<u64>();
+        let duration_stratum_zero_probability_count = split
+            .speaker_count_duration_strata
+            .iter()
+            .map(|stratum| stratum.zero_reference_probability_count)
+            .sum::<u64>();
+        let count_duration_strata_valid = !split.speaker_count_duration_strata.is_empty()
+            && split
+                .speaker_count_duration_strata
+                .windows(2)
+                .all(|window| window[0].duration_bucket < window[1].duration_bucket)
+            && split.speaker_count_duration_strata.iter().all(|stratum| {
+                stratum.recording_count > 0
+                    && stratum.posterior_recording_count <= stratum.recording_count
+                    && stratum.unresolved_recording_count <= stratum.recording_count
+                    && stratum.zero_reference_probability_count <= stratum.posterior_recording_count
+                    && bounded(stratum.exact_speaker_count_rate)
+                    && stratum
+                        .mean_negative_log_likelihood
+                        .is_none_or(finite_nonnegative)
+                    && stratum
+                        .mean_brier_score
+                        .is_none_or(|value| value.is_finite() && (0.0..=2.0).contains(&value))
+                    && bounded(stratum.top_k_coverage)
+                    && bounded(stratum.credible_set_coverage)
+            })
+            && duration_stratum_recording_count == split.recording_count
+            && duration_stratum_posterior_count == split.count_posterior_recording_count
+            && duration_stratum_unresolved_count == split.count_unresolved_recording_count
+            && duration_stratum_zero_probability_count
+                == split.count_zero_reference_probability_count;
+        let count_posterior_valid = split
+            .count_posterior_recording_count
+            .saturating_add(split.count_posterior_unavailable_count)
+            == split.recording_count
+            && split.count_unresolved_recording_count <= split.recording_count
+            && split.count_zero_reference_probability_count
+                <= split.count_posterior_recording_count
+            && split
+                .count_mean_negative_log_likelihood
+                .is_none_or(finite_nonnegative)
+            && split
+                .count_mean_brier_score
+                .is_none_or(|value| value.is_finite() && (0.0..=2.0).contains(&value))
+            && bounded(split.count_top_k_coverage)
+            && bounded(split.count_credible_set_coverage)
+            && split.count_mean_entropy_bits.is_none_or(finite_nonnegative)
+            && if split.count_posterior_recording_count == 0 {
+                split.count_mean_negative_log_likelihood.is_none()
+                    && split.count_mean_brier_score.is_none()
+                    && split.count_top_k_coverage.is_none()
+                    && split.count_credible_set_coverage.is_none()
+                    && split.count_mean_entropy_bits.is_none()
+            } else {
+                split.count_mean_brier_score.is_some()
+                    && split.count_top_k_coverage.is_some()
+                    && split.count_credible_set_coverage.is_some()
+                    && split.count_mean_entropy_bits.is_some()
+                    && (split.count_zero_reference_probability_count
+                        == split.count_posterior_recording_count
+                        || split.count_mean_negative_log_likelihood.is_some())
+            };
+        let count_quantiles_valid = [
+            split.p50_absolute_speaker_count_error,
+            split.p90_absolute_speaker_count_error,
+            split.p95_absolute_speaker_count_error,
+        ]
+        .into_iter()
+        .all(|value| value.is_some_and(finite_nonnegative))
+            && split.p50_absolute_speaker_count_error <= split.p90_absolute_speaker_count_error
+            && split.p90_absolute_speaker_count_error <= split.p95_absolute_speaker_count_error
+            && split.p95_absolute_speaker_count_error
+                <= split
+                    .maximum_absolute_speaker_count_error
+                    .map(|value| value as f64);
+        let occupancy_valid = split.dominant_collapse_recording_count <= split.recording_count
+            && split.reference_collapse_recording_count <= split.recording_count
+            && split.mean_effective_speaker_count.is_none_or(|value| {
+                value.is_finite()
+                    && (0.0..=f64::from(crate::model::MAX_SPEAKER_COUNT)).contains(&value)
+            })
+            && bounded(split.mean_dominant_speaker_share)
+            && bounded(split.p90_dominant_speaker_share)
+            && bounded(split.p99_dominant_speaker_share)
+            && bounded(split.maximum_dominant_speaker_share)
+            && split.mean_dominant_speaker_share <= split.maximum_dominant_speaker_share
+            && split.p90_dominant_speaker_share <= split.p99_dominant_speaker_share
+            && split.p99_dominant_speaker_share <= split.maximum_dominant_speaker_share
+            && bounded(split.mean_unknown_speaker_share)
+            && bounded(split.maximum_unknown_speaker_share)
+            && split.mean_unknown_speaker_share <= split.maximum_unknown_speaker_share
+            && bounded(split.mean_minority_reference_recall);
+        let word_metrics_valid = split
+            .scored_word_count
+            .saturating_add(split.excluded_word_count)
+            == split.reference_word_count
+            && split
+                .correct_word_count
+                .saturating_add(split.incorrect_word_count)
+                .saturating_add(split.unknown_word_count)
+                == split.scored_word_count
+            && split.micro_word_diarization_error_rate
+                == ratio(
+                    split
+                        .incorrect_word_count
+                        .saturating_add(split.unknown_word_count),
+                    split.scored_word_count,
+                )
+            && bounded(split.micro_word_diarization_error_rate)
+            && bounded(split.macro_word_diarization_error_rate)
+            && (split.scored_word_count > 0 || split.macro_word_diarization_error_rate.is_none());
         split.recording_count > 0
             && finite_nonnegative(split.reference_speaker_time_sec)
             && split.micro_der.is_none_or(finite_nonnegative)
@@ -4075,6 +4922,13 @@ fn variant_splits_are_valid(splits: &[PublicCorpusAblationSplit], calibration_bi
             && split
                 .mean_absolute_speaker_count_error
                 .is_none_or(finite_nonnegative)
+            && confusion_valid
+            && count_strata_valid
+            && count_duration_strata_valid
+            && count_posterior_valid
+            && count_quantiles_valid
+            && occupancy_valid
+            && word_metrics_valid
             && selective_valid
             && assignment_calibration_valid
             && bounded(split.mean_speaker_count_stability)
@@ -4101,6 +4955,48 @@ fn positive_ratio(numerator: f64, denominator: f64) -> Option<f64> {
 fn signed_ratio(numerator: f64, denominator: f64) -> Option<f64> {
     (denominator > 0.0 && numerator.is_finite())
         .then(|| canonical_evidence_number(numerator / denominator))
+}
+
+fn speaker_count_duration_bucket(duration_sec: f64) -> PublicSpeakerCountDurationBucket {
+    if duration_sec <= 30.0 {
+        PublicSpeakerCountDurationBucket::UpToThirtySeconds
+    } else if duration_sec <= 120.0 {
+        PublicSpeakerCountDurationBucket::UpToTwoMinutes
+    } else if duration_sec <= 600.0 {
+        PublicSpeakerCountDurationBucket::UpToTenMinutes
+    } else {
+        PublicSpeakerCountDurationBucket::LongerThanTenMinutes
+    }
+}
+
+fn quantile_nearest_rank_u64(values: &[u64], probability_millionths: u32) -> Option<f64> {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    quantile_nearest_rank_index(sorted.len(), probability_millionths)
+        .map(|index| canonical_evidence_number(sorted[index] as f64))
+}
+
+fn quantile_nearest_rank_f64(values: &[f64], probability_millionths: u32) -> Option<f64> {
+    if values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    quantile_nearest_rank_index(sorted.len(), probability_millionths)
+        .map(|index| canonical_evidence_number(sorted[index]))
+}
+
+fn quantile_nearest_rank_index(length: usize, probability_millionths: u32) -> Option<usize> {
+    if length == 0 || !(1..=1_000_000).contains(&probability_millionths) {
+        return None;
+    }
+    let rank = (u128::from(probability_millionths)
+        .saturating_mul(length as u128)
+        .saturating_add(999_999))
+        / 1_000_000;
+    usize::try_from(rank.saturating_sub(1))
+        .ok()
+        .map(|index| index.min(length - 1))
 }
 
 /// Quantize retained aggregate evidence without changing inference precision.
@@ -5048,6 +5944,7 @@ mod tests {
             recording_id: bundle.references[0].recording_id.clone(),
             duration_ms: bundle.references[0].duration_ms,
             turns: bundle.references[0].turns.clone(),
+            speaker_count_estimate: None,
             performance: None,
         };
         let score = crate::diarization::score_diarization_documents(
@@ -5072,6 +5969,78 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&second_output).expect("second output"),
             std::fs::read_to_string(&fixture.output_path).expect("first output")
+        );
+    }
+
+    #[test]
+    fn optional_word_annotations_are_checksum_bound_and_transcript_free() {
+        let fixture = Fixture::new(
+            "aishell-4-openslr111-v1",
+            "aishell-word-fixture",
+            "development",
+        );
+        let word_path = fixture.input.path().join("words.json");
+        std::fs::write(
+            &word_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": super::PUBLIC_CORPUS_WORD_ANNOTATION_SCHEMA_VERSION,
+                "recording_id": "aishell-word-fixture",
+                "words": [
+                    {
+                        "word_id": "word-001",
+                        "start_ms": 100,
+                        "end_ms": 200,
+                        "speaker_ref": "aishell-word-fixture-speaker-a"
+                    },
+                    {
+                        "word_id": "word-002",
+                        "start_ms": 450,
+                        "end_ms": 500,
+                        "speaker_ref": "aishell-word-fixture-speaker-b"
+                    }
+                ]
+            }))
+            .expect("word annotation JSON"),
+        )
+        .expect("word annotation");
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.descriptor_path).expect("descriptor"))
+                .expect("descriptor JSON");
+        descriptor["recordings"][0]["word_annotation_path"] = json!("words.json");
+        descriptor["recordings"][0]["word_annotation_sha256"] = json!(sha256(&word_path));
+        std::fs::write(
+            &fixture.descriptor_path,
+            serde_json::to_vec_pretty(&descriptor).expect("descriptor JSON"),
+        )
+        .expect("descriptor");
+
+        let bundle = fixture
+            .build("accept-aishell-4-cc-by-sa-4.0")
+            .expect("word-bound bundle");
+        assert_eq!(bundle.references[0].words.len(), 2);
+        assert_eq!(bundle.recordings[0].word_count, 2);
+        assert_eq!(
+            bundle.recordings[0].word_annotation_sha256,
+            Some(sha256(&word_path))
+        );
+        let hypothesis = crate::diarization::DiarizationHypothesisDocument {
+            schema_version: crate::diarization::DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: bundle.references[0].recording_id.clone(),
+            duration_ms: bundle.references[0].duration_ms,
+            turns: bundle.references[0].turns.clone(),
+            speaker_count_estimate: None,
+            performance: None,
+        };
+        let score = crate::diarization::score_diarization_documents(
+            &bundle.references[0],
+            &hypothesis,
+            &crate::diarization::DiarizationScorerConfig::default(),
+        )
+        .expect("word score");
+        assert_eq!(score.word_attribution.correct_word_count, 2);
+        assert_eq!(
+            score.word_attribution.word_diarization_error_rate,
+            Some(0.0)
         );
     }
 
@@ -5183,6 +6152,7 @@ mod tests {
                 reason_code: "fixture".to_owned(),
             }],
             speaker_hints: Vec::new(),
+            words: Vec::new(),
         };
         let clipped = clipped_reference(&reference, Some(650)).expect("clipped reference");
         assert_eq!(clipped.duration_ms, 650);
@@ -5409,6 +6379,68 @@ mod tests {
             exact_speaker_count_rate: Some(1.0),
             mean_signed_speaker_count_error: Some(0.0),
             mean_absolute_speaker_count_error: Some(0.0),
+            p50_absolute_speaker_count_error: Some(0.0),
+            p90_absolute_speaker_count_error: Some(0.0),
+            p95_absolute_speaker_count_error: Some(0.0),
+            maximum_absolute_speaker_count_error: Some(0),
+            speaker_count_confusion: vec![super::PublicSpeakerCountConfusionCell {
+                reference_speakers: 1,
+                hypothesis_speakers: 1,
+                recording_count: 1,
+            }],
+            speaker_count_strata: vec![super::PublicSpeakerCountStratum {
+                reference_speakers: 1,
+                recording_count: 1,
+                posterior_recording_count: 0,
+                unresolved_recording_count: 1,
+                zero_reference_probability_count: 0,
+                exact_speaker_count_rate: Some(1.0),
+                mean_negative_log_likelihood: None,
+                mean_brier_score: None,
+                top_k_coverage: None,
+                credible_set_coverage: None,
+            }],
+            speaker_count_duration_strata: vec![super::PublicSpeakerCountDurationStratum {
+                duration_bucket: super::PublicSpeakerCountDurationBucket::UpToThirtySeconds,
+                recording_count: 1,
+                posterior_recording_count: 0,
+                unresolved_recording_count: 1,
+                zero_reference_probability_count: 0,
+                exact_speaker_count_rate: Some(1.0),
+                mean_negative_log_likelihood: None,
+                mean_brier_score: None,
+                top_k_coverage: None,
+                credible_set_coverage: None,
+            }],
+            count_posterior_recording_count: 0,
+            count_posterior_unavailable_count: 1,
+            count_unresolved_recording_count: 1,
+            count_zero_reference_probability_count: 0,
+            count_mean_negative_log_likelihood: None,
+            count_mean_brier_score: None,
+            count_top_k_coverage: None,
+            count_credible_set_coverage: None,
+            count_mean_entropy_bits: None,
+            dominant_collapse_recording_count: 0,
+            reference_collapse_recording_count: 0,
+            phantom_speaker_count: 0,
+            collapsed_reference_speaker_count: 0,
+            mean_effective_speaker_count: Some(1.0),
+            mean_dominant_speaker_share: Some(1.0),
+            p90_dominant_speaker_share: Some(1.0),
+            p99_dominant_speaker_share: Some(1.0),
+            maximum_dominant_speaker_share: Some(1.0),
+            mean_unknown_speaker_share: Some(0.0),
+            maximum_unknown_speaker_share: Some(0.0),
+            mean_minority_reference_recall: Some(1.0),
+            reference_word_count: 0,
+            scored_word_count: 0,
+            correct_word_count: 0,
+            incorrect_word_count: 0,
+            unknown_word_count: 0,
+            excluded_word_count: 0,
+            micro_word_diarization_error_rate: None,
+            macro_word_diarization_error_rate: None,
             selective_reference_speaker_time_sec: 1.0,
             selective_covered_speaker_time_sec: 1.0,
             selective_correct_covered_speaker_time_sec: 1.0,
@@ -5489,6 +6521,20 @@ mod tests {
         .expect("complete evidence");
         assert!(!failed.passed);
         assert!(failed.macro_jer_delta.is_some_and(|delta| delta > 0.0));
+    }
+
+    #[test]
+    fn ablation_split_verifier_recomputes_count_and_word_conservation() {
+        let valid = ablation_variant(AcousticFeatureAblation::FullV2, Some(0.2), Some(0.3));
+        assert!(super::variant_splits_are_valid(&valid.splits, 10));
+
+        let mut forged_count = valid.clone();
+        forged_count.splits[0].exact_speaker_count_rate = Some(0.0);
+        assert!(!super::variant_splits_are_valid(&forged_count.splits, 10));
+
+        let mut forged_words = valid;
+        forged_words.splits[0].reference_word_count = 1;
+        assert!(!super::variant_splits_are_valid(&forged_words.splits, 10));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5910,6 +6956,11 @@ mod tests {
             change_boundary_collar_ms: 250,
             overlap_policy: crate::diarization::EvaluationOverlapPolicy::Exclude,
             calibration_bins: 10,
+            count_top_k: 3,
+            count_credible_mass_millionths: 900_000,
+            dominant_speaker_collapse_share_millionths: 990_000,
+            minimum_reference_speaker_recall_millionths: 100_000,
+            minimum_effective_occupancy_ms: 250,
         };
         let diarization_request = crate::model::DiarizationRequest {
             engine: crate::model::DiarizationEngine::Acoustic,

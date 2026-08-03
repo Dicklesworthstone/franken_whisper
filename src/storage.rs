@@ -1642,6 +1642,22 @@ CREATE INDEX IF NOT EXISTS idx_speaker_profile_summaries_run_id
         report: Option<&crate::model::DiarizationReport>,
         skip_sp: bool,
     ) -> FwResult<()> {
+        if report.is_some_and(|report| {
+            report.implementation.starts_with("native-acoustic")
+                && report.speaker_count.estimate.is_none()
+        }) {
+            return Err(FwError::Storage(format!(
+                "cannot persist native acoustic diarization for run {run_id}: \
+                 speaker-count-estimate-v2 is required by the current report contract"
+            )));
+        }
+        if let Some(estimate) = report.and_then(|report| report.speaker_count.estimate.as_ref()) {
+            estimate.validate().map_err(|error| {
+                FwError::Storage(format!(
+                    "cannot persist invalid speaker-count estimate for run {run_id}: {error}"
+                ))
+            })?;
+        }
         let run_id_value = text_value(run_id.to_owned());
         for table in [
             "diarization_turns",
@@ -2542,10 +2558,12 @@ mod tests {
         AccelerationBackend, AccelerationReport, BackendKind, BackendParams, DiarizationEngine,
         DiarizationFallbackStatus, DiarizationReport, DiarizationRequest, DiarizationTurn,
         InputSource, KnownSpeakerInterval, KnownSpeakerPolicy, RunEvent, RunReport,
-        SpeakerCountOutcome, SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus,
-        SpeakerCountRequest, SpeakerEvidenceReason, SpeakerEvidenceSummary, SpeakerHintDisposition,
-        SpeakerHintEvidenceSummary, SpeakerProfileSummary, TranscribeRequest, TranscriptionResult,
-        TranscriptionSegment,
+        SpeakerCountCalibrationStatus, SpeakerCountEstimate, SpeakerCountEvidenceLane,
+        SpeakerCountLaneEvidence, SpeakerCountLaneUnavailableReason, SpeakerCountOutcome,
+        SpeakerCountOutcomeReason, SpeakerCountOutcomeStatus, SpeakerCountPosteriorBin,
+        SpeakerCountRange, SpeakerCountRequest, SpeakerCountResourceSummary, SpeakerEvidenceReason,
+        SpeakerEvidenceSummary, SpeakerHintDisposition, SpeakerHintEvidenceSummary,
+        SpeakerProfileSummary, TranscribeRequest, TranscriptionResult, TranscriptionSegment,
     };
 
     use super::{BlockingConnection, RunStore, stored_projection_timeline, value_to_string};
@@ -2774,7 +2792,7 @@ mod tests {
             speaker_queries: Vec::new(),
             speaker_count: SpeakerCountOutcome {
                 request: SpeakerCountRequest::HardConstraint { count: 1 },
-                estimate: None,
+                estimate: Some(synthetic_speaker_count_estimate()),
                 status: SpeakerCountOutcomeStatus::Satisfied,
                 supported_speaker_count: 1,
                 active_speaker_refs: vec!["speaker_a".to_owned()],
@@ -2800,6 +2818,90 @@ mod tests {
             fallback_status: DiarizationFallbackStatus::NotNeeded,
             diagnostics: vec!["synthetic persistence fixture".to_owned()],
         });
+    }
+
+    fn synthetic_speaker_count_estimate() -> SpeakerCountEstimate {
+        let posterior_probability = 0.85_f64;
+        let unresolved_probability = 0.15_f64;
+        let estimate = SpeakerCountEstimate {
+            schema_version: "speaker-count-estimate-v2".to_owned(),
+            selected_count: Some(1),
+            supported_range: Some(SpeakerCountRange {
+                minimum: 1,
+                maximum: 1,
+            }),
+            posterior: vec![SpeakerCountPosteriorBin {
+                count: 1,
+                probability: posterior_probability,
+            }],
+            unresolved_probability,
+            entropy_bits: -posterior_probability * posterior_probability.log2()
+                - unresolved_probability * unresolved_probability.log2(),
+            stability: 0.9,
+            constraint_lower_bound: 1,
+            candidate_upper_bound: 1,
+            calibration_status: SpeakerCountCalibrationStatus::DevelopmentUncertified,
+            calibration_sha256: "a".repeat(64),
+            evidence_sha256: "b".repeat(64),
+            lanes: vec![
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::MergeRisk,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.9,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::SparseNormalizedEigengap,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(
+                        SpeakerCountLaneUnavailableReason::InsufficientPrototypes,
+                    ),
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::FeatureJackknife,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.9,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::EffectiveOccupancy,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 0.9,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::ConstraintGraph,
+                    available: true,
+                    proposed_count: Some(1),
+                    confidence: 1.0,
+                    unavailable_reason: None,
+                },
+                SpeakerCountLaneEvidence {
+                    lane: SpeakerCountEvidenceLane::CallerPrior,
+                    available: false,
+                    proposed_count: None,
+                    confidence: 0.0,
+                    unavailable_reason: Some(SpeakerCountLaneUnavailableReason::NotRequested),
+                },
+            ],
+            resources: SpeakerCountResourceSummary {
+                prototype_count: 1,
+                affinity_pair_evaluations: 0,
+                retained_sparse_edges: 0,
+                estimated_peak_buffer_bytes: 256,
+                stability_replicates: 5,
+                solver_iterations: 0,
+                solver_sparse_matvec_terms: 0,
+                solver_residual: Some(0.0),
+            },
+        };
+        estimate.validate().expect("synthetic count estimate");
+        estimate
     }
 
     fn table_row_count(store: &RunStore, table: &str) -> usize {
@@ -2893,6 +2995,19 @@ mod tests {
             stored_count.reasons,
             vec![SpeakerCountOutcomeReason::RequestedCountMatched]
         );
+        let stored_estimate = stored_count
+            .estimate
+            .as_ref()
+            .expect("speaker-count estimate should survive SQLite persistence");
+        stored_estimate
+            .validate()
+            .expect("stored speaker-count estimate should remain valid");
+        assert_eq!(stored_estimate.schema_version, "speaker-count-estimate-v2");
+        assert_eq!(stored_estimate.selected_count, Some(1));
+        assert_eq!(stored_estimate.unresolved_probability, 0.15);
+        assert_eq!(stored_estimate.resources.prototype_count, 1);
+        assert_eq!(stored_estimate.resources.retained_sparse_edges, 0);
+        assert_eq!(stored_estimate.resources.estimated_peak_buffer_bytes, 256);
         let stored_hints: Vec<SpeakerHintEvidenceSummary> =
             serde_json::from_str(&value_to_string(typed_evidence[0].get(3)))
                 .expect("typed hint evidence JSON");
@@ -2917,6 +3032,16 @@ mod tests {
         assert_eq!(
             loaded_diarization.speaker_count.speaker_evidence[0].voiced_frame_count,
             87
+        );
+        assert_eq!(
+            loaded_diarization
+                .speaker_count
+                .estimate
+                .as_ref()
+                .expect("loaded speaker-count estimate")
+                .resources
+                .stability_replicates,
+            5
         );
 
         let profile_flags = store
@@ -2964,6 +3089,33 @@ mod tests {
                 "{table} must contain only canonical runs after rebuild"
             );
         }
+    }
+
+    #[test]
+    fn invalid_speaker_count_estimate_is_rejected_before_index_mutation() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("invalid-count-estimate.sqlite3");
+        let store = RunStore::open(&db_path).expect("store");
+        let mut report = minimal_report("run-invalid-count-estimate", &db_path);
+        attach_synthetic_diarization(&mut report, false);
+        report
+            .result
+            .diarization
+            .as_mut()
+            .and_then(|report| report.speaker_count.estimate.as_mut())
+            .expect("synthetic estimate")
+            .unresolved_probability = 0.25;
+
+        let error = store
+            .persist_report(&report)
+            .expect_err("invalid estimate must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("speaker-count posterior and unresolved mass do not normalize"),
+            "{error}"
+        );
+        assert_eq!(table_row_count(&store, "diarization_reports"), 0);
     }
 
     #[test]

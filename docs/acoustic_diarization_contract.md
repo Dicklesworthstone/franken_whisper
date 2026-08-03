@@ -254,8 +254,197 @@ frame/missingness counts, supported dimension counts, bounded retained state,
 and fallback/calibration state. They never expose feature values, audio,
 transcript text, paths, or recording identifiers.
 
-Wavelet evidence is limited to inexpensive Haar-like multiscale contrasts over
-feature trajectories. A full raw-waveform CWT is not the default algorithm.
+### 4.3.1 Experimental multiscale sidecar v2
+
+`acoustic-multiscale-sidecar-v2` is an evaluation-only surface. Its
+configuration defaults to `Off`, has independent per-axis mode orders and a
+SHA-256, and is not a member of the six frozen `AcousticFeatureAblation`
+variants. No
+normal transcription, segmentation, clustering, robot, or persistence path
+constructs this study. Running its arithmetic therefore cannot change the
+acoustic-v2 schema hash, feature dimensions, report bytes, or default result.
+
+The current prototype implements four independently selectable, bounded
+kernel families:
+
+| Family | Input and support | Output | Owner |
+|---|---|---|---|
+| Frame Haar or D4/db2 analysis | One exact 400-sample normalized 16 kHz frame through the configuration-bound runner; at most four levels | Per-level local detail-energy fraction, log mean-square energy, normalized entropy, coefficient flatness, crest factor, adjacent-detail change, and Parseval residual | `MixedAuxiliary` |
+| Modulation regression | A 64-frame ring at the acoustic-v2 10 ms cadence | Normalized regression power at 1.5625, 3.125, 6.25, and 12.5 Hz for the voice temporal-modulation, channel-level, and channel-coloration trajectories | `Voice`, `Channel`, and `Channel` respectively |
+| Masked trajectory Haar or D4/db2 analysis | One shared 64-frame ring of voiced cepstral-envelope magnitude, frame-local voiced occupancy, and low/mid/high band-energy fractions; at most four levels | Per-family and per-level valid support, mean absolute detail, RMS detail, normalized entropy, and separately available adjacent-detail change | `Voice` for envelope magnitude, `MixedAuxiliary` for voiced occupancy, and `Channel` for every band fraction |
+| Fixed scattering summaries | The same masked, normalized 64-frame trajectories with circular undecimated Haar supports 2, 4, and 8 | Independently selected first-order mean modulus and/or second-order mean modulus for ordered scale pairs `(2,4)`, `(2,8)`, and `(4,8)` | Same per-trajectory ownership as the masked trajectory input |
+
+The standalone wavelet kernel also accepts bounded conformance fixtures from
+the basis-specific minimum through 400 samples, and the public standalone
+modulation sidecar can emit an unbound summary. Evaluation evidence must instead
+use `AcousticSidecarStudy::observe_normalized_16khz_frame`; that executor binds
+the 400-sample support, 16 kHz sample rate, 160-sample hop, selected bases,
+level counts, scattering selection, and numerical contract to one configuration
+digest. A study observation carries the raw 32-byte digest in a private,
+getter-only binding, so the configuration-bound observation type cannot be
+silently relabeled under another mode. Direct standalone or otherwise unbound
+kernel results do not carry this binding and are therefore conformance
+diagnostics, not evaluation evidence.
+
+Those physical declarations are caller preconditions, not content-provenance
+proof. The in-memory executor cannot verify an external sample rate, prove
+that successive arrays advance by exactly 160 samples, or infer that a
+separately supplied `AcousticFrameFeatures` value was derived from the same
+PCM array. A valid evaluator must construct both from one normalized stream,
+preserve contiguous frame indices, and bind its extractor revision separately.
+The sidecar digest identifies configuration, schema, and sidecar arithmetic;
+it does not hash every upstream acoustic-v2 threshold or FFT-bin decision.
+
+Wavelet input is mean-centered and unit-energy normalized. DC-offset and
+positive-gain invariance applies only while the centered input remains above
+the absolute silence floor and every transformed PCM sample remains within the
+submitted `[-1, 1]` domain; below the floor, the result is explicitly
+unavailable as silence. Coefficient flatness adds a configuration-hashed,
+scale-relative power stabilizer equal to the level's mean detail power times `f32::EPSILON`
+to every coefficient power and to the arithmetic-mean denominator. This keeps
+the ratio gain-invariant and bounded while preventing `f32` re-quantization of
+mathematically zero coefficients after a DC shift from dominating the
+geometric mean. A detail level at or below `PCM_EPSILON²` retains its measured
+local energy fraction, uses `POWER_EPSILON` for log energy, and reports zero
+distribution-shape statistics, including flatness. An odd intermediate width
+duplicates its final sample, which is right half-sample symmetric extension,
+and the analysis filters then use periodic support. Haar uses
+`[1/sqrt(2), 1/sqrt(2)]` and `[1/sqrt(2), -1/sqrt(2)]`. D4 uses the frozen
+four-tap analysis coefficients with forward taps starting at `2 * output_index`
+and approximation-then-detail output order. Every level checks a Parseval
+residual computed from raw energies, independently of reported-fraction
+clamping, and rejects a relative error above `2e-5`. Silence returns an
+explicit zero-level result rather than invented coefficients. Raw-PCM wavelets
+combine vocal source, room, device, codec, and
+playback effects, so they may never enter a reusable voice profile.
+
+Modulation outputs are point-frequency regressions, not frequency bands. Each
+family removes its valid-sample mean, residualizes the sine/cosine basis
+against the intercept, solves the checked two-coordinate least-squares system,
+and reports explained-energy fraction. A summary exists only after 64
+contiguous frames; a duplicate or gap is rejected without state mutation. A
+family requires at least 32 valid observations, non-negligible centered energy,
+and a full-rank residualized sine/cosine Gram system at every selected
+frequency. Failure of any condition makes that complete family unavailable
+with zero output rather than inventing measured absence. Invalid observations
+are omitted, never replaced with zeros. Voice validity is a broader
+sidecar-specific temporal-modulation mask:
+voiced, non-low-energy, non-clipped, non-transient, and with a positive frame
+index. Unlike the acoustic-v2 identity mask, it intentionally does not require
+reliable pitch or RMS at or above -50 dBFS; public coverage and channel-confound
+gates must decide whether that broader support is useful. Channel validity
+requires a non-low-energy, non-clipped observation. The fixed complex-step
+constants, derived twiddle table, oldest-to-newest ring order, and compile-time
+recurrence are configuration-hashed and avoid target-varying runtime
+transcendental calls. The summary retains the valid counts, so an evaluator can
+measure coverage and reject a candidate that works only on easy speech.
+
+The trajectory ring has canonical family order
+`voiced_cepstral_envelope_magnitude`, `voiced_occupancy`, `low_band_fraction`,
+`mid_band_fraction`, `high_band_fraction`, and canonical oldest-to-newest time
+order. Cepstral-envelope magnitude is the frame-local RMS across all 12
+gain-centered acoustic-v2 cepstral-envelope coordinates. It is voice-owned and
+valid on a voiced, non-low-energy, non-clipped, non-transient frame; it has no
+predecessor-frame or positive-index dependency. Gain centering removes level,
+not room, device, or codec coloration, so `Voice` remains a provisional study
+axis subject to the channel-confound gate rather than proof of reusable identity.
+Voiced occupancy is the frame-local binary `quality.voiced` indicator, not the
+history-bearing `voiced_fraction` IIR; it is valid whenever the frame is not
+clipped and remains mixed auxiliary activity evidence rather than reusable
+speaker identity. Each band fraction is valid only on a non-low-energy,
+non-clipped frame and remains channel-owned. With the current 40 Hz FFT-bin
+centers, acoustic-v2 derives the fractions over half-open bin-index ranges
+whose centers are 0-440 Hz, 480-1,960 Hz, and 2,000-8,000 Hz respectively.
+Those truncated extractor cut points are upstream provenance and are not
+silently promoted into a sidecar identity.
+
+No trajectory result exists before 64 contiguous frames, and a duplicate or
+gap is rejected without advancing state. A family requires at least 32 of 64
+valid observations and non-negligible centered energy; an otherwise supported
+constant or near-constant family is explicitly unavailable. Its valid
+observations are mean-centered and jointly unit-energy normalized. Invalid
+observations are omitted from both moments and coefficients; they are never
+zero-imputed. A trajectory DWT coefficient exists only when every input in
+that filter support is valid, and that mask is propagated through the
+approximation path. A reported level requires at least two valid detail
+coefficients. Adjacent-detail change has its own availability flag and valid
+pair count, so a missing adjacent pair cannot masquerade as measured zero
+change. Adjacent change is linear over neighboring retained coefficients and
+does not wrap the final coefficient back to the first. The masked DWT uses
+periodic forward taps at `2 * output_index`;
+unlike the scattering aggregate, its decimated statistics are deliberately
+phase-sensitive.
+
+The scattering candidate uses fixed, zero-learned, undecimated circular Haar
+high-pass filters: the first half of each support is positive, the second half
+negative, and the complete filter has unit L2 norm. First order averages the
+valid modulus response at each support. Second order filters a first-order
+modulus path only at a larger support and averages the resulting valid
+modulus. One output requires at least eight valid circular positions. Circular
+shift invariance applies to these full-window averages, within floating-point
+tolerance, when the values and validity mask move together. Focused tests use
+`2e-6`; the promotion tolerance remains to be frozen by `.15.3`. A constant or
+near-constant normalized input is unavailable rather than reported as a bank
+of zeros. `FirstOrder`, `SecondOrder`, and `FirstAndSecondOrder` are distinct
+hashed selections. `SecondOrder` computes
+only prerequisite first-order supports 2 and 4, then deliberately leaves
+first-order output fields unavailable and zero. The combined selection also
+computes and reports support 8. Selected evidence therefore cannot be confused
+with hidden intermediate work.
+
+Cancellation is checked before a study frame, before wavelet levels, before
+each modulation family, before each selected frequency, before each trajectory
+family and DWT level, and before each scattering scale and scale pair. The
+modulation and trajectory states are cloned together and committed only after
+every enabled family succeeds. A cancelled frame can therefore be retried
+without a hidden advance in either ring, including cancellation after the
+modulation projections have completed but before trajectory analysis begins.
+Diagnostics name filter-tap terms, validity-mask visits, valid
+sample-frequency visits, exact buffer/table payload bytes, and target-specific
+in-struct bytes. On direct five-family, fully valid conformance arrays, four
+trajectory levels use 1,200 filter-tap terms and 600 validity visits for Haar,
+or 2,400 and 1,200 for D4. Full-valid first-order scattering uses 4,480 filter
+terms and visits; second-order uses 8,320; combined selection uses 10,880.
+The trajectory-DWT scratch payload is 960 bytes. Scattering scratch is 1,280
+bytes for first order alone and 1,600 bytes whenever second order is selected
+on the declared Rust representation. A visit
+count is not a scalar FLOP count, and none of these fields is a stack or RSS
+bound. Wall time, RTF, and sampled RSS belong in the outer public evaluator so
+host-dependent measurements cannot contaminate deterministic accuracy hashes.
+
+All frame-wavelet, modulation, trajectory-DWT, and scattering results remain
+signal-derived. They intentionally have no serialization implementation, and
+their custom `Debug` output omits feature values. Source-derived, public-corpus,
+or per-recording sidecar observations and feature values must not be logged,
+written to SQLite/JSONL, placed in a speaker-profile store, or retained in
+repository evidence. Deterministically generated synthetic conformance values
+and goldens may remain in unit tests. A future public study artifact may retain
+only aggregate, path-free and transcript-free metrics plus schema/configuration
+hashes, operation counts, performance observations, and a self-hash.
+
+This prototype is not an accuracy result or promotion. Focused synthetic/unit
+checks cover bounded arithmetic, independent transform oracles, masked
+band-energy trajectory DWT, fixed first/second-order scattering summaries, a
+Voice-owned voiced-envelope magnitude trajectory, frame-local occupancy,
+cancellation rollback,
+missingness boundaries, affine and circular-shift metamorphic checks,
+fixed-state accounting, configuration separation, and default-path isolation.
+It does not yet include multi-coordinate cepstral trajectory candidates—the
+current RMS magnitude intentionally collapses coefficient sign and ordering—a
+public sidecar evaluator, public pair and boundary discrimination,
+DER/JER/count/calibration results, RTF/RSS evidence,
+or held-out certification. Nothing in this section establishes that any new
+candidate improves diarization. `bd-odj7.13.15` therefore remains in progress.
+
+The future sidecar evaluator must be a schema separate from public acoustic
+ablation v8. It must freeze the full-v2 baseline and candidate order before
+reading development metrics; report boundary precision/recall/F1 and timing,
+same/different discrimination, speaker-count error, DER/JER, calibration,
+coverage, channel-confound rate, RTF, RSS, and deterministic hashes; and
+predeclare uncertainty-aware improvement and non-regression limits. Held-out
+audio stays sealed unless one development candidate passes every relevant
+gate. If none passes, the correct outcome is a retained aggregate negative
+result and no feature adoption.
 
 ### 4.4 Probabilistic clustering v2 development status
 
@@ -292,6 +481,15 @@ Accordingly, `selected_clustering_mode` remains `fixed_safe_v1`, no candidate
 lock was minted, and no held-out recording was read. These results establish
 real public development evidence and performance observations, not production
 promotion or held-out certification.
+
+The subsequent `acoustic-clustering-probabilistic-v3-development` count
+candidate adds a separately versioned `speaker-count-estimate-v2` report. It
+has not inherited the v2 evaluation authority: until a new frozen public
+development bundle passes the count, DER/JER, calibration, determinism, memory,
+and latency gates, the normal assignment path remains `fixed_safe_v1`. Native
+fixed-safe runs still emit the count-estimate object, but with
+`fixed_safe_uncalibrated`, no concrete bins or selected count, and all
+probability mass assigned to `unresolved`.
 
 ## 5. Known intervals
 
@@ -352,10 +550,12 @@ boundaries and cannot invent, drop, duplicate, or reorder text.
 `SpeakerCountRequest` has exactly one mode:
 
 - `Infer` selects only speakers that pass acoustic evidence gates;
-- `Prior` carries sorted, unique probability mass over positive counts and
-  currently returns `speaker_count_unresolved` until calibrated prior fusion is
-  implemented;
-- `Range` bounds the evidence-supported search;
+- `Prior` carries sorted, unique probability mass over positive counts as soft
+  evidence pooled into at most 15% of concrete posterior mass; counts outside
+  its support remain eligible, and five-view acoustic agreement attenuates the
+  prior to 7.5% at unanimity;
+- `Range` is a soft uniform preference inside the interval, not a hard search
+  bound;
 - `HardConstraint` searches for exactly the requested count but does not assert
   that the count exists in the recording.
 
@@ -527,32 +727,57 @@ does not invent speakers merely to satisfy a range minimum or exact count; it
 reports `unsatisfied_constraints`, reports `speaker_count_unresolved`, or
 returns a hard error according to typed fallback policy.
 
-The probabilistic speaker-count candidate uses five deterministic semantic
-views: full evidence, no pitch, no dynamics, no formants, and no channel.
-Count selection requires a three-of-five majority and a matching
-co-association consensus. Insufficient shared voice evidence, invalid
-posterior arithmetic, or unstable count invokes a typed fixed-safe fallback.
-Public evidence aggregates stability for every requested probabilistic run,
-including runs that fell back, so fallback cannot inflate the mean by
-disappearing from its denominator.
+The v3 probabilistic speaker-count candidate uses five deterministic semantic
+views: full evidence, no pitch, no dynamics, no formants, and no channel. It
+retains their complete bounded merge-risk curves, combines them with a
+symmetrized degree-bounded normalized-affinity eigengap proposal, applies hard
+constraint-graph lower bounds, and linearly pools at most 15% caller-prior mass
+into the acoustic count distribution before checking the selected count
+against effective post-assignment occupancy. Five-view acoustic agreement
+linearly attenuates that mix to 7.5% at unanimity. The bounded pool can move
+probability but cannot erase acoustically supported counts, acquire the
+unbounded leverage of a near-zero log prior, or veto unanimous evidence through
+the unresolved-mass threshold. The
+public estimate carries ordered concrete count bins plus separate unresolved
+mass, entropy, stability, six typed lane summaries, and content-free
+calibration/evidence hashes. It also reports content-free resource accounting:
+prototype and retained-edge counts, affinity comparisons, estimated peak
+algorithm buffers, stability replicates, eigensolver iterations and sparse
+matrix-vector terms, and the final residual when available. These values and
+the solver's diagonal shift are bound into the evidence/calibration
+fingerprints. Lane agreement is only a development score input; the estimate
+is explicitly `development_uncertified`, not described as a calibrated
+posterior.
+
+Selection requires the concrete MAP action to dominate unresolved mass, at
+least three of five feature views to support it, co-association consensus, and
+matching supported occupancy. Any failure retains an unresolved estimate and
+invokes the typed fixed-safe assignment fallback. No-voice, insufficient
+prototype, invalid-affinity, non-convergence, contradictory-constraint, and
+resource-limited states remain non-authoritative. Public evidence aggregates
+stability for every requested probabilistic run, including runs that fell
+back, so fallback cannot inflate the mean by disappearing from its
+denominator.
 
 The six-dimensional temporal/lexical heuristic is not an acoustic fallback.
 An explicit acoustic request cannot silently invoke external or lexical
-behavior. Every fallback names its source and reason.
+behavior. Soft count priors and ranges are rejected by external/neural engines
+instead of being silently hardened into backend min/max controls. Every
+fallback names its source and reason.
 
 ## 9. Scoring
 
-The retained evaluation authority is `diarization-scorer-v3`. Low-level
+The retained evaluation authority is `diarization-scorer-v4`. Low-level
 metric helpers are not sufficient evidence by themselves: a retained verdict
 must be produced by `score_diarization_documents` from these exact versioned
 documents:
 
 | Document | Schema identity |
 |---|---|
-| Reference | `diarization-reference-v1` |
-| Hypothesis | `diarization-hypothesis-v1` |
-| Configuration | `diarization-scorer-config-v1` |
-| Result | `diarization-score-result-v1` |
+| Reference | `diarization-reference-v2` |
+| Hypothesis | `diarization-hypothesis-v2` |
+| Configuration | `diarization-scorer-config-v2` |
+| Result | `diarization-score-result-v2` |
 | Corpus manifest | `diarization-corpus-manifest-v1` |
 | Leakage audit | `diarization-leakage-audit-v1` |
 
@@ -565,11 +790,16 @@ attached to an unknown label, ambiguous overlapping hints, and non-canonical
 ordering fail closed with `diarization.scorer.*` reason codes.
 
 The reference and hypothesis identify the same opaque recording and exact
-duration. They contain timed speaker turns only: there is deliberately no
+duration. They contain timed speaker turns but deliberately contain no
 filesystem path, media URI, transcript text, or free-form provenance field.
-Reference turns are labeled; hypothesis turns may use an absent label for an
-honest unknown. Hypothesis assignment confidence and overlap suspicion remain
-separate observations.
+Reference v2 may additionally contain aligned word intervals whose `word_id`
+is an opaque non-lexical annotation identity. The interval and reference
+speaker are sufficient to score speaker attribution; lexical tokens are
+forbidden from retained evaluation inputs. Reference turns are labeled;
+hypothesis turns may use an absent label for an honest unknown. Hypothesis v2
+may carry the complete bounded `speaker-count-estimate-v2`. Assignment
+confidence, count uncertainty, and overlap suspicion remain separate
+observations.
 
 ### 9.1 Frozen metric policy
 
@@ -598,7 +828,19 @@ The same result separately reports:
 - union speech miss, false alarm, and speech-activity error rate;
 - one-to-one change precision, recall, F1, and mean absolute timing error under
   the named `change_boundary_collar_ms`;
-- conditional speaker-attribution accuracy and speaker-count error;
+- conditional speaker-attribution accuracy and raw speaker-count error;
+- proper multiclass count-posterior Brier score, finite negative log
+  likelihood plus an explicit zero-reference-probability flag, concrete
+  top-k coverage, a deterministic credible set that may retain unresolved
+  mass, entropy, and calibration authority; a reference count outside the
+  concrete posterior support still contributes its missing target-class term
+  to the Brier score rather than disappearing from the outcome space;
+- scored occupancy per anonymized hypothesis label, effective speaker count,
+  phantom-label count, dominant-label share, UNKNOWN share, recurrence, and
+  per-reference recall-collapse diagnostics;
+- transcript-free aligned-word speaker counts and word diarization error rate
+  (WDER), with the same ignored-region, collar, and overlap policy as the
+  duration score;
 - duration-weighted overlap precision, recall, and F1;
 - hard/soft hint adherence, contradiction, unknown duration, and hard
   violation duration;
@@ -613,6 +855,23 @@ Reference, hypothesis, configuration, and result hashes use canonical compact
 JSON and SHA-256. `result_sha256` hashes the complete result with that one field
 temporarily empty, making tampering independently detectable. Repeated scoring
 of identical canonical inputs must serialize byte-for-byte identically.
+
+Speaker-count exactness is not a collapse test. A hypothesis can emit exactly
+the reference number of label names while assigning nearly all speech to one
+label. Scorer v4 therefore independently declares dominant collapse when a
+multi-speaker reference crosses the configured labeled-share threshold, and
+reference collapse when any mapped reference speaker falls below its
+configured attribution recall. Labels below
+`minimum_effective_occupancy_ms` do not count as effective or phantom
+speakers. UNKNOWN share is measured over hypothesis speaker-time
+(`UNKNOWN / (labeled + UNKNOWN)`), so false alarms cannot make it exceed one.
+All thresholds are integer millionths or milliseconds in the self-hashed
+configuration.
+
+Reference labels that occur only inside excluded scoring regions do not enter
+the reference-collapse count or minority-recall diagnostic. Hypothesis labels
+seen only there remain visible with zero scored occupancy, but are neither
+effective nor phantom speakers.
 
 ### 9.2 Corpus manifests and leakage
 
@@ -698,7 +957,7 @@ approved.
 
 ### 11.1 Local confidential evaluator
 
-`confidential-diarization-evaluation-manifest-v1` is deliberately different
+`confidential-diarization-evaluation-manifest-v2` is deliberately different
 from the path-free public corpus manifest. It is a local input document that
 contains absolute audio, reference, and hypothesis paths and therefore must
 remain outside the checkout. Its Rust representation supports deserialization
@@ -721,11 +980,14 @@ The `diarization-eval` command:
   streaming audio-hash block, and the final write, leaving no aggregate when
   cancelled;
 - writes only
-  `confidential-diarization-evaluation-aggregate-v1`.
+  `confidential-diarization-evaluation-aggregate-v2`.
 
-The aggregate contains micro/macro accuracy, change, count, overlap,
-calibration, and optional performance summaries plus opaque content/config
-fingerprints. It contains no per-recording row, path, filename, transcript,
+The aggregate contains micro/macro accuracy, change, raw count error,
+count-posterior proper scores and coverage, occupancy-collapse totals,
+transcript-free word-attribution totals, overlap, calibration, and optional
+performance summaries plus opaque content/config fingerprints. Posterior
+unavailability, unresolved selections, and zero reference probability remain
+separate counts. It contains no per-recording row, path, filename, transcript,
 timestamp, speaker/recording identity, feature vector, or excerpt. Repeated
 evaluation of identical content is byte-stable apart from the caller-chosen
 external filename, which is never serialized.
@@ -751,7 +1013,7 @@ rights. The LDC entry is usable only by an operator who already has lawful
 access.
 
 `diarization-corpus build` consumes
-`public-diarization-corpus-input-v1` from an absolute root outside the checkout.
+`public-diarization-corpus-input-v2` from an absolute root outside the checkout.
 Every selected input is a relative path under that canonical root. Symlink
 escapes, traversal, absolute descriptor paths, wrong SHA-256 values, unexpected
 WAV sample rate/channel count, invalid selected channels, malformed RTTM,
@@ -761,13 +1023,29 @@ one selected recording/channel, and an explicit source-label to path-free
 speaker-ID map. Concurrent different-speaker turns are preserved and marked as
 overlap. Ignored regions remain explicit scorer inputs.
 
-The generated `public-diarization-corpus-bundle-v1` contains the path-free
+Each recording may bind an optional external
+`public-diarization-word-annotation-v1` document by relative path and exact
+SHA-256. It contains only the recording identity and canonically ordered
+opaque word IDs, integer-millisecond intervals, and reference speaker IDs.
+The adapter validates every word against active reference speech, caps
+per-recording and corpus totals, and never imports lexical text.
+
+The generated `public-diarization-corpus-bundle-v2` contains the path-free
 manifest, canonical reference documents, media/annotation/reference SHA-256
-values, checked WAV geometry, and a passing self-hashed leakage audit. It never
-contains local paths, URIs, transcripts, or media bytes. The output is created
-once in a directory outside both the checkout and input root; source media is
-never copied. The path-bearing descriptor type is deserialization-only and has
-no `Debug` or serialization implementation.
+values, optional word-annotation SHA-256 values and counts, checked WAV
+geometry, and a passing self-hashed leakage audit. It never contains local
+paths, URIs, transcripts, or media bytes. The output is created once in a
+directory outside both the checkout and input root; source media is never
+copied. The path-bearing descriptor type is deserialization-only and has no
+`Debug` or serialization implementation.
+
+The current ablation evidence is
+`public-diarization-acoustic-ablation-v8` with runner v8. Every split reports
+the full count confusion matrix, exact/error quantiles, reference-count and
+duration strata, posterior calibration summaries, collapse/occupancy
+diagnostics, and optional micro/macro WDER. These additions do not promote a
+candidate: the historical v7 development result in section 4.4 remains the
+last retained verdict until a hash-locked v8 development run passes.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an
@@ -783,7 +1061,353 @@ license acknowledgement, cancellation, and byte-stable replay. Full accuracy
 certification points the same command at externally acquired data and retains
 the resulting bundle and scorer outputs outside the repository.
 
-### 11.3 Repository and release guard
+### 11.3 Adversarial and metamorphic acoustic recipes
+
+`src/adversarial_corpus.rs` is the public-safe failure-reproduction substrate.
+It generates finite in-memory PCM from `adversarial-synthetic-call-v1` recipes;
+it does not read a path or serialize the resulting samples. Synthetic profiles
+contain only oscillator, amplitude, stationary coloration, and stereo-position
+parameters. Turns contain only a numeric profile index, integer time range,
+gain, pitch movement, and a playback condition. They do not contain words,
+names, demographic labels, recordings, or biometric templates.
+
+The v1 challenge registry contains one deterministic seed for each required
+regime:
+
+| Source or transform family | Metamorphic contract |
+|---|---|
+| Gain/distance imbalance | Speaker labels remain permutation-equivalent |
+| Stationary EQ/muffling and band limitation | Labels remain stable; quality may degrade |
+| Resampling and quantization | Timing is unchanged; consistency error is measured |
+| Clipping, noise, reverb, and interruptions | Labels remain stable or become explicitly uncertain; no invented identity |
+| Leading/trailing silence | Every reference boundary shifts by the exact leading duration |
+| Rapid turns and long turns | Source geometry is authoritative |
+| Similar pitch and within-speaker voice-state shifts | Pitch alone may neither merge nor split an identity |
+| Within-speaker channel shifts and loudspeaker playback | Channel evidence may create a subprofile, not a new voice |
+| Stereo channel swap | Speaker output is channel-permutation invariant |
+| Controlled overlap | Overlap evidence increases without fabricating a third identity |
+
+Every `adversarial-transform-plan-v1` binds the exact input PCM hash and
+contains at most 64 bounded integer-parameter steps. Source authority is either
+synthetic or public-licensed; the latter requires a lowercase SHA-256 of an
+external acknowledgement or license record, never its path or text. Execution
+checkpoints cancellation between steps, rejects non-finite or malformed PCM,
+caps allocations, and emits `adversarial-transform-evidence-v1`. Its graph
+records only the plan hash, per-step recipe hash, input/output audio hashes,
+and expected relationship. It contains no audio, path, filename, transcript,
+embedding, speaker name, or per-frame feature.
+
+Pipeline harnesses provide aggregate fingerprints for input, normalization,
+speech mask, feature extraction, change detection, clustering, projection,
+and scoring. Comparison returns the first differing or missing stage. A stable
+regression classification is an uppercase error code plus that stage.
+Deterministic delta minimization removes transform subsequences only when the
+caller-supplied evaluator reproduces the exact same classification twice;
+disagreement fails as a non-deterministic classifier. The result retains
+original step indices and an evaluation count. The minimized artifact is a
+recipe, not an accuracy certificate.
+
+An identity-preserving recipe does not promise that an imperfect candidate
+will pass. Its purpose is to turn violations into small, reproducible public
+regressions. Promotion still requires the frozen scorer, public corpus gates,
+unseen held-out evidence, and the rollout authority described above.
+
+### 11.4 Stage-aware external differential oracles
+
+`src/differential_oracle.rs` is an explicit developer-only bridge to
+operator-installed diarization systems. It does not add a Cargo dependency,
+does not run during transcription, and does not make any external system part
+of the shipped native decision path. Its stable registry spans three
+architecturally different families:
+
+- cascaded pipelines: pyannote and NeMo spectral clustering;
+- Bayesian HMM refinement: VBx;
+- end-to-end/attractor systems: EEND, DiaPer, and Sortformer.
+
+Each registry entry names a dedicated
+`FRANKEN_WHISPER_*_ORACLE_BIN` override and a default adapter executable. The
+operator supplies that adapter. A version probe receives
+`--franken-whisper-diarization-oracle-version --protocol
+franken-whisper-diarization-oracle-protocol-v1` and must emit one strict
+`franken-whisper-diarization-oracle-version-v1` JSON object on stdout. A run
+receives `--franken-whisper-diarization-oracle-run`, the same protocol flag,
+an external `--audio` path, and a lowercase SHA-256 `--recording-key`. It must
+emit one strict `franken-whisper-diarization-stage-document-v1` object on
+stdout. Arguments are never retained, and neither stdout nor stderr content is
+copied into the report.
+
+The canonical stage document has a duration and optional outputs for:
+
+1. speech activity intervals;
+2. opaque, non-lexical word timing IDs;
+3. speaker-change boundaries;
+4. opaque segment-to-cluster assignments;
+5. overlap intervals;
+6. final diarization turns.
+
+Word identities must use bounded `w-` hexadecimal tokens and cluster segment
+identities bounded `seg-` hexadecimal tokens. There is no field for transcript
+text, a media path, a model path, a raw embedding vector, or a speaker name.
+Intervals and counts are bounded; activity/overlap intervals must be ordered
+and non-overlapping; confidences must be finite and in `[0, 1]`.
+
+The comparator reports all six stages in that order. Activity and overlap use
+exact integer-millisecond intersection-over-union. Word timing joins opaque
+IDs and measures two-boundary collar recall. Change points use the frozen
+one-to-one matcher. Cluster comparison uses contingency counts and pairwise
+co-assignment, making it label-permutation invariant in linear-logarithmic
+time rather than materializing all segment pairs. It also measures shared
+segment coverage and requires matching geometry for each shared opaque segment
+identity, so an adapter cannot appear equivalent by omitting or moving
+anchors. Confidence availability and mean absolute confidence delta are
+reported separately, but do not determine equivalence because independently
+implemented tools need not calibrate confidence to the same scale. Final turns
+use the frozen Hungarian speaker mapping and retain only label-free DER/JER
+components. Missing stages remain explicitly missing; they are not converted
+into errors or fabricated values. `earliest_divergence` is the first present
+stage whose frozen diagnostic threshold is exceeded.
+
+An optional third stage document can help interpret a disagreement. Its only
+categories are `reference_favors_native`, `reference_favors_oracle`,
+`reference_tied`, and inconclusive/unavailable states. These are diagnostics,
+not correctness certificates. Every report hard-codes:
+
+```json
+{"authority":"diagnostic_only","native_incorrectness_claim_permitted":false}
+```
+
+Missing binaries, nonzero exits, timeouts, incompatible versions, invalid
+JSON, invalid geometry, and tool/recording identity mismatches create a clean
+`skipped` report with a stable reason and failure stage. Cancellation remains
+cancellation and kills the child rather than being misreported as a tool
+result. Safe partial provenance is retained when available: tool family,
+validated tool/adapter versions, executable hash, version/run stdout hashes,
+audio hash, and input-document hashes. Paths, stderr, output content, labels,
+word IDs, and local recording identities are not retained. Every report
+self-verifies its authority, state invariants, stage ordering, configuration
+hash, provenance hashes, and result hash before being written with
+create-new semantics outside the checkout.
+
+The CLI exposes only explicit development commands:
+
+```bash
+franken_whisper diarization-oracle registry
+franken_whisper diarization-oracle run \
+  --tool pyannote \
+  --audio /absolute/external/audio \
+  --native /absolute/external/native-stage.json \
+  --reference /absolute/external/reference-stage.json \
+  --output /absolute/external/differential-report.json
+```
+
+All input documents, media, and output reports must be absolute external
+files. A missing `--reference` is valid and produces
+`inconclusive_no_reference` for genuine disagreements.
+
+### 11.5 Optional ECAPA model and numerical conformance boundary
+
+`src/ecapa_conformance.rs` freezes the model/evidence contract and
+`src/ecapa_inference.rs` implements its bounded safe-Rust ECAPA-TDNN forward
+path. Neither module admits neural inference into `auto`, changes the acoustic
+default, downloads a model, or parses a framework checkpoint at runtime.
+Profile/clustering integration and routing remain separate work.
+
+The source is
+[`speechbrain/spkrec-ecapa-voxceleb`](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/tree/eac27266f68caa806381260bd44ace38b136c76a)
+at immutable revision `eac27266f68caa806381260bd44ace38b136c76a`,
+under Apache-2.0. The `embedding_model.ckpt` identity is:
+
+- 83,316,686 source bytes;
+- SHA-256
+  `0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2`;
+- 231 source entries: 200 inference `f32` tensors and 31 scalar `i64`
+  BatchNorm `num_batches_tracked` counters;
+- hyperparameter SHA-256
+  `ecd11c44202b32edb72709dd1013a16f2f060ebee3438ae8a9f9fecb0666ecd2`;
+- training-code revision
+  `aa0185408025e80f6c748d2c7af7fa96958c2231`.
+
+The model card says the model was trained on VoxCeleb1 and VoxCeleb2. That is
+speaker-verification training over English web video, not calibration for
+meeting diarization. Telephone, far-field, playback, muffling, accent,
+language, overlap, and domain shifts require held-out validation. An embedding
+is acoustic similarity evidence, never a gender, name, or person-identity
+claim.
+
+The versioned export protocol is
+`franken-whisper-ecapa-export-v1`, implemented by the
+`ecapa-tdnn-voxceleb-v1` profile in
+`scripts/convert_to_safetensors.py`. Source checkpoint loading is a
+development-only, out-of-process trust boundary. The profile accepts only the
+checkpoint identity above and requires Python 3.12.12, NumPy 2.2.6, Torch 2.7.1,
+and safetensors 0.5.3. It then does the following:
+
+1. requires the exact 83,316,686-byte source hash and 231-entry census;
+2. rejects every non-tensor or unexpected dtype, dropping only the 31 named
+   `num_batches_tracked` counters;
+3. preserves unfused BatchNorm parameters and PyTorch logical row-major layout;
+4. materializes contiguous IEEE-754 `f32` values in little-endian order;
+5. emits canonical, lexicographically ordered safetensors header and payload
+   data with path- and time-free provenance metadata; and
+6. parses the complete in-memory byte stream with the official safetensors
+   reader, then writes, fsyncs, and rehashes a same-directory temporary file
+   before atomically hard-linking that verified inode into an exclusively
+   created final path.
+
+Two isolated executions produce the same 83,246,544-byte package, SHA-256
+`9276a840c52cdd2e9afb73cd87a38e15749e12bf494d3ca47b5bc162f237cbcc`.
+The contained tensor payload is 83,223,808 bytes. Neither source nor exported
+weights belong in Git, and the converted artifact is not yet published.
+`scripts/fetch_aux_models.sh` therefore pins the immutable source URL, source
+hash, conversion command, and output hash without pretending that a download
+is available.
+
+The shipped Rust verifier first streams the complete package through a bounded,
+cancel-aware exact-size and SHA-256 check. It then passes that same
+authenticated owned byte buffer—without reopening the path—to
+`native_engine::weights::SafetensorsFile` and `WeightsManifest` to require the
+exact 200 names and shapes, require every dtype to be `F32`, and compare the
+complete deterministic metadata object. Structural, mapping, dtype, metadata,
+truncation, corruption, and cancellation failures report stable `ecapa.*`
+reasons without printing paths, tensor contents, or source bytes. There is no
+second model-package format or sidecar manifest.
+
+The Rust PCM frontend in this bead is a bounded scalar conformance reference,
+not the later production kernel; it accepts at most 16,000 samples (one second).
+For exact 16 kHz mono finite PCM in `[-1, 1]`, it uses a 400-sample periodic
+Hamming window, 160-sample hop, centered zero padding, 400-point one-sided
+squared-magnitude spectrum, 80 SpeechBrain symmetric triangular HTK mel filters
+over 0–8 kHz, `amin=1e-10`, 80 dB clipping, and per-utterance feature-mean
+subtraction without standard-deviation normalization. The neural boundary
+separately rejects normalized feature windows below 51 frames. Resampling and
+downmixing must already have occurred at the normalized-audio boundary. Callers
+must apply `validate_ecapa_input_format` while sample-rate and channel metadata
+are still available; the raw-slice conformance frontend cannot detect
+mislabeled 8 kHz or interleaved PCM and never guesses their format. A
+production PCM-to-feature kernel and common-pipeline hookup remain integration
+gates.
+
+The raw 192-value model output is the golden embedding stage. `EcapaModel`
+returns an L2-unit-normalized vector and rejects non-finite, wrong-shaped, or
+norm-below-`1e-6` output. Future common-diarizer integration will consume that
+normalized representation; it is not routed into production clustering yet.
+The public analytic fixture combines 173 Hz and 347 Hz harmonics, a chirp, and
+one impulse; it contains no speech or identity evidence.
+`franken-whisper-ecapa-golden-v1` binds full-array hashes and selected values
+for the two frontend stages, initial TDNN, first SE-Res2 block, multi-feature
+aggregation, attentive pooling, and raw embedding.
+
+`franken-whisper-ecapa-full-oracle-v1` is the corresponding transcript-free
+seven-tensor safetensors capture. Its exact identity is 2,160,320 bytes and
+SHA-256
+`2c80806fbf68262ab1e0a1b52af18139f08272b7802fc3b0fd96011192dcf485`.
+The payload contains 539,616 `f32` values: 16,160 frontend values and 523,456
+neural-stage values. Its deterministic metadata binds the golden-evidence and
+contract identities, analytic fixture, model and training-code revisions,
+export schema, Python 3.12.12, NumPy 2.2.6, Torch and Torchaudio 2.7.1,
+Safetensors 0.5.3, and SpeechBrain 0.5.16. Oracle generation passes explicit
+all-valid lengths through SpeechBrain normalization and ECAPA inference, clones
+the raw filterbank before sentence normalization, and snapshots every hooked
+stage so later in-place operations cannot mutate evidence.
+
+The offline exporter constructs and independently parses both safetensors byte
+streams before exclusively creating either output. The Rust oracle verifier
+then applies the same bounded, cancel-aware exact-size and SHA-256 check as the
+weight verifier, parses that authenticated owned buffer without reopening the
+path, and requires the exact names, shapes, `F32` dtypes, metadata, and
+per-tensor payload hashes. Neither artifact is vendored or tracked in Git.
+
+The network convolution boundary is distinct from the frontend boundary.
+Every ECAPA convolution uses SpeechBrain's same-length reflection padding over
+the dilation-expanded effective kernel; it does not use the frontend's centered
+zero padding. TDNN order is convolution, ReLU, then evaluation-mode BatchNorm.
+Res2Net chunk zero is the identity, chunk one is convolved directly, and each
+later chunk is added to the preceding block output before convolution.
+Attention is normalized over time independently for every channel, and both
+global-context and attentive standard deviations clamp variance at `1e-12`.
+Inference accepts 51 through 301 frames (one half-second through three seconds
+at the frozen hop) and features with absolute value at most 160. Longer
+tracklets must, once this representation is integrated, be deterministically
+windowed by the common diarization pipeline; the neural kernel never allocates
+or runs in proportion to a complete recording.
+
+The forward path preplans a checked conservative numeric-buffer ceiling before
+copying input. At 301 frames, the ECAPA-owned `f32` activation and kernel-band
+payload ceiling is 7,944,704 bytes. The plan adds an 8,388,608-byte reserve for
+the reviewed FrankenTorch/matrixmultiply packing buffers, yielding a combined
+16,333,312-byte ceiling and a 20 MiB default caller limit. Allocator metadata,
+stack use, resident weights, and test-only golden captures are explicitly
+outside that number. Every in-scope production-forward ECAPA-owned heap `f32`
+scratch allocation first acquires a safe RAII logical-byte lease. The lease
+fails closed if live buffers would exceed the admitted owned bound and
+decrements on every success/error/cancellation drop path. Successful inference
+requires the live count to return to zero and then records the observed logical
+peak in the versioned trace. The external model test exercises this meter at
+both the oracle's 101 frames and the admitted 301-frame maximum; test-only stage
+captures remain deliberately unmetered.
+
+Folded evaluation BatchNorm makes the resident model payload 83,070,208 bytes.
+The separately named 204,065,488-byte load accounting is exactly the retained
+83,246,544-byte package plus that resident payload plus the largest
+37,748,736-byte decoded source tensor. It bounds those logical payloads, not
+allocator capacity/metadata, JSON maps, names, shapes, reader buffers, stack,
+or process RSS. Compute loops and finite-value scans checkpoint in bounded row,
+channel, or value chunks. Public library callers can supply the same callback
+while loading and inferring; the no-callback convenience still honors the
+process Ctrl-C token. The kernel entry point is explicitly FrankenTorch CPU f32
+and cannot auto-dispatch to Metal. Timing and maximum-attention-sum diagnostics
+are observational, content-redacted, and nondeterministic; the latter is a
+low-bandwidth signal-derived aggregate rather than source content. Exact
+repeatability is asserted only within the same process/build/host kernel path;
+portable cross-backend and cross-host conformance is tolerance-based.
+
+The packing proof was reviewed against FrankenTorch revision
+`523aaf827faf538aa541126ee222fcd7af348410`. Diagnostics expose that evidence
+identity as `scratch_proof_reviewed_frankentorch_revision`; the field records
+the source revision against which the proof was reviewed, not an attestation of
+the mutable sibling checkout compiled into the running binary. The repository
+intentionally consumes FrankenTorch as a sibling path dependency rather than
+pretending Cargo pins that checkout. Changing that checkout or source topology
+requires renewing the proof and updating the field. Builds also reject
+matrixmultiply's `MATMUL_SGEMM_NC`, `MATMUL_SGEMM_KC`, and
+`MATMUL_SGEMM_MC` compile-time overrides; they would otherwise invalidate the
+published packing reserve.
+
+Each golden `reference_sha256` hashes the CPU-contiguous C-order tensor in its
+declared shape after encoding every value as little-endian IEEE-754 `f32`.
+The network-stage shapes are channel-first `[1, channels, time]`; a native
+time-major matrix must therefore be logically transposed before comparison.
+The hash authenticates the exact SpeechBrain/PyTorch oracle capture and its
+layout; it is not an exact-byte requirement for output from a distinct numeric
+backend. A supplied full oracle capture must match this hash before its values
+can be used for tolerance-based native comparison.
+
+Declared maximum absolute/relative tolerances are respectively `0.05/0.005`
+for pre-normalization filterbanks, `0.08/0.005` for normalized filterbanks,
+`0.002/0.002` for initial TDNN, SE-Res2, and aggregation, `0.001/0.002` for
+pooling, and `0.02/0.002` for the raw embedding. The scalar Rust frontend is
+held to a tighter `0.001` absolute error on the frozen selected points.
+The authenticated external conformance test compares the complete Rust frontend
+arrays with the two oracle frontend tensors. It then feeds the oracle-normalized
+filterbank into the native forward path, isolating backend arithmetic while it
+compares every value in all five neural-stage tensors. A second full neural pass
+feeds the Rust frontend output into the same network and compares all 523,456
+neural-stage values again, detecting error amplification across the composed
+boundary. Thus all 539,616 reference elements are checked and every neural
+value is also checked through composition, together with attention
+normalization, output unit norm, fixed-build repeatability, and observed scratch
+accounting. The weight package and full oracle remain external test inputs
+supplied through
+`FRANKEN_WHISPER_ECAPA_TEST_WEIGHTS` and
+`FRANKEN_WHISPER_ECAPA_TEST_ORACLE`; ordinary `cargo test` deliberately skips
+this large public-artifact proof rather than silently substituting a fixture.
+Non-finite values, native shape drift, oracle evidence hash/version/shape
+drift, or a tolerance failure are hard conformance failures. They may not be
+waived by downstream DER, silently widened, or converted into an
+acoustic-engine success. A tolerance change requires a new schema/version,
+regenerated public evidence, and an explicit discrepancy record.
+
+### 11.6 Repository and release guard
 
 Audio/video extensions and transcript sidecars are ignored broadly, including
 case variants and text/JSON/subtitle forms. Raw decoder spans and transcript-

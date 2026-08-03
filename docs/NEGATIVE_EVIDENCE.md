@@ -4,6 +4,76 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-07-31 - BlackThrush: **NO ADMISSIBLE FLAC RATIO — three otherwise-clean whole-job runs were vetoed by the unchanged external-process gate.**
+
+The first real-codec whole-job cell is still `UNDECIDABLE`. All three completed
+invocations compared the native Symphonia FLAC normalizer plus franken ASR
+against `/usr/bin/ffmpeg` plus pinned whisper.cpp in the same process-wall
+measurement. The 124.458688 s mono 16 kHz FLAC was SHA-256
+`fc591b8a46b62d6a8a9e58baaa58a525ab5a260827a0ed561c184d2ea0a74502`;
+the reference WAV was
+`fd6fb19ecf3c293e5c9e33f075b383d1a8d7aca0ddb0ef7ec82b55bf91021722`.
+Both normalizers emitted exactly `1,991,339` frames in every invocation.
+
+Decode was explicitly matched at beam size 1, best-of 1, temperature 0,
+fallback off, `max_context=0`, language `en`, translate false, and no
+timestamps. Every run reproduced `WER=0.007782` (256/257 words, 2 edits),
+5/5 windows and encoder calls, and 289/287 single-token forwards, classified
+`matched_within_10pct`. Both engines were requested and configured for 32
+threads; the table records tick-positive TIDs actually observed rather than
+the request.
+
+| claim | diagnostic `whisper.cpp / franken`, CI95 | medians, ms (franken / incumbent) | corrected null medians (franken / incumbent) | 2x floor / load gap | observed TIDs; peak threads | binding veto |
+|---|---:|---:|---:|---:|---|---|
+| `7854` | `1.323391 [1.284453, 1.330635]` | `704.012 / 925.789` | `0.983971 / 0.997561` | `1.068707 / 0.046182` | ASR `35/53`, peak `43/32`; normalizer `35/2`, peak `43/37` | external `ps=0.184327` core |
+| `7860` | `1.330772 [1.261550, 1.357191]` | `696.441 / 927.338` | `0.983730 / 0.994375` | `1.081271 / 0.058784` | ASR `35/48`, peak `42/32`; normalizer `35/2`, peak `42/37` | external `sbh=0.133214` core |
+| `7867` | `1.337700 [1.286240, 1.343423]` | `703.593 / 931.850` | `0.999360 / 0.999402` | `1.038784 / 0.000202` | ASR `35/57`, peak `39/32`; normalizer `35/3`, peak `39/37` | external `am=0.552386` core |
+
+The corrected dual-null median clause passed in every row: all six medians
+were inside `[0.98, 1.02]`. Each comparison also cleared its retained
+2x-widest-null floor, the `0.100000` load-split bound, normalization,
+transcript, work, actual-thread, frequency-policy, identity, and immediate
+plus settled host-wide gates. The external-process ceiling remained
+`0.100000` CPU core and was the sole failed gate each time. Therefore none of
+the three diagnostic ratios is a performance claim.
+
+All rows ran on `threadripperje`, boot
+`b107a2c6-9fac-40df-a637-c3a772b0ad57`, AMD Ryzen Threadripper PRO 5995WX,
+64 physical cores / 128 logical threads, 536,069,869,568 bytes RAM, one NUMA
+node, affinity and effective cpuset `0-127`, with all 128 CPUs reporting
+`amd-pstate-epp`, `performance` governor, and `performance` EPP. The frozen
+harness self-reported strict-RCH provenance
+`base=43a2b10:clean-overlay:examples/incumbent_ab.rs@1b874005...` and
+running-image SHA-256
+`4a5eb9478acc53dfcef115b9799cd25a02ee07d5b734d916803982fa8a588d8a`.
+Pinned whisper.cpp 1.8.3 self-reported
+`73cafc3ab406c8c917e402bf1cb8365eda72f147b3489aba33c4db7dff1a9f10`;
+the running ffmpeg normalizer self-reported
+`437c72289719f4145f6677aa0bbd454a151cf482097549270761c5d0a8b04512`.
+
+Raw logs and SHA-256:
+
+- `/data/tmp/fw-realistic-phase5/codec_flac_claim7854_n7.log`:
+  `ca6ee06ea4151c98dd463e907216057eba4e8329be25b44090867072bcb6fef4`
+- `/data/tmp/fw-realistic-phase5/codec_flac_claim7860_n7.log`:
+  `1721af831a50e806257c9b04ba3268c8dc7d545cb8030e7be0ab2fb8a49f959c`
+- `/data/tmp/fw-realistic-phase5/codec_flac_claim7867_n7.log`:
+  `5f53a4c66f04ef628b9fa596d543457e5d22e195c1f63e3ac050d07f95ac58ef`
+
+Claim `7876` then refused before timing: after a 60-second post-booking settle,
+a fresh 30-second audit caught `sbh=0.12` and `am=0.16` core. No harness ran
+and no artifact root or ratio exists for that claim.
+
+**Concrete retry predicate:** rerun this exact frozen n=7 cell only when a
+fresh interval shows every resident process at or below `0.100000` core and
+the same condition remains true for the complete invocation. Retain the
+artifact and running-image identities, matched decode/work/transcript checks,
+actual observed threads, corrected `[0.98, 1.02]` dual-null-median clause,
+2x-widest-null margin, load split, governor, normalization, and host-wide
+gates unchanged. Do not lower the external-process ceiling or select among
+the diagnostic attempts.
+
+---
 ## 2026-07-31 - BlackThrush: **CORRECTION + METHOD — the `sbh` retry predicate on the tiny.en timestamp cell IS satisfied, and the aggregate admission census that cleared this host is not admissible evidence.**
 
 This does **not** add a second veto for the same cell. Claim `7774` below

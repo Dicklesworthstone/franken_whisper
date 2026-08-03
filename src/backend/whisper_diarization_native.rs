@@ -16,10 +16,11 @@
 //!    (`request.model` → `$FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL`), load it, read
 //!    the normalized WAV, decode through the engine.
 //! 2. **Diarize**: assign a speaker to every real segment via the orchestrator's
-//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]). A range
-//!    maximum can cap its provisional clusters, but a hard count never forces
-//!    cluster collapse without acoustic evidence. Segments are labeled
-//!    `SPEAKER_NN` (DISC-002: cross-engine labels need not match exactly).
+//!    heuristic diarizer ([`crate::orchestrator::diarize_segments`]). These are
+//!    provisional labels, so explicit count inputs are reserved for the later
+//!    selected diarization stage and never applied to the heuristic. Segments
+//!    are labeled `SPEAKER_NN` (DISC-002: cross-engine labels need not match
+//!    exactly).
 //!
 //! ## Diarizer honesty — NOT a neural speaker encoder
 //!
@@ -167,6 +168,32 @@ fn speaker_count_for(request: &TranscribeRequest) -> SpeakerCountRequest {
         })
 }
 
+fn validate_speaker_count_capability(request: &TranscribeRequest) -> FwResult<SpeakerCountRequest> {
+    let speaker_count = speaker_count_for(request);
+    let selected_engine = request
+        .backend_params
+        .acoustic_diarization
+        .as_ref()
+        .map_or(crate::model::DiarizationEngine::Auto, |request| {
+            request.engine
+        });
+    if matches!(
+        speaker_count,
+        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+    ) && matches!(
+        selected_engine,
+        crate::model::DiarizationEngine::External | crate::model::DiarizationEngine::Neural
+    ) {
+        return Err(FwError::InvalidRequest(
+            "soft speaker-count priors and ranges require the native acoustic diarization engine"
+                .to_owned(),
+        ));
+    }
+    // These labels are provisional backend output. The later selected
+    // diarization stage owns every explicit count request.
+    Ok(SpeakerCountRequest::Infer)
+}
+
 /// Compute the whole-clip audio duration in seconds for the diarizer, preferring
 /// the request's duration hint, then the engine's window stats, then the segment
 /// timestamps.
@@ -208,6 +235,11 @@ pub fn run(
         tok.checkpoint()?;
     }
 
+    // Reject unsupported count semantics before model resolution, audio reads,
+    // or inference. Invalid soft evidence must not become an expensive late
+    // failure or disappear behind the silence fast path.
+    let speaker_count = validate_speaker_count_capability(request)?;
+
     // Resolve the model spec up front so an unavailability error is reported
     // before any expensive work.
     let spec = effective_model_spec(request)?;
@@ -245,16 +277,10 @@ pub fn run(
         tok.checkpoint()?;
     }
 
-    // Real diarization: assign a speaker to every engine segment via the
-    // heuristic diarizer. Its provisional labels may honor a range maximum,
-    // but a hard count never forces cluster collapse without acoustic evidence.
+    // Legacy diarization: assign provisional speaker labels from transcript
+    // timing/text features. This path cannot fuse soft acoustic count evidence
+    // and never forces cluster collapse from count cardinality alone.
     let mut segments = output.segments.clone();
-    let speaker_count = speaker_count_for(request);
-    if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
-        return Err(FwError::InvalidRequest(
-            "legacy native diarization cannot faithfully execute a speaker-count prior".to_owned(),
-        ));
-    }
     let duration_sec = audio_duration_sec(request, &output);
     let diarize_token = token
         .copied()
@@ -784,28 +810,6 @@ mod tests {
         native_engine::find_model_file("tiny.en").is_some()
     }
 
-    fn load_jfk_samples() -> Option<Vec<f32>> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/native/jfk.wav");
-        let bytes = std::fs::read(path).ok()?;
-        decode::read_wav_16k_mono(&bytes).ok()
-    }
-
-    fn write_samples_wav(dir: &Path, name: &str, samples: &[f32]) -> PathBuf {
-        let pcm: Vec<i16> = samples
-            .iter()
-            .map(|s| {
-                (if s.is_finite() {
-                    s.clamp(-1.0, 1.0)
-                } else {
-                    0.0
-                } * 32767.0) as i16
-            })
-            .collect();
-        let path = dir.join(name);
-        write_pcm16_mono_wav(&path, 16_000, &pcm);
-        path
-    }
-
     #[test]
     fn gated_e2e_jfk_tiny_en_transcript_and_speakers() {
         if !tiny_en_available() {
@@ -851,48 +855,68 @@ mod tests {
     }
 
     #[test]
-    fn gated_e2e_min_speakers_two_honored_on_multi_window_clip() {
-        let Some(samples) = load_jfk_samples() else {
-            eprintln!("SKIP gated_e2e_min_speakers: jfk.wav missing");
-            return;
-        };
-        if !tiny_en_available() {
-            eprintln!("SKIP gated_e2e_min_speakers: tiny.en model missing");
-            return;
-        }
-        // Concatenate jfk 3x (~33 s) so the diarizer has many segments to cluster
-        // and can comply with a min_speakers=2 constraint.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut long = Vec::with_capacity(samples.len() * 3);
-        for _ in 0..3 {
-            long.extend_from_slice(&samples);
-        }
-        let wav = write_samples_wav(dir.path(), "jfk3x.wav", &long);
-
-        let mut req = request();
-        req.model = Some("tiny.en".to_owned());
-        req.language = None;
-        req.backend_params.acoustic_diarization = Some(DiarizationRequest {
-            speaker_count: SpeakerCountRequest::Range {
+    fn explicit_count_inputs_are_reserved_for_the_selected_diarization_stage() {
+        for speaker_count in [
+            SpeakerCountRequest::HardConstraint { count: 2 },
+            SpeakerCountRequest::Range {
                 minimum: 2,
-                maximum: 64,
+                maximum: 4,
             },
-            ..DiarizationRequest::default()
-        });
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        ] {
+            let mut req = request();
+            req.model = Some("definitely-not-a-real-model-zzz".to_owned());
+            req.backend_params.acoustic_diarization = Some(DiarizationRequest {
+                speaker_count,
+                ..DiarizationRequest::default()
+            });
 
-        let result = run(&req, &wav, dir.path(), Duration::from_secs(180), None)
-            .expect("multi-window diarization run");
+            assert_eq!(
+                validate_speaker_count_capability(&req).expect("acoustic-stage count input"),
+                SpeakerCountRequest::Infer,
+                "legacy provisional labels must never consume the acoustic-stage count request"
+            );
+        }
+    }
 
-        let speakers = result.raw_output["speakers_detected"]
-            .as_u64()
-            .expect("speakers_detected present");
-        assert!(
-            speakers >= 2,
-            "min_speakers=2 should yield >= 2 speakers on a multi-segment clip, got {speakers}"
-        );
-        let re = regex_speaker();
-        for s in &result.segments {
-            assert!(re(s.speaker.as_deref().expect("speaker")));
+    #[test]
+    fn soft_external_count_inputs_are_rejected_before_native_inference() {
+        for speaker_count in [
+            SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 4,
+            },
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        ] {
+            let mut req = request();
+            req.model = Some("definitely-not-a-real-model-zzz".to_owned());
+            req.backend_params.acoustic_diarization = Some(DiarizationRequest {
+                engine: crate::model::DiarizationEngine::External,
+                speaker_count,
+                ..DiarizationRequest::default()
+            });
+
+            let error = run(
+                &req,
+                Path::new("definitely-not-an-audio-file.wav"),
+                Path::new("."),
+                Duration::from_secs(1),
+                None,
+            )
+            .expect_err("unsupported soft count input must fail before model or audio access");
+
+            assert!(matches!(error, FwError::InvalidRequest(_)));
+            assert!(error.to_string().contains("native acoustic"));
         }
     }
 
