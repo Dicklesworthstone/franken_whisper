@@ -17,7 +17,13 @@ const MIN_THRESHOLD: f32 = 0.003;
 const GAP_BRIDGE_MAX_FRAMES: usize = 2;
 const MIN_REGION_FRAMES: usize = 2;
 /// Hard bound on private valley candidates retained for one alignment stage.
-const MAX_ENERGY_VALLEY_CANDIDATES: usize = 16_384;
+///
+/// The inclusive local-minimum predicate admits every interior frame of a
+/// flat low-energy plateau, so the true worst case is one candidate per 20 ms.
+/// A 90-minute call therefore needs up to 270,000 candidates. This 2^19 bound
+/// covers more than 2.9 hours at that density while retaining a bounded
+/// roughly 8 MiB `EnergyValley` vector on 64-bit targets.
+const MAX_ENERGY_VALLEY_CANDIDATES: usize = 524_288;
 
 /// A local minimum in the private frame-RMS trace.  This is transient
 /// waveform evidence for timestamp refinement; callers must not serialize it
@@ -644,10 +650,10 @@ mod tests {
 
     #[test]
     fn energy_valley_candidate_cap_fails_closed_without_partial_profile() {
-        let mut frame_rms = Vec::with_capacity((MAX_ENERGY_VALLEY_CANDIDATES + 1) * 3);
-        for _ in 0..=MAX_ENERGY_VALLEY_CANDIDATES {
-            frame_rms.extend([0.1, 0.0, 0.1]);
-        }
+        assert_eq!(MAX_ENERGY_VALLEY_CANDIDATES, 524_288);
+        // A flat low-energy plateau qualifies every interior frame under the
+        // inclusive local-minimum predicate, not merely alternating frames.
+        let frame_rms = vec![0.0; MAX_ENERGY_VALLEY_CANDIDATES + 3];
 
         let error = collect_energy_valleys(&frame_rms, 0.05)
             .expect_err("candidate cap must reject rather than return a partial profile");
