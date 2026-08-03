@@ -14829,7 +14829,8 @@ mod tests {
 
     #[test]
     fn sidecar_runner_rejects_mismatched_stage_locks_before_path_access() {
-        let absent_root = std::path::Path::new("/franken-whisper-absent-sidecar-root");
+        let root = private_tempdir("absent-sidecar-root");
+        let absent_root = root.path().join("absent");
         let absent_descriptor = absent_root.join("descriptor.json");
         let absent_bundle = absent_root.join("bundle.json");
         let absent_evidence = absent_root.join("evidence.json");
@@ -14837,8 +14838,8 @@ mod tests {
 
         let development_error = super::run_public_corpus_sidecar_study_with_cancel(
             super::PublicCorpusSidecarStudyRequest {
-                project_root: absent_root,
-                input_root: absent_root,
+                project_root: &absent_root,
+                input_root: &absent_root,
                 descriptor_path: &absent_descriptor,
                 bundle_output_path: &absent_bundle,
                 evidence_output_path: &absent_evidence,
@@ -14854,8 +14855,8 @@ mod tests {
 
         let certification_error = super::run_public_corpus_sidecar_study_with_cancel(
             super::PublicCorpusSidecarStudyRequest {
-                project_root: absent_root,
-                input_root: absent_root,
+                project_root: &absent_root,
+                input_root: &absent_root,
                 descriptor_path: &absent_descriptor,
                 bundle_output_path: &absent_bundle,
                 evidence_output_path: &absent_evidence,
@@ -14877,6 +14878,7 @@ mod tests {
         assert!(!absent_bundle.exists());
         assert!(!absent_evidence.exists());
         assert!(!absent_lock.exists());
+        assert!(!absent_root.exists());
     }
 
     #[test]
