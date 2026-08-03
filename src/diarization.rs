@@ -7503,13 +7503,16 @@ const SPEAKER_COUNT_MINIMUM_UNRESOLVED_MASS: f64 = 0.15;
 const SPEAKER_COUNT_MAXIMUM_UNRESOLVED_MASS: f64 = 0.90;
 const SPEAKER_COUNT_CONCRETE_CREDIBLE_MASS: f64 = 0.90;
 const SPEAKER_COUNT_OCCUPANCY_STABILITY_WEIGHT: f64 = 0.30;
-/// Versioned monotone map from the candidate's raw attribution likelihood to
-/// its reported confidence. Rejection continues to use the raw likelihood so
-/// calibration cannot silently increase selective coverage.
+/// Versioned monotone map from the candidate's normalized local emission score
+/// to its reported confidence. It deliberately excludes Viterbi transition,
+/// duration, and accumulated-path evidence, so it is not a calibrated temporal
+/// assignment posterior. Rejection uses the same local score, so a reporting
+/// map cannot silently increase selective coverage.
 pub const ACOUSTIC_ASSIGNMENT_CONFIDENCE_CALIBRATION_VERSION: &str =
-    "ami-development-raw-likelihood-v2";
+    "development-normalized-local-emission-v3";
 const ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR: f32 = 0.0;
 const ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE: f32 = 1.0;
+const MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE: f32 = 0.20;
 /// Frozen identity for the first variance-aware change posterior.
 pub const ACOUSTIC_CHANGE_CALIBRATION_VERSION: &str = "acoustic-change-posterior-v2";
 /// Public development protocol used to fit the v2 operating point.
@@ -7524,7 +7527,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v3-development";
+    "acoustic-clustering-probabilistic-v4-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -13719,6 +13722,17 @@ fn fused_speaker_count_estimate(
         return None;
     }
 
+    // The concrete weights are evidence scores, not yet calibrated count
+    // probabilities.  If their mass is diffuse, preserve that ambiguity as
+    // explicit unresolved mass instead of allowing agreement between
+    // correlated lanes to manufacture a decisive count.  This is deliberately
+    // a conservative uncertainty guard; `DevelopmentUncertified` remains the
+    // only status until a frozen public calibration proves count coverage.
+    let maximum_concrete_weight = concrete_weights
+        .iter()
+        .map(|(_, weight)| *weight)
+        .max_by(f64::total_cmp)?;
+
     let mut lane_counts = BTreeMap::<usize, usize>::new();
     for lane in lanes {
         *lane_counts.entry(lane.selected_count).or_default() += 1;
@@ -13744,12 +13758,14 @@ fn fused_speaker_count_estimate(
     let evidence_strength = SPEAKER_COUNT_STABILITY_EVIDENCE_WEIGHT * selection_stability
         + SPEAKER_COUNT_RISK_EVIDENCE_WEIGHT * risk_confidence
         + SPEAKER_COUNT_SPECTRAL_EVIDENCE_WEIGHT * spectral_confidence;
-    let unresolved_probability = (SPEAKER_COUNT_UNRESOLVED_INTERCEPT
+    let evidence_unresolved_probability = (SPEAKER_COUNT_UNRESOLVED_INTERCEPT
         - SPEAKER_COUNT_UNRESOLVED_EVIDENCE_SLOPE * evidence_strength)
         .clamp(
             SPEAKER_COUNT_MINIMUM_UNRESOLVED_MASS,
             SPEAKER_COUNT_MAXIMUM_UNRESOLVED_MASS,
         );
+    let unresolved_probability =
+        evidence_unresolved_probability.max((1.0 - maximum_concrete_weight).clamp(0.0, 1.0));
     let concrete_mass = 1.0 - unresolved_probability;
     for (_, weight) in &mut concrete_weights {
         *weight = concrete_mass * *weight / concrete_weight_sum;
@@ -15644,19 +15660,14 @@ where
             let raw_confidence = if hard {
                 1.0
             } else if clustering_mode == AcousticClusteringMode::ProbabilisticV1 {
-                let chosen_likelihood = (-chosen_cost.min(80.0)).exp();
-                let strongest_alternative = emissions[index]
-                    .iter()
-                    .enumerate()
-                    .filter(|(candidate, _)| *candidate != state)
-                    .map(|(_, cost)| (-cost.min(80.0)).exp())
-                    .max_by(f32::total_cmp)
-                    .unwrap_or(0.0);
-                let pairwise_share =
-                    chosen_likelihood / (chosen_likelihood + strongest_alternative).max(1e-6);
-                let discrimination = 0.5 + 0.5 * pairwise_share;
-                let reliability = 0.85 + 0.15 * clusters[state].reliability.clamp(0.0, 1.0);
-                (chosen_likelihood * discrimination * reliability).clamp(0.0, 1.0)
+                // A pairwise same-speaker score is not a temporal assignment
+                // posterior: it ignores competing speakers, UNKNOWN, and the
+                // Viterbi transition/duration/path evidence. Normalize only
+                // the complete finite local-emission state-space, then retain
+                // the resulting local score's narrower evidence claim.
+                // Profile reliability remains an independent gate in
+                // `evaluate_speaker_evidence`.
+                normalized_local_emission_score(&emissions[index], state)
             } else {
                 // Assignment discrimination and accumulated profile reliability
                 // are separate evidence gates. Multiplying by raw reliability
@@ -15688,16 +15699,22 @@ where
                     && clustering_mode == AcousticClusteringMode::ProbabilisticV1
                     && tracklet.overlap_suspected
                 {
+                    let chosen_local_score =
+                        normalized_local_emission_score(&emissions[index], state);
                     emissions[index][..clusters.len()]
                         .iter()
                         .enumerate()
                         .filter(|(candidate, cost)| *candidate != state && cost.is_finite())
-                        .map(|(candidate, cost)| (candidate, (-cost.min(80.0)).exp()))
-                        .filter(|(_, likelihood)| {
-                            let chosen_likelihood = (-chosen_cost.min(80.0)).exp();
-                            *likelihood >= 0.55
-                                && chosen_likelihood >= 0.55
-                                && *likelihood / chosen_likelihood.max(1e-6) >= 0.65
+                        .map(|(candidate, _)| {
+                            (
+                                candidate,
+                                normalized_local_emission_score(&emissions[index], candidate),
+                            )
+                        })
+                        .filter(|(_, local_score)| {
+                            *local_score >= MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE
+                                && chosen_local_score >= MIN_OVERLAP_SECONDARY_LOCAL_EMISSION_SCORE
+                                && *local_score / chosen_local_score.max(1e-6) >= 0.65
                         })
                         .max_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)))
                 } else {
@@ -15711,8 +15728,10 @@ where
                     speaker_confidence: reported_confidence,
                     secondary_speaker_ref: secondary
                         .map(|(secondary_state, _)| labels[secondary_state].clone()),
-                    secondary_speaker_confidence: secondary.map(|(_, likelihood)| {
-                        (likelihood * tracklet.overlap_probability).clamp(0.0, 1.0)
+                    secondary_speaker_confidence: secondary.map(|(secondary_state, _)| {
+                        (normalized_local_emission_score(&emissions[index], secondary_state)
+                            * tracklet.overlap_probability)
+                            .clamp(0.0, 1.0)
                     }),
                     change_confidence: tracklet.change_confidence,
                     overlap_suspected: tracklet.overlap_suspected,
@@ -15727,6 +15746,39 @@ fn calibrate_assignment_confidence(raw_confidence: f32) -> f32 {
     let bounded = raw_confidence.clamp(0.0, 1.0);
     (ACOUSTIC_ASSIGNMENT_CONFIDENCE_FLOOR + ACOUSTIC_ASSIGNMENT_CONFIDENCE_SCALE * bounded)
         .clamp(0.0, 1.0)
+}
+
+/// Return one finite state's normalized local emission score using bounded
+/// log-sum-exp normalization. Infinite states (including impossible hard-hint
+/// assignments) carry no mass. The score excludes temporal transition,
+/// duration, and accumulated-path evidence; it is not a calibrated temporal
+/// assignment posterior. This development-only helper does not alter
+/// FixedSafe decisions.
+fn normalized_local_emission_score(costs: &[f32], state: usize) -> f32 {
+    let Some(&chosen_cost) = costs.get(state) else {
+        return 0.0;
+    };
+    if !chosen_cost.is_finite() {
+        return 0.0;
+    }
+    let Some(minimum_cost) = costs
+        .iter()
+        .copied()
+        .filter(|cost| cost.is_finite())
+        .min_by(f32::total_cmp)
+    else {
+        return 0.0;
+    };
+    let normalizer = costs
+        .iter()
+        .copied()
+        .filter(|cost| cost.is_finite())
+        .map(|cost| (minimum_cost - cost).exp())
+        .sum::<f32>();
+    if !normalizer.is_finite() || normalizer <= 0.0 {
+        return 0.0;
+    }
+    ((minimum_cost - chosen_cost).exp() / normalizer).clamp(0.0, 1.0)
 }
 
 fn duration_aware_switch_penalty(
@@ -24603,6 +24655,65 @@ mod tests {
     }
 
     #[test]
+    fn diffuse_count_evidence_preserves_unresolved_mass() {
+        let lane = || super::ProbabilisticLaneResult {
+            selected_count: 5,
+            groups: vec![vec![0], vec![1]],
+            risk_curve: super::SpeakerCountRiskCurve {
+                selected_count: 5,
+                points: vec![
+                    super::SpeakerCountRiskPoint {
+                        count: 2,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 3,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 4,
+                        expected_loss: 0.0,
+                    },
+                    super::SpeakerCountRiskPoint {
+                        count: 5,
+                        expected_loss: 0.0,
+                    },
+                ],
+            },
+        };
+        let lanes = (0..super::SPEAKER_COUNT_PERTURBATION_LANES)
+            .map(|_| lane())
+            .collect::<Vec<_>>();
+        let estimate = super::fused_speaker_count_estimate(
+            &lanes,
+            None,
+            Some(SpeakerCountLaneUnavailableReason::InvalidAffinity),
+            &SpeakerCountRequest::Infer,
+            super::SpeakerCountPolicy {
+                min: 2,
+                max: 5,
+                exact: None,
+            },
+            1,
+            super::unavailable_speaker_count_resources(3).expect("resource summary"),
+        )
+        .expect("diffuse-count estimate");
+        estimate.validate().expect("valid diffuse-count estimate");
+        assert_eq!(estimate.selected_count, None);
+        assert!(
+            estimate.unresolved_probability > 0.5,
+            "the diffuse concrete weights must raise unresolved mass above the 0.4875 evidence-only value: {estimate:#?}"
+        );
+        assert!(
+            estimate
+                .posterior
+                .iter()
+                .all(|bin| bin.probability < estimate.unresolved_probability),
+            "diffuse concrete mass must remain explicit rather than selecting a count: {estimate:#?}"
+        );
+    }
+
+    #[test]
     fn soft_count_prior_does_not_exclude_acoustically_supported_counts() {
         let lane = || super::ProbabilisticLaneResult {
             selected_count: 1,
@@ -24904,6 +25015,18 @@ mod tests {
             super::acoustic_speaker_pair_calibration().minimum_assignment_probability;
         assert!(raw[1] < rejection_threshold);
         assert_eq!(super::calibrate_assignment_confidence(raw[1]), raw[1]);
+    }
+
+    #[test]
+    fn normalized_local_emission_score_is_finite_and_includes_unknown() {
+        let costs = [0.0_f32, std::f32::consts::LN_2, f32::INFINITY];
+        let first = super::normalized_local_emission_score(&costs, 0);
+        let second = super::normalized_local_emission_score(&costs, 1);
+        assert!((first - (2.0 / 3.0)).abs() < f32::EPSILON);
+        assert!((second - (1.0 / 3.0)).abs() < f32::EPSILON);
+        assert!((first + second - 1.0).abs() < f32::EPSILON);
+        assert_eq!(super::normalized_local_emission_score(&costs, 2), 0.0);
+        assert_eq!(super::normalized_local_emission_score(&costs, 3), 0.0);
     }
 
     #[test]
