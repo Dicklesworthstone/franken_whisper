@@ -5609,8 +5609,7 @@ impl AcousticSidecarStudy {
 /// Identity of the evaluation-only boundary fusion seam.
 ///
 /// This lane is never constructed by the production diarization entrypoints.
-pub(crate) const ACOUSTIC_SIDECAR_FUSION_VERSION: &str =
-    "acoustic-sidecar-boundary-fusion-v1";
+pub(crate) const ACOUSTIC_SIDECAR_FUSION_VERSION: &str = "acoustic-sidecar-boundary-fusion-v1";
 
 /// Development-locked monotone calibration for one sidecar configuration.
 ///
@@ -5650,6 +5649,15 @@ pub(crate) struct AcousticSidecarEvaluationRequest {
 impl AcousticSidecarEvaluationRequest {
     fn validate(self) -> FwResult<()> {
         self.study_config.validate()?;
+        if self.study_config.mode.wavelet_basis().is_none()
+            && !self.study_config.mode.uses_modulation()
+            && self.study_config.trajectory_wavelet_mode.basis().is_none()
+            && !self.study_config.scattering_mode.is_enabled()
+        {
+            return Err(FwError::InvalidRequest(
+                "sidecar fusion requires at least one enabled study feature family".to_owned(),
+            ));
+        }
         self.calibration.validate()
     }
 }
@@ -5674,20 +5682,94 @@ impl std::fmt::Debug for AcousticSidecarOwnerContrast {
     }
 }
 
+/// Canonical output of the development-locked sidecar calibration.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct AcousticSidecarCalibratedEvidence {
+    pub log_odds: f32,
+    pub probability: f32,
+}
+
+/// Apply the one hash-bound calibration used by both boundary fusion and the
+/// public aggregate evaluator.
+pub(crate) fn acoustic_sidecar_calibrate_owner_contrast(
+    contrast: AcousticSidecarOwnerContrast,
+    calibration: AcousticSidecarFusionCalibration,
+) -> FwResult<Option<AcousticSidecarCalibratedEvidence>> {
+    calibration.validate()?;
+    if contrast.comparable_components > contrast.component_comparisons {
+        return Err(FwError::InvalidRequest(
+            "sidecar comparable component count exceeds inspected components".to_owned(),
+        ));
+    }
+    for (owner_contrast, available) in contrast
+        .owner_contrast
+        .iter()
+        .copied()
+        .zip(contrast.owner_available)
+    {
+        if !owner_contrast.is_finite()
+            || !(0.0..=1.0).contains(&owner_contrast)
+            || (!available && owner_contrast != 0.0)
+        {
+            return Err(FwError::InvalidRequest(
+                "sidecar calibration requires canonical finite owner contrast within [0, 1]"
+                    .to_owned(),
+            ));
+        }
+    }
+    if (contrast.comparable_components > 0) != contrast.owner_available.into_iter().any(|value| value)
+    {
+        return Err(FwError::InvalidRequest(
+            "sidecar comparable components and owner availability are inconsistent".to_owned(),
+        ));
+    }
+    if contrast.comparable_components < calibration.minimum_comparable_components {
+        return Ok(None);
+    }
+    let maximum_contrast = contrast
+        .owner_contrast
+        .iter()
+        .zip(contrast.owner_available)
+        .filter_map(|(contrast, available)| available.then_some(*contrast))
+        .try_fold(None::<f32>, |maximum, contrast| {
+            Ok(Some(
+                maximum.map_or(contrast, |current| current.max(contrast)),
+            ))
+        })?
+        .ok_or_else(|| {
+            FwError::InvalidRequest(
+                "sidecar calibration received comparable components without an available owner"
+                    .to_owned(),
+            )
+        })?;
+    let log_odds = (f64::from(calibration.logit_intercept)
+        + f64::from(calibration.contrast_weight) * f64::from(maximum_contrast))
+    .clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32;
+    let probability = logistic_probability(log_odds).clamp(f32::EPSILON, 1.0 - f32::EPSILON);
+    if !log_odds.is_finite() || !probability.is_finite() || !(0.0..1.0).contains(&probability) {
+        return Err(FwError::InvalidRequest(
+            "sidecar calibration produced non-finite or closed-interval evidence".to_owned(),
+        ));
+    }
+    Ok(Some(AcousticSidecarCalibratedEvidence {
+        log_odds,
+        probability,
+    }))
+}
+
 /// One signal-bearing, non-serializable evaluation observation.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct AcousticSidecarBoundarySignal {
     pub frame_index: usize,
     pub contrast: AcousticSidecarOwnerContrast,
+    calibrated_log_odds: Option<f32>,
     pub calibrated_probability: Option<f32>,
-    pub observation: AcousticSidecarStudyObservation,
 }
 
 impl std::fmt::Debug for AcousticSidecarBoundarySignal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AcousticSidecarBoundarySignal")
-            .field("frame_index", &self.frame_index)
             .field("contrast", &self.contrast)
             .field(
                 "calibrated_probability_available",
@@ -5714,6 +5796,7 @@ pub(crate) struct AcousticSidecarFusionEvaluationEvidence {
     pub consumed_probability_count: usize,
     pub changed_boundary_probability_count: usize,
     pub maximum_retained_signals: usize,
+    pub retained_signal_capacity: usize,
     pub frame_wavelet_filter_tap_terms: u64,
     pub trajectory_wavelet_filter_tap_terms: u64,
     pub trajectory_validity_sample_visits: u64,
@@ -5751,6 +5834,7 @@ impl std::fmt::Debug for AcousticSidecarFusionEvaluationEvidence {
                 &self.changed_boundary_probability_count,
             )
             .field("maximum_retained_signals", &self.maximum_retained_signals)
+            .field("retained_signal_capacity", &self.retained_signal_capacity)
             .finish_non_exhaustive()
     }
 }
@@ -5795,13 +5879,43 @@ pub(crate) fn acoustic_sidecar_observation_owner_contrast(
             "sidecar fusion observations must share one schema and configuration".to_owned(),
         ));
     }
+    let wavelet_expected = left.config.mode.wavelet_basis().is_some();
+    if left.wavelet.is_some() != wavelet_expected || right.wavelet.is_some() != wavelet_expected {
+        return Err(FwError::InvalidRequest(
+            "sidecar frame-wavelet availability contradicts its configuration".to_owned(),
+        ));
+    }
+    if !left.config.mode.uses_modulation()
+        && (left.modulation.is_some() || right.modulation.is_some())
+    {
+        return Err(FwError::InvalidRequest(
+            "sidecar modulation availability contradicts its configuration".to_owned(),
+        ));
+    }
+    if left.config.trajectory_wavelet_mode.basis().is_none()
+        && (left.trajectory_wavelet.is_some() || right.trajectory_wavelet.is_some())
+    {
+        return Err(FwError::InvalidRequest(
+            "sidecar trajectory-wavelet availability contradicts its configuration".to_owned(),
+        ));
+    }
+    if !left.config.scattering_mode.is_enabled()
+        && (left.scattering.is_some() || right.scattering.is_some())
+    {
+        return Err(FwError::InvalidRequest(
+            "sidecar scattering availability contradicts its configuration".to_owned(),
+        ));
+    }
     let mut output = AcousticSidecarOwnerContrast::default();
     let mut compare = |owner: AcousticSidecarFeatureOwner,
                        left: Option<f32>,
                        right: Option<f32>,
                        unit_interval: bool|
      -> FwResult<()> {
-        output.component_comparisons = output.component_comparisons.saturating_add(1);
+        output.component_comparisons =
+            output.component_comparisons.checked_add(1).ok_or_else(|| {
+                FwError::InvalidRequest("sidecar component comparison count overflowed".to_owned())
+            })?;
         let (Some(left), Some(right)) = (left, right) else {
             return Ok(());
         };
@@ -5819,11 +5933,19 @@ pub(crate) fn acoustic_sidecar_observation_owner_contrast(
         output.owner_available[owner_index] = true;
         output.owner_contrast[owner_index] =
             output.owner_contrast[owner_index].max((left - right).abs());
-        output.comparable_components = output.comparable_components.saturating_add(1);
+        output.comparable_components =
+            output.comparable_components.checked_add(1).ok_or_else(|| {
+                FwError::InvalidRequest("sidecar comparable component count overflowed".to_owned())
+            })?;
         Ok(())
     };
 
     if let (Some(left_wavelet), Some(right_wavelet)) = (left.wavelet, right.wavelet) {
+        if left_wavelet.basis != right_wavelet.basis || left_wavelet.owner != right_wavelet.owner {
+            return Err(FwError::InvalidRequest(
+                "sidecar frame-wavelet observations use inconsistent basis or ownership".to_owned(),
+            ));
+        }
         let levels = left_wavelet
             .valid_level_count
             .min(right_wavelet.valid_level_count)
@@ -5872,6 +5994,14 @@ pub(crate) fn acoustic_sidecar_observation_owner_contrast(
     }
 
     if let (Some(left), Some(right)) = (left.modulation, right.modulation) {
+        if left.voice_owner != right.voice_owner
+            || left.channel_level_owner != right.channel_level_owner
+            || left.channel_coloration_owner != right.channel_coloration_owner
+        {
+            return Err(FwError::InvalidRequest(
+                "sidecar modulation observations use inconsistent ownership".to_owned(),
+            ));
+        }
         for frequency in 0..ACOUSTIC_MODULATION_FREQUENCY_HZ.len() {
             compare(
                 left.voice_owner,
@@ -5905,7 +6035,8 @@ pub(crate) fn acoustic_sidecar_observation_owner_contrast(
 
     if let (Some(left), Some(right)) = (left.trajectory_wavelet, right.trajectory_wavelet) {
         for (left_family, right_family) in left.families.iter().zip(right.families) {
-            if left_family.family != right_family.family || left_family.owner != right_family.owner {
+            if left_family.family != right_family.family || left_family.owner != right_family.owner
+            {
                 return Err(FwError::InvalidRequest(
                     "sidecar trajectory observations use inconsistent family ordering".to_owned(),
                 ));
@@ -5953,7 +6084,8 @@ pub(crate) fn acoustic_sidecar_observation_owner_contrast(
 
     if let (Some(left), Some(right)) = (left.scattering, right.scattering) {
         for (left_family, right_family) in left.families.iter().zip(right.families) {
-            if left_family.family != right_family.family || left_family.owner != right_family.owner {
+            if left_family.family != right_family.family || left_family.owner != right_family.owner
+            {
                 return Err(FwError::InvalidRequest(
                     "sidecar scattering observations use inconsistent family ordering".to_owned(),
                 ));
@@ -5998,6 +6130,8 @@ pub(crate) fn acoustic_sidecar_fusion_configuration_sha256(
         "owners=voice-channel-mixed-auxiliary",
         "missingness=both-available-no-zero-imputation",
         "probability=development-locked-monotone-logistic",
+        "logit-arithmetic=f64-then-finite-f32-clamp",
+        "probability-clamp=f32-epsilon-open-unit-interval",
         "fusion=max-baseline-sidecar-unless-baseline-fallback",
     ] {
         hasher.update((value.len() as u64).to_le_bytes());
@@ -6006,9 +6140,7 @@ pub(crate) fn acoustic_sidecar_fusion_configuration_sha256(
     hasher.update(acoustic_sidecar_study_config_digest(request.study_config)?);
     hasher.update(request.calibration.logit_intercept.to_bits().to_le_bytes());
     hasher.update(request.calibration.contrast_weight.to_bits().to_le_bytes());
-    hasher.update(
-        (request.calibration.minimum_comparable_components as u64).to_le_bytes(),
-    );
+    hasher.update((request.calibration.minimum_comparable_components as u64).to_le_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(sidecar_sha256_hex(&digest))
 }
@@ -6030,26 +6162,51 @@ impl AcousticSidecarBoundaryAdapter {
                 request,
             )?),
             sidecar_configuration_sha256: Some(study.configuration_sha256_hex()),
-            peak_retained_state_bytes_on_target: study.retained_state_bytes_on_target(),
             ..AcousticSidecarFusionEvaluationEvidence::default()
         };
-        Ok(Self {
+        let mut adapter = Self {
             request,
             study,
             previous: None,
             evidence,
-        })
+        };
+        let retained_hash_bytes = [
+            adapter.evidence.fusion_configuration_sha256.as_ref(),
+            adapter.evidence.sidecar_configuration_sha256.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(0usize, |total, hash| {
+            total.checked_add(hash.capacity()).ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "sidecar adapter retained hash capacity overflowed".to_owned(),
+                )
+            })
+        })?;
+        adapter.evidence.peak_retained_state_bytes_on_target = std::mem::size_of::<Self>()
+            .checked_add(retained_hash_bytes)
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "sidecar adapter retained-state accounting overflowed".to_owned(),
+                )
+            })?;
+        Ok(adapter)
     }
 
     fn add_operation(total: &mut u64, value: usize, family: &str) -> FwResult<()> {
         let value = u64::try_from(value).map_err(|_| {
-            FwError::InvalidRequest(format!(
-                "sidecar {family} operation count exceeds u64"
-            ))
+            FwError::InvalidRequest(format!("sidecar {family} operation count exceeds u64"))
         })?;
         *total = total.checked_add(value).ok_or_else(|| {
             FwError::InvalidRequest(format!("sidecar {family} operation count overflowed"))
         })?;
+        Ok(())
+    }
+
+    fn add_count(total: &mut usize, value: usize, family: &str) -> FwResult<()> {
+        *total = total
+            .checked_add(value)
+            .ok_or_else(|| FwError::InvalidRequest(format!("sidecar {family} count overflowed")))?;
         Ok(())
     }
 
@@ -6063,10 +6220,9 @@ impl AcousticSidecarBoundaryAdapter {
         C: FnMut() -> bool,
     {
         if is_cancelled() {
-            return Err(FwError::Cancelled(format!(
-                "sidecar boundary fusion cancelled before frame {}",
-                frame.frame_index
-            )));
+            return Err(FwError::Cancelled(
+                "sidecar boundary fusion cancelled before frame analysis".to_owned(),
+            ));
         }
         let observation =
             self.study
@@ -6075,46 +6231,30 @@ impl AcousticSidecarBoundaryAdapter {
             || Ok(AcousticSidecarOwnerContrast::default()),
             |previous| acoustic_sidecar_observation_owner_contrast(previous, &observation),
         )?;
-        let calibrated_probability =
-            (contrast.comparable_components
-                >= self.request.calibration.minimum_comparable_components)
-                .then(|| {
-                    let maximum_contrast = contrast
-                        .owner_contrast
-                        .iter()
-                        .zip(contrast.owner_available)
-                        .filter_map(|(contrast, available)| available.then_some(*contrast))
-                        .fold(0.0_f32, f32::max);
-                    logistic_probability(
-                        self.request.calibration.logit_intercept
-                            + self.request.calibration.contrast_weight * maximum_contrast,
-                    )
-                    .clamp(f32::EPSILON, 1.0 - f32::EPSILON)
-                });
-        if calibrated_probability.is_some_and(|probability| {
-            !probability.is_finite() || !(0.0..1.0).contains(&probability)
-        }) {
-            return Err(FwError::InvalidRequest(
-                "sidecar fusion calibration produced an invalid probability".to_owned(),
-            ));
-        }
+        let calibrated =
+            acoustic_sidecar_calibrate_owner_contrast(contrast, self.request.calibration)?;
         let signal = AcousticSidecarBoundarySignal {
             frame_index: frame.frame_index,
             contrast,
-            calibrated_probability,
-            observation,
+            calibrated_log_odds: calibrated.map(|evidence| evidence.log_odds),
+            calibrated_probability: calibrated.map(|evidence| evidence.probability),
         };
 
-        self.evidence.submitted_frame_count =
-            self.evidence.submitted_frame_count.saturating_add(1);
-        self.evidence.comparable_frame_count = self
-            .evidence
-            .comparable_frame_count
-            .saturating_add(usize::from(contrast.comparable_components > 0));
-        self.evidence.calibrated_signal_count = self
-            .evidence
-            .calibrated_signal_count
-            .saturating_add(usize::from(calibrated_probability.is_some()));
+        Self::add_count(
+            &mut self.evidence.submitted_frame_count,
+            1,
+            "submitted frame",
+        )?;
+        Self::add_count(
+            &mut self.evidence.comparable_frame_count,
+            usize::from(contrast.comparable_components > 0),
+            "comparable frame",
+        )?;
+        Self::add_count(
+            &mut self.evidence.calibrated_signal_count,
+            usize::from(calibrated.is_some()),
+            "calibrated signal",
+        )?;
         if let Some(summary) = observation.wavelet {
             Self::add_operation(
                 &mut self.evidence.frame_wavelet_filter_tap_terms,
@@ -6128,9 +6268,7 @@ impl AcousticSidecarBoundaryAdapter {
         }
         if let Some(summary) = observation.modulation {
             Self::add_operation(
-                &mut self
-                    .evidence
-                    .modulation_projection_sample_frequency_visits,
+                &mut self.evidence.modulation_projection_sample_frequency_visits,
                 summary.projection_sample_frequency_visits,
                 "modulation projection",
             )?;
@@ -6179,8 +6317,37 @@ impl AcousticSidecarBoundaryAdapter {
         Ok(signal)
     }
 
-    fn finish(self) -> AcousticSidecarFusionEvaluationEvidence {
-        self.evidence
+    fn finish(
+        mut self,
+        selector: AcousticSidecarSelectorSummary,
+    ) -> FwResult<AcousticSidecarFusionEvaluationEvidence> {
+        self.evidence.maximum_retained_signals = selector.maximum_retained_signals;
+        self.evidence.retained_signal_capacity = selector.retained_signal_capacity;
+        self.evidence.consumed_probability_count = selector.consumed_probability_count;
+        self.evidence.changed_boundary_probability_count =
+            selector.changed_boundary_probability_count;
+        self.evidence.fusion_executed = selector.consumed_probability_count > 0;
+        let ring_payload_bytes = selector
+            .retained_signal_capacity
+            .checked_mul(std::mem::size_of::<AcousticSidecarBoundarySignal>())
+            .and_then(|payload| {
+                payload.checked_add(std::mem::size_of::<VecDeque<AcousticSidecarBoundarySignal>>())
+            })
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "sidecar signal-ring retained-state accounting overflowed".to_owned(),
+                )
+            })?;
+        self.evidence.peak_retained_state_bytes_on_target = self
+            .evidence
+            .peak_retained_state_bytes_on_target
+            .checked_add(ring_payload_bytes)
+            .ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "sidecar total retained-state accounting overflowed".to_owned(),
+                )
+            })?;
+        Ok(self.evidence)
     }
 }
 
@@ -6198,24 +6365,21 @@ where
     S: FnMut(AcousticFrameFeatures) -> FwResult<()>,
     C: FnMut() -> bool,
 {
-    extract_acoustic_features_with_frames(
-        samples,
-        &mut is_cancelled,
-        |_, frame, _| sink(frame),
-    )
+    extract_acoustic_features_with_frames(samples, &mut is_cancelled, |_, frame, _| sink(frame))
 }
 
-fn extract_acoustic_features_with_frames<S, C>(
+/// Crate-internal form of [`extract_acoustic_features`] that lends each exact
+/// analysis frame to an evaluation sidecar before releasing it.
+///
+/// The callback receives the same cancellation source so nested bounded DSP
+/// remains cancel-correct without retaining or copying frame PCM.
+pub(crate) fn extract_acoustic_features_with_frames<S, C>(
     samples: &[f32],
     is_cancelled: &mut C,
     mut sink: S,
 ) -> FwResult<FeatureExtractionSummary>
 where
-    S: FnMut(
-        &[f32; ACOUSTIC_FRAME_SAMPLES],
-        AcousticFrameFeatures,
-        &mut C,
-    ) -> FwResult<()>,
+    S: FnMut(&[f32; ACOUSTIC_FRAME_SAMPLES], AcousticFrameFeatures, &mut C) -> FwResult<()>,
     C: FnMut() -> bool,
 {
     if is_cancelled() {
@@ -6263,8 +6427,7 @@ where
             )));
         }
         let start = frame_index * ACOUSTIC_HOP_SAMPLES;
-        let frame: &[f32; ACOUSTIC_FRAME_SAMPLES] = samples
-            [start..start + ACOUSTIC_FRAME_SAMPLES]
+        let frame: &[f32; ACOUSTIC_FRAME_SAMPLES] = samples[start..start + ACOUSTIC_FRAME_SAMPLES]
             .try_into()
             .map_err(|_| {
                 FwError::InvalidRequest(
@@ -6683,7 +6846,7 @@ impl<'a> AcousticSegmentationStream<'a> {
         AcousticSegmentationSummary,
     )> {
         let feature_summary = self.feature_stream.finish();
-        let (tracklets, segmentation_summary, _) = self.segmenter.finish()?;
+        let (tracklets, segmentation_summary, _, _) = self.segmenter.finish()?;
         Ok((feature_summary, tracklets, segmentation_summary))
     }
 }
@@ -7632,6 +7795,14 @@ impl ChangePeakSelector {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AcousticSidecarSelectorSummary {
+    maximum_retained_signals: usize,
+    retained_signal_capacity: usize,
+    consumed_probability_count: usize,
+    changed_boundary_probability_count: usize,
+}
+
 struct AcousticSegmenter<'a> {
     hints: &'a AcousticBoundaryHints,
     feature_ablation: AcousticFeatureAblation,
@@ -7757,11 +7928,7 @@ impl<'a> AcousticSegmenter<'a> {
         validate_acoustic_frame(&frame)?;
         match (&self.sidecar_signal_ring, sidecar_signal.as_ref()) {
             (None, None) => {}
-            (Some(_), Some(signal))
-                if signal.frame_index == frame.frame_index
-                    && signal.observation.frame_index == frame.frame_index =>
-            {
-            }
+            (Some(_), Some(signal)) if signal.frame_index == frame.frame_index => {}
             (Some(_), Some(_)) => {
                 return Err(FwError::InvalidRequest(
                     "sidecar signal and acoustic frame indices must align".to_owned(),
@@ -7793,9 +7960,8 @@ impl<'a> AcousticSegmenter<'a> {
             (self.sidecar_signal_ring.as_mut(), sidecar_signal)
         {
             signal_ring.push_back(signal);
-            self.maximum_retained_sidecar_signals = self
-                .maximum_retained_sidecar_signals
-                .max(signal_ring.len());
+            self.maximum_retained_sidecar_signals =
+                self.maximum_retained_sidecar_signals.max(signal_ring.len());
         }
 
         if self.ring.len() == CHANGE_RING_FRAMES {
@@ -7845,7 +8011,17 @@ impl<'a> AcousticSegmenter<'a> {
         Vec<AcousticTracklet>,
         AcousticSegmentationSummary,
         AcousticChangeEvaluationEvidence,
+        AcousticSidecarSelectorSummary,
     )> {
+        if self
+            .sidecar_signal_ring
+            .as_ref()
+            .is_some_and(|signals| signals.len() != self.ring.len())
+        {
+            return Err(FwError::InvalidRequest(
+                "sidecar and acoustic segmentation rings lost alignment before finish".to_owned(),
+            ));
+        }
         if self.ring.len() > 2 * CHANGE_SCALES_FRAMES[0] {
             let first_frame_index = self.ring.front().map_or(0, |frame| frame.frame_index);
             let earliest_center = self
@@ -7856,13 +8032,26 @@ impl<'a> AcousticSegmenter<'a> {
                 .max(CHANGE_SCALES_FRAMES[0]);
             let latest_center = self.ring.len() - CHANGE_SCALES_FRAMES[0];
             for center in earliest_center..=latest_center {
-                self.evaluate_ring_center(center);
+                self.evaluate_ring_center(center)?;
             }
         }
         if let Some(peak_evidence) = self.peak_selector.finish() {
             self.emit_detected_boundary(peak_evidence);
         }
         while let Some(frame) = self.ring.pop_front() {
+            if let Some(signal_ring) = self.sidecar_signal_ring.as_mut() {
+                let signal = signal_ring.pop_front().ok_or_else(|| {
+                    FwError::InvalidRequest(
+                        "sidecar ring ended before the acoustic segmentation ring".to_owned(),
+                    )
+                })?;
+                if signal.frame_index != frame.frame_index {
+                    return Err(FwError::InvalidRequest(
+                        "sidecar and acoustic segmentation rings lost alignment during finish"
+                            .to_owned(),
+                    ));
+                }
+            }
             consume_segment_frame(
                 frame,
                 &mut self.accumulator,
@@ -7871,6 +8060,15 @@ impl<'a> AcousticSegmenter<'a> {
                 &mut self.forced_boundaries,
                 self.feature_ablation,
             );
+        }
+        if self
+            .sidecar_signal_ring
+            .as_ref()
+            .is_some_and(|signals| !signals.is_empty())
+        {
+            return Err(FwError::InvalidRequest(
+                "sidecar ring outlived the acoustic segmentation ring".to_owned(),
+            ));
         }
         if let Some(tracklet) = self.accumulator.finish(self.tracklets.len(), None) {
             self.tracklets.push(tracklet);
@@ -7931,6 +8129,15 @@ impl<'a> AcousticSegmenter<'a> {
                 emitted: self.emitted_boundaries.into_values().collect(),
                 evaluated: self.evaluated_change_evidence,
             },
+            AcousticSidecarSelectorSummary {
+                maximum_retained_signals: self.maximum_retained_sidecar_signals,
+                retained_signal_capacity: self
+                    .sidecar_signal_ring
+                    .as_ref()
+                    .map_or(0, VecDeque::capacity),
+                consumed_probability_count: self.consumed_sidecar_probability_count,
+                changed_boundary_probability_count: self.changed_boundary_probability_count,
+            },
         ))
     }
 
@@ -7939,7 +8146,7 @@ impl<'a> AcousticSegmenter<'a> {
         insert_detected_boundary(&mut self.emitted_boundaries, evidence);
     }
 
-    fn evaluate_ring_center(&mut self, center: usize) {
+    fn evaluate_ring_center(&mut self, center: usize) -> FwResult<()> {
         let center_index = self.ring[center].frame_index;
         let mut evidence = multiscale_change_evidence_with_detector(
             &self.ring,
@@ -7948,6 +8155,44 @@ impl<'a> AcousticSegmenter<'a> {
             self.feature_ablation,
             self.detector_mode,
         );
+        if let Some(signal_ring) = self.sidecar_signal_ring.as_ref() {
+            let signal = signal_ring.get(center).ok_or_else(|| {
+                FwError::InvalidRequest(
+                    "sidecar ring is missing the acoustic evaluation center".to_owned(),
+                )
+            })?;
+            if signal.frame_index != center_index {
+                return Err(FwError::InvalidRequest(
+                    "sidecar signal does not align with the acoustic evaluation center".to_owned(),
+                ));
+            }
+            if let (Some(sidecar_log_odds), Some(sidecar_probability)) =
+                (signal.calibrated_log_odds, signal.calibrated_probability)
+                && evidence.fallback_reason.is_none()
+            {
+                self.consumed_sidecar_probability_count = self
+                    .consumed_sidecar_probability_count
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        FwError::InvalidRequest(
+                            "sidecar probability consumption count overflowed".to_owned(),
+                        )
+                    })?;
+                if sidecar_probability > evidence.change_probability {
+                    evidence.change_probability = sidecar_probability;
+                    evidence.raw_log_odds = sidecar_log_odds;
+                    evidence.calibration_id = ACOUSTIC_SIDECAR_FUSION_VERSION;
+                    self.changed_boundary_probability_count = self
+                        .changed_boundary_probability_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            FwError::InvalidRequest(
+                                "sidecar boundary change count overflowed".to_owned(),
+                            )
+                        })?;
+                }
+            }
+        }
         if self.capture_evaluation_evidence {
             self.evaluated_change_evidence.push(evidence.clone());
         }
@@ -7984,6 +8229,7 @@ impl<'a> AcousticSegmenter<'a> {
             self.emit_detected_boundary(peak_evidence);
         }
         self.last_evaluated_frame_index = Some(center_index);
+        Ok(())
     }
 }
 
@@ -8140,7 +8386,7 @@ where
         }
         segmenter.push(frame)?;
     }
-    let (tracklets, summary, _) = segmenter.finish()?;
+    let (tracklets, summary, _, _) = segmenter.finish()?;
     Ok((tracklets, summary))
 }
 
@@ -10796,11 +11042,12 @@ pub fn diarize_acoustic_pcm_with_ablation_and_detector<C>(
 where
     C: FnMut() -> bool,
 {
-    let (report, projection, _, _) = diarize_acoustic_pcm_with_detector_evidence_internal(
+    let (report, projection, _, _, _) = diarize_acoustic_pcm_with_detector_evidence_internal(
         input,
         feature_ablation,
         detector_mode,
         AcousticClusteringMode::FixedSafeV1,
+        None,
         false,
         is_cancelled,
     )?;
@@ -10823,11 +11070,47 @@ pub(crate) fn diarize_acoustic_pcm_with_modes_evidence<C>(
 where
     C: FnMut() -> bool,
 {
+    let (report, projection, change_evidence, clustering_evidence, _) =
+        diarize_acoustic_pcm_with_detector_evidence_internal(
+            input,
+            feature_ablation,
+            detector_mode,
+            clustering_mode,
+            None,
+            true,
+            is_cancelled,
+        )?;
+    Ok((report, projection, change_evidence, clustering_evidence))
+}
+
+/// Run the full-v2 acoustic pipeline with an optional, evaluation-only
+/// sidecar fused into the existing boundary selector.
+///
+/// `None` takes the same default path as [`diarize_acoustic_pcm_with_modes_evidence`].
+/// A request is configuration-bound, keeps its observations in the existing
+/// 401-frame segmentation horizon, and never changes production defaults.
+pub(crate) fn diarize_acoustic_pcm_with_sidecar_evidence<C>(
+    input: AcousticDiarizationInput<'_>,
+    detector_mode: AcousticChangeDetectorMode,
+    clustering_mode: AcousticClusteringMode,
+    sidecar_request: Option<AcousticSidecarEvaluationRequest>,
+    is_cancelled: C,
+) -> FwResult<(
+    DiarizationReport,
+    DiarizationProjection,
+    AcousticChangeEvaluationEvidence,
+    AcousticClusteringEvaluationEvidence,
+    AcousticSidecarFusionEvaluationEvidence,
+)>
+where
+    C: FnMut() -> bool,
+{
     diarize_acoustic_pcm_with_detector_evidence_internal(
         input,
-        feature_ablation,
+        AcousticFeatureAblation::FullV2,
         detector_mode,
         clustering_mode,
+        sidecar_request,
         true,
         is_cancelled,
     )
@@ -10838,6 +11121,7 @@ fn diarize_acoustic_pcm_with_detector_evidence_internal<C>(
     feature_ablation: AcousticFeatureAblation,
     detector_mode: AcousticChangeDetectorMode,
     clustering_mode: AcousticClusteringMode,
+    sidecar_request: Option<AcousticSidecarEvaluationRequest>,
     capture_evaluation_evidence: bool,
     mut is_cancelled: C,
 ) -> FwResult<(
@@ -10845,6 +11129,7 @@ fn diarize_acoustic_pcm_with_detector_evidence_internal<C>(
     DiarizationProjection,
     AcousticChangeEvaluationEvidence,
     AcousticClusteringEvaluationEvidence,
+    AcousticSidecarFusionEvaluationEvidence,
 )>
 where
     C: FnMut() -> bool,
@@ -10888,14 +11173,36 @@ where
         detector_mode,
     )?;
     segmenter.capture_evaluation_evidence = capture_evaluation_evidence;
-    let extraction =
-        extract_acoustic_features(samples, &mut is_cancelled, |frame| segmenter.push(frame))?;
+    let mut sidecar_adapter = sidecar_request
+        .map(AcousticSidecarBoundaryAdapter::new)
+        .transpose()?;
+    if sidecar_adapter.is_some() {
+        segmenter.enable_sidecar_fusion()?;
+    }
+    let extraction = if let Some(adapter) = sidecar_adapter.as_mut() {
+        extract_acoustic_features_with_frames(
+            samples,
+            &mut is_cancelled,
+            |frame_samples, frame, is_cancelled| {
+                let signal = adapter.observe(frame_samples, &frame, is_cancelled)?;
+                segmenter.push_with_sidecar_signal(frame, signal)
+            },
+        )?
+    } else {
+        extract_acoustic_features(samples, &mut is_cancelled, |frame| segmenter.push(frame))?
+    };
     if is_cancelled() {
         return Err(FwError::Cancelled(
             "acoustic diarization cancelled after feature extraction".to_owned(),
         ));
     }
-    let (tracklets, segmentation, change_evaluation_evidence) = segmenter.finish()?;
+    let (tracklets, segmentation, change_evaluation_evidence, sidecar_selector) =
+        segmenter.finish()?;
+    let sidecar_evaluation = if let Some(adapter) = sidecar_adapter {
+        adapter.finish(sidecar_selector)?
+    } else {
+        AcousticSidecarFusionEvaluationEvidence::default()
+    };
     let enrollment = enroll_known_speaker_profiles(&tracklets, request, audio_duration_ms)
         .map_err(|error| FwError::InvalidRequest(error.to_string()))?;
     let clustering = cluster_acoustic_tracklets_with_mode(
@@ -11039,6 +11346,7 @@ where
         projection,
         change_evaluation_evidence,
         clustering_evaluation,
+        sidecar_evaluation,
     ))
 }
 
@@ -16808,6 +17116,25 @@ mod tests {
         output
     }
 
+    fn haar_sidecar_fusion_request(
+        logit_intercept: f32,
+        contrast_weight: f32,
+        minimum_comparable_components: usize,
+    ) -> super::AcousticSidecarEvaluationRequest {
+        super::AcousticSidecarEvaluationRequest {
+            study_config: AcousticSidecarStudyConfig {
+                mode: AcousticSidecarStudyMode::Haar,
+                frame_wavelet_levels: 1,
+                ..AcousticSidecarStudyConfig::default()
+            },
+            calibration: super::AcousticSidecarFusionCalibration {
+                logit_intercept,
+                contrast_weight,
+                minimum_comparable_components,
+            },
+        }
+    }
+
     fn median_pitch(frames: &[AcousticFrameFeatures]) -> f32 {
         let mut pitches = frames
             .iter()
@@ -20671,6 +20998,450 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_frame_extraction_seam_preserves_canonical_features_and_pcm_alignment() {
+        let samples = sine_wave(173.0, 0.2, 0.37);
+        let expected = features(&samples);
+        let mut actual = Vec::new();
+        let mut active = || false;
+        let summary = super::extract_acoustic_features_with_frames(
+            &samples,
+            &mut active,
+            |frame_samples, frame, _| {
+                let start = frame.frame_index * ACOUSTIC_HOP_SAMPLES;
+                assert_eq!(
+                    frame_samples.as_slice(),
+                    &samples[start..start + ACOUSTIC_FRAME_SAMPLES]
+                );
+                actual.push(frame);
+                Ok(())
+            },
+        )
+        .expect("frame-bearing extraction");
+
+        assert_eq!(actual, expected);
+        assert_eq!(summary.frame_count, expected.len());
+        assert_eq!(
+            acoustic_feature_bytes(&actual),
+            acoustic_feature_bytes(&expected)
+        );
+    }
+
+    #[test]
+    fn sidecar_fusion_request_is_validated_and_hashes_every_calibration_term() {
+        let request = haar_sidecar_fusion_request(-4.0, 9.0, 3);
+        let hash = super::acoustic_sidecar_fusion_configuration_sha256(request)
+            .expect("valid fusion configuration hash");
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            hash,
+            super::acoustic_sidecar_fusion_configuration_sha256(request)
+                .expect("deterministic fusion configuration hash")
+        );
+        for distinct in [
+            haar_sidecar_fusion_request(-3.0, 9.0, 3),
+            haar_sidecar_fusion_request(-4.0, 8.0, 3),
+            haar_sidecar_fusion_request(-4.0, 9.0, 2),
+        ] {
+            assert_ne!(
+                hash,
+                super::acoustic_sidecar_fusion_configuration_sha256(distinct)
+                    .expect("distinct valid fusion configuration")
+            );
+        }
+
+        let disabled = super::AcousticSidecarEvaluationRequest {
+            study_config: AcousticSidecarStudyConfig::default(),
+            calibration: request.calibration,
+        };
+        assert!(super::acoustic_sidecar_fusion_configuration_sha256(disabled).is_err());
+        for invalid in [
+            super::AcousticSidecarFusionCalibration {
+                logit_intercept: f32::NAN,
+                ..request.calibration
+            },
+            super::AcousticSidecarFusionCalibration {
+                contrast_weight: -1.0,
+                ..request.calibration
+            },
+            super::AcousticSidecarFusionCalibration {
+                minimum_comparable_components: 0,
+                ..request.calibration
+            },
+        ] {
+            assert!(
+                super::acoustic_sidecar_fusion_configuration_sha256(
+                    super::AcousticSidecarEvaluationRequest {
+                        calibration: invalid,
+                        ..request
+                    }
+                )
+                .is_err()
+            );
+        }
+        let malformed = super::AcousticSidecarOwnerContrast {
+            owner_contrast: [f32::NAN, 0.0, 0.0],
+            ..super::AcousticSidecarOwnerContrast::default()
+        };
+        assert!(
+            super::acoustic_sidecar_calibrate_owner_contrast(malformed, request.calibration)
+                .is_err()
+        );
+        let inconsistent = super::AcousticSidecarOwnerContrast {
+            owner_contrast: [0.5, 0.0, 0.0],
+            owner_available: [true, false, false],
+            comparable_components: 1,
+            component_comparisons: 0,
+        };
+        assert!(
+            super::acoustic_sidecar_calibrate_owner_contrast(inconsistent, request.calibration)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sidecar_owner_contrast_preserves_missingness_and_feature_ownership() {
+        let config = AcousticSidecarStudyConfig {
+            mode: AcousticSidecarStudyMode::HaarAndModulation,
+            frame_wavelet_levels: 1,
+            ..AcousticSidecarStudyConfig::default()
+        };
+        let mut study = AcousticSidecarStudy::new(config).expect("owner contrast study");
+        let mut observations = [None; 3];
+        for frame_index in 0..=ACOUSTIC_MODULATION_HISTORY_FRAMES {
+            let phase = std::f32::consts::TAU * frame_index as f32
+                / ACOUSTIC_MODULATION_HISTORY_FRAMES as f32;
+            let mut frame = synthetic_feature(frame_index, 0.25, false, false);
+            frame.voice.temporal_modulation = 0.5 + 0.3 * (4.0 * phase).sin();
+            frame.channel.rms_dbfs = -20.0 + 3.0 * (2.0 * phase).sin();
+            frame.channel.muffling_proxy = 0.5 + 0.3 * (8.0 * phase).sin();
+            let frame_samples = std::array::from_fn(|sample| {
+                0.3 * (std::f32::consts::TAU * (sample + frame_index) as f32 / 37.0).sin()
+            });
+            let observation = study
+                .observe_normalized_16khz_frame(&frame_samples, &frame, &mut || false)
+                .expect("owner contrast observation");
+            if frame_index + 2 >= ACOUSTIC_MODULATION_HISTORY_FRAMES {
+                observations[frame_index + 2 - ACOUSTIC_MODULATION_HISTORY_FRAMES] =
+                    Some(observation);
+            }
+        }
+        let before_window = observations[0].expect("pre-window observation");
+        let first_window = observations[1].expect("first complete window");
+        let second_window = observations[2].expect("second complete window");
+        assert!(before_window.modulation().is_none());
+        assert!(first_window.modulation().is_some());
+        assert!(second_window.modulation().is_some());
+
+        let missing =
+            super::acoustic_sidecar_observation_owner_contrast(&before_window, &first_window)
+                .expect("missingness-aware contrast");
+        assert_eq!(missing.owner_available, [false, false, true]);
+        assert!(missing.comparable_components > 0);
+
+        let complete =
+            super::acoustic_sidecar_observation_owner_contrast(&first_window, &second_window)
+                .expect("complete owner contrast");
+        assert_eq!(complete.owner_available, [true, true, true]);
+        assert!(complete.comparable_components > missing.comparable_components);
+        assert!(
+            complete
+                .owner_contrast
+                .iter()
+                .all(|value| value.is_finite())
+        );
+
+        let mut invalid_wavelet_owner = second_window;
+        invalid_wavelet_owner
+            .wavelet
+            .as_mut()
+            .expect("wavelet summary")
+            .owner = AcousticSidecarFeatureOwner::Voice;
+        assert!(
+            super::acoustic_sidecar_observation_owner_contrast(
+                &first_window,
+                &invalid_wavelet_owner,
+            )
+            .is_err()
+        );
+        let mut invalid_modulation_owner = second_window;
+        invalid_modulation_owner
+            .modulation
+            .as_mut()
+            .expect("modulation summary")
+            .voice_owner = AcousticSidecarFeatureOwner::Channel;
+        assert!(
+            super::acoustic_sidecar_observation_owner_contrast(
+                &first_window,
+                &invalid_modulation_owner,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sidecar_fusion_is_bounded_honest_and_keeps_extreme_log_odds_finite() {
+        let hints = AcousticBoundaryHints::default();
+        let mut fused = super::AcousticSegmenter::new_with_supervised_boundaries(
+            &hints,
+            &[],
+            super::AcousticFeatureAblation::FullV2,
+            super::AcousticChangeDetectorMode::FixedSafeV1,
+        )
+        .expect("fused segmenter");
+        let mut unavailable = super::AcousticSegmenter::new_with_supervised_boundaries(
+            &hints,
+            &[],
+            super::AcousticFeatureAblation::FullV2,
+            super::AcousticChangeDetectorMode::FixedSafeV1,
+        )
+        .expect("unavailable segmenter");
+        let mut baseline = super::AcousticSegmenter::new_with_supervised_boundaries(
+            &hints,
+            &[],
+            super::AcousticFeatureAblation::FullV2,
+            super::AcousticChangeDetectorMode::FixedSafeV1,
+        )
+        .expect("baseline segmenter");
+        fused.capture_evaluation_evidence = true;
+        unavailable.capture_evaluation_evidence = true;
+        baseline.capture_evaluation_evidence = true;
+        fused.enable_sidecar_fusion().expect("enable fused ring");
+        unavailable
+            .enable_sidecar_fusion()
+            .expect("enable unavailable ring");
+
+        let extreme_request = haar_sidecar_fusion_request(f32::MAX, f32::MAX, 1);
+        let unavailable_request = haar_sidecar_fusion_request(-4.0, 9.0, usize::MAX);
+        let mut extreme_adapter =
+            super::AcousticSidecarBoundaryAdapter::new(extreme_request).expect("extreme adapter");
+        let mut unavailable_adapter =
+            super::AcousticSidecarBoundaryAdapter::new(unavailable_request)
+                .expect("unavailable adapter");
+        let frame_count = super::CHANGE_RING_FRAMES + 20;
+        for frame_index in 0..frame_count {
+            let frame = synthetic_feature(
+                frame_index,
+                0.25 + (frame_index % 7) as f32 * 0.002,
+                false,
+                false,
+            );
+            let mut frame_samples = [0.0_f32; ACOUSTIC_FRAME_SAMPLES];
+            if frame_index % 2 == 1 {
+                frame_samples[0] = 0.8;
+            }
+            let fused_signal = extreme_adapter
+                .observe(&frame_samples, &frame, &mut || false)
+                .expect("extreme fusion signal");
+            let unavailable_signal = unavailable_adapter
+                .observe(&frame_samples, &frame, &mut || false)
+                .expect("unavailable fusion signal");
+            fused
+                .push_with_sidecar_signal(frame.clone(), fused_signal)
+                .expect("aligned fused frame");
+            unavailable
+                .push_with_sidecar_signal(frame.clone(), unavailable_signal)
+                .expect("aligned unavailable frame");
+            baseline.push(frame).expect("baseline frame");
+        }
+
+        let (_, _, fused_changes, fused_selector) = fused.finish().expect("finish fused");
+        let (unavailable_tracklets, unavailable_summary, unavailable_changes, unavailable_selector) =
+            unavailable.finish().expect("finish unavailable");
+        let (baseline_tracklets, baseline_summary, baseline_changes, baseline_selector) =
+            baseline.finish().expect("finish baseline");
+        let fused_evidence = extreme_adapter
+            .finish(fused_selector)
+            .expect("finish fused evidence");
+        let unavailable_evidence = unavailable_adapter
+            .finish(unavailable_selector)
+            .expect("finish unavailable evidence");
+
+        assert!(fused_evidence.fusion_requested);
+        assert!(fused_evidence.fusion_executed);
+        assert!(fused_evidence.consumed_probability_count > 0);
+        assert!(fused_evidence.changed_boundary_probability_count > 0);
+        assert_eq!(
+            fused_evidence.maximum_retained_signals,
+            super::CHANGE_RING_FRAMES
+        );
+        assert!(fused_evidence.maximum_retained_signals <= super::CHANGE_RING_FRAMES);
+        assert!(fused_evidence.retained_signal_capacity >= fused_evidence.maximum_retained_signals);
+        let expected_retained_bytes = std::mem::size_of::<super::AcousticSidecarBoundaryAdapter>()
+            + fused_evidence
+                .fusion_configuration_sha256
+                .as_ref()
+                .map_or(0, String::capacity)
+            + fused_evidence
+                .sidecar_configuration_sha256
+                .as_ref()
+                .map_or(0, String::capacity)
+            + std::mem::size_of::<VecDeque<super::AcousticSidecarBoundarySignal>>()
+            + fused_evidence.retained_signal_capacity
+                * std::mem::size_of::<super::AcousticSidecarBoundarySignal>();
+        assert_eq!(
+            fused_evidence.peak_retained_state_bytes_on_target,
+            expected_retained_bytes
+        );
+        assert_eq!(fused_evidence.submitted_frame_count, frame_count);
+        assert!(fused_evidence.calibrated_signal_count < frame_count);
+        assert!(
+            fused_changes
+                .evaluated
+                .iter()
+                .all(|evidence| evidence.raw_log_odds.is_finite()
+                    && evidence.change_probability.is_finite())
+        );
+        assert!(fused_changes.evaluated.iter().any(|evidence| {
+            evidence.calibration_id == super::ACOUSTIC_SIDECAR_FUSION_VERSION
+                && evidence.raw_log_odds == f32::MAX
+        }));
+        let debug = format!("{fused_evidence:?}");
+        assert!(!debug.contains("AcousticSidecarStudyObservation"));
+        assert!(!debug.contains("owner_contrast"));
+
+        assert!(unavailable_evidence.fusion_requested);
+        assert!(!unavailable_evidence.fusion_executed);
+        assert_eq!(unavailable_evidence.calibrated_signal_count, 0);
+        assert_eq!(unavailable_evidence.consumed_probability_count, 0);
+        assert_eq!(unavailable_evidence.changed_boundary_probability_count, 0);
+        assert_eq!(
+            unavailable_evidence.maximum_retained_signals,
+            super::CHANGE_RING_FRAMES
+        );
+        assert_eq!(
+            unavailable_evidence.retained_signal_capacity,
+            fused_evidence.retained_signal_capacity
+        );
+        assert_eq!(unavailable_tracklets, baseline_tracklets);
+        assert_eq!(unavailable_summary, baseline_summary);
+        assert_eq!(unavailable_changes, baseline_changes);
+        assert_eq!(
+            baseline_selector,
+            super::AcousticSidecarSelectorSummary::default()
+        );
+    }
+
+    #[test]
+    fn sidecar_ring_rejects_misalignment_before_mutating_segmentation_state() {
+        let hints = AcousticBoundaryHints::default();
+        let mut segmenter = super::AcousticSegmenter::new_with_supervised_boundaries(
+            &hints,
+            &[],
+            super::AcousticFeatureAblation::FullV2,
+            super::AcousticChangeDetectorMode::FixedSafeV1,
+        )
+        .expect("alignment segmenter");
+        segmenter
+            .enable_sidecar_fusion()
+            .expect("enable alignment ring");
+        let mut adapter =
+            super::AcousticSidecarBoundaryAdapter::new(haar_sidecar_fusion_request(-4.0, 9.0, 1))
+                .expect("alignment adapter");
+        let samples = [0.0_f32; ACOUSTIC_FRAME_SAMPLES];
+        let aligned_frame = synthetic_feature(0, 0.25, false, false);
+        let signal = adapter
+            .observe(&samples, &aligned_frame, &mut || false)
+            .expect("alignment signal");
+        let error = segmenter
+            .push_with_sidecar_signal(synthetic_feature(1, 0.25, false, false), signal)
+            .expect_err("misaligned signal");
+        assert!(error.to_string().contains("indices must align"));
+        assert_eq!(segmenter.input_frame_count, 0);
+        assert!(segmenter.ring.is_empty());
+        assert!(
+            segmenter
+                .sidecar_signal_ring
+                .as_ref()
+                .is_some_and(VecDeque::is_empty)
+        );
+
+        segmenter
+            .push_with_sidecar_signal(aligned_frame, signal)
+            .expect("aligned retry");
+        let (_, summary, _, selector) = segmenter.finish().expect("alignment finish");
+        assert_eq!(summary.input_frame_count, 1);
+        assert_eq!(selector.maximum_retained_signals, 1);
+    }
+
+    #[test]
+    fn sidecar_opt_out_pipeline_is_exactly_the_existing_evaluation_path() {
+        const INPUT_SHA256: &str =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let samples = sine_wave(140.0, 2.0, 0.35);
+        let segments = [TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(2.0),
+            text: "sidecar opt-out fixture".to_owned(),
+            speaker: None,
+            confidence: Some(0.9),
+        }];
+        let request = DiarizationRequest {
+            engine: DiarizationEngine::Acoustic,
+            speaker_count: SpeakerCountRequest::HardConstraint { count: 1 },
+            known_intervals: vec![KnownSpeakerInterval {
+                speaker_ref: "fixture_speaker".to_owned(),
+                start_ms: 0,
+                end_ms: 2_000,
+                confidence: 1.0,
+                policy: KnownSpeakerPolicy::HardMustLink,
+                provenance: None,
+            }],
+            enrollment_edge_guard_ms: 0,
+            ..DiarizationRequest::default()
+        };
+        let hints = AcousticBoundaryHints {
+            speech_regions_ms: vec![(0, 2_000)],
+            word_boundaries_ms: vec![0, 2_000],
+            tiny_diarize_boundaries_ms: Vec::new(),
+        };
+        let input = AcousticDiarizationInput {
+            samples: &samples,
+            normalized_input_sha256: INPUT_SHA256,
+            segments: &segments,
+            word_aligned: true,
+            request: &request,
+            boundary_hints: &hints,
+        };
+        let baseline = super::diarize_acoustic_pcm_with_modes_evidence(
+            input,
+            super::AcousticFeatureAblation::FullV2,
+            super::AcousticChangeDetectorMode::FixedSafeV1,
+            super::AcousticClusteringMode::FixedSafeV1,
+            || false,
+        )
+        .expect("existing evaluation path");
+        let opt_out = super::diarize_acoustic_pcm_with_sidecar_evidence(
+            input,
+            super::AcousticChangeDetectorMode::FixedSafeV1,
+            super::AcousticClusteringMode::FixedSafeV1,
+            None,
+            || false,
+        )
+        .expect("sidecar opt-out path");
+        let baseline_bytes = serde_json::to_vec(&(
+            &baseline.0,
+            &baseline.1.segments,
+            &baseline.1.mixed_speaker_segment_indices,
+            &baseline.1.overlap_suspected_segment_indices,
+        ))
+        .expect("serialize baseline output");
+        let opt_out_bytes = serde_json::to_vec(&(
+            &opt_out.0,
+            &opt_out.1.segments,
+            &opt_out.1.mixed_speaker_segment_indices,
+            &opt_out.1.overlap_suspected_segment_indices,
+        ))
+        .expect("serialize opt-out output");
+        assert_eq!(baseline_bytes, opt_out_bytes);
+        assert_eq!(baseline.2, opt_out.2);
+        assert_eq!(baseline.3, opt_out.3);
+        assert_eq!(
+            opt_out.4,
+            super::AcousticSidecarFusionEvaluationEvidence::default()
+        );
+    }
+
+    #[test]
     fn robust_tracklet_identity_ignores_silence_clipping_and_transients() {
         let mut accumulator = super::TrackletAccumulator::default();
         for index in 0..8 {
@@ -21325,7 +22096,7 @@ mod tests {
                 .push(synthetic_feature(index, 0.0, false, false))
                 .expect("streaming frame");
         }
-        let (tracklets, summary, _) = segmenter.finish().expect("finish");
+        let (tracklets, summary, _, _) = segmenter.finish().expect("finish");
         assert_eq!(summary.input_frame_count, 20_000);
         assert_eq!(tracklets.len(), 1);
         assert!(
@@ -21466,7 +22237,7 @@ mod tests {
                 .push(synthetic_feature(index, 0.2, silence, false))
                 .expect("frame");
         }
-        let (_, _, emitted) = segmenter.finish().expect("finish");
+        let (_, _, emitted, _) = segmenter.finish().expect("finish");
         assert!(
             emitted.emitted.iter().all(|evidence| !evidence.silence_gap),
             "{emitted:#?}"

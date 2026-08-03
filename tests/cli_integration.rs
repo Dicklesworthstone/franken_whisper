@@ -26,7 +26,8 @@ use franken_whisper::model::{
 use franken_whisper::public_corpus::{
     PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION, PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
     PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION, PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION,
-    PublicCorpusEvaluationStage, parse_public_corpus_sidecar_study_evidence,
+    PublicCorpusEvaluationStage, PublicCorpusSidecarDisposition, PublicCorpusSidecarLane,
+    parse_public_corpus_sidecar_study_evidence,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::sync::{self, ConflictPolicy};
@@ -793,6 +794,12 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
         .prefix("fw-sidecar-corpus-project-")
         .tempdir_in(external_temp_root)
         .expect("runtime project");
+    let canonical_input_root = input.path().canonicalize().expect("canonical input root");
+    let canonical_output_root = output.path().canonicalize().expect("canonical output root");
+    let canonical_runtime_project_root = runtime_project
+        .path()
+        .canonicalize()
+        .expect("canonical runtime project root");
     std::fs::create_dir(runtime_project.path().join(".git")).expect("project marker");
     std::fs::write(
         runtime_project.path().join("Cargo.toml"),
@@ -803,11 +810,13 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
     let audio_name = "sidecar-private-audio.wav";
     let annotation_name = "sidecar-private-reference.rttm";
     let descriptor_name = "sidecar-private-descriptor.json";
+    let bundle_name = "sidecar-private-bundle.json";
+    let evidence_name = "sidecar-private-evidence.json";
     let audio_path = input.path().join(audio_name);
     let annotation_path = input.path().join(annotation_name);
     let descriptor_path = input.path().join(descriptor_name);
-    let bundle_path = output.path().join("sidecar-private-bundle.json");
-    let evidence_path = output.path().join("sidecar-private-evidence.json");
+    let bundle_path = output.path().join(bundle_name);
+    let evidence_path = output.path().join(evidence_name);
 
     let spec = hound::WavSpec {
         channels: 1,
@@ -925,20 +934,76 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
         evidence.evaluation_stage,
         PublicCorpusEvaluationStage::Development
     );
-    assert_eq!(evidence.variants.len(), 13);
+    assert_eq!(evidence.variants.len(), PublicCorpusSidecarLane::ALL.len());
+    let retained_lane_order = evidence
+        .variants
+        .iter()
+        .map(|variant| variant.lane)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained_lane_order.as_slice(),
+        PublicCorpusSidecarLane::ALL.as_slice()
+    );
+    assert_eq!(
+        evidence.variants[0].disposition,
+        PublicCorpusSidecarDisposition::Baseline
+    );
+    assert!(
+        evidence.variants[1..]
+            .iter()
+            .all(|variant| variant.disposition == PublicCorpusSidecarDisposition::Rejected)
+    );
+    assert!(evidence.selected_candidate_lane.is_none());
+    assert!(evidence.adopted_candidate_lane.is_none());
     assert_eq!(evidence.deterministic_accuracy_sha256.len(), 64);
     assert_eq!(evidence.result_sha256.len(), 64);
     assert!(bundle_path.is_file());
 
     let stdout = String::from_utf8(result.stdout).expect("UTF-8 stdout");
     let retained = String::from_utf8(retained_evidence.clone()).expect("UTF-8 evidence");
+    let retained_bundle = std::fs::read_to_string(&bundle_path).expect("UTF-8 bundle");
     for forbidden in [
         input.path().to_str().expect("input path"),
         output.path().to_str().expect("output path"),
         runtime_project.path().to_str().expect("project path"),
+        canonical_input_root.to_str().expect("canonical input path"),
+        canonical_output_root
+            .to_str()
+            .expect("canonical output path"),
+        canonical_runtime_project_root
+            .to_str()
+            .expect("canonical project path"),
         audio_name,
         annotation_name,
         descriptor_name,
+        bundle_name,
+        evidence_name,
+        "audio_path",
+        "annotation_path",
+        "descriptor_path",
+    ] {
+        assert!(
+            !retained_bundle.contains(forbidden),
+            "bundle leaked {forbidden}"
+        );
+    }
+    for forbidden in [
+        input.path().to_str().expect("input path"),
+        output.path().to_str().expect("output path"),
+        runtime_project.path().to_str().expect("project path"),
+        canonical_input_root.to_str().expect("canonical input path"),
+        canonical_output_root
+            .to_str()
+            .expect("canonical output path"),
+        canonical_runtime_project_root
+            .to_str()
+            .expect("canonical project path"),
+        audio_name,
+        annotation_name,
+        descriptor_name,
+        bundle_name,
+        evidence_name,
+        "sidecar-corpus-e2e-root",
         "sidecar-source",
         "sidecar-source-near",
         "sidecar-source-far",
@@ -952,6 +1017,12 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
         "bundle_output_path",
         "evidence_output_path",
         "locked_development_evidence_path",
+        "recording_id",
+        "speaker_id",
+        "speaker_ref",
+        "frame_index",
+        "start_ms",
+        "end_ms",
         "transcript",
     ] {
         assert!(!stdout.contains(forbidden), "stdout leaked {forbidden}");
@@ -978,9 +1049,19 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
         input.path().to_str().expect("input path"),
         output.path().to_str().expect("output path"),
         runtime_project.path().to_str().expect("project path"),
+        canonical_input_root.to_str().expect("canonical input path"),
+        canonical_output_root
+            .to_str()
+            .expect("canonical output path"),
+        canonical_runtime_project_root
+            .to_str()
+            .expect("canonical project path"),
         audio_name,
         annotation_name,
         descriptor_name,
+        bundle_name,
+        evidence_name,
+        "sidecar-corpus-e2e-root",
         "sidecar-cli-development",
         "sidecar-cli-speaker-near",
         "sidecar-cli-speaker-far",

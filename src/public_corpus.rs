@@ -5,7 +5,7 @@
 //! can be retained externally. It never copies source media and refuses to
 //! write generated annotations inside the project checkout.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -30,12 +30,13 @@ use crate::diarization::{
     DiarizationScorerConfig, EvaluationOverlapPolicy, EvaluationPerformanceObservation,
     EvaluationRegion, EvaluationSplit, EvaluationTurn, EvaluationWord, acoustic_change_calibration,
     acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
+    acoustic_sidecar_calibrate_owner_contrast,
     acoustic_sidecar_fusion_configuration_sha256,
     acoustic_sidecar_observation_owner_contrast, acoustic_sidecar_study_config_sha256,
     acoustic_speaker_pair_calibration_sha256, audit_diarization_manifest,
     diarize_acoustic_pcm_with_modes_evidence, diarize_acoustic_pcm_with_sidecar_evidence,
-    extract_acoustic_features, parse_diarization_corpus_manifest, parse_diarization_reference,
-    score_change_points, score_diarization_documents,
+    extract_acoustic_features_with_frames, parse_diarization_corpus_manifest,
+    parse_diarization_reference, score_change_points, score_diarization_documents,
     select_acoustic_change_evidence_at_threshold, speaker_change_points_ms,
     verify_leakage_audit_hash,
 };
@@ -91,6 +92,10 @@ pub const PUBLIC_CORPUS_SIDECAR_MAX_PAIR_ECE: f64 = 0.10;
 /// Maximum rate at which channel contrast dominates voice contrast on
 /// comparable different-speaker pairs.
 pub const PUBLIC_CORPUS_SIDECAR_MAX_CHANNEL_CONFOUND_RATE: f64 = 0.50;
+/// Maximum relative candidate RTF regression admitted for promotion.
+pub const PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RTF_REGRESSION: f64 = 0.25;
+/// Maximum relative sampled peak-RSS regression admitted for promotion.
+pub const PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RSS_REGRESSION: f64 = 0.25;
 
 const PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS: u64 = 250;
 const PUBLIC_SIDECAR_RELIABILITY_BINS: usize = 10;
@@ -100,6 +105,8 @@ const PUBLIC_SIDECAR_PAIR_LAGS_FRAMES: [usize; 4] = [25, 50, 100, 200];
 const PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING: usize = 4_096;
 const PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS: usize = 1;
 const PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES: usize = 2_000;
+const PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS: u64 = 401;
+const PUBLIC_SIDECAR_MINIMUM_PAIRED_RECORDINGS: u64 = 5;
 /// Predeclared minimum relative micro-DER reduction required on development.
 pub const PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.05;
 /// Predeclared relative change-F1 gain for the calibrated detector.
@@ -834,6 +841,8 @@ pub enum PublicCorpusSidecarGateFailure {
     PairBrier,
     PairCalibration,
     ChannelConfound,
+    SpeakerCountRegression,
+    PerformanceRegression,
     PairedDerUncertainty,
 }
 
@@ -848,7 +857,11 @@ pub struct PublicCorpusSidecarGatePolicy {
     pub maximum_pair_brier_score: f64,
     pub maximum_pair_expected_calibration_error: f64,
     pub maximum_channel_confound_rate: f64,
+    pub minimum_paired_recording_count: u64,
+    pub maximum_relative_rtf_regression: f64,
+    pub maximum_relative_rss_regression: f64,
     pub require_boundary_f1_non_regression: bool,
+    pub require_speaker_count_non_regression: bool,
     pub require_held_out_micro_der_non_regression: bool,
     pub require_nonpositive_paired_der_upper_bound: bool,
 }
@@ -935,8 +948,8 @@ pub struct PublicCorpusSidecarPairMetrics {
     pub comparison_count: u64,
     pub same_speaker_count: u64,
     pub different_speaker_count: u64,
-    pub mean_same_speaker_probability: Option<f64>,
-    pub mean_different_speaker_probability: Option<f64>,
+    pub mean_different_probability_given_same_speaker: Option<f64>,
+    pub mean_different_probability_given_different_speaker: Option<f64>,
     pub roc_auc: Option<f64>,
     pub brier_score: Option<f64>,
     pub expected_calibration_error: Option<f64>,
@@ -947,8 +960,15 @@ pub struct PublicCorpusSidecarPairMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicCorpusSidecarCoverage {
+    pub fusion_requested: bool,
+    pub evaluated_recording_count: u64,
+    pub fusion_requested_recording_count: u64,
+    pub fusion_executed_recording_count: u64,
     pub submitted_frame_count: u64,
     pub comparable_frame_count: u64,
+    pub calibrated_signal_count: u64,
+    pub consumed_probability_count: u64,
+    pub changed_boundary_probability_count: u64,
     pub comparable_frame_coverage: Option<f64>,
     pub component_comparison_count: u64,
     /// Canonical Voice, Channel, MixedAuxiliary order.
@@ -956,7 +976,13 @@ pub struct PublicCorpusSidecarCoverage {
     pub channel_confound_opportunity_count: u64,
     pub channel_confound_count: u64,
     pub channel_confound_rate: Option<f64>,
+    pub exact_speaker_count_rate_delta: Option<f64>,
+    pub mean_absolute_speaker_count_error_delta: Option<f64>,
+    pub dominant_collapse_count_delta: Option<i64>,
+    pub relative_rtf_regression: Option<f64>,
+    pub relative_rss_regression: Option<f64>,
     pub maximum_retained_signal_count: u64,
+    pub retained_signal_capacity: u64,
 }
 
 /// Exact operation counts and bounded memory payloads reported by the kernels.
@@ -988,7 +1014,8 @@ pub struct PublicCorpusSidecarPerformance {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicCorpusSidecarPairedUncertainty {
-    pub paired_recording_count: u64,
+    pub paired_der_recording_count: u64,
+    pub paired_jer_recording_count: u64,
     pub bootstrap_replicates: usize,
     pub bootstrap_seed_sha256: String,
     pub mean_der_delta: Option<f64>,
@@ -1120,6 +1147,17 @@ struct PublicCorpusSidecarSelectionFingerprint<'a> {
     policy_id: &'a str,
     lane_order: &'a [PublicCorpusSidecarLane],
     gate_policy: &'a PublicCorpusSidecarGatePolicy,
+}
+
+#[derive(Serialize)]
+struct PublicCorpusSidecarBootstrapSeedFingerprint<'a> {
+    uncertainty_id: &'a str,
+    descriptor_sha256: &'a str,
+    lane: PublicCorpusSidecarLane,
+    split: EvaluationSplit,
+    baseline_recording_count: usize,
+    candidate_recording_count: usize,
+    replicates: usize,
 }
 
 #[derive(Serialize)]
@@ -1371,6 +1409,20 @@ pub fn parse_public_corpus_ablation_evidence(
     Ok(evidence)
 }
 
+/// Parse and fully validate aggregate-only acoustic-sidecar evidence.
+pub fn parse_public_corpus_sidecar_study_evidence(
+    bytes: &[u8],
+) -> FwResult<PublicCorpusSidecarStudyEvidence> {
+    let evidence = serde_json::from_slice(bytes).map_err(|_| {
+        public_corpus_error(
+            "sidecar_study_json",
+            "sidecar study evidence must be valid JSON without trailing data",
+        )
+    })?;
+    verify_public_corpus_sidecar_study_evidence(&evidence)?;
+    Ok(evidence)
+}
+
 /// Verify schemas, hashes, scorer documents, ordering, and leakage evidence.
 pub fn verify_public_corpus_bundle(bundle: &PublicCorpusBundle) -> FwResult<()> {
     if bundle.schema_version != PUBLIC_CORPUS_BUNDLE_SCHEMA_VERSION {
@@ -1532,6 +1584,99 @@ pub fn verify_public_corpus_bundle(bundle: &PublicCorpusBundle) -> FwResult<()> 
     Ok(())
 }
 
+fn validate_public_corpus_descriptor_metadata(
+    descriptor: &PublicCorpusInput,
+    registry_entry: &PublicCorpusRegistryEntry,
+) -> FwResult<()> {
+    let mut recording_ids = BTreeSet::new();
+    let mut manifest_recordings = Vec::with_capacity(descriptor.recordings.len());
+    for recording in &descriptor.recordings {
+        validate_public_id(&recording.recording_id, "recording_id")?;
+        if !recording_ids.insert(recording.recording_id.clone()) {
+            return Err(public_corpus_error(
+                "duplicate_recording",
+                "descriptor recording IDs must be unique",
+            ));
+        }
+        validate_public_id(&recording.origin_recording_id, "origin_recording_id")?;
+        validate_split(
+            registry_entry.split_policy,
+            &recording.recording_id,
+            recording.split,
+        )?;
+        validate_sha256(&recording.audio_sha256, "audio_sha256")?;
+        validate_sha256(&recording.annotation_sha256, "annotation_sha256")?;
+        validate_relative_path_syntax(&recording.audio_path, "audio")?;
+        validate_relative_path_syntax(&recording.annotation_path, "annotation")?;
+        match (
+            recording.word_annotation_path.as_ref(),
+            recording.word_annotation_sha256.as_ref(),
+        ) {
+            (Some(path), Some(hash)) => {
+                validate_relative_path_syntax(path, "word_annotation")?;
+                validate_sha256(hash, "word_annotation_sha256")?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(public_corpus_error(
+                    "word_annotation_pair",
+                    "word_annotation_path and word_annotation_sha256 must be supplied together",
+                ));
+            }
+        }
+        if recording.expected_sample_rate_hz == 0
+            || recording.expected_channel_count == 0
+            || recording.selected_channel == 0
+            || recording.selected_channel > recording.expected_channel_count
+        {
+            return Err(public_corpus_error(
+                "audio_contract",
+                "expected sample-rate and channel geometry is invalid",
+            ));
+        }
+        validate_public_id(
+            &recording.annotation_recording_id,
+            "annotation_recording_id",
+        )?;
+        validate_rttm_channel(&recording.annotation_channel)?;
+        validate_speaker_map(&recording.speaker_map)?;
+        let speaker_refs = recording
+            .speaker_map
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut derived_from_recording_ids = recording.derived_from_recording_ids.clone();
+        let mut enrollment_recording_ids = recording.enrollment_recording_ids.clone();
+        derived_from_recording_ids.sort();
+        enrollment_recording_ids.sort();
+        manifest_recordings.push(crate::diarization::CorpusRecordingManifest {
+            recording_id: recording.recording_id.clone(),
+            split: recording.split,
+            origin_recording_id: recording.origin_recording_id.clone(),
+            speaker_refs,
+            derived_from_recording_ids,
+            augmentation_group_id: recording.augmentation_group_id.clone(),
+            enrollment_recording_ids,
+        });
+    }
+    let manifest = DiarizationCorpusManifest {
+        schema_version: DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION.to_owned(),
+        corpus_id: descriptor.corpus_key.clone(),
+        license_id: registry_entry.license_id.clone(),
+        recordings: manifest_recordings,
+    };
+    parse_diarization_corpus_manifest(&serde_json::to_vec(&manifest)?)?;
+    if !audit_diarization_manifest(&manifest)?.passed {
+        return Err(public_corpus_error(
+            "split_leakage",
+            "descriptor metadata violates the frozen cross-split leakage contract",
+        ));
+    }
+    Ok(())
+}
+
 /// Build one path-free bundle from external WAV and RTTM inputs.
 ///
 /// The output is opened with `create_new`, and all source/output roots must be
@@ -1560,6 +1705,31 @@ pub fn build_public_corpus_bundle_with_cancel(
     descriptor_path: &Path,
     output_path: &Path,
     license_acknowledgement_id: &str,
+    is_cancelled: impl FnMut() -> bool,
+) -> FwResult<PublicCorpusBundle> {
+    build_public_corpus_bundle_for_split_with_cancel(
+        project_root,
+        input_root,
+        descriptor_path,
+        output_path,
+        license_acknowledgement_id,
+        None,
+        is_cancelled,
+    )
+}
+
+/// Sidecar-only materialization seam. Descriptor metadata for every split is
+/// validated up front, but only `selected_split` media and annotations are
+/// opened. Passing `None` preserves the public bundle adapter's original
+/// all-split behavior and bytes.
+#[allow(clippy::too_many_arguments)]
+fn build_public_corpus_bundle_for_split_with_cancel(
+    project_root: &Path,
+    input_root: &Path,
+    descriptor_path: &Path,
+    output_path: &Path,
+    license_acknowledgement_id: &str,
+    selected_split: Option<EvaluationSplit>,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> FwResult<PublicCorpusBundle> {
     checkpoint_cancelled(&mut is_cancelled)?;
@@ -1619,6 +1789,20 @@ pub fn build_public_corpus_bundle_with_cancel(
     descriptor
         .recordings
         .sort_by(|left, right| left.recording_id.cmp(&right.recording_id));
+    if selected_split.is_some() {
+        validate_public_corpus_descriptor_metadata(&descriptor, registry_entry)?;
+    }
+    if let Some(selected_split) = selected_split {
+        descriptor
+            .recordings
+            .retain(|recording| recording.split == selected_split);
+        if descriptor.recordings.is_empty() {
+            return Err(public_corpus_error(
+                "sidecar_split_missing",
+                "the selected evaluation stage has no recording in the descriptor",
+            ));
+        }
+    }
 
     let mut recording_ids = BTreeSet::new();
     let mut references = Vec::with_capacity(descriptor.recordings.len());
@@ -2580,6 +2764,1790 @@ fn evaluate_public_variant(
         ));
     }
     Ok(splits)
+}
+
+#[derive(Clone, Copy, Default)]
+struct SidecarReliabilityAccumulator {
+    observation_count: u64,
+    positive_count: u64,
+    probability_sum: f64,
+}
+
+struct SidecarProbabilityAccumulator {
+    observation_count: u64,
+    positive_count: u64,
+    probability_sum: f64,
+    negative_probability_sum: f64,
+    positive_probability_sum: f64,
+    brier_sum: f64,
+    reliability: Vec<SidecarReliabilityAccumulator>,
+}
+
+impl SidecarProbabilityAccumulator {
+    fn new() -> Self {
+        Self {
+            observation_count: 0,
+            positive_count: 0,
+            probability_sum: 0.0,
+            negative_probability_sum: 0.0,
+            positive_probability_sum: 0.0,
+            brier_sum: 0.0,
+            reliability: vec![
+                SidecarReliabilityAccumulator::default();
+                PUBLIC_SIDECAR_RELIABILITY_BINS
+            ],
+        }
+    }
+
+    fn push(&mut self, probability: f64, positive: bool) -> FwResult<()> {
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            return Err(public_corpus_error(
+                "sidecar_probability",
+                "sidecar probability must be finite and within [0, 1]",
+            ));
+        }
+        self.observation_count = self.observation_count.checked_add(1).ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "sidecar probability observation count overflowed",
+            )
+        })?;
+        self.positive_count = self
+            .positive_count
+            .checked_add(u64::from(positive))
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    "sidecar positive observation count overflowed",
+                )
+            })?;
+        self.probability_sum += probability;
+        if positive {
+            self.positive_probability_sum += probability;
+        } else {
+            self.negative_probability_sum += probability;
+        }
+        let target = f64::from(positive);
+        self.brier_sum += (probability - target).powi(2);
+        let bin = ((probability * PUBLIC_SIDECAR_RELIABILITY_BINS as f64).floor() as usize)
+            .min(PUBLIC_SIDECAR_RELIABILITY_BINS - 1);
+        let reliability = &mut self.reliability[bin];
+        reliability.observation_count = reliability.observation_count.saturating_add(1);
+        reliability.positive_count = reliability
+            .positive_count
+            .saturating_add(u64::from(positive));
+        reliability.probability_sum += probability;
+        Ok(())
+    }
+
+    fn finish_reliability(&self) -> (Option<f64>, Option<f64>, Vec<PublicCorpusSidecarReliabilityBin>) {
+        let mut ece = 0.0;
+        let reliability = self
+            .reliability
+            .iter()
+            .enumerate()
+            .map(|(index, bin)| {
+                let mean_probability =
+                    positive_ratio(bin.probability_sum, bin.observation_count as f64);
+                let empirical_frequency = ratio(bin.positive_count, bin.observation_count);
+                if let (Some(mean), Some(empirical)) = (mean_probability, empirical_frequency) {
+                    ece += bin.observation_count as f64 / self.observation_count.max(1) as f64
+                        * (mean - empirical).abs();
+                }
+                PublicCorpusSidecarReliabilityBin {
+                    index,
+                    lower_probability: canonical_evidence_number(
+                        index as f64 / PUBLIC_SIDECAR_RELIABILITY_BINS as f64,
+                    ),
+                    upper_probability: canonical_evidence_number(
+                        (index + 1) as f64 / PUBLIC_SIDECAR_RELIABILITY_BINS as f64,
+                    ),
+                    observation_count: bin.observation_count,
+                    positive_count: bin.positive_count,
+                    mean_probability,
+                    empirical_frequency,
+                }
+            })
+            .collect();
+        (
+            positive_ratio(self.brier_sum, self.observation_count as f64),
+            (self.observation_count > 0).then(|| canonical_evidence_number(ece)),
+            reliability,
+        )
+    }
+}
+
+struct SidecarPairAccumulator {
+    probabilities: SidecarProbabilityAccumulator,
+    same_score_bins: Vec<u64>,
+    different_score_bins: Vec<u64>,
+}
+
+impl SidecarPairAccumulator {
+    fn new() -> Self {
+        Self {
+            probabilities: SidecarProbabilityAccumulator::new(),
+            same_score_bins: vec![0; PUBLIC_SIDECAR_PAIR_SCORE_BINS],
+            different_score_bins: vec![0; PUBLIC_SIDECAR_PAIR_SCORE_BINS],
+        }
+    }
+
+    fn push(&mut self, probability: f64, different_speaker: bool) -> FwResult<()> {
+        self.probabilities.push(probability, different_speaker)?;
+        let bin = ((probability * PUBLIC_SIDECAR_PAIR_SCORE_BINS as f64).floor() as usize)
+            .min(PUBLIC_SIDECAR_PAIR_SCORE_BINS - 1);
+        if different_speaker {
+            self.different_score_bins[bin] = self.different_score_bins[bin].saturating_add(1);
+        } else {
+            self.same_score_bins[bin] = self.same_score_bins[bin].saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> PublicCorpusSidecarPairMetrics {
+        let same_speaker_count = self
+            .probabilities
+            .observation_count
+            .saturating_sub(self.probabilities.positive_count);
+        let different_speaker_count = self.probabilities.positive_count;
+        let roc_auc = if same_speaker_count > 0 && different_speaker_count > 0 {
+            let mut lower_same = 0_u64;
+            let mut concordance = 0.0;
+            for (&same, &different) in self
+                .same_score_bins
+                .iter()
+                .zip(&self.different_score_bins)
+            {
+                concordance += different as f64 * (lower_same as f64 + 0.5 * same as f64);
+                lower_same = lower_same.saturating_add(same);
+            }
+            Some(canonical_evidence_number(
+                concordance / (same_speaker_count as f64 * different_speaker_count as f64),
+            ))
+        } else {
+            None
+        };
+        let (brier_score, expected_calibration_error, reliability) =
+            self.probabilities.finish_reliability();
+        PublicCorpusSidecarPairMetrics {
+            comparison_count: self.probabilities.observation_count,
+            same_speaker_count,
+            different_speaker_count,
+            mean_different_probability_given_same_speaker: positive_ratio(
+                self.probabilities.negative_probability_sum,
+                same_speaker_count as f64,
+            ),
+            mean_different_probability_given_different_speaker: positive_ratio(
+                self.probabilities.positive_probability_sum,
+                different_speaker_count as f64,
+            ),
+            roc_auc,
+            brier_score,
+            expected_calibration_error,
+            reliability,
+        }
+    }
+}
+
+struct SidecarObservationAccumulator {
+    boundary_probabilities: SidecarProbabilityAccumulator,
+    pairs: SidecarPairAccumulator,
+    submitted_frame_count: u64,
+    comparable_frame_count: u64,
+    component_comparison_count: u64,
+    owner_available_frame_counts: [u64; 3],
+    channel_confound_opportunity_count: u64,
+    channel_confound_count: u64,
+}
+
+impl SidecarObservationAccumulator {
+    fn new() -> Self {
+        Self {
+            boundary_probabilities: SidecarProbabilityAccumulator::new(),
+            pairs: SidecarPairAccumulator::new(),
+            submitted_frame_count: 0,
+            comparable_frame_count: 0,
+            component_comparison_count: 0,
+            owner_available_frame_counts: [0; 3],
+            channel_confound_opportunity_count: 0,
+            channel_confound_count: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SidecarOperationsAccumulator {
+    fusion_requested: bool,
+    fusion_executed: bool,
+    evaluated_recording_count: u64,
+    fusion_requested_recording_count: u64,
+    fusion_executed_recording_count: u64,
+    submitted_frame_count: u64,
+    comparable_frame_count: u64,
+    calibrated_signal_count: u64,
+    consumed_probability_count: u64,
+    changed_boundary_probability_count: u64,
+    maximum_retained_signal_count: u64,
+    retained_signal_capacity: u64,
+    frame_wavelet_filter_tap_terms: u64,
+    trajectory_wavelet_filter_tap_terms: u64,
+    trajectory_validity_sample_visits: u64,
+    scattering_filter_sample_terms: u64,
+    scattering_validity_sample_visits: u64,
+    modulation_projection_sample_frequency_visits: u64,
+    peak_scratch_buffer_payload_bytes: u64,
+    peak_retained_state_bytes_on_target: u64,
+    cached_twiddle_payload_bytes: u64,
+    expected_sidecar_configuration_sha256: Option<String>,
+    expected_fusion_configuration_sha256: Option<String>,
+}
+
+impl SidecarOperationsAccumulator {
+    fn push(&mut self, evidence: &AcousticSidecarFusionEvaluationEvidence) -> FwResult<()> {
+        let checked_usize = |value: usize, field: &str| {
+            u64::try_from(value).map_err(|_| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    &format!("{field} exceeds the retained u64 range"),
+                )
+            })
+        };
+        let checked_add = |total: &mut u64, value: u64, field: &str| -> FwResult<()> {
+            *total = total.checked_add(value).ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    &format!("{field} aggregate overflowed"),
+                )
+            })?;
+            Ok(())
+        };
+        self.fusion_requested |= evidence.fusion_requested;
+        self.fusion_executed |= evidence.fusion_executed;
+        self.evaluated_recording_count = self.evaluated_recording_count.saturating_add(1);
+        self.fusion_requested_recording_count = self
+            .fusion_requested_recording_count
+            .saturating_add(u64::from(evidence.fusion_requested));
+        self.fusion_executed_recording_count = self
+            .fusion_executed_recording_count
+            .saturating_add(u64::from(evidence.fusion_executed));
+        checked_add(
+            &mut self.submitted_frame_count,
+            checked_usize(evidence.submitted_frame_count, "submitted frame count")?,
+            "submitted frame count",
+        )?;
+        checked_add(
+            &mut self.comparable_frame_count,
+            checked_usize(evidence.comparable_frame_count, "comparable frame count")?,
+            "comparable frame count",
+        )?;
+        checked_add(
+            &mut self.calibrated_signal_count,
+            checked_usize(evidence.calibrated_signal_count, "calibrated signal count")?,
+            "calibrated signal count",
+        )?;
+        checked_add(
+            &mut self.consumed_probability_count,
+            checked_usize(evidence.consumed_probability_count, "consumed probability count")?,
+            "consumed probability count",
+        )?;
+        checked_add(
+            &mut self.changed_boundary_probability_count,
+            checked_usize(
+                evidence.changed_boundary_probability_count,
+                "changed boundary probability count",
+            )?,
+            "changed boundary probability count",
+        )?;
+        self.maximum_retained_signal_count = self.maximum_retained_signal_count.max(
+            checked_usize(evidence.maximum_retained_signals, "maximum retained signal count")?,
+        );
+        self.retained_signal_capacity = self.retained_signal_capacity.max(checked_usize(
+            evidence.retained_signal_capacity,
+            "retained signal capacity",
+        )?);
+        for (total, value, field) in [
+            (
+                &mut self.frame_wavelet_filter_tap_terms,
+                evidence.frame_wavelet_filter_tap_terms,
+                "frame wavelet terms",
+            ),
+            (
+                &mut self.trajectory_wavelet_filter_tap_terms,
+                evidence.trajectory_wavelet_filter_tap_terms,
+                "trajectory wavelet terms",
+            ),
+            (
+                &mut self.trajectory_validity_sample_visits,
+                evidence.trajectory_validity_sample_visits,
+                "trajectory validity visits",
+            ),
+            (
+                &mut self.scattering_filter_sample_terms,
+                evidence.scattering_filter_sample_terms,
+                "scattering filter terms",
+            ),
+            (
+                &mut self.scattering_validity_sample_visits,
+                evidence.scattering_validity_sample_visits,
+                "scattering validity visits",
+            ),
+            (
+                &mut self.modulation_projection_sample_frequency_visits,
+                evidence.modulation_projection_sample_frequency_visits,
+                "modulation projection visits",
+            ),
+        ] {
+            checked_add(total, value, field)?;
+        }
+        self.peak_scratch_buffer_payload_bytes = self.peak_scratch_buffer_payload_bytes.max(
+            checked_usize(
+                evidence.peak_scratch_buffer_payload_bytes,
+                "peak scratch payload",
+            )?,
+        );
+        self.peak_retained_state_bytes_on_target = self.peak_retained_state_bytes_on_target.max(
+            checked_usize(
+                evidence.peak_retained_state_bytes_on_target,
+                "peak retained payload",
+            )?,
+        );
+        self.cached_twiddle_payload_bytes = self.cached_twiddle_payload_bytes.max(checked_usize(
+            evidence.cached_twiddle_payload_bytes,
+            "cached twiddle payload",
+        )?);
+        for (expected, actual, field) in [
+            (
+                &mut self.expected_sidecar_configuration_sha256,
+                evidence.sidecar_configuration_sha256.as_ref(),
+                "sidecar configuration",
+            ),
+            (
+                &mut self.expected_fusion_configuration_sha256,
+                evidence.fusion_configuration_sha256.as_ref(),
+                "fusion configuration",
+            ),
+        ] {
+            if let Some(actual) = actual {
+                if expected.as_ref().is_some_and(|expected| expected != actual) {
+                    return Err(public_corpus_error(
+                        "sidecar_configuration_drift",
+                        &format!("{field} changed across recordings"),
+                    ));
+                }
+                *expected = Some(actual.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn operations(&self) -> PublicCorpusSidecarOperations {
+        PublicCorpusSidecarOperations {
+            frame_wavelet_filter_tap_terms: self.frame_wavelet_filter_tap_terms,
+            trajectory_wavelet_filter_tap_terms: self.trajectory_wavelet_filter_tap_terms,
+            trajectory_validity_sample_visits: self.trajectory_validity_sample_visits,
+            scattering_filter_sample_terms: self.scattering_filter_sample_terms,
+            scattering_validity_sample_visits: self.scattering_validity_sample_visits,
+            modulation_projection_sample_frequency_visits: self
+                .modulation_projection_sample_frequency_visits,
+            peak_scratch_buffer_payload_bytes: self.peak_scratch_buffer_payload_bytes,
+            peak_retained_state_bytes_on_target: self.peak_retained_state_bytes_on_target,
+            cached_twiddle_payload_bytes: self.cached_twiddle_payload_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SidecarRecordingAccuracy {
+    der: Option<f64>,
+    jer: Option<f64>,
+}
+
+struct SidecarLaneEvaluation {
+    split: PublicCorpusSidecarStudySplit,
+    recording_accuracy: Vec<SidecarRecordingAccuracy>,
+}
+
+struct SidecarRingEntry {
+    frame_index: usize,
+    observation: AcousticSidecarStudyObservation,
+}
+
+fn public_sidecar_probability(
+    calibration: &PublicCorpusSidecarCalibration,
+    contrast: crate::diarization::AcousticSidecarOwnerContrast,
+) -> FwResult<Option<f64>> {
+    acoustic_sidecar_calibrate_owner_contrast(
+        contrast,
+        AcousticSidecarFusionCalibration {
+            logit_intercept: calibration.logit_intercept as f32,
+            contrast_weight: calibration.contrast_weight as f32,
+            minimum_comparable_components: calibration.minimum_comparable_components,
+        },
+    )
+    .map(|evidence| evidence.map(|evidence| f64::from(evidence.probability)))
+}
+
+fn maximum_available_sidecar_contrast(
+    contrast: &crate::diarization::AcousticSidecarOwnerContrast,
+) -> Option<f64> {
+    contrast
+        .owner_contrast
+        .iter()
+        .zip(contrast.owner_available)
+        .filter_map(|(&value, available)| available.then_some(f64::from(value)))
+        .max_by(f64::total_cmp)
+}
+
+fn reference_speaker_at_ms(
+    reference: &DiarizationReferenceDocument,
+    timestamp_ms: u64,
+) -> Option<&str> {
+    if reference
+        .ignored_regions
+        .iter()
+        .any(|region| region.start_ms <= timestamp_ms && timestamp_ms < region.end_ms)
+    {
+        return None;
+    }
+    let mut speaker = None;
+    for turn in &reference.turns {
+        if turn.start_ms <= timestamp_ms && timestamp_ms < turn.end_ms {
+            let current = turn.speaker.as_deref()?;
+            if speaker.is_some_and(|speaker| speaker != current) {
+                return None;
+            }
+            speaker = Some(current);
+        }
+    }
+    speaker
+}
+
+fn boundary_label_at_ms(
+    reference: &DiarizationReferenceDocument,
+    reference_changes: &[u64],
+    timestamp_ms: u64,
+) -> Option<bool> {
+    if reference
+        .ignored_regions
+        .iter()
+        .any(|region| region.start_ms <= timestamp_ms && timestamp_ms < region.end_ms)
+    {
+        return None;
+    }
+    if reference_changes
+        .iter()
+        .any(|change| change.abs_diff(timestamp_ms) <= PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS)
+    {
+        return Some(true);
+    }
+    reference_speaker_at_ms(reference, timestamp_ms).map(|_| false)
+}
+
+fn analyze_sidecar_observations(
+    samples: &[f32],
+    reference: &DiarizationReferenceDocument,
+    study_config: AcousticSidecarStudyConfig,
+    calibration: &PublicCorpusSidecarCalibration,
+    aggregate: &mut SidecarObservationAccumulator,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<()> {
+    let mut study = AcousticSidecarStudy::new(study_config)?;
+    let mut previous = None;
+    let mut ring = VecDeque::<SidecarRingEntry>::with_capacity(
+        PUBLIC_SIDECAR_PAIR_LAGS_FRAMES[PUBLIC_SIDECAR_PAIR_LAGS_FRAMES.len() - 1] + 1,
+    );
+    let reference_changes =
+        speaker_change_points_ms(&reference.turns, reference.duration_ms, true)?;
+    let mut pair_count = 0_usize;
+    extract_acoustic_features_with_frames(
+        samples,
+        &mut *is_cancelled,
+        |frame_samples, frame, is_cancelled| {
+            let observation =
+                study.observe_normalized_16khz_frame(frame_samples, &frame, is_cancelled)?;
+            aggregate.submitted_frame_count = aggregate
+                .submitted_frame_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_aggregate_overflow",
+                        "sidecar analysis frame count overflowed",
+                    )
+                })?;
+            if let Some(previous) = previous.as_ref() {
+                let contrast =
+                    acoustic_sidecar_observation_owner_contrast(previous, &observation)?;
+                aggregate.component_comparison_count = aggregate
+                    .component_comparison_count
+                    .checked_add(u64::try_from(contrast.component_comparisons).unwrap_or(u64::MAX))
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_aggregate_overflow",
+                            "sidecar component comparison count overflowed",
+                        )
+                    })?;
+                if contrast.comparable_components > 0 {
+                    aggregate.comparable_frame_count = aggregate
+                        .comparable_frame_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            public_corpus_error(
+                                "sidecar_aggregate_overflow",
+                                "sidecar comparable frame count overflowed",
+                            )
+                        })?;
+                }
+                for (count, available) in aggregate
+                    .owner_available_frame_counts
+                    .iter_mut()
+                    .zip(contrast.owner_available)
+                {
+                    *count = count.saturating_add(u64::from(available));
+                }
+                if contrast.comparable_components >= calibration.minimum_comparable_components
+                    && let Some(probability) = public_sidecar_probability(calibration, contrast)?
+                {
+                    let timestamp_ms = u64::try_from(frame.frame_index)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(10);
+                    if let Some(positive) =
+                        boundary_label_at_ms(reference, &reference_changes, timestamp_ms)
+                    {
+                        aggregate.boundary_probabilities.push(probability, positive)?;
+                    }
+                }
+            }
+
+            if pair_count < PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING {
+                for lag in PUBLIC_SIDECAR_PAIR_LAGS_FRAMES {
+                    if pair_count >= PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING {
+                        break;
+                    }
+                    let Some(expected_frame) = frame.frame_index.checked_sub(lag) else {
+                        continue;
+                    };
+                    let Some(left) = ring
+                        .iter()
+                        .find(|entry| entry.frame_index == expected_frame)
+                    else {
+                        continue;
+                    };
+                    let left_ms = u64::try_from(left.frame_index)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(10);
+                    let right_ms = u64::try_from(frame.frame_index)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(10);
+                    let (Some(left_speaker), Some(right_speaker)) = (
+                        reference_speaker_at_ms(reference, left_ms),
+                        reference_speaker_at_ms(reference, right_ms),
+                    ) else {
+                        continue;
+                    };
+                    let contrast = acoustic_sidecar_observation_owner_contrast(
+                        &left.observation,
+                        &observation,
+                    )?;
+                    if contrast.comparable_components < calibration.minimum_comparable_components {
+                        continue;
+                    }
+                    let Some(probability) = public_sidecar_probability(calibration, contrast)? else {
+                        continue;
+                    };
+                    let different_speaker = left_speaker != right_speaker;
+                    aggregate.pairs.push(probability, different_speaker)?;
+                    pair_count += 1;
+                    if different_speaker
+                        && contrast.owner_available[0]
+                        && contrast.owner_available[1]
+                    {
+                        aggregate.channel_confound_opportunity_count = aggregate
+                            .channel_confound_opportunity_count
+                            .saturating_add(1);
+                        aggregate.channel_confound_count = aggregate
+                            .channel_confound_count
+                            .saturating_add(u64::from(
+                                contrast.owner_contrast[1] > contrast.owner_contrast[0],
+                            ));
+                    }
+                }
+            }
+            previous = Some(observation);
+            ring.push_back(SidecarRingEntry {
+                frame_index: frame.frame_index,
+                observation,
+            });
+            let maximum_lag =
+                PUBLIC_SIDECAR_PAIR_LAGS_FRAMES[PUBLIC_SIDECAR_PAIR_LAGS_FRAMES.len() - 1];
+            while ring.front().is_some_and(|entry| {
+                frame.frame_index.saturating_sub(entry.frame_index) > maximum_lag
+            }) {
+                ring.pop_front();
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+fn finish_sidecar_boundary_metrics(
+    probabilities: &SidecarProbabilityAccumulator,
+    pipeline: &PublicCorpusAblationSplit,
+) -> PublicCorpusSidecarBoundaryMetrics {
+    let (brier_score, expected_calibration_error, reliability) =
+        probabilities.finish_reliability();
+    PublicCorpusSidecarBoundaryMetrics {
+        reference_count: pipeline.change_reference_count,
+        hypothesis_count: pipeline.change_hypothesis_count,
+        matched_count: pipeline.change_matched_count,
+        precision: pipeline.change_precision,
+        recall: pipeline.change_recall,
+        f1: pipeline.change_f1,
+        mean_absolute_error_sec: pipeline.change_mean_absolute_error_sec,
+        probability_observation_count: probabilities.observation_count,
+        probability_positive_count: probabilities.positive_count,
+        brier_score,
+        expected_calibration_error,
+        reliability,
+    }
+}
+
+fn empty_sidecar_boundary_metrics(
+    pipeline: &PublicCorpusAblationSplit,
+) -> PublicCorpusSidecarBoundaryMetrics {
+    finish_sidecar_boundary_metrics(&SidecarProbabilityAccumulator::new(), pipeline)
+}
+
+struct SidecarCalibrationFitHistogram {
+    negative_counts: Vec<u64>,
+    positive_counts: Vec<u64>,
+}
+
+impl SidecarCalibrationFitHistogram {
+    fn new() -> Self {
+        Self {
+            negative_counts: vec![0; PUBLIC_SIDECAR_FIT_BINS],
+            positive_counts: vec![0; PUBLIC_SIDECAR_FIT_BINS],
+        }
+    }
+
+    fn push(&mut self, contrast: f64, positive: bool) -> FwResult<()> {
+        if !contrast.is_finite() || !(0.0..=1.0).contains(&contrast) {
+            return Err(public_corpus_error(
+                "sidecar_fit_contrast",
+                "calibration contrast must be finite and within [0, 1]",
+            ));
+        }
+        let bin = ((contrast * PUBLIC_SIDECAR_FIT_BINS as f64).floor() as usize)
+            .min(PUBLIC_SIDECAR_FIT_BINS - 1);
+        let target = if positive {
+            &mut self.positive_counts[bin]
+        } else {
+            &mut self.negative_counts[bin]
+        };
+        *target = target.checked_add(1).ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_fit_overflow",
+                "calibration histogram count overflowed",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn observation_count(&self) -> u64 {
+        self.negative_counts
+            .iter()
+            .chain(&self.positive_counts)
+            .copied()
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    fn positive_count(&self) -> u64 {
+        self.positive_counts
+            .iter()
+            .copied()
+            .fold(0_u64, u64::saturating_add)
+    }
+}
+
+fn fit_public_sidecar_calibration(
+    histogram: &SidecarCalibrationFitHistogram,
+) -> FwResult<Option<PublicCorpusSidecarCalibration>> {
+    let observation_count = histogram.observation_count();
+    let positive_count = histogram.positive_count();
+    let negative_count = observation_count.saturating_sub(positive_count);
+    if positive_count == 0 || negative_count == 0 {
+        return Ok(None);
+    }
+    let mut best = None::<(f64, f32, f32)>;
+    for intercept_step in -32_i32..=0 {
+        let intercept = intercept_step as f32 * 0.25;
+        for weight_step in 0_u32..=64 {
+            let weight = weight_step as f32 * 0.25;
+            let calibration = AcousticSidecarFusionCalibration {
+                logit_intercept: intercept,
+                contrast_weight: weight,
+                minimum_comparable_components: PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+            };
+            let mut positive_loss = 0.0;
+            let mut negative_loss = 0.0;
+            for index in 0..PUBLIC_SIDECAR_FIT_BINS {
+                let contrast_value =
+                    ((index as f64 + 0.5) / PUBLIC_SIDECAR_FIT_BINS as f64) as f32;
+                let contrast = crate::diarization::AcousticSidecarOwnerContrast {
+                    owner_contrast: [contrast_value, 0.0, 0.0],
+                    owner_available: [true, false, false],
+                    comparable_components: PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+                    component_comparisons: PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+                };
+                let probability = f64::from(
+                    acoustic_sidecar_calibrate_owner_contrast(contrast, calibration)?
+                        .ok_or_else(|| {
+                            public_corpus_error(
+                                "sidecar_fit_calibration",
+                                "valid fit contrast unexpectedly produced no probability",
+                            )
+                        })?
+                        .probability,
+                );
+                positive_loss -= histogram.positive_counts[index] as f64 * probability.ln();
+                negative_loss -=
+                    histogram.negative_counts[index] as f64 * (1.0 - probability).ln();
+            }
+            let balanced_loss = 0.5
+                * (positive_loss / positive_count as f64
+                    + negative_loss / negative_count as f64);
+            let candidate = (balanced_loss, intercept, weight);
+            if best.is_none_or(|best| {
+                candidate.0 < best.0
+                    || (candidate.0 == best.0
+                        && (candidate.2, candidate.1) < (best.2, best.1))
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    let (_, intercept, weight) = best.ok_or_else(|| {
+        public_corpus_error(
+            "sidecar_fit_calibration",
+            "calibration grid produced no finite candidate",
+        )
+    })?;
+    let fitted = AcousticSidecarFusionCalibration {
+        logit_intercept: intercept,
+        contrast_weight: weight,
+        minimum_comparable_components: PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+    };
+    let mut brier_sum = 0.0;
+    for index in 0..PUBLIC_SIDECAR_FIT_BINS {
+        let contrast_value =
+            ((index as f64 + 0.5) / PUBLIC_SIDECAR_FIT_BINS as f64) as f32;
+        let contrast = crate::diarization::AcousticSidecarOwnerContrast {
+            owner_contrast: [contrast_value, 0.0, 0.0],
+            owner_available: [true, false, false],
+            comparable_components: PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+            component_comparisons: PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+        };
+        let probability = f64::from(
+            acoustic_sidecar_calibrate_owner_contrast(contrast, fitted)?
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_fit_calibration",
+                        "valid fitted contrast unexpectedly produced no probability",
+                    )
+                })?
+                .probability,
+        );
+        brier_sum += histogram.positive_counts[index] as f64 * (1.0 - probability).powi(2)
+            + histogram.negative_counts[index] as f64 * probability.powi(2);
+    }
+    let mut calibration = PublicCorpusSidecarCalibration {
+        fit_id: PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION.to_owned(),
+        logit_intercept: f64::from(intercept),
+        contrast_weight: f64::from(weight),
+        minimum_comparable_components: PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+        fit_observation_count: observation_count,
+        fit_positive_count: positive_count,
+        fit_brier_score: positive_ratio(brier_sum, observation_count as f64),
+        calibration_sha256: String::new(),
+    };
+    calibration.calibration_sha256 = public_sidecar_calibration_sha256(&calibration)?;
+    Ok(Some(calibration))
+}
+
+fn public_sidecar_calibration_sha256(
+    calibration: &PublicCorpusSidecarCalibration,
+) -> FwResult<String> {
+    canonical_sha256(&PublicCorpusSidecarCalibrationFingerprint {
+        fit_id: &calibration.fit_id,
+        logit_intercept: calibration.logit_intercept,
+        contrast_weight: calibration.contrast_weight,
+        minimum_comparable_components: calibration.minimum_comparable_components,
+        fit_observation_count: calibration.fit_observation_count,
+        fit_positive_count: calibration.fit_positive_count,
+        fit_brier_score: calibration.fit_brier_score,
+    })
+}
+
+fn sidecar_evaluation_request(
+    lane: PublicCorpusSidecarLane,
+    calibration: &PublicCorpusSidecarCalibration,
+) -> FwResult<AcousticSidecarEvaluationRequest> {
+    if calibration.fit_id != PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION
+        || calibration.minimum_comparable_components == 0
+        || !calibration.logit_intercept.is_finite()
+        || !calibration.contrast_weight.is_finite()
+        || calibration.contrast_weight < 0.0
+        || f64::from(calibration.logit_intercept as f32) != calibration.logit_intercept
+        || f64::from(calibration.contrast_weight as f32) != calibration.contrast_weight
+        || public_sidecar_calibration_sha256(calibration)? != calibration.calibration_sha256
+    {
+        return Err(public_corpus_error(
+            "sidecar_calibration",
+            "sidecar calibration identity, bounds, or hash is invalid",
+        ));
+    }
+    if lane == PublicCorpusSidecarLane::FullV2Baseline {
+        return Err(public_corpus_error(
+            "sidecar_calibration",
+            "the unfused baseline cannot receive a sidecar calibration",
+        ));
+    }
+    Ok(AcousticSidecarEvaluationRequest {
+        study_config: lane.study_config(),
+        calibration: AcousticSidecarFusionCalibration {
+            logit_intercept: calibration.logit_intercept as f32,
+            contrast_weight: calibration.contrast_weight as f32,
+            minimum_comparable_components: calibration.minimum_comparable_components,
+        },
+    })
+}
+
+struct LoadedPublicSidecarRecording {
+    samples: Vec<f32>,
+    reference: DiarizationReferenceDocument,
+    boundary_hints: AcousticBoundaryHints,
+}
+
+fn load_public_sidecar_recording(
+    reference: &DiarizationReferenceDocument,
+    recording_evidence: &PublicCorpusRecordingEvidence,
+    input_recording: &PublicCorpusInputRecording,
+    canonical_input: &Path,
+    maximum_recording_duration_ms: Option<u64>,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<LoadedPublicSidecarRecording> {
+    if recording_evidence.sample_rate_hz != 16_000
+        || recording_evidence.channel_count != 1
+        || recording_evidence.selected_channel != 1
+    {
+        return Err(public_corpus_error(
+            "sidecar_audio_contract",
+            "the acoustic sidecar runner requires 16 kHz mono PCM WAV input",
+        ));
+    }
+    let audio_path =
+        canonical_relative_file(canonical_input, &input_recording.audio_path, "audio")?;
+    let audio_bytes = read_bounded(&audio_path, MAX_EVALUATION_AUDIO_BYTES, "sidecar_audio")?;
+    checkpoint_cancelled(is_cancelled)?;
+    if format!("{:x}", Sha256::digest(&audio_bytes)) != recording_evidence.audio_sha256 {
+        return Err(public_corpus_error(
+            "audio_changed",
+            "audio changed after bundle validation and before sidecar execution",
+        ));
+    }
+    let mut samples = crate::native_engine::decode::read_wav_16k_mono(&audio_bytes).map_err(|_| {
+        public_corpus_error(
+            "sidecar_audio_decode",
+            "one validated WAV could not be decoded as 16 kHz mono PCM",
+        )
+    })?;
+    checkpoint_cancelled(is_cancelled)?;
+    let available_duration_ms = u64::try_from(samples.len()).unwrap_or(u64::MAX) / 16;
+    let evaluation_duration_ms = maximum_recording_duration_ms.map_or(available_duration_ms, |max| {
+        max.min(available_duration_ms)
+    });
+    let clipped_reference = clipped_reference(reference, Some(evaluation_duration_ms))?;
+    let maximum_samples = usize::try_from(clipped_reference.duration_ms)
+        .ok()
+        .and_then(|duration_ms| duration_ms.checked_mul(16))
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_duration",
+                "clipped recording duration exceeds the supported sample range",
+            )
+        })?;
+    samples.truncate(maximum_samples);
+    let boundary_hints = AcousticBoundaryHints {
+        speech_regions_ms: merged_scored_speech_regions(
+            &clipped_reference.turns,
+            &clipped_reference.ignored_regions,
+        ),
+        ..AcousticBoundaryHints::default()
+    };
+    Ok(LoadedPublicSidecarRecording {
+        samples,
+        reference: clipped_reference,
+        boundary_hints,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_public_sidecar_lane(
+    bundle: &PublicCorpusBundle,
+    input_recordings: &BTreeMap<String, PublicCorpusInputRecording>,
+    canonical_input: &Path,
+    maximum_recording_duration_ms: Option<u64>,
+    lane: PublicCorpusSidecarLane,
+    target_split: EvaluationSplit,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<Option<PublicCorpusSidecarCalibration>> {
+    let mut histogram = SidecarCalibrationFitHistogram::new();
+    for ((reference, recording_evidence), manifest_recording) in bundle
+        .references
+        .iter()
+        .zip(&bundle.recordings)
+        .zip(&bundle.manifest.recordings)
+    {
+        if manifest_recording.split != target_split {
+            continue;
+        }
+        checkpoint_cancelled(is_cancelled)?;
+        let input_recording = input_recordings
+            .get(&reference.recording_id)
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_alignment",
+                    "validated recording is absent from the descriptor",
+                )
+            })?;
+        let loaded = load_public_sidecar_recording(
+            reference,
+            recording_evidence,
+            input_recording,
+            canonical_input,
+            maximum_recording_duration_ms,
+            is_cancelled,
+        )?;
+        let reference_changes = speaker_change_points_ms(
+            &loaded.reference.turns,
+            loaded.reference.duration_ms,
+            true,
+        )?;
+        let mut study = AcousticSidecarStudy::new(lane.study_config())?;
+        let mut previous = None;
+        extract_acoustic_features_with_frames(
+            &loaded.samples,
+            &mut *is_cancelled,
+            |frame_samples, frame, is_cancelled| {
+                let observation =
+                    study.observe_normalized_16khz_frame(frame_samples, &frame, is_cancelled)?;
+                if let Some(previous) = previous.as_ref() {
+                    let contrast =
+                        acoustic_sidecar_observation_owner_contrast(previous, &observation)?;
+                    if contrast.comparable_components >= PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS
+                        && let Some(maximum_contrast) =
+                            maximum_available_sidecar_contrast(&contrast)
+                    {
+                        let timestamp_ms = u64::try_from(frame.frame_index)
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(10);
+                        if let Some(positive) = boundary_label_at_ms(
+                            &loaded.reference,
+                            &reference_changes,
+                            timestamp_ms,
+                        ) {
+                            histogram.push(maximum_contrast, positive)?;
+                        }
+                    }
+                }
+                previous = Some(observation);
+                Ok(())
+            },
+        )?;
+    }
+    fit_public_sidecar_calibration(&histogram)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_public_sidecar_lane(
+    bundle: &PublicCorpusBundle,
+    input_recordings: &BTreeMap<String, PublicCorpusInputRecording>,
+    canonical_input: &Path,
+    maximum_recording_duration_ms: Option<u64>,
+    diarization_request: &DiarizationRequest,
+    scorer_config: &DiarizationScorerConfig,
+    lane: PublicCorpusSidecarLane,
+    calibration: Option<&PublicCorpusSidecarCalibration>,
+    detector_mode: AcousticChangeDetectorMode,
+    clustering_mode: AcousticClusteringMode,
+    target_split: EvaluationSplit,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<SidecarLaneEvaluation> {
+    let sidecar_request = match (lane, calibration) {
+        (PublicCorpusSidecarLane::FullV2Baseline, None) => None,
+        (PublicCorpusSidecarLane::FullV2Baseline, Some(_)) => {
+            return Err(public_corpus_error(
+                "sidecar_lane_configuration",
+                "the unfused baseline cannot receive a calibration",
+            ));
+        }
+        (_, Some(calibration)) => Some(sidecar_evaluation_request(lane, calibration)?),
+        (_, None) => {
+            return Err(public_corpus_error(
+                "sidecar_lane_configuration",
+                "every fused sidecar lane requires a locked calibration",
+            ));
+        }
+    };
+    let expected_sidecar_configuration_sha256 = sidecar_request
+        .map(|request| acoustic_sidecar_study_config_sha256(request.study_config))
+        .transpose()?;
+    let expected_fusion_configuration_sha256 = sidecar_request
+        .map(acoustic_sidecar_fusion_configuration_sha256)
+        .transpose()?;
+    let mut pipeline = PublicAblationAccumulator::default();
+    let mut observations = SidecarObservationAccumulator::new();
+    let mut operations = SidecarOperationsAccumulator::default();
+    let mut recording_accuracy = Vec::new();
+    let mut selected_recording_count = 0_u64;
+
+    for ((reference, recording_evidence), manifest_recording) in bundle
+        .references
+        .iter()
+        .zip(&bundle.recordings)
+        .zip(&bundle.manifest.recordings)
+    {
+        if manifest_recording.split != target_split {
+            continue;
+        }
+        selected_recording_count = selected_recording_count.checked_add(1).ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "selected recording count overflowed",
+            )
+        })?;
+        checkpoint_cancelled(is_cancelled)?;
+        let input_recording = input_recordings
+            .get(&reference.recording_id)
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_alignment",
+                    "validated recording is absent from the descriptor",
+                )
+            })?;
+        let loaded = load_public_sidecar_recording(
+            reference,
+            recording_evidence,
+            input_recording,
+            canonical_input,
+            maximum_recording_duration_ms,
+            is_cancelled,
+        )?;
+        let started = Instant::now();
+        let (
+            report_turns,
+            speaker_count_estimate,
+            detector_changes,
+            evaluated_changes,
+            clustering_evidence,
+            sidecar_evidence,
+        ) = if loaded.boundary_hints.speech_regions_ms.is_empty() {
+            checkpoint_cancelled(is_cancelled)?;
+            let sidecar_evidence = sidecar_request.map_or_else(
+                AcousticSidecarFusionEvaluationEvidence::default,
+                |request| AcousticSidecarFusionEvaluationEvidence {
+                    fusion_requested: true,
+                    fusion_configuration_sha256: expected_fusion_configuration_sha256.clone(),
+                    sidecar_configuration_sha256: expected_sidecar_configuration_sha256.clone(),
+                    ..AcousticSidecarFusionEvaluationEvidence::default()
+                },
+            );
+            (
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                AcousticClusteringEvaluationEvidence {
+                    requested_mode: clustering_mode,
+                    executed_mode: AcousticClusteringMode::FixedSafeV1,
+                    fallback_reason: None,
+                    speaker_count_stability: 0.0,
+                },
+                sidecar_evidence,
+            )
+        } else {
+            let input_sha256 = hash_pcm_prefix(&loaded.samples);
+            let (report, _, change_evidence, clustering_evidence, sidecar_evidence) =
+                diarize_acoustic_pcm_with_sidecar_evidence(
+                    AcousticDiarizationInput {
+                        samples: &loaded.samples,
+                        normalized_input_sha256: &input_sha256,
+                        segments: &[],
+                        word_aligned: false,
+                        request: diarization_request,
+                        boundary_hints: &loaded.boundary_hints,
+                    },
+                    detector_mode,
+                    clustering_mode,
+                    sidecar_request,
+                    &mut *is_cancelled,
+                )?;
+            let detector_changes = change_evidence
+                .emitted
+                .iter()
+                .filter(|evidence| {
+                    !evidence.vad_boundary
+                        && !evidence.supervised_boundary
+                        && evidence.boundary_ms > 0
+                        && evidence.boundary_ms < loaded.reference.duration_ms
+                })
+                .map(|evidence| ChangeProbabilityObservation {
+                    boundary_ms: evidence.boundary_ms,
+                    probability: f64::from(evidence.change_probability),
+                })
+                .collect();
+            (
+                report.turns,
+                report.speaker_count.estimate,
+                detector_changes,
+                change_evidence.evaluated,
+                clustering_evidence,
+                sidecar_evidence,
+            )
+        };
+        let wall_time_ms = u64::try_from(started.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let peak_rss_bytes = sampled_process_rss_bytes();
+        if let Some(calibration) = calibration
+            && !loaded.boundary_hints.speech_regions_ms.is_empty()
+        {
+            analyze_sidecar_observations(
+                &loaded.samples,
+                &loaded.reference,
+                lane.study_config(),
+                calibration,
+                &mut observations,
+                is_cancelled,
+            )?;
+        }
+        operations.push(&sidecar_evidence)?;
+        let hypothesis = DiarizationHypothesisDocument {
+            schema_version: DIARIZATION_HYPOTHESIS_SCHEMA_VERSION.to_owned(),
+            recording_id: loaded.reference.recording_id.clone(),
+            duration_ms: loaded.reference.duration_ms,
+            turns: report_turns
+                .into_iter()
+                .map(|turn| EvaluationTurn {
+                    start_ms: turn.start_ms,
+                    end_ms: turn.end_ms.min(loaded.reference.duration_ms),
+                    speaker: turn.speaker_ref,
+                    speaker_confidence: turn.speaker_confidence,
+                    overlap_suspected: turn.overlap_suspected,
+                })
+                .filter(|turn| turn.end_ms > turn.start_ms)
+                .collect(),
+            speaker_count_estimate,
+            performance: Some(EvaluationPerformanceObservation {
+                audio_duration_ms: loaded.reference.duration_ms,
+                wall_time_ms,
+                peak_rss_bytes,
+            }),
+        };
+        let score = score_diarization_documents(&loaded.reference, &hypothesis, scorer_config)?;
+        let reference_changes = speaker_change_points_ms(
+            &loaded.reference.turns,
+            loaded.reference.duration_ms,
+            true,
+        )?;
+        let detector_change_score = score_change_points(
+            &reference_changes
+                .iter()
+                .map(|timestamp| *timestamp as f64 / 1_000.0)
+                .collect::<Vec<_>>(),
+            &detector_changes
+                .iter()
+                .map(|observation| observation.boundary_ms as f64 / 1_000.0)
+                .collect::<Vec<_>>(),
+            scorer_config.change_boundary_collar_ms as f64 / 1_000.0,
+        )?;
+        let detector_change_ms = detector_changes
+            .iter()
+            .map(|observation| observation.boundary_ms)
+            .collect::<Vec<_>>();
+        let change_collar_metrics = PUBLIC_CHANGE_DIAGNOSTIC_COLLARS_MS
+            .iter()
+            .map(|&collar_ms| {
+                score_change_metric_observation(
+                    &reference_changes,
+                    &detector_change_ms,
+                    collar_ms,
+                    collar_ms as f64,
+                )
+            })
+            .collect::<FwResult<Vec<_>>>()?;
+        let change_threshold_sweep = PUBLIC_CHANGE_THRESHOLD_SWEEP
+            .iter()
+            .map(|&threshold| {
+                let selected =
+                    select_acoustic_change_evidence_at_threshold(&evaluated_changes, threshold as f32)?;
+                let hypothesis_ms = selected
+                    .into_iter()
+                    .filter_map(|evidence| {
+                        (evidence.boundary_ms > 0
+                            && evidence.boundary_ms < loaded.reference.duration_ms)
+                            .then_some(evidence.boundary_ms)
+                    })
+                    .collect::<Vec<_>>();
+                score_change_metric_observation(
+                    &reference_changes,
+                    &hypothesis_ms,
+                    scorer_config.change_boundary_collar_ms,
+                    threshold,
+                )
+            })
+            .collect::<FwResult<Vec<_>>>()?;
+        let change_calibration = score_change_event_calibration(
+            &reference_changes,
+            &detector_changes,
+            scorer_config.change_boundary_collar_ms,
+            scorer_config.calibration_bins,
+        )?;
+        recording_accuracy.push(SidecarRecordingAccuracy {
+            der: score.diarization.der,
+            jer: score.diarization.jer,
+        });
+        pipeline.push(
+            &score,
+            &detector_change_score,
+            &change_calibration,
+            &change_collar_metrics,
+            &change_threshold_sweep,
+            &clustering_evidence,
+        )?;
+    }
+    if selected_recording_count == 0 {
+        return Err(public_corpus_error(
+            "sidecar_split_missing",
+            "the selected evaluation stage has no recording in the validated bundle",
+        ));
+    }
+    if operations.evaluated_recording_count != selected_recording_count {
+        return Err(public_corpus_error(
+            "sidecar_recording_alignment",
+            "the sidecar reducer did not account for every selected recording",
+        ));
+    }
+    let aggregate_pipeline = pipeline.finish(target_split);
+    let is_baseline = lane == PublicCorpusSidecarLane::FullV2Baseline;
+    if is_baseline {
+        if operations.fusion_requested
+            || operations.fusion_executed
+            || operations.fusion_requested_recording_count != 0
+            || operations.fusion_executed_recording_count != 0
+            || operations.expected_sidecar_configuration_sha256.is_some()
+            || operations.expected_fusion_configuration_sha256.is_some()
+        {
+            return Err(public_corpus_error(
+                "sidecar_baseline_fusion",
+                "the unfused baseline unexpectedly reported sidecar activity",
+            ));
+        }
+    } else if !operations.fusion_requested
+        || operations.fusion_requested_recording_count != selected_recording_count
+        || operations.expected_sidecar_configuration_sha256
+            != expected_sidecar_configuration_sha256
+        || operations.expected_fusion_configuration_sha256
+            != expected_fusion_configuration_sha256
+        || operations.fusion_executed
+            != (operations.consumed_probability_count > 0
+                && operations.fusion_executed_recording_count > 0)
+    {
+        return Err(public_corpus_error(
+            "sidecar_fusion_evidence",
+            "candidate fusion request, hashes, or downstream consumption evidence is inconsistent",
+        ));
+    }
+    if !is_baseline
+        && (observations.submitted_frame_count != operations.submitted_frame_count
+            || observations.comparable_frame_count != operations.comparable_frame_count)
+    {
+        return Err(public_corpus_error(
+            "sidecar_observation_alignment",
+            "bounded diagnostic observations do not match fused frame accounting",
+        ));
+    }
+    let boundary = if is_baseline {
+        empty_sidecar_boundary_metrics(&aggregate_pipeline)
+    } else {
+        finish_sidecar_boundary_metrics(&observations.boundary_probabilities, &aggregate_pipeline)
+    };
+    let conditional_pairs = observations.pairs.finish();
+    let performance = PublicCorpusSidecarPerformance {
+        audio_duration_sec: aggregate_pipeline.audio_duration_sec,
+        wall_time_sec: aggregate_pipeline.wall_time_sec,
+        real_time_factor: aggregate_pipeline.real_time_factor,
+        sampled_peak_rss_bytes: aggregate_pipeline.sampled_peak_rss_bytes,
+    };
+    let pipeline_is_publishable = is_baseline || operations.fusion_executed;
+    if !pipeline_is_publishable {
+        recording_accuracy.clear();
+    }
+    let split = PublicCorpusSidecarStudySplit {
+        split: target_split,
+        pipeline: pipeline_is_publishable.then_some(aggregate_pipeline),
+        fusion_executed: operations.fusion_executed,
+        boundary,
+        conditional_pairs,
+        coverage: PublicCorpusSidecarCoverage {
+            fusion_requested: operations.fusion_requested,
+            evaluated_recording_count: operations.evaluated_recording_count,
+            fusion_requested_recording_count: operations.fusion_requested_recording_count,
+            fusion_executed_recording_count: operations.fusion_executed_recording_count,
+            submitted_frame_count: operations.submitted_frame_count,
+            comparable_frame_count: operations.comparable_frame_count,
+            calibrated_signal_count: operations.calibrated_signal_count,
+            consumed_probability_count: operations.consumed_probability_count,
+            changed_boundary_probability_count: operations.changed_boundary_probability_count,
+            comparable_frame_coverage: ratio(
+                operations.comparable_frame_count,
+                operations.submitted_frame_count,
+            ),
+            component_comparison_count: observations.component_comparison_count,
+            owner_available_frame_counts: observations.owner_available_frame_counts,
+            channel_confound_opportunity_count: observations
+                .channel_confound_opportunity_count,
+            channel_confound_count: observations.channel_confound_count,
+            channel_confound_rate: ratio(
+                observations.channel_confound_count,
+                observations.channel_confound_opportunity_count,
+            ),
+            maximum_retained_signal_count: operations.maximum_retained_signal_count,
+            retained_signal_capacity: operations.retained_signal_capacity,
+        },
+        operations: operations.operations(),
+        performance,
+        paired_uncertainty: None,
+    };
+    Ok(SidecarLaneEvaluation {
+        split,
+        recording_accuracy,
+    })
+}
+
+fn bootstrap_mean_interval(
+    deltas: &[f64],
+    seed: &[u8; 32],
+    stream: u64,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if deltas.is_empty() {
+        return (None, None, None);
+    }
+    let mean = canonical_evidence_number(deltas.iter().sum::<f64>() / deltas.len() as f64);
+    let mut replicates = Vec::with_capacity(PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES);
+    for replicate in 0..PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES {
+        let mut sum = 0.0;
+        for draw in 0..deltas.len() {
+            let mut hasher = Sha256::new();
+            hasher.update(seed);
+            hasher.update(stream.to_le_bytes());
+            hasher.update((replicate as u64).to_le_bytes());
+            hasher.update((draw as u64).to_le_bytes());
+            let digest: [u8; 32] = hasher.finalize().into();
+            let index = u64::from_le_bytes(digest[..8].try_into().expect("eight-byte digest"))
+                % deltas.len() as u64;
+            sum += deltas[index as usize];
+        }
+        replicates.push(sum / deltas.len() as f64);
+    }
+    replicates.sort_by(f64::total_cmp);
+    let last = replicates.len() - 1;
+    let lower = replicates[last * 25 / 1_000];
+    let upper = replicates[last * 975 / 1_000];
+    (
+        Some(mean),
+        Some(canonical_evidence_number(lower)),
+        Some(canonical_evidence_number(upper)),
+    )
+}
+
+fn paired_sidecar_uncertainty(
+    baseline: &[SidecarRecordingAccuracy],
+    candidate: &[SidecarRecordingAccuracy],
+    descriptor_sha256: &str,
+    lane: PublicCorpusSidecarLane,
+    split: EvaluationSplit,
+) -> FwResult<PublicCorpusSidecarPairedUncertainty> {
+    if baseline.len() != candidate.len() {
+        return Err(public_corpus_error(
+            "sidecar_pair_alignment",
+            "baseline and candidate recording orders have different cardinality",
+        ));
+    }
+    let seed_fingerprint = PublicCorpusSidecarBootstrapSeedFingerprint {
+        uncertainty_id: PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION,
+        descriptor_sha256,
+        lane,
+        split,
+        baseline_recording_count: baseline.len(),
+        candidate_recording_count: candidate.len(),
+        replicates: PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
+    };
+    let bootstrap_seed_sha256 = canonical_sha256(&seed_fingerprint)?;
+    let seed: [u8; 32] = hex_sha256_bytes(&bootstrap_seed_sha256)?;
+    let mut der_deltas = Vec::new();
+    let mut jer_deltas = Vec::new();
+    for index in 0..baseline.len() {
+        if let (Some(baseline), Some(candidate)) = (baseline[index].der, candidate[index].der) {
+            der_deltas.push(candidate - baseline);
+        }
+        if let (Some(baseline), Some(candidate)) = (baseline[index].jer, candidate[index].jer) {
+            jer_deltas.push(candidate - baseline);
+        }
+    }
+    let (mean_der_delta, der_delta_ci95_lower, der_delta_ci95_upper) =
+        bootstrap_mean_interval(&der_deltas, &seed, 0);
+    let (mean_jer_delta, jer_delta_ci95_lower, jer_delta_ci95_upper) =
+        bootstrap_mean_interval(&jer_deltas, &seed, 1);
+    Ok(PublicCorpusSidecarPairedUncertainty {
+        paired_der_recording_count: u64::try_from(der_deltas.len()).unwrap_or(u64::MAX),
+        paired_jer_recording_count: u64::try_from(jer_deltas.len()).unwrap_or(u64::MAX),
+        bootstrap_replicates: PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
+        bootstrap_seed_sha256,
+        mean_der_delta,
+        der_delta_ci95_lower,
+        der_delta_ci95_upper,
+        mean_jer_delta,
+        jer_delta_ci95_lower,
+        jer_delta_ci95_upper,
+    })
+}
+
+fn public_sidecar_gate_policy() -> PublicCorpusSidecarGatePolicy {
+    PublicCorpusSidecarGatePolicy {
+        minimum_relative_development_micro_der_improvement: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MIN_DEVELOPMENT_DER_IMPROVEMENT,
+        ),
+        maximum_macro_jer_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MAX_MACRO_JER_REGRESSION,
+        ),
+        minimum_comparable_frame_coverage: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MIN_COMPARABLE_FRAME_COVERAGE,
+        ),
+        minimum_pair_roc_auc: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MIN_PAIR_ROC_AUC,
+        ),
+        maximum_pair_brier_score: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MAX_PAIR_BRIER,
+        ),
+        maximum_pair_expected_calibration_error: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MAX_PAIR_ECE,
+        ),
+        maximum_channel_confound_rate: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MAX_CHANNEL_CONFOUND_RATE,
+        ),
+        minimum_paired_recording_count: PUBLIC_SIDECAR_MINIMUM_PAIRED_RECORDINGS,
+        maximum_relative_rtf_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RTF_REGRESSION,
+        ),
+        maximum_relative_rss_regression: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RSS_REGRESSION,
+        ),
+        require_boundary_f1_non_regression: true,
+        require_speaker_count_non_regression: true,
+        require_held_out_micro_der_non_regression: true,
+        require_nonpositive_paired_der_upper_bound: true,
+    }
+}
+
+fn public_sidecar_selection_policy_sha256(
+    gate_policy: &PublicCorpusSidecarGatePolicy,
+) -> FwResult<String> {
+    canonical_sha256(&PublicCorpusSidecarSelectionFingerprint {
+        policy_id: PUBLIC_CORPUS_SIDECAR_SELECTION_POLICY_VERSION,
+        lane_order: &PublicCorpusSidecarLane::ALL,
+        gate_policy,
+    })
+}
+
+fn public_sidecar_protocol(
+    maximum_recording_duration_ms: Option<u64>,
+    diarization_request: &DiarizationRequest,
+    diarization_request_sha256: String,
+) -> FwResult<PublicCorpusSidecarStudyProtocol> {
+    let gate_policy = public_sidecar_gate_policy();
+    Ok(PublicCorpusSidecarStudyProtocol {
+        oracle_vad: true,
+        oracle_speaker_count: false,
+        maximum_recording_duration_ms,
+        prefix_selection: "deterministic-prefix-v1".to_owned(),
+        rss_observation: "linux-vmhwm-otherwise-sampled-process-rss-v1".to_owned(),
+        diarization_request: diarization_request.clone(),
+        diarization_request_sha256,
+        feature_ablation: AcousticFeatureAblation::FullV2,
+        detector_mode: AcousticChangeDetectorMode::CalibratedPosterior,
+        clustering_mode: AcousticClusteringMode::ProbabilisticV1,
+        sidecar_schema_id: ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION.to_owned(),
+        fusion_id: ACOUSTIC_SIDECAR_FUSION_VERSION.to_owned(),
+        calibration_fit_id: PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION.to_owned(),
+        pair_scorer_id: PUBLIC_CORPUS_SIDECAR_PAIR_SCORER_VERSION.to_owned(),
+        uncertainty_id: PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION.to_owned(),
+        selection_policy_id: PUBLIC_CORPUS_SIDECAR_SELECTION_POLICY_VERSION.to_owned(),
+        selection_policy_sha256: public_sidecar_selection_policy_sha256(&gate_policy)?,
+        boundary_collar_ms: PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS,
+        reliability_bins: PUBLIC_SIDECAR_RELIABILITY_BINS,
+        pair_lags_frames: PUBLIC_SIDECAR_PAIR_LAGS_FRAMES,
+        maximum_pairs_per_recording: PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING,
+        paired_bootstrap_replicates: PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
+        lane_order: PublicCorpusSidecarLane::ALL.to_vec(),
+        gate_policy,
+    })
+}
+
+fn unavailable_public_sidecar_split(split: EvaluationSplit) -> PublicCorpusSidecarStudySplit {
+    let probabilities = SidecarProbabilityAccumulator::new();
+    let (brier_score, expected_calibration_error, reliability) =
+        probabilities.finish_reliability();
+    PublicCorpusSidecarStudySplit {
+        split,
+        pipeline: None,
+        fusion_executed: false,
+        boundary: PublicCorpusSidecarBoundaryMetrics {
+            reference_count: 0,
+            hypothesis_count: 0,
+            matched_count: 0,
+            precision: None,
+            recall: None,
+            f1: None,
+            mean_absolute_error_sec: None,
+            probability_observation_count: 0,
+            probability_positive_count: 0,
+            brier_score,
+            expected_calibration_error,
+            reliability,
+        },
+        conditional_pairs: SidecarPairAccumulator::new().finish(),
+        coverage: PublicCorpusSidecarCoverage {
+            fusion_requested: false,
+            evaluated_recording_count: 0,
+            fusion_requested_recording_count: 0,
+            fusion_executed_recording_count: 0,
+            submitted_frame_count: 0,
+            comparable_frame_count: 0,
+            calibrated_signal_count: 0,
+            consumed_probability_count: 0,
+            changed_boundary_probability_count: 0,
+            comparable_frame_coverage: None,
+            component_comparison_count: 0,
+            owner_available_frame_counts: [0; 3],
+            channel_confound_opportunity_count: 0,
+            channel_confound_count: 0,
+            channel_confound_rate: None,
+            maximum_retained_signal_count: 0,
+            retained_signal_capacity: 0,
+        },
+        operations: PublicCorpusSidecarOperations {
+            frame_wavelet_filter_tap_terms: 0,
+            trajectory_wavelet_filter_tap_terms: 0,
+            trajectory_validity_sample_visits: 0,
+            scattering_filter_sample_terms: 0,
+            scattering_validity_sample_visits: 0,
+            modulation_projection_sample_frequency_visits: 0,
+            peak_scratch_buffer_payload_bytes: 0,
+            peak_retained_state_bytes_on_target: 0,
+            cached_twiddle_payload_bytes: 0,
+        },
+        performance: PublicCorpusSidecarPerformance {
+            audio_duration_sec: 0.0,
+            wall_time_sec: 0.0,
+            real_time_factor: None,
+            sampled_peak_rss_bytes: 0,
+        },
+        paired_uncertainty: None,
+    }
+}
+
+fn public_sidecar_promotion_gate(
+    stage: PublicCorpusEvaluationStage,
+    policy: &PublicCorpusSidecarGatePolicy,
+    baseline: &PublicCorpusSidecarStudySplit,
+    candidate_lane: PublicCorpusSidecarLane,
+    candidate: &PublicCorpusSidecarStudySplit,
+) -> PublicCorpusSidecarPromotionGate {
+    let baseline_pipeline = baseline.pipeline.as_ref();
+    let candidate_pipeline = candidate.pipeline.as_ref();
+    let relative_micro_der_improvement = candidate_pipeline
+        .and_then(|candidate| candidate.micro_der)
+        .zip(baseline_pipeline.and_then(|baseline| baseline.micro_der))
+        .and_then(|(candidate, baseline)| {
+            (baseline > 0.0)
+                .then(|| canonical_evidence_number((baseline - candidate) / baseline))
+        });
+    let macro_jer_delta = candidate_pipeline
+        .and_then(|candidate| candidate.macro_jer)
+        .zip(baseline_pipeline.and_then(|baseline| baseline.macro_jer))
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let boundary_f1_delta = candidate_pipeline
+        .and_then(|candidate| candidate.change_f1)
+        .zip(baseline_pipeline.and_then(|baseline| baseline.change_f1))
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let paired_der_ci95_upper = candidate
+        .paired_uncertainty
+        .as_ref()
+        .and_then(|uncertainty| uncertainty.der_delta_ci95_upper);
+    let exact_speaker_count_rate_delta = candidate_pipeline
+        .and_then(|candidate| candidate.exact_speaker_count_rate)
+        .zip(baseline_pipeline.and_then(|baseline| baseline.exact_speaker_count_rate))
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let mean_absolute_speaker_count_error_delta = candidate_pipeline
+        .and_then(|candidate| candidate.mean_absolute_speaker_count_error)
+        .zip(baseline_pipeline.and_then(|baseline| {
+            baseline.mean_absolute_speaker_count_error
+        }))
+        .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
+    let dominant_collapse_count_delta = candidate_pipeline
+        .zip(baseline_pipeline)
+        .and_then(|(candidate, baseline)| {
+            let candidate = i64::try_from(candidate.dominant_collapse_recording_count).ok()?;
+            let baseline = i64::try_from(baseline.dominant_collapse_recording_count).ok()?;
+            candidate.checked_sub(baseline)
+        });
+    let relative_rtf_regression = candidate
+        .performance
+        .real_time_factor
+        .zip(baseline.performance.real_time_factor)
+        .and_then(|(candidate, baseline)| {
+            (baseline > 0.0)
+                .then(|| canonical_evidence_number((candidate - baseline) / baseline))
+        });
+    let relative_rss_regression = (baseline.performance.sampled_peak_rss_bytes > 0).then(|| {
+        canonical_evidence_number(
+            (candidate.performance.sampled_peak_rss_bytes as f64
+                - baseline.performance.sampled_peak_rss_bytes as f64)
+                / baseline.performance.sampled_peak_rss_bytes as f64,
+        )
+    });
+    let mut failures = Vec::new();
+    if !candidate.fusion_executed || candidate.coverage.consumed_probability_count == 0 {
+        failures.push(PublicCorpusSidecarGateFailure::FusionNotExecuted);
+    }
+    if candidate_pipeline.is_none()
+        || relative_micro_der_improvement.is_none()
+        || macro_jer_delta.is_none()
+    {
+        failures.push(PublicCorpusSidecarGateFailure::MissingAccuracy);
+    }
+    let der_passed = match stage {
+        PublicCorpusEvaluationStage::Development => relative_micro_der_improvement.is_some_and(
+            |improvement| {
+                improvement >= policy.minimum_relative_development_micro_der_improvement
+            },
+        ),
+        PublicCorpusEvaluationStage::Certification => relative_micro_der_improvement
+            .is_some_and(|improvement| !policy.require_held_out_micro_der_non_regression || improvement >= 0.0),
+    };
+    if !der_passed {
+        failures.push(PublicCorpusSidecarGateFailure::InsufficientDerImprovement);
+    }
+    if !macro_jer_delta.is_some_and(|delta| delta <= policy.maximum_macro_jer_regression) {
+        failures.push(PublicCorpusSidecarGateFailure::MacroJerRegression);
+    }
+    if policy.require_boundary_f1_non_regression
+        && !boundary_f1_delta.is_some_and(|delta| delta >= 0.0)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::BoundaryF1Regression);
+    }
+    if !candidate
+        .coverage
+        .comparable_frame_coverage
+        .is_some_and(|coverage| coverage >= policy.minimum_comparable_frame_coverage)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::InsufficientComparableCoverage);
+    }
+    if candidate.conditional_pairs.same_speaker_count == 0
+        || candidate.conditional_pairs.different_speaker_count == 0
+    {
+        failures.push(PublicCorpusSidecarGateFailure::MissingConditionalPairs);
+    }
+    if !candidate
+        .conditional_pairs
+        .roc_auc
+        .is_some_and(|auc| auc >= policy.minimum_pair_roc_auc)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::PairDiscrimination);
+    }
+    if !candidate
+        .conditional_pairs
+        .brier_score
+        .is_some_and(|brier| brier <= policy.maximum_pair_brier_score)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::PairBrier);
+    }
+    if !candidate
+        .conditional_pairs
+        .expected_calibration_error
+        .is_some_and(|ece| ece <= policy.maximum_pair_expected_calibration_error)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::PairCalibration);
+    }
+    if !candidate
+        .coverage
+        .channel_confound_rate
+        .is_some_and(|rate| rate <= policy.maximum_channel_confound_rate)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::ChannelConfound);
+    }
+    if policy.require_speaker_count_non_regression
+        && (!exact_speaker_count_rate_delta.is_some_and(|delta| delta >= 0.0)
+            || !mean_absolute_speaker_count_error_delta.is_some_and(|delta| delta <= 0.0)
+            || !dominant_collapse_count_delta.is_some_and(|delta| delta <= 0))
+    {
+        failures.push(PublicCorpusSidecarGateFailure::SpeakerCountRegression);
+    }
+    if !relative_rtf_regression
+        .is_some_and(|regression| regression <= policy.maximum_relative_rtf_regression)
+        || !relative_rss_regression
+            .is_some_and(|regression| regression <= policy.maximum_relative_rss_regression)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::PerformanceRegression);
+    }
+    if policy.require_nonpositive_paired_der_upper_bound
+        && (candidate
+            .paired_uncertainty
+            .as_ref()
+            .is_none_or(|uncertainty| {
+                uncertainty.paired_der_recording_count < policy.minimum_paired_recording_count
+            })
+            || !paired_der_ci95_upper.is_some_and(|upper| upper <= 0.0))
+    {
+        failures.push(PublicCorpusSidecarGateFailure::PairedDerUncertainty);
+    }
+    failures.sort();
+    failures.dedup();
+    PublicCorpusSidecarPromotionGate {
+        split: candidate.split,
+        candidate: candidate_lane,
+        baseline: PublicCorpusSidecarLane::FullV2Baseline,
+        relative_micro_der_improvement,
+        macro_jer_delta,
+        boundary_f1_delta,
+        comparable_frame_coverage: candidate.coverage.comparable_frame_coverage,
+        pair_roc_auc: candidate.conditional_pairs.roc_auc,
+        pair_brier_score: candidate.conditional_pairs.brier_score,
+        pair_expected_calibration_error: candidate
+            .conditional_pairs
+            .expected_calibration_error,
+        channel_confound_rate: candidate.coverage.channel_confound_rate,
+        exact_speaker_count_rate_delta,
+        mean_absolute_speaker_count_error_delta,
+        dominant_collapse_count_delta,
+        relative_rtf_regression,
+        relative_rss_regression,
+        paired_der_ci95_upper,
+        passed: failures.is_empty(),
+        failures,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6035,6 +8003,23 @@ fn canonical_external_file(
 }
 
 fn canonical_relative_file(root: &Path, relative: &Path, field: &str) -> FwResult<PathBuf> {
+    validate_relative_path_syntax(relative, field)?;
+    let canonical = root.join(relative).canonicalize().map_err(|_| {
+        public_corpus_error(
+            "input_file",
+            &format!("{field} input must resolve to a readable file"),
+        )
+    })?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return Err(public_corpus_error(
+            "input_escape",
+            &format!("{field} input must resolve beneath input_root"),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_relative_path_syntax(relative: &Path, field: &str) -> FwResult<()> {
     if relative.is_absolute()
         || relative.as_os_str().is_empty()
         || relative.components().any(|component| {
@@ -6049,19 +8034,7 @@ fn canonical_relative_file(root: &Path, relative: &Path, field: &str) -> FwResul
             &format!("{field} path must be a non-empty relative path without traversal"),
         ));
     }
-    let canonical = root.join(relative).canonicalize().map_err(|_| {
-        public_corpus_error(
-            "input_file",
-            &format!("{field} input must resolve to a readable file"),
-        )
-    })?;
-    if !canonical.starts_with(root) || !canonical.is_file() {
-        return Err(public_corpus_error(
-            "input_escape",
-            &format!("{field} input must resolve beneath input_root"),
-        ));
-    }
-    Ok(canonical)
+    Ok(())
 }
 
 fn validate_new_output(project: &Path, input: &Path, output: &Path) -> FwResult<PathBuf> {

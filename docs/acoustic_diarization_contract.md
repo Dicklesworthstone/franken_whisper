@@ -464,15 +464,14 @@ serializes an `AcousticSidecarStudyObservation` or any constituent feature
 value.
 
 The sidecar kernels and evaluator are not an accuracy result or promotion.
-Focused synthetic/unit
-checks cover bounded arithmetic, fixed transform goldens plus in-tree scalar
-differential references, masked
-band-energy stationary trajectory wavelets, fixed first/second-order scattering summaries, a
+Focused synthetic/unit checks cover bounded arithmetic, fixed transform goldens
+plus in-tree scalar differential references, masked band-energy stationary
+trajectory wavelets, fixed first/second-order scattering summaries, a
 Voice-owned voiced-envelope magnitude trajectory, frame-local occupancy,
-cancellation rollback,
-missingness boundaries for both scattering orders, affine and explicit
-trajectory/scattering one-frame-translation metamorphic checks,
-fixed-state accounting, configuration separation, and default-path isolation.
+cancellation rollback, missingness boundaries for both scattering orders,
+affine and explicit trajectory/scattering one-frame-translation metamorphic
+checks, fixed-state accounting, configuration separation, and default-path
+isolation.
 It still does not include multi-coordinate cepstral trajectory candidates—the
 current RMS magnitude intentionally collapses coefficient sign and ordering—or
 any retained real-corpus development, RTF/RSS, held-out, or adoption result.
@@ -510,11 +509,12 @@ candidate that passes every uncertainty-aware improvement and non-regression
 gate. Its disposition is `advance_to_certification`; all other candidates are
 `rejected` and the unfused lane remains `baseline`. Held-out audio stays sealed
 unless the exact development artifact authorizes that one candidate.
-Certification evaluates only the locked candidate and may mark it `adopted`
-only after held-out non-regression. If no candidate passes development, the
-correct outcome is a retained aggregate negative result and no feature
-adoption. Implementing this contract does not claim that any lane has advanced
-or been adopted; that authority requires a real public-corpus artifact.
+Certification evaluates the unfused baseline plus only the locked candidate
+and may mark that candidate `adopted` only after held-out non-regression. If no
+candidate passes development, the correct outcome is a retained aggregate
+negative result and no feature adoption. Implementing this contract does not
+claim that any lane has advanced or been adopted; that authority requires a
+real public-corpus artifact.
 
 ### 4.4 Probabilistic clustering v2 development status
 
