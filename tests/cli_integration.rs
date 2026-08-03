@@ -32,6 +32,46 @@ use franken_whisper::public_corpus::{
 use franken_whisper::storage::RunStore;
 use franken_whisper::sync::{self, ConflictPolicy};
 
+fn private_tempdir_in(root: &std::path::Path, prefix: &str) -> tempfile::TempDir {
+    let directory = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(root)
+        .unwrap_or_else(|error| panic!("private temporary directory {prefix}: {error}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|error| panic!("private temporary directory {prefix}: {error}"));
+    }
+    directory
+}
+
+fn private_external_temp_root(prefix: &str) -> tempfile::TempDir {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .expect("canonical project root");
+    let platform_temp = std::env::temp_dir();
+    if let Ok(platform_temp) = platform_temp.canonicalize()
+        && !platform_temp.starts_with(&project)
+        && !project.starts_with(&platform_temp)
+        && let Ok(directory) = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(&platform_temp)
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("private external root {prefix}: {error}"));
+        }
+        return directory;
+    }
+    let project_parent = project.parent().expect("project parent");
+    private_tempdir_in(project_parent, prefix)
+}
+
 // ---------------------------------------------------------------------------
 // Storage: runs get --id
 // ---------------------------------------------------------------------------
@@ -486,17 +526,11 @@ fn runs_json_exposes_only_privacy_safe_projection_provenance() {
 
 #[test]
 fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
-    // RCH may set its process-wide temporary directory beneath the synchronized
-    // checkout. Use the platform's external Unix temporary root explicitly so
-    // the fixture exercises the same disjoint-root contract on local and remote
-    // workers.
-    let external_temp_root = if cfg!(unix) {
-        std::path::Path::new("/tmp")
-    } else {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("project parent")
-    };
+    // RCH may place the process temporary directory beneath the synchronized
+    // checkout. Prefer the platform temp root when it is disjoint; otherwise
+    // create one private sibling of the checkout without assuming `/tmp`.
+    let external_root = private_external_temp_root("fw-confidential-root-");
+    let external_temp_root = external_root.path();
     let input = tempfile::Builder::new()
         .prefix("fw-confidential-input-")
         .tempdir_in(external_temp_root)
@@ -624,29 +658,19 @@ fn confidential_diarization_eval_cli_emits_only_external_aggregates() {
     }
 }
 
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+    ignore = "public artifact publication is unsupported on this platform"
+)]
 #[test]
 fn public_diarization_corpus_cli_builds_external_path_free_bundle() {
     use sha2::{Digest, Sha256};
 
-    let external_temp_root = if cfg!(unix) {
-        std::path::Path::new("/tmp")
-    } else {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("project parent")
-    };
-    let input = tempfile::Builder::new()
-        .prefix("fw-public-corpus-input-")
-        .tempdir_in(external_temp_root)
-        .expect("external input");
-    let output = tempfile::Builder::new()
-        .prefix("fw-public-corpus-output-")
-        .tempdir_in(external_temp_root)
-        .expect("external output");
-    let runtime_project = tempfile::Builder::new()
-        .prefix("fw-public-corpus-project-")
-        .tempdir_in(external_temp_root)
-        .expect("runtime project");
+    let external_root = private_external_temp_root("fw-public-corpus-root-");
+    let external_temp_root = external_root.path();
+    let input = private_tempdir_in(external_temp_root, "fw-public-corpus-input-");
+    let output = private_tempdir_in(external_temp_root, "fw-public-corpus-output-");
+    let runtime_project = private_tempdir_in(external_temp_root, "fw-public-corpus-project-");
     std::fs::create_dir(runtime_project.path().join(".git")).expect("project marker");
     std::fs::write(
         runtime_project.path().join("Cargo.toml"),
@@ -771,29 +795,19 @@ fn public_diarization_corpus_cli_builds_external_path_free_bundle() {
     }
 }
 
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+    ignore = "public artifact publication is unsupported on this platform"
+)]
 #[test]
 fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
     use sha2::{Digest, Sha256};
 
-    let external_temp_root = if cfg!(unix) {
-        std::path::Path::new("/tmp")
-    } else {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("project parent")
-    };
-    let input = tempfile::Builder::new()
-        .prefix("fw-sidecar-corpus-input-")
-        .tempdir_in(external_temp_root)
-        .expect("external input");
-    let output = tempfile::Builder::new()
-        .prefix("fw-sidecar-corpus-output-")
-        .tempdir_in(external_temp_root)
-        .expect("external output");
-    let runtime_project = tempfile::Builder::new()
-        .prefix("fw-sidecar-corpus-project-")
-        .tempdir_in(external_temp_root)
-        .expect("runtime project");
+    let external_root = private_external_temp_root("fw-sidecar-corpus-root-");
+    let external_temp_root = external_root.path();
+    let input = private_tempdir_in(external_temp_root, "fw-sidecar-corpus-input-");
+    let output = private_tempdir_in(external_temp_root, "fw-sidecar-corpus-output-");
+    let runtime_project = private_tempdir_in(external_temp_root, "fw-sidecar-corpus-project-");
     let canonical_input_root = input.path().canonicalize().expect("canonical input root");
     let canonical_output_root = output.path().canonicalize().expect("canonical output root");
     let canonical_runtime_project_root = runtime_project
@@ -927,9 +941,57 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
         PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION
     );
     assert_eq!(
+        evidence.schema_version,
+        "public-diarization-acoustic-sidecar-study-v3"
+    );
+    assert_eq!(
         evidence.runner_version,
         PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION
     );
+    assert_eq!(
+        evidence.runner_version,
+        "public-diarization-acoustic-sidecar-study-runner-v3"
+    );
+    assert_eq!(
+        evidence.protocol.pair_calibration_fit_id,
+        "public-sidecar-pair-calibration-empirical-grid-v1"
+    );
+    assert_eq!(
+        evidence.protocol.fusion_id,
+        "acoustic-sidecar-boundary-fusion-v2"
+    );
+    assert_eq!(
+        evidence.protocol.pair_probability_target_id,
+        "public-sidecar-different-speaker-given-selected-comparable-frozen-lag-pair-v1"
+    );
+    assert_eq!(
+        evidence.protocol.pair_population_id,
+        "public-sidecar-reference-labeled-frozen-lag-pair-population-v1"
+    );
+    assert_eq!(
+        evidence.protocol.pair_selection_key_id,
+        "public-sidecar-conditional-pair-bottom-k-normalized-pcm-sha256-v3"
+    );
+    assert_eq!(
+        evidence.protocol.pair_selection_digest_id,
+        "public-sidecar-reference-labeled-selected-pair-sequence-sha256-v2"
+    );
+    assert_eq!(
+        evidence.protocol.pair_scorer_id,
+        "public-sidecar-conditional-pair-calibrated-v3"
+    );
+    assert_eq!(
+        evidence.protocol.selection_policy_id,
+        "public-sidecar-selection-policy-v3"
+    );
+    assert_eq!(evidence.protocol.pair_score_bins, 100);
+    assert!(
+        evidence.variants[1].pair_calibration.is_some(),
+        "the two-speaker fixture must retain an independently fitted pair calibration"
+    );
+    let retained_json: serde_json::Value =
+        serde_json::from_slice(&retained_evidence).expect("sidecar wire JSON");
+    assert!(!retained_json["variants"][1]["pair_calibration"].is_null());
     assert_eq!(
         evidence.evaluation_stage,
         PublicCorpusEvaluationStage::Development
@@ -948,6 +1010,19 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
         evidence.variants[0].disposition,
         PublicCorpusSidecarDisposition::Baseline
     );
+    assert!(
+        evidence.variants[0].splits[0]
+            .coverage
+            .pair_selection_sha256
+            .is_none(),
+        "the unfused baseline must not publish a candidate pair-selection identity"
+    );
+    assert!(evidence.variants[1..].iter().all(|variant| {
+        variant.splits.iter().all(|split| {
+            split.coverage.fusion_executed_recording_count
+                <= split.coverage.consumed_probability_count
+        })
+    }));
     assert!(
         evidence.variants[1..]
             .iter()
@@ -1067,6 +1142,81 @@ fn public_diarization_corpus_cli_runs_external_path_free_sidecar_study() {
         "sidecar-cli-speaker-far",
     ] {
         assert!(!stderr.contains(forbidden), "stderr leaked {forbidden}");
+    }
+
+    let certification_bundle_name = "sidecar-private-certification-bundle.json";
+    let certification_evidence_name = "sidecar-private-certification-evidence.json";
+    let certification_bundle_path = output.path().join(certification_bundle_name);
+    let certification_evidence_path = output.path().join(certification_evidence_name);
+    let certification = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .current_dir(runtime_project.path())
+        .args([
+            "diarization-corpus",
+            "sidecar-study",
+            "--input-root",
+            input.path().to_str().expect("UTF-8 input root"),
+            "--descriptor",
+            descriptor_path.to_str().expect("UTF-8 descriptor"),
+            "--bundle-output",
+            certification_bundle_path
+                .to_str()
+                .expect("UTF-8 certification bundle output"),
+            "--output",
+            certification_evidence_path
+                .to_str()
+                .expect("UTF-8 certification evidence output"),
+            "--license-ack",
+            "accept-aishell-4-cc-by-sa-4.0",
+            "--maximum-recording-duration-ms",
+            "1250",
+            "--stage",
+            "certification",
+            "--locked-development-evidence",
+            evidence_path.to_str().expect("UTF-8 development lock"),
+        ])
+        .output()
+        .expect("rejected-lock certification attempt");
+    assert!(
+        !certification.status.success(),
+        "a rejected development artifact must not unlock certification"
+    );
+    assert!(
+        certification.stdout.is_empty(),
+        "failed certification must not emit evidence"
+    );
+    assert!(!certification_bundle_path.exists());
+    assert!(!certification_evidence_path.exists());
+    let certification_stderr =
+        String::from_utf8(certification.stderr).expect("UTF-8 certification stderr");
+    assert!(certification_stderr.contains("sidecar_stage_lock"));
+    assert!(!certification_stderr.contains("sidecar_split_missing"));
+    for forbidden in [
+        input.path().to_str().expect("input path"),
+        output.path().to_str().expect("output path"),
+        runtime_project.path().to_str().expect("project path"),
+        canonical_input_root.to_str().expect("canonical input path"),
+        canonical_output_root
+            .to_str()
+            .expect("canonical output path"),
+        canonical_runtime_project_root
+            .to_str()
+            .expect("canonical project path"),
+        audio_name,
+        annotation_name,
+        descriptor_name,
+        bundle_name,
+        evidence_name,
+        certification_bundle_name,
+        certification_evidence_name,
+        "sidecar-corpus-e2e-root",
+        "sidecar-cli-development",
+        "sidecar-cli-speaker-near",
+        "sidecar-cli-speaker-far",
+    ] {
+        assert!(
+            !certification_stderr.contains(forbidden),
+            "certification stderr leaked {forbidden}"
+        );
     }
 }
 

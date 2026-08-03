@@ -247,7 +247,7 @@ pub enum Command {
     /// Score external confidential references/hypotheses and emit aggregates only.
     #[command(name = "diarization-eval")]
     DiarizationEval(ConfidentialEvaluationArgs),
-    /// Inspect, build, or evaluate reproducible external public-corpus evidence.
+    /// Inspect public-corpus contracts, or write evidence on Linux/Android/Apple.
     #[command(name = "diarization-corpus")]
     DiarizationCorpus {
         #[command(subcommand)]
@@ -270,11 +270,11 @@ pub enum Command {
 pub enum PublicCorpusCommand {
     /// Emit the built-in corpus/license/conversion registry as JSON.
     Registry,
-    /// Build a path-free, leakage-audited bundle from external WAV/RTTM data.
+    /// Build a path-free bundle (artifact writing requires Linux/Android/Apple).
     Build(PublicCorpusBuildArgs),
-    /// Run all frozen acoustic feature ablations and emit aggregates only.
+    /// Run frozen ablations (artifact writing requires Linux/Android/Apple).
     Ablate(PublicCorpusAblationArgs),
-    /// Run the frozen evaluation-only acoustic sidecar study and emit aggregates only.
+    /// Run the sidecar study (artifact writing requires Linux/Android/Apple).
     SidecarStudy(PublicCorpusSidecarStudyArgs),
 }
 
