@@ -230,7 +230,7 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-if [[ -z "${out_prefix}" || "${tiny_diarize}" != "1" || "${json_output}" != "1" || "${max_context}" != "0" ]]; then
+if [[ -z "${out_prefix}" || "${out_prefix##*/}" != "whispercpp_output" || "${tiny_diarize}" != "1" || "${json_output}" != "1" || "${max_context}" != "0" ]]; then
   echo "missing TinyDiarize JSON artifact contract" >&2
   exit 42
 fi
@@ -3045,6 +3045,15 @@ fn tiny_diarize_emits_native_json_artifact_and_preserves_speaker_turn_signal() {
     assert_eq!(
         report["result"]["raw_output"]["transcription"][1]["speaker_turn_next"],
         false
+    );
+    assert!(
+        report["result"]["artifact_paths"]
+            .as_array()
+            .expect("artifact paths")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|path| path.ends_with("/whispercpp_output.json")),
+        "expected artifact path basename whispercpp_output.json"
     );
 }
 
