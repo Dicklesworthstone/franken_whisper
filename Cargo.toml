@@ -76,6 +76,12 @@ ft-api = { path = "../frankentorch/crates/ft-api", optional = true }
 fj-api = { path = "../frankenjax/crates/fj-api", optional = true }
 fj-core = { path = "../frankenjax/crates/fj-core", optional = true }
 
+# Safe handle-relative openat, ownership checks, and no-clobber rename
+# publication are unavailable in std. This narrowly featured target-specific
+# edge closes that capability gap while preserving the unsafe-code prohibition.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
 [lints.rust]
 unsafe_code = "deny"
 

@@ -5,14 +5,22 @@
 //! can be retained externally. It never copies source media and refuses to
 //! write generated annotations inside the project checkout.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use std::ffi::OsString;
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use std::io::{BufWriter, Write};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use uuid::Uuid;
 
 use crate::diarization::{
     ACOUSTIC_CHANGE_CALIBRATION_FIT_VERSION, ACOUSTIC_CHANGE_CALIBRATION_VERSION,
@@ -23,16 +31,15 @@ use crate::diarization::{
     AcousticSidecarEvaluationRequest, AcousticSidecarFusionCalibration,
     AcousticSidecarFusionEvaluationEvidence, AcousticSidecarStudy, AcousticSidecarStudyConfig,
     AcousticSidecarStudyMode, AcousticSidecarStudyObservation, AcousticTrajectoryWaveletMode,
-    ChangePointScore,
-    DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION, DIARIZATION_HYPOTHESIS_SCHEMA_VERSION,
-    DIARIZATION_REFERENCE_SCHEMA_VERSION, DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest,
-    DiarizationHypothesisDocument, DiarizationLeakageAudit, DiarizationReferenceDocument,
-    DiarizationScorerConfig, EvaluationOverlapPolicy, EvaluationPerformanceObservation,
-    EvaluationRegion, EvaluationSplit, EvaluationTurn, EvaluationWord, acoustic_change_calibration,
+    ChangePointScore, DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION,
+    DIARIZATION_HYPOTHESIS_SCHEMA_VERSION, DIARIZATION_REFERENCE_SCHEMA_VERSION,
+    DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest, DiarizationHypothesisDocument,
+    DiarizationLeakageAudit, DiarizationReferenceDocument, DiarizationScorerConfig,
+    EvaluationOverlapPolicy, EvaluationPerformanceObservation, EvaluationRegion, EvaluationSplit,
+    EvaluationTurn, EvaluationWord, acoustic_change_calibration,
     acoustic_change_calibration_sha256, acoustic_feature_schema_sha256,
-    acoustic_sidecar_calibrate_owner_contrast,
-    acoustic_sidecar_fusion_configuration_sha256,
-    acoustic_sidecar_observation_owner_contrast, acoustic_sidecar_study_config_sha256,
+    acoustic_sidecar_calibrate_owner_contrast, acoustic_sidecar_fusion_configuration_sha256,
+    acoustic_sidecar_observation_owner_contrast_from_study, acoustic_sidecar_study_config_sha256,
     acoustic_speaker_pair_calibration_sha256, audit_diarization_manifest,
     diarize_acoustic_pcm_with_modes_evidence, diarize_acoustic_pcm_with_sidecar_evidence,
     extract_acoustic_features_with_frames, parse_diarization_corpus_manifest,
@@ -61,22 +68,37 @@ pub const PUBLIC_CORPUS_ABLATION_RUNNER_VERSION: &str =
     "public-diarization-acoustic-ablation-runner-v8";
 /// Schema identity for the separate aggregate-only acoustic sidecar study.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-v1";
+    "public-diarization-acoustic-sidecar-study-v3";
 /// Frozen implementation identity for the aggregate-only sidecar runner.
 pub const PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION: &str =
-    "public-diarization-acoustic-sidecar-study-runner-v1";
+    "public-diarization-acoustic-sidecar-study-runner-v3";
 /// Identity of the bounded development calibration fit.
 pub const PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION: &str =
-    "public-sidecar-boundary-calibration-grid-v1";
+    "public-sidecar-boundary-calibration-empirical-grid-v2";
+/// Identity of the separately fitted lagged-pair calibration.
+pub const PUBLIC_CORPUS_SIDECAR_PAIR_CALIBRATION_FIT_VERSION: &str =
+    "public-sidecar-pair-calibration-empirical-grid-v1";
+/// Target represented by the separately calibrated lagged-pair probability.
+pub const PUBLIC_CORPUS_SIDECAR_PAIR_PROBABILITY_TARGET_VERSION: &str =
+    "public-sidecar-different-speaker-given-selected-comparable-frozen-lag-pair-v1";
+/// Lane-independent reference-labeled universe sampled before feature availability.
+pub const PUBLIC_CORPUS_SIDECAR_PAIR_POPULATION_VERSION: &str =
+    "public-sidecar-reference-labeled-frozen-lag-pair-population-v1";
+/// Identity of the score-independent deterministic bottom-k selection key.
+pub const PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_KEY_VERSION: &str =
+    "public-sidecar-conditional-pair-bottom-k-normalized-pcm-sha256-v3";
+/// Identity of the lane-independent selected-pair sequence digest.
+pub const PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_DIGEST_VERSION: &str =
+    "public-sidecar-reference-labeled-selected-pair-sequence-sha256-v2";
 /// Identity of the deterministic conditional-pair scorer.
 pub const PUBLIC_CORPUS_SIDECAR_PAIR_SCORER_VERSION: &str =
-    "public-sidecar-conditional-pair-scorer-v1";
+    "public-sidecar-conditional-pair-calibrated-v3";
 /// Identity of the deterministic paired-recording uncertainty calculation.
 pub const PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION: &str =
-    "public-sidecar-paired-bootstrap-sha-counter-v1";
+    "public-sidecar-paired-bootstrap-splitmix64-v2";
 /// Identity of the fail-closed development selector and held-out gate.
 pub const PUBLIC_CORPUS_SIDECAR_SELECTION_POLICY_VERSION: &str =
-    "public-sidecar-selection-policy-v1";
+    "public-sidecar-selection-policy-v3";
 /// A candidate must reduce development micro-DER by at least one percent.
 pub const PUBLIC_CORPUS_SIDECAR_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.01;
 /// A candidate may regress macro-JER by no more than one absolute point.
@@ -89,9 +111,17 @@ pub const PUBLIC_CORPUS_SIDECAR_MIN_PAIR_ROC_AUC: f64 = 0.55;
 pub const PUBLIC_CORPUS_SIDECAR_MAX_PAIR_BRIER: f64 = 0.25;
 /// Maximum expected calibration error admitted for conditional pairs.
 pub const PUBLIC_CORPUS_SIDECAR_MAX_PAIR_ECE: f64 = 0.10;
-/// Maximum rate at which channel contrast dominates voice contrast on
-/// comparable different-speaker pairs.
-pub const PUBLIC_CORPUS_SIDECAR_MAX_CHANNEL_CONFOUND_RATE: f64 = 0.50;
+/// Maximum rate at which an auxiliary contrast dominates Voice on selected
+/// same-speaker pairs where both owners are available.
+pub const PUBLIC_CORPUS_SIDECAR_MAX_SAME_SPEAKER_AUXILIARY_DOMINANCE_RATE: f64 = 0.50;
+/// Every expected auxiliary owner needs substantial same-speaker support.
+pub const PUBLIC_CORPUS_SIDECAR_MIN_AUXILIARY_DOMINANCE_OPPORTUNITIES: u64 = 100;
+/// At least one quarter of the frozen reference-pair sample must be scored.
+pub const PUBLIC_CORPUS_SIDECAR_MIN_PAIR_SCORE_COVERAGE: f64 = 0.25;
+/// Each conditional class needs substantial aggregate support before promotion.
+pub const PUBLIC_CORPUS_SIDECAR_MIN_PAIRS_PER_CLASS: u64 = 100;
+/// Conditional-pair evidence must span at least five recordings.
+pub const PUBLIC_CORPUS_SIDECAR_MIN_PAIR_RECORDINGS: u64 = 5;
 /// Maximum relative candidate RTF regression admitted for promotion.
 pub const PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RTF_REGRESSION: f64 = 0.25;
 /// Maximum relative sampled peak-RSS regression admitted for promotion.
@@ -100,13 +130,19 @@ pub const PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RSS_REGRESSION: f64 = 0.25;
 const PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS: u64 = 250;
 const PUBLIC_SIDECAR_RELIABILITY_BINS: usize = 10;
 const PUBLIC_SIDECAR_FIT_BINS: usize = 256;
-const PUBLIC_SIDECAR_PAIR_SCORE_BINS: usize = 256;
+const PUBLIC_SIDECAR_PAIR_SCORE_BINS: usize = 100;
 const PUBLIC_SIDECAR_PAIR_LAGS_FRAMES: [usize; 4] = [25, 50, 100, 200];
 const PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING: usize = 4_096;
+const PUBLIC_SIDECAR_MAX_RETAINED_PAIR_SAMPLE_CAPACITY: usize = 8_192;
 const PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS: usize = 1;
 const PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES: usize = 2_000;
+const PUBLIC_SIDECAR_BOOTSTRAP_SEED_POLICY: &str = "fixed-lane-split-bootstrap-seed-v2";
+const PUBLIC_SIDECAR_BOOTSTRAP_SAMPLER: &str = "splitmix64-per-replicate-stream-v1";
 const PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS: u64 = 401;
+const PUBLIC_SIDECAR_MAX_RETAINED_SIGNAL_CAPACITY: u64 = 1_024;
+const PUBLIC_SIDECAR_MAX_REPORTED_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const PUBLIC_SIDECAR_MINIMUM_PAIRED_RECORDINGS: u64 = 5;
+const PUBLIC_OUTPUT_CANCELLATION_GRANULARITY_BYTES: usize = 64 * 1024;
 /// Predeclared minimum relative micro-DER reduction required on development.
 pub const PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.05;
 /// Predeclared relative change-F1 gain for the calibrated detector.
@@ -806,6 +842,64 @@ impl PublicCorpusSidecarLane {
             },
         }
     }
+
+    const fn uses_frame_wavelet(self) -> bool {
+        matches!(
+            self,
+            Self::FrameHaarL4
+                | Self::FrameD4L4
+                | Self::FrameHaarL4AndModulation
+                | Self::FrameD4L4AndModulation
+                | Self::AllHaarL4
+                | Self::AllD4L4
+        )
+    }
+
+    const fn uses_modulation(self) -> bool {
+        matches!(
+            self,
+            Self::Modulation
+                | Self::FrameHaarL4AndModulation
+                | Self::FrameD4L4AndModulation
+                | Self::AllHaarL4
+                | Self::AllD4L4
+        )
+    }
+
+    const fn uses_trajectory_wavelet(self) -> bool {
+        matches!(
+            self,
+            Self::TrajectoryHaarL4 | Self::TrajectoryD4L4 | Self::AllHaarL4 | Self::AllD4L4
+        )
+    }
+
+    const fn uses_scattering(self) -> bool {
+        matches!(
+            self,
+            Self::ScatteringFirstOrder
+                | Self::ScatteringSecondOrder
+                | Self::ScatteringFirstAndSecondOrder
+                | Self::AllHaarL4
+                | Self::AllD4L4
+        )
+    }
+
+    /// Expected Voice-versus-Channel and Voice-versus-MixedAuxiliary checks.
+    const fn auxiliary_dominance_expectations(self) -> [bool; 2] {
+        match self {
+            Self::FullV2Baseline | Self::FrameHaarL4 | Self::FrameD4L4 => [false, false],
+            Self::Modulation => [true, false],
+            Self::FrameHaarL4AndModulation
+            | Self::FrameD4L4AndModulation
+            | Self::TrajectoryHaarL4
+            | Self::TrajectoryD4L4
+            | Self::ScatteringFirstOrder
+            | Self::ScatteringSecondOrder
+            | Self::ScatteringFirstAndSecondOrder
+            | Self::AllHaarL4
+            | Self::AllD4L4 => [true, true],
+        }
+    }
 }
 
 /// Whether a lane is the unfused control or an opt-in boundary-fusion pass.
@@ -813,7 +907,7 @@ impl PublicCorpusSidecarLane {
 #[serde(rename_all = "snake_case")]
 pub enum PublicCorpusSidecarFusionScope {
     BaselineUnfused,
-    BoundaryFusionV1,
+    BoundaryFusionV2,
 }
 
 /// Promotion authority attached to one lane.
@@ -836,11 +930,13 @@ pub enum PublicCorpusSidecarGateFailure {
     MacroJerRegression,
     BoundaryF1Regression,
     InsufficientComparableCoverage,
+    InsufficientPairCoverage,
+    InsufficientPairSupport,
     MissingConditionalPairs,
     PairDiscrimination,
     PairBrier,
     PairCalibration,
-    ChannelConfound,
+    AuxiliaryConfound,
     SpeakerCountRegression,
     PerformanceRegression,
     PairedDerUncertainty,
@@ -857,7 +953,11 @@ pub struct PublicCorpusSidecarGatePolicy {
     pub minimum_pair_roc_auc: f64,
     pub maximum_pair_brier_score: f64,
     pub maximum_pair_expected_calibration_error: f64,
-    pub maximum_channel_confound_rate: f64,
+    pub maximum_same_speaker_auxiliary_dominance_rate: f64,
+    pub minimum_same_speaker_auxiliary_dominance_opportunities: u64,
+    pub minimum_pair_score_coverage: f64,
+    pub minimum_conditional_pairs_per_class: u64,
+    pub minimum_conditional_pair_recording_count: u64,
     pub minimum_paired_recording_count: u64,
     pub maximum_relative_rtf_regression: f64,
     pub maximum_relative_rss_regression: f64,
@@ -879,20 +979,38 @@ pub struct PublicCorpusSidecarStudyProtocol {
     pub diarization_request: DiarizationRequest,
     pub diarization_request_sha256: String,
     pub feature_ablation: AcousticFeatureAblation,
+    pub feature_schema_sha256: String,
     pub detector_mode: AcousticChangeDetectorMode,
     pub clustering_mode: AcousticClusteringMode,
+    pub change_calibration_id: String,
+    pub change_calibration_fit_id: String,
+    pub change_calibration_sha256: String,
+    pub change_decision_probability: f64,
+    pub speaker_pair_calibration_id: String,
+    pub speaker_pair_calibration_sha256: String,
     pub sidecar_schema_id: String,
     pub fusion_id: String,
     pub calibration_fit_id: String,
+    pub pair_calibration_fit_id: String,
+    pub pair_probability_target_id: String,
+    pub pair_population_id: String,
+    pub pair_selection_key_id: String,
+    pub pair_selection_digest_id: String,
     pub pair_scorer_id: String,
     pub uncertainty_id: String,
+    pub uncertainty_seed_policy_id: String,
+    pub uncertainty_sampler_id: String,
     pub selection_policy_id: String,
     pub selection_policy_sha256: String,
     pub boundary_collar_ms: u64,
     pub reliability_bins: usize,
+    pub pair_score_bins: usize,
     pub pair_lags_frames: [usize; 4],
     pub maximum_pairs_per_recording: usize,
+    pub maximum_retained_pair_sample_capacity: usize,
     pub paired_bootstrap_replicates: usize,
+    pub maximum_retained_signal_capacity: usize,
+    pub maximum_reported_payload_bytes: u64,
     pub lane_order: Vec<PublicCorpusSidecarLane>,
     pub gate_policy: PublicCorpusSidecarGatePolicy,
 }
@@ -911,6 +1029,23 @@ pub struct PublicCorpusSidecarCalibration {
     pub calibration_sha256: String,
 }
 
+/// Development-fitted mapping from a frozen lagged-pair contrast to the
+/// empirical probability that the pair belongs to different speakers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarPairCalibration {
+    pub fit_id: String,
+    pub target_id: String,
+    pub logit_intercept: f64,
+    pub contrast_weight: f64,
+    pub minimum_comparable_components: usize,
+    pub fit_observation_count: u64,
+    pub fit_positive_count: u64,
+    pub fit_brier_score: Option<f64>,
+    /// SHA-256 of the calibration fingerprint with this field excluded.
+    pub calibration_sha256: String,
+}
+
 /// One fixed probability-reliability bin. Its count is aggregate-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -920,8 +1055,29 @@ pub struct PublicCorpusSidecarReliabilityBin {
     pub upper_probability: f64,
     pub observation_count: u64,
     pub positive_count: u64,
+    pub probability_sum: f64,
+    pub positive_probability_sum: f64,
+    pub squared_probability_sum: f64,
+    pub positive_squared_probability_sum: f64,
+    pub squared_error_sum: f64,
     pub mean_probability: Option<f64>,
     pub empirical_frequency: Option<f64>,
+}
+
+/// One fixed score-order bin used to recompute conditional-pair ROC AUC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarPairScoreBin {
+    pub index: usize,
+    pub lower_probability: f64,
+    pub upper_probability: f64,
+    pub same_speaker_count: u64,
+    pub different_speaker_count: u64,
+    pub probability_sum: f64,
+    pub different_speaker_probability_sum: f64,
+    pub squared_probability_sum: f64,
+    pub different_speaker_squared_probability_sum: f64,
+    pub squared_error_sum: f64,
 }
 
 /// Aggregate boundary metrics for one lane and split.
@@ -955,9 +1111,22 @@ pub struct PublicCorpusSidecarPairMetrics {
     pub brier_score: Option<f64>,
     pub expected_calibration_error: Option<f64>,
     pub reliability: Vec<PublicCorpusSidecarReliabilityBin>,
+    pub score_histogram: Vec<PublicCorpusSidecarPairScoreBin>,
 }
 
-/// Aggregate availability and channel-confound accounting.
+/// Aggregate dominance of one auxiliary owner over Voice on selected pairs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicCorpusSidecarAuxiliaryDominanceMetrics {
+    pub same_speaker_opportunity_count: u64,
+    pub same_speaker_dominance_count: u64,
+    pub same_speaker_dominance_rate: Option<f64>,
+    pub different_speaker_opportunity_count: u64,
+    pub different_speaker_dominance_count: u64,
+    pub different_speaker_dominance_rate: Option<f64>,
+}
+
+/// Aggregate availability, sampled-pair coverage, and auxiliary dominance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicCorpusSidecarCoverage {
@@ -974,14 +1143,21 @@ pub struct PublicCorpusSidecarCoverage {
     pub component_comparison_count: u64,
     /// Canonical Voice, Channel, MixedAuxiliary order.
     pub owner_available_frame_counts: [u64; 3],
-    pub channel_confound_opportunity_count: u64,
-    pub channel_confound_count: u64,
-    pub channel_confound_rate: Option<f64>,
-    pub exact_speaker_count_rate_delta: Option<f64>,
-    pub mean_absolute_speaker_count_error_delta: Option<f64>,
-    pub dominant_collapse_count_delta: Option<i64>,
-    pub relative_rtf_regression: Option<f64>,
-    pub relative_rss_regression: Option<f64>,
+    pub channel_dominance: PublicCorpusSidecarAuxiliaryDominanceMetrics,
+    pub mixed_auxiliary_dominance: PublicCorpusSidecarAuxiliaryDominanceMetrics,
+    pub eligible_pair_count: u64,
+    pub retained_pair_sample_count: u64,
+    pub retained_same_speaker_pair_count: u64,
+    pub retained_different_speaker_pair_count: u64,
+    pub pair_selection_sha256: Option<String>,
+    pub pair_score_coverage: Option<f64>,
+    pub same_speaker_pair_score_coverage: Option<f64>,
+    pub different_speaker_pair_score_coverage: Option<f64>,
+    pub pair_scored_recording_count: u64,
+    pub same_speaker_pair_recording_count: u64,
+    pub different_speaker_pair_recording_count: u64,
+    pub maximum_retained_pair_sample_count: u64,
+    pub retained_pair_sample_capacity: u64,
     pub maximum_retained_signal_count: u64,
     pub retained_signal_capacity: u64,
 }
@@ -1055,10 +1231,20 @@ pub struct PublicCorpusSidecarPromotionGate {
     pub macro_jer_delta: Option<f64>,
     pub boundary_f1_delta: Option<f64>,
     pub comparable_frame_coverage: Option<f64>,
+    pub pair_score_coverage: Option<f64>,
+    pub same_speaker_pair_score_coverage: Option<f64>,
+    pub different_speaker_pair_score_coverage: Option<f64>,
+    pub pair_scored_recording_count: u64,
     pub pair_roc_auc: Option<f64>,
     pub pair_brier_score: Option<f64>,
     pub pair_expected_calibration_error: Option<f64>,
-    pub channel_confound_rate: Option<f64>,
+    pub channel_same_speaker_dominance_rate: Option<f64>,
+    pub mixed_auxiliary_same_speaker_dominance_rate: Option<f64>,
+    pub exact_speaker_count_rate_delta: Option<f64>,
+    pub mean_absolute_speaker_count_error_delta: Option<f64>,
+    pub dominant_collapse_count_delta: Option<i64>,
+    pub relative_rtf_regression: Option<f64>,
+    pub relative_rss_regression: Option<f64>,
     pub paired_der_ci95_upper: Option<f64>,
     pub failures: Vec<PublicCorpusSidecarGateFailure>,
     pub passed: bool,
@@ -1074,6 +1260,7 @@ pub struct PublicCorpusSidecarStudyVariant {
     pub fusion_configuration_sha256: Option<String>,
     pub lane_configuration_sha256: String,
     pub calibration: Option<PublicCorpusSidecarCalibration>,
+    pub pair_calibration: Option<PublicCorpusSidecarPairCalibration>,
     pub disposition: PublicCorpusSidecarDisposition,
     pub splits: Vec<PublicCorpusSidecarStudySplit>,
     pub gate: Option<PublicCorpusSidecarPromotionGate>,
@@ -1100,7 +1287,9 @@ pub struct PublicCorpusSidecarStudyEvidence {
     pub selected_candidate_lane: Option<PublicCorpusSidecarLane>,
     pub adopted_candidate_lane: Option<PublicCorpusSidecarLane>,
     pub variants: Vec<PublicCorpusSidecarStudyVariant>,
-    /// Hash with wall-time, RSS, and RTF observations normalized away.
+    /// Hash with host timing, RSS, allocator-capacity, and target-sized
+    /// retained-state diagnostics normalized away. Accuracy-derived gate and
+    /// selection decisions remain bound; performance-only consequences do not.
     pub deterministic_accuracy_sha256: String,
     /// Hash of this evidence with this field temporarily empty.
     pub result_sha256: String,
@@ -1134,18 +1323,33 @@ struct PublicCorpusSidecarCalibrationFingerprint<'a> {
 }
 
 #[derive(Serialize)]
+struct PublicCorpusSidecarPairCalibrationFingerprint<'a> {
+    fit_id: &'a str,
+    target_id: &'a str,
+    logit_intercept: f64,
+    contrast_weight: f64,
+    minimum_comparable_components: usize,
+    fit_observation_count: u64,
+    fit_positive_count: u64,
+    fit_brier_score: Option<f64>,
+}
+
+#[derive(Serialize)]
 struct PublicCorpusSidecarLaneFingerprint<'a> {
     runner_version: &'a str,
     lane: PublicCorpusSidecarLane,
     fusion_scope: PublicCorpusSidecarFusionScope,
     study_configuration_sha256: &'a str,
     fusion_configuration_sha256: Option<&'a str>,
+    pair_calibration_sha256: Option<&'a str>,
     protocol_sha256: &'a str,
 }
 
 #[derive(Serialize)]
 struct PublicCorpusSidecarSelectionFingerprint<'a> {
     policy_id: &'a str,
+    accuracy_ranking: &'a str,
+    operational_gate_behavior: &'a str,
     lane_order: &'a [PublicCorpusSidecarLane],
     gate_policy: &'a PublicCorpusSidecarGatePolicy,
 }
@@ -1153,11 +1357,10 @@ struct PublicCorpusSidecarSelectionFingerprint<'a> {
 #[derive(Serialize)]
 struct PublicCorpusSidecarBootstrapSeedFingerprint<'a> {
     uncertainty_id: &'a str,
-    descriptor_sha256: &'a str,
+    seed_policy_id: &'a str,
+    sampler_id: &'a str,
     lane: PublicCorpusSidecarLane,
     split: EvaluationSplit,
-    baseline_recording_count: usize,
-    candidate_recording_count: usize,
     replicates: usize,
 }
 
@@ -1680,8 +1883,12 @@ fn validate_public_corpus_descriptor_metadata(
 
 /// Build one path-free bundle from external WAV and RTTM inputs.
 ///
-/// The output is opened with `create_new`, and all source/output roots must be
-/// absolute, canonical, and disjoint from the project checkout.
+/// On Linux, Android, and Apple platforms, the complete output is privately
+/// staged and published with an identity-bound no-clobber rename. Its parent
+/// must be owned by the effective user and not group/world writable. Other
+/// targets return `FwError::Unsupported` with `public_corpus.output_platform`.
+/// All source/output roots must be absolute, canonical, and disjoint from the
+/// project checkout.
 pub fn build_public_corpus_bundle(
     project_root: &Path,
     input_root: &Path,
@@ -1715,14 +1922,16 @@ pub fn build_public_corpus_bundle_with_cancel(
         output_path,
         license_acknowledgement_id,
         None,
+        None,
         is_cancelled,
     )
 }
 
 /// Sidecar-only materialization seam. Descriptor metadata for every split is
 /// validated up front, but only `selected_split` media and annotations are
-/// opened. Passing `None` preserves the public bundle adapter's original
-/// all-split behavior and bytes.
+/// opened. An expected descriptor digest closes the preflight/materialization
+/// race before any selected media is accessed. A `None` split and digest
+/// preserve the public bundle adapter's original all-split behavior and bytes.
 #[allow(clippy::too_many_arguments)]
 fn build_public_corpus_bundle_for_split_with_cancel(
     project_root: &Path,
@@ -1731,6 +1940,45 @@ fn build_public_corpus_bundle_for_split_with_cancel(
     output_path: &Path,
     license_acknowledgement_id: &str,
     selected_split: Option<EvaluationSplit>,
+    expected_descriptor_sha256: Option<&str>,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> FwResult<PublicCorpusBundle> {
+    let canonical_project = canonical_directory(project_root, "project_root")?;
+    let canonical_input = canonical_directory(input_root, "input_root")?;
+    if paths_overlap(&canonical_project, &canonical_input) {
+        return Err(public_corpus_error(
+            "input_root_overlap",
+            "input root must be disjoint from the project checkout",
+        ));
+    }
+    let output_parent = validate_new_output(&canonical_project, &canonical_input, output_path)?;
+    let bundle = materialize_public_corpus_bundle_for_split_with_cancel(
+        project_root,
+        input_root,
+        descriptor_path,
+        license_acknowledgement_id,
+        selected_split,
+        expected_descriptor_sha256,
+        &mut is_cancelled,
+    )?;
+    write_new_json(
+        output_path,
+        &output_parent,
+        &bundle,
+        "public-corpus bundle",
+        &mut is_cancelled,
+    )?;
+    Ok(bundle)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_public_corpus_bundle_for_split_with_cancel(
+    project_root: &Path,
+    input_root: &Path,
+    descriptor_path: &Path,
+    license_acknowledgement_id: &str,
+    selected_split: Option<EvaluationSplit>,
+    expected_descriptor_sha256: Option<&str>,
     mut is_cancelled: impl FnMut() -> bool,
 ) -> FwResult<PublicCorpusBundle> {
     checkpoint_cancelled(&mut is_cancelled)?;
@@ -1744,11 +1992,16 @@ fn build_public_corpus_bundle_for_split_with_cancel(
     }
     let canonical_descriptor =
         canonical_input_file(&canonical_input, descriptor_path, "descriptor")?;
-    let output_parent = validate_new_output(&canonical_project, &canonical_input, output_path)?;
     checkpoint_cancelled(&mut is_cancelled)?;
 
     let descriptor_bytes = read_bounded(&canonical_descriptor, MAX_DESCRIPTOR_BYTES, "descriptor")?;
     let descriptor_sha256 = format!("{:x}", Sha256::digest(&descriptor_bytes));
+    if expected_descriptor_sha256.is_some_and(|expected| expected != descriptor_sha256) {
+        return Err(public_corpus_error(
+            "sidecar_descriptor_changed",
+            "descriptor changed after the stage lock preflight",
+        ));
+    }
     let mut descriptor: PublicCorpusInput =
         serde_json::from_slice(&descriptor_bytes).map_err(|_| {
             public_corpus_error(
@@ -2060,13 +2313,17 @@ fn build_public_corpus_bundle_for_split_with_cancel(
     bundle.bundle_sha256 = canonical_sha256(&bundle)?;
     verify_public_corpus_bundle(&bundle)?;
     checkpoint_cancelled(&mut is_cancelled)?;
-    write_new_json(output_path, &output_parent, &bundle, "public-corpus bundle")?;
     Ok(bundle)
 }
 
 /// Build, execute, score, and retain one aggregate-only public feature
 /// ablation. Source media and per-recording hypotheses never leave
 /// `input_root` or process memory.
+///
+/// Bundle/evidence artifact publication requires Linux, Android, or an Apple
+/// platform and an effective-user-owned parent that is not group/world
+/// writable. Other targets fail before corpus materialization with
+/// `public_corpus.output_platform`.
 pub fn run_public_corpus_ablation_with_cancel(
     request: PublicCorpusAblationRequest<'_>,
     mut is_cancelled: impl FnMut() -> bool,
@@ -2110,16 +2367,12 @@ pub fn run_public_corpus_ablation_with_cancel(
         validate_new_output(&canonical_project, &canonical_input, bundle_output_path)?;
     let evidence_output_parent =
         validate_new_output(&canonical_project, &canonical_input, evidence_output_path)?;
-    let normalized_output = |path: &Path, parent: &Path| {
-        path.file_name()
-            .map(|file_name| parent.join(file_name))
-            .ok_or_else(|| {
-                public_corpus_error("ablation_output", "output must have a terminal file name")
-            })
-    };
-    if normalized_output(bundle_output_path, &bundle_output_parent)?
-        == normalized_output(evidence_output_path, &evidence_output_parent)?
-    {
+    if bundle_output_parent.same_output_target(
+        bundle_output_path,
+        &evidence_output_parent,
+        evidence_output_path,
+        "ablation_output",
+    )? {
         return Err(public_corpus_error(
             "ablation_output",
             "bundle and ablation evidence outputs must be distinct",
@@ -2158,12 +2411,13 @@ pub fn run_public_corpus_ablation_with_cancel(
     } else {
         None
     };
-    let bundle = build_public_corpus_bundle_with_cancel(
+    let bundle = materialize_public_corpus_bundle_for_split_with_cancel(
         project_root,
         input_root,
         descriptor_path,
-        bundle_output_path,
         license_acknowledgement_id,
+        None,
+        None,
         &mut is_cancelled,
     )?;
     checkpoint_cancelled(&mut is_cancelled)?;
@@ -2468,10 +2722,10 @@ pub fn run_public_corpus_ablation_with_cancel(
         schema_version: PUBLIC_CORPUS_ABLATION_SCHEMA_VERSION.to_owned(),
         runner_version: PUBLIC_CORPUS_ABLATION_RUNNER_VERSION.to_owned(),
         scorer_version: DIARIZATION_SCORER_VERSION.to_owned(),
-        corpus_key: bundle.corpus_key,
-        source_version: bundle.source_version,
-        bundle_sha256: bundle.bundle_sha256,
-        descriptor_sha256: bundle.descriptor_sha256,
+        corpus_key: bundle.corpus_key.clone(),
+        source_version: bundle.source_version.clone(),
+        bundle_sha256: bundle.bundle_sha256.clone(),
+        descriptor_sha256: bundle.descriptor_sha256.clone(),
         scorer_config,
         scorer_config_sha256,
         evaluation_stage,
@@ -2496,12 +2750,617 @@ pub fn run_public_corpus_ablation_with_cancel(
     result.result_sha256 = canonical_sha256(&result)?;
     verify_public_corpus_ablation_evidence(&result)?;
     checkpoint_cancelled(&mut is_cancelled)?;
-    write_new_json(
+    let staged_bundle = stage_new_json(
+        bundle_output_path,
+        &bundle_output_parent,
+        &bundle,
+        "public-corpus bundle",
+        &mut is_cancelled,
+    )?;
+    let staged_evidence = match stage_new_json(
         evidence_output_path,
         &evidence_output_parent,
         &result,
         "ablation evidence",
+        &mut is_cancelled,
+    ) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(staged_scrubbed_error(
+                error,
+                &[(&staged_bundle, "public-corpus bundle")],
+            ));
+        }
+    };
+    if let Err(error) = checkpoint_cancelled(&mut is_cancelled) {
+        return Err(staged_scrubbed_error(
+            error,
+            &[
+                (&staged_bundle, "public-corpus bundle"),
+                (&staged_evidence, "ablation evidence"),
+            ],
+        ));
+    }
+    if let Err(error) = publish_staged_json(staged_bundle, "public-corpus bundle") {
+        return Err(staged_scrubbed_error(
+            error,
+            &[(&staged_evidence, "ablation evidence")],
+        ));
+    }
+    publish_staged_json(staged_evidence, "ablation evidence")?;
+    Ok(result)
+}
+
+/// Run one sealed, aggregate-only public acoustic-sidecar study.
+///
+/// Development can inspect descriptor metadata for every split, but opens
+/// only development media and annotations. Certification validates the exact
+/// development lock and selected lane before opening any held-out bytes.
+/// Bundle/evidence artifact publication requires Linux, Android, or an Apple
+/// platform and an effective-user-owned parent that is not group/world
+/// writable. Other targets fail before corpus materialization with
+/// `public_corpus.output_platform`.
+pub fn run_public_corpus_sidecar_study_with_cancel(
+    request: PublicCorpusSidecarStudyRequest<'_>,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> FwResult<PublicCorpusSidecarStudyEvidence> {
+    let PublicCorpusSidecarStudyRequest {
+        project_root,
+        input_root,
+        descriptor_path,
+        bundle_output_path,
+        evidence_output_path,
+        license_acknowledgement_id,
+        maximum_recording_duration_ms,
+        evaluation_stage,
+        locked_development_evidence_path,
+    } = request;
+    if maximum_recording_duration_ms == Some(0) {
+        return Err(public_corpus_error(
+            "sidecar_duration",
+            "maximum recording duration must be positive when supplied",
+        ));
+    }
+    match (evaluation_stage, locked_development_evidence_path) {
+        (PublicCorpusEvaluationStage::Development, None)
+        | (PublicCorpusEvaluationStage::Certification, Some(_)) => {}
+        (PublicCorpusEvaluationStage::Development, Some(_)) => {
+            return Err(public_corpus_error(
+                "sidecar_stage_lock",
+                "development evaluation must not receive held-out lock evidence",
+            ));
+        }
+        (PublicCorpusEvaluationStage::Certification, None) => {
+            return Err(public_corpus_error(
+                "sidecar_stage_lock",
+                "certification requires locked development evidence",
+            ));
+        }
+    }
+    checkpoint_cancelled(&mut is_cancelled)?;
+    let canonical_project = canonical_directory(project_root, "project_root")?;
+    let canonical_input = canonical_directory(input_root, "input_root")?;
+    if paths_overlap(&canonical_project, &canonical_input) {
+        return Err(public_corpus_error(
+            "input_root_overlap",
+            "input root must be disjoint from the project checkout",
+        ));
+    }
+    let bundle_output_parent =
+        validate_new_output(&canonical_project, &canonical_input, bundle_output_path)?;
+    let evidence_output_parent =
+        validate_new_output(&canonical_project, &canonical_input, evidence_output_path)?;
+    if bundle_output_parent.same_output_target(
+        bundle_output_path,
+        &evidence_output_parent,
+        evidence_output_path,
+        "sidecar_output",
+    )? {
+        return Err(public_corpus_error(
+            "sidecar_output",
+            "bundle and sidecar evidence outputs must be distinct",
+        ));
+    }
+
+    // Lock verification deliberately precedes descriptor-driven media access.
+    let locked_development = if let Some(path) = locked_development_evidence_path {
+        let canonical_locked = canonical_external_file(
+            &canonical_project,
+            &canonical_input,
+            path,
+            "sidecar_development_lock",
+        )?;
+        let bytes = read_bounded(
+            &canonical_locked,
+            MAX_DESCRIPTOR_BYTES,
+            "sidecar_development_lock",
+        )?;
+        let evidence = parse_public_corpus_sidecar_study_evidence(&bytes)?;
+        let selected = evidence.selected_candidate_lane.ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_stage_lock",
+                "certification requires one development-selected candidate",
+            )
+        })?;
+        let selected_variant = evidence
+            .variants
+            .iter()
+            .find(|variant| variant.lane == selected)
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_stage_lock",
+                    "development-selected candidate is absent from its artifact",
+                )
+            })?;
+        if evidence.evaluation_stage != PublicCorpusEvaluationStage::Development
+            || evidence.adopted_candidate_lane.is_some()
+            || selected == PublicCorpusSidecarLane::FullV2Baseline
+            || selected_variant.disposition
+                != PublicCorpusSidecarDisposition::AdvanceToCertification
+            || !selected_variant
+                .gate
+                .as_ref()
+                .is_some_and(|gate| gate.passed)
+            || selected_variant.calibration.is_none()
+            || selected_variant.pair_calibration.is_none()
+        {
+            return Err(public_corpus_error(
+                "sidecar_stage_lock",
+                "certification lock has no valid development-selected candidate",
+            ));
+        }
+        Some(evidence)
+    } else {
+        None
+    };
+
+    let canonical_descriptor =
+        canonical_input_file(&canonical_input, descriptor_path, "descriptor")?;
+    let descriptor_bytes = read_bounded(&canonical_descriptor, MAX_DESCRIPTOR_BYTES, "descriptor")?;
+    let descriptor_sha256 = format!("{:x}", Sha256::digest(&descriptor_bytes));
+    let descriptor: PublicCorpusInput =
+        serde_json::from_slice(&descriptor_bytes).map_err(|_| {
+            public_corpus_error(
+                "descriptor_json",
+                "descriptor must be valid public-corpus input JSON without trailing data",
+            )
+        })?;
+    if descriptor.schema_version != PUBLIC_CORPUS_INPUT_SCHEMA_VERSION {
+        return Err(public_corpus_error(
+            "descriptor_schema_version",
+            "unsupported public-corpus input schema version",
+        ));
+    }
+    validate_public_id(&descriptor.corpus_key, "corpus_key")?;
+    validate_public_id(&descriptor.source_version, "source_version")?;
+
+    let scorer_config = DiarizationScorerConfig {
+        schema_version: crate::diarization::DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION.to_owned(),
+        speaker_boundary_collar_ms: 250,
+        change_boundary_collar_ms: 250,
+        overlap_policy: EvaluationOverlapPolicy::Exclude,
+        calibration_bins: 10,
+        count_top_k: 3,
+        count_credible_mass_millionths: 900_000,
+        dominant_speaker_collapse_share_millionths: 990_000,
+        minimum_reference_speaker_recall_millionths: 100_000,
+        minimum_effective_occupancy_ms: 250,
+    };
+    let scorer_config_sha256 = canonical_sha256(&scorer_config)?;
+    let diarization_request = DiarizationRequest {
+        engine: DiarizationEngine::Acoustic,
+        speaker_count: SpeakerCountRequest::Infer,
+        ..DiarizationRequest::default()
+    };
+    let diarization_request_sha256 = canonical_sha256(&diarization_request)?;
+    let protocol = public_sidecar_protocol(
+        maximum_recording_duration_ms,
+        &diarization_request,
+        diarization_request_sha256,
     )?;
+    let protocol_sha256 = canonical_sha256(&protocol)?;
+    if let Some(locked) = &locked_development
+        && (locked.descriptor_sha256 != descriptor_sha256
+            || locked.corpus_key != descriptor.corpus_key
+            || locked.source_version != descriptor.source_version
+            || locked.scorer_config != scorer_config
+            || locked.scorer_config_sha256 != scorer_config_sha256
+            || locked.protocol != protocol
+            || locked.protocol_sha256 != protocol_sha256)
+    {
+        return Err(public_corpus_error(
+            "sidecar_stage_lock",
+            "development lock does not bind the current descriptor, scorer, and protocol",
+        ));
+    }
+    checkpoint_cancelled(&mut is_cancelled)?;
+
+    let target_split = evaluation_stage.selected_split();
+    let bundle = materialize_public_corpus_bundle_for_split_with_cancel(
+        project_root,
+        input_root,
+        descriptor_path,
+        license_acknowledgement_id,
+        Some(target_split),
+        Some(&descriptor_sha256),
+        &mut is_cancelled,
+    )?;
+    if bundle.descriptor_sha256 != descriptor_sha256
+        || bundle.corpus_key != descriptor.corpus_key
+        || bundle.source_version != descriptor.source_version
+    {
+        return Err(public_corpus_error(
+            "sidecar_descriptor_changed",
+            "descriptor changed between lock preflight and selected-split materialization",
+        ));
+    }
+    let input_recordings = descriptor
+        .recordings
+        .into_iter()
+        .filter(|recording| recording.split == target_split)
+        .map(|recording| (recording.recording_id.clone(), recording))
+        .collect::<BTreeMap<_, _>>();
+    if input_recordings.len() != bundle.references.len() {
+        return Err(public_corpus_error(
+            "sidecar_alignment",
+            "selected descriptor and materialized bundle recording counts differ",
+        ));
+    }
+
+    let mut baseline = evaluate_public_sidecar_lane(
+        &bundle,
+        &input_recordings,
+        &canonical_input,
+        maximum_recording_duration_ms,
+        &diarization_request,
+        &scorer_config,
+        PublicCorpusSidecarLane::FullV2Baseline,
+        None,
+        None,
+        protocol.detector_mode,
+        protocol.clustering_mode,
+        target_split,
+        &mut is_cancelled,
+    )?;
+    let baseline_study_sha256 = acoustic_sidecar_study_config_sha256(
+        PublicCorpusSidecarLane::FullV2Baseline.study_config(),
+    )?;
+    let baseline_lane_sha256 = canonical_sha256(&PublicCorpusSidecarLaneFingerprint {
+        runner_version: PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+        lane: PublicCorpusSidecarLane::FullV2Baseline,
+        fusion_scope: PublicCorpusSidecarFusionScope::BaselineUnfused,
+        study_configuration_sha256: &baseline_study_sha256,
+        fusion_configuration_sha256: None,
+        pair_calibration_sha256: None,
+        protocol_sha256: &protocol_sha256,
+    })?;
+    baseline.split.paired_uncertainty = None;
+    let mut variants = vec![PublicCorpusSidecarStudyVariant {
+        lane: PublicCorpusSidecarLane::FullV2Baseline,
+        fusion_scope: PublicCorpusSidecarFusionScope::BaselineUnfused,
+        study_configuration_sha256: baseline_study_sha256,
+        fusion_configuration_sha256: None,
+        lane_configuration_sha256: baseline_lane_sha256,
+        calibration: None,
+        pair_calibration: None,
+        disposition: PublicCorpusSidecarDisposition::Baseline,
+        splits: vec![baseline.split.clone()],
+        gate: None,
+    }];
+
+    match evaluation_stage {
+        PublicCorpusEvaluationStage::Development => {
+            for lane in PublicCorpusSidecarLane::ALL.into_iter().skip(1) {
+                checkpoint_cancelled(&mut is_cancelled)?;
+                let calibrations = fit_public_sidecar_lane(
+                    &bundle,
+                    &input_recordings,
+                    &canonical_input,
+                    maximum_recording_duration_ms,
+                    lane,
+                    target_split,
+                    &mut is_cancelled,
+                )?;
+                let mut evaluation = if let Some(calibrations) = calibrations.as_ref() {
+                    evaluate_public_sidecar_lane(
+                        &bundle,
+                        &input_recordings,
+                        &canonical_input,
+                        maximum_recording_duration_ms,
+                        &diarization_request,
+                        &scorer_config,
+                        lane,
+                        Some(&calibrations.boundary),
+                        calibrations.pair.as_ref(),
+                        protocol.detector_mode,
+                        protocol.clustering_mode,
+                        target_split,
+                        &mut is_cancelled,
+                    )?
+                } else {
+                    SidecarLaneEvaluation {
+                        split: unavailable_public_sidecar_split(target_split)?,
+                        recording_accuracy: Vec::new(),
+                    }
+                };
+                if evaluation.split.fusion_executed {
+                    evaluation.split.paired_uncertainty = Some(paired_sidecar_uncertainty(
+                        &baseline.recording_accuracy,
+                        &evaluation.recording_accuracy,
+                        lane,
+                        target_split,
+                        &mut is_cancelled,
+                    )?);
+                }
+                let gate = public_sidecar_promotion_gate(
+                    evaluation_stage,
+                    &protocol.gate_policy,
+                    &baseline.split,
+                    lane,
+                    &evaluation.split,
+                );
+                let study_configuration_sha256 =
+                    acoustic_sidecar_study_config_sha256(lane.study_config())?;
+                let fusion_configuration_sha256 = calibrations
+                    .as_ref()
+                    .map(|calibrations| sidecar_evaluation_request(lane, &calibrations.boundary))
+                    .transpose()?
+                    .map(|request| {
+                        acoustic_sidecar_fusion_configuration_sha256(
+                            request,
+                            protocol.detector_mode,
+                        )
+                    })
+                    .transpose()?;
+                let pair_calibration_sha256 = calibrations
+                    .as_ref()
+                    .and_then(|calibrations| calibrations.pair.as_ref())
+                    .map(|calibration| calibration.calibration_sha256.as_str());
+                let lane_configuration_sha256 =
+                    canonical_sha256(&PublicCorpusSidecarLaneFingerprint {
+                        runner_version: PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+                        lane,
+                        fusion_scope: PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                        study_configuration_sha256: &study_configuration_sha256,
+                        fusion_configuration_sha256: fusion_configuration_sha256.as_deref(),
+                        pair_calibration_sha256,
+                        protocol_sha256: &protocol_sha256,
+                    })?;
+                variants.push(PublicCorpusSidecarStudyVariant {
+                    lane,
+                    fusion_scope: PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                    study_configuration_sha256,
+                    fusion_configuration_sha256,
+                    lane_configuration_sha256,
+                    calibration: calibrations
+                        .as_ref()
+                        .map(|calibrations| calibrations.boundary.clone()),
+                    pair_calibration: calibrations
+                        .as_ref()
+                        .and_then(|calibrations| calibrations.pair.clone()),
+                    disposition: PublicCorpusSidecarDisposition::Rejected,
+                    splits: vec![evaluation.split],
+                    gate: Some(gate),
+                });
+            }
+            apply_public_sidecar_development_selection(&mut variants);
+        }
+        PublicCorpusEvaluationStage::Certification => {
+            let locked = locked_development.as_ref().ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_stage_lock",
+                    "certification requires locked development evidence",
+                )
+            })?;
+            let selected = locked.selected_candidate_lane.ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_stage_lock",
+                    "development lock has no selected sidecar candidate",
+                )
+            })?;
+            for lane in PublicCorpusSidecarLane::ALL.into_iter().skip(1) {
+                let locked_variant = locked
+                    .variants
+                    .iter()
+                    .find(|variant| variant.lane == lane)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_stage_lock",
+                            "development lock is missing a frozen sidecar lane",
+                        )
+                    })?;
+                let boundary_calibration = locked_variant.calibration.clone();
+                let pair_calibration = locked_variant.pair_calibration.clone();
+                let study_configuration_sha256 =
+                    acoustic_sidecar_study_config_sha256(lane.study_config())?;
+                let fusion_configuration_sha256 = boundary_calibration
+                    .as_ref()
+                    .map(|calibration| sidecar_evaluation_request(lane, calibration))
+                    .transpose()?
+                    .map(|request| {
+                        acoustic_sidecar_fusion_configuration_sha256(
+                            request,
+                            protocol.detector_mode,
+                        )
+                    })
+                    .transpose()?;
+                if let Some(pair_calibration) = pair_calibration.as_ref() {
+                    validate_public_sidecar_pair_calibration(pair_calibration)?;
+                }
+                let lane_configuration_sha256 =
+                    canonical_sha256(&PublicCorpusSidecarLaneFingerprint {
+                        runner_version: PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+                        lane,
+                        fusion_scope: PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                        study_configuration_sha256: &study_configuration_sha256,
+                        fusion_configuration_sha256: fusion_configuration_sha256.as_deref(),
+                        pair_calibration_sha256: pair_calibration
+                            .as_ref()
+                            .map(|calibration| calibration.calibration_sha256.as_str()),
+                        protocol_sha256: &protocol_sha256,
+                    })?;
+                if lane == selected {
+                    let boundary_calibration = boundary_calibration.as_ref().ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_stage_lock",
+                            "selected development lane has no locked boundary calibration",
+                        )
+                    })?;
+                    let pair_calibration = pair_calibration.as_ref().ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_stage_lock",
+                            "selected development lane has no locked pair calibration",
+                        )
+                    })?;
+                    let mut evaluation = evaluate_public_sidecar_lane(
+                        &bundle,
+                        &input_recordings,
+                        &canonical_input,
+                        maximum_recording_duration_ms,
+                        &diarization_request,
+                        &scorer_config,
+                        lane,
+                        Some(boundary_calibration),
+                        Some(pair_calibration),
+                        protocol.detector_mode,
+                        protocol.clustering_mode,
+                        target_split,
+                        &mut is_cancelled,
+                    )?;
+                    if evaluation.split.fusion_executed {
+                        evaluation.split.paired_uncertainty = Some(paired_sidecar_uncertainty(
+                            &baseline.recording_accuracy,
+                            &evaluation.recording_accuracy,
+                            lane,
+                            target_split,
+                            &mut is_cancelled,
+                        )?);
+                    }
+                    let gate = public_sidecar_promotion_gate(
+                        evaluation_stage,
+                        &protocol.gate_policy,
+                        &baseline.split,
+                        lane,
+                        &evaluation.split,
+                    );
+                    let disposition = if gate.passed {
+                        PublicCorpusSidecarDisposition::Adopted
+                    } else {
+                        PublicCorpusSidecarDisposition::Rejected
+                    };
+                    variants.push(PublicCorpusSidecarStudyVariant {
+                        lane,
+                        fusion_scope: PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                        study_configuration_sha256,
+                        fusion_configuration_sha256,
+                        lane_configuration_sha256,
+                        calibration: Some(boundary_calibration.clone()),
+                        pair_calibration: Some(pair_calibration.clone()),
+                        disposition,
+                        splits: vec![evaluation.split],
+                        gate: Some(gate),
+                    });
+                } else {
+                    variants.push(PublicCorpusSidecarStudyVariant {
+                        lane,
+                        fusion_scope: PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                        study_configuration_sha256,
+                        fusion_configuration_sha256,
+                        lane_configuration_sha256,
+                        calibration: boundary_calibration,
+                        pair_calibration,
+                        disposition: PublicCorpusSidecarDisposition::Rejected,
+                        splits: vec![unavailable_public_sidecar_split(target_split)?],
+                        gate: None,
+                    });
+                }
+            }
+        }
+    }
+    let selected_candidate_lane = match evaluation_stage {
+        PublicCorpusEvaluationStage::Development => variants
+            .iter()
+            .find(|variant| {
+                variant.disposition == PublicCorpusSidecarDisposition::AdvanceToCertification
+            })
+            .map(|variant| variant.lane),
+        PublicCorpusEvaluationStage::Certification => locked_development
+            .as_ref()
+            .and_then(|evidence| evidence.selected_candidate_lane),
+    };
+    let adopted_candidate_lane = variants
+        .iter()
+        .find(|variant| variant.disposition == PublicCorpusSidecarDisposition::Adopted)
+        .map(|variant| variant.lane);
+    let locked_development_result_sha256 = locked_development
+        .as_ref()
+        .map(|evidence| evidence.result_sha256.clone());
+    let locked_development_accuracy_sha256 = locked_development
+        .as_ref()
+        .map(|evidence| evidence.deterministic_accuracy_sha256.clone());
+    let mut result = PublicCorpusSidecarStudyEvidence {
+        schema_version: PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION.to_owned(),
+        runner_version: PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION.to_owned(),
+        scorer_version: DIARIZATION_SCORER_VERSION.to_owned(),
+        corpus_key: bundle.corpus_key.clone(),
+        source_version: bundle.source_version.clone(),
+        bundle_sha256: bundle.bundle_sha256.clone(),
+        descriptor_sha256,
+        scorer_config,
+        scorer_config_sha256,
+        evaluation_stage,
+        locked_development_result_sha256,
+        locked_development_accuracy_sha256,
+        protocol,
+        protocol_sha256,
+        selected_candidate_lane,
+        adopted_candidate_lane,
+        variants,
+        deterministic_accuracy_sha256: String::new(),
+        result_sha256: String::new(),
+    };
+    result.deterministic_accuracy_sha256 = deterministic_sidecar_accuracy_sha256(&result)?;
+    result.result_sha256 = canonical_sha256(&result)?;
+    verify_public_corpus_sidecar_study_evidence(&result)?;
+    checkpoint_cancelled(&mut is_cancelled)?;
+    let staged_bundle = stage_new_json(
+        bundle_output_path,
+        &bundle_output_parent,
+        &bundle,
+        "public-corpus bundle",
+        &mut is_cancelled,
+    )?;
+    let staged_evidence = match stage_new_json(
+        evidence_output_path,
+        &evidence_output_parent,
+        &result,
+        "sidecar study evidence",
+        &mut is_cancelled,
+    ) {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(staged_scrubbed_error(
+                error,
+                &[(&staged_bundle, "public-corpus bundle")],
+            ));
+        }
+    };
+    if let Err(error) = checkpoint_cancelled(&mut is_cancelled) {
+        return Err(staged_scrubbed_error(
+            error,
+            &[
+                (&staged_bundle, "public-corpus bundle"),
+                (&staged_evidence, "sidecar study evidence"),
+            ],
+        ));
+    }
+    if let Err(error) = publish_staged_json(staged_bundle, "public-corpus bundle") {
+        return Err(staged_scrubbed_error(
+            error,
+            &[(&staged_evidence, "sidecar study evidence")],
+        ));
+    }
+    publish_staged_json(staged_evidence, "sidecar study evidence")?;
     Ok(result)
 }
 
@@ -2772,15 +3631,42 @@ struct SidecarReliabilityAccumulator {
     observation_count: u64,
     positive_count: u64,
     probability_sum: f64,
+    probability_sum_correction: f64,
+    positive_probability_sum: f64,
+    positive_probability_sum_correction: f64,
+    squared_probability_sum: f64,
+    squared_probability_sum_correction: f64,
+    positive_squared_probability_sum: f64,
+    positive_squared_probability_sum_correction: f64,
+    squared_error_sum: f64,
+    squared_error_sum_correction: f64,
+}
+
+fn add_sidecar_compensated(total: &mut f64, correction: &mut f64, value: f64) {
+    let next = *total + value;
+    if total.abs() >= value.abs() {
+        *correction += (*total - next) + value;
+    } else {
+        *correction += (value - next) + *total;
+    }
+    *total = next;
+}
+
+fn sidecar_compensated_total(total: f64, correction: f64) -> f64 {
+    total + correction
+}
+
+struct FinishedSidecarReliability {
+    brier_score: Option<f64>,
+    expected_calibration_error: Option<f64>,
+    probability_sum: f64,
+    positive_probability_sum: f64,
+    reliability: Vec<PublicCorpusSidecarReliabilityBin>,
 }
 
 struct SidecarProbabilityAccumulator {
     observation_count: u64,
     positive_count: u64,
-    probability_sum: f64,
-    negative_probability_sum: f64,
-    positive_probability_sum: f64,
-    brier_sum: f64,
     reliability: Vec<SidecarReliabilityAccumulator>,
 }
 
@@ -2789,10 +3675,6 @@ impl SidecarProbabilityAccumulator {
         Self {
             observation_count: 0,
             positive_count: 0,
-            probability_sum: 0.0,
-            negative_probability_sum: 0.0,
-            positive_probability_sum: 0.0,
-            brier_sum: 0.0,
             reliability: vec![
                 SidecarReliabilityAccumulator::default();
                 PUBLIC_SIDECAR_RELIABILITY_BINS
@@ -2801,10 +3683,13 @@ impl SidecarProbabilityAccumulator {
     }
 
     fn push(&mut self, probability: f64, positive: bool) -> FwResult<()> {
-        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+        if !probability.is_finite()
+            || !(f64::from(f32::EPSILON)..=f64::from(1.0_f32 - f32::EPSILON)).contains(&probability)
+            || f64::from(probability as f32) != probability
+        {
             return Err(public_corpus_error(
                 "sidecar_probability",
-                "sidecar probability must be finite and within [0, 1]",
+                "sidecar probability must be a finite f32 value within the calibrated open-unit clamp",
             ));
         }
         self.observation_count = self.observation_count.checked_add(1).ok_or_else(|| {
@@ -2822,34 +3707,88 @@ impl SidecarProbabilityAccumulator {
                     "sidecar positive observation count overflowed",
                 )
             })?;
-        self.probability_sum += probability;
-        if positive {
-            self.positive_probability_sum += probability;
-        } else {
-            self.negative_probability_sum += probability;
-        }
-        let target = f64::from(positive);
-        self.brier_sum += (probability - target).powi(2);
-        let bin = ((probability * PUBLIC_SIDECAR_RELIABILITY_BINS as f64).floor() as usize)
-            .min(PUBLIC_SIDECAR_RELIABILITY_BINS - 1);
+        let bin =
+            sidecar_f32_probability_bin_index(probability as f32, PUBLIC_SIDECAR_RELIABILITY_BINS);
         let reliability = &mut self.reliability[bin];
-        reliability.observation_count = reliability.observation_count.saturating_add(1);
+        reliability.observation_count =
+            reliability
+                .observation_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_aggregate_overflow",
+                        "sidecar reliability observation count overflowed",
+                    )
+                })?;
         reliability.positive_count = reliability
             .positive_count
-            .saturating_add(u64::from(positive));
-        reliability.probability_sum += probability;
+            .checked_add(u64::from(positive))
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    "sidecar reliability positive count overflowed",
+                )
+            })?;
+        add_sidecar_compensated(
+            &mut reliability.probability_sum,
+            &mut reliability.probability_sum_correction,
+            probability,
+        );
+        add_sidecar_compensated(
+            &mut reliability.positive_probability_sum,
+            &mut reliability.positive_probability_sum_correction,
+            probability * f64::from(positive),
+        );
+        add_sidecar_compensated(
+            &mut reliability.squared_probability_sum,
+            &mut reliability.squared_probability_sum_correction,
+            probability * probability,
+        );
+        add_sidecar_compensated(
+            &mut reliability.positive_squared_probability_sum,
+            &mut reliability.positive_squared_probability_sum_correction,
+            probability * probability * f64::from(positive),
+        );
+        let error = probability - f64::from(positive);
+        add_sidecar_compensated(
+            &mut reliability.squared_error_sum,
+            &mut reliability.squared_error_sum_correction,
+            error * error,
+        );
         Ok(())
     }
 
-    fn finish_reliability(&self) -> (Option<f64>, Option<f64>, Vec<PublicCorpusSidecarReliabilityBin>) {
+    fn finish_reliability(&self) -> FinishedSidecarReliability {
         let mut ece = 0.0;
         let reliability = self
             .reliability
             .iter()
             .enumerate()
             .map(|(index, bin)| {
+                let probability_sum = canonical_evidence_number(sidecar_compensated_total(
+                    bin.probability_sum,
+                    bin.probability_sum_correction,
+                ));
+                let positive_probability_sum =
+                    canonical_evidence_number(sidecar_compensated_total(
+                        bin.positive_probability_sum,
+                        bin.positive_probability_sum_correction,
+                    ));
+                let squared_probability_sum = canonical_evidence_number(sidecar_compensated_total(
+                    bin.squared_probability_sum,
+                    bin.squared_probability_sum_correction,
+                ));
+                let positive_squared_probability_sum =
+                    canonical_evidence_number(sidecar_compensated_total(
+                        bin.positive_squared_probability_sum,
+                        bin.positive_squared_probability_sum_correction,
+                    ));
+                let squared_error_sum = canonical_evidence_number(sidecar_compensated_total(
+                    bin.squared_error_sum,
+                    bin.squared_error_sum_correction,
+                ));
                 let mean_probability =
-                    positive_ratio(bin.probability_sum, bin.observation_count as f64);
+                    positive_ratio(probability_sum, bin.observation_count as f64);
                 let empirical_frequency = ratio(bin.positive_count, bin.observation_count);
                 if let (Some(mean), Some(empirical)) = (mean_probability, empirical_frequency) {
                     ece += bin.observation_count as f64 / self.observation_count.max(1) as f64
@@ -2865,62 +3804,136 @@ impl SidecarProbabilityAccumulator {
                     ),
                     observation_count: bin.observation_count,
                     positive_count: bin.positive_count,
+                    probability_sum,
+                    positive_probability_sum,
+                    squared_probability_sum,
+                    positive_squared_probability_sum,
+                    squared_error_sum,
                     mean_probability,
                     empirical_frequency,
                 }
             })
-            .collect();
-        (
-            positive_ratio(self.brier_sum, self.observation_count as f64),
-            (self.observation_count > 0).then(|| canonical_evidence_number(ece)),
+            .collect::<Vec<_>>();
+        let probability_sum =
+            canonical_evidence_number(reliability.iter().map(|bin| bin.probability_sum).sum());
+        let positive_probability_sum = canonical_evidence_number(
+            reliability
+                .iter()
+                .map(|bin| bin.positive_probability_sum)
+                .sum(),
+        );
+        let brier_sum =
+            canonical_evidence_number(reliability.iter().map(|bin| bin.squared_error_sum).sum());
+        FinishedSidecarReliability {
+            brier_score: positive_ratio(brier_sum, self.observation_count as f64),
+            expected_calibration_error: (self.observation_count > 0)
+                .then(|| canonical_evidence_number(ece)),
+            probability_sum,
+            positive_probability_sum,
             reliability,
-        )
+        }
     }
 }
 
 struct SidecarPairAccumulator {
     probabilities: SidecarProbabilityAccumulator,
-    same_score_bins: Vec<u64>,
-    different_score_bins: Vec<u64>,
+    score_bins: Vec<SidecarReliabilityAccumulator>,
 }
 
 impl SidecarPairAccumulator {
     fn new() -> Self {
         Self {
             probabilities: SidecarProbabilityAccumulator::new(),
-            same_score_bins: vec![0; PUBLIC_SIDECAR_PAIR_SCORE_BINS],
-            different_score_bins: vec![0; PUBLIC_SIDECAR_PAIR_SCORE_BINS],
+            score_bins: vec![
+                SidecarReliabilityAccumulator::default();
+                PUBLIC_SIDECAR_PAIR_SCORE_BINS
+            ],
         }
     }
 
     fn push(&mut self, probability: f64, different_speaker: bool) -> FwResult<()> {
         self.probabilities.push(probability, different_speaker)?;
-        let bin = ((probability * PUBLIC_SIDECAR_PAIR_SCORE_BINS as f64).floor() as usize)
-            .min(PUBLIC_SIDECAR_PAIR_SCORE_BINS - 1);
-        if different_speaker {
-            self.different_score_bins[bin] = self.different_score_bins[bin].saturating_add(1);
-        } else {
-            self.same_score_bins[bin] = self.same_score_bins[bin].saturating_add(1);
-        }
+        let bin =
+            sidecar_f32_probability_bin_index(probability as f32, PUBLIC_SIDECAR_PAIR_SCORE_BINS);
+        let score_bin = &mut self.score_bins[bin];
+        score_bin.observation_count =
+            score_bin.observation_count.checked_add(1).ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    "pair score histogram count overflowed",
+                )
+            })?;
+        score_bin.positive_count = score_bin
+            .positive_count
+            .checked_add(u64::from(different_speaker))
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    "different-speaker score histogram count overflowed",
+                )
+            })?;
+        add_sidecar_compensated(
+            &mut score_bin.probability_sum,
+            &mut score_bin.probability_sum_correction,
+            probability,
+        );
+        add_sidecar_compensated(
+            &mut score_bin.positive_probability_sum,
+            &mut score_bin.positive_probability_sum_correction,
+            probability * f64::from(different_speaker),
+        );
+        add_sidecar_compensated(
+            &mut score_bin.squared_probability_sum,
+            &mut score_bin.squared_probability_sum_correction,
+            probability * probability,
+        );
+        add_sidecar_compensated(
+            &mut score_bin.positive_squared_probability_sum,
+            &mut score_bin.positive_squared_probability_sum_correction,
+            probability * probability * f64::from(different_speaker),
+        );
+        let error = probability - f64::from(different_speaker);
+        add_sidecar_compensated(
+            &mut score_bin.squared_error_sum,
+            &mut score_bin.squared_error_sum_correction,
+            error * error,
+        );
         Ok(())
     }
 
-    fn finish(&self) -> PublicCorpusSidecarPairMetrics {
+    fn finish(&self) -> FwResult<PublicCorpusSidecarPairMetrics> {
         let same_speaker_count = self
             .probabilities
             .observation_count
-            .saturating_sub(self.probabilities.positive_count);
+            .checked_sub(self.probabilities.positive_count)
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    "different-speaker count exceeds pair observation count",
+                )
+            })?;
         let different_speaker_count = self.probabilities.positive_count;
         let roc_auc = if same_speaker_count > 0 && different_speaker_count > 0 {
             let mut lower_same = 0_u64;
             let mut concordance = 0.0;
-            for (&same, &different) in self
-                .same_score_bins
-                .iter()
-                .zip(&self.different_score_bins)
-            {
+            for bin in &self.score_bins {
+                let same = bin
+                    .observation_count
+                    .checked_sub(bin.positive_count)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_aggregate_overflow",
+                            "different-speaker score count exceeds the bin total",
+                        )
+                    })?;
+                let different = bin.positive_count;
                 concordance += different as f64 * (lower_same as f64 + 0.5 * same as f64);
-                lower_same = lower_same.saturating_add(same);
+                lower_same = lower_same.checked_add(same).ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_aggregate_overflow",
+                        "same-speaker AUC accumulator overflowed",
+                    )
+                })?;
             }
             Some(canonical_evidence_number(
                 concordance / (same_speaker_count as f64 * different_speaker_count as f64),
@@ -2928,24 +3941,210 @@ impl SidecarPairAccumulator {
         } else {
             None
         };
-        let (brier_score, expected_calibration_error, reliability) =
-            self.probabilities.finish_reliability();
-        PublicCorpusSidecarPairMetrics {
+        let score_histogram = self
+            .score_bins
+            .iter()
+            .enumerate()
+            .map(|(index, bin)| {
+                let same_speaker_count = bin
+                    .observation_count
+                    .checked_sub(bin.positive_count)
+                    .ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_aggregate_overflow",
+                            "different-speaker score count exceeds the bin total",
+                        )
+                    })?;
+                Ok(PublicCorpusSidecarPairScoreBin {
+                    index,
+                    lower_probability: canonical_evidence_number(
+                        index as f64 / PUBLIC_SIDECAR_PAIR_SCORE_BINS as f64,
+                    ),
+                    upper_probability: canonical_evidence_number(
+                        (index + 1) as f64 / PUBLIC_SIDECAR_PAIR_SCORE_BINS as f64,
+                    ),
+                    same_speaker_count,
+                    different_speaker_count: bin.positive_count,
+                    probability_sum: canonical_evidence_number(sidecar_compensated_total(
+                        bin.probability_sum,
+                        bin.probability_sum_correction,
+                    )),
+                    different_speaker_probability_sum: canonical_evidence_number(
+                        sidecar_compensated_total(
+                            bin.positive_probability_sum,
+                            bin.positive_probability_sum_correction,
+                        ),
+                    ),
+                    squared_probability_sum: canonical_evidence_number(sidecar_compensated_total(
+                        bin.squared_probability_sum,
+                        bin.squared_probability_sum_correction,
+                    )),
+                    different_speaker_squared_probability_sum: canonical_evidence_number(
+                        sidecar_compensated_total(
+                            bin.positive_squared_probability_sum,
+                            bin.positive_squared_probability_sum_correction,
+                        ),
+                    ),
+                    squared_error_sum: canonical_evidence_number(sidecar_compensated_total(
+                        bin.squared_error_sum,
+                        bin.squared_error_sum_correction,
+                    )),
+                })
+            })
+            .collect::<FwResult<Vec<_>>>()?;
+        let score_bins_per_reliability_bin =
+            PUBLIC_SIDECAR_PAIR_SCORE_BINS / PUBLIC_SIDECAR_RELIABILITY_BINS;
+        let mut linked_reliability =
+            vec![SidecarReliabilityAccumulator::default(); PUBLIC_SIDECAR_RELIABILITY_BINS];
+        for (index, bin) in score_histogram.iter().enumerate() {
+            let linked = &mut linked_reliability[index / score_bins_per_reliability_bin];
+            let observation_count = bin
+                .same_speaker_count
+                .checked_add(bin.different_speaker_count)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_aggregate_overflow",
+                        "linked pair reliability observation count overflowed",
+                    )
+                })?;
+            linked.observation_count = linked
+                .observation_count
+                .checked_add(observation_count)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_aggregate_overflow",
+                        "linked pair reliability observation count overflowed",
+                    )
+                })?;
+            linked.positive_count = linked
+                .positive_count
+                .checked_add(bin.different_speaker_count)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_aggregate_overflow",
+                        "linked pair reliability positive count overflowed",
+                    )
+                })?;
+            add_sidecar_compensated(
+                &mut linked.probability_sum,
+                &mut linked.probability_sum_correction,
+                bin.probability_sum,
+            );
+            add_sidecar_compensated(
+                &mut linked.positive_probability_sum,
+                &mut linked.positive_probability_sum_correction,
+                bin.different_speaker_probability_sum,
+            );
+            add_sidecar_compensated(
+                &mut linked.squared_probability_sum,
+                &mut linked.squared_probability_sum_correction,
+                bin.squared_probability_sum,
+            );
+            add_sidecar_compensated(
+                &mut linked.positive_squared_probability_sum,
+                &mut linked.positive_squared_probability_sum_correction,
+                bin.different_speaker_squared_probability_sum,
+            );
+            add_sidecar_compensated(
+                &mut linked.squared_error_sum,
+                &mut linked.squared_error_sum_correction,
+                bin.squared_error_sum,
+            );
+        }
+        let linked_probabilities = SidecarProbabilityAccumulator {
+            observation_count: self.probabilities.observation_count,
+            positive_count: self.probabilities.positive_count,
+            reliability: linked_reliability,
+        };
+        let finished = linked_probabilities.finish_reliability();
+        let same_probability_sum =
+            canonical_evidence_number(finished.probability_sum - finished.positive_probability_sum);
+        Ok(PublicCorpusSidecarPairMetrics {
             comparison_count: self.probabilities.observation_count,
             same_speaker_count,
             different_speaker_count,
             mean_different_probability_given_same_speaker: positive_ratio(
-                self.probabilities.negative_probability_sum,
+                same_probability_sum,
                 same_speaker_count as f64,
             ),
             mean_different_probability_given_different_speaker: positive_ratio(
-                self.probabilities.positive_probability_sum,
+                finished.positive_probability_sum,
                 different_speaker_count as f64,
             ),
             roc_auc,
-            brier_score,
-            expected_calibration_error,
-            reliability,
+            brier_score: finished.brier_score,
+            expected_calibration_error: finished.expected_calibration_error,
+            reliability: finished.reliability,
+            score_histogram,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SidecarAuxiliaryDominanceAccumulator {
+    same_speaker_opportunity_count: u64,
+    same_speaker_dominance_count: u64,
+    different_speaker_opportunity_count: u64,
+    different_speaker_dominance_count: u64,
+}
+
+impl SidecarAuxiliaryDominanceAccumulator {
+    fn push(
+        &mut self,
+        different_speaker: bool,
+        opportunity: bool,
+        dominance: bool,
+    ) -> FwResult<()> {
+        if dominance && !opportunity {
+            return Err(public_corpus_error(
+                "sidecar_auxiliary_dominance",
+                "auxiliary dominance cannot be present without a comparison opportunity",
+            ));
+        }
+        let (opportunity_count, dominance_count) = if different_speaker {
+            (
+                &mut self.different_speaker_opportunity_count,
+                &mut self.different_speaker_dominance_count,
+            )
+        } else {
+            (
+                &mut self.same_speaker_opportunity_count,
+                &mut self.same_speaker_dominance_count,
+            )
+        };
+        *opportunity_count = opportunity_count
+            .checked_add(u64::from(opportunity))
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    "auxiliary-dominance opportunity count overflowed",
+                )
+            })?;
+        *dominance_count = dominance_count
+            .checked_add(u64::from(dominance))
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_aggregate_overflow",
+                    "auxiliary-dominance count overflowed",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn finish(&self) -> PublicCorpusSidecarAuxiliaryDominanceMetrics {
+        PublicCorpusSidecarAuxiliaryDominanceMetrics {
+            same_speaker_opportunity_count: self.same_speaker_opportunity_count,
+            same_speaker_dominance_count: self.same_speaker_dominance_count,
+            same_speaker_dominance_rate: ratio(
+                self.same_speaker_dominance_count,
+                self.same_speaker_opportunity_count,
+            ),
+            different_speaker_opportunity_count: self.different_speaker_opportunity_count,
+            different_speaker_dominance_count: self.different_speaker_dominance_count,
+            different_speaker_dominance_rate: ratio(
+                self.different_speaker_dominance_count,
+                self.different_speaker_opportunity_count,
+            ),
         }
     }
 }
@@ -2957,12 +4156,25 @@ struct SidecarObservationAccumulator {
     comparable_frame_count: u64,
     component_comparison_count: u64,
     owner_available_frame_counts: [u64; 3],
-    channel_confound_opportunity_count: u64,
-    channel_confound_count: u64,
+    channel_dominance: SidecarAuxiliaryDominanceAccumulator,
+    mixed_auxiliary_dominance: SidecarAuxiliaryDominanceAccumulator,
+    eligible_pair_count: u64,
+    retained_pair_sample_count: u64,
+    retained_same_speaker_pair_count: u64,
+    retained_different_speaker_pair_count: u64,
+    pair_selection_hasher: Sha256,
+    pair_scored_recording_count: u64,
+    same_speaker_pair_recording_count: u64,
+    different_speaker_pair_recording_count: u64,
+    maximum_retained_pair_sample_count: u64,
+    retained_pair_sample_capacity: u64,
 }
 
 impl SidecarObservationAccumulator {
     fn new() -> Self {
+        let mut pair_selection_hasher = Sha256::new();
+        pair_selection_hasher
+            .update(PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_DIGEST_VERSION.as_bytes());
         Self {
             boundary_probabilities: SidecarProbabilityAccumulator::new(),
             pairs: SidecarPairAccumulator::new(),
@@ -2970,10 +4182,43 @@ impl SidecarObservationAccumulator {
             comparable_frame_count: 0,
             component_comparison_count: 0,
             owner_available_frame_counts: [0; 3],
-            channel_confound_opportunity_count: 0,
-            channel_confound_count: 0,
+            channel_dominance: SidecarAuxiliaryDominanceAccumulator::default(),
+            mixed_auxiliary_dominance: SidecarAuxiliaryDominanceAccumulator::default(),
+            eligible_pair_count: 0,
+            retained_pair_sample_count: 0,
+            retained_same_speaker_pair_count: 0,
+            retained_different_speaker_pair_count: 0,
+            pair_selection_hasher,
+            pair_scored_recording_count: 0,
+            same_speaker_pair_recording_count: 0,
+            different_speaker_pair_recording_count: 0,
+            maximum_retained_pair_sample_count: 0,
+            retained_pair_sample_capacity: 0,
         }
     }
+}
+
+fn update_sidecar_pair_selection_digest(
+    hasher: &mut Sha256,
+    normalized_pcm_sha256: &[u8; 32],
+    selected_pairs: &[SidecarPairSample],
+) -> FwResult<()> {
+    let retained_pair_count = u64::try_from(selected_pairs.len()).map_err(|_| {
+        public_corpus_error(
+            "sidecar_aggregate_overflow",
+            "retained pair sample count exceeds u64",
+        )
+    })?;
+    hasher.update(normalized_pcm_sha256);
+    hasher.update(retained_pair_count.to_le_bytes());
+    for pair in selected_pairs {
+        hasher.update(pair.key.digest);
+        hasher.update(pair.key.left_frame_index.to_le_bytes());
+        hasher.update(pair.key.right_frame_index.to_le_bytes());
+        hasher.update(pair.key.lag_frames.to_le_bytes());
+        hasher.update([u8::from(pair.different_speaker)]);
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3005,6 +4250,26 @@ struct SidecarOperationsAccumulator {
 
 impl SidecarOperationsAccumulator {
     fn push(&mut self, evidence: &AcousticSidecarFusionEvaluationEvidence) -> FwResult<()> {
+        if evidence.fusion_executed != (evidence.consumed_probability_count > 0)
+            || evidence.comparable_frame_count > evidence.submitted_frame_count
+            || evidence.calibrated_signal_count > evidence.comparable_frame_count
+            || evidence.consumed_probability_count > evidence.calibrated_signal_count
+            || evidence.changed_boundary_probability_count > evidence.consumed_probability_count
+        {
+            return Err(public_corpus_error(
+                "sidecar_fusion_evidence",
+                "per-recording fusion consumption counters are inconsistent",
+            ));
+        }
+        if evidence.fusion_requested
+            != (evidence.sidecar_configuration_sha256.is_some()
+                && evidence.fusion_configuration_sha256.is_some())
+        {
+            return Err(public_corpus_error(
+                "sidecar_fusion_evidence",
+                "fusion request and configuration identities are inconsistent",
+            ));
+        }
         let checked_usize = |value: usize, field: &str| {
             u64::try_from(value).map_err(|_| {
                 public_corpus_error(
@@ -3056,7 +4321,10 @@ impl SidecarOperationsAccumulator {
         )?;
         checked_add(
             &mut self.consumed_probability_count,
-            checked_usize(evidence.consumed_probability_count, "consumed probability count")?,
+            checked_usize(
+                evidence.consumed_probability_count,
+                "consumed probability count",
+            )?,
             "consumed probability count",
         )?;
         checked_add(
@@ -3067,9 +4335,10 @@ impl SidecarOperationsAccumulator {
             )?,
             "changed boundary probability count",
         )?;
-        self.maximum_retained_signal_count = self.maximum_retained_signal_count.max(
-            checked_usize(evidence.maximum_retained_signals, "maximum retained signal count")?,
-        );
+        self.maximum_retained_signal_count = self.maximum_retained_signal_count.max(checked_usize(
+            evidence.maximum_retained_signals,
+            "maximum retained signal count",
+        )?);
         self.retained_signal_capacity = self.retained_signal_capacity.max(checked_usize(
             evidence.retained_signal_capacity,
             "retained signal capacity",
@@ -3108,18 +4377,16 @@ impl SidecarOperationsAccumulator {
         ] {
             checked_add(total, value, field)?;
         }
-        self.peak_scratch_buffer_payload_bytes = self.peak_scratch_buffer_payload_bytes.max(
-            checked_usize(
+        self.peak_scratch_buffer_payload_bytes =
+            self.peak_scratch_buffer_payload_bytes.max(checked_usize(
                 evidence.peak_scratch_buffer_payload_bytes,
                 "peak scratch payload",
-            )?,
-        );
-        self.peak_retained_state_bytes_on_target = self.peak_retained_state_bytes_on_target.max(
-            checked_usize(
+            )?);
+        self.peak_retained_state_bytes_on_target =
+            self.peak_retained_state_bytes_on_target.max(checked_usize(
                 evidence.peak_retained_state_bytes_on_target,
                 "peak retained payload",
-            )?,
-        );
+            )?);
         self.cached_twiddle_payload_bytes = self.cached_twiddle_payload_bytes.max(checked_usize(
             evidence.cached_twiddle_payload_bytes,
             "cached twiddle payload",
@@ -3167,6 +4434,8 @@ impl SidecarOperationsAccumulator {
 
 #[derive(Clone, Copy)]
 struct SidecarRecordingAccuracy {
+    recording_audio_sha256: [u8; 32],
+    reference_sha256: [u8; 32],
     der: Option<f64>,
     jer: Option<f64>,
 }
@@ -3178,7 +4447,198 @@ struct SidecarLaneEvaluation {
 
 struct SidecarRingEntry {
     frame_index: usize,
+    speaker_token: Option<usize>,
     observation: AcousticSidecarStudyObservation,
+}
+
+fn push_bounded_sidecar_ring_entry<T>(
+    ring: &mut VecDeque<T>,
+    current_frame_index: usize,
+    maximum_lag: usize,
+    entry: T,
+    mut frame_index: impl FnMut(&T) -> usize,
+) -> FwResult<()> {
+    let maximum_retained = maximum_lag.checked_add(1).ok_or_else(|| {
+        public_corpus_error(
+            "sidecar_pair_resource_bound",
+            "sidecar ring length bound overflowed",
+        )
+    })?;
+    if frame_index(&entry) != current_frame_index {
+        return Err(public_corpus_error(
+            "sidecar_pair_alignment",
+            "sidecar ring entry does not match the current frame",
+        ));
+    }
+    while let Some(front) = ring.front() {
+        let age = current_frame_index
+            .checked_sub(frame_index(front))
+            .ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_pair_alignment",
+                    "sidecar ring contains an entry from a future frame",
+                )
+            })?;
+        if age <= maximum_lag {
+            break;
+        }
+        ring.pop_front();
+    }
+    if ring.len() > maximum_lag || ring.len() >= ring.capacity() {
+        return Err(public_corpus_error(
+            "sidecar_pair_resource_bound",
+            "sidecar ring cannot accept the current frame without growing",
+        ));
+    }
+    let retained_capacity = ring.capacity();
+    ring.push_back(entry);
+    if ring.len() > maximum_retained || ring.capacity() != retained_capacity {
+        return Err(public_corpus_error(
+            "sidecar_pair_resource_bound",
+            "sidecar ring exceeded its frozen length or capacity bound",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SidecarPairSelectionKey {
+    digest: [u8; 32],
+    left_frame_index: u64,
+    right_frame_index: u64,
+    lag_frames: u64,
+}
+
+struct SidecarPairSample {
+    key: SidecarPairSelectionKey,
+    maximum_contrast: Option<f64>,
+    different_speaker: bool,
+    channel_dominance_opportunity: bool,
+    channel_dominance: bool,
+    mixed_auxiliary_dominance_opportunity: bool,
+    mixed_auxiliary_dominance: bool,
+}
+
+impl PartialEq for SidecarPairSample {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for SidecarPairSample {}
+
+impl PartialOrd for SidecarPairSample {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SidecarPairSample {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+struct SidecarPairBottomKSampler {
+    retained_limit: usize,
+    eligible_pair_count: u64,
+    retained: BinaryHeap<SidecarPairSample>,
+}
+
+impl SidecarPairBottomKSampler {
+    fn new(retained_limit: usize) -> FwResult<Self> {
+        if retained_limit == 0 || retained_limit > PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING {
+            return Err(public_corpus_error(
+                "sidecar_pair_sampler",
+                "pair sampler retained limit is outside the frozen bound",
+            ));
+        }
+        let retained = BinaryHeap::with_capacity(retained_limit);
+        if retained.capacity() > PUBLIC_SIDECAR_MAX_RETAINED_PAIR_SAMPLE_CAPACITY {
+            return Err(public_corpus_error(
+                "sidecar_pair_sampler",
+                "pair sampler allocation exceeds the frozen capacity bound",
+            ));
+        }
+        Ok(Self {
+            retained_limit,
+            eligible_pair_count: 0,
+            retained,
+        })
+    }
+
+    fn consider(&mut self, sample: SidecarPairSample) -> FwResult<()> {
+        self.eligible_pair_count = self.eligible_pair_count.checked_add(1).ok_or_else(|| {
+            public_corpus_error("sidecar_pair_sampler", "eligible pair count overflowed")
+        })?;
+        if self.retained.len() < self.retained_limit {
+            self.retained.push(sample);
+        } else if self
+            .retained
+            .peek()
+            .is_some_and(|maximum| sample.key < maximum.key)
+        {
+            self.retained.pop();
+            self.retained.push(sample);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> FwResult<(u64, usize, usize, Vec<SidecarPairSample>)> {
+        let mut retained = self.retained.into_vec();
+        let retained_capacity = retained.capacity();
+        if retained_capacity > PUBLIC_SIDECAR_MAX_RETAINED_PAIR_SAMPLE_CAPACITY {
+            return Err(public_corpus_error(
+                "sidecar_pair_sampler",
+                "retained pair vector exceeds the frozen capacity bound",
+            ));
+        }
+        retained.sort_unstable_by_key(|sample| sample.key);
+        Ok((
+            self.eligible_pair_count,
+            retained.len(),
+            retained_capacity,
+            retained,
+        ))
+    }
+}
+
+fn sidecar_pair_selection_key(
+    normalized_pcm_sha256: &[u8; 32],
+    left_frame_index: usize,
+    right_frame_index: usize,
+    lag_frames: usize,
+) -> FwResult<SidecarPairSelectionKey> {
+    let left_frame_index = u64::try_from(left_frame_index).map_err(|_| {
+        public_corpus_error(
+            "sidecar_pair_sampler",
+            "left pair frame exceeds the retained u64 range",
+        )
+    })?;
+    let right_frame_index = u64::try_from(right_frame_index).map_err(|_| {
+        public_corpus_error(
+            "sidecar_pair_sampler",
+            "right pair frame exceeds the retained u64 range",
+        )
+    })?;
+    let lag_frames = u64::try_from(lag_frames).map_err(|_| {
+        public_corpus_error(
+            "sidecar_pair_sampler",
+            "pair lag exceeds the retained u64 range",
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_KEY_VERSION.as_bytes());
+    hasher.update(normalized_pcm_sha256);
+    hasher.update(left_frame_index.to_le_bytes());
+    hasher.update(right_frame_index.to_le_bytes());
+    hasher.update(lag_frames.to_le_bytes());
+    Ok(SidecarPairSelectionKey {
+        digest: hasher.finalize().into(),
+        left_frame_index,
+        right_frame_index,
+        lag_frames,
+    })
 }
 
 fn public_sidecar_probability(
@@ -3207,73 +4667,303 @@ fn maximum_available_sidecar_contrast(
         .max_by(f64::total_cmp)
 }
 
-fn reference_speaker_at_ms(
-    reference: &DiarizationReferenceDocument,
-    timestamp_ms: u64,
-) -> Option<&str> {
-    if reference
-        .ignored_regions
-        .iter()
-        .any(|region| region.start_ms <= timestamp_ms && timestamp_ms < region.end_ms)
-    {
-        return None;
-    }
-    let mut speaker = None;
-    for turn in &reference.turns {
-        if turn.start_ms <= timestamp_ms && timestamp_ms < turn.end_ms {
-            let current = turn.speaker.as_deref()?;
-            if speaker.is_some_and(|speaker| speaker != current) {
-                return None;
-            }
-            speaker = Some(current);
-        }
-    }
-    speaker
+fn sidecar_auxiliary_dominance(
+    contrast: &crate::diarization::AcousticSidecarOwnerContrast,
+    auxiliary_owner_index: usize,
+) -> (bool, bool) {
+    let opportunity = contrast.owner_available[0]
+        && contrast
+            .owner_available
+            .get(auxiliary_owner_index)
+            .copied()
+            .unwrap_or(false);
+    let dominance =
+        opportunity && contrast.owner_contrast[auxiliary_owner_index] > contrast.owner_contrast[0];
+    (opportunity, dominance)
 }
 
-fn boundary_label_at_ms(
-    reference: &DiarizationReferenceDocument,
-    reference_changes: &[u64],
-    timestamp_ms: u64,
-) -> Option<bool> {
-    if reference
-        .ignored_regions
-        .iter()
-        .any(|region| region.start_ms <= timestamp_ms && timestamp_ms < region.end_ms)
-    {
-        return None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidecarReferenceFrameLabel<'a> {
+    speaker: Option<&'a str>,
+    boundary: Option<bool>,
+}
+
+/// Monotonic, overlap-aware reference lookup for the 10 ms acoustic cadence.
+///
+/// Every turn and ignored interval is admitted at most once. Active turns use
+/// a heap ordered by end time, so per-frame work depends on overlap depth rather
+/// than rescanning the complete annotation document.
+struct SidecarReferenceSweep<'a> {
+    reference: &'a DiarizationReferenceDocument,
+    reference_changes: &'a [u64],
+    next_turn_index: usize,
+    active_turn_ends: BinaryHeap<Reverse<(u64, usize)>>,
+    active_speaker_counts: BTreeMap<&'a str, usize>,
+    active_unknown_speaker_count: usize,
+    next_ignored_region_index: usize,
+    active_ignored_end_ms: u64,
+    next_change_index: usize,
+    previous_timestamp_ms: Option<u64>,
+}
+
+impl<'a> SidecarReferenceSweep<'a> {
+    fn new(
+        reference: &'a DiarizationReferenceDocument,
+        reference_changes: &'a [u64],
+    ) -> FwResult<Self> {
+        if !reference
+            .turns
+            .windows(2)
+            .all(|window| window[0].start_ms <= window[1].start_ms)
+            || !reference
+                .ignored_regions
+                .windows(2)
+                .all(|window| window[0].start_ms <= window[1].start_ms)
+            || !reference_changes
+                .windows(2)
+                .all(|window| window[0] <= window[1])
+        {
+            return Err(public_corpus_error(
+                "sidecar_reference_order",
+                "reference turns, ignored regions, and change points must be monotonically ordered",
+            ));
+        }
+        Ok(Self {
+            reference,
+            reference_changes,
+            next_turn_index: 0,
+            active_turn_ends: BinaryHeap::new(),
+            active_speaker_counts: BTreeMap::new(),
+            active_unknown_speaker_count: 0,
+            next_ignored_region_index: 0,
+            active_ignored_end_ms: 0,
+            next_change_index: 0,
+            previous_timestamp_ms: None,
+        })
     }
-    if reference_changes
-        .iter()
-        .any(|change| change.abs_diff(timestamp_ms) <= PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS)
-    {
-        return Some(true);
+
+    fn add_active_turn(&mut self, turn_index: usize) -> FwResult<()> {
+        if let Some(speaker) = self.reference.turns[turn_index].speaker.as_deref() {
+            let count = self.active_speaker_counts.entry(speaker).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_reference_bound",
+                    "active reference speaker count overflowed",
+                )
+            })?;
+        } else {
+            self.active_unknown_speaker_count = self
+                .active_unknown_speaker_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_reference_bound",
+                        "active unknown-speaker count overflowed",
+                    )
+                })?;
+        }
+        Ok(())
     }
-    reference_speaker_at_ms(reference, timestamp_ms).map(|_| false)
+
+    fn remove_active_turn(&mut self, turn_index: usize) -> FwResult<()> {
+        if let Some(speaker) = self.reference.turns[turn_index].speaker.as_deref() {
+            let remove_speaker = {
+                let count = self.active_speaker_counts.get_mut(speaker).ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_reference_state",
+                        "ended reference turn was absent from the active speaker set",
+                    )
+                })?;
+                *count = count.checked_sub(1).ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_reference_state",
+                        "active reference speaker count underflowed",
+                    )
+                })?;
+                *count == 0
+            };
+            if remove_speaker {
+                self.active_speaker_counts.remove(speaker);
+            }
+        } else {
+            self.active_unknown_speaker_count = self
+                .active_unknown_speaker_count
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_reference_state",
+                        "active unknown-speaker count underflowed",
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn label_at_ms(&mut self, timestamp_ms: u64) -> FwResult<SidecarReferenceFrameLabel<'a>> {
+        if self
+            .previous_timestamp_ms
+            .is_some_and(|previous| timestamp_ms < previous)
+        {
+            return Err(public_corpus_error(
+                "sidecar_reference_order",
+                "sidecar reference timestamps must be monotonically ordered",
+            ));
+        }
+        self.previous_timestamp_ms = Some(timestamp_ms);
+
+        while self
+            .active_turn_ends
+            .peek()
+            .is_some_and(|Reverse((end_ms, _))| *end_ms <= timestamp_ms)
+        {
+            let Reverse((_, turn_index)) = self.active_turn_ends.pop().ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_reference_state",
+                    "active reference heap unexpectedly became empty",
+                )
+            })?;
+            self.remove_active_turn(turn_index)?;
+        }
+        while self
+            .reference
+            .turns
+            .get(self.next_turn_index)
+            .is_some_and(|turn| turn.start_ms <= timestamp_ms)
+        {
+            let turn_index = self.next_turn_index;
+            self.next_turn_index = self.next_turn_index.checked_add(1).ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_reference_bound",
+                    "reference turn cursor overflowed",
+                )
+            })?;
+            let turn = &self.reference.turns[turn_index];
+            if turn.end_ms > timestamp_ms {
+                self.active_turn_ends
+                    .push(Reverse((turn.end_ms, turn_index)));
+                self.add_active_turn(turn_index)?;
+            }
+        }
+
+        while self
+            .reference
+            .ignored_regions
+            .get(self.next_ignored_region_index)
+            .is_some_and(|region| region.start_ms <= timestamp_ms)
+        {
+            let region = &self.reference.ignored_regions[self.next_ignored_region_index];
+            self.active_ignored_end_ms = self.active_ignored_end_ms.max(region.end_ms);
+            self.next_ignored_region_index = self
+                .next_ignored_region_index
+                .checked_add(1)
+                .ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_reference_bound",
+                        "ignored-region cursor overflowed",
+                    )
+                })?;
+        }
+        let ignored = timestamp_ms < self.active_ignored_end_ms;
+
+        while self
+            .reference_changes
+            .get(self.next_change_index)
+            .is_some_and(|change| {
+                change.saturating_add(PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS) < timestamp_ms
+            })
+        {
+            self.next_change_index = self.next_change_index.checked_add(1).ok_or_else(|| {
+                public_corpus_error(
+                    "sidecar_reference_bound",
+                    "reference change cursor overflowed",
+                )
+            })?;
+        }
+        let near_boundary = self
+            .reference_changes
+            .get(self.next_change_index)
+            .is_some_and(|change| {
+                change.abs_diff(timestamp_ms) <= PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS
+            });
+        let speaker =
+            if self.active_unknown_speaker_count == 0 && self.active_speaker_counts.len() == 1 {
+                self.active_speaker_counts.keys().next().copied()
+            } else {
+                None
+            };
+        Ok(SidecarReferenceFrameLabel {
+            speaker: if ignored { None } else { speaker },
+            boundary: if ignored {
+                None
+            } else if near_boundary {
+                Some(true)
+            } else {
+                speaker.map(|_| false)
+            },
+        })
+    }
+}
+
+fn sidecar_frame_timestamp_ms(frame_index: usize) -> FwResult<u64> {
+    u64::try_from(frame_index)
+        .ok()
+        .and_then(|index| index.checked_mul(10))
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_frame_index",
+                "sidecar frame timestamp exceeds the retained u64 range",
+            )
+        })
 }
 
 fn analyze_sidecar_observations(
     samples: &[f32],
     reference: &DiarizationReferenceDocument,
+    normalized_pcm_sha256: &str,
     study_config: AcousticSidecarStudyConfig,
-    calibration: &PublicCorpusSidecarCalibration,
+    boundary_calibration: &PublicCorpusSidecarCalibration,
+    pair_calibration: Option<&PublicCorpusSidecarPairCalibration>,
     aggregate: &mut SidecarObservationAccumulator,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> FwResult<()> {
+    if let Some(pair_calibration) = pair_calibration {
+        validate_public_sidecar_pair_calibration(pair_calibration)?;
+    }
     let mut study = AcousticSidecarStudy::new(study_config)?;
+    let study_configuration_sha256_digest = study.configuration_sha256_digest();
     let mut previous = None;
     let mut ring = VecDeque::<SidecarRingEntry>::with_capacity(
         PUBLIC_SIDECAR_PAIR_LAGS_FRAMES[PUBLIC_SIDECAR_PAIR_LAGS_FRAMES.len() - 1] + 1,
     );
     let reference_changes =
         speaker_change_points_ms(&reference.turns, reference.duration_ms, true)?;
-    let mut pair_count = 0_usize;
+    let mut reference_sweep = SidecarReferenceSweep::new(reference, &reference_changes)?;
+    let speaker_tokens = reference
+        .turns
+        .iter()
+        .filter_map(|turn| turn.speaker.as_deref())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .enumerate()
+        .map(|(token, speaker)| (speaker, token))
+        .collect::<BTreeMap<_, _>>();
+    let normalized_pcm_sha256 = hex_sha256_bytes(
+        normalized_pcm_sha256,
+        "sidecar_pair_sampler",
+        "normalized PCM digest",
+    )?;
+    let mut pair_sampler = SidecarPairBottomKSampler::new(PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING)?;
     extract_acoustic_features_with_frames(
         samples,
         &mut *is_cancelled,
         |frame_samples, frame, is_cancelled| {
             let observation =
                 study.observe_normalized_16khz_frame(frame_samples, &frame, is_cancelled)?;
+            let timestamp_ms = sidecar_frame_timestamp_ms(frame.frame_index)?;
+            let reference_label = reference_sweep.label_at_ms(timestamp_ms)?;
+            let speaker_token = reference_label
+                .speaker
+                .and_then(|speaker| speaker_tokens.get(speaker).copied());
             aggregate.submitted_frame_count = aggregate
                 .submitted_frame_count
                 .checked_add(1)
@@ -3284,11 +4974,22 @@ fn analyze_sidecar_observations(
                     )
                 })?;
             if let Some(previous) = previous.as_ref() {
-                let contrast =
-                    acoustic_sidecar_observation_owner_contrast(previous, &observation)?;
+                let contrast = acoustic_sidecar_observation_owner_contrast_from_study(
+                    previous,
+                    &observation,
+                    study_config,
+                    study_configuration_sha256_digest,
+                )?;
+                let component_comparisons =
+                    u64::try_from(contrast.component_comparisons).map_err(|_| {
+                        public_corpus_error(
+                            "sidecar_aggregate_overflow",
+                            "sidecar component comparison count exceeds u64",
+                        )
+                    })?;
                 aggregate.component_comparison_count = aggregate
                     .component_comparison_count
-                    .checked_add(u64::try_from(contrast.component_comparisons).unwrap_or(u64::MAX))
+                    .checked_add(component_comparisons)
                     .ok_or_else(|| {
                         public_corpus_error(
                             "sidecar_aggregate_overflow",
@@ -3311,91 +5012,233 @@ fn analyze_sidecar_observations(
                     .iter_mut()
                     .zip(contrast.owner_available)
                 {
-                    *count = count.saturating_add(u64::from(available));
+                    *count = count.checked_add(u64::from(available)).ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_aggregate_overflow",
+                            "sidecar owner-availability count overflowed",
+                        )
+                    })?;
                 }
-                if contrast.comparable_components >= calibration.minimum_comparable_components
-                    && let Some(probability) = public_sidecar_probability(calibration, contrast)?
+                if contrast.comparable_components
+                    >= boundary_calibration.minimum_comparable_components
+                    && let Some(probability) =
+                        public_sidecar_probability(boundary_calibration, contrast)?
                 {
-                    let timestamp_ms = u64::try_from(frame.frame_index)
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(10);
-                    if let Some(positive) =
-                        boundary_label_at_ms(reference, &reference_changes, timestamp_ms)
-                    {
-                        aggregate.boundary_probabilities.push(probability, positive)?;
+                    if let Some(positive) = reference_label.boundary {
+                        aggregate
+                            .boundary_probabilities
+                            .push(probability, positive)?;
                     }
                 }
             }
 
-            if pair_count < PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING {
-                for lag in PUBLIC_SIDECAR_PAIR_LAGS_FRAMES {
-                    if pair_count >= PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING {
-                        break;
-                    }
-                    let Some(expected_frame) = frame.frame_index.checked_sub(lag) else {
-                        continue;
-                    };
-                    let Some(left) = ring
-                        .iter()
-                        .find(|entry| entry.frame_index == expected_frame)
-                    else {
-                        continue;
-                    };
-                    let left_ms = u64::try_from(left.frame_index)
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(10);
-                    let right_ms = u64::try_from(frame.frame_index)
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(10);
-                    let (Some(left_speaker), Some(right_speaker)) = (
-                        reference_speaker_at_ms(reference, left_ms),
-                        reference_speaker_at_ms(reference, right_ms),
-                    ) else {
-                        continue;
-                    };
-                    let contrast = acoustic_sidecar_observation_owner_contrast(
-                        &left.observation,
-                        &observation,
-                    )?;
-                    if contrast.comparable_components < calibration.minimum_comparable_components {
-                        continue;
-                    }
-                    let Some(probability) = public_sidecar_probability(calibration, contrast)? else {
-                        continue;
-                    };
-                    let different_speaker = left_speaker != right_speaker;
-                    aggregate.pairs.push(probability, different_speaker)?;
-                    pair_count += 1;
-                    if different_speaker
-                        && contrast.owner_available[0]
-                        && contrast.owner_available[1]
-                    {
-                        aggregate.channel_confound_opportunity_count = aggregate
-                            .channel_confound_opportunity_count
-                            .saturating_add(1);
-                        aggregate.channel_confound_count = aggregate
-                            .channel_confound_count
-                            .saturating_add(u64::from(
-                                contrast.owner_contrast[1] > contrast.owner_contrast[0],
-                            ));
-                    }
+            for lag in PUBLIC_SIDECAR_PAIR_LAGS_FRAMES {
+                let Some(expected_frame) = frame.frame_index.checked_sub(lag) else {
+                    continue;
+                };
+                let Some(position) = ring.len().checked_sub(lag) else {
+                    continue;
+                };
+                let left = ring.get(position).ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_pair_alignment",
+                        "ordered sidecar ring position is unavailable",
+                    )
+                })?;
+                if left.frame_index != expected_frame {
+                    return Err(public_corpus_error(
+                        "sidecar_pair_alignment",
+                        "sidecar extractor frames are not contiguous in the ordered ring",
+                    ));
                 }
+                let (Some(left_speaker), Some(right_speaker)) = (left.speaker_token, speaker_token)
+                else {
+                    continue;
+                };
+                let contrast = acoustic_sidecar_observation_owner_contrast_from_study(
+                    &left.observation,
+                    &observation,
+                    study_config,
+                    study_configuration_sha256_digest,
+                )?;
+                let maximum_contrast = (contrast.comparable_components
+                    >= PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS)
+                    .then(|| maximum_available_sidecar_contrast(&contrast))
+                    .flatten();
+                let different_speaker = left_speaker != right_speaker;
+                let (channel_dominance_opportunity, channel_dominance) =
+                    sidecar_auxiliary_dominance(&contrast, 1);
+                let (mixed_auxiliary_dominance_opportunity, mixed_auxiliary_dominance) =
+                    sidecar_auxiliary_dominance(&contrast, 2);
+                pair_sampler.consider(SidecarPairSample {
+                    key: sidecar_pair_selection_key(
+                        &normalized_pcm_sha256,
+                        left.frame_index,
+                        frame.frame_index,
+                        lag,
+                    )?,
+                    maximum_contrast,
+                    different_speaker,
+                    channel_dominance_opportunity,
+                    channel_dominance,
+                    mixed_auxiliary_dominance_opportunity,
+                    mixed_auxiliary_dominance,
+                })?;
             }
-            previous = Some(observation);
-            ring.push_back(SidecarRingEntry {
-                frame_index: frame.frame_index,
-                observation,
-            });
             let maximum_lag =
                 PUBLIC_SIDECAR_PAIR_LAGS_FRAMES[PUBLIC_SIDECAR_PAIR_LAGS_FRAMES.len() - 1];
-            while ring.front().is_some_and(|entry| {
-                frame.frame_index.saturating_sub(entry.frame_index) > maximum_lag
-            }) {
-                ring.pop_front();
-            }
+            previous = Some(observation);
+            push_bounded_sidecar_ring_entry(
+                &mut ring,
+                frame.frame_index,
+                maximum_lag,
+                SidecarRingEntry {
+                    frame_index: frame.frame_index,
+                    speaker_token,
+                    observation,
+                },
+                |entry| entry.frame_index,
+            )?;
             Ok(())
         },
     )?;
+    let (eligible_pair_count, retained_pair_count, retained_pair_capacity, selected_pairs) =
+        pair_sampler.finish()?;
+    update_sidecar_pair_selection_digest(
+        &mut aggregate.pair_selection_hasher,
+        &normalized_pcm_sha256,
+        &selected_pairs,
+    )?;
+    aggregate.eligible_pair_count = aggregate
+        .eligible_pair_count
+        .checked_add(eligible_pair_count)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "eligible pair count overflowed",
+            )
+        })?;
+    aggregate.maximum_retained_pair_sample_count = aggregate
+        .maximum_retained_pair_sample_count
+        .max(u64::try_from(retained_pair_count).map_err(|_| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "retained pair sample count exceeds u64",
+            )
+        })?);
+    let retained_pair_count = u64::try_from(retained_pair_count).map_err(|_| {
+        public_corpus_error(
+            "sidecar_aggregate_overflow",
+            "retained pair sample count exceeds u64",
+        )
+    })?;
+    aggregate.retained_pair_sample_count = aggregate
+        .retained_pair_sample_count
+        .checked_add(retained_pair_count)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "retained pair sample count overflowed",
+            )
+        })?;
+    let retained_different_speaker_pair_count = u64::try_from(
+        selected_pairs
+            .iter()
+            .filter(|pair| pair.different_speaker)
+            .count(),
+    )
+    .map_err(|_| {
+        public_corpus_error(
+            "sidecar_aggregate_overflow",
+            "retained different-speaker pair count exceeds u64",
+        )
+    })?;
+    let retained_same_speaker_pair_count = retained_pair_count
+        .checked_sub(retained_different_speaker_pair_count)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "retained different-speaker count exceeds the retained pair count",
+            )
+        })?;
+    aggregate.retained_same_speaker_pair_count = aggregate
+        .retained_same_speaker_pair_count
+        .checked_add(retained_same_speaker_pair_count)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "retained same-speaker pair count overflowed",
+            )
+        })?;
+    aggregate.retained_different_speaker_pair_count = aggregate
+        .retained_different_speaker_pair_count
+        .checked_add(retained_different_speaker_pair_count)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "retained different-speaker pair count overflowed",
+            )
+        })?;
+    aggregate.retained_pair_sample_capacity = aggregate.retained_pair_sample_capacity.max(
+        u64::try_from(retained_pair_capacity).map_err(|_| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "retained pair sample capacity exceeds u64",
+            )
+        })?,
+    );
+    let mut scored_pair = false;
+    let mut scored_same_speaker = false;
+    let mut scored_different_speaker = false;
+    for pair in selected_pairs {
+        if let (Some(pair_calibration), Some(maximum_contrast)) =
+            (pair_calibration, pair.maximum_contrast)
+        {
+            let probability =
+                public_sidecar_pair_probability_from_validated(pair_calibration, maximum_contrast)?;
+            aggregate.pairs.push(probability, pair.different_speaker)?;
+            scored_pair = true;
+            scored_different_speaker |= pair.different_speaker;
+            scored_same_speaker |= !pair.different_speaker;
+        }
+        aggregate.channel_dominance.push(
+            pair.different_speaker,
+            pair.channel_dominance_opportunity,
+            pair.channel_dominance,
+        )?;
+        aggregate.mixed_auxiliary_dominance.push(
+            pair.different_speaker,
+            pair.mixed_auxiliary_dominance_opportunity,
+            pair.mixed_auxiliary_dominance,
+        )?;
+    }
+    aggregate.pair_scored_recording_count = aggregate
+        .pair_scored_recording_count
+        .checked_add(u64::from(scored_pair))
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "pair-scored recording count overflowed",
+            )
+        })?;
+    aggregate.same_speaker_pair_recording_count = aggregate
+        .same_speaker_pair_recording_count
+        .checked_add(u64::from(scored_same_speaker))
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "same-speaker pair recording count overflowed",
+            )
+        })?;
+    aggregate.different_speaker_pair_recording_count = aggregate
+        .different_speaker_pair_recording_count
+        .checked_add(u64::from(scored_different_speaker))
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_aggregate_overflow",
+                "different-speaker pair recording count overflowed",
+            )
+        })?;
     Ok(())
 }
 
@@ -3403,8 +5246,7 @@ fn finish_sidecar_boundary_metrics(
     probabilities: &SidecarProbabilityAccumulator,
     pipeline: &PublicCorpusAblationSplit,
 ) -> PublicCorpusSidecarBoundaryMetrics {
-    let (brier_score, expected_calibration_error, reliability) =
-        probabilities.finish_reliability();
+    let finished = probabilities.finish_reliability();
     PublicCorpusSidecarBoundaryMetrics {
         reference_count: pipeline.change_reference_count,
         hypothesis_count: pipeline.change_hypothesis_count,
@@ -3415,9 +5257,9 @@ fn finish_sidecar_boundary_metrics(
         mean_absolute_error_sec: pipeline.change_mean_absolute_error_sec,
         probability_observation_count: probabilities.observation_count,
         probability_positive_count: probabilities.positive_count,
-        brier_score,
-        expected_calibration_error,
-        reliability,
+        brier_score: finished.brier_score,
+        expected_calibration_error: finished.expected_calibration_error,
+        reliability: finished.reliability,
     }
 }
 
@@ -3498,17 +5340,19 @@ fn fit_public_sidecar_calibration(
 ) -> FwResult<Option<PublicCorpusSidecarCalibration>> {
     let observation_count = histogram.observation_count()?;
     let positive_count = histogram.positive_count()?;
-    let negative_count = observation_count.checked_sub(positive_count).ok_or_else(|| {
-        public_corpus_error(
-            "sidecar_fit_overflow",
-            "calibration positive count exceeds its observation count",
-        )
-    })?;
+    let negative_count = observation_count
+        .checked_sub(positive_count)
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_fit_overflow",
+                "calibration positive count exceeds its observation count",
+            )
+        })?;
     if positive_count == 0 || negative_count == 0 {
         return Ok(None);
     }
     let mut best = None::<(f64, f32, f32)>;
-    for intercept_step in -32_i32..=0 {
+    for intercept_step in -32_i32..=32 {
         let intercept = intercept_step as f32 * 0.25;
         for weight_step in 0_u32..=64 {
             let weight = weight_step as f32 * 0.25;
@@ -3520,8 +5364,7 @@ fn fit_public_sidecar_calibration(
             let mut positive_loss = 0.0;
             let mut negative_loss = 0.0;
             for index in 0..PUBLIC_SIDECAR_FIT_BINS {
-                let contrast_value =
-                    ((index as f64 + 0.5) / PUBLIC_SIDECAR_FIT_BINS as f64) as f32;
+                let contrast_value = ((index as f64 + 0.5) / PUBLIC_SIDECAR_FIT_BINS as f64) as f32;
                 let contrast = crate::diarization::AcousticSidecarOwnerContrast {
                     owner_contrast: [contrast_value, 0.0, 0.0],
                     owner_available: [true, false, false],
@@ -3539,17 +5382,20 @@ fn fit_public_sidecar_calibration(
                         .probability,
                 );
                 positive_loss -= histogram.positive_counts[index] as f64 * probability.ln();
-                negative_loss -=
-                    histogram.negative_counts[index] as f64 * (1.0 - probability).ln();
+                negative_loss -= histogram.negative_counts[index] as f64 * (1.0 - probability).ln();
             }
-            let balanced_loss = 0.5
-                * (positive_loss / positive_count as f64
-                    + negative_loss / negative_count as f64);
-            let candidate = (balanced_loss, intercept, weight);
+            // Ordinary empirical NLL retains the observed class prior. Equal
+            // class weighting would produce a discrimination score centered
+            // near 0.5 rather than a calibrated probability when boundaries
+            // or speaker changes are rare.
+            let empirical_loss = (positive_loss + negative_loss) / observation_count as f64;
+            if !empirical_loss.is_finite() {
+                continue;
+            }
+            let candidate = (empirical_loss, intercept, weight);
             if best.is_none_or(|best| {
                 candidate.0 < best.0
-                    || (candidate.0 == best.0
-                        && (candidate.2, candidate.1) < (best.2, best.1))
+                    || (candidate.0 == best.0 && (candidate.2, candidate.1) < (best.2, best.1))
             }) {
                 best = Some(candidate);
             }
@@ -3568,8 +5414,7 @@ fn fit_public_sidecar_calibration(
     };
     let mut brier_sum = 0.0;
     for index in 0..PUBLIC_SIDECAR_FIT_BINS {
-        let contrast_value =
-            ((index as f64 + 0.5) / PUBLIC_SIDECAR_FIT_BINS as f64) as f32;
+        let contrast_value = ((index as f64 + 0.5) / PUBLIC_SIDECAR_FIT_BINS as f64) as f32;
         let contrast = crate::diarization::AcousticSidecarOwnerContrast {
             owner_contrast: [contrast_value, 0.0, 0.0],
             owner_available: [true, false, false],
@@ -3617,15 +5462,118 @@ fn public_sidecar_calibration_sha256(
     })
 }
 
+fn fit_public_sidecar_pair_calibration(
+    histogram: &SidecarCalibrationFitHistogram,
+) -> FwResult<Option<PublicCorpusSidecarPairCalibration>> {
+    let Some(boundary_shape) = fit_public_sidecar_calibration(histogram)? else {
+        return Ok(None);
+    };
+    let mut calibration = PublicCorpusSidecarPairCalibration {
+        fit_id: PUBLIC_CORPUS_SIDECAR_PAIR_CALIBRATION_FIT_VERSION.to_owned(),
+        target_id: PUBLIC_CORPUS_SIDECAR_PAIR_PROBABILITY_TARGET_VERSION.to_owned(),
+        logit_intercept: boundary_shape.logit_intercept,
+        contrast_weight: boundary_shape.contrast_weight,
+        minimum_comparable_components: boundary_shape.minimum_comparable_components,
+        fit_observation_count: boundary_shape.fit_observation_count,
+        fit_positive_count: boundary_shape.fit_positive_count,
+        fit_brier_score: boundary_shape.fit_brier_score,
+        calibration_sha256: String::new(),
+    };
+    calibration.calibration_sha256 = public_sidecar_pair_calibration_sha256(&calibration)?;
+    Ok(Some(calibration))
+}
+
+fn public_sidecar_pair_calibration_sha256(
+    calibration: &PublicCorpusSidecarPairCalibration,
+) -> FwResult<String> {
+    canonical_sha256(&PublicCorpusSidecarPairCalibrationFingerprint {
+        fit_id: &calibration.fit_id,
+        target_id: &calibration.target_id,
+        logit_intercept: calibration.logit_intercept,
+        contrast_weight: calibration.contrast_weight,
+        minimum_comparable_components: calibration.minimum_comparable_components,
+        fit_observation_count: calibration.fit_observation_count,
+        fit_positive_count: calibration.fit_positive_count,
+        fit_brier_score: calibration.fit_brier_score,
+    })
+}
+
+fn validate_public_sidecar_pair_calibration(
+    calibration: &PublicCorpusSidecarPairCalibration,
+) -> FwResult<()> {
+    if calibration.fit_id != PUBLIC_CORPUS_SIDECAR_PAIR_CALIBRATION_FIT_VERSION
+        || calibration.target_id != PUBLIC_CORPUS_SIDECAR_PAIR_PROBABILITY_TARGET_VERSION
+        || calibration.minimum_comparable_components != PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS
+        || calibration.fit_observation_count == 0
+        || calibration.fit_positive_count == 0
+        || calibration.fit_positive_count >= calibration.fit_observation_count
+        || !calibration.logit_intercept.is_finite()
+        || !calibration.contrast_weight.is_finite()
+        || !(-8.0..=8.0).contains(&calibration.logit_intercept)
+        || !(0.0..=16.0).contains(&calibration.contrast_weight)
+        || (calibration.logit_intercept * 4.0).fract() != 0.0
+        || (calibration.contrast_weight * 4.0).fract() != 0.0
+        || f64::from(calibration.logit_intercept as f32) != calibration.logit_intercept
+        || f64::from(calibration.contrast_weight as f32) != calibration.contrast_weight
+        || !calibration
+            .fit_brier_score
+            .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+        || !is_sha256_hex(&calibration.calibration_sha256)
+        || public_sidecar_pair_calibration_sha256(calibration)? != calibration.calibration_sha256
+    {
+        return Err(public_corpus_error(
+            "sidecar_pair_calibration",
+            "pair calibration identity, target, bounds, class support, or hash is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn public_sidecar_pair_probability_from_validated(
+    calibration: &PublicCorpusSidecarPairCalibration,
+    maximum_contrast: f64,
+) -> FwResult<f64> {
+    if !maximum_contrast.is_finite() || !(0.0..=1.0).contains(&maximum_contrast) {
+        return Err(public_corpus_error(
+            "sidecar_pair_calibration",
+            "pair contrast must be finite and within [0, 1]",
+        ));
+    }
+    let contrast = crate::diarization::AcousticSidecarOwnerContrast {
+        owner_contrast: [maximum_contrast as f32, 0.0, 0.0],
+        owner_available: [true, false, false],
+        comparable_components: calibration.minimum_comparable_components,
+        component_comparisons: calibration.minimum_comparable_components,
+    };
+    acoustic_sidecar_calibrate_owner_contrast(
+        contrast,
+        AcousticSidecarFusionCalibration {
+            logit_intercept: calibration.logit_intercept as f32,
+            contrast_weight: calibration.contrast_weight as f32,
+            minimum_comparable_components: calibration.minimum_comparable_components,
+        },
+    )?
+    .map(|evidence| f64::from(evidence.probability))
+    .ok_or_else(|| {
+        public_corpus_error(
+            "sidecar_pair_calibration",
+            "valid pair contrast unexpectedly produced no probability",
+        )
+    })
+}
+
 fn sidecar_evaluation_request(
     lane: PublicCorpusSidecarLane,
     calibration: &PublicCorpusSidecarCalibration,
 ) -> FwResult<AcousticSidecarEvaluationRequest> {
     if calibration.fit_id != PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION
-        || calibration.minimum_comparable_components == 0
+        || calibration.minimum_comparable_components != PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS
         || !calibration.logit_intercept.is_finite()
         || !calibration.contrast_weight.is_finite()
-        || calibration.contrast_weight < 0.0
+        || !(-8.0..=8.0).contains(&calibration.logit_intercept)
+        || !(0.0..=16.0).contains(&calibration.contrast_weight)
+        || (calibration.logit_intercept * 4.0).fract() != 0.0
+        || (calibration.contrast_weight * 4.0).fract() != 0.0
         || f64::from(calibration.logit_intercept as f32) != calibration.logit_intercept
         || f64::from(calibration.contrast_weight as f32) != calibration.contrast_weight
         || public_sidecar_calibration_sha256(calibration)? != calibration.calibration_sha256
@@ -3657,6 +5605,11 @@ struct LoadedPublicSidecarRecording {
     boundary_hints: AcousticBoundaryHints,
 }
 
+struct FittedPublicSidecarCalibrations {
+    boundary: PublicCorpusSidecarCalibration,
+    pair: Option<PublicCorpusSidecarPairCalibration>,
+}
+
 fn load_public_sidecar_recording(
     reference: &DiarizationReferenceDocument,
     recording_evidence: &PublicCorpusRecordingEvidence,
@@ -3684,17 +5637,17 @@ fn load_public_sidecar_recording(
             "audio changed after bundle validation and before sidecar execution",
         ));
     }
-    let mut samples = crate::native_engine::decode::read_wav_16k_mono(&audio_bytes).map_err(|_| {
-        public_corpus_error(
-            "sidecar_audio_decode",
-            "one validated WAV could not be decoded as 16 kHz mono PCM",
-        )
-    })?;
+    let mut samples =
+        crate::native_engine::decode::read_wav_16k_mono(&audio_bytes).map_err(|_| {
+            public_corpus_error(
+                "sidecar_audio_decode",
+                "one validated WAV could not be decoded as 16 kHz mono PCM",
+            )
+        })?;
     checkpoint_cancelled(is_cancelled)?;
     let available_duration_ms = u64::try_from(samples.len()).unwrap_or(u64::MAX) / 16;
-    let evaluation_duration_ms = maximum_recording_duration_ms.map_or(available_duration_ms, |max| {
-        max.min(available_duration_ms)
-    });
+    let evaluation_duration_ms = maximum_recording_duration_ms
+        .map_or(available_duration_ms, |max| max.min(available_duration_ms));
     let clipped_reference = clipped_reference(reference, Some(evaluation_duration_ms))?;
     let maximum_samples = usize::try_from(clipped_reference.duration_ms)
         .ok()
@@ -3729,8 +5682,9 @@ fn fit_public_sidecar_lane(
     lane: PublicCorpusSidecarLane,
     target_split: EvaluationSplit,
     is_cancelled: &mut impl FnMut() -> bool,
-) -> FwResult<Option<PublicCorpusSidecarCalibration>> {
-    let mut histogram = SidecarCalibrationFitHistogram::new();
+) -> FwResult<Option<FittedPublicSidecarCalibrations>> {
+    let mut boundary_histogram = SidecarCalibrationFitHistogram::new();
+    let mut pair_histogram = SidecarCalibrationFitHistogram::new();
     for ((reference, recording_evidence), manifest_recording) in bundle
         .references
         .iter()
@@ -3757,44 +5711,142 @@ fn fit_public_sidecar_lane(
             maximum_recording_duration_ms,
             is_cancelled,
         )?;
-        let reference_changes = speaker_change_points_ms(
-            &loaded.reference.turns,
-            loaded.reference.duration_ms,
-            true,
+        let reference_changes =
+            speaker_change_points_ms(&loaded.reference.turns, loaded.reference.duration_ms, true)?;
+        let mut reference_sweep =
+            SidecarReferenceSweep::new(&loaded.reference, &reference_changes)?;
+        let speaker_tokens = loaded
+            .reference
+            .turns
+            .iter()
+            .filter_map(|turn| turn.speaker.as_deref())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+            .map(|(token, speaker)| (speaker, token))
+            .collect::<BTreeMap<_, _>>();
+        let normalized_pcm_sha256 = hex_sha256_bytes(
+            &hash_pcm_prefix(&loaded.samples),
+            "sidecar_pair_sampler",
+            "normalized PCM digest",
         )?;
-        let mut study = AcousticSidecarStudy::new(lane.study_config())?;
+        let study_config = lane.study_config();
+        let mut study = AcousticSidecarStudy::new(study_config)?;
+        let study_configuration_sha256_digest = study.configuration_sha256_digest();
         let mut previous = None;
+        let mut ring = VecDeque::<SidecarRingEntry>::with_capacity(
+            PUBLIC_SIDECAR_PAIR_LAGS_FRAMES[PUBLIC_SIDECAR_PAIR_LAGS_FRAMES.len() - 1] + 1,
+        );
+        let mut pair_sampler =
+            SidecarPairBottomKSampler::new(PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING)?;
         extract_acoustic_features_with_frames(
             &loaded.samples,
             &mut *is_cancelled,
             |frame_samples, frame, is_cancelled| {
                 let observation =
                     study.observe_normalized_16khz_frame(frame_samples, &frame, is_cancelled)?;
+                let timestamp_ms = sidecar_frame_timestamp_ms(frame.frame_index)?;
+                let reference_label = reference_sweep.label_at_ms(timestamp_ms)?;
+                let speaker_token = reference_label
+                    .speaker
+                    .and_then(|speaker| speaker_tokens.get(speaker).copied());
                 if let Some(previous) = previous.as_ref() {
-                    let contrast =
-                        acoustic_sidecar_observation_owner_contrast(previous, &observation)?;
-                    if contrast.comparable_components >= PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS
+                    let contrast = acoustic_sidecar_observation_owner_contrast_from_study(
+                        previous,
+                        &observation,
+                        study_config,
+                        study_configuration_sha256_digest,
+                    )?;
+                    if contrast.comparable_components
+                        >= PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS
                         && let Some(maximum_contrast) =
                             maximum_available_sidecar_contrast(&contrast)
+                        && let Some(positive) = reference_label.boundary
                     {
-                        let timestamp_ms = u64::try_from(frame.frame_index)
-                            .unwrap_or(u64::MAX)
-                            .saturating_mul(10);
-                        if let Some(positive) = boundary_label_at_ms(
-                            &loaded.reference,
-                            &reference_changes,
-                            timestamp_ms,
-                        ) {
-                            histogram.push(maximum_contrast, positive)?;
-                        }
+                        boundary_histogram.push(maximum_contrast, positive)?;
                     }
                 }
+                for lag in PUBLIC_SIDECAR_PAIR_LAGS_FRAMES {
+                    let Some(expected_frame) = frame.frame_index.checked_sub(lag) else {
+                        continue;
+                    };
+                    let Some(position) = ring.len().checked_sub(lag) else {
+                        continue;
+                    };
+                    let left = ring.get(position).ok_or_else(|| {
+                        public_corpus_error(
+                            "sidecar_pair_alignment",
+                            "ordered calibration ring position is unavailable",
+                        )
+                    })?;
+                    if left.frame_index != expected_frame {
+                        return Err(public_corpus_error(
+                            "sidecar_pair_alignment",
+                            "calibration extractor frames are not contiguous",
+                        ));
+                    }
+                    let (Some(left_speaker), Some(right_speaker)) =
+                        (left.speaker_token, speaker_token)
+                    else {
+                        continue;
+                    };
+                    let contrast = acoustic_sidecar_observation_owner_contrast_from_study(
+                        &left.observation,
+                        &observation,
+                        study_config,
+                        study_configuration_sha256_digest,
+                    )?;
+                    let maximum_contrast = (contrast.comparable_components
+                        >= PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS)
+                        .then(|| maximum_available_sidecar_contrast(&contrast))
+                        .flatten();
+                    let different_speaker = left_speaker != right_speaker;
+                    let (channel_dominance_opportunity, channel_dominance) =
+                        sidecar_auxiliary_dominance(&contrast, 1);
+                    let (mixed_auxiliary_dominance_opportunity, mixed_auxiliary_dominance) =
+                        sidecar_auxiliary_dominance(&contrast, 2);
+                    pair_sampler.consider(SidecarPairSample {
+                        key: sidecar_pair_selection_key(
+                            &normalized_pcm_sha256,
+                            left.frame_index,
+                            frame.frame_index,
+                            lag,
+                        )?,
+                        maximum_contrast,
+                        different_speaker,
+                        channel_dominance_opportunity,
+                        channel_dominance,
+                        mixed_auxiliary_dominance_opportunity,
+                        mixed_auxiliary_dominance,
+                    })?;
+                }
                 previous = Some(observation);
+                let maximum_lag =
+                    PUBLIC_SIDECAR_PAIR_LAGS_FRAMES[PUBLIC_SIDECAR_PAIR_LAGS_FRAMES.len() - 1];
+                push_bounded_sidecar_ring_entry(
+                    &mut ring,
+                    frame.frame_index,
+                    maximum_lag,
+                    SidecarRingEntry {
+                        frame_index: frame.frame_index,
+                        speaker_token,
+                        observation,
+                    },
+                    |entry| entry.frame_index,
+                )?;
                 Ok(())
             },
         )?;
+        let (_, _, _, selected_pairs) = pair_sampler.finish()?;
+        for pair in selected_pairs {
+            if let Some(maximum_contrast) = pair.maximum_contrast {
+                pair_histogram.push(maximum_contrast, pair.different_speaker)?;
+            }
+        }
     }
-    fit_public_sidecar_calibration(&histogram)
+    let boundary = fit_public_sidecar_calibration(&boundary_histogram)?;
+    let pair = fit_public_sidecar_pair_calibration(&pair_histogram)?;
+    Ok(boundary.map(|boundary| FittedPublicSidecarCalibrations { boundary, pair }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3806,25 +5858,31 @@ fn evaluate_public_sidecar_lane(
     diarization_request: &DiarizationRequest,
     scorer_config: &DiarizationScorerConfig,
     lane: PublicCorpusSidecarLane,
-    calibration: Option<&PublicCorpusSidecarCalibration>,
+    boundary_calibration: Option<&PublicCorpusSidecarCalibration>,
+    pair_calibration: Option<&PublicCorpusSidecarPairCalibration>,
     detector_mode: AcousticChangeDetectorMode,
     clustering_mode: AcousticClusteringMode,
     target_split: EvaluationSplit,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> FwResult<SidecarLaneEvaluation> {
-    let sidecar_request = match (lane, calibration) {
-        (PublicCorpusSidecarLane::FullV2Baseline, None) => None,
-        (PublicCorpusSidecarLane::FullV2Baseline, Some(_)) => {
+    let sidecar_request = match (lane, boundary_calibration, pair_calibration) {
+        (PublicCorpusSidecarLane::FullV2Baseline, None, None) => None,
+        (PublicCorpusSidecarLane::FullV2Baseline, _, _) => {
             return Err(public_corpus_error(
                 "sidecar_lane_configuration",
-                "the unfused baseline cannot receive a calibration",
+                "the unfused baseline cannot receive boundary or pair calibration",
             ));
         }
-        (_, Some(calibration)) => Some(sidecar_evaluation_request(lane, calibration)?),
-        (_, None) => {
+        (_, Some(boundary), pair) => {
+            if let Some(pair) = pair {
+                validate_public_sidecar_pair_calibration(pair)?;
+            }
+            Some(sidecar_evaluation_request(lane, boundary)?)
+        }
+        (_, _, _) => {
             return Err(public_corpus_error(
                 "sidecar_lane_configuration",
-                "every fused sidecar lane requires a locked calibration",
+                "every fused sidecar lane requires a locked boundary calibration and cannot retain a pair calibration alone",
             ));
         }
     };
@@ -3832,7 +5890,7 @@ fn evaluate_public_sidecar_lane(
         .map(|request| acoustic_sidecar_study_config_sha256(request.study_config))
         .transpose()?;
     let expected_fusion_configuration_sha256 = sidecar_request
-        .map(acoustic_sidecar_fusion_configuration_sha256)
+        .map(|request| acoustic_sidecar_fusion_configuration_sha256(request, detector_mode))
         .transpose()?;
     let mut pipeline = PublicAblationAccumulator::default();
     let mut observations = SidecarObservationAccumulator::new();
@@ -3872,6 +5930,7 @@ fn evaluate_public_sidecar_lane(
             maximum_recording_duration_ms,
             is_cancelled,
         )?;
+        let normalized_pcm_sha256 = hash_pcm_prefix(&loaded.samples);
         let started = Instant::now();
         let (
             report_turns,
@@ -3884,7 +5943,7 @@ fn evaluate_public_sidecar_lane(
             checkpoint_cancelled(is_cancelled)?;
             let sidecar_evidence = sidecar_request.map_or_else(
                 AcousticSidecarFusionEvaluationEvidence::default,
-                |request| AcousticSidecarFusionEvaluationEvidence {
+                |_| AcousticSidecarFusionEvaluationEvidence {
                     fusion_requested: true,
                     fusion_configuration_sha256: expected_fusion_configuration_sha256.clone(),
                     sidecar_configuration_sha256: expected_sidecar_configuration_sha256.clone(),
@@ -3905,12 +5964,11 @@ fn evaluate_public_sidecar_lane(
                 sidecar_evidence,
             )
         } else {
-            let input_sha256 = hash_pcm_prefix(&loaded.samples);
             let (report, _, change_evidence, clustering_evidence, sidecar_evidence) =
                 diarize_acoustic_pcm_with_sidecar_evidence(
                     AcousticDiarizationInput {
                         samples: &loaded.samples,
-                        normalized_input_sha256: &input_sha256,
+                        normalized_input_sha256: &normalized_pcm_sha256,
                         segments: &[],
                         word_aligned: false,
                         request: diarization_request,
@@ -3948,17 +6006,35 @@ fn evaluate_public_sidecar_lane(
             .unwrap_or(u64::MAX)
             .max(1);
         let peak_rss_bytes = sampled_process_rss_bytes();
-        if let Some(calibration) = calibration
-            && !loaded.boundary_hints.speech_regions_ms.is_empty()
-        {
-            analyze_sidecar_observations(
-                &loaded.samples,
-                &loaded.reference,
-                lane.study_config(),
-                calibration,
-                &mut observations,
-                is_cancelled,
-            )?;
+        if let Some(boundary_calibration) = boundary_calibration {
+            if loaded.boundary_hints.speech_regions_ms.is_empty() {
+                // The selected-pair digest is record-framed, so a candidate
+                // recording with no scoreable speech must still contribute
+                // its normalized PCM identity and an explicit zero-pair
+                // count. Otherwise an empty/fully ignored recording could be
+                // changed or omitted without changing the evidence identity.
+                let normalized_pcm_sha256 = hex_sha256_bytes(
+                    &normalized_pcm_sha256,
+                    "sidecar_pair_sampler",
+                    "normalized PCM digest",
+                )?;
+                update_sidecar_pair_selection_digest(
+                    &mut observations.pair_selection_hasher,
+                    &normalized_pcm_sha256,
+                    &[],
+                )?;
+            } else {
+                analyze_sidecar_observations(
+                    &loaded.samples,
+                    &loaded.reference,
+                    &normalized_pcm_sha256,
+                    lane.study_config(),
+                    boundary_calibration,
+                    pair_calibration,
+                    &mut observations,
+                    is_cancelled,
+                )?;
+            }
         }
         operations.push(&sidecar_evidence)?;
         let hypothesis = DiarizationHypothesisDocument {
@@ -3984,11 +6060,8 @@ fn evaluate_public_sidecar_lane(
             }),
         };
         let score = score_diarization_documents(&loaded.reference, &hypothesis, scorer_config)?;
-        let reference_changes = speaker_change_points_ms(
-            &loaded.reference.turns,
-            loaded.reference.duration_ms,
-            true,
-        )?;
+        let reference_changes =
+            speaker_change_points_ms(&loaded.reference.turns, loaded.reference.duration_ms, true)?;
         let detector_change_score = score_change_points(
             &reference_changes
                 .iter()
@@ -4018,8 +6091,10 @@ fn evaluate_public_sidecar_lane(
         let change_threshold_sweep = PUBLIC_CHANGE_THRESHOLD_SWEEP
             .iter()
             .map(|&threshold| {
-                let selected =
-                    select_acoustic_change_evidence_at_threshold(&evaluated_changes, threshold as f32)?;
+                let selected = select_acoustic_change_evidence_at_threshold(
+                    &evaluated_changes,
+                    threshold as f32,
+                )?;
                 let hypothesis_ms = selected
                     .into_iter()
                     .filter_map(|evidence| {
@@ -4043,6 +6118,16 @@ fn evaluate_public_sidecar_lane(
             scorer_config.calibration_bins,
         )?;
         recording_accuracy.push(SidecarRecordingAccuracy {
+            recording_audio_sha256: hex_sha256_bytes(
+                &recording_evidence.audio_sha256,
+                "sidecar_pair_alignment",
+                "recording audio digest",
+            )?,
+            reference_sha256: hex_sha256_bytes(
+                &recording_evidence.reference_sha256,
+                "sidecar_pair_alignment",
+                "reference digest",
+            )?,
             der: score.diarization.der,
             jer: score.diarization.jer,
         });
@@ -4084,10 +6169,8 @@ fn evaluate_public_sidecar_lane(
         }
     } else if !operations.fusion_requested
         || operations.fusion_requested_recording_count != selected_recording_count
-        || operations.expected_sidecar_configuration_sha256
-            != expected_sidecar_configuration_sha256
-        || operations.expected_fusion_configuration_sha256
-            != expected_fusion_configuration_sha256
+        || operations.expected_sidecar_configuration_sha256 != expected_sidecar_configuration_sha256
+        || operations.expected_fusion_configuration_sha256 != expected_fusion_configuration_sha256
         || operations.fusion_executed
             != (operations.consumed_probability_count > 0
                 && operations.fusion_executed_recording_count > 0)
@@ -4111,7 +6194,10 @@ fn evaluate_public_sidecar_lane(
     } else {
         finish_sidecar_boundary_metrics(&observations.boundary_probabilities, &aggregate_pipeline)
     };
-    let conditional_pairs = observations.pairs.finish();
+    let conditional_pairs = observations.pairs.finish()?;
+    let conditional_pair_count = conditional_pairs.comparison_count;
+    let conditional_same_speaker_count = conditional_pairs.same_speaker_count;
+    let conditional_different_speaker_count = conditional_pairs.different_speaker_count;
     let performance = PublicCorpusSidecarPerformance {
         audio_duration_sec: aggregate_pipeline.audio_duration_sec,
         wall_time_sec: aggregate_pipeline.wall_time_sec,
@@ -4144,13 +6230,39 @@ fn evaluate_public_sidecar_lane(
             ),
             component_comparison_count: observations.component_comparison_count,
             owner_available_frame_counts: observations.owner_available_frame_counts,
-            channel_confound_opportunity_count: observations
-                .channel_confound_opportunity_count,
-            channel_confound_count: observations.channel_confound_count,
-            channel_confound_rate: ratio(
-                observations.channel_confound_count,
-                observations.channel_confound_opportunity_count,
+            channel_dominance: observations.channel_dominance.finish(),
+            mixed_auxiliary_dominance: observations.mixed_auxiliary_dominance.finish(),
+            eligible_pair_count: observations.eligible_pair_count,
+            retained_pair_sample_count: observations.retained_pair_sample_count,
+            retained_same_speaker_pair_count: observations.retained_same_speaker_pair_count,
+            retained_different_speaker_pair_count: observations
+                .retained_different_speaker_pair_count,
+            pair_selection_sha256: (!is_baseline && operations.evaluated_recording_count > 0).then(
+                || {
+                    format!(
+                        "{:x}",
+                        observations.pair_selection_hasher.clone().finalize()
+                    )
+                },
             ),
+            pair_score_coverage: ratio(
+                conditional_pair_count,
+                observations.retained_pair_sample_count,
+            ),
+            same_speaker_pair_score_coverage: ratio(
+                conditional_same_speaker_count,
+                observations.retained_same_speaker_pair_count,
+            ),
+            different_speaker_pair_score_coverage: ratio(
+                conditional_different_speaker_count,
+                observations.retained_different_speaker_pair_count,
+            ),
+            pair_scored_recording_count: observations.pair_scored_recording_count,
+            same_speaker_pair_recording_count: observations.same_speaker_pair_recording_count,
+            different_speaker_pair_recording_count: observations
+                .different_speaker_pair_recording_count,
+            maximum_retained_pair_sample_count: observations.maximum_retained_pair_sample_count,
+            retained_pair_sample_capacity: observations.retained_pair_sample_capacity,
             maximum_retained_signal_count: operations.maximum_retained_signal_count,
             retained_signal_capacity: operations.retained_signal_capacity,
         },
@@ -4164,27 +6276,66 @@ fn evaluate_public_sidecar_lane(
     })
 }
 
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 fn bootstrap_mean_interval(
     deltas: &[f64],
     seed: &[u8; 32],
     stream: u64,
-) -> (Option<f64>, Option<f64>, Option<f64>) {
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<(Option<f64>, Option<f64>, Option<f64>)> {
+    checkpoint_cancelled(is_cancelled)?;
     if deltas.is_empty() {
-        return (None, None, None);
+        return Ok((None, None, None));
     }
-    let mean = canonical_evidence_number(deltas.iter().sum::<f64>() / deltas.len() as f64);
+    let delta_count = u64::try_from(deltas.len()).map_err(|_| {
+        public_corpus_error(
+            "sidecar_bootstrap_bound",
+            "paired uncertainty row count exceeds the retained u64 range",
+        )
+    })?;
+    let mut observed_sum = 0.0;
+    for (index, delta) in deltas.iter().enumerate() {
+        if index % 4_096 == 0 {
+            checkpoint_cancelled(is_cancelled)?;
+        }
+        observed_sum += delta;
+    }
+    let mean = canonical_evidence_number(observed_sum / deltas.len() as f64);
     let mut replicates = Vec::with_capacity(PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES);
     for replicate in 0..PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES {
+        if replicate % 16 == 0 {
+            checkpoint_cancelled(is_cancelled)?;
+        }
+        let replicate = u64::try_from(replicate).map_err(|_| {
+            public_corpus_error(
+                "sidecar_bootstrap_bound",
+                "bootstrap replicate index exceeds the retained u64 range",
+            )
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        hasher.update(stream.to_le_bytes());
+        hasher.update(replicate.to_le_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut state = u64::from_le_bytes(digest[..8].try_into().map_err(|_| {
+            public_corpus_error(
+                "sidecar_bootstrap_seed",
+                "bootstrap stream digest did not contain eight seed bytes",
+            )
+        })?);
         let mut sum = 0.0;
         for draw in 0..deltas.len() {
-            let mut hasher = Sha256::new();
-            hasher.update(seed);
-            hasher.update(stream.to_le_bytes());
-            hasher.update((replicate as u64).to_le_bytes());
-            hasher.update((draw as u64).to_le_bytes());
-            let digest: [u8; 32] = hasher.finalize().into();
-            let index = u64::from_le_bytes(digest[..8].try_into().expect("eight-byte digest"))
-                % deltas.len() as u64;
+            if draw % 4_096 == 0 {
+                checkpoint_cancelled(is_cancelled)?;
+            }
+            let index = splitmix64_next(&mut state) % delta_count;
             sum += deltas[index as usize];
         }
         replicates.push(sum / deltas.len() as f64);
@@ -4193,19 +6344,41 @@ fn bootstrap_mean_interval(
     let last = replicates.len() - 1;
     let lower = replicates[last * 25 / 1_000];
     let upper = replicates[last * 975 / 1_000];
-    (
+    Ok((
         Some(mean),
         Some(canonical_evidence_number(lower)),
         Some(canonical_evidence_number(upper)),
-    )
+    ))
+}
+
+fn hex_sha256_bytes(value: &str, code: &str, field: &str) -> FwResult<[u8; 32]> {
+    if !is_sha256_hex(value) {
+        return Err(public_corpus_error(
+            code,
+            &format!("{field} must be lowercase SHA-256"),
+        ));
+    }
+    let mut output = [0_u8; 32];
+    let bytes = value.as_bytes();
+    let nibble = |byte: u8| -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => 0,
+        }
+    };
+    for (index, output) in output.iter_mut().enumerate() {
+        *output = (nibble(bytes[index * 2]) << 4) | nibble(bytes[index * 2 + 1]);
+    }
+    Ok(output)
 }
 
 fn paired_sidecar_uncertainty(
     baseline: &[SidecarRecordingAccuracy],
     candidate: &[SidecarRecordingAccuracy],
-    descriptor_sha256: &str,
     lane: PublicCorpusSidecarLane,
     split: EvaluationSplit,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> FwResult<PublicCorpusSidecarPairedUncertainty> {
     if baseline.len() != candidate.len() {
         return Err(public_corpus_error(
@@ -4215,18 +6388,32 @@ fn paired_sidecar_uncertainty(
     }
     let seed_fingerprint = PublicCorpusSidecarBootstrapSeedFingerprint {
         uncertainty_id: PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION,
-        descriptor_sha256,
+        seed_policy_id: PUBLIC_SIDECAR_BOOTSTRAP_SEED_POLICY,
+        sampler_id: PUBLIC_SIDECAR_BOOTSTRAP_SAMPLER,
         lane,
         split,
-        baseline_recording_count: baseline.len(),
-        candidate_recording_count: candidate.len(),
         replicates: PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
     };
     let bootstrap_seed_sha256 = canonical_sha256(&seed_fingerprint)?;
-    let seed: [u8; 32] = hex_sha256_bytes(&bootstrap_seed_sha256)?;
+    let seed: [u8; 32] = hex_sha256_bytes(
+        &bootstrap_seed_sha256,
+        "sidecar_bootstrap_seed",
+        "bootstrap seed",
+    )?;
     let mut der_deltas = Vec::new();
     let mut jer_deltas = Vec::new();
     for index in 0..baseline.len() {
+        if index % 4_096 == 0 {
+            checkpoint_cancelled(is_cancelled)?;
+        }
+        if baseline[index].recording_audio_sha256 != candidate[index].recording_audio_sha256
+            || baseline[index].reference_sha256 != candidate[index].reference_sha256
+        {
+            return Err(public_corpus_error(
+                "sidecar_pair_alignment",
+                "baseline and candidate recording identities differ",
+            ));
+        }
         if let (Some(baseline), Some(candidate)) = (baseline[index].der, candidate[index].der) {
             der_deltas.push(candidate - baseline);
         }
@@ -4235,12 +6422,24 @@ fn paired_sidecar_uncertainty(
         }
     }
     let (mean_der_delta, der_delta_ci95_lower, der_delta_ci95_upper) =
-        bootstrap_mean_interval(&der_deltas, &seed, 0);
+        bootstrap_mean_interval(&der_deltas, &seed, 0, is_cancelled)?;
     let (mean_jer_delta, jer_delta_ci95_lower, jer_delta_ci95_upper) =
-        bootstrap_mean_interval(&jer_deltas, &seed, 1);
+        bootstrap_mean_interval(&jer_deltas, &seed, 1, is_cancelled)?;
+    let paired_der_recording_count = u64::try_from(der_deltas.len()).map_err(|_| {
+        public_corpus_error(
+            "sidecar_pair_alignment",
+            "paired DER recording count exceeds u64",
+        )
+    })?;
+    let paired_jer_recording_count = u64::try_from(jer_deltas.len()).map_err(|_| {
+        public_corpus_error(
+            "sidecar_pair_alignment",
+            "paired JER recording count exceeds u64",
+        )
+    })?;
     Ok(PublicCorpusSidecarPairedUncertainty {
-        paired_der_recording_count: u64::try_from(der_deltas.len()).unwrap_or(u64::MAX),
-        paired_jer_recording_count: u64::try_from(jer_deltas.len()).unwrap_or(u64::MAX),
+        paired_der_recording_count,
+        paired_jer_recording_count,
         bootstrap_replicates: PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
         bootstrap_seed_sha256,
         mean_der_delta,
@@ -4263,18 +6462,21 @@ fn public_sidecar_gate_policy() -> PublicCorpusSidecarGatePolicy {
         minimum_comparable_frame_coverage: canonical_evidence_number(
             PUBLIC_CORPUS_SIDECAR_MIN_COMPARABLE_FRAME_COVERAGE,
         ),
-        minimum_pair_roc_auc: canonical_evidence_number(
-            PUBLIC_CORPUS_SIDECAR_MIN_PAIR_ROC_AUC,
-        ),
-        maximum_pair_brier_score: canonical_evidence_number(
-            PUBLIC_CORPUS_SIDECAR_MAX_PAIR_BRIER,
-        ),
+        minimum_pair_roc_auc: canonical_evidence_number(PUBLIC_CORPUS_SIDECAR_MIN_PAIR_ROC_AUC),
+        maximum_pair_brier_score: canonical_evidence_number(PUBLIC_CORPUS_SIDECAR_MAX_PAIR_BRIER),
         maximum_pair_expected_calibration_error: canonical_evidence_number(
             PUBLIC_CORPUS_SIDECAR_MAX_PAIR_ECE,
         ),
-        maximum_channel_confound_rate: canonical_evidence_number(
-            PUBLIC_CORPUS_SIDECAR_MAX_CHANNEL_CONFOUND_RATE,
+        maximum_same_speaker_auxiliary_dominance_rate: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MAX_SAME_SPEAKER_AUXILIARY_DOMINANCE_RATE,
         ),
+        minimum_same_speaker_auxiliary_dominance_opportunities:
+            PUBLIC_CORPUS_SIDECAR_MIN_AUXILIARY_DOMINANCE_OPPORTUNITIES,
+        minimum_pair_score_coverage: canonical_evidence_number(
+            PUBLIC_CORPUS_SIDECAR_MIN_PAIR_SCORE_COVERAGE,
+        ),
+        minimum_conditional_pairs_per_class: PUBLIC_CORPUS_SIDECAR_MIN_PAIRS_PER_CLASS,
+        minimum_conditional_pair_recording_count: PUBLIC_CORPUS_SIDECAR_MIN_PAIR_RECORDINGS,
         minimum_paired_recording_count: PUBLIC_SIDECAR_MINIMUM_PAIRED_RECORDINGS,
         maximum_relative_rtf_regression: canonical_evidence_number(
             PUBLIC_CORPUS_SIDECAR_MAX_RELATIVE_RTF_REGRESSION,
@@ -4294,6 +6496,8 @@ fn public_sidecar_selection_policy_sha256(
 ) -> FwResult<String> {
     canonical_sha256(&PublicCorpusSidecarSelectionFingerprint {
         policy_id: PUBLIC_CORPUS_SIDECAR_SELECTION_POLICY_VERSION,
+        accuracy_ranking: "accuracy-eligible-minimum-micro-der-then-lane-v2",
+        operational_gate_behavior: "unique-accuracy-winner-must-pass-full-gate-no-runner-up-v2",
         lane_order: &PublicCorpusSidecarLane::ALL,
         gate_policy,
     })
@@ -4304,6 +6508,12 @@ fn public_sidecar_protocol(
     diarization_request: &DiarizationRequest,
     diarization_request_sha256: String,
 ) -> FwResult<PublicCorpusSidecarStudyProtocol> {
+    if maximum_recording_duration_ms == Some(0) {
+        return Err(public_corpus_error(
+            "sidecar_protocol",
+            "maximum recording duration must be positive when supplied",
+        ));
+    }
     let gate_policy = public_sidecar_gate_policy();
     Ok(PublicCorpusSidecarStudyProtocol {
         oracle_vad: true,
@@ -4314,30 +6524,54 @@ fn public_sidecar_protocol(
         diarization_request: diarization_request.clone(),
         diarization_request_sha256,
         feature_ablation: AcousticFeatureAblation::FullV2,
+        feature_schema_sha256: acoustic_feature_schema_sha256(
+            AcousticFeatureAblation::FullV2.schema_version(),
+        ),
         detector_mode: AcousticChangeDetectorMode::CalibratedPosterior,
         clustering_mode: AcousticClusteringMode::ProbabilisticV1,
+        change_calibration_id: ACOUSTIC_CHANGE_CALIBRATION_VERSION.to_owned(),
+        change_calibration_fit_id: ACOUSTIC_CHANGE_CALIBRATION_FIT_VERSION.to_owned(),
+        change_calibration_sha256: acoustic_change_calibration_sha256(),
+        change_decision_probability: canonical_evidence_number(f64::from(
+            acoustic_change_calibration().decision_probability,
+        )),
+        speaker_pair_calibration_id: ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION.to_owned(),
+        speaker_pair_calibration_sha256: acoustic_speaker_pair_calibration_sha256(),
         sidecar_schema_id: ACOUSTIC_SIDECAR_STUDY_SCHEMA_VERSION.to_owned(),
         fusion_id: ACOUSTIC_SIDECAR_FUSION_VERSION.to_owned(),
         calibration_fit_id: PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION.to_owned(),
+        pair_calibration_fit_id: PUBLIC_CORPUS_SIDECAR_PAIR_CALIBRATION_FIT_VERSION.to_owned(),
+        pair_probability_target_id: PUBLIC_CORPUS_SIDECAR_PAIR_PROBABILITY_TARGET_VERSION
+            .to_owned(),
+        pair_population_id: PUBLIC_CORPUS_SIDECAR_PAIR_POPULATION_VERSION.to_owned(),
+        pair_selection_key_id: PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_KEY_VERSION.to_owned(),
+        pair_selection_digest_id: PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_DIGEST_VERSION.to_owned(),
         pair_scorer_id: PUBLIC_CORPUS_SIDECAR_PAIR_SCORER_VERSION.to_owned(),
         uncertainty_id: PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION.to_owned(),
+        uncertainty_seed_policy_id: PUBLIC_SIDECAR_BOOTSTRAP_SEED_POLICY.to_owned(),
+        uncertainty_sampler_id: PUBLIC_SIDECAR_BOOTSTRAP_SAMPLER.to_owned(),
         selection_policy_id: PUBLIC_CORPUS_SIDECAR_SELECTION_POLICY_VERSION.to_owned(),
         selection_policy_sha256: public_sidecar_selection_policy_sha256(&gate_policy)?,
         boundary_collar_ms: PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS,
         reliability_bins: PUBLIC_SIDECAR_RELIABILITY_BINS,
+        pair_score_bins: PUBLIC_SIDECAR_PAIR_SCORE_BINS,
         pair_lags_frames: PUBLIC_SIDECAR_PAIR_LAGS_FRAMES,
         maximum_pairs_per_recording: PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING,
+        maximum_retained_pair_sample_capacity: PUBLIC_SIDECAR_MAX_RETAINED_PAIR_SAMPLE_CAPACITY,
         paired_bootstrap_replicates: PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
+        maximum_retained_signal_capacity: PUBLIC_SIDECAR_MAX_RETAINED_SIGNAL_CAPACITY as usize,
+        maximum_reported_payload_bytes: PUBLIC_SIDECAR_MAX_REPORTED_PAYLOAD_BYTES,
         lane_order: PublicCorpusSidecarLane::ALL.to_vec(),
         gate_policy,
     })
 }
 
-fn unavailable_public_sidecar_split(split: EvaluationSplit) -> PublicCorpusSidecarStudySplit {
+fn unavailable_public_sidecar_split(
+    split: EvaluationSplit,
+) -> FwResult<PublicCorpusSidecarStudySplit> {
     let probabilities = SidecarProbabilityAccumulator::new();
-    let (brier_score, expected_calibration_error, reliability) =
-        probabilities.finish_reliability();
-    PublicCorpusSidecarStudySplit {
+    let finished = probabilities.finish_reliability();
+    Ok(PublicCorpusSidecarStudySplit {
         split,
         pipeline: None,
         fusion_executed: false,
@@ -4351,11 +6585,11 @@ fn unavailable_public_sidecar_split(split: EvaluationSplit) -> PublicCorpusSidec
             mean_absolute_error_sec: None,
             probability_observation_count: 0,
             probability_positive_count: 0,
-            brier_score,
-            expected_calibration_error,
-            reliability,
+            brier_score: finished.brier_score,
+            expected_calibration_error: finished.expected_calibration_error,
+            reliability: finished.reliability,
         },
-        conditional_pairs: SidecarPairAccumulator::new().finish(),
+        conditional_pairs: SidecarPairAccumulator::new().finish()?,
         coverage: PublicCorpusSidecarCoverage {
             fusion_requested: false,
             evaluated_recording_count: 0,
@@ -4369,9 +6603,21 @@ fn unavailable_public_sidecar_split(split: EvaluationSplit) -> PublicCorpusSidec
             comparable_frame_coverage: None,
             component_comparison_count: 0,
             owner_available_frame_counts: [0; 3],
-            channel_confound_opportunity_count: 0,
-            channel_confound_count: 0,
-            channel_confound_rate: None,
+            channel_dominance: SidecarAuxiliaryDominanceAccumulator::default().finish(),
+            mixed_auxiliary_dominance: SidecarAuxiliaryDominanceAccumulator::default().finish(),
+            eligible_pair_count: 0,
+            retained_pair_sample_count: 0,
+            retained_same_speaker_pair_count: 0,
+            retained_different_speaker_pair_count: 0,
+            pair_selection_sha256: None,
+            pair_score_coverage: None,
+            same_speaker_pair_score_coverage: None,
+            different_speaker_pair_score_coverage: None,
+            pair_scored_recording_count: 0,
+            same_speaker_pair_recording_count: 0,
+            different_speaker_pair_recording_count: 0,
+            maximum_retained_pair_sample_count: 0,
+            retained_pair_sample_capacity: 0,
             maximum_retained_signal_count: 0,
             retained_signal_capacity: 0,
         },
@@ -4393,7 +6639,7 @@ fn unavailable_public_sidecar_split(split: EvaluationSplit) -> PublicCorpusSidec
             sampled_peak_rss_bytes: 0,
         },
         paired_uncertainty: None,
-    }
+    })
 }
 
 fn public_sidecar_promotion_gate(
@@ -4409,8 +6655,13 @@ fn public_sidecar_promotion_gate(
         .and_then(|candidate| candidate.micro_der)
         .zip(baseline_pipeline.and_then(|baseline| baseline.micro_der))
         .and_then(|(candidate, baseline)| {
-            (baseline > 0.0)
-                .then(|| canonical_evidence_number((baseline - candidate) / baseline))
+            if baseline > 0.0 {
+                Some(canonical_evidence_number((baseline - candidate) / baseline))
+            } else if baseline == 0.0 && candidate == 0.0 {
+                Some(0.0)
+            } else {
+                None
+            }
         });
     let macro_jer_delta = candidate_pipeline
         .and_then(|candidate| candidate.macro_jer)
@@ -4430,24 +6681,22 @@ fn public_sidecar_promotion_gate(
         .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
     let mean_absolute_speaker_count_error_delta = candidate_pipeline
         .and_then(|candidate| candidate.mean_absolute_speaker_count_error)
-        .zip(baseline_pipeline.and_then(|baseline| {
-            baseline.mean_absolute_speaker_count_error
-        }))
+        .zip(baseline_pipeline.and_then(|baseline| baseline.mean_absolute_speaker_count_error))
         .map(|(candidate, baseline)| canonical_evidence_number(candidate - baseline));
-    let dominant_collapse_count_delta = candidate_pipeline
-        .zip(baseline_pipeline)
-        .and_then(|(candidate, baseline)| {
-            let candidate = i64::try_from(candidate.dominant_collapse_recording_count).ok()?;
-            let baseline = i64::try_from(baseline.dominant_collapse_recording_count).ok()?;
-            candidate.checked_sub(baseline)
-        });
+    let dominant_collapse_count_delta =
+        candidate_pipeline
+            .zip(baseline_pipeline)
+            .and_then(|(candidate, baseline)| {
+                let candidate = i64::try_from(candidate.dominant_collapse_recording_count).ok()?;
+                let baseline = i64::try_from(baseline.dominant_collapse_recording_count).ok()?;
+                candidate.checked_sub(baseline)
+            });
     let relative_rtf_regression = candidate
         .performance
         .real_time_factor
         .zip(baseline.performance.real_time_factor)
         .and_then(|(candidate, baseline)| {
-            (baseline > 0.0)
-                .then(|| canonical_evidence_number((candidate - baseline) / baseline))
+            (baseline > 0.0).then(|| canonical_evidence_number((candidate - baseline) / baseline))
         });
     let relative_rss_regression = (baseline.performance.sampled_peak_rss_bytes > 0).then(|| {
         canonical_evidence_number(
@@ -4467,13 +6716,16 @@ fn public_sidecar_promotion_gate(
         failures.push(PublicCorpusSidecarGateFailure::MissingAccuracy);
     }
     let der_passed = match stage {
-        PublicCorpusEvaluationStage::Development => relative_micro_der_improvement.is_some_and(
-            |improvement| {
+        PublicCorpusEvaluationStage::Development => {
+            relative_micro_der_improvement.is_some_and(|improvement| {
                 improvement >= policy.minimum_relative_development_micro_der_improvement
-            },
-        ),
-        PublicCorpusEvaluationStage::Certification => relative_micro_der_improvement
-            .is_some_and(|improvement| !policy.require_held_out_micro_der_non_regression || improvement >= 0.0),
+            })
+        }
+        PublicCorpusEvaluationStage::Certification => {
+            relative_micro_der_improvement.is_some_and(|improvement| {
+                !policy.require_held_out_micro_der_non_regression || improvement >= 0.0
+            })
+        }
     };
     if !der_passed {
         failures.push(PublicCorpusSidecarGateFailure::InsufficientDerImprovement);
@@ -4493,10 +6745,37 @@ fn public_sidecar_promotion_gate(
     {
         failures.push(PublicCorpusSidecarGateFailure::InsufficientComparableCoverage);
     }
+    if !candidate
+        .coverage
+        .pair_score_coverage
+        .is_some_and(|coverage| coverage >= policy.minimum_pair_score_coverage)
+        || !candidate
+            .coverage
+            .same_speaker_pair_score_coverage
+            .is_some_and(|coverage| coverage >= policy.minimum_pair_score_coverage)
+        || !candidate
+            .coverage
+            .different_speaker_pair_score_coverage
+            .is_some_and(|coverage| coverage >= policy.minimum_pair_score_coverage)
+    {
+        failures.push(PublicCorpusSidecarGateFailure::InsufficientPairCoverage);
+    }
     if candidate.conditional_pairs.same_speaker_count == 0
         || candidate.conditional_pairs.different_speaker_count == 0
     {
         failures.push(PublicCorpusSidecarGateFailure::MissingConditionalPairs);
+    }
+    if candidate.conditional_pairs.same_speaker_count < policy.minimum_conditional_pairs_per_class
+        || candidate.conditional_pairs.different_speaker_count
+            < policy.minimum_conditional_pairs_per_class
+        || candidate.coverage.pair_scored_recording_count
+            < policy.minimum_conditional_pair_recording_count
+        || candidate.coverage.same_speaker_pair_recording_count
+            < policy.minimum_conditional_pair_recording_count
+        || candidate.coverage.different_speaker_pair_recording_count
+            < policy.minimum_conditional_pair_recording_count
+    {
+        failures.push(PublicCorpusSidecarGateFailure::InsufficientPairSupport);
     }
     if !candidate
         .conditional_pairs
@@ -4519,12 +6798,23 @@ fn public_sidecar_promotion_gate(
     {
         failures.push(PublicCorpusSidecarGateFailure::PairCalibration);
     }
-    if !candidate
-        .coverage
-        .channel_confound_rate
-        .is_some_and(|rate| rate <= policy.maximum_channel_confound_rate)
-    {
-        failures.push(PublicCorpusSidecarGateFailure::ChannelConfound);
+    let auxiliary_dominance_failed = candidate_lane
+        .auxiliary_dominance_expectations()
+        .into_iter()
+        .zip([
+            &candidate.coverage.channel_dominance,
+            &candidate.coverage.mixed_auxiliary_dominance,
+        ])
+        .any(|(expected, diagnostics)| {
+            expected
+                && (diagnostics.same_speaker_opportunity_count
+                    < policy.minimum_same_speaker_auxiliary_dominance_opportunities
+                    || !diagnostics.same_speaker_dominance_rate.is_some_and(|rate| {
+                        rate <= policy.maximum_same_speaker_auxiliary_dominance_rate
+                    }))
+        });
+    if auxiliary_dominance_failed {
+        failures.push(PublicCorpusSidecarGateFailure::AuxiliaryConfound);
     }
     if policy.require_speaker_count_non_regression
         && (!exact_speaker_count_rate_delta.is_some_and(|delta| delta >= 0.0)
@@ -4561,12 +6851,23 @@ fn public_sidecar_promotion_gate(
         macro_jer_delta,
         boundary_f1_delta,
         comparable_frame_coverage: candidate.coverage.comparable_frame_coverage,
+        pair_score_coverage: candidate.coverage.pair_score_coverage,
+        same_speaker_pair_score_coverage: candidate.coverage.same_speaker_pair_score_coverage,
+        different_speaker_pair_score_coverage: candidate
+            .coverage
+            .different_speaker_pair_score_coverage,
+        pair_scored_recording_count: candidate.coverage.pair_scored_recording_count,
         pair_roc_auc: candidate.conditional_pairs.roc_auc,
         pair_brier_score: candidate.conditional_pairs.brier_score,
-        pair_expected_calibration_error: candidate
-            .conditional_pairs
-            .expected_calibration_error,
-        channel_confound_rate: candidate.coverage.channel_confound_rate,
+        pair_expected_calibration_error: candidate.conditional_pairs.expected_calibration_error,
+        channel_same_speaker_dominance_rate: candidate
+            .coverage
+            .channel_dominance
+            .same_speaker_dominance_rate,
+        mixed_auxiliary_same_speaker_dominance_rate: candidate
+            .coverage
+            .mixed_auxiliary_dominance
+            .same_speaker_dominance_rate,
         exact_speaker_count_rate_delta,
         mean_absolute_speaker_count_error_delta,
         dominant_collapse_count_delta,
@@ -4576,6 +6877,82 @@ fn public_sidecar_promotion_gate(
         passed: failures.is_empty(),
         failures,
     }
+}
+
+fn sidecar_gate_is_accuracy_eligible(gate: &PublicCorpusSidecarPromotionGate) -> bool {
+    gate.failures.iter().all(|failure| {
+        matches!(
+            failure,
+            PublicCorpusSidecarGateFailure::PerformanceRegression
+                | PublicCorpusSidecarGateFailure::NotSelectedByRanking
+        )
+    })
+}
+
+/// Return the index in the full lane vector (including the baseline at index
+/// zero) of the unique accuracy-ranked candidate.
+fn sidecar_accuracy_ranked_variant_index(
+    variants: &[PublicCorpusSidecarStudyVariant],
+) -> Option<usize> {
+    variants
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, variant)| {
+            variant
+                .gate
+                .as_ref()
+                .is_some_and(sidecar_gate_is_accuracy_eligible)
+        })
+        .min_by(|(_, left), (_, right)| {
+            let left_der = left
+                .splits
+                .first()
+                .and_then(|split| split.pipeline.as_ref())
+                .and_then(|pipeline| pipeline.micro_der)
+                .unwrap_or(f64::INFINITY);
+            let right_der = right
+                .splits
+                .first()
+                .and_then(|split| split.pipeline.as_ref())
+                .and_then(|pipeline| pipeline.micro_der)
+                .unwrap_or(f64::INFINITY);
+            left_der
+                .total_cmp(&right_der)
+                .then_with(|| left.lane.cmp(&right.lane))
+        })
+        .map(|(index, _)| index)
+}
+
+fn apply_public_sidecar_development_selection(
+    variants: &mut [PublicCorpusSidecarStudyVariant],
+) -> Option<PublicCorpusSidecarLane> {
+    let selected_index = sidecar_accuracy_ranked_variant_index(variants);
+    for (index, variant) in variants.iter_mut().enumerate().skip(1) {
+        if Some(index) == selected_index && variant.gate.as_ref().is_some_and(|gate| gate.passed) {
+            variant.disposition = PublicCorpusSidecarDisposition::AdvanceToCertification;
+        } else {
+            variant.disposition = PublicCorpusSidecarDisposition::Rejected;
+            if Some(index) != selected_index
+                && let Some(gate) = variant.gate.as_mut()
+                && sidecar_gate_is_accuracy_eligible(gate)
+            {
+                gate.passed = false;
+                if !gate
+                    .failures
+                    .contains(&PublicCorpusSidecarGateFailure::NotSelectedByRanking)
+                {
+                    gate.failures
+                        .push(PublicCorpusSidecarGateFailure::NotSelectedByRanking);
+                    gate.failures.sort();
+                }
+            }
+        }
+    }
+    selected_index.and_then(|index| {
+        (variants[index].disposition == PublicCorpusSidecarDisposition::AdvanceToCertification)
+            .then_some(variants[index].lane)
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6486,6 +8863,1469 @@ fn clustering_held_out_gate(
     })
 }
 
+fn sidecar_f32_probability_bin_index(probability: f32, bin_count: usize) -> usize {
+    ((f64::from(probability) * bin_count as f64).floor() as usize).min(bin_count - 1)
+}
+
+fn sidecar_f32_probability_bin_support(index: usize, bin_count: usize) -> Option<(f64, f64)> {
+    if bin_count == 0 || index >= bin_count {
+        return None;
+    }
+    let minimum_bits = f32::EPSILON.to_bits() as u64;
+    let maximum_bits = (1.0_f32 - f32::EPSILON).to_bits() as u64;
+    let end_bits = maximum_bits + 1;
+    let lower_bound = |target_index: usize| {
+        let mut lower = minimum_bits;
+        let mut upper = end_bits;
+        while lower < upper {
+            let midpoint = lower + (upper - lower) / 2;
+            let is_before = midpoint <= maximum_bits
+                && sidecar_f32_probability_bin_index(f32::from_bits(midpoint as u32), bin_count)
+                    < target_index;
+            if is_before {
+                lower = midpoint + 1;
+            } else {
+                upper = midpoint;
+            }
+        }
+        lower
+    };
+    let first_bits = lower_bound(index);
+    let after_last_bits = lower_bound(index + 1);
+    if first_bits >= after_last_bits || first_bits > maximum_bits {
+        return None;
+    }
+    let last_bits = after_last_bits - 1;
+    Some((
+        f64::from(f32::from_bits(first_bits as u32)),
+        f64::from(f32::from_bits(last_bits as u32)),
+    ))
+}
+
+fn maximum_bounded_second_moment(
+    lower_probability: f64,
+    upper_probability: f64,
+    observation_count: u64,
+    probability_sum: f64,
+) -> f64 {
+    let count = observation_count as f64;
+    let width = upper_probability - lower_probability;
+    if observation_count == 0 || width == 0.0 {
+        return count * lower_probability.powi(2);
+    }
+    let normalized_excess =
+        ((probability_sum - count * lower_probability) / width).clamp(0.0, count);
+    let full_upper_count = normalized_excess.floor();
+    let fractional_upper = normalized_excess - full_upper_count;
+    count * lower_probability.powi(2)
+        + 2.0 * lower_probability * width * normalized_excess
+        + width.powi(2) * (full_upper_count + fractional_upper.powi(2))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sidecar_probability_moments_are_feasible(
+    lower_probability: f64,
+    upper_probability: f64,
+    observation_count: u64,
+    positive_count: u64,
+    probability_sum: f64,
+    positive_probability_sum: f64,
+    squared_probability_sum: f64,
+    positive_squared_probability_sum: f64,
+    squared_error_sum: f64,
+) -> bool {
+    if !lower_probability.is_finite()
+        || !upper_probability.is_finite()
+        || !(0.0..=1.0).contains(&lower_probability)
+        || !(0.0..=1.0).contains(&upper_probability)
+        || lower_probability > upper_probability
+        || positive_count > observation_count
+    {
+        return false;
+    }
+    if observation_count == 0 {
+        return positive_count == 0
+            && probability_sum == 0.0
+            && positive_probability_sum == 0.0
+            && squared_probability_sum == 0.0
+            && positive_squared_probability_sum == 0.0
+            && squared_error_sum == 0.0;
+    }
+    let count = observation_count as f64;
+    let positives = positive_count as f64;
+    let negatives = count - positives;
+    let negative_probability_sum = probability_sum - positive_probability_sum;
+    let negative_squared_probability_sum =
+        squared_probability_sum - positive_squared_probability_sum;
+    // Direct first-moment sums and their bounds share the canonical
+    // 12-decimal evidence lattice, whose rounding is monotone. Compare those
+    // canonical values directly so the aggregate support check does not grow
+    // looser merely because a bin contains more observations.
+    let canonical_lower_sum = canonical_evidence_number(lower_probability * count);
+    let canonical_upper_sum = canonical_evidence_number(upper_probability * count);
+    let canonical_positive_lower_sum = canonical_evidence_number(lower_probability * positives);
+    let canonical_positive_upper_sum = canonical_evidence_number(upper_probability * positives);
+    let canonical_negative_probability_sum = canonical_evidence_number(negative_probability_sum);
+    let canonical_negative_lower_sum = canonical_evidence_number(lower_probability * negatives);
+    let canonical_negative_upper_sum = canonical_evidence_number(upper_probability * negatives);
+    // The negative-class sum is derived by subtracting two independently
+    // canonicalized aggregates. Its absolute binary subtraction error grows
+    // with the magnitudes of those totals even when the derived result is
+    // small, so budget against the operands rather than an adjacent score gap.
+    let subtraction_scale = probability_sum
+        .abs()
+        .max(positive_probability_sum.abs())
+        .max(canonical_negative_probability_sum.abs())
+        .max(1.0);
+    let negative_support_tolerance = 2e-12 + 8.0 * f64::EPSILON * subtraction_scale;
+    let tolerance = 1e-9 * count.max(1.0);
+    let maximum_squared_probability_sum = maximum_bounded_second_moment(
+        lower_probability,
+        upper_probability,
+        observation_count,
+        probability_sum,
+    );
+    let maximum_positive_squared_probability_sum = maximum_bounded_second_moment(
+        lower_probability,
+        upper_probability,
+        positive_count,
+        positive_probability_sum,
+    );
+    let negative_count = observation_count - positive_count;
+    let maximum_negative_squared_probability_sum = maximum_bounded_second_moment(
+        lower_probability,
+        upper_probability,
+        negative_count,
+        negative_probability_sum,
+    );
+    let moment_scale = squared_probability_sum
+        .abs()
+        .max(positive_squared_probability_sum.abs())
+        .max(negative_squared_probability_sum.abs())
+        .max(squared_error_sum.abs())
+        .max(maximum_squared_probability_sum.abs())
+        .max(1.0);
+    // These sufficient statistics can establish aggregate feasibility, not
+    // the membership of every omitted raw score. Keep the allowances tied
+    // only to canonicalization and floating arithmetic; an adjacency-derived
+    // cap both overclaimed that proof boundary and rejected valid large bins.
+    let moment_tolerance = 2e-12 + 8.0 * f64::EPSILON * moment_scale;
+    // Negative-class moments are differences of two independently rounded
+    // fixed-12 aggregates. Their Jensen/secant checks can accumulate one
+    // decimal half-unit from each input plus binary arithmetic error. Four
+    // decimal units and 32 ulps cover that explicit error budget without
+    // scaling the allowance by observation count.
+    let derived_moment_tolerance = 4e-12 + 32.0 * f64::EPSILON * moment_scale;
+    probability_sum.is_finite()
+        && positive_probability_sum.is_finite()
+        && squared_probability_sum.is_finite()
+        && positive_squared_probability_sum.is_finite()
+        && squared_error_sum.is_finite()
+        && canonical_evidence_number(probability_sum) == probability_sum
+        && canonical_evidence_number(positive_probability_sum) == positive_probability_sum
+        && canonical_evidence_number(squared_probability_sum) == squared_probability_sum
+        && canonical_evidence_number(positive_squared_probability_sum)
+            == positive_squared_probability_sum
+        && canonical_evidence_number(squared_error_sum) == squared_error_sum
+        && (positive_count > 0
+            || (positive_probability_sum == 0.0 && positive_squared_probability_sum == 0.0))
+        && (positive_count < observation_count
+            || (negative_probability_sum == 0.0 && negative_squared_probability_sum == 0.0))
+        && probability_sum >= canonical_lower_sum
+        && probability_sum <= canonical_upper_sum
+        && positive_probability_sum >= canonical_positive_lower_sum
+        && positive_probability_sum <= canonical_positive_upper_sum
+        && canonical_negative_probability_sum + negative_support_tolerance
+            >= canonical_negative_lower_sum
+        && canonical_negative_probability_sum - negative_support_tolerance
+            <= canonical_negative_upper_sum
+        && squared_probability_sum + moment_tolerance >= lower_probability.powi(2) * count
+        && squared_probability_sum - moment_tolerance <= upper_probability.powi(2) * count
+        && positive_squared_probability_sum + moment_tolerance
+            >= lower_probability.powi(2) * positives
+        && positive_squared_probability_sum - moment_tolerance
+            <= upper_probability.powi(2) * positives
+        && negative_squared_probability_sum + derived_moment_tolerance
+            >= lower_probability.powi(2) * negatives
+        && negative_squared_probability_sum - derived_moment_tolerance
+            <= upper_probability.powi(2) * negatives
+        && (count == 0.0
+            || squared_probability_sum + moment_tolerance >= probability_sum.powi(2) / count)
+        && (positives == 0.0
+            || positive_squared_probability_sum + moment_tolerance
+                >= positive_probability_sum.powi(2) / positives)
+        && (negatives == 0.0
+            || negative_squared_probability_sum + derived_moment_tolerance
+                >= negative_probability_sum.powi(2) / negatives)
+        && squared_probability_sum - moment_tolerance
+            <= (lower_probability + upper_probability) * probability_sum
+                - lower_probability * upper_probability * count
+        && positive_squared_probability_sum - moment_tolerance
+            <= (lower_probability + upper_probability) * positive_probability_sum
+                - lower_probability * upper_probability * positives
+        && negative_squared_probability_sum - derived_moment_tolerance
+            <= (lower_probability + upper_probability) * negative_probability_sum
+                - lower_probability * upper_probability * negatives
+        && squared_probability_sum - moment_tolerance <= maximum_squared_probability_sum
+        && positive_squared_probability_sum - moment_tolerance
+            <= maximum_positive_squared_probability_sum
+        && negative_squared_probability_sum - derived_moment_tolerance
+            <= maximum_negative_squared_probability_sum
+        && squared_error_sum >= 0.0
+        && squared_error_sum - moment_tolerance <= count
+        && (squared_error_sum
+            - canonical_evidence_number(
+                squared_probability_sum - 2.0 * positive_probability_sum + positives,
+            ))
+        .abs()
+            <= derived_moment_tolerance
+        && negative_probability_sum >= -tolerance
+        && positive_probability_sum - tolerance <= probability_sum
+        && positive_squared_probability_sum - derived_moment_tolerance <= squared_probability_sum
+        && negative_squared_probability_sum >= -derived_moment_tolerance
+        && positive_squared_probability_sum - moment_tolerance <= positive_probability_sum
+        && negative_squared_probability_sum - derived_moment_tolerance <= negative_probability_sum
+        && squared_probability_sum - moment_tolerance <= probability_sum
+}
+
+struct VerifiedSidecarReliability {
+    probability_sum: f64,
+    positive_probability_sum: f64,
+}
+
+fn verified_sidecar_reliability(
+    observation_count: u64,
+    positive_count: u64,
+    brier_score: Option<f64>,
+    expected_calibration_error: Option<f64>,
+    reliability: &[PublicCorpusSidecarReliabilityBin],
+) -> Option<VerifiedSidecarReliability> {
+    if positive_count > observation_count || reliability.len() != PUBLIC_SIDECAR_RELIABILITY_BINS {
+        return None;
+    }
+    let mut retained_observations = 0_u64;
+    let mut retained_positives = 0_u64;
+    let mut probability_sum = 0.0;
+    let mut positive_probability_sum = 0.0;
+    let mut squared_error_sum = 0.0;
+    let mut expected_ece = 0.0;
+    for (index, bin) in reliability.iter().enumerate() {
+        if bin.index != index
+            || bin.lower_probability
+                != canonical_evidence_number(index as f64 / PUBLIC_SIDECAR_RELIABILITY_BINS as f64)
+            || bin.upper_probability
+                != canonical_evidence_number(
+                    (index + 1) as f64 / PUBLIC_SIDECAR_RELIABILITY_BINS as f64,
+                )
+            || bin.positive_count > bin.observation_count
+        {
+            return None;
+        }
+        let Some(next_observations) = retained_observations.checked_add(bin.observation_count)
+        else {
+            return None;
+        };
+        retained_observations = next_observations;
+        let Some(next_positives) = retained_positives.checked_add(bin.positive_count) else {
+            return None;
+        };
+        retained_positives = next_positives;
+        let Some((support_lower, support_upper)) =
+            sidecar_f32_probability_bin_support(index, PUBLIC_SIDECAR_RELIABILITY_BINS)
+        else {
+            return None;
+        };
+        if !sidecar_probability_moments_are_feasible(
+            support_lower,
+            support_upper,
+            bin.observation_count,
+            bin.positive_count,
+            bin.probability_sum,
+            bin.positive_probability_sum,
+            bin.squared_probability_sum,
+            bin.positive_squared_probability_sum,
+            bin.squared_error_sum,
+        ) {
+            return None;
+        }
+        probability_sum += bin.probability_sum;
+        positive_probability_sum += bin.positive_probability_sum;
+        squared_error_sum += bin.squared_error_sum;
+        match (bin.mean_probability, bin.empirical_frequency) {
+            (None, None)
+                if bin.observation_count == 0
+                    && bin.probability_sum == 0.0
+                    && bin.positive_probability_sum == 0.0
+                    && bin.squared_probability_sum == 0.0
+                    && bin.positive_squared_probability_sum == 0.0
+                    && bin.squared_error_sum == 0.0 => {}
+            (Some(mean), Some(empirical))
+                if bin.observation_count > 0
+                    && mean.is_finite()
+                    && empirical.is_finite()
+                    && (0.0..=1.0).contains(&mean)
+                    && Some(mean)
+                        == positive_ratio(bin.probability_sum, bin.observation_count as f64)
+                    && mean >= bin.lower_probability
+                    && if index + 1 == PUBLIC_SIDECAR_RELIABILITY_BINS {
+                        mean <= bin.upper_probability
+                    } else {
+                        mean < bin.upper_probability
+                    }
+                    && (0.0..=1.0).contains(&empirical)
+                    && empirical
+                        == ratio(bin.positive_count, bin.observation_count).unwrap_or(0.0) =>
+            {
+                expected_ece += bin.observation_count as f64 / observation_count.max(1) as f64
+                    * (mean - empirical).abs();
+            }
+            _ => return None,
+        }
+    }
+    let bounded = |value: Option<f64>| {
+        value.is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+    };
+    let expected_brier = positive_ratio(
+        canonical_evidence_number(squared_error_sum),
+        observation_count as f64,
+    );
+    let valid = retained_observations == observation_count
+        && retained_positives == positive_count
+        && bounded(brier_score)
+        && bounded(expected_calibration_error)
+        && if observation_count == 0 {
+            brier_score.is_none() && expected_calibration_error.is_none()
+        } else {
+            brier_score == expected_brier
+                && expected_calibration_error == Some(canonical_evidence_number(expected_ece))
+        };
+    valid.then_some(VerifiedSidecarReliability {
+        probability_sum: canonical_evidence_number(probability_sum),
+        positive_probability_sum: canonical_evidence_number(positive_probability_sum),
+    })
+}
+
+fn sidecar_reliability_is_valid(
+    observation_count: u64,
+    positive_count: u64,
+    brier_score: Option<f64>,
+    expected_calibration_error: Option<f64>,
+    reliability: &[PublicCorpusSidecarReliabilityBin],
+) -> bool {
+    verified_sidecar_reliability(
+        observation_count,
+        positive_count,
+        brier_score,
+        expected_calibration_error,
+        reliability,
+    )
+    .is_some()
+}
+
+fn sidecar_boundary_metrics_are_valid(
+    boundary: &PublicCorpusSidecarBoundaryMetrics,
+    pipeline: Option<&PublicCorpusAblationSplit>,
+) -> bool {
+    let precision = ratio(boundary.matched_count, boundary.hypothesis_count);
+    let recall = ratio(boundary.matched_count, boundary.reference_count);
+    let f1 = precision.zip(recall).map(|(precision, recall)| {
+        let denominator = precision + recall;
+        if denominator > 0.0 {
+            2.0 * precision * recall / denominator
+        } else {
+            0.0
+        }
+    });
+    let aligned = pipeline.is_none_or(|pipeline| {
+        boundary.reference_count == pipeline.change_reference_count
+            && boundary.hypothesis_count == pipeline.change_hypothesis_count
+            && boundary.matched_count == pipeline.change_matched_count
+            && boundary.precision == pipeline.change_precision
+            && boundary.recall == pipeline.change_recall
+            && boundary.f1 == pipeline.change_f1
+            && boundary.mean_absolute_error_sec == pipeline.change_mean_absolute_error_sec
+    });
+    boundary.matched_count <= boundary.reference_count
+        && boundary.matched_count <= boundary.hypothesis_count
+        && boundary.precision == precision
+        && boundary.recall == recall
+        && boundary.f1 == f1
+        && boundary.mean_absolute_error_sec.is_none_or(|value| {
+            value.is_finite()
+                && value >= 0.0
+                && value <= PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS as f64 / 1_000.0
+        })
+        && (boundary.matched_count > 0) == boundary.mean_absolute_error_sec.is_some()
+        && aligned
+        && sidecar_reliability_is_valid(
+            boundary.probability_observation_count,
+            boundary.probability_positive_count,
+            boundary.brier_score,
+            boundary.expected_calibration_error,
+            &boundary.reliability,
+        )
+}
+
+fn sidecar_pair_metrics_are_valid(metrics: &PublicCorpusSidecarPairMetrics) -> bool {
+    let Some(expected_count) = metrics
+        .same_speaker_count
+        .checked_add(metrics.different_speaker_count)
+    else {
+        return false;
+    };
+    let Some(reliability) = verified_sidecar_reliability(
+        metrics.comparison_count,
+        metrics.different_speaker_count,
+        metrics.brier_score,
+        metrics.expected_calibration_error,
+        &metrics.reliability,
+    ) else {
+        return false;
+    };
+    if metrics.score_histogram.len() != PUBLIC_SIDECAR_PAIR_SCORE_BINS
+        || !PUBLIC_SIDECAR_PAIR_SCORE_BINS.is_multiple_of(PUBLIC_SIDECAR_RELIABILITY_BINS)
+    {
+        return false;
+    }
+    let score_bins_per_reliability_bin =
+        PUBLIC_SIDECAR_PAIR_SCORE_BINS / PUBLIC_SIDECAR_RELIABILITY_BINS;
+    let mut grouped_score_bins =
+        [SidecarReliabilityAccumulator::default(); PUBLIC_SIDECAR_RELIABILITY_BINS];
+    let mut retained_same = 0_u64;
+    let mut retained_different = 0_u64;
+    let mut lower_same = 0_u64;
+    let mut concordance = 0.0;
+    for (index, bin) in metrics.score_histogram.iter().enumerate() {
+        if bin.index != index
+            || bin.lower_probability
+                != canonical_evidence_number(index as f64 / PUBLIC_SIDECAR_PAIR_SCORE_BINS as f64)
+            || bin.upper_probability
+                != canonical_evidence_number(
+                    (index + 1) as f64 / PUBLIC_SIDECAR_PAIR_SCORE_BINS as f64,
+                )
+        {
+            return false;
+        }
+        let Some(bin_observation_count) = bin
+            .same_speaker_count
+            .checked_add(bin.different_speaker_count)
+        else {
+            return false;
+        };
+        let Some((support_lower, support_upper)) =
+            sidecar_f32_probability_bin_support(index, PUBLIC_SIDECAR_PAIR_SCORE_BINS)
+        else {
+            return false;
+        };
+        if !sidecar_probability_moments_are_feasible(
+            support_lower,
+            support_upper,
+            bin_observation_count,
+            bin.different_speaker_count,
+            bin.probability_sum,
+            bin.different_speaker_probability_sum,
+            bin.squared_probability_sum,
+            bin.different_speaker_squared_probability_sum,
+            bin.squared_error_sum,
+        ) {
+            return false;
+        }
+        let grouped = &mut grouped_score_bins[index / score_bins_per_reliability_bin];
+        let Some(grouped_observation_count) =
+            grouped.observation_count.checked_add(bin_observation_count)
+        else {
+            return false;
+        };
+        let Some(grouped_positive_count) = grouped
+            .positive_count
+            .checked_add(bin.different_speaker_count)
+        else {
+            return false;
+        };
+        grouped.observation_count = grouped_observation_count;
+        grouped.positive_count = grouped_positive_count;
+        add_sidecar_compensated(
+            &mut grouped.probability_sum,
+            &mut grouped.probability_sum_correction,
+            bin.probability_sum,
+        );
+        add_sidecar_compensated(
+            &mut grouped.positive_probability_sum,
+            &mut grouped.positive_probability_sum_correction,
+            bin.different_speaker_probability_sum,
+        );
+        add_sidecar_compensated(
+            &mut grouped.squared_probability_sum,
+            &mut grouped.squared_probability_sum_correction,
+            bin.squared_probability_sum,
+        );
+        add_sidecar_compensated(
+            &mut grouped.positive_squared_probability_sum,
+            &mut grouped.positive_squared_probability_sum_correction,
+            bin.different_speaker_squared_probability_sum,
+        );
+        add_sidecar_compensated(
+            &mut grouped.squared_error_sum,
+            &mut grouped.squared_error_sum_correction,
+            bin.squared_error_sum,
+        );
+        let Some(next_same) = retained_same.checked_add(bin.same_speaker_count) else {
+            return false;
+        };
+        let Some(next_different) = retained_different.checked_add(bin.different_speaker_count)
+        else {
+            return false;
+        };
+        concordance += bin.different_speaker_count as f64
+            * (lower_same as f64 + 0.5 * bin.same_speaker_count as f64);
+        lower_same = next_same;
+        retained_same = next_same;
+        retained_different = next_different;
+    }
+    for (grouped, reliability_bin) in grouped_score_bins.iter().zip(&metrics.reliability) {
+        if grouped.observation_count != reliability_bin.observation_count
+            || grouped.positive_count != reliability_bin.positive_count
+            || canonical_evidence_number(sidecar_compensated_total(
+                grouped.probability_sum,
+                grouped.probability_sum_correction,
+            )) != reliability_bin.probability_sum
+            || canonical_evidence_number(sidecar_compensated_total(
+                grouped.positive_probability_sum,
+                grouped.positive_probability_sum_correction,
+            )) != reliability_bin.positive_probability_sum
+            || canonical_evidence_number(sidecar_compensated_total(
+                grouped.squared_probability_sum,
+                grouped.squared_probability_sum_correction,
+            )) != reliability_bin.squared_probability_sum
+            || canonical_evidence_number(sidecar_compensated_total(
+                grouped.positive_squared_probability_sum,
+                grouped.positive_squared_probability_sum_correction,
+            )) != reliability_bin.positive_squared_probability_sum
+            || canonical_evidence_number(sidecar_compensated_total(
+                grouped.squared_error_sum,
+                grouped.squared_error_sum_correction,
+            )) != reliability_bin.squared_error_sum
+        {
+            return false;
+        }
+    }
+    let expected_auc = if metrics.same_speaker_count > 0 && metrics.different_speaker_count > 0 {
+        Some(canonical_evidence_number(
+            concordance
+                / (metrics.same_speaker_count as f64 * metrics.different_speaker_count as f64),
+        ))
+    } else {
+        None
+    };
+    let same_probability_sum = canonical_evidence_number(
+        reliability.probability_sum - reliability.positive_probability_sum,
+    );
+    let expected_same_mean =
+        positive_ratio(same_probability_sum, metrics.same_speaker_count as f64);
+    let expected_different_mean = positive_ratio(
+        reliability.positive_probability_sum,
+        metrics.different_speaker_count as f64,
+    );
+    let mean_shape_is_valid = |mean: Option<f64>, count: u64| {
+        if count == 0 {
+            mean.is_none()
+        } else {
+            mean.is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+        }
+    };
+    expected_count == metrics.comparison_count
+        && retained_same == metrics.same_speaker_count
+        && retained_different == metrics.different_speaker_count
+        && mean_shape_is_valid(
+            metrics.mean_different_probability_given_same_speaker,
+            metrics.same_speaker_count,
+        )
+        && mean_shape_is_valid(
+            metrics.mean_different_probability_given_different_speaker,
+            metrics.different_speaker_count,
+        )
+        && metrics.mean_different_probability_given_same_speaker == expected_same_mean
+        && metrics.mean_different_probability_given_different_speaker == expected_different_mean
+        && metrics.roc_auc == expected_auc
+}
+
+fn sidecar_auxiliary_dominance_is_valid(
+    diagnostics: &PublicCorpusSidecarAuxiliaryDominanceMetrics,
+    retained_same_speaker_pair_count: u64,
+    retained_different_speaker_pair_count: u64,
+) -> bool {
+    diagnostics.same_speaker_dominance_count <= diagnostics.same_speaker_opportunity_count
+        && diagnostics.different_speaker_dominance_count
+            <= diagnostics.different_speaker_opportunity_count
+        && diagnostics.same_speaker_opportunity_count <= retained_same_speaker_pair_count
+        && diagnostics.different_speaker_opportunity_count <= retained_different_speaker_pair_count
+        && diagnostics.same_speaker_dominance_rate
+            == ratio(
+                diagnostics.same_speaker_dominance_count,
+                diagnostics.same_speaker_opportunity_count,
+            )
+        && diagnostics.different_speaker_dominance_rate
+            == ratio(
+                diagnostics.different_speaker_dominance_count,
+                diagnostics.different_speaker_opportunity_count,
+            )
+}
+
+fn sidecar_auxiliary_dominance_is_zero(
+    diagnostics: &PublicCorpusSidecarAuxiliaryDominanceMetrics,
+) -> bool {
+    diagnostics.same_speaker_opportunity_count == 0
+        && diagnostics.same_speaker_dominance_count == 0
+        && diagnostics.same_speaker_dominance_rate.is_none()
+        && diagnostics.different_speaker_opportunity_count == 0
+        && diagnostics.different_speaker_dominance_count == 0
+        && diagnostics.different_speaker_dominance_rate.is_none()
+}
+
+fn sidecar_uncertainty_is_valid(
+    uncertainty: &PublicCorpusSidecarPairedUncertainty,
+    lane: PublicCorpusSidecarLane,
+    split: EvaluationSplit,
+    baseline_recording_count: usize,
+    candidate_recording_count: usize,
+) -> bool {
+    let seed_fingerprint = PublicCorpusSidecarBootstrapSeedFingerprint {
+        uncertainty_id: PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION,
+        seed_policy_id: PUBLIC_SIDECAR_BOOTSTRAP_SEED_POLICY,
+        sampler_id: PUBLIC_SIDECAR_BOOTSTRAP_SAMPLER,
+        lane,
+        split,
+        replicates: PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
+    };
+    let seed_valid = canonical_sha256(&seed_fingerprint)
+        .is_ok_and(|expected| expected == uncertainty.bootstrap_seed_sha256);
+    let interval_valid = |count: u64, mean: Option<f64>, lower: Option<f64>, upper: Option<f64>| {
+        if count == 0 {
+            mean.is_none() && lower.is_none() && upper.is_none()
+        } else {
+            mean.zip(lower)
+                .zip(upper)
+                .is_some_and(|((mean, lower), upper)| {
+                    mean.is_finite() && lower.is_finite() && upper.is_finite() && lower <= upper
+                })
+        }
+    };
+    uncertainty.bootstrap_replicates == PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES
+        && seed_valid
+        && usize::try_from(uncertainty.paired_der_recording_count)
+            .is_ok_and(|count| count <= candidate_recording_count)
+        && usize::try_from(uncertainty.paired_jer_recording_count)
+            .is_ok_and(|count| count <= candidate_recording_count)
+        && baseline_recording_count == candidate_recording_count
+        && interval_valid(
+            uncertainty.paired_der_recording_count,
+            uncertainty.mean_der_delta,
+            uncertainty.der_delta_ci95_lower,
+            uncertainty.der_delta_ci95_upper,
+        )
+        && interval_valid(
+            uncertainty.paired_jer_recording_count,
+            uncertainty.mean_jer_delta,
+            uncertainty.jer_delta_ci95_lower,
+            uncertainty.jer_delta_ci95_upper,
+        )
+}
+
+fn sidecar_split_is_valid(
+    split: &PublicCorpusSidecarStudySplit,
+    lane: PublicCorpusSidecarLane,
+    evidence: &PublicCorpusSidecarStudyEvidence,
+    baseline_recording_count: usize,
+    baseline_audio_duration_sec: f64,
+) -> bool {
+    let is_baseline = lane == PublicCorpusSidecarLane::FullV2Baseline;
+    let pipeline_valid = split.pipeline.as_ref().is_none_or(|pipeline| {
+        pipeline.split == split.split
+            && variant_splits_are_valid(
+                std::slice::from_ref(pipeline),
+                evidence.scorer_config.calibration_bins,
+            )
+            && pipeline.audio_duration_sec == split.performance.audio_duration_sec
+            && pipeline.wall_time_sec == split.performance.wall_time_sec
+            && pipeline.real_time_factor == split.performance.real_time_factor
+            && pipeline.sampled_peak_rss_bytes == split.performance.sampled_peak_rss_bytes
+    });
+    let performance_valid = split.performance.audio_duration_sec.is_finite()
+        && split.performance.audio_duration_sec >= 0.0
+        && split.performance.wall_time_sec.is_finite()
+        && split.performance.wall_time_sec >= 0.0
+        && split.performance.real_time_factor
+            == positive_ratio(
+                split.performance.wall_time_sec,
+                split.performance.audio_duration_sec,
+            );
+    let coverage = &split.coverage;
+    let maximum_pair_count = coverage
+        .evaluated_recording_count
+        .checked_mul(PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING as u64);
+    let maximum_eligible_pair_count = PUBLIC_SIDECAR_PAIR_LAGS_FRAMES
+        .into_iter()
+        .try_fold(0_u64, |total, lag| {
+            total.checked_add(coverage.submitted_frame_count.saturating_sub(lag as u64))
+        });
+    let owner_available_frame_count = coverage
+        .owner_available_frame_counts
+        .into_iter()
+        .try_fold(0_u64, |total, count| total.checked_add(count));
+    let retained_class_pair_count = coverage
+        .retained_same_speaker_pair_count
+        .checked_add(coverage.retained_different_speaker_pair_count);
+    let pair_class_recording_count_sum = coverage
+        .same_speaker_pair_recording_count
+        .checked_add(coverage.different_speaker_pair_recording_count);
+    let [expects_channel_dominance, expects_mixed_dominance] =
+        lane.auxiliary_dominance_expectations();
+    let auxiliary_dominance_owner_shape_valid = (expects_channel_dominance
+        || sidecar_auxiliary_dominance_is_zero(&coverage.channel_dominance))
+        && (expects_mixed_dominance
+            || sidecar_auxiliary_dominance_is_zero(&coverage.mixed_auxiliary_dominance));
+    let minimum_per_recording_maximum = |total: u64| {
+        if total == 0 {
+            Some(0)
+        } else if coverage.evaluated_recording_count == 0 {
+            None
+        } else {
+            Some(
+                total / coverage.evaluated_recording_count
+                    + u64::from(total % coverage.evaluated_recording_count != 0),
+            )
+        }
+    };
+    let minimum_maximum_retained_pair_count =
+        minimum_per_recording_maximum(coverage.retained_pair_sample_count);
+    let minimum_maximum_retained_signal_count =
+        minimum_per_recording_maximum(coverage.submitted_frame_count)
+            .map(|minimum| minimum.min(PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS));
+    let retained_signal_shape_valid = coverage.maximum_retained_signal_count
+        <= coverage.submitted_frame_count
+        && (coverage.submitted_frame_count == 0
+            || (coverage.maximum_retained_signal_count > 0
+                && coverage.retained_signal_capacity >= PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS
+                && split.operations.peak_retained_state_bytes_on_target > 0));
+    let minimum_retained_pair_count = coverage
+        .eligible_pair_count
+        .min(PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING as u64);
+    let submitted_sidecar_shape_valid = coverage.submitted_frame_count == 0
+        || (coverage.retained_pair_sample_capacity
+            >= PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING as u64
+            && (!lane.uses_frame_wavelet()
+                || split.operations.peak_scratch_buffer_payload_bytes > 0));
+    let zero_submitted_computation_shape_valid = coverage.submitted_frame_count > 0
+        || (coverage.comparable_frame_count == 0
+            && coverage.calibrated_signal_count == 0
+            && coverage.consumed_probability_count == 0
+            && coverage.changed_boundary_probability_count == 0
+            && coverage.component_comparison_count == 0
+            && coverage.owner_available_frame_counts == [0; 3]
+            && sidecar_auxiliary_dominance_is_zero(&coverage.channel_dominance)
+            && sidecar_auxiliary_dominance_is_zero(&coverage.mixed_auxiliary_dominance)
+            && coverage.eligible_pair_count == 0
+            && coverage.retained_pair_sample_count == 0
+            && coverage.retained_same_speaker_pair_count == 0
+            && coverage.retained_different_speaker_pair_count == 0
+            && coverage.pair_score_coverage.is_none()
+            && coverage.same_speaker_pair_score_coverage.is_none()
+            && coverage.different_speaker_pair_score_coverage.is_none()
+            && coverage.pair_scored_recording_count == 0
+            && coverage.same_speaker_pair_recording_count == 0
+            && coverage.different_speaker_pair_recording_count == 0
+            && coverage.maximum_retained_pair_sample_count == 0
+            && coverage.maximum_retained_signal_count == 0
+            && split.conditional_pairs.comparison_count == 0
+            && split.operations.frame_wavelet_filter_tap_terms == 0
+            && split.operations.trajectory_wavelet_filter_tap_terms == 0
+            && split.operations.trajectory_validity_sample_visits == 0
+            && split.operations.scattering_filter_sample_terms == 0
+            && split.operations.scattering_validity_sample_visits == 0
+            && split
+                .operations
+                .modulation_projection_sample_frequency_visits
+                == 0
+            && split.operations.peak_scratch_buffer_payload_bytes == 0
+            && split.operations.cached_twiddle_payload_bytes == 0);
+    let coverage_valid = coverage.fusion_requested_recording_count
+        <= coverage.evaluated_recording_count
+        && coverage
+            .pair_selection_sha256
+            .as_ref()
+            .is_none_or(|digest| is_sha256_hex(digest))
+        && coverage.fusion_executed_recording_count <= coverage.fusion_requested_recording_count
+        && coverage.fusion_executed_recording_count <= coverage.consumed_probability_count
+        && coverage.comparable_frame_count <= coverage.submitted_frame_count
+        && coverage.calibrated_signal_count == coverage.comparable_frame_count
+        && coverage.consumed_probability_count <= coverage.calibrated_signal_count
+        && coverage.changed_boundary_probability_count <= coverage.consumed_probability_count
+        && split.boundary.probability_observation_count <= coverage.calibrated_signal_count
+        && coverage.comparable_frame_coverage
+            == ratio(
+                coverage.comparable_frame_count,
+                coverage.submitted_frame_count,
+            )
+        && coverage
+            .owner_available_frame_counts
+            .iter()
+            .all(|count| *count <= coverage.comparable_frame_count)
+        && owner_available_frame_count
+            .is_some_and(|count| count >= coverage.comparable_frame_count)
+        && coverage.component_comparison_count >= coverage.comparable_frame_count
+        && sidecar_auxiliary_dominance_is_valid(
+            &coverage.channel_dominance,
+            coverage.retained_same_speaker_pair_count,
+            coverage.retained_different_speaker_pair_count,
+        )
+        && sidecar_auxiliary_dominance_is_valid(
+            &coverage.mixed_auxiliary_dominance,
+            coverage.retained_same_speaker_pair_count,
+            coverage.retained_different_speaker_pair_count,
+        )
+        && auxiliary_dominance_owner_shape_valid
+        && coverage.retained_pair_sample_count <= coverage.eligible_pair_count
+        && retained_class_pair_count == Some(coverage.retained_pair_sample_count)
+        && coverage.retained_pair_sample_count >= minimum_retained_pair_count
+        && split.conditional_pairs.comparison_count <= coverage.retained_pair_sample_count
+        && split.conditional_pairs.same_speaker_count <= coverage.retained_same_speaker_pair_count
+        && split.conditional_pairs.different_speaker_count
+            <= coverage.retained_different_speaker_pair_count
+        && coverage.pair_score_coverage
+            == ratio(
+                split.conditional_pairs.comparison_count,
+                coverage.retained_pair_sample_count,
+            )
+        && coverage.same_speaker_pair_score_coverage
+            == ratio(
+                split.conditional_pairs.same_speaker_count,
+                coverage.retained_same_speaker_pair_count,
+            )
+        && coverage.different_speaker_pair_score_coverage
+            == ratio(
+                split.conditional_pairs.different_speaker_count,
+                coverage.retained_different_speaker_pair_count,
+            )
+        && coverage.pair_scored_recording_count <= coverage.evaluated_recording_count
+        && coverage.same_speaker_pair_recording_count <= coverage.pair_scored_recording_count
+        && coverage.different_speaker_pair_recording_count <= coverage.pair_scored_recording_count
+        && pair_class_recording_count_sum
+            .is_some_and(|sum| coverage.pair_scored_recording_count <= sum)
+        && coverage.pair_scored_recording_count <= split.conditional_pairs.comparison_count
+        && coverage.same_speaker_pair_recording_count <= split.conditional_pairs.same_speaker_count
+        && coverage.different_speaker_pair_recording_count
+            <= split.conditional_pairs.different_speaker_count
+        && (split.conditional_pairs.comparison_count > 0)
+            == (coverage.pair_scored_recording_count > 0)
+        && (split.conditional_pairs.same_speaker_count > 0)
+            == (coverage.same_speaker_pair_recording_count > 0)
+        && (split.conditional_pairs.different_speaker_count > 0)
+            == (coverage.different_speaker_pair_recording_count > 0)
+        && maximum_eligible_pair_count
+            .is_some_and(|maximum| coverage.eligible_pair_count <= maximum)
+        && coverage.maximum_retained_pair_sample_count
+            <= PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING as u64
+        && coverage.maximum_retained_pair_sample_count <= coverage.retained_pair_sample_count
+        && (coverage.eligible_pair_count > 0) == (coverage.maximum_retained_pair_sample_count > 0)
+        && minimum_maximum_retained_pair_count
+            .is_some_and(|minimum| coverage.maximum_retained_pair_sample_count >= minimum)
+        && coverage.maximum_retained_pair_sample_count <= coverage.retained_pair_sample_capacity
+        && coverage.retained_pair_sample_capacity
+            <= evidence.protocol.maximum_retained_pair_sample_capacity as u64
+        && coverage.maximum_retained_signal_count <= PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS
+        && minimum_maximum_retained_signal_count
+            .is_some_and(|minimum| coverage.maximum_retained_signal_count >= minimum)
+        && coverage.maximum_retained_signal_count <= coverage.retained_signal_capacity
+        && coverage.retained_signal_capacity
+            <= evidence.protocol.maximum_retained_signal_capacity as u64
+        && retained_signal_shape_valid
+        && submitted_sidecar_shape_valid
+        && zero_submitted_computation_shape_valid
+        && maximum_pair_count.is_some_and(|maximum| coverage.retained_pair_sample_count <= maximum);
+    let execution_valid = if is_baseline {
+        split.pipeline.is_some()
+            && split.pipeline.as_ref().is_some_and(|pipeline| {
+                coverage.evaluated_recording_count == pipeline.recording_count
+            })
+            && !split.fusion_executed
+            && !coverage.fusion_requested
+            && coverage.pair_selection_sha256.is_none()
+            && coverage.fusion_requested_recording_count == 0
+            && coverage.fusion_executed_recording_count == 0
+            && coverage.submitted_frame_count == 0
+            && coverage.comparable_frame_count == 0
+            && coverage.calibrated_signal_count == 0
+            && coverage.consumed_probability_count == 0
+            && coverage.changed_boundary_probability_count == 0
+            && coverage.component_comparison_count == 0
+            && coverage.owner_available_frame_counts == [0; 3]
+            && sidecar_auxiliary_dominance_is_zero(&coverage.channel_dominance)
+            && sidecar_auxiliary_dominance_is_zero(&coverage.mixed_auxiliary_dominance)
+            && coverage.eligible_pair_count == 0
+            && coverage.retained_pair_sample_count == 0
+            && coverage.retained_same_speaker_pair_count == 0
+            && coverage.retained_different_speaker_pair_count == 0
+            && coverage.pair_score_coverage.is_none()
+            && coverage.same_speaker_pair_score_coverage.is_none()
+            && coverage.different_speaker_pair_score_coverage.is_none()
+            && coverage.pair_scored_recording_count == 0
+            && coverage.same_speaker_pair_recording_count == 0
+            && coverage.different_speaker_pair_recording_count == 0
+            && coverage.maximum_retained_pair_sample_count == 0
+            && coverage.retained_pair_sample_capacity == 0
+            && coverage.maximum_retained_signal_count == 0
+            && coverage.retained_signal_capacity == 0
+            && split.boundary.probability_observation_count == 0
+            && split.boundary.probability_positive_count == 0
+            && split.boundary.brier_score.is_none()
+            && split.boundary.expected_calibration_error.is_none()
+            && split.conditional_pairs.comparison_count == 0
+            && split.operations.frame_wavelet_filter_tap_terms == 0
+            && split.operations.trajectory_wavelet_filter_tap_terms == 0
+            && split.operations.trajectory_validity_sample_visits == 0
+            && split.operations.scattering_filter_sample_terms == 0
+            && split.operations.scattering_validity_sample_visits == 0
+            && split
+                .operations
+                .modulation_projection_sample_frequency_visits
+                == 0
+            && split.operations.peak_scratch_buffer_payload_bytes == 0
+            && split.operations.peak_retained_state_bytes_on_target == 0
+            && split.operations.cached_twiddle_payload_bytes == 0
+            && split.paired_uncertainty.is_none()
+    } else {
+        split.fusion_executed == (coverage.consumed_probability_count > 0)
+            && (split.pipeline.is_some() == split.fusion_executed)
+            && if coverage.evaluated_recording_count == 0 {
+                !coverage.fusion_requested
+                    && coverage.fusion_requested_recording_count == 0
+                    && coverage.fusion_executed_recording_count == 0
+                    && coverage.pair_selection_sha256.is_none()
+                    && !split.fusion_executed
+            } else {
+                usize::try_from(coverage.evaluated_recording_count)
+                    .is_ok_and(|count| count == baseline_recording_count)
+                    && split.performance.audio_duration_sec == baseline_audio_duration_sec
+                    && coverage.fusion_requested
+                    && coverage.pair_selection_sha256.is_some()
+                    && coverage.fusion_requested_recording_count
+                        == coverage.evaluated_recording_count
+                    && split.pipeline.as_ref().is_none_or(|pipeline| {
+                        coverage.evaluated_recording_count == pipeline.recording_count
+                    })
+                    && (coverage.fusion_executed_recording_count > 0) == split.fusion_executed
+            }
+    };
+    let candidate_recording_count = split
+        .pipeline
+        .as_ref()
+        .and_then(|pipeline| usize::try_from(pipeline.recording_count).ok())
+        .unwrap_or(0);
+    let uncertainty_valid = match (&split.paired_uncertainty, split.fusion_executed) {
+        (Some(uncertainty), true) => sidecar_uncertainty_is_valid(
+            uncertainty,
+            lane,
+            split.split,
+            baseline_recording_count,
+            candidate_recording_count,
+        ),
+        (None, false) => true,
+        _ => false,
+    };
+    let disabled_operations_valid = (lane.uses_frame_wavelet()
+        || split.operations.frame_wavelet_filter_tap_terms == 0)
+        && (lane.uses_trajectory_wavelet()
+            || (split.operations.trajectory_wavelet_filter_tap_terms == 0
+                && split.operations.trajectory_validity_sample_visits == 0))
+        && (lane.uses_scattering()
+            || (split.operations.scattering_filter_sample_terms == 0
+                && split.operations.scattering_validity_sample_visits == 0))
+        && (lane.uses_modulation()
+            || (split
+                .operations
+                .modulation_projection_sample_frequency_visits
+                == 0
+                && split.operations.cached_twiddle_payload_bytes == 0));
+    let memory_accounting_valid = split.operations.peak_scratch_buffer_payload_bytes
+        <= evidence.protocol.maximum_reported_payload_bytes
+        && split.operations.peak_retained_state_bytes_on_target
+            <= evidence.protocol.maximum_reported_payload_bytes
+        && split.operations.cached_twiddle_payload_bytes
+            <= evidence.protocol.maximum_reported_payload_bytes;
+    pipeline_valid
+        && performance_valid
+        && coverage_valid
+        && execution_valid
+        && uncertainty_valid
+        && disabled_operations_valid
+        && memory_accounting_valid
+        && sidecar_boundary_metrics_are_valid(&split.boundary, split.pipeline.as_ref())
+        && sidecar_pair_metrics_are_valid(&split.conditional_pairs)
+}
+
+fn deterministic_sidecar_accuracy_sha256(
+    evidence: &PublicCorpusSidecarStudyEvidence,
+) -> FwResult<String> {
+    let mut normalized = evidence.clone();
+    normalized.deterministic_accuracy_sha256.clear();
+    normalized.result_sha256.clear();
+    // The certification accuracy identity binds the deterministic development
+    // accuracy identity, not its result hash (which intentionally includes
+    // timing and target memory observations).
+    normalized.locked_development_result_sha256 = None;
+    for variant in &mut normalized.variants {
+        if let Some(gate) = variant.gate.as_mut() {
+            gate.relative_rtf_regression = None;
+            gate.relative_rss_regression = None;
+            gate.failures.retain(|failure| {
+                !matches!(
+                    failure,
+                    PublicCorpusSidecarGateFailure::PerformanceRegression
+                        | PublicCorpusSidecarGateFailure::NotSelectedByRanking
+                )
+            });
+            gate.passed = gate.failures.is_empty();
+        }
+        for split in &mut variant.splits {
+            split.performance.wall_time_sec = 0.0;
+            split.performance.real_time_factor = None;
+            split.performance.sampled_peak_rss_bytes = 0;
+            // VecDeque capacity and target-sized retained-state accounting are
+            // allocator/target diagnostics, not accuracy evidence.
+            split.coverage.retained_signal_capacity = 0;
+            split.coverage.retained_pair_sample_capacity = 0;
+            split.operations.peak_retained_state_bytes_on_target = 0;
+            if let Some(pipeline) = split.pipeline.as_mut() {
+                pipeline.wall_time_sec = 0.0;
+                pipeline.real_time_factor = None;
+                pipeline.sampled_peak_rss_bytes = 0;
+            }
+        }
+    }
+    match normalized.evaluation_stage {
+        PublicCorpusEvaluationStage::Development => {
+            normalized.adopted_candidate_lane = None;
+            normalized.selected_candidate_lane =
+                apply_public_sidecar_development_selection(&mut normalized.variants);
+        }
+        PublicCorpusEvaluationStage::Certification => {
+            let selected = normalized.selected_candidate_lane;
+            normalized.adopted_candidate_lane = None;
+            for variant in normalized.variants.iter_mut().skip(1) {
+                if Some(variant.lane) == selected {
+                    variant.disposition = if variant.gate.as_ref().is_some_and(|gate| gate.passed) {
+                        normalized.adopted_candidate_lane = Some(variant.lane);
+                        PublicCorpusSidecarDisposition::Adopted
+                    } else {
+                        PublicCorpusSidecarDisposition::Rejected
+                    };
+                } else {
+                    variant.disposition = PublicCorpusSidecarDisposition::Rejected;
+                }
+            }
+        }
+    }
+    canonical_sha256(&normalized)
+}
+
+/// Verify every frozen sidecar identity, aggregate bound, lock, and decision.
+pub fn verify_public_corpus_sidecar_study_evidence(
+    evidence: &PublicCorpusSidecarStudyEvidence,
+) -> FwResult<()> {
+    if evidence.schema_version != PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION
+        || evidence.runner_version != PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION
+        || evidence.scorer_version != DIARIZATION_SCORER_VERSION
+    {
+        return Err(public_corpus_error(
+            "sidecar_study_version",
+            "sidecar study schema, runner, or scorer version is unsupported",
+        ));
+    }
+    validate_public_id(&evidence.corpus_key, "corpus_key")?;
+    validate_public_id(&evidence.source_version, "source_version")?;
+    if !public_corpus_registry()
+        .entries
+        .iter()
+        .any(|entry| entry.corpus_key == evidence.corpus_key)
+    {
+        return Err(public_corpus_error(
+            "sidecar_corpus_key",
+            "sidecar corpus key is not in the frozen public registry",
+        ));
+    }
+    for (field, value) in [
+        ("bundle_sha256", &evidence.bundle_sha256),
+        ("descriptor_sha256", &evidence.descriptor_sha256),
+        ("scorer_config_sha256", &evidence.scorer_config_sha256),
+        ("protocol_sha256", &evidence.protocol_sha256),
+        (
+            "deterministic_accuracy_sha256",
+            &evidence.deterministic_accuracy_sha256,
+        ),
+        ("result_sha256", &evidence.result_sha256),
+    ] {
+        if !is_sha256_hex(value) {
+            return Err(public_corpus_error(
+                "sidecar_hash_format",
+                &format!("{field} must be 64 lowercase hexadecimal characters"),
+            ));
+        }
+    }
+    for value in [
+        evidence.locked_development_result_sha256.as_deref(),
+        evidence.locked_development_accuracy_sha256.as_deref(),
+    ] {
+        if value.is_some_and(|value| !is_sha256_hex(value)) {
+            return Err(public_corpus_error(
+                "sidecar_hash_format",
+                "locked development hashes must be absent or lowercase SHA-256",
+            ));
+        }
+    }
+    let expected_scorer = DiarizationScorerConfig {
+        schema_version: crate::diarization::DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION.to_owned(),
+        speaker_boundary_collar_ms: 250,
+        change_boundary_collar_ms: 250,
+        overlap_policy: EvaluationOverlapPolicy::Exclude,
+        calibration_bins: 10,
+        count_top_k: 3,
+        count_credible_mass_millionths: 900_000,
+        dominant_speaker_collapse_share_millionths: 990_000,
+        minimum_reference_speaker_recall_millionths: 100_000,
+        minimum_effective_occupancy_ms: 250,
+    };
+    let expected_request = DiarizationRequest {
+        engine: DiarizationEngine::Acoustic,
+        speaker_count: SpeakerCountRequest::Infer,
+        ..DiarizationRequest::default()
+    };
+    let expected_protocol = public_sidecar_protocol(
+        evidence.protocol.maximum_recording_duration_ms,
+        &expected_request,
+        canonical_sha256(&expected_request)?,
+    )?;
+    if evidence.scorer_config != expected_scorer
+        || canonical_sha256(&evidence.scorer_config)? != evidence.scorer_config_sha256
+        || evidence.protocol != expected_protocol
+        || canonical_sha256(&evidence.protocol)? != evidence.protocol_sha256
+    {
+        return Err(public_corpus_error(
+            "sidecar_protocol",
+            "sidecar scorer or protocol differs from the frozen contract",
+        ));
+    }
+    if evidence.variants.len() != PublicCorpusSidecarLane::ALL.len() {
+        return Err(public_corpus_error(
+            "sidecar_variants",
+            "sidecar evidence must contain exactly thirteen frozen lanes",
+        ));
+    }
+    let baseline_validation_split = evidence
+        .variants
+        .first()
+        .and_then(|variant| variant.splits.first())
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_baseline",
+                "sidecar evidence has no scored unfused baseline",
+            )
+        })?;
+    let baseline_recording_count = baseline_validation_split
+        .pipeline
+        .as_ref()
+        .and_then(|pipeline| usize::try_from(pipeline.recording_count).ok())
+        .ok_or_else(|| {
+            public_corpus_error(
+                "sidecar_baseline",
+                "sidecar evidence has no scored unfused baseline",
+            )
+        })?;
+    for (variant, expected_lane) in evidence.variants.iter().zip(PublicCorpusSidecarLane::ALL) {
+        if variant.pair_calibration.is_some() && variant.calibration.is_none() {
+            return Err(public_corpus_error(
+                "sidecar_calibration_pair",
+                "a lagged-pair calibration cannot be retained without its boundary calibration",
+            ));
+        }
+        let expected_scope = if expected_lane == PublicCorpusSidecarLane::FullV2Baseline {
+            PublicCorpusSidecarFusionScope::BaselineUnfused
+        } else {
+            PublicCorpusSidecarFusionScope::BoundaryFusionV2
+        };
+        let expected_study_sha256 =
+            acoustic_sidecar_study_config_sha256(expected_lane.study_config())?;
+        let expected_fusion_sha256 = match variant.calibration.as_ref() {
+            Some(calibration) => {
+                if expected_lane == PublicCorpusSidecarLane::FullV2Baseline
+                    || calibration.fit_observation_count == 0
+                    || calibration.fit_positive_count == 0
+                    || calibration.fit_positive_count >= calibration.fit_observation_count
+                    || !is_sha256_hex(&calibration.calibration_sha256)
+                    || !calibration
+                        .fit_brier_score
+                        .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+                    || public_sidecar_calibration_sha256(calibration)?
+                        != calibration.calibration_sha256
+                {
+                    return Err(public_corpus_error(
+                        "sidecar_calibration",
+                        "retained sidecar calibration is invalid or unfitted",
+                    ));
+                }
+                Some(acoustic_sidecar_fusion_configuration_sha256(
+                    sidecar_evaluation_request(expected_lane, calibration)?,
+                    evidence.protocol.detector_mode,
+                )?)
+            }
+            None => None,
+        };
+        let expected_pair_calibration_sha256 = match variant.pair_calibration.as_ref() {
+            Some(calibration) => {
+                if expected_lane == PublicCorpusSidecarLane::FullV2Baseline {
+                    return Err(public_corpus_error(
+                        "sidecar_pair_calibration",
+                        "the unfused baseline cannot retain a pair calibration",
+                    ));
+                }
+                validate_public_sidecar_pair_calibration(calibration)?;
+                Some(calibration.calibration_sha256.as_str())
+            }
+            None => None,
+        };
+        let expected_lane_sha256 = canonical_sha256(&PublicCorpusSidecarLaneFingerprint {
+            runner_version: PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+            lane: expected_lane,
+            fusion_scope: expected_scope,
+            study_configuration_sha256: &expected_study_sha256,
+            fusion_configuration_sha256: expected_fusion_sha256.as_deref(),
+            pair_calibration_sha256: expected_pair_calibration_sha256,
+            protocol_sha256: &evidence.protocol_sha256,
+        })?;
+        if variant.lane != expected_lane
+            || variant.fusion_scope != expected_scope
+            || variant.study_configuration_sha256 != expected_study_sha256
+            || variant.fusion_configuration_sha256 != expected_fusion_sha256
+            || variant.lane_configuration_sha256 != expected_lane_sha256
+            || !is_sha256_hex(&variant.study_configuration_sha256)
+            || !is_sha256_hex(&variant.lane_configuration_sha256)
+            || variant
+                .fusion_configuration_sha256
+                .as_ref()
+                .is_some_and(|hash| !is_sha256_hex(hash))
+            || variant.splits.len() != 1
+            || variant.splits[0].split != evidence.evaluation_stage.selected_split()
+            || !sidecar_split_is_valid(
+                &variant.splits[0],
+                expected_lane,
+                evidence,
+                baseline_recording_count,
+                baseline_validation_split.performance.audio_duration_sec,
+            )
+        {
+            return Err(public_corpus_error(
+                "sidecar_variant_contract",
+                "sidecar lane identity, hashes, split, or aggregates are invalid",
+            ));
+        }
+        if expected_lane != PublicCorpusSidecarLane::FullV2Baseline {
+            let split = &variant.splits[0];
+            if split.pipeline.is_none()
+                && split.coverage.evaluated_recording_count == 0
+                && split != &unavailable_public_sidecar_split(split.split)?
+            {
+                return Err(public_corpus_error(
+                    "sidecar_unavailable_shape",
+                    "an unavailable sidecar lane must use the canonical all-zero split",
+                ));
+            }
+            if split.coverage.evaluated_recording_count > 0
+                && (variant.calibration.is_none() || variant.fusion_configuration_sha256.is_none())
+            {
+                return Err(public_corpus_error(
+                    "sidecar_fusion_evidence",
+                    "an evaluated sidecar lane requires calibration and fusion identity",
+                ));
+            }
+            if evidence.evaluation_stage == PublicCorpusEvaluationStage::Development
+                && split.coverage.evaluated_recording_count > 0
+            {
+                let calibration = variant.calibration.as_ref().ok_or_else(|| {
+                    public_corpus_error(
+                        "sidecar_calibration_provenance",
+                        "development boundary calibration is missing",
+                    )
+                })?;
+                if calibration.fit_observation_count != split.boundary.probability_observation_count
+                    || calibration.fit_positive_count != split.boundary.probability_positive_count
+                {
+                    return Err(public_corpus_error(
+                        "sidecar_calibration_provenance",
+                        "development boundary fit counts do not match the measured rows",
+                    ));
+                }
+                match variant.pair_calibration.as_ref() {
+                    Some(pair_calibration)
+                        if pair_calibration.fit_observation_count
+                            == split.conditional_pairs.comparison_count
+                            && pair_calibration.fit_positive_count
+                                == split.conditional_pairs.different_speaker_count => {}
+                    None if split.conditional_pairs.comparison_count == 0 => {}
+                    _ => {
+                        return Err(public_corpus_error(
+                            "sidecar_pair_calibration_provenance",
+                            "development pair fit counts do not match the measured rows",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut common_pair_population = None;
+    for variant in evidence.variants.iter().skip(1) {
+        let coverage = &variant.splits[0].coverage;
+        if coverage.evaluated_recording_count == 0 {
+            continue;
+        }
+        let fingerprint = (
+            coverage.eligible_pair_count,
+            coverage.retained_pair_sample_count,
+            coverage.retained_same_speaker_pair_count,
+            coverage.retained_different_speaker_pair_count,
+            coverage.maximum_retained_pair_sample_count,
+            coverage.pair_selection_sha256.as_deref(),
+        );
+        if common_pair_population.is_some_and(|expected| expected != fingerprint) {
+            return Err(public_corpus_error(
+                "sidecar_pair_population",
+                "evaluated lanes do not share one reference-labeled selected-pair universe",
+            ));
+        }
+        common_pair_population = Some(fingerprint);
+    }
+    let baseline = &evidence.variants[0];
+    if baseline.disposition != PublicCorpusSidecarDisposition::Baseline
+        || baseline.calibration.is_some()
+        || baseline.pair_calibration.is_some()
+        || baseline.fusion_configuration_sha256.is_some()
+        || baseline.gate.is_some()
+    {
+        return Err(public_corpus_error(
+            "sidecar_baseline",
+            "unfused baseline has an invalid calibration, gate, or disposition",
+        ));
+    }
+    let baseline_split = &baseline.splits[0];
+    let stage_valid = match evidence.evaluation_stage {
+        PublicCorpusEvaluationStage::Development => {
+            if evidence.locked_development_result_sha256.is_some()
+                || evidence.locked_development_accuracy_sha256.is_some()
+                || evidence.adopted_candidate_lane.is_some()
+                || evidence.variants.iter().skip(1).any(|variant| {
+                    variant.calibration.is_some()
+                        != (variant.splits[0].coverage.evaluated_recording_count > 0)
+                })
+            {
+                false
+            } else {
+                let mut expected_variants = evidence.variants.clone();
+                for variant in expected_variants.iter_mut().skip(1) {
+                    variant.gate = Some(public_sidecar_promotion_gate(
+                        evidence.evaluation_stage,
+                        &evidence.protocol.gate_policy,
+                        baseline_split,
+                        variant.lane,
+                        &variant.splits[0],
+                    ));
+                    variant.disposition = PublicCorpusSidecarDisposition::Rejected;
+                }
+                let expected_selected =
+                    apply_public_sidecar_development_selection(&mut expected_variants);
+                evidence.selected_candidate_lane == expected_selected
+                    && evidence
+                        .variants
+                        .iter()
+                        .skip(1)
+                        .zip(expected_variants.iter().skip(1))
+                        .all(|(variant, expected)| {
+                            variant.gate == expected.gate
+                                && variant.disposition == expected.disposition
+                        })
+            }
+        }
+        PublicCorpusEvaluationStage::Certification => {
+            let Some(selected) = evidence.selected_candidate_lane else {
+                return Err(public_corpus_error(
+                    "sidecar_stage_contract",
+                    "certification evidence has no locked selected candidate",
+                ));
+            };
+            if evidence.locked_development_result_sha256.is_none()
+                || evidence.locked_development_accuracy_sha256.is_none()
+                || selected == PublicCorpusSidecarLane::FullV2Baseline
+            {
+                false
+            } else {
+                evidence.variants.iter().skip(1).all(|variant| {
+                    if variant.lane == selected {
+                        let expected_gate = public_sidecar_promotion_gate(
+                            evidence.evaluation_stage,
+                            &evidence.protocol.gate_policy,
+                            baseline_split,
+                            variant.lane,
+                            &variant.splits[0],
+                        );
+                        variant.calibration.is_some()
+                            && variant.pair_calibration.is_some()
+                            && variant.splits[0].coverage.evaluated_recording_count > 0
+                            && variant.gate.as_ref() == Some(&expected_gate)
+                            && variant.disposition
+                                == if expected_gate.passed {
+                                    PublicCorpusSidecarDisposition::Adopted
+                                } else {
+                                    PublicCorpusSidecarDisposition::Rejected
+                                }
+                    } else {
+                        variant.gate.is_none()
+                            && variant.disposition == PublicCorpusSidecarDisposition::Rejected
+                            && variant.splits[0].pipeline.is_none()
+                            && variant.splits[0].coverage.evaluated_recording_count == 0
+                            && !variant.splits[0].fusion_executed
+                    }
+                }) && evidence.adopted_candidate_lane
+                    == evidence
+                        .variants
+                        .iter()
+                        .find(|variant| {
+                            variant.disposition == PublicCorpusSidecarDisposition::Adopted
+                        })
+                        .map(|variant| variant.lane)
+            }
+        }
+    };
+    if !stage_valid {
+        return Err(public_corpus_error(
+            "sidecar_stage_contract",
+            "sidecar stage, locks, gates, selection, or dispositions are inconsistent",
+        ));
+    }
+    if deterministic_sidecar_accuracy_sha256(evidence)? != evidence.deterministic_accuracy_sha256 {
+        return Err(public_corpus_error(
+            "sidecar_accuracy_hash_mismatch",
+            "sidecar deterministic accuracy hash does not match normalized evidence",
+        ));
+    }
+    let mut unhashed = evidence.clone();
+    let expected_result_sha256 = unhashed.result_sha256.clone();
+    unhashed.result_sha256.clear();
+    if canonical_sha256(&unhashed)? != expected_result_sha256 {
+        return Err(public_corpus_error(
+            "sidecar_hash_mismatch",
+            "result_sha256 does not match canonical sidecar evidence",
+        ));
+    }
+    Ok(())
+}
+
 /// Verify every frozen identity, hash, aggregate bound, and held-out decision.
 pub fn verify_public_corpus_ablation_evidence(
     evidence: &PublicCorpusAblationEvidence,
@@ -7527,11 +11367,17 @@ fn quantile_nearest_rank_index(length: usize, probability_millionths: u32) -> Op
 /// after a serialize/parse cycle. Twelve places are substantially finer than
 /// the scorer's millisecond timing resolution and predeclared gate margins.
 fn canonical_evidence_number(value: f64) -> f64 {
-    const SCALE: f64 = 1_000_000_000_000.0;
-    if !value.is_finite() || value.abs() > f64::MAX / SCALE {
+    if !value.is_finite() {
         return value;
     }
-    let rounded = (value * SCALE).round() / SCALE;
+    // Decimal formatting performs the rounding in decimal space. In
+    // contrast, multiply/round/divide by 1e12 is not idempotent once the
+    // scaled value approaches f64's integer-precision limit: a producer's
+    // once-canonical value can move again when the verifier canonicalizes it.
+    // Parsing a fixed-12 decimal representation yields a stable lattice point
+    // while retaining resolution far below the smallest frozen f32 score-bin
+    // gap.
+    let rounded = format!("{value:.12}").parse::<f64>().unwrap_or(value);
     if rounded == 0.0 { 0.0 } else { rounded }
 }
 
@@ -8065,18 +11911,73 @@ fn validate_relative_path_syntax(relative: &Path, field: &str) -> FwResult<()> {
     Ok(())
 }
 
-fn validate_new_output(project: &Path, input: &Path, output: &Path) -> FwResult<PathBuf> {
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct ValidatedOutputParent {
+    canonical_path: PathBuf,
+    requested_path: PathBuf,
+    directory: File,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+struct ValidatedOutputParent;
+
+impl ValidatedOutputParent {
+    fn same_output_target(
+        &self,
+        output: &Path,
+        other: &Self,
+        other_output: &Path,
+        field: &str,
+    ) -> FwResult<bool> {
+        let file_name = output
+            .file_name()
+            .ok_or_else(|| public_corpus_error(field, "output must have a terminal file name"))?;
+        let other_file_name = other_output
+            .file_name()
+            .ok_or_else(|| public_corpus_error(field, "output must have a terminal file name"))?;
+        let file_name = file_name
+            .to_str()
+            .ok_or_else(|| public_corpus_error(field, "output file names must be ASCII"))?;
+        let other_file_name = other_file_name
+            .to_str()
+            .ok_or_else(|| public_corpus_error(field, "output file names must be ASCII"))?;
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            verify_output_parent_identity(self)?;
+            verify_output_parent_identity(other)?;
+            let left = self.directory.metadata().map_err(|_| {
+                public_corpus_error(field, "output parent identity could not be read")
+            })?;
+            let right = other.directory.metadata().map_err(|_| {
+                public_corpus_error(field, "output parent identity could not be read")
+            })?;
+            Ok(file_name.eq_ignore_ascii_case(other_file_name)
+                && left.dev() == right.dev()
+                && left.ino() == right.ino())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            let _ = (self, other, file_name, other_file_name);
+            Err(FwError::Unsupported(
+                "public_corpus.output_platform: race-safe public artifact publication requires Linux, Android, or an Apple platform"
+                    .to_owned(),
+            ))
+        }
+    }
+}
+
+fn validate_new_output(
+    project: &Path,
+    input: &Path,
+    output: &Path,
+) -> FwResult<ValidatedOutputParent> {
     if !output.is_absolute() || output.extension().and_then(|value| value.to_str()) != Some("json")
     {
         return Err(public_corpus_error(
             "output_path",
             "output must be an absolute path with a .json extension",
-        ));
-    }
-    if output.exists() {
-        return Err(public_corpus_error(
-            "output_exists",
-            "output must not already exist",
         ));
     }
     let parent = output.parent().ok_or_else(|| {
@@ -8085,26 +11986,279 @@ fn validate_new_output(project: &Path, input: &Path, output: &Path) -> FwResult<
             "output must have an existing parent directory",
         )
     })?;
-    let canonical_parent = parent.canonicalize().map_err(|_| {
-        public_corpus_error(
-            "output_parent",
-            "output parent must be an existing directory",
-        )
-    })?;
-    if !canonical_parent.is_dir()
-        || paths_overlap(project, &canonical_parent)
-        || paths_overlap(input, &canonical_parent)
+    let output_name = output
+        .file_name()
+        .ok_or_else(|| public_corpus_error("output_path", "output must include a file name"))?;
+    let output_name_text = output_name
+        .to_str()
+        .ok_or_else(|| public_corpus_error("output_path", "output file names must be ASCII"))?;
+    if !output_name_text.is_ascii()
+        || output_name_text
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase())
+        || !output_name_text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(public_corpus_error(
-            "output_overlap",
-            "output parent must be disjoint from the project and input roots",
+            "output_path",
+            "output file names may contain only lowercase ASCII letters, digits, period, underscore, and hyphen",
         ));
     }
-    Ok(canonical_parent)
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+
+        // Open first, then canonicalize and compare identity. Canonicalizing
+        // before opening would leave a swap window between the overlap check
+        // and the directory handle that later owns openat publication.
+        // DIRECTORY and NOFOLLOW also reject a FIFO/non-directory or a
+        // terminal symlink without a potentially blocking std::fs::File open.
+        let directory = File::from(
+            open(
+                parent,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| {
+                public_corpus_error("output_parent", "output parent could not be identity-bound")
+            })?,
+        );
+        let canonical_parent = parent.canonicalize().map_err(|_| {
+            public_corpus_error(
+                "output_parent",
+                "output parent must be an existing directory",
+            )
+        })?;
+        let validated = ValidatedOutputParent {
+            canonical_path: canonical_parent,
+            requested_path: parent.to_owned(),
+            directory,
+        };
+        verify_output_parent_identity(&validated)?;
+        use rustix::fs::{AtFlags, Dir, statat};
+
+        // Enumerate through the already identity-bound directory handle, not
+        // through a path that could resolve to a replacement directory. This
+        // makes an existing differently-cased sibling fail consistently on
+        // case-sensitive and case-insensitive filesystems. Exact `statat` and
+        // no-clobber publication remain the atomic guards; the effective user
+        // is already the trust boundary for concurrent directory mutation.
+        let entries = Dir::read_from(&validated.directory).map_err(|_| {
+            public_corpus_error(
+                "output_target",
+                "output parent entries could not be checked for case-fold collisions",
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|_| {
+                public_corpus_error(
+                    "output_target",
+                    "output parent entries could not be checked for case-fold collisions",
+                )
+            })?;
+            if entry
+                .file_name()
+                .to_bytes()
+                .eq_ignore_ascii_case(output_name_text.as_bytes())
+            {
+                return Err(public_corpus_error(
+                    "output_exists",
+                    "output or an ASCII-case-fold sibling already exists",
+                ));
+            }
+        }
+
+        match statat(&validated.directory, output_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {
+                return Err(public_corpus_error(
+                    "output_exists",
+                    "output must not already exist",
+                ));
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => {}
+            Err(_) => {
+                return Err(public_corpus_error(
+                    "output_target",
+                    "output target could not be checked relative to its validated parent",
+                ));
+            }
+        }
+        if paths_overlap(project, &validated.canonical_path)
+            || paths_overlap(input, &validated.canonical_path)
+        {
+            return Err(public_corpus_error(
+                "output_overlap",
+                "output parent must be disjoint from the project and input roots",
+            ));
+        }
+        Ok(validated)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = (project, input, parent);
+        Err(FwError::Unsupported(
+            "public_corpus.output_platform: race-safe public artifact publication requires Linux, Android, or an Apple platform"
+                .to_owned(),
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_output_parent_identity(parent: &ValidatedOutputParent) -> FwResult<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let opened = parent.directory.metadata().map_err(|_| {
+        public_corpus_error(
+            "output_parent_changed",
+            "validated output parent identity could not be read",
+        )
+    })?;
+    let current = parent.canonical_path.symlink_metadata().map_err(|_| {
+        public_corpus_error(
+            "output_parent_changed",
+            "output parent changed after validation",
+        )
+    })?;
+    let requested = parent.requested_path.symlink_metadata().map_err(|_| {
+        public_corpus_error(
+            "output_parent_changed",
+            "requested output parent changed after validation",
+        )
+    })?;
+    if !opened.is_dir()
+        || !current.is_dir()
+        || !requested.is_dir()
+        || opened.dev() != current.dev()
+        || opened.ino() != current.ino()
+        || opened.dev() != requested.dev()
+        || opened.ino() != requested.ino()
+    {
+        return Err(public_corpus_error(
+            "output_parent_changed",
+            "output parent changed after validation",
+        ));
+    }
+    if opened.uid() != rustix::process::geteuid().as_raw() || opened.mode() & 0o022 != 0 {
+        return Err(public_corpus_error(
+            "output_parent_permissions",
+            "output parent must be owned by the effective user and not group/world writable",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputLeafState {
+    Missing,
+    Expected,
+    Other,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn output_leaf_state(
+    parent: &ValidatedOutputParent,
+    name: &std::ffi::OsStr,
+    expected: &File,
+) -> FwResult<OutputLeafState> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use rustix::fs::{AtFlags, FileType, statat};
+
+    let expected = expected.metadata().map_err(|_| {
+        public_corpus_error(
+            "output_target_changed",
+            "staged output identity could not be verified",
+        )
+    })?;
+    let current = match statat(&parent.directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(current) => current,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(OutputLeafState::Missing),
+        Err(_) => {
+            return Err(public_corpus_error(
+                "output_target_changed",
+                "staged output identity could not be inspected during publication",
+            ));
+        }
+    };
+    #[cfg(target_vendor = "apple")]
+    let device_matches = expected.dev() == current.st_dev as u64;
+    #[cfg(not(target_vendor = "apple"))]
+    let device_matches = expected.dev() == current.st_dev;
+    if expected.is_file()
+        && FileType::from_raw_mode(current.st_mode) == FileType::RegularFile
+        && device_matches
+        && expected.ino() == current.st_ino
+    {
+        Ok(OutputLeafState::Expected)
+    } else {
+        Ok(OutputLeafState::Other)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn verify_output_leaf_identity(
+    parent: &ValidatedOutputParent,
+    name: &std::ffi::OsStr,
+    expected: &File,
+) -> FwResult<()> {
+    if output_leaf_state(parent, name, expected)? != OutputLeafState::Expected {
+        return Err(public_corpus_error(
+            "output_target_changed",
+            "staged output identity changed during publication",
+        ));
+    }
+    Ok(())
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left.starts_with(right) || right.starts_with(left)
+    if left.starts_with(right) || right.starts_with(left) {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let ancestry = |path: &Path| -> std::io::Result<Vec<(u64, u64)>> {
+            let mut identities = Vec::new();
+            let mut current = path;
+            loop {
+                let metadata = current.metadata()?;
+                if !metadata.is_dir() {
+                    return Err(std::io::Error::other("path ancestor is not a directory"));
+                }
+                identities.push((metadata.dev(), metadata.ino()));
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                if parent == current {
+                    break;
+                }
+                current = parent;
+            }
+            Ok(identities)
+        };
+        // Canonical path strings do not collapse every filesystem alias. APFS
+        // firmlinks and aliases of either root can expose the same directory
+        // inode under disjoint spellings, so compare each terminal directory
+        // identity against the other path's ancestor chain. An arbitrary mount
+        // alias of a strict descendant is not discoverable from these two
+        // ancestry walks and remains outside this check's authority. Metadata
+        // failure is treated as overlap to keep publication fail-closed.
+        return match (ancestry(left), ancestry(right)) {
+            (Ok(left_ancestry), Ok(right_ancestry)) => {
+                let left_identity = left_ancestry[0];
+                let right_identity = right_ancestry[0];
+                right_ancestry.contains(&left_identity) || left_ancestry.contains(&right_identity)
+            }
+            _ => true,
+        };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        false
+    }
 }
 
 fn read_bounded(path: &Path, limit: u64, field: &str) -> FwResult<Vec<u8>> {
@@ -8139,51 +12293,397 @@ fn read_bounded(path: &Path, limit: u64, field: &str) -> FwResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn write_new_json<T: Serialize>(
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct StagedJsonOutput<'a> {
+    output_parent: &'a ValidatedOutputParent,
+    staging_name: OsString,
+    output_name: OsString,
+    file: File,
+    preserve_payload_on_drop: bool,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+struct StagedJsonOutput<'a>(std::marker::PhantomData<&'a ()>);
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+impl StagedJsonOutput<'_> {
+    fn scrub_payload(&self) -> std::io::Result<()> {
+        self.file.set_len(0)?;
+        self.file.sync_all()
+    }
+
+    fn scrub_payload_or_error(&self, artifact: &str) -> FwResult<()> {
+        self.scrub_payload().map_err(|_| {
+            public_corpus_error(
+                "output_cleanup_uncertain",
+                &format!(
+                    "{artifact} staging payload could not be explicitly truncated and synchronized"
+                ),
+            )
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+impl StagedJsonOutput<'_> {
+    fn scrub_payload_or_error(&self, _artifact: &str) -> FwResult<()> {
+        Ok(())
+    }
+}
+
+fn staged_scrubbed_error(
+    primary: FwError,
+    staged_outputs: &[(&StagedJsonOutput<'_>, &str)],
+) -> FwError {
+    let mut uncertain_artifacts = Vec::new();
+    for (staged, artifact) in staged_outputs {
+        if staged.scrub_payload_or_error(artifact).is_err() {
+            uncertain_artifacts.push(*artifact);
+        }
+    }
+    if uncertain_artifacts.is_empty() {
+        primary
+    } else {
+        public_corpus_error(
+            "output_cleanup_uncertain",
+            &format!(
+                "staging payload cleanup is uncertain for {}; preceding failure: {primary}",
+                uncertain_artifacts.join(", ")
+            ),
+        )
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+impl Drop for StagedJsonOutput<'_> {
+    fn drop(&mut self) {
+        if !self.preserve_payload_on_drop {
+            // Panic/unwind fallback. Ordinary errors explicitly scrub and
+            // report any cleanup failure before returning from staging or
+            // publication orchestration.
+            let _ = self.scrub_payload();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+struct CancellingWriter<'a, W, C> {
+    inner: W,
+    is_cancelled: &'a mut C,
+    cancelled: bool,
+    bytes_until_cancel_check: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+impl<W: Write, C: FnMut() -> bool> Write for CancellingWriter<'_, W, C> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.cancelled || (self.bytes_until_cancel_check == 0 && (self.is_cancelled)()) {
+            self.cancelled = true;
+            return Err(std::io::Error::other(
+                "public corpus output serialization cancelled",
+            ));
+        }
+        if self.bytes_until_cancel_check == 0 {
+            self.bytes_until_cancel_check = PUBLIC_OUTPUT_CANCELLATION_GRANULARITY_BYTES;
+        }
+        let maximum_write = bytes.len().min(self.bytes_until_cancel_check);
+        let written = self.inner.write(&bytes[..maximum_write])?;
+        self.bytes_until_cancel_check = self.bytes_until_cancel_check.saturating_sub(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.cancelled || (self.is_cancelled)() {
+            self.cancelled = true;
+            return Err(std::io::Error::other(
+                "public corpus output serialization cancelled",
+            ));
+        }
+        self.inner.flush()
+    }
+}
+
+fn stage_new_json<'a, T: Serialize>(
     output_path: &Path,
-    canonical_parent: &Path,
+    output_parent: &'a ValidatedOutputParent,
     value: &T,
     artifact: &str,
-) -> FwResult<()> {
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<StagedJsonOutput<'a>> {
+    checkpoint_cancelled(is_cancelled)?;
     let output_name = output_path
         .file_name()
-        .ok_or_else(|| public_corpus_error("output_path", "output must include a file name"))?;
-    let canonical_target = canonical_parent.join(output_name);
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&canonical_target)
-        .map_err(|_| {
+        .ok_or_else(|| public_corpus_error("output_path", "output must include a file name"))?
+        .to_owned();
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        use rustix::fs::{Mode, OFlags, fchmod, openat};
+
+        verify_output_parent_identity(output_parent)?;
+        let mut staging = None;
+        for _ in 0..8 {
+            let staging_name = OsString::from(format!(
+                ".franken-whisper-output-{}.tmp",
+                Uuid::new_v4().simple()
+            ));
+            match openat(
+                &output_parent.directory,
+                &staging_name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(descriptor) => {
+                    staging = Some((staging_name, File::from(descriptor)));
+                    break;
+                }
+                Err(error) if error == rustix::io::Errno::EXIST => {}
+                Err(_) => {
+                    return Err(public_corpus_error(
+                        "output_create",
+                        &format!("new {artifact} staging output could not be created"),
+                    ));
+                }
+            }
+        }
+        let (staging_name, file) = staging.ok_or_else(|| {
             public_corpus_error(
                 "output_create",
-                &format!("new {artifact} output could not be created"),
+                &format!("new {artifact} staging output could not be created"),
             )
         })?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, value).map_err(|_| {
-        public_corpus_error(
-            "output_write",
-            &format!("{artifact} output could not be serialized"),
-        )
-    })?;
-    writer.write_all(b"\n").map_err(|_| {
-        public_corpus_error(
-            "output_write",
-            &format!("{artifact} output could not be written"),
-        )
-    })?;
-    writer.flush().map_err(|_| {
-        public_corpus_error(
-            "output_write",
-            &format!("{artifact} output could not be flushed"),
-        )
-    })?;
-    writer.get_ref().sync_all().map_err(|_| {
-        public_corpus_error(
-            "output_write",
-            &format!("{artifact} output could not be durably synchronized"),
-        )
-    })
+        let staged = StagedJsonOutput {
+            output_parent,
+            staging_name,
+            output_name,
+            file,
+            preserve_payload_on_drop: false,
+        };
+        if fchmod(&staged.file, Mode::RUSR | Mode::WUSR).is_err() {
+            staged.scrub_payload_or_error(artifact)?;
+            return Err(public_corpus_error(
+                "output_target_permissions",
+                "new staging output permissions could not be restricted to mode 0600",
+            ));
+        }
+        if let Err(error) = verify_output_parent_identity(output_parent) {
+            staged.scrub_payload_or_error(artifact)?;
+            return Err(error);
+        }
+        let staging_metadata = match staged.file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                staged.scrub_payload_or_error(artifact)?;
+                return Err(public_corpus_error(
+                    "output_target_changed",
+                    "new staging output identity could not be verified",
+                ));
+            }
+        };
+        if !staging_metadata.is_file()
+            || staging_metadata.uid() != rustix::process::geteuid().as_raw()
+            || staging_metadata.mode() & 0o777 != 0o600
+        {
+            staged.scrub_payload_or_error(artifact)?;
+            return Err(public_corpus_error(
+                "output_target_permissions",
+                "new staging output must remain a mode-0600 regular file owned by the effective user",
+            ));
+        }
+        let mut writer = CancellingWriter {
+            inner: BufWriter::new(&staged.file),
+            is_cancelled,
+            cancelled: false,
+            bytes_until_cancel_check: PUBLIC_OUTPUT_CANCELLATION_GRANULARITY_BYTES,
+        };
+        let serialized = serde_json::to_writer_pretty(&mut writer, value);
+        if writer.cancelled || serialized.is_err() {
+            let cancelled = writer.cancelled;
+            let CancellingWriter { inner, .. } = writer;
+            let (_, buffered) = inner.into_parts();
+            drop(buffered);
+            staged.scrub_payload_or_error(artifact)?;
+            return if cancelled {
+                Err(public_corpus_cancelled_error())
+            } else {
+                Err(public_corpus_error(
+                    "output_write",
+                    &format!("{artifact} output could not be serialized"),
+                ))
+            };
+        }
+        let newline = writer.write_all(b"\n");
+        if writer.cancelled || newline.is_err() {
+            let cancelled = writer.cancelled;
+            let CancellingWriter { inner, .. } = writer;
+            let (_, buffered) = inner.into_parts();
+            drop(buffered);
+            staged.scrub_payload_or_error(artifact)?;
+            return if cancelled {
+                Err(public_corpus_cancelled_error())
+            } else {
+                Err(public_corpus_error(
+                    "output_write",
+                    &format!("{artifact} output could not be written"),
+                ))
+            };
+        }
+        let flushed = writer.flush();
+        if writer.cancelled || flushed.is_err() {
+            let cancelled = writer.cancelled;
+            let CancellingWriter { inner, .. } = writer;
+            let (_, buffered) = inner.into_parts();
+            drop(buffered);
+            staged.scrub_payload_or_error(artifact)?;
+            return if cancelled {
+                Err(public_corpus_cancelled_error())
+            } else {
+                Err(public_corpus_error(
+                    "output_write",
+                    &format!("{artifact} output could not be flushed"),
+                ))
+            };
+        }
+        drop(writer);
+        if staged.file.sync_all().is_err() {
+            staged.scrub_payload_or_error(artifact)?;
+            return Err(public_corpus_error(
+                "output_write",
+                &format!("{artifact} staging output could not be durably synchronized"),
+            ));
+        }
+        if is_cancelled() {
+            staged.scrub_payload_or_error(artifact)?;
+            return Err(public_corpus_cancelled_error());
+        }
+        if let Err(error) = verify_output_parent_identity(output_parent) {
+            staged.scrub_payload_or_error(artifact)?;
+            return Err(error);
+        }
+        Ok(staged)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = (output_parent, value, artifact, is_cancelled, output_name);
+        Err(FwError::Unsupported(
+            "public_corpus.output_platform: atomic public artifact publication requires Linux, Android, or an Apple platform"
+                .to_owned(),
+        ))
+    }
+}
+
+fn publish_staged_json(staged: StagedJsonOutput<'_>, artifact: &str) -> FwResult<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use rustix::fs::{RenameFlags, renameat_with};
+
+        let mut staged = staged;
+        if let Err(error) = verify_output_parent_identity(staged.output_parent) {
+            return Err(staged_scrubbed_error(error, &[(&staged, artifact)]));
+        }
+        if let Err(error) =
+            verify_output_leaf_identity(staged.output_parent, &staged.staging_name, &staged.file)
+        {
+            return Err(staged_scrubbed_error(error, &[(&staged, artifact)]));
+        }
+        let renamed = renameat_with(
+            &staged.output_parent.directory,
+            &staged.staging_name,
+            &staged.output_parent.directory,
+            &staged.output_name,
+            RenameFlags::NOREPLACE,
+        );
+        if let Err(rename_error) = renamed {
+            let final_state =
+                output_leaf_state(staged.output_parent, &staged.output_name, &staged.file);
+            let staging_state =
+                output_leaf_state(staged.output_parent, &staged.staging_name, &staged.file);
+            match (final_state, staging_state) {
+                (Ok(OutputLeafState::Expected), _) => {
+                    staged.preserve_payload_on_drop = true;
+                    return Err(public_corpus_error(
+                        "output_commit_uncertain",
+                        &format!(
+                            "{artifact} output names the staged inode after an ambiguous publication error"
+                        ),
+                    ));
+                }
+                (
+                    Ok(OutputLeafState::Missing | OutputLeafState::Other),
+                    Ok(OutputLeafState::Expected),
+                ) if rename_error == rustix::io::Errno::EXIST => {
+                    let error = public_corpus_error(
+                        "output_create",
+                        &format!("new {artifact} output could not be atomically published"),
+                    );
+                    return Err(staged_scrubbed_error(error, &[(&staged, artifact)]));
+                }
+                _ => {
+                    // Only a no-clobber EXIST result plus an intact source is
+                    // authoritative pre-commit evidence. Other filesystem
+                    // errors may be ambiguous, so do not truncate the held
+                    // inode even when a follow-up lookup appears unchanged.
+                    staged.preserve_payload_on_drop = true;
+                    return Err(public_corpus_error(
+                        "output_commit_uncertain",
+                        &format!(
+                            "{artifact} publication state could not be resolved after a rename error"
+                        ),
+                    ));
+                }
+            }
+        }
+        // The no-clobber rename is the publication commit point. From here on,
+        // an error means the committed file could not be durably confirmed;
+        // Drop must never truncate that final-name inode.
+        staged.preserve_payload_on_drop = true;
+        verify_output_parent_identity(staged.output_parent).map_err(|_| {
+            public_corpus_error(
+                "output_commit_uncertain",
+                &format!(
+                    "{artifact} output was published but its parent identity could not be confirmed"
+                ),
+            )
+        })?;
+        verify_output_leaf_identity(staged.output_parent, &staged.output_name, &staged.file)
+            .map_err(|_| {
+                public_corpus_error(
+                    "output_commit_uncertain",
+                    &format!(
+                        "{artifact} output was published but its final identity could not be confirmed"
+                    ),
+                )
+            })?;
+        staged.output_parent.directory.sync_all().map_err(|_| {
+            public_corpus_error(
+                "output_commit_uncertain",
+                &format!(
+                    "{artifact} output was published but its directory could not be durably synchronized"
+                ),
+            )
+        })?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = (staged, artifact);
+        Err(FwError::Unsupported(
+            "public_corpus.output_platform: atomic public artifact publication requires Linux, Android, or an Apple platform"
+                .to_owned(),
+        ))
+    }
+}
+
+fn write_new_json<T: Serialize>(
+    output_path: &Path,
+    output_parent: &ValidatedOutputParent,
+    value: &T,
+    artifact: &str,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> FwResult<()> {
+    let staged = stage_new_json(output_path, output_parent, value, artifact, is_cancelled)?;
+    publish_staged_json(staged, artifact)
 }
 
 fn canonical_sha256<T: Serialize>(value: &T) -> FwResult<String> {
@@ -8199,12 +12699,14 @@ fn is_sha256_hex(value: &str) -> bool {
 
 fn checkpoint_cancelled(is_cancelled: &mut impl FnMut() -> bool) -> FwResult<()> {
     if is_cancelled() {
-        Err(FwError::Cancelled(
-            "public_corpus.cancelled: public corpus preparation cancelled".to_owned(),
-        ))
+        Err(public_corpus_cancelled_error())
     } else {
         Ok(())
     }
+}
+
+fn public_corpus_cancelled_error() -> FwError {
+    FwError::Cancelled("public_corpus.cancelled: public corpus preparation cancelled".to_owned())
 }
 
 fn public_corpus_error(code: &str, message: &str) -> FwError {
@@ -8219,18 +12721,65 @@ mod tests {
     use sha2::Digest as _;
     use tempfile::tempdir;
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    use serde::Serialize;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    use serde::ser::SerializeStruct as _;
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    use super::write_new_json;
     use super::{
         PUBLIC_CORPUS_INPUT_SCHEMA_VERSION, PublicAblationAccumulator, PublicCorpusAblationSplit,
         PublicCorpusAblationVariant, build_public_corpus_bundle,
         build_public_corpus_bundle_with_cancel, clipped_reference, development_improvement_gate,
         held_out_non_regression_gate, merged_scored_speech_regions, parse_public_corpus_bundle,
-        public_corpus_registry, validate_split,
+        public_corpus_registry, validate_new_output, validate_split,
     };
     use crate::FwResult;
     use crate::diarization::{
         AcousticFeatureAblation, DIARIZATION_REFERENCE_SCHEMA_VERSION,
         DiarizationReferenceDocument, EvaluationRegion, EvaluationSplit, EvaluationTurn,
     };
+
+    fn private_tempdir(label: &str) -> tempfile::TempDir {
+        let directory = tempdir().unwrap_or_else(|error| panic!("{label}: {error}"));
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("private {label}: {error}"));
+        }
+        directory
+    }
+
+    fn create_private_directory(path: &Path) {
+        std::fs::create_dir(path).expect("fixture directory");
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("private fixture directory");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    struct AlwaysFailsSerialization;
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    impl Serialize for AlwaysFailsSerialization {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut state = serializer.serialize_struct("SensitiveFixture", 2)?;
+            state.serialize_field("sensitive", "must-not-survive")?;
+            Err(<S::Error as serde::ser::Error>::custom(
+                "intentional failure after a serialized field",
+            ))
+        }
+    }
 
     fn write_wave(path: &Path, sample_rate: u32, channels: u16, frames: u32) {
         let spec = hound::WavSpec {
@@ -8292,6 +12841,415 @@ mod tests {
         })
     }
 
+    fn external_recording(
+        recording_id: &str,
+        split: &str,
+        audio_path: &str,
+        audio_sha256: &str,
+        annotation_path: &str,
+        annotation_sha256: &str,
+    ) -> serde_json::Value {
+        json!({
+            "recording_id": recording_id,
+            "split": split,
+            "origin_recording_id": format!("{recording_id}-origin"),
+            "audio_path": audio_path,
+            "audio_sha256": audio_sha256,
+            "expected_sample_rate_hz": 16_000,
+            "expected_channel_count": 1,
+            "selected_channel": 1,
+            "annotation_path": annotation_path,
+            "annotation_sha256": annotation_sha256,
+            "annotation_recording_id": format!("source-{recording_id}"),
+            "annotation_channel": "1",
+            "speaker_map": {
+                "source-speaker": format!("{recording_id}-speaker")
+            },
+            "ignored_regions": []
+        })
+    }
+
+    fn sidecar_hash_fixture() -> super::PublicCorpusSidecarStudyEvidence {
+        let scorer_config = crate::diarization::DiarizationScorerConfig::default();
+        let diarization_request = crate::model::DiarizationRequest {
+            engine: crate::model::DiarizationEngine::Acoustic,
+            speaker_count: crate::model::SpeakerCountRequest::Infer,
+            ..crate::model::DiarizationRequest::default()
+        };
+        let request_sha256 =
+            super::canonical_sha256(&diarization_request).expect("diarization request hash");
+        let protocol = super::public_sidecar_protocol(None, &diarization_request, request_sha256)
+            .expect("sidecar protocol");
+        let protocol_sha256 = super::canonical_sha256(&protocol).expect("protocol hash");
+        super::PublicCorpusSidecarStudyEvidence {
+            schema_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION.to_owned(),
+            runner_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION.to_owned(),
+            scorer_version: crate::diarization::DIARIZATION_SCORER_VERSION.to_owned(),
+            corpus_key: "aishell-4-openslr111-v1".to_owned(),
+            source_version: "fixture-v1".to_owned(),
+            bundle_sha256: "1".repeat(64),
+            descriptor_sha256: "2".repeat(64),
+            scorer_config_sha256: super::canonical_sha256(&scorer_config).expect("scorer hash"),
+            scorer_config,
+            evaluation_stage: super::PublicCorpusEvaluationStage::Development,
+            locked_development_result_sha256: None,
+            locked_development_accuracy_sha256: None,
+            protocol,
+            protocol_sha256,
+            selected_candidate_lane: None,
+            adopted_candidate_lane: None,
+            variants: vec![
+                super::PublicCorpusSidecarStudyVariant {
+                    lane: super::PublicCorpusSidecarLane::FullV2Baseline,
+                    fusion_scope: super::PublicCorpusSidecarFusionScope::BaselineUnfused,
+                    study_configuration_sha256: "3".repeat(64),
+                    fusion_configuration_sha256: None,
+                    lane_configuration_sha256: "4".repeat(64),
+                    calibration: None,
+                    pair_calibration: None,
+                    disposition: super::PublicCorpusSidecarDisposition::Baseline,
+                    splits: vec![
+                        super::unavailable_public_sidecar_split(EvaluationSplit::Development)
+                            .expect("baseline shell"),
+                    ],
+                    gate: None,
+                },
+                super::PublicCorpusSidecarStudyVariant {
+                    lane: super::PublicCorpusSidecarLane::FrameHaarL4,
+                    fusion_scope: super::PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                    study_configuration_sha256: "5".repeat(64),
+                    fusion_configuration_sha256: Some("6".repeat(64)),
+                    lane_configuration_sha256: "7".repeat(64),
+                    calibration: None,
+                    pair_calibration: None,
+                    disposition: super::PublicCorpusSidecarDisposition::Rejected,
+                    splits: vec![
+                        super::unavailable_public_sidecar_split(EvaluationSplit::Development)
+                            .expect("unavailable split"),
+                    ],
+                    gate: Some(super::PublicCorpusSidecarPromotionGate {
+                        split: EvaluationSplit::Development,
+                        candidate: super::PublicCorpusSidecarLane::FrameHaarL4,
+                        baseline: super::PublicCorpusSidecarLane::FullV2Baseline,
+                        relative_micro_der_improvement: None,
+                        macro_jer_delta: None,
+                        boundary_f1_delta: None,
+                        comparable_frame_coverage: None,
+                        pair_score_coverage: None,
+                        same_speaker_pair_score_coverage: None,
+                        different_speaker_pair_score_coverage: None,
+                        pair_scored_recording_count: 0,
+                        pair_roc_auc: None,
+                        pair_brier_score: None,
+                        pair_expected_calibration_error: None,
+                        channel_same_speaker_dominance_rate: None,
+                        mixed_auxiliary_same_speaker_dominance_rate: None,
+                        exact_speaker_count_rate_delta: None,
+                        mean_absolute_speaker_count_error_delta: None,
+                        dominant_collapse_count_delta: None,
+                        relative_rtf_regression: Some(0.30),
+                        relative_rss_regression: Some(0.30),
+                        paired_der_ci95_upper: None,
+                        failures: vec![
+                            super::PublicCorpusSidecarGateFailure::PerformanceRegression,
+                        ],
+                        passed: false,
+                    }),
+                },
+            ],
+            deterministic_accuracy_sha256: String::new(),
+            result_sha256: String::new(),
+        }
+    }
+
+    /// Gate-only aggregate input. Tests that need verifier coverage must use
+    /// a runner-produced artifact; this helper intentionally does not model
+    /// every per-recording pipeline and sampler invariant.
+    fn sidecar_gate_split(
+        split: EvaluationSplit,
+        micro_der: f64,
+        real_time_factor: f64,
+        sampled_peak_rss_bytes: u64,
+    ) -> super::PublicCorpusSidecarStudySplit {
+        let mut pipeline =
+            ablation_variant(AcousticFeatureAblation::FullV2, Some(micro_der), Some(0.30))
+                .splits
+                .into_iter()
+                .find(|candidate| candidate.split == split)
+                .expect("requested ablation split");
+        pipeline.audio_duration_sec = 10.0;
+        pipeline.wall_time_sec = real_time_factor * pipeline.audio_duration_sec;
+        pipeline.real_time_factor = Some(real_time_factor);
+        pipeline.sampled_peak_rss_bytes = sampled_peak_rss_bytes;
+        let mut result =
+            super::unavailable_public_sidecar_split(split).expect("sidecar split shell");
+        result.pipeline = Some(pipeline.clone());
+        result.fusion_executed = true;
+        result.boundary = super::empty_sidecar_boundary_metrics(&pipeline);
+        result.conditional_pairs.comparison_count = 200;
+        result.conditional_pairs.same_speaker_count = 100;
+        result.conditional_pairs.different_speaker_count = 100;
+        result
+            .conditional_pairs
+            .mean_different_probability_given_same_speaker = Some(0.20);
+        result
+            .conditional_pairs
+            .mean_different_probability_given_different_speaker = Some(0.80);
+        result.conditional_pairs.roc_auc = Some(0.60);
+        result.conditional_pairs.brier_score = Some(0.20);
+        result.conditional_pairs.expected_calibration_error = Some(0.05);
+        result.coverage.fusion_requested = true;
+        result.coverage.evaluated_recording_count = 1;
+        result.coverage.fusion_requested_recording_count = 1;
+        result.coverage.fusion_executed_recording_count = 1;
+        result.coverage.submitted_frame_count = 2;
+        result.coverage.comparable_frame_count = 2;
+        result.coverage.calibrated_signal_count = 2;
+        result.coverage.consumed_probability_count = 1;
+        result.coverage.comparable_frame_coverage = Some(1.0);
+        result.coverage.component_comparison_count = 2;
+        result.coverage.owner_available_frame_counts = [2, 0, 0];
+        result.coverage.eligible_pair_count = 200;
+        result.coverage.retained_pair_sample_count = 200;
+        result.coverage.retained_same_speaker_pair_count = 100;
+        result.coverage.retained_different_speaker_pair_count = 100;
+        result.coverage.pair_selection_sha256 = Some("9".repeat(64));
+        result.coverage.pair_score_coverage = Some(1.0);
+        result.coverage.same_speaker_pair_score_coverage = Some(1.0);
+        result.coverage.different_speaker_pair_score_coverage = Some(1.0);
+        result.coverage.pair_scored_recording_count = 5;
+        result.coverage.same_speaker_pair_recording_count = 5;
+        result.coverage.different_speaker_pair_recording_count = 5;
+        result.coverage.maximum_retained_pair_sample_count = 200;
+        result.coverage.retained_pair_sample_capacity = 4_096;
+        result.performance.audio_duration_sec = 10.0;
+        result.performance.wall_time_sec = real_time_factor * 10.0;
+        result.performance.real_time_factor = Some(real_time_factor);
+        result.performance.sampled_peak_rss_bytes = sampled_peak_rss_bytes;
+        result.paired_uncertainty = Some(super::PublicCorpusSidecarPairedUncertainty {
+            paired_der_recording_count: 5,
+            paired_jer_recording_count: 5,
+            bootstrap_replicates: super::PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES,
+            bootstrap_seed_sha256: "8".repeat(64),
+            mean_der_delta: Some(-0.01),
+            der_delta_ci95_lower: Some(-0.02),
+            der_delta_ci95_upper: Some(-0.001),
+            mean_jer_delta: Some(0.0),
+            jer_delta_ci95_lower: Some(-0.01),
+            jer_delta_ci95_upper: Some(0.01),
+        });
+        result
+    }
+
+    fn sidecar_gate_scenario_evidence(
+        stage: super::PublicCorpusEvaluationStage,
+        candidate_real_time_factor: f64,
+        candidate_peak_rss_bytes: u64,
+    ) -> super::PublicCorpusSidecarStudyEvidence {
+        let split = stage.selected_split();
+        let mut evidence = sidecar_hash_fixture();
+        evidence.evaluation_stage = stage;
+        let mut baseline = sidecar_gate_split(split, 0.20, 0.10, 100);
+        baseline.fusion_executed = false;
+        baseline.coverage = super::unavailable_public_sidecar_split(split)
+            .expect("baseline coverage shell")
+            .coverage;
+        baseline.conditional_pairs = super::SidecarPairAccumulator::new()
+            .finish()
+            .expect("baseline pairs");
+        baseline.paired_uncertainty = None;
+        let candidate = sidecar_gate_split(
+            split,
+            0.19,
+            candidate_real_time_factor,
+            candidate_peak_rss_bytes,
+        );
+        let gate = super::public_sidecar_promotion_gate(
+            stage,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &candidate,
+        );
+        evidence.variants[0].splits = vec![baseline];
+        evidence.variants[1].splits = vec![candidate];
+        evidence.variants[1].gate = Some(gate.clone());
+        match stage {
+            super::PublicCorpusEvaluationStage::Development => {
+                evidence.locked_development_result_sha256 = None;
+                evidence.locked_development_accuracy_sha256 = None;
+                evidence.selected_candidate_lane = gate
+                    .passed
+                    .then_some(super::PublicCorpusSidecarLane::FrameHaarL4);
+                evidence.adopted_candidate_lane = None;
+                evidence.variants[1].disposition = if gate.passed {
+                    super::PublicCorpusSidecarDisposition::AdvanceToCertification
+                } else {
+                    super::PublicCorpusSidecarDisposition::Rejected
+                };
+            }
+            super::PublicCorpusEvaluationStage::Certification => {
+                evidence.locked_development_result_sha256 = Some("a".repeat(64));
+                evidence.locked_development_accuracy_sha256 = Some("b".repeat(64));
+                evidence.selected_candidate_lane =
+                    Some(super::PublicCorpusSidecarLane::FrameHaarL4);
+                evidence.adopted_candidate_lane = gate
+                    .passed
+                    .then_some(super::PublicCorpusSidecarLane::FrameHaarL4);
+                evidence.variants[1].disposition = if gate.passed {
+                    super::PublicCorpusSidecarDisposition::Adopted
+                } else {
+                    super::PublicCorpusSidecarDisposition::Rejected
+                };
+            }
+        }
+        evidence
+    }
+
+    fn valid_unavailable_sidecar_evidence() -> super::PublicCorpusSidecarStudyEvidence {
+        let scorer_config = crate::diarization::DiarizationScorerConfig {
+            schema_version: crate::diarization::DIARIZATION_SCORER_CONFIG_SCHEMA_VERSION.to_owned(),
+            speaker_boundary_collar_ms: 250,
+            change_boundary_collar_ms: 250,
+            overlap_policy: crate::diarization::EvaluationOverlapPolicy::Exclude,
+            calibration_bins: 10,
+            count_top_k: 3,
+            count_credible_mass_millionths: 900_000,
+            dominant_speaker_collapse_share_millionths: 990_000,
+            minimum_reference_speaker_recall_millionths: 100_000,
+            minimum_effective_occupancy_ms: 250,
+        };
+        let request = crate::model::DiarizationRequest {
+            engine: crate::model::DiarizationEngine::Acoustic,
+            speaker_count: crate::model::SpeakerCountRequest::Infer,
+            ..crate::model::DiarizationRequest::default()
+        };
+        let request_sha256 = super::canonical_sha256(&request).expect("request hash");
+        let protocol = super::public_sidecar_protocol(None, &request, request_sha256)
+            .expect("sidecar protocol");
+        let protocol_sha256 = super::canonical_sha256(&protocol).expect("protocol hash");
+        let mut baseline_split =
+            super::unavailable_public_sidecar_split(EvaluationSplit::Development)
+                .expect("baseline split shell");
+        let baseline_pipeline =
+            ablation_variant(AcousticFeatureAblation::FullV2, Some(0.20), Some(0.30))
+                .splits
+                .into_iter()
+                .find(|split| split.split == EvaluationSplit::Development)
+                .expect("baseline pipeline");
+        baseline_split.boundary = super::empty_sidecar_boundary_metrics(&baseline_pipeline);
+        baseline_split.performance = super::PublicCorpusSidecarPerformance {
+            audio_duration_sec: baseline_pipeline.audio_duration_sec,
+            wall_time_sec: baseline_pipeline.wall_time_sec,
+            real_time_factor: baseline_pipeline.real_time_factor,
+            sampled_peak_rss_bytes: baseline_pipeline.sampled_peak_rss_bytes,
+        };
+        baseline_split.coverage.evaluated_recording_count = baseline_pipeline.recording_count;
+        baseline_split.pipeline = Some(baseline_pipeline);
+
+        let baseline_study_sha256 = crate::diarization::acoustic_sidecar_study_config_sha256(
+            super::PublicCorpusSidecarLane::FullV2Baseline.study_config(),
+        )
+        .expect("baseline study hash");
+        let baseline_lane_sha256 =
+            super::canonical_sha256(&super::PublicCorpusSidecarLaneFingerprint {
+                runner_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+                lane: super::PublicCorpusSidecarLane::FullV2Baseline,
+                fusion_scope: super::PublicCorpusSidecarFusionScope::BaselineUnfused,
+                study_configuration_sha256: &baseline_study_sha256,
+                fusion_configuration_sha256: None,
+                pair_calibration_sha256: None,
+                protocol_sha256: &protocol_sha256,
+            })
+            .expect("baseline lane hash");
+        let mut variants = vec![super::PublicCorpusSidecarStudyVariant {
+            lane: super::PublicCorpusSidecarLane::FullV2Baseline,
+            fusion_scope: super::PublicCorpusSidecarFusionScope::BaselineUnfused,
+            study_configuration_sha256: baseline_study_sha256,
+            fusion_configuration_sha256: None,
+            lane_configuration_sha256: baseline_lane_sha256,
+            calibration: None,
+            pair_calibration: None,
+            disposition: super::PublicCorpusSidecarDisposition::Baseline,
+            splits: vec![baseline_split.clone()],
+            gate: None,
+        }];
+        for lane in super::PublicCorpusSidecarLane::ALL.into_iter().skip(1) {
+            let split = super::unavailable_public_sidecar_split(EvaluationSplit::Development)
+                .expect("candidate unavailable split");
+            let gate = super::public_sidecar_promotion_gate(
+                super::PublicCorpusEvaluationStage::Development,
+                &protocol.gate_policy,
+                &baseline_split,
+                lane,
+                &split,
+            );
+            let study_configuration_sha256 =
+                crate::diarization::acoustic_sidecar_study_config_sha256(lane.study_config())
+                    .expect("candidate study hash");
+            let lane_configuration_sha256 =
+                super::canonical_sha256(&super::PublicCorpusSidecarLaneFingerprint {
+                    runner_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+                    lane,
+                    fusion_scope: super::PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                    study_configuration_sha256: &study_configuration_sha256,
+                    fusion_configuration_sha256: None,
+                    pair_calibration_sha256: None,
+                    protocol_sha256: &protocol_sha256,
+                })
+                .expect("candidate lane hash");
+            variants.push(super::PublicCorpusSidecarStudyVariant {
+                lane,
+                fusion_scope: super::PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                study_configuration_sha256,
+                fusion_configuration_sha256: None,
+                lane_configuration_sha256,
+                calibration: None,
+                pair_calibration: None,
+                disposition: super::PublicCorpusSidecarDisposition::Rejected,
+                splits: vec![split],
+                gate: Some(gate),
+            });
+        }
+        assert_eq!(
+            super::apply_public_sidecar_development_selection(&mut variants),
+            None
+        );
+        let scorer_config_sha256 = super::canonical_sha256(&scorer_config).expect("scorer hash");
+        let mut evidence = super::PublicCorpusSidecarStudyEvidence {
+            schema_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_SCHEMA_VERSION.to_owned(),
+            runner_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION.to_owned(),
+            scorer_version: crate::diarization::DIARIZATION_SCORER_VERSION.to_owned(),
+            corpus_key: "aishell-4-openslr111-v1".to_owned(),
+            source_version: "unavailable-fixture-v1".to_owned(),
+            bundle_sha256: "1".repeat(64),
+            descriptor_sha256: "2".repeat(64),
+            scorer_config,
+            scorer_config_sha256,
+            evaluation_stage: super::PublicCorpusEvaluationStage::Development,
+            locked_development_result_sha256: None,
+            locked_development_accuracy_sha256: None,
+            protocol,
+            protocol_sha256,
+            selected_candidate_lane: None,
+            adopted_candidate_lane: None,
+            variants,
+            deterministic_accuracy_sha256: String::new(),
+            result_sha256: String::new(),
+        };
+        evidence.deterministic_accuracy_sha256 =
+            super::deterministic_sidecar_accuracy_sha256(&evidence).expect("accuracy hash");
+        evidence.result_sha256 = super::canonical_sha256(&evidence).expect("result hash");
+        evidence
+    }
+
+    fn rehash_sidecar_evidence(evidence: &mut super::PublicCorpusSidecarStudyEvidence) {
+        evidence.deterministic_accuracy_sha256 =
+            super::deterministic_sidecar_accuracy_sha256(evidence).expect("accuracy hash");
+        evidence.result_sha256.clear();
+        evidence.result_sha256 = super::canonical_sha256(evidence).expect("result hash");
+    }
+
     struct Fixture {
         project: tempfile::TempDir,
         input: tempfile::TempDir,
@@ -8302,9 +13260,9 @@ mod tests {
 
     impl Fixture {
         fn new(corpus_key: &str, recording_id: &str, split: &str) -> Self {
-            let project = tempdir().expect("project");
-            let input = tempdir().expect("input");
-            let output = tempdir().expect("output");
+            let project = private_tempdir("project");
+            let input = private_tempdir("input");
+            let output = private_tempdir("output");
             write_wave(&input.path().join("audio.wav"), 8_000, 2, 8_000);
             std::fs::write(
                 input.path().join("annotation.rttm"),
@@ -8376,6 +13334,2395 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
+    #[test]
+    fn selected_split_materialization_never_opens_held_out_media() {
+        let project = private_tempdir("project");
+        let input = private_tempdir("input");
+        let output = private_tempdir("output");
+        let development_audio = input.path().join("development.wav");
+        let development_annotation = input.path().join("development.rttm");
+        write_wave(&development_audio, 16_000, 1, 16_000);
+        std::fs::write(
+            &development_annotation,
+            "SPEAKER source-development-recording 1 0.000 0.500 <NA> <NA> source-speaker <NA> <NA>\n",
+        )
+        .expect("development RTTM");
+        let descriptor_path = input.path().join("descriptor.json");
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+                "corpus_key": "aishell-4-openslr111-v1",
+                "source_version": "stage-selective-fixture-v1",
+                "recordings": [
+                    external_recording(
+                        "development-recording",
+                        "development",
+                        "development.wav",
+                        &sha256(&development_audio),
+                        "development.rttm",
+                        &sha256(&development_annotation),
+                    ),
+                    external_recording(
+                        "held-out-recording",
+                        "test",
+                        "held-out-does-not-exist.wav",
+                        &"0".repeat(64),
+                        "held-out-does-not-exist.rttm",
+                        &"1".repeat(64),
+                    ),
+                ]
+            }))
+            .expect("descriptor JSON"),
+        )
+        .expect("descriptor");
+        let descriptor_sha256 = sha256(&descriptor_path);
+        let bundle_path = output.path().join("development-bundle.json");
+
+        let bundle = super::build_public_corpus_bundle_for_split_with_cancel(
+            project.path(),
+            input.path(),
+            &descriptor_path,
+            &bundle_path,
+            "accept-aishell-4-cc-by-sa-4.0",
+            Some(EvaluationSplit::Development),
+            Some(&descriptor_sha256),
+            || false,
+        )
+        .expect("development-only materialization");
+
+        assert_eq!(bundle.references.len(), 1);
+        assert_eq!(bundle.references[0].recording_id, "development-recording");
+        assert!(bundle_path.is_file());
+        assert!(!input.path().join("held-out-does-not-exist.wav").exists());
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
+    #[test]
+    fn descriptor_metadata_rejects_held_out_traversal_before_selected_media_access() {
+        let project = private_tempdir("project");
+        let input = private_tempdir("input");
+        let output = private_tempdir("output");
+        let descriptor_path = input.path().join("descriptor.json");
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+                "corpus_key": "aishell-4-openslr111-v1",
+                "source_version": "metadata-preflight-fixture-v1",
+                "recordings": [
+                    external_recording(
+                        "development-missing",
+                        "development",
+                        "development-missing.wav",
+                        &"0".repeat(64),
+                        "development-missing.rttm",
+                        &"1".repeat(64),
+                    ),
+                    external_recording(
+                        "held-out-traversal",
+                        "test",
+                        "../held-out.wav",
+                        &"2".repeat(64),
+                        "held-out.rttm",
+                        &"3".repeat(64),
+                    ),
+                ]
+            }))
+            .expect("descriptor JSON"),
+        )
+        .expect("descriptor");
+        let bundle_path = output.path().join("bundle.json");
+        let error = super::build_public_corpus_bundle_for_split_with_cancel(
+            project.path(),
+            input.path(),
+            &descriptor_path,
+            &bundle_path,
+            "accept-aishell-4-cc-by-sa-4.0",
+            Some(EvaluationSplit::Development),
+            None,
+            || false,
+        )
+        .expect_err("held-out path traversal must fail metadata preflight");
+        assert!(error.to_string().contains("relative_path"));
+        assert!(!error.to_string().contains("input_file"));
+        assert!(!bundle_path.exists());
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
+    #[test]
+    fn descriptor_metadata_rejects_cross_split_identity_leakage_before_media_access() {
+        let project = private_tempdir("project");
+        let input = private_tempdir("input");
+        let output = private_tempdir("output");
+        let development = external_recording(
+            "development-missing",
+            "development",
+            "development-missing.wav",
+            &"0".repeat(64),
+            "development-missing.rttm",
+            &"1".repeat(64),
+        );
+        let mut held_out = external_recording(
+            "held-out-missing",
+            "test",
+            "held-out-missing.wav",
+            &"2".repeat(64),
+            "held-out-missing.rttm",
+            &"3".repeat(64),
+        );
+        held_out["origin_recording_id"] = development["origin_recording_id"].clone();
+        let descriptor_path = input.path().join("descriptor.json");
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+                "corpus_key": "aishell-4-openslr111-v1",
+                "source_version": "metadata-leakage-fixture-v1",
+                "recordings": [development, held_out]
+            }))
+            .expect("descriptor JSON"),
+        )
+        .expect("descriptor");
+        let bundle_path = output.path().join("bundle.json");
+        let error = super::build_public_corpus_bundle_for_split_with_cancel(
+            project.path(),
+            input.path(),
+            &descriptor_path,
+            &bundle_path,
+            "accept-aishell-4-cc-by-sa-4.0",
+            Some(EvaluationSplit::Development),
+            None,
+            || false,
+        )
+        .expect_err("cross-split origin reuse must fail metadata preflight");
+        assert!(error.to_string().contains("split_leakage"));
+        assert!(!error.to_string().contains("input_file"));
+        assert!(!bundle_path.exists());
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
+    #[test]
+    fn descriptor_digest_mismatch_fails_before_selected_media_access() {
+        let project = private_tempdir("project");
+        let input = private_tempdir("input");
+        let output = private_tempdir("output");
+        let descriptor_path = input.path().join("descriptor.json");
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": PUBLIC_CORPUS_INPUT_SCHEMA_VERSION,
+                "corpus_key": "aishell-4-openslr111-v1",
+                "source_version": "descriptor-race-fixture-v1",
+                "recordings": [external_recording(
+                    "development-missing",
+                    "development",
+                    "development-missing.wav",
+                    &"0".repeat(64),
+                    "development-missing.rttm",
+                    &"1".repeat(64),
+                )]
+            }))
+            .expect("descriptor JSON"),
+        )
+        .expect("descriptor");
+        let bundle_path = output.path().join("bundle.json");
+        let error = super::build_public_corpus_bundle_for_split_with_cancel(
+            project.path(),
+            input.path(),
+            &descriptor_path,
+            &bundle_path,
+            "accept-aishell-4-cc-by-sa-4.0",
+            Some(EvaluationSplit::Development),
+            Some(&"f".repeat(64)),
+            || false,
+        )
+        .expect_err("descriptor mismatch must precede media access");
+        assert!(error.to_string().contains("sidecar_descriptor_changed"));
+        assert!(!error.to_string().contains("input_file"));
+        assert!(!bundle_path.exists());
+    }
+
+    #[test]
+    fn sidecar_lane_order_and_configuration_identities_are_frozen() {
+        let expected_ids = [
+            "full_v2_baseline",
+            "frame_haar_l4",
+            "frame_d4_l4",
+            "modulation",
+            "frame_haar_l4_and_modulation",
+            "frame_d4_l4_and_modulation",
+            "trajectory_haar_l4",
+            "trajectory_d4_l4",
+            "scattering_first_order",
+            "scattering_second_order",
+            "scattering_first_and_second_order",
+            "all_haar_l4",
+            "all_d4_l4",
+        ];
+        assert_eq!(
+            super::PublicCorpusSidecarLane::ALL.map(super::PublicCorpusSidecarLane::id),
+            expected_ids
+        );
+        let configuration_hashes = super::PublicCorpusSidecarLane::ALL
+            .into_iter()
+            .map(|lane| {
+                crate::diarization::acoustic_sidecar_study_config_sha256(lane.study_config())
+                    .expect("lane configuration hash")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(configuration_hashes.len(), expected_ids.len());
+
+        let expected_configurations = [
+            ("off", 0, "off", 0, "off"),
+            ("haar", 4, "off", 0, "off"),
+            ("daubechies_four_tap", 4, "off", 0, "off"),
+            ("modulation", 0, "off", 0, "off"),
+            ("haar_modulation", 4, "off", 0, "off"),
+            ("daubechies_four_tap_modulation", 4, "off", 0, "off"),
+            ("off", 0, "haar", 4, "off"),
+            ("off", 0, "daubechies_four_tap", 4, "off"),
+            ("off", 0, "off", 0, "first_order"),
+            ("off", 0, "off", 0, "second_order"),
+            ("off", 0, "off", 0, "first_and_second_order"),
+            ("haar_modulation", 4, "haar", 4, "first_and_second_order"),
+            (
+                "daubechies_four_tap_modulation",
+                4,
+                "daubechies_four_tap",
+                4,
+                "first_and_second_order",
+            ),
+        ];
+        let actual_configurations = super::PublicCorpusSidecarLane::ALL.map(|lane| {
+            let config = lane.study_config();
+            (
+                config.mode.id(),
+                config.frame_wavelet_levels,
+                config.trajectory_wavelet_mode.id(),
+                config.trajectory_wavelet_levels,
+                config.scattering_mode.id(),
+            )
+        });
+        assert_eq!(actual_configurations, expected_configurations);
+    }
+
+    #[test]
+    fn sidecar_pair_bottom_k_matches_full_sort_and_samples_late_audio() {
+        let audio_sha256 = [0x5a; 32];
+        let mut sampler =
+            super::SidecarPairBottomKSampler::new(super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING)
+                .expect("bounded sampler");
+        let mut lane_peer =
+            super::SidecarPairBottomKSampler::new(super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING)
+                .expect("peer sampler");
+        let mut all_keys = Vec::new();
+        let mut prefix_keys = Vec::new();
+        for right_frame_index in 1_usize..=10_000 {
+            let left_frame_index = right_frame_index - 1;
+            let key = super::sidecar_pair_selection_key(
+                &audio_sha256,
+                left_frame_index,
+                right_frame_index,
+                1,
+            )
+            .expect("selection key");
+            all_keys.push(key);
+            if prefix_keys.len() < super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING {
+                prefix_keys.push(key);
+            }
+            sampler
+                .consider(super::SidecarPairSample {
+                    key,
+                    maximum_contrast: Some(0.25),
+                    different_speaker: false,
+                    channel_dominance_opportunity: false,
+                    channel_dominance: false,
+                    mixed_auxiliary_dominance_opportunity: false,
+                    mixed_auxiliary_dominance: false,
+                })
+                .expect("sample candidate");
+            lane_peer
+                .consider(super::SidecarPairSample {
+                    key,
+                    maximum_contrast: (right_frame_index % 2 == 0).then_some(0.75),
+                    different_speaker: true,
+                    channel_dominance_opportunity: true,
+                    channel_dominance: true,
+                    mixed_auxiliary_dominance_opportunity: true,
+                    mixed_auxiliary_dominance: true,
+                })
+                .expect("peer candidate");
+        }
+        let mut reverse_sampler =
+            super::SidecarPairBottomKSampler::new(super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING)
+                .expect("reverse sampler");
+        for right_frame_index in (1_usize..=10_000).rev() {
+            let key = super::sidecar_pair_selection_key(
+                &audio_sha256,
+                right_frame_index - 1,
+                right_frame_index,
+                1,
+            )
+            .expect("reverse selection key");
+            reverse_sampler
+                .consider(super::SidecarPairSample {
+                    key,
+                    maximum_contrast: Some(0.50),
+                    different_speaker: false,
+                    channel_dominance_opportunity: false,
+                    channel_dominance: false,
+                    mixed_auxiliary_dominance_opportunity: false,
+                    mixed_auxiliary_dominance: false,
+                })
+                .expect("reverse candidate");
+        }
+
+        all_keys.sort_unstable();
+        all_keys.truncate(super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING);
+        prefix_keys.sort_unstable();
+        let (eligible_count, retained_count, retained_capacity, selected) =
+            sampler.finish().expect("selected samples");
+        let (_, peer_retained_count, _, peer_selected) =
+            lane_peer.finish().expect("peer selected samples");
+        let (_, reverse_retained_count, _, reverse_selected) =
+            reverse_sampler.finish().expect("reverse selected samples");
+        let selected_keys = selected.iter().map(|sample| sample.key).collect::<Vec<_>>();
+        let peer_keys = peer_selected
+            .iter()
+            .map(|sample| sample.key)
+            .collect::<Vec<_>>();
+        let reverse_keys = reverse_selected
+            .iter()
+            .map(|sample| sample.key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(eligible_count, 10_000);
+        assert_eq!(
+            retained_count,
+            super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING
+        );
+        assert_eq!(peer_retained_count, retained_count);
+        assert_eq!(reverse_retained_count, retained_count);
+        assert!(retained_capacity <= super::PUBLIC_SIDECAR_MAX_RETAINED_PAIR_SAMPLE_CAPACITY);
+        assert!(
+            selected_keys == all_keys,
+            "bounded sampler must match an exact full-sort bottom-k"
+        );
+        assert!(
+            peer_keys == selected_keys,
+            "feature availability, lane score, and class label must not alter positions"
+        );
+        assert!(
+            peer_selected
+                .iter()
+                .any(|sample| sample.maximum_contrast.is_none()),
+            "the peer sample must exercise lane-specific score missingness"
+        );
+        assert!(
+            reverse_keys == selected_keys,
+            "input order must not alter positions"
+        );
+        assert!(
+            selected_keys != prefix_keys,
+            "bottom-k must not be prefix sampling"
+        );
+        assert!(
+            selected_keys
+                .iter()
+                .any(|key| key.right_frame_index > 9_000),
+            "the bounded sample must retain evidence from late audio"
+        );
+    }
+
+    #[test]
+    fn sidecar_pair_selection_digest_binds_labels_but_not_lane_scores() {
+        fn digest(different_speaker: bool, maximum_contrast: Option<f64>) -> Vec<u8> {
+            let normalized_pcm_sha256 = [0x6b; 32];
+            let key = super::sidecar_pair_selection_key(&normalized_pcm_sha256, 10, 35, 25)
+                .expect("selection key");
+            let selected = [super::SidecarPairSample {
+                key,
+                maximum_contrast,
+                different_speaker,
+                channel_dominance_opportunity: false,
+                channel_dominance: false,
+                mixed_auxiliary_dominance_opportunity: false,
+                mixed_auxiliary_dominance: false,
+            }];
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(super::PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_DIGEST_VERSION.as_bytes());
+            super::update_sidecar_pair_selection_digest(
+                &mut hasher,
+                &normalized_pcm_sha256,
+                &selected,
+            )
+            .expect("selection digest");
+            hasher.finalize().to_vec()
+        }
+
+        assert_ne!(
+            digest(false, Some(0.25)),
+            digest(true, Some(0.25)),
+            "a same/different reference-label swap must change the digest"
+        );
+        assert_eq!(
+            digest(false, Some(0.25)),
+            digest(false, None),
+            "lane-specific score availability must not change the selected universe"
+        );
+    }
+
+    #[test]
+    fn sidecar_pair_selection_digest_binds_empty_recordings_and_their_order() {
+        fn digest(recordings: &[[u8; 32]]) -> Vec<u8> {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(super::PUBLIC_CORPUS_SIDECAR_PAIR_SELECTION_DIGEST_VERSION.as_bytes());
+            for normalized_pcm_sha256 in recordings {
+                super::update_sidecar_pair_selection_digest(
+                    &mut hasher,
+                    normalized_pcm_sha256,
+                    &[],
+                )
+                .expect("empty-recording selection digest");
+            }
+            hasher.finalize().to_vec()
+        }
+
+        let first = [0x17; 32];
+        let second = [0x93; 32];
+        assert_ne!(
+            digest(&[first]),
+            digest(&[second]),
+            "a zero-pair recording's normalized PCM identity must remain bound"
+        );
+        assert_ne!(
+            digest(&[first, second]),
+            digest(&[second, first]),
+            "record-framed zero-pair blocks must retain deterministic recording order"
+        );
+        assert_ne!(
+            digest(&[first]),
+            digest(&[first, second]),
+            "adding an empty recording must change the selected-universe identity"
+        );
+    }
+
+    #[test]
+    fn sidecar_pair_ring_never_grows_past_its_initial_bound() {
+        let maximum_lag = super::PUBLIC_SIDECAR_PAIR_LAGS_FRAMES
+            [super::PUBLIC_SIDECAR_PAIR_LAGS_FRAMES.len() - 1];
+        let requested_capacity = maximum_lag + 1;
+        let mut ring = std::collections::VecDeque::with_capacity(requested_capacity);
+        let initial_capacity = ring.capacity();
+        let mut peak_len = 0;
+        let mut peak_capacity = initial_capacity;
+
+        for frame_index in 0_usize..10_000 {
+            super::push_bounded_sidecar_ring_entry(
+                &mut ring,
+                frame_index,
+                maximum_lag,
+                frame_index,
+                |entry| *entry,
+            )
+            .expect("bounded ring push");
+            peak_len = peak_len.max(ring.len());
+            peak_capacity = peak_capacity.max(ring.capacity());
+            assert_eq!(ring.back().copied(), Some(frame_index));
+            assert_eq!(
+                ring.front().copied(),
+                Some(frame_index.saturating_sub(maximum_lag))
+            );
+        }
+
+        assert_eq!(peak_len, requested_capacity);
+        assert_eq!(peak_capacity, initial_capacity);
+        assert!(initial_capacity >= requested_capacity);
+    }
+
+    #[test]
+    fn sidecar_reference_sweep_matches_overlap_ignore_and_boundary_semantics() {
+        let reference = DiarizationReferenceDocument {
+            schema_version: DIARIZATION_REFERENCE_SCHEMA_VERSION.to_owned(),
+            recording_id: "sidecar-reference-sweep".to_owned(),
+            duration_ms: 2_000,
+            turns: vec![
+                EvaluationTurn::labeled(0, 300, "speaker-a"),
+                EvaluationTurn::labeled(100, 400, "speaker-a"),
+                EvaluationTurn::labeled(250, 500, "speaker-b"),
+                EvaluationTurn::unknown(600, 700),
+                EvaluationTurn::labeled(800, 900, "speaker-a"),
+            ],
+            ignored_regions: vec![
+                EvaluationRegion {
+                    start_ms: 50,
+                    end_ms: 150,
+                    reason_code: "first-ignore".to_owned(),
+                },
+                EvaluationRegion {
+                    start_ms: 120,
+                    end_ms: 200,
+                    reason_code: "overlapping-ignore".to_owned(),
+                },
+                EvaluationRegion {
+                    start_ms: 450,
+                    end_ms: 460,
+                    reason_code: "boundary-ignore".to_owned(),
+                },
+            ],
+            speaker_hints: Vec::new(),
+            words: Vec::new(),
+        };
+        let reference_changes = [500, 1_500];
+        let mut sweep =
+            super::SidecarReferenceSweep::new(&reference, &reference_changes).expect("sweep");
+        for (timestamp_ms, expected_speaker, expected_boundary) in [
+            (0, Some("speaker-a"), Some(false)),
+            (50, None, None),
+            (149, None, None),
+            (150, None, None),
+            (200, Some("speaker-a"), Some(false)),
+            (249, Some("speaker-a"), Some(false)),
+            (250, None, Some(true)),
+            (300, None, Some(true)),
+            (400, Some("speaker-b"), Some(true)),
+            (450, None, None),
+            (460, Some("speaker-b"), Some(true)),
+            (500, None, Some(true)),
+            (600, None, Some(true)),
+            (700, None, Some(true)),
+            (751, None, None),
+            (800, Some("speaker-a"), Some(false)),
+            (900, None, None),
+            (1_250, None, Some(true)),
+            (1_500, None, Some(true)),
+            (1_751, None, None),
+        ] {
+            let label = sweep.label_at_ms(timestamp_ms).expect("ordered label");
+            assert_eq!(label.speaker, expected_speaker, "speaker at {timestamp_ms}");
+            assert_eq!(
+                label.boundary, expected_boundary,
+                "boundary at {timestamp_ms}"
+            );
+        }
+
+        let mut decreasing =
+            super::SidecarReferenceSweep::new(&reference, &reference_changes).expect("sweep");
+        decreasing.label_at_ms(10).expect("first timestamp");
+        assert!(decreasing.label_at_ms(9).is_err());
+
+        let mut exhaustive =
+            super::SidecarReferenceSweep::new(&reference, &reference_changes).expect("sweep");
+        for timestamp_ms in 0..reference.duration_ms {
+            let ignored = reference
+                .ignored_regions
+                .iter()
+                .any(|region| region.start_ms <= timestamp_ms && timestamp_ms < region.end_ms);
+            let mut expected_speaker = None;
+            let mut speaker_conflict = false;
+            for turn in reference
+                .turns
+                .iter()
+                .filter(|turn| turn.start_ms <= timestamp_ms && timestamp_ms < turn.end_ms)
+            {
+                let Some(speaker) = turn.speaker.as_deref() else {
+                    speaker_conflict = true;
+                    continue;
+                };
+                if expected_speaker.is_some_and(|expected| expected != speaker) {
+                    speaker_conflict = true;
+                } else {
+                    expected_speaker = Some(speaker);
+                }
+            }
+            if speaker_conflict {
+                expected_speaker = None;
+            }
+            let expected_boundary = if ignored {
+                None
+            } else if reference_changes.iter().any(|change| {
+                change.abs_diff(timestamp_ms) <= super::PUBLIC_SIDECAR_BOUNDARY_COLLAR_MS
+            }) {
+                Some(true)
+            } else {
+                expected_speaker.map(|_| false)
+            };
+            let expected_speaker = (!ignored).then_some(expected_speaker).flatten();
+            assert_eq!(
+                exhaustive.label_at_ms(timestamp_ms).expect("ordered label"),
+                super::SidecarReferenceFrameLabel {
+                    speaker: expected_speaker,
+                    boundary: expected_boundary,
+                },
+                "oracle mismatch at {timestamp_ms}",
+            );
+        }
+
+        let mut unsorted_turns = reference.clone();
+        unsorted_turns.turns.swap(0, 1);
+        assert!(super::SidecarReferenceSweep::new(&unsorted_turns, &reference_changes).is_err());
+        let mut unsorted_ignored = reference.clone();
+        unsorted_ignored.ignored_regions.swap(0, 2);
+        assert!(super::SidecarReferenceSweep::new(&unsorted_ignored, &reference_changes).is_err());
+    }
+
+    #[test]
+    fn sidecar_bootstrap_is_fixed_cancellable_and_identity_aligned() {
+        let baseline = (0_u8..5)
+            .map(|index| super::SidecarRecordingAccuracy {
+                recording_audio_sha256: [index; 32],
+                reference_sha256: [index.wrapping_add(16); 32],
+                der: Some(0.20 + f64::from(index) * 0.01),
+                jer: Some(0.30 + f64::from(index) * 0.01),
+            })
+            .collect::<Vec<_>>();
+        let candidate = (0_u8..5)
+            .map(|index| super::SidecarRecordingAccuracy {
+                recording_audio_sha256: [index; 32],
+                reference_sha256: [index.wrapping_add(16); 32],
+                der: Some(0.19 + f64::from(index) * 0.01),
+                jer: Some(0.29 + f64::from(index) * 0.01),
+            })
+            .collect::<Vec<_>>();
+        let first = super::paired_sidecar_uncertainty(
+            &baseline,
+            &candidate,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            EvaluationSplit::Development,
+            &mut || false,
+        )
+        .expect("first fixed bootstrap");
+        let repeated = super::paired_sidecar_uncertainty(
+            &baseline,
+            &candidate,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            EvaluationSplit::Development,
+            &mut || false,
+        )
+        .expect("repeated fixed bootstrap");
+        assert_eq!(first, repeated);
+
+        let mut baseline_with_inert_row = baseline.clone();
+        baseline_with_inert_row.push(super::SidecarRecordingAccuracy {
+            recording_audio_sha256: [0xf0; 32],
+            reference_sha256: [0xf1; 32],
+            der: None,
+            jer: None,
+        });
+        let mut candidate_with_inert_row = candidate.clone();
+        candidate_with_inert_row.push(super::SidecarRecordingAccuracy {
+            recording_audio_sha256: [0xf0; 32],
+            reference_sha256: [0xf1; 32],
+            der: None,
+            jer: None,
+        });
+        let inert_row = super::paired_sidecar_uncertainty(
+            &baseline_with_inert_row,
+            &candidate_with_inert_row,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            EvaluationSplit::Development,
+            &mut || false,
+        )
+        .expect("inert null row bootstrap");
+        assert_eq!(first, inert_row);
+
+        let distinct_lane = super::paired_sidecar_uncertainty(
+            &baseline,
+            &candidate,
+            super::PublicCorpusSidecarLane::FrameD4L4,
+            EvaluationSplit::Development,
+            &mut || false,
+        )
+        .expect("distinct-lane bootstrap");
+        assert_ne!(
+            first.bootstrap_seed_sha256,
+            distinct_lane.bootstrap_seed_sha256
+        );
+
+        let mut misaligned = candidate.clone();
+        misaligned[0].recording_audio_sha256 = [0xff; 32];
+        assert!(
+            super::paired_sidecar_uncertainty(
+                &baseline,
+                &misaligned,
+                super::PublicCorpusSidecarLane::FrameHaarL4,
+                EvaluationSplit::Development,
+                &mut || false,
+            )
+            .is_err()
+        );
+        let mut reference_misaligned = candidate.clone();
+        reference_misaligned[0].reference_sha256 = [0xfe; 32];
+        assert!(
+            super::paired_sidecar_uncertainty(
+                &baseline,
+                &reference_misaligned,
+                super::PublicCorpusSidecarLane::FrameHaarL4,
+                EvaluationSplit::Development,
+                &mut || false,
+            )
+            .is_err()
+        );
+        assert!(
+            super::paired_sidecar_uncertainty(
+                &baseline,
+                &candidate,
+                super::PublicCorpusSidecarLane::FrameHaarL4,
+                EvaluationSplit::Development,
+                &mut || true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sidecar_calibration_fit_requires_both_classes() {
+        let mut negative_only = super::SidecarCalibrationFitHistogram::new();
+        negative_only.push(0.25, false).expect("negative sample");
+        assert!(
+            super::fit_public_sidecar_calibration(&negative_only)
+                .expect("negative-only fit")
+                .is_none()
+        );
+
+        let mut positive_only = super::SidecarCalibrationFitHistogram::new();
+        positive_only.push(0.75, true).expect("positive sample");
+        assert!(
+            super::fit_public_sidecar_calibration(&positive_only)
+                .expect("positive-only fit")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sidecar_calibration_fit_preserves_empirical_class_priors() {
+        let fitted_probability = |positive_count: usize| {
+            let mut histogram = super::SidecarCalibrationFitHistogram::new();
+            for index in 0..10 {
+                histogram
+                    .push(0.50, index < positive_count)
+                    .expect("fit observation");
+            }
+            let calibration = super::fit_public_sidecar_calibration(&histogram)
+                .expect("calibration fit")
+                .expect("both-class calibration");
+            let contrast = crate::diarization::AcousticSidecarOwnerContrast {
+                owner_contrast: [0.50, 0.0, 0.0],
+                owner_available: [true, false, false],
+                comparable_components: super::PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+                component_comparisons: super::PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+            };
+            super::public_sidecar_probability(&calibration, contrast)
+                .expect("calibrated probability")
+                .expect("comparable probability")
+        };
+
+        let rare_probability = fitted_probability(1);
+        let common_probability = fitted_probability(9);
+        assert!(
+            rare_probability < 0.20,
+            "a 10% positive prior must not be class-balanced toward 0.5: {rare_probability}"
+        );
+        assert!(
+            common_probability > 0.80,
+            "a 90% positive prior must remain representable: {common_probability}"
+        );
+    }
+
+    #[test]
+    fn sidecar_pair_calibration_has_an_independent_target_and_fail_closed_bounds() {
+        let mut one_class = super::SidecarCalibrationFitHistogram::new();
+        one_class.push(0.25, false).expect("same-speaker row");
+        assert!(
+            super::fit_public_sidecar_pair_calibration(&one_class)
+                .expect("one-class pair fit")
+                .is_none()
+        );
+
+        let mut histogram = super::SidecarCalibrationFitHistogram::new();
+        histogram.push(0.10, false).expect("same-speaker row");
+        histogram.push(0.90, true).expect("different-speaker row");
+        let fitted = super::fit_public_sidecar_pair_calibration(&histogram)
+            .expect("pair calibration fit")
+            .expect("both-class pair calibration");
+        super::validate_public_sidecar_pair_calibration(&fitted)
+            .expect("fitter output must satisfy its public contract");
+        assert_eq!(
+            fitted.target_id,
+            super::PUBLIC_CORPUS_SIDECAR_PAIR_PROBABILITY_TARGET_VERSION
+        );
+
+        let mut wrong_target = fitted.clone();
+        wrong_target.target_id = "different-target".to_owned();
+        wrong_target.calibration_sha256 =
+            super::public_sidecar_pair_calibration_sha256(&wrong_target)
+                .expect("wrong-target hash");
+        assert!(super::validate_public_sidecar_pair_calibration(&wrong_target).is_err());
+
+        let mut off_lattice = fitted.clone();
+        off_lattice.logit_intercept = -0.10;
+        off_lattice.calibration_sha256 =
+            super::public_sidecar_pair_calibration_sha256(&off_lattice).expect("off-lattice hash");
+        assert!(super::validate_public_sidecar_pair_calibration(&off_lattice).is_err());
+
+        let mut impossible_counts = fitted;
+        impossible_counts.fit_positive_count = impossible_counts.fit_observation_count;
+        impossible_counts.calibration_sha256 =
+            super::public_sidecar_pair_calibration_sha256(&impossible_counts)
+                .expect("impossible-count hash");
+        assert!(super::validate_public_sidecar_pair_calibration(&impossible_counts).is_err());
+    }
+
+    #[test]
+    fn sidecar_reliability_brier_is_stable_near_probability_boundaries() {
+        let mut probabilities = super::SidecarProbabilityAccumulator::new();
+        probabilities
+            .push(f64::from(1.0_f32 - f32::EPSILON), true)
+            .expect("near-certain positive");
+        let finished = probabilities.finish_reliability();
+        assert!(finished.brier_score.is_some_and(|score| score >= 0.0));
+        assert!(super::sidecar_reliability_is_valid(
+            probabilities.observation_count,
+            probabilities.positive_count,
+            finished.brier_score,
+            finished.expected_calibration_error,
+            &finished.reliability,
+        ));
+    }
+
+    #[test]
+    fn sidecar_pair_gate_metrics_are_recomputed_from_retained_aggregates() {
+        let mut accumulator = super::SidecarPairAccumulator::new();
+        for _ in 0..8 {
+            accumulator
+                .push(f64::from(0.10_f32), false)
+                .expect("same-speaker row");
+            accumulator
+                .push(f64::from(0.90_f32), true)
+                .expect("different-speaker row");
+        }
+        let metrics = accumulator.finish().expect("pair metrics");
+        assert!(super::sidecar_pair_metrics_are_valid(&metrics));
+
+        let changed = |value: f64| if value == 0.0 { 0.125 } else { 0.0 };
+
+        let mut auc = metrics.clone();
+        auc.roc_auc = auc.roc_auc.map(changed);
+        assert!(!super::sidecar_pair_metrics_are_valid(&auc));
+
+        let mut brier = metrics.clone();
+        brier.brier_score = brier.brier_score.map(changed);
+        assert!(!super::sidecar_pair_metrics_are_valid(&brier));
+
+        let mut ece = metrics.clone();
+        ece.expected_calibration_error = ece.expected_calibration_error.map(changed);
+        assert!(!super::sidecar_pair_metrics_are_valid(&ece));
+
+        let mut subpicounit_ece = metrics.clone();
+        let canonical_ece = subpicounit_ece
+            .expected_calibration_error
+            .expect("nonempty pair ECE");
+        let noncanonical_ece = f64::from_bits(canonical_ece.to_bits() + 1);
+        assert_ne!(
+            noncanonical_ece,
+            super::canonical_evidence_number(noncanonical_ece)
+        );
+        subpicounit_ece.expected_calibration_error = Some(noncanonical_ece);
+        assert!(
+            !super::sidecar_pair_metrics_are_valid(&subpicounit_ece),
+            "sub-picounit noncanonical ECE tampering must be rejected exactly"
+        );
+
+        let mut same_mean = metrics.clone();
+        same_mean.mean_different_probability_given_same_speaker = same_mean
+            .mean_different_probability_given_same_speaker
+            .map(changed);
+        assert!(!super::sidecar_pair_metrics_are_valid(&same_mean));
+
+        let mut reliability_sum = metrics.clone();
+        let occupied = reliability_sum
+            .reliability
+            .iter_mut()
+            .find(|bin| bin.observation_count > 0)
+            .expect("occupied reliability bin");
+        occupied.squared_error_sum =
+            super::canonical_evidence_number(occupied.squared_error_sum + 0.01);
+        assert!(!super::sidecar_pair_metrics_are_valid(&reliability_sum));
+
+        let mut impossible_negative_subset = metrics.clone();
+        let forged = &mut impossible_negative_subset.reliability[5];
+        forged.observation_count = 100;
+        forged.positive_count = 50;
+        forged.probability_sum = 50.0;
+        forged.positive_probability_sum = 29.5;
+        forged.squared_probability_sum = 25.0;
+        forged.positive_squared_probability_sum = 17.405;
+        forged.squared_error_sum = 16.0;
+        forged.mean_probability = Some(0.5);
+        forged.empirical_frequency = Some(0.5);
+        for (index, bin) in impossible_negative_subset
+            .reliability
+            .iter_mut()
+            .enumerate()
+        {
+            if index != 5 {
+                bin.observation_count = 0;
+                bin.positive_count = 0;
+                bin.probability_sum = 0.0;
+                bin.positive_probability_sum = 0.0;
+                bin.squared_probability_sum = 0.0;
+                bin.positive_squared_probability_sum = 0.0;
+                bin.squared_error_sum = 0.0;
+                bin.mean_probability = None;
+                bin.empirical_frequency = None;
+            }
+        }
+        impossible_negative_subset.comparison_count = 100;
+        impossible_negative_subset.same_speaker_count = 50;
+        impossible_negative_subset.different_speaker_count = 50;
+        impossible_negative_subset.mean_different_probability_given_same_speaker = Some(0.41);
+        impossible_negative_subset.mean_different_probability_given_different_speaker = Some(0.59);
+        impossible_negative_subset.roc_auc = Some(0.5);
+        impossible_negative_subset.brier_score = Some(0.16);
+        impossible_negative_subset.expected_calibration_error = Some(0.0);
+        assert!(
+            super::verified_sidecar_reliability(
+                100,
+                50,
+                Some(0.16),
+                Some(0.0),
+                &impossible_negative_subset.reliability,
+            )
+            .is_none(),
+            "negative-class probability mass below a bin boundary must be rejected"
+        );
+
+        assert!(
+            !super::sidecar_probability_moments_are_feasible(
+                0.5, 0.6, 100, 50, 50.5, 25.25, 26.0, 13.0, 25.5,
+            ),
+            "second moments above the bounded-interval secant must be rejected"
+        );
+        assert!(
+            !super::sidecar_probability_moments_are_feasible(
+                0.5, 0.51, 1, 0, 0.505, 0.0, 0.255_04, 0.0, 0.255_04,
+            ),
+            "one observation's first moment must determine its second moment"
+        );
+
+        let mut impossible_fine_bin = metrics.clone();
+        for bin in &mut impossible_fine_bin.reliability {
+            bin.observation_count = 0;
+            bin.positive_count = 0;
+            bin.probability_sum = 0.0;
+            bin.positive_probability_sum = 0.0;
+            bin.squared_probability_sum = 0.0;
+            bin.positive_squared_probability_sum = 0.0;
+            bin.squared_error_sum = 0.0;
+            bin.mean_probability = None;
+            bin.empirical_frequency = None;
+        }
+        for bin in &mut impossible_fine_bin.score_histogram {
+            bin.same_speaker_count = 0;
+            bin.different_speaker_count = 0;
+            bin.probability_sum = 0.0;
+            bin.different_speaker_probability_sum = 0.0;
+            bin.squared_probability_sum = 0.0;
+            bin.different_speaker_squared_probability_sum = 0.0;
+            bin.squared_error_sum = 0.0;
+        }
+        let mean = super::canonical_evidence_number(0.505);
+        let ece = super::canonical_evidence_number((mean - 0.5).abs());
+        let brier = super::canonical_evidence_number(25.04 / 100.0);
+        let coarse = &mut impossible_fine_bin.reliability[5];
+        coarse.observation_count = 100;
+        coarse.positive_count = 50;
+        coarse.probability_sum = 50.5;
+        coarse.positive_probability_sum = 25.25;
+        coarse.squared_probability_sum = 25.54;
+        coarse.positive_squared_probability_sum = 12.77;
+        coarse.squared_error_sum = 25.04;
+        coarse.mean_probability = Some(mean);
+        coarse.empirical_frequency = Some(0.5);
+        let fine = &mut impossible_fine_bin.score_histogram[50];
+        fine.same_speaker_count = 50;
+        fine.different_speaker_count = 50;
+        fine.probability_sum = 50.5;
+        fine.different_speaker_probability_sum = 25.25;
+        fine.squared_probability_sum = 25.54;
+        fine.different_speaker_squared_probability_sum = 12.77;
+        fine.squared_error_sum = 25.04;
+        impossible_fine_bin.comparison_count = 100;
+        impossible_fine_bin.same_speaker_count = 50;
+        impossible_fine_bin.different_speaker_count = 50;
+        impossible_fine_bin.mean_different_probability_given_same_speaker = Some(mean);
+        impossible_fine_bin.mean_different_probability_given_different_speaker = Some(mean);
+        impossible_fine_bin.roc_auc = Some(0.5);
+        impossible_fine_bin.brier_score = Some(brier);
+        impossible_fine_bin.expected_calibration_error = Some(ece);
+        assert!(
+            super::verified_sidecar_reliability(
+                100,
+                50,
+                Some(brier),
+                Some(ece),
+                &impossible_fine_bin.reliability,
+            )
+            .is_some(),
+            "the wider coarse bin is deliberately feasible"
+        );
+        assert!(
+            !super::sidecar_pair_metrics_are_valid(&impossible_fine_bin),
+            "the tighter fine-bin secant must reject an impossible score histogram"
+        );
+
+        let mut contradictory_histogram = metrics.clone();
+        let low_index = contradictory_histogram
+            .score_histogram
+            .iter()
+            .position(|bin| bin.same_speaker_count > 0)
+            .expect("same-speaker score bin");
+        let high_index = contradictory_histogram
+            .score_histogram
+            .iter()
+            .position(|bin| bin.different_speaker_count > 0)
+            .expect("different-speaker score bin");
+        let low = &mut contradictory_histogram.score_histogram[low_index];
+        low.different_speaker_count = low.same_speaker_count;
+        low.same_speaker_count = 0;
+        low.different_speaker_probability_sum = low.probability_sum;
+        low.different_speaker_squared_probability_sum = low.squared_probability_sum;
+        low.squared_error_sum = super::canonical_evidence_number(
+            low.squared_probability_sum - 2.0 * low.probability_sum
+                + low.different_speaker_count as f64,
+        );
+        let high = &mut contradictory_histogram.score_histogram[high_index];
+        high.same_speaker_count = high.different_speaker_count;
+        high.different_speaker_count = 0;
+        high.different_speaker_probability_sum = 0.0;
+        high.different_speaker_squared_probability_sum = 0.0;
+        high.squared_error_sum = high.squared_probability_sum;
+        contradictory_histogram.roc_auc = Some(0.0);
+        assert!(
+            !super::sidecar_pair_metrics_are_valid(&contradictory_histogram),
+            "fine score ordering must remain linked to coarse reliability evidence"
+        );
+
+        let mut score_histogram = metrics;
+        score_histogram.score_histogram[0].same_speaker_count += 1;
+        assert!(!super::sidecar_pair_metrics_are_valid(&score_histogram));
+    }
+
+    #[test]
+    fn sidecar_pair_histogram_cannot_split_equal_f32_scores_across_bins() {
+        let score = f64::from(0.55_f32);
+        let score_index = super::sidecar_f32_probability_bin_index(
+            score as f32,
+            super::PUBLIC_SIDECAR_PAIR_SCORE_BINS,
+        );
+        let lower_index = score_index - 1;
+        assert_eq!(
+            lower_index
+                / (super::PUBLIC_SIDECAR_PAIR_SCORE_BINS / super::PUBLIC_SIDECAR_RELIABILITY_BINS),
+            score_index
+                / (super::PUBLIC_SIDECAR_PAIR_SCORE_BINS / super::PUBLIC_SIDECAR_RELIABILITY_BINS),
+            "the forgery must remain inside one linked reliability bin"
+        );
+        let (_, lower_highest) = super::sidecar_f32_probability_bin_support(
+            lower_index,
+            super::PUBLIC_SIDECAR_PAIR_SCORE_BINS,
+        )
+        .expect("lower score-bin support");
+        assert!(score > lower_highest);
+
+        let mut accumulator = super::SidecarPairAccumulator::new();
+        accumulator.push(score, false).expect("same-speaker score");
+        accumulator
+            .push(score, true)
+            .expect("different-speaker score");
+        let mut forged = accumulator.finish().expect("equal-score metrics");
+        assert_eq!(forged.roc_auc, Some(0.5));
+        assert!(super::sidecar_pair_metrics_are_valid(&forged));
+
+        let probability_sum = super::canonical_evidence_number(score);
+        let squared_probability_sum = super::canonical_evidence_number(score * score);
+        let positive_squared_error = super::canonical_evidence_number((score - 1.0).powi(2));
+        let lower = &mut forged.score_histogram[lower_index];
+        lower.same_speaker_count = 1;
+        lower.probability_sum = probability_sum;
+        lower.squared_probability_sum = squared_probability_sum;
+        lower.squared_error_sum = squared_probability_sum;
+        let source = &mut forged.score_histogram[score_index];
+        source.same_speaker_count = 0;
+        source.different_speaker_count = 1;
+        source.probability_sum = probability_sum;
+        source.different_speaker_probability_sum = probability_sum;
+        source.squared_probability_sum = squared_probability_sum;
+        source.different_speaker_squared_probability_sum = squared_probability_sum;
+        source.squared_error_sum = positive_squared_error;
+        forged.roc_auc = Some(1.0);
+
+        assert!(
+            !super::sidecar_pair_metrics_are_valid(&forged),
+            "one representable score cannot be split to fabricate strict AUC ordering"
+        );
+    }
+
+    #[test]
+    fn sidecar_pair_histogram_rejects_single_cross_boundary_f32_forgery() {
+        let (_, lower_highest) =
+            super::sidecar_f32_probability_bin_support(0, super::PUBLIC_SIDECAR_PAIR_SCORE_BINS)
+                .expect("lowest score-bin support");
+        let (upper_lowest, _) =
+            super::sidecar_f32_probability_bin_support(1, super::PUBLIC_SIDECAR_PAIR_SCORE_BINS)
+                .expect("second score-bin support");
+        assert!(upper_lowest > lower_highest);
+        assert!(upper_lowest - lower_highest < 1e-9);
+
+        let mut accumulator = super::SidecarPairAccumulator::new();
+        for _ in 0..4 {
+            accumulator
+                .push(lower_highest, false)
+                .expect("lower-bin same-speaker score");
+        }
+        accumulator
+            .push(upper_lowest, false)
+            .expect("upper-bin same-speaker score");
+        accumulator
+            .push(upper_lowest, true)
+            .expect("upper-bin different-speaker score");
+        let mut forged = accumulator.finish().expect("boundary-adjacent metrics");
+        assert_eq!(forged.roc_auc, Some(0.9));
+        assert!(super::sidecar_pair_metrics_are_valid(&forged));
+
+        let moved_square = upper_lowest * upper_lowest;
+        let lower = &mut forged.score_histogram[0];
+        lower.same_speaker_count += 1;
+        lower.probability_sum =
+            super::canonical_evidence_number(lower.probability_sum + upper_lowest);
+        lower.squared_probability_sum =
+            super::canonical_evidence_number(lower.squared_probability_sum + moved_square);
+        lower.squared_error_sum =
+            super::canonical_evidence_number(lower.squared_error_sum + moved_square);
+        let upper = &mut forged.score_histogram[1];
+        upper.same_speaker_count -= 1;
+        upper.probability_sum =
+            super::canonical_evidence_number(upper.probability_sum - upper_lowest);
+        upper.squared_probability_sum =
+            super::canonical_evidence_number(upper.squared_probability_sum - moved_square);
+        upper.squared_error_sum =
+            super::canonical_evidence_number(upper.squared_error_sum - moved_square);
+        forged.roc_auc = Some(1.0);
+
+        assert!(
+            !super::sidecar_pair_metrics_are_valid(&forged),
+            "one adjacent-bin f32 score cannot be moved to fabricate perfect AUC"
+        );
+    }
+
+    #[test]
+    fn sidecar_pair_histogram_rejects_adjacent_bin_class_swap_auc_forgery() {
+        let (_, lower_highest) =
+            super::sidecar_f32_probability_bin_support(0, super::PUBLIC_SIDECAR_PAIR_SCORE_BINS)
+                .expect("lowest score-bin support");
+        let (upper_lowest, _) =
+            super::sidecar_f32_probability_bin_support(1, super::PUBLIC_SIDECAR_PAIR_SCORE_BINS)
+                .expect("second score-bin support");
+        assert!(upper_lowest - lower_highest < 1e-9);
+
+        let mut accumulator = super::SidecarPairAccumulator::new();
+        accumulator
+            .push(lower_highest, true)
+            .expect("lower different-speaker score");
+        accumulator
+            .push(upper_lowest, false)
+            .expect("upper same-speaker score");
+        let mut forged = accumulator.finish().expect("boundary-adjacent metrics");
+        assert_eq!(forged.roc_auc, Some(0.0));
+        assert!(super::sidecar_pair_metrics_are_valid(&forged));
+
+        let lower_square = lower_highest * lower_highest;
+        let upper_square = upper_lowest * upper_lowest;
+        let lower = &mut forged.score_histogram[0];
+        lower.same_speaker_count = 1;
+        lower.different_speaker_count = 0;
+        lower.different_speaker_probability_sum = 0.0;
+        lower.different_speaker_squared_probability_sum = 0.0;
+        lower.squared_error_sum = super::canonical_evidence_number(lower_square);
+        let upper = &mut forged.score_histogram[1];
+        upper.same_speaker_count = 0;
+        upper.different_speaker_count = 1;
+        upper.different_speaker_probability_sum = super::canonical_evidence_number(upper_lowest);
+        upper.different_speaker_squared_probability_sum =
+            super::canonical_evidence_number(upper_square);
+        upper.squared_error_sum = super::canonical_evidence_number((upper_lowest - 1.0).powi(2));
+        forged.roc_auc = Some(1.0);
+
+        assert!(
+            !super::sidecar_pair_metrics_are_valid(&forged),
+            "fine-bin class swaps cannot diverge from coarse reliability to forge AUC"
+        );
+    }
+
+    #[test]
+    fn sidecar_pair_histogram_accepts_large_genuine_f32_bin_aggregate() {
+        let score = f64::from(1.0_f32 - f32::EPSILON);
+        let mut awkward_accumulator = super::SidecarPairAccumulator::new();
+        for _ in 0..4_098 {
+            awkward_accumulator
+                .push(score, false)
+                .expect("genuine awkward-count score");
+        }
+        let awkward_metrics = awkward_accumulator
+            .finish()
+            .expect("awkward-count genuine aggregate");
+        assert!(super::sidecar_pair_metrics_are_valid(&awkward_metrics));
+
+        let mut accumulator = super::SidecarPairAccumulator::new();
+        for index in 0_usize..40_960 {
+            accumulator
+                .push(score, index.is_multiple_of(2))
+                .expect("genuine high-bin score");
+        }
+        let metrics = accumulator.finish().expect("large genuine aggregate");
+
+        assert!(
+            super::sidecar_pair_metrics_are_valid(&metrics),
+            "sequential squared-sum roundoff must not reject producer output"
+        );
+
+        let (_, lowest_bin_upper) =
+            super::sidecar_f32_probability_bin_support(0, super::PUBLIC_SIDECAR_PAIR_SCORE_BINS)
+                .expect("lowest score-bin support");
+        let mut low_bin_accumulator = super::SidecarPairAccumulator::new();
+        for _ in 0..40_960 {
+            low_bin_accumulator
+                .push(lowest_bin_upper, true)
+                .expect("genuine low-bin different-speaker score");
+        }
+        let low_bin_metrics = low_bin_accumulator
+            .finish()
+            .expect("large genuine low-bin aggregate");
+        assert!(
+            super::sidecar_pair_metrics_are_valid(&low_bin_metrics),
+            "canonical moment identities must accept a valid low-bin aggregate"
+        );
+
+        let derived_negative_score = f64::from(0.99_f32);
+        let mut derived_negative_accumulator = super::SidecarPairAccumulator::new();
+        for index in 0..64 {
+            derived_negative_accumulator
+                .push(derived_negative_score, index < 6)
+                .expect("genuine mixed-class high-bin score");
+        }
+        let derived_negative_metrics = derived_negative_accumulator
+            .finish()
+            .expect("genuine derived-negative aggregate");
+        assert!(
+            super::sidecar_pair_metrics_are_valid(&derived_negative_metrics),
+            "derived negative-class moments must retain their rounding budget"
+        );
+    }
+
+    #[test]
+    fn sidecar_probability_moments_accept_large_rounded_class_difference() {
+        let same_probability = f64::from(0.1_f32);
+        let different_probability = f64::from(0.199_999_99_f32);
+        let same_count = 1_u64;
+        let different_count = (super::MAX_RECORDINGS as u64)
+            .checked_mul(super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING as u64)
+            .and_then(|count| count.checked_sub(same_count))
+            .expect("maximum retained-pair count");
+        let observation_count = same_count + different_count;
+        let probability_sum = super::canonical_evidence_number(
+            same_probability * same_count as f64 + different_probability * different_count as f64,
+        );
+        let positive_probability_sum =
+            super::canonical_evidence_number(different_probability * different_count as f64);
+        let squared_probability_sum = super::canonical_evidence_number(
+            same_probability.powi(2) * same_count as f64
+                + different_probability.powi(2) * different_count as f64,
+        );
+        let positive_squared_probability_sum = super::canonical_evidence_number(
+            different_probability.powi(2) * different_count as f64,
+        );
+        let squared_error_sum = super::canonical_evidence_number(
+            same_probability.powi(2) * same_count as f64
+                + (different_probability - 1.0).powi(2) * different_count as f64,
+        );
+        let (support_lower, support_upper) =
+            super::sidecar_f32_probability_bin_support(1, super::PUBLIC_SIDECAR_RELIABILITY_BINS)
+                .expect("second reliability-bin support");
+
+        assert_eq!(support_lower, same_probability);
+        assert_eq!(support_upper, different_probability);
+        assert!(super::sidecar_probability_moments_are_feasible(
+            support_lower,
+            support_upper,
+            observation_count,
+            different_count,
+            probability_sum,
+            positive_probability_sum,
+            squared_probability_sum,
+            positive_squared_probability_sum,
+            squared_error_sum,
+        ));
+    }
+
+    #[test]
+    fn canonical_evidence_lattice_is_idempotent_at_f32_bin_endpoints() {
+        let awkward = 4_097.999_511_480_331_f64;
+        let canonical_awkward = super::canonical_evidence_number(awkward);
+        assert_eq!(
+            super::canonical_evidence_number(canonical_awkward),
+            canonical_awkward
+        );
+        for bin_count in [
+            super::PUBLIC_SIDECAR_RELIABILITY_BINS,
+            super::PUBLIC_SIDECAR_PAIR_SCORE_BINS,
+        ] {
+            for index in 0..bin_count {
+                let (lower, upper) = super::sidecar_f32_probability_bin_support(index, bin_count)
+                    .expect("f32 score-bin support");
+                for count in [1_u64, 2, 3, 4_098, 8_192, 40_960] {
+                    for value in [
+                        lower * count as f64,
+                        upper * count as f64,
+                        lower.powi(2) * count as f64,
+                        upper.powi(2) * count as f64,
+                    ] {
+                        let canonical = super::canonical_evidence_number(value);
+                        assert_eq!(
+                            super::canonical_evidence_number(canonical),
+                            canonical,
+                            "bin_count={bin_count} index={index} count={count} value={value}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_calibration_rejects_values_outside_the_frozen_fit_lattice() {
+        let mut histogram = super::SidecarCalibrationFitHistogram::new();
+        histogram.push(0.10, false).expect("negative sample");
+        histogram.push(0.90, true).expect("positive sample");
+        let fitted = super::fit_public_sidecar_calibration(&histogram)
+            .expect("calibration fit")
+            .expect("both-class calibration");
+        super::sidecar_evaluation_request(super::PublicCorpusSidecarLane::FrameHaarL4, &fitted)
+            .expect("fitter output is accepted");
+
+        let mut off_lattice = fitted.clone();
+        off_lattice.logit_intercept = -0.10;
+        off_lattice.calibration_sha256 =
+            super::public_sidecar_calibration_sha256(&off_lattice).expect("tampered hash");
+        assert!(
+            super::sidecar_evaluation_request(
+                super::PublicCorpusSidecarLane::FrameHaarL4,
+                &off_lattice,
+            )
+            .expect_err("off-lattice intercept")
+            .to_string()
+            .contains("sidecar_calibration")
+        );
+
+        let mut wrong_minimum = fitted;
+        wrong_minimum.minimum_comparable_components += 1;
+        wrong_minimum.calibration_sha256 =
+            super::public_sidecar_calibration_sha256(&wrong_minimum).expect("tampered hash");
+        assert!(
+            super::sidecar_evaluation_request(
+                super::PublicCorpusSidecarLane::FrameHaarL4,
+                &wrong_minimum,
+            )
+            .expect_err("wrong comparable-component minimum")
+            .to_string()
+            .contains("sidecar_calibration")
+        );
+    }
+
+    #[test]
+    fn sidecar_public_verifier_round_trips_and_rejects_rehashed_tampering() {
+        let evidence = valid_unavailable_sidecar_evidence();
+        super::verify_public_corpus_sidecar_study_evidence(&evidence)
+            .expect("valid unavailable evidence");
+        let encoded = serde_json::to_vec(&evidence).expect("sidecar JSON");
+        assert_eq!(
+            super::parse_public_corpus_sidecar_study_evidence(&encoded)
+                .expect("verified round trip"),
+            evidence
+        );
+
+        let mut noncanonical_unavailable = evidence.clone();
+        noncanonical_unavailable.variants[1].splits[0]
+            .coverage
+            .retained_pair_sample_capacity = 1;
+        rehash_sidecar_evidence(&mut noncanonical_unavailable);
+        let error = super::verify_public_corpus_sidecar_study_evidence(&noncanonical_unavailable)
+            .expect_err("rehashed noncanonical unavailable split");
+        assert!(error.to_string().contains("sidecar_unavailable_shape"));
+
+        let mut off_lattice = evidence;
+        let mut calibration = super::PublicCorpusSidecarCalibration {
+            fit_id: super::PUBLIC_CORPUS_SIDECAR_CALIBRATION_FIT_VERSION.to_owned(),
+            logit_intercept: -0.10,
+            contrast_weight: 1.0,
+            minimum_comparable_components: super::PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS,
+            fit_observation_count: 2,
+            fit_positive_count: 1,
+            fit_brier_score: Some(0.20),
+            calibration_sha256: String::new(),
+        };
+        calibration.calibration_sha256 =
+            super::public_sidecar_calibration_sha256(&calibration).expect("calibration hash");
+        off_lattice.variants[1].calibration = Some(calibration);
+        rehash_sidecar_evidence(&mut off_lattice);
+        let error = super::verify_public_corpus_sidecar_study_evidence(&off_lattice)
+            .expect_err("rehashed off-lattice calibration");
+        assert!(error.to_string().contains("sidecar_calibration"));
+    }
+
+    #[test]
+    fn sidecar_public_verifier_rejects_rehashed_zero_duration_protocol() {
+        let mut evidence = valid_unavailable_sidecar_evidence();
+        evidence.protocol.maximum_recording_duration_ms = Some(0);
+        evidence.protocol_sha256 =
+            super::canonical_sha256(&evidence.protocol).expect("zero-duration protocol hash");
+        for variant in &mut evidence.variants {
+            variant.lane_configuration_sha256 =
+                super::canonical_sha256(&super::PublicCorpusSidecarLaneFingerprint {
+                    runner_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+                    lane: variant.lane,
+                    fusion_scope: variant.fusion_scope,
+                    study_configuration_sha256: &variant.study_configuration_sha256,
+                    fusion_configuration_sha256: variant.fusion_configuration_sha256.as_deref(),
+                    pair_calibration_sha256: variant
+                        .pair_calibration
+                        .as_ref()
+                        .map(|calibration| calibration.calibration_sha256.as_str()),
+                    protocol_sha256: &evidence.protocol_sha256,
+                })
+                .expect("zero-duration lane hash");
+        }
+        rehash_sidecar_evidence(&mut evidence);
+
+        let error = super::verify_public_corpus_sidecar_study_evidence(&evidence)
+            .expect_err("rehashed zero-duration protocol");
+        assert!(error.to_string().contains("sidecar_protocol"));
+    }
+
+    #[test]
+    fn sidecar_runner_rejects_mismatched_stage_locks_before_path_access() {
+        let absent_root = std::path::Path::new("/franken-whisper-absent-sidecar-root");
+        let absent_descriptor = absent_root.join("descriptor.json");
+        let absent_bundle = absent_root.join("bundle.json");
+        let absent_evidence = absent_root.join("evidence.json");
+        let absent_lock = absent_root.join("development-lock.json");
+
+        let development_error = super::run_public_corpus_sidecar_study_with_cancel(
+            super::PublicCorpusSidecarStudyRequest {
+                project_root: absent_root,
+                input_root: absent_root,
+                descriptor_path: &absent_descriptor,
+                bundle_output_path: &absent_bundle,
+                evidence_output_path: &absent_evidence,
+                license_acknowledgement_id: "unused-stage-lock-test",
+                maximum_recording_duration_ms: None,
+                evaluation_stage: super::PublicCorpusEvaluationStage::Development,
+                locked_development_evidence_path: Some(&absent_lock),
+            },
+            || false,
+        )
+        .expect_err("development must reject a held-out lock");
+        assert!(development_error.to_string().contains("sidecar_stage_lock"));
+
+        let certification_error = super::run_public_corpus_sidecar_study_with_cancel(
+            super::PublicCorpusSidecarStudyRequest {
+                project_root: absent_root,
+                input_root: absent_root,
+                descriptor_path: &absent_descriptor,
+                bundle_output_path: &absent_bundle,
+                evidence_output_path: &absent_evidence,
+                license_acknowledgement_id: "unused-stage-lock-test",
+                maximum_recording_duration_ms: None,
+                evaluation_stage: super::PublicCorpusEvaluationStage::Certification,
+                locked_development_evidence_path: None,
+            },
+            || false,
+        )
+        .expect_err("certification must require a development lock");
+        assert!(
+            certification_error
+                .to_string()
+                .contains("sidecar_stage_lock")
+        );
+
+        assert!(!absent_descriptor.exists());
+        assert!(!absent_bundle.exists());
+        assert!(!absent_evidence.exists());
+        assert!(!absent_lock.exists());
+    }
+
+    #[test]
+    fn sidecar_public_verifier_rejects_calibrated_unmaterialized_development_lane() {
+        let mut evidence = valid_unavailable_sidecar_evidence();
+        let mut histogram = super::SidecarCalibrationFitHistogram::new();
+        histogram.push(0.10, false).expect("negative fit row");
+        histogram.push(0.90, true).expect("positive fit row");
+        let calibration = super::fit_public_sidecar_calibration(&histogram)
+            .expect("calibration fit")
+            .expect("both-class calibration");
+        let lane = evidence.variants[1].lane;
+        let study_configuration_sha256 = evidence.variants[1].study_configuration_sha256.clone();
+        let fusion_configuration_sha256 =
+            crate::diarization::acoustic_sidecar_fusion_configuration_sha256(
+                super::sidecar_evaluation_request(lane, &calibration)
+                    .expect("calibrated lane request"),
+                evidence.protocol.detector_mode,
+            )
+            .expect("fusion configuration hash");
+        let lane_configuration_sha256 =
+            super::canonical_sha256(&super::PublicCorpusSidecarLaneFingerprint {
+                runner_version: super::PUBLIC_CORPUS_SIDECAR_STUDY_RUNNER_VERSION,
+                lane,
+                fusion_scope: super::PublicCorpusSidecarFusionScope::BoundaryFusionV2,
+                study_configuration_sha256: &study_configuration_sha256,
+                fusion_configuration_sha256: Some(&fusion_configuration_sha256),
+                pair_calibration_sha256: None,
+                protocol_sha256: &evidence.protocol_sha256,
+            })
+            .expect("calibrated lane hash");
+        evidence.variants[1].calibration = Some(calibration);
+        evidence.variants[1].fusion_configuration_sha256 = Some(fusion_configuration_sha256);
+        evidence.variants[1].lane_configuration_sha256 = lane_configuration_sha256;
+        rehash_sidecar_evidence(&mut evidence);
+
+        let error = super::verify_public_corpus_sidecar_study_evidence(&evidence)
+            .expect_err("calibrated development lane without evaluation");
+        assert!(error.to_string().contains("sidecar_stage_contract"));
+    }
+
+    #[test]
+    fn sidecar_public_verifier_rejects_unmaterialized_certification_selection() {
+        let mut evidence = valid_unavailable_sidecar_evidence();
+        let split = EvaluationSplit::Test;
+        let mut baseline_split =
+            super::unavailable_public_sidecar_split(split).expect("baseline split shell");
+        let baseline_pipeline =
+            ablation_variant(AcousticFeatureAblation::FullV2, Some(0.20), Some(0.30))
+                .splits
+                .into_iter()
+                .find(|candidate| candidate.split == split)
+                .expect("test baseline pipeline");
+        baseline_split.boundary = super::empty_sidecar_boundary_metrics(&baseline_pipeline);
+        baseline_split.performance = super::PublicCorpusSidecarPerformance {
+            audio_duration_sec: baseline_pipeline.audio_duration_sec,
+            wall_time_sec: baseline_pipeline.wall_time_sec,
+            real_time_factor: baseline_pipeline.real_time_factor,
+            sampled_peak_rss_bytes: baseline_pipeline.sampled_peak_rss_bytes,
+        };
+        baseline_split.coverage.evaluated_recording_count = baseline_pipeline.recording_count;
+        baseline_split.pipeline = Some(baseline_pipeline);
+
+        evidence.evaluation_stage = super::PublicCorpusEvaluationStage::Certification;
+        evidence.locked_development_result_sha256 = Some("a".repeat(64));
+        evidence.locked_development_accuracy_sha256 = Some("b".repeat(64));
+        evidence.selected_candidate_lane = Some(super::PublicCorpusSidecarLane::FrameHaarL4);
+        evidence.adopted_candidate_lane = None;
+        evidence.variants[0].splits = vec![baseline_split.clone()];
+        for variant in evidence.variants.iter_mut().skip(1) {
+            variant.disposition = super::PublicCorpusSidecarDisposition::Rejected;
+            variant.splits = vec![
+                super::unavailable_public_sidecar_split(split)
+                    .expect("certification unavailable split"),
+            ];
+            variant.gate = None;
+        }
+        let selected_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Certification,
+            &evidence.protocol.gate_policy,
+            &baseline_split,
+            evidence.variants[1].lane,
+            &evidence.variants[1].splits[0],
+        );
+        evidence.variants[1].gate = Some(selected_gate);
+        rehash_sidecar_evidence(&mut evidence);
+
+        let error = super::verify_public_corpus_sidecar_study_evidence(&evidence)
+            .expect_err("certification selected lane without calibration or evaluation");
+        assert!(error.to_string().contains("sidecar_stage_contract"));
+    }
+
+    #[test]
+    fn requested_but_unconsumed_sidecar_is_not_canonical_unavailable() {
+        let evidence = sidecar_hash_fixture();
+        let unavailable = super::unavailable_public_sidecar_split(EvaluationSplit::Development)
+            .expect("canonical unavailable split");
+        assert!(super::sidecar_split_is_valid(
+            &unavailable,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut requested = unavailable.clone();
+        requested.coverage.fusion_requested = true;
+        requested.coverage.evaluated_recording_count = 3;
+        requested.coverage.fusion_requested_recording_count = 3;
+        requested.coverage.pair_selection_sha256 = Some("9".repeat(64));
+        requested.performance.audio_duration_sec = 30.0;
+        requested.performance.real_time_factor = Some(0.0);
+        assert_ne!(requested, unavailable);
+        assert!(super::sidecar_split_is_valid(
+            &requested,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+        let mut impossible_empty_computation = requested.clone();
+        impossible_empty_computation
+            .operations
+            .frame_wavelet_filter_tap_terms = 1;
+        assert!(!super::sidecar_split_is_valid(
+            &impossible_empty_computation,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut comparable = requested.clone();
+        comparable.coverage.submitted_frame_count = 1;
+        comparable.coverage.comparable_frame_count = 1;
+        comparable.coverage.calibrated_signal_count = 1;
+        comparable.coverage.comparable_frame_coverage = Some(1.0);
+        comparable.coverage.component_comparison_count = 1;
+        comparable.coverage.owner_available_frame_counts = [1, 0, 0];
+        assert!(!super::sidecar_split_is_valid(
+            &comparable,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+        comparable.coverage.maximum_retained_signal_count = 1;
+        comparable.coverage.retained_signal_capacity = 401;
+        comparable.operations.peak_retained_state_bytes_on_target = 1;
+        assert!(!super::sidecar_split_is_valid(
+            &comparable,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+        comparable.coverage.retained_pair_sample_capacity =
+            super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING as u64;
+        comparable.operations.peak_scratch_buffer_payload_bytes = 1;
+        // A constant frame still invokes the wavelet kernel and allocates its
+        // fixed scratch payload, but legitimately performs zero nonzero taps.
+        assert!(super::sidecar_split_is_valid(
+            &comparable,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut undersized_signal_capacity = comparable.clone();
+        undersized_signal_capacity.coverage.retained_signal_capacity =
+            super::PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS - 1;
+        assert!(!super::sidecar_split_is_valid(
+            &undersized_signal_capacity,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut reachable_signal_maximum = comparable.clone();
+        reachable_signal_maximum.coverage.submitted_frame_count = 7;
+        reachable_signal_maximum.coverage.comparable_frame_coverage = super::ratio(1, 7);
+        reachable_signal_maximum
+            .coverage
+            .maximum_retained_signal_count = 3;
+        assert!(super::sidecar_split_is_valid(
+            &reachable_signal_maximum,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+        let mut underreported_signal_maximum = reachable_signal_maximum;
+        underreported_signal_maximum
+            .coverage
+            .maximum_retained_signal_count = 2;
+        assert!(!super::sidecar_split_is_valid(
+            &underreported_signal_maximum,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut reachable_pair_maximum = comparable.clone();
+        reachable_pair_maximum.coverage.submitted_frame_count = 79;
+        reachable_pair_maximum.coverage.comparable_frame_coverage = super::ratio(1, 79);
+        reachable_pair_maximum
+            .coverage
+            .maximum_retained_signal_count = 27;
+        reachable_pair_maximum.coverage.eligible_pair_count = 4;
+        reachable_pair_maximum.coverage.retained_pair_sample_count = 4;
+        reachable_pair_maximum
+            .coverage
+            .retained_same_speaker_pair_count = 2;
+        reachable_pair_maximum
+            .coverage
+            .retained_different_speaker_pair_count = 2;
+        reachable_pair_maximum.coverage.pair_score_coverage = Some(1.0);
+        reachable_pair_maximum
+            .coverage
+            .same_speaker_pair_score_coverage = Some(1.0);
+        reachable_pair_maximum
+            .coverage
+            .different_speaker_pair_score_coverage = Some(1.0);
+        reachable_pair_maximum.coverage.pair_scored_recording_count = 2;
+        reachable_pair_maximum
+            .coverage
+            .same_speaker_pair_recording_count = 2;
+        reachable_pair_maximum
+            .coverage
+            .different_speaker_pair_recording_count = 2;
+        let mut retained_pairs = super::SidecarPairAccumulator::new();
+        for different_speaker in [false, true, false, true] {
+            retained_pairs
+                .push(0.5, different_speaker)
+                .expect("retained pair");
+        }
+        reachable_pair_maximum.conditional_pairs =
+            retained_pairs.finish().expect("retained pair metrics");
+        reachable_pair_maximum
+            .coverage
+            .maximum_retained_pair_sample_count = 2;
+        assert!(super::sidecar_split_is_valid(
+            &reachable_pair_maximum,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+        let mut impossible_pair_recording_union = reachable_pair_maximum.clone();
+        impossible_pair_recording_union
+            .coverage
+            .pair_scored_recording_count = 3;
+        impossible_pair_recording_union
+            .coverage
+            .same_speaker_pair_recording_count = 1;
+        impossible_pair_recording_union
+            .coverage
+            .different_speaker_pair_recording_count = 1;
+        assert!(!super::sidecar_split_is_valid(
+            &impossible_pair_recording_union,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+        let mut underreported_pair_maximum = reachable_pair_maximum;
+        underreported_pair_maximum
+            .coverage
+            .maximum_retained_pair_sample_count = 1;
+        assert!(!super::sidecar_split_is_valid(
+            &underreported_pair_maximum,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut under_retained_pairs = comparable.clone();
+        under_retained_pairs.coverage.eligible_pair_count = 2;
+        under_retained_pairs
+            .coverage
+            .maximum_retained_pair_sample_count = 1;
+        let mut retained_pair = super::SidecarPairAccumulator::new();
+        retained_pair.push(0.5, false).expect("retained pair");
+        under_retained_pairs.conditional_pairs =
+            retained_pair.finish().expect("retained pair metrics");
+        assert!(!super::sidecar_split_is_valid(
+            &under_retained_pairs,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut missing_owner = comparable.clone();
+        missing_owner.coverage.owner_available_frame_counts = [0; 3];
+        assert!(!super::sidecar_split_is_valid(
+            &missing_owner,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut uncalibrated_comparable = comparable.clone();
+        uncalibrated_comparable.coverage.calibrated_signal_count = 0;
+        assert!(!super::sidecar_split_is_valid(
+            &uncalibrated_comparable,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut too_many_boundary_probabilities = comparable;
+        let mut probabilities = super::SidecarProbabilityAccumulator::new();
+        probabilities
+            .push(f64::from(0.20_f32), false)
+            .expect("negative probability");
+        probabilities
+            .push(f64::from(0.80_f32), true)
+            .expect("positive probability");
+        let finished = probabilities.finish_reliability();
+        too_many_boundary_probabilities
+            .boundary
+            .probability_observation_count = 2;
+        too_many_boundary_probabilities
+            .boundary
+            .probability_positive_count = 1;
+        too_many_boundary_probabilities.boundary.brier_score = finished.brier_score;
+        too_many_boundary_probabilities
+            .boundary
+            .expected_calibration_error = finished.expected_calibration_error;
+        too_many_boundary_probabilities.boundary.reliability = finished.reliability;
+        assert!(!super::sidecar_split_is_valid(
+            &too_many_boundary_probabilities,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut wrong_count = requested.clone();
+        wrong_count.coverage.evaluated_recording_count = 2;
+        wrong_count.coverage.fusion_requested_recording_count = 2;
+        assert!(!super::sidecar_split_is_valid(
+            &wrong_count,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+
+        let mut wrong_duration = requested;
+        wrong_duration.performance.audio_duration_sec = 29.0;
+        assert!(!super::sidecar_split_is_valid(
+            &wrong_duration,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &evidence,
+            3,
+            30.0,
+        ));
+    }
+
+    #[test]
+    fn sidecar_split_rejects_more_executed_recordings_than_consumed_probabilities() {
+        let mut pipeline =
+            ablation_variant(AcousticFeatureAblation::FullV2, Some(0.20), Some(0.30))
+                .splits
+                .into_iter()
+                .find(|split| split.split == EvaluationSplit::Development)
+                .expect("development pipeline");
+        pipeline.recording_count = 2;
+        pipeline.speaker_count_confusion[0].recording_count = 2;
+        pipeline.speaker_count_strata[0].recording_count = 2;
+        pipeline.speaker_count_strata[0].unresolved_recording_count = 2;
+        pipeline.speaker_count_duration_strata[0].recording_count = 2;
+        pipeline.speaker_count_duration_strata[0].unresolved_recording_count = 2;
+        pipeline.count_posterior_unavailable_count = 2;
+        pipeline.count_unresolved_recording_count = 2;
+        assert!(super::variant_splits_are_valid(
+            std::slice::from_ref(&pipeline),
+            10,
+        ));
+
+        let audio_duration_sec = pipeline.audio_duration_sec;
+        let mut executed = super::unavailable_public_sidecar_split(EvaluationSplit::Development)
+            .expect("executed split shell");
+        executed.boundary = super::empty_sidecar_boundary_metrics(&pipeline);
+        executed.performance = super::PublicCorpusSidecarPerformance {
+            audio_duration_sec,
+            wall_time_sec: pipeline.wall_time_sec,
+            real_time_factor: pipeline.real_time_factor,
+            sampled_peak_rss_bytes: pipeline.sampled_peak_rss_bytes,
+        };
+        executed.pipeline = Some(pipeline);
+        executed.fusion_executed = true;
+        executed.coverage.fusion_requested = true;
+        executed.coverage.evaluated_recording_count = 2;
+        executed.coverage.fusion_requested_recording_count = 2;
+        executed.coverage.fusion_executed_recording_count = 2;
+        executed.coverage.submitted_frame_count = 4;
+        executed.coverage.comparable_frame_count = 2;
+        executed.coverage.calibrated_signal_count = 2;
+        executed.coverage.consumed_probability_count = 2;
+        executed.coverage.comparable_frame_coverage = super::ratio(2, 4);
+        executed.coverage.component_comparison_count = 2;
+        executed.coverage.owner_available_frame_counts = [0, 0, 2];
+        executed.coverage.pair_selection_sha256 = Some("9".repeat(64));
+        executed.coverage.maximum_retained_signal_count = 2;
+        executed.coverage.retained_signal_capacity = super::PUBLIC_SIDECAR_MAX_RETAINED_SIGNALS;
+        executed.coverage.retained_pair_sample_capacity =
+            super::PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING as u64;
+        executed.operations.frame_wavelet_filter_tap_terms = 1;
+        executed.operations.peak_scratch_buffer_payload_bytes = 1;
+        executed.operations.peak_retained_state_bytes_on_target = 1;
+        let aligned_accuracy = [
+            super::SidecarRecordingAccuracy {
+                recording_audio_sha256: [1; 32],
+                reference_sha256: [11; 32],
+                der: None,
+                jer: None,
+            },
+            super::SidecarRecordingAccuracy {
+                recording_audio_sha256: [2; 32],
+                reference_sha256: [12; 32],
+                der: None,
+                jer: None,
+            },
+        ];
+        executed.paired_uncertainty = Some(
+            super::paired_sidecar_uncertainty(
+                &aligned_accuracy,
+                &aligned_accuracy,
+                super::PublicCorpusSidecarLane::FrameHaarL4,
+                EvaluationSplit::Development,
+                &mut || false,
+            )
+            .expect("zero-count paired uncertainty"),
+        );
+        assert!(super::sidecar_split_is_valid(
+            &executed,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &sidecar_hash_fixture(),
+            2,
+            audio_duration_sec,
+        ));
+
+        let mut impossible = executed;
+        impossible.coverage.consumed_probability_count = 1;
+        assert!(!super::sidecar_split_is_valid(
+            &impossible,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &sidecar_hash_fixture(),
+            2,
+            audio_duration_sec,
+        ));
+    }
+
+    #[test]
+    fn sidecar_pair_gate_rejects_trivial_support_and_class_specific_missingness() {
+        let evidence = sidecar_hash_fixture();
+        let policy = &evidence.protocol.gate_policy;
+        let baseline = sidecar_gate_split(EvaluationSplit::Development, 0.20, 0.10, 100);
+
+        let mut trivial = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.12, 120);
+        trivial.conditional_pairs.comparison_count = 2;
+        trivial.conditional_pairs.same_speaker_count = 1;
+        trivial.conditional_pairs.different_speaker_count = 1;
+        trivial.coverage.eligible_pair_count = 2;
+        trivial.coverage.retained_pair_sample_count = 2;
+        trivial.coverage.retained_same_speaker_pair_count = 1;
+        trivial.coverage.retained_different_speaker_pair_count = 1;
+        trivial.coverage.pair_score_coverage = Some(1.0);
+        trivial.coverage.same_speaker_pair_score_coverage = Some(1.0);
+        trivial.coverage.different_speaker_pair_score_coverage = Some(1.0);
+        trivial.coverage.pair_scored_recording_count = 1;
+        trivial.coverage.same_speaker_pair_recording_count = 1;
+        trivial.coverage.different_speaker_pair_recording_count = 1;
+        let trivial_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &trivial,
+        );
+        assert!(
+            trivial_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::InsufficientPairSupport)
+        );
+        assert!(
+            !trivial_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::InsufficientPairCoverage)
+        );
+
+        let mut class_sparse = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.12, 120);
+        class_sparse.conditional_pairs.comparison_count = 300;
+        class_sparse.conditional_pairs.same_speaker_count = 200;
+        class_sparse.conditional_pairs.different_speaker_count = 100;
+        class_sparse.coverage.eligible_pair_count = 1_100;
+        class_sparse.coverage.retained_pair_sample_count = 1_100;
+        class_sparse.coverage.retained_same_speaker_pair_count = 1_000;
+        class_sparse.coverage.retained_different_speaker_pair_count = 100;
+        class_sparse.coverage.pair_score_coverage = Some(300.0 / 1_100.0);
+        class_sparse.coverage.same_speaker_pair_score_coverage = Some(0.20);
+        class_sparse.coverage.different_speaker_pair_score_coverage = Some(1.0);
+        let sparse_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &class_sparse,
+        );
+        assert!(
+            sparse_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::InsufficientPairCoverage),
+            "overall coverage must not conceal a sparse same-speaker class"
+        );
+    }
+
+    #[test]
+    fn sidecar_boundary_fusion_survives_missing_pair_calibration() {
+        let evidence = sidecar_hash_fixture();
+        let baseline = sidecar_gate_split(EvaluationSplit::Development, 0.20, 0.10, 100);
+        let mut boundary_only = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.12, 120);
+        boundary_only.conditional_pairs = super::SidecarPairAccumulator::new()
+            .finish()
+            .expect("empty conditional metrics");
+        boundary_only.coverage.eligible_pair_count = 100;
+        boundary_only.coverage.retained_pair_sample_count = 100;
+        boundary_only.coverage.retained_same_speaker_pair_count = 100;
+        boundary_only.coverage.retained_different_speaker_pair_count = 0;
+        boundary_only.coverage.pair_score_coverage = Some(0.0);
+        boundary_only.coverage.same_speaker_pair_score_coverage = Some(0.0);
+        boundary_only.coverage.different_speaker_pair_score_coverage = None;
+        boundary_only.coverage.pair_scored_recording_count = 0;
+        boundary_only.coverage.same_speaker_pair_recording_count = 0;
+        boundary_only
+            .coverage
+            .different_speaker_pair_recording_count = 0;
+        let gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &boundary_only,
+        );
+        assert!(boundary_only.fusion_executed);
+        assert!(boundary_only.pipeline.is_some());
+        assert!(
+            !gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::FusionNotExecuted)
+        );
+        assert!(
+            !gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::MissingAccuracy)
+        );
+        assert!(
+            gate.failures
+                .contains(&super::PublicCorpusSidecarGateFailure::MissingConditionalPairs)
+        );
+    }
+
+    #[test]
+    fn sidecar_auxiliary_dominance_gate_is_lane_appropriate() {
+        let evidence = sidecar_hash_fixture();
+        let baseline = sidecar_gate_split(EvaluationSplit::Development, 0.20, 0.10, 100);
+        let pure_wavelet = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.12, 120);
+        let pure_wavelet_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &pure_wavelet,
+        );
+        assert!(
+            !pure_wavelet_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::AuxiliaryConfound),
+            "a pure MixedAuxiliary lane has no Voice owner to compare"
+        );
+
+        let missing_support_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::Modulation,
+            &pure_wavelet,
+        );
+        assert!(
+            missing_support_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::AuxiliaryConfound)
+        );
+
+        let candidate_with_dominance_count = |dominance_count: usize| {
+            let mut candidate = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.12, 120);
+            let mut diagnostics = super::SidecarAuxiliaryDominanceAccumulator::default();
+            for index in 0..100 {
+                diagnostics
+                    .push(false, true, index < dominance_count)
+                    .expect("same-speaker dominance row");
+            }
+            candidate.coverage.channel_dominance = diagnostics.finish();
+            candidate
+        };
+        let admitted = candidate_with_dominance_count(50);
+        let admitted_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::Modulation,
+            &admitted,
+        );
+        assert!(
+            !admitted_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::AuxiliaryConfound)
+        );
+        let combined_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4AndModulation,
+            &admitted,
+        );
+        assert!(
+            combined_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::AuxiliaryConfound),
+            "channel support must not conceal missing MixedAuxiliary support"
+        );
+
+        let mut one_opportunity = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.12, 120);
+        let mut one_diagnostic = super::SidecarAuxiliaryDominanceAccumulator::default();
+        one_diagnostic
+            .push(false, true, false)
+            .expect("single same-speaker opportunity");
+        one_opportunity.coverage.channel_dominance = one_diagnostic.finish();
+        let one_opportunity_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::Modulation,
+            &one_opportunity,
+        );
+        assert!(
+            one_opportunity_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::AuxiliaryConfound),
+            "a single opportunity is not substantial confound evidence"
+        );
+
+        let rejected = candidate_with_dominance_count(51);
+        let rejected_gate = super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::Modulation,
+            &rejected,
+        );
+        assert!(
+            rejected_gate
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::AuxiliaryConfound)
+        );
+    }
+
+    #[test]
+    fn sidecar_accuracy_hash_excludes_only_host_resource_diagnostics() {
+        let passing_development = sidecar_gate_scenario_evidence(
+            super::PublicCorpusEvaluationStage::Development,
+            0.12,
+            120,
+        );
+        let mut failing_development = sidecar_gate_scenario_evidence(
+            super::PublicCorpusEvaluationStage::Development,
+            0.20,
+            200,
+        );
+        assert!(
+            passing_development.variants[1]
+                .gate
+                .as_ref()
+                .expect("passing gate")
+                .passed
+        );
+        assert_eq!(
+            failing_development.variants[1]
+                .gate
+                .as_ref()
+                .expect("failing gate")
+                .failures,
+            vec![super::PublicCorpusSidecarGateFailure::PerformanceRegression]
+        );
+        assert_eq!(
+            passing_development.selected_candidate_lane,
+            Some(super::PublicCorpusSidecarLane::FrameHaarL4)
+        );
+        assert_eq!(failing_development.selected_candidate_lane, None);
+        failing_development.variants[1].splits[0]
+            .coverage
+            .retained_signal_capacity = 1_024;
+        failing_development.variants[1].splits[0]
+            .coverage
+            .retained_pair_sample_capacity = 8_192;
+        failing_development.variants[1].splits[0]
+            .operations
+            .peak_retained_state_bytes_on_target = 65_536;
+        assert_eq!(
+            super::deterministic_sidecar_accuracy_sha256(&failing_development)
+                .expect("performance-failing accuracy hash"),
+            super::deterministic_sidecar_accuracy_sha256(&passing_development)
+                .expect("performance-passing accuracy hash")
+        );
+        assert_ne!(
+            super::canonical_sha256(&failing_development).expect("failing result identity"),
+            super::canonical_sha256(&passing_development).expect("passing result identity")
+        );
+
+        let passing_certification = sidecar_gate_scenario_evidence(
+            super::PublicCorpusEvaluationStage::Certification,
+            0.12,
+            120,
+        );
+        let mut failing_certification = sidecar_gate_scenario_evidence(
+            super::PublicCorpusEvaluationStage::Certification,
+            0.20,
+            200,
+        );
+        failing_certification.locked_development_result_sha256 = Some("c".repeat(64));
+        assert_eq!(
+            passing_certification.adopted_candidate_lane,
+            Some(super::PublicCorpusSidecarLane::FrameHaarL4)
+        );
+        assert_eq!(failing_certification.adopted_candidate_lane, None);
+        assert_eq!(
+            super::deterministic_sidecar_accuracy_sha256(&failing_certification)
+                .expect("rejected certification accuracy hash"),
+            super::deterministic_sidecar_accuracy_sha256(&passing_certification)
+                .expect("adopted certification accuracy hash")
+        );
+
+        let mut changed_operation_count = passing_development.clone();
+        changed_operation_count.variants[1].splits[0]
+            .operations
+            .frame_wavelet_filter_tap_terms = 1;
+        assert_ne!(
+            super::deterministic_sidecar_accuracy_sha256(&changed_operation_count)
+                .expect("operation-sensitive accuracy hash"),
+            super::deterministic_sidecar_accuracy_sha256(&passing_development)
+                .expect("unchanged operation hash")
+        );
+    }
+
+    #[test]
+    fn sidecar_accuracy_winner_has_no_operational_runner_up_fallback() {
+        let mut evidence = sidecar_hash_fixture();
+        let baseline = sidecar_gate_split(EvaluationSplit::Development, 0.20, 0.10, 100);
+        let top_accuracy = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.20, 200);
+        let runner_up = sidecar_gate_split(EvaluationSplit::Development, 0.19, 0.12, 120);
+        evidence.variants[0].splits = vec![baseline.clone()];
+        evidence.variants[1].splits = vec![top_accuracy.clone()];
+        evidence.variants[1].gate = Some(super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &top_accuracy,
+        ));
+        let mut runner_up_variant = evidence.variants[1].clone();
+        runner_up_variant.lane = super::PublicCorpusSidecarLane::FrameD4L4;
+        runner_up_variant.splits = vec![runner_up.clone()];
+        runner_up_variant.gate = Some(super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameD4L4,
+            &runner_up,
+        ));
+        evidence.variants.push(runner_up_variant);
+
+        assert_eq!(
+            super::sidecar_accuracy_ranked_variant_index(&evidence.variants),
+            Some(1)
+        );
+        assert_eq!(
+            super::apply_public_sidecar_development_selection(&mut evidence.variants),
+            None,
+            "a performance-failing accuracy winner must not fall through"
+        );
+        assert_eq!(
+            evidence.variants[1].disposition,
+            super::PublicCorpusSidecarDisposition::Rejected
+        );
+        assert_eq!(
+            evidence.variants[2].disposition,
+            super::PublicCorpusSidecarDisposition::Rejected
+        );
+        assert!(
+            evidence.variants[2]
+                .gate
+                .as_ref()
+                .expect("runner-up gate")
+                .failures
+                .contains(&super::PublicCorpusSidecarGateFailure::NotSelectedByRanking)
+        );
+
+        let passing_top = sidecar_gate_split(EvaluationSplit::Development, 0.18, 0.12, 120);
+        evidence.variants[1].splits = vec![passing_top.clone()];
+        evidence.variants[1].gate = Some(super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameHaarL4,
+            &passing_top,
+        ));
+        evidence.variants[2].gate = Some(super::public_sidecar_promotion_gate(
+            super::PublicCorpusEvaluationStage::Development,
+            &evidence.protocol.gate_policy,
+            &baseline,
+            super::PublicCorpusSidecarLane::FrameD4L4,
+            &runner_up,
+        ));
+        assert_eq!(
+            super::apply_public_sidecar_development_selection(&mut evidence.variants),
+            Some(super::PublicCorpusSidecarLane::FrameHaarL4)
+        );
+        assert_eq!(
+            evidence.variants[1].disposition,
+            super::PublicCorpusSidecarDisposition::AdvanceToCertification
+        );
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn build_requires_exact_license_acknowledgement() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
@@ -8384,6 +15731,10 @@ mod tests {
         assert!(!fixture.output_path.exists());
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn checksum_mismatch_fails_before_output() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
@@ -8403,6 +15754,10 @@ mod tests {
         assert!(!fixture.output_path.exists());
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn malformed_rttm_fails_with_stable_code() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
@@ -8427,6 +15782,10 @@ mod tests {
         assert!(error.to_string().contains("rttm_shape"));
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn wave_channel_and_sample_rate_contracts_are_checked() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
@@ -8445,6 +15804,10 @@ mod tests {
         assert!(error.to_string().contains("audio_metadata_mismatch"));
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn overlap_ignored_regions_and_determinism_survive_round_trip() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
@@ -8497,6 +15860,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn optional_word_annotations_are_checksum_bound_and_transcript_free() {
         let fixture = Fixture::new(
@@ -8597,6 +15964,10 @@ mod tests {
         assert!(error.to_string().contains("ami_recording_id"));
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn cancellation_leaves_no_output() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
@@ -8617,6 +15988,10 @@ mod tests {
         assert!(!fixture.output_path.exists());
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn output_must_remain_outside_project_and_inputs() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
@@ -8630,6 +16005,580 @@ mod tests {
         )
         .expect_err("project output");
         assert!(error.to_string().contains("output_overlap"));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    #[test]
+    fn public_artifact_output_fails_closed_on_unsupported_platforms() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("artifact.json");
+        let error = match build_public_corpus_bundle(
+            &project,
+            &input,
+            &input.join("descriptor-must-not-be-read.json"),
+            &output_path,
+            "unused-license-acknowledgement",
+        ) {
+            Ok(_) => panic!("unsupported public artifact platform was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, crate::FwError::Unsupported(_)));
+        assert!(error.to_string().contains("output_platform"));
+        assert!(!output_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn output_parent_swap_is_rejected_before_payload_creation() {
+        use std::os::unix::fs::symlink;
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        let moved_output_parent = root.path().join("moved-output");
+        let redirect = root.path().join("redirect");
+        for directory in [&project, &input, &output_parent, &redirect] {
+            create_private_directory(directory);
+        }
+        let canonical_project = project.canonicalize().expect("canonical project");
+        let canonical_input = input.canonicalize().expect("canonical input");
+        let output_path = output_parent.join("artifact.json");
+        let canonical_output_parent =
+            validate_new_output(&canonical_project, &canonical_input, &output_path)
+                .expect("validated output");
+
+        std::fs::rename(&output_parent, &moved_output_parent).expect("move output parent");
+        symlink(&redirect, &output_parent).expect("replace output parent with redirect");
+        let error = write_new_json(
+            &output_path,
+            &canonical_output_parent,
+            &json!({"sensitive": "must-not-be-written"}),
+            "fixture",
+            &mut || false,
+        )
+        .expect_err("redirected output parent");
+
+        assert!(error.to_string().contains("output_parent_changed"));
+        assert!(!redirect.join("artifact.json").exists());
+        assert!(!moved_output_parent.join("artifact.json").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn output_parent_symlink_back_to_held_inode_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        let moved_output_parent = root.path().join("moved-output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let canonical_project = project.canonicalize().expect("canonical project");
+        let canonical_input = input.canonicalize().expect("canonical input");
+        let output_path = output_parent.join("artifact.json");
+        let validated = validate_new_output(&canonical_project, &canonical_input, &output_path)
+            .expect("validated output");
+
+        std::fs::rename(&output_parent, &moved_output_parent).expect("move output parent");
+        symlink(&moved_output_parent, &output_parent).expect("symlink back to held parent");
+        let error = write_new_json(
+            &output_path,
+            &validated,
+            &json!({"sensitive": "must-not-be-written"}),
+            "fixture",
+            &mut || false,
+        )
+        .expect_err("symlink spelling of held output parent");
+
+        assert!(error.to_string().contains("output_parent_changed"));
+        assert!(!output_path.exists());
+        assert!(!moved_output_parent.join("artifact.json").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn output_parent_same_path_replacement_is_identity_rejected() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        let moved_output_parent = root.path().join("moved-output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let canonical_project = project.canonicalize().expect("canonical project");
+        let canonical_input = input.canonicalize().expect("canonical input");
+        let output_path = output_parent.join("artifact.json");
+        let canonical_output_parent =
+            validate_new_output(&canonical_project, &canonical_input, &output_path)
+                .expect("validated output");
+
+        std::fs::rename(&output_parent, &moved_output_parent).expect("move output parent");
+        create_private_directory(&output_parent);
+        let error = write_new_json(
+            &output_path,
+            &canonical_output_parent,
+            &json!({"sensitive": "must-not-be-written"}),
+            "fixture",
+            &mut || false,
+        )
+        .expect_err("replacement output parent");
+
+        assert!(error.to_string().contains("output_parent_changed"));
+        assert!(!output_path.exists());
+        assert!(!moved_output_parent.join("artifact.json").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn output_parent_must_be_owner_only_mutable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        std::fs::set_permissions(&output_parent, std::fs::Permissions::from_mode(0o777))
+            .expect("world-writable output parent");
+        let output_path = output_parent.join("artifact.json");
+
+        let error = match validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        ) {
+            Ok(_) => panic!("world-writable output parent was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("output_parent_permissions"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn terminal_output_parent_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let real_output_parent = root.path().join("real-output");
+        let output_parent = root.path().join("output-link");
+        for directory in [&project, &input, &real_output_parent] {
+            create_private_directory(directory);
+        }
+        symlink(&real_output_parent, &output_parent).expect("output parent symlink");
+
+        let error = match validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_parent.join("artifact.json"),
+        ) {
+            Ok(_) => panic!("terminal output parent symlink was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("output_parent"));
+        assert!(!real_output_parent.join("artifact.json").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn dangling_output_symlink_is_rejected_before_evaluation() {
+        use std::os::unix::fs::symlink;
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("artifact.json");
+        symlink("missing-target", &output_path).expect("dangling output symlink");
+
+        let error = match validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        ) {
+            Ok(_) => panic!("dangling output entry was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("output_exists"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn fifo_output_leaf_is_rejected_without_opening_it() {
+        use rustix::fs::{Mode, mkfifoat};
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("artifact.json");
+        let output_directory =
+            std::fs::File::open(&output_parent).expect("output directory handle");
+        mkfifoat(&output_directory, "artifact.json", Mode::RUSR | Mode::WUSR)
+            .expect("fixture FIFO");
+
+        let error = match validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        ) {
+            Ok(_) => panic!("FIFO output entry was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("output_exists"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn uppercase_output_file_name_is_rejected_before_creation() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let canonical_project = project.canonicalize().expect("canonical project");
+        let canonical_input = input.canonicalize().expect("canonical input");
+        let upper_path = output_parent.join("Bundle.json");
+        let lower_path = output_parent.join("bundle.json");
+        std::fs::write(&lower_path, b"existing\n").expect("existing lowercase output");
+        let error = match validate_new_output(&canonical_project, &canonical_input, &upper_path) {
+            Ok(_) => panic!("upper-case output name was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("output_path"));
+        assert_eq!(
+            std::fs::read(&lower_path).expect("existing lowercase output"),
+            b"existing\n"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn lowercase_output_rejects_existing_ascii_case_fold_sibling() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let canonical_project = project.canonicalize().expect("canonical project");
+        let canonical_input = input.canonicalize().expect("canonical input");
+        let upper_path = output_parent.join("Bundle.json");
+        let lower_path = output_parent.join("bundle.json");
+        std::fs::write(&upper_path, b"existing\n").expect("existing uppercase sibling");
+
+        let error = match validate_new_output(&canonical_project, &canonical_input, &lower_path) {
+            Ok(_) => panic!("ASCII-case-fold sibling was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("output_exists"));
+        assert_eq!(
+            std::fs::read(&upper_path).expect("existing uppercase sibling"),
+            b"existing\n"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn non_ascii_output_file_name_is_rejected_before_creation() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("évidence.json");
+        let error = match validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        ) {
+            Ok(_) => panic!("non-ASCII output name was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("output_path"));
+        assert!(!output_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn output_file_name_requires_safe_ascii_and_lowercase_json_suffix() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let project = project.canonicalize().expect("canonical project");
+        let input = input.canonicalize().expect("canonical input");
+
+        for file_name in ["artifact name.json", "artifact.JSON", "artifact.txt"] {
+            let output_path = output_parent.join(file_name);
+            let error = match validate_new_output(&project, &input, &output_path) {
+                Ok(_) => panic!("unsafe output name was accepted: {file_name}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("output_path"));
+            assert!(!output_path.exists());
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apfs_data_firmlink_alias_cannot_publish_into_the_checkout() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("canonical project");
+        let Ok(relative_project) = project.strip_prefix("/") else {
+            return;
+        };
+        let alias = Path::new("/System/Volumes/Data").join(relative_project);
+        let (Ok(project_metadata), Ok(alias_metadata)) = (project.metadata(), alias.metadata())
+        else {
+            return;
+        };
+        if project_metadata.dev() != alias_metadata.dev()
+            || project_metadata.ino() != alias_metadata.ino()
+        {
+            return;
+        }
+        assert!(super::paths_overlap(&project, &alias));
+        if project_metadata.uid() != rustix::process::geteuid().as_raw()
+            || project_metadata.mode() & 0o022 != 0
+        {
+            return;
+        }
+
+        let input = private_tempdir("input");
+        let output_path = alias.join(format!(
+            "firmlink-overlap-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let error = match validate_new_output(&project, input.path(), &output_path) {
+            Ok(_) => panic!("firmlink alias into the checkout was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("output_overlap"));
+        assert!(!output_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn failed_output_serialization_never_publishes_partial_json() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("artifact.json");
+        let validated = validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        )
+        .expect("validated output");
+
+        let error = write_new_json(
+            &output_path,
+            &validated,
+            &AlwaysFailsSerialization,
+            "fixture",
+            &mut || false,
+        )
+        .expect_err("serialization failure");
+
+        assert!(error.to_string().contains("output_write"));
+        assert!(!output_path.exists());
+        let staging = std::fs::read_dir(&output_parent)
+            .expect("staging directory")
+            .map(|entry| entry.expect("staging entry"))
+            .collect::<Vec<_>>();
+        assert_eq!(staging.len(), 1);
+        assert!(
+            staging[0]
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".franken-whisper-output-")
+        );
+        let metadata = staging[0].metadata().expect("staging metadata");
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert!(
+            std::fs::read(staging[0].path())
+                .expect("empty marker")
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn output_serialization_cancellation_never_publishes_partial_json() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("artifact.json");
+        let validated = validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        )
+        .expect("validated output");
+        let value = json!({"payload": "x".repeat(200_000)});
+        let mut cancellation_checks = 0_usize;
+
+        let error = write_new_json(&output_path, &validated, &value, "fixture", &mut || {
+            cancellation_checks += 1;
+            cancellation_checks >= 2
+        })
+        .expect_err("serialization cancellation");
+
+        assert!(matches!(error, crate::FwError::Cancelled(_)));
+        assert!(!output_path.exists());
+        let staging = std::fs::read_dir(&output_parent)
+            .expect("staging directory")
+            .map(|entry| entry.expect("staging entry"))
+            .collect::<Vec<_>>();
+        assert_eq!(staging.len(), 1);
+        assert_eq!(staging[0].metadata().expect("staging metadata").len(), 0);
+        assert!(cancellation_checks >= 2);
+        assert!(
+            std::fs::read(staging[0].path())
+                .expect("empty marker")
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn no_clobber_publication_preserves_racing_final_output() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("artifact.json");
+        let validated = validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        )
+        .expect("validated output");
+        let staged = super::stage_new_json(
+            &output_path,
+            &validated,
+            &json!({"sensitive": "must-not-win-the-race"}),
+            "fixture",
+            &mut || false,
+        )
+        .expect("staged output");
+        std::fs::write(&output_path, b"external-winner\n").expect("racing final output");
+
+        let error = super::publish_staged_json(staged, "fixture")
+            .expect_err("no-clobber publication failure");
+
+        assert!(error.to_string().contains("output_create"));
+        assert_eq!(
+            std::fs::read(&output_path).expect("racing final bytes"),
+            b"external-winner\n"
+        );
+        let staging = std::fs::read_dir(&output_parent)
+            .expect("staging directory")
+            .map(|entry| entry.expect("staging entry"))
+            .filter(|entry| entry.path() != output_path)
+            .collect::<Vec<_>>();
+        assert_eq!(staging.len(), 1);
+        assert_eq!(staging[0].metadata().expect("staging metadata").len(), 0);
+        assert!(
+            std::fs::read(staging[0].path())
+                .expect("empty marker")
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn ambiguous_rename_state_never_truncates_final_staged_inode() {
+        let root = private_tempdir("root");
+        let project = root.path().join("project");
+        let input = root.path().join("input");
+        let output_parent = root.path().join("output");
+        for directory in [&project, &input, &output_parent] {
+            create_private_directory(directory);
+        }
+        let output_path = output_parent.join("artifact.json");
+        let validated = validate_new_output(
+            &project.canonicalize().expect("canonical project"),
+            &input.canonicalize().expect("canonical input"),
+            &output_path,
+        )
+        .expect("validated output");
+        let staged = super::stage_new_json(
+            &output_path,
+            &validated,
+            &json!({"payload": "must-remain-intact"}),
+            "fixture",
+            &mut || false,
+        )
+        .expect("staged output");
+        let staging_path = output_parent.join(&staged.staging_name);
+        std::fs::hard_link(&staging_path, &output_path).expect("same-inode final race");
+
+        let error =
+            super::publish_staged_json(staged, "fixture").expect_err("ambiguous publication state");
+
+        assert!(error.to_string().contains("output_commit_uncertain"));
+        let final_bytes = std::fs::read(&output_path).expect("final bytes");
+        assert!(final_bytes.ends_with(b"\n"));
+        assert!(
+            String::from_utf8(final_bytes)
+                .expect("UTF-8 JSON")
+                .contains("must-remain-intact")
+        );
+        assert!(staging_path.metadata().expect("staging marker").len() > 0);
     }
 
     #[test]
@@ -9331,11 +17280,15 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        ignore = "public artifact publication is unsupported on this platform"
+    )]
     #[test]
     fn public_ablation_runner_completes_with_path_free_aggregate_evidence() {
-        let project = tempdir().expect("project");
-        let input = tempdir().expect("input");
-        let output = tempdir().expect("output");
+        let project = private_tempdir("project");
+        let input = private_tempdir("input");
+        let output = private_tempdir("output");
         let mut recordings = Vec::new();
         for (recording_id, split, wave_frames, turn_start) in [
             ("aishell-fixture-train", "train", 32_000, "1.200"),
