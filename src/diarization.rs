@@ -12482,6 +12482,10 @@ fn canonicalize_zero_duration_projection_segments(
     segments: &[TranscriptionSegment],
     word_aligned: bool,
 ) -> FwResult<Vec<TranscriptionSegment>> {
+    if !word_aligned {
+        return Ok(segments.to_vec());
+    }
+
     let mut canonical = Vec::with_capacity(segments.len());
     let mut previous_timed = None;
     for segment in segments {
@@ -25716,6 +25720,58 @@ mod tests {
         assert_eq!(projection.segments[2].speaker.as_deref(), Some("bob"));
         super::validate_projection_segments(&projection.segments, true)
             .expect("canonicalized output geometry must remain monotonic");
+    }
+
+    #[test]
+    fn zero_duration_non_word_segment_remains_fail_closed() {
+        let turns = vec![turn(0, 2_000, Some("alice"), Some(0.9))];
+        let segments = vec![transcript_segment(
+            Some(1.0),
+            Some(1.0),
+            "external zero-width segment",
+            Some(0.72),
+        )];
+
+        assert!(
+            project_diarization_onto_segments(&segments, &turns, false)
+                .expect_err("non-word-aligned geometry is not a decoder observation")
+                .to_string()
+                .contains("projection segments")
+        );
+    }
+
+    #[test]
+    fn zero_duration_word_observation_does_not_hide_a_malformed_next_neighbor() {
+        let turns = vec![turn(0, 2_000, Some("alice"), Some(0.9))];
+        let segments = vec![
+            transcript_segment(Some(0.0), Some(1.0), "first", Some(0.91)),
+            transcript_segment(Some(1.0), Some(1.0), "zero-width", Some(0.72)),
+            transcript_segment(Some(0.9), Some(2.0), "overlapping next", Some(0.83)),
+        ];
+
+        assert!(
+            project_diarization_onto_segments(&segments, &turns, true)
+                .expect_err("zero-width canonicalization must not hide a backward neighbor")
+                .to_string()
+                .contains("projection segments")
+        );
+    }
+
+    #[test]
+    fn zero_duration_word_observation_does_not_hide_a_malformed_previous_neighbor() {
+        let turns = vec![turn(0, 2_000, Some("alice"), Some(0.9))];
+        let segments = vec![
+            transcript_segment(Some(0.0), Some(1.1), "overlapping previous", Some(0.91)),
+            transcript_segment(Some(1.0), Some(1.0), "zero-width", Some(0.72)),
+            transcript_segment(Some(1.0), Some(2.0), "third", Some(0.83)),
+        ];
+
+        assert!(
+            project_diarization_onto_segments(&segments, &turns, true)
+                .expect_err("zero-width canonicalization must not hide a previous overlap")
+                .to_string()
+                .contains("projection segments")
+        );
     }
 
     #[test]
