@@ -12426,12 +12426,14 @@ pub fn project_diarization_onto_segments(
     word_aligned: bool,
 ) -> FwResult<DiarizationProjection> {
     validate_diarization_turns(turns)?;
-    validate_projection_segments(segments, word_aligned)?;
+    let canonical_segments =
+        canonicalize_zero_duration_projection_segments(segments, word_aligned)?;
+    validate_projection_segments(&canonical_segments, word_aligned)?;
 
     let mut projected = Vec::with_capacity(segments.len());
     let mut mixed = Vec::new();
     let mut overlaps = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
+    for (index, segment) in canonical_segments.iter().enumerate() {
         let mut output = segment.clone();
         output.speaker = None;
         let Some((start_sec, end_sec)) = segment.start_sec.zip(segment.end_sec) else {
@@ -12462,6 +12464,53 @@ pub fn project_diarization_onto_segments(
         mixed_speaker_segment_indices: mixed,
         overlap_suspected_segment_indices: overlaps,
     })
+}
+
+/// Canonicalize a zero-width decoder observation for acoustic projection.
+///
+/// A `whisper.cpp` word split can quantize a middle observation to `[t, t]`.
+/// It remains a real transcript observation, so its text, confidence, order,
+/// and segment slot must survive.  It is not, however, a time interval from
+/// which speaker ownership can be inferred.  Canonicalize only an otherwise
+/// well-formed, monotonic zero-width pair to absent timing; projection will
+/// then retain it as an explicitly unknown speaker observation.  Other bad
+/// timestamp shapes remain fail-closed in [`validate_projection_segments`].
+fn canonicalize_zero_duration_projection_segments(
+    segments: &[TranscriptionSegment],
+    word_aligned: bool,
+) -> FwResult<Vec<TranscriptionSegment>> {
+    let mut canonical = Vec::with_capacity(segments.len());
+    let mut previous_timed = None;
+    for segment in segments {
+        let mut output = segment.clone();
+        let (Some(start), Some(end)) = (segment.start_sec, segment.end_sec) else {
+            canonical.push(output);
+            continue;
+        };
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start {
+            canonical.push(output);
+            continue;
+        }
+        let monotonic_with_previous =
+            previous_timed.is_none_or(|(previous_start, previous_end)| {
+                start >= previous_start
+                    && (!word_aligned || start + CANONICAL_PROJECTION_EPSILON_SEC >= previous_end)
+            });
+        if !monotonic_with_previous {
+            return Err(FwError::InvalidRequest(
+                "projection segments must have paired finite timestamps in monotonic order"
+                    .to_owned(),
+            ));
+        }
+        previous_timed = Some((start, end));
+
+        if start == end {
+            output.start_sec = None;
+            output.end_sec = None;
+        }
+        canonical.push(output);
+    }
+    Ok(canonical)
 }
 
 fn validate_diarization_turns(turns: &[DiarizationTurn]) -> FwResult<()> {
@@ -25493,6 +25542,57 @@ mod tests {
             project_diarization_onto_segments(&segments, &turns, false).expect("projection");
         assert_eq!(projection.segments[0].speaker, None);
         assert_eq!(projection.mixed_speaker_segment_indices, vec![0]);
+    }
+
+    #[test]
+    fn zero_duration_middle_decoder_observation_is_retained_as_untimed_unknown() {
+        let turns = vec![
+            turn(0, 1_000, Some("alice"), Some(0.9)),
+            turn(1_000, 2_000, Some("bob"), Some(0.9)),
+        ];
+        let segments = vec![
+            transcript_segment(Some(0.0), Some(1.0), "first", Some(0.91)),
+            transcript_segment(Some(1.0), Some(1.0), "zero-width", Some(0.72)),
+            transcript_segment(Some(1.0), Some(2.0), "third", Some(0.83)),
+        ];
+        let transcript_bytes = serde_json::to_vec(
+            &segments
+                .iter()
+                .map(|segment| &segment.text)
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize original transcript observations");
+
+        let projection = project_diarization_onto_segments(&segments, &turns, true)
+            .expect("a zero-duration middle decoder observation must not reject diarization");
+
+        assert_eq!(
+            serde_json::to_vec(
+                &projection
+                    .segments
+                    .iter()
+                    .map(|segment| &segment.text)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("serialize projected transcript observations"),
+            transcript_bytes,
+            "projection must preserve transcript bytes and observation order"
+        );
+        assert_eq!(
+            projection
+                .segments
+                .iter()
+                .map(|segment| segment.confidence)
+                .collect::<Vec<_>>(),
+            vec![Some(0.91), Some(0.72), Some(0.83)]
+        );
+        assert_eq!(projection.segments[1].start_sec, None);
+        assert_eq!(projection.segments[1].end_sec, None);
+        assert_eq!(projection.segments[1].speaker, None);
+        assert_eq!(projection.segments[0].speaker.as_deref(), Some("alice"));
+        assert_eq!(projection.segments[2].speaker.as_deref(), Some("bob"));
+        super::validate_projection_segments(&projection.segments, true)
+            .expect("canonicalized output geometry must remain monotonic");
     }
 
     #[test]
