@@ -402,16 +402,68 @@ opaque non-lexical IDs and timing/speaker annotations, never token text. See
 for the versioned schemas and fail-closed policy.
 
 The multiscale acoustic sidecar is exposed only through the separate public
-evaluation command `diarization-corpus sidecar-study`. It is not a
+evaluation command `diarization-corpus sidecar-study`, using
+`public-diarization-acoustic-sidecar-study-v3` and its v3 runner. It is not a
 `transcribe` option: normal segmentation, clustering, robot output,
 persistence, and acoustic-v2 report bytes remain unchanged. The command runs a
 frozen full-v2 baseline plus twelve ordered sidecar lanes, retains only
 aggregate path-free and transcript-free evidence, and creates both outputs in
-external directories. Its stdout bytes exactly match the retained study
-evidence file. A completed study is not an automatic promotion; the artifact
-records whether each candidate was rejected, advanced for held-out
-certification, or adopted, and no lane has any such authority until a real
-public-corpus result establishes it.
+external directories on Linux, Android, and Apple platforms. Other targets
+return `public_corpus.output_platform` before corpus materialization. On a
+successful supported-platform run, stdout bytes exactly match the retained
+study evidence file.
+
+The frozen protocol uses oracle VAD speech regions while leaving speaker count
+in inferred mode. Its DER/JER and speaker-count results therefore measure
+segmentation and clustering conditioned on reference speech activity; they are
+not end-to-end VAD-accuracy evidence.
+
+Development fits separate adjacent-boundary and lagged different-speaker
+calibrations. The boundary-fusion-v2 configuration hash binds the selected change-detector
+mode as well as the sidecar/calibration and selector constants, so materially
+different fallback and peak-selection behavior cannot share an identity.
+Conditional diagnostics begin with one lane-independent universe
+of uniquely reference-labeled 25/50/100/200-frame-lag pairs. Each recording
+retains at most 4,096 members by a score-, label-, and availability-independent
+selection-key-v3 SHA-256 over normalized clipped PCM identity, frame indices,
+and lag. The pair scorer is separately protocol-bound and is not part of that
+key. A reference-labeled selected-sequence-v2 digest binds every retained key,
+frame pair, lag, and same/different label and must match across evaluated lanes. Evidence
+retains aggregate selected/scored same/different counts, overall and per-class
+score coverage, recording support, linked reliability moments, and a 100-bin
+score-order histogram; it retains no selected keys, labels, frame indices, or
+probabilities. The producer bins exact clamped-`f32` scores. The verifier checks
+linked counts, class moments, and first/second-moment feasibility against each
+bin's exact clamped-`f32` support, which rejects direct aggregate
+contradictions. Because the individual selected probabilities are
+intentionally omitted, those sufficient statistics cannot establish every
+member's bin assignment or replay score ordering; they are aggregate internal-
+consistency evidence, not member-level provenance. Promotion requires at least
+0.25 total and per-class score coverage, 100 scored pairs and five recordings in each class, pair
+discrimination/calibration bounds, and substantial owner-specific same-speaker
+auxiliary-dominance evidence wherever Voice and that owner coexist.
+
+A completed study is not an automatic promotion. The artifact records whether
+each candidate was rejected, advanced for held-out certification, or adopted,
+and no lane has such authority until a real public-corpus result establishes
+it. When any lane is accuracy-eligible, development ranks one winner first; if
+that lane fails an operational bound, no lower-ranked lane advances. RTF and
+RSS are host-dependent observations against the live unfused baseline in the
+same invocation; passing them is not a speed or memory-win claim. The
+deterministic accuracy projection removes performance-only failures and
+`NotSelectedByRanking`, zeros timing/RSS, allocator capacities, and target-sized
+retained-state bytes, and clears certification's locked development result hash
+while retaining its accuracy hash before recomputing selection/adoption.
+
+The verifier recomputes aggregate metrics, fine/coarse score-distribution
+consistency, coverages, gates, ranking, dispositions, and hashes. It validates
+calibration fingerprints and fit-count provenance, but aggregate evidence
+cannot prove each omitted probability's histogram membership, refit
+calibrations, regenerate selected pairs, replay audio-derived metrics, or
+reproduce bootstrap intervals; verification proves aggregate internal
+consistency, not member-level provenance or corpus replay. Paired intervals use a fixed versioned
+lane/split seed and a cancellable SplitMix64 stream. Reference annotations use
+a monotonic overlap-aware sweep instead of rescanning all turns every 10 ms.
 
 The library's `adversarial_corpus` module supplies a Rust-native, public-safe
 accuracy harness without checking audio fixtures into the repository. It
@@ -743,6 +795,11 @@ External-only preparation and aggregate evaluation for public or
 operator-licensed diarization corpora. The registry does not download data or
 accept a license on the operator's behalf.
 
+`registry` is available on every supported CLI target. The artifact-writing
+`build`, `ablate`, and `sidecar-study` commands require Linux, Android, or an
+Apple platform; Windows and other targets return
+`public_corpus.output_platform` before reading corpus media or annotations.
+
 ```bash
 # inspect frozen source, license, conversion, and acknowledgement contracts
 franken_whisper diarization-corpus registry
@@ -773,13 +830,59 @@ franken_whisper diarization-corpus sidecar-study \
   --stage development
 ```
 
-All path arguments must be absolute. Input data must remain outside the
-checkout, and bundle/evidence parents must be outside both the checkout and
-input root. Outputs use create-new semantics and are never overwritten. Add
+All path arguments must be absolute. Entire output file names must use lowercase
+ASCII letters, digits, period, underscore, and hyphen and end in the exact
+suffix `.json`; a handle-relative preflight also rejects an existing
+ASCII-case-fold sibling, making ordinary case-sensitive and case-insensitive
+collisions fail consistently. Exact-name no-clobber publication remains the
+atomic creation guard. Input data must
+remain outside the checkout, and bundle/evidence parents must be outside both
+the checkout and input root. Outputs use create-new semantics and are never overwritten. On
+Linux, Android, and Apple platforms, complete JSON is privately staged relative
+to an identity-bound directory handle and atomically published with no-clobber
+semantics. The terminal parent may not be a symlink; it must be owned by the
+effective user and not group/world writable. This protects handle-relative
+directory contents while treating the effective user as trusted, because that
+user can also alter a final artifact afterward. Requested and canonical
+terminal-directory identities are checked throughout. Ancestor rename
+authority, ACLs, privileged mount changes, and arbitrary mount aliases of a
+checkout/input descendant are outside this boundary; use a privately controlled
+output path and filesystem without broader ACL access. Other platforms fail
+closed for this public-artifact path. Add
 `--maximum-recording-duration-ms <N>` to freeze a deterministic prefix. A
+pre-publication failure creates no final-name artifact and never modifies an
+existing final-name entry. After permission verification, later failures
+truncate and synchronize the private staging inode to a zero-length mode-0600
+marker; this is not a secure block erase. Creation is followed by an explicit
+mode-0600 permission operation and verification that the inode is a regular
+file owned by the effective user with exactly those access bits; failure is
+reported before payload serialization. POSIX/NFSv4 ACLs and mount policies
+that grant access beyond Unix mode bits are outside this writer's authority, so
+public-artifact output directories must reside on a filesystem where such
+broader access is absent. A permission-establishment failure leaves an empty
+marker but makes no mode claim. A storage failure during a payload scrub reports
+`public_corpus.output_cleanup_uncertain`. An error after the
+no-clobber rename is reported as
+`public_corpus.output_commit_uncertain`, because the final artifact may already
+exist and is not truncated. An ambiguous rename error uses the same
+commit-uncertain result and conservatively preserves the held inode; only an
+authoritative no-clobber conflict is treated as definitely pre-commit. Bundle
+and evidence files are each published
+atomically, but their two renames are not a cross-file transaction; successful
+evidence publication is the completion signal for the pair. A
 sidecar certification run uses `--stage certification` and must also supply
 `--locked-development-evidence <PATH>`; it evaluates the unfused baseline and
 only the single candidate selected by the exact locked development artifact.
+Both stages parse and hash the complete descriptor and audit its path-free
+cross-split metadata, but materialize WAV, RTTM, and optional word-annotation
+bytes only for the stage's selected split. Certification validates the retained
+development artifact's complete internal contract—including both calibration
+fingerprints and provenance, selected lane, recomputed gates/ranking/disposition,
+and result/accuracy hashes—then binds the current descriptor and protocol before
+opening held-out inputs. This validation does not refit calibration or replay
+development audio. Development and certification
+therefore create distinct split-specific bundle hashes; the shared descriptor
+and protocol hashes are the cross-stage lock.
 Source paths, filenames, recording/speaker identifiers, per-recording
 observations, feature values, audio, and transcripts never enter the aggregate
 study evidence.
@@ -3958,7 +4061,7 @@ For batch jobs, prefer a `Type=oneshot` unit and a `*.timer` for scheduling. Rob
 | `aarch64-unknown-linux-gnu` | Tier 1 (CI-tested) | Install ffmpeg via package manager |
 | `x86_64-apple-darwin` | Tier 1 (CI-tested) | `brew install ffmpeg` |
 | `aarch64-apple-darwin` | Tier 1 (CI-tested) | `brew install ffmpeg` |
-| `x86_64-pc-windows-msvc` | Tier 1 (CI-tested) | Install ffmpeg manually; `dshow` for mic |
+| `x86_64-pc-windows-msvc` | Tier 1 (CI-built) | Install ffmpeg manually; `dshow` for mic; public-corpus artifact writers fail closed |
 | `armv7-unknown-linux-musleabihf` | Best-effort | No auto-provisioned ffmpeg; cross-build via `cross` |
 | WebAssembly | Not supported | Symphonia + clap pull in OS APIs |
 

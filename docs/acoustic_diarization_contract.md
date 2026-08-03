@@ -347,8 +347,9 @@ are omitted, never replaced with zeros. Voice validity is a broader
 sidecar-specific temporal-modulation mask:
 voiced, non-low-energy, non-clipped, non-transient, and with a positive frame
 index. Unlike the acoustic-v2 identity mask, it intentionally does not require
-reliable pitch or RMS at or above -50 dBFS; public coverage and channel-confound
-gates must decide whether that broader support is useful. Channel validity
+reliable pitch or RMS at or above -50 dBFS; public coverage gates and, where
+Voice can be compared with auxiliary owners, the owner-separated same-speaker
+auxiliary-dominance gates decide whether that broader support is useful. Channel validity
 requires a non-low-energy, non-clipped observation. The fixed complex-step
 constants, derived twiddle table, oldest-to-newest ring order, and compile-time
 recurrence are configuration-hashed and avoid target-varying runtime
@@ -363,7 +364,8 @@ gain-centered acoustic-v2 cepstral-envelope coordinates. It is voice-owned and
 valid on a voiced, non-low-energy, non-clipped, non-transient frame; it has no
 predecessor-frame or positive-index dependency. Gain centering removes level,
 not room, device, or codec coloration, so `Voice` remains a provisional study
-axis subject to the channel-confound gate rather than proof of reusable identity.
+axis subject to the lane-appropriate same-speaker auxiliary-dominance gates,
+rather than evidence of reusable identity.
 Voiced occupancy is the frame-local binary `quality.voiced` indicator, not the
 history-bearing `voiced_fraction` IIR; it is valid whenever the frame is not
 clipped and remains mixed auxiliary activity evidence rather than reusable
@@ -479,10 +481,14 @@ Nothing in this section establishes that any new candidate improves
 diarization. `bd-odj7.13.15` therefore remains in progress.
 
 The evaluator uses the separate
-`public-diarization-acoustic-sidecar-study-v1` schema and
-`public-diarization-acoustic-sidecar-study-runner-v1`; it does not modify public
-acoustic ablation v8. Before reading development metrics it freezes this exact
-lane order:
+`public-diarization-acoustic-sidecar-study-v3` schema and
+`public-diarization-acoustic-sidecar-study-runner-v3`; it does not modify public
+acoustic ablation v8. The protocol fixes oracle VAD (`oracle_vad=true`) and
+leaves speaker count inferred (`oracle_speaker_count=false` with an `Infer`
+request). Its DER/JER and speaker-count evidence therefore evaluates
+segmentation and clustering conditioned on reference speech regions, not
+end-to-end VAD accuracy. Before reading development metrics it freezes this
+exact lane order:
 
 1. `full_v2_baseline`
 2. `frame_haar_l4`
@@ -498,23 +504,136 @@ lane order:
 12. `all_haar_l4`
 13. `all_d4_l4`
 
-The baseline is explicitly unfused. Each candidate reports aggregate boundary
-precision/recall/F1 and timing, conditional same/different discrimination,
-coverage, channel-confound rate, calibration, operation counts, RTF, RSS, and
-deterministic/self hashes. Candidate-pipeline DER/JER and speaker-count metrics
-are admitted only when `fusion_executed=true`; unavailable fusion cannot
-masquerade as a measured zero or a baseline-equivalent result. Development fits
-calibration from bounded aggregate histograms and may select at most one
-candidate that passes every uncertainty-aware improvement and non-regression
-gate. Its disposition is `advance_to_certification`; all other candidates are
-`rejected` and the unfused lane remains `baseline`. Held-out audio stays sealed
-unless the exact development artifact authorizes that one candidate.
+The baseline is explicitly unfused. For each candidate, the v3 artifact retains
+aggregate boundary metrics; conditional same/different-speaker metrics;
+comparable-frame and retained-pair score coverage; Channel and MixedAuxiliary
+dominance opportunities, counts, and rates split by same/different-speaker
+class; separate boundary and lagged-pair calibrations and hashes; operation
+counts; RTF/RSS; and deterministic/self hashes. Candidate-pipeline DER/JER and
+speaker-count metrics are admitted only when `fusion_executed=true`;
+unavailable fusion cannot masquerade as a measured zero or a baseline-equivalent
+result. Development separately fits adjacent-frame boundary probability and
+`P(different speaker | selected comparable reference-labeled frozen-lag pair)`.
+The `acoustic-sidecar-boundary-fusion-v2` configuration identity binds the
+selected change-detector mode in addition to sidecar configuration,
+calibration, and selector constants; detector modes with different fallback
+or peak-selection behavior therefore cannot share a fusion hash.
+The v2 selected-sequence digest binds the normalized-PCM identity, retained
+count, every selected key and frame/lag coordinate, and its same/different
+reference label. Aggregate class totals therefore cannot conceal a label swap
+between two retained positions, and all evaluated lanes must emit the same
+digest. A candidate is accuracy-eligible when its only failures, if any, are
+`PerformanceRegression` or the derived `NotSelectedByRanking`. Eligible
+candidates rank by minimum candidate-pipeline micro-DER and then frozen lane
+order. The unique top-ranked candidate must pass the complete live gate;
+failure does not promote a runner-up. An advancing winner's disposition is
+`advance_to_certification`; all other candidates are `rejected` and the
+unfused lane remains `baseline`. Held-out audio stays sealed unless the exact
+development artifact authorizes that one candidate.
 Certification evaluates the unfused baseline plus only the locked candidate
 and may mark that candidate `adopted` only after held-out non-regression. If no
 candidate passes development, the correct outcome is a retained aggregate
 negative result and no feature adoption. Implementing this contract does not
 claim that any lane has advanced or been adopted; that authority requires a
 real public-corpus artifact.
+
+The frozen v3 selection policy requires at least 1% relative development
+micro-DER improvement and certification micro-DER non-regression. Both stages
+cap absolute macro-JER regression at 0.01 and require boundary-F1 and
+speaker-count non-regression. Comparable-frame coverage must be at least 0.25.
+Overall pair-score coverage and the same- and different-speaker class-specific
+coverages—scored retained pairs divided by their retained bottom-k
+denominators—must each be at least 0.25. At least 100 scored same-speaker and
+100 scored different-speaker pairs are required, spanning at least five scored
+recordings overall and five recordings in each class. Pair ROC AUC must be at
+least 0.55, Brier at most 0.25, and ECE at most 0.10. Every expected
+Voice-versus-auxiliary owner comparison requires at least 100 same-speaker
+opportunities and a dominance rate at most 0.50: Modulation expects Channel;
+combined frame/modulation, trajectory, scattering, and all-feature lanes expect
+both Channel and MixedAuxiliary. Pure frame-wavelet lanes have MixedAuxiliary
+but no Voice owner and therefore have no meaningful dominance comparison;
+their pair discrimination/calibration gates still apply. Different-speaker
+dominance remains diagnostic only. Separately, at least five recordings must
+contribute paired DER and its 95% bootstrap upper delta bound must be
+nonpositive. Relative RTF and RSS regression must each be at most 0.25.
+
+The 2,000-replicate paired bootstrap uses the versioned
+`public-sidecar-paired-bootstrap-splitmix64-v2` procedure. Its canonical seed
+binds only the frozen seed policy, sampler, lane, split, and replicate count;
+the DER/JER stream identity is bound separately. It deliberately does not bind
+raw descriptor bytes or row cardinality, so descriptor whitespace, canonical
+record ordering, held-out metadata, or identity-matched rows with no paired
+metric cannot reroll an unchanged development sample. One SHA-256 digest
+initializes each replicate stream; versioned SplitMix64 draws replace a digest
+per draw, and cancellation is checked throughout pairing, observed-mean
+accumulation, and resampling.
+
+The eligible pair universe comprises 25/50/100/200-frame-lag pairs whose two
+frames each have a unique reference-speaker label; unknown, ignored, and
+overlapping labels are excluded. Eligibility and bottom-k admission occur
+independently of feature availability. Each recording retains at most 4,096
+pairs ordered by a score- and label-independent SHA-256 key over the
+selection-key-v3 identity, normalized duration-clipped PCM digest, left/right
+frame indices, and lag. The key excludes pair-scorer identity, feature
+availability, probability, and same/different label; scorer, target,
+population, and selected-sequence-digest identities are separately
+protocol-bound. A v2 digest over each recording's normalized PCM identity,
+ordered selected keys and coordinates, and per-key same/different reference
+label must match across every evaluated lane. Evidence retains
+aggregate eligible/retained/scored counts, retained same/different counts,
+overall and per-class score coverage and recording support, maximum retained
+counts and capacities, reliability-bin sufficient statistics, and a 100-bin
+score-order histogram whose ten fine bins per reliability bin carry linked
+class counts and probability, squared-probability, and squared-error sums. It
+retains no selected members, frame indices, labels, keys, or probabilities.
+The producer bins exact `f32` scores after intersecting them with the scorer's
+`[f32::EPSILON, 1 - f32::EPSILON]` clamp. Verification checks linked counts and
+first/second-moment feasibility against the exact closed `f32` support that
+maps to each bin. Those checks reject direct aggregate contradictions, but the
+omitted individual probabilities mean that sufficient statistics cannot prove
+every member's bin assignment or independently replay score ordering and
+binned ROC AUC.
+Allocator capacities are target diagnostics and are normalized out of the
+deterministic accuracy hash.
+
+The verifier recomputes boundary precision/recall/F1; boundary and pair
+Brier/ECE from retained reliability sums; pair class means and 100-bin ROC AUC;
+fine-to-coarse score-distribution consistency; overall and per-class coverage;
+dominance ratios; promotion gates; ranking; dispositions; protocol and
+configuration hashes; the deterministic-accuracy hash; and the self-hash. It
+validates retained calibration identities, parameter bounds and hashes,
+development fit-count provenance, cross-lane selected-pair identity, bootstrap
+seed/count/interval shape, and bounded sampler accounting. Because raw fit
+histograms, selected pair members, audio-derived contrasts, per-recording
+scoring rows, and per-recording bootstrap deltas are absent, it cannot
+independently establish every selected probability's histogram membership,
+refit either calibration, regenerate bottom-k membership, replay pipeline
+DER/JER, or reproduce bootstrap interval values. Verification
+therefore establishes artifact-internal consistency against the frozen
+protocol, not corpus replay.
+
+Reference labels for calibration and pair diagnostics use one monotonic,
+overlap-aware sweep over canonically ordered turns, ignored intervals, and
+change points. Active turns are retired by end-time heap, so a long annotation
+cannot force a complete turn/change scan for every 10 ms frame. This cursor is
+evaluation-local and retains no label or timestamp in the aggregate artifact.
+
+RTF and RSS are host-dependent operational gate inputs, not accuracy evidence:
+they are excluded from the deterministic accuracy hash but retained in the
+self-hashed result. The deterministic projection clears result/accuracy
+self-hash fields and, for certification, the locked development result hash
+while retaining the locked development accuracy hash. It zeros sidecar and
+candidate-pipeline wall time, RTF, and RSS; retained pair/signal allocator
+capacities; and target-sized retained-state bytes. It removes
+`PerformanceRegression` and `NotSelectedByRanking`, recomputes gate pass state,
+and reruns development selection or certification adoption. Other deterministic
+accuracy, calibration, configuration, and decision evidence remains bound.
+The RTF comparison uses the live unfused baseline and the candidate
+under the same request in one invocation. RSS is the Linux process high-water
+mark when available and otherwise a sampled process RSS, so it is a coarse
+process-level observation rather than an isolated per-lane footprint. Passing
+these bounds cannot establish a speed or memory win, and no such claim exists
+without a separately retained public probe.
 
 ### 4.4 Probabilistic clustering v2 development status
 
@@ -1106,8 +1225,47 @@ values, optional word-annotation SHA-256 values and counts, checked WAV
 geometry, and a passing self-hashed leakage audit. It never contains local
 paths, URIs, transcripts, or media bytes. The output is created once in a
 directory outside both the checkout and input root; source media is never
-copied. The path-bearing descriptor type is deserialization-only and has no
-`Debug` or serialization implementation.
+copied. Entire output file names use lowercase ASCII letters, digits, period,
+underscore, and hyphen and end in the exact suffix `.json`; uppercase names are
+rejected, and a handle-relative directory preflight rejects any existing
+ASCII-case-fold sibling. This makes ordinary case-sensitive and
+case-insensitive collisions fail consistently; exact-name no-clobber
+publication remains the atomic creation guard, and concurrent mutation by the
+effective user remains outside the threat boundary. On Linux, Android, and
+Apple platforms, complete JSON is serialized into a
+private staging file relative to an identity-bound directory handle, fsynced,
+and atomically published with no-clobber rename semantics. The terminal parent
+must not be a symlink, must be owned by the effective user, and must not be
+group/world writable. Requested and canonical terminal-directory identities
+are checked throughout; the effective user is trusted because it can also alter
+a final artifact after publication. Ancestor rename authority, ACLs, privileged
+mount changes, and arbitrary mount aliases of strict checkout/input descendants
+are outside this boundary, so callers must use a privately controlled output
+path and filesystem. Other platforms fail closed with
+`public_corpus.output_platform` before corpus materialization.
+Before the no-clobber rename commit point, the run creates no final-name
+artifact and never modifies an already existing final-name entry. After
+permission verification, cancellation or later failure truncates and
+synchronizes the private staging inode to a zero-length mode-0600 marker; this
+is not a secure block erase. The writer explicitly applies
+mode 0600 after creation and verifies that the inode is a regular file owned by
+the effective user with exactly those access bits before serializing payload
+bytes. POSIX/NFSv4 ACLs and mount-level permission synthesis are outside this
+mode-bit check; the caller must select an output filesystem that does not grant
+broader access through those mechanisms. A failure while establishing or
+verifying permissions leaves an empty marker without a mode guarantee. Failure to complete a payload scrub
+reports `public_corpus.output_cleanup_uncertain`. After that commit point, a
+failed identity or directory-sync
+confirmation reports `public_corpus.output_commit_uncertain`; the final-name
+artifact may already exist and is never truncated. An ambiguous rename result
+is also commit-uncertain and conservatively preserves the held inode; only an
+authoritative no-clobber conflict permits pre-commit scrubbing. A
+bundle/evidence pair is staged before either publication, but the two
+independent final-name renames
+are not a cross-file transaction, so callers must treat successful evidence
+publication as the completed pair.
+The path-bearing descriptor type is deserialization-only and has no `Debug` or
+serialization implementation.
 
 The current ablation evidence is
 `public-diarization-acoustic-ablation-v8` with runner v8. Every split reports
@@ -1129,18 +1287,28 @@ sequence retained in the evidence file, including its terminal newline; the
 artifact's `result_sha256` remains the canonical self-hash with that field
 cleared, not a hash of the pretty file bytes.
 
-`--stage development` reads only development recordings and must not receive a
-lock. `--stage certification` reads only held-out recordings and requires
-`--locked-development-evidence`; before corpus access it verifies the exact
-development result and deterministic-accuracy hashes, bundle, descriptor,
-duration protocol, candidate order/configuration hashes, fitted calibration,
-selected lane, gates, and disposition. A failed development selection cannot
-unlock certification. Both stages retain no source path, filename,
-recording/speaker identifier, timestamped observation, raw feature value,
-audio, or transcript. Cancellation is checked throughout preparation and
-evaluation, and evidence is written only after canonical verification. None of
-these CLI or artifact paths construct a sidecar during transcription or change
-the default-off acoustic-v2 path.
+Both stages parse and hash the complete descriptor and audit its path-free
+cross-split metadata. `--stage development` then opens only development WAV,
+RTTM, and optional word-annotation bytes and must not receive a lock.
+`--stage certification` requires `--locked-development-evidence`; it first
+verifies that artifact's result and deterministic-accuracy hashes, protocol,
+candidate order/configuration hashes, separately fitted boundary and lagged-pair
+calibrations and their provenance, selected lane, recomputed gates, ranking,
+and disposition. It then hashes the current descriptor, requires the descriptor
+and protocol identities to match the development lock, and only afterward opens
+held-out WAV or annotation bytes. A failed development selection therefore
+cannot unlock certification. The materialized bundles are split-specific, so
+their bundle hashes differ across stages; the common descriptor and protocol
+hashes form the cross-stage binding. The aggregate study evidence from either
+stage retains no source path, filename, recording/speaker identifier,
+timestamped observation, raw feature value, audio, or transcript. The separate
+path-free public bundle does retain the selected split's validated public
+reference rows, including recording/speaker identifiers and timestamps needed
+by the scorer; it retains no source paths, filenames, audio, transcript text,
+or sidecar feature values. Cancellation is checked throughout preparation and
+evaluation, and evidence is written only after canonical verification.
+None of these CLI or artifact paths construct a sidecar during transcription or
+change the default-off acoustic-v2 path.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an
@@ -1512,8 +1680,11 @@ shaped performance text are also ignored under `tests/artifacts/perf`.
 gate. It scans tracked or staged path names first. If any prohibited path is
 present, it emits only path/reason NDJSON and exits before reading file
 contents. Only after the path phase is clean does it inspect magic bytes and
-transcript-shaped content in risky artifact roots, so a misleading filename
-cannot bypass the policy. It never prints matched content.
+transcript-shaped content in risky artifact roots. Recognized container magic
+therefore catches several renamed media formats, but this is defense in depth:
+headerless raw audio and transcript-shaped content outside the enumerated risky
+roots are not proven absent by content inspection alone. Path/extension rules
+remain the primary boundary. The gate never prints matched content.
 
 Both the automatic tag workflow and the distribution workflow compile this
 gate directly with `rustc`. Distribution builds remain allowed to proceed
