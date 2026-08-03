@@ -16223,11 +16223,9 @@ mod tests {
         assert!(error.to_string().contains("output_exists"));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn fifo_output_leaf_is_rejected_without_opening_it() {
-        use rustix::fs::{Mode, mkfifoat};
-
         let root = private_tempdir("root");
         let project = root.path().join("project");
         let input = root.path().join("input");
@@ -16236,10 +16234,27 @@ mod tests {
             create_private_directory(directory);
         }
         let output_path = output_parent.join("artifact.json");
-        let output_directory =
-            std::fs::File::open(&output_parent).expect("output directory handle");
-        mkfifoat(&output_directory, "artifact.json", Mode::RUSR | Mode::WUSR)
-            .expect("fixture FIFO");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use rustix::fs::{Mode, mkfifoat};
+
+            let output_directory =
+                std::fs::File::open(&output_parent).expect("output directory handle");
+            mkfifoat(&output_directory, "artifact.json", Mode::RUSR | Mode::WUSR)
+                .expect("fixture FIFO");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // rustix intentionally does not expose mkfifoat on Apple targets.
+            // The system mkfifo utility creates the same private test fixture
+            // without introducing unsafe code into this memory-safe crate.
+            let status = std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&output_path)
+                .status()
+                .expect("run system mkfifo for fixture");
+            assert!(status.success(), "system mkfifo failed: {status}");
+        }
 
         let error = match validate_new_output(
             &project.canonicalize().expect("canonical project"),
