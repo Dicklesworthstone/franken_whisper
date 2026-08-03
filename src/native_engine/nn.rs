@@ -161,6 +161,8 @@ fn mid_gemv_cap() -> usize {
             .filter(|&c: &usize| c >= 1)
             .unwrap_or(8)
     })
+}
+
 /// Worker width for a cohort of independent one-token decoder streams.
 ///
 /// A scalar GEMV deliberately caps moderate projections at eight workers, but a
