@@ -16,6 +16,8 @@ const FRAME_MS: u32 = 20;
 const MIN_THRESHOLD: f32 = 0.003;
 const GAP_BRIDGE_MAX_FRAMES: usize = 2;
 const MIN_REGION_FRAMES: usize = 2;
+/// Hard bound on private valley candidates retained for one alignment stage.
+const MAX_ENERGY_VALLEY_CANDIDATES: usize = 16_384;
 
 /// A local minimum in the private frame-RMS trace.  This is transient
 /// waveform evidence for timestamp refinement; callers must not serialize it
@@ -26,8 +28,9 @@ pub(crate) struct EnergyValley {
     pub rms: f32,
 }
 
-/// Private, bounded frame-energy evidence used by alignment.  The full RMS
-/// trace is intentionally discarded after valley candidates are derived.
+/// Private, bounded, timestamp-sorted frame-energy evidence used by alignment.
+/// The full RMS trace is intentionally discarded after valley candidates are
+/// derived.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EnergyValleyProfile {
     pub frame_ms: u32,
@@ -189,24 +192,36 @@ pub(crate) fn energy_valleys_from_wav(
     let activity_threshold =
         ((avg_rms * 1.5).max(MIN_THRESHOLD)).min((max_rms * 0.8).max(MIN_THRESHOLD));
 
-    let valleys = frame_rms
-        .windows(3)
-        .enumerate()
-        .filter_map(|(offset, window)| {
-            let rms = window[1];
-            (rms.is_finite() && rms < activity_threshold && rms <= window[0] && rms <= window[2])
-                .then_some(EnergyValley {
-                    timestamp_ms: (offset as u64 + 1).saturating_mul(u64::from(FRAME_MS)),
-                    rms,
-                })
-        })
-        .collect();
+    let valleys = collect_energy_valleys(&frame_rms, activity_threshold)?;
 
     Ok(EnergyValleyProfile {
         frame_ms: FRAME_MS,
         activity_threshold,
         valleys,
     })
+}
+
+fn collect_energy_valleys(
+    frame_rms: &[f32],
+    activity_threshold: f32,
+) -> FwResult<Vec<EnergyValley>> {
+    let mut valleys = Vec::new();
+    for (offset, window) in frame_rms.windows(3).enumerate() {
+        let rms = window[1];
+        if !(rms.is_finite() && rms < activity_threshold && rms <= window[0] && rms <= window[2]) {
+            continue;
+        }
+        if valleys.len() == MAX_ENERGY_VALLEY_CANDIDATES {
+            return Err(FwError::InvalidRequest(format!(
+                "energy-valley evidence exceeds retained-candidate cap of {MAX_ENERGY_VALLEY_CANDIDATES}; snapping failed closed"
+            )));
+        }
+        valleys.push(EnergyValley {
+            timestamp_ms: (offset as u64 + 1).saturating_mul(u64::from(FRAME_MS)),
+            rms,
+        });
+    }
+    Ok(valleys)
 }
 
 fn parse_pcm16_mono_wav(path: &Path) -> Result<WavPcm16Mono, String> {
@@ -508,7 +523,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{analyze_wav, energy_valleys_from_wav};
+    use super::{
+        MAX_ENERGY_VALLEY_CANDIDATES, analyze_wav, collect_energy_valleys, energy_valleys_from_wav,
+    };
 
     fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
         let data_len = (samples.len() * 2) as u32;
@@ -623,6 +640,19 @@ mod tests {
                 .iter()
                 .any(|valley| valley.timestamp_ms == 20 && valley.rms == 0.0)
         );
+    }
+
+    #[test]
+    fn energy_valley_candidate_cap_fails_closed_without_partial_profile() {
+        let mut frame_rms = Vec::with_capacity((MAX_ENERGY_VALLEY_CANDIDATES + 1) * 3);
+        for _ in 0..=MAX_ENERGY_VALLEY_CANDIDATES {
+            frame_rms.extend([0.1, 0.0, 0.1]);
+        }
+
+        let error = collect_energy_valleys(&frame_rms, 0.05)
+            .expect_err("candidate cap must reject rather than return a partial profile");
+        assert!(error.to_string().contains("retained-candidate cap"));
+        assert!(error.to_string().contains("failed closed"));
     }
 
     #[test]
