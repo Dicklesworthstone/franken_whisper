@@ -4916,16 +4916,27 @@ fn sidecar_frame_timestamp_ms(frame_index: usize) -> FwResult<u64> {
         })
 }
 
+struct SidecarObservationAnalysis<'a> {
+    reference: &'a DiarizationReferenceDocument,
+    normalized_pcm_sha256: &'a str,
+    study_config: AcousticSidecarStudyConfig,
+    boundary_calibration: &'a PublicCorpusSidecarCalibration,
+    pair_calibration: Option<&'a PublicCorpusSidecarPairCalibration>,
+}
+
 fn analyze_sidecar_observations(
     samples: &[f32],
-    reference: &DiarizationReferenceDocument,
-    normalized_pcm_sha256: &str,
-    study_config: AcousticSidecarStudyConfig,
-    boundary_calibration: &PublicCorpusSidecarCalibration,
-    pair_calibration: Option<&PublicCorpusSidecarPairCalibration>,
+    analysis: SidecarObservationAnalysis<'_>,
     aggregate: &mut SidecarObservationAccumulator,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> FwResult<()> {
+    let SidecarObservationAnalysis {
+        reference,
+        normalized_pcm_sha256,
+        study_config,
+        boundary_calibration,
+        pair_calibration,
+    } = analysis;
     if let Some(pair_calibration) = pair_calibration {
         validate_public_sidecar_pair_calibration(pair_calibration)?;
     }
@@ -5023,12 +5034,11 @@ fn analyze_sidecar_observations(
                     >= boundary_calibration.minimum_comparable_components
                     && let Some(probability) =
                         public_sidecar_probability(boundary_calibration, contrast)?
+                    && let Some(positive) = reference_label.boundary
                 {
-                    if let Some(positive) = reference_label.boundary {
-                        aggregate
-                            .boundary_probabilities
-                            .push(probability, positive)?;
-                    }
+                    aggregate
+                        .boundary_probabilities
+                        .push(probability, positive)?;
                 }
             }
 
@@ -6026,11 +6036,13 @@ fn evaluate_public_sidecar_lane(
             } else {
                 analyze_sidecar_observations(
                     &loaded.samples,
-                    &loaded.reference,
-                    &normalized_pcm_sha256,
-                    lane.study_config(),
-                    boundary_calibration,
-                    pair_calibration,
+                    SidecarObservationAnalysis {
+                        reference: &loaded.reference,
+                        normalized_pcm_sha256: &normalized_pcm_sha256,
+                        study_config: lane.study_config(),
+                        boundary_calibration,
+                        pair_calibration,
+                    },
                     &mut observations,
                     is_cancelled,
                 )?;
@@ -9121,20 +9133,12 @@ fn verified_sidecar_reliability(
         {
             return None;
         }
-        let Some(next_observations) = retained_observations.checked_add(bin.observation_count)
-        else {
-            return None;
-        };
+        let next_observations = retained_observations.checked_add(bin.observation_count)?;
         retained_observations = next_observations;
-        let Some(next_positives) = retained_positives.checked_add(bin.positive_count) else {
-            return None;
-        };
+        let next_positives = retained_positives.checked_add(bin.positive_count)?;
         retained_positives = next_positives;
-        let Some((support_lower, support_upper)) =
-            sidecar_f32_probability_bin_support(index, PUBLIC_SIDECAR_RELIABILITY_BINS)
-        else {
-            return None;
-        };
+        let (support_lower, support_upper) =
+            sidecar_f32_probability_bin_support(index, PUBLIC_SIDECAR_RELIABILITY_BINS)?;
         if !sidecar_probability_moments_are_feasible(
             support_lower,
             support_upper,
@@ -9584,16 +9588,14 @@ fn sidecar_split_is_valid(
         || sidecar_auxiliary_dominance_is_zero(&coverage.channel_dominance))
         && (expects_mixed_dominance
             || sidecar_auxiliary_dominance_is_zero(&coverage.mixed_auxiliary_dominance));
-    let minimum_per_recording_maximum = |total: u64| {
+    let minimum_per_recording_maximum = |total: u64| -> Option<u64> {
         if total == 0 {
             Some(0)
-        } else if coverage.evaluated_recording_count == 0 {
-            None
         } else {
-            Some(
-                total / coverage.evaluated_recording_count
-                    + u64::from(total % coverage.evaluated_recording_count != 0),
-            )
+            let quotient = total.checked_div(coverage.evaluated_recording_count)?;
+            quotient.checked_add(u64::from(
+                !total.is_multiple_of(coverage.evaluated_recording_count),
+            ))
         }
     };
     let minimum_maximum_retained_pair_count =
@@ -12246,14 +12248,14 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
         // alias of a strict descendant is not discoverable from these two
         // ancestry walks and remains outside this check's authority. Metadata
         // failure is treated as overlap to keep publication fail-closed.
-        return match (ancestry(left), ancestry(right)) {
+        match (ancestry(left), ancestry(right)) {
             (Ok(left_ancestry), Ok(right_ancestry)) => {
                 let left_identity = left_ancestry[0];
                 let right_identity = right_ancestry[0];
                 right_ancestry.contains(&left_identity) || left_ancestry.contains(&right_identity)
             }
             _ => true,
-        };
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
@@ -15997,16 +15999,21 @@ mod tests {
     #[test]
     fn output_must_remain_outside_project_and_inputs() {
         let fixture = Fixture::new("aishell-4-openslr111-v1", "aishell-fixture", "development");
-        let unsafe_output = fixture.project.path().join("bundle.json");
-        let error = build_public_corpus_bundle(
-            fixture.project.path(),
-            fixture.input.path(),
-            &fixture.descriptor_path,
-            &unsafe_output,
-            "accept-aishell-4-cc-by-sa-4.0",
-        )
-        .expect_err("project output");
-        assert!(error.to_string().contains("output_overlap"));
+        for (label, unsafe_output) in [
+            ("project output", fixture.project.path().join("bundle.json")),
+            ("input output", fixture.input.path().join("bundle.json")),
+        ] {
+            let error = build_public_corpus_bundle(
+                fixture.project.path(),
+                fixture.input.path(),
+                &fixture.descriptor_path,
+                &unsafe_output,
+                "accept-aishell-4-cc-by-sa-4.0",
+            )
+            .expect_err(label);
+            assert!(error.to_string().contains("output_overlap"));
+            assert!(!unsafe_output.exists());
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]

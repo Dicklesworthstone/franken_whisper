@@ -30,6 +30,7 @@ storage.sqlite3-shm
 *.[aA][iI][fF]
 *.[aA][iI][fF][fF]
 *.[aA][mM][rR]
+*.[aA][wW][bB]
 *.[cC][aA][fF]
 *.[oO][pP][uU][sS]
 *.[wW][mM][aA]
@@ -68,6 +69,7 @@ storage.sqlite3-shm
 *.aif
 *.aiff
 *.amr
+*.awb
 *.caf
 *.opus
 *.wma
@@ -85,6 +87,7 @@ storage.sqlite3-shm
 *.AIF
 *.AIFF
 *.AMR
+*.AWB
 *.CAF
 *.OPUS
 *.WMA

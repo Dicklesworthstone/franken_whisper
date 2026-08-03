@@ -5908,8 +5908,8 @@ fn validate_acoustic_sidecar_observation_identity(
         }
     }
 
-    if let Some(summary) = observation.modulation {
-        if !observation.config.mode.uses_modulation()
+    if let Some(summary) = observation.modulation
+        && (!observation.config.mode.uses_modulation()
             || !fixed_window_matches(
                 summary.window_start_frame_index,
                 summary.window_end_frame_index,
@@ -5917,16 +5917,15 @@ fn validate_acoustic_sidecar_observation_identity(
             )
             || summary.voice_owner != AcousticSidecarFeatureOwner::Voice
             || summary.channel_level_owner != AcousticSidecarFeatureOwner::Channel
-            || summary.channel_coloration_owner != AcousticSidecarFeatureOwner::Channel
-        {
-            return Err(FwError::InvalidRequest(
-                "sidecar modulation metadata contradicts its canonical configuration".to_owned(),
-            ));
-        }
+            || summary.channel_coloration_owner != AcousticSidecarFeatureOwner::Channel)
+    {
+        return Err(FwError::InvalidRequest(
+            "sidecar modulation metadata contradicts its canonical configuration".to_owned(),
+        ));
     }
 
-    if let Some(summary) = observation.trajectory_wavelet {
-        if observation.config.trajectory_wavelet_mode.basis() != Some(summary.basis)
+    if let Some(summary) = observation.trajectory_wavelet
+        && (observation.config.trajectory_wavelet_mode.basis() != Some(summary.basis)
             || observation.config.trajectory_wavelet_levels != summary.requested_levels
             || !fixed_window_matches(
                 summary.window_start_frame_index,
@@ -5941,13 +5940,12 @@ fn validate_acoustic_sidecar_observation_identity(
                 .zip(AcousticTrajectoryFamily::ALL)
                 .any(|(family, expected)| {
                     family.family != expected || family.owner != expected.owner()
-                })
-        {
-            return Err(FwError::InvalidRequest(
-                "sidecar trajectory-wavelet metadata contradicts its canonical configuration"
-                    .to_owned(),
-            ));
-        }
+                }))
+    {
+        return Err(FwError::InvalidRequest(
+            "sidecar trajectory-wavelet metadata contradicts its canonical configuration"
+                .to_owned(),
+        ));
     }
 
     if let Some(summary) = observation.scattering {
@@ -16297,9 +16295,11 @@ mod tests {
             .map(|&(count, probability)| SpeakerCountPosteriorBin { count, probability })
             .collect::<Vec<_>>();
         let entropy_term = |probability: f64| {
-            (probability > 0.0)
-                .then(|| -probability * probability.log2())
-                .unwrap_or(0.0)
+            if probability > 0.0 {
+                -probability * probability.log2()
+            } else {
+                0.0
+            }
         };
         let entropy_bits = posterior
             .iter()
@@ -18349,7 +18349,7 @@ mod tests {
         }
         frame.voice.voiced_fraction = 0.55 + 0.25 * (3.0 * phase).sin();
         frame.voice.temporal_modulation = 0.5 + 0.3 * (4.0 * phase).sin();
-        if frame_index % 5 == 0 {
+        if frame_index.is_multiple_of(5) {
             frame.voice.f0_hz = None;
             frame.voice.pitch_uncertainty_octaves = None;
             frame.voice.voicing_confidence = 0.0;
@@ -19041,10 +19041,12 @@ mod tests {
                     .map(|value| f64::from(*value) * f64::from(*value))
                     .sum::<f64>();
                 let mut output_energy = 0.0_f64;
-                for output_index in 0..current_len / 2 {
+                for (output_index, approximation_sample) in
+                    approximation[..current_len / 2].iter_mut().enumerate()
+                {
                     let (low, high, _) =
                         super::wavelet_pair(basis, &current, current_len, output_index * 2);
-                    approximation[output_index] = low;
+                    *approximation_sample = low;
                     output_energy +=
                         f64::from(low) * f64::from(low) + f64::from(high) * f64::from(high);
                 }
