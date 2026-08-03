@@ -161,6 +161,16 @@ fn mid_gemv_cap() -> usize {
             .filter(|&c: &usize| c >= 1)
             .unwrap_or(8)
     })
+/// Worker width for a cohort of independent one-token decoder streams.
+///
+/// A scalar GEMV deliberately caps moderate projections at eight workers, but a
+/// cohort carries `tq` independent dot products per output row.  Scale that
+/// proven per-stream width by the cohort size so five simultaneous windows can
+/// occupy roughly forty cores, while the vocabulary projection may use the
+/// entire physical-core pool.
+#[inline]
+fn cohort_gemv_worker_count(out: usize, tq: usize) -> usize {
+    avail_parallelism().min(gemv_worker_count(out).saturating_mul(tq).max(1))
 }
 
 /// Worker cap for the vocab-class (bandwidth-bound) GEMV. **32** (measured optimum):
@@ -532,6 +542,46 @@ pub fn matmul_raw_lhs(lhs: &[f32], m: usize, b: &Mat) -> FwResult<Mat> {
     let lhs_meta = meta_2d(m, k);
     let rhs_meta = meta_2d(k, n);
     let data = matmul_into_uninit(lhs, &b.data, &lhs_meta, &rhs_meta, m * n)?;
+    Ok(Mat::from_vec(m, n, data))
+}
+
+/// `[m,k] x [k,n] -> [m,n]` on the allocating FrankenTorch CPU f32 path.
+///
+/// Unlike [`matmul_raw_lhs`], this entry point never takes the local GEMV fast
+/// path, the uninitialized-output path, or Metal auto-offload. It is intended
+/// for inference contracts that report an explicitly CPU-only compute path.
+/// Every storage/product bound is checked before constructing kernel metadata.
+pub(crate) fn matmul_raw_lhs_cpu(lhs: &[f32], m: usize, b: &Mat) -> FwResult<Mat> {
+    let k = b.rows;
+    let n = b.cols;
+    if m == 0 || k == 0 || n == 0 {
+        return Err(FwError::InvalidRequest(
+            "matmul_raw_lhs_cpu: dimensions must be non-zero".to_owned(),
+        ));
+    }
+    let lhs_len = m.checked_mul(k).ok_or_else(|| {
+        FwError::InvalidRequest("matmul_raw_lhs_cpu: lhs dimensions overflow".to_owned())
+    })?;
+    let rhs_len = k.checked_mul(n).ok_or_else(|| {
+        FwError::InvalidRequest("matmul_raw_lhs_cpu: rhs dimensions overflow".to_owned())
+    })?;
+    let output_len = m.checked_mul(n).ok_or_else(|| {
+        FwError::InvalidRequest("matmul_raw_lhs_cpu: output dimensions overflow".to_owned())
+    })?;
+    if lhs.len() != lhs_len || b.data.len() != rhs_len {
+        return Err(FwError::InvalidRequest(
+            "matmul_raw_lhs_cpu: storage length does not match dimensions".to_owned(),
+        ));
+    }
+    let lhs_meta = meta_2d(m, k);
+    let rhs_meta = meta_2d(k, n);
+    let data = ft_kernel_cpu::matmul_tensor_contiguous_f32(lhs, &b.data, &lhs_meta, &rhs_meta)
+        .map_err(kernel_err)?;
+    if data.len() != output_len {
+        return Err(FwError::InvalidRequest(
+            "matmul_raw_lhs_cpu: kernel returned an invalid output length".to_owned(),
+        ));
+    }
     Ok(Mat::from_vec(m, n, data))
 }
 
@@ -2991,6 +3041,95 @@ pub fn gemv_i8_batch(w: &I8Mat, x: &[f32], tq: usize, bias: Option<&[f32]>, out_
     }
 }
 
+/// Int8 GEMV for a cohort of independent one-token decoder streams.
+///
+/// Unlike the prefill scheduler in [`gemv_i8_batch`], this uses the persistent
+/// Rayon pool and scales the output-row fan-out with cohort width.  Results are
+/// accumulated in output-major order so every worker owns one contiguous slice;
+/// the final transpose is pure movement and preserves every scalar bit.
+pub fn gemv_i8_cohort(
+    w: &I8Mat,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+) {
+    let (out, inp) = (w.out, w.inp);
+    debug_assert_eq!(x.len(), tq * inp, "i8 cohort x shape mismatch");
+    debug_assert_eq!(out_slice.len(), tq * out, "i8 cohort out shape mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out));
+    if tq == 0 || out == 0 {
+        return;
+    }
+    if tq == 1 {
+        gemv_i8(w, x, bias, out_slice);
+        return;
+    }
+
+    let mut xi8 = vec![0i8; tq * inp];
+    let mut xs = vec![0.0f32; tq];
+    for t in 0..tq {
+        let row = &x[t * inp..(t + 1) * inp];
+        let xamax = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-9);
+        let scale = xamax / 127.0;
+        xs[t] = scale;
+        quantize_act_i8_into(row, 1.0 / scale, &mut xi8[t * inp..(t + 1) * inp]);
+    }
+
+    let workers = cohort_gemv_worker_count(out, tq).min(out.max(1));
+    let band = out.div_ceil(workers).max(1);
+    let mut by_output = vec![0.0f32; out * tq];
+    by_output
+        .par_chunks_mut(band * tq)
+        .enumerate()
+        .for_each(|(wk, local)| {
+            let o0 = wk * band;
+            let width = local.len() / tq;
+            for local_o in 0..width {
+                let o = o0 + local_o;
+                let wrow = &w.data[o * inp..(o + 1) * inp];
+                let weight_scale = w.scales[o];
+                let b = bias.map_or(0.0, |bb| bb[o]);
+                let dst = &mut local[local_o * tq..(local_o + 1) * tq];
+                let mut t = 0;
+                while t + 4 <= tq {
+                    let (da, db, dc, dd) = dot_i8_4col(
+                        wrow,
+                        &xi8[t * inp..(t + 1) * inp],
+                        &xi8[(t + 1) * inp..(t + 2) * inp],
+                        &xi8[(t + 2) * inp..(t + 3) * inp],
+                        &xi8[(t + 3) * inp..(t + 4) * inp],
+                    );
+                    dst[t] = da as f32 * weight_scale * xs[t] + b;
+                    dst[t + 1] = db as f32 * weight_scale * xs[t + 1] + b;
+                    dst[t + 2] = dc as f32 * weight_scale * xs[t + 2] + b;
+                    dst[t + 3] = dd as f32 * weight_scale * xs[t + 3] + b;
+                    t += 4;
+                }
+                while t + 2 <= tq {
+                    let (da, db) = dot_i8_2col(
+                        wrow,
+                        &xi8[t * inp..(t + 1) * inp],
+                        &xi8[(t + 1) * inp..(t + 2) * inp],
+                    );
+                    dst[t] = da as f32 * weight_scale * xs[t] + b;
+                    dst[t + 1] = db as f32 * weight_scale * xs[t + 1] + b;
+                    t += 2;
+                }
+                if t < tq {
+                    dst[t] =
+                        dot_i8(wrow, &xi8[t * inp..(t + 1) * inp]) as f32 * weight_scale * xs[t]
+                            + b;
+                }
+            }
+        });
+    for o in 0..out {
+        for t in 0..tq {
+            out_slice[t * out + o] = by_output[o * tq + t];
+        }
+    }
+}
+
 /// Dot of an int8 weight row against an **f32** activation (no activation
 /// quantization): `Σ_i (w[i] as f32) · x[i]`. Scalar fallback.
 #[cfg(not(all(
@@ -3339,6 +3478,64 @@ pub fn gemv_i8w_f32a_blocked(
         .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
 }
 
+/// Batched block-int8-weight × f32-activation GEMV.
+///
+/// Each `(token, output)` follows [`gemv_i8w_f32a_blocked`]'s block and
+/// accumulation order exactly, while output-row bands keep one weight row hot
+/// across every token in the cohort.  The temporary band layout is contiguous;
+/// the final scatter only reorders already-computed scalar results.
+pub fn gemv_i8w_f32a_blocked_batch(
+    w: &I8BlockMat,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+) {
+    let (out, inp, block) = (w.out, w.inp, w.block);
+    let n_blocks = inp.div_ceil(block);
+    debug_assert_eq!(x.len(), tq * inp, "blocked batch x shape mismatch");
+    debug_assert_eq!(
+        out_slice.len(),
+        tq * out,
+        "blocked batch out shape mismatch"
+    );
+    debug_assert!(bias.is_none_or(|b| b.len() == out));
+    if tq == 0 || out == 0 {
+        return;
+    }
+
+    let workers = cohort_gemv_worker_count(out, tq).min(out.max(1));
+    let band = out.div_ceil(workers).max(1);
+    let mut by_output = vec![0.0f32; out * tq];
+    by_output
+        .par_chunks_mut(band * tq)
+        .enumerate()
+        .for_each(|(wk, local)| {
+            let o0 = wk * band;
+            let width = local.len() / tq;
+            for local_o in 0..width {
+                let o = o0 + local_o;
+                let wrow = &w.data[o * inp..(o + 1) * inp];
+                let srow = &w.scales[o * n_blocks..(o + 1) * n_blocks];
+                for t in 0..tq {
+                    let xrow = &x[t * inp..(t + 1) * inp];
+                    let mut acc = 0.0f32;
+                    for (b, &sc) in srow.iter().enumerate() {
+                        let s = b * block;
+                        let e = ((b + 1) * block).min(inp);
+                        acc += dot_i8w_f32(&wrow[s..e], &xrow[s..e]) * sc;
+                    }
+                    local[local_o * tq + t] = acc + bias.map_or(0.0, |bb| bb[o]);
+                }
+            }
+        });
+    for o in 0..out {
+        for t in 0..tq {
+            out_slice[t * out + o] = by_output[o * tq + t];
+        }
+    }
+}
+
 /// PACKED block-wise 4-bit weight (Q4_0-style), fixed `block == 32`. Two signed
 /// nibbles ride in each byte: for block `b`, byte `j` (`0..16`) holds `w[b*32+j]`
 /// in the low nibble and `w[b*32+j+16]` in the high nibble, each a 4-bit two's
@@ -3535,6 +3732,60 @@ pub fn gemv_i4_packed_f32a(w: &I4BlockMat, x: &[f32], bias: Option<&[f32]>, out_
         .for_each(|(wk, band_slice)| fill(wk * band, band_slice));
 }
 
+/// Batched packed-int4-weight × f32-activation GEMV for independent decoder
+/// streams.  One output-weight row is reused across every activation row, and
+/// every scalar result is bit-identical to [`gemv_i4_packed_f32a`].
+pub fn gemv_i4_packed_f32a_batch(
+    w: &I4BlockMat,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+) {
+    const BLOCK: usize = 32;
+    let (out, inp) = (w.out, w.inp);
+    let n_blocks = inp / BLOCK;
+    let row_bytes = inp / 2;
+    debug_assert_eq!(x.len(), tq * inp, "i4 batch x shape mismatch");
+    debug_assert_eq!(out_slice.len(), tq * out, "i4 batch out shape mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out));
+    if tq == 0 || out == 0 {
+        return;
+    }
+
+    let workers = cohort_gemv_worker_count(out, tq).min(out.max(1));
+    let band = out.div_ceil(workers).max(1);
+    let mut by_output = vec![0.0f32; out * tq];
+    by_output
+        .par_chunks_mut(band * tq)
+        .enumerate()
+        .for_each(|(wk, local)| {
+            let o0 = wk * band;
+            let width = local.len() / tq;
+            for local_o in 0..width {
+                let o = o0 + local_o;
+                let wrow = &w.data[o * row_bytes..(o + 1) * row_bytes];
+                let srow = &w.scales[o * n_blocks..(o + 1) * n_blocks];
+                for t in 0..tq {
+                    let xrow = &x[t * inp..(t + 1) * inp];
+                    let mut acc = 0.0f32;
+                    for (b, &sc) in srow.iter().enumerate() {
+                        acc += dot_i4_block_packed(
+                            &wrow[b * 16..b * 16 + 16],
+                            &xrow[b * BLOCK..b * BLOCK + BLOCK],
+                        ) * sc;
+                    }
+                    local[local_o * tq + t] = acc + bias.map_or(0.0, |bb| bb[o]);
+                }
+            }
+        });
+    for o in 0..out {
+        for t in 0..tq {
+            out_slice[t * out + o] = by_output[o * tq + t];
+        }
+    }
+}
+
 /// Batched fused dequant + GEMV: `out[t, o] = bias[o] + dot(W[o, :], x[t, :])`
 /// for `tq` activation rows `x` (`[tq, in]` row-major) against a natural
 /// `[out, in]` f16 weight, producing `[tq, out]` row-major.
@@ -3662,6 +3913,63 @@ pub fn gemv_f16_batch(
         for t in 0..tq {
             let dst = &mut out_slice[t * out + o0..t * out + o1];
             dst.copy_from_slice(&local[t * out + o0..t * out + o1]);
+        }
+    }
+}
+
+/// F16-weight GEMV for independent one-token decoder streams.
+///
+/// The ordinary batch kernel is tuned for long prefill matrices.  Decoder
+/// cohorts are small and repeated hundreds of times, so spawning OS threads per
+/// projection dominates.  This path keeps the weight row hot across all cohort
+/// activations, uses the persistent Rayon pool, and scales row bands with the
+/// number of live streams.
+pub fn gemv_f16_cohort(
+    w_f16: &[Float16],
+    out: usize,
+    inp: usize,
+    x: &[f32],
+    tq: usize,
+    bias: Option<&[f32]>,
+    out_slice: &mut [f32],
+) {
+    debug_assert_eq!(w_f16.len(), out * inp, "f16 cohort weight shape mismatch");
+    debug_assert_eq!(x.len(), tq * inp, "f16 cohort x shape mismatch");
+    debug_assert_eq!(out_slice.len(), tq * out, "f16 cohort out shape mismatch");
+    debug_assert!(bias.is_none_or(|b| b.len() == out));
+    if tq == 0 || out == 0 {
+        return;
+    }
+    if tq == 1 {
+        gemv_f16(w_f16, out, inp, x, bias, out_slice);
+        return;
+    }
+
+    let workers = cohort_gemv_worker_count(out, tq).min(out.max(1));
+    let band = out.div_ceil(workers).max(1);
+    let use_fused = f16c_dot_available();
+    let mut by_output = vec![0.0f32; out * tq];
+    by_output
+        .par_chunks_mut(band * tq)
+        .enumerate()
+        .for_each(|(wk, local)| {
+            let o0 = wk * band;
+            let width = local.len() / tq;
+            let mut scratch = vec![0.0f32; inp];
+            for local_o in 0..width {
+                let o = o0 + local_o;
+                let wrow = &w_f16[o * inp..(o + 1) * inp];
+                let b = bias.map_or(0.0, |bb| bb[o]);
+                let dst = &mut local[local_o * tq..(local_o + 1) * tq];
+                for t in 0..tq {
+                    let xrow = &x[t * inp..(t + 1) * inp];
+                    dst[t] = dequant_row_dot(wrow, xrow, &mut scratch, use_fused) + b;
+                }
+            }
+        });
+    for o in 0..out {
+        for t in 0..tq {
+            out_slice[t * out + o] = by_output[o * tq + t];
         }
     }
 }
@@ -4602,7 +4910,7 @@ impl KvCache {
             self.v[off..off + span].copy_from_slice(&v.data);
             if !self.k_columns.is_empty() {
                 for r in 0..t {
-                    let token = self.len + r;
+                    let token = self.len + r; // ubs:ignore — cache position, not a secret
                     let src = &k.data[r * self.n_state..(r + 1) * self.n_state];
                     for (d, &value) in src.iter().enumerate() {
                         self.k_columns[d * self.capacity_tokens + token] = value;
@@ -7371,6 +7679,18 @@ mod tests {
     }
 
     #[test]
+    fn matmul_raw_lhs_cpu_is_checked_and_uses_expected_layout() {
+        let b = Mat::from_vec(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let output =
+            matmul_raw_lhs_cpu(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, &b).expect("CPU matmul");
+        assert_eq!(output.rows, 2);
+        assert_eq!(output.cols, 2);
+        assert_eq!(output.data, vec![58.0, 64.0, 139.0, 154.0]);
+        assert!(matmul_raw_lhs_cpu(&[1.0, 2.0], 1, &b).is_err());
+        assert!(matmul_raw_lhs_cpu(&[], 0, &b).is_err());
+    }
+
+    #[test]
     fn attention_raw_bit_identical_to_mat_path() {
         // `attention_with_cache` attends over the KvCache's raw prefix slice via
         // `attention_raw`; it must be byte-for-byte the `Mat`-based `attention`.
@@ -7493,5 +7813,113 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn quantized_cohort_gemvs_match_scalar_rows_bit_exact() {
+        let mut rng = Lcg::new(0x0C04_027B_A7C4);
+        let (tq, out, inp) = (5usize, 96usize, 384usize);
+        let weights: Vec<Float16> = (0..out * inp)
+            .map(|_| Float16::from_f32(rng.next_f32() * 0.4))
+            .collect();
+        let x: Vec<f32> = (0..tq * inp).map(|_| rng.next_f32()).collect();
+        let bias: Vec<f32> = (0..out).map(|_| rng.next_f32()).collect();
+
+        let i8 = quantize_f16_to_i8(&weights, out, inp);
+        let mut i8_scalar = vec![0.0f32; tq * out];
+        for t in 0..tq {
+            gemv_i8(
+                &i8,
+                &x[t * inp..(t + 1) * inp],
+                Some(&bias),
+                &mut i8_scalar[t * out..(t + 1) * out],
+            );
+        }
+        let mut i8_cohort = vec![0.0f32; tq * out];
+        gemv_i8_cohort(&i8, &x, tq, Some(&bias), &mut i8_cohort);
+        assert_eq!(
+            i8_cohort
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            i8_scalar
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "int8 cohort changed a scalar row"
+        );
+
+        let mut f16_scalar = vec![0.0f32; tq * out];
+        for t in 0..tq {
+            gemv_f16(
+                &weights,
+                out,
+                inp,
+                &x[t * inp..(t + 1) * inp],
+                Some(&bias),
+                &mut f16_scalar[t * out..(t + 1) * out],
+            );
+        }
+        let mut f16_cohort = vec![0.0f32; tq * out];
+        gemv_f16_cohort(&weights, out, inp, &x, tq, Some(&bias), &mut f16_cohort);
+        assert_eq!(
+            f16_cohort
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            f16_scalar
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "f16 cohort changed a scalar row"
+        );
+
+        let blocked = quantize_f16_to_i8_blocked(&weights, out, inp, 32);
+        let mut blocked_scalar = vec![0.0f32; tq * out];
+        for t in 0..tq {
+            gemv_i8w_f32a_blocked(
+                &blocked,
+                &x[t * inp..(t + 1) * inp],
+                Some(&bias),
+                &mut blocked_scalar[t * out..(t + 1) * out],
+            );
+        }
+        let mut blocked_batch = vec![0.0f32; tq * out];
+        gemv_i8w_f32a_blocked_batch(&blocked, &x, tq, Some(&bias), &mut blocked_batch);
+        assert_eq!(
+            blocked_batch
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            blocked_scalar
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "block-int8 cohort changed a scalar row"
+        );
+
+        let packed = quantize_f16_to_i4_packed(&weights, out, inp);
+        let mut packed_scalar = vec![0.0f32; tq * out];
+        for t in 0..tq {
+            gemv_i4_packed_f32a(
+                &packed,
+                &x[t * inp..(t + 1) * inp],
+                Some(&bias),
+                &mut packed_scalar[t * out..(t + 1) * out],
+            );
+        }
+        let mut packed_batch = vec![0.0f32; tq * out];
+        gemv_i4_packed_f32a_batch(&packed, &x, tq, Some(&bias), &mut packed_batch);
+        assert_eq!(
+            packed_batch
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            packed_scalar
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "packed-int4 cohort changed a scalar row"
+        );
     }
 }

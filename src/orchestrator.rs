@@ -3884,6 +3884,7 @@ impl SpeakerEmbedding {
     }
 
     /// Compute the element-wise mean of a slice of embeddings.
+    #[cfg(test)]
     fn centroid(embeddings: &[SpeakerEmbedding]) -> SpeakerEmbedding {
         let n = embeddings.len() as f64;
         if n < 1.0 {
@@ -3996,15 +3997,6 @@ fn silhouette_score(
     Some(sum / n as f64)
 }
 
-fn resolve_speaker_target(request: &SpeakerCountRequest) -> Option<usize> {
-    match request {
-        SpeakerCountRequest::Range { maximum, .. } => Some(*maximum as usize),
-        SpeakerCountRequest::Infer
-        | SpeakerCountRequest::Prior { .. }
-        | SpeakerCountRequest::HardConstraint { .. } => None,
-    }
-}
-
 /// Assign speaker labels to segments using temporal/lexical-heuristic feature
 /// clustering.
 ///
@@ -4027,8 +4019,17 @@ pub(crate) fn diarize_segments(
     speaker_count: &SpeakerCountRequest,
     token: &CancellationToken,
 ) -> FwResult<DiarizeReport> {
+    token.checkpoint()?;
+    if !matches!(speaker_count, SpeakerCountRequest::Infer) {
+        return Err(FwError::InvalidRequest(
+            "heuristic diarization cannot faithfully execute explicit speaker-count inputs; use \
+             the native acoustic diarization engine"
+                .to_owned(),
+        ));
+    }
+
     let total = segments.len();
-    let mut notes: Vec<String> = vec![
+    let notes: Vec<String> = vec![
         "heuristic: temporal/lexical-feature clustering without neural speaker encoder".to_owned(),
     ];
 
@@ -4041,8 +4042,6 @@ pub(crate) fn diarize_segments(
             notes,
         });
     }
-
-    token.checkpoint()?;
 
     let duration = audio_duration
         .or_else(|| segments.iter().filter_map(|s| s.end_sec).reduce(f64::max))
@@ -4132,8 +4131,8 @@ pub(crate) fn diarize_segments(
     // accumulates members in the same push order `centroid()` re-sums them, so the
     // stored centroid — and thus every subsequent cosine decision and the whole
     // assignment sequence — is BYTE-IDENTICAL to the recompute form (verified by
-    // benches/diarize_cluster_perf + the equivalence test). `cluster_members` is
-    // still maintained for the Step-2b constraint merge, which is left untouched.
+    // benches/diarize_cluster_perf + the equivalence test). `cluster_members`
+    // still provides each cluster's exact running member count.
     let mut cluster_sums: Vec<[f64; 6]> = Vec::new();
     let mut assignments: Vec<usize> = Vec::with_capacity(total);
 
@@ -4157,8 +4156,8 @@ pub(crate) fn diarize_segments(
             if let Some(cid) = best_cluster {
                 assignments.push(cid);
                 cluster_members[cid].push(emb.clone());
-                for k in 0..6 {
-                    cluster_sums[cid][k] += emb.features[k];
+                for (sum, feature) in cluster_sums[cid].iter_mut().zip(&emb.features) {
+                    *sum += *feature;
                 }
                 let count = cluster_members[cid].len() as f64;
                 centroids[cid] = SpeakerEmbedding {
@@ -4181,83 +4180,7 @@ pub(crate) fn diarize_segments(
         }
     }
 
-    // Step 2b: Apply only a range maximum by merging clusters if over the
-    // upper bound. A hard count is an evidence claim, not a merge target: this
-    // legacy temporal/lexical heuristic cannot validate it and must not collapse
-    // otherwise distinct labels merely to manufacture the requested cardinality.
-    if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
-        return Err(FwError::InvalidRequest(
-            "heuristic diarization cannot faithfully execute a speaker-count prior".to_owned(),
-        ));
-    }
-    let effective_max = resolve_speaker_target(speaker_count);
-
-    let unconstrained_count = centroids.len();
-    if let Some(max_k) = effective_max {
-        let max_k = max_k.max(1); // at least 1 cluster
-        while centroids.len() > max_k {
-            // Find the two closest centroids and merge them.
-            let mut best_pair = (0, 1);
-            let mut best_dist = f64::INFINITY;
-            for i in 0..centroids.len() {
-                for j in (i + 1)..centroids.len() {
-                    let d = centroids[i].euclidean_distance(&centroids[j]);
-                    if d < best_dist {
-                        best_dist = d;
-                        best_pair = (i, j);
-                    }
-                }
-            }
-            let (keep, remove) = best_pair;
-            // Move all members of `remove` into `keep`.
-            let removed_members = cluster_members.swap_remove(remove);
-            centroids.swap_remove(remove);
-            // Fix assignments: `remove` was absorbed into `keep`; the
-            // cluster that was last is now at index `remove` due to
-            // swap_remove.
-            let last_idx = centroids.len(); // old len - 1 after swap_remove
-            for a in &mut assignments {
-                if *a == remove {
-                    *a = keep;
-                } else if *a == last_idx {
-                    // This was the swapped-in cluster (formerly at end).
-                    *a = remove;
-                }
-            }
-            cluster_members[keep].extend(removed_members);
-            centroids[keep] = SpeakerEmbedding::centroid(&cluster_members[keep]);
-        }
-
-        if unconstrained_count > centroids.len() {
-            notes.push(format!(
-                "merged {unconstrained_count} clusters down to {} to respect the speaker-count \
-                 range maximum",
-                centroids.len()
-            ));
-        }
-    }
-
-    match speaker_count {
-        SpeakerCountRequest::Range { minimum, .. }
-            if u32::try_from(centroids.len()).is_ok_and(|detected| detected < *minimum) =>
-        {
-            notes.push(format!(
-                "detected {} speakers but minimum={minimum} requested; \
-                 heuristic cannot synthesize additional speakers",
-                centroids.len()
-            ));
-        }
-        SpeakerCountRequest::HardConstraint { count } => {
-            notes.push(format!(
-                "observed {} heuristic clusters with hard count={count} requested; \
-                 this is not acoustic count evidence and the heuristic did not force cardinality",
-                centroids.len()
-            ));
-        }
-        _ => {}
-    }
-
-    // Compact assignment IDs to be contiguous 0..N after potential merges.
+    // Compact assignment IDs to be contiguous 0..N.
     let unique_ids: Vec<usize> = {
         let mut seen: Vec<usize> = assignments.clone();
         seen.sort_unstable();
@@ -4406,6 +4329,10 @@ async fn execute_diarize(
                     )?;
                     if acoustic_request.fallback == DiarizationFallbackPolicy::External
                         && external_fallback_admitted
+                        && matches!(
+                            &acoustic_request.speaker_count,
+                            SpeakerCountRequest::Infer | SpeakerCountRequest::HardConstraint { .. }
+                        )
                         && diarization_report.fallback_status
                             != DiarizationFallbackStatus::NotNeeded
                         && result_has_external_diarization(&result)
@@ -4638,15 +4565,16 @@ fn validate_diarization_execution_request(
             "known speaker intervals require the native acoustic diarization engine".to_owned(),
         ));
     }
-    if matches!(request.speaker_count, SpeakerCountRequest::Prior { .. })
-        && matches!(
-            engine,
-            DiarizationEngine::External | DiarizationEngine::Neural
-        )
-    {
+    if matches!(
+        request.speaker_count,
+        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+    ) && matches!(
+        engine,
+        DiarizationEngine::External | DiarizationEngine::Neural
+    ) {
         return Err(FwError::InvalidRequest(
-            "speaker-count priors require the native acoustic diarization engine; external and \
-             neural engines cannot yet fuse a calibrated count prior"
+            "soft speaker-count priors and ranges require the native acoustic diarization engine; \
+             external and neural engines cannot faithfully fuse soft count evidence"
                 .to_owned(),
         ));
     }
@@ -4777,12 +4705,10 @@ fn result_has_external_diarization(result: &crate::model::TranscriptionResult) -
 
 fn speaker_count_satisfies_request(speaker_count: u32, request: &SpeakerCountRequest) -> bool {
     match request {
-        SpeakerCountRequest::Infer => true,
-        SpeakerCountRequest::Range { minimum, maximum } => {
-            speaker_count >= *minimum && speaker_count <= *maximum
-        }
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => true,
         SpeakerCountRequest::HardConstraint { count } => speaker_count == *count,
-        SpeakerCountRequest::Prior { .. } => false,
     }
 }
 
@@ -4793,12 +4719,10 @@ fn unknown_diarization_report(
 ) -> DiarizationReport {
     let count_request_satisfied = speaker_count_satisfies_request(0, speaker_count);
     let status = match speaker_count {
-        SpeakerCountRequest::Infer | SpeakerCountRequest::Prior { .. } => {
-            SpeakerCountOutcomeStatus::Unresolved
-        }
-        SpeakerCountRequest::Range { .. } | SpeakerCountRequest::HardConstraint { .. } => {
-            SpeakerCountOutcomeStatus::Unsatisfied
-        }
+        SpeakerCountRequest::Infer
+        | SpeakerCountRequest::Prior { .. }
+        | SpeakerCountRequest::Range { .. } => SpeakerCountOutcomeStatus::Unresolved,
+        SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
     };
     DiarizationReport {
         implementation: "fallback-unknown".to_owned(),
@@ -4821,6 +4745,8 @@ fn unknown_diarization_report(
             reasons: vec![
                 if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
                     SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+                } else if matches!(speaker_count, SpeakerCountRequest::Range { .. }) {
+                    SpeakerCountOutcomeReason::SpeakerCountEvidenceUnresolved
                 } else if count_request_satisfied {
                     SpeakerCountOutcomeReason::NoSupportedSpeakers
                 } else {
@@ -4829,7 +4755,10 @@ fn unknown_diarization_report(
             ],
             speaker_evidence: Vec::new(),
         },
-        fallback_status: if matches!(speaker_count, SpeakerCountRequest::Prior { .. }) {
+        fallback_status: if matches!(
+            speaker_count,
+            SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+        ) {
             DiarizationFallbackStatus::SpeakerCountUnresolved
         } else if count_request_satisfied {
             DiarizationFallbackStatus::InsufficientEvidence
@@ -4845,6 +4774,15 @@ fn external_diarization_report(
     normalized_input_sha256: &str,
     speaker_count: &SpeakerCountRequest,
 ) -> FwResult<DiarizationReport> {
+    if matches!(
+        speaker_count,
+        SpeakerCountRequest::Prior { .. } | SpeakerCountRequest::Range { .. }
+    ) {
+        return Err(FwError::InvalidRequest(
+            "external diarization cannot faithfully fuse a soft speaker-count prior or range"
+                .to_owned(),
+        ));
+    }
     let mut intervals = Vec::<(u64, u64, String)>::new();
     for segment in &result.segments {
         let Some(speaker_ref) = segment.speaker.as_ref() else {
@@ -4970,16 +4908,28 @@ fn external_diarization_report(
         });
     let count_request_satisfied = speaker_count_satisfies_request(detected_speakers, speaker_count);
     let status = match speaker_count {
-        SpeakerCountRequest::Infer => SpeakerCountOutcomeStatus::Resolved,
-        SpeakerCountRequest::Range { .. } | SpeakerCountRequest::HardConstraint { .. }
-            if count_request_satisfied =>
-        {
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+            SpeakerCountOutcomeStatus::Resolved
+        }
+        SpeakerCountRequest::HardConstraint { .. } if count_request_satisfied => {
             SpeakerCountOutcomeStatus::Satisfied
         }
-        SpeakerCountRequest::Range { .. } | SpeakerCountRequest::HardConstraint { .. } => {
-            SpeakerCountOutcomeStatus::Unsatisfied
-        }
+        SpeakerCountRequest::HardConstraint { .. } => SpeakerCountOutcomeStatus::Unsatisfied,
         SpeakerCountRequest::Prior { .. } => SpeakerCountOutcomeStatus::Unresolved,
+    };
+    let count_reason = match speaker_count {
+        SpeakerCountRequest::Infer | SpeakerCountRequest::Range { .. } => {
+            SpeakerCountOutcomeReason::EvidenceSupportedCount
+        }
+        SpeakerCountRequest::HardConstraint { .. } if count_request_satisfied => {
+            SpeakerCountOutcomeReason::RequestedCountMatched
+        }
+        SpeakerCountRequest::HardConstraint { .. } => {
+            SpeakerCountOutcomeReason::RequestedCountMismatch
+        }
+        SpeakerCountRequest::Prior { .. } => {
+            SpeakerCountOutcomeReason::SpeakerCountPriorFusionUnavailable
+        }
     };
     Ok(DiarizationReport {
         implementation: "external-backend".to_owned(),
@@ -4999,14 +4949,7 @@ fn external_diarization_report(
             active_speaker_refs: profile_totals.keys().cloned().collect(),
             dominant_speaker_share,
             unknown_voiced_share: 0.0,
-            reasons: vec![
-                SpeakerCountOutcomeReason::ExternalAttribution,
-                if count_request_satisfied {
-                    SpeakerCountOutcomeReason::RequestedCountMatched
-                } else {
-                    SpeakerCountOutcomeReason::RequestedCountMismatch
-                },
-            ],
+            reasons: vec![SpeakerCountOutcomeReason::ExternalAttribution, count_reason],
             speaker_evidence,
         },
         fallback_status: DiarizationFallbackStatus::ExternalBackend,
@@ -5130,14 +5073,13 @@ mod tests {
         finite_seconds_interval_to_ms, has_canonical_word_alignment, is_abbreviation_period,
         is_decimal_period, is_ellipsis_period, merge_regions_by_gap, ms_to_frames,
         optional_stage_skip, parse_acoustic_diarization_rollout, parse_budget_ms,
-        parse_event_ts_ms, punctuate_segments, recommended_budget, resolve_speaker_target,
-        resolved_diarization_engine, resolved_diarization_engine_for_rollout,
-        result_has_external_diarization, run_pipeline, run_stage_with_budget, sanitize_process_pid,
-        selected_diarization_engine, sha256_bytes_hex, sha256_file, sha256_json_value,
-        silhouette_score, source_separate, source_separate_with_analysis, split_long_regions,
-        stage_budget_ms, stage_failure_code, stage_failure_message, stage_latency_profile,
-        state_root, transcript_boundaries_ms, vad_energy_detect, vad_energy_detect_with_analysis,
-        validate_diarization_execution_request,
+        parse_event_ts_ms, punctuate_segments, recommended_budget, resolved_diarization_engine,
+        resolved_diarization_engine_for_rollout, result_has_external_diarization, run_pipeline,
+        run_stage_with_budget, sanitize_process_pid, selected_diarization_engine, sha256_bytes_hex,
+        sha256_file, sha256_json_value, silhouette_score, source_separate,
+        source_separate_with_analysis, split_long_regions, stage_budget_ms, stage_failure_code,
+        stage_failure_message, stage_latency_profile, state_root, transcript_boundaries_ms,
+        vad_energy_detect, vad_energy_detect_with_analysis, validate_diarization_execution_request,
     };
 
     #[test]
@@ -9259,6 +9201,17 @@ mod tests {
         assert_eq!(report.turns[0].speaker_ref.as_deref(), Some("speaker_a"));
         assert_eq!(report.turns[1].speaker_ref.as_deref(), Some("speaker_b"));
 
+        let soft_error = external_diarization_report(
+            &result,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 3,
+            },
+        )
+        .expect_err("external report must not discard soft count semantics");
+        assert!(soft_error.to_string().contains("cannot faithfully fuse"));
+
         let mut overlapping = result;
         overlapping.segments[0].start_sec = Some(0.5);
         assert!(
@@ -9305,8 +9258,8 @@ mod tests {
     }
 
     #[test]
-    fn speaker_count_prior_is_rejected_by_engines_that_cannot_fuse_it() {
-        let request = DiarizationRequest {
+    fn soft_speaker_count_inputs_are_rejected_by_engines_that_cannot_fuse_them() {
+        let prior_request = DiarizationRequest {
             speaker_count: SpeakerCountRequest::Prior {
                 bins: vec![
                     crate::model::SpeakerCountPriorMass {
@@ -9323,19 +9276,34 @@ mod tests {
         };
         let error = validate_diarization_execution_request(
             DiarizationEngine::External,
-            &request,
+            &prior_request,
             Some(2_000),
         )
         .expect_err("external engine cannot silently approximate a calibrated prior");
-        assert!(error.to_string().contains("cannot yet fuse"));
+        assert!(error.to_string().contains("cannot faithfully fuse"));
         assert!(
             validate_diarization_execution_request(
                 DiarizationEngine::Acoustic,
-                &request,
+                &prior_request,
                 Some(2_000),
             )
             .is_ok()
         );
+
+        let range_request = DiarizationRequest {
+            speaker_count: SpeakerCountRequest::Range {
+                minimum: 2,
+                maximum: 4,
+            },
+            ..DiarizationRequest::default()
+        };
+        let error = validate_diarization_execution_request(
+            DiarizationEngine::Neural,
+            &range_request,
+            Some(2_000),
+        )
+        .expect_err("neural engine cannot silently harden a soft count range");
+        assert!(error.to_string().contains("cannot faithfully fuse"));
     }
 
     #[test]
@@ -14059,142 +14027,40 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_speaker_target_none_for_inference() {
-        assert!(resolve_speaker_target(&SpeakerCountRequest::Infer).is_none());
-    }
-
-    #[test]
-    fn resolve_speaker_target_does_not_force_hard_count() {
-        let request = SpeakerCountRequest::HardConstraint { count: 3 };
-        assert_eq!(resolve_speaker_target(&request), None);
-    }
-
-    #[test]
-    fn resolve_speaker_target_falls_back_to_max_speakers() {
-        let request = SpeakerCountRequest::Range {
-            minimum: 1,
-            maximum: 5,
-        };
-        assert_eq!(resolve_speaker_target(&request), Some(5));
-    }
-
-    #[test]
-    fn resolve_speaker_target_uses_canonical_range_maximum() {
-        let request = SpeakerCountRequest::Range {
-            minimum: 2,
-            maximum: 64,
-        };
-        assert_eq!(resolve_speaker_target(&request), Some(64));
-    }
-
-    #[test]
-    fn resolve_speaker_target_does_not_approximate_a_prior() {
-        let request = SpeakerCountRequest::Prior {
-            bins: vec![crate::model::SpeakerCountPriorMass {
-                count: 2,
-                probability: 1.0,
-            }],
-        };
-        assert!(resolve_speaker_target(&request).is_none());
-    }
-
-    #[test]
-    fn diarize_does_not_force_hard_speaker_count_without_acoustic_evidence() {
+    fn heuristic_diarization_rejects_explicit_count_inputs_before_mutation() {
         let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
-        // Create segments with very different characteristics so the
-        // unconstrained diarizer produces more than 2 clusters.
-        let mut segments = vec![
-            make_segment(0.0, 1.0, "hello world"),
-            make_segment(1.0, 2.0, "hi there"),
-            make_segment(
-                5.0,
-                8.0,
-                "this is a very long segment with many words to change features",
-            ),
-            make_segment(
-                8.0,
-                11.0,
-                "another very long segment different vocabulary complexity",
-            ),
-            make_segment(20.0, 21.0, "far away short"),
-            make_segment(
-                25.0,
-                30.0,
-                "way at the end of the recording totally different position",
-            ),
+        let original = vec![
+            make_segment(0.0, 1.0, "first segment"),
+            make_segment(1.0, 2.0, "second segment"),
         ];
-        let mut inferred_segments = segments.clone();
-        let inferred = diarize_segments(
-            &mut inferred_segments,
-            Some(30.0),
-            &SpeakerCountRequest::Infer,
-            &token,
-        )
-        .unwrap();
-
-        let request = SpeakerCountRequest::HardConstraint { count: 2 };
-        let report = diarize_segments(&mut segments, Some(30.0), &request, &token).unwrap();
-
-        assert_eq!(report.speakers_detected, inferred.speakers_detected);
-        assert_eq!(report.segments_labeled, inferred.segments_labeled);
-        assert_eq!(
-            segments
-                .iter()
-                .map(|segment| segment.speaker.as_deref())
-                .collect::<Vec<_>>(),
-            inferred_segments
-                .iter()
-                .map(|segment| segment.speaker.as_deref())
-                .collect::<Vec<_>>(),
-            "a legacy hard count must not alter inferred speaker labels"
-        );
-        assert!(report.notes.iter().any(|note| {
-            note.contains("hard count=2") && note.contains("did not force cardinality")
-        }));
-    }
-
-    #[test]
-    fn diarize_respects_max_speakers_constraint() {
-        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
-        let mut segments = vec![
-            make_segment(0.0, 1.0, "short"),
-            make_segment(5.0, 8.0, "this is a very long segment with many words"),
-            make_segment(20.0, 21.0, "far away"),
-            make_segment(25.0, 30.0, "way at the end totally different"),
-        ];
-
-        let request = SpeakerCountRequest::Range {
-            minimum: 1,
-            maximum: 2,
-        };
-        let report = diarize_segments(&mut segments, Some(30.0), &request, &token).unwrap();
-
-        assert!(
-            report.speakers_detected <= 2,
-            "should have at most 2 speakers, got {}",
-            report.speakers_detected
-        );
-    }
-
-    #[test]
-    fn diarize_notes_min_speakers_deficit() {
-        let token = CancellationToken::no_deadline(); // ubs:ignore — cancellation token is not a secret
-        // A single segment can only produce 1 speaker — min_speakers=3
-        // should produce a note.
-        let mut segments = vec![make_segment(0.0, 5.0, "only one speaker here")];
-
-        let request = SpeakerCountRequest::Range {
-            minimum: 3,
-            maximum: 64,
-        };
-        let report = diarize_segments(&mut segments, Some(5.0), &request, &token).unwrap();
-
-        assert_eq!(report.speakers_detected, 1);
-        assert!(
-            report.notes.iter().any(|n| n.contains("minimum=3")),
-            "should note the min_speakers deficit, notes: {:?}",
-            report.notes
-        );
+        for request in [
+            SpeakerCountRequest::HardConstraint { count: 2 },
+            SpeakerCountRequest::Range {
+                minimum: 1,
+                maximum: 2,
+            },
+            SpeakerCountRequest::Prior {
+                bins: vec![crate::model::SpeakerCountPriorMass {
+                    count: 2,
+                    probability: 1.0,
+                }],
+            },
+        ] {
+            let mut segments = original.clone();
+            let error = diarize_segments(&mut segments, Some(2.0), &request, &token)
+                .expect_err("legacy heuristic cannot execute explicit count semantics");
+            assert!(error.to_string().contains("native acoustic"));
+            assert!(
+                segments.iter().zip(&original).all(|(actual, expected)| {
+                    actual.start_sec == expected.start_sec
+                        && actual.end_sec == expected.end_sec
+                        && actual.text == expected.text
+                        && actual.speaker == expected.speaker
+                        && actual.confidence == expected.confidence
+                }),
+                "rejection must precede segment mutation"
+            );
+        }
     }
 
     #[test]

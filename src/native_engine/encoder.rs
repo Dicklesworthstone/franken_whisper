@@ -1153,7 +1153,7 @@ fn forward_time_major(
             let due = if tome_every == 0 {
                 tome_state.is_none() && li == tome_after
             } else {
-                li >= tome_after && (li - tome_after) % tome_every == 0
+                li >= tome_after && (li - tome_after).is_multiple_of(tome_every)
             };
             if tome > 0 && due && x.rows > tome + 2 && x.rows - tome >= tome_floor {
                 let (merged, umap) = tome_merge(&x, tome);

@@ -143,7 +143,7 @@ use std::time::{Duration, Instant};
 use franken_whisper::audio::normalize_to_wav;
 use franken_whisper::conformance::word_error_rate;
 use franken_whisper::native_engine::decode::{
-    DecodeParams, DecodeWorkStats, LoadedModel, transcribe_samples,
+    DecodeOutput, DecodeParams, DecodeWorkStats, LoadedModel, transcribe_samples_batch,
 };
 use franken_whisper::native_engine::dtw::WordTiming;
 use franken_whisper::native_engine::find_model_file;
@@ -347,6 +347,24 @@ impl EngineWork {
             temperature_fallback_retries: work.temperature_fallback_retries,
             ..Self::default()
         }
+    }
+
+    fn from_franken_batch(outputs: &[DecodeOutput]) -> Self {
+        let mut total = Self::default();
+        for output in outputs {
+            let work = Self::from_franken(&output.work);
+            total.window_attempts += work.window_attempts;
+            total.encoder_calls += work.encoder_calls;
+            total.decoder_prefill_calls += work.decoder_prefill_calls;
+            total.decoder_prefill_tokens += work.decoder_prefill_tokens;
+            total.selected_tokens += work.selected_tokens;
+            total.single_token_decode_calls += work.single_token_decode_calls;
+            total.accepted_windows += work.accepted_windows;
+            total.accepted_result_tokens += work.accepted_result_tokens;
+            total.prompt_reset_retries += work.prompt_reset_retries;
+            total.temperature_fallback_retries += work.temperature_fallback_retries;
+        }
+        total
     }
 
     fn from_worker_json(value: &Value) -> Self {
@@ -2077,6 +2095,7 @@ fn run_incumbent(
     scope: BenchScope,
     observe_threads: bool,
     decode: &MatchedDecode,
+    batch_copies: usize,
 ) -> Observation {
     let job_started = Instant::now();
     let (wav, normalization_ms, normalizer_probe) = match input_mode {
@@ -2088,14 +2107,11 @@ fn run_incumbent(
             (wav, Some(wall_ms), probe)
         }
     };
-    let mut args: Vec<String> = vec![
-        "-m".into(),
-        model.display().to_string(),
-        "-f".into(),
-        wav.display().to_string(),
-        "-t".into(),
-        threads.to_string(),
-    ];
+    let mut args: Vec<String> = vec!["-m".into(), model.display().to_string()];
+    for _ in 0..batch_copies {
+        args.extend(["-f".to_owned(), wav.display().to_string()]);
+    }
+    args.extend(["-t".to_owned(), threads.to_string()]);
     // Decoding parameters come from the version contract, not from this call site,
     // so the two arms cannot drift apart across edits.
     args.extend(decode.incumbent_args());
@@ -2203,25 +2219,45 @@ fn run_incumbent(
     }
 }
 
+fn transcribe_franken_batch(
+    model: &LoadedModel,
+    sample_sets: &[&[f32]],
+    params: &DecodeParams,
+) -> Vec<DecodeOutput> {
+    let jobs: Vec<(&[f32], DecodeParams)> = sample_sets
+        .iter()
+        .map(|samples| (*samples, params.clone()))
+        .collect();
+    transcribe_samples_batch(model, &jobs, &(|| Ok(())))
+        .into_iter()
+        .map(|result| result.expect("fw batch transcribe"))
+        .collect()
+}
+
 /// One franken run: transcribe with the model already resident.
 fn run_franken_resident(
     model: &LoadedModel,
     samples: &[f32],
     params: &DecodeParams,
     attest: bool,
+    batch_copies: usize,
 ) -> Observation {
+    let sample_sets = vec![samples; batch_copies];
     let started = Instant::now();
-    let out = transcribe_samples(model, samples, params, &(|| Ok(()))).expect("fw transcribe");
+    let outputs = transcribe_franken_batch(model, &sample_sets, params);
     let elapsed = started.elapsed().as_secs_f64() * 1e3;
-    let segments: Vec<String> = out
-        .segments
+    let segments: Vec<String> = outputs
         .iter()
+        .flat_map(|output| &output.segments)
         .map(|segment| segment.text.trim().to_owned())
         .collect();
     let chars = segments.iter().map(String::len).sum();
     let transcript = segments.join(" ");
-    let work = EngineWork::from_franken(&out.work);
-    let timed_words = native_timed_words(out.word_timings.as_ref());
+    let work = EngineWork::from_franken_batch(&outputs);
+    let timed_words = outputs
+        .iter()
+        .flat_map(|output| native_timed_words(output.word_timings.as_ref()))
+        .collect::<Vec<_>>();
     let timed_words_sha256 = timed_words_sha256(&timed_words);
     Observation {
         measured_ms: elapsed,
@@ -2259,6 +2295,7 @@ fn run_franken_whole(
     threads: usize,
     timestamp_mode: TimestampMode,
     observe_threads: bool,
+    batch_copies: usize,
 ) -> Observation {
     let current_exe = std::env::current_exe().expect("resolve harness executable");
     let mut command = Command::new(current_exe);
@@ -2275,6 +2312,7 @@ fn run_franken_whole(
         )
         .arg(timestamp_mode.as_arg())
         .arg(threads.to_string())
+        .arg(batch_copies.to_string())
         .env("RAYON_NUM_THREADS", threads.to_string())
         .env("FW_LOAD_WORKERS", threads.to_string());
     if input_mode == InputMode::Codec {
@@ -2410,6 +2448,10 @@ fn franken_worker_main(args: &[String]) {
         .get(8)
         .and_then(|value| value.parse().ok())
         .expect("worker threads");
+    let batch_copies: usize = args
+        .get(9)
+        .and_then(|value| value.parse().ok())
+        .expect("worker batch copies");
 
     let (wav, normalization_ms) = match input_mode {
         InputMode::NormalizedWav => (PathBuf::from(input), None),
@@ -2424,8 +2466,11 @@ fn franken_worker_main(args: &[String]) {
             (wav, Some(started.elapsed().as_secs_f64() * 1e3))
         }
     };
-    let samples = read_wav_mono16k(&wav);
-    let normalized_frames = (input_mode == InputMode::Codec).then_some(samples.len());
+    let sample_sets = (0..batch_copies)
+        .map(|_| read_wav_mono16k(&wav))
+        .collect::<Vec<_>>();
+    let normalized_frames =
+        (input_mode == InputMode::Codec).then(|| sample_sets.first().map_or(0, Vec::len));
     let model = GgmlModel::load(model_path)
         .and_then(LoadedModel::from_ggml)
         .expect("worker load model");
@@ -2459,16 +2504,19 @@ fn franken_worker_main(args: &[String]) {
         model_hint: Some(model_short.to_owned()),
         ..DecodeParams::default()
     };
-    let out =
-        transcribe_samples(&model, &samples, &params, &(|| Ok(()))).expect("worker transcribe");
-    let segments: Vec<String> = out
-        .segments
+    let sample_refs = sample_sets.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let outputs = transcribe_franken_batch(&model, &sample_refs, &params);
+    let segments: Vec<String> = outputs
         .iter()
+        .flat_map(|output| &output.segments)
         .map(|segment| segment.text.trim().to_owned())
         .collect();
     let chars = segments.iter().map(String::len).sum::<usize>();
     let transcript = segments.join(" ");
-    let timed_words = native_timed_words(out.word_timings.as_ref());
+    let timed_words = outputs
+        .iter()
+        .flat_map(|output| native_timed_words(output.word_timings.as_ref()))
+        .collect::<Vec<_>>();
     let timed_words_json: Vec<Value> = timed_words
         .iter()
         .map(|word| {
@@ -2479,8 +2527,11 @@ fn franken_worker_main(args: &[String]) {
             })
         })
         .collect();
-    let serialized_segments =
-        serde_json::to_vec(&out.segments).expect("serialize worker transcription segments");
+    let serialized_segments = outputs
+        .iter()
+        .flat_map(|output| &output.segments)
+        .collect::<Vec<_>>();
+    let work = EngineWork::from_franken_batch(&outputs);
     println!(
         "FW_WORKER_RESULT {}",
         json!({
@@ -2492,7 +2543,10 @@ fn franken_worker_main(args: &[String]) {
             "timed_words": timed_words_json,
             "normalization_ms": normalization_ms,
             "normalized_frames": normalized_frames,
-            "serialized_segments_sha256": sha256_bytes(&serialized_segments),
+            "serialized_segments_sha256": sha256_bytes(
+                &serde_json::to_vec(&serialized_segments)
+                    .expect("serialize worker transcription segments")
+            ),
             "transcript": transcript,
             "actual_threads": rayon::current_num_threads(),
             // The measured arm attests the decode row it actually ran, so the
@@ -2500,16 +2554,16 @@ fn franken_worker_main(args: &[String]) {
             // rather than against a params struct built in the parent.
             "decode_row": contract.decode.as_row(),
             "work": {
-                "window_attempts": out.work.window_attempts,
-                "encoder_calls": out.work.encoder_calls,
-                "decoder_prefill_calls": out.work.decoder_prefill_calls,
-                "decoder_prefill_tokens": out.work.decoder_prefill_tokens,
-                "sampled_tokens": out.work.sampled_tokens,
-                "greedy_single_token_forwards": out.work.greedy_single_token_forwards,
-                "accepted_windows": out.work.accepted_windows,
-                "accepted_result_tokens": out.work.accepted_result_tokens,
-                "prompt_reset_retries": out.work.prompt_reset_retries,
-                "temperature_fallback_retries": out.work.temperature_fallback_retries,
+                "window_attempts": work.window_attempts,
+                "encoder_calls": work.encoder_calls,
+                "decoder_prefill_calls": work.decoder_prefill_calls,
+                "decoder_prefill_tokens": work.decoder_prefill_tokens,
+                "sampled_tokens": work.selected_tokens,
+                "greedy_single_token_forwards": work.single_token_decode_calls,
+                "accepted_windows": work.accepted_windows,
+                "accepted_result_tokens": work.accepted_result_tokens,
+                "prompt_reset_retries": work.prompt_reset_retries,
+                "temperature_fallback_retries": work.temperature_fallback_retries,
             },
         })
     );
@@ -2549,6 +2603,18 @@ fn main() {
     );
     let scope = BenchScope::from_env();
     let input_mode = InputMode::from_env();
+    let batch_copies = std::env::var("FW_BATCH_COPIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    assert!(batch_copies >= 1, "FW_BATCH_COPIES must be positive");
+    assert!(
+        batch_copies == 1
+            || (scope == BenchScope::WholeJob
+                && input_mode == InputMode::NormalizedWav
+                && timestamp_mode == TimestampMode::None),
+        "multi-file batching currently certifies normalized-WAV, no_ts whole jobs"
+    );
     assert!(
         !timestamp_mode.word_timestamps() || scope == BenchScope::WholeJob,
         "word_ts requires FW_BENCH_SCOPE=whole_job so both arms include output serialization"
@@ -2651,6 +2717,7 @@ fn main() {
             &samples,
             &params,
             false,
+            batch_copies,
         ),
         BenchScope::WholeJob => run_franken_whole(
             &model_path,
@@ -2661,6 +2728,7 @@ fn main() {
             threads,
             timestamp_mode,
             false,
+            batch_copies,
         ),
     };
     let probe_franken_threads = || match scope {
@@ -2669,6 +2737,7 @@ fn main() {
             &samples,
             &params,
             true,
+            batch_copies,
         ),
         BenchScope::WholeJob => run_franken_whole(
             &model_path,
@@ -2679,6 +2748,7 @@ fn main() {
             threads,
             timestamp_mode,
             true,
+            batch_copies,
         ),
     };
     let run_whisper = || {
@@ -2696,6 +2766,7 @@ fn main() {
             scope,
             false,
             &contract.decode,
+            batch_copies,
         )
     };
     let probe_whisper_threads = || {
@@ -2713,6 +2784,7 @@ fn main() {
             scope,
             true,
             &contract.decode,
+            batch_copies,
         )
     };
 
@@ -2788,7 +2860,7 @@ fn main() {
     );
     println!(
         "INCUMBENT_AB_CONFIG workload={workload:?} rounds={rounds} order=alternating \
-         input={wav} input_mode={} reference_wav={} audio_sec={:.1} \
+         input={wav} input_mode={} reference_wav={} audio_sec={:.1} batch_files={batch_copies} \
          requested_threads={threads} \
          timestamp_mode={} timestamps={} word_timestamps={} \
          scope={} measured={}",
