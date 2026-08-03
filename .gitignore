@@ -18,6 +18,46 @@ storage.sqlite3-shm
 *.sqlite3-shm
 
 # Audio working files and confidential local evaluation media
+# Bracketed forms are authoritative on case-sensitive filesystems; the explicit
+# lower/upper spellings below remain readable guardrails for common names.
+*.[wW][aA][vV]
+*.[uU][lL][aA][wW]
+*.[mM][pP]3
+*.[fF][lL][aA][cC]
+*.[oO][gG][gG]
+*.[mM]4[aA]
+*.[aA][aA][cC]
+*.[aA][iI][fF]
+*.[aA][iI][fF][fF]
+*.[aA][mM][rR]
+*.[cC][aA][fF]
+*.[oO][pP][uU][sS]
+*.[wW][mM][aA]
+*.3[gG][pP]
+*.[mM][pP]4
+*.[mM][oO][vV]
+*.[wW][eE][bB][mM]
+*.[wW][vV]
+*.[oO][gG][aA]
+*.[mM][kK][aA]
+*.[mM][kK][vV]
+*.[aA][dD][tT][sS]
+*.[aA][cC]3
+*.[eE][aA][cC]3
+*.[dD][tT][sS]
+*.[aA][pP][eE]
+*.[aA][lL][aA][cC]
+*.[aA][uU]
+*.[sS][nN][dD]
+*.[mM][pP]2
+*.[mM][pP][aA]
+*.[mM]4[bBpP]
+*.3[gG]2
+*.[rR][aA]
+*.[rR][mM]
+*.[wW][eE][bB][aA]
+*.[rR][aA][wW]
+*.[pP][cC][mM]
 *.wav
 *.ulaw
 *.mp3
