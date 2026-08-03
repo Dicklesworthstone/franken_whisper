@@ -244,3 +244,11 @@ rustc-ice-*.txt
 
 # Python tooling cache (scripts/)
 __pycache__/
+
+# === multi-repo ephemeral cleanup 2026-08-03 ===
+# Stray out-of-tree rustc outputs and one-off probe binaries (normal builds
+# live under target/).
+/librust_out.rlib
+*.rlib
+/lint_probe
+/rust_out
