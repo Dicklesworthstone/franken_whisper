@@ -5665,9 +5665,13 @@ impl AcousticSidecarEvaluationRequest {
 /// Missingness-aware contrast in canonical Voice, Channel, MixedAuxiliary order.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub(crate) struct AcousticSidecarOwnerContrast {
+    /// Maximum normalized delta per canonical Voice, Channel, Mixed owner.
     pub owner_contrast: [f32; 3],
+    /// Whether at least one component was comparable for each owner.
     pub owner_available: [bool; 3],
+    /// Components with values available in both observations.
     pub comparable_components: usize,
+    /// Component slots inspected after both parent summaries were available.
     pub component_comparisons: usize,
 }
 
@@ -5717,7 +5721,8 @@ pub(crate) fn acoustic_sidecar_calibrate_owner_contrast(
             ));
         }
     }
-    if (contrast.comparable_components > 0) != contrast.owner_available.into_iter().any(|value| value)
+    if (contrast.comparable_components > 0)
+        != contrast.owner_available.into_iter().any(|value| value)
     {
         return Err(FwError::InvalidRequest(
             "sidecar comparable components and owner availability are inconsistent".to_owned(),
@@ -5759,24 +5764,10 @@ pub(crate) fn acoustic_sidecar_calibrate_owner_contrast(
 
 /// One signal-bearing, non-serializable evaluation observation.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) struct AcousticSidecarBoundarySignal {
-    pub frame_index: usize,
-    pub contrast: AcousticSidecarOwnerContrast,
+struct AcousticSidecarBoundarySignal {
+    frame_index: usize,
     calibrated_log_odds: Option<f32>,
-    pub calibrated_probability: Option<f32>,
-}
-
-impl std::fmt::Debug for AcousticSidecarBoundarySignal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AcousticSidecarBoundarySignal")
-            .field("contrast", &self.contrast)
-            .field(
-                "calibrated_probability_available",
-                &self.calibrated_probability.is_some(),
-            )
-            .finish_non_exhaustive()
-    }
+    calibrated_probability: Option<f32>,
 }
 
 /// Aggregate-only evaluation diagnostics.
@@ -6235,7 +6226,6 @@ impl AcousticSidecarBoundaryAdapter {
             acoustic_sidecar_calibrate_owner_contrast(contrast, self.request.calibration)?;
         let signal = AcousticSidecarBoundarySignal {
             frame_index: frame.frame_index,
-            contrast,
             calibrated_log_odds: calibrated.map(|evidence| evidence.log_odds),
             calibrated_probability: calibrated.map(|evidence| evidence.probability),
         };
