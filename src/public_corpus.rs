@@ -21,8 +21,9 @@ use crate::diarization::{
     AcousticClusteringEvaluationEvidence, AcousticClusteringFallbackReason, AcousticClusteringMode,
     AcousticDiarizationInput, AcousticFeatureAblation, AcousticScatteringMode,
     AcousticSidecarEvaluationRequest, AcousticSidecarFusionCalibration,
-    AcousticSidecarFusionEvaluationEvidence, AcousticSidecarStudyConfig, AcousticSidecarStudyMode,
-    AcousticTrajectoryWaveletMode, ChangePointScore,
+    AcousticSidecarFusionEvaluationEvidence, AcousticSidecarStudy, AcousticSidecarStudyConfig,
+    AcousticSidecarStudyMode, AcousticSidecarStudyObservation, AcousticTrajectoryWaveletMode,
+    ChangePointScore,
     DIARIZATION_CORPUS_MANIFEST_SCHEMA_VERSION, DIARIZATION_HYPOTHESIS_SCHEMA_VERSION,
     DIARIZATION_REFERENCE_SCHEMA_VERSION, DIARIZATION_SCORER_VERSION, DiarizationCorpusManifest,
     DiarizationHypothesisDocument, DiarizationLeakageAudit, DiarizationReferenceDocument,
@@ -33,8 +34,8 @@ use crate::diarization::{
     acoustic_sidecar_observation_owner_contrast, acoustic_sidecar_study_config_sha256,
     acoustic_speaker_pair_calibration_sha256, audit_diarization_manifest,
     diarize_acoustic_pcm_with_modes_evidence, diarize_acoustic_pcm_with_sidecar_evidence,
-    parse_diarization_corpus_manifest, parse_diarization_reference, score_change_points,
-    score_diarization_documents,
+    extract_acoustic_features, parse_diarization_corpus_manifest, parse_diarization_reference,
+    score_change_points, score_diarization_documents,
     select_acoustic_change_evidence_at_threshold, speaker_change_points_ms,
     verify_leakage_audit_hash,
 };
@@ -71,7 +72,7 @@ pub const PUBLIC_CORPUS_SIDECAR_PAIR_SCORER_VERSION: &str =
     "public-sidecar-conditional-pair-scorer-v1";
 /// Identity of the deterministic paired-recording uncertainty calculation.
 pub const PUBLIC_CORPUS_SIDECAR_UNCERTAINTY_VERSION: &str =
-    "public-sidecar-paired-recording-normal-ci-v1";
+    "public-sidecar-paired-bootstrap-sha-counter-v1";
 /// Identity of the fail-closed development selector and held-out gate.
 pub const PUBLIC_CORPUS_SIDECAR_SELECTION_POLICY_VERSION: &str =
     "public-sidecar-selection-policy-v1";
@@ -98,6 +99,7 @@ const PUBLIC_SIDECAR_PAIR_SCORE_BINS: usize = 256;
 const PUBLIC_SIDECAR_PAIR_LAGS_FRAMES: [usize; 4] = [25, 50, 100, 200];
 const PUBLIC_SIDECAR_MAX_PAIRS_PER_RECORDING: usize = 4_096;
 const PUBLIC_SIDECAR_MINIMUM_COMPARABLE_COMPONENTS: usize = 1;
+const PUBLIC_SIDECAR_BOOTSTRAP_REPLICATES: usize = 2_000;
 /// Predeclared minimum relative micro-DER reduction required on development.
 pub const PUBLIC_CORPUS_MIN_DEVELOPMENT_DER_IMPROVEMENT: f64 = 0.05;
 /// Predeclared relative change-F1 gain for the calibrated detector.
@@ -876,6 +878,7 @@ pub struct PublicCorpusSidecarStudyProtocol {
     pub reliability_bins: usize,
     pub pair_lags_frames: [usize; 4],
     pub maximum_pairs_per_recording: usize,
+    pub paired_bootstrap_replicates: usize,
     pub lane_order: Vec<PublicCorpusSidecarLane>,
     pub gate_policy: PublicCorpusSidecarGatePolicy,
 }
@@ -986,12 +989,12 @@ pub struct PublicCorpusSidecarPerformance {
 #[serde(deny_unknown_fields)]
 pub struct PublicCorpusSidecarPairedUncertainty {
     pub paired_recording_count: u64,
+    pub bootstrap_replicates: usize,
+    pub bootstrap_seed_sha256: String,
     pub mean_der_delta: Option<f64>,
-    pub der_delta_standard_error: Option<f64>,
     pub der_delta_ci95_lower: Option<f64>,
     pub der_delta_ci95_upper: Option<f64>,
     pub mean_jer_delta: Option<f64>,
-    pub jer_delta_standard_error: Option<f64>,
     pub jer_delta_ci95_lower: Option<f64>,
     pub jer_delta_ci95_upper: Option<f64>,
 }
