@@ -383,11 +383,24 @@ fn media_magic(bytes: &[u8]) -> bool {
     bytes.starts_with(b"fLaC")
         || bytes.starts_with(b"OggS")
         || bytes.starts_with(b"ID3")
+        || bytes.starts_with(b"#!AMR\n")
+        || bytes.starts_with(b"#!AMR-WB\n")
         || bytes.starts_with(b"wvpk")
         || bytes.starts_with(b"caff")
         || bytes.starts_with(b".snd")
         || bytes.starts_with(b"MAC ")
         || bytes.starts_with(b".RMF")
+        || bytes.starts_with(b".ra\xfd")
+        || bytes.starts_with(&[
+            0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00,
+            0x62, 0xce, 0x6c,
+        ])
+        || bytes.starts_with(&[0x0b, 0x77])
+        || bytes.starts_with(&[0x7f, 0xfe, 0x80, 0x01])
+        || bytes.starts_with(&[0xfe, 0x7f, 0x01, 0x80])
+        || bytes.starts_with(&[0x1f, 0xff, 0xe8, 0x00])
+        || bytes.starts_with(&[0xff, 0x1f, 0x00, 0xe8])
+        || bytes.starts_with(&[0x64, 0x58, 0x20, 0x25])
         || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
         || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE")
         || (bytes.len() >= 12
@@ -562,5 +575,35 @@ mod tests {
         assert!(media_magic(b"wvpk"));
         assert!(media_magic(&[0x1a, 0x45, 0xdf, 0xa3]));
         assert!(!media_magic(b"plain text"));
+    }
+
+    #[test]
+    fn media_magic_detects_banned_audio_headers_without_prefix_near_misses() {
+        assert!(media_magic(b"#!AMR\nsynthetic"));
+        assert!(media_magic(b"#!AMR-WB\nsynthetic"));
+        assert!(media_magic(&[0x0b, 0x77, 0x00, 0x00]));
+        assert!(media_magic(&[
+            0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00,
+            0x62, 0xce, 0x6c,
+        ]));
+        assert!(media_magic(b".ra\xfdsynthetic"));
+        for sync_word in [
+            [0x7f, 0xfe, 0x80, 0x01],
+            [0xfe, 0x7f, 0x01, 0x80],
+            [0x1f, 0xff, 0xe8, 0x00],
+            [0xff, 0x1f, 0x00, 0xe8],
+            [0x64, 0x58, 0x20, 0x25],
+        ] {
+            assert!(media_magic(&sync_word));
+        }
+
+        assert!(!media_magic(b"#!AMR synthetic"));
+        assert!(!media_magic(&[0x0b, 0x76, 0x00, 0x00]));
+        assert!(!media_magic(&[
+            0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00,
+            0x62, 0xce, 0x6d,
+        ]));
+        assert!(!media_magic(b".ra\xfcsynthetic"));
+        assert!(!media_magic(&[0x7f, 0xfe, 0x80, 0x00]));
     }
 }
