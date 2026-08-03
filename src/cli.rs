@@ -247,7 +247,7 @@ pub enum Command {
     /// Score external confidential references/hypotheses and emit aggregates only.
     #[command(name = "diarization-eval")]
     DiarizationEval(ConfidentialEvaluationArgs),
-    /// Inspect or build reproducible external public-corpus evidence.
+    /// Inspect, build, or evaluate reproducible external public-corpus evidence.
     #[command(name = "diarization-corpus")]
     DiarizationCorpus {
         #[command(subcommand)]
@@ -265,7 +265,7 @@ pub enum Command {
     Youtube(Box<YoutubeArgs>),
 }
 
-/// Public-corpus registry and preparation commands.
+/// Public-corpus registry, preparation, and aggregate evaluation commands.
 #[derive(Debug, Subcommand)]
 pub enum PublicCorpusCommand {
     /// Emit the built-in corpus/license/conversion registry as JSON.
@@ -274,6 +274,8 @@ pub enum PublicCorpusCommand {
     Build(PublicCorpusBuildArgs),
     /// Run all frozen acoustic feature ablations and emit aggregates only.
     Ablate(PublicCorpusAblationArgs),
+    /// Run the frozen evaluation-only acoustic sidecar study and emit aggregates only.
+    SidecarStudy(PublicCorpusSidecarStudyArgs),
 }
 
 /// Developer-only external differential-diagnostic commands.
@@ -450,6 +452,67 @@ impl fmt::Debug for PublicCorpusAblationArgs {
             )
             .field("stage", &self.stage)
             .field("locked_development_evidence", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Arguments for the external, aggregate-only acoustic sidecar study.
+#[derive(Args)]
+pub struct PublicCorpusSidecarStudyArgs {
+    /// Absolute external root containing selected public inputs.
+    #[arg(long)]
+    pub input_root: PathBuf,
+
+    /// Absolute path to the external path-bearing corpus descriptor.
+    #[arg(long)]
+    pub descriptor: PathBuf,
+
+    /// New absolute path for the path-free validated corpus bundle.
+    #[arg(long)]
+    pub bundle_output: PathBuf,
+
+    /// New absolute path for aggregate-only sidecar-study evidence.
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Exact acknowledgement ID emitted by `diarization-corpus registry`.
+    #[arg(long)]
+    pub license_ack: String,
+
+    /// Deterministically score only each recording prefix of this duration.
+    #[arg(long)]
+    pub maximum_recording_duration_ms: Option<u64>,
+
+    /// Development tuning or hash-locked unseen certification.
+    #[arg(long, value_enum)]
+    pub stage: PublicCorpusEvaluationStageArg,
+
+    /// Existing sidecar development evidence required only for certification.
+    #[arg(long)]
+    pub locked_development_evidence: Option<PathBuf>,
+}
+
+impl fmt::Debug for PublicCorpusSidecarStudyArgs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCorpusSidecarStudyArgs")
+            .field("input_root", &"<redacted>")
+            .field("descriptor", &"<redacted>")
+            .field("bundle_output", &"<redacted>")
+            .field("output", &"<redacted>")
+            .field("license_ack", &self.license_ack)
+            .field(
+                "maximum_recording_duration_ms",
+                &self.maximum_recording_duration_ms,
+            )
+            .field("stage", &self.stage)
+            .field(
+                "locked_development_evidence",
+                &self
+                    .locked_development_evidence
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -3428,6 +3491,46 @@ mod tests {
         let debug = format!("{args:?}");
         assert!(!debug.contains("EXTERNAL"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn public_corpus_cli_parses_sidecar_study_and_redacts_every_path() {
+        let cli = Cli::try_parse_from([
+            "franken_whisper",
+            "diarization-corpus",
+            "sidecar-study",
+            "--input-root",
+            "/SIDE_CAR_SECRET/INPUT",
+            "--descriptor",
+            "/SIDE_CAR_SECRET/INPUT/descriptor.json",
+            "--bundle-output",
+            "/SIDE_CAR_SECRET/OUTPUT/bundle.json",
+            "--output",
+            "/SIDE_CAR_SECRET/OUTPUT/study.json",
+            "--license-ack",
+            "accept-ami-cc-by-4.0",
+            "--maximum-recording-duration-ms",
+            "120000",
+            "--stage",
+            "certification",
+            "--locked-development-evidence",
+            "/SIDE_CAR_SECRET/LOCK/development.json",
+        ])
+        .expect("public corpus sidecar-study command");
+        let debug = format!("{cli:?}");
+        assert!(!debug.contains("SIDE_CAR_SECRET"));
+        assert_eq!(debug.matches("<redacted>").count(), 5);
+
+        let Command::DiarizationCorpus {
+            command: PublicCorpusCommand::SidecarStudy(args),
+        } = cli.command
+        else {
+            panic!("expected public corpus sidecar study");
+        };
+        assert_eq!(args.license_ack, "accept-ami-cc-by-4.0");
+        assert_eq!(args.maximum_recording_duration_ms, Some(120_000));
+        assert_eq!(args.stage, PublicCorpusEvaluationStageArg::Certification);
+        assert!(args.locked_development_evidence.is_some());
     }
 
     #[test]

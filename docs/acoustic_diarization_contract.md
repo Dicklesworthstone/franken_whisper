@@ -457,11 +457,14 @@ their custom `Debug` output omits feature values. Source-derived, public-corpus,
 or per-recording sidecar observations and feature values must not be logged,
 written to SQLite/JSONL, placed in a speaker-profile store, or retained in
 repository evidence. Deterministically generated synthetic conformance values
-and goldens may remain in unit tests. A future public study artifact may retain
+and goldens may remain in unit tests. The public sidecar-study artifact retains
 only aggregate, path-free and transcript-free metrics plus schema/configuration
-hashes, operation counts, performance observations, and a self-hash.
+hashes, operation counts, performance observations, and a self-hash. It never
+serializes an `AcousticSidecarStudyObservation` or any constituent feature
+value.
 
-This prototype is not an accuracy result or promotion. Focused synthetic/unit
+The sidecar kernels and evaluator are not an accuracy result or promotion.
+Focused synthetic/unit
 checks cover bounded arithmetic, fixed transform goldens plus in-tree scalar
 differential references, masked
 band-energy stationary trajectory wavelets, fixed first/second-order scattering summaries, a
@@ -470,22 +473,48 @@ cancellation rollback,
 missingness boundaries for both scattering orders, affine and explicit
 trajectory/scattering one-frame-translation metamorphic checks,
 fixed-state accounting, configuration separation, and default-path isolation.
-It does not yet include multi-coordinate cepstral trajectory candidates—the
-current RMS magnitude intentionally collapses coefficient sign and ordering—a
-public sidecar evaluator, public pair and boundary discrimination,
-DER/JER/count/calibration results, RTF/RSS evidence,
-or held-out certification. Nothing in this section establishes that any new
-candidate improves diarization. `bd-odj7.13.15` therefore remains in progress.
+It still does not include multi-coordinate cepstral trajectory candidates—the
+current RMS magnitude intentionally collapses coefficient sign and ordering—or
+any retained real-corpus development, RTF/RSS, held-out, or adoption result.
+Nothing in this section establishes that any new candidate improves
+diarization. `bd-odj7.13.15` therefore remains in progress.
 
-The future sidecar evaluator must be a schema separate from public acoustic
-ablation v8. It must freeze the full-v2 baseline and candidate order before
-reading development metrics; report boundary precision/recall/F1 and timing,
-same/different discrimination, speaker-count error, DER/JER, calibration,
-coverage, channel-confound rate, RTF, RSS, and deterministic hashes; and
-predeclare uncertainty-aware improvement and non-regression limits. Held-out
-audio stays sealed unless one development candidate passes every relevant
-gate. If none passes, the correct outcome is a retained aggregate negative
-result and no feature adoption.
+The evaluator uses the separate
+`public-diarization-acoustic-sidecar-study-v1` schema and
+`public-diarization-acoustic-sidecar-study-runner-v1`; it does not modify public
+acoustic ablation v8. Before reading development metrics it freezes this exact
+lane order:
+
+1. `full_v2_baseline`
+2. `frame_haar_l4`
+3. `frame_d4_l4`
+4. `modulation`
+5. `frame_haar_l4_and_modulation`
+6. `frame_d4_l4_and_modulation`
+7. `trajectory_haar_l4`
+8. `trajectory_d4_l4`
+9. `scattering_first_order`
+10. `scattering_second_order`
+11. `scattering_first_and_second_order`
+12. `all_haar_l4`
+13. `all_d4_l4`
+
+The baseline is explicitly unfused. Each candidate reports aggregate boundary
+precision/recall/F1 and timing, conditional same/different discrimination,
+coverage, channel-confound rate, calibration, operation counts, RTF, RSS, and
+deterministic/self hashes. Candidate-pipeline DER/JER and speaker-count metrics
+are admitted only when `fusion_executed=true`; unavailable fusion cannot
+masquerade as a measured zero or a baseline-equivalent result. Development fits
+calibration from bounded aggregate histograms and may select at most one
+candidate that passes every uncertainty-aware improvement and non-regression
+gate. Its disposition is `advance_to_certification`; all other candidates are
+`rejected` and the unfused lane remains `baseline`. Held-out audio stays sealed
+unless the exact development artifact authorizes that one candidate.
+Certification evaluates only the locked candidate and may mark it `adopted`
+only after held-out non-regression. If no candidate passes development, the
+correct outcome is a retained aggregate negative result and no feature
+adoption. Implementing this contract does not claim that any lane has advanced
+or been adopted; that authority requires a real public-corpus artifact.
 
 ### 4.4 Probabilistic clustering v2 development status
 
@@ -1087,6 +1116,31 @@ duration strata, posterior calibration summaries, collapse/occupancy
 diagnostics, and optional micro/macro WDER. These additions do not promote a
 candidate: the historical v7 development result in section 4.4 remains the
 last retained verdict until a hash-locked v8 development run passes.
+
+`diarization-corpus sidecar-study` is a sibling evaluation command, not an
+extension of ablation v8 or a normal diarization mode. It consumes the same
+absolute external input root and path-bearing descriptor, creates a new
+path-free bundle plus a new aggregate-only sidecar artifact outside both the
+checkout and input root, and refuses to overwrite either output. The request
+type has no `Debug` or serialization implementation. CLI `Debug` output
+redacts the input root, descriptor, bundle output, evidence output, and optional
+locked-development path. Successful stdout is the exact pretty-JSON byte
+sequence retained in the evidence file, including its terminal newline; the
+artifact's `result_sha256` remains the canonical self-hash with that field
+cleared, not a hash of the pretty file bytes.
+
+`--stage development` reads only development recordings and must not receive a
+lock. `--stage certification` reads only held-out recordings and requires
+`--locked-development-evidence`; before corpus access it verifies the exact
+development result and deterministic-accuracy hashes, bundle, descriptor,
+duration protocol, candidate order/configuration hashes, fitted calibration,
+selected lane, gates, and disposition. A failed development selection cannot
+unlock certification. Both stages retain no source path, filename,
+recording/speaker identifier, timestamped observation, raw feature value,
+audio, or transcript. Cancellation is checked throughout preparation and
+evaluation, and evidence is written only after canonical verification. None of
+these CLI or artifact paths construct a sidecar during transcription or change
+the default-off acoustic-v2 path.
 
 The AMI adapter enforces the corpus site's scenario-only training,
 development, and unseen-test meeting-family split. Other corpora use an

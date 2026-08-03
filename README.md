@@ -401,6 +401,18 @@ opaque non-lexical IDs and timing/speaker annotations, never token text. See
 [`docs/acoustic_diarization_contract.md`](docs/acoustic_diarization_contract.md)
 for the versioned schemas and fail-closed policy.
 
+The multiscale acoustic sidecar is exposed only through the separate public
+evaluation command `diarization-corpus sidecar-study`. It is not a
+`transcribe` option: normal segmentation, clustering, robot output,
+persistence, and acoustic-v2 report bytes remain unchanged. The command runs a
+frozen full-v2 baseline plus twelve ordered sidecar lanes, retains only
+aggregate path-free and transcript-free evidence, and creates both outputs in
+an external directory. Its stdout bytes exactly match the retained study
+evidence file. A completed study is not an automatic promotion; the artifact
+records whether each candidate was rejected, advanced for held-out
+certification, or adopted, and no lane has any such authority until a real
+public-corpus result establishes it.
+
 The library's `adversarial_corpus` module supplies a Rust-native, public-safe
 accuracy harness without checking audio fixtures into the repository. It
 generates transcript-free harmonic calls with deterministic speaker, turn,
@@ -586,7 +598,7 @@ franken_whisper deliberately downloads with the forgiving `bestaudio/best` forma
 
 ## Command Reference
 
-`franken_whisper` exposes seven top-level subcommands.
+`franken_whisper` exposes ten top-level subcommands.
 
 ### `transcribe`
 
@@ -724,6 +736,52 @@ Word-level timestamp *extraction* (max-len, token-threshold, token-sum-threshold
 | `--correction-tolerance-wer <F>` | — | WER tolerance for confirmation vs. retraction |
 | `--no-adaptive` | `false` | Disable adaptive window sizing |
 | `--always-correct` | `false` | Force quality model on every window (evaluation mode) |
+
+### `diarization-corpus`
+
+External-only preparation and aggregate evaluation for public or
+operator-licensed diarization corpora. The registry does not download data or
+accept a license on the operator's behalf.
+
+```bash
+# inspect frozen source, license, conversion, and acknowledgement contracts
+franken_whisper diarization-corpus registry
+
+# validate external WAV/RTTM inputs and create one path-free bundle
+franken_whisper diarization-corpus build \
+  --input-root /absolute/external/corpus \
+  --descriptor /absolute/external/corpus/descriptor.json \
+  --output /absolute/external/results/bundle.json \
+  --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID>
+
+# run the existing acoustic-v2 representation/detector/clustering ablation v8
+franken_whisper diarization-corpus ablate \
+  --input-root /absolute/external/corpus \
+  --descriptor /absolute/external/corpus/descriptor.json \
+  --bundle-output /absolute/external/results/ablation-bundle.json \
+  --output /absolute/external/results/ablation-development.json \
+  --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID> \
+  --stage development
+
+# run the separate, evaluation-only multiscale sidecar study
+franken_whisper diarization-corpus sidecar-study \
+  --input-root /absolute/external/corpus \
+  --descriptor /absolute/external/corpus/descriptor.json \
+  --bundle-output /absolute/external/results/sidecar-bundle.json \
+  --output /absolute/external/results/sidecar-development.json \
+  --license-ack <REGISTRY_ACKNOWLEDGEMENT_ID> \
+  --stage development
+```
+
+All path arguments must be absolute. Input data must remain outside the
+checkout, and bundle/evidence parents must be outside both the checkout and
+input root. Outputs use create-new semantics and are never overwritten. Add
+`--maximum-recording-duration-ms <N>` to freeze a deterministic prefix. A
+sidecar certification run uses `--stage certification` and must also supply
+`--locked-development-evidence <PATH>`; it evaluates only the single candidate
+selected by the exact locked development artifact. Source paths, filenames,
+recording/speaker identifiers, per-recording observations, feature values,
+audio, and transcripts never enter the aggregate study evidence.
 
 ### `robot`
 
