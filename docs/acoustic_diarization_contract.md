@@ -254,21 +254,23 @@ frame/missingness counts, supported dimension counts, bounded retained state,
 and fallback/calibration state. They never expose feature values, audio,
 transcript text, paths, or recording identifiers.
 
-### 4.3.1 Experimental multiscale sidecar v3
+### 4.3.1 Experimental multiscale sidecar v4
 
-`acoustic-multiscale-sidecar-v3` is an evaluation-only surface. Its
+`acoustic-multiscale-sidecar-v4` is an evaluation-only surface. Its
 configuration defaults to `Off`, has independent per-axis mode orders and a
 SHA-256, and is not a member of the six frozen `AcousticFeatureAblation`
 variants. No
 normal transcription, segmentation, clustering, robot, or persistence path
 constructs this study. Running its arithmetic therefore cannot change the
 acoustic-v2 schema hash, feature dimensions, report bytes, or default result.
-This v3 identity corrects the pre-evidence v2 identity after the prototype's
-semantics accumulated material changes: observations bind the complete
-configuration, trajectory summaries expose independent availability,
-transforms use stationary non-wrapping geometry, and every unit-energy lane
-now rejects representationally near-constant input. None of those v2-labeled
-prototype observations are schema-compatible with v3.
+This v4 identity supersedes the pre-evidence v3 identity. V3 had already
+corrected v2 for complete observation configuration, independent trajectory
+availability, stationary non-wrapping geometry, and near-constant admission.
+V4 additionally validates submitted PCM for every configuration, including
+trajectory-only and fully disabled studies, and freezes trajectory/scattering
+precision, cast, operation-accounting, and scratch-buffer formulas in the
+configuration digest. Neither v2- nor v3-labeled prototype observations are
+schema-compatible with v4.
 
 The current prototype implements four independently selectable, bounded
 kernel families:
@@ -293,11 +295,15 @@ its frame-wavelet axis or silently relabeled under another configuration.
 Direct standalone or otherwise unbound kernel results do not carry this
 binding and are therefore conformance diagnostics, not evaluation evidence.
 
-Those physical declarations are caller preconditions, not content-provenance
-proof. The in-memory executor cannot verify an external sample rate, prove
-that successive arrays advance by exactly 160 samples, or infer that a
-separately supplied `AcousticFrameFeatures` value was derived from the same
-PCM array. A valid evaluator must construct both from one normalized stream,
+The executor checks all 400 submitted samples are finite and within inclusive
+`[-1, 1]` before any configured family runs. It applies that domain check even
+when the frame-wavelet axis is disabled, so a trajectory-only, modulation-only,
+scattering-only, or fully disabled observation cannot bless invalid PCM.
+Physical sample rate, hop cadence, and content provenance remain caller
+preconditions: the in-memory executor cannot verify an external sample rate,
+prove that successive arrays advance by exactly 160 samples, or infer that a
+separately supplied `AcousticFrameFeatures` value was derived from the same PCM
+array. A valid evaluator must construct both from one normalized stream,
 preserve contiguous frame indices, and bind its extractor revision separately.
 The sidecar digest identifies configuration, schema, and sidecar arithmetic;
 it does not hash every upstream acoustic-v2 threshold or FFT-bin decision.
@@ -420,6 +426,18 @@ committed only after every enabled family succeeds. A cancelled frame can
 therefore be retried without a hidden advance in either ring, including
 cancellation after the modulation projections have completed but before
 trajectory analysis begins.
+All trajectory/scattering moment, energy, filter-response, and aggregate
+accumulation is `f64`; normalized samples, coefficients/moduli, and public
+summary values are rounded once when stored as `f32`. Adjacent trajectory-detail
+change widens both stored `f32` coefficients before forming the difference and
+absolute value in `f64`. Trajectory-wavelet accounting records one validity
+visit per inspected support tap and two filter terms per tap only when the
+complete low/high support is valid. Scattering records one validity visit per
+inspected support tap and one filter term per tap only for a fully valid
+support. These precision, cast, and counting rules, the three
+trajectory-wavelet scratch value/mask pairs, four first-order scattering pairs,
+and one additional second-order pair are configuration-hashed.
+
 Diagnostics name filter-tap terms, validity-mask visits, valid
 sample-frequency visits, exact buffer/table payload bytes, and target-specific
 in-struct bytes. On direct five-family, fully valid conformance arrays, four
@@ -449,7 +467,8 @@ differential references, masked
 band-energy stationary trajectory wavelets, fixed first/second-order scattering summaries, a
 Voice-owned voiced-envelope magnitude trajectory, frame-local occupancy,
 cancellation rollback,
-missingness boundaries, affine and one-frame-translation metamorphic checks,
+missingness boundaries for both scattering orders, affine and explicit
+trajectory/scattering one-frame-translation metamorphic checks,
 fixed-state accounting, configuration separation, and default-path isolation.
 It does not yet include multi-coordinate cepstral trajectory candidates—the
 current RMS magnitude intentionally collapses coefficient sign and ordering—a
