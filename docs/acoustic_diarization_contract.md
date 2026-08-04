@@ -925,18 +925,22 @@ does not invent speakers merely to satisfy a range minimum or exact count; it
 reports `unsatisfied_constraints`, reports `speaker_count_unresolved`, or
 returns a hard error according to typed fallback policy.
 
-The v3 probabilistic speaker-count candidate uses five deterministic semantic
+The v5 probabilistic speaker-count candidate uses five deterministic semantic
 views: full evidence, no pitch, no dynamics, no formants, and no channel. It
 retains their complete bounded merge-risk curves, combines them with a
 symmetrized degree-bounded normalized-affinity eigengap proposal, applies hard
 constraint-graph lower bounds, and linearly pools at most 15% caller-prior mass
 into the acoustic count distribution before checking the selected count
-against effective post-assignment occupancy. Five-view acoustic agreement
-linearly attenuates that mix to 7.5% at unanimity. The bounded pool can move
-probability but cannot erase acoustically supported counts, acquire the
+against effective post-assignment occupancy. A clipped prior or range receives
+only the fraction of that weight retained inside the feasible count domain.
+Five-view acoustic agreement linearly attenuates the mix further to 7.5% at
+unanimity. The ordinary inferred-count search ceiling is eight, but distinct
+hard anchors may raise both the lower bound and ceiling, up to the global bound
+of 64, rather than creating an inverted search interval. The bounded pool can
+move probability but cannot erase acoustically supported counts, acquire the
 unbounded leverage of a near-zero log prior, or veto unanimous evidence through
-the unresolved-mass threshold. The
-public estimate carries ordered concrete count bins plus separate unresolved
+the unresolved-mass threshold. The public estimate carries ordered concrete
+count bins plus separate unresolved
 mass, entropy, stability, six typed lane summaries, and content-free
 calibration/evidence hashes. It also reports content-free resource accounting:
 prototype and retained-edge counts, affinity comparisons, estimated peak

@@ -3089,18 +3089,17 @@ fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() 
 
     assert!(
         output.status.success(),
-        "robot TinyDiarize acoustic run must succeed"
+        "robot TinyDiarize acoustic run must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8(output.stdout)
+        .expect("robot TinyDiarize acoustic output must be valid UTF-8");
     let events: Vec<serde_json::Value> = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let parsed = serde_json::from_str(line);
-            assert!(parsed.is_ok(), "robot output line must be valid NDJSON");
-            parsed.unwrap_or_default()
-        })
+        .map(|line| serde_json::from_str(line).expect("robot output line must be valid NDJSON"))
         .collect();
 
     let hint_evidence = events
@@ -3183,13 +3182,17 @@ fn robot_tiny_diarize_emits_redacted_hint_evidence_and_native_acoustic_report() 
         run_complete["backend"] == "whisper_cpp",
         "run_complete must identify the whisper.cpp backend"
     );
-    assert!(
-        serde_json::from_value::<franken_whisper::model::DiarizationReport>(
-            run_complete["diarization"].clone(),
-        )
-        .is_ok(),
-        "run_complete must contain a typed native acoustic report"
-    );
+    let diarization_report = serde_json::from_value::<franken_whisper::model::DiarizationReport>(
+        run_complete["diarization"].clone(),
+    )
+    .expect("run_complete must contain a typed native acoustic report");
+    diarization_report
+        .speaker_count
+        .estimate
+        .as_ref()
+        .expect("native acoustic report must retain its speaker-count estimate")
+        .validate()
+        .expect("native acoustic speaker-count estimate must satisfy its public contract");
     assert!(
         run_complete["diarization"]["implementation"] == "native-acoustic-v2",
         "run_complete diarization must identify the native acoustic implementation"

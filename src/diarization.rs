@@ -12012,7 +12012,7 @@ where
         | SpeakerCountRequest::Range { .. } => 1,
     };
     let count_constraints_feasible = requested_minimum <= initial_clusters.len();
-    let mut count_policy = if count_constraints_feasible {
+    let count_policy = if count_constraints_feasible {
         resolve_count_policy(speaker_count, initial_clusters.len())?
     } else {
         SpeakerCountPolicy {
@@ -12021,7 +12021,8 @@ where
             exact: Some(initial_clusters.len()),
         }
     };
-    count_policy.min = count_policy.min.max(constraint_lower_bound);
+    let count_policy =
+        apply_count_constraint_floor(count_policy, constraint_lower_bound, initial_clusters.len())?;
     let (
         clusters,
         merge_trace,
@@ -13240,6 +13241,37 @@ fn resolve_count_policy(
         max: max.min(available),
         exact,
     })
+}
+
+fn apply_count_constraint_floor(
+    mut policy: SpeakerCountPolicy,
+    constraint_lower_bound: usize,
+    available: usize,
+) -> FwResult<SpeakerCountPolicy> {
+    if constraint_lower_bound == 0 || constraint_lower_bound > MAX_SPEAKER_COUNT as usize {
+        return Err(FwError::InvalidRequest(format!(
+            "speaker constraint graph requires {constraint_lower_bound} profiles but the bounded domain permits at most {MAX_SPEAKER_COUNT}"
+        )));
+    }
+    if constraint_lower_bound > available {
+        return Err(FwError::InvalidRequest(format!(
+            "speaker constraint graph requires {constraint_lower_bound} profiles but only {available} are available"
+        )));
+    }
+    if let Some(exact) = policy.exact
+        && constraint_lower_bound > exact
+    {
+        return Err(FwError::InvalidRequest(format!(
+            "hard speaker count {exact} conflicts with {constraint_lower_bound} distinct hard speaker anchors"
+        )));
+    }
+    policy.min = policy.min.max(constraint_lower_bound);
+    // The ordinary infer ceiling is eight speakers, but caller-provided hard
+    // anchors are stronger evidence and may validly raise that floor as high as
+    // MAX_SPEAKER_COUNT. Preserve the bounded ceiling while avoiding an
+    // inverted search interval when the hard floor is above eight.
+    policy.max = policy.max.max(policy.min);
+    Ok(policy)
 }
 
 fn clusters_compatible(
@@ -24984,6 +25016,38 @@ mod tests {
             estimate.validate().expect("bounded estimate");
             assert!(estimate.candidate_upper_bound <= crate::model::MAX_SPEAKER_COUNT);
         }
+    }
+
+    #[test]
+    fn hard_anchor_floor_can_raise_infer_ceiling_but_not_an_exact_count() {
+        let inferred = super::resolve_count_policy(&SpeakerCountRequest::Infer, 12)
+            .expect("ordinary inference policy");
+        assert_eq!((inferred.min, inferred.max, inferred.exact), (1, 8, None));
+
+        let anchored = super::apply_count_constraint_floor(inferred, 9, 12)
+            .expect("nine valid hard anchors must raise the infer ceiling");
+        assert_eq!((anchored.min, anchored.max, anchored.exact), (9, 9, None));
+
+        let exact =
+            super::resolve_count_policy(&SpeakerCountRequest::HardConstraint { count: 8 }, 12)
+                .expect("exact count policy");
+        let error = super::apply_count_constraint_floor(exact, 9, 12)
+            .expect_err("nine distinct hard anchors must conflict with an exact count of eight");
+        assert!(
+            error
+                .to_string()
+                .contains("hard speaker count 8 conflicts with 9 distinct hard speaker anchors")
+        );
+
+        let unavailable = super::resolve_count_policy(&SpeakerCountRequest::Infer, 8)
+            .expect("bounded inference policy");
+        let error = super::apply_count_constraint_floor(unavailable, 9, 8)
+            .expect_err("a hard-anchor floor cannot exceed available profiles");
+        assert!(
+            error
+                .to_string()
+                .contains("requires 9 profiles but only 8 are available")
+        );
     }
 
     #[test]
