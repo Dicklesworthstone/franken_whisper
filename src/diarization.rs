@@ -7549,7 +7549,7 @@ pub const ACOUSTIC_CHANGE_FIXED_SAFE_VERSION: &str = "acoustic-change-fixed-safe
 pub const ACOUSTIC_CLUSTERING_FIXED_SAFE_VERSION: &str = "acoustic-clustering-fixed-safe-v1";
 /// Development identity for probabilistic pair scoring and stable count selection.
 pub const ACOUSTIC_CLUSTERING_PROBABILISTIC_VERSION: &str =
-    "acoustic-clustering-probabilistic-v10-development";
+    "acoustic-clustering-probabilistic-v9-development";
 /// Public schema for bounded count distributions with explicit unresolved mass.
 pub const SPEAKER_COUNT_ESTIMATE_SCHEMA_VERSION: &str = "speaker-count-estimate-v2";
 const TEMPORAL_KNOWN_SWITCH_BASE: f32 = 0.22;
@@ -7606,9 +7606,9 @@ pub struct AcousticSpeakerPairCalibration {
 pub const fn acoustic_speaker_pair_calibration() -> AcousticSpeakerPairCalibration {
     AcousticSpeakerPairCalibration {
         variance_floor: 0.05,
-        different_logit_intercept: -3.5,
-        voice_distance_weight: 4.5,
-        channel_distance_weight: 0.25,
+        different_logit_intercept: -3.0,
+        voice_distance_weight: 4.0,
+        channel_distance_weight: 0.10,
         full_support_frames: 50.0,
         false_split_loss: 1.0,
         false_merge_loss: 12.0,
